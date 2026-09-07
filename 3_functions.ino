@@ -745,9 +745,11 @@ enum Csv4Index {
   CSV4_n183Heading,             // NMEA 0183 decoded heading (deg ×10; -10 = nothing decoded). Separate from CSV4_HeadingNMEA, which is the NMEA2000 source.
   CSV4_n183HdgRef,              // reference frame of the above: 0 none, 1 magnetic, 2 true
   CSV4_bmsSignalActive,         // live BMS on/off opto input (GPIO42): 1 = 5-28 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice
+  CSV4_panelHiRateInput,        // switch panel HIGH/LOW opto input (Cable 3 pin 5, GPIO39): 1 = wire energized = switch ON = asking for High. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
+  CSV4_panelForceFloatInput,    // switch panel FORCEFLOAT opto input (Cable 3 pin 7, GPIO40): 1 = wire energized = switch ON = asking for Maintain. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
   CSV4_sessionId,               // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV4_sendMs,                  // millis() when this payload was built
-  CSV4_FIELD_COUNT  // = 24
+  CSV4_FIELD_COUNT  // = 26
 };
 
 enum Csv3Index {
@@ -760,7 +762,7 @@ enum Csv3Index {
   CSV3_yyMin,
   CSV3_retired1,  // was FieldAdjustmentInterval — dead slot, sends 0; kept so CSV3 indices never renumber
   CSV3_ManualDutyTarget,
-  CSV3_SwitchControlOverride,
+  CSV3_PhysicalPanelOverride,
   CSV3_waveAmplitude,
   CSV3_CurrentThreshold,
   CSV3_PeukertExponent_scaled,
@@ -1297,10 +1299,21 @@ void setupWiFi() {
   //   GPIO46     — LOW = AP mode, HIGH = Client mode. Both run the alternator fully, so holding 46 LOW is
   //                the credential-free emergency path: join ALTERNATOR_WIFI, browse to 192.168.4.1
 
-  // GPIO45 = Configuration Mode Override (always checked first)
-  pinMode(45, INPUT_PULLUP);
-  bool forceConfigMode = (digitalRead(45) == LOW);
+  // Harness wires (RJ3 pins 11/12), documented as read "during a restart". Read once: loop() re-enters
+  // here from standby to raise the radio in the mode already chosen, and a live re-read could flip
+  // currentMode and stack a second "/" under the dashboard (the route once-flags are per function).
+  static bool strapsLatched = false;
+  static bool forceConfigMode = false;
+  static bool requestAPMode = false;
+  if (!strapsLatched) {
+    pinMode(45, INPUT_PULLUP);
+    forceConfigMode = (digitalRead(45) == LOW);
+    pinMode(46, INPUT_PULLUP);
+    requestAPMode = (digitalRead(46) == LOW);
+    strapsLatched = true;
+  }
 
+  // GPIO45 = Configuration Mode Override (always checked first)
   if (forceConfigMode) {
     Serial.println("=== GPIO45 LOW: FORCED CONFIGURATION MODE ===");
     Serial.println("=== ALTERNATOR DISABLED FOR SAFETY - Use GPIO46 LOW for emergency operation ===");
@@ -1317,9 +1330,6 @@ void setupWiFi() {
   // This allows emergency operation: GPIO41 low = factory firmware, GPIO41 high = OTA firmware (if valid OTA exists, else factory)
   // GPIO46 low = AP mode regardless of any credentials of any kind
   // Settings persist in userdata partition; AP credentials default to ALTERNATOR_WIFI/alternator123
-
-  pinMode(46, INPUT_PULLUP);
-  bool requestAPMode = (digitalRead(46) == LOW);
 
   if (requestAPMode) {
     Serial.println("=== GPIO46 LOW: OPERATIONAL AP MODE ===");
@@ -1535,7 +1545,7 @@ bool connectToWiFi(const char *ssid, const char *password, unsigned long timeout
     }
 
     // List what IS visible so a typo'd SSID is obvious at the bench. Blocking ~2-3 s scan:
-    // acceptable only because this function runs in setup(), before the control loop starts.
+    // acceptable only because every caller runs with the field off: setup(), or a loop() wake out of standby.
     WiFi.disconnect();
     if (wdtMainTaskSubscribed) esp_task_wdt_reset();
     int16_t n = WiFi.scanNetworks();
@@ -2779,8 +2789,8 @@ void setupServer() {
     // is. Stamped from Vessel Info rather than asked for in the covering email, which is the half
     // that gets forgotten. Sanitised on the way out: the stored strings pre-date any input filter.
     char battTxt[80], battChem[24];
-    dvccCopyPlainText(battTxt, sizeof(battTxt), BATTERY_MAKE_MODEL.c_str());
-    dvccCopyPlainText(battChem, sizeof(battChem), BATTERY_TYPE.c_str());
+    dvccCopyPlainText(battTxt, sizeof(battTxt), BATTERY_MAKE_MODEL);
+    dvccCopyPlainText(battChem, sizeof(battChem), BATTERY_TYPE);
     if (battTxt[0]) {
       n += (size_t)snprintf(buf + n, cap - n, "# battery on this boat: %s | %s | %d Ah | %u V\n",
                             battTxt, battChem[0] ? battChem : "chemistry not set",
@@ -3859,8 +3869,8 @@ void setupServer() {
     // Update RAM variables
     BOAT_LENGTH_FT = doc["boat_length_ft"];
     BOAT_DISPLACEMENT_LBS = doc["boat_displacement_lbs"];
-    BOAT_TYPE = doc["boat_type"].as<String>();
-    BOAT_MAKE_MODEL = doc["boat_make_model"].as<String>();
+    vesselSetText(BOAT_TYPE, sizeof(BOAT_TYPE), doc["boat_type"] | "");
+    vesselSetText(BOAT_MAKE_MODEL, sizeof(BOAT_MAKE_MODEL), doc["boat_make_model"] | "");
     BOAT_YEAR = doc["boat_year"];
     if (doc.containsKey("home_port") && !doc["home_port"].isNull()) {
       const char *homePortStr = doc["home_port"];
@@ -3869,7 +3879,7 @@ void setupServer() {
     } else {
       HOME_PORT[0] = '\0';  // Empty string if not provided
     }
-    ENGINE_MAKE = doc["engine_make"].as<String>();
+    vesselSetText(ENGINE_MAKE, sizeof(ENGINE_MAKE), doc["engine_make"] | "");
     ENGINE_HP = doc["engine_hp"];
     // System voltage is the sole source of truth for the 12/24/36/48V class. On a change, rescale the
     // whole charge-voltage profile + both absolute OV rungs (software cut, INA228 hardware limit) + both
@@ -3878,25 +3888,26 @@ void setupServer() {
     int newBatteryVoltage = doc["battery_voltage"] | (int)SYSTEM_VOLTAGE_CLASS;
     if (newBatteryVoltage != 12 && newBatteryVoltage != 24 && newBatteryVoltage != 36 && newBatteryVoltage != 48) newBatteryVoltage = oldBatteryVoltage;
     int    oldCapacityAh = BatteryCapacity_Ah;
-    String oldBatteryType = BATTERY_TYPE;
+    char oldBatteryType[sizeof(BATTERY_TYPE)];
+    strncpy(oldBatteryType, BATTERY_TYPE, sizeof(oldBatteryType));
     SYSTEM_VOLTAGE_CLASS = (uint8_t)newBatteryVoltage;
     applyNominalVoltageChange(oldBatteryVoltage, newBatteryVoltage);
     // An absent/invalid key yields 0, which zeroes the full-charge tail-current threshold
     // (TailCurrent * BatteryCapacity_Ah) and the displayed capacity. Keep the current value instead.
     BatteryCapacity_Ah = constrain((int)(doc["battery_capacity_ah"] | BatteryCapacity_Ah), 1, 100000);
     PeukertRatedCurrent_A = BatteryCapacity_Ah / 20.0f;  // /get derives this on write; import must too
-    BATTERY_TYPE = doc["battery_type"].as<String>();
+    vesselSetText(BATTERY_TYPE, sizeof(BATTERY_TYPE), doc["battery_type"] | "");
     // Chemistry no longer moves the INA228 limit — VoltageHardwareLimit is a persisted user
     // setting; the chemistry-specific value arrives via the battery-defaults proposal.
     // Voltage/capacity/chemistry all move the CV plant gain the commissioning fit measured, so the stored
     // tune no longer describes this bank. Only nag once a pass has actually been finished (epoch stamped).
     if (CommissionEpoch > 0 && (newBatteryVoltage != oldBatteryVoltage
                                 || BatteryCapacity_Ah != oldCapacityAh
-                                || BATTERY_TYPE != oldBatteryType)) {
+                                || strcmp(BATTERY_TYPE, oldBatteryType) != 0)) {
       raiseRecommissionNag();
     }
-    BATTERY_MAKE_MODEL = doc["battery_make_model"].as<String>();
-    ALTERNATOR_BRAND_MODEL = doc["alternator_brand_model"].as<String>();
+    vesselSetText(BATTERY_MAKE_MODEL, sizeof(BATTERY_MAKE_MODEL), doc["battery_make_model"] | "");
+    vesselSetText(ALTERNATOR_BRAND_MODEL, sizeof(ALTERNATOR_BRAND_MODEL), doc["alternator_brand_model"] | "");
     SolarWatts = doc["solar_watts"];
     // Unclamped, an out-of-range value indexes past axisRemap[] and wild-reads through src[]
     uint8_t prevOrient = imuMountOrientation;
@@ -4626,15 +4637,16 @@ void setupServer() {
     }
     if (request->hasParam("commissionAbort")) {
       foundParameter = true;
-      if (cxStartPersistFreshPending()) {
+      // One atomic cancel picks the branch — a separate "still pending?" read could be retired by the
+      // worker before the cancel lands. Resume/none fall through: a resume's cancel only stops the
+      // bookkeeping writes, the original snapshot is intact for the teardown below.
+      if (cxStartPersistCancel() == CX_CANCEL_FRESH) {
         // A fresh Start still staging (state=1 not yet committed) never began: cancel back to the
         // exact pre-click state. The live-run teardown below would wrongly demote a previously-
         // commissioned device whose re-run never actually started.
-        cxStartPersistCancel();
         settingsDirty = true;
         queueConsoleMessage("Commissioning: start cancelled before the restore point was saved — nothing changed");
       } else {
-        cxStartPersistCancel();  // a resume raced the worker: stop its bookkeeping writes — the original snapshot is intact
         faCommissionGate = false;
         // Abort is a teardown path too: committed cells from an aborted sweep are honest data captured
         // at level — freeze + persist, never discard (RPM_RIPPLE_TABLE_SPEC §2.2).
@@ -4664,12 +4676,12 @@ void setupServer() {
     // offers Continue; the origin snapshot stays so a later Abort / Clear-and-restart can still fully revert.
     if (request->hasParam("commissionStop")) {
       foundParameter = true;
-      if (cxStartPersistFreshPending()) {
-        cxStartPersistCancel();  // a fresh Start still staging never began: exact pre-click teardown
+      // One atomic cancel picks the branch (see commissionAbort). FRESH = the worker was stopped before
+      // state=1 was committed, so nothing began; resume/none get the live-run teardown.
+      if (cxStartPersistCancel() == CX_CANCEL_FRESH) {
         settingsDirty = true;
         queueConsoleMessage("Commissioning: stopped before the restore point was saved — nothing changed");
       } else {
-        cxStartPersistCancel();  // a resume raced the worker: stop its bookkeeping writes — the original snapshot is intact
         faCommissionGate = false;
         if (ripGameFill || ripTabPendingWipe) { ripGameFill = false; ripTabPendingWipe = false; ripTabPendingSave = true; }
         testProtectionsEnabled = commissionProtBackup;
@@ -5226,23 +5238,37 @@ void setupServer() {
       settingWrite(NK_capLimitMode, inputMessage.c_str());
       capLimitMode = constrain(inputMessage.toInt(), 0, 1);
     }
-    if (request->hasParam("SwitchControlOverride")) {
+    if (request->hasParam("PhysicalPanelOverride")) {
       foundParameter = true;
-      inputMessage = request->getParam("SwitchControlOverride")->value();
-      settingWrite(NK_SwitchControlOverride, inputMessage.c_str());
-      SwitchControlOverride = inputMessage.toInt();
+      inputMessage = request->getParam("PhysicalPanelOverride")->value();
+      settingWrite(NK_PhysicalPanelOverride, inputMessage.c_str());
+      PhysicalPanelOverride = inputMessage.toInt();
+      // Ownership of both modes just moved. Re-resolve here rather than waiting for the loop pass, so
+      // the CSV3 echo this request triggers already carries the modes the new owner asks for — turning
+      // the override off has to put the app's stored choice back on screen in the same round trip.
+      if (applyChargeRateMode(resolveChargeRateMode())) {
+        queueConsoleMessageF("Charge rate mode: switched to %s", HiLow == 1 ? "Normal" : "Low");
+      }
+      const int wantMaintain = resolveMaintainMode();
+      if (wantMaintain != MaintainMode) {
+        MaintainMode = wantMaintain;
+        queueConsoleMessageF("MaintainMode mode %s", MaintainMode ? "enabled" : "disabled");
+      }
+      queueConsoleMessage(PhysicalPanelOverride ? "Physical Panel Override on: the Cable 3 switches now set the charge rate and Force Maintain Mode, and the toggles in this app are inert."
+                                                : "Physical Panel Override off: this app sets the charge rate and Force Maintain Mode. The Cable 3 switches are still reported but change nothing.");
     }
     if (request->hasParam("MaintainMode")) {
       foundParameter = true;
       inputMessage = request->getParam("MaintainMode")->value();
-      MaintainMode = inputMessage.toInt();
-      if (!BatteryShuntPresent) MaintainMode = 0;  // no battery-current sensor at all → 0-net-amps hold impossible
-      settingWrite(NK_MaintainMode, String(MaintainMode).c_str());
-      if (MaintainMode) {
+      MaintainModeUserSel = inputMessage.toInt();  // the app's stored choice; inert while PhysicalPanelOverride is on, but still recorded so turning the override back off restores it
+      if (!BatteryShuntPresent) MaintainModeUserSel = 0;  // no battery-current sensor at all → 0-net-amps hold impossible
+      settingWrite(NK_MaintainMode, String(MaintainModeUserSel).c_str());
+      if (MaintainModeUserSel) {
         // MaintainMode and TargetVoltageMode are mutually exclusive — clear the other.
         TargetVoltageMode = 0;
         settingWrite(NK_TargetVoltageMode, "0");
       }
+      MaintainMode = resolveMaintainMode();  // effective value: this choice only lands while the override is off
       queueConsoleMessageF("MaintainMode mode %s", MaintainMode ? "enabled" : "disabled");
     }
     if (request->hasParam("TargetVoltageMode")) {
@@ -5253,6 +5279,7 @@ void setupServer() {
       if (TargetVoltageMode) {
         // MaintainMode and TargetVoltageMode are mutually exclusive — clear the other.
         MaintainMode = 0;
+        MaintainModeUserSel = 0;  // clear the stored choice too, or switching Target Voltage back off would silently resurrect Maintain
         settingWrite(NK_MaintainMode, "0");
       }
       queueConsoleMessageF("TargetVoltageMode %s", TargetVoltageMode ? "enabled" : "disabled");
@@ -5269,27 +5296,13 @@ void setupServer() {
     if (request->hasParam("HiLow")) {
       foundParameter = true;
       inputMessage = request->getParam("HiLow")->value();
-      int newMode = inputMessage.toInt();
-      if (newMode != HiLow) {
-        HiLow = newMode;
-        settingWrite(NK_HiLow, inputMessage.c_str());
-        loadCapTablesForMode(HiLow);  // swap active cap tables to match new mode
-        // Do NOT deactivate the thermal loop here. The new cap is already honored: the
-        // velocity-form penalty update clamps to the LIVE capCurrent (which tracks the new
-        // table) every tick, so the penalty re-bounds to the new cap immediately. Setting
-        // tempPIDActive=false would instead force the re-enable path, which CLEARS the slope
-        // buffer — that restarts the 60s warmup window and drops the setpoint to limit-20 (the
-        // spurious 20°F reduction seen on a Lo<->Hi switch), and also re-seeds the penalty
-        // accumulator from P-only, dumping the learned holding level. A mode switch must be
-        // bumpless for the thermal loop.
-        stateRevision++;              // force immediate CSVData echo of new table values
-        if (HiLow == 0) {
-          // Switching to Low drops the ceiling. Capture the present ceiling and arm the glide so the
-          // control loop ramps it down to the new Low cap instead of stepping (prevents the iExcess
-          // false-trip on the deliberate command drop). Up-switches don't glide — the loop lets them rise.
-          modeCapSlew = uTargetAmps;
-          modeCapSlewActive = true;
-        }
+      HiLowUserSel = inputMessage.toInt();  // the app's stored choice; inert while PhysicalPanelOverride is on, but still recorded so turning the override back off restores it
+      settingWrite(NK_HiLow, inputMessage.c_str());
+      // Applied here as well as in servicePanelSwitchInputs() so the mode is live before this request
+      // returns; the loop-side call then finds nothing left to do. applyChargeRateMode() (6_functions.ino)
+      // carries the table swap, the thermal-loop note and the Hi->Lo ceiling glide. With the override on
+      // this resolves back to the panel's mode and the request changes nothing but the stored choice.
+      if (applyChargeRateMode(resolveChargeRateMode())) {
         queueConsoleMessageF("Charge rate mode: switched to %s", HiLow == 1 ? "Normal" : "Low");
       }
     }
@@ -5315,7 +5328,7 @@ void setupServer() {
       // HAS_BATT_SHUNT, so suppress at runtime and leave the user's Float/Maintain choice in NVS.
       if (!BatteryShuntPresent) {
         if (UseFloat != 0)     { UseFloat = 0;     settingWrite(NK_UseFloat, "0"); }
-        if (MaintainMode != 0) { MaintainMode = 0; settingWrite(NK_MaintainMode, "0"); }
+        if (MaintainMode != 0 || MaintainModeUserSel != 0) { MaintainMode = 0; MaintainModeUserSel = 0; settingWrite(NK_MaintainMode, "0"); }
         queueConsoleMessage("Battery shunt marked absent: State of Charge, battery health, battery current limit and float charging are off.");
         queueConsoleMessage("Load-dump detection is off too. The alternator current limit now protects the battery.");
       } else if (!HAS_BATT_SHUNT) {
@@ -5380,7 +5393,7 @@ void setupServer() {
       if (b == 4800 || b == 9600 || b == 19200 || b == 38400) {  // reject anything the front end isn't specified for rather than bricking the port
         NMEA0183Baud = b;
         settingWrite(NK_NMEA0183Baud, String(NMEA0183Baud).c_str());
-        applyNMEA0183Serial();
+        n183ReconfigPending = true;  // Core 1 applies it; see the flag's declaration
         queueConsoleMessageF("NMEA 0183 baud set to %d", NMEA0183Baud);
       } else {
         queueConsoleMessageF("NMEA 0183 baud must be 4800/9600/19200/38400 - %d rejected, keeping %d", b, NMEA0183Baud);
@@ -5391,7 +5404,7 @@ void setupServer() {
       inputMessage = request->getParam("NMEA0183Invert")->value();
       NMEA0183Invert = (inputMessage.toInt() == 1) ? 1 : 0;
       settingWrite(NK_NMEA0183Invert, String(NMEA0183Invert).c_str());
-      applyNMEA0183Serial();
+      n183ReconfigPending = true;  // Core 1 applies it; see the flag's declaration
       queueConsoleMessageF("NMEA 0183 polarity set to %s", NMEA0183Invert ? "inverted (TTL talker)" : "normal (RS-232 talker)");
     }
     if (request->hasParam("NMEA2KData")) {
@@ -8365,6 +8378,14 @@ void setupServer() {
     settingsDirty = true;  // send CSV3 immediately so new client gets current settings
     client->send("hello!", NULL, millis(), 10000);
   });
+  // MUST precede "/debug": a plain-string URI matches exact-or-prefix-with-slash and the server
+  // dispatches in registration order, so "/debug" registered first swallows both of these.
+  // Bench-only data-growth ceiling test: fill every ring to cap + measure the worst-case
+  // scans (handlers defined at the tail of 8_functions.ino where the ring symbols are in scope).
+  { void debugFillMax(AsyncWebServerRequest *); void debugClearMax(AsyncWebServerRequest *);
+    server.on("/debug/fillmax",  HTTP_GET, debugFillMax);
+    server.on("/debug/clearmax", HTTP_GET, debugClearMax); }
+
   // Diagnostic endpoint to check partition and version
   server.on("/debug", HTTP_GET, [](AsyncWebServerRequest *request) {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -8396,9 +8417,10 @@ void setupServer() {
     size_t tlsPsAfter = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     const char *tlsMem = !tlsTest ? "ALLOC-FAILED" : ((tlsPsBefore - tlsPsAfter) >= 16000 ? "PSRAM" : "INTERNAL");
     if (tlsTest) mbedtls_free(tlsTest);
-    char out[2816];
+    char out[2944];
     int dpos = snprintf(out, sizeof(out),
              "Partition: %s\nVersion: %s\nFree heap: %lu\n"
+             "Web FS %s: %d/%d KB used (%d%%) - boot seed, -1 = unread\n"
              "TLS buffers -> %s (largest internal block %u B, free PSRAM %u B)\n"
              "Net task cores (0/1=pinned, 2147483647=floating, -99=not found): async_tcp=%d lwIP=%d\n"
              "AdjustField worst full pass (ms): total=%.1f | thermal=%.1f snapshot=%.1f fastov=%.1f modes=%.1f control=%.1f duty=%.1f tail=%.1f\n"
@@ -8410,6 +8432,8 @@ void setupServer() {
              (running && running->label) ? running->label : "unknown",
              FIRMWARE_VERSION,
              (unsigned long)ESP.getFreeHeap(),
+             WebFsPartLabel, WebFsUsedKb, WebFsTotalKb,
+             (WebFsTotalKb > 0) ? (100 * WebFsUsedKb / WebFsTotalKb) : -1,
              tlsMem,
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -8451,12 +8475,6 @@ void setupServer() {
     }
     request->send(200, "text/plain", out);
   });
-
-  // Bench-only data-growth ceiling test: fill every ring to cap + measure the worst-case
-  // scans (handlers defined at the tail of 8_functions.ino where the ring symbols are in scope).
-  { void debugFillMax(AsyncWebServerRequest *); void debugClearMax(AsyncWebServerRequest *);
-    server.on("/debug/fillmax",  HTTP_GET, debugFillMax);
-    server.on("/debug/clearmax", HTTP_GET, debugClearMax); }
 
   // Phone-sourced GPS + time backup. Browser + Capacitor app both POST here
   // periodically (every ~30-60s) when they have a location fix. The priority
@@ -9808,6 +9826,7 @@ void SendWifiData() {
                                "%d,"  // CSV4_FIELD_COUNT
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+                               "%d,%d,"
                                "%u,%u",  // +2: sessionId, sendMs
 
                                CSV4_FIELD_COUNT,
@@ -9833,6 +9852,8 @@ void SendWifiData() {
                                SafeInt(n183HeadingDeg, 10),              // CSV4_n183Heading (deg ×10; -1 stays -10)
                                (int)n183HdgRef,                          // CSV4_n183HdgRef
                                (int)bmsSignalActive,                     // CSV4_bmsSignalActive
+                               (int)panelHiRateInput,                    // CSV4_panelHiRateInput
+                               (int)panelForceFloatInput,                // CSV4_panelForceFloatInput
                                (unsigned)g_sessionId,                    // CSV4_sessionId
                                (unsigned)millis()                        // CSV4_sendMs
     );
@@ -10643,7 +10664,7 @@ void SendWifiData() {
                                SafeInt(yyMin),
                                0,  // CSV3_retired1
                                SafeInt(ManualDutyTarget, 100),
-                               SafeInt(SwitchControlOverride),
+                               SafeInt(PhysicalPanelOverride),
                                SafeInt(waveAmplitude),
                                SafeInt(CurrentThreshold, 100),
                                SafeInt(PeukertExponent_scaled),
@@ -11317,17 +11338,17 @@ void saveVesselInfoToNvs() {
   }
   vesselNvsSet(h, NK_boatLenFt,          String(BOAT_LENGTH_FT, 2).c_str());
   vesselNvsSet(h, NK_boatDispLbs,        String(BOAT_DISPLACEMENT_LBS, 0).c_str());
-  vesselNvsSet(h, NK_boatType,           BOAT_TYPE.c_str());
-  vesselNvsSet(h, NK_boatMakeModel,      BOAT_MAKE_MODEL.c_str());
+  vesselNvsSet(h, NK_boatType,           BOAT_TYPE);
+  vesselNvsSet(h, NK_boatMakeModel,      BOAT_MAKE_MODEL);
   vesselNvsSet(h, NK_boatYear,           String((int)BOAT_YEAR).c_str());
   vesselNvsSet(h, NK_homePort,           HOME_PORT);
-  vesselNvsSet(h, NK_engineMake,         ENGINE_MAKE.c_str());
+  vesselNvsSet(h, NK_engineMake,         ENGINE_MAKE);
   vesselNvsSet(h, NK_engineHp,           String((int)ENGINE_HP).c_str());
   vesselNvsSet(h, NK_BatteryVoltage,     String((int)SYSTEM_VOLTAGE_CLASS).c_str());
   vesselNvsSet(h, NK_BatteryCapacity_Ah, String(BatteryCapacity_Ah).c_str());
-  vesselNvsSet(h, NK_batteryType,        BATTERY_TYPE.c_str());
-  vesselNvsSet(h, NK_battMakeModel,      BATTERY_MAKE_MODEL.c_str());
-  vesselNvsSet(h, NK_altBrandModel,      ALTERNATOR_BRAND_MODEL.c_str());
+  vesselNvsSet(h, NK_batteryType,        BATTERY_TYPE);
+  vesselNvsSet(h, NK_battMakeModel,      BATTERY_MAKE_MODEL);
+  vesselNvsSet(h, NK_altBrandModel,      ALTERNATOR_BRAND_MODEL);
   vesselNvsSet(h, NK_SolarWatts,         String(SolarWatts).c_str());
   vesselNvsSet(h, NK_imuMountOrient,     String((int)imuMountOrientation).c_str());
   vesselNvsSet(h, NK_regMountLoc,        String((int)regulatorMountLoc).c_str());

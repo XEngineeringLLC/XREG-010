@@ -7291,6 +7291,111 @@ void loadCapTablesForMode(int mode) {
   nvs_close(nvs_handle);
 }
 
+// ── Switch panel inputs (Cable 3 / RJ3) ───────────────────────────────────────────────────────
+// Two isolated inputs share the ignition wire's inverting-opto topology: HIGH/LOW on GPIO39 asks for
+// the High charge rate, FORCEFLOAT on GPIO40 asks for Force "Maintain Mode". Which source is obeyed
+// is a clean select, never a blend: PhysicalPanelOverride == 0 (the default) means the app's stored
+// choice IS the mode and the wires only report their state; == 1 means the wires alone are the mode
+// and the app's toggles are inert. HiLowUserSel / MaintainModeUserSel keep holding the app's choice
+// either way, so switching the override on and back off restores exactly what the app had set.
+
+// Effective charge-rate mode. Panel sense: switch ON (wire energized, pin LOW) = High (HiLow 1),
+// switch off = Low (HiLow 0).
+int resolveChargeRateMode() {
+  if (PhysicalPanelOverride == 0) return (HiLowUserSel == 0) ? 0 : 1;
+  return panelHiRateInput ? 1 : 0;
+}
+
+// Effective Force "Maintain Mode" — same select, plus the two physical gates the /get handler
+// applies and that hold no matter who owns the mode: no battery-current sensor means a 0-net-amps
+// hold is impossible, and Maintain/Target Voltage are mutually exclusive. A panel asking for
+// Maintain yields to an active Target Voltage mode rather than clearing it, because clearing it is
+// an NVS write and this runs in the control loop.
+int resolveMaintainMode() {
+  bool on = (PhysicalPanelOverride == 0) ? (MaintainModeUserSel == 1) : panelForceFloatInput;
+  if (!BatteryShuntPresent) on = false;
+  if (TargetVoltageMode == 1) on = false;
+  return on ? 1 : 0;
+}
+
+// Single application path for a charge-rate change, shared by the /get?HiLow handler, the override
+// handler and the panel service so every route behaves identically. Returns true when the live mode
+// actually moved. Never touches NVS — persistence belongs to whoever owns the user's stored choice.
+bool applyChargeRateMode(int newMode) {
+  if (newMode == HiLow) return false;
+  HiLow = newMode;
+  loadCapTablesForMode(HiLow);  // swap active cap tables to match new mode
+  // Do NOT deactivate the thermal loop here. The new cap is already honored: the
+  // velocity-form penalty update clamps to the LIVE capCurrent (which tracks the new
+  // table) every tick, so the penalty re-bounds to the new cap immediately. Setting
+  // tempPIDActive=false would instead force the re-enable path, which CLEARS the slope
+  // buffer — that restarts the 60s warmup window and drops the setpoint to limit-20 (the
+  // spurious 20°F reduction seen on a Lo<->Hi switch), and also re-seeds the penalty
+  // accumulator from P-only, dumping the learned holding level. A mode switch must be
+  // bumpless for the thermal loop.
+  stateRevision++;  // force immediate CSVData echo of new table values
+  if (HiLow == 0) {
+    // Switching to Low drops the ceiling. Capture the present ceiling and arm the glide so the
+    // control loop ramps it down to the new Low cap instead of stepping (prevents the iExcess
+    // false-trip on the deliberate command drop). Up-switches don't glide — the loop lets them rise.
+    modeCapSlew = uTargetAmps;
+    modeCapSlewActive = true;
+  }
+  return true;
+}
+
+// Reads both Cable 3 optos, then re-derives the two effective modes from whoever currently owns them.
+// Called every loop pass from loop(), immediately after the ignition read. Debounced because each
+// charge-rate edge swaps the cap tables out of NVS and can re-enter the charge-stage machine — a
+// bouncing mechanical contact must not do that repeatedly. The ignition input needs no debounce
+// because nothing edge-triggers off it. The reads and the console lines happen whether or not the
+// panel has authority, so an installer can prove the wiring before handing it any.
+void servicePanelSwitchInputs() {
+  const uint32_t PANEL_DEBOUNCE_MS = 50;
+  static bool primed = false;
+  static bool rawHiPrev = false;
+  static bool rawFloatPrev = false;
+  static uint32_t hiChangeMs = 0;
+  static uint32_t floatChangeMs = 0;
+  const uint32_t now = millis();
+
+  const bool rawHi = !digitalRead(panelHiRatePin);      // inverting opto: voltage at the connector reads LOW
+  const bool rawFloat = !digitalRead(panelForceFloatPin);
+
+  // First pass adopts the pins as-is. Without this the debounced states start at false, so a panel
+  // that is already switched on reads as a released switch for the first 50ms — with the override on
+  // that is a real mode change (cap-table swap, ceiling glide, console line) undone one tick later.
+  if (!primed) {
+    primed = true;
+    rawHiPrev = panelHiRateInput = rawHi;
+    rawFloatPrev = panelForceFloatInput = rawFloat;
+  }
+
+  if (rawHi != rawHiPrev) {
+    rawHiPrev = rawHi;
+    hiChangeMs = now;
+  } else if (rawHi != panelHiRateInput && (uint32_t)(now - hiChangeMs) >= PANEL_DEBOUNCE_MS) {
+    panelHiRateInput = rawHi;
+    queueConsoleMessageF("Switch panel: charge rate wire %s", rawHi ? "energized (asks for High)" : "open (asks for Low)");
+  }
+  if (rawFloat != rawFloatPrev) {
+    rawFloatPrev = rawFloat;
+    floatChangeMs = now;
+  } else if (rawFloat != panelForceFloatInput && (uint32_t)(now - floatChangeMs) >= PANEL_DEBOUNCE_MS) {
+    panelForceFloatInput = rawFloat;
+    queueConsoleMessageF("Switch panel: force float wire %s", rawFloat ? "energized" : "open");
+  }
+
+  if (applyChargeRateMode(resolveChargeRateMode())) {
+    queueConsoleMessageF("Charge rate mode: switched to %s", HiLow == 1 ? "Normal" : "Low");
+  }
+  const int wantMaintain = resolveMaintainMode();
+  if (wantMaintain != MaintainMode) {
+    MaintainMode = wantMaintain;  // the control loop edge-detects this global; no NVS write on this path
+    queueConsoleMessageF("MaintainMode mode %s", MaintainMode ? "enabled" : "disabled");
+  }
+}
+
 // Immediate save of all user-editable columns (no throttle)
 // Used when user clicks Save button or Reset button
 void saveUserTableEdits() {

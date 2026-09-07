@@ -839,12 +839,17 @@
 
               <!-- Global cap mode toggles -->
               <div class="cap-mode-row" id="capModeRow">
+                <!-- Greyed while Physical Panel Override is on: the Cable 3 switch owns the charge rate
+                     then, and these buttons would be a live but inert control (.is-gated, script.js). -->
+                <div class="cap-rate-gate" id="chargeRatePanelGate">
                 <span class="cap-mode-label">Charge Rate:</span>
                 <div class="cap-mode-toggle">
                   <button type="button" id="chargeRateLowBtn" class="cap-mode-btn"
                     onclick="handleChargeRateModeToggle('low')">Low</button>
                   <button type="button" id="chargeRateHighBtn" class="cap-mode-btn cap-mode-active"
                     onclick="handleChargeRateModeToggle('high')">High</button>
+                </div>
+                <p class="gate-note">Physical Panel Override is on, so the charge rate is set by the switch on data Cable 3 pin 5 &mdash; switch on is High, switch off is Low &mdash; and these buttons only show which mode that switch has chosen. Turn the override off under Setup &rarr; System &rarr; Security &amp; Maintenance to set the rate from here.</p>
                 </div>
                 <span class="cap-mode-label" style="margin-left: 16px;">Limit by:</span>
                 <div class="cap-mode-toggle">
@@ -6954,7 +6959,11 @@
                 </div>
               </div>
 
+              <!-- Greyed while Physical Panel Override is on: the Cable 3 Force Float switch owns this
+                   mode then, and the toggle would be a live but inert control (.is-gated, script.js). -->
+              <div id="maintainModePanelGate">
               <hr />
+              <p class="gate-note">Physical Panel Override is on, so Force &quot;Maintain Mode&quot; is set by the switch on data Cable 3 pin 7, and this toggle only shows what that switch has chosen. Turn the override off under Setup &rarr; System &rarr; Security &amp; Maintenance to set it from here.</p>
               <div class="form-row gate-batt-current">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Force "Maintain Mode" (<span id="MaintainMode_echo">?</span>):</span>
@@ -6977,6 +6986,7 @@
                   </form>
                 </div>
               </div>
+              </div><!-- END maintainModePanelGate -->
 
             </details>
 
@@ -9985,24 +9995,44 @@
 
 <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                  <span>Switch Panel Override (<span id="SwitchControlOverride_echo">?</span>):</span>
+                  <span>Physical Panel Override (<span id="PhysicalPanelOverride_echo">?</span>):</span>
                   <span class="tooltip">
-                    ℹ️
-                    <span class="tooltip-box">Coming soon</span>
+                    &#8505;&#65039;
+                    <span class="tooltip-box">Chooses who sets the charge rate and Force &quot;Maintain Mode&quot;: this app, or the two switch-panel wires on data Cable 3 (Charge Rate on pin 5, Force Float on pin 7).<br><br><strong>Off</strong> — this app decides both modes. The wires are still read and reported below, but they change nothing.<br><br><strong>On</strong> — the panel decides both modes, and the matching controls in this app grey out and stop having any effect. Charge Rate: switch on = High, switch off = Low. Force Float: switch on = Force &quot;Maintain Mode&quot;, which still needs a battery shunt and still yields to Target Voltage mode.</span>
                   </span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
                     <span class="toggle-label">Off</span>
                     <label class="switch">
-                      <input id="SwitchControlOverride_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('SwitchControlOverride_checkbox', 'SwitchControlOverride', 'SwitchControlOverride')) { this.form.submit(); submitMessage(); }" />
+                      <input id="PhysicalPanelOverride_checkbox" type="checkbox"
+                        onchange="if(handleUserToggle('PhysicalPanelOverride_checkbox', 'PhysicalPanelOverride', 'PhysicalPanelOverride')) { this.form.submit(); submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
-                    <input id="SwitchControlOverride" name="SwitchControlOverride" type="number" value=""
+                    <input id="PhysicalPanelOverride" name="PhysicalPanelOverride" type="number" value=""
                       style="display:none;" />
                   </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Charge Rate Wire (<span id="panelHiRateWord_ID">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Live state of the Charge Rate switch wire (data Cable 3 pin 5). Energized means 5 to 28 V is present at the wire, which is the panel switch turned on, asking for the High charge rate. Read at all times, so you can prove the wiring before the switch is given any authority.</span></span>
+                </div>
+                <div class="form-input">
+                  <span style="font-size: 14px;" id="panelHiRateEffect_ID">-</span>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Force Float Wire (<span id="panelForceFloatWord_ID">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Live state of the Force Float switch wire (data Cable 3 pin 7). Energized means 5 to 28 V is present at the wire, which is the panel switch turned on, asking for Force &quot;Maintain Mode&quot;. Read at all times, so you can prove the wiring before the switch is given any authority. Force &quot;Maintain Mode&quot; needs the battery shunt and yields to Target Voltage mode.</span></span>
+                </div>
+                <div class="form-input">
+                  <span style="font-size: 14px;" id="panelForceFloatEffect_ID">-</span>
                 </div>
               </div>
 
@@ -16283,8 +16313,9 @@
   </div><!-- END maint-ack-overlay -->
 
   <!-- Before You Start — one screen ahead of the Commissioning Prerequisites, on every route into the
-       wizard. Holds the two things that are about how you run the process rather than what the regulator
-       is set to; ✕ leaves the flow exactly as the prerequisites ✕ does. -->
+       wizard. Holds the things that are about how you run the process rather than what the regulator
+       is set to; ✕ leaves the flow exactly as the prerequisites ✕ does. The laptop advice and the
+       panel-override warning are both conditional — commPrepIntroShow() decides which ones show. -->
   <div id="commprep-intro-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:center; justify-content:center; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="position:relative; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16292,8 +16323,9 @@
         <button onclick="commPrepIntroClose(false)" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
       </div>
       <div style="padding:14px 16px;">
-        <p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;"><strong style="color:#e0e0e0;">Use a laptop or tablet if you can.</strong> Setup and Commissioning works on a phone, but it's a worse UX on a small screen.</p>
+        <p id="commprep-intro-smallscreen" style="display:none; font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;"><strong style="color:#e0e0e0;">Use a laptop or tablet if you can.</strong> Setup and Commissioning works on a phone, but it's a worse UX on a small screen.</p>
         <p style="font-size:13px; line-height:1.5; color:#bbb; margin:0;">During the wizard, keep house loads steady &mdash; avoid switching large loads on or off mid-run.</p>
+        <p id="commprep-intro-paneloverride" style="display:none; font-size:13px; line-height:1.5; color:#bbb; margin:14px 0 0;"><strong style="color:#e0e0e0;">Physical Panel Override is on.</strong> The switches on data Cable 3 hold the charge rate and Force &quot;Maintain Mode&quot;, so either can move mid-wizard if someone touches the panel &mdash; including the charge rate this wizard asks you to set. Leave the panel alone during the run, or turn the override off first under Setup &rarr; System &rarr; Security &amp; Maintenance.</p>
       </div>
       <div style="padding:12px 16px; border-top:1px solid #333; display:flex; justify-content:flex-end;">
         <button onclick="commPrepIntroClose(true)" style="border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em; background:linear-gradient(180deg,#35d6c7,#23a99c); color:#06302d; font-weight:700; border:none;">Continue</button>

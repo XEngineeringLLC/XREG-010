@@ -109,6 +109,9 @@ struct FadResult;       // function bodies in 8_functions.ino) — forward-decla
 struct ZFitResult;      // zeroFitRegress() return type (full def near ZeroFitRecord) — same reason
 struct RipFit;          // measured ripple projection (full def below); forward-declared so the auto-prototypes
                         // of ripFitEncode(const RipFit&)/ripFitDecode(...) don't precede its definition
+// cxStartPersistCancel()'s verdict (2_functions.ino) — defined up here, not next to the machine, so the
+// auto-prototype can't precede the type.
+enum CxStartCancel : uint8_t { CX_CANCEL_NONE = 0, CX_CANCEL_FRESH = 1, CX_CANCEL_RESUME = 2 };
 // Auto-prototype generator fails on default-argument functions defined in later .ino files.
 bool fieldOffSettled(uint32_t extraMs = 0);
 bool fieldCutSettled(uint32_t extraMs = 0);
@@ -335,22 +338,34 @@ const char *SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOi
 // Vessel Info
 float BOAT_LENGTH_FT = 0;
 float BOAT_DISPLACEMENT_LBS = 0;
-String BOAT_TYPE = "monohull";
-String BOAT_MAKE_MODEL = "";
+// Fixed buffers, not Strings: /saveVesselInfo writes these on the web task while Core 1 reads
+// BATTERY_TYPE (batteryIsLithium, N2K/RV-C TX, cvpfChemGasses). String::operator= frees the old
+// heap buffer on any reassignment past SSO, so a reader could dereference freed memory; an array
+// can only tear. Same reason HOME_PORT below has always been a char array. 50 chars + NUL matches
+// the form's maxlength.
+char BOAT_TYPE[51] = "monohull";
+char BOAT_MAKE_MODEL[51] = "";
 uint16_t BOAT_YEAR = 2025;
-String ENGINE_MAKE = "";
+char ENGINE_MAKE[51] = "";
 uint16_t ENGINE_HP = 0;
 uint8_t SYSTEM_VOLTAGE_CLASS = 12;
 // BatteryCapacity_Ah already exists
-String BATTERY_TYPE = "lifepo4";
-String BATTERY_MAKE_MODEL = "";
-String ALTERNATOR_BRAND_MODEL = "";
+char BATTERY_TYPE[51] = "lifepo4";
+char BATTERY_MAKE_MODEL[51] = "";
+char ALTERNATOR_BRAND_MODEL[51] = "";
 // SolarWatts already exists
 // imuMountOrientation already exists
 float IMU_DIST_BOW_FT = 0;
 float IMU_DIST_CL_FT = 0;
 float IMU_HEIGHT_WL_FT = 0;
 char HOME_PORT[51] = "";  // 50 chars + null terminator
+
+// Bounded copy for every vessel-info text field above. A null src (absent JSON key) writes "".
+static void vesselSetText(char *dst, size_t cap, const char *src) {
+  if (!src) src = "";
+  strncpy(dst, src, cap - 1);
+  dst[cap - 1] = '\0';
+}
 
 
 // Accelerometer Stuff
@@ -816,6 +831,9 @@ uint32_t FreePSRAM = 0;   // KB of free PSRAM
 size_t TotalInternalRam, LargestInternalBlock, TotalPSRAM;
 int LittleFsFreeKb = -1;   // free space on the userdata LittleFS partition, KB; -1 until the boot seed. Event-driven: it can only change when this firmware writes a file, so writers set fsFreeDirty and the refresh runs at the next fieldCutSettled heap walk (usedBytes() is a ~100ms full-flash traversal — never on a live control pass)
 bool fsFreeDirty = false;  // a LittleFS write happened since the last Free Data Storage refresh. Every writer runs on Core 1 (loop) — plain bool, no atomics
+int WebFsUsedKb = -1;              // web-asset partition in use, KB; -1 until the boot seed. Only an OTA changes it, so one read at boot covers the whole run
+int WebFsTotalKb = -1;             // that partition's size, KB — 1024 for both prod_fs and factory_fs
+const char *WebFsPartLabel = "?";  // which partition the two above describe: a failed OTA remounts webFS on factory_fs, so the mount now is not always the mount that was read
 
 
 // ===== TASK STACK MONITORING =====
@@ -1586,7 +1604,7 @@ float VictronBattTempF = NAN;       // VE.Direct "T" field (°F), BMV/SmartShunt
 float rvcRxBattTempF = NAN;         // RV-C DC_SOURCE_STATUS_2 source temperature (°F) at the dvccInst instance
 bool  cvTempDerateInert = false;    // battery-temp source class (measured vs board) differs from CommissionTempSrc's class; derate returns 1.0 until the CV fit is re-run
 int ManualFieldToggle = 0;           // 0 = Auto (PID) — fresh-flash default. Set to 1 for manual field control (debugging).
-int SwitchControlOverride = 1;       // set to 1 for web interface switches to override physical switch panel
+int PhysicalPanelOverride = 0;       // 0 (default) = the app owns HiLow and MaintainMode and the Cable 3 panel wires only report; 1 = the panel wires own both modes and the app toggles go inert
 int MaintainMode = 0;                // Set to 1 to target 0 amps at battery
 int TargetVoltageMode = 0;
 float TargetVoltageSetpoint = 14.0f;
@@ -1594,6 +1612,23 @@ int OnOff = 0;             // 0 is charger off, 1 is charger On (corresponds to 
 int Ignition = 0;          // Digital Input      NEED THIS TO HAVE WIFI ON , FOR NOW
 int IgnitionOverride = 2;  // Auto (any value != 1) = follow real GPIO1 ignition wire (default); 1 = force ON. Cannot force off.
 int HiLow = 1;             // 0 will be a low setting, 1 a high setting
+// ── Switch panel inputs (data Cable 3 / connector RJ3) ────────────────────────────────────────
+// RJ3 pin 5 = net HIGH/LOW   -> R47 -> opto U10 -> GPIO39: switch ON = the High charge rate (HiLow 1).
+// RJ3 pin 7 = net FORCEFLOAT -> R76/R52 -> opto U17 -> GPIO40: switch ON = Force "Maintain Mode".
+// Same inverting optocoupler topology as the ignition wire on GPIO1: voltage applied at the connector
+// makes the opto conduct and pulls the ESP32 pin LOW, so asserted == !digitalRead(pin).
+// RJ3 pin 3 (net EXTRA_OPTICAL_GPIO1 -> GPIO8) has no defined function and is left untouched.
+// Both wires are always read and always reported; PhysicalPanelOverride alone decides whether they
+// steer anything (resolveChargeRateMode / resolveMaintainMode, 6_functions.ino).
+const int panelHiRatePin = 39;
+const int panelForceFloatPin = 40;
+bool panelHiRateInput = false;      // debounced HIGH/LOW input: true = voltage present at Cable 3 pin 5, i.e. switch ON = High rate
+bool panelForceFloatInput = false;  // debounced FORCEFLOAT input: true = voltage present at Cable 3 pin 7, i.e. switch ON = Maintain
+// HiLow and MaintainMode above are the EFFECTIVE modes every consumer reads. These two hold what the
+// web/app toggle last asked for, which is also what NVS carries, so the override can be switched on
+// and back off again and the app's own choice comes back exactly as it was.
+int HiLowUserSel = 1;
+int MaintainModeUserSel = 0;
 int AmpSensorRange = 1;    // 0=±200A, 1=±300A (default), 2=±500A — hall effect sensor range
 int LimpHome = 0;          // 1 will set to limp home mode, whatever that gets set up to be
 int resolution = 12;       // for OneWire temp sensor measurement
@@ -1601,6 +1636,7 @@ int VeData = 0;            // Set to 1 if VE serial data exists
 int NMEA0183Data = 0;      // Master switch for the NMEA 0183 serial receiver: only 1 lets the timed loop call ReadNMEA0183Data (which also self-checks it); turning it off clears any held 0183 heading, since nothing would ever age that value out again
 // ── NMEA 0183 receive (Serial2 / GPIO6, its own opto channel — nothing else on the board touches that pin) ──
 int NMEA0183Baud = 19200;         // 4800 = standard 0183 talker, 9600, 19200 = YachtDevices combined out, 38400 = AIS/HS
+volatile bool n183ReconfigPending = false;  // set by the /get handler on the web task; applyNMEA0183Serial() runs on Core 1 instead, because it deletes the UART driver the loop reader is inside
 int NMEA0183Invert = 0;           // UART invert flag. 0 suits an RS-232-level talker: its mark idles negative, the opto LED
                                   // stays dark and the 13k pull-up holds the line high. 1 suits a TTL-level talker, which
                                   // idles high, lights the LED and pulls the open collector low — same case as VE.Direct.
@@ -1815,7 +1851,7 @@ float MaxTemperatureThermistor_AllTime = -99;    // Lifetime max thermistor temp
 float MeasuredAmpsMax_AllTime = 0.0f;            // Lifetime max alternator output (A) - random test
 float RPMMax_AllTime = 0.0f;                     // Lifetime max RPM - random test
 // SOC tracking accumulators (must be global for NVS save/load)
-float socAccumulator_AllTime = 0.0f;
+double socAccumulator_AllTime = 0.0;     // %·s (lifetime) — double; float stopped resolving 100/2s additions after ~4 days
 unsigned long totalSocSampleTime_AllTime = 0;
 unsigned long totalVoltageSampleTime_AllTime = 0;
 unsigned long totalSpeedSampleTime_AllTime = 0;
@@ -3816,7 +3852,7 @@ static String ripFitEncode(const RipFit &r) {
   return s;
 }
 static void ripFitDecode(const String &s, RipFit &r) {
-  float f[9]; int n = 0, from = 0;
+  float f[9] = {0}; int n = 0, from = 0;   // a string with fewer than 9 fields leaves the tail unwritten; it is copied out unconditionally below
   memset(&r, 0, sizeof(r));
   for (int field = 0; field < 10 && from <= s.length(); field++) {
     int comma = s.indexOf(',', from);
@@ -5872,6 +5908,19 @@ void setup() {
     size_t fsTotal = 0, fsUsed = 0;
     if (fsStatsTry(fsTotal, fsUsed) && fsTotal >= fsUsed) LittleFsFreeKb = (int)((fsTotal - fsUsed) / 1024);
   }
+  {  // Web-asset partition headroom — nothing in the product measured it before, so an OTA bundle that
+     // no longer fits was only visible from a local build. checkWebFilesExist() already mounted webFS,
+     // so this reads the live mount: no second mount, no new lfs buffers. 0 back means unmounted.
+    size_t wTotal = webFS.totalBytes(), wUsed = webFS.usedBytes();
+    if (wTotal > 0 && wUsed <= wTotal) {
+      WebFsTotalKb   = (int)(wTotal / 1024);
+      WebFsUsedKb    = (int)(wUsed / 1024);
+      WebFsPartLabel = usingFactoryWebFiles ? "factory_fs" : "prod_fs";
+      int pct = 100 * WebFsUsedKb / WebFsTotalKb;
+      Serial.printf("Web FS %s: %d/%d KB used (%d%%)\n", WebFsPartLabel, WebFsUsedKb, WebFsTotalKb, pct);
+      if (pct >= 85) queueConsoleMessageF("Web partition %d%% full (%d of %d KB) - the next OTA bundle may not fit", pct, WebFsUsedKb, WebFsTotalKb);
+    }
+  }
   // Black box beats the NVS copy for last-session stats: NVS full-saves fire only at the
   // field-off edge / shutdown, so a session that ends in a crash or reset leaves SessionDur/
   // MaxLoop/MinHeap holding an older session's values. The snapshot is exact at death.
@@ -5902,6 +5951,10 @@ void setup() {
   digitalWrite(21, LOW);  // Start with alarm off
   alarmOutputState = false;
   pinMode(42, INPUT);  // bmsLogic
+  // Switch panel inputs on Cable 3. Pull-ups so an opto that is off (nothing wired, or switch open)
+  // floats HIGH = not asserted; the opto pulls LOW = asserted. Same idiom as the ignition input above.
+  pinMode(panelHiRatePin, INPUT_PULLUP);     // Cable 3 pin 5 - HIGH/LOW
+  pinMode(panelForceFloatPin, INPUT_PULLUP);  // Cable 3 pin 7 - FORCEFLOAT
   // The Arduino core defaults LEDC to the 40MHz XTAL clock on S3, which caps 12-bit PWM at 9727Hz —
   // 19kHz attach fails outright (bench 2026-08-16). Force the 80MHz APB clock (ceiling 19455Hz).
   // Safe here: field PWM is the only LEDC user, and the WiFi-nap ladder only swings CPU 240<->80MHz,
@@ -6118,6 +6171,8 @@ void loop() {
     Ignition = 1;  // force ON (bench / no ignition wire) — override can ONLY force on, never off
   }
   // IgnitionOverride != 1 (Auto, default): no override — honor the real GPIO1 reading above
+
+  servicePanelSwitchInputs();  // Cable 3 HIGH/LOW + FORCEFLOAT optos: always debounced and reported, and driving HiLow / MaintainMode while PhysicalPanelOverride is on (6_functions.ino)
  
   WiFiWakeButton = !digitalRead(5);  // Read WiFi wake button state. Active LOW (button pulls to ground)
 
@@ -6605,6 +6660,9 @@ void loop() {
         VeTime = ft_ReadVEData.worstWindow;
         VeTime2 = ft_ReadVEData.worstSession;
       }
+      // Outside the NMEA0183Data gate: a baud/polarity change made while the receiver is off must
+      // still land, so the port is right the moment it is switched back on.
+      if (n183ReconfigPending && hardwarePresent == 1) { n183ReconfigPending = false; applyNMEA0183Serial(); }
       if (NMEA0183Data == 1 && hardwarePresent == 1) TIMED_CALL(ft_ReadNMEA0183, ReadNMEA0183Data());  // deadline-capped inside; see the HARD REAL-TIME CONTRACT note on the function
       // n2kTxEnable also forces ParseMessages: node mode needs it for address claim + heartbeat
       // servicing even if the user left the receive toggle off. dvccEn forces it too: the follow

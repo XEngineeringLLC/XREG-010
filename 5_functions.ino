@@ -1490,9 +1490,9 @@ void nmea2kTransmitTick() {
         if (n2kBattCfgEnable == 1) {
           tN2kBatType bt = N2kDCbt_Flooded;
           tN2kBatChem bc = N2kDCbc_LeadAcid;
-          if (BATTERY_TYPE.equalsIgnoreCase("lifepo4")) bc = N2kDCbc_LiIon;
-          else if (BATTERY_TYPE.equalsIgnoreCase("agm")) bt = N2kDCbt_AGM;
-          else if (BATTERY_TYPE.equalsIgnoreCase("gel")) bt = N2kDCbt_Gel;
+          if (strcasecmp(BATTERY_TYPE, "lifepo4") == 0) bc = N2kDCbc_LiIon;
+          else if (strcasecmp(BATTERY_TYPE, "agm") == 0) bt = N2kDCbt_AGM;
+          else if (strcasecmp(BATTERY_TYPE, "gel") == 0) bt = N2kDCbt_Gel;
           tN2kBatNomVolt nv = (SYSTEM_VOLTAGE_CLASS == 12) ? N2kDCbnv_12v
                               : (SYSTEM_VOLTAGE_CLASS == 24) ? N2kDCbnv_24v
                               : (SYSTEM_VOLTAGE_CLASS == 48) ? N2kDCbnv_48v
@@ -1550,10 +1550,10 @@ void nmea2kTransmitTick() {
       case SLOT_RVC_CHGRCFG:  // CHARGER_CONFIGURATION_STATUS 1FFC6h
         if (rvcChgrEnable == 1) {
           uint8_t bt = 0x0F;  // 4-bit field, all 1s = unknown
-          if (BATTERY_TYPE.equalsIgnoreCase("lead_acid")) bt = 0;
-          else if (BATTERY_TYPE.equalsIgnoreCase("gel")) bt = 1;
-          else if (BATTERY_TYPE.equalsIgnoreCase("agm")) bt = 2;
-          else if (BATTERY_TYPE.equalsIgnoreCase("lifepo4")) bt = 3;
+          if (strcasecmp(BATTERY_TYPE, "lead_acid") == 0) bt = 0;
+          else if (strcasecmp(BATTERY_TYPE, "gel") == 0) bt = 1;
+          else if (strcasecmp(BATTERY_TYPE, "agm") == 0) bt = 2;
+          else if (strcasecmp(BATTERY_TYPE, "lifepo4") == 0) bt = 3;
           rvcBeginMsg(N2kMsg, 0x1FFC6UL);
           N2kMsg.AddByte((unsigned char)rvcChgrInstance);
           N2kMsg.AddByte(2);  // charging algorithm: 3-stage (matches the N2K N2kCA_3State we publish)
@@ -2553,9 +2553,9 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
     float currentSOC = SOC_percent / 100.0f;  // Convert to actual percentage
 
     socAccumulator += currentSOC * elapsedSeconds;
-    socAccumulator_AllTime += currentSOC * elapsedSeconds;
-    totalSocSampleTime += elapsedSeconds;
-    totalSocSampleTime_AllTime += elapsedSeconds;
+    socAccumulator_AllTime += (double)currentSOC * elapsedSeconds;
+    totalSocSampleTime += (unsigned long)elapsedSeconds;
+    totalSocSampleTime_AllTime += (unsigned long)elapsedSeconds;
 
     if (totalSocSampleTime > 0) {
       AvgSOC = socAccumulator / totalSocSampleTime;
@@ -3998,7 +3998,7 @@ void checkWebFilesExist() {
     return;
   }
 
-  for (int i = 0; i < 5; i++) {
+  for (size_t i = 0; i < sizeof(gzFiles) / sizeof(gzFiles[0]); i++) {
     if (!webFS.exists(gzFiles[i])) {
       Serial.printf("MISSING: %s\n", gzFiles[i]);
       missingCount++;
@@ -5692,7 +5692,7 @@ void saveNVSDataFull() {
   if (prev_spdTime_AllTime   != (uint32_t)totalSpeedSampleTime_AllTime)     { nvs_set_u32(h, "SpdTime_AT",     (uint32_t)totalSpeedSampleTime_AllTime);        prev_spdTime_AllTime   = (uint32_t)totalSpeedSampleTime_AllTime;     chg = true; }
   if (prev_AvgSOC != (int32_t)(AvgSOC * 100))                               { nvs_set_i32(h, "AvgSOC",         (int32_t)(AvgSOC * 100));                       prev_AvgSOC = (int32_t)(AvgSOC * 100);                               chg = true; }
   // SOC alltime + voltage AllTime accumulators + battery state
-  { uint64_t sc = (uint64_t)(socAccumulator_AllTime * 100.0f);
+  { uint64_t sc = (uint64_t)(socAccumulator_AllTime * 100.0);
     if (prev_socAccum_AllTime != sc)                                         { nvs_set_u64(h, "SocAccum_AT", sc);                                               prev_socAccum_AllTime = sc;                                          chg = true; } }
   if (prev_socTime_AllTime != (uint32_t)totalSocSampleTime_AllTime)         { nvs_set_u32(h, "SocTime_AT",     (uint32_t)totalSocSampleTime_AllTime);          prev_socTime_AllTime = (uint32_t)totalSocSampleTime_AllTime;         chg = true; }
   if (prev_vltAccum_AllTime  != voltageAccumulator_AllTime)                  { nvs_set_blob(h, "VltAccum_AT",   &voltageAccumulator_AllTime, sizeof(double));   prev_vltAccum_AllTime  = voltageAccumulator_AllTime;                  chg = true; }
@@ -5950,7 +5950,7 @@ void seedSocFromVoltage() {
     }
     Serial.printf("SOC SEED: estimated %d%% from %.2fV terminal, %.1fA, %.0f°F (Rx%.2f) -> %.2fV OCV (%s curve, %s Reff)\n",
                   estimatedSoC, voltage, iBat, isnan(boardTempF) ? -99.0f : boardTempF, rTempScale,
-                  vOcv, BATTERY_TYPE.c_str(), isLithium ? "Li" : "Pb");
+                  vOcv, BATTERY_TYPE, isLithium ? "Li" : "Pb");
   } else {
     Serial.printf("SOC SEED: no valid voltage (%.2fV) - defaulting to 50%%\n", voltage);
   }
@@ -6091,7 +6091,7 @@ void loadNVSData() {
   // Average SOC (AllTime - load ACCUMULATORS, then calculate average)
   uint64_t temp_uint64;
   if (nvs_get_u64(nvs_handle, "SocAccum_AT", &temp_uint64) == ESP_OK) {
-    socAccumulator_AllTime = temp_uint64 / 100.0f;
+    socAccumulator_AllTime = temp_uint64 / 100.0;
     Serial.printf("NVS LOAD: socAccumulator_AllTime = %.2f\n", socAccumulator_AllTime);
   }
 

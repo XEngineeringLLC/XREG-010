@@ -1100,7 +1100,7 @@ function renderLoopBlame(data) {
     const parts = [];
     for (const [ix, us] of [[data.blameIdx1, data.blameUs1], [data.blameIdx2, data.blameUs2], [data.blameIdx3, data.blameUs3]]) {
         const i = Number(ix);
-        if (!Number.isFinite(i) || i < 0) continue;
+        if (!Number.isFinite(i) || i < 0 || i === 255) continue;  // 255 = firmware loopBlameIdx empty slot, not an index
         const name = (i < FT_BLAME_NAMES.length) ? FT_BLAME_NAMES[i] : ('ft#' + i);
         parts.push(name + ' ' + (Number(us) / 1000).toFixed(1));
     }
@@ -1132,6 +1132,8 @@ const CSV4_FIELDS = [
     "n183Heading",                // NMEA 0183 decoded heading (deg ×10; negative = nothing decoded). Distinct from HeadingNMEA, which is the NMEA2000 source.
     "n183HdgRef",                 // reference frame of the above: 0 none, 1 magnetic, 2 true
     "bmsSignalActive",            // live BMS on/off opto input: 1 = 5-28 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice
+    "panelHiRateInput",           // switch panel HIGH/LOW opto input (Cable 3 pin 5): 1 = wire energized = switch on = asking for High. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything
+    "panelForceFloatInput",       // switch panel FORCEFLOAT opto input (Cable 3 pin 7): 1 = wire energized = switch on = asking for Maintain. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything
     "sessionId",                  // device boot identity, same in every channel this boot
     "sendMs",                     // device millis() when this payload was built
 ];
@@ -3309,7 +3311,7 @@ const CSV3_FIELDS = [
     "yyMin",
     "retired1",
     "ManualDutyTarget",
-    "SwitchControlOverride",
+    "PhysicalPanelOverride",
     "waveAmplitude",
     "CurrentThreshold",
     "PeukertExponent_scaled",
@@ -7848,7 +7850,7 @@ function updateAllEchosOptimized(data) {
         { key: 'ManualDutyTarget', id: 'ManualDutyTarget_echo', transform: v => (v / 100).toFixed(2) },
         // Second ids: the Gate Tuning Capture panel carries duplicates of these two Field Control rows.
         { key: 'ManualDutyTarget', id: 'ManualDutyTarget_echo_gate', transform: v => (v / 100).toFixed(2) },
-        { key: 'SwitchControlOverride', id: 'SwitchControlOverride_echo', transform: v => v == 1 ? 'Override' : 'Normal' },
+        { key: 'PhysicalPanelOverride', id: 'PhysicalPanelOverride_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'OnOff', id: 'OnOff_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'ManualFieldToggle', id: 'ManualFieldToggle_echo', transform: v => v === 0 ? 1 : 0 },
         { key: 'LimpHome', id: 'LimpHome_echo', transform: v => v == 1 ? 'On' : 'Off' },
@@ -8854,17 +8856,22 @@ async function handleVesselInfoSave(event) {
 // are deliberately conservative (lifetime over capacity) and the summary tells the user to
 // verify against the manufacturer's data sheet. Type "other" skips the whole pass.
 
-// Compile-time firmware defaults in UI units — fallback "Now" when a key is absent from /exportConfig
+// Compile-time firmware defaults in UI units — fallback "Now" when a key is absent from /exportConfig.
+// MUST track the global initialisers in Xregulator.ino; 16 of these had drifted away from the
+// firmware, so a fresh device with an unwritten key showed a fabricated "Now" and mis-flagged the
+// row as changed. Voltage/current entries are the 12 V seeds — InitSystemSettings multiplies them
+// by seedVScale for a 24/36/48 V bank, so this fallback is only exact at 12 V.
 const BATTDEF_FW_DEFAULT = {
-    BulkVoltage: 14.5, AbsorptionVoltage: 14.0,
-    UseFloat: 0, FloatVoltage: 13.4, FLOAT_DURATION: 12, RebulkVoltage: 13.2, RebulkCurrent_A: 5,
-    SOC_BlockRebulk_percent: 95, SOC_AllowRebulk_percent: 94, TailCurrent_A: 5, TailCurrent: 2,
-    ChargedVoltage: 14, BattCurrentLimitA: 100, MaximumAllowedBatteryAmps: 150,
+    BulkVoltage: 13.9, AbsorptionVoltage: 13.9,
+    UseFloat: 0, FloatVoltage: 13.6, FLOAT_DURATION: 8, RebulkVoltage: 13.1, RebulkCurrent_A: 10,
+    SOC_BlockRebulk_percent: 90, SOC_AllowRebulk_percent: 80, TailCurrent_A: 10, TailCurrent: 5,
+    ChargedVoltage: 13.8, BattCurrentLimitA: 100, MaximumAllowedBatteryAmps: 125,
     coldChargeLockoutEnable: 1, battTempDerateEnable: 1, hotChargeLockoutEnable: 0, MaxChargeTempF: 122,
     PeukertExponent: 1.05, ChargeEfficiency: 99,
-    AbsorptionTimeoutMs: 20,
-    VoltageAlarmHigh: 15, VoltageAlarmLow: 11, SocAlarmLow: 0, AlternatorHardShutdownV: 14.2,
-    VoltageHardwareLimit: 14.3, OvTierLoMarginV: 0.10, OvTierMidMarginV: 0.20,
+    AbsorptionTimeoutMs: 45,
+    VoltageAlarmHigh: 14.8, VoltageAlarmLow: 11.9, SocAlarmLow: 10, AlternatorHardShutdownV: 14.2,
+    VoltageHardwareLimit: 14.3, OvTierLoMarginV: 0.10, OvTierMidMarginV: 0.20, OvMeasMarginV: 0.10,
+    IExcessCeilA: 20,
     capSocLowMax: 20, capMinSpan: 70, capRestFloor: 30, capSettleRate: 2.0, bhStepLowA: 30, bhStepDeltaA: 30,
     CvKdDeadbandVps: 0.4, CvKdArmV: 0.5, CvKdTd: 0.85,
     vTgtRampUp: 0.15, vTgtRampDn: 0.15,
@@ -9627,6 +9634,16 @@ let _commPrepIntroResolve = null;
 function commPrepIntroShow() {
     return new Promise(res => {
         _commPrepIntroResolve = res;
+        // Both of the conditional paragraphs are decided here. The laptop advice is a waste of words on
+        // a laptop, so it needs an actually-small screen. The panel warning is meaningless unless the
+        // switches really do own the modes, and the source of truth for that is the firmware echo —
+        // nothing is claimed before it has arrived. The wizard is NOT special-cased: with the override
+        // on, a hand on the panel can still move the charge rate or Maintain mid-run, which is what the
+        // warning is for.
+        const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? 'block' : 'none'; };
+        show('commprep-intro-smallscreen', _isPhoneSizedScreen());
+        const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+        show('commprep-intro-paneloverride', !!c3 && Number(c3.PhysicalPanelOverride) === 1);
         document.getElementById('commprep-intro-overlay').style.display = 'flex';
     });
 }
@@ -11647,6 +11664,38 @@ function renderBmsSignalRow(present) {
     if (Number(c3.bmsLogic) !== 1) { setText('bmsSigEffect_ID', 'not in use'); return; }
     const permits = (Number(c3.bmsLogicLevelOff) === 0) ? !!present : !present;
     setText('bmsSigEffect_ID', permits ? 'charging permitted' : 'charging blocked');
+}
+
+// Switch panel wires on data Cable 3 (Charge Rate = pin 5, Force Float = pin 7). Word = the raw
+// debounced opto state, always live so an installer can prove the wiring; effect = what that state is
+// doing right now, which is nothing at all unless Physical Panel Override is on.
+function renderPanelSwitchRows(hiAsserted, floatAsserted) {
+    const setText = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
+    setText('panelHiRateWord_ID', hiAsserted ? 'energized' : 'dead/open');
+    setText('panelForceFloatWord_ID', floatAsserted ? 'energized' : 'dead/open');
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    if (!c3 || c3.PhysicalPanelOverride === undefined) {
+        setText('panelHiRateEffect_ID', '\u2014');
+        setText('panelForceFloatEffect_ID', '\u2014');
+        return;
+    }
+    if (Number(c3.PhysicalPanelOverride) !== 1) {
+        setText('panelHiRateEffect_ID', 'no effect (this app decides)');
+        setText('panelForceFloatEffect_ID', 'no effect (this app decides)');
+        return;
+    }
+    setText('panelHiRateEffect_ID', hiAsserted ? 'setting High charge rate' : 'setting Low charge rate');
+    setText('panelForceFloatEffect_ID', floatAsserted ? 'Force Maintain Mode engaged' : 'Force Maintain Mode off');
+}
+
+// Grey the two controls the switch panel takes over, so neither is ever a live but inert knob. The
+// source of truth is the firmware echo, not the checkbox, and nothing is greyed until that echo has
+// actually arrived. Called from the CSV3 handler, which is where the echo lands.
+function syncPanelOverrideGates(on) {
+    for (const id of ['chargeRatePanelGate', 'maintainModePanelGate']) {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('is-gated', !!on);
+    }
 }
 
 function fieldOffReasonUpdate(fieldActiveStatus, reasonCode) {
@@ -13824,6 +13873,11 @@ function updateIMUMovingState(sogRaw) {
     }
 }
 
+// FUTURE FIX: these colours never render. applyStaleStyleByAge() writes an inline style.color on
+// these same three elements every tick — including in its FRESH branch, where it assigns
+// var(--reading) — and an inline colour beats the .anchor-good/warn/bad class rules in styles.css.
+// The fix is in applyStaleStyleByAge, not here: it must use a stale/fresh class, or
+// removeProperty('color') on the fresh path. Tuning the thresholds below changes nothing until then.
 // Placeholder thresholds — adjust once real-world data is available
 // Roll (heel deviation 2min): warn=5°, bad=12°
 // Pitch (pitch deviation 2min): warn=3°, bad=8°
@@ -14475,7 +14529,7 @@ function updateTogglesFromData(data) {
         // ESP32 sends 0=PID, 1=Manual — invert so checked=PID matches the label order
         const invertedManual = data.ManualFieldToggle === undefined ? undefined : (data.ManualFieldToggle === 0 ? 1 : 0);
         updateCheckbox("ManualFieldToggle_checkbox", invertedManual, "ManualFieldToggle");
-        updateCheckbox("SwitchControlOverride_checkbox", data.SwitchControlOverride, "SwitchControlOverride");
+        updateCheckbox("PhysicalPanelOverride_checkbox", data.PhysicalPanelOverride, "PhysicalPanelOverride");
         updateCheckbox("header-alternator-enable", data.OnOff, "OnOff");
         updateCheckbox("LimpHome_checkbox", data.LimpHome, "LimpHome");
         // HiLow / charge rate mode handled via pendingToggles in CSVData3 handler
@@ -17597,6 +17651,9 @@ window.addEventListener("load", function () {
             // Minimal On/Off Control status row (Setup > Integrations). Raw pin at 2 Hz so an
             // installer can toggle their BMS output and watch it follow before enabling the gate.
             if (data.bmsSignalActive !== undefined) renderBmsSignalRow(Number(data.bmsSignalActive));
+            if (data.panelHiRateInput !== undefined) {
+                renderPanelSwitchRows(Number(data.panelHiRateInput) === 1, Number(data.panelForceFloatInput) === 1);
+            }
 
             // Cache raw nav values for cross-listener consumers (baro Zambretti forecast on CSV2).
             Object.assign(window._navLast, data);
@@ -17775,6 +17832,12 @@ window.addEventListener("load", function () {
                 } else {
                     setCapMode(data.capLimitMode === 1 ? 'kw' : 'amps');
                 }
+            }
+            // Physical Panel Override owns HiLow and MaintainMode while it is on, so grey both controls.
+            if (data.PhysicalPanelOverride !== undefined) {
+                syncPanelOverrideGates(Number(data.PhysicalPanelOverride) === 1);
+                renderPanelSwitchRows(Number((window._navLast || {}).panelHiRateInput) === 1,
+                                      Number((window._navLast || {}).panelForceFloatInput) === 1);
             }
             // HiLow pending toggle confirmation (HiLow is a CSV3 field)
             if (data.HiLow !== undefined) {
@@ -18202,7 +18265,7 @@ max-width: 100%;     /* allow full width on mobile */
 
     // Invert because labels are swapped
     document.getElementById("ManualFieldToggle_checkbox").checked = (document.getElementById("ManualFieldToggle").value === "0");
-    document.getElementById("SwitchControlOverride_checkbox").checked = (document.getElementById("SwitchControlOverride").value === "1");
+    document.getElementById("PhysicalPanelOverride_checkbox").checked = (document.getElementById("PhysicalPanelOverride").value === "1");
     //document.getElementById("OnOff_checkbox").checked = (document.getElementById("OnOff").value === "1");
     document.getElementById("LimpHome_checkbox").checked = (document.getElementById("LimpHome").value === "1");
     document.getElementById("VeData_checkbox").checked = (document.getElementById("VeData").value === "1");
@@ -20550,20 +20613,6 @@ document.querySelectorAll('.pri-orientation-card').forEach(card => {
         radio.checked = true;
     });
 });
-
-// TODO: Update this validation logic based on actual IMU axis conventions
-// For now, just checking that values are reasonably close to 0 or 1
-function validateIMUAlignment(x, y, z) {
-    const tolerance = 0.2;
-
-    // Check if each value is close to 0 or close to ±1
-    const isValid = (val) => {
-        return (Math.abs(val) < tolerance) ||
-            (Math.abs(Math.abs(val) - 1.0) < tolerance);
-    };
-
-    return isValid(x) && isValid(y) && isValid(z);
-}
 
 function formatMinutesToDHM(minutes) {
     if (isNaN(minutes) || minutes === null || minutes === undefined) {

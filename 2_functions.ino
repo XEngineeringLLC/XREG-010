@@ -377,7 +377,7 @@ bool fsRemove(const char *path) {
 #define NK_CvKdTd "CvKdTd"
 #define NK_SolarWatts "SolarWatts"
 #define NK_StartupRiseRate "StartupRiseRate"
-#define NK_SwitchControlOverride "SwtchCntrlOvrrd"
+#define NK_PhysicalPanelOverride "PhysPanelOvrrd"   // renamed from the dead placeholder "SwtchCntrlOvrrd"; that string is retired, never reuse it
 #define NK_SwitchingFrequency "SwitchingFrqncy"
 #define NK_SystemIDStepAmplitude "SystmIDStpAmplt"
 #define NK_systemIDTestType "SysIDTestType"
@@ -742,7 +742,8 @@ void runSettingsMigrations() {
 static const int COMMISSION_SNAP_FIELDS = 14;
 
 // Serialize the current scalar tune into `key` as one positional CSV. 12th field = HiLow (charge-rate
-// mode) so a revert never strands the user in the wrong mode; fields 13/14 = IExcessBaseA/CcOffsetA (the
+// mode — the app's stored selection HiLowUserSel, not the effective HiLow, which the switch panel owns
+// while the override is on) so a revert never strands the user in the wrong mode; fields 13/14 = IExcessBaseA/CcOffsetA (the
 // affine trip-line the Thresholds step writes). This scalar set IS the whole positional snapshot; the
 // Min% floor table is backed up separately (see the deferred-Start worker, cxStartPersistService).
 void commissionSnapshotScalarsToBuf(char *buf, size_t n) {
@@ -750,7 +751,7 @@ void commissionSnapshotScalarsToBuf(char *buf, size_t n) {
            "%.4f,%.4f,%.3f,%.3f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,%.3f,%d,%.1f,%.1f",
            PidKp, PidKi, OutputPIDFilterTC, VoltageFilterTC,
            IExcessTau, IExcessFloorA, IExcessCeilA, IExcessFrac, IExcessFracBulk,
-           SystemIDStabilizeAmps, SystemIDStepAmplitude, HiLow, IExcessBaseA, IExcessCcOffsetA);
+           SystemIDStabilizeAmps, SystemIDStepAmplitude, HiLowUserSel, IExcessBaseA, IExcessCcOffsetA);
 }
 
 void commissionSnapshotScalars(const char* key) {
@@ -799,10 +800,10 @@ bool commissionRestoreScalars(const char* key) {
   SystemIDStepAmplitude = v[10]; settingWrite(NK_SystemIDStepAmplitude, String(SystemIDStepAmplitude, 3).c_str());
   // HiLow (12th field). When it differs, restore the mode AND swap the active cap tables to match.
   int snapMode = (int)(v[11] + 0.5f);
-  if (snapMode != HiLow) {
-    HiLow = snapMode;
-    settingWrite(NK_HiLow, String(HiLow).c_str());
-    loadCapTablesForMode(HiLow);
+  if (snapMode != HiLowUserSel) {
+    HiLowUserSel = snapMode;  // restore the app's stored choice; it only reaches the live mode while the panel override is off
+    settingWrite(NK_HiLow, String(HiLowUserSel).c_str());
+    applyChargeRateMode(resolveChargeRateMode());
   }
   // Affine trip-line intercept + CC offset (13th/14th fields, always written as a pair).
   IExcessBaseA = v[12];     settingWrite(NK_IExcessBaseA, String(IExcessBaseA, 1).c_str());
@@ -1014,10 +1015,6 @@ void cxStartPersistBegin(bool resuming) {
   xSemaphoreGive(cxStartMutex);
 }
 
-bool cxStartPersistFreshPending() {
-  return cxStartPersistStep != 0 && !cxStartResume;
-}
-
 // Cancel a still-pending Start (abort/done raced the worker). Fresh start: nothing has run, so this
 // is an exact teardown to the pre-click state — NOT a revert, and the caller must not fall into the
 // live-run teardown (which would demote a previously-commissioned device whose re-run never began).
@@ -1025,14 +1022,17 @@ bool cxStartPersistFreshPending() {
 // Whole body under cxStartMutex: once the take succeeds the worker is provably between cases, so the
 // machine cannot advance again (it re-reads step under the lock) and the compensating writes below
 // can never interleave with an in-flight staged write. Returns with the cancel COMPLETE.
-void cxStartPersistCancel() {
-  if (!cxStartMutex) return;
+// The fresh/resume/none verdict is decided under that same take: a caller that instead re-read the
+// step could branch on a Start the worker had already retired to state=1 and skip the live teardown.
+CxStartCancel cxStartPersistCancel() {
+  if (!cxStartMutex) return CX_CANCEL_NONE;
   xSemaphoreTake(cxStartMutex, portMAX_DELAY);  // worker holds it at most one staged NVS write
-  if (cxStartPersistStep == 0) { xSemaphoreGive(cxStartMutex); return; }
+  if (cxStartPersistStep == 0) { xSemaphoreGive(cxStartMutex); return CX_CANCEL_NONE; }
   bool fresh = !cxStartResume;
   cxStartPersistStep = 0;
   if (fresh) {
     testProtectionsEnabled = commissionProtBackup;
+    kneeFitA = cxStartKneeFitA;             // the handler zeroed it on the click; it is live in the Min% temp correction, not scratch
     settingRemove(NK_commissionSnap);       // drop whatever subset the worker already wrote
     settingRemove(NK_commissionPreRun);
     settingRemove(NK_commissionStepSnap);
@@ -1044,6 +1044,7 @@ void cxStartPersistCancel() {
     commissionWriteManualMask();
   }
   xSemaphoreGive(cxStartMutex);
+  return fresh ? CX_CANCEL_FRESH : CX_CANCEL_RESUME;
 }
 
 // Retire one staged write per call — called every loop() pass, no-op when idle. Each case runs
@@ -1061,6 +1062,7 @@ void cxStartPersistService() {
       if (!cxStartResume && !settingWrite(NK_commissionSnap, cxStartTuneCsv)) {
         // No restore point ⇒ refuse the run: starting anyway would leave Abort with nothing to revert to.
         testProtectionsEnabled = commissionProtBackup;
+        kneeFitA = cxStartKneeFitA;   // same teardown as the fresh cancel path
         cxStartPersistStep = 0;
         cxStartPersistFail = true;
         settingsDirty = true;
@@ -2492,13 +2494,15 @@ void updateSensorWindow() {
     if (engineOn) currentWindow->altCurr_on_area_v_us += (int64_t)altCurr * delta_us;
   }
 
-  int32_t victronCurr = (int32_t)(VictronCurrent * 100.0);
-  if (victronCurr < currentWindow->victronCurr_min) currentWindow->victronCurr_min = victronCurr;
-  if (victronCurr > currentWindow->victronCurr_max) currentWindow->victronCurr_max = victronCurr;
-  if (shouldAccumulate) {
-    currentWindow->victronCurr_area_v_us += (int64_t)victronCurr * delta_us;
-    currentWindow->victronCurr_valid_us += delta_us;
-    if (engineOn) currentWindow->victronCurr_on_area_v_us += (int64_t)victronCurr * delta_us;
+  if (!IS_STALE(IDX_VICTRON_CURRENT)) {   // no VE.Direct shunt fitted must read absent, not a measured 0.0 A
+    int32_t victronCurr = (int32_t)(VictronCurrent * 100.0);
+    if (victronCurr < currentWindow->victronCurr_min) currentWindow->victronCurr_min = victronCurr;
+    if (victronCurr > currentWindow->victronCurr_max) currentWindow->victronCurr_max = victronCurr;
+    if (shouldAccumulate) {
+      currentWindow->victronCurr_area_v_us += (int64_t)victronCurr * delta_us;
+      currentWindow->victronCurr_valid_us += delta_us;
+      if (engineOn) currentWindow->victronCurr_on_area_v_us += (int64_t)victronCurr * delta_us;
+    }
   }
 
   if (HAS_BATT_SHUNT) {
@@ -2667,20 +2671,26 @@ void updateSensorWindow() {
     }
   }
 
-  int32_t aws = (int32_t)(ApparentWindSpeedNMEA * 100.0);
-  if (aws < currentWindow->aws_min) currentWindow->aws_min = aws;
-  if (aws > currentWindow->aws_max) currentWindow->aws_max = aws;
-  if (shouldAccumulate) {
-    currentWindow->aws_area_v_us += (int64_t)aws * delta_us;
-    currentWindow->aws_valid_us += delta_us;
+  // Apparent wind - CONDITIONAL on freshness. Ungated, a boat with no wind instrument
+  // accumulated the 0.0 initialiser as measured data and the cloud drew a solid 0-kt line.
+  if (!IS_STALE(IDX_APPARENT_WIND_SPEED)) {
+    int32_t aws = (int32_t)(ApparentWindSpeedNMEA * 100.0);
+    if (aws < currentWindow->aws_min) currentWindow->aws_min = aws;
+    if (aws > currentWindow->aws_max) currentWindow->aws_max = aws;
+    if (shouldAccumulate) {
+      currentWindow->aws_area_v_us += (int64_t)aws * delta_us;
+      currentWindow->aws_valid_us += delta_us;
+    }
   }
 
-  int32_t awa = (int32_t)(ApparentWindAngleNMEA * 100.0);
-  if (awa < currentWindow->awa_min) currentWindow->awa_min = awa;
-  if (awa > currentWindow->awa_max) currentWindow->awa_max = awa;
-  if (shouldAccumulate) {
-    currentWindow->awa_area_v_us += (int64_t)awa * delta_us;
-    currentWindow->awa_valid_us += delta_us;
+  if (!IS_STALE(IDX_APPARENT_WIND_ANGLE)) {
+    int32_t awa = (int32_t)(ApparentWindAngleNMEA * 100.0);
+    if (awa < currentWindow->awa_min) currentWindow->awa_min = awa;
+    if (awa > currentWindow->awa_max) currentWindow->awa_max = awa;
+    if (shouldAccumulate) {
+      currentWindow->awa_area_v_us += (int64_t)awa * delta_us;
+      currentWindow->awa_valid_us += delta_us;
+    }
   }
 
   if (!isnan(TrueWindSpeedNMEA)) {
@@ -2958,6 +2968,10 @@ void uploadBufferedRecords() {
   }
   esp_task_wdt_reset();
 }
+// Defined here, ahead of the ring dump/restore section that owns it, because the drain-to-empty
+// path in executeUploadPayload below deletes the file.
+#define SENSOR_RING_BACKUP_PATH  "/sensor_ring_backup.bin"
+
 bool executeUploadPayload(const char *payload) {
   lastHttpResponseCode = 0;  // per-attempt reset — a transport failure must not leave the previous attempt's code standing
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -3151,6 +3165,12 @@ done_headers:
         if (!sensorRingAnnouncedEmpty) {
           queueConsoleMessage("Cloud sync: all data uploaded");
           sensorRingAnnouncedEmpty = true;
+          // These records are now in the cloud, so the Phase-4 dump is stale. Left in place it is
+          // restored at the next boot and every record is re-POSTed. Raw remove: fsExists() would
+          // re-take the non-recursive fsMutex and block 5 s.
+          fsTakeLock();
+          LittleFS.remove(SENSOR_RING_BACKUP_PATH);
+          fsReleaseLock();
         }
       } else {
         // Throttle the "N queued" progress chatter to at most one per minute.
@@ -3309,7 +3329,6 @@ void popTailSnapshot() {
 // Binary-format file used by Phase 3 (shutdown dump + boot restore) so the
 // PSRAM ring survives a power-cycle when WiFi/cloud couldn't drain everything
 // during the 30-min ignition-off window.
-#define SENSOR_RING_BACKUP_PATH  "/sensor_ring_backup.bin"
 #define SENSOR_RING_BACKUP_MAGIC 0x53524258u  // 'SRBX'
 #define SENSOR_RING_BACKUP_VER   3u  // v3: + chargeStage byte (LT-plot cloud-stitch field)
 

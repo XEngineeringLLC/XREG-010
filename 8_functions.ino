@@ -1060,7 +1060,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "ManualDutyTarget", NK_ManualDutyTarget, 3 },
   { "IgnitionOverride", NK_IgnitionOverride, 3 },
   { "LimpHome", NK_LimpHome, 3 },
-  { "SwitchControlOverride", NK_SwitchControlOverride, 3 },
+  { "PhysicalPanelOverride", NK_PhysicalPanelOverride, 3 },
   { "TuningMode", NK_TuningMode, 3 },
   { "CVTuningMode", NK_CVTuningMode, 3 },
   { "battMaxMode", NK_battMaxMode, 3 },
@@ -1814,7 +1814,7 @@ static inline float cvpfVScale() { return (float)SYSTEM_VOLTAGE_CLASS / 12.0f; }
 // Lithium does not evolve gas at any charge voltage we permit; every other chemistry does. "other" is treated
 // as gassing: a false refusal costs the user a retry, a false pass ships an over-gained loop.
 static bool cvpfChemGasses() {
-  return !BATTERY_TYPE.equalsIgnoreCase("lifepo4");
+  return strcasecmp(BATTERY_TYPE, "lifepo4") != 0;
 }
 
 void cvpfSample(uint32_t nowMs) {

@@ -1139,16 +1139,16 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     BOAT_DISPLACEMENT_LBS  = settingRead(NK_boatDispLbs).toFloat();
     // The three defaults below are meaningful (chemistry drives the OCV preset, boat type
     // drives the perf model), so an empty key keeps the compile-time value rather than ""
-    String s = settingRead(NK_boatType);          if (s.length()) BOAT_TYPE = s;
-    BOAT_MAKE_MODEL        = settingRead(NK_boatMakeModel);
+    String s = settingRead(NK_boatType);          if (s.length()) vesselSetText(BOAT_TYPE, sizeof(BOAT_TYPE), s.c_str());
+    vesselSetText(BOAT_MAKE_MODEL, sizeof(BOAT_MAKE_MODEL), settingRead(NK_boatMakeModel).c_str());
     int y = settingRead(NK_boatYear).toInt();     if (y > 0) BOAT_YEAR = (uint16_t)y;
     strncpy(HOME_PORT, settingRead(NK_homePort).c_str(), sizeof(HOME_PORT) - 1);
     HOME_PORT[sizeof(HOME_PORT) - 1] = '\0';
-    ENGINE_MAKE            = settingRead(NK_engineMake);
+    vesselSetText(ENGINE_MAKE, sizeof(ENGINE_MAKE), settingRead(NK_engineMake).c_str());
     ENGINE_HP              = (uint16_t)settingRead(NK_engineHp).toInt();
-    s = settingRead(NK_batteryType);              if (s.length()) BATTERY_TYPE = s;
-    BATTERY_MAKE_MODEL     = settingRead(NK_battMakeModel);
-    ALTERNATOR_BRAND_MODEL = settingRead(NK_altBrandModel);
+    s = settingRead(NK_batteryType);              if (s.length()) vesselSetText(BATTERY_TYPE, sizeof(BATTERY_TYPE), s.c_str());
+    vesselSetText(BATTERY_MAKE_MODEL, sizeof(BATTERY_MAKE_MODEL), settingRead(NK_battMakeModel).c_str());
+    vesselSetText(ALTERNATOR_BRAND_MODEL, sizeof(ALTERNATOR_BRAND_MODEL), settingRead(NK_altBrandModel).c_str());
     // Unclamped, an out-of-range value indexes past axisRemap[] and wild-reads through src[]
     imuMountOrientation    = (uint8_t)constrain(settingRead(NK_imuMountOrient).toInt(), 0, IMU_ORIENT_COUNT - 1);
     regulatorMountLoc      = (uint8_t)constrain(settingRead(NK_regMountLoc).toInt(), 0, 1);
@@ -1420,10 +1420,10 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     ManualFieldToggle = settingRead(NK_ManualFieldToggle).toInt();
   }
-  if (!settingExists(NK_SwitchControlOverride)) {
-    settingWrite(NK_SwitchControlOverride, String(SwitchControlOverride).c_str());
+  if (!settingExists(NK_PhysicalPanelOverride)) {
+    settingWrite(NK_PhysicalPanelOverride, String(PhysicalPanelOverride).c_str());
   } else {
-    SwitchControlOverride = settingRead(NK_SwitchControlOverride).toInt();
+    PhysicalPanelOverride = settingRead(NK_PhysicalPanelOverride).toInt();
   }
   if (!settingExists(NK_IgnitionOverride)) {
     settingWrite(NK_IgnitionOverride, String(IgnitionOverride).c_str());
@@ -1467,6 +1467,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     MaintainMode = settingRead(NK_MaintainMode).toInt();
   }
+  MaintainModeUserSel = MaintainMode;  // NVS holds the app's choice; servicePanelSwitchInputs() derives the effective MaintainMode from it (or from the Cable 3 wire) on the first loop pass
   if (!settingExists(NK_TargetVoltageMode)) {
     settingWrite(NK_TargetVoltageMode, String(TargetVoltageMode).c_str());
   } else {
@@ -1482,6 +1483,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     HiLow = settingRead(NK_HiLow).toInt();
   }
+  HiLowUserSel = HiLow;  // NVS holds the app's choice; servicePanelSwitchInputs() derives the effective HiLow from it (or from the Cable 3 wire) on the first loop pass
   if (!settingExists(NK_AmpSensorRange)) {
     settingWrite(NK_AmpSensorRange, String(AmpSensorRange).c_str());
   } else {
@@ -2074,7 +2076,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   // gap, and the destroyed setting could not be restored by fixing the resistance.
   if (!BatteryShuntPresent) {
     if (UseFloat != 0)     { UseFloat = 0;     settingWrite(NK_UseFloat, "0"); }
-    if (MaintainMode != 0) { MaintainMode = 0; settingWrite(NK_MaintainMode, "0"); }
+    if (MaintainMode != 0) { MaintainMode = 0; MaintainModeUserSel = 0; settingWrite(NK_MaintainMode, "0"); }
   } else if (!HAS_BATT_SHUNT) {
     queueConsoleMessage("Battery shunt resistance is not set: State of Charge, battery health, battery current limit and float charging are off.");
     queueConsoleMessage("Enter the shunt resistance to enable them. Your float setting is kept.");
