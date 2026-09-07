@@ -5241,8 +5241,8 @@ void setupServer() {
     if (request->hasParam("PhysicalPanelOverride")) {
       foundParameter = true;
       inputMessage = request->getParam("PhysicalPanelOverride")->value();
-      settingWrite(NK_PhysicalPanelOverride, inputMessage.c_str());
-      PhysicalPanelOverride = inputMessage.toInt();
+      PhysicalPanelOverride = (inputMessage.toInt() == 1) ? 1 : 0;  // clamped: the resolvers test == 0 and the app gates on === 1, so any other value would split them
+      settingWrite(NK_PhysicalPanelOverride, String(PhysicalPanelOverride).c_str());
       // Ownership of both modes just moved. Re-resolve here rather than waiting for the loop pass, so
       // the CSV3 echo this request triggers already carries the modes the new owner asks for — turning
       // the override off has to put the app's stored choice back on screen in the same round trip.
@@ -5263,13 +5263,16 @@ void setupServer() {
       MaintainModeUserSel = inputMessage.toInt();  // the app's stored choice; inert while PhysicalPanelOverride is on, but still recorded so turning the override back off restores it
       if (!BatteryShuntPresent) MaintainModeUserSel = 0;  // no battery-current sensor at all → 0-net-amps hold impossible
       settingWrite(NK_MaintainMode, String(MaintainModeUserSel).c_str());
-      if (MaintainModeUserSel) {
-        // MaintainMode and TargetVoltageMode are mutually exclusive — clear the other.
+      if (MaintainModeUserSel && PhysicalPanelOverride == 0) {
+        // MaintainMode and TargetVoltageMode are mutually exclusive — clear the other. Only while the app
+        // owns the mode: with the panel override on this choice is inert, so clearing Target Voltage for
+        // it would cost the user that mode for nothing.
         TargetVoltageMode = 0;
         settingWrite(NK_TargetVoltageMode, "0");
       }
       MaintainMode = resolveMaintainMode();  // effective value: this choice only lands while the override is off
-      queueConsoleMessageF("MaintainMode mode %s", MaintainMode ? "enabled" : "disabled");
+      if (PhysicalPanelOverride) queueConsoleMessageF("MaintainMode choice stored (%s) - the Cable 3 Force Float switch decides while Physical Panel Override is on", MaintainModeUserSel ? "on" : "off");
+      else queueConsoleMessageF("MaintainMode mode %s", MaintainMode ? "enabled" : "disabled");
     }
     if (request->hasParam("TargetVoltageMode")) {
       foundParameter = true;
@@ -5304,6 +5307,8 @@ void setupServer() {
       // this resolves back to the panel's mode and the request changes nothing but the stored choice.
       if (applyChargeRateMode(resolveChargeRateMode())) {
         queueConsoleMessageF("Charge rate mode: switched to %s", HiLow == 1 ? "Normal" : "Low");
+      } else if (PhysicalPanelOverride) {
+        queueConsoleMessageF("Charge rate choice stored (%s) - the Cable 3 switch decides while Physical Panel Override is on", HiLowUserSel == 0 ? "Low" : "Normal");
       }
     }
     if (request->hasParam("InvertAltAmps")) {

@@ -6256,6 +6256,7 @@ static void improvSendResult(uint8_t cmd, const char *const *strs, int n) {
   uint8_t buf[255];
   int pos = 2;
   for (int i = 0; i < n; i++) {
+    if (pos >= 255) break;  // buffer full: a further length byte would land one past the end
     int l = strlen(strs[i]);
     if (pos + 1 + l > 255) l = 255 - pos - 1;
     if (l < 0) l = 0;

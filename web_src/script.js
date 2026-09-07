@@ -4643,7 +4643,7 @@ async function phoneSpeedBgDisclosed() {
 // speed stream still runs and GNSS still reads, but the shade stays empty, so the owner cannot
 // see that their location is in use or stop it from there. Asked at the first native start
 // rather than at launch, for the same reason the location prompt is. iOS has no equivalent
-// permission and the plugin resolves granted, so this is a no-op there.
+// permission and its plugin does not implement this method, so the call rejects and is swallowed.
 async function ensureSpeedNotificationPermission() {
     if (speedNotifPermTried) return false;
     speedNotifPermTried = true;
@@ -9400,7 +9400,7 @@ async function commPrepOwPollNow() {
 // Rows are rebuilt only when the id/role/present set changes, so an open role <select> is never torn
 // down mid-choice; the temperature cell updates in place. No age column: a sensor is on the bus or it is
 // not, and one that is listed but has stopped answering says so where its temperature would be.
-const CP_OW_ROLE_LABEL = ['Alternator', 'Battery', 'Other'];   // firmware roles 0..2 (2 is EXTRA)
+const CP_OW_ROLE_LABEL = ['Alternator', 'Battery', 'Extra'];   // firmware roles 0..2; must match OW_ROLE_NAMES
 const CP_OW_STALE_S = 30;                                      // read cadence is 5 s; 30 s of silence is a fault, not jitter
 function commPrepOwRender(j) {
     const box = document.getElementById('commprep-ow');
@@ -9506,8 +9506,13 @@ function commPrepOwGate(j) {
         + n + ' sensor' + (n === 1 ? ' is' : 's are') + ' on the bus and none of them is set to Alternator. '
         + (!settingsUnlocked ? 'Unlock settings to set it.' : 'Set it in the table below.');
     if (box.innerHTML !== html) box.innerHTML = html;
-    // Locked settings refuse the assignment, so blocking Next would dead-end the screen — say it, don't block it.
-    if (start && settingsUnlocked) { start.disabled = true; start.style.opacity = '0.45'; start.style.cursor = 'default'; start.title = CP_OW_GATE_TITLE; }
+    // Locked settings refuse the assignment, so blocking Next would dead-end the screen — say it, don't
+    // block it. Re-run on every poll, so a lock that lands while the gate is up (arm window expired,
+    // another client disarmed) also gives Next back.
+    if (start) {
+        if (settingsUnlocked) { start.disabled = true; start.style.opacity = '0.45'; start.style.cursor = 'default'; start.title = CP_OW_GATE_TITLE; }
+        else if (start.disabled) commPrepPaintCta();
+    }
 }
 async function commPrepOwAssign(sel) {
     const tr = sel.closest('tr');
@@ -9520,16 +9525,25 @@ async function commPrepOwAssign(sel) {
     if (!settingsUnlocked) { xAlert('Please unlock settings first'); revert(); return; }
     if (!/^[0-9a-f]{16}$/.test(id) || !Number.isFinite(newRole)) { revert(); return; }
     sel.disabled = true;
+    let enabledEarly = null;   // enable turned on ahead of the bind, undone if the bind is refused
     try {
-        await owWriteRole(id, oldRole, newRole);
         // The assignment IS the enable: there is no separate Installed/None control on this screen to
-        // contradict it. Battery role on → the source chain may read it; role off → it may not.
-        if (newRole === 1 || oldRole === 1) await commPrepOwSetEnable('battTempProbeEnable', newRole === 1);
-        if (newRole === 2 || oldRole === 2) await commPrepOwSetEnable('extraTempProbeEnable', newRole === 2);
+        // contradict it. Battery role on → the source chain may read it; role off → it may not. The
+        // enable goes on BEFORE the bind: with one probe on the bus and both enables off, the firmware's
+        // enumerate re-binds it to Alternator between the clear and the re-bind, and the re-bind is then
+        // refused as already assigned.
+        if (newRole === 1 && oldRole !== 1) { await commPrepOwSetEnable('battTempProbeEnable', true); enabledEarly = 'battTempProbeEnable'; }
+        if (newRole === 2 && oldRole !== 2) { await commPrepOwSetEnable('extraTempProbeEnable', true); enabledEarly = 'extraTempProbeEnable'; }
+        await owWriteRole(id, oldRole, newRole);
+        if (oldRole === 1 && newRole !== 1) await commPrepOwSetEnable('battTempProbeEnable', false);
+        if (oldRole === 2 && newRole !== 2) await commPrepOwSetEnable('extraTempProbeEnable', false);
         _commPrepOwScanUntilMs = Date.now() + 1500;
     } catch (e) {
         diagLog('prerequisites probe role assignment failed:', e);
-        xAlert('Could not assign the sensor. Check the connection and try again.');
+        if (enabledEarly) { try { await commPrepOwSetEnable(enabledEarly, false); } catch (e2) { } }
+        const why = String((e && e.message) || '');
+        xAlert(/^Rejected/.test(why) ? ('Could not assign the sensor: ' + why.replace(/^Rejected:\s*/, '') + '.')
+                                     : 'Could not assign the sensor. Check the connection and try again.');
         revert();
     } finally {
         sel.disabled = false;
@@ -9671,8 +9685,9 @@ function commPrepRender(cfg) {
 
     // The charge block (Bulk/Absorption/Float/current/protection) appears ONLY for Other — every other
     // chemistry got these proposed by the battery-defaults populator, which bails for Other and leaves
-    // nothing set. Battery temperature limits are not here at all: they are non-critical for the run and
-    // the populator sets them from chemistry.
+    // nothing set. Battery temperature limits are not here at all: they are non-critical for the run. The
+    // populator proposes the cold/hot lockout enables and the hot limit from chemistry; the cold floor
+    // (MinChargeTempF) stays at the firmware default until edited under Setup > Battery.
     const chem = (window.vesselInfo && String(window.vesselInfo.battery_type || '').toLowerCase()) || '';
     const isOther = chem === 'other';
 
@@ -9741,7 +9756,7 @@ function commPrepRender(cfg) {
         '<div style="display:flex; align-items:center; gap:10px; margin-top:8px;">' +
         '<button type="button" id="commprep-ow-scan" onclick="commPrepOwScan()" style="background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:5px; padding:5px 12px; cursor:pointer; font-size:0.8em;">Rescan</button>' +
         '<span id="commprep-ow-status" style="font-size:11px; color:#888;"></span></div>' +
-        '<div style="' + capCss + '">Alternator feeds the over-temperature protection. Battery supplies the battery temperature the charge lockouts and the voltage-loop gain derate use. Other is a spare reading, shown on Live Data with its own alarms.</div>' +
+        '<div style="' + capCss + '">Alternator feeds the over-temperature protection. Battery supplies the battery temperature the charge lockouts and the voltage-loop gain derate use. Extra is any other temperature you want to watch, shown on Live Data with its own alarms.</div>' +
         '</div>' + hr + '</div>';
 
     // FLOAT_DURATION is stored/exported in seconds; the input edits hours (firmware re-multiplies on write).
@@ -11695,6 +11710,12 @@ function syncPanelOverrideGates(on) {
     for (const id of ['chargeRatePanelGate', 'maintainModePanelGate']) {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('is-gated', !!on);
+    }
+    // pointer-events:none stops mouse and touch only; Tab + Enter would still fire the handlers and the
+    // firmware would record the keystroke as the app's stored choice.
+    for (const id of ['chargeRateLowBtn', 'chargeRateHighBtn', 'MaintainMode_checkbox']) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !!on;
     }
 }
 
@@ -14340,7 +14361,7 @@ function armSettings() {
 // still-armed window, relock when the 30-min window expires or another client disarms.
 function syncArmState() {   // returns the round trip so a caller that must see a fresh mirror can await it
     if (DEMO_MODE) return Promise.resolve();
-    return fetch(buildURL('/armSettings'))
+    return fetchWithTimeout(buildURL('/armSettings'), {}, 8000)   // bounded: openCommPrereqs awaits this, and a hung request would park the first-install chain
         .then(r => r.ok ? r.json() : null)
         .then(j => {
             if (!j) return;
@@ -15066,6 +15087,9 @@ async function owWriteRole(id, oldRole, newRole) {
     for (const p of params) {   // sequential: the clear must land before the re-bind
         const r = await fetchWithTimeout(buildURL('/get?' + p), {}, 8000);
         if (!r.ok) throw new Error('HTTP ' + r.status);
+        // The firmware refuses a malformed or already-bound id with HTTP 200 and a "Rejected: ..." body.
+        const t = (await r.text()).trim();
+        if (/^Rejected/.test(t)) throw new Error(t);
     }
 }
 // Role change from a row's <select>.
@@ -17836,8 +17860,10 @@ window.addEventListener("load", function () {
             // Physical Panel Override owns HiLow and MaintainMode while it is on, so grey both controls.
             if (data.PhysicalPanelOverride !== undefined) {
                 syncPanelOverrideGates(Number(data.PhysicalPanelOverride) === 1);
-                renderPanelSwitchRows(Number((window._navLast || {}).panelHiRateInput) === 1,
-                                      Number((window._navLast || {}).panelForceFloatInput) === 1);
+                const nl = window._navLast || {};
+                if (nl.panelHiRateInput !== undefined) {   // before the first CSV4 packet the wire state is unknown, not "dead/open"
+                    renderPanelSwitchRows(Number(nl.panelHiRateInput) === 1, Number(nl.panelForceFloatInput) === 1);
+                }
             }
             // HiLow pending toggle confirmation (HiLow is a CSV3 field)
             if (data.HiLow !== undefined) {

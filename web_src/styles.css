@@ -5851,7 +5851,7 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   color: var(--text-muted);
 }
 
-/* Header Batt temperature row inside the Alt/Board chip — present only while a battery temperature
+/* Header Batt temperature row inside the Alt/Batt chip — present only while a battery temperature
    exists (renderBattTempReadouts toggles has-batt-temp). */
 #hdr-temp-duo:not(.has-batt-temp) .hdr-batt-temp { display: none; }
 @media (max-width: 480px) {

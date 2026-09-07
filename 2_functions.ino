@@ -708,7 +708,7 @@ long clampLoadedSetting(const char *name, const char *nvsKey, long value, long l
   return clamped;
 }
 
-#define SETTINGS_SCHEMA_VERSION 1
+#define SETTINGS_SCHEMA_VERSION 2
 
 // Cumulative settings-schema migration chain. Runs once at boot, right after the last NVS
 // settings loader (initWeatherModeSettings), so steps see the fully seeded key set — a step
@@ -725,6 +725,12 @@ void runSettingsMigrations() {
     switch (stored) {
       case 0:
         break;  // 0->1: stamp only — fielded pre-schema settings are valid as-is
+      case 1:
+        // 1->2: SwitchControlOverride (key "SwtchCntrlOvrrd", a dead placeholder) became
+        // PhysicalPanelOverride ("PhysPanelOvrrd") on 2026-09-06 with the opposite sense (old 1 = web owns
+        // the modes = new 0), so the value is not carried over; the retired key is erased.
+        settingRemove("SwtchCntrlOvrrd");
+        break;
     }
     stored++;
     settingWrite(NK_cfgSchema, String(stored).c_str());
@@ -2494,7 +2500,7 @@ void updateSensorWindow() {
     if (engineOn) currentWindow->altCurr_on_area_v_us += (int64_t)altCurr * delta_us;
   }
 
-  if (!IS_STALE(IDX_VICTRON_CURRENT)) {   // no VE.Direct shunt fitted must read absent, not a measured 0.0 A
+  if (IS_SEEN(IDX_VICTRON_CURRENT) && !IS_STALE(IDX_VICTRON_CURRENT)) {   // no VE.Direct shunt fitted must read absent, not a measured 0.0 A
     int32_t victronCurr = (int32_t)(VictronCurrent * 100.0);
     if (victronCurr < currentWindow->victronCurr_min) currentWindow->victronCurr_min = victronCurr;
     if (victronCurr > currentWindow->victronCurr_max) currentWindow->victronCurr_max = victronCurr;
@@ -2632,7 +2638,7 @@ void updateSensorWindow() {
   if (sustSrcHold && (millis() - sustSrcChangedMs) >= SUST_WINDOW_MS) sustSrcHold = false;
 
   // Speed over ground - CONDITIONAL on freshness
-  if (!IS_STALE(IDX_SOG_NMEA)) {
+  if (IS_SEEN(IDX_SOG_NMEA) && !IS_STALE(IDX_SOG_NMEA)) {
     int32_t sog = (int32_t)(SOGNMEA * 100.0);
     if (sog < currentWindow->sog_min) currentWindow->sog_min = sog;
     if (sog > currentWindow->sog_max) currentWindow->sog_max = sog;
@@ -2651,7 +2657,7 @@ void updateSensorWindow() {
   }
 
   // Course over ground - CONDITIONAL on freshness
-  if (!IS_STALE(IDX_COG_NMEA)) {
+  if (IS_SEEN(IDX_COG_NMEA) && !IS_STALE(IDX_COG_NMEA)) {
     int32_t cog = (int32_t)(COGNMEA * 100.0);
     if (cog < currentWindow->cog_min) currentWindow->cog_min = cog;
     if (cog > currentWindow->cog_max) currentWindow->cog_max = cog;
@@ -2661,7 +2667,7 @@ void updateSensorWindow() {
     }
   }
 
-  if (!IS_STALE(IDX_HEADING_NMEA)) {
+  if (IS_SEEN(IDX_HEADING_NMEA) && !IS_STALE(IDX_HEADING_NMEA)) {
     int32_t heading = (int32_t)(HeadingNMEA * 100.0);
     if (heading < currentWindow->heading_min) currentWindow->heading_min = heading;
     if (heading > currentWindow->heading_max) currentWindow->heading_max = heading;
@@ -2673,7 +2679,7 @@ void updateSensorWindow() {
 
   // Apparent wind - CONDITIONAL on freshness. Ungated, a boat with no wind instrument
   // accumulated the 0.0 initialiser as measured data and the cloud drew a solid 0-kt line.
-  if (!IS_STALE(IDX_APPARENT_WIND_SPEED)) {
+  if (IS_SEEN(IDX_APPARENT_WIND_SPEED) && !IS_STALE(IDX_APPARENT_WIND_SPEED)) {
     int32_t aws = (int32_t)(ApparentWindSpeedNMEA * 100.0);
     if (aws < currentWindow->aws_min) currentWindow->aws_min = aws;
     if (aws > currentWindow->aws_max) currentWindow->aws_max = aws;
@@ -2683,7 +2689,7 @@ void updateSensorWindow() {
     }
   }
 
-  if (!IS_STALE(IDX_APPARENT_WIND_ANGLE)) {
+  if (IS_SEEN(IDX_APPARENT_WIND_ANGLE) && !IS_STALE(IDX_APPARENT_WIND_ANGLE)) {
     int32_t awa = (int32_t)(ApparentWindAngleNMEA * 100.0);
     if (awa < currentWindow->awa_min) currentWindow->awa_min = awa;
     if (awa > currentWindow->awa_max) currentWindow->awa_max = awa;
@@ -2772,6 +2778,18 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   const bool bcOk  = snap.window.battCurr_valid_us > 0;
   const bool socOk = snap.window.soc_valid_us > 0;
   char bcMinS[16], bcMaxS[16], bcAvgS[16], bcOnAvgS[16], socMinS[16], socMaxS[16], socAvgS[16];
+  // Same rule for the VE.Direct shunt and the four wind fields: updateSensorWindow skips their
+  // accumulators while the source is stale or never seen, so valid_us == 0 means absent. The cloud
+  // nulls the 9999 min/max sentinels itself but plots a 0.0 average as data, which is the flat
+  // 0-kt / 0 A line a boat without the instrument used to draw.
+  const bool vcOk  = snap.window.victronCurr_valid_us > 0;
+  const bool awsOk = snap.window.aws_valid_us > 0;
+  const bool twsOk = snap.window.tws_valid_us > 0;
+  const bool awaOk = snap.window.awa_valid_us > 0;
+  const bool twaOk = snap.window.twa_valid_us > 0;
+  char vcMinS[16], vcMaxS[16], vcAvgS[16], vcOnAvgS[16];
+  char awsMinS[16], awsMaxS[16], awsAvgS[16], twsMinS[16], twsMaxS[16], twsAvgS[16];
+  char awaMinS[16], awaMaxS[16], awaAvgS[16], twaMinS[16], twaMaxS[16], twaAvgS[16];
   int written = snprintf(
     payloadBuffer, PAYLOAD_BUFFER_SIZE,
     "{"
@@ -2796,7 +2814,7 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     // Alternator
     "\"alt_curr_min\":%.2f,\"alt_curr_max\":%.2f,\"alt_curr_avg\":%.2f,"
     "\"duty_cycle_min\":%.2f,\"duty_cycle_max\":%.2f,\"duty_cycle_avg\":%.2f,"
-    "\"victron_curr_min\":%.2f,\"victron_curr_max\":%.2f,\"victron_curr_avg\":%.2f,"
+    "\"victron_curr_min\":%s,\"victron_curr_max\":%s,\"victron_curr_avg\":%s,"
     "\"soc_min\":%s,\"soc_max\":%s,\"soc_avg\":%s,"
     // Engine
     "\"rpm_min\":%d,\"rpm_max\":%d,\"rpm_avg\":%d,"
@@ -2814,20 +2832,20 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     "\"speed_source_phone\":%s,"
     "\"lat_current\":%.6f,\"lon_current\":%.6f,"
     // NMEA wind & sailing
-    "\"aws_min\":%.2f,\"aws_max\":%.2f,\"aws_avg\":%.2f,"
-    "\"tws_min\":%.2f,\"tws_max\":%.2f,\"tws_avg\":%.2f,"
+    "\"aws_min\":%s,\"aws_max\":%s,\"aws_avg\":%s,"
+    "\"tws_min\":%s,\"tws_max\":%s,\"tws_avg\":%s,"
     "\"vmg_min\":%.2f,\"vmg_max\":%.2f,\"vmg_avg\":%.2f,"
     "\"leeway_min\":%.2f,\"leeway_max\":%.2f,\"leeway_avg\":%.2f,"
     // Wind/heading angles + alt-zero + charge stage (long-term-plot stitch fields).
     // awa/twa envelope; cog/heading/alt_zero avg-only; charge_stage categorical (0-7).
-    "\"awa_min\":%.2f,\"awa_max\":%.2f,\"awa_avg\":%.2f,"
-    "\"twa_min\":%.2f,\"twa_max\":%.2f,\"twa_avg\":%.2f,"
+    "\"awa_min\":%s,\"awa_max\":%s,\"awa_avg\":%s,"
+    "\"twa_min\":%s,\"twa_max\":%s,\"twa_avg\":%s,"
     "\"cog_avg\":%.2f,\"heading_avg\":%.2f,\"alt_zero_avg\":%.2f,"
     "\"charge_stage\":%d,"
     // Engine-on-weighted averages (denominator = µs engine was spinning this window)
     // + coverage. engine_on_pct 0 ⇒ engine never ran ⇒ *_onavg values meaningless (0s).
     "\"batt_volt_onavg\":%.2f,\"batt_curr_onavg\":%s,\"alt_curr_onavg\":%.2f,"
-    "\"victron_curr_onavg\":%.2f,\"duty_cycle_onavg\":%.2f,\"engine_on_pct\":%.2f,"
+    "\"victron_curr_onavg\":%s,\"duty_cycle_onavg\":%.2f,\"engine_on_pct\":%.2f,"
     // IMU peak motion (per-window aggregates)
     "\"imu_heel_min\":%.2f,\"imu_heel_max\":%.2f,\"imu_heel_avg\":%.2f,"
     "\"imu_pitch_min\":%.2f,\"imu_pitch_max\":%.2f,\"imu_pitch_avg\":%.2f,"
@@ -2858,8 +2876,9 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     SAFE_AVG_100(snap.window.altCurr_area_v_us, snap.window.altCurr_valid_us),
     snap.window.dutyCycle_min / 100.0, snap.window.dutyCycle_max / 100.0,
     SAFE_AVG_100(snap.window.dutyCycle_area_v_us, snap.window.dutyCycle_valid_us),
-    snap.window.victronCurr_min / 100.0, snap.window.victronCurr_max / 100.0,
-    SAFE_AVG_100(snap.window.victronCurr_area_v_us, snap.window.victronCurr_valid_us),
+    ltJsonNum(vcMinS, sizeof(vcMinS), snap.window.victronCurr_min / 100.0, vcOk),
+    ltJsonNum(vcMaxS, sizeof(vcMaxS), snap.window.victronCurr_max / 100.0, vcOk),
+    ltJsonNum(vcAvgS, sizeof(vcAvgS), SAFE_AVG_100(snap.window.victronCurr_area_v_us, snap.window.victronCurr_valid_us), vcOk),
     ltJsonNum(socMinS, sizeof(socMinS), snap.window.soc_min / 100.0, socOk),
     ltJsonNum(socMaxS, sizeof(socMaxS), snap.window.soc_max / 100.0, socOk),
     ltJsonNum(socAvgS, sizeof(socAvgS), SAFE_AVG_100(snap.window.soc_area_v_us, snap.window.soc_valid_us), socOk),
@@ -2880,18 +2899,22 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     snap.window.sogSust1m_max / 100.0,
     snap.window.sogSustPhone ? "true" : "false",
     snap.window.lat_current, snap.window.lon_current,
-    snap.window.aws_min / 100.0, snap.window.aws_max / 100.0,
-    SAFE_AVG_100(snap.window.aws_area_v_us, snap.window.aws_valid_us),
-    snap.window.tws_min / 100.0, snap.window.tws_max / 100.0,
-    SAFE_AVG_100(snap.window.tws_area_v_us, snap.window.tws_valid_us),
+    ltJsonNum(awsMinS, sizeof(awsMinS), snap.window.aws_min / 100.0, awsOk),
+    ltJsonNum(awsMaxS, sizeof(awsMaxS), snap.window.aws_max / 100.0, awsOk),
+    ltJsonNum(awsAvgS, sizeof(awsAvgS), SAFE_AVG_100(snap.window.aws_area_v_us, snap.window.aws_valid_us), awsOk),
+    ltJsonNum(twsMinS, sizeof(twsMinS), snap.window.tws_min / 100.0, twsOk),
+    ltJsonNum(twsMaxS, sizeof(twsMaxS), snap.window.tws_max / 100.0, twsOk),
+    ltJsonNum(twsAvgS, sizeof(twsAvgS), SAFE_AVG_100(snap.window.tws_area_v_us, snap.window.tws_valid_us), twsOk),
     snap.window.vmg_min / 100.0, snap.window.vmg_max / 100.0,
     SAFE_AVG_100(snap.window.vmg_area_v_us, snap.window.vmg_valid_us),
     snap.window.leeway_min / 100.0, snap.window.leeway_max / 100.0,
     SAFE_AVG_100(snap.window.leeway_area_v_us, snap.window.leeway_valid_us),
-    snap.window.awa_min / 100.0, snap.window.awa_max / 100.0,
-    SAFE_AVG_100(snap.window.awa_area_v_us, snap.window.awa_valid_us),
-    snap.window.twa_min / 100.0, snap.window.twa_max / 100.0,
-    SAFE_AVG_100(snap.window.twa_area_v_us, snap.window.twa_valid_us),
+    ltJsonNum(awaMinS, sizeof(awaMinS), snap.window.awa_min / 100.0, awaOk),
+    ltJsonNum(awaMaxS, sizeof(awaMaxS), snap.window.awa_max / 100.0, awaOk),
+    ltJsonNum(awaAvgS, sizeof(awaAvgS), SAFE_AVG_100(snap.window.awa_area_v_us, snap.window.awa_valid_us), awaOk),
+    ltJsonNum(twaMinS, sizeof(twaMinS), snap.window.twa_min / 100.0, twaOk),
+    ltJsonNum(twaMaxS, sizeof(twaMaxS), snap.window.twa_max / 100.0, twaOk),
+    ltJsonNum(twaAvgS, sizeof(twaAvgS), SAFE_AVG_100(snap.window.twa_area_v_us, snap.window.twa_valid_us), twaOk),
     SAFE_AVG_100(snap.window.cog_area_v_us, snap.window.cog_valid_us),
     SAFE_AVG_100(snap.window.heading_area_v_us, snap.window.heading_valid_us),
     SAFE_AVG_100(snap.window.altZero_area_v_us, snap.window.altZero_valid_us),
@@ -2899,7 +2922,7 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     SAFE_AVG_100(snap.window.battVolt_on_area_v_us, snap.window.active_us),
     ltJsonNum(bcOnAvgS, sizeof(bcOnAvgS), SAFE_AVG_100(snap.window.battCurr_on_area_v_us, snap.window.active_us), bcOk),
     SAFE_AVG_100(snap.window.altCurr_on_area_v_us, snap.window.active_us),
-    SAFE_AVG_100(snap.window.victronCurr_on_area_v_us, snap.window.active_us),
+    ltJsonNum(vcOnAvgS, sizeof(vcOnAvgS), SAFE_AVG_100(snap.window.victronCurr_on_area_v_us, snap.window.active_us), vcOk),
     SAFE_AVG_100(snap.window.dutyCycle_on_area_v_us, snap.window.active_us),
     snap.window.battVolt_valid_us > 0
       ? 100.0 * (double)snap.window.active_us / (double)snap.window.battVolt_valid_us : 0.0,
@@ -2971,6 +2994,15 @@ void uploadBufferedRecords() {
 // Defined here, ahead of the ring dump/restore section that owns it, because the drain-to-empty
 // path in executeUploadPayload below deletes the file.
 #define SENSOR_RING_BACKUP_PATH  "/sensor_ring_backup.bin"
+// The ring just emptied by consumption, so the Phase-4 dump on flash is stale: left in place it is
+// restored at the next boot and every record is re-POSTed. Raw remove: fsExists() would re-take the
+// non-recursive fsMutex and block 5 s. Runs on httpsTask (Core 0).
+static void sensorRingDropBackupFile() {
+  fsTakeLock();
+  LittleFS.remove(SENSOR_RING_BACKUP_PATH);
+  fsReleaseLock();
+  fsFreeDirty = true;
+}
 
 bool executeUploadPayload(const char *payload) {
   lastHttpResponseCode = 0;  // per-attempt reset — a transport failure must not leave the previous attempt's code standing
@@ -3165,12 +3197,7 @@ done_headers:
         if (!sensorRingAnnouncedEmpty) {
           queueConsoleMessage("Cloud sync: all data uploaded");
           sensorRingAnnouncedEmpty = true;
-          // These records are now in the cloud, so the Phase-4 dump is stale. Left in place it is
-          // restored at the next boot and every record is re-POSTed. Raw remove: fsExists() would
-          // re-take the non-recursive fsMutex and block 5 s.
-          fsTakeLock();
-          LittleFS.remove(SENSOR_RING_BACKUP_PATH);
-          fsReleaseLock();
+          sensorRingDropBackupFile();
         }
       } else {
         // Throttle the "N queued" progress chatter to at most one per minute.
@@ -3187,6 +3214,8 @@ done_headers:
     } else if (httpCode == 400 || httpCode == 401) {
       Serial.printf("HTTP %d: dropping bad-data ring slot\n", httpCode);
       popTailSnapshot();
+      // A drain can end on a rejected record too, and the dump is just as stale then (see the 200 branch).
+      if (ringIsEmpty() && !sensorRingAnnouncedEmpty) { sensorRingAnnouncedEmpty = true; sensorRingDropBackupFile(); }
       snprintf(messageBuffer, MESSAGE_BUFFER_SIZE, "Cleared bad data (%u queued)", (unsigned)sensorRingCount);
       queueConsoleMessage(messageBuffer);
       sensorRingInFlightIndex = -1;
@@ -3543,7 +3572,7 @@ void pushLongTermRecord() {
     // active_us alone would publish a fabricated 0 A engine-on average.
     if (rec.validMask & (1u << 1)) rec.onAvg[1] = ltScale((int32_t)(currentWindow->battCurr_on_area_v_us / on_us), 10);
     rec.onAvg[2] = ltScale((int32_t)(currentWindow->altCurr_on_area_v_us / on_us), 10);
-    rec.onAvg[3] = ltScale((int32_t)(currentWindow->victronCurr_on_area_v_us / on_us), 10);
+    if (rec.validMask & (1u << 3)) rec.onAvg[3] = ltScale((int32_t)(currentWindow->victronCurr_on_area_v_us / on_us), 10);  // VE.Direct: same absent-sensor rule
     rec.onAvg[4] = ltScale((int32_t)(currentWindow->dutyCycle_on_area_v_us / on_us), 1);
   }
 

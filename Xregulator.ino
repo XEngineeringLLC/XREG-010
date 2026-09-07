@@ -830,7 +830,7 @@ int Heapfrag = 0;         // 0–100 %, integer only
 uint32_t FreePSRAM = 0;   // KB of free PSRAM
 size_t TotalInternalRam, LargestInternalBlock, TotalPSRAM;
 int LittleFsFreeKb = -1;   // free space on the userdata LittleFS partition, KB; -1 until the boot seed. Event-driven: it can only change when this firmware writes a file, so writers set fsFreeDirty and the refresh runs at the next fieldCutSettled heap walk (usedBytes() is a ~100ms full-flash traversal — never on a live control pass)
-bool fsFreeDirty = false;  // a LittleFS write happened since the last Free Data Storage refresh. Every writer runs on Core 1 (loop) — plain bool, no atomics
+bool fsFreeDirty = false;  // a LittleFS write happened since the last Free Data Storage refresh. Writers are Core 1 (loop) plus the httpsTask ring-backup remove; a bool store is one byte, and a set lost against a concurrent Core 1 clear only delays the readout to the next write
 int WebFsUsedKb = -1;              // web-asset partition in use, KB; -1 until the boot seed. Only an OTA changes it, so one read at boot covers the whole run
 int WebFsTotalKb = -1;             // that partition's size, KB — 1024 for both prod_fs and factory_fs
 const char *WebFsPartLabel = "?";  // which partition the two above describe: a failed OTA remounts webFS on factory_fs, so the mount now is not always the mount that was read
@@ -1494,7 +1494,8 @@ float uTargetAmps = 3;                           // the one that gets used as th
 // Charge-rate Hi->Lo ceiling slew (see AdjustField in 6_functions.ino). When the user drops the
 // charge-rate mode to Low, the ceiling is glided down from its present value instead of stepping,
 // so the field follows it and the iExcess supervisor never sees a false measured-vs-command excess.
-// Armed by the /get?HiLow=0 handler; self-clears in the control loop once the new (lower) cap is reached.
+// Armed by applyChargeRateMode() on any Hi->Lo change (app toggle, panel switch, commissioning restore);
+// self-clears in the control loop once the new (lower) cap is reached.
 float modeCapSlew = 0.0f;          // imposed ceiling during the down-glide (A)
 bool modeCapSlewActive = false;    // true while a Hi->Lo glide is in progress
 uint32_t modeCapSlewEndMs = 0;     // millis() the glide self-cleared; iExcess stays suppressed for
@@ -1851,10 +1852,10 @@ float MaxTemperatureThermistor_AllTime = -99;    // Lifetime max thermistor temp
 float MeasuredAmpsMax_AllTime = 0.0f;            // Lifetime max alternator output (A) - random test
 float RPMMax_AllTime = 0.0f;                     // Lifetime max RPM - random test
 // SOC tracking accumulators (must be global for NVS save/load)
-double socAccumulator_AllTime = 0.0;     // %·s (lifetime) — double; float stopped resolving 100/2s additions after ~4 days
-unsigned long totalSocSampleTime_AllTime = 0;
-unsigned long totalVoltageSampleTime_AllTime = 0;
-unsigned long totalSpeedSampleTime_AllTime = 0;
+double socAccumulator_AllTime = 0.0;     // %·s (lifetime) — double; float loses integer exactness past 2^24, about 2-4 days of 2 s samples
+double totalSocSampleTime_AllTime = 0.0;      // s (lifetime) — double so the denominator carries the same fractional seconds as the numerator; saved to NVS as u32
+double totalVoltageSampleTime_AllTime = 0.0;  // s (lifetime) — double, same reason; saved to NVS as u32
+double totalSpeedSampleTime_AllTime = 0.0;    // s (lifetime) — double, same reason; saved to NVS as u32
 double voltageAccumulator_AllTime = 0.0;  // V·s (lifetime) — double; float overflowed in ~14 days
 double speedAccumulator_AllTime = 0.0;    // kt·s (lifetime) — double
 float AvgVoltage_AllTime = 0.0f;
@@ -5090,6 +5091,10 @@ const unsigned long DATA_TIMEOUT = 10000;  // 10 seconds default timeout
 // Universal macros for clean syntax
 #define MARK_FRESH(index) dataTimestamps[index] = millis()
 #define IS_STALE(index) (millis() - dataTimestamps[index] > DATA_TIMEOUT)
+// A source that has never stamped still holds 0, which IS_STALE reads as fresh for the first DATA_TIMEOUT
+// ms after boot. Window accumulators gate on this too, or the first window of every boot takes the
+// variable's 0.0 initialiser as measured data.
+#define IS_SEEN(index) (dataTimestamps[index] != 0)
 #define SET_IF_STALE(index, variable, staleValue) \
   if (IS_STALE(index)) { variable = staleValue; }
 
@@ -5618,13 +5623,25 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "To return to this Wifi Configuration page at any time, connect the WifiReset wire (pin 11, RJ3, Green/White) to Ground during a restart."
   "</div>"
 
-  "<button type=\"submit\">Save Configuration</button>"
+  "<button type=\"submit\" id=\"sv\">Save Configuration</button>"
 
   "<div class=\"info-box\">"
   "After saving, this page may become unresponsive or disappear. In any case, wait 20 seconds, then reconnect to your chosen network to access the full alternator interface at this same url (alternator.local).  Or, just use the iOS app."
   "</div>"
   "</form>"
   "</div>"
+
+  // Post-save countdown. The button is the only feedback the user gets — the POST answer usually
+  // never lands, since the device restarts ~4s later and this page loses the AP with it.
+  "<script>"
+  "(function(){var f=document.forms[0],b=document.getElementById('sv');"
+  "f.addEventListener('submit',function(e){e.preventDefault();b.disabled=true;"
+  "var q=new URLSearchParams(new FormData(f));"
+  "fetch('/wifi',{method:'POST',body:q}).catch(function(){});"
+  "var n=25;(function t(){b.textContent=n>0?('Restarting - '+n+'s'):'Reconnect now, then open alternator.local';"
+  "if(n-->0)setTimeout(t,1000)})()});})();"
+  "</script>"
+
   "</body></html>";
 
 // mbedTLS allocator routed to PSRAM. This core is built with CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC, which

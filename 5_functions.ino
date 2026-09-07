@@ -2546,29 +2546,22 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
   // Average-SoC bookkeeping is meaningless without a real Bcur-driven SOC_percent.
   if (HAS_BATT_SHUNT) {
     // ===== AVERAGE SOC TRACKING (TIME-WEIGHTED) =====
-    static float socAccumulator = 0.0f;
+    static double socAccumulator = 0.0;  // %·s (session)
     // socAccumulator_AllTime and totalSocSampleTime_AllTime are globals, not statics here
-    static unsigned long totalSocSampleTime = 0;  // Session seconds tracked
+    static double totalSocSampleTime = 0.0;  // Session seconds tracked — double so it carries the same fractional seconds as the numerator
 
     float currentSOC = SOC_percent / 100.0f;  // Convert to actual percentage
 
     socAccumulator += currentSOC * elapsedSeconds;
     socAccumulator_AllTime += (double)currentSOC * elapsedSeconds;
-    totalSocSampleTime += (unsigned long)elapsedSeconds;
-    totalSocSampleTime_AllTime += (unsigned long)elapsedSeconds;
+    totalSocSampleTime += elapsedSeconds;  // no integer cast: the denominator must carry the same fractional seconds as the numerator
+    totalSocSampleTime_AllTime += elapsedSeconds;
 
     if (totalSocSampleTime > 0) {
       AvgSOC = socAccumulator / totalSocSampleTime;
     }
     if (totalSocSampleTime_AllTime > 0) {
       AvgSOC_AllTime = socAccumulator_AllTime / totalSocSampleTime_AllTime;
-    }
-
-
-    if (totalSocSampleTime_AllTime > 0) {
-      float calculatedAvg = socAccumulator_AllTime / totalSocSampleTime_AllTime;
-    } else {
-      Serial.println("WARNING: totalSocSampleTime_AllTime is ZERO!");
     }
   }
 
@@ -2738,21 +2731,21 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
     return;
   }
 
-  static float speedAccumulator = 0.0f;
-  static unsigned long totalSpeedSampleTime = 0;  // Session seconds
+  static double speedAccumulator = 0.0;  // kt·s (session)
+  static double totalSpeedSampleTime = 0.0;  // Session seconds — double so it carries the same fractional seconds as the numerator
 
   float elapsedSeconds = elapsedMillis / 1000.0f;
 
   speedAccumulator += (float)(SOGNMEA * elapsedSeconds);
   speedAccumulator_AllTime += (float)(SOGNMEA * elapsedSeconds);
-  totalSpeedSampleTime += (unsigned long)elapsedSeconds;
-  totalSpeedSampleTime_AllTime += (unsigned long)elapsedSeconds;
+  totalSpeedSampleTime += elapsedSeconds;  // no integer cast: the denominator must carry the same fractional seconds as the numerator
+  totalSpeedSampleTime_AllTime += elapsedSeconds;
 
   if (totalSpeedSampleTime > 0) {
-    AvgSpeed = speedAccumulator / (float)totalSpeedSampleTime;
+    AvgSpeed = speedAccumulator / totalSpeedSampleTime;
   }
   if (totalSpeedSampleTime_AllTime > 0) {
-    AvgSpeed_AllTime = speedAccumulator_AllTime / (float)totalSpeedSampleTime_AllTime;
+    AvgSpeed_AllTime = speedAccumulator_AllTime / totalSpeedSampleTime_AllTime;
   }
 }
 
@@ -6072,7 +6065,7 @@ void loadNVSData() {
   nvs_get_blob(nvs_handle, "SpdAccum_AT", &speedAccumulator_AllTime, &required_size);
   if (nvs_get_u32(nvs_handle, "SpdTime_AT", &temp_uint32) == ESP_OK) totalSpeedSampleTime_AllTime = temp_uint32;
   if (totalSpeedSampleTime_AllTime > 0)
-    AvgSpeed_AllTime = speedAccumulator_AllTime / (float)totalSpeedSampleTime_AllTime;
+    AvgSpeed_AllTime = speedAccumulator_AllTime / totalSpeedSampleTime_AllTime;
 
   // Sailing metrics
   required_size = sizeof(float);

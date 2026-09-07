@@ -3822,7 +3822,7 @@ void AdjustFieldLearnMode() {
           uTargetAmps = fminf(uTargetAmps, warmupCeiling);
         }
 
-        // Charge-rate Hi->Lo ceiling glide. Armed by the HiLow handler when the user picks Low: the
+        // Charge-rate Hi->Lo ceiling glide. Armed by applyChargeRateMode() whenever the mode drops to Low: the
         // table has already dropped to the Low cap, but the alternator is still at the old output. Hold
         // the ceiling up and ramp it down to the new (lower) uTargetAmps at MaxTableValue A/s (~1s full
         // scale) so the field tracks it instead of stepping. The ramp shrinks the drop but cannot by
@@ -7386,12 +7386,17 @@ void servicePanelSwitchInputs() {
     queueConsoleMessageF("Switch panel: force float wire %s", rawFloat ? "energized" : "open");
   }
 
+  // CSV3 (the only channel carrying HiLow / MaintainMode) goes out on settingsDirty or a 60 s fallback.
+  // The /get handlers set the flag themselves; this loop path has to as well, or the app's toggles show
+  // the old mode for up to a minute after a panel switch is flipped.
   if (applyChargeRateMode(resolveChargeRateMode())) {
+    settingsDirty = true;
     queueConsoleMessageF("Charge rate mode: switched to %s", HiLow == 1 ? "Normal" : "Low");
   }
   const int wantMaintain = resolveMaintainMode();
   if (wantMaintain != MaintainMode) {
     MaintainMode = wantMaintain;  // the control loop edge-detects this global; no NVS write on this path
+    settingsDirty = true;
     queueConsoleMessageF("MaintainMode mode %s", MaintainMode ? "enabled" : "disabled");
   }
 }
