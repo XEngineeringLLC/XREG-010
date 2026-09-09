@@ -1718,13 +1718,16 @@ a.btn-secondary {
 }
 
 /* ── Header minimize / collapse (all widths; state in localStorage header_collapsed) ──
-   Collapsed = header shrinks to the one-line #header-collapsed-strip. The strip and the two
-   safety banners are the only survivors, so a live PROTECTIONS-DISABLED warning or an
-   unfollowed-BMS-limit warning is never hidden by minimizing. Metric text uses inherit so it
-   follows the header's light/dark colour without a separate dark-mode rule. */
+   Collapsed = header shrinks to the one-line #header-collapsed-strip. The strip, the two
+   safety banners and the settings auto-lock notice are the only survivors, so a live
+   PROTECTIONS-DISABLED warning, an unfollowed-BMS-limit warning, or the note that settings
+   relocked themselves is never hidden by minimizing (collapse state is remembered, so a
+   returning user would otherwise never see the note that is meant for exactly that moment).
+   Metric text uses inherit so it follows the header's light/dark colour without a separate
+   dark-mode rule. */
 #header-collapsed-strip { display: none; }
 .permanent-header.header-collapsed { padding: 0; gap: 0; }
-.permanent-header.header-collapsed > *:not(#header-collapsed-strip):not(#protections-banner):not(#dvcc-banner) { display: none; }
+.permanent-header.header-collapsed > *:not(#header-collapsed-strip):not(#protections-banner):not(#dvcc-banner):not(#armlock-notice) { display: none; }
 .permanent-header.header-collapsed #header-collapsed-strip {
   container-type: inline-size;   /* fields below reveal against THIS width */
   display: flex;
@@ -2256,6 +2259,37 @@ a.btn-secondary {
   letter-spacing: 0.02em;
 }
 
+/* Red variant of the strip above — the settings auto-lock notice. Geometry is inherited from
+   .header-notice so the two can never disagree; only colour, cursor and the dismiss slot differ.
+   Ordering matters: this must stay AFTER .header-notice (equal specificity, later wins).
+   position:relative is the dismiss button's containing block; box-sizing is explicit because
+   this stylesheet has no global border-box reset and the padding would otherwise overflow. */
+.header-notice-alert {
+  position: relative;
+  box-sizing: border-box;
+  color: #b00000;
+  background: rgba(214, 0, 0, 0.09);
+  border-color: rgba(214, 0, 0, 0.45);
+  cursor: default;
+  padding-right: 34px;
+}
+
+.header-notice-x {
+  position: absolute;
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
 /* Unlock Settings — the only locked-state indicator now that the red "Settings are Locked"
    line is gone, so it is deliberately heavier than a stock .btn-primary. Must stay visually
    identical to #hcs-unlock (the collapsed strip's "Tap to unlock"). */
@@ -2355,6 +2389,12 @@ a.btn-secondary {
   color: #ffc75a;
   background: rgba(255, 179, 0, 0.10);
   border-color: rgba(255, 179, 0, 0.40);
+}
+
+.dark-mode .header-notice-alert {
+  color: #ff6666;
+  background: rgba(255, 60, 60, 0.10);
+  border-color: rgba(255, 60, 60, 0.38);
 }
 
 .dark-mode .wm-rest {
@@ -3759,6 +3799,10 @@ input:checked+.slider:before {
   gap: 10px;
   min-width: 0;
 }
+
+/* Ledger plots are items of this flex column; with no width of their own the uPlot canvas sets
+   their min-content size and they overflow the card instead of fitting it. */
+#sled-harv-plot, #sled-cons-plot { width: 100%; min-width: 0; }
 
 .card-group-title {
   font-size: 13px;
@@ -5859,83 +5903,145 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   .ow-role-sel { min-width: 6.5em; }
 }
 
-/* ── Limit panel (header "What is limiting charging") ──────────────────────────────────
-   One fixed-size box: fixed top anchor (never vertically centred — centring moves the box when
-   its height changes), fixed width, every block always laid out. Hidden content uses visibility
-   so its space is held; the two sentence blocks are two lines tall in every state. Tinted +
-   blurred rather than opaque so the header readouts stay visible behind it. */
+/* ── Limit panel (header "What is limiting charging") ──────────────────────────
+   Non-modal: the overlay is click-through so the header readouts this panel explains stay usable
+   behind it, and the panel is draggable by its header (makePanelDraggable, desktop only).
+   Height is honest — only the two sentence blocks reserve space (they rewrite themselves on every
+   CSV1 frame, so a limiter flip must not twitch the box); a block that is structurally absent is
+   display:none via .why-gone. --why-tone is the severity colour, set on the panel by
+   whyPanelRender(), and drives the header dot and the verdict's left bar together. */
 .why-tap { cursor: pointer; }
 .why-tap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.why-gone { display: none !important; }
 .why-overlay {
   position: fixed;
   inset: 0;
   z-index: 9100;
-  background: rgba(0, 0, 0, 0.18);
+  background: transparent;
+  pointer-events: none;
 }
 .why-panel {
+  --why-tone: #8a8a8a;
+  pointer-events: auto;
   position: fixed;
   top: calc(env(safe-area-inset-top, 0px) + 12px);
   left: 50%;
   transform: translateX(-50%);
-  width: min(430px, calc(100vw - 24px));
+  width: min(400px, calc(100vw - 24px));
   max-height: calc(100dvh - env(safe-area-inset-top, 0px) - 24px);
   overflow-y: auto;
   box-sizing: border-box;
-  background: rgba(24, 24, 24, 0.9);
-  -webkit-backdrop-filter: blur(14px);
-  backdrop-filter: blur(14px);
+  background: rgba(22, 22, 22, 0.94);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
   color: #ddd;
-  border: 1px solid #444;
-  border-radius: 8px;
-  box-shadow: 0 6px 32px rgba(0, 0, 0, 0.8);
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  box-shadow: 0 12px 44px rgba(0, 0, 0, 0.8);
   font-size: 13.5px;
-  line-height: 1.3;
+  line-height: 1.35;
 }
+.why-panel.tone-ok    { --why-tone: #2ec4b6; }
+.why-panel.tone-limit { --why-tone: #e6a23c; }
+.why-panel.tone-alarm { --why-tone: #f0584f; }
 .why-panel:focus { outline: none; }
+/* Sticky so the ✕ stays reachable if a long limiter sentence scrolls the panel. */
 .why-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 10px 16px 9px;
-  border-bottom: 1px solid #333;
-  background: rgba(37, 37, 37, 0.6);
-  border-radius: 8px 8px 0 0;
+  gap: 9px;
+  padding: 9px 12px 8px;
+  background: linear-gradient(180deg, rgba(46, 196, 182, 0.13), rgba(34, 34, 34, 0.92));
+  border-bottom: 1px solid rgba(46, 196, 182, 0.30);
+  border-radius: 10px 10px 0 0;
+  cursor: move;
 }
-.why-title { font-weight: 600; font-size: 13px; color: #aaa; letter-spacing: 0.03em; }
-.why-close { background: none; border: none; color: #888; font-size: 18px; line-height: 1; padding: 0 2px; cursor: pointer; }
+.why-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--why-tone);
+}
+.why-panel.tone-alarm .why-dot { animation: why-pulse 1.6s infinite; }
+@keyframes why-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(240, 88, 79, 0.55); }
+  70%  { box-shadow: 0 0 0 7px rgba(240, 88, 79, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(240, 88, 79, 0); }
+}
+.why-title { flex: 1 1 auto; font-weight: 600; font-size: 13px; color: #aaa; letter-spacing: 0.03em; }
+.why-close { flex: 0 0 auto; background: none; border: none; color: #888; font-size: 18px; line-height: 1; padding: 0 2px; cursor: pointer; }
 .why-close:hover { color: #ddd; }
-.why-body { padding: 14px 16px 16px; }
-.why-panel hr { border: none; border-top: 1px solid #333; margin: 12px 0; }
+.why-body { padding: 12px 13px 13px; }
 .why-now,
-.why-bms-grid {
+.why-ext-grid {
   display: grid;
   grid-template-columns: 11.5em 6.5ch 3.2ch;
   column-gap: 8px;
-  row-gap: 4px;
+  row-gap: 5px;
   align-items: baseline;
 }
-.why-bms-grid { grid-template-columns: 11.5em 6.5ch 3.2ch minmax(0, 1fr); }
-.why-k { color: #999; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.why-v { font-variant-numeric: tabular-nums; text-align: right; font-weight: 700; color: #fff; white-space: nowrap; }
-.why-u { color: #bbb; white-space: nowrap; }
-.why-own { color: #999; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; min-height: 1.25em; }
-.why-line { display: flex; align-items: center; min-height: 2.7em; font-variant-numeric: tabular-nums; }
-.why-headline { color: #fff; font-weight: 600; }
-.why-where { color: #bbb; }
-.why-bms-note { color: #999; font-size: 12.5px; margin-top: 8px; min-height: 2.6em; }
-.why-hidden { visibility: hidden; }
-/* Below 440px the panel is narrower than label + value + unit + "your setting: 14.40 V", so the
-   own-setting text drops to its own line under each BMS row instead of truncating. */
-@media (max-width: 439px) {
-  .why-bms-grid { grid-template-columns: 11.5em 6.5ch 3.2ch; }
-  .why-own { grid-column: 1 / -1; margin-top: -3px; line-height: 1.25; }
+/* The live numbers are a card, so the prose below them reads as a separate answer. */
+.why-now {
+  padding: 9px 11px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
 }
+/* "your setting: 14.40 V" gets its own line under each row rather than a fourth column: at this
+   panel width the column truncated, and the media query that used to rescue it keys off the
+   VIEWPORT, which says nothing about a 400px panel on a wide desktop. */
+.why-ext-grid .why-own { grid-column: 1 / -1; margin-top: -3px; line-height: 1.25; }
+.why-k { color: #999; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.why-v { font-variant-numeric: tabular-nums; text-align: right; font-weight: 700; color: #2ec4b6; white-space: nowrap; }
+.why-u { color: #8d8d8d; white-space: nowrap; }
+.why-own { color: #999; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; min-height: 1.25em; }
+.why-verdict {
+  margin-top: 11px;
+  padding: 9px 11px;
+  border-left: 3px solid var(--why-tone);
+  border-radius: 0 8px 8px 0;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.015));
+}
+/* Two lines tall in every state: the sentence is rewritten on each arriving frame and a
+   one-line/two-line flip would otherwise bounce everything under it. */
+.why-line { display: flex; align-items: center; min-height: 2.7em; font-variant-numeric: tabular-nums; }
+.why-headline { color: #f2f2f2; font-weight: 600; }
+.why-where { color: #9d9d9d; font-size: 12.5px; margin-top: 9px; padding: 0 3px; }
+.why-ext {
+  margin-top: 11px;
+  padding: 9px 11px;
+  background: rgba(46, 196, 182, 0.06);
+  border: 1px solid rgba(46, 196, 182, 0.22);
+  border-radius: 8px;
+}
+.why-ext-note { color: #999; font-size: 12.5px; margin-top: 8px; }
 @media (max-width: 380px) {
   .why-panel { font-size: 12.5px; }
   .why-now,
-  .why-bms-grid { grid-template-columns: 10em 6.5ch 3.2ch; }
+  .why-ext-grid { grid-template-columns: 10em 6.5ch 3.2ch; }
 }
 /* 320px screens: the two-sentence headlines (field maxed, protection) need this to stay on two lines. */
 @media (max-width: 340px) {
   .why-line { font-size: 11.5px; }
+}
+/* Mobile: bottom sheet with a tap-blocking scrim, same treatment as the sysid panel. Dragging is
+   already off below 600px in makePanelDraggable, so the header is not a grab handle here. */
+@media (max-width: 600px) {
+  .why-overlay { background: rgba(0, 0, 0, 0.45); pointer-events: auto; }
+  /* !important: a desktop drag writes inline top/left, and shrinking the window past 600px must
+     still snap the panel back to a sheet rather than leave it stranded at the dragged pixels. */
+  .why-panel {
+    top: auto !important; bottom: 0 !important; left: 0 !important; right: auto !important;
+    transform: none !important;
+    width: 100% !important; max-width: none !important;
+    max-height: 88dvh !important;
+    border-radius: 14px 14px 0 0;
+    border-bottom: none;
+    box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.5);
+  }
+  .why-head { cursor: default; border-radius: 14px 14px 0 0; }
 }

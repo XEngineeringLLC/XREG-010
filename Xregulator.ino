@@ -817,9 +817,17 @@ const uint8_t WIFI_FULL_SWEEP_EVERY = 5;           // every Nth scan sweeps all 
 // acknowledgment that settings may change, not authentication). RAM-only, so a reboot disarms.
 // While disarmed every mutating endpoint rejects, which permanently kills replayed/stale
 // settings URLs (the cvGainMode-flip class) without any password rotation.
+// True while the LM2907 tach is known to be lying (field-cut test, hard-cut tail). Set every tick by
+// buildTickSnapshot; read by the engine start/stop console lines so they do not report a phantom.
+bool g_rpmTachMasked = false;
 bool settingsArmed = false;
 unsigned long settingsArmedAtMs = 0;
 const unsigned long SETTINGS_ARM_TIMEOUT_MS = 30UL * 60UL * 1000UL;
+// Auto-lock notice, latched when the window runs out with nothing connected so the next client
+// to arrive learns settings relocked themselves. RAM-only like the gate: a reboot locks settings
+// anyway and announces itself, so a surviving flag would only describe a window that no longer exists.
+bool settingsAutoLockNotice = false;
+uint32_t settingsAutoLockedEpoch = 0;  // 0 = no usable clock at lock time; the UI then omits the time
 
 // ===== HEAP MONITORING =====
 int rawFreeHeap = 0;      // in bytes
@@ -3249,7 +3257,13 @@ GovernorMode govMode = GOV_NORMAL_SLEW;
 
 float setpointLimited = 0.0f;
 float setpointCommand = 0.0f;   // pre-slew current command (Icv in CV, uTargetAmps in idle); global so the Control Accuracy score gate can see whether setpointLimited is still slewing toward it
-uint8_t ctrlLimiter = 0;        // banner limiter code (→ CSV4/NavStream): 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty (machine/RPM limit), 6 protection (cap binding or post-protection recovery window), 7 battery above target (zero-output stand-down, altZeroOutput), 8 BMS charge-current limit (DVCC CCL), 9 BMS charge-voltage limit (DVCC CVL)
+// The field-duty floor governor_apply actually enforced on its last call — the resolved
+// max(Min Field %, this speed's Keep-Alive %), or 0 on every path that bypasses the floor (shutdown
+// ramps, sysID, an active protection clamp, MANUAL). Lives here rather than beside g_fieldVoltDutyCeil
+// in 6_functions.ino because 3_functions.ino's CSV2 builder reads it, and the .ino files concatenate
+// in filename order — a definition in 6_ is not in scope there.
+float g_fieldDutyFloor = 0.0f;
+uint8_t ctrlLimiter = 0;        // banner limiter code (→ CSV4/NavStream): 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty (machine/RPM limit), 6 protection (cap binding or post-protection recovery window), 7 battery above target (zero-output stand-down, altZeroOutput), 8 BMS charge-current limit (DVCC CCL), 9 BMS charge-voltage limit (DVCC CVL), 10 manual field mode (open loop — the user's duty IS the output), 11 min field floor holding duty UP (the only code where the limit raises output rather than lowering it), 12 zero-current command (Maintain Mode or zero-current float — the bank is held at 0 A on purpose), 13 warm-up ramp ceiling still climbing (WarmupRampRate), 14 charge-rate High->Low glide holding the old ceiling on the way down
 bool setpointInitialized = false;
 
 // ===== LEARNING MODE CONTROL PARAMETERS =====
@@ -3582,6 +3596,8 @@ struct TuningScoreState {
   uint32_t lastToggleMs;      // millis() when scoring window last opened (for 5s timeout timer)
   float rpmSum;               // for computing avg RPM over test
   float tempSum;              // for computing avg alt temp over test
+  uint32_t tempSampleCount;   // NON-NAN temp samples only; avgSampleCount counts every sample, so
+                              // dividing by that fabricated 0.0F averages when no probe was bound
   uint16_t avgSampleCount;
   float worstErrorA;  // largest single |error| seen during test
   float score;        // current normalized score = errorAccum / activeTimeSec
@@ -3775,6 +3791,7 @@ struct CVTuningScoreState {
   bool testStarted;
   // Averages
   float rpmSum, tempSum;
+  uint32_t tempSampleCount;   // see TuningScore.tempSampleCount
   uint16_t avgSampleCount;
 };
 
@@ -4359,10 +4376,17 @@ uint8_t capLimitMode = 0;  // 0 = use amp cap (rpmCapCurrentTable), 1 = use kW c
 // ===== MINIMUM FIELD DUTY TABLE =====
 // Minimum PWM duty cycle (%) applied to the field at each RPM breakpoint. Always live:
 // getMinimumFieldForRPM interpolates this table and hard-floors the result with the scalar MinDuty,
-// so the flat 1% default behaves exactly like MinDuty alone until a cell is hand-raised (or the
-// Auto Min% learner rewrites it). A 0 cell means "no minimum field" (full shut-off allowed).
-float rpmMinDutyTable[RPM_TABLE_SIZE] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
-float defaultMinDutyValues[RPM_TABLE_SIZE] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
+// so the flat baseline behaves exactly like MinDuty alone until a cell is hand-raised (or the
+// Auto Min% learner rewrites it). A 0 cell means "no minimum field" (full shut-off allowed) — and
+// because getMinimumFieldForRPM returns a HARD zero there, a zero cell drops the MinDuty scalar with
+// it. That is why an unmeasured bin carries the baseline rather than 0: an all-zero table silently
+// makes the user's Min Field % setting inert at every engine speed.
+float rpmMinDutyTable[RPM_TABLE_SIZE] = { 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25 };
+float defaultMinDutyValues[RPM_TABLE_SIZE] = { 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25 };
+// Floor a bin carries when nothing has ever been measured there. Deliberately NOT voltage-class
+// scaled (unlike the MinDuty scalar): it is small enough to be immaterial as field current on any
+// bank, and commissioning overwrites every bin it measures within minutes of first power-up.
+#define KNEE_BASELINE_PCT 0.25f
 
 // ===== AUTO MIN% LEARNING ("knee tracker") =====
 // Learns, per RPM bin, the field duty where output amps begin to build (the "knee") and parks
@@ -4413,6 +4437,7 @@ void kneeLearnInit();
 void kneeLearnService(bool fieldOff);
 void saveKneeLearnState();
 void kneeLearnResetDefaults();
+void kneeRebuildOwnedTable();
 String kneeLearnStateJson();
 
 // Config Sharing (8_functions.ino) — export/import the cloneable settings set
@@ -4849,7 +4874,7 @@ enum { ROLL_RPMEDGE = 0, ROLL_AMPSDRIFT, ROLL_AMPSDRIFTEXC, ROLL_TONEPK, ROLL_LD
        // amplitude limit, alt/batt half-window mean-shift vs the stationarity limit, and RPM half-window
        // mean-shift vs its stationarity limit.
        ROLL_RIPCMDEXC, ROLL_RIPALTEXC, ROLL_RIPBATTEXC, ROLL_RIPRPMSHIFT, ROLL_COUNT };
-#define ROLL_EMPTY (-2000000000)   // CSV sentinel: no sample in the 10s window (distinct from SafeInt's -1)
+#define ROLL_EMPTY (-2000000000)   // CSV sentinel: no sample in the 10s window. Also SafeInt's NaN/Inf return, so this is now the one "not available" value on every CSV stream
 struct Roll10s {
   float v[10];
   uint32_t sec[10];
@@ -5024,7 +5049,7 @@ IgnWatermark wmIgn_extraTempF = { NAN, NAN }; // ExtraTempF (°F)
 
 // Watermark update/read helpers — defined in 7_functions.ino.
 inline void wmIgnUpdate(IgnWatermark &w, float v);
-inline float wmIgnSafe(float v);
+inline int wmIgnCsv(float v, int scale);
 
 // Universal data freshness tracking
 
@@ -5568,6 +5593,7 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "button{background:#00a19a;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;width:100%}"
   "button:hover{background:#008c86}"
   ".info-box{background:#e8f4f8;border:1px solid #bee5eb;color:#0c5460;padding:12px;border-radius:4px;margin:10px 0;font-size:14px}"
+  ".status{display:none;font-weight:bold;text-align:center}"
   "label{display:block;margin-top:8px;color:#333}"
   // Option-grouping boxes: each WiFi mode (its description + its inputs) lives in one bordered box
   ".option{border-radius:8px;padding:14px;margin:16px 0;border:2px solid}"
@@ -5624,6 +5650,7 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "</div>"
 
   "<button type=\"submit\" id=\"sv\">Save Configuration</button>"
+  "<div class=\"info-box status\" id=\"st\"></div>"
 
   "<div class=\"info-box\">"
   "After saving, this page may become unresponsive or disappear. In any case, wait 20 seconds, then reconnect to your chosen network to access the full alternator interface at this same url (alternator.local).  Or, just use the iOS app."
@@ -5631,14 +5658,17 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "</form>"
   "</div>"
 
-  // Post-save countdown. The button is the only feedback the user gets — the POST answer usually
-  // never lands, since the device restarts ~4s later and this page loses the AP with it.
+  // Post-save countdown. This local status panel is the only feedback the user gets — the POST answer
+  // usually never lands, since the device restarts ~4s later and this page loses the AP with it. The
+  // Save button is hidden and replaced by the panel so the finished message can't read as a button
+  // waiting to be pressed.
   "<script>"
-  "(function(){var f=document.forms[0],b=document.getElementById('sv');"
-  "f.addEventListener('submit',function(e){e.preventDefault();b.disabled=true;"
+  "(function(){var f=document.forms[0],b=document.getElementById('sv'),s=document.getElementById('st');"
+  "f.addEventListener('submit',function(e){e.preventDefault();b.disabled=true;b.style.display='none';"
+  "s.style.display='block';"
   "var q=new URLSearchParams(new FormData(f));"
   "fetch('/wifi',{method:'POST',body:q}).catch(function(){});"
-  "var n=25;(function t(){b.textContent=n>0?('Restarting - '+n+'s'):'Reconnect now, then open alternator.local';"
+  "var n=25;(function t(){s.textContent=n>0?('Settings saved. Restarting - '+n+'s'):'Restart complete. Reconnect your device to your chosen network, then open alternator.local in a browser.';"
   "if(n-->0)setTimeout(t,1000)})()});})();"
   "</script>"
 
@@ -6183,6 +6213,7 @@ void loop() {
   // Deferred commissioning-start persist (2_functions.ino): one staged NVS commit per pass — keeps
   // the Start's restore-point burst off the network task (in-handler it froze the SSE stream ~2 s).
   cxStartPersistService();
+  serviceSettingsArmHold();  // 5_functions.ino: an open interface holds the settings arm window open
   Ignition = !digitalRead(1);  // ! is for optocoupler (LOW = ignition ON)
   if (IgnitionOverride == 1) {
     Ignition = 1;  // force ON (bench / no ignition wire) — override can ONLY force on, never off
@@ -6952,7 +6983,11 @@ void loop() {
 
       // Client-specific connection monitoring
       // if (currentMode == MODE_CLIENT) {  // moved the gating check into the checkwificonnection function WAS NOT SUFFICIENT FOR WHATEVER REASON
-      if (currentMode == MODE_CLIENT && (Ignition == 1 || (wifiWakeStart > 0 && (millis() - wifiWakeStart) < WIFI_WAKE_DURATION) || wifiNapActive)) {
+      // pendingShutdownFlush belongs here: the ignition-off drain holds 240MHz and the radio up for
+      // up to 30 min to finish uploads, but never calls enterLowPowerStandby(), so wifiNapActive is
+      // still false. Without it the reconnect engine sat idle through exactly the window whose whole
+      // purpose is network work. checkWiFiConnection() self-guards if the radio is actually off.
+      if (currentMode == MODE_CLIENT && (Ignition == 1 || pendingShutdownFlush || (wifiWakeStart > 0 && (millis() - wifiWakeStart) < WIFI_WAKE_DURATION) || wifiNapActive)) {
         // if (currentMode == MODE_CLIENT && (Ignition == 1 || wifiWakeActive)) { // can't try to do anything wifi related unless ignition is on and clock speed is fast enough to not crash
         TIMED_CALL(ft_checkWiFiConnection, checkWiFiConnection());
 

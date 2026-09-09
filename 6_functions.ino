@@ -1181,7 +1181,7 @@ void applyNominalVoltageChange(int oldV, int newV) {
     // (rpmMinDuty + frac x (MaxDuty - rpmMinDuty)) collapses to an unsatisfiable value, silently
     // disarming the phantom-RPM cut. The re-commission flag is only an advisory nag — it clears no
     // commissioned value — so the reset has to happen here. A class change also means a different
-    // alternator, which invalidates the learned knee anyway. Back to the flat 1% default (behaves
+    // alternator, which invalidates the learned knee anyway. Back to the flat baseline (behaves
     // as MinDuty alone) with the knee tracker unlearned; bin 0 keeps its permanent 0% lock while
     // the learner owns the table, matching what the boot rebuild in kneeLearnInit produces.
     for (int i = 0; i < RPM_TABLE_SIZE; i++) {
@@ -1266,7 +1266,8 @@ void apply_pwm_float(float dutyPercent) {
  * @param lastAppliedDuty  Previous applied duty (float)
  * @param requestDutyFloat Requested duty from PID/manual/fault
  * @param gmode            Governor mode (slew/bypass/hold)
- * @param effectiveMinDuty RPM-dependent minimum (0.0 for shutdown modes)
+ * @param effectiveMinDuty RPM-dependent minimum; 0.0 = floor bypassed entirely (shutdown ramps,
+ *                         sysID, an active protection clamp, and MANUAL field mode)
  * @param writeToHardware  false if GPIO4 already LOW (skip PWM write)
  * @return                 The actual duty applied (float)
  */
@@ -1297,6 +1298,8 @@ float governor_apply(float lastAppliedDuty, float requestDutyFloat, int gmode,
   if (finalMax < finalMin) {
     finalMax = finalMin;
   }
+
+  g_fieldDutyFloor = finalMin;   // what was really enforced, for CSV2_fieldDutyFloor — 0 on the bypass paths
 
   float requestClamped = clamp_f(requestDutyFloat, finalMin, finalMax);
 
@@ -1898,9 +1901,9 @@ void commitTuningRecord() {
   rec.avgRPM = (tuningScore.avgSampleCount > 0)
                  ? (tuningScore.rpmSum / tuningScore.avgSampleCount)
                  : 0.0f;
-  rec.avgAltTempF = (tuningScore.avgSampleCount > 0)
-                      ? (tuningScore.tempSum / tuningScore.avgSampleCount)
-                      : 0.0f;
+  rec.avgAltTempF = (tuningScore.tempSampleCount > 0)
+                      ? (tuningScore.tempSum / tuningScore.tempSampleCount)
+                      : NAN;   // no probe read during the run -> JSON null, never a 0.0F average
   rec.worstErrorA = tuningScore.worstErrorA;
   rec.battV = BatteryV;
   rec.chargeStage = getChargeStageDisplayCode();
@@ -2016,7 +2019,7 @@ void commitCVTuningRecord() {
   rec.kOvershoot = cvKOvershoot;
   rec.consecutiveReads = cvConsecutiveReads;
   rec.avgRPM = (cvTuningScore.avgSampleCount > 0) ? (cvTuningScore.rpmSum / cvTuningScore.avgSampleCount) : 0.0f;
-  rec.avgAltTempF = (cvTuningScore.avgSampleCount > 0) ? (cvTuningScore.tempSum / cvTuningScore.avgSampleCount) : 0.0f;
+  rec.avgAltTempF = (cvTuningScore.tempSampleCount > 0) ? (cvTuningScore.tempSum / cvTuningScore.tempSampleCount) : NAN;   // no probe -> JSON null
   rec.battVAtStart = cvTuningScore.battVAtStart;
   rec.socAtStart = cvTuningScore.socAtStart;
   rec.chargingVoltageTarget = cvBaseTarget;
@@ -2160,7 +2163,7 @@ void commitSystemIDRecord(bool aborted) {
   // Conditions at commit — RPM is the true sine-phase mean when one was accumulated (step
   // tests and pre-sine aborts have none → snapshot).
   rec.avgRPM       = (systemIDRpmAvg > 0.0f) ? systemIDRpmAvg : (float)RPM;
-  rec.avgAltTempF  = isnan(AlternatorTemperatureF) ? 0.0f : AlternatorTemperatureF;
+  rec.avgAltTempF  = AlternatorTemperatureF;   // NAN = no probe; the emitters carry it as JSON null, never 0.0F
   rec.battV        = BatteryV;
   rec.chargeStage  = getChargeStageDisplayCode();
   rec.epoch        = getCurrentTimestamp();
@@ -2257,7 +2260,7 @@ void commitSysidSweepRecord() {
   rec.cycles         = systemIDSineCycles;
   rec.nPoints        = systemIDBodeCount;
   rec.avgRPM         = (float)RPM;
-  rec.avgAltTempF    = isnan(AlternatorTemperatureF) ? 0.0f : AlternatorTemperatureF;
+  rec.avgAltTempF    = AlternatorTemperatureF;   // NAN = no probe; the emitters carry it as JSON null, never 0.0F
   rec.battV          = BatteryV;
   rec.chargeStage    = getChargeStageDisplayCode();
   rec.epoch          = getCurrentTimestamp();
@@ -2357,7 +2360,7 @@ void commitTuningSweepRecord() {
   rec.cycles       = tuningSweepCycles;
   rec.nPoints      = tuningBodeCount;
   rec.avgRPM       = tuningSweepRpmN ? (float)(tuningSweepRpmSum / tuningSweepRpmN) : (float)RPM;
-  rec.avgAltTempF  = isnan(AlternatorTemperatureF) ? 0.0f : AlternatorTemperatureF;
+  rec.avgAltTempF  = AlternatorTemperatureF;   // NAN = no probe; the emitters carry it as JSON null, never 0.0F
   // Run-condition snapshot — waveform params + how trustworthy the sweep was.
   rec.sineAmpA       = tuningSweepAmpA;
   rec.baseA          = tuningSweepBaseA;
@@ -3754,7 +3757,7 @@ void AdjustFieldLearnMode() {
           if (fabsf(e) > tuningScore.worstErrorA) tuningScore.worstErrorA = fabsf(e);
           tuningScore.rpmSum += RPM;
           float tempSample = isnan(AlternatorTemperatureF) ? TempToUse : AlternatorTemperatureF;
-          if (!isnan(tempSample)) tuningScore.tempSum += tempSample;
+          if (!isnan(tempSample)) { tuningScore.tempSum += tempSample; tuningScore.tempSampleCount++; }
           tuningScore.avgSampleCount++;
           if (tuningScore.activeTimeSec > 0.0f) {
             tuningScore.score = tuningScore.errorAccum / tuningScore.activeTimeSec;
@@ -3817,9 +3820,12 @@ void AdjustFieldLearnMode() {
         uTargetAmps = I_cmd;
 
         // Warmup ramp: advance ceiling each tick, apply as cap on uTargetAmps
+        // warmupBinding: the ramp, not the table, is what output is riding — limiter code 13. Once the
+        // ceiling saturates at MaxTableValue it can no longer undercut, so this cannot latch true.
+        bool warmupBinding = false;
         if (WarmupRampRate > 0.0f) {
           warmupCeiling = fminf(warmupCeiling + WarmupRampRate * actualDtSec, (float)MaxTableValue);
-          uTargetAmps = fminf(uTargetAmps, warmupCeiling);
+          if (warmupCeiling < uTargetAmps) { uTargetAmps = warmupCeiling; warmupBinding = true; }
         }
 
         // Charge-rate Hi->Lo ceiling glide. Armed by applyChargeRateMode() whenever the mode drops to Low: the
@@ -3833,12 +3839,14 @@ void AdjustFieldLearnMode() {
         // at 0 for the duration (see those blocks below).
         // The HARD protections stay live throughout — hardware OV, fast OV, and (unless Group 0 is toggled off) the HardOCTripAmps trip.
         // The glide self-clears once the held ceiling reaches the new cap (or an up-switch raises it past).
+        bool glideBinding = false;   // the held (descending) ceiling is above the new cap — limiter code 14
         if (modeCapSlewActive) {
           if (modeCapSlew > (float)uTargetAmps) {
             // Ramp at MaxTableValue / MODE_CAP_GLIDE_SEC A/s (~2.5s full-scale) — gentle enough that the
             // field stays close to the descending ceiling, so the post-glide settling tail stays tiny.
             modeCapSlew = fmaxf((float)uTargetAmps, modeCapSlew - (MaxTableValue / MODE_CAP_GLIDE_SEC) * actualDtSec);
             uTargetAmps = modeCapSlew;
+            glideBinding = true;
           } else {
             modeCapSlewActive = false;
             modeCapSlewEndMs = currentMillis;   // start the post-glide iExcess grace window
@@ -5306,7 +5314,7 @@ void AdjustFieldLearnMode() {
           cvTuningScore.activeTimeSec += actualDtSec;
           cvTuningScore.rpmSum += RPM;
           float tempSample = isnan(AlternatorTemperatureF) ? TempToUse : AlternatorTemperatureF;
-          if (!isnan(tempSample)) cvTuningScore.tempSum += tempSample;
+          if (!isnan(tempSample)) { cvTuningScore.tempSum += tempSample; cvTuningScore.tempSampleCount++; }
           cvTuningScore.avgSampleCount++;
         }
 
@@ -5414,6 +5422,17 @@ void AdjustFieldLearnMode() {
         {
           bool zeroCmd = (MaintainMode == 1 || zeroFloatActive);
           bool underTracking = ((float)pidInput < setpointLimited - fmaxf(3.0f, 0.10f * setpointLimited));
+          // Min-field floor binding: duty parked on the keep-alive floor while the loop is still
+          // OVER-delivering. The only limiter that raises output instead of lowering it, so it needs
+          // its own test rather than a min-select place — the PID cannot report it either, since its
+          // own outMin IS MinDuty (applyCcOutputLimits), so pidOutput rails at the floor rather than
+          // asking for less. tick.rpmMinDuty <= 0 is the sentinel that disables the whole floor in
+          // governor_apply (above the commissioned RPM ceiling), so gate on it here too.
+          bool overTracking = ((float)pidInput > setpointLimited + fmaxf(2.0f, 0.05f * setpointLimited));
+          float floorNow = fmaxf(MinDuty, tick.rpmMinDuty);
+          bool atFloorNow = (tick.rpmMinDuty > 0.01f)
+                            && (lastAppliedDuty <= floorNow + fmaxf(0.1f, 0.01f * (ccDutyCeiling() - floorNow)));
+          bool minFloorBinding = atFloorNow && overTracking;
           bool dutyPegged = (lastAppliedDuty >= ccDutyCeiling() - 1.0f);
           static uint32_t dutyPegStartMs = 0;
           if (dutyPegged && underTracking) {
@@ -5425,14 +5444,25 @@ void AdjustFieldLearnMode() {
           bool protBinding = (fastOvClampActive && ((float)uTargetAmps < i_ceiling_pre_ov - 0.01f))
                              || postProtectRiseActive;
           uint8_t rawCode;
-          if (CVTuningMode || zeroCmd || inStartupRamp)           rawCode = 0;
+          // zeroCmd is split out of the first line and placed BELOW the floor test on purpose: a
+          // Maintain / zero-float command sitting against a live keep-alive floor is exactly the
+          // case where the floor, not the zero command, is what the bank is actually seeing.
+          // 12 (zero command) and 14 (Hi->Lo glide) sit BELOW zeroCmd's own test in this order for a
+          // reason: warmupBinding and glideBinding are both computed ABOVE the Maintain/zero-float
+          // assignment of uTargetAmps = 0, so either can still read true while the real story is the
+          // zero command. Letting 12 answer first keeps that from surfacing as a stale ramp.
+          if (CVTuningMode || inStartupRamp)                       rawCode = 0;
           else if (protBinding)                                   rawCode = 6;
+          else if (minFloorBinding)                               rawCode = 11;
+          else if (zeroCmd)                                       rawCode = 12;
+          else if (glideBinding)                                  rawCode = 14;
           else if (altZeroOutput)                                 rawCode = 7;
           else if (fieldSaturated)                                rawCode = 5;
           else if (voltageControlActive && Icv < icvCeil - 0.5f)  rawCode = dvccCvlBinding ? 9 : 3;  // held at the BMS's voltage vs our own target
           else if (dvccCclBinding)                                rawCode = 8;  // BMS charge-current limit is the active ceiling
           else if (battCeilBinding)                               rawCode = 4;
           else if (thermalPenaltyAmps > 0.5f)                     rawCode = 2;
+          else if (warmupBinding)                                 rawCode = 13;  // last real ceiling before the catch-all
           else                                                    rawCode = 1;
           // Publish a change only after 5 consecutive identical ticks (~150 ms): edge-hover
           // between two codes (Icv at icvCeil, thermal penalty at 0.5 A) parks the published
@@ -5452,7 +5482,8 @@ void AdjustFieldLearnMode() {
       g_thermalOwnsCeiling = false;      // ceiling chain does not run here; must not read stale-true on AUTO re-entry
       uTargetAmps = 0;
       setpointLimited = 0.0f;
-      ctrlLimiter = 0;
+      ctrlLimiter = 10;                  // the user's own duty IS the limit here — published so the banner
+                                         // and limit panel can name manual instead of "nothing limiting"
       pidInput = (double)((OutputPIDSigSrc == 2) ? MeasuredAmps : (OutputPIDSigSrc == 1) ? g_pidMA_N
                                                                                          : g_pidI_filtered);
     }  // end of MANUAL mode else
@@ -5480,8 +5511,13 @@ void AdjustFieldLearnMode() {
   // duty can sit BELOW the learned Min% floor's output — a stale floor otherwise pins all three
   // phases at one current, both captured duties come out identical, and every pulse edge drops
   // ("no clean current step", bench 2026-08-04). The pulse phases already bypass via sysIDRunning.
+  // SYS_MODE_MANUAL: manual is open loop by definition — the commanded duty is delivered as typed,
+  // including 0. Passing 0 here drops the scalar Min Field % too (governor_apply's shutdown branch),
+  // which is the point: the tachometer keep-alive floor is the last thing manual still obeyed. The
+  // Max Field ceiling is deliberately NOT bypassed — it is what bounds field current on 24/36/48V.
   float dutyNewFloat = governor_apply(lastAppliedDuty, dutyRequest, govMode,
-                                      (sysIDRunning || fastOvClampActive || cvpfCcActive) ? 0.0f : tick.rpmMinDuty,
+                                      (sysIDRunning || fastOvClampActive || cvpfCcActive
+                                       || sysMode == SYS_MODE_MANUAL) ? 0.0f : tick.rpmMinDuty,
                                       true, actualDtSec);
   pidLog_dutyApplied = dutyNewFloat;
 
@@ -6779,6 +6815,9 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   bool hardCutRpmGrace = (g_lastFieldCutMs != 0)
                          && ((uint32_t)(currentMillis - g_lastFieldCutMs) < FIELDCUT_RPM_GRACE_MS)
                          && ((fieldCurveActive != 0) || chargingEnabledLocal);
+  // Published for the engine start/stop console lines (5_functions.ino). The protection gates below
+  // already ignore the corrupted tach; the log line did not, so a commissioning field-cut printed
+  // "Engine STOPPED"/"STARTED" for an engine that never changed state.
   bool rpmDropoutGrace = fieldCutRpmGrace || hardCutRpmGrace
                          || ((g_lastProtClampMs != 0)
                              && ((uint32_t)(currentMillis - g_lastProtClampMs) < PROT_RPM_GRACE_MS)
@@ -6792,6 +6831,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   } else {
     rpmZeroSinceMs = 0;
   }
+  g_rpmTachMasked = rpmDropoutGrace;
   tick.engineFullyStopped = (!rpmDropoutGrace && rpmZeroSinceMs != 0 && (currentMillis - rpmZeroSinceMs) >= RPM_ZERO_CUT_MS);
 
   // Engine-restart confirmation: a confirmed stop arms rpmRestartPending; RPM must then hold
@@ -6950,10 +6990,16 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
       staleOnsetMs = tick.nowMs;
       uint32_t ageMs = (tempTimestamp == 0) ? tick.nowMs : (tick.nowMs - tempTimestamp);
       const char *why = (tempTimestamp != 0 && ageMs <= 20000) ? "BAD-VALUE" : "READ-GAP";
+      // tempLastGoodF/tempLastSuccessMillis are still at their -99F/0 init until the FIRST good read
+      // ever. Printing those raw reads as a plausible cold measurement taken a lifetime ago.
+      char lastGoodStr[40];
+      if (tempLastSuccessMillis == 0) snprintf(lastGoodStr, sizeof(lastGoodStr), "lastGood=never read");
+      else snprintf(lastGoodStr, sizeof(lastGoodStr), "lastGood=%.1fF (%.1fs ago)",
+                    (float)tempLastGoodF, (tick.nowMs - tempLastSuccessMillis) / 1000.0f);
       queueConsoleMessageF(
-        "TEMP STALE TRIP (%s): %s age=%.1fs lastGood=%.1fF (%.1fs ago) | during gap: conn+%lu enum+%lu crc+%lu req+%lu read+%lu allFF+%lu",
+        "TEMP STALE TRIP (%s): %s age=%.1fs %s | during gap: conn+%lu enum+%lu crc+%lu req+%lu read+%lu allFF+%lu",
         why, tempFromAlt ? "alt" : "thermistor",
-        ageMs / 1000.0f, (float)tempLastGoodF, (tick.nowMs - tempLastSuccessMillis) / 1000.0f,
+        ageMs / 1000.0f, lastGoodStr,
         (unsigned long)(tempConnectedFailCount - tempFailSnapConn),
         (unsigned long)(tempEnumerateFailCount - tempFailSnapEnum),
         (unsigned long)(tempCrcFailCount - tempFailSnapCrc),
@@ -6961,8 +7007,17 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
         (unsigned long)(tempReadFailCount - tempFailSnapRead),
         (unsigned long)(tempAllFFCount - tempFailSnapAllFF));
     } else if (!tempDataVeryStale && prevTempStale) {
-      queueConsoleMessageF("TEMP STALE CLEARED: fresh again after %.1fs, temp=%.1fF",
-                           (tick.nowMs - staleOnsetMs) / 1000.0f, tempSelected);
+      // The idle gate above clears staleness on RPM alone, so this transition does NOT prove a read
+      // succeeded. With no probe tempSelected is still NAN here — "fresh again, temp=nanF" claimed a
+      // recovery that never happened. Say which of the two actually cleared it.
+      bool sane = !isnan(tempSelected) && tempSelected >= -50.0f && tempSelected <= 400.0f;
+      if (sane) {
+        queueConsoleMessageF("TEMP STALE CLEARED: fresh again after %.1fs, temp=%.1fF",
+                             (tick.nowMs - staleOnsetMs) / 1000.0f, tempSelected);
+      } else {
+        queueConsoleMessageF("TEMP STALE CLEARED after %.1fs by the idle gate — still no valid reading (engine below running speed, nothing to protect)",
+                             (tick.nowMs - staleOnsetMs) / 1000.0f);
+      }
     }
     prevTempStale = tempDataVeryStale;
   }
@@ -8015,6 +8070,7 @@ void rpmAxisWipeExecute() {
   pendingClearOverheatHistory  = true;  // per-RPM-bin thermal history
   faPendingMatrixClear = true;          // /famatrix.bin  (50-RPM x amp cells)
   ripTabPendingWipe    = true;          // /riptab.bin    (50-RPM bins)
+  ripFitForget(true, "RPM scaling changed");   // both fits carry the RPM they were measured at, and came from the two tables above
   faPendingFlipWipeAll = true;          // /faflip.bin    (all 9 pages)
   rpmAxisWipePending = true;
   settingWrite(NK_RpmAxisWipePend, "1");
@@ -8038,12 +8094,38 @@ void kneeLearnService(bool fieldOff) {
 // Reset learned state: every bin back to 0% and unlocked, so learning restarts from scratch.
 // The live table is only zeroed while the learner owns it (learning on) — with learning off, a
 // hand-entered table survives the knee-state wipe.
+// Rebuild the visible Keep-Alive column from the learner's stored floors. THE one place that
+// expresses "what does a bin hold while the learner owns the table" — kneeLearnInit, the
+// kneeLearnEnable turn-on handler and kneeLearnResetDefaults all route through here so they cannot
+// drift apart (they had, before: two of them produced a flat baseline and the third produced zeros).
+//
+// A bin the learner or commissioning has decided (kneeFrozen) is copied verbatim, INCLUDING a
+// deliberate zero above the commissioned RPM ceiling — that zero is the 2026-06-23 safety invariant
+// and must survive. An UNDECIDED bin sitting at zero gets KNEE_BASELINE_PCT instead: without it a
+// fresh or freshly-wiped device carries an all-zero table, getMinimumFieldForRPM returns its
+// hard-zero sentinel at every speed, governor_apply reads that as "no floor" and drops the MinDuty
+// scalar too — so the user's Min Field % setting does nothing at any engine speed and nothing says so.
+// The baseline is written back into kneeFloor, not just the column, or the learner's next probe
+// restart (rpmMinDutyTable[b] = kneeFloor[b]) knocks it straight back to zero.
+// Bin 0 keeps its permanent zero: it sits at 100 RPM, below MinRPMForField, so the field is cut
+// there regardless and the learner never probes it.
+void kneeRebuildOwnedTable() {
+  for (int i = 0; i < RPM_TABLE_SIZE; i++) {
+    if (i != 0 && !kneeFrozen[i] && kneeFloor[i] <= 0.0f) kneeFloor[i] = KNEE_BASELINE_PCT;
+    float f = (i == 0) ? 0.0f : kneeFloor[i];
+    if (f < 0) f = 0; if (f > kneeMaxFloorPct) f = kneeMaxFloorPct;
+    rpmMinDutyTable[i] = f;
+  }
+}
+
 void kneeLearnResetDefaults() {
   for (int i = 0; i < RPM_TABLE_SIZE; i++) {
     kneeFloor[i] = 0; kneeKnee[i] = 0; kneeFrozen[i] = false; kneeLearnTempF[i] = 0; kneeLastMs[i] = 0;
-    if (kneeLearnEnable) rpmMinDutyTable[i] = 0;
   }
   kneeFitA = 0.0f; kneeFitC = 0.0f;   // no commissioning fit any more → live correction reverts to whole-knee
+  // Unfreezing every bin above makes them all "undecided", so this restores the flat baseline rather
+  // than the zeros this used to leave behind. Learner off = the hand-entered column stands untouched.
+  if (kneeLearnEnable) kneeRebuildOwnedTable();
   saveKneeLearnState();
 }
 
@@ -8092,13 +8174,9 @@ void kneeLearnInit() {
     for (int i = 0; i < RPM_TABLE_SIZE; i++) { kneeFloor[i] = 0; kneeKnee[i] = 0; kneeFrozen[i] = false; kneeLearnTempF[i] = 0; }
 
   // While learning owns the table, the floor owns it from boot (bin 0 always 0%).
-  // Learning off = hand-entered table stands.
-  if (kneeLearnEnable)
-    for (int i = 0; i < RPM_TABLE_SIZE; i++) {
-      float f = (i == 0) ? 0.0f : kneeFloor[i];
-      if (f < 0) f = 0; if (f > kneeMaxFloorPct) f = kneeMaxFloorPct;
-      rpmMinDutyTable[i] = f;
-    }
+  // Learning off = hand-entered table stands. Also repairs a device already carrying an all-zero
+  // table from before the baseline existed — undecided bins refill, measured ones are left alone.
+  if (kneeLearnEnable) kneeRebuildOwnedTable();
 }
 
 // Build the /kneeLearnState JSON (knobs + live status + per-bin learned state).
@@ -8640,8 +8718,10 @@ void thermalLog_tick(uint32_t nowMs) {
   ThermalLogEntry &e = thermalLog[thermalLogHead];
 
   e.ts = nowMs;
-  e.tempFiltered = thermalLogScale10(tempFiltered);
-  e.tempProjected = thermalLogScale10(projectedTempF);
+  // Both are NAN until the first sane temperature read, and the logger has no temp-validity gate, so
+  // thermalLogScale10's 0 stamped a real 0.0F into EVERY row. INT16_MIN = blank cell.
+  e.tempFiltered = !isfinite(tempFiltered) ? INT16_MIN : thermalLogScale10(tempFiltered);
+  e.tempProjected = !isfinite(projectedTempF) ? INT16_MIN : thermalLogScale10(projectedTempF);
   // effective setpoint: mirrors the logic in tempPID_tick (slopeBufFull = 7°F margin, else 20°F warmup margin)
   {
     float logLimit = TemperatureLimitF;

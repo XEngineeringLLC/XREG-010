@@ -722,9 +722,13 @@ void triggerWeatherUpdate() {
 
 void printTempDebugStatus() {
   unsigned long age = millis() - tempLastSuccessMillis;
+  if (tempLastSuccessMillis == 0) {   // never read: -99F/age-since-boot would read as a real measurement
+    Serial.printf("TempDbg: lastGood=never read ");
+  } else {
+    Serial.printf("TempDbg: lastGood=%.2fF age=%lums ", (float)tempLastGoodF, age);
+  }
   Serial.printf(
-    "TempDbg: lastGood=%.2fF age=%lums ok=%lu readFail=%lu crcFail=%lu crcRec=%lu allFF=%lu 85C=%lu oor=%lu reqFail=%lu connFail=%lu resFix=%lu rereadFail=%lu resFixCrcFail=%lu enumFail=%lu coreBusySkip=%lu intervalSkip=%lu\n",
-    tempLastGoodF, age,
+    "ok=%lu readFail=%lu crcFail=%lu crcRec=%lu allFF=%lu 85C=%lu oor=%lu reqFail=%lu connFail=%lu resFix=%lu rereadFail=%lu resFixCrcFail=%lu enumFail=%lu coreBusySkip=%lu intervalSkip=%lu\n",
     (unsigned long)tempReadSuccessCount,
     (unsigned long)tempReadFailCount,
     (unsigned long)tempCrcFailCount,

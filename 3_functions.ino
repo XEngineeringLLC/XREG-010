@@ -702,17 +702,19 @@ enum Csv2Index {
   CSV2_ft_solarLedger_win,  // solar ledger service worst us (window)
   CSV2_ft_solarLedger_ses,  // solar ledger service worst us (session)
   // Battery + extra temperature probes and the battery-temperature source chain (BATTERY_TEMP_SENSORS_SPEC.md §7)
-  CSV2_BatteryTempProbeF,   // BATT-role DS18B20 (°F x10; -9999 = no reading yet)
-  CSV2_ExtraTempF,          // EXTRA-role DS18B20 (°F x10; -9999 = no reading yet)
-  CSV2_battTempActiveF,     // batteryTempF() result this tick (°F x10; -9999 = no source qualifies)
+  CSV2_BatteryTempProbeF,   // BATT-role DS18B20 (°F x10; ROLL_EMPTY = no reading yet)
+  CSV2_ExtraTempF,          // EXTRA-role DS18B20 (°F x10; ROLL_EMPTY = no reading yet)
+  CSV2_battTempActiveF,     // batteryTempF() result this tick (°F x10; ROLL_EMPTY = no source qualifies)
   CSV2_battTempActiveSrc,   // 0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board temperature
   CSV2_owProbeCount,        // DS18B20s in the 1-Wire registry
   CSV2_owUnassignedCount,   // present probes with no role
-  CSV2_VictronBattTempF,    // VE.Direct "T" battery temperature (°F x10; -9999 = none)
-  CSV2_rvcRxBattTempF,      // RV-C DC_SOURCE_STATUS_2 battery temperature (°F x10; -9999 = none)
+  CSV2_VictronBattTempF,    // VE.Direct "T" battery temperature (°F x10; ROLL_EMPTY = none)
+  CSV2_rvcRxBattTempF,      // RV-C DC_SOURCE_STATUS_2 battery temperature (°F x10; ROLL_EMPTY = none)
   CSV2_cvTempDerateInert,   // 1 = battery-temperature source class changed since commissioning; CV derate held at 1.0
   CSV2_wmIgn_battTempF_lo,  CSV2_wmIgn_battTempF_hi,   // BatteryTempProbeF (°F, int)
   CSV2_wmIgn_extraTempF_lo, CSV2_wmIgn_extraTempF_hi,  // ExtraTempF (°F, int)
+
+  CSV2_fieldDutyFloor,      // enforced field-duty FLOOR x100 — governor_apply's resolved max(Min Field %, this speed's Keep-Alive %), 0 when the floor is bypassed (shutdown, sysID, protection clamp, MANUAL). Twin of CSV2_fieldDutyCeil
 
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
@@ -740,7 +742,7 @@ enum Csv4Index {
   CSV4_VictronCurrent,          // Victron battery current (A ×100)
   CSV4_currentFuelGPH,          // live fuel flow (gal/hr ×100)
   CSV4_currentNMPG,             // live fuel economy (naut mi/gal ×100)
-  CSV4_ctrlLimiter,             // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window) — rides NavStream so the banner tint updates at ~500ms
+  CSV4_ctrlLimiter,             // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target, 8 BMS charge-current limit, 9 BMS charge-voltage limit, 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide — rides NavStream so the banner tint updates at ~500ms
   CSV4_chargeStage,             // CHARGE_STAGE_* code — rides NavStream so the Plots-tab mode ribbon tracks stage changes at ~500ms (CSV2 still carries it for the thermal ring)
   CSV4_n183Heading,             // NMEA 0183 decoded heading (deg ×10; -10 = nothing decoded). Separate from CSV4_HeadingNMEA, which is the NMEA2000 source.
   CSV4_n183HdgRef,              // reference frame of the above: 0 none, 1 magnetic, 2 true
@@ -1051,7 +1053,7 @@ enum Csv3Index {
   CSV3_setpointSlewEnable,      // inner-loop current setpoint slew master switch (0/1)
   CSV3_cvRiseGovEnable,         // CV rise governor / anti-windup master switch (0/1)
   CSV3_dutySlewEnable,          // field duty slew master switch (0/1)
-  CSV3_CommissionTempF,         // board temp when CV fit applied — derate reference (°F ×10; -32768 = unset/NaN)
+  CSV3_CommissionTempF,         // board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset/NaN)
   CSV3_battTempDerateEnable,    // battery-temp gain derate master on/off (0/1)
   CSV3_battTempCoeff,           // battery fractional resistance change per °C; ×10000
   CSV3_TempPIDKiDownFrac,       // thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000
@@ -1255,7 +1257,17 @@ void loadCapTablesForMode(int mode);
 int SafeInt(double f, int scale = 1) {
   // where this is matters, don't move!!
   // Param widened to double so AllTime accumulators don't narrow at call sites; float callers promote implicitly.
-  return isnan(f) || isinf(f) ? -1 : (int)round(f * scale);
+  // NaN/Inf -> ROLL_EMPTY, not -1: -1 is a legitimate reading for signed currents, angles, deltas and
+  // Celsius temperatures, so "no sensor" and "a real -1" were indistinguishable on the wire. The browser
+  // rewrites anything <= -1999999999 to NaN at parse time and every renderer prints an em dash for it.
+  return isnan(f) || isinf(f) ? ROLL_EMPTY : (int)round(f * scale);
+}
+// %.1f on a NAN emits "nan", which is not valid JSON and kills the whole record at the parser. The
+// tuning/sysid/CV ledger records stamp NAN when no probe had read; null is the honest carrier.
+const char *jsonNum1(char *buf, size_t n, float v) {
+  if (isnan(v) || isinf(v)) snprintf(buf, n, "null");
+  else snprintf(buf, n, "%.1f", v);
+  return buf;
 }
 void loadAPCredentials(bool forceDefaults = false) {
   if (forceDefaults) {
@@ -2326,15 +2338,19 @@ void setupServer() {
               int idx = (state.oldest + state.row - 2) % THERMAL_LOG_SIZE;
               ThermalLogEntry e;
               memcpy(&e, &thermalLog[idx], sizeof(ThermalLogEntry));
+              // INT16_MIN = no valid temperature at that row; an empty cell, never a fabricated 0.0F.
+              char tFilt[12], tProj[12];
+              if (e.tempFiltered == INT16_MIN) tFilt[0] = '\0'; else snprintf(tFilt, sizeof(tFilt), "%.1f", e.tempFiltered / 10.0f);
+              if (e.tempProjected == INT16_MIN) tProj[0] = '\0'; else snprintf(tProj, sizeof(tProj), "%.1f", e.tempProjected / 10.0f);
               state.lineLen = snprintf(
                 state.line, sizeof(state.line),
-                "%lu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,"
+                "%lu,%s,%s,%.1f,%.1f,%.1f,%.1f,%.1f,"
                 "%.1f,%.1f,%.1f,%d,%.1f,%.1f,%.1f,%u,%u,"
                 "%.1f,%.1f,%.1f,%.1f,%u,%.1f,"
                 "%u,%.1f,%.1f\n",
                 (unsigned long)e.ts,
-                e.tempFiltered / 10.0f,
-                e.tempProjected / 10.0f,
+                tFilt,
+                tProj,
                 e.nominalTarget / 10.0f,
                 e.rpmCap / 10.0f,
                 e.voltCap / 10.0f,
@@ -4646,6 +4662,13 @@ void setupServer() {
         // commissioned device whose re-run never actually started.
         settingsDirty = true;
         queueConsoleMessage("Commissioning: start cancelled before the restore point was saved — nothing changed");
+      } else if (commissionState != 1 && !settingExists(NK_commissionSnap)) {
+        // No run in flight: a finished pass (commissionDone) drops BOTH the origin snapshot and the
+        // pre-run record, so the teardown below would find neither, fall through to the legacy zeroing
+        // and silently demote a COMMISSIONED device to NOT_COMMISSIONED — wiping every done/manual
+        // mark — while reporting "settings left as they are". Abort is a no-op here. State 1 with no
+        // snapshot still takes the teardown: that IS the legacy/older-firmware run the zeroing is for.
+        queueConsoleMessage("Commissioning: nothing to abort — no run is in progress, the committed tune and its record are untouched");
       } else {
         faCommissionGate = false;
         // Abort is a teardown path too: committed cells from an aborted sweep are honest data captured
@@ -4959,9 +4982,12 @@ void setupServer() {
       foundParameter = true;
       // Floor 500 ms: each HALF-window (§11 stationarity/min-of-halves) must hold ≥1 cycle of the lowest
       // resolvable disturbance; ceiling 4 s bounds capture latency. Also sizes the min-sample gate.
+      float ripWinPrev = ripWinMs;
       ripWinMs = clamp_f(request->getParam("ripWinMs")->value().toFloat(), 500.0f, 4000.0f);
       settingWrite(NK_ripWinMs, String(ripWinMs, 0).c_str());
-      queueConsoleMessage("Ripple capture window changed — stored map/fit values from the old window are not comparable (clear map + re-run current check)");
+      // Window length defines BOTH measured quantities: the min-of-halves pk-pk and the worst
+      // half-window voltage slope. Drop both fits (see ripFitForget).
+      if (fabsf(ripWinMs - ripWinPrev) > 0.5f) ripFitForget(true, "Ripple capture window changed");
     }
     if (request->hasParam("ripDriftFloorA")) {
       foundParameter = true;
@@ -4994,12 +5020,9 @@ void setupServer() {
       kneeLearnEnable = (request->getParam("kneeLearnEnable")->value().toInt() != 0);
       settingWrite(NK_kneeLearnEnable, kneeLearnEnable ? "1" : "0");
       if (kneeLearnEnable) {
-        // Take ownership of the Min% column immediately from the learned floors (bin 0 always 0%).
-        for (int i = 0; i < RPM_TABLE_SIZE; i++) {
-          float f = (i == 0) ? 0.0f : kneeFloor[i];
-          if (f < 0) f = 0; if (f > kneeMaxFloorPct) f = kneeMaxFloorPct;
-          rpmMinDutyTable[i] = f;
-        }
+        // Take ownership of the Min% column immediately from the learned floors (bin 0 always 0%,
+        // undecided bins to the baseline) — same rule as boot and reset, one implementation.
+        kneeRebuildOwnedTable();
       }
     }
     if (request->hasParam("kneeMarginPct")) {
@@ -5619,7 +5642,7 @@ void setupServer() {
         dvccState = 0;  // immediate clamp release — don't wait for the next brain tick
         dvccCvlV = dvccCclA = NAN;
       } else {
-        queueConsoleMessage("DVCC follow enabled: authority must settle before limits apply. Verify the shown CVL/CCL match your BMS before relying on it.");
+        queueConsoleMessage("Charge-limit follow enabled: authority must settle before limits apply. Verify the shown CVL/CCL match what the sender itself displays before relying on it.");
       }
     }
     if (request->hasParam("dvccSrcType")) {
@@ -6789,7 +6812,7 @@ void setupServer() {
       // (the per-RPM onset-knee fit spans all bins). Wipe the knee tracker entirely so the floors are
       // re-measured at the new breakpoints instead of silently re-applied at shifted RPMs.
       if (rpmPointChanged) {
-        kneeLearnResetDefaults();   // zero floors/knees, unfreeze, drop rpmMinDutyTable to 0
+        kneeLearnResetDefaults();   // clear floors/knees, unfreeze, column back to the flat baseline
         commissionClearStage(7);    // Keep-alive floor + Field decay stage now stale (demotes a commissioned device to in-progress)
         queueConsoleMessage("Learning: RPM breakpoints changed — keep-alive floors cleared, re-run the Keep-Alive Floor step");
       }
@@ -7724,12 +7747,14 @@ void setupServer() {
     if (request->hasParam("IExcessTau")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessTau")->value();
+      float iexTauPrev = IExcessTau;
       IExcessTau = constrain(inputMessage.toFloat(), 20.0f, 300.0f);
       settingWrite(NK_IExcessTau, String(IExcessTau, 1).c_str());
       queueConsoleMessageF("IExcess averaging TC set to: %.0f ms", IExcessTau);
-      // The ripple map and the a0+a1·I fit are captured THROUGH this filter (detector-eye ripple),
-      // so changing it invalidates them — same hazard as ripWinMs.
-      queueConsoleMessage("IExcess averaging TC changed — stored ripple map/fit values from the old TC are not comparable (clear map + re-run current check)");
+      // The a0+a1·I fit is the pk-pk of THIS low-pass, so a tau change invalidates it. The slope fit
+      // is not measured through this filter and survives; the Resonance & Ripple Map never was
+      // (raw stream, own fixed window) — see ripFitForget.
+      if (fabsf(IExcessTau - iexTauPrev) > 0.05f) ripFitForget(false, "IExcess averaging TC changed");
       if (CVTuningMode) cvTuningParamChanged = true;
     }
     if (request->hasParam("IExcessRelFrac")) {
@@ -8297,22 +8322,29 @@ void setupServer() {
   // Settings arm gate (replaced /setPassword + /checkPassword). ?arm=1 opens the 30-min
   // write window, ?arm=0 closes it, no param just reports state — the dashboard polls this
   // to restore/expire its unlocked UI, so a reload while armed comes back unlocked.
+  // ?ackLock=1 clears the auto-lock notice. serviceSettingsArmHold() holds the window open while
+  // any client is attached, so remainSec reads full-scale instead of counting down under a live user.
   server.on("/armSettings", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("arm")) {
       bool arm = request->getParam("arm")->value().toInt() != 0;
       if (arm) {
         settingsArmed = true;
         settingsArmedAtMs = millis();
+        settingsAutoLockNotice = false;  // the user is back and re-armed: the notice has done its job
         queueConsoleMessage("Settings ARMED: changes accepted for 30 min");
       } else if (settingsArmed) {
         settingsArmed = false;
         queueConsoleMessage("Settings locked");
       }
     }
+    // The ack lands on the DEVICE, not per browser: one lock event, one notice, so a second phone
+    // is not nagged about a lock the first already cleared and a stale flag cannot outlive it.
+    if (request->hasParam("ackLock")) settingsAutoLockNotice = false;
     bool active = settingsArmActive();
     unsigned long remainSec = active ? (SETTINGS_ARM_TIMEOUT_MS - (millis() - settingsArmedAtMs)) / 1000UL : 0;
-    char out[48];
-    snprintf(out, sizeof(out), "{\"armed\":%d,\"remainSec\":%lu}", active ? 1 : 0, remainSec);
+    char out[128];
+    snprintf(out, sizeof(out), "{\"armed\":%d,\"remainSec\":%lu,\"lockNotice\":%d,\"lockEpoch\":%lu}",
+             active ? 1 : 0, remainSec, settingsAutoLockNotice ? 1 : 0, (unsigned long)settingsAutoLockedEpoch);
     request->send(200, "application/json", out);
   });
 
@@ -8754,18 +8786,19 @@ void setupServer() {
     pos += snprintf(buf + pos, 16384 - pos, "{\"rec\":[");
     for (int i = 0; i < tuningLogCount && pos < 15900; i++) {
       TuningRecord &r = tuningLog[sortIdx[i]];
+      char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, 16384 - pos,
         "%s{\"n\":%d,\"s\":%.2f,\"t\":%.1f,"
         "\"kp\":%.4f,\"ki\":%.4f,\"kd\":%.5f,"
         "\"sd\":%d,\"tg\":%.2f,\"dr\":%.1f,"
         "\"wa\":%d,\"wp\":%d,\"wf\":%d,"
-        "\"rpm\":%.0f,\"temp\":%.1f,\"worst\":%.1f,\"bv\":%.2f,\"cs\":%d,\"ts\":%u,\"note\":\"%s\"}",
+        "\"rpm\":%.0f,\"temp\":%s,\"worst\":%.1f,\"bv\":%.2f,\"cs\":%d,\"ts\":%u,\"note\":\"%s\"}",
         i > 0 ? "," : "",
         r.runNumber, r.score, r.activeTimeSec,
         r.kp, r.ki, r.kd,
         r.sampleDivisor, r.trackingGain, r.dutyRampRate,
         (int)r.waveAmplitude, (int)r.wavePeriod, (int)r.waveFloor,
-        r.avgRPM, r.avgAltTempF, r.worstErrorA, r.battV, (int)r.chargeStage, (unsigned)r.epoch, r.note);
+        r.avgRPM, jsonNum1(tbuf, sizeof(tbuf), r.avgAltTempF), r.worstErrorA, r.battV, (int)r.chargeStage, (unsigned)r.epoch, r.note);
     }
     bool testActive = (TuningMode && tuningScore.toggleCount > 0);
     float ts = (tuningScore.activeTimeSec > 0.0f)
@@ -9036,16 +9069,17 @@ void setupServer() {
     pos += snprintf(buf + pos, CAP - pos, "{\"rec\":[");
     for (int i = 0; i < tuningSweepLogCount && pos < CAP - 600; i++) {
       TuningSweepRecord &r = tuningSweepLog[sortIdx[i]];
+      char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, CAP - pos,
         "%s{\"n\":%d,\"bw\":%.2f,\"pg\":%.3f,\"pgf\":%.2f,\"wp\":%.0f,\"wpf\":%.2f,"
         "\"kp\":%.4f,\"ki\":%.4f,\"kd\":%.5f,\"f0\":%.2f,\"f1\":%.2f,\"cy\":%d,"
-        "\"rpm\":%.0f,\"temp\":%.1f,"
+        "\"rpm\":%.0f,\"temp\":%s,"
         "\"amp\":%.2f,\"base\":%.2f,\"bv\":%.2f,\"rmin\":%.0f,\"rmax\":%.0f,"
         "\"coh\":%.3f,\"clip\":%d,\"cs\":%d,\"ts\":%u,\"pts\":[",
         i > 0 ? "," : "",
         r.runNumber, r.bandwidthHz, r.peakGain, r.peakGainFreqHz, r.worstPhaseDeg, r.worstPhaseFreqHz,
         r.kp, r.ki, r.kd, r.sweepStartHz, r.sweepEndHz, (int)r.cycles,
-        r.avgRPM, r.avgAltTempF,
+        r.avgRPM, jsonNum1(tbuf, sizeof(tbuf), r.avgAltTempF),
         r.sineAmpA, r.baseA, r.battV, r.rpmMin, r.rpmMax,
         r.worstCoherence, (int)r.dutyRailed, (int)r.chargeStage, (unsigned)r.epoch);
       for (int k = 0; k < r.nPoints && k < TUNING_SWEEP_NPOINTS && pos < CAP - 60; k++) {
@@ -9091,14 +9125,15 @@ void setupServer() {
     pos += snprintf(buf + pos, CAP - pos, "{\"rec\":[");
     for (int i = 0; i < sysidSweepLogCount && pos < CAP - 600; i++) {
       SysIDSweepRecord &r = sysidSweepLog[sortIdx[i]];
+      char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, CAP - pos,
         "%s{\"n\":%d,\"ro\":%.2f,\"dc\":%.4f,\"wp\":%.0f,\"wpf\":%.2f,"
         "\"amp\":%.1f,\"floor\":%.1f,\"f0\":%.2f,\"f1\":%.2f,\"cy\":%d,"
-        "\"rpm\":%.0f,\"temp\":%.1f,\"bv\":%.2f,\"cs\":%d,\"ts\":%u,\"pts\":[",
+        "\"rpm\":%.0f,\"temp\":%s,\"bv\":%.2f,\"cs\":%d,\"ts\":%u,\"pts\":[",
         i > 0 ? "," : "",
         r.runNumber, r.rolloffHz, r.dcGainApPct, r.worstPhaseDeg, r.worstPhaseFreqHz,
         r.setupAmplitude, r.stabilizeAmps, r.sweepStartHz, r.sweepEndHz, (int)r.cycles,
-        r.avgRPM, r.avgAltTempF, r.battV, (int)r.chargeStage, (unsigned)r.epoch);
+        r.avgRPM, jsonNum1(tbuf, sizeof(tbuf), r.avgAltTempF), r.battV, (int)r.chargeStage, (unsigned)r.epoch);
       for (int k = 0; k < r.nPoints && k < SYSID_SINE_NPOINTS && pos < CAP - 60; k++) {
         pos += snprintf(buf + pos, CAP - pos, "%s{\"f\":%.2f,\"g\":%.4f,\"ph\":%.1f}",
                         k > 0 ? "," : "", r.curve[k].freqHz, r.curve[k].gainApPct, r.curve[k].phaseDeg);
@@ -9147,13 +9182,14 @@ void setupServer() {
     pos += snprintf(buf + pos, 10240 - pos, "{\"rec\":[");
     for (int i = 0; i < systemIDLogCount && pos < 9800; i++) {
       SystemIDRecord &r = systemIDLog[sortIdx[i]];
+      char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, 10240 - pos,
         "%s{\"n\":%u,\"s\":%.1f,"
         "\"rd\":[%.0f,%.0f,%.0f],\"fd\":[%.0f,%.0f,%.0f],"
         "\"ra\":%.1f,\"fa\":%.1f,"
         "\"sa\":[%.2f,%.2f,%.2f],\"qp\":[%.3f,%.3f,%.3f],"
         "\"ar\":%u,\"ap\":%u,\"amp\":%.2f,"
-        "\"rpm\":%.0f,\"temp\":%.1f,\"bv\":%.2f,\"cs\":%d,\"ts\":%u}",
+        "\"rpm\":%.0f,\"temp\":%s,\"bv\":%.2f,\"cs\":%d,\"ts\":%u}",
         i > 0 ? "," : "",
         (unsigned)r.runNumber, r.score,
         r.riseDelays[0], r.riseDelays[1], r.riseDelays[2],
@@ -9162,7 +9198,7 @@ void setupServer() {
         r.stepAmps[0], r.stepAmps[1], r.stepAmps[2],
         r.quietPP[0], r.quietPP[1], r.quietPP[2],
         (unsigned)r.abortReason, (unsigned)r.abortPhase, r.setupStepAmplitude,
-        r.avgRPM, r.avgAltTempF, r.battV, (int)r.chargeStage, (unsigned)r.epoch);
+        r.avgRPM, jsonNum1(tbuf, sizeof(tbuf), r.avgAltTempF), r.battV, (int)r.chargeStage, (unsigned)r.epoch);
     }
     pos += snprintf(buf + pos, 10240 - pos,
       "],\"active\":%d,\"ready\":%d}",
@@ -9206,6 +9242,7 @@ void setupServer() {
     pos += snprintf(buf + pos, (pos >= 32768 ? 0 : 32768 - pos), "{\"rec\":[");
     for (int i = 0; i < cvTuningLogCount && pos < 32000; i++) {
       CVTuningRecord &r = cvTuningLog[sortIdx[i]];
+      char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, (pos >= 32768 ? 0 : 32768 - pos),
         "%s{\"n\":%d,\"s\":%.2f,\"st\":%.1f,\"wo\":%.3f,\"io\":%.4f,\"t\":%.1f,"
         "\"ls\":%.2f,\"lst\":%.1f,\"lwo\":%.3f,\"lio\":%.4f,\"lus\":%.3f,"
@@ -9217,7 +9254,7 @@ void setupServer() {
         "\"iefr\":%.3f,\"ietau\":%.0f,\"iekb\":%.2f,"
         "\"lddt\":%.0f,\"ldt1\":%.0f,\"ldt3\":%.0f,"
         "\"wa\":%.2f,\"wp\":%d,\"ko\":%.1f,\"cr\":%d,"
-        "\"rpm\":%.0f,\"tmp\":%.1f,\"bv\":%.2f,\"soc\":%.1f,\"cvt\":%.2f,\"cs\":%d,\"ts\":%u,\"p2p\":%.3f,\"note\":\"%s\"}",
+        "\"rpm\":%.0f,\"tmp\":%s,\"bv\":%.2f,\"soc\":%.1f,\"cvt\":%.2f,\"cs\":%d,\"ts\":%u,\"p2p\":%.3f,\"note\":\"%s\"}",
         i > 0 ? "," : "",
         r.runNumber, r.score, r.avgSettlingTimeSec, r.worstOvershootV,
         r.avgIntegratedOvershootVs, r.activeTimeSec,
@@ -9230,7 +9267,7 @@ void setupServer() {
         r.iExcessFrac, r.iExcessTau, r.iExcessKBleed,
         r.loadDumpDtThresh, r.loadDumpDtThresh1, r.loadDumpDtThresh3,
         r.waveAmplitudeV, (int)r.wavePeriodSec, r.kOvershoot, (int)r.consecutiveReads,
-        r.avgRPM, r.avgAltTempF, r.battVAtStart, r.socAtStart * 100.0f, r.chargingVoltageTarget,
+        r.avgRPM, jsonNum1(tbuf, sizeof(tbuf), r.avgAltTempF), r.battVAtStart, r.socAtStart * 100.0f, r.chargingVoltageTarget,
         (int)r.chargeStage, (unsigned)r.epoch, r.steadyP2PV, r.note);
     }
     bool cvTestActive = (CVTuningMode && cvTuningScore.testStarted);
@@ -9520,6 +9557,10 @@ void dnsHandleRequest() {  // process dns request for captive portals
 void enterLowPowerStandby() {
   if (wifiNapEnabled && currentMode == MODE_CLIENT) {
     if (!wifiNapActive) {
+      // Napping can be switched on after a previous standby already took the WIFI_OFF branch below.
+      // Declaring the nap without raising STA first strands checkWiFiConnection() on its WIFI_OFF
+      // early-out while the call-site gate believes WiFi is up — dead until ignition-on or GPIO5.
+      if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);  // seek engine does the join, non-blocking
       WiFi.setSleep(true);           // modem sleep — WiFi naps between DTIM beacons
       wifiNapActive = true;
       queueConsoleMessage("WiFi napping: dashboard stays reachable at low power (no button needed)");
@@ -9686,10 +9727,13 @@ void SendWifiData() {
     queueConsoleMessageF("BOOTED firmware v%s (reset: %s | esp=%d rtc0=%d rtc1=%d)",
                          FIRMWARE_VERSION, resetReasonName(), g_rawResetEsp, g_rawResetRtc0, g_rawResetRtc1);
     if (g_blackBoxPrevValid) {
-      queueConsoleMessageF("BLACKBOX: up=%lus IBV=%.2fV duty=%.1f%% RPM=%d amps=%.1f altT=%dF mode=%u stage=%u loop=%.1fms heap=%ldKB",
+      char bbTemp[12];   // -999 is the store-side "no probe had read" marker (loop()); never print it raw
+      if (g_blackBoxPrev.altTempF == -999) snprintf(bbTemp, sizeof(bbTemp), "n/a");
+      else snprintf(bbTemp, sizeof(bbTemp), "%dF", (int)g_blackBoxPrev.altTempF);
+      queueConsoleMessageF("BLACKBOX: up=%lus IBV=%.2fV duty=%.1f%% RPM=%d amps=%.1f altT=%s mode=%u stage=%u loop=%.1fms heap=%ldKB",
                            (unsigned long)(g_blackBoxPrev.upMillis / 1000UL), g_blackBoxPrev.ibv,
                            g_blackBoxPrev.duty, (int)g_blackBoxPrev.rpm, g_blackBoxPrev.measAmps,
-                           (int)g_blackBoxPrev.altTempF, g_blackBoxPrev.sysMode, g_blackBoxPrev.chargeStage,
+                           bbTemp, g_blackBoxPrev.sysMode, g_blackBoxPrev.chargeStage,
                            g_blackBoxPrev.maxLoopUs / 1000.0f, (long)g_blackBoxPrev.minHeapKB);
     } else {
       queueConsoleMessage("BLACKBOX: RTC RAM lost - true power interruption preceded this boot");
@@ -9738,7 +9782,8 @@ void SendWifiData() {
                                "%u,%u",  // +2: sessionId, sendMs
 
                                CSV1_FIELD_COUNT,
-                               SafeInt(AlternatorTemperatureF, 100),
+                               !isfinite(AlternatorTemperatureF) ? ROLL_EMPTY : SafeInt(AlternatorTemperatureF, 100),  // no probe bound to the alt role -> "not available"; SafeInt's -1 rendered as a real -0.0F
+
                                SafeInt(dutyCycle, 100),
                                SafeInt(battVOut, 100),
                                SafeInt(altOut, 100),
@@ -9819,7 +9864,11 @@ void SendWifiData() {
   // channels. These fields used to ride the 5 s CSV2 cadence and looked frozen on the dial/helm.
   if (!sentSomething && now - lastpayload4send >= 500UL && events.count() > 0) {
     static char *payload4 = nullptr;
-    static const size_t PAYLOAD4_SIZE = 256;  // ~7 B/field, plus the two 10-digit stamp fields; rounded up with headroom
+    static const size_t PAYLOAD4_SIZE = 512;  // ~7 B/field, plus the two 10-digit stamp fields; rounded up with headroom
+                                              // Was 256: SafeInt's sentinel widened from -1 to -2000000000, and 19 SafeInt
+                                              // fields at 11 chars each puts the arithmetic worst case at 253 of 256 bytes.
+                                              // snprintf truncates and the length guard below drops the frame, so an
+                                              // overrun would silently stop NavStream rather than corrupt memory.
     if (!payload4) {
       payload4 = (char *)ps_malloc(PAYLOAD4_SIZE);  // allocated to PSRAM
       if (!payload4) {
@@ -9838,14 +9887,16 @@ void SendWifiData() {
                                SafeInt(HeadingNMEA),                     // CSV4_HeadingNMEA
                                SafeInt(SOGNMEA, 100),                    // CSV4_SOGNMEA
                                SafeInt(COGNMEA),                         // CSV4_COGNMEA
-                               SafeInt(STWNMEA, 100),                    // CSV4_STWNMEA (knots ×100; NAN/no-log -> 0)
+                               !isfinite(STWNMEA) ? ROLL_EMPTY : SafeInt(STWNMEA, 100),                                  // CSV4_STWNMEA (knots ×100)
                                SafeInt(ApparentWindSpeedNMEA, 100),      // CSV4_ApparentWindSpeedNMEA
                                SafeInt(ApparentWindAngleNMEA),           // CSV4_ApparentWindAngleNMEA
-                               SafeInt(TrueWindSpeedNMEA, 100),          // CSV4_TrueWindSpeedNMEA
-                               SafeInt(TrueWindAngleNMEA),               // CSV4_TrueWindAngleNMEA
-                               SafeInt(LeewayNMEA),                      // CSV4_LeewayNMEA
-                               SafeInt(VMGNMEA, 100),                    // CSV4_VMGNMEA
-                               SafeInt(VMGUpwind, 100),                  // CSV4_VMGUpwind (VMG to windward, knots ×100)
+                               // No wind instrument / no target bearing / no boat speed leaves these NAN. SafeInt's -1
+                               // rendered as real readings (-0.0 kt, -1 deg) and banked a flat line in the trend rings.
+                               !isfinite(TrueWindSpeedNMEA) ? ROLL_EMPTY : SafeInt(TrueWindSpeedNMEA, 100),                // CSV4_TrueWindSpeedNMEA
+                               !isfinite(TrueWindAngleNMEA) ? ROLL_EMPTY : SafeInt(TrueWindAngleNMEA),                     // CSV4_TrueWindAngleNMEA
+                               !isfinite(LeewayNMEA) ? ROLL_EMPTY : SafeInt(LeewayNMEA),                                   // CSV4_LeewayNMEA
+                               !isfinite(VMGNMEA) ? ROLL_EMPTY : SafeInt(VMGNMEA, 100),                                    // CSV4_VMGNMEA
+                               !isfinite(VMGUpwind) ? ROLL_EMPTY : SafeInt(VMGUpwind, 100),                                // CSV4_VMGUpwind (VMG to windward, knots ×100)
                                SafeInt(VictronSolarPower_W),             // CSV4_VictronSolarPower
                                SafeInt(VictronSolarVoltage_V, 100),      // CSV4_VictronSolarVoltage
                                SafeInt(VictronSolarCurrent_A, 100),      // CSV4_VictronSolarCurrent
@@ -9957,6 +10008,7 @@ void SendWifiData() {
                                "%d,%d,"         // +2 timed OV cut session counters: LOW tier, MID tier
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +10 solar ledger: today's pred/act harvest + consumption, bar, source, days, coverage, ft win/ses
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +13 battery/extra temperature: BATT probe, EXTRA probe, active F, active src, probe count, unassigned, VE.Direct T, RV-C T, derate inert, batt wm lo/hi, extra wm lo/hi
+                               "%d,"            // +1 enforced field-duty floor (x100)
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -10002,7 +10054,7 @@ void SendWifiData() {
                                SafeInt(pKwHrToday, 100),
                                SafeInt(pKwHrTomorrow, 100),
                                SafeInt(pKwHr2days, 100),
-                               SafeInt(ambientTemp),
+                               !isfinite(ambientTemp) ? ROLL_EMPTY : SafeInt(ambientTemp),   // no BMP388 -> "—"
                                SafeInt(baroPressure, 10),
                                SafeInt(firmwareVersionInt),
                                deviceIdUpper,
@@ -10241,7 +10293,7 @@ void SendWifiData() {
                                SafeInt(currentRPMTableIndex),
                                SafeInt(pidInitialized ? 1 : 0),
                                SafeInt(pidSetpoint, 100),
-                               SafeInt(TempToUse),
+                               !isfinite(TempToUse) ? ROLL_EMPTY : SafeInt(TempToUse),   // no probe on either source -> "—"
                                SafeInt(learningTargetFromRPM, 100),
                                SafeInt(finalLearningTarget, 100),
                                SafeInt(overheatingPenaltyTimer / 1000),
@@ -10338,34 +10390,34 @@ void SendWifiData() {
                                SafeInt(nvsFullSaveLastMs),
                                SafeInt(nvsFullSaveWorstMs),
                                SafeInt(nvsFullSaveCount),
-                               SafeInt(wmIgnSafe(wmIgn_amps.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_amps.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_altTempF.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_altTempF.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_IBV.lo), 10),
-                               SafeInt(wmIgnSafe(wmIgn_IBV.hi), 10),
-                               SafeInt(wmIgnSafe(wmIgn_Bcur.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_Bcur.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_SOC.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_SOC.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_RPM.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_RPM.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_SOG.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_SOG.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_AWS.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_AWS.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_TWS.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_TWS.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_heel.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_heel.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_pitch.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_pitch.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_vacc.lo), 10),
-                               SafeInt(wmIgnSafe(wmIgn_vacc.hi), 10),
-                               SafeInt(wmIgnSafe(wmIgn_baro.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_baro.hi), 1),
-                               SafeInt(wmIgnSafe(wmIgn_ambient.lo), 1),
-                               SafeInt(wmIgnSafe(wmIgn_ambient.hi), 1),
+                               wmIgnCsv(wmIgn_amps.lo, 1),
+                               wmIgnCsv(wmIgn_amps.hi, 1),
+                               wmIgnCsv(wmIgn_altTempF.lo, 1),
+                               wmIgnCsv(wmIgn_altTempF.hi, 1),
+                               wmIgnCsv(wmIgn_IBV.lo, 10),
+                               wmIgnCsv(wmIgn_IBV.hi, 10),
+                               wmIgnCsv(wmIgn_Bcur.lo, 1),
+                               wmIgnCsv(wmIgn_Bcur.hi, 1),
+                               wmIgnCsv(wmIgn_SOC.lo, 1),
+                               wmIgnCsv(wmIgn_SOC.hi, 1),
+                               wmIgnCsv(wmIgn_RPM.lo, 1),
+                               wmIgnCsv(wmIgn_RPM.hi, 1),
+                               wmIgnCsv(wmIgn_SOG.lo, 1),
+                               wmIgnCsv(wmIgn_SOG.hi, 1),
+                               wmIgnCsv(wmIgn_AWS.lo, 1),
+                               wmIgnCsv(wmIgn_AWS.hi, 1),
+                               wmIgnCsv(wmIgn_TWS.lo, 1),
+                               wmIgnCsv(wmIgn_TWS.hi, 1),
+                               wmIgnCsv(wmIgn_heel.lo, 1),
+                               wmIgnCsv(wmIgn_heel.hi, 1),
+                               wmIgnCsv(wmIgn_pitch.lo, 1),
+                               wmIgnCsv(wmIgn_pitch.hi, 1),
+                               wmIgnCsv(wmIgn_vacc.lo, 10),
+                               wmIgnCsv(wmIgn_vacc.hi, 10),
+                               wmIgnCsv(wmIgn_baro.lo, 1),
+                               wmIgnCsv(wmIgn_baro.hi, 1),
+                               wmIgnCsv(wmIgn_ambient.lo, 1),
+                               wmIgnCsv(wmIgn_ambient.hi, 1),
                                (int)restartRemainingSec,
                                (int)currentGpsSource,
                                (int)currentTimeSource,
@@ -10373,10 +10425,10 @@ void SendWifiData() {
                                (int)loggingActive,
                                SafeInt(sustainedTWS, 10),
                                SafeInt(currentGaleMinutes, 1),
-                               SafeInt(wmIgnSafe(wmIgn_VMGman.lo), 10),
-                               SafeInt(wmIgnSafe(wmIgn_VMGman.hi), 10),
-                               SafeInt(wmIgnSafe(wmIgn_VMGup.lo), 10),
-                               SafeInt(wmIgnSafe(wmIgn_VMGup.hi), 10),
+                               wmIgnCsv(wmIgn_VMGman.lo, 10),
+                               wmIgnCsv(wmIgn_VMGman.hi, 10),
+                               wmIgnCsv(wmIgn_VMGup.lo, 10),
+                               wmIgnCsv(wmIgn_VMGup.hi, 10),
                                SafeInt(altWorstPct(), 10),
                                altStatus(),
                                SafeInt(altCoveragePct(), 10),
@@ -10413,7 +10465,7 @@ void SendWifiData() {
                                SafeInt(loop80IterCount),
                                SafeInt(loopFieldOnWin / 1000),
                                SafeInt(loopFieldOnSes / 1000),
-                               SafeInt(tempFiltered, 100),
+                               !isfinite(tempFiltered) ? ROLL_EMPTY : SafeInt(tempFiltered, 100),   // NAN until the first sane read -> "—", never a real -0.01F in the thermal plot
                                SafeInt(outerImpliedPenalty, 100),
                                SafeInt((tempPIDActive ? (1 << 0) : 0) | (sysMode == SYS_MODE_AUTO ? (1 << 4) : 0) | (shutdownPhase != SHUTDOWN_PHASE_NONE ? (1 << 5) : 0)),
                                SafeInt(thermalAntiWindupLatch ? 1 : 0),
@@ -10560,19 +10612,20 @@ void SendWifiData() {
                                SafeInt(sledLive.dayIdx ? sledLive.coverageMin : 0),      // CSV2_sledCoverageMin
                                SafeInt(ft_solarLedger.worstWindow),                      // CSV2_ft_solarLedger_win
                                SafeInt(ft_solarLedger.worstSession),                     // CSV2_ft_solarLedger_ses
-                               isfinite(BatteryTempProbeF) ? (int)lroundf(BatteryTempProbeF * 10.0f) : -9999,  // CSV2_BatteryTempProbeF
-                               isfinite(ExtraTempF) ? (int)lroundf(ExtraTempF * 10.0f) : -9999,                // CSV2_ExtraTempF
-                               isfinite(battTempActiveF) ? (int)lroundf(battTempActiveF * 10.0f) : -9999,      // CSV2_battTempActiveF
+                               isfinite(BatteryTempProbeF) ? (int)lroundf(BatteryTempProbeF * 10.0f) : ROLL_EMPTY,  // CSV2_BatteryTempProbeF
+                               isfinite(ExtraTempF) ? (int)lroundf(ExtraTempF * 10.0f) : ROLL_EMPTY,                // CSV2_ExtraTempF
+                               isfinite(battTempActiveF) ? (int)lroundf(battTempActiveF * 10.0f) : ROLL_EMPTY,      // CSV2_battTempActiveF
                                (int)battTempActiveSrc,                                   // CSV2_battTempActiveSrc
                                (int)owProbeCount,                                        // CSV2_owProbeCount
                                (int)owUnassignedCount(),                                 // CSV2_owUnassignedCount
-                               isfinite(VictronBattTempF) ? (int)lroundf(VictronBattTempF * 10.0f) : -9999,    // CSV2_VictronBattTempF
-                               isfinite(rvcRxBattTempF) ? (int)lroundf(rvcRxBattTempF * 10.0f) : -9999,        // CSV2_rvcRxBattTempF
+                               isfinite(VictronBattTempF) ? (int)lroundf(VictronBattTempF * 10.0f) : ROLL_EMPTY,    // CSV2_VictronBattTempF
+                               isfinite(rvcRxBattTempF) ? (int)lroundf(rvcRxBattTempF * 10.0f) : ROLL_EMPTY,        // CSV2_rvcRxBattTempF
                                (int)cvTempDerateInert,                                   // CSV2_cvTempDerateInert
-                               SafeInt(wmIgnSafe(wmIgn_battTempF.lo), 1),                // CSV2_wmIgn_battTempF_lo
-                               SafeInt(wmIgnSafe(wmIgn_battTempF.hi), 1),                // CSV2_wmIgn_battTempF_hi
-                               SafeInt(wmIgnSafe(wmIgn_extraTempF.lo), 1),               // CSV2_wmIgn_extraTempF_lo
-                               SafeInt(wmIgnSafe(wmIgn_extraTempF.hi), 1),               // CSV2_wmIgn_extraTempF_hi
+                               wmIgnCsv(wmIgn_battTempF.lo, 1),                // CSV2_wmIgn_battTempF_lo
+                               wmIgnCsv(wmIgn_battTempF.hi, 1),                // CSV2_wmIgn_battTempF_hi
+                               wmIgnCsv(wmIgn_extraTempF.lo, 1),               // CSV2_wmIgn_extraTempF_lo
+                               wmIgnCsv(wmIgn_extraTempF.hi, 1),               // CSV2_wmIgn_extraTempF_hi
+                               SafeInt(g_fieldDutyFloor, 100),                           // CSV2_fieldDutyFloor
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost
@@ -10956,7 +11009,7 @@ void SendWifiData() {
                                (int)setpointSlewEnable,
                                (int)cvRiseGovEnable,
                                (int)dutySlewEnable,
-                               isnan(CommissionTempF) ? -32768 : (int)lroundf(CommissionTempF * 10.0f),
+                               isnan(CommissionTempF) ? ROLL_EMPTY : (int)lroundf(CommissionTempF * 10.0f),
                                (int)battTempDerateEnable,
                                SafeInt(battTempCoeff, 10000),
                                SafeInt(TempPIDKiDownFrac, 1000),

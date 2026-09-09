@@ -1056,17 +1056,18 @@ const CSV2_FIELDS = [
     "sledCoverageMin",         // minutes of today the device has been awake
     "ft_solarLedger_win",
     "ft_solarLedger_ses",
-    "BatteryTempProbeF",       // BATT-role DS18B20 (°F x10; -9999 = no reading)
-    "ExtraTempF",              // EXTRA-role DS18B20 (°F x10; -9999 = no reading)
-    "battTempActiveF",         // battery temperature in use this tick (°F x10; -9999 = none)
+    "BatteryTempProbeF",       // BATT-role DS18B20 (°F x10; ROLL_EMPTY = no reading)
+    "ExtraTempF",              // EXTRA-role DS18B20 (°F x10; ROLL_EMPTY = no reading)
+    "battTempActiveF",         // battery temperature in use this tick (°F x10; ROLL_EMPTY = none)
     "battTempActiveSrc",       // 0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board stand-in
     "owProbeCount",            // 1-Wire probes present on the last enumeration
     "owUnassignedCount",       // present probes with no role
-    "VictronBattTempF",        // VE.Direct T field (°F x10; -9999 = none)
-    "rvcRxBattTempF",          // RV-C DC_SOURCE_STATUS_2 (°F x10; -9999 = none)
+    "VictronBattTempF",        // VE.Direct T field (°F x10; ROLL_EMPTY = none)
+    "rvcRxBattTempF",          // RV-C DC_SOURCE_STATUS_2 (°F x10; ROLL_EMPTY = none)
     "cvTempDerateInert",       // 1 = battery-temp source class changed since commissioning; derate holds 1.0
     "wmIgn_battTempF_lo", "wmIgn_battTempF_hi",     // BatteryTempProbeF (°F, int)
     "wmIgn_extraTempF_lo", "wmIgn_extraTempF_hi",   // ExtraTempF (°F, int)
+    "fieldDutyFloor",          // enforced field-duty floor x100: max of Min Field % and this speed's Keep-Alive %; 0 = floor bypassed (shutdown, sysID, protection clamp, MANUAL)
     "sessionId",               // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
@@ -1127,7 +1128,7 @@ const CSV4_FIELDS = [
     "VictronCurrent",             // Victron battery current (A ×100)
     "currentFuelGPH",             // live fuel flow (gal/hr ×100)
     "currentNMPG",                // live fuel economy (naut mi/gal ×100)
-    "ctrlLimiter",                // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target (zero-output stand-down), 8 BMS charge-current limit (DVCC CCL), 9 BMS charge-voltage limit (DVCC CVL)
+    "ctrlLimiter",                // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target (zero-output stand-down), 8 external charge-current limit (DVCC CCL), 9 external charge-voltage limit (DVCC CVL), 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide
     "chargeStage",                // CHARGE_STAGE_* code — feeds gLastChargeStage at 2 Hz for the mode ribbon
     "n183Heading",                // NMEA 0183 decoded heading (deg ×10; negative = nothing decoded). Distinct from HeadingNMEA, which is the NMEA2000 source.
     "n183HdgRef",                 // reference frame of the above: 0 none, 1 magnetic, 2 true
@@ -1153,7 +1154,29 @@ const ROLL_EMPTY_SENTINEL = -1999999999;   // firmware sends -2000000000 when a 
 // analysis fits (autotune, diag) see NaN instead of a plausible-looking number.
 const BATT_NA_KEYS_CSV1 = ['Bcur'];
 const BATT_NA_KEYS_CSV2 = ['SOC_percent', 'dBcur_dt'];
-function battNaToNaN(data, keys) {
+// Same treatment, same sentinel, for readings whose SENSOR can be absent: no DS18B20 bound to the
+// alternator role, no wind instrument, no paddlewheel, no target bearing. These used to ride
+// SafeInt's -1 and render as real measurements (-0.0 F, -0.0 kt, -1 deg) while banking a flat line
+// into the live temperature plot, the true-wind trend ring and the alt-health session points.
+const SENSOR_NA_KEYS_CSV1 = ['AlternatorTemperatureF'];
+const SENSOR_NA_KEYS_CSV4 = ['STWNMEA', 'TrueWindSpeedNMEA', 'TrueWindAngleNMEA', 'LeewayNMEA', 'VMGNMEA', 'VMGUpwind'];
+// Ignition-cycle watermarks plus the filtered/board/selected temperatures. A sensor absent for the
+// whole cycle left these at 0 or -1 (SafeInt) and they rendered as measured extremes —
+// 0 kt SOG, 0 deg heel, -18 C board temp. The CSV2 readout chain already prints "—" for non-finite.
+const SENSOR_NA_KEYS_CSV2 = ['wmIgn_amps_lo', 'wmIgn_amps_hi', 'wmIgn_altTempF_lo', 'wmIgn_altTempF_hi',
+    'wmIgn_IBV_lo', 'wmIgn_IBV_hi', 'wmIgn_Bcur_lo', 'wmIgn_Bcur_hi', 'wmIgn_SOC_lo', 'wmIgn_SOC_hi',
+    'wmIgn_RPM_lo', 'wmIgn_RPM_hi', 'wmIgn_SOG_lo', 'wmIgn_SOG_hi', 'wmIgn_AWS_lo', 'wmIgn_AWS_hi',
+    'wmIgn_TWS_lo', 'wmIgn_TWS_hi', 'wmIgn_heel_lo', 'wmIgn_heel_hi', 'wmIgn_pitch_lo', 'wmIgn_pitch_hi',
+    'wmIgn_vacc_lo', 'wmIgn_vacc_hi', 'wmIgn_baro_lo', 'wmIgn_baro_hi', 'wmIgn_ambient_lo',
+    'wmIgn_ambient_hi', 'wmIgn_VMGman_lo', 'wmIgn_VMGman_hi', 'wmIgn_VMGup_lo', 'wmIgn_VMGup_hi',
+    'wmIgn_battTempF_lo', 'wmIgn_battTempF_hi', 'wmIgn_extraTempF_lo', 'wmIgn_extraTempF_hi', 'tempFiltered',
+    'ambientTemp', 'TempToUse'];
+// Since SafeInt itself returns ROLL_EMPTY for NaN/Inf, EVERY field on CSV1/2/3/4 can carry the
+// sentinel, so the sweep runs over the whole parsed object and the key lists above are kept only as
+// the record of which fields the firmware ALSO guards explicitly at the call site. Nothing legitimate
+// reads below -1999999999, so a whole-object sweep cannot swallow a real value. TS carries no SafeInt
+// field and is not swept.
+function battNaToNaN(data, keys = Object.keys(data)) {
     for (const k of keys) {
         if (!(k in data)) continue;
         const v = Number(data[k]);
@@ -3599,7 +3622,7 @@ const CSV3_FIELDS = [
     "setpointSlewEnable",            // inner-loop current setpoint slew master switch (0/1)
     "cvRiseGovEnable",               // CV rise governor / anti-windup master switch (0/1)
     "dutySlewEnable",                // field duty slew master switch (0/1)
-    "CommissionTempF",               // board temp when CV fit applied — derate reference (°F ×10; -32768 = unset)
+    "CommissionTempF",               // board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset)
     "battTempDerateEnable",          // battery-temp gain derate master on/off (0/1)
     "battTempCoeff",                 // battery fractional resistance change per °C; ×10000
     "TempPIDKiDownFrac",             // thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000
@@ -4917,6 +4940,13 @@ function clearTrackedTimeout(id) {
     if (i !== -1) activeTimers.splice(i, 1);
 }
 
+// Same for an interval stopped before cleanupResources runs.
+function clearTrackedInterval(id) {
+    clearInterval(id);
+    const i = activeTimers.findIndex(t => t.type === 'interval' && t.id === id);
+    if (i !== -1) activeTimers.splice(i, 1);
+}
+
 function cleanupResources() {
     diagLog("Cleaning up resources");
 
@@ -4944,6 +4974,10 @@ function cleanupResources() {
         clearTimeout(g_logPollTimer);
         g_logPollTimer = null;
     }
+
+    // The ripple-map poll's interval died with activeTimers above; drop its id or rippleMapPollSync
+    // still believes it is running and never restarts it.
+    rippleMapPollId = null;
 
     if (typeof currentTempPlot !== 'undefined' && currentTempPlot) {
         currentTempPlot.destroy();
@@ -7328,7 +7362,11 @@ function updatePlotConfiguration(data) {
     }
 
     // Sample interval changed → re-grid the fixed 5-min buffer (point spacing changed) and rebuild plots.
-    if (data.webgaugesinterval !== cachedWebgaugesInterval) {
+    // Finite and positive first: newMaxPoints divides by this, so a 0 or a sentinel-turned-NaN makes
+    // new Array(newMaxPoints) throw RangeError, and the throw kills the WHOLE CSV3 dispatcher — every
+    // echo and settings readout stops updating with nothing on screen to say so.
+    if (Number.isFinite(data.webgaugesinterval) && data.webgaugesinterval > 0
+        && data.webgaugesinterval !== cachedWebgaugesInterval) {
         cachedWebgaugesInterval = data.webgaugesinterval;
         cachedPlotTimeWindow = data.plotTimeWindow;   // reinit captures liveWindowSec below
 
@@ -8219,7 +8257,10 @@ function updateAllEchosOptimized(data) {
 
     echoUpdates.forEach(update => {
         if (update.key in data) {
-            const newValue = update.transform(data[update.key]);
+            // Most transforms end in .toFixed(), and NaN.toFixed() is the string "NaN". Print the
+            // em dash instead, so a sentinel echo reads like every other absent value on the page.
+            const raw = data[update.key];
+            const newValue = (typeof raw === 'number' && !Number.isFinite(raw)) ? '—' : update.transform(raw);
             if (updateEchoIfChanged(update.id, newValue)) {
                 updatesCount++;
             }
@@ -9350,7 +9391,15 @@ let _commPrepShuntInit = 1;      // BatteryShuntPresent at open (1 = INA228 fitt
 let _commPrepShuntPresent = 1;   // live shunt-present selection
 let _commPrepFloatInit = '';     // UseFloat at open (Other-only charge block); written only if the select changed
 let _commPrepRpmActive = false;  // deep-linked into the RPM editor from the wizard: suppress the live blue row highlight
-let _commPrepFirstInstall = true; // false on a re-commission: different intro copy, and Next skips tach alignment
+let _commPrepFirstInstall = true; // false on a re-commission: different intro copy
+// Whether Next hands off to the tach-alignment screen. Split from _commPrepFirstInstall because the two
+// questions are different: the intro copy asks "is this their first install", the alignment screen asks
+// "is the engine-speed axis about to be re-measured against". A wholesale restart answers no to the first
+// and YES to the second — it reverts every other setting to pre-commissioning and re-runs all nine steps,
+// and every RPM-binned one of them is measured against this axis (see commissionClearRpmDependents in the
+// firmware, which wipes seven stages when it moves). Continuing a partial run answers no to both: a rescale
+// mid-tune would invalidate the steps already done in that same run.
+let _commPrepShowAlign = true;
 let _commPrepDeferHandoff = false; // vessel-save chain: Next resolves the screen instead of opening Charge Rate Limits (the chain does, after battdef / SoC / restart ack)
 let _commPrepOwLast = null;      // last /tempSensors JSON, polled while this screen is open
 let _commPrepOwSig = null;       // id:role:present signature of the rendered probe rows (null forces the first build)
@@ -9601,8 +9650,9 @@ function maintAckClose() {
 // off to — tach alignment is a first-install-only screen. deferHandoff (the vessel-save chain):
 // Next resolves true instead of opening Charge Rate Limits — the chain opens it after the
 // battery-defaults, SoC and restart-ack screens; every other exit resolves false.
-async function openCommPrereqs(firstInstall, deferHandoff) {
+async function openCommPrereqs(firstInstall, deferHandoff, showAlign) {
     _commPrepFirstInstall = !!firstInstall;
+    _commPrepShowAlign = (showAlign === undefined) ? !!firstInstall : !!showAlign;
     _commPrepDeferHandoff = !!deferHandoff;
     try {
         // A successful /saveVesselInfo proves the device is armed; this tab's mirror can be stale after a
@@ -9611,10 +9661,7 @@ async function openCommPrereqs(firstInstall, deferHandoff) {
         // alongside the config read (one small request — never the longer of the two) instead of racing
         // the first assignment.
         const armP = settingsUnlocked ? null : syncArmState();
-        // Start the config read while the Before You Start screen is up, so Continue lands on a
-        // rendered screen instead of a spinner. ✕ there leaves the flow, exactly as ✕ on the next screen does.
         const cfgP = commPrepFetchCfg();
-        if (!await commPrepIntroShow()) return false;
         vesselNextStepWait(true);
         const [j] = await Promise.all([cfgP, armP]);
         vesselNextStepWait(false);
@@ -9640,31 +9687,6 @@ async function openCommPrereqs(firstInstall, deferHandoff) {
         diagLog('commissioning prerequisites failed:', e);
         return false;
     }
-}
-
-// Before You Start — how to run the process, separated from what the regulator is set to. Resolves true
-// on Continue, false on ✕ (which abandons the whole pre-flight, like ✕ on the prerequisites screen).
-let _commPrepIntroResolve = null;
-function commPrepIntroShow() {
-    return new Promise(res => {
-        _commPrepIntroResolve = res;
-        // Both of the conditional paragraphs are decided here. The laptop advice is a waste of words on
-        // a laptop, so it needs an actually-small screen. The panel warning is meaningless unless the
-        // switches really do own the modes, and the source of truth for that is the firmware echo —
-        // nothing is claimed before it has arrived. The wizard is NOT special-cased: with the override
-        // on, a hand on the panel can still move the charge rate or Maintain mid-run, which is what the
-        // warning is for.
-        const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? 'block' : 'none'; };
-        show('commprep-intro-smallscreen', _isPhoneSizedScreen());
-        const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
-        show('commprep-intro-paneloverride', !!c3 && Number(c3.PhysicalPanelOverride) === 1);
-        document.getElementById('commprep-intro-overlay').style.display = 'flex';
-    });
-}
-function commPrepIntroClose(cont) {
-    document.getElementById('commprep-intro-overlay').style.display = 'none';
-    const r = _commPrepIntroResolve; _commPrepIntroResolve = null;
-    if (r) r(!!cont);
 }
 
 // First install — the vessel-save chain awaits this one and makes the Charge Rate Limits handoff itself
@@ -9714,8 +9736,13 @@ function commPrepRender(cfg) {
         '<div style="' + capCss + '">' + cap + '</div></div>';
     const grpHdr = t => '<div style="font-size:11px; color:#9cc; letter-spacing:0.04em; text-transform:uppercase; margin:2px 0 8px;">' + t + '</div>';
 
-    // The laptop advice and the steady-loads reminder are their own screen ahead of this one.
-    const intro = '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;">' + (_commPrepFirstInstall
+    // Phone-only laptop nudge. This is the first screen of the flow and the first one that is a form,
+    // so it is where a small screen starts to hurt; the vessel-info landing nudge (smallScreenSetupMsg)
+    // never fires on a re-commission, which reaches this screen too.
+    const smallScreen = _isPhoneSizedScreen()
+        ? '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;"><strong style="color:#e0e0e0;">Use a laptop or tablet if you can.</strong> Setup and Commissioning works on a phone, but it\'s a worse UX on a small screen.</p>'
+        : '';
+    const intro = smallScreen + '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;">' + (_commPrepFirstInstall
             ? 'A few things to set before commissioning measures your system. These affect how the regulator reads temperature and current. Anything you skip stays editable later under Setup.'
             : 'These are the settings commissioning measures against, filled in from the regulator. Confirm they still describe the system before the wizard re-measures it — anything you change here is written when you press Next.') + '</p>' + dvccNotice;
 
@@ -9921,7 +9948,7 @@ async function commPrepFinish(start) {
     if (!start || deferred) return;
     // Both paths: Low/High charge-rate limits next, ← Back reopens this screen. Tach alignment is
     // first-install only — RPMScalingFactor/PulleyRatio persist and stay editable under Setup ▸ Engine.
-    openRpmCap(_commPrepFirstInstall ? openRpmAlign : openCommissionModal, commPrepReopen);
+    openRpmCap(_commPrepShowAlign ? openRpmAlign : openCommissionModal, commPrepReopen);
 }
 
 // ← Back from Charge Rate Limits: the screen comes back as it was left, and its Next hands off directly.
@@ -10057,7 +10084,9 @@ async function rpmCapContinue(mode) {
             setChargeRateMode(mode === 0 ? 'low' : 'high');
         } catch (e) {
             pendingToggles.delete('HiLow');
-            await xAlert('Switching to ' + (mode === 0 ? 'Low' : 'High') + ' charge rate failed — the regulator is still in ' + (currentChargeRateMode === 'low' ? 'Low' : 'High') + '. Press Continue again.\n\n' + e);
+            // Deliberately does not assert which mode the device is in: a timeout here often means the
+            // switch WAS applied and the reply was just slow. Continue re-sends the same value either way.
+            await xAlert('Switching to ' + (mode === 0 ? 'Low' : 'High') + ' charge rate was not confirmed. Press Continue again.\n\n' + e);
             return;
         }
     }
@@ -10215,7 +10244,7 @@ async function socSeedFetch() {
 async function socSeedMaybeAutoOpen() {
     // Don't auto-pop over the first-run chain's screens or the commissioning modal (the chain shows this
     // popup itself, in sequence); still reachable from the header SOC readout.
-    const overModal = ['commprep-intro-overlay', 'commprep-modal-overlay', 'battdef-modal-overlay', 'nextstep-modal-overlay', 'commission-modal-overlay'].some(id => {
+    const overModal = ['commprep-modal-overlay', 'battdef-modal-overlay', 'nextstep-modal-overlay', 'commission-modal-overlay'].some(id => {
         const el = document.getElementById(id);
         return el && (el.style.display === 'flex' || el.style.display === 'block');
     });
@@ -11644,6 +11673,14 @@ function fieldOffReasonText(reasonCode) {
         case 8:  return 'voltage sensors disagree';
         case 9:  return 'protection lockout active';
         case 10: {
+            // The firmware collapses four causes into one code: chargingEnabled = (Ignition && OnOff),
+            // cleared again by the Idle stage. Both inputs are on hand here — Ignition rides CSV1 at
+            // ~10 Hz, the enable checkbox mirrors the OnOff echo — so name the one that is actually off
+            // rather than printing the shared word. Ignition first: with the key off, the app toggle
+            // says nothing about why the field is down.
+            const ign = (typeof g_lastCsv1 === 'object' && g_lastCsv1 && g_lastCsv1.Ignition !== undefined)
+                ? Number(g_lastCsv1.Ignition) : NaN;
+            if (ign === 0) return 'ignition off';
             const enableOn = (() => { const cb = document.getElementById('header-alternator-enable'); return cb ? cb.checked : true; })();
             if (!enableOn) return 'alternator switched off';
             if (gLastChargeStage === 7) return 'charge cycle complete — resting';
@@ -11703,10 +11740,23 @@ function renderPanelSwitchRows(hiAsserted, floatAsserted) {
     setText('panelForceFloatEffect_ID', floatAsserted ? 'Force Maintain Mode engaged' : 'Force Maintain Mode off');
 }
 
+// The commissioning wizard's own override warning. Driven from the same echo as the gates below so
+// it appears and clears live during a run, and read straight from the CSV3 cache on wizard open so the
+// first step does not wait for the next event-driven frame.
+function cxPanelOverrideStrip(on) {
+    const el = document.getElementById('cx-panel-override-warn');
+    if (el) el.style.display = on ? 'block' : 'none';
+}
+function cxPanelOverrideStripSync() {
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    cxPanelOverrideStrip(!!c3 && Number(c3.PhysicalPanelOverride) === 1);
+}
+
 // Grey the two controls the switch panel takes over, so neither is ever a live but inert knob. The
 // source of truth is the firmware echo, not the checkbox, and nothing is greyed until that echo has
 // actually arrived. Called from the CSV3 handler, which is where the echo lands.
 function syncPanelOverrideGates(on) {
+    cxPanelOverrideStrip(on);
     for (const id of ['chargeRatePanelGate', 'maintainModePanelGate']) {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('is-gated', !!on);
@@ -14008,7 +14058,9 @@ function applyStaleStyleByAge(elementId, ageMs, staleThreshold = STALE_THRESHOLD
 // Active-limit cue: teal pill on the governing figure's label (ctrlLimiter 1 alt current,
 // 2 thermal, 3 CV voltage, 4 battery limit, 5 field at max duty → header duty readout,
 // 6 protection → RED duty pill + PROTECTION word left of the charge stage,
-// 7 battery above target → voltage pill + muted BATT > TARGET word in the same slot).
+// 7 battery above target → voltage pill + muted BATT > TARGET word in the same slot,
+// 10 manual field and 11 min-field floor → duty pill, 11 also gets a MIN FIELD word).
+// 10 needs no word of its own: the field-status readout already prints MANUAL.
 // Alt temp digits also go red >2°F over the limit.
 function updateHeaderLimiterColors(sa) {
     const RED = "#f44336", NORM = "var(--reading)";
@@ -14034,7 +14086,7 @@ function updateHeaderLimiterColors(sa) {
     pill('lbl-voltage', sa.ibv, STALE_THRESHOLD_DEFAULT_MS, lim === 3 || lim === 7 || lim === 9);
     pill('lbl-alt-current', sa.measuredAmps, STALE_THRESHOLD_DEFAULT_MS, lim === 1);
     pill('lbl-batt-current', sa.bcur, STALE_THRESHOLD_DEFAULT_MS, lim === 4 || lim === 8);
-    pill('duty-pill-wrap', sa.dutyCycle, STALE_THRESHOLD_DEFAULT_MS, lim === 5);
+    pill('duty-pill-wrap', sa.dutyCycle, STALE_THRESHOLD_DEFAULT_MS, lim === 5 || lim === 10 || lim === 11);
     // Code 6 (protection): red duty pill + red PROTECTION word inline left of the stage word
     const dw = document.getElementById('duty-pill-wrap');
     const want6 = (sa.dutyCycle <= STALE_THRESHOLD_DEFAULT_MS) && lim === 6;
@@ -14043,9 +14095,13 @@ function updateHeaderLimiterColors(sa) {
     if (pn) { const d = (lim === 6) ? '' : 'none'; if (pn.style.display !== d) pn.style.display = d; }
     const bn = document.getElementById('battgt-note');
     if (bn) { const d = (lim === 7) ? '' : 'none'; if (bn.style.display !== d) bn.style.display = d; }
-    // Codes 8/9 (BMS charge limits, DVCC follow): the user must always see WHO is limiting
-    const dn = document.getElementById('bms-note');
+    // Codes 8/9 (external charge limits, DVCC follow): the user must always see WHO is limiting
+    const dn = document.getElementById('extlim-note');
     if (dn) { const d = (lim === 8 || lim === 9) ? '' : 'none'; if (dn.style.display !== d) dn.style.display = d; }
+    // Code 11 (min field floor): the field can't go lower, so output is higher than the loop wants —
+    // the one limiter that pushes output UP, and the reason a full bank keeps taking current at idle.
+    const mf = document.getElementById('minfield-note');
+    if (mf) { const d = (lim === 11) ? '' : 'none'; if (mf.style.display !== d) mf.style.display = d; }
 }
 
 function updateAllStalenessStyles() {
@@ -14343,6 +14399,7 @@ function armSettings() {
         })
         .then(j => {
             if (j && j.armed) applySettingsUnlockUI();
+            renderArmLockNotice(j);
             if (button) button.disabled = false;
         })
         .catch(err => {
@@ -14367,9 +14424,42 @@ function syncArmState() {   // returns the round trip so a caller that must see 
             if (!j) return;
             if (j.armed && !settingsUnlocked) applySettingsUnlockUI();
             else if (!j.armed && settingsUnlocked) applySettingsLockUI();
+            renderArmLockNotice(j);
         })
         .catch(() => {});
 }
+
+// The auto-lock notice is ONE flag on the device, not one per browser: the window running out is
+// a device event, so every client that arrives sees it and any one of them can clear it. Per-client
+// (sessionStorage) would leave the device flag set forever, and a lock from last week would greet
+// every new tab. Two phones therefore see it once each, and the first ✕ settles it for both.
+let armLockAcked = false;   // local mute covering the gap between the ✕ and the device confirming
+
+function renderArmLockNotice(j) {
+    const el = document.getElementById('armlock-notice');
+    if (!el) return;
+    if (!j || !j.lockNotice) { armLockAcked = false; el.style.display = 'none'; return; }
+    if (armLockAcked) return;   // an in-flight poll answered before the ack must not bring it back
+    const ep = Number(j.lockEpoch);
+    // Same 2020 floor the device-clock readout uses: firmware sends 0 when no source has ever set
+    // the clock, and a garbage epoch must print no time rather than a 1970 date stated as fact.
+    const when = (Number.isFinite(ep) && ep > 1577836800)
+        ? ' at ' + new Date(ep * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+          + ' on ' + new Date(ep * 1000).toLocaleDateString()
+        : '';
+    const txt = document.getElementById('armlock-notice-text');
+    if (txt) txt.textContent = 'Settings locked themselves' + when
+        + ' — the 30 minute window ran out with no interface connected. Press Unlock Settings before making changes.';
+    el.style.display = 'block';
+}
+
+function dismissArmLockNotice() {
+    armLockAcked = true;
+    const el = document.getElementById('armlock-notice');
+    if (el) el.style.display = 'none';
+    if (!DEMO_MODE) fetch(buildURL('/armSettings?ackLock=1')).catch(() => { });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     syncArmState();
     setInterval(syncArmState, 30000);
@@ -14463,7 +14553,7 @@ async function submitCapLimitModeImmediately(desiredValue) {
         method: 'GET',
         cache: 'no-store'
     }, 4000);
-    if (!r.ok) throw new Error('rejected (HTTP ' + r.status + ')');
+    if (!r.ok) { const e = new Error('rejected (HTTP ' + r.status + ')'); e.deviceRejected = true; throw e; }
     return r;
 }
 
@@ -14481,9 +14571,10 @@ function handleCapModeToggle(mode) {
     setCapMode(mode); // optimistic UI immediately
 
     submitCapLimitModeImmediately(desiredValue).catch(err => {
+        if (!err || !err.deviceRejected) return;   // timeout proves nothing — let the echo reconcile (HiLow pattern)
         pendingToggles.delete('capLimitMode');
         setCapMode(mode === 'kw' ? 'amps' : 'kw');   // undo the optimistic flip (HiLow pattern)
-        xAlert('Cap mode switch failed — the regulator did not change mode. ' + err);
+        xAlert('Cap mode switch failed — the regulator refused the change. ' + err);
     });
 }
 
@@ -14675,11 +14766,13 @@ function updateTogglesFromData(data) {
         updateCheckbox("cvRecovEnable_checkbox", data.cvRecovEnable, "cvRecovEnable");
         updateCheckbox("cvRecovBoostEnable_checkbox", data.cvRecovBoostEnable, "cvRecovBoostEnable");
         // Manual-test slew-mode pill: reflect the saved mode unless the user just clicked (pend window guards the flicker).
-        if (data.testSlewMode !== undefined && Date.now() > _testSlewModePendMs) {
+        // Number.isFinite before the | 0: NaN|0 is 0, which would tick the "Off" pill and assert a mode
+        // the device never sent.
+        if (Number.isFinite(data.testSlewMode) && Date.now() > _testSlewModePendMs) {
             const _tsr = document.querySelector('.seg-pill input[name="testSlewMode"][value="' + (data.testSlewMode | 0) + '"]');
             if (_tsr) _tsr.checked = true;
         }
-        if (data.cvTestSlewMode !== undefined && Date.now() > _cvTestSlewModePendMs) {
+        if (Number.isFinite(data.cvTestSlewMode) && Date.now() > _cvTestSlewModePendMs) {
             const _cvr = document.querySelector('.seg-pill input[name="cvTestSlewMode"][value="' + (data.cvTestSlewMode | 0) + '"]');
             if (_cvr) _cvr.checked = true;
         }
@@ -14861,7 +14954,7 @@ function previewCvAlpha() {
 // (g_lastCsv3) and the live battery temperature, its source, the applied scale and the inert flag from
 // CSV2 (g_lastCsv2) — two channels, so it reads the caches rather than the single `data` arg. Honours
 // the °F/°C toggle via toDisplayTemp(). CommissionTempF is sent °F×10 with -32768 = unset;
-// CommissionTempSrc 0 = legacy = board; cvTempDerateScale is ×1000; battTempActiveF is °F×10 with -9999 = none.
+// CommissionTempSrc 0 = legacy = board; cvTempDerateScale is ×1000; battTempActiveF is °F×10 with ROLL_EMPTY = none.
 function renderBattTempDerate() {
     const el = document.getElementById('battTempDerate_status');
     if (!el) return;
@@ -14901,7 +14994,9 @@ function renderBattTempDerate() {
 const BATT_TEMP_SRC_NAMES = ['none', 'probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'board temperature'];
 // battTempSource setting labels (index = wire code): 0 Automatic .. 6 None.
 const BATT_TEMP_SOURCE_OPTION_NAMES = ['Automatic', 'Battery probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'Board temperature', 'None'];
-const TEMP_NA_X10 = -9999;   // the CSV2 x10 temperature fields carry this for NAN
+const TEMP_NA_X10 = -9999;   // pre-0.0.5 firmware sent this for NAN on the CSV2 x10 temperature
+                             // fields; they now send ROLL_EMPTY. Kept as a FLOOR (n <= TEMP_NA_X10)
+                             // so this bundle still reads an older device correctly.
 
 function tempX10(v) {
     const n = Number(v);
@@ -14946,7 +15041,7 @@ function renderBattTempReadouts(data) {
     const extraF = tempX10(data.ExtraTempF);
     set('extraTemp_ID', fmt(extraF));
     set('extraTempSetup_ID', fmt(extraF));
-    const xwm = document.querySelector('#extraTemp-display .wm-inline');   // NAN watermarks arrive as 0 (wmIgnSafe): hide them until the extra probe has read
+    const xwm = document.querySelector('#extraTemp-display .wm-inline');   // absent-probe watermarks now render "—"; this hides the row outright until the extra probe has read
     if (xwm) { const d = Number.isFinite(extraF) ? '' : 'none'; if (xwm.style.display !== d) xwm.style.display = d; }
 }
 
@@ -15177,7 +15272,9 @@ async function submitChargeRateModeImmediately(desiredValue) {
     const params = new URLSearchParams();
     params.set('HiLow', String(desiredValue));
     const r = await fetchWithTimeout(buildURL(`/get?${params.toString()}`), { method: 'GET', cache: 'no-store' }, 4000);
-    if (!r.ok) throw new Error('rejected (HTTP ' + r.status + ')');
+    // deviceRejected marks the ONLY case that proves the device did not act. A timeout/abort out of
+    // fetchWithTimeout proves nothing — callers must not report it as a refusal.
+    if (!r.ok) { const e = new Error('rejected (HTTP ' + r.status + ')'); e.deviceRejected = true; throw e; }
     return r;
 }
 
@@ -15203,9 +15300,14 @@ function handleChargeRateModeToggle(mode) {
     pendingToggles.set('HiLow', { desiredValue: desiredValue, baseRev: lastSeenRev });
     setChargeRateMode(mode); // optimistic UI immediately
     submitChargeRateModeImmediately(desiredValue).catch(err => {
+        // Only a refusal (403 while locked) proves the mode did not move. A 4s timeout does not: the
+        // write is normally applied and echoed a moment later, so reverting here bounced the buttons
+        // and the alert claimed something false. Leave the pending entry alone and let the CSVData3
+        // HiLow reconciler settle it against the device (it accepts the device value after 2.5s).
+        if (!err || !err.deviceRejected) return;
         pendingToggles.delete('HiLow');
         setChargeRateMode(mode === 'low' ? 'high' : 'low');   // undo the optimistic flip
-        xAlert('Charge rate switch failed — the regulator did not change mode. ' + err);
+        xAlert('Charge rate switch failed — the regulator refused the change. ' + err);
     });
 }
 
@@ -15421,8 +15523,12 @@ function computeStripState() {
     // Zero-output stand-down (ctrlLimiter 7): battery/other source holds the bus above target —
     // field parked at floor delivering nothing. Below the test words, above the stage words.
     if (limFresh && Number(window._ctrlLimiter) === 7) return { label: 'BATT > TGT', cls: 'st-idle' };
-    // BMS charge limit binding (ctrlLimiter 8 CCL / 9 CVL): still charging, externally limited
-    if (limFresh && (Number(window._ctrlLimiter) === 8 || Number(window._ctrlLimiter) === 9)) return { label: 'BMS LIMIT', cls: 'st-charging' };
+    // External charge limit binding (ctrlLimiter 8 CCL / 9 CVL): still charging, limited by a
+    // battery BMS or a gateway passing limits on. Named for the fact, not the guess at the source.
+    if (limFresh && (Number(window._ctrlLimiter) === 8 || Number(window._ctrlLimiter) === 9)) return { label: 'EXT LIMIT', cls: 'st-charging' };
+    // Min field floor binding (ctrlLimiter 11): charging, but the keep-alive floor is setting output
+    // rather than the loop. Below EXT so an externally-imposed limit still wins the one word slot.
+    if (limFresh && Number(window._ctrlLimiter) === 11) return { label: 'MIN FIELD', cls: 'st-charging' };
     if (fs === 'ACTIVE')        return { label: cs || 'ACTIVE', cls: 'st-charging' };
     if (fs === 'RAMP DOWN')     return { label: 'RAMP DOWN', cls: 'st-charging' };
     if (fs === 'MANUAL')        return { label: 'MANUAL', cls: 'st-manual' };
@@ -15960,7 +16066,7 @@ window.addEventListener("load", function () {
             }
 
             const data = Object.fromEntries(CSV1_FIELDS.map((key, i) => [key, values[i]]));
-            battNaToNaN(data, BATT_NA_KEYS_CSV1);
+            battNaToNaN(data);
             g_lastCsv1 = data;  // cache for the diagnostics snapshot in log exports
             noteStreamRx('csv1');
 
@@ -16110,7 +16216,8 @@ window.addEventListener("load", function () {
                         newTextContent = (value / 60).toFixed(1);
                     }
                     else if (key === "AlternatorTemperatureF") {
-                        newTextContent = toDisplayTemp(value / 100).toFixed(1);
+                        // NaN here = SENSOR_NA_KEYS_CSV1 rewrote the no-probe sentinel; never print "NaN"
+                        newTextContent = Number.isFinite(value) ? toDisplayTemp(value / 100).toFixed(1) : "—";
                     }
                     // Currents (Alt + Batt) — 3 sig figs: integer at ≥100, 1 dec at ≥10, 2 dec below.
                     else if (key === "MeasuredAmps" || key === "Bcur") {
@@ -16294,12 +16401,12 @@ window.addEventListener("load", function () {
             }
 
             const data = Object.fromEntries(CSV2_FIELDS.map((key, i) => [key, values[i]]));
-            battNaToNaN(data, BATT_NA_KEYS_CSV2);
+            battNaToNaN(data);
             g_lastCsv2 = data;  // cache for the diagnostics snapshot in log exports
             noteStreamRx('csv2');
             renderBattTempDerate();   // live battery temp + applied derate scale arrive on CSV2
             renderBattTempReadouts(data);
-            try { whyPanelRefreshOpen(); } catch (e) { }   // Limit panel: BMS state/limits + thermal derate ride CSV2
+            try { whyPanelRefreshOpen(); } catch (e) { }   // Limit panel: external limits/state + thermal derate ride CSV2
             renderLoopBlame(data);    // worst field-on pass attribution line
             renderImuInstallWarning(data.imuInstallCode);
             // Active RPM row highlight in the cap/learning table — currentRPMTableIndex
@@ -16510,7 +16617,7 @@ window.addEventListener("load", function () {
                         newTextContent = (value / 10).toFixed(1);
                     }
                     else if (key === "faDomTempF" || key === "faSesPkpkTempF") {
-                        newTextContent = (value === -1) ? "—" : Math.round(toDisplayTemp(value / 10));  // -1 = SafeInt NaN sentinel (no probe at capture)
+                        newTextContent = !Number.isFinite(value) ? "—" : Math.round(toDisplayTemp(value / 10));  // non-finite = SafeInt NaN sentinel, NaN'd at parse (no probe at capture)
                     }
                     else if (key === "faDomEpoch" || key === "faSesPkpkEpoch") {
                         newTextContent = (value > 1577836800) ? new Date(value * 1000).toLocaleDateString() : "—";
@@ -17402,7 +17509,7 @@ window.addEventListener("load", function () {
                 let hWord, hDetail;
                 if (!portOn) {
                     hWord = 'CAN receive off';
-                    hDetail = 'turn on Receive NMEA2K Data (NMEA 2000 card) or Follow BMS Charge Limits below';
+                    hDetail = 'turn on Receive NMEA2K Data (NMEA 2000 card) or Follow External Charge Limits below';
                 } else if (!everHeard) {
                     hWord = 'none heard';
                     hDetail = 'nothing decoded yet';
@@ -17640,6 +17747,7 @@ window.addEventListener("load", function () {
             }
 
             const data = Object.fromEntries(CSV4_FIELDS.map((key, i) => [key, values[i]]));
+            battNaToNaN(data);
             g_lastCsv4 = data;  // cache for the diagnostics snapshot in log exports
             noteStreamRx('csv4');
 
@@ -17673,7 +17781,7 @@ window.addEventListener("load", function () {
             }
 
             // Minimal On/Off Control status row (Setup > Integrations). Raw pin at 2 Hz so an
-            // installer can toggle their BMS output and watch it follow before enabling the gate.
+            // installer can toggle their BMS on/off output and watch it follow before enabling the gate.
             if (data.bmsSignalActive !== undefined) renderBmsSignalRow(Number(data.bmsSignalActive));
             if (data.panelHiRateInput !== undefined) {
                 renderPanelSwitchRows(Number(data.panelHiRateInput) === 1, Number(data.panelForceFloatInput) === 1);
@@ -17761,6 +17869,7 @@ window.addEventListener("load", function () {
             }
 
             const data = Object.fromEntries(CSV3_FIELDS.map((key, i) => [key, values[i]]));
+            battNaToNaN(data);
             g_lastCsv3 = data;  // cache for cvBinToCsv header
             noteStreamRx('csv3');
 
@@ -18121,17 +18230,20 @@ window.addEventListener("load", function () {
                     if (minDutyInput && minDutyInput !== focused && !dirtyInputs.has(minDutyInput.id)) {
                         const p = pendingTableValues.get(minDutyInput.id);
                         if (p) {
+                            // 2 dp, not 1: the unmeasured-bin baseline is 0.25%, which rounds to
+                            // "0.3" at 1 dp and then never matches the typed value, so the pending
+                            // highlight hangs until its deadline instead of confirming.
                             const incoming = data[`rpmMinDutyTable${i}`] !== undefined
-                                ? (data[`rpmMinDutyTable${i}`] / 100).toFixed(1)
+                                ? (data[`rpmMinDutyTable${i}`] / 100).toFixed(2)
                                 : undefined;
-                            const confirmed = incoming !== undefined && Math.abs(Number(incoming) - Number(p.value)) < 0.05;
+                            const confirmed = incoming !== undefined && Math.abs(Number(incoming) - Number(p.value)) < 0.006;
                             if (confirmed || Date.now() >= p.deadlineMs) {
                                 minDutyInput.classList.remove('table-input-pending');
                                 pendingTableValues.delete(minDutyInput.id);
                                 if (incoming !== undefined) minDutyInput.value = incoming;
                             }
                         } else if (data[`rpmMinDutyTable${i}`] !== undefined) {
-                            minDutyInput.value = (data[`rpmMinDutyTable${i}`] / 100).toFixed(1);
+                            minDutyInput.value = (data[`rpmMinDutyTable${i}`] / 100).toFixed(2);
                         }
                     }
                 }
@@ -18696,6 +18808,9 @@ function showSubTab(parentTab, subTabName, evt = null) {
         if (typeof window.initBaroPanel === 'function') window.initBaroPanel();
         // Draw the Wind Trend plot now it's visible (it needs a non-zero width to size).
         if (typeof windTrendRender === 'function') setTimeout(() => { try { windTrendRender(); } catch (e) { } }, 60);
+    }
+    // Solar ledger plots live on the Integrations sub-tab; solarLedgerRender bails while its container is hidden.
+    if (parentTab === 'livedata' && subTabName === 'integrations') {
         if (typeof solarLedgerTabOpened === 'function') setTimeout(() => { try { solarLedgerTabOpened(); } catch (e) { } }, 60);
     }
 
@@ -18912,7 +19027,7 @@ function goToDiagSettings(ck) {
 
 // Header safety strip for charge-limit follow (#dvcc-banner). Follow ON while the state is
 // anything but FOLLOWING means the clamps are NAN and the regulator is running its own targets
-// — safe in direction, but an owner who enabled follow may believe the BMS is the backstop and
+// — safe in direction, but an owner who enabled follow may believe the sender is the backstop and
 // have left local targets that only made sense behind it. States: 1 waiting, 4 stale,
 // 5 untrusted. Never call this a protection: no limit received is not a fault, it is the
 // absence of a request.
@@ -18926,19 +19041,19 @@ function updateDvccNotice(st, srcAddr) {
     if (st === 5) {
         // Latched — it needs a deliberate reset, so waiting out a grace period buys nothing.
         dvccNoticeSince = 0;
-        msg = '<b>BMS CHARGE LIMITS REJECTED</b> &mdash; an implausible value was received. This '
+        msg = '<b>EXTERNAL CHARGE LIMITS REJECTED</b> &mdash; an implausible value was received. This '
             + "regulator's own targets are in control until the trust latch is reset.";
     } else if (st === 1 || st === 4) {
         if (!dvccNoticeSince) dvccNoticeSince = Date.now();
         if (Date.now() - dvccNoticeSince >= DVCC_NOTICE_GRACE_MS) {
             msg = (st === 4)
-                ? '<b>BMS CHARGE LIMITS LOST</b> &mdash; the sender went silent. This '
+                ? '<b>EXTERNAL CHARGE LIMITS LOST</b> &mdash; the sender went silent. This '
                   + "regulator's own targets are in control."
                 : ((srcAddr === 255 || !isFinite(srcAddr))
-                    ? '<b>NO BMS CHARGE LIMITS</b> &mdash; follow is on but nothing is arriving. This '
+                    ? '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; follow is on but nothing is arriving. This '
                       + "regulator's own targets are in control. Check the CAN wiring, the bus "
                       + 'termination, and the selected dialect.'
-                    : '<b>NO BMS CHARGE LIMITS</b> &mdash; the sender is on the bus but is not '
+                    : '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; the sender is on the bus but is not '
                       + "publishing limits (CVL/CCL). This regulator's own targets are in control.");
         }
     } else {
@@ -19688,17 +19803,70 @@ function updateLifeIndicators(data) {
 
 // Open-loop field modes (manual / limp-home) command duty directly, bypassing the current-limiting
 // loop. On a 24/36/48V bank each duty-percent drives ~2×/3×/4× the field current of 12V, so a duty that's
-// safe at 12V can over-current the field. Warn (don't cap) each time the user enters one of these
-// modes on a higher-voltage system. window._nominalStored is the system voltage from the Vessel Info fetch/save.
-function warnHighVoltageOpenLoop(modeName) {
+// safe at 12V can over-current the field. window._nominalStored is the system voltage from the Vessel
+// Info fetch/save. Returns a paragraph to append to the mode's own warning, or '' on a 12V bank.
+function openLoopHighVoltageNote() {
     const nsv = parseInt(window._nominalStored, 10) || 12;
-    if (nsv <= 12) return;
-    const mult = nsv / 12;
-    xAlert(modeName + ' on a ' + nsv + 'V system\n\n'
-        + modeName + ' commands field duty directly, bypassing the current-limiting loop. At ' + nsv
-        + 'V each duty-percent drives about ' + mult + '× the field current of a 12V system, so a '
-        + 'duty that is safe at 12V can over-current the field here.\n\n'
-        + 'Keep the commanded duty low and raise it gradually while watching field/output current.');
+    if (nsv <= 12) return '';
+    return '\n\nThis is a ' + nsv + 'V system. Each duty-percent drives about ' + (nsv / 12)
+        + '× the field current of a 12V system, so a duty that is safe at 12V can over-current the '
+        + 'field here. Keep the commanded duty low and raise it gradually while watching field and '
+        + 'output current.';
+}
+
+// Everything manual mode stops enforcing, in the firmware's own priority order (selectFieldControlMode
+// in 6_functions.ino returns MODE_NORMAL_MANUAL at PRIORITY 2, above every check below it) plus the
+// field floor, which governor_apply skips for manual. Keep this list in step with that function —
+// a warning that under-states the bypass list is worse than no warning.
+function manualFieldBypassText() {
+    return 'Manual mode drives the field straight from the Manual Field PWM box. It is a bench and '
+        + 'diagnostic mode: while it is on, the regulator stops protecting the alternator and the battery.\n\n'
+        + 'No longer enforced:\n'
+        + '• Alternator temperature — no cut-back, no over-temperature shutdown, and no cut when the '
+        + 'temperature sensor stops reporting. The alternator can cook.\n'
+        + '• Min Field % and the per-speed Keep-Alive floor — a PWM of 0 really means zero field, so a '
+        + 'tachometer driven off the stator will stop reading.\n'
+        + '• Engine speed — no low-RPM cut, no engine-stopped cut, no implausible-tachometer cut. The '
+        + 'field stays energized with the engine stopped.\n'
+        + '• Battery too cold and too hot to charge.\n'
+        + '• Battery voltage plausibility and the two-sensor disagreement checks.\n'
+        + '• The timed over-voltage steps and any protection lockout already running.\n'
+        + '• The whole current-control loop: no charge current target, no battery current limit, no '
+        + 'externally sent limits, no charge stages.\n\n'
+        + 'Still enforced: the master On/Off switch, the hardware over-voltage shutdown (Alternator Hard '
+        + 'Shutdown V), and the Max Field % / Max Field Volts ceiling.'
+        + openLoopHighVoltageNote();
+}
+
+// Entering manual is the only switch in the app that REMOVES protections, so it asks first and puts
+// the switch back if the answer is no. Leaving manual (back to PID) always goes straight through.
+// The confirm has to run before handleUserToggle, or a cancel would leave a pending desired value
+// behind that the next settings echo would fight.
+function manualFieldToggleChanged(cb) {
+    if (!cb) return;
+    const wantManual = !cb.checked;                           // checked = PID; the position just chosen
+    if (!wantManual) { manualFieldToggleApply(cb, false); return; }   // → PID, nothing to warn about
+    xConfirm(manualFieldBypassText(), {
+        title: 'Manual field mode — protections off',
+        okText: 'Switch to Manual',
+        cancelText: 'Stay on PID'
+    }).then(ok => {
+        if (ok) { manualFieldToggleApply(cb, true); return; }
+        cb.checked = true;                             // back to PID; nothing was ever sent
+        syncSegmented('ManualFieldToggle_checkbox');   // abSegClick already painted Manual; repaint PID
+    });
+}
+
+// Both branches assert the switch position rather than reading it: nothing holds a pending toggle
+// while the confirm is open, so a settings echo arriving mid-dialog repaints the switch from firmware
+// state, and a later read of cb.checked would send the opposite of what the user just agreed to.
+function manualFieldToggleApply(cb, manual) {
+    cb.checked = !manual;
+    if (!handleManualFieldToggle('ManualFieldToggle_checkbox')) return;
+    syncSegmented('ManualFieldToggle_checkbox');
+    const form = cb.form || cb.closest('form');
+    if (form) form.submit();
+    submitMessage();
 }
 
 function handleManualFieldToggle(checkboxId) {
@@ -19708,7 +19876,6 @@ function handleManualFieldToggle(checkboxId) {
     // ESP32 convention is inverted: 0 = PID, 1 = Manual
     // So when checkbox is checked (PID), we send 0; unchecked (Manual), we send 1
     const invertedVal = cb.checked ? '0' : '1';
-    if (invertedVal === '1') warnHighVoltageOpenLoop('Manual field mode');  // entering open-loop manual
 
     const result = handleUserToggle(checkboxId, 'ManualFieldToggle', 'ManualFieldToggle');
 
@@ -21041,10 +21208,12 @@ function buildStreamFreshness() {
 // carries the per-block verdict — read it before trusting any value here against a same-click log.
 // NOTE: values are RAW as transmitted (display /N scaling is applied later per-field), so e.g.
 // BatteryV reads 1401, not 14.01 — see the CSV field map for per-field scale factors.
+// One exception: the firmware's "not available" sentinel (ROLL_EMPTY, -2000000000) is rewritten to
+// NaN at parse time and so serialises here as JSON null. A null means no reading, not a zero.
 function getDiagnosticsSnapshot() {
     return {
         captured_at: new Date().toISOString(),
-        note: 'raw as-transmitted values (pre display scaling)',
+        note: 'raw as-transmitted values (pre display scaling); null = no reading (ROLL_EMPTY sentinel)',
         freshness: buildStreamFreshness(),
         csv1: g_lastCsv1 || null,
         csv2: g_lastCsv2 || null,
@@ -21931,10 +22100,17 @@ let _windWmGale = '';
 // needle animates smoothly at frame rate. The wind values themselves ride CSV2 (the
 // NMEA wind fields are in the CSV2 payload), so they're cached in windLiveOnCsv2 below.
 function windLiveOnCsv1(data) {
+    // Apparent wind can be absent (no instrument): rotate(NaN ...) is an invalid SVG attribute, which
+    // parks the needle at 0 deg and reads as "wind dead ahead". Hide the needle instead and blank the
+    // LCDs — a pointer left at its last angle over two blank readouts is the same lie more quietly.
+    const aDirOk = Number.isFinite(_windCsv1.aDir), aSpdOk = Number.isFinite(_windCsv1.aSpd);
     const needle = document.getElementById('windNeedle');
-    if (needle) needle.setAttribute('transform', 'rotate(' + _windCsv1.aDir + ' 60 60)');
-    const lcdS = document.getElementById('windLcdSpd'); if (lcdS) lcdS.textContent = _windCsv1.aSpd.toFixed(1);
-    const lcdA = document.getElementById('windLcdAng'); if (lcdA) lcdA.textContent = Math.round(_windCsv1.aDir) + '°';
+    if (needle) {
+        needle.style.visibility = aDirOk ? 'visible' : 'hidden';
+        if (aDirOk) needle.setAttribute('transform', 'rotate(' + _windCsv1.aDir + ' 60 60)');
+    }
+    const lcdS = document.getElementById('windLcdSpd'); if (lcdS) lcdS.textContent = aSpdOk ? _windCsv1.aSpd.toFixed(1) : '—';
+    const lcdA = document.getElementById('windLcdAng'); if (lcdA) lcdA.textContent = aDirOk ? Math.round(_windCsv1.aDir) + '°' : '—';
 }
 
 // CSV4 / NavStream (~2Hz): cache the scaled wind values (the NMEA wind fields now ride CSV4).
@@ -24798,6 +24974,7 @@ function openCommissionModal() {
            handled: (paused && paused.handled) || {},   // stage → 'skip' | 'manual' for this run's Finish summary
            paused: paused };
     document.getElementById('commission-modal-overlay').style.display = 'block';
+    cxPanelOverrideStripSync();
     // Make the panel draggable (idempotent) — drag by the header, clamped on-screen.
     makePanelDraggable(document.getElementById('commission-modal-panel'),
                        document.getElementById('commission-drag-handle'));
@@ -25080,6 +25257,10 @@ function rpmAlignRender() {
     document.getElementById('rpmalign-body').innerHTML =
         '<p style="font-size:15px;line-height:1.5;"><strong>Start the engine</strong> — it needs to be running so a live engine-speed reading shows below. Idle is fine; no field is driven here.</p>' +
         '<p style="font-size:15px;line-height:1.5;">Make the regulator\'s engine-speed reading match your boat\'s tachometer (or a handheld tachometer). Extreme precision is not needed here.</p>' +
+        // On a restart the two values below are the ones already in use — say so, or the screen reads as
+        // if it wants fresh numbers and invites an unnecessary rescale (which erases the RPM-indexed learning).
+        (_commPrepFirstInstall ? '' :
+          '<p style="font-size:14px;line-height:1.5;color:#9a9a9a;">These are the settings already in use, not fresh defaults. If the reading below still matches your tachometer, change nothing and press Continue.</p>') +
         '<div style="margin:10px 0 16px; padding:10px 12px; background:#222; border-radius:6px; display:flex; align-items:center; justify-content:space-between;">' +
           '<span style="font-size:13px; color:#888;">Regulator RPM</span>' +
           '<strong id="cx-rpma-rpm" style="color:#2ec4b6; font-size:22px;">—</strong>' +
@@ -26659,11 +26840,12 @@ function cxRenderMatrix(b) {
             '<div style="position:relative;">' +
             '<canvas id="cxGame" style="display:block; width:100%; height:400px; background:#161618; border-radius:6px;"></canvas>' +
             '<div id="cxGameToast" style="position:absolute; z-index:2; left:50%; transform:translateX(-50%); top:12px; background:rgba(240,80,60,.92); color:#fff; font-size:12px; font-weight:600; padding:4px 12px; border-radius:12px; opacity:0; transition:opacity .25s; pointer-events:none; max-width:calc(100% - 16px); box-sizing:border-box; text-align:center;"></div>' +
-            // Hold-fire overlay: covers the game between field-arm and Start Shooting (hidden during idle
-            // detection and once shooting). cxGameArmUpdate drives it each frame; initial display follows
-            // the live flags so a mid-sweep re-render of this template doesn't flash it back over the game.
-            '<div id="cxGameArm" style="position:absolute; z-index:1; inset:0; display:' + ((cx.matrixShooting || !cx.rtFieldArmed) ? 'none' : 'flex') + '; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:0 18px; box-sizing:border-box; text-align:center; background:rgba(22,22,24,0.6); border-radius:6px;">' +
-              '<div id="cxGameArmMsg" style="color:#cfd2d6; font-size:14px; font-weight:600; max-width:440px; line-height:1.45;">Bringing the alternator up to the test current…</div>' +
+            // Hold-fire band: the prose half of the pre-shooting screen, from Start Game until Start
+            // Shooting. It carries no scrim — the canvas behind it is drawing the title card, not the
+            // playfield — and sits in the bottom third so the card's art and numbers stay clear above it.
+            // Initial display follows the live flag so a mid-sweep re-render can't flash it over the game.
+            '<div id="cxGameArm" style="position:absolute; z-index:1; inset:auto 0 0 0; height:34%; display:' + (cx.matrixShooting ? 'none' : 'flex') + '; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:0 18px 10px; box-sizing:border-box; text-align:center; border-radius:6px;">' +
+              '<div id="cxGameArmMsg" style="color:#cfd2d6; font-size:14px; font-weight:600; max-width:440px; line-height:1.45;">Hold the engine at idle — measuring your idle speed to set the capture band…</div>' +
               '<button id="cxGameArmBtn" onclick="cxGameBeginShooting()" class="btn-primary" style="display:none; padding:10px 28px; font-size:15px;">Start Shooting</button>' +
             '</div>' +
             '</div>' +
@@ -26720,7 +26902,6 @@ function cxMatrixStart() {
     cx.rtestState = undefined; cx.rtest = null; cx.rtestOn = false; cx.rtestRpm = 0;  // re-sweep → re-check resonance
     cxGame.binLo = 0; cxGame.bins = null; cxGame.seeded = false;  // band rebuilt after idle detection
     commissionRender();
-    cxGameToast('Sit at idle — detecting your idle RPM…');
     // Idle-adaptive capture band (§2.5): median of ~4 s of live RPM sets the band floor to idle−50
     // (a hardcoded 500 floor bricks the done button on engines idling above ~900). Snap to the
     // 50-RPM grid, clamp to [400, 1200], fall back to 500 if the reading is absent/nonsensical.
@@ -26940,6 +27121,93 @@ const cxGame = { active: false, raf: 0, lastT: 0, bins: null, seeded: false, bin
 const _cxInvBmp = ['00100000100', '00010001000', '00111111100', '01101110110',
                    '11111111111', '10111111101', '10100000101', '00011011000'].map(s => s.split('').map(Number));
 
+// Same bitmap, drawn centred on a point — for the title card's marching row (the playfield below
+// blits it inline against its own target column, so it can't share this).
+function cxInvSprite(g, xc, yc, px, col, alpha) {
+    g.globalAlpha = alpha; g.fillStyle = col;
+    const iw = 11 * px, ih = 8 * px;
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 11; c++)
+        if (_cxInvBmp[r][c]) g.fillRect(Math.round(xc - iw / 2 + c * px), Math.round(yc - ih / 2 + r * px), px, px);
+    g.globalAlpha = 1;
+}
+
+// 5×7 pixel font for the title card. Hand-rolled: the device serves this app off LittleFS with no
+// internet, so a webfont is impossible, and no system font has the invader bitmap's grain. Uppercase
+// and digits only — anything else renders as a blank cell.
+const _cxFont = {
+    A: '01110,10001,10001,11111,10001,10001,10001', B: '11110,10001,10001,11110,10001,10001,11110',
+    C: '01110,10001,10000,10000,10000,10001,01110', D: '11110,10001,10001,10001,10001,10001,11110',
+    E: '11111,10000,10000,11110,10000,10000,11111', F: '11111,10000,10000,11110,10000,10000,10000',
+    G: '01110,10001,10000,10111,10001,10001,01111', H: '10001,10001,10001,11111,10001,10001,10001',
+    I: '11111,00100,00100,00100,00100,00100,11111', J: '00111,00010,00010,00010,00010,10010,01100',
+    K: '10001,10010,10100,11000,10100,10010,10001', L: '10000,10000,10000,10000,10000,10000,11111',
+    M: '10001,11011,10101,10101,10001,10001,10001', N: '10001,11001,10101,10011,10001,10001,10001',
+    O: '01110,10001,10001,10001,10001,10001,01110', P: '11110,10001,10001,11110,10000,10000,10000',
+    Q: '01110,10001,10001,10001,10101,10010,01101', R: '11110,10001,10001,11110,10100,10010,10001',
+    S: '01111,10000,10000,01110,00001,00001,11110', T: '11111,00100,00100,00100,00100,00100,00100',
+    U: '10001,10001,10001,10001,10001,10001,01110', V: '10001,10001,10001,10001,10001,01010,00100',
+    W: '10001,10001,10001,10101,10101,11011,10001', X: '10001,10001,01010,00100,01010,10001,10001',
+    Y: '10001,10001,01010,00100,00100,00100,00100', Z: '11111,00001,00010,00100,01000,10000,11111',
+    '0': '01110,10001,10011,10101,11001,10001,01110', '1': '00100,01100,00100,00100,00100,00100,01110',
+    '2': '01110,10001,00001,00010,00100,01000,11111', '3': '11111,00010,00100,00010,00001,10001,01110',
+    '4': '00010,00110,01010,10010,11111,00010,00010', '5': '11111,10000,11110,00001,00001,10001,01110',
+    '6': '00110,01000,10000,11110,10001,10001,01110', '7': '11111,00001,00010,00100,01000,01000,01000',
+    '8': '01110,10001,10001,01110,10001,10001,01110', '9': '01110,10001,10001,01111,00001,00010,01100',
+    '-': '00000,00000,00000,11111,00000,00000,00000', '.': '00000,00000,00000,00000,00000,01100,01100'
+};
+for (const k in _cxFont) _cxFont[k] = _cxFont[k].split(',');
+const _CXG_ADV = 6;   // glyph is 5 columns wide; the 6th is the inter-letter gap
+function cxPxTextW(str, px) { return (str.length * _CXG_ADV - 1) * px; }
+// Always centred on xc — every line on the title card is. Coordinates round to whole pixels or the
+// blocks smear at fractional dpr scales.
+function cxPxText(g, str, xc, y, px, col) {
+    str = String(str).toUpperCase();
+    const x = Math.round(xc - cxPxTextW(str, px) / 2);
+    y = Math.round(y); g.fillStyle = col;
+    for (let i = 0; i < str.length; i++) {
+        const gl = _cxFont[str[i]];
+        if (!gl) continue;
+        for (let r = 0; r < 7; r++) for (let c = 0; c < 5; c++)
+            if (gl[r][c] === '1') g.fillRect(x + (i * _CXG_ADV + c) * px, y + r * px, px, px);
+    }
+}
+let _cxStars = null;   // attract-screen starfield, generated once per page
+
+// Title card — owns the canvas from Start Game until Start Shooting. The playfield used to draw live
+// through that whole stretch (invaders wobbling, ship tracking the throttle, band highlight moving)
+// while nothing was being scored: the fold window does not open until cxGameBeginShooting. Numbers
+// only up here; the full sentence and the button live in the #cxGameArm overlay over the bottom band.
+function cxGameAttract(g, w, h, t) {
+    if (!_cxStars) _cxStars = Array.from({ length: 70 },
+        () => ({ x: Math.random(), y: Math.random(), s: Math.random() }));
+    for (const st of _cxStars) {
+        const x = ((st.x + t * 0.006 * (0.3 + st.s)) % 1) * w, d = 1 + Math.round(st.s);
+        g.fillStyle = 'rgba(255,255,255,' + (0.06 + st.s * 0.16).toFixed(3) + ')';
+        g.fillRect(Math.round(x), Math.round(st.y * h), d, d);
+    }
+    const march = Math.round(Math.sin(t * 1.1) * 7);
+    const ipx = Math.max(1.6, Math.min(2.8, w / 240)), gap = Math.max(32, Math.min(48, w / 14));
+    for (let i = 0; i < 7; i++)
+        cxInvSprite(g, w / 2 + (i - 3) * gap + march, h * 0.115, ipx,
+                    i % 3 === 0 ? '#2ec4b6' : i % 3 === 1 ? '#f0a500' : '#8a8a92', 0.9);
+    cxPxText(g, 'X ENGINEERING', w / 2, h * 0.185, Math.max(2, Math.min(3, Math.floor(w * 0.55 / 77))), '#2ec4b6');
+    const big = Math.max(3, Math.min(6, Math.floor(w * 0.86 / 59)));   // 'ALTERNATOR' is 59 font units wide
+    const ty = h * 0.255;
+    cxPxText(g, 'ALTERNATOR', w / 2, ty, big, '#f0a500');
+    cxPxText(g, 'INVADERS', w / 2, ty + big * 9, big, '#f0a500');
+    // The two numbers that gate the start. Before the field is armed there is no current to report,
+    // so this reads engine speed — the thing the operator is being asked to hold.
+    const npx = Math.max(2, Math.min(4, Math.floor(w / 160)));
+    const ry = ty + big * 16 + 18;
+    if (!cx.rtFieldArmed) {
+        cxPxText(g, isFinite(cx.liveRpm) ? Math.round(cx.liveRpm) + ' RPM' : 'READING RPM', w / 2, ry, npx, '#8a8a92');
+    } else {
+        const a = isFinite(cx.liveAmps) ? cx.liveAmps : 0;
+        cxPxText(g, a.toFixed(0) + ' A OF ' + (cx.matrixLevelA || 0).toFixed(0) + ' A',
+                 w / 2, ry, npx, cxGame.armReady ? '#2ec4b6' : '#f0a500');
+    }
+}
+
 function cxGameStart() {
     const strip = document.getElementById('cx-rpm-strip');
     if (strip) strip.style.display = 'none';
@@ -27008,12 +27276,22 @@ function cxGameToast(msg) {
 }
 // Hold-fire gate: after arming, the field ramps to the test current — the game must not charge/fire
 // until the measured current has held at setpoint (mirrors firmware ripScoreArmed, which won't fold a
-// bin until then). Drives the centered overlay each frame; reveals Start Shooting once steady.
+// bin until then). Runs the whole pre-shooting sequence's copy, idle detection included: the canvas
+// behind it is showing the title card (cxGameAttract), so this is the only prose on screen and it must
+// never go blank. Reveals Start Shooting once steady. cxGame.armReady feeds the card's colour.
 function cxGameArmUpdate(now) {
     const ov = document.getElementById('cxGameArm');
     if (!ov) return;
-    if (cx.matrixShooting || !cx.rtFieldArmed) { ov.style.display = 'none'; return; }   // hidden during idle detection (pre-arm) and once shooting
+    if (cx.matrixShooting) { ov.style.display = 'none'; cxGame.armReady = false; return; }
     ov.style.display = 'flex';
+    const msg = document.getElementById('cxGameArmMsg');
+    const btn = document.getElementById('cxGameArmBtn');
+    if (!cx.rtFieldArmed) {   // idle detection — the field is not commanded yet, so there is no current to be steady at
+        cxGame.armReady = false; cxGame.atTgtSince = 0;
+        if (btn) btn.style.display = 'none';
+        if (msg) msg.textContent = 'Hold the engine at idle — measuring your idle speed to set the capture band…';
+        return;
+    }
     const tgt = cx.matrixLevelA || 0;
     const tol = Math.max(3, 0.08 * tgt);   // same band firmware uses for ripAtTgt
     const a = cx.liveAmps;
@@ -27021,8 +27299,7 @@ function cxGameArmUpdate(now) {
     if (atTgt) { if (!cxGame.atTgtSince) cxGame.atTgtSince = now; }
     else cxGame.atTgtSince = 0;
     const ready = atTgt && (now - cxGame.atTgtSince >= CX_SHOOT_HOLD_MS);
-    const msg = document.getElementById('cxGameArmMsg');
-    const btn = document.getElementById('cxGameArmBtn');
+    cxGame.armReady = ready;
     if (ready) {
         if (btn) btn.style.display = '';
         if (msg) msg.innerHTML = 'Current steady at <strong>' + a.toFixed(0) + ' A</strong> — on setpoint. Press Start Shooting to begin mapping ripple.';
@@ -27096,6 +27373,7 @@ function cxGameDraw(c, t, rpm, curKey, dt) {
     const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
     if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
     const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    if (!cx.matrixShooting) { cxGameAttract(g, w, h, t); return; }   // nothing is scored yet — show the title card, not a live-looking playfield
     const padT = 14, padB = 14, axisX = 40;
     const shipX = axisX + (w - axisX) * 0.52;    // ship well left of the targets → long shot travel
     const tgtX = w - 46;
@@ -28278,7 +28556,11 @@ function cxRenderStress(b) {
     b.innerHTML = body;
     if (!j) fetch(buildURL('/cvstress.json')).then(r => r.json()).then(jj => {
         if (jj.tune) _cvsTune = jj.tune;
-        if (jj.last && !s.lastBlob) { s.lastBlob = jj.last; if (cx.phase === 8 && !s.running) commissionRender(); }
+        // Follow the device, never latch: the firmware DISCARDS this blob the moment a retune stales
+        // the verdict (cvStressForgetLast), so a cached string would put a dead result card back on
+        // screen after an upstream step was re-run inside the same wizard pass.
+        const fresh = jj.last || '';
+        if (fresh !== (s.lastBlob || '')) { s.lastBlob = fresh; if (cx.phase === 8 && !s.running) commissionRender(); }
         s.j = s.j || null;
     }).catch(() => { });
 }
@@ -28698,7 +28980,13 @@ async function commissionClearAndRestart() {
         // done-mask back (CSV3 is event-driven, so that lag is user-visible).
         cxLastState = 0; cxLastPhase = 0; cxLastMask = 0; cxLastManual = 0;
         renderCommissionStatus(0, 0, 0, 0);
-        openCommPrereqs(false);   // re-commission: prerequisites → Low/High limits → wizard, reopened fresh at Prep
+        // Wholesale restart: prerequisites → Low/High limits → TACH ALIGNMENT → wizard. The alignment
+        // screen belongs in a revert-and-redo — everything else is being put back to pre-commissioning and
+        // re-measured, and the engine-speed axis is what the re-measuring is done against. It opens on the
+        // values already stored (rpmAlignRender seeds from the RPMScalingFactor/PulleyRatio echoes), and
+        // commissionAbort does not touch them: the snapshot commissionSnapshotScalarsToBuf writes carries
+        // no tach fields. So it reads where you left it, not a default — leave it alone and press Continue.
+        openCommPrereqs(false, false, true);
     }).catch(e => xAlert('Clear failed: ' + e));
 }
 
@@ -30793,7 +31081,7 @@ function buildFaScopeCsv(d) {
     csv += '# Alt scope capture (fast alternator-current channel)\n';
     csv += '# captured,' + when + '\n';
     csv += '# rpm,' + d.rpm + '\n';
-    csv += '# alt_temp_F,' + d.altTempF + '\n';
+    csv += '# alt_temp_F,' + (d.altTempF === -32768 ? '' : d.altTempF) + '\n';   // INT16_MIN = no probe had read
     csv += '# sample_rate_hz,' + d.rate + '\n';
     csv += '# range,' + (d.atten ? '12dB' : '6dB') + '\n';
     csv += 'ms,amps_raw,amps_filtered\n';
@@ -31737,6 +32025,26 @@ function rippleMapThemeDark() {
     return (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) < 128;
 }
 
+// Auto-refresh policy. The heatmap is otherwise event-driven: page load, entering the Diag
+// sub-tab, expanding the section, and once after Clear Map. A standing poll is not free —
+// /famatrix.csv emits ~115 B per learned cell, so a full 1200-cell map is ~140 kB per fetch,
+// several times the whole SSE telemetry stream. But a freshly cleared map sits empty on screen
+// with no event coming to fill it. So poll only while the map is nearly empty, then stop and
+// let the event triggers carry it.
+const RIPPLEMAP_POLL_MS = 10000;
+const RIPPLEMAP_POLL_UNTIL_CELLS = 10;
+let rippleMapPollId = null;
+
+function rippleMapPollSync(nCells) {
+    if (nCells >= RIPPLEMAP_POLL_UNTIL_CELLS) {
+        if (rippleMapPollId !== null) { clearTrackedInterval(rippleMapPollId); rippleMapPollId = null; }
+    } else if (rippleMapPollId === null) {
+        // drawRippleMap self-gates on canvas visibility, so a tick off the Diag tab costs nothing;
+        // document.hidden covers the backgrounded Capacitor WebView, where timers still run.
+        rippleMapPollId = setTrackedInterval(() => { if (!document.hidden) drawRippleMap(); }, RIPPLEMAP_POLL_MS);
+    }
+}
+
 function drawRippleMap() {
     const canvas = document.getElementById('ripplemap-canvas');
     if (!canvas || canvas.offsetParent === null) return;
@@ -31758,6 +32066,7 @@ function drawRippleMap() {
             canvas.addEventListener('pointerleave', () => { rippleMapHover = null; rippleMapRender(); rippleMapInfoDefault(); });
         }
         rippleMapInfoDefault();
+        rippleMapPollSync(rippleMapCells.length);
     }).catch(() => { });
 }
 
@@ -31896,6 +32205,7 @@ function rippleMapClearVisual() {
     const cells = document.getElementById('faCellsUsed_ID');
     if (cells) cells.textContent = '0';
     faClearSpans(FA_TONE_SPANS);
+    rippleMapPollSync(0);   // start now, so an unreachable device still refills the map when it returns
     setTimeout(drawRippleMap, 2500);
 }
 
@@ -32706,10 +33016,14 @@ function solarLedgerClearConfirm() {
 }
 
 // ==================== LIMIT PANEL (header "What is limiting charging") ====================
-// Names the one thing holding charging back (CSV4 ctrlLimiter), the number it is held against, and
-// where that number is set. Read-only; every value comes from the CSV1/CSV2/CSV4 caches and the
-// settings echoes, so it re-renders on each arriving frame while open. Every block is always laid
-// out (visibility, never display) — the box is one fixed size and a limit change moves nothing.
+// Names the one thing setting charging (CSV4 ctrlLimiter), the number it is held against, and
+// where that number is set. Codes 1-9 hold output DOWN; code 11 (min field floor) holds it UP, and
+// code 10 (manual) means the operator's own PWM setting is the answer.
+// Read-only; every value comes from the CSV1/CSV2/CSV4 caches and the
+// settings echoes, so it re-renders on each arriving frame while open. Only the two sentence blocks
+// reserve space (two lines tall, so a limiter flip does not twitch the box); a block with nothing to
+// say for this limiter is display:none and the panel is genuinely shorter for it. The severity tone
+// (--why-tone) is set on the panel here and colours the header dot and the verdict's left bar.
 let _whyOpen = false;
 let _whyOpener = null;
 let _whyCsv1AtMs = 0;
@@ -32729,7 +33043,14 @@ function whyPanelOpen(opener) {
     ov.style.display = 'block';
     document.addEventListener('keydown', _whyKeydown);
     const p = document.getElementById('why-panel');
-    if (p) p.focus({ preventScroll: true });
+    if (p) {
+        // Draggable by its header (idempotent; makePanelDraggable no-ops below 600px, where the CSS
+        // makes it a bottom sheet). A placement survives close/reopen — the element is never rebuilt —
+        // so only re-clamp it, and leave an un-dragged panel to the CSS top-centre anchor.
+        makePanelDraggable(p, document.getElementById('why-drag-handle'));
+        if (p._userDragged) positionFloatingPanel(p);
+        p.focus({ preventScroll: true });
+    }
 }
 function whyPanelClose() {
     const ov = document.getElementById('why-overlay');
@@ -32741,16 +33062,38 @@ function whyPanelClose() {
 }
 function _whyKeydown(e) { if (e.key === 'Escape') { e.preventDefault(); whyPanelClose(); } }
 
-// Own stage voltage (the un-clamped target) — a BMS voltage limit is measured against this.
+// Own stage voltage (the un-clamped target) — an external voltage limit is measured against this.
 function _whyOwnVoltageSetting() {
     const id = { 1: 'BulkVoltage_echo', 2: 'AbsorptionVoltage_echo', 3: 'FloatVoltage_echo', 6: 'TargetVoltageSetpoint_echo' }[Number(gLastChargeStage)];
     if (!id) return NaN;
     return parseFloat(getEchoText(id, ''));
 }
 
+// Who published the DVCC charge limits. Identity is collected passively from PGN 60928 / 126996 and is
+// often absent (nothing can be requested with transmit off), so every part degrades on its own: a named
+// manufacturer, else a bare bus address, else no attribution. Worth the words because on a Victron system
+// the publisher is usually a Cerbo GX passing on its own merged DVCC settings, NOT the battery's BMS —
+// and that decides whether the owner goes to the GX or to the battery to change the number.
+function _whyLimitAuthority(c2) {
+    const src = Number(c2.dvccRxSrcAddr);
+    const mfg = Number(c2.dvccAuthMfg || 0);
+    const at = (isFinite(src) && src !== 255) ? ' at address ' + src : '';
+    const dialect = (((document.getElementById('dvccSrcType_echo') || {}).textContent || '').indexOf('RV-C') >= 0)
+        ? 'RV-C' : 'VE.Can';
+    if (mfg === 358) {
+        return 'Published by a Victron device' + at + ' over ' + dialect + ', not set here. On a Victron system '
+             + 'this is usually the Cerbo GX passing on DVCC rather than the battery itself.';
+    }
+    if (at) {
+        return 'Published by the device' + at + ' over ' + dialect + ', not set here — a battery BMS, or a '
+             + 'gateway passing on its charge limits.';
+    }
+    return 'Sent by an external charge authority, not set here — a battery BMS, or a gateway passing on its charge limits.';
+}
+
 function whyPanelRender() {
     const set = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
-    const hide = (id, h) => { const el = document.getElementById(id); if (el) el.classList.toggle('why-hidden', !!h); };
+    const hide = (id, h) => { const el = document.getElementById(id); if (el) el.classList.toggle('why-gone', !!h); };
     const NA = '—';
     const num = (v, d) => Number.isFinite(v) ? v.toFixed(d) : NA;
     const amps = v => Number.isFinite(v) ? String(Math.round(v)) : NA;
@@ -32774,7 +33117,7 @@ function whyPanelRender() {
     const lim = limFresh ? Number(window._ctrlLimiter) : NaN;
     const fs = c1 ? Number(c1.fieldActiveStatus) : NaN;
     const running = fs === 1 || fs === 2 || fs === 3;
-    let head = '', where = '';
+    let head = '', where = '', tone = '';
     if (!c1 || !limFresh) {
         head = 'Waiting for data';
     } else if (!running) {
@@ -32820,37 +33163,112 @@ function whyPanelRender() {
                 where = 'Another charge source is holding the bank up, or the battery is still resting high.';
                 break;
             case 8:
-                head = 'BMS current limit — ' + (cclOk ? amps(ccl) : NA) + ' A, ' + (Number.isFinite(bcur) ? 'battery ' + amps(bcur) : 'output ' + amps(alt)) + ' A';
-                where = 'Sent by your battery’s BMS, not set here.';
+                head = 'External current limit — ' + (cclOk ? amps(ccl) : NA) + ' A, ' + (Number.isFinite(bcur) ? 'battery ' + amps(bcur) : 'output ' + amps(alt)) + ' A';
+                where = _whyLimitAuthority(c2);
                 break;
             case 9:
-                head = 'BMS voltage limit — ' + (cvlOk ? num(cvl, 2) : num(vt, 2)) + ' V, now ' + num(ibv, 2) + ' V';
-                where = 'Sent by your battery’s BMS, not set here.';
+                head = 'External voltage limit — ' + (cvlOk ? num(cvl, 2) : num(vt, 2)) + ' V, now ' + num(ibv, 2) + ' V';
+                where = _whyLimitAuthority(c2);
+                break;
+            case 10:
+                head = 'Manual field mode — field held at ' + num(duty, 1) + '%, output ' + amps(alt) + ' A. '
+                     + 'Nothing is limiting charging: the protections are off and your PWM setting is the output.';
+                where = 'Field Control, under Setup ▸ Alternator ▸ Output Control. Switch it back to PID to '
+                      + 'restore temperature, engine-speed, battery and current protection.';
+                break;
+            case 11: {
+                // The floor is the ONLY limit that raises output. Which of the two floors is binding is
+                // read off the published value rather than re-derived: the firmware already merged the
+                // scalar into the per-speed value (getMinimumFieldForRPM) and added the copper-temperature
+                // correction, so the scalar owns it only when the enforced floor still equals the setting.
+                const floorPct = f(c2, 'fieldDutyFloor', 100);
+                const minSet = parseFloat(getEchoText('MinDuty_echo', ''));
+                const scalarOwns = Number.isFinite(floorPct) && Number.isFinite(minSet) && Math.abs(floorPct - minSet) < 0.05;
+                head = 'Min field floor — field cannot go below ' + num(floorPct, 2) + '%, output ' + amps(alt)
+                     + ' A. The loop is asking for less; the floor is what the battery is getting.';
+                where = scalarOwns
+                    ? 'Min Field (%), under Setup ▸ Alternator ▸ Output Control.'
+                    : 'The Keep-Alive (%) column at ' + rpmTxt(rpm) + ' RPM, under Setup ▸ Alternator ▸ RPM Table '
+                      + '(Min Field (%) raises it no further at this speed).';
+                break;
+            }
+            case 12: {
+                // Deliberate zero-current command. Which of the two is answering matters: Maintain is a
+                // manual override that suspends the charge-stage machine, zero-current float is the float
+                // stage doing its job with the rebulk criteria still armed. Tested as "stage is Float"
+                // rather than "stage is Maintain": zeroFloatActive requires TargetVoltageMode == 0, so
+                // Float is the only stage it can show, while Maintain-with-Target-Voltage displays as
+                // TARGET_V and would fail a === 5 test.
+                const maint = Number(gLastChargeStage) !== 3;
+                head = (maint ? 'Maintain Mode' : 'Zero-current float')
+                     + ' — battery held at 0 A on purpose. The alternator is carrying ' + amps(alt)
+                     + ' A of house load; the bank is ' + (maint ? 'neither charging nor discharging.' : 'full and resting.');
+                const c3z = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+                const panelOwns = !!c3z && Number(c3z.PhysicalPanelOverride) === 1;
+                where = maint
+                    ? 'Maintain Mode, under Setup ▸ Battery.' + (panelOwns ? ' Physical Panel Override is on, so the Cable 3 switch can force this too.' : '')
+                    : 'Float Mode = Zero-Current Float, under Setup ▸ Battery. The rebulk criteria stay armed.';
+                break;
+            }
+            case 13: {
+                // cap is the RPM-table ceiling BEFORE warm-up, thermal and the glide (firmware g_I_cap),
+                // so it is the level the ramp is climbing toward — not the ramp's own current value.
+                const wRate = parseFloat(getEchoText('WarmupRampRate_echo', ''));
+                const wCap = Number.isFinite(cap) ? cap : parseFloat(getEchoText('MaxTableValue_echo', ''));
+                const eta = (Number.isFinite(wRate) && wRate > 0 && Number.isFinite(wCap) && Number.isFinite(alt) && wCap > alt)
+                    ? Math.round((wCap - alt) / wRate) : NaN;
+                head = 'Warm-up ramp — output ceiling still climbing'
+                     + (Number.isFinite(wRate) ? ' at ' + wRate.toFixed(1) + ' A/s' : '')
+                     + ', now ' + amps(alt) + ' A of ' + amps(wCap) + ' A.'
+                     + ((Number.isFinite(eta) && eta > 0) ? ' Full output in about ' + eta + ' s.' : '');
+                where = 'Warmup Ramp Rate, under Setup ▸ Alternator ▸ Output Control.';
+                break;
+            }
+            case 14:
+                head = 'Easing down to the ' + rate + ' charge rate — ' + amps(alt) + ' A now, settling to ' + amps(cap) + ' A.';
+                where = 'Charge Rate, in the header. The step is spread over a couple of seconds on purpose, so the field tracks the new ceiling down instead of stepping to it.';
                 break;
             default:
                 head = 'Waiting for data';
         }
+        // Severity tone. Teal = nothing to fix: nothing limiting (0), the min-field floor (11) and the
+        // Hi->Lo glide (14), which both push output UP; the deliberate zero-current command (12); and the
+        // warm-up ramp (13), which is on its way up by itself. Red = a protection is cutting output (6).
+        // Amber = a real ceiling the owner can act on, manual field mode (10) included since its
+        // protections are off. Grey stays for the no-data / not-charging states, which never reach here.
+        const TONE_OK = [0, 11, 12, 13, 14];
+        tone = TONE_OK.indexOf(lim) >= 0 ? 'tone-ok'
+             : (lim === 6) ? 'tone-alarm'
+             : (lim >= 1 && lim <= 10) ? 'tone-limit' : '';   // unknown code falls through to grey, like no data
     }
     set('why-headline', head);
     set('why-where', where);
+    hide('why-where', !where);
+    const panel = document.getElementById('why-panel');
+    if (panel) {
+        panel.classList.toggle('tone-ok', tone === 'tone-ok');
+        panel.classList.toggle('tone-limit', tone === 'tone-limit');
+        panel.classList.toggle('tone-alarm', tone === 'tone-alarm');
+    }
 
-    // Block D — BMS, only while a BMS is in charge (DVCC following = 3)
-    // The block keeps its shape while hidden (placeholders, never empty spans) so the box never resizes.
-    const bmsOn = !!c1 && running && Number(c2.dvccState) === 3;
-    hide('why-bms', !bmsOn); hide('why-bms-hr', !bmsOn);
-    if (bmsOn) {
+    // Block D — the external authority's limits, only while one is in charge (DVCC following = 3).
+    // Fully removed otherwise: dvccState changes on a real event, not frame to frame, so collapsing it
+    // costs no stability and it was the whole of the panel's dead space.
+    const extOn = !!c1 && running && Number(c2.dvccState) === 3;
+    hide('why-ext', !extOn);
+    if (extOn) {
         const cvl = f(c2, 'dvccRxCvl', 100), ccl = f(c2, 'dvccRxCcl', 10);
         const cvlOk = Number.isFinite(cvl) && cvl > -1000000, cclOk = Number.isFinite(ccl) && ccl > -1000000;
         const ownV = _whyOwnVoltageSetting();
         const ownA = parseFloat(getEchoText('BattCurrentLimitA_echo', ''));
         const ownAon = getEchoText('BattLimitEnable_echo', '') !== 'OFF' && Number.isFinite(ownA) && ownA > 0;
-        set('why-bms-v', cvlOk ? num(cvl, 2) : NA);
-        set('why-bms-a', cclOk ? amps(ccl) : NA);
-        set('why-bms-v-own', Number.isFinite(ownV) ? 'your setting: ' + ownV.toFixed(2) + ' V' : 'your setting: \u2014');
-        set('why-bms-a-own', ownAon ? 'your setting: ' + amps(ownA) + ' A' : 'your setting: none');
+        set('why-ext-v', cvlOk ? num(cvl, 2) : NA);
+        set('why-ext-a', cclOk ? amps(ccl) : NA);
+        set('why-ext-v-own', Number.isFinite(ownV) ? 'your setting: ' + ownV.toFixed(2) + ' V' : 'your setting: \u2014');
+        set('why-ext-a-own', ownAon ? 'your setting: ' + amps(ownA) + ' A' : 'your setting: none');
     } else {
-        set('why-bms-v', NA); set('why-bms-a', NA);
-        set('why-bms-v-own', '\u00a0'); set('why-bms-a-own', '\u00a0');
+        set('why-ext-v', NA); set('why-ext-a', NA);
+        set('why-ext-v-own', '\u00a0'); set('why-ext-a-own', '\u00a0');
     }
 }
 
@@ -32858,6 +33276,8 @@ function whyPanelRender() {
 // spans, so they get button semantics + keyboard activation here.
 document.addEventListener('DOMContentLoaded', function () {
     const ov = document.getElementById('why-overlay');
+    // Tap-outside-to-close is the mobile bottom sheet only — on desktop the overlay is click-through
+    // (pointer-events:none) so the header readouts stay live behind the panel, and this never fires.
     if (ov) ov.addEventListener('click', e => { if (e.target === ov) whyPanelClose(); });
     document.querySelectorAll('.why-tap').forEach(el => {
         el.setAttribute('role', 'button');

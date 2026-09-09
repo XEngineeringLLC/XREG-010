@@ -220,7 +220,8 @@
         <div class="stage-row">
           <span id="prot-note" class="prot-word why-tap" style="display:none;"><span class="pw-full">PROTECTION</span><span class="pw-short">P</span></span>
           <span id="battgt-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">BATT &gt; TARGET</span><span class="pw-short">B&gt;T</span></span>
-          <span id="bms-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">BMS LIMIT</span><span class="pw-short">BMS</span></span>
+          <span id="extlim-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">EXT LIMIT</span><span class="pw-short">EXT</span></span>
+          <span id="minfield-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">MIN FIELD</span><span class="pw-short">MIN</span></span>
           <span id="charge-stage" class="charge-stage charge-stage-unknown">—</span>
         </div>
         <span id="field-off-reason" class="field-off-reason"></span>
@@ -294,10 +295,18 @@
     <div id="protections-banner" class="lock-status-locked" style="display:none;">⚠️ PROTECTIONS DISABLED FOR TUNING — RE-ENABLE BEFORE NORMAL USE ⚠️</div>
 
     <!-- Charge-limit follow is ON but nothing is clamping (waiting / stale / untrusted). Survives
-         header collapse like the protections banner: a user who believes the BMS is the backstop
+         header collapse like the protections banner: a user who believes the sender is the backstop
          must not be able to minimize away the fact that it is not. Text set by updateDvccNotice(). -->
     <div id="dvcc-banner" class="header-notice" style="display:none;"
       onclick="goToDvccFollow()" title="Open Setup &rarr; Integrations &rarr; Charge-Limit Follow"></div>
+
+    <!-- Settings relocked themselves while nothing was connected — shown to whoever arrives next.
+         Text set by renderArmLockNotice(); the &#10005; acks it on the device, not per browser. -->
+    <div id="armlock-notice" class="header-notice header-notice-alert" style="display:none;">
+      <span id="armlock-notice-text"></span>
+      <button type="button" class="header-notice-x" onclick="dismissArmLockNotice();"
+        aria-label="Dismiss">&#10005;</button>
+    </div>
 
     <!-- Settings Access — the button arms the firmware's 30-min settings write window
          (no password; LAN clients are trusted, this is an acknowledgment). The button's
@@ -923,7 +932,7 @@
                             <td><input id="rpmCapKW0_input" name="rpmCapKW0" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable0_input" name="rpmMinDutyTable0" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -945,7 +954,7 @@
                             <td><input id="rpmCapKW1_input" name="rpmCapKW1" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable1_input" name="rpmMinDutyTable1" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -967,7 +976,7 @@
                             <td><input id="rpmCapKW2_input" name="rpmCapKW2" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable2_input" name="rpmMinDutyTable2" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -989,7 +998,7 @@
                             <td><input id="rpmCapKW3_input" name="rpmCapKW3" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable3_input" name="rpmMinDutyTable3" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -1011,7 +1020,7 @@
                             <td><input id="rpmCapKW4_input" name="rpmCapKW4" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable4_input" name="rpmMinDutyTable4" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -1033,7 +1042,7 @@
                             <td><input id="rpmCapKW5_input" name="rpmCapKW5" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable5_input" name="rpmMinDutyTable5" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -1055,7 +1064,7 @@
                             <td><input id="rpmCapKW6_input" name="rpmCapKW6" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable6_input" name="rpmMinDutyTable6" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -1077,7 +1086,7 @@
                             <td><input id="rpmCapKW7_input" name="rpmCapKW7" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable7_input" name="rpmMinDutyTable7" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -1099,7 +1108,7 @@
                             <td><input id="rpmCapKW8_input" name="rpmCapKW8" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable8_input" name="rpmMinDutyTable8" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -1122,7 +1131,7 @@
                             <td><input id="rpmCapKW9_input" name="rpmCapKW9" type="number" min="0" max="9999"
                                 step="0.01" data-cap-col="kw"></td>
                             <td><input id="rpmMinDutyTable9_input" name="rpmMinDutyTable9" type="number" min="0"
-                                max="100" step="0.1"></td>
+                                max="100" step="0.05"></td>
                           </tr>
                           <tr class="history-row">
                             <td colspan="4">
@@ -1478,8 +1487,13 @@
                     <span>Field Control (<span id="ManualFieldToggle_echo">?</span>):</span>
                     <span class="tooltip">
                       ℹ️
-                      <span class="tooltip-box">Manual mode disables safeguards: no Min Field or Max Field enforcement, no
-                        temperature or voltage limiting, no per-speed tachometer keep-alive floor.</span>
+                      <span class="tooltip-box">PID runs the charge stages and every protection. Manual drives the field
+                        straight from the Manual Field PWM box below and turns the protections off: no temperature
+                        cut-back or over-temperature shutdown, no Min Field or per-speed tachometer keep-alive floor
+                        (a PWM of 0 really means zero field), no engine-speed or tachometer-plausibility cut, no
+                        battery temperature or voltage checks, and no current control at all. The master On/Off
+                        switch, the hardware over-voltage shutdown and the Max Field ceiling still apply. Switching
+                        to Manual asks for confirmation and lists the full set.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -1489,7 +1503,7 @@
                         <button type="button" class="cap-mode-btn" data-checked="1" onclick="abSegClick(this)">PID</button>
                       </div>
                       <input id="ManualFieldToggle_checkbox" type="checkbox" style="display:none;"
-                        onchange="if(handleManualFieldToggle('ManualFieldToggle_checkbox')) { this.form.submit(); submitMessage(); }" />
+                        onchange="manualFieldToggleChanged(this)" />
                       <input id="ManualFieldToggle" name="ManualFieldToggle" type="number" value=""
                         style="display:none;" />
                     </form>
@@ -1503,8 +1517,10 @@
                     <span>Manual Field PWM (%) (<span id="ManualDutyTarget_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Direct
                         PWM duty cycle applied to the field winding when Manual mode is active, 0–100% in steps of
-                        0.01. Has no effect in PID mode. Use with caution — Manual mode bypasses many thermal,
-                        voltage, and current protections.</span></span>
+                        0.01, delivered as typed — Min Field and the per-speed keep-alive floor do not raise it, so 0
+                        is a genuinely dead field. Only the Max Field ceiling still caps it. Has no effect in PID
+                        mode. Use with caution — Manual mode bypasses the thermal, engine-speed, battery and current
+                        protections.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -1521,11 +1537,16 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Min Field (%) (<span id="MinDuty_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Global
-                        tachometer keep-alive floor: the minimum field held anywhere while the alternator is enabled.
-                        A little field keeps the stator energized, which is what a stator-driven tachometer reads. It is
-                        also the lowest duty the current control loop can command, so raising it narrows the loop's
-                        working range — prefer setting the floor per engine speed in the RPM table's Keep-Alive (%)
-                        column and leaving this at or near zero.</span></span>
+                        tachometer keep-alive floor: the minimum field held anywhere the alternator is charging under
+                        PID control. A little field keeps the stator energized, which is what a stator-driven
+                        tachometer reads. It is also the lowest duty the current control loop can command, so raising
+                        it narrows the loop's working range — prefer setting the floor per engine speed in the RPM
+                        table's Keep-Alive (%) column and leaving this at or near zero. It raises that column, never
+                        lowers it, and it has no effect at an engine speed whose Keep-Alive cell is 0 — commissioning
+                        sets 0 above the highest speed it measured, where the field must be able to shut fully off.
+                        Manual field mode ignores both floors, as do shutdown ramps and an active protection clamp.
+                        When the floor is what is setting output — the loop wanting less than the floor delivers — the
+                        banner reads MIN FIELD.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -6414,7 +6435,7 @@
                 <div class="form-row">
                   <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                     <span>Turn around this far below a current limit (A):</span>
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Applies to the current cap for your engine speed, the battery current limit and a BMS current limit. The sweeper needs room because the layers that normally hold output off a limit are switched off while it runs, and the field is still building behind the ramp when it gets there. Never takes more than a quarter of the limit it is guarding, so a small cap at idle still leaves a usable sweep. 0 turns around on the limit itself.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Applies to the current cap for your engine speed, the battery current limit and an external charge-current limit. The sweeper needs room because the layers that normally hold output off a limit are switched off while it runs, and the field is still building behind the ramp when it gets there. Never takes more than a quarter of the limit it is guarding, so a small cap at idle still leaves a usable sweep. 0 turns around on the limit itself.</span></span>
                   </div>
                   <div class="form-input" style="gap:8px;">
                     <input id="altsweep-margin-a" type="number" step="1" min="0" max="100" value="10" />
@@ -6425,7 +6446,7 @@
                 <div class="form-row">
                   <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                     <span>Turn around this far below a voltage limit (V):</span>
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Applies to the charge-voltage target and a BMS voltage limit. Same reason as the current margin: nothing is holding the bus off the target during a sweep, so arriving exactly on it is how a run ends in an over-voltage cut &mdash; which throws away the down leg the measurement depends on. 0 turns around on the limit itself.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Applies to the charge-voltage target and an external charge-voltage limit. Same reason as the current margin: nothing is holding the bus off the target during a sweep, so arriving exactly on it is how a run ends in an over-voltage cut &mdash; which throws away the down leg the measurement depends on. 0 turns around on the limit itself.</span></span>
                   </div>
                   <div class="form-input" style="gap:8px;">
                     <input id="altsweep-margin-v" type="number" step="0.01" min="0" max="2" value="0.20" />
@@ -6449,7 +6470,7 @@
                 <div class="form-row">
                   <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                     <span>Manual Field PWM (%) (<span id="ManualDutyTarget_echo_gate">?</span>):</span>
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">A duplicate of Manual Field PWM (%) in Setup &rarr; Alternator &rarr; Field Control &mdash; one setting, reachable from both places, because a capture session spends its time parking the field by hand. It is the duty applied straight to the field winding while Manual mode is on, and has no effect while it is off. Manual mode bypasses most thermal, voltage and current protections, and the sweeper needs AUTO &mdash; a sweep and a held manual field are alternatives, never both at once.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">A duplicate of Manual Field PWM (%) in Setup &rarr; Alternator &rarr; Field Control &mdash; one setting, reachable from both places, because a capture session spends its time parking the field by hand. It is the duty applied straight to the field winding while Manual mode is on, delivered as typed (Min Field does not raise it), and has no effect while it is off. Manual mode bypasses the thermal, engine-speed, battery and current protections, and the sweeper needs AUTO &mdash; a sweep and a held manual field are alternatives, never both at once.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -9102,7 +9123,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">RV-C Messages (<span id="rvcHeardWord_ID">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether RV-C limit messages are actually arriving. heard = decoded within the last 20 seconds; silent = decoded earlier but nothing recently; none heard = nothing has ever decoded, so check the BMS is on this CAN backbone and that the battery instance above matches the bank it broadcasts. Only the selected dialect is decoded, so this reads "idle" while Victron VE.Can is the chosen source. The decoded numbers themselves are in the shared status row below.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether RV-C limit messages are actually arriving. heard = decoded within the last 20 seconds; silent = decoded earlier but nothing recently; none heard = nothing has ever decoded, so check the sender is on this CAN backbone and that the battery instance above matches the bank it broadcasts. Only the selected dialect is decoded, so this reads "idle" while Victron VE.Can is the chosen source. The decoded numbers themselves are in the shared status row below.</span></span>
                 </div>
                 <div class="form-input">
                   <span class="integ-live" id="rvcHeardDetail_ID">&mdash;</span>
@@ -9228,15 +9249,15 @@
 
             </details>
 
-            <!-- Charge Coordination (DVCC-style BMS charge-limit follow) — shared across dialects -->
+            <!-- Charge Coordination (DVCC-style external charge-limit follow) — shared across dialects -->
             <details class="integ-section" id="dvccFollowSection">
               <summary class="integ-section-title">Charge-Limit Follow<span class="integ-badge">shared</span><span class="integ-state"><span id="integStateFollow">off</span></span></summary>
 
               <p class="integ-copy">Everything here applies to whichever dialect is selected above — Victron VE.Can or RV-C — and the status row shows what that dialect has decoded. Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge.</p>
 
               <div class="form-row">
-                <div class="form-label">Follow BMS Charge Limits (<span id="dvccEn_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Obey the charge voltage and current limits (CVL/CCL) a battery management system or gateway publishes on the NMEA2000 port — the coordination Victron calls DVCC. Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge. A new authority must send steady, plausible values for the settling time before its limits apply. If no limits ever arrive, or the sender goes silent, this regulator falls back to its own targets and a warning strip appears at the top of the dashboard &mdash; charging is never left ungoverned, but the BMS is not the backstop it would be while following. A current limit of 0 A is obeyed as "stop charging" — that is the battery's strongest command. While a lower BMS voltage limit is in control, the internal bulk/absorption/float progression pauses and resumes when the limit releases. Leave this off to simply watch the decoded limits below and confirm they match what your BMS or GX displays.</span></span>
+                <div class="form-label">Follow External Charge Limits (<span id="dvccEn_echo">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Obey the charge voltage and current limits (CVL/CCL) a battery management system or gateway publishes on the NMEA2000 port — the coordination Victron calls DVCC. Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge. A new authority must send steady, plausible values for the settling time before its limits apply. If no limits ever arrive, or the sender goes silent, this regulator falls back to its own targets and a warning strip appears at the top of the dashboard &mdash; charging is never left ungoverned, but the sender is not the backstop it would be while following. A current limit of 0 A is obeyed as "stop charging" — that is the battery's strongest command. While a lower external voltage limit is in control, the internal bulk/absorption/float progression pauses and resumes when the limit releases. Leave this off to simply watch the decoded limits below and confirm they match what your BMS or GX displays.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -12356,7 +12377,7 @@
               <span class="metric-label">Software Image
                 <span class="tooltip">ℹ️
                   <span class="tooltip-box">Factory Golden = safe working default, User Updateable = newer versions
-                    loaded from Setup→Software Updates</span>
+                    loaded from Cloud Features &rarr; Software Update</span>
                 </span>
               </span>
               <span class="metric-value" style="font-size: 13px;"><span id="currentPartitionTypeID">?</span></span>
@@ -13641,7 +13662,7 @@
                 <div style="padding: 6px 8px; font-size: 12px; color: #666;">DVCC Follow
                   <span class="tooltip">&#8505;&#65039;
                     <span class="tooltip-box">The charge-limit follow brain: a once-per-second check of the
-                      BMS limit stream (settling, silence, plausibility) that publishes the clamps the
+                      external limit stream (settling, silence, plausibility) that publishes the clamps the
                       control loop reads. Pure arithmetic — this row is the standing proof it never
                       intrudes on the control loop.</span>
                   </span>
@@ -14491,7 +14512,7 @@
       <div class="settings-card">
         <div class="form-row form-row-wide" style="align-items:center; gap:8px; flex-wrap:wrap;">
           <span style="font-size:14px; font-weight:600;">Resonance &amp; Ripple Map</span>
-          <span class="tooltip">ℹ️<span class="tooltip-box">A learned table of the strongest current-ripple tones at every engine speed and load. Each cell is a rolling recent-average of the last 4 qualified windows (fixed depth, not user-adjustable), so it tracks the machine lately and never freezes; the map persists until Clear Map. The worst-value table below is fed by those same windows, but keeps the largest single values instead of averaging them. A tone that stays at a fixed frequency as RPM changes points to a resonance (drive-system most likely, then crankshaft torsional, then electrical); a tone that scales with RPM is ordinary rectifier ripple.</span></span>
+          <span class="tooltip">ℹ️<span class="tooltip-box">A learned table of the strongest current-ripple tones at every engine speed and load. Each cell is a rolling recent-average of the last 4 qualified windows (fixed depth, not user-adjustable), so it tracks the machine lately and never freezes; the map persists until Clear Map. The worst-value table below is fed by those same windows, but keeps the largest single values instead of averaging them. A tone that stays at a fixed frequency as RPM changes points to a resonance (drive-system most likely, then crankshaft torsional, then electrical); a tone that scales with RPM is ordinary rectifier ripple. This picture is not live: it reloads when you open the Diag tab, expand this section, or reload the page. While the map is nearly empty it also refreshes itself every 10 seconds, so a freshly cleared map visibly refills, then it stops once there is real shape to look at.</span></span>
           <span style="margin-left:auto;font-size:12px;color:var(--text-muted);white-space:nowrap;"><span id="faCellsUsed_ID" style="font-weight:600;">?</span> cells learned</span>
           <button type="button" class="btn-secondary btn-sm" onclick="downloadRippleBundle()">Download CSV</button>
           <button type="button" class="btn-danger-ghost btn-sm"
@@ -16099,6 +16120,14 @@
         <button onclick="closeCommissionModal()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="padding:20px;">
+        <!-- Physical Panel Override warning — lives in the wizard chrome, ABOVE #commission-body, so it
+             is on screen for every step and every route in, and it stays up because the hazard it names
+             (a hand on the panel moving the charge rate or Maintain mid-run) lasts the whole run.
+             Shown/hidden by cxPanelOverrideStrip() off the CSV3 echo, so turning the override off during
+             the run clears it. -->
+        <div id="cx-panel-override-warn" style="display:none; margin-bottom:14px; padding:9px 11px; background:rgba(240,165,0,0.08); border:1px solid rgba(240,165,0,0.4); border-radius:6px; font-size:12px; line-height:1.5; color:#e6a23c;">
+          <strong>Physical Panel Override is on.</strong> The switches on data Cable 3 hold the charge rate and Force &quot;Maintain Mode&quot; &mdash; including the charge rate this wizard asks you to set. Leave the panel alone for the whole run, or turn the override off under Setup &rarr; System &rarr; Security &amp; Maintenance.
+        </div>
         <div id="commission-steps" style="display:flex; flex-wrap:wrap; gap:4px 8px; margin-bottom:14px; font-size:11px; color:#777;"></div>
         <!-- Permanent RPM sparkline — lives ABOVE the per-phase #commission-body so the
              body's innerHTML re-render each phase never wipes it. Fed off CSV1 (cxRpmSparkOnCsv1).
@@ -16312,27 +16341,6 @@
     </div>
   </div><!-- END maint-ack-overlay -->
 
-  <!-- Before You Start — one screen ahead of the Commissioning Prerequisites, on every route into the
-       wizard. Holds the things that are about how you run the process rather than what the regulator
-       is set to; ✕ leaves the flow exactly as the prerequisites ✕ does. The laptop advice and the
-       panel-override warning are both conditional — commPrepIntroShow() decides which ones show. -->
-  <div id="commprep-intro-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:center; justify-content:center; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">
-      <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
-        <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Before You Start</span>
-        <button onclick="commPrepIntroClose(false)" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
-      </div>
-      <div style="padding:14px 16px;">
-        <p id="commprep-intro-smallscreen" style="display:none; font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;"><strong style="color:#e0e0e0;">Use a laptop or tablet if you can.</strong> Setup and Commissioning works on a phone, but it's a worse UX on a small screen.</p>
-        <p style="font-size:13px; line-height:1.5; color:#bbb; margin:0;">During the wizard, keep house loads steady &mdash; avoid switching large loads on or off mid-run.</p>
-        <p id="commprep-intro-paneloverride" style="display:none; font-size:13px; line-height:1.5; color:#bbb; margin:14px 0 0;"><strong style="color:#e0e0e0;">Physical Panel Override is on.</strong> The switches on data Cable 3 hold the charge rate and Force &quot;Maintain Mode&quot;, so either can move mid-wizard if someone touches the panel &mdash; including the charge rate this wizard asks you to set. Leave the panel alone during the run, or turn the override off first under Setup &rarr; System &rarr; Security &amp; Maintenance.</p>
-      </div>
-      <div style="padding:12px 16px; border-top:1px solid #333; display:flex; justify-content:flex-end;">
-        <button onclick="commPrepIntroClose(true)" style="border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em; background:linear-gradient(180deg,#35d6c7,#23a99c); color:#06302d; font-weight:700; border:none;">Continue</button>
-      </div>
-    </div>
-  </div><!-- END commprep-intro-overlay -->
-
   <!-- Commissioning Prerequisites: collects the sensor/current settings commissioning depends on before
        the wizard measures them. On a first Vessel Info save it comes BEFORE the battery-defaults popup, so
        the proposal is derived from the hardware described here (the Charge Rate Limits handoff is then
@@ -16392,12 +16400,17 @@
 
   <!-- Limit panel — names the one thing holding charging back, the number it is held against, and
        where that number is set. Opened from the header readout labels, the field percentage and the
-       PROTECTION / BATT > TARGET / BMS LIMIT words (every .why-tap); rendered by whyPanelRender() from
-       the CSV1/CSV2/CSV4 caches plus settings echoes. Every block is always laid out (visibility, never
-       display) so the box is one fixed size and a limit change while open moves nothing. -->
+       PROTECTION / BATT > TARGET / EXT LIMIT words (every .why-tap); rendered by whyPanelRender() from
+       the CSV1/CSV2/CSV4 caches plus settings echoes. Non-modal (click-through overlay) and draggable
+       by its header, so it can sit beside the readouts it is explaining rather than covering them.
+       Sizing rule: space is RESERVED only for text that rewrites itself while open (the two sentence
+       blocks, held two lines tall so a limiter flip does not twitch the box); a block that is
+       structurally absent (no external authority in charge, no "where" for this limiter) is display:none and the
+       panel is genuinely shorter for it. -->
   <div id="why-overlay" class="why-overlay" style="display:none;">
-    <div id="why-panel" class="why-panel" role="dialog" aria-modal="true" aria-labelledby="why-title" tabindex="-1">
-      <div class="why-head">
+    <div id="why-panel" class="why-panel" role="dialog" aria-labelledby="why-title" tabindex="-1">
+      <div id="why-drag-handle" class="why-head">
+        <span class="why-dot" aria-hidden="true"></span>
         <span id="why-title" class="why-title">What is limiting charging</span>
         <button type="button" class="why-close" onclick="whyPanelClose()" aria-label="Close">&#x2715;</button>
       </div>
@@ -16408,17 +16421,16 @@
           <span class="why-k">Asking for</span><span class="why-v" id="why-ask">&mdash;</span><span class="why-u">A</span>
           <span class="why-k">Field drive</span><span class="why-v" id="why-duty">&mdash;</span><span class="why-u">%</span>
         </div>
-        <hr>
-        <div class="why-line why-headline" id="why-headline">Waiting for data</div>
-        <hr>
+        <div class="why-verdict">
+          <div class="why-line why-headline" id="why-headline">Waiting for data</div>
+        </div>
         <div class="why-line why-where" id="why-where"></div>
-        <hr class="why-bms-hr" id="why-bms-hr">
-        <div class="why-bms" id="why-bms">
-          <div class="why-bms-grid">
-            <span class="why-k">Charge voltage</span><span class="why-v" id="why-bms-v">&mdash;</span><span class="why-u">V</span><span class="why-own" id="why-bms-v-own"></span>
-            <span class="why-k">Charge current</span><span class="why-v" id="why-bms-a">&mdash;</span><span class="why-u">A</span><span class="why-own" id="why-bms-a-own"></span>
+        <div class="why-ext" id="why-ext">
+          <div class="why-ext-grid">
+            <span class="why-k">Charge voltage</span><span class="why-v" id="why-ext-v">&mdash;</span><span class="why-u">V</span><span class="why-own" id="why-ext-v-own"></span>
+            <span class="why-k">Charge current</span><span class="why-v" id="why-ext-a">&mdash;</span><span class="why-u">A</span><span class="why-own" id="why-ext-a-own"></span>
           </div>
-          <div class="why-bms-note">If the BMS stops responding, your own settings apply.</div>
+          <div class="why-ext-note">If the sender stops responding, your own settings apply.</div>
         </div>
       </div>
     </div>

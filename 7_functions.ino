@@ -5542,11 +5542,12 @@ static const char *altSweepLimitNow() {
   float v = getBatteryVoltage();
   if (ChargingVoltageTarget > 0.5f && v >= ChargingVoltageTarget - altSweepMarginV)
                                                                            return "charge-voltage target";
-  // DVCC limits count only while actually following a BMS — dvccCvlV/dvccCclA hold their last
-  // decoded values when the link drops or the feature is off, and a stale one would end every sweep.
+  // DVCC limits count only while actually following an external authority — dvccCvlV/dvccCclA hold
+  // their last decoded values when the link drops or the feature is off, and a stale one would end
+  // every sweep. "external" not "BMS": the publisher is as often a gateway (Cerbo GX) as a battery.
   bool dvccFollowing = (dvccEn == 1 && dvccState == 3);
   if (dvccFollowing && !isnan(dvccCvlV) && v >= dvccCvlV - altSweepMarginV)
-                                                                           return "BMS voltage limit";
+                                                                           return "external voltage limit";
   float amps = isnan(MeasuredAmps) ? 0.0f : MeasuredAmps;
   // capLimitMode 1 = the cap table is watts, not amps (the min-select chain divides it by bus volts).
   float capA = (capLimitMode == 1 && v > 0.5f) ? (interpolateRPMTable(RPM, rpmCapPowerTable) / v)
@@ -5554,7 +5555,7 @@ static const char *altSweepLimitNow() {
   capA = fminf(capA, (float)MaxTableValue);
   if (capA > 0.5f && amps >= capA - altSweepAmpMargin(capA))               return "current limit at this engine speed";
   if (dvccFollowing && !isnan(dvccCclA) && dvccCclA > 0.5f && amps >= dvccCclA - altSweepAmpMargin(dvccCclA))
-                                                                           return "BMS current limit";
+                                                                           return "external current limit";
   // Same enable gate the battery-limit ceiling uses in the min-select chain (BattLimitEnable +
   // a configured INA228 shunt), so a disabled limit cannot cut the sweep short.
   if (BattLimitEnable && HAS_BATT_SHUNT && BatteryCurrentSource == 0 && BattCurrentLimitA > 0.5f
@@ -5929,7 +5930,7 @@ static int16_t thermalLogScale10(float v) {
   if (isnan(v) || isinf(v)) return 0;
   float scaled = v * 10.0f;
   if (scaled > 32767.0f) return 32767;
-  if (scaled < -32768.0f) return -32768;
+  if (scaled < -32767.0f) return -32767;   // NOT -32768: INT16_MIN is the log's "no reading" blank
   return (int16_t)lroundf(scaled);
 }
 
@@ -5950,4 +5951,12 @@ inline void wmIgnUpdate(IgnWatermark &w, float v) {
   if (isnan(w.lo) || v < w.lo) w.lo = v;
   if (isnan(w.hi) || v > w.hi) w.hi = v;
 }
-inline float wmIgnSafe(float v) { return isnan(v) ? 0.0f : v; }
+// CSV emitter for a watermark. A sensor absent for the whole ignition cycle leaves the pair NAN;
+// a 0 there was rendered as a measured low/high (0 F, 0 kt, 0 deg heel). ROLL_EMPTY -> "—".
+inline int wmIgnCsv(float v, int scale) {
+  if (!isfinite(v)) return ROLL_EMPTY;
+  float x = v * (float)scale;   // lroundf on a non-finite or out-of-range float is undefined
+  if (x >  2000000000.0f) return  2000000000;
+  if (x < -1000000000.0f) return -1000000000;   // stays clear of ROLL_EMPTY, which must stay unreachable
+  return (int)lroundf(x);
+}

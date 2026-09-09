@@ -1238,8 +1238,14 @@ static uint8_t rvcChargeState() {
 // enum only names thermal, battery-temperature and battery-voltage causes, so the limiters with
 // no equivalent (RPM/belt cap, max duty, protection recovery, BMS current limit) report the
 // derating bit with reason 255 = not available rather than a wrong named cause.
+// Codes 10 (manual field) and 11 (min field floor) are NOT derating: manual output is whatever the
+// operator typed, and the floor RAISES output. Claiming a derate for either would tell the bus the
+// charger is holding back when it is not. 12 (zero-current command) joins them for the same reason as
+// 10: zero IS the operator's command, not a derate. 13 (warm-up ramp) and 14 (Hi->Lo glide) ARE real
+// derates and fall to the default 255, which is right — the RV-C enum has no name for either. Every
+// code here reports exactly what it reported before it had a name of its own, so the bus sees no change.
 static void rvcDeratingFromLimiter(uint8_t &derating, uint8_t &reason) {
-  if (ctrlLimiter == 0) { derating = 0; reason = 0; return; }
+  if (ctrlLimiter == 0 || ctrlLimiter == 10 || ctrlLimiter == 11 || ctrlLimiter == 12) { derating = 0; reason = 0; return; }
   derating = 1;
   switch (ctrlLimiter) {
     case 2: reason = 1; break;  // thermal derate -> High Internal Temperature
@@ -2164,10 +2170,13 @@ void captureResetReason() {
   Serial.printf("RESET: %s | esp=%d rtc0=%d rtc1=%d\n",
                 resetReasonName(), g_rawResetEsp, g_rawResetRtc0, g_rawResetRtc1);
   if (g_blackBoxPrevValid) {
-    Serial.printf("BLACKBOX: up=%lus IBV=%.2fV duty=%.1f%% RPM=%d amps=%.1f altT=%dF mode=%u stage=%u loop=%.1fms heap=%ldKB\n",
+    char bbTemp[12];   // -999 is the store-side "no probe had read" marker (loop()); never print it raw
+    if (g_blackBoxPrev.altTempF == -999) snprintf(bbTemp, sizeof(bbTemp), "n/a");
+    else snprintf(bbTemp, sizeof(bbTemp), "%dF", (int)g_blackBoxPrev.altTempF);
+    Serial.printf("BLACKBOX: up=%lus IBV=%.2fV duty=%.1f%% RPM=%d amps=%.1f altT=%s mode=%u stage=%u loop=%.1fms heap=%ldKB\n",
                   (unsigned long)(g_blackBoxPrev.upMillis / 1000UL), g_blackBoxPrev.ibv,
                   g_blackBoxPrev.duty, (int)g_blackBoxPrev.rpm, g_blackBoxPrev.measAmps,
-                  (int)g_blackBoxPrev.altTempF, g_blackBoxPrev.sysMode, g_blackBoxPrev.chargeStage,
+                  bbTemp, g_blackBoxPrev.sysMode, g_blackBoxPrev.chargeStage,
                   g_blackBoxPrev.maxLoopUs / 1000.0f, (long)g_blackBoxPrev.minHeapKB);
   } else {
     Serial.println("BLACKBOX: RTC RAM lost - true power interruption preceded this boot");
@@ -2852,13 +2861,20 @@ void UpdateEngineRuntime(unsigned long elapsedMillis) {
 
   // Engine start/stop edge — one console line per transition. Anchors the session
   // timeline so charging events can be read against engine state.
-  if (engineIsRunning && !engineWasRunning) {
-    queueConsoleMessageF("Engine STARTED (RPM=%d)", (int)RPM);
-  } else if (!engineIsRunning && engineWasRunning) {
-    queueConsoleMessageF("Engine STOPPED (RPM=%d)", (int)RPM);
+  // The whole edge detector FREEZES while g_rpmTachMasked: an abrupt field cut (commissioning stage
+  // 7, or a protection cut) spikes then false-zeros the LM2907 for ~4.6s, and the log line reported
+  // a stop/start the engine never made. Freezing, not suppressing — engineWasRunning is held too, so
+  // a phantom that returns before the mask lifts produces no transition at all, while a stop that is
+  // REAL still announces itself once the mask lifts, just up to ~4.6s late. Run-time and cycle
+  // accounting above are untouched.
+  if (!g_rpmTachMasked) {
+    if (engineIsRunning && !engineWasRunning) {
+      queueConsoleMessageF("Engine STARTED (RPM=%d)", (int)RPM);
+    } else if (!engineIsRunning && engineWasRunning) {
+      queueConsoleMessageF("Engine STOPPED (RPM=%d)", (int)RPM);
+    }
+    engineWasRunning = engineIsRunning;
   }
-
-  engineWasRunning = engineIsRunning;
 }
 // 5-sample moving average
 void getSmoothedGPS(double &smoothLat, double &smoothLon) {
@@ -5494,15 +5510,36 @@ void ensurePreferredBootPartition() {
     }
   }
 }
+// Close the arm window and latch the notice the next client will see. One place, so the lazy
+// endpoint check and the periodic hold service below cannot drift apart.
+static void settingsArmExpire() {
+  settingsArmed = false;
+  settingsAutoLockNotice = true;
+  settingsAutoLockedEpoch = (uint32_t)getCurrentTimestamp();  // 0 when no time source has ever landed
+  queueConsoleMessage("Settings auto-locked (30 min after the last interface disconnected)");
+}
+
 // Lazy-expiring check for the settings arm gate — every mutating endpoint calls this.
 bool settingsArmActive() {
   if (!settingsArmed) return false;
   if (millis() - settingsArmedAtMs > SETTINGS_ARM_TIMEOUT_MS) {
-    settingsArmed = false;
-    queueConsoleMessage("Settings auto-locked (30 min window expired)");
+    settingsArmExpire();
     return false;
   }
   return true;
+}
+
+// Once per loop pass. While at least one SSE client is attached the window's start keeps moving
+// forward, so a user working in the interface is never silently rejected mid-session; the 30-min
+// countdown then runs from the moment the last client drops, which keeps a closed laptop lid or a
+// backgrounded phone app relocking on schedule.
+void serviceSettingsArmHold() {
+  if (!settingsArmed) return;
+  if (events.count() > 0) {
+    settingsArmedAtMs = millis();
+    return;
+  }
+  if (millis() - settingsArmedAtMs > SETTINGS_ARM_TIMEOUT_MS) settingsArmExpire();
 }
 // Mirror every queued message into the /consolehist.txt history ring (own indices, own short
 // critical section — never nested inside the queue's).

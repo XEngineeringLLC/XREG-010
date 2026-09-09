@@ -774,6 +774,33 @@ void commissionStepSnapshot() {
   commissionSnapshotScalars(NK_commissionStepSnap);
 }
 
+// Discard the measured-ripple projections. Sibling of cvStressForgetLast below: a stored measurement
+// whose defining conditions moved is not stale data to be labelled, it is a measurement of a quantity
+// this device no longer computes. And it is not inert — ripFitAlt draws the red "ripple crosses the trip
+// line" shading and the verdict on the Protections plot, so a stale fit is an active false alarm.
+//
+// Scope, from the capture path (faFiltRippleUpdate): the pk-pk is an IExcessTau low-pass sampled over a
+// ripWinMs window, split in half for the min-of-halves estimator. Both knobs change the QUANTITY, not its
+// precision, so both invalidate ripFitAlt.
+//   alsoSlope: ONLY for a ripWinMs change. slpFitAlt's value is the worst positive slope of g_cvKdFiltV,
+//   the D term's own filtered voltage — IExcessTau does not touch it, and only decides which windows were
+//   admitted. An admitted point stays a valid slope, so a tau change must not throw it away.
+// NOT in scope for either knob: the Resonance & Ripple Map. faWindowFinalize measures the raw decimated
+// stream (dmv / faToneBuf) over its own fixed FA_WIN_DECIM_N window with hard-coded EMAs (FA_EMA_ALPHA,
+// FA_AMPS_EMA_ALPHA). Neither knob reaches it. Earlier console copy told the operator to clear the map;
+// that was wrong on both counts — it named the one table these knobs cannot affect, and left the two
+// they do affect in place.
+void ripFitForget(bool alsoSlope, const char *why) {
+  bool had = (ripFitAlt.nPts > 0) || (alsoSlope && slpFitAlt.nPts > 0);
+  memset(&ripFitAlt, 0, sizeof(ripFitAlt));
+  settingRemove(NK_ripFitAlt);
+  if (alsoSlope) { memset(&slpFitAlt, 0, sizeof(slpFitAlt)); settingRemove(NK_slpFitAlt); }
+  // Generic consequence: the callers cover two different failures — a knob change makes the stored fit a
+  // measurement of a quantity the device no longer computes, while a tach rescale leaves the measurement
+  // intact but relabels the RPM it was taken at. "No longer valid" is true of both.
+  if (had) queueConsoleMessageF("%s - the stored ripple current-check fit is no longer valid and was discarded; re-run the current check to replace it", why);
+}
+
 // Apply a positional-CSV scalar snapshot from `key`. Returns false (and drops a corrupt key) on a short
 // read. Does NOT touch the Min% backup and does NOT remove `key` on success — the caller owns cleanup.
 bool commissionRestoreScalars(const char* key) {
@@ -797,6 +824,7 @@ bool commissionRestoreScalars(const char* key) {
   PidKi = v[1];                  settingWrite(NK_PidKi, String(PidKi, 4).c_str());
   OutputPIDFilterTC = v[2];      settingWrite(NK_OutputPIDFilterTC, String(OutputPIDFilterTC, 2).c_str());
   VoltageFilterTC = v[3];        settingWrite(NK_VoltageFilterTC, String(VoltageFilterTC, 2).c_str());
+  if (fabsf(v[4] - IExcessTau) > 0.05f) ripFitForget(false, "Commissioning revert moved the IExcess averaging TC");
   IExcessTau = v[4];             settingWrite(NK_IExcessTau, String(IExcessTau, 1).c_str());
   IExcessFloorA = v[5];          settingWrite(NK_IExcessFloorA, String(IExcessFloorA, 1).c_str());
   IExcessCeilA = v[6];           settingWrite(NK_IExcessCeilA, String(IExcessCeilA, 1).c_str());
@@ -939,6 +967,18 @@ void commissionRecomputeState() {
   if (st != commissionState) commissionSetState(st);
 }
 
+// The stress verdict grades ONE tuned CV loop. The moment a retune clears its done bit the stored
+// blob stops being a statement about this device, so it has to go with the bit — otherwise the
+// wizard's Step 9, the standalone Tuning modal and the config export all keep serving a verdict for
+// a loop that no longer exists. Called from every path that clears bit 8 by invalidation; NOT from
+// commissionSkipStage, where skipping means "not run this pass", not "the old one is wrong".
+static void cvStressForgetLast() {
+  if (cvsLastBlob[0] == '\0') return;
+  cvsLastBlob[0] = '\0';
+  settingRemove(NK_cvStressLast);
+  queueConsoleMessage("Stress-test verdict discarded — the loop it graded was retuned");
+}
+
 // Mark a stage complete, then invalidate (clear) every downstream stage it feeds so an
 // interrupted partial run can't leave a dependent showing a stale ✓. Does NOT touch
 // commissionState — that is owned by start/abort/done.
@@ -948,6 +988,7 @@ void commissionMarkStage(int stage) {
   commissionDoneMask |= (1 << stage);
   commissionDoneMask &= ~deps;
   commissionWriteDoneMask();
+  if (deps & (1 << 8)) cvStressForgetLast();
   // This stage is now MEASURED (not hand-set); its invalidated dependents revert to pending, not manual.
   commissionManualMask &= ~((1 << stage) | deps);
   commissionWriteManualMask();
@@ -962,6 +1003,7 @@ void commissionClearStage(int stage) {
   uint16_t cleared = (1 << stage) | commissionDependentsMask(stage);
   commissionDoneMask &= ~cleared;
   commissionWriteDoneMask();
+  if (cleared & (1 << 8)) cvStressForgetLast();
   commissionManualMask &= ~cleared;   // a staled stage is no longer satisfied, hand-set or otherwise
   commissionWriteManualMask();
   if (commissionState == 2 && !commissionRequiredComplete()) commissionSetState(1);
@@ -6542,7 +6584,7 @@ void faMatrixMaybeFlush() {
 
 // Snapshot the scope ring for the /fastscope.bin endpoint. Header (24 B, little-endian):
 // u32 magic 'FSC1', u16 sampleRate/10, u16 count, u16 zero-amps mV, u16 ampsPerVolt,
-// u8 attenIs12, u8 chanState, u16 RPM, i16 altTempF (whole °F), u32 epoch (0 = clock not synced),
+// u8 attenIs12, u8 chanState, u16 RPM, i16 altTempF (whole °F, INT16_MIN = no probe had read),
 // u16 reserved. Then count × int16 calibrated mV, oldest-first. The capture is the trailing
 // ring ending NOW, so RPM/temp/epoch are stamped at request time = capture-end time.
 // Returns total bytes filled (0 = caller buffer too small).
@@ -6557,7 +6599,13 @@ size_t faScopeSnapshot(uint8_t *buf, size_t cap) {
   uint16_t zeroMv = (uint16_t)FA_ZERO_MV;
   uint16_t apv = (uint16_t)faAmpsPerVolt();
   uint16_t rpm = (uint16_t)fmaxf(0.0f, fminf(RPM, 65535.0f));
-  int16_t altTempF = (int16_t)AlternatorTemperatureF;
+  // (int16_t)NAN is undefined behaviour and stamped garbage into the header. Same blank convention
+  // as the zero-log's altTempFx10.
+  int16_t altTempF = INT16_MIN;   // blank
+  if (isfinite(AlternatorTemperatureF)) {   // lroundf out of int16 range is undefined; -32767 floor keeps INT16_MIN unreachable
+    float t = AlternatorTemperatureF;
+    altTempF = (t > 32767.0f) ? 32767 : (t < -32767.0f) ? -32767 : (int16_t)lroundf(t);
+  }
   uint32_t epoch = timeIsSynced ? (uint32_t)time(NULL) : 0;
   memcpy(buf + 0, &magic, 4);
   memcpy(buf + 4, &rateDiv10, 2);
