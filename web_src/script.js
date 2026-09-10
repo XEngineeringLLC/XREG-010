@@ -9567,15 +9567,12 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
             noticeHtml += battDefNotice('limit', 'Battery temperature source',
                 'Battery temperature is taken from the regulator board unless a battery probe, an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source provides it. The board runs warmer than its surroundings, so the cold-charge lockout is a coarse guard when it is the only source. A battery probe fitted later is assigned under Setup > Temperature, where the hot-charge lockout and battery temperature limits also live.');
         }
-        // Float is proposed for the lead chemistries, but the /get?UseFloat handler writes 0 whenever the
-        // shunt is marked absent (the boot reconciliation does the same), so proposing 1 here only made
-        // the post-apply check report it as "did not take". Propose the value the regulator will hold,
-        // keep the float voltage/duration rows (inert until float is on), and say why.
+        // Voltage float is allowed without a shunt (2026-09-09): absorption then ends on its time limit
+        // instead of tail current, the way a solar controller floats with no shunt. Say which exit will
+        // run, and that the time limit is therefore the setting to get right.
         if (der.useFloat === 1 && shuntPresent !== 1) {
-            const fr = der.rows.find(r => r.param === 'UseFloat');
-            if (fr) fr.value = 0;
-            noticeHtml += battDefNotice('limit', 'Float charging needs the battery shunt',
-                'Voltage Float is the usual choice for this chemistry, but the battery shunt is marked absent, and without one the regulator holds float charging off (along with State of Charge, battery health and the battery current limit), so Float Mode is proposed as No Float, the value the regulator would set anyway. Float Voltage and Float Duration are still proposed so they are in place for later. Declare the shunt under Setup > Battery, enter its resistance, and run this again to switch to Voltage Float.');
+            noticeHtml += battDefNotice('info', 'Float without a shunt runs on time',
+                'The battery shunt is marked absent, so the regulator cannot see the battery\'s own current. Absorption will end on its time limit (Absorption Timeout under Setup > Battery) instead of on tail current, and float then holds the float voltage. With no shunt that time limit is the setting to get right for this bank. Declaring the shunt and entering its resistance switches the exit to tail current.');
         }
         if (type === 'lifepo4' && battSrc !== 0) {
             noticeHtml += battDefNotice('info', 'Float changed to No Float',
@@ -10157,7 +10154,7 @@ function commPrepRender(cfg) {
         '<button type="button" id="commprep-sh-1" class="cap-mode-btn' + (shuntPresent === 1 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntPresent(1)">Installed</button>' +
         '<button type="button" id="commprep-sh-0" class="cap-mode-btn' + (shuntPresent === 0 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntPresent(0)">None</button>' +
         '</div>' +
-        '<div style="font-size:11px; color:#888; margin-top:5px; line-height:1.4;">Set this before commissioning. Without a shunt: state of charge, the battery-current limit, and float charging turn off, and absorption can no longer end on tapering current — it runs until its time limit instead. The alternator-current limit protects the battery (as best it can — it\'s unaware of other charging sources). This mode is NOT RECOMMENDED and for skilled use only.</div>' +
+        '<div style="font-size:11px; color:#888; margin-top:5px; line-height:1.4;">Set this before commissioning. Without a shunt: state of charge, the battery-current limit, and zero-current float turn off, and absorption can no longer end on tapering current — it runs until its time limit instead, then float (if enabled) holds the float voltage. The alternator-current limit protects the battery (as best it can — it\'s unaware of other charging sources). This mode is NOT RECOMMENDED and for skilled use only.</div>' +
         '</div>';
 
     const thermistor = '<div id="commprep-thermistor" style="display:' + (ts === 1 ? '' : 'none') + '; margin:0 0 14px; padding:10px 12px; background:#191919; border:1px solid #333; border-radius:6px;">' +
@@ -10325,7 +10322,7 @@ function commPrepCollectChanges() {
     const ufSel = document.getElementById('commprep-usefloat');
     if (ufSel && ufSel.value !== _commPrepFloatInit) out.push({ param: 'UseFloat', value: parseInt(ufSel.value, 10) });
     if (_commPrepTempSrc !== _commPrepTsInit) out.push({ param: 'TempSource', value: _commPrepTempSrc });
-    // Write shunt-present before the wizard starts so its side effects (float off, SoC/limit off) settle
+    // Write shunt-present before the wizard starts so its side effects (zero-current float demoted, SoC/limit off) settle
     // ahead of commissioning, instead of being toggled mid-run.
     if (_commPrepShuntPresent !== _commPrepShuntInit) out.push({ param: 'BatteryShuntPresent', value: _commPrepShuntPresent });
     return out;
@@ -15179,7 +15176,15 @@ function updateTogglesFromData(data) {
         // Single point that drives the whole no-shunt UI: body.no-batt-current greys every
         // .gate-batt-current setting and hides every .req-batt-current readout (styles.css).
         // Only touch it when the echo is actually present.
-        if ('BatteryShuntPresent' in data) document.body.classList.toggle('no-batt-current', String(data.BatteryShuntPresent) === '0' || (parseFloat(data.ShuntResistanceMicroOhm) || 0) <= 0);  // mirror firmware HAS_BATT_SHUNT
+        if ('BatteryShuntPresent' in data) {
+            const noShunt = String(data.BatteryShuntPresent) === '0' || (parseFloat(data.ShuntResistanceMicroOhm) || 0) <= 0;  // mirror firmware HAS_BATT_SHUNT
+            document.body.classList.toggle('no-batt-current', noShunt);
+            // The Float Phase card itself is not gated: voltage float runs on the absorption time limit
+            // with no shunt. Zero-current float is the one float mode that is a battery-current control
+            // law, so only that option goes (the firmware demotes a stored 2 to 1 the same way).
+            const zc = document.querySelector('select[name="UseFloat"] option[value="2"]');
+            if (zc) zc.disabled = noShunt;
+        }
         // Same shape for the Extra probe: its alarms live in Setup > Alarms and grey out there
         // while the probe is off, instead of only existing when it is on.
         if ('extraTempProbeEnable' in data) document.body.classList.toggle('no-extra-temp', String(data.extraTempProbeEnable) === '0');
@@ -23128,7 +23133,7 @@ function updateFloatVisibility(pendingVal) {
     if (el) el.classList.toggle('is-gated', v !== 1);
     const d = document.getElementById('floatModeDesc');
     if (d) d.textContent =
-        v === 2 ? 'Alternator carries the house loads; battery rests at 0 A. Rebulk criteria stay armed.' :
+        v === 2 ? 'Alternator carries the house loads; battery rests at 0 A. Rebulk criteria stay armed. Needs the battery shunt.' :
         v === 1 ? 'Holds the battery at Float Voltage after Absorption (settings below).' :
                   'Field off after Absorption; battery carries the loads until rebulk criteria are met.';
 }

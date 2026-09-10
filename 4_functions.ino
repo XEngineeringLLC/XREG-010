@@ -2078,16 +2078,18 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     UseFloat = settingRead(NK_UseFloat).toInt();
   }
-  // Shunt declared absent → float (needs tail current) and MaintainMode can never run. Clear them at boot
-  // (runs after shunt-present, UseFloat and MaintainMode are all read) so a config import pairing no-shunt
-  // with float-on can't leave the stage machine acting on a meaningless Bcur. /get does the same on a live
-  // toggle. A present-but-unset resistance is deliberately NOT reconciled — it is a recoverable calibration
-  // gap, and the destroyed setting could not be restored by fixing the resistance.
+  // Shunt declared absent → the two battery-CURRENT control laws (zero-current float, MaintainMode) can never
+  // run: demote UseFloat 2 to voltage float and clear MaintainMode at boot (runs after shunt-present, UseFloat
+  // and MaintainMode are all read) so a config import pairing no-shunt with either can't leave the stage
+  // machine acting on a meaningless Bcur. /get does the same on a live toggle. Voltage float is NOT gated:
+  // absorption ends on AbsorptionTimeoutMs and CV holds FloatVoltage, no current needed. A present-but-unset
+  // resistance is deliberately NOT reconciled — it is a recoverable calibration gap, and the destroyed
+  // setting could not be restored by fixing the resistance.
   if (!BatteryShuntPresent) {
-    if (UseFloat != 0)     { UseFloat = 0;     settingWrite(NK_UseFloat, "0"); }
+    if (UseFloat == 2)     { UseFloat = 1;     settingWrite(NK_UseFloat, "1"); }
     if (MaintainMode != 0) { MaintainMode = 0; MaintainModeUserSel = 0; settingWrite(NK_MaintainMode, "0"); }
   } else if (!HAS_BATT_SHUNT) {
-    queueConsoleMessage("Battery shunt resistance is not set: State of Charge, battery health, battery current limit and float charging are off.");
+    queueConsoleMessage("Battery shunt resistance is not set: State of Charge, battery health, battery current limit and zero-current float are off. Absorption ends on its time limit.");
     queueConsoleMessage("Enter the shunt resistance to enable them. Your float setting is kept.");
   }
 

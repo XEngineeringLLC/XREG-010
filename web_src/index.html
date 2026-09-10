@@ -6776,7 +6776,7 @@
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
                 Phase Definitions
               </summary>
-              <p class="gate-note gate-note-shunt">No battery shunt is installed, so every setting that reads battery current is greyed below: Tail Current, the whole Float Phase, Force &quot;Maintain Mode&quot; and the Rebulk Current Threshold. Absorption ends on time alone until a shunt is fitted under Setup &rarr; Battery &rarr; Measurement Sources.</p>
+              <p class="gate-note gate-note-shunt">No battery shunt is installed, so every setting that reads battery current is greyed below: Tail Current, zero-current float, Force &quot;Maintain Mode&quot; and the Rebulk Current Threshold. Absorption ends on time alone, and float (if enabled) then holds the float voltage, until a shunt is fitted under Setup &rarr; Battery &rarr; Measurement Sources.</p>
               <div style="padding-left: 12px; border-left: 2px solid var(--border); margin-top: 10px;">
 
             <!-- Bulk Phase -->
@@ -6924,7 +6924,7 @@
             </details>
 
             <!-- Float Phase -->
-            <details class="gate-batt-current" style="margin-top: 16px;">
+            <details style="margin-top: 16px;">
               <summary
                 style="cursor: pointer; font-weight: 600; font-size: 14px; padding: 6px 0; border-bottom: 1px solid var(--border); margin-bottom: 8px;">
                 Float Phase

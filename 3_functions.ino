@@ -5535,16 +5535,18 @@ void setupServer() {
       inputMessage = request->getParam("BatteryShuntPresent")->value();
       settingWrite(NK_BatteryShuntPresent, inputMessage.c_str());
       BatteryShuntPresent = inputMessage.toInt();
-      // Persist the force-off ONLY for the sticky statement "no shunt". A shunt declared present but with no
+      // Only the two battery-CURRENT control laws go with the sticky statement "no shunt": zero-current float
+      // is demoted to voltage float and Maintain is cleared. Voltage float stays — absorption ends on its
+      // time limit and CV holds FloatVoltage, no current needed. A shunt declared present but with no
       // resistance entered is a recoverable calibration gap: every Bcur consumer already gates on
       // HAS_BATT_SHUNT, so suppress at runtime and leave the user's Float/Maintain choice in NVS.
       if (!BatteryShuntPresent) {
-        if (UseFloat != 0)     { UseFloat = 0;     settingWrite(NK_UseFloat, "0"); }
+        if (UseFloat == 2)     { UseFloat = 1;     settingWrite(NK_UseFloat, "1"); }
         if (MaintainMode != 0 || MaintainModeUserSel != 0) { MaintainMode = 0; MaintainModeUserSel = 0; settingWrite(NK_MaintainMode, "0"); }
-        queueConsoleMessage("Battery shunt marked absent: State of Charge, battery health, battery current limit and float charging are off.");
+        queueConsoleMessage("Battery shunt marked absent: State of Charge, battery health, battery current limit and zero-current float are off. Absorption ends on its time limit, then float holds the float voltage.");
         queueConsoleMessage("Load-dump detection is off too. The alternator current limit now protects the battery.");
       } else if (!HAS_BATT_SHUNT) {
-        queueConsoleMessage("Battery shunt resistance is not set: State of Charge, battery health, battery current limit and float charging are off.");
+        queueConsoleMessage("Battery shunt resistance is not set: State of Charge, battery health, battery current limit and zero-current float are off. Absorption ends on its time limit.");
         queueConsoleMessage("Enter the shunt resistance to enable them. Your float setting is kept.");
       }
     }
@@ -6164,10 +6166,11 @@ void setupServer() {
       foundParameter = true;
       inputMessage = request->getParam("UseFloat")->value();
       UseFloat = constrain(inputMessage.toInt(), 0, 2);  // 0=idle, 1=voltage float, 2=zero-current float
-      // Keyed on the sticky "no shunt" statement, not HAS_BATT_SHUNT: with a shunt fitted but no resistance
-      // entered, plain float still works (absorption ends on AbsorptionTimeoutMs, CV then holds FloatVoltage)
-      // and zeroFloatActive already self-gates. Refusing here would persist a 0 the user can't undo.
-      if (!BatteryShuntPresent) UseFloat = 0;
+      // Voltage float needs no battery current: without a shunt absorption ends on AbsorptionTimeoutMs and
+      // CV then holds FloatVoltage, the way a solar controller floats with no shunt. Zero-current float IS a
+      // battery-current control law, so with the shunt declared absent it is stored as voltage float (the
+      // runtime EFFECTIVE_USE_FLOAT map does the same for a shunt present but unset).
+      if (!BatteryShuntPresent && UseFloat == 2) UseFloat = 1;
       settingWrite(NK_UseFloat, String(UseFloat).c_str());
     }
     if (request->hasParam("RebulkCurrent_A")) {
