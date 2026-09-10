@@ -1050,6 +1050,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "imu_dist_bow_ft", NK_imuDistBowFt, 3 },
   { "imu_dist_cl_ft", NK_imuDistClFt, 3 },
   { "imu_height_wl_ft", NK_imuHtWlFt, 3 },
+  { "regulator_name", NK_regName, 3 },
   { "vesselSaved", NK_vesselSaved, 3 },
   // ── Debug/support state — persisted runtime intent, lifecycle and small result blobs.
   //    Tier 3: rides every snapshot/export so a support session sees the device's full picture
@@ -1328,12 +1329,13 @@ String exportTablesObject() {
 // Derived view of the Vessel Info NVS record, served at /vessel_info.json. Built from the live
 // globals rather than re-reading NVS so it always matches what the loops are running. Numbers stay
 // JSON numbers — the dashboard form tests `!== undefined` and radio-selects on a numeric compare,
-// so a quoted "0" orientation would fail to select. The same 19 fields are also in the manifest
+// so a quoted "0" orientation would fail to select. The same 20 fields are also in the manifest
 // half of /exportConfig; this is the ungated, form-shaped view of them.
 String vesselInfoJson() {
   String j;
   j.reserve(768);
-  j = "{\"boat_length_ft\":";           j += String(BOAT_LENGTH_FT, 2);
+  j = "{\"regulator_name\":";          cfgAppendJsonStr(j, String(REGULATOR_NAME));
+  j += ",\"boat_length_ft\":";          j += String(BOAT_LENGTH_FT, 2);
   j += ",\"boat_displacement_lbs\":";   j += String(BOAT_DISPLACEMENT_LBS, 0);
   j += ",\"boat_type\":";               cfgAppendJsonStr(j, BOAT_TYPE);
   j += ",\"boat_make_model\":";         cfgAppendJsonStr(j, BOAT_MAKE_MODEL);
@@ -1652,7 +1654,7 @@ bool bhStartTest() {
   if (sysMode != SYS_MODE_AUTO){ bhAbortReason = "must be in AUTO mode";     return false; }   // generator only runs in the AUTO control path
   // altSweepRequested too: a sweep start is two-stage (the HTTP press arms the request, the next
   // control tick promotes it to altSweepActive), so active alone leaves a one-tick window.
-  if (TuningMode || CVTuningMode || systemIDActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || resTestActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested) { bhAbortReason = "another test active"; return false; }
+  if (TuningMode || CVTuningMode || systemIDActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || resTestActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) { bhAbortReason = "another test active"; return false; }
   if (BatteryCurrentSource != 0 || !HAS_BATT_SHUNT){ bhAbortReason = "needs INA228 battery shunt"; return false; }
   if (bhNumEdges < 3) bhNumEdges = 3;
   if (bhNumEdges > BH_MAX_TOGGLES - 3) bhNumEdges = BH_MAX_TOGGLES - 3;
@@ -2213,7 +2215,7 @@ bool cvpfStartTest(float diMaxReq) {
   if (!cvpfBuf)                 { cvpfAbortMsg = "buffer unallocated";     return false; }
   if (RPM < 100)                { cvpfAbortMsg = "engine not running";     return false; }
   if (sysMode != SYS_MODE_AUTO) { cvpfAbortMsg = "must be in AUTO mode";   return false; }
-  if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested) {
+  if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) {
     cvpfAbortMsg = "another test active"; return false;
   }
   cvpfBufCount = 0; cvpfSampleLastMs = 0;
@@ -2373,7 +2375,7 @@ bool cvStressStartTest() {
   if (cvStressActive)           { cvStressAbortMsg = "already running";      return false; }
   if (RPM < 100)                { cvStressAbortMsg = "engine not running";   return false; }
   if (sysMode != SYS_MODE_AUTO) { cvStressAbortMsg = "must be in AUTO mode"; return false; }
-  if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || protTestActive || (altSweepActive != 0) || altSweepRequested) {
+  if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) {
     cvStressAbortMsg = "another test active"; return false;
   }
   if (millis() - cvsLastEndMs < 2000UL) { cvStressAbortMsg = "cooling down — retry in a moment"; return false; }

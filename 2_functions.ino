@@ -394,7 +394,7 @@ bool fsRemove(const char *path) {
 #define NK_systemIDSineCycles "SysIDSineCyc"
 #define NK_SystemIDStabilizeAmps "SysIDStabAmps"
 #define NK_commissionState "commissnState"   // 0=not / 1=in-progress / 2=commissioned
-#define NK_commissionPhase "commissnPhase"    // current wizard phase (0=Prep…8=Stress test, 9=finished); moves backward on Back
+#define NK_commissionPhase "commissnPhase"    // current wizard phase (0=Prep…9=Charge health calibration, 10=finished); moves backward on Back
 #define NK_commissionDoneMask "commissnDoneMsk" // per-stage completion bitmask (bit i = stage i done); 15-char max
 #define NK_commissionManualMask "commissnManMsk" // per-stage set-by-hand bitmask (skip / mark-done-manually)
 #define NK_commissionSnap "commissnSnap"      // Phase-0 origin snapshot (explicit-abort full revert): positional CSV of the settings the flow writes
@@ -577,6 +577,7 @@ bool fsRemove(const char *path) {
 #define NK_imuDistBowFt    "imuDistBowFt"
 #define NK_imuDistClFt     "imuDistClFt"
 #define NK_imuHtWlFt       "imuHtWlFt"
+#define NK_regName         "regName"
 #define NK_vesselSaved     "vesselSaved"
 // NMEA2000 transmit (producer)
 #define NK_n2kTxEn         "n2kTxEn"
@@ -708,7 +709,7 @@ long clampLoadedSetting(const char *name, const char *nvsKey, long value, long l
   return clamped;
 }
 
-#define SETTINGS_SCHEMA_VERSION 2
+#define SETTINGS_SCHEMA_VERSION 3
 
 // Cumulative settings-schema migration chain. Runs once at boot, right after the last NVS
 // settings loader (initWeatherModeSettings), so steps see the fully seeded key set — a step
@@ -730,6 +731,17 @@ void runSettingsMigrations() {
         // PhysicalPanelOverride ("PhysPanelOvrrd") on 2026-09-06 with the opposite sense (old 1 = web owns
         // the modes = new 0), so the value is not carried over; the retired key is erased.
         settingRemove("SwtchCntrlOvrrd");
+        break;
+      case 2:
+        // 2->3: the alternator-health steadiness gate moved from max-min spread bands to rms departure
+        // from a fitted line on 2026-09-09. altRpmTol -> altRpmLineRms/altRpmRateMax, altDutyTolPct ->
+        // altDutyLineRms/altDutySlewMax, altAmpsTolPct/altAmpsFloorA -> altAmpsLinePct/altAmpsLineFlrA.
+        // The measured quantity changed, so a stored spread is not a valid rms limit: the old keys are
+        // erased and the new ones take their defaults rather than carrying a number over.
+        settingRemove("altRpmTol");
+        settingRemove("altDutyTolPct");
+        settingRemove("altAmpsTolPct");
+        settingRemove("altAmpsFloorA");
         break;
     }
     stored++;
@@ -782,23 +794,31 @@ void commissionStepSnapshot() {
 // Scope, from the capture path (faFiltRippleUpdate): the pk-pk is an IExcessTau low-pass sampled over a
 // ripWinMs window, split in half for the min-of-halves estimator. Both knobs change the QUANTITY, not its
 // precision, so both invalidate ripFitAlt.
-//   alsoSlope: ONLY for a ripWinMs change. slpFitAlt's value is the worst positive slope of g_cvKdFiltV,
-//   the D term's own filtered voltage — IExcessTau does not touch it, and only decides which windows were
-//   admitted. An admitted point stays a valid slope, so a tau change must not throw it away.
+//   ripple / slope: which stored fit the caller's change invalidates — the two are independent.
+//   ripFitAlt (ripple) is the pk-pk of the IExcessTau low-pass over a ripWinMs window, so BOTH of those
+//   knobs kill it. slpFitAlt (slope) is the worst positive slope of g_cvKdFiltV, the D term's own filtered
+//   voltage: CvKdVoltFiltTC IS that filter and ripWinMs IS the window the slope is taken over, so both of
+//   those kill it, while IExcessTau only decides which windows were admitted — an admitted point stays a
+//   valid slope, so a tau change must not throw it away. A tach rescale relabels the RPM of both, so both.
 // NOT in scope for either knob: the Resonance & Ripple Map. faWindowFinalize measures the raw decimated
 // stream (dmv / faToneBuf) over its own fixed FA_WIN_DECIM_N window with hard-coded EMAs (FA_EMA_ALPHA,
 // FA_AMPS_EMA_ALPHA). Neither knob reaches it. Earlier console copy told the operator to clear the map;
 // that was wrong on both counts — it named the one table these knobs cannot affect, and left the two
 // they do affect in place.
-void ripFitForget(bool alsoSlope, const char *why) {
-  bool had = (ripFitAlt.nPts > 0) || (alsoSlope && slpFitAlt.nPts > 0);
-  memset(&ripFitAlt, 0, sizeof(ripFitAlt));
-  settingRemove(NK_ripFitAlt);
-  if (alsoSlope) { memset(&slpFitAlt, 0, sizeof(slpFitAlt)); settingRemove(NK_slpFitAlt); }
+void ripFitForget(bool ripple, bool slope, const char *why) {
+  bool hadRip = ripple && (ripFitAlt.nPts > 0);
+  bool hadSlp = slope && (slpFitAlt.nPts > 0);
+  if (ripple) { memset(&ripFitAlt, 0, sizeof(ripFitAlt)); settingRemove(NK_ripFitAlt); }
+  if (slope)  { memset(&slpFitAlt, 0, sizeof(slpFitAlt)); settingRemove(NK_slpFitAlt); }
   // Generic consequence: the callers cover two different failures — a knob change makes the stored fit a
   // measurement of a quantity the device no longer computes, while a tach rescale leaves the measurement
   // intact but relabels the RPM it was taken at. "No longer valid" is true of both.
-  if (had) queueConsoleMessageF("%s - the stored ripple current-check fit is no longer valid and was discarded; re-run the current check to replace it", why);
+  if (hadRip || hadSlp) {
+    const char *what = (hadRip && hadSlp) ? "ripple and voltage-slope current-check fits are no longer valid and were"
+                       : hadRip           ? "ripple current-check fit is no longer valid and was"
+                                          : "voltage-slope current-check fit is no longer valid and was";
+    queueConsoleMessageF("%s - the stored %s discarded; re-run the current check to replace it", why, what);
+  }
 }
 
 // Apply a positional-CSV scalar snapshot from `key`. Returns false (and drops a corrupt key) on a short
@@ -824,7 +844,7 @@ bool commissionRestoreScalars(const char* key) {
   PidKi = v[1];                  settingWrite(NK_PidKi, String(PidKi, 4).c_str());
   OutputPIDFilterTC = v[2];      settingWrite(NK_OutputPIDFilterTC, String(OutputPIDFilterTC, 2).c_str());
   VoltageFilterTC = v[3];        settingWrite(NK_VoltageFilterTC, String(VoltageFilterTC, 2).c_str());
-  if (fabsf(v[4] - IExcessTau) > 0.05f) ripFitForget(false, "Commissioning revert moved the IExcess averaging TC");
+  if (fabsf(v[4] - IExcessTau) > 0.05f) ripFitForget(true, false, "Commissioning revert moved the IExcess averaging TC");
   IExcessTau = v[4];             settingWrite(NK_IExcessTau, String(IExcessTau, 1).c_str());
   IExcessFloorA = v[5];          settingWrite(NK_IExcessFloorA, String(IExcessFloorA, 1).c_str());
   IExcessCeilA = v[6];           settingWrite(NK_IExcessCeilA, String(IExcessCeilA, 1).c_str());
@@ -861,6 +881,8 @@ bool commissionRestore() {
 // Put the lifecycle bookkeeping back to exactly what it was before the run that is being aborted
 // (written by the deferred Start worker on every fresh Start). Returns false when no record exists —
 // the caller then falls back to the legacy zeroing.
+static void cvStressForgetLast();   // defined below, next to the done-mask helpers it belongs with
+
 bool commissionRestorePreRun() {
   if (!settingExists(NK_commissionPreRun)) return false;
   String s = settingRead(NK_commissionPreRun);
@@ -872,6 +894,9 @@ bool commissionRestorePreRun() {
   commissionSetPhase((uint8_t)ph);
   commissionDoneMask = (uint16_t)dm;
   commissionWriteDoneMask();
+  // A pre-run mask without bit 8 means any stored verdict was earned by the run now being reverted, so it
+  // grades a tune that no longer exists. No-ops when there is no stored verdict.
+  if (!(commissionDoneMask & (1 << 8))) cvStressForgetLast();
   commissionManualMask = (uint16_t)mm;
   commissionWriteManualMask();
   return true;
@@ -892,14 +917,19 @@ void commissionSetPhase(uint8_t p) {
 
 // ── Per-stage completion tracking ─────────────────────────────────────────────
 // commissionDoneMask carries one bit per stage (0=Prep, 1=Field curve … 7=Min% floor + Field decay,
-// 8=Stress test). It is the source of truth for the per-step ✓ marks and for the default checkbox
+// 8=Stress test, 9=Charge health calibration). New stages are APPENDED, never inserted: the mask is
+// stored in NVS, so reusing an existing bit index would silently reinterpret a fielded device's
+// history as a stage it never ran. It is the source of truth for the per-step ✓ marks and for the default checkbox
 // selection of a partial re-run. commissionState (0/1/2) is the lifecycle badge and is DERIVED from
 // the mask wherever it is recomputed below.
-#define COMMISSION_STAGE_COUNT 9
-#define COMMISSION_ALL_DONE    0x1FF  // bits 0..8 set = every stage complete (7 = Min% floor + Field decay, 8 = CV stress test)
+#define COMMISSION_STAGE_COUNT 10
+#define COMMISSION_ALL_DONE    0x3FF  // bits 0..9 set = every stage complete (7 = Min% floor + Field decay, 8 = CV stress test, 9 = Charge health calibration)
 // COMMISSIONED requires only bits 0..7: the Stress test(8) is a diagnostic reference check that writes
-// no settings, so skipping it never blocks the badge or keeps the nag alive. Its done bit still drives
-// the step-9 ✓ and goes stale on upstream retunes like any other stage.
+// no settings, and the Charge health calibration(9) needs a battery that will accept current, which is
+// not always true on the day — neither may block the badge or keep the nag alive. Their done bits still
+// drive the per-step ✓. The Stress test's goes stale on upstream retunes like any other stage; the
+// calibration's does not (commissionDependentsMask lists it under nothing) — it measures the machine's
+// speed lead, not the tune.
 #define COMMISSION_REQUIRED_MASK 0x0FF
 static bool commissionRequiredComplete() { return (commissionDoneMask & COMMISSION_REQUIRED_MASK) == COMMISSION_REQUIRED_MASK; }
 
@@ -2832,6 +2862,16 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   char vcMinS[16], vcMaxS[16], vcAvgS[16], vcOnAvgS[16];
   char awsMinS[16], awsMaxS[16], awsAvgS[16], twsMinS[16], twsMaxS[16], twsAvgS[16];
   char awaMinS[16], awaMaxS[16], awaAvgS[16], twaMinS[16], twaMaxS[16], twaAvgS[16];
+  // Same rule for the nav fields: sog/cog/heading accumulate only while IS_SEEN + fresh, vmg/leeway only
+  // while not NaN, so valid_us == 0 means the instrument was absent all window. cog and heading are
+  // avg-only — no min/max sentinel exists for the cloud to null, so their 0.00 was permanent.
+  const bool sogOk = snap.window.sog_valid_us > 0;
+  const bool vmgOk = snap.window.vmg_valid_us > 0;
+  const bool lwOk  = snap.window.leeway_valid_us > 0;
+  const bool cogOk = snap.window.cog_valid_us > 0;
+  const bool hdgOk = snap.window.heading_valid_us > 0;
+  char sogMinS[16], sogMaxS[16], sogAvgS[16], vmgMinS[16], vmgMaxS[16], vmgAvgS[16];
+  char lwMinS[16], lwMaxS[16], lwAvgS[16], cogAvgS[16], hdgAvgS[16];
   int written = snprintf(
     payloadBuffer, PAYLOAD_BUFFER_SIZE,
     "{"
@@ -2869,20 +2909,20 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     // Control loop diagnostics
     "\"u_target_amps_min\":%.2f,\"u_target_amps_max\":%.2f,\"u_target_amps_avg\":%.2f,"
     // NMEA navigation
-    "\"sog_min\":%.2f,\"sog_max\":%.2f,\"sog_avg\":%.2f,"
+    "\"sog_min\":%s,\"sog_max\":%s,\"sog_avg\":%s,"
     "\"sog_sust1m_max\":%.2f,"
     "\"speed_source_phone\":%s,"
     "\"lat_current\":%.6f,\"lon_current\":%.6f,"
     // NMEA wind & sailing
     "\"aws_min\":%s,\"aws_max\":%s,\"aws_avg\":%s,"
     "\"tws_min\":%s,\"tws_max\":%s,\"tws_avg\":%s,"
-    "\"vmg_min\":%.2f,\"vmg_max\":%.2f,\"vmg_avg\":%.2f,"
-    "\"leeway_min\":%.2f,\"leeway_max\":%.2f,\"leeway_avg\":%.2f,"
+    "\"vmg_min\":%s,\"vmg_max\":%s,\"vmg_avg\":%s,"
+    "\"leeway_min\":%s,\"leeway_max\":%s,\"leeway_avg\":%s,"
     // Wind/heading angles + alt-zero + charge stage (long-term-plot stitch fields).
     // awa/twa envelope; cog/heading/alt_zero avg-only; charge_stage categorical (0-7).
     "\"awa_min\":%s,\"awa_max\":%s,\"awa_avg\":%s,"
     "\"twa_min\":%s,\"twa_max\":%s,\"twa_avg\":%s,"
-    "\"cog_avg\":%.2f,\"heading_avg\":%.2f,\"alt_zero_avg\":%.2f,"
+    "\"cog_avg\":%s,\"heading_avg\":%s,\"alt_zero_avg\":%.2f,"
     "\"charge_stage\":%d,"
     // Engine-on-weighted averages (denominator = µs engine was spinning this window)
     // + coverage. engine_on_pct 0 ⇒ engine never ran ⇒ *_onavg values meaningless (0s).
@@ -2936,8 +2976,9 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     SAFE_AVG_100(snap.window.baro_area_v_us, snap.window.baro_valid_us),
     snap.window.uTargetAmps_min / 100.0, snap.window.uTargetAmps_max / 100.0,
     SAFE_AVG_100(snap.window.uTargetAmps_area_v_us, snap.window.uTargetAmps_valid_us),
-    snap.window.sog_min / 100.0, snap.window.sog_max / 100.0,
-    SAFE_AVG_100(snap.window.sog_area_v_us, snap.window.sog_valid_us),
+    ltJsonNum(sogMinS, sizeof(sogMinS), snap.window.sog_min / 100.0, sogOk),
+    ltJsonNum(sogMaxS, sizeof(sogMaxS), snap.window.sog_max / 100.0, sogOk),
+    ltJsonNum(sogAvgS, sizeof(sogAvgS), SAFE_AVG_100(snap.window.sog_area_v_us, snap.window.sog_valid_us), sogOk),
     snap.window.sogSust1m_max / 100.0,
     snap.window.sogSustPhone ? "true" : "false",
     snap.window.lat_current, snap.window.lon_current,
@@ -2947,18 +2988,20 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     ltJsonNum(twsMinS, sizeof(twsMinS), snap.window.tws_min / 100.0, twsOk),
     ltJsonNum(twsMaxS, sizeof(twsMaxS), snap.window.tws_max / 100.0, twsOk),
     ltJsonNum(twsAvgS, sizeof(twsAvgS), SAFE_AVG_100(snap.window.tws_area_v_us, snap.window.tws_valid_us), twsOk),
-    snap.window.vmg_min / 100.0, snap.window.vmg_max / 100.0,
-    SAFE_AVG_100(snap.window.vmg_area_v_us, snap.window.vmg_valid_us),
-    snap.window.leeway_min / 100.0, snap.window.leeway_max / 100.0,
-    SAFE_AVG_100(snap.window.leeway_area_v_us, snap.window.leeway_valid_us),
+    ltJsonNum(vmgMinS, sizeof(vmgMinS), snap.window.vmg_min / 100.0, vmgOk),
+    ltJsonNum(vmgMaxS, sizeof(vmgMaxS), snap.window.vmg_max / 100.0, vmgOk),
+    ltJsonNum(vmgAvgS, sizeof(vmgAvgS), SAFE_AVG_100(snap.window.vmg_area_v_us, snap.window.vmg_valid_us), vmgOk),
+    ltJsonNum(lwMinS, sizeof(lwMinS), snap.window.leeway_min / 100.0, lwOk),
+    ltJsonNum(lwMaxS, sizeof(lwMaxS), snap.window.leeway_max / 100.0, lwOk),
+    ltJsonNum(lwAvgS, sizeof(lwAvgS), SAFE_AVG_100(snap.window.leeway_area_v_us, snap.window.leeway_valid_us), lwOk),
     ltJsonNum(awaMinS, sizeof(awaMinS), snap.window.awa_min / 100.0, awaOk),
     ltJsonNum(awaMaxS, sizeof(awaMaxS), snap.window.awa_max / 100.0, awaOk),
     ltJsonNum(awaAvgS, sizeof(awaAvgS), SAFE_AVG_100(snap.window.awa_area_v_us, snap.window.awa_valid_us), awaOk),
     ltJsonNum(twaMinS, sizeof(twaMinS), snap.window.twa_min / 100.0, twaOk),
     ltJsonNum(twaMaxS, sizeof(twaMaxS), snap.window.twa_max / 100.0, twaOk),
     ltJsonNum(twaAvgS, sizeof(twaAvgS), SAFE_AVG_100(snap.window.twa_area_v_us, snap.window.twa_valid_us), twaOk),
-    SAFE_AVG_100(snap.window.cog_area_v_us, snap.window.cog_valid_us),
-    SAFE_AVG_100(snap.window.heading_area_v_us, snap.window.heading_valid_us),
+    ltJsonNum(cogAvgS, sizeof(cogAvgS), SAFE_AVG_100(snap.window.cog_area_v_us, snap.window.cog_valid_us), cogOk),
+    ltJsonNum(hdgAvgS, sizeof(hdgAvgS), SAFE_AVG_100(snap.window.heading_area_v_us, snap.window.heading_valid_us), hdgOk),
     SAFE_AVG_100(snap.window.altZero_area_v_us, snap.window.altZero_valid_us),
     (int)snap.chargeStage,
     SAFE_AVG_100(snap.window.battVolt_on_area_v_us, snap.window.active_us),
@@ -5187,7 +5230,7 @@ static volatile bool faPendingMatrixClear = false;  // set by /get handler (Core
 #define FILT_RIPPLE_ADM_TC 0.300f      // admission-EMA time constant (s) — heavy enough that belt ripple averages out of it, so its window spread measures operating-point drift, not ripple. Matches Path A's 300 ms precedent. NOT the measurement filter.
 // Capture-gate knobs (Pattern B, Diag ▸ Measured-Ripple Capture Gating card; each has a live
 // pass/fail readout there). Own settings, NOT the fa* anomaly-detector gates.
-float ripWinMs = 2000.0f;       // ms — pk-pk measurement window. Must hold ≥2 periods of the slowest disturbance to characterize (idle hunt ~1 s → 2 s default; the old 500 ms saw hunt as drift and rejected it). CAVEAT: the window defines the measured quantity — map/fit values captured under a different length are not comparable (clear map + re-run current check after changing). NVS NOTE: devices flashed before 2026-07-01 hold 500 in NVS — set 2000 on the Diag card after flashing.
+float ripWinMs = 2000.0f;       // ms — pk-pk measurement window. Must hold ≥2 periods of the slowest disturbance to characterize (idle hunt ~1 s → 2 s default; the old 500 ms saw hunt as drift and rejected it). CAVEAT: the window defines the measured quantity — fits captured under a different length are not comparable, so the handler calls ripFitForget (both fits) on a change; the Resonance & Ripple Map is NOT affected (own fixed window) and needs nothing. NVS NOTE: devices flashed before 2026-07-01 hold 500 in NVS — set 2000 on the Diag card after flashing.
 float ripDriftFloorA = 2.0f;    // A — floor shared by the command-travel gate AND the stationarity gate (mean-shift tolerance below which a window always passes)
 float ripDriftPct = 5.0f;       // % of window-mean alt current — command-travel gate ONLY (commands are ripple-free, so amplitude gating stays correct for them; the sensor gates are stationarity-based below)
 // Stationarity gate (spec §11 — replaces the §10.8 amplitude drift gate): a window is "steady" if its
@@ -6585,7 +6628,7 @@ void faMatrixMaybeFlush() {
 // Snapshot the scope ring for the /fastscope.bin endpoint. Header (24 B, little-endian):
 // u32 magic 'FSC1', u16 sampleRate/10, u16 count, u16 zero-amps mV, u16 ampsPerVolt,
 // u8 attenIs12, u8 chanState, u16 RPM, i16 altTempF (whole °F, INT16_MIN = no probe had read),
-// u16 reserved. Then count × int16 calibrated mV, oldest-first. The capture is the trailing
+// u32 epoch (0 = clock not synced), u16 reserved. Then count × int16 calibrated mV, oldest-first. The capture is the trailing
 // ring ending NOW, so RPM/temp/epoch are stamped at request time = capture-end time.
 // Returns total bytes filled (0 = caller buffer too small).
 size_t faScopeSnapshot(uint8_t *buf, size_t cap) {

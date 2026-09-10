@@ -1242,8 +1242,11 @@ static uint8_t rvcChargeState() {
 // operator typed, and the floor RAISES output. Claiming a derate for either would tell the bus the
 // charger is holding back when it is not. 12 (zero-current command) joins them for the same reason as
 // 10: zero IS the operator's command, not a derate. 13 (warm-up ramp) and 14 (Hi->Lo glide) ARE real
-// derates and fall to the default 255, which is right — the RV-C enum has no name for either. Every
-// code here reports exactly what it reported before it had a name of its own, so the bus sees no change.
+// derates and fall to the default 255, which is right — the RV-C enum has no name for either. Every code
+// here reports what it reported before it had a name of its own EXCEPT 11, which used to fall through to
+// 1 (derating, reason 0xFF): the floor raises output, so "not derating" is the true statement, and after
+// the ctrlLimiter reorder (6_functions.ino) 11 only wins when no thermal/BMS/battery ceiling binds — so a
+// real derate can no longer hide behind it.
 static void rvcDeratingFromLimiter(uint8_t &derating, uint8_t &reason) {
   if (ctrlLimiter == 0 || ctrlLimiter == 10 || ctrlLimiter == 11 || ctrlLimiter == 12) { derating = 0; reason = 0; return; }
   derating = 1;
@@ -2736,7 +2739,10 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
 
   // ===== SPEED CALCULATION - Using SOGNMEA (time-weighted average) - UNCHANGED =====
 
-  if (IS_STALE(IDX_SOG_NMEA) || SOGNMEA < 0) {
+  // IS_SEEN as well as IS_STALE: a boat with no GPS never stamps, and IS_STALE reads an unstamped 0
+  // as fresh for the first DATA_TIMEOUT of every boot — that window would add 0.0 kt at full weight
+  // to the NVS-persisted lifetime average.
+  if (!IS_SEEN(IDX_SOG_NMEA) || IS_STALE(IDX_SOG_NMEA) || SOGNMEA < 0) {
     return;
   }
 
@@ -2745,8 +2751,8 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
 
   float elapsedSeconds = elapsedMillis / 1000.0f;
 
-  speedAccumulator += (float)(SOGNMEA * elapsedSeconds);
-  speedAccumulator_AllTime += (float)(SOGNMEA * elapsedSeconds);
+  speedAccumulator += (double)SOGNMEA * (double)elapsedSeconds;  // both accumulators are double; a float product would round the increment away
+  speedAccumulator_AllTime += (double)SOGNMEA * (double)elapsedSeconds;
   totalSpeedSampleTime += elapsedSeconds;  // no integer cast: the denominator must carry the same fractional seconds as the numerator
   totalSpeedSampleTime_AllTime += elapsedSeconds;
 

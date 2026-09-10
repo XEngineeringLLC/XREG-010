@@ -51,6 +51,13 @@ struct FrontPoint { float x[NAXIS]; float ex[2]; float y; uint32_t nSamp; uint32
 // cadence (the fold may run far faster — 200 Hz on alt). Shared by alt-health (4 axes + amps band,
 // avgWinMs = ALT_EMIT_AVG_MS) and vessel-performance (sail/motor, 3 axes, output band disabled,
 // default window).
+//
+// The paragraph above describes gateMode EP_BAND, which is still what every vessel-performance axis
+// uses. Alt-health moved its rpm, field and output axes to EP_STRAIGHT (rms departure from a fitted
+// line, so a steady acceleration qualifies) and its temperature axis to EP_EXTERNAL (a trailing
+// window that must survive the eligibility barrier); see altEpisodeSyncCfg. Everything else in this
+// struct — dwell from the run start, boxcar, emit rate limit, trimmed-range emit test — is unchanged
+// and applies to every mode.
 
 #define EP_FEED_DT_MS      100    // steadiness/average update cadence (10 Hz), decimated from the fold
 #define EP_AVG_WIN_MS     2000    // default trailing boxcar width for the emitted average (per-instance avgWinMs overrides)
@@ -76,11 +83,115 @@ struct MonoDeque {
   }
 };
 
+// How one axis decides it is steady. BAND is the original rule above. STRAIGHT asks whether the
+// signal moved along a straight LINE rather than whether it held still — a boat accelerating out of
+// a harbour is smooth but never still, and its output tracks that ramp faithfully, so the band form
+// threw the whole moving half of the operating range away. EXTERNAL hands the verdict to the caller,
+// for a test that must survive the eligibility barrier (alt-health's trailing temperature window).
+enum EpGateMode : uint8_t { EP_BAND = 0, EP_STRAIGHT = 1, EP_EXTERNAL = 2 };
+
+#define EP_FIT_N     64    // straightness ring depth (samples) = 6.4 s at EP_FEED_DT_MS. Power of two so the
+                           // index arithmetic is a mask, not a runtime divide. A fit window longer than the
+                           // ring holds is clamped, exactly as a band window is clamped to its deque.
+#define EP_LEAD_MAX  11    // lead-pairing delay depth (samples) — 0..10 × EP_FEED_DT_MS, i.e. up to 1.0 s
+
+// Least-squares straightness over a trailing time window: rms departure from the best-fit line, plus
+// the line's own slope. Storage is a fixed INTERNAL-RAM ring (~512 B per axis) because this runs
+// inside the control tick and a PSRAM sweep of 30 elements ten times a second would cost more than
+// the arithmetic. The fit is recomputed from the ring each tick instead of being carried in running
+// sums — 2 × 30 single-precision iterations, and it cannot drift. Values are centred on the window's
+// first sample and time is window-relative, so float32 keeps its headroom at rpm ≈ 2000; `double` is
+// software-emulated on the S3 and is never used here.
+struct LineFit {
+  float    v[EP_FIT_N];
+  uint32_t t[EP_FIT_N];
+  int      head, n;
+  float    rms, slope, mean;        // last fit: rms departure, slope per SECOND, window mean
+  void clear() { head = 0; n = 0; rms = 0; slope = 0; mean = 0; }
+  void push(uint32_t tMs, float x) {
+    v[head] = x; t[head] = tMs; head = (head + 1) & (EP_FIT_N - 1);
+    if (n < EP_FIT_N) n++;
+  }
+  // Fit the samples within the trailing winMs. Returns how many were used (< 3 → rms/slope invalid).
+  int fit(uint32_t nowMs, uint32_t winMs) {
+    int cnt = 0;
+    while (cnt < n) {
+      int idx = (head - 1 - cnt) & (EP_FIT_N - 1);
+      if ((uint32_t)(nowMs - t[idx]) > winMs) break;
+      cnt++;
+    }
+    if (cnt < 3) {
+      rms = 0.0f; slope = 0.0f;
+      mean = (n > 0) ? v[(head - 1) & (EP_FIT_N - 1)] : 0.0f;
+      return cnt;
+    }
+    int      oldest = (head - cnt) & (EP_FIT_N - 1);
+    uint32_t t0 = t[oldest];
+    float    y0 = v[oldest];                 // centring reference: keeps every accumulator O(band), not O(rpm²)
+    float sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (int i = 0; i < cnt; i++) {
+      int   idx = (oldest + i) & (EP_FIT_N - 1);
+      float x = (float)((uint32_t)(t[idx] - t0)) * 0.001f;    // seconds, so the slope is per second
+      float y = v[idx] - y0;
+      sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    float fn = (float)cnt;
+    float den = fn * sxx - sx * sx;
+    float b = (fabsf(den) > 1e-9f) ? ((fn * sxy - sx * sy) / den) : 0.0f;
+    float a = (sy - b * sx) / fn;
+    float sse = 0;                            // residuals in a second pass rather than by the
+    for (int i = 0; i < cnt; i++) {           // Syy − a·Sy − b·Sxy identity, which cancels catastrophically
+      int   idx = (oldest + i) & (EP_FIT_N - 1);
+      float x = (float)((uint32_t)(t[idx] - t0)) * 0.001f;
+      float r = (v[idx] - y0) - (a + b * x);
+      sse += r * r;
+    }
+    slope = b; rms = sqrtf(sse / fn); mean = y0 + sy / fn;
+    return cnt;
+  }
+};
+
+// Lead pairing. The alternator's output answers where the engine is GOING, not where it has been, so
+// a speeding-up engine looks like it is producing more than it really can at the speed shown. Delay
+// the responding channels by a fixed number of feed ticks before any window sees them. Fed only from
+// Episode::feed, i.e. behind the EP_FEED_DT_MS decimation — never in the ~110-200 Hz fold path,
+// where the same 4 samples would be 20-36 ms instead of 400 ms.
+struct LeadLine {
+  float v[EP_LEAD_MAX];
+  int   head, n, delay;
+  void clear() { head = 0; n = 0; }
+  void setDelay(int d) {
+    if (d < 0) d = 0;
+    if (d > EP_LEAD_MAX - 1) d = EP_LEAD_MAX - 1;
+    if (d != delay) { delay = d; clear(); }
+  }
+  // Push x and return the sample `delay` ticks old — or the OLDEST one held while the line is still
+  // filling, so a fresh run pairs like with like instead of holding a zero.
+  float push(float x) {
+    v[head] = x; head = (head + 1) % EP_LEAD_MAX;
+    if (n < EP_LEAD_MAX) n++;
+    int back = (delay < n) ? delay : (n - 1);
+    return v[(head - 1 - back + EP_LEAD_MAX) % EP_LEAD_MAX];
+  }
+};
+
 template <int NAXIS>
 struct Episode {
   EpAxisCfg cfg[NAXIS];             // per-axis {tol, steadySec}; synced by the caller each fold
   EpAxisCfg outCfg;                 // optional output-steadiness band (outCfg.tol <= 0 → disabled)
-  uint32_t  minRunMs;               // retained for interface compatibility (unused by this detector)
+  uint32_t  minRunMs;               // emit floor: eligible data must span this long since the last hard barrier (0 = off)
+
+  // Per-axis qualification, index [NAXIS] = the output channel. All default to the original BAND
+  // rule, so an instance that sets none of them (sail/motor) behaves exactly as before and pays
+  // nothing. gateMode[] and fit[] must be set BEFORE init() — deque storage is allocated only for
+  // the axes that are still judged by a band.
+  uint8_t   gateMode[NAXIS + 1] = {};      // EpGateMode
+  LineFit  *fit[NAXIS + 1] = {};           // EP_STRAIGHT axes: caller-owned fit state (internal RAM)
+  LeadLine *lead[NAXIS + 1] = {};          // optional per-axis feed delay (lead pairing)
+  bool      extOk[NAXIS + 1] = {};         // EP_EXTERNAL axes: the caller's verdict for this tick
+  float     slopeMax[NAXIS + 1] = {};      // EP_STRAIGHT: |slope| cap per second (≤ 0 = uncapped)
+  float     tolPct[NAXIS + 1] = {};        // EP_STRAIGHT: tolerance as % of the window mean, floored at cfg tol (0 = absolute only)
+  bool      emitTrimSkip[NAXIS + 1] = {};  // axes the emit-time trimmed-range re-test does NOT apply to
 
   MonoDeque maxDQ[NAXIS + 1], minDQ[NAXIS + 1];   // per axis + [NAXIS] = output band: sliding window max/min
   int       dqCap[NAXIS + 1];       // each deque ring's capacity (samples), sized from maxDwellSec in init
@@ -109,12 +220,17 @@ struct Episode {
   uint32_t  emitDirty[NAXIS + 1] = {}, emitSpanShort = 0;
 
   // ringBuf/ringCap = the caller's PSRAM boxcar ring; maxDwellSec[NAXIS+1] sizes each axis's (and the
-  // output band's) deque to its longest expected steady time. Deque storage is ps_malloc'd here.
+  // output band's) deque to its longest expected steady time. Deque storage is ps_malloc'd here, and
+  // ONLY for EP_BAND axes — a straightness or external axis never touches a deque, so set gateMode[]
+  // before calling this or you will pay for rings nothing reads.
   void init(RawSample<NAXIS> *ringBuf, int ringCap, const float *maxDwellSec) {
     avgRing = ringBuf; avgCap = ringCap;
     outCfg = { 0, 0 }; minRunMs = 0;
     ready = true;
+    for (int a = 0; a < NAXIS + 1; a++)
+      if (gateMode[a] == EP_STRAIGHT && !fit[a]) gateMode[a] = EP_BAND;   // no fit state → band rule, and a deque below
     for (int a = 0; a < NAXIS + 1; a++) {
+      if (gateMode[a] != EP_BAND) { dqCap[a] = 0; continue; }
       int cap = (int)(maxDwellSec[a] * (1000.0f / EP_FEED_DT_MS)) + 4;
       if (cap < 4) cap = 4;
       dqCap[a] = cap;
@@ -132,7 +248,11 @@ struct Episode {
   // Reset all detector state (sliding-window history, boxcar, dwell origin). Called on a hard barrier
   // and by the caller's "Start Over". Safe even if init's alloc failed (clear() only zeroes indices).
   void clearRun() {
-    for (int a = 0; a < NAXIS + 1; a++) { maxDQ[a].clear(); minDQ[a].clear(); }
+    for (int a = 0; a < NAXIS + 1; a++) {
+      if (gateMode[a] == EP_BAND) { maxDQ[a].clear(); minDQ[a].clear(); }
+      if (fit[a]) fit[a]->clear();
+      if (lead[a]) lead[a]->clear();
+    }
     ringHead = 0; ringCount = 0; count = 0;
     for (int a = 0; a < NAXIS; a++) avgSumX[a] = 0;
     for (int a = 0; a < NAXIS + 1; a++) axisSteady[a] = false;
@@ -156,18 +276,44 @@ struct Episode {
     lastFeedMs = s.tMs;
     if (!haveData) { dataStartMs = s.tMs; haveData = true; }
 
-    // Per-axis sliding-window min/max over each axis's own trailing dwell window (clamped to storage).
+    // Lead pairing, applied here and nowhere else: this is the one place running at exactly the
+    // decimated cadence the delay is counted in. Everything downstream — windows, boxcar, emitted
+    // average — sees the delayed value on the delayed channels.
+    RawSample<NAXIS> ls = s;
+    for (int a = 0; a < NAXIS; a++) if (lead[a]) ls.x[a] = lead[a]->push(s.x[a]);
+    if (lead[NAXIS]) ls.out = lead[NAXIS]->push(s.out);
+
+    // Per-axis qualification over each axis's own trailing window (clamped to storage).
     feedTicks++;
     int nBad = 0, badAxis = -1; bool badDwellOk = false;
     bool qualified = true;
     for (int a = 0; a < NAXIS; a++) {
-      uint32_t win = (uint32_t)(cfg[a].steadySec * 1000.0f);
-      uint32_t winMax = (uint32_t)((dqCap[a] - 2) * EP_FEED_DT_MS);   // can't window more than the ring holds
-      if (win > winMax) win = winMax;
-      maxDQ[a].push(s.tMs, s.x[a], win);
-      minDQ[a].push(s.tMs, s.x[a], win);
-      bool dwellOk = ((uint32_t)(s.tMs - dataStartMs) >= win);
-      bool inBand  = (maxDQ[a].front() - minDQ[a].front() <= cfg[a].tol);
+      bool dwellOk, inBand;
+      if (gateMode[a] == EP_EXTERNAL) {
+        dwellOk = true; inBand = extOk[a];          // the caller owns this axis's window entirely
+      } else if (gateMode[a] == EP_STRAIGHT && fit[a]) {
+        uint32_t win = (uint32_t)(cfg[a].steadySec * 1000.0f);
+        uint32_t winMax = (uint32_t)((EP_FIT_N - 2) * EP_FEED_DT_MS);
+        if (win > winMax) win = winMax;
+        fit[a]->push(ls.tMs, ls.x[a]);
+        int nf = fit[a]->fit(ls.tMs, win);
+        float tol = cfg[a].tol;                     // absolute floor…
+        if (tolPct[a] > 0) {                        // …raised to a share of the reading where that is larger
+          float rel = tolPct[a] * 0.01f * fabsf(fit[a]->mean);
+          if (rel > tol) tol = rel;
+        }
+        dwellOk = ((uint32_t)(ls.tMs - dataStartMs) >= win);
+        inBand  = (nf >= 3) && (fit[a]->rms <= tol)
+                  && (slopeMax[a] <= 0.0f || fabsf(fit[a]->slope) <= slopeMax[a]);
+      } else {
+        uint32_t win = (uint32_t)(cfg[a].steadySec * 1000.0f);
+        uint32_t winMax = (uint32_t)((dqCap[a] - 2) * EP_FEED_DT_MS);   // can't window more than the ring holds
+        if (win > winMax) win = winMax;
+        maxDQ[a].push(ls.tMs, ls.x[a], win);
+        minDQ[a].push(ls.tMs, ls.x[a], win);
+        dwellOk = ((uint32_t)(ls.tMs - dataStartMs) >= win);
+        inBand  = (maxDQ[a].front() - minDQ[a].front() <= cfg[a].tol);
+      }
       if (dwellOk) {
         if (!inBand) { axUnqual[a]++; if (!axWasUnq[a]) axExcur[a]++; }
         axWasUnq[a] = !inBand;
@@ -176,13 +322,30 @@ struct Episode {
       if (!axisSteady[a]) { qualified = false; nBad++; badAxis = a; badDwellOk = dwellOk; }
     }
     if (outCfg.tol > 0) {
-      uint32_t win = (uint32_t)(outCfg.steadySec * 1000.0f);
-      uint32_t winMax = (uint32_t)((dqCap[NAXIS] - 2) * EP_FEED_DT_MS);
-      if (win > winMax) win = winMax;
-      maxDQ[NAXIS].push(s.tMs, s.out, win);
-      minDQ[NAXIS].push(s.tMs, s.out, win);
-      bool dwellOk = ((uint32_t)(s.tMs - dataStartMs) >= win);
-      bool inBand  = (maxDQ[NAXIS].front() - minDQ[NAXIS].front() <= outCfg.tol);
+      bool dwellOk, inBand;
+      if (gateMode[NAXIS] == EP_STRAIGHT && fit[NAXIS]) {
+        uint32_t win = (uint32_t)(outCfg.steadySec * 1000.0f);
+        uint32_t winMax = (uint32_t)((EP_FIT_N - 2) * EP_FEED_DT_MS);
+        if (win > winMax) win = winMax;
+        fit[NAXIS]->push(ls.tMs, ls.out);
+        int nf = fit[NAXIS]->fit(ls.tMs, win);
+        float tol = outCfg.tol;
+        if (tolPct[NAXIS] > 0) {
+          float rel = tolPct[NAXIS] * 0.01f * fabsf(fit[NAXIS]->mean);
+          if (rel > tol) tol = rel;
+        }
+        dwellOk = ((uint32_t)(ls.tMs - dataStartMs) >= win);
+        inBand  = (nf >= 3) && (fit[NAXIS]->rms <= tol)
+                  && (slopeMax[NAXIS] <= 0.0f || fabsf(fit[NAXIS]->slope) <= slopeMax[NAXIS]);
+      } else {
+        uint32_t win = (uint32_t)(outCfg.steadySec * 1000.0f);
+        uint32_t winMax = (uint32_t)((dqCap[NAXIS] - 2) * EP_FEED_DT_MS);
+        if (win > winMax) win = winMax;
+        maxDQ[NAXIS].push(ls.tMs, ls.out, win);
+        minDQ[NAXIS].push(ls.tMs, ls.out, win);
+        dwellOk = ((uint32_t)(ls.tMs - dataStartMs) >= win);
+        inBand  = (maxDQ[NAXIS].front() - minDQ[NAXIS].front() <= outCfg.tol);
+      }
       if (dwellOk) {
         if (!inBand) { axUnqual[NAXIS]++; if (!axWasUnq[NAXIS]) axExcur[NAXIS]++; }
         axWasUnq[NAXIS] = !inBand;
@@ -196,14 +359,14 @@ struct Episode {
     if (nBad == 1 && badDwellOk) soleBlock[badAxis]++;   // dwell-fill misses aren't band violations — skip
 
     // Trailing boxcar average (the emitted value): push, then evict samples older than avgWinMs.
-    avgRing[ringHead] = s;
+    avgRing[ringHead] = ls;
     ringHead = (ringHead + 1) % avgCap;
     if (ringCount < avgCap) ringCount++;
-    for (int a = 0; a < NAXIS; a++) avgSumX[a] += s.x[a];
-    avgSumEx[0] += s.ex[0]; avgSumEx[1] += s.ex[1]; avgSumOut += s.out;
+    for (int a = 0; a < NAXIS; a++) avgSumX[a] += ls.x[a];
+    avgSumEx[0] += ls.ex[0]; avgSumEx[1] += ls.ex[1]; avgSumOut += ls.out;
     while (ringCount > 1) {
       int tail = (ringHead - ringCount + avgCap) % avgCap;
-      if ((uint32_t)(s.tMs - avgRing[tail].tMs) <= avgWinMs) break;
+      if ((uint32_t)(ls.tMs - avgRing[tail].tMs) <= avgWinMs) break;
       for (int a = 0; a < NAXIS; a++) avgSumX[a] -= avgRing[tail].x[a];
       avgSumEx[0] -= avgRing[tail].ex[0]; avgSumEx[1] -= avgRing[tail].ex[1]; avgSumOut -= avgRing[tail].out;
       ringCount--;
@@ -217,27 +380,45 @@ struct Episode {
     // clock never reached 8 s and the record book starved (bench 2026-08-20: 12 min steady run,
     // ONE record, live % unmoored). Trimming lets isolated blips ride in the average (unbiased,
     // band-bounded smear) instead of vetoing the emit; a sustained shift still fails the range.
-    if (qualified && (uint32_t)(s.tMs - lastEmitMs) >= EP_EMIT_PERIOD_MS && ringCount > 2) {
+    // An axis in emitTrimSkip is exempt: a max-minus-min test on an axis that is now judged by
+    // straightness would re-impose stillness at emit time and undo the whole change. The axes that
+    // DO stay in the test are compared against emitTrimTol(), which adds the travel the axis's own
+    // slope cap permits across the boxcar — otherwise the field axis would be allowed to slew at
+    // 1 %/s and then vetoed for having moved 2 % in the 2 s boxcar, which is the same contradiction
+    // in a different place (measured on the 2026-09-08 THEDRIVE capture: 58 emits with the flat
+    // tolerance, 202 with this one, against 206 for the offline reference).
+    // minRunMs is a floor on the ELIGIBLE span (since dataStartMs), not on continuous qualification —
+    // a continuous clock is the starvation trap described above. Below every axis window it is moot.
+    if (qualified && (uint32_t)(ls.tMs - lastEmitMs) >= EP_EMIT_PERIOD_MS && ringCount > 2
+        && (minRunMs == 0 || (uint32_t)(ls.tMs - dataStartMs) >= minRunMs)) {
       int tail = (ringHead - ringCount + avgCap) % avgCap;
-      bool clean = ((uint32_t)(s.tMs - avgRing[tail].tMs) + 2u * EP_FEED_DT_MS >= avgWinMs);
+      bool clean = ((uint32_t)(ls.tMs - avgRing[tail].tMs) + 2u * EP_FEED_DT_MS >= avgWinMs);
       if (!clean) emitSpanShort++;
       for (int a = 0; clean && a < NAXIS; a++)
-        if (trimmedRange(a) > cfg[a].tol) { clean = false; emitDirty[a]++; }
-      if (clean && outCfg.tol > 0 && trimmedRange(NAXIS) > outCfg.tol) { clean = false; emitDirty[NAXIS]++; }
+        if (!emitTrimSkip[a] && trimmedRange(a) > emitTrimTol(a, cfg[a].tol)) { clean = false; emitDirty[a]++; }
+      if (clean && outCfg.tol > 0 && !emitTrimSkip[NAXIS] && trimmedRange(NAXIS) > emitTrimTol(NAXIS, outCfg.tol)) { clean = false; emitDirty[NAXIS]++; }
       if (clean) {
-        lastEmitMs = s.tMs;
+        lastEmitMs = ls.tMs;
         if (out) {
           for (int a = 0; a < NAXIS; a++) out->x[a] = (float)(avgSumX[a] / (double)ringCount);
           out->ex[0] = (float)(avgSumEx[0] / (double)ringCount);
           out->ex[1] = (float)(avgSumEx[1] / (double)ringCount);
           out->y = (float)(avgSumOut / (double)ringCount);
           out->nSamp = (uint32_t)ringCount;
-          out->tEmit = s.tMs;
+          out->tEmit = ls.tMs;
           return true;
         }
       }
     }
     return false;
+  }
+
+  // What the boxcar's trimmed range is allowed to be for one axis: its own tolerance, plus the
+  // travel its slope cap permits across the boxcar window. A band axis has no slope cap, so this is
+  // exactly its band — unchanged. A straightness axis gets the room its own rules already grant it.
+  float emitTrimTol(int axis, float baseTol) const {
+    if (slopeMax[axis] <= 0.0f) return baseTol;
+    return baseTol + slopeMax[axis] * ((float)avgWinMs * 0.001f);
   }
 
   // Trimmed max−min over the boxcar ring for one axis (axis == NAXIS → the output). Drops the
@@ -271,8 +452,9 @@ struct Episode {
     if (!haveData) return -1.0f;
     float rem = 0.0f;
     for (int a = 0; a < NAXIS; a++) {
+      if (gateMode[a] == EP_EXTERNAL) continue;    // its window is the caller's, and does not start at the run
       uint32_t win = (uint32_t)(cfg[a].steadySec * 1000.0f);
-      uint32_t winMax = (uint32_t)((dqCap[a] - 2) * EP_FEED_DT_MS);
+      uint32_t winMax = (uint32_t)(((gateMode[a] == EP_STRAIGHT ? EP_FIT_N : dqCap[a]) - 2) * EP_FEED_DT_MS);
       if (win > winMax) win = winMax;
       uint32_t el = (uint32_t)(nowMs - dataStartMs);
       if (el < win) { float r = (win - el) / 1000.0f; if (r > rem) rem = r; }
@@ -561,10 +743,11 @@ static inline float altExcitation(float duty, float vbus, float tF) {
 // Steadiness/averaging axes: {RPM, field-duty %, Vbus, tempF}. Defined here (before every function
 // that references them) so the rest of the module can use the front. Generic engine: Xregulator.ino.
 #define ALT_NAXIS        4
-#define ALT_EMIT_AVG_MS  2000     // record/grade averaging window. Sized from /altwinstats.csv on a real
-                                  // idle hour (2026-08-21): luckiest-2s-window inflation 0.25% vs 0.13%
-                                  // at 8 s, but 8 s passed only 11 of 53 ≥2 s steady runs — the old 8 s
-                                  // guess starved harvest (and all transient capture) for ~0.1% inflation
+#define ALT_EMIT_AVG_MS  2000     // record/grade averaging window. Sized from the emit-window sizing probe
+                                  // on a real idle hour (2026-08-21): luckiest-2s-window inflation 0.25% vs
+                                  // 0.13% at 8 s, but 8 s passed only 11 of 53 ≥2 s steady runs — the old 8 s
+                                  // guess starved harvest (and all transient capture) for ~0.1% inflation.
+                                  // That probe was removed 2026-09-09 once it had answered this question
 #define ALT_FRONT_CAP    4096     // sparse support points (PSRAM); sized to be unreachable even AP-mode/no-prune — cost scales with count, not cap (see ALT_HEALTH_LWLR_ENGINE_SPEC.md)
 #define ALT_EP_RING_CAP  1024     // Episode trailing-boxcar buffer (PSRAM). Only ~ALT_EMIT_AVG_MS of
                                   // decimated samples are ever live in it (~80 at 10 Hz); generously
@@ -573,6 +756,14 @@ static inline float altExcitation(float duty, float vbus, float tF) {
 #define ALT_PENDING_CAP  4096     // = front cap: holds every unsynced point through weeks offline (PSRAM)
 
 static Episode<ALT_NAXIS>     altEpisode;
+// Straightness + lead-pairing state for the three axes that use them. INTERNAL RAM on purpose
+// (~1.7 KB total): they are read and written inside the control tick at 10 Hz, and a PSRAM sweep of
+// 30 elements ten times a second would cost more than the arithmetic. In exchange the RPM, field and
+// output axes stop allocating monotonic deques entirely (52 KB of PSRAM, and the integer-divide-heavy
+// pushes that went with them); net of the new full-dwell temperature gate below and the retired
+// emit-window probe, PSRAM use drops about 16 KB.
+static LineFit  altFitRpm, altFitDuty, altFitAmps;
+static LeadLine altLeadVbus, altLeadAmps;
 static FrontStore<ALT_NAXIS>  altFront2;                // "My History" — the LEARNED surface (always the learn target)
 static FrontStore<ALT_NAXIS>  altFrontUp;               // "Uploaded File" — a borrowed surface, resident alongside My History
 static RawSample<ALT_NAXIS>  *altEpRing   = nullptr;
@@ -629,10 +820,18 @@ static inline FrontStore<ALT_NAXIS> &altGradeFront() {
   return (altRefSource == 1 && altHaveUpload) ? altFrontUp : altFront2;
 }
 
-// ---- session-temp gate: a lighter temp dwell (half of altThermSec) than the Episode's full temp dwell ----
-// Same monotonic-deque sliding-window min/max as Episode, fed the same decimated tF. Lets the Session
-// plot show a dot once temp has held for HALF the full steady time, while the surface/trend still wait
-// for the full dwell. PSRAM-backed (cap sized in init for ample headroom past any half-dwell).
+// ---- trailing case-temperature gates (full dwell + the lighter half dwell for the Session plot) ----
+// Same monotonic-deque sliding-window min/max as Episode, fed the same decimated tF. Two instances:
+// the FULL dwell (altThermSec) supplies the detector's temperature verdict, and the HALF dwell lets
+// the Session plot show a dot before the record-book dwell is reached. PSRAM-backed (cap sized in
+// init for ample headroom past any dwell).
+//
+// Deliberately NOT reset by the detector's eligibility barrier: this is a physical
+// thermal-equilibrium test, and clearing it whenever output dipped below the admission floor would
+// turn "4 °F over the last 40 s" back into "40 unbroken seconds above the floors" — which offline
+// replay of three 2026-09-08 captures identifies as the single largest cause of the old gate banking
+// 12 points on a 13-minute drive. Only a feed gap (field off, boot) clears it: without folds there
+// is no thermal history to trail.
 struct AltTempGate {
   MonoDeque maxDQ, minDQ;
   uint32_t  startMs, lastFeedMs; bool have, steady; int cap;
@@ -645,8 +844,8 @@ struct AltTempGate {
     clear();
   }
   void clear() { maxDQ.clear(); minDQ.clear(); startMs = 0; lastFeedMs = 0; have = false; steady = false; }
-  void feed(bool eligible, float tF, uint32_t nowMs, float tol, float secs) {
-    if (!eligible) { clear(); return; }
+  void feed(float tF, uint32_t nowMs, float tol, float secs) {
+    if (!maxDQ.ts || !minDQ.ts) return;   // init's ps_malloc failed — stay un-steady rather than deref null
     if (have && (uint32_t)(nowMs - lastFeedMs) < EP_FEED_DT_MS) return;   // decimate to match the fold's Episode feed
     if (have && (uint32_t)(nowMs - lastFeedMs) > 5u * EP_FEED_DT_MS) clear();  // feed gap = hard barrier, same as Episode::feed
     lastFeedMs = nowMs;
@@ -658,7 +857,8 @@ struct AltTempGate {
     steady = ((uint32_t)(nowMs - startMs) >= win) && (maxDQ.front() - minDQ.front() <= tol);
   }
 };
-static AltTempGate altSessTempGate;
+static AltTempGate altThermGate;      // FULL dwell (altThermSec) — the detector's temperature axis
+static AltTempGate altSessTempGate;   // HALF dwell — the Session plot's lighter tier
 static String altPendingSeededFrom = "";   // non-empty → this pending batch is an adopted import (provenance tag)
 static int altFrontEmitCount = 0;        // episode points emitted (whether or not they pushed the front)
 
@@ -678,14 +878,21 @@ static inline float altSessTempDwell() { return altThermSec * 0.5f; }
 float altTrendBucketSec = 3600.0f;  // TREND_BUCKET_SEC — engine-seconds per trend bucket (production 3600 = 1 h; testing 600)
 float altTrendFeedSec   = 10.0f;    // TREND_FEED_SEC — min spacing between graded samples entering a bucket (intake throttle)
 float altTrendMinSamp   = 2.0f;     // MIN_SAMPLES — a bucket needs ≥ this many graded steady-run samples before it commits
-// Output-steadiness band (5th criterion: the measured amps themselves must hold steady — directly
-// guards what gets recorded, letting the input bands stay tight) + detector signal conditioning:
-float altAmpsTolPct   = 2.5f;    // output-amps band, % of the filtered reading — backstop sitting above the ~1.9% p-p the four input bands can pass
-float altAmpsFloorA   = 0.5f;    // output-amps band floor (A) — governs below ~20 A (2.5% takes over above). Was 1.0,
-                                 // halved 2026-08-27: measured steady 3 s amps range at quiet idle was 0.35 A median /
-                                 // 0.42 A p90, and 1.0 A let a "steady" record hide 13% of output at a 7.5 A cell
-float altAmpsSec      = 3.0f;    // output-amps steady time (s)
+// Output straightness (5th criterion: the measured amps must themselves lie on a straight line —
+// directly guards what gets recorded, letting the input limits stay tight) + signal conditioning.
+// The output is allowed ANY slope: while the machine ramps smoothly up a straight speed line, its
+// output rides a straight line of its own, and that pair is exactly the measurement worth banking.
+float altAmpsLinePct  = 0.5f;    // output-amps rms departure from its own line, % of the window mean
+float altAmpsLineFloorA = 0.4f;  // …with this absolute floor (A), which governs below ~80 A. Registry name is
+                                 // altAmpsLineFlrA — the NVS key caps at 15 characters
+float altAmpsSec      = 3.0f;    // output-amps straightness window (s)
 float altEmaSec       = 0.5f;    // EMA time constant (s) on detector inputs RPM/duty/Vbus/amps (0 = off)
+float altLeadSec      = 0.40f;   // output lead: amps and bus volts are delayed this long relative to RPM, field
+                                 // and temperature before the window statistics. Validated on the 2026-09-08
+                                 // held-field sweeps: uncorrected, an accelerating pass reads 2-4 A high against
+                                 // a decelerating pass at the same indicated speed, and per-sample scatter about
+                                 // the truth curve is ~2.4 A; corrected, the two agree to 0.1-0.6 A at ~0.4 A
+                                 // scatter. Quantized to whole EP_FEED_DT_MS ticks, clamped to 0..10
 float altMinRunSec    = 2.0f;    // minimum steady-run length to emit a point (s)
 float altRefRadius    = 2.0f;    // normalized nearest-support distance beyond which live % + trend report no reference
 float altSafetyMargin = 0.0f;    // amps — gate keeps only runs that strictly beat the front (no keep-bias: the cloud only prunes, so sub-front samples were pure pollution of the local eval surface)
@@ -702,15 +909,18 @@ float altHiFieldSec   = 30.0f;   // both conditions must persist this long befor
 // further down). One float registry → one /get handler loop + boot-load loop + "AltSettings" echo.
 struct AltSetting { const char *name; float *ptr; };
 static AltSetting ALT_SETTINGS[] = {
-  {"altRpmTol", &altRpmTol},   {"altRpmSec", &altRpmSec},
-  {"altDutyTolPct", &altDutyTolPct}, {"altDutySec", &altDutySec},
+  {"altRpmLineRms", &altRpmLineRms}, {"altRpmRateMax", &altRpmRateMax}, {"altRpmSec", &altRpmSec},
+  {"altDutyLineRms", &altDutyLineRms}, {"altDutySlewMax", &altDutySlewMax}, {"altDutySec", &altDutySec},
   {"altVbusTol", &altVbusTol}, {"altVbusSec", &altVbusSec},
   {"altThermDegF", &altThermDegF}, {"altThermSec", &altThermSec},
   {"altTrendBuckSec", &altTrendBucketSec},                             // TREND_BUCKET_SEC (name ≤15 chars; var is altTrendBucketSec)
   {"altTrendFeedSec", &altTrendFeedSec},                               // TREND_FEED_SEC (trend intake throttle)
   {"altTrendMinSamp", &altTrendMinSamp},                               // MIN_SAMPLES (bucket commit gate)
-  {"altAmpsTolPct", &altAmpsTolPct}, {"altAmpsFloorA", &altAmpsFloorA}, {"altAmpsSec", &altAmpsSec},
-  {"altEmaSec", &altEmaSec}, {"altMinRunSec", &altMinRunSec}, {"altRefRadius", &altRefRadius},
+  {"altAmpsLinePct", &altAmpsLinePct},
+  {"altAmpsLineFlrA", &altAmpsLineFloorA},                             // 15-char NVS cap (var is altAmpsLineFloorA)
+  {"altAmpsSec", &altAmpsSec},
+  {"altEmaSec", &altEmaSec}, {"altLeadSec", &altLeadSec},
+  {"altMinRunSec", &altMinRunSec}, {"altRefRadius", &altRefRadius},
   {"altMinAmps", &altMinAmps}, {"altMinDuty", &altMinDuty},
   {"altSafetyMargin", &altSafetyMargin}, {"altIdwPower", &altIdwPower}, {"altPruneK", &altPruneK},
   {"altRidgeFrac", &altRidgeFrac}, {"altRiskThresh", &altRiskThresh},
@@ -866,17 +1076,31 @@ static void altSimTick(uint32_t nowMs) {
   altSimDuty = exc * 100.0f / vbus;             // invert excitation → duty so the duty axis tracks exc
 }
 
-// Per-axis tol from the deviation-bound knobs, steady time from the *Sec knobs. Resynced every
-// fold so live knob edits take effect immediately. ampsFilt sizes the relative output band
-// (percent-of-reading with an absolute floor — one knob pair works at 5 A float and 150 A bulk).
+// Per-axis limits from the knobs, window length from the *Sec knobs. Resynced every fold so live
+// knob edits take effect immediately. The axis MODES themselves are structural and are set once in
+// altFrontInit, before Episode::init decides which axes need deque storage.
+//
+// The tolerance carried in cfg[a].tol does double duty: it is the axis's own limit (rms departure
+// for a straightness axis, max−min for a band axis) AND the tolerance the emit-time trimmed boxcar
+// range is checked against, for the axes still subject to that test (field, Vbus, temperature).
+// The output amps limit is relative with an absolute floor, so one pair works at 5 A float and
+// 150 A bulk; ampsFilt is no longer needed for it — the fit knows its own window mean.
 static void altEpisodeSyncCfg(float ampsFilt) {
-  altEpisode.cfg[0] = { altRpmTol,     altRpmSec  };   // RPM (filtered)
-  altEpisode.cfg[1] = { altDutyTolPct, altDutySec };   // field duty % (filtered, absolute % points)
-  altEpisode.cfg[2] = { altVbusTol,    altVbusSec };   // Vbus (V, filtered)
-  altEpisode.cfg[3] = { altThermDegF,  altThermSec };  // temp (°F)
-  float aTol = altAmpsTolPct * 0.01f * ampsFilt;
-  altEpisode.outCfg = { (aTol > altAmpsFloorA) ? aTol : altAmpsFloorA, altAmpsSec };
+  (void)ampsFilt;                                                   // the relative amps limit now scales off the fit's window mean
+  altEpisode.cfg[0] = { altRpmLineRms,  altRpmSec  };   // RPM (filtered) — straightness
+  altEpisode.slopeMax[0] = altRpmRateMax;
+  altEpisode.cfg[1] = { altDutyLineRms, altDutySec };   // field duty % (filtered, absolute % points) — straightness + slew cap
+  altEpisode.slopeMax[1] = altDutySlewMax;
+  altEpisode.cfg[2] = { altVbusTol,     altVbusSec };   // Vbus (V, filtered) — unchanged max−min band
+  altEpisode.cfg[3] = { altThermDegF,   altThermSec };  // temp (°F) — verdict from altThermGate; tol still gates the emit trim test
+  altEpisode.outCfg = { altAmpsLineFloorA, altAmpsSec };// output amps — straightness, floor…
+  altEpisode.tolPct[ALT_NAXIS] = altAmpsLinePct;        // …raised to this share of the window mean where that is larger
   altEpisode.minRunMs = (altMinRunSec > 0) ? (uint32_t)(altMinRunSec * 1000.0f) : 0;
+  // Lead pairing in whole feed ticks. Clamped to 0..EP_LEAD_MAX-1 by setDelay; a changed delay
+  // restarts the line rather than mixing two alignments in one window.
+  int leadN = (int)lroundf(altLeadSec * (1000.0f / (float)EP_FEED_DT_MS));
+  if (altEpisode.lead[2])         altEpisode.lead[2]->setDelay(leadN);
+  if (altEpisode.lead[ALT_NAXIS]) altEpisode.lead[ALT_NAXIS]->setDelay(leadN);
 }
 
 // Emitted-run hand-off: the ~200 Hz fold only stashes here; grading/admission run in the 1 Hz
@@ -888,139 +1112,6 @@ static int altEmitQCount = 0;
 static bool altCapWarned = false;   // once per boot OR per Start Over (cleared in resetAlternatorHealth)
 
 // ---- per-control-tick fold (THE canonical cadence) ----
-// ---- emit-window sizing probe — TEMPORARY DIAGNOSTIC, REMOVE AFTER AUGUST 2026 ----
-// Not a feature. It exists to pick ONE constant (ALT_EMIT_AVG_MS) and is user-facing only via a raw
-// CSV. To remove: this block, the /altwinstats.csv route in 3_functions.ino, and the altWinProbeFeed
-// call in altFold_tick. Costs ~4.8 KB PSRAM and one ring push per 10 Hz probe tick; nothing else
-// reads it, so deleting it cannot affect grading, records, or the trend.
-//
-// Measures, during FULL-steady runs, how far a trailing W-second average of the graded amps signal
-// rides above the run's overall mean — exactly the inflation a max-per-cell record book harvests at
-// that window width. One steady run = one committed sample per window it spans ≥2×. Serves
-// /altwinstats.csv. Answer so far, from two independent sessions (idle hour 2026-08-21, driveway idle
-// 2026-08-21 pm): inflation is 0.12-0.31% at EVERY width from 1 s to 60 s — immaterial against the
-// 2.5% amps band — while harvest collapses at the long end (2 s caught 47 of 149 runs, 8 s caught 3).
-// ALT_EMIT_AVG_MS is hard-set to 2000 on that basis. Kept installed only because the user is still
-// running it; it has no remaining question to answer.
-#define AWP_NWIN 7
-static const float AWP_WIN_S[AWP_NWIN] = { 1, 2, 4, 8, 15, 30, 60 };
-#define AWP_RING_N 620                     // 62 s @ the 10 Hz probe cadence — covers the 60 s window
-static float    *awpAmps = nullptr;        // PSRAM rings (allocated in altFrontInit)
-static uint32_t *awpT = nullptr;
-static int      awpHead = 0, awpN = 0;
-static uint32_t awpLastFeedMs = 0, awpLastCalcMs = 0;
-static bool     awpInRun = false;
-static uint32_t awpRunStartMs = 0, awpRunLastMs = 0;
-static double   awpRunSum = 0;
-static uint32_t awpRunN = 0;
-static float    awpRunMax[AWP_NWIN], awpRunMin[AWP_NWIN];
-static bool     awpRunHave[AWP_NWIN];
-static uint32_t awpCnt[AWP_NWIN];
-static double   awpSumInfl[AWP_NWIN], awpSumInflPct[AWP_NWIN], awpSumRange[AWP_NWIN];
-static float    awpMaxInfl[AWP_NWIN];
-static uint32_t awpRunsTotal = 0;
-static double   awpSteadySec = 0, awpAmpSum = 0;
-static uint32_t awpAmpN = 0;
-static void awpCloseRun() {
-  if (!awpInRun) return;
-  awpInRun = false;
-  if (awpRunN < 5) return;
-  float runMean = (float)(awpRunSum / awpRunN);
-  float durS = (float)((uint32_t)(awpRunLastMs - awpRunStartMs)) / 1000.0f;
-  awpRunsTotal++; awpSteadySec += durS;
-  if (runMean < 1.0f) return;              // ratio meaningless at near-zero output
-  for (int w = 0; w < AWP_NWIN; w++) {
-    if (!awpRunHave[w] || durS < 2.0f * AWP_WIN_S[w]) continue;   // ≥2 window-lengths of run for a fair max
-    float infl = awpRunMax[w] - runMean;
-    awpCnt[w]++;
-    awpSumInfl[w] += infl;
-    awpSumInflPct[w] += 100.0f * infl / runMean;
-    awpSumRange[w] += (awpRunMax[w] - awpRunMin[w]);
-    if (infl > awpMaxInfl[w]) awpMaxInfl[w] = infl;
-  }
-}
-static void awpReset() {
-  awpHead = awpN = 0; awpInRun = false;
-  memset(awpCnt, 0, sizeof(awpCnt));
-  memset(awpMaxInfl, 0, sizeof(awpMaxInfl));
-  for (int w = 0; w < AWP_NWIN; w++) awpSumInfl[w] = awpSumInflPct[w] = awpSumRange[w] = 0;
-  awpRunsTotal = 0; awpSteadySec = 0; awpAmpSum = 0; awpAmpN = 0;
-}
-static void altWinProbeFeed(uint32_t nowMs, float amps, bool steady) {
-  if (!awpAmps || !awpT) return;
-  if (awpLastFeedMs != 0 && (uint32_t)(nowMs - awpLastFeedMs) < 100u) return;
-  bool gap = (awpLastFeedMs != 0) && ((uint32_t)(nowMs - awpLastFeedMs) > 1000u);
-  awpLastFeedMs = nowMs;
-  if (gap || !steady) {
-    awpCloseRun(); awpN = 0; awpHead = 0;  // ring holds in-run data only; a gap can't bridge runs
-    if (!steady) return;
-  }
-  if (!awpInRun) {
-    awpInRun = true; awpRunStartMs = nowMs; awpRunSum = 0; awpRunN = 0;
-    for (int w = 0; w < AWP_NWIN; w++) { awpRunHave[w] = false; awpRunMax[w] = -1e30f; awpRunMin[w] = 1e30f; }
-  }
-  awpRunLastMs = nowMs;
-  awpAmps[awpHead] = amps; awpT[awpHead] = nowMs;
-  awpHead = (awpHead + 1) % AWP_RING_N;
-  if (awpN < AWP_RING_N) awpN++;
-  awpRunSum += amps; awpRunN++;
-  awpAmpSum += amps; awpAmpN++;
-  if ((uint32_t)(nowMs - awpLastCalcMs) < 1000u) return;   // trailing averages sampled 1/s, like emits
-  awpLastCalcMs = nowMs;
-  double sum = 0; int cnt = 0, wi = 0;
-  for (int back = 0; back < awpN && wi < AWP_NWIN; back++) {
-    int idx = (awpHead - 1 - back + AWP_RING_N) % AWP_RING_N;
-    uint32_t age = (uint32_t)(nowMs - awpT[idx]);
-    while (wi < AWP_NWIN && age > (uint32_t)(AWP_WIN_S[wi] * 1000.0f)) {
-      // window wi is complete (this sample is already older than it) → record its trailing average,
-      // but only once the run itself has spanned the window (no partial-window impostors)
-      if (cnt > 0 && (uint32_t)(nowMs - awpRunStartMs) >= (uint32_t)(AWP_WIN_S[wi] * 1000.0f)) {
-        float avg = (float)(sum / cnt);
-        if (avg > awpRunMax[wi]) awpRunMax[wi] = avg;
-        if (avg < awpRunMin[wi]) awpRunMin[wi] = avg;
-        awpRunHave[wi] = true;
-      }
-      wi++;
-    }
-    if (wi >= AWP_NWIN) break;
-    sum += awpAmps[idx]; cnt++;
-  }
-  for (; wi < AWP_NWIN; wi++) {            // ring exhausted before these windows aged out
-    if (cnt > 0 && (uint32_t)(nowMs - awpRunStartMs) >= (uint32_t)(AWP_WIN_S[wi] * 1000.0f)) {
-      float avg = (float)(sum / cnt);
-      if (avg > awpRunMax[wi]) awpRunMax[wi] = avg;
-      if (avg < awpRunMin[wi]) awpRunMin[wi] = avg;
-      awpRunHave[wi] = true;
-    }
-  }
-}
-// /altwinstats.csv — one row per candidate window width. avgInflA/avgInflPct = how far that window's
-// best trailing average sat above its run's mean (averaged over runs); maxInflA = worst single run;
-// avgRangeA = mean max-min spread of the window averages within a run. ?reset=1 clears.
-void altWinStatsCsvSend(AsyncWebServerRequest *request) {
-  if (request->hasParam("reset")) { awpReset(); request->send(200, "text/plain", "reset\n"); return; }
-  String out;
-  out.reserve(900);
-  if (!awpAmps || !awpT) { request->send(200, "text/plain", "probe unavailable (alloc failed)\n"); return; }
-  out += "# steadyRuns=" + String(awpRunsTotal) + " steadySec=" + String(awpSteadySec, 0);
-  out += " meanAmps=" + String((awpAmpN > 0) ? (float)(awpAmpSum / awpAmpN) : 0.0f, 1);
-  out += " prodWinMs=" + String((unsigned)ALT_EMIT_AVG_MS) + "\n";
-  out += "win_s,runs,avgInflA,avgInflPct,maxInflA,avgRangeA\n";
-  for (int w = 0; w < AWP_NWIN; w++) {
-    out += String(AWP_WIN_S[w], 0); out += ',';
-    out += String(awpCnt[w]);
-    if (awpCnt[w] > 0) {
-      out += ',';
-      out += String((float)(awpSumInfl[w] / awpCnt[w]), 2); out += ',';
-      out += String((float)(awpSumInflPct[w] / awpCnt[w]), 2); out += ',';
-      out += String(awpMaxInfl[w], 2); out += ',';
-      out += String((float)(awpSumRange[w] / awpCnt[w]), 2);
-    } else out += ",0,0,0,0";
-    out += '\n';
-  }
-  request->send(200, "text/csv", out);
-}
-
 // ══ GATE-TUNING CAPTURE ═══════════════════════════════════════════════════════════════════════
 // Manual session logger (this block) + field sweeper (altSweep_tick, next to fieldCurve_tick).
 // Spec: Working Markdown Docs/ALT_GATE_TUNING_CAPTURE_SPEC.md. Replaces the gate-replay ring
@@ -1279,13 +1370,21 @@ struct __attribute__((packed)) AltLogHdr {
   uint8_t  chargeStage;
   uint8_t  pad0[3];      // keeps the floats below 4-byte aligned (one byte was the retired segment index)
   float    startTempF, startVbus;
-  float    emaSec, rpmTol, dutyTolPct, vbusTol, thermDegF, thermSec, ampsTolPct, ampsFloorA;
+  float    emaSec;
+  // ver 1 only: the four max−min band widths of the stillness gate. The straightness gate replaced
+  // them, so ver 2 writes 0 here and carries its own limits in the ver-2 block below. The slots stay
+  // where they are so one parser can read both versions off fixed offsets.
+  float    v1RpmTol, v1DutyTolPct;
+  float    vbusTol, thermDegF, thermSec;
+  float    v1AmpsTolPct, v1AmpsFloorA;
   float    rpmSec, dutySec, vbusSec, ampsSec, minRunSec;
   uint32_t emitAvgMs;
   float    axisScale[4];
   char     fw[16];
+  // ---- appended in ver 2 (straightness gate) ----
+  float    rpmLineRms, rpmRateMax, dutyLineRms, dutySlewMax, ampsLinePct, ampsLineFloorA, leadSec;
 };
-static_assert(sizeof(AltLogHdr) == 136, "AltLogHdr size changed — parseAltLogBin() in script.js must match");
+static_assert(sizeof(AltLogHdr) == 164, "AltLogHdr size changed — parseAltLogBin() in script.js must match");
 
 // /altlog.bin — header then rows, streamed. Refused while recording: a growing row count under a
 // chunked reader would hand out a file whose header disagrees with its body.
@@ -1324,7 +1423,7 @@ void altLogBinSend(AsyncWebServerRequest *request) {
   AltLogHdr h;
   memset(&h, 0, sizeof(h));
   h.magic = 0x414C474Cu;   // 'ALGL'
-  h.ver = 1;
+  h.ver = 2;               // 2 = straightness gate (ver 1 was the max−min band gate)
   h.rowBytes = (uint16_t)sizeof(AltLogRow);
   h.rowCount = altLogRows;
   h.capRows = ALTLOG_CAP_ROWS;
@@ -1338,11 +1437,16 @@ void altLogBinSend(AsyncWebServerRequest *request) {
   h.chargeStage = altLogChargeStage;
   h.startTempF = altLogStartTempF;
   h.startVbus = altLogStartVbus;
-  h.emaSec = altEmaSec;       h.rpmTol = altRpmTol;       h.dutyTolPct = altDutyTolPct;
+  h.emaSec = altEmaSec;
   h.vbusTol = altVbusTol;     h.thermDegF = altThermDegF; h.thermSec = altThermSec;
-  h.ampsTolPct = altAmpsTolPct; h.ampsFloorA = altAmpsFloorA;
   h.rpmSec = altRpmSec;       h.dutySec = altDutySec;     h.vbusSec = altVbusSec;
   h.ampsSec = altAmpsSec;     h.minRunSec = altMinRunSec;
+  h.rpmLineRms = altRpmLineRms;   h.rpmRateMax = altRpmRateMax;
+  h.dutyLineRms = altDutyLineRms; h.dutySlewMax = altDutySlewMax;
+  h.ampsLinePct = altAmpsLinePct; h.ampsLineFloorA = altAmpsLineFloorA;
+  h.leadSec = altLeadSec;
+  // v1RpmTol / v1DutyTolPct / v1AmpsTolPct / v1AmpsFloorA stay at the memset 0 — those settings no
+  // longer exist, and a file must not claim a gate that did not shape it.
   h.emitAvgMs = (uint32_t)ALT_EMIT_AVG_MS;
   for (int a = 0; a < ALT_NAXIS; a++) h.axisScale[a] = altFront2.axisScale[a];
   strncpy(h.fw, FIRMWARE_VERSION, sizeof(h.fw) - 1);
@@ -1459,7 +1563,7 @@ void altFold_tick(uint32_t nowMs) {
   // against an Uploaded surface. Only surface ADMISSION into My History is gated by Pause (altProcessEmits).
   if (hardwarePresent != 1 && altSimMode < 0.5f) {                                   // no real hardware → display only
     altSteady = false; altSessSteady = false;
-    altSessTempGate.clear(); altEpisode.clearRun();
+    altThermGate.clear(); altSessTempGate.clear(); altEpisode.clearRun();
     return;
   }
 
@@ -1469,7 +1573,12 @@ void altFold_tick(uint32_t nowMs) {
   altEpisodeSyncCfg(fAmps);
   bool eligible = (!isnan(fVbus) && fVbus >= ALT_MIN_BATT_V * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f) && fAmps >= altMinAmps && fDuty >= altMinDuty && fRpm >= 0);
   altEligibleNow = eligible;                                                    // exported for the gate-capture log's flags byte
-  altSessTempGate.feed(eligible, tF, nowMs, altThermDegF, altSessTempDwell());   // lighter (half-dwell) temp gate for the session plot
+  // Both temperature gates are fed on every fold, eligible or not: they are trailing thermal
+  // windows, not run timers (see AltTempGate). The full-dwell verdict is the detector's temperature
+  // axis; the half-dwell one is the Session plot's lighter tier.
+  altThermGate.feed(tF, nowMs, altThermDegF, altThermSec);
+  altSessTempGate.feed(tF, nowMs, altThermDegF, altSessTempDwell());
+  altEpisode.extOk[3] = altThermGate.steady;
   RawSample<ALT_NAXIS> s;
   s.x[0] = fRpm; s.x[1] = fDuty; s.x[2] = fVbus; s.x[3] = tF; s.out = fAmps; s.tMs = nowMs;
   s.ex[0] = fDuty; s.ex[1] = altTempSlopeFMin;   // retain run duty + case-temp slope (F/min) for diagnosis;
@@ -1477,10 +1586,10 @@ void altFold_tick(uint32_t nowMs) {
   FrontPoint<ALT_NAXIS> ep;
   bool emitted = altEpisode.feed(eligible, s, &ep);
   altSteady = (altEpisode.count > 0);                              // FULL steady (temp held altThermSec) → ring + surface + trend
-  altWinProbeFeed(nowMs, fAmps, altSteady);                        // emit-window sizing probe (10 Hz internal decimation)
-  // SESSION steady = all axes EXCEPT temperature steady on their ~3 s windows (Episode per-axis flags for
-  // {RPM,duty,Vbus} + the amps band) AND temperature steady for the HALF dwell (altSessTempGate). Lets a
-  // Session-plot dot appear before the full record-book dwell is reached.
+  // SESSION steady = all axes EXCEPT temperature qualifying on their ~3 s windows (Episode per-axis flags for
+  // {RPM,duty,Vbus} + the output amps axis) AND temperature steady for the HALF dwell (altSessTempGate). Lets a
+  // Session-plot dot appear before the full record-book dwell is reached. Those per-axis flags now carry the
+  // straightness verdicts, so the plot and the record book judge motion by the same rule.
   altSessSteady = eligible
                   && altEpisode.axisSteady[0] && altEpisode.axisSteady[1] && altEpisode.axisSteady[2]
                   && altEpisode.axisSteady[ALT_NAXIS] && altSessTempGate.steady;
@@ -1565,6 +1674,7 @@ static float alf_exc()       { return altLive_exc; }
 static float alf_amps()      { return altLive_amps; }
 static float alf_pred()      { return altLive_pred; }
 static float alf_pct()       { return altLive_pct; }
+static float alf_latchPct()  { return altLatchPct; }                             // header Health chip (device-side latch)
 static float alf_worst()     { return altWorstPctLive; }
 static float alf_overall()   { return altOverallPctLive; }
 static float alf_status()    { return (float)altStatusCode; }
@@ -1621,6 +1731,7 @@ static AltLiveField ALT_LIVE[] = {
   {"logState", alf_logState}, {"logRows", alf_logRows}, {"logSecLeft", alf_logSecLeft},
   {"logCap", alf_logCap},
   {"sweepState", alf_sweepState}, {"sweepRev", alf_sweepRev},
+  {"latchPct", alf_latchPct},
 };
 static const size_t ALT_LIVE_COUNT = sizeof(ALT_LIVE) / sizeof(ALT_LIVE[0]);
 static void altSendLive() {
@@ -1799,11 +1910,14 @@ void altDebugCsvSend(AsyncWebServerRequest *request) {
               case 6: st.len = snprintf(st.line, sizeof(st.line), "BUCKET,baseline_engNow_bucketSec,%.1f,%.1f,%.0f\n", altTrendBaselineSec, EngineRunTime_AllTime, altTrendBucketSec); break;
               case 7: st.len = snprintf(st.line, sizeof(st.line), "SESSION,mean_p10_n,%.1f,%.1f,%lu\n", alf_sessMean(), alf_sessP10(), (unsigned long)altSessN); break;
               case 8: st.len = snprintf(st.line, sizeof(st.line), "COUNT,myHist_upload_trend_myHistSrc_upSrc,%d,%d,%d,%d,%d\n", st.myN, st.upN, st.trN, (int)altFront2.source, (int)altFrontUp.source); break;
-              case 9: {   // elapsed steadiness dwell (ms): session-temp gate + episode (full) data window
+              case 9: {   // elapsed history (ms): both temperature gates (trailing, survive the barrier)
+                          // and the episode's own data window (restarts at every barrier)
                 uint32_t now = millis();
+                uint32_t thermMs    = altThermGate.have    ? (now - altThermGate.startMs) : 0;
                 uint32_t sessTempMs = altSessTempGate.have ? (now - altSessTempGate.startMs) : 0;
                 uint32_t epDataMs   = altEpisode.haveData  ? (now - altEpisode.dataStartMs) : 0;
-                st.len = snprintf(st.line, sizeof(st.line), "GATE,sessTempDwellMs_epDataMs,%u,%u\n", (unsigned)sessTempMs, (unsigned)epDataMs);
+                st.len = snprintf(st.line, sizeof(st.line), "GATE,thermTrailMs_sessTempMs_epDataMs,%u,%u,%u\n",
+                                  (unsigned)thermMs, (unsigned)sessTempMs, (unsigned)epDataMs);
                 break;
               }
               case 10:   // per-axis steadiness at this instant — names which axis starves emits
@@ -1846,6 +1960,12 @@ void altDebugCsvSend(AsyncWebServerRequest *request) {
                                   (unsigned long)altEpisode.emitDirty[0], (unsigned long)altEpisode.emitDirty[1],
                                   (unsigned long)altEpisode.emitDirty[2], (unsigned long)altEpisode.emitDirty[3],
                                   (unsigned long)altEpisode.emitDirty[ALT_NAXIS], (unsigned long)altEpisode.emitSpanShort);
+                break;
+              case 17:   // live straightness fits — rms departure from the line, and the line's slope per second.
+                         // Compare rms to the PARAM line limits and slope to the rate/slew caps.
+                st.len = snprintf(st.line, sizeof(st.line), "GATE,lineRms_rpm_duty_amps_slope_rpm_duty_amps,%.2f,%.3f,%.3f,%.1f,%.3f,%.3f\n",
+                                  altFitRpm.rms, altFitDuty.rms, altFitAmps.rms,
+                                  altFitRpm.slope, altFitDuty.slope, altFitAmps.slope);
                 break;
               default: st.phase = 3; st.idx = 0; break;
             }
@@ -2040,6 +2160,7 @@ bool altUploadFrontCsv(char *body, bool fixed) {
   altFrontUp.source = 1;                        // borrowed surface
   altHaveUpload = true;
   altRefSource = 1;                             // grade session + trend against the uploaded surface
+  altLatchPct = 0;                              // the latched % was graded against the old reference
   altPaused = fixed ? 1.0f : 0.0f;              // Uploaded defaults Pause ON; user may keep learning My History
   settingWrite(NK_altPaused, fixed ? "1.0000" : "0.0000");
   settingWrite(NK_altRefSrc, "1");
@@ -2103,9 +2224,9 @@ void resetAlternatorHealth() {
   altBucket_sum = 0; altBucket_n = 0; altBucket_worst = 0; altCurEngHour = -1;
   memset(altBucketHist, 0, sizeof(altBucketHist));
   altPersistTrendBucket();                       // overwrite the persisted partial bucket with the cleared one
-  altWorstPctLive = 0; altOverallPctLive = 0; altStatusCode = 0; altLive_pct = 0;
+  altWorstPctLive = 0; altOverallPctLive = 0; altStatusCode = 0; altLive_pct = 0; altLatchPct = 0;
   altState = FRONT_NO_REFERENCE; altHiFieldAlert = false;
-  altSteady = false; altSessSteady = false; altSessTempGate.clear();
+  altSteady = false; altSessSteady = false; altThermGate.clear(); altSessTempGate.clear();
   altRefSource = 0;                              // revert active reference to My History (Uploaded surface kept, just inactive)
   memset(altSessHist, 0, sizeof(altSessHist)); altSessN = 0; altSessSum = 0;   // session stats restart with the data
   altSessRingHead = 0; altSessRingCount = 0; altSessRingLastMs = 0;              // and the served session series
@@ -2128,21 +2249,35 @@ void altFrontInit() {
   altSessRing = (AltSessPt *)ps_malloc((size_t)ALT_SESS_RING_N * sizeof(AltSessPt));   // session series (~32 KB)
   if (altSessRing) memset(altSessRing, 0, (size_t)ALT_SESS_RING_N * sizeof(AltSessPt));
   else queueConsoleMessage("AltHealth: session-series ps_malloc failed — /altsess.csv empty, plots stay browser-only");
-  awpAmps = (float *)ps_malloc((size_t)AWP_RING_N * sizeof(float));         // TEMPORARY probe rings (~4.8 KB) — REMOVE AFTER AUGUST 2026
-  awpT    = (uint32_t *)ps_malloc((size_t)AWP_RING_N * sizeof(uint32_t));
   if (!altEpRing || !altFrontBuf || !altFrontUpBuf || !altPending) { queueConsoleMessage("ERROR: AltFront ps_malloc failed"); return; }
   memset(altEpRing,     0, (size_t)ALT_EP_RING_CAP * sizeof(RawSample<ALT_NAXIS>));
   memset(altFrontBuf,   0, (size_t)ALT_FRONT_CAP   * sizeof(FrontPoint<ALT_NAXIS>));
   memset(altFrontUpBuf, 0, (size_t)ALT_FRONT_CAP   * sizeof(FrontPoint<ALT_NAXIS>));
   memset(altPending,  0, (size_t)ALT_PENDING_CAP * sizeof(FrontPoint<ALT_NAXIS>));
   altPendingCount = 0;
-  // Per-axis deque window caps (max steady time the axis can be set to): RPM/duty/Vbus/amps ~30 s
-  // headroom, temperature 240 s (covers the full temp dwell + room). Index 4 = the output (amps) band.
+  // Axis modes are structural, so they are set BEFORE init(): it allocates deque storage only for
+  // the axes still judged by a band. RPM / field / output amps ask for straightness; temperature's
+  // verdict comes from altThermGate, whose window has to outlive the eligibility barrier. RPM and
+  // output amps are also exempt from the emit-time trimmed-range re-test — a max−min test there
+  // would re-impose stillness on exactly the two axes this gate stopped demanding it from (offline
+  // replay of THEDRIVE, 2026-09-08: 26 points with those clauses in place, 209 without).
+  altEpisode.gateMode[0] = EP_STRAIGHT;  altEpisode.fit[0] = &altFitRpm;
+  altEpisode.gateMode[1] = EP_STRAIGHT;  altEpisode.fit[1] = &altFitDuty;
+  altEpisode.gateMode[2] = EP_BAND;      altEpisode.lead[2] = &altLeadVbus;
+  altEpisode.gateMode[3] = EP_EXTERNAL;
+  altEpisode.gateMode[ALT_NAXIS] = EP_STRAIGHT;
+  altEpisode.fit[ALT_NAXIS] = &altFitAmps;
+  altEpisode.lead[ALT_NAXIS] = &altLeadAmps;
+  altEpisode.emitTrimSkip[0] = true;
+  altEpisode.emitTrimSkip[ALT_NAXIS] = true;
+  // Per-axis deque window caps (max steady time the axis can be set to): only the Vbus axis still
+  // holds a deque, but the array keeps one entry per axis so the indices stay readable.
   static const float ALT_MAXDWELL[ALT_NAXIS + 1] = { 30.0f, 30.0f, 30.0f, 240.0f, 30.0f };
   altEpisode.init(altEpRing, ALT_EP_RING_CAP, ALT_MAXDWELL);
   altEpisode.avgWinMs = ALT_EMIT_AVG_MS;   // sail/motor keep the 2 s default; alt records are sustained averages
-  altEpisodeSyncCfg(0.0f);   // amps band starts at the floor; resized from filtered amps every fold
-  altSessTempGate.init(2600);   // session-temp (half-dwell) gate, ~240 s of 10 Hz headroom (matches temp axis maxdwell)
+  altEpisodeSyncCfg(0.0f);   // per-axis limits + the lead delay; resynced every fold so live edits land
+  altThermGate.init(2600);      // full-dwell temperature gate, ~240 s of 10 Hz headroom
+  altSessTempGate.init(2600);   // session-temp (half-dwell) gate, same headroom
   altFront2.init(altFrontBuf, ALT_FRONT_CAP);
   altFrontUp.init(altFrontUpBuf, ALT_FRONT_CAP);
   // axisScale ≈ the span of each axis that moves output a comparable amount (rationale + rebalance
@@ -2241,6 +2376,7 @@ void altHealth_tick(uint32_t nowMs) {
     altLive_pred = pred;
     altRefOk = (altState == FRONT_MEASURED || altState == FRONT_ESTIMATED);
     altLive_pct = (altRefOk && pred > 0.1f) ? (altLive_gAmps / pred * 100.0f) : 0.0f;
+    if (altRefOk && altLive_pct > 0.0f) altLatchPct = altLive_pct;   // same gate as the Diag headline; only this survives an ungraded tick
     // Session stats = the SESSION-PLOTTED points: session-steady (lighter gate) AND graded. The trend is
     // NOT fed here — it is built purely from FULL-steady runs in altProcessEmits (spec §2).
     if (altSessSteady && altRefOk && altLive_pct > 0.0f) {
@@ -2293,7 +2429,8 @@ void altSettingsLoad() {
     char key[16];
     snprintf(key, sizeof(key), "%s", ALT_SETTINGS[i].name);  // NVS key = registry name (15-char cap)
     if (!settingExists(key)) {
-      if (strcmp(key, "altVbusTol") == 0 || strcmp(key, "altDutyTolPct") == 0 || strcmp(key, "altMinDuty") == 0) continue;
+      if (strcmp(key, "altVbusTol") == 0 || strcmp(key, "altDutyLineRms") == 0
+          || strcmp(key, "altDutySlewMax") == 0 || strcmp(key, "altMinDuty") == 0) continue;
       settingWrite(key, String(*ALT_SETTINGS[i].ptr, 4).c_str());
     }
     else *ALT_SETTINGS[i].ptr = settingRead(key).toFloat();
@@ -2304,9 +2441,10 @@ void altSettingsLoad() {
 // so SYSTEM_VOLTAGE_CLASS is authoritative. Volt-domain ×(V/12), duty-domain ×(12/V), identity at 12V; a live
 // class change rescales them in applyNominalVoltageChange like every other class-scaled setting.
 void altSeedClassKnobs() {
-  if (!settingExists("altVbusTol"))    { altVbusTol    *= (float)SYSTEM_VOLTAGE_CLASS / 12.0f; settingWrite("altVbusTol",    String(altVbusTol, 4).c_str()); }
-  if (!settingExists("altDutyTolPct")) { altDutyTolPct *= 12.0f / (float)SYSTEM_VOLTAGE_CLASS; settingWrite("altDutyTolPct", String(altDutyTolPct, 4).c_str()); }
-  if (!settingExists("altMinDuty"))    { altMinDuty    *= 12.0f / (float)SYSTEM_VOLTAGE_CLASS; settingWrite("altMinDuty",    String(altMinDuty, 4).c_str()); }
+  if (!settingExists("altVbusTol"))     { altVbusTol     *= (float)SYSTEM_VOLTAGE_CLASS / 12.0f; settingWrite("altVbusTol",     String(altVbusTol, 4).c_str()); }
+  if (!settingExists("altDutyLineRms")) { altDutyLineRms *= 12.0f / (float)SYSTEM_VOLTAGE_CLASS; settingWrite("altDutyLineRms", String(altDutyLineRms, 4).c_str()); }
+  if (!settingExists("altDutySlewMax")) { altDutySlewMax *= 12.0f / (float)SYSTEM_VOLTAGE_CLASS; settingWrite("altDutySlewMax", String(altDutySlewMax, 4).c_str()); }
+  if (!settingExists("altMinDuty"))     { altMinDuty     *= 12.0f / (float)SYSTEM_VOLTAGE_CLASS; settingWrite("altMinDuty",     String(altMinDuty, 4).c_str()); }
 }
 bool altSettingsHandle(AsyncWebServerRequest *request) {
   bool handled = false;
@@ -2325,6 +2463,7 @@ bool altSettingsHandle(AsyncWebServerRequest *request) {
   // Pause untouched. Selecting Uploaded with no uploaded surface present is ignored.
   if (request->hasParam("altSource")) {
     int src = request->getParam("altSource")->value().toInt();
+    uint8_t prevRefSource = altRefSource;
     if (src == 1 && altHaveUpload) {
       if (altRefSource != 1) {                              // default Pause ON only when SWITCHING into Uploaded
         altPaused = 1.0f;                                   // (spec §4.3 "on select") — a repeat click won't clobber a deliberate Continue
@@ -2336,12 +2475,14 @@ bool altSettingsHandle(AsyncWebServerRequest *request) {
       altRefSource = 0;
       settingWrite(NK_altRefSrc, "0");
     }
+    if (altRefSource != prevRefSource) altLatchPct = 0;   // the latched % was graded against the old reference
     handled = true;
   }
   return handled;
 }
 void sendAltSettings() {
-  char buf[320];
+  char buf[448];   // ~215 B at the current 31 knobs and their defaults; sized so a few large values
+                   // (rate caps, trend bucket seconds) cannot reach the truncation guard below
   int off = 0;
   for (size_t i = 0; i < ALT_SETTING_COUNT; i++) {
     int n = snprintf(buf + off, sizeof(buf) - off, (i ? ",%.4f" : "%.4f"), *ALT_SETTINGS[i].ptr);
@@ -5959,4 +6100,405 @@ inline int wmIgnCsv(float v, int scale) {
   if (x >  2000000000.0f) return  2000000000;
   if (x < -1000000000.0f) return -1000000000;   // stays clear of ROLL_EMPTY, which must stay unreachable
   return (int)lroundf(x);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Charge health system calibration (commissioning stage 9) — the alternator's speed lead
+//
+// With the field pinned at a fixed level, output answers where the engine is GOING rather than
+// where it is: the rotor holds its flux for a few tenths of a second against the stator's
+// push-back, so a falling pass reads high against a rising one at the same indicated speed. The
+// health tracker grades recorded output against a steady-state surface, so it has to pair each
+// output sample with the engine speed of that moment — altLeadSec — or every window taken while
+// the boat is accelerating is smeared. Measured on the 09-08 held-field sweeps at 0.40 s here,
+// the same at every speed and field level, which is what the rotor explanation predicts.
+//
+// One run, one continuous recording. The operator brings the engine to a high speed of their own
+// choosing and holds it; the tuned current loop sizes the field THERE; the duty it settled on is
+// frozen; three passes follow — down to idle, back up, down again. Sizing at the top is the whole
+// point: it is the fastest the machine turns all run, so no later moment can exceed what the
+// sizing step already proved safe. (Sizing at idle, which this replaces, bounded the top of the
+// swing by nothing — output at fixed field is steeply nonlinear in speed just above the knee.)
+//
+// Both directions are required: a single direction cannot separate a time shift from the shape of
+// the speed curve. The third pass costs about eight seconds and yields two independent answers,
+// passes 1+2 and passes 2+3, which is the consistency check.
+//
+// Duty-override contract is the fieldCut_tick family: returns TRUE only while it OWNS duty. The
+// sizing phase does NOT own duty — it returns false and drives the real current PID through the
+// chcCcActive branch in AdjustField, exactly like the field-decay ramp.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+// The estimator, over one contiguous span of the capture [lo,hi). amps[i] is paired with rpm[i+k]
+// (k in CHC_SAMP_MS samples, so k IS the delay in feed ticks) and the count-weighted mean
+// |rising − falling| gap over speed bins is scored. Still samples belong to neither direction and
+// are dropped. Parabolic refine on the three points around the minimum gives a sub-sample answer;
+// the caller rounds it to whole ticks, which is all the delay line can hold. Returns the lead in
+// seconds (0.0 is a real answer — no lead), -1 if no candidate scored enough bins, or -2 if the
+// minimum sits at the top of the searched range, where the real lead is past what CHC_KMAX sees.
+static float chcFitLead(int lo, int hi, float *gapBefore, float *gapAfter) {
+  const int n = hi - lo;
+  if (gapBefore) *gapBefore = -1.0f;
+  if (gapAfter)  *gapAfter  = -1.0f;
+  if (!chcBuf || lo < 0 || hi > chcCount || n < 40) return -1.0f;
+  static float sumUp[128], sumDn[128];
+  static uint16_t nUp[128], nDn[128];
+  float cost[CHC_KMAX + 1];
+  for (int k = 0; k <= CHC_KMAX; k++) {
+    for (int b = 0; b < 128; b++) { sumUp[b] = sumDn[b] = 0.0f; nUp[b] = nDn[b] = 0; }
+    for (int i = 0; i + k < n; i++) {
+      int a = i + k - 3, c = i + k + 3;
+      if (a < 0) a = 0;
+      if (c > n - 1) c = n - 1;
+      if (c <= a) continue;
+      float rate = ((float)chcBuf[lo + c].rpm - (float)chcBuf[lo + a].rpm) / ((float)(c - a) * (CHC_SAMP_MS / 1000.0f));
+      if (fabsf(rate) < CHC_RATE_MIN) continue;
+      int b = (int)((float)chcBuf[lo + i + k].rpm / CHC_BIN_RPM);
+      if (b < 0 || b > 127) continue;
+      float amps = (float)chcBuf[lo + i].amps10 * 0.1f;
+      if (rate > 0) { sumUp[b] += amps; nUp[b]++; } else { sumDn[b] += amps; nDn[b]++; }
+    }
+    float sw = 0.0f, sg = 0.0f; int nb = 0;
+    for (int b = 0; b < 128; b++) {
+      if (!nUp[b] || !nDn[b]) continue;
+      float w = (float)((nUp[b] < nDn[b]) ? nUp[b] : nDn[b]);
+      sg += w * fabsf(sumUp[b] / nUp[b] - sumDn[b] / nDn[b]);
+      sw += w; nb++;
+    }
+    cost[k] = (nb >= CHC_MIN_BINS && sw > 0.0f) ? (sg / sw) : NAN;
+  }
+  int bi = -1;
+  for (int k = 0; k <= CHC_KMAX; k++)
+    if (!isnan(cost[k]) && (bi < 0 || cost[k] < cost[bi])) bi = k;
+  if (bi < 0) return -1.0f;
+  if (bi == 0) {
+    // Zero delay IS the answer for a machine with no lead, but only when the next candidate is
+    // worse — a lone scored point at k=0 is a fit that found nothing, not a minimum.
+    if (isnan(cost[1]) || !(cost[1] > cost[0])) return -1.0f;
+    if (gapBefore) *gapBefore = cost[0];
+    if (gapAfter)  *gapAfter  = cost[0];
+    return 0.0f;
+  }
+  if (bi >= CHC_KMAX) return -2.0f;
+  if (isnan(cost[bi - 1]) || isnan(cost[bi + 1])) return -1.0f;
+  float den = cost[bi - 1] - 2.0f * cost[bi] + cost[bi + 1];
+  float d = (fabsf(den) > 1e-9f) ? (0.5f * (cost[bi - 1] - cost[bi + 1]) / den) : 0.0f;
+  if (d < -1.0f) d = -1.0f;
+  if (d >  1.0f) d =  1.0f;
+  if (gapBefore) *gapBefore = isnan(cost[0]) ? -1.0f : cost[0];
+  if (gapAfter)  *gapAfter  = cost[bi];
+  return ((float)bi + d) * (CHC_SAMP_MS / 1000.0f);
+}
+
+// The throttle pace the operator actually delivered, over the samples the fit could use (|rate| at
+// or above CHC_RATE_MIN — the turnarounds are not part of any pass's pace). Reported at the end
+// for reference; nothing consumes it.
+static void chcRateStats(int lo, int hi) {
+  chcRateMin = chcRateMax = chcRateAvg = -1.0f;
+  const int n = hi - lo;
+  if (!chcBuf || lo < 0 || hi > chcCount || n < 8) return;
+  double sum = 0.0; int k = 0;
+  for (int i = 0; i < n; i++) {
+    int a = i - 3, c = i + 3;
+    if (a < 0) a = 0;
+    if (c > n - 1) c = n - 1;
+    if (c <= a) continue;
+    float rate = fabsf(((float)chcBuf[lo + c].rpm - (float)chcBuf[lo + a].rpm)
+                       / ((float)(c - a) * (CHC_SAMP_MS / 1000.0f)));
+    if (rate < CHC_RATE_MIN) continue;
+    if (chcRateMin < 0.0f || rate < chcRateMin) chcRateMin = rate;
+    if (rate > chcRateMax) chcRateMax = rate;
+    sum += rate; k++;
+  }
+  if (k > 0) chcRateAvg = (float)(sum / (double)k);
+}
+
+// Read one saved charge-rate column straight out of NVS. Which one the test is SIZED from depends
+// on bank size (CHC_LOHI_AH); the HIGH column is always the guard, because it is the real ceiling.
+// Called from the chcStart web handler, never from chc_tick: the control path does not touch flash.
+// capLimitMode 1 = the charge-rate columns are WATTS (capPowerTable / capPowerTableLo) and the control
+// path divides them by bus volts at use time; chcCapAmpsAt does the same. Both kW defaults are all
+// zero, so a kW-mode unit with no stored column sizes to nothing and Start fails on CHC_MIN_TEST_A,
+// instead of on a 100 A amps default the regulator is not using.
+void chcLoadCapColumn(bool high, float *out) {
+  const bool kw = (capLimitMode == 1);
+  for (int i = 0; i < RPM_TABLE_SIZE; i++)
+    out[i] = kw ? (high ? defaultCapPowerValues[i] : 0.0f)
+                : (high ? defaultCapCurrentValues[i] : defaultCapCurrentValues[i] * LOW_MODE_CAP_FRACTION);
+  nvs_handle_t h;
+  if (nvs_open("learning", NVS_READONLY, &h) != ESP_OK) return;
+  size_t sz = (size_t)RPM_TABLE_SIZE * sizeof(float);
+  float tmp[RPM_TABLE_SIZE];
+  const char *key = kw ? (high ? "capPowerTable" : "capPowerTableLo") : (high ? "capTable" : "capTableLo");
+  if (nvs_get_blob(h, key, tmp, &sz) == ESP_OK && sz == (size_t)RPM_TABLE_SIZE * sizeof(float))
+    for (int i = 0; i < RPM_TABLE_SIZE; i++) out[i] = tmp[i];
+  nvs_close(h);
+}
+
+// One column's ceiling in AMPS at one speed, read the way the control path reads it: watts over bus
+// volts in kW mode, and never above the alternator rating (MaxTableValue), which every normal command
+// path also applies.
+static float chcCapAmpsAt(float rpm, const float *table) {
+  float a = interpolateRPMTable(rpm, table);
+  if (capLimitMode == 1) a = (BatteryV > 0.5f) ? a / BatteryV : 0.0f;
+  return fminf(a, (float)MaxTableValue);
+}
+
+static void chcFinish(bool ok, const char *why) {
+  chcOk = ok;
+  chcResultsReady = true;
+  // why == chcAbortMsg on the ready-phase backstops, which hand the buffer back to itself.
+  if (why && why[0] && why != chcAbortMsg) {
+    strncpy(chcAbortMsg, why, sizeof(chcAbortMsg) - 1);
+    chcAbortMsg[sizeof(chcAbortMsg) - 1] = '\0';
+  }
+}
+
+bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
+  static uint8_t  phase = 0;          // 0 idle, 1 wait for a steady speed, 2 size the field, 3-5 passes, 7 ease-out
+  static uint32_t phaseStartMs = 0, lastSampMs = 0, holdSampMs = 0, inBandSinceMs = 0, steadySinceMs = 0;
+  static float    entryDuty = 1.0f, holdDuty = 0.0f, preSetpoint = 0.0f, ampsEma = 0.0f;
+  static float    holdRef = 0.0f, holdSum = 0.0f;
+  static int      holdK = 0;
+
+  // A teardown outside this function (6_functions.ino, when the field leaves normal AUTO) zeroes
+  // chcActive while chc_tick is not being called; without this the run would resume mid-phase.
+  if (phase != 0 && chcActive == 0) { phase = 0; chcCcActive = false; return false; }
+
+  // ── Abort — a cancel from the wizard or a protection cut latched into the same flag ──
+  if (phase != 0 && chcAbortRequested) {
+    chcAbortRequested = false;
+    if (chcCcActive) { chcCcActive = false; setpointLimited = preSetpoint; }
+    if (!chcResultsReady) chcFinish(false, chcAbortMsg[0] ? chcAbortMsg : "stopped");
+    chcActive = 0; chcPhase = 0; chcLastEndMs = millis();
+    phase = 0;
+    return false;   // no ease-out: the caller ignores dutyOut on false and the normal path resumes bumpless from lastAppliedDuty
+  }
+
+  // ── IDLE ──
+  if (phase == 0) {
+    if (!chcRequested) return false;
+    // A request is only consumed on a normal running control tick, so one pressed with the engine
+    // stopped (or during a fault lockout) would otherwise sit armed and pin the field by itself
+    // whenever running resumed. Expire it instead — the button is a metre away from the throttle.
+    if ((uint32_t)(nowMs - chcReqMs) > 30000u) {
+      chcRequested = false;
+      chcFinish(false, "the engine stopped, or the field was switched off");
+      queueConsoleMessage("Charge health calibration: start request expired — the control loop was not running (engine stopped or field off). Press Start again.");
+      return false;
+    }
+    chcRequested = false;
+    chcAbortRequested = false;   // a Cancel from after the last run must not eat this Start
+    if (chcBuf == nullptr) chcBuf = (ChcSample *)ps_malloc(CHC_BUF_N * sizeof(ChcSample));
+    if (!chcBuf) { chcFinish(false, "PSRAM alloc failed"); return false; }
+    chcIdleRpm = (RPM > 0) ? RPM : 0.0f;
+    chcHoldRpm = 0.0f; chcHoldMs = 0;
+    chcSizeCapA = 0.0f; chcTargetA = 0.0f; chcHoldDuty = 0.0f; chcCmdA = 0.0f;
+    chcMinA = 0.0f; chcPeakA = 0.0f; chcCount = 0;
+    chcLeadSec = chcLead12 = chcLead23 = -1.0f;
+    chcGapBefore = chcGapAfter = -1.0f;
+    chcRateMin = chcRateMax = chcRateAvg = -1.0f;
+    for (int i = 0; i < 3; i++) { chcPassStart[i] = 0; chcPassEnd[i] = 0; }
+    chcResultsReady = false; chcOk = false; chcAbortMsg[0] = '\0';
+    chcActive = 1; chcPhase = 1;
+    holdSampMs = 0; steadySinceMs = 0; holdRef = 0.0f; holdSum = 0.0f; holdK = 0;
+    entryDuty = (lastAppliedDuty > 1.0f) ? lastAppliedDuty : 1.0f;
+    phase = 1; phaseStartMs = nowMs;
+    queueConsoleMessageF("Charge health calibration: started, idle %.0f rpm — waiting for a steady high speed", chcIdleRpm);
+    return false;   // no field driven yet: normal charging continues while the operator picks the speed
+  }
+
+  const float vTarget = (ChargingVoltageTarget > 1.0f) ? ChargingVoltageTarget : BulkVoltage;
+  chcGuardCapA = chcCapAmpsAt((RPM > 0) ? RPM : chcIdleRpm, chcHiTable);
+
+  // ── WAIT: the operator picks the speed. Steady = RPM inside a band around the first sample of
+  //   the stretch for CHC_HOLD_STEADY_MS; the band is half of the wizard's own (max−min) test, so
+  //   the two agree on what "still moving" means. Any excursion restarts the stretch. ──
+  if (phase == 1) {
+    chcPhase = 1;
+    if (holdSampMs == 0 || (uint32_t)(nowMs - holdSampMs) >= CHC_SAMP_MS) {
+      holdSampMs = nowMs;
+      float r = RPM;
+      if (!(r > 0.0f)) { steadySinceMs = 0; holdK = 0; }
+      else if (steadySinceMs == 0 || fabsf(r - holdRef) > fmaxf(15.0f, 0.025f * holdRef)) {
+        holdRef = r; steadySinceMs = nowMs; holdSum = r; holdK = 1;
+      } else { holdSum += r; holdK++; }
+    }
+    chcHoldMs = (steadySinceMs == 0) ? 0u : (uint32_t)(nowMs - steadySinceMs);
+    if (chcHoldMs >= CHC_HOLD_STEADY_MS && holdK > 0) {
+      float mean = holdSum / (float)holdK;
+      if (mean < chcIdleRpm + CHC_HOLD_ABOVE_IDLE) {
+        // Too close to idle to leave the passes any range. Keep waiting rather than failing — the
+        // wizard says so on screen and the operator just opens the throttle further.
+        steadySinceMs = 0; holdK = 0; chcHoldMs = 0;
+      } else {
+        chcHoldRpm = mean;
+        chcSizeCapA = chcCapAmpsAt(chcHoldRpm, (BatteryCapacity_Ah >= CHC_LOHI_AH) ? chcHiTable : chcLoTable);
+        chcTargetA = chcSizeCapA * (float)chcTestPct * 0.01f;
+        if (chcTargetA < CHC_MIN_TEST_A) {
+          chcFinish(false, "the charge-rate limit at this speed is too small to measure");
+          chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
+          return false;
+        }
+        entryDuty = (lastAppliedDuty > 1.0f) ? lastAppliedDuty : 1.0f;
+        preSetpoint = setpointLimited;
+        ampsEma = ampsRaw; inBandSinceMs = 0;
+        chcCmdA = chcTargetA;
+        chcCcActive = true;   // hand the setpoint to the real current loop (branch in AdjustField)
+        phase = 2; phaseStartMs = nowMs; chcPhase = 2;
+        queueConsoleMessageF("Charge health calibration: holding %.0f rpm — sizing the field for %.1f A (%d%% of the %.0f A %s column)",
+                             chcHoldRpm, chcTargetA, (int)chcTestPct, chcSizeCapA,
+                             (BatteryCapacity_Ah >= CHC_LOHI_AH) ? "High" : "Low");
+        return false;   // sizing phase does not own duty — the real PID does
+      }
+    }
+    if (nowMs - phaseStartMs >= CHC_WAIT_TIMEOUT_MS) {
+      chcFinish(false, "no steady engine speed was held");
+      chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
+      return false;
+    }
+    return false;
+  }
+
+  // ── SIZE: the chcCcActive branch slews the setpoint to chcCmdA at TEST_ENTRY_RATE_A and the real
+  //   PID drives duty. Here we only WATCH: once the command has arrived and the measured current
+  //   has sat inside the band for CHC_SETTLE_MS, capture the applied duty and freeze it. ──
+  if (phase == 2) {
+    chcPhase = 2;
+    ampsEma += 0.05f * (ampsRaw - ampsEma);
+    // Both run-ending ceilings apply here too: the bank charges under the sizing current just as it
+    // does under a pass, and neither ceiling is survivable by continuing.
+    if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC || BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
+      chcCcActive = false;
+      setpointLimited = preSetpoint;
+      chcFinish(false, (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC)
+                       ? "output reached the charge-rate limit for this speed"
+                       : "the bus reached the charge target");
+      chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
+      return false;
+    }
+    bool arrived = fabsf(setpointLimited - chcCmdA) < 0.5f;
+    float band = fmaxf(2.0f, 0.08f * chcCmdA);
+    bool settled = false;
+    if (arrived && fabsf(ampsEma - chcCmdA) < band) {
+      if (inBandSinceMs == 0) inBandSinceMs = nowMs;
+      settled = (nowMs - inBandSinceMs >= CHC_SETTLE_MS);
+    } else {
+      inBandSinceMs = 0;
+    }
+    // Target unreachable (the field rails before the level): proceed on whatever real output there
+    // is — the passes only need something to watch rise and fall. Truly nothing → plain reason.
+    if (!settled && (nowMs - phaseStartMs >= CHC_SETTLE_TIMEOUT_MS)) {
+      if (ampsEma >= CHC_MIN_TEST_A) {
+        settled = true;
+        queueConsoleMessageF("Charge health calibration: %.1f A not reachable here — proceeding at %.1f A", chcCmdA, ampsEma);
+      } else {
+        chcCcActive = false;
+        setpointLimited = preSetpoint;
+        chcFinish(false, "the field reached its ceiling before making the test current");
+        chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
+        return false;
+      }
+    }
+    if (settled) {
+      holdDuty = (lastAppliedDuty > 0.0f) ? lastAppliedDuty : MinDuty;
+      chcHoldDuty = holdDuty;
+      chcCcActive = false;
+      // Restore the pre-test setpoint BEFORE returning true: the SystemID resume snapshot fires on
+      // this tick's rising edge (after this call) and must capture the pre-test value, not the test
+      // target — otherwise test end would re-assert the test current.
+      setpointLimited = preSetpoint;
+      chcMinA = ampsRaw; chcPeakA = ampsRaw;
+      chcCount = 0; lastSampMs = 0;
+      chcPassStart[0] = 0;
+      phase = 3; phaseStartMs = nowMs; chcPhase = 3;
+      queueConsoleMessageF("Charge health calibration: settled at %.1f A — field frozen at %.1f%%, three passes between %.0f and %.0f rpm",
+                           ampsEma, holdDuty, chcIdleRpm, chcHoldRpm);
+      dutyOut = holdDuty;
+      return true;
+    }
+    return false;
+  }
+
+  // ── PASSES: field frozen, one continuous recording. Each pass ends where it was aimed; the
+  //   operator is never told to stop, only where to go next. ──
+  if (phase >= 3 && phase <= 5) {
+    dutyOut = holdDuty;
+    if (ampsRaw > chcPeakA) chcPeakA = ampsRaw;
+    if (ampsRaw < chcMinA)  chcMinA  = ampsRaw;
+    if (lastSampMs == 0 || (uint32_t)(nowMs - lastSampMs) >= CHC_SAMP_MS) {
+      lastSampMs = nowMs;
+      if (chcCount < CHC_BUF_N) {
+        chcBuf[chcCount].rpm = (uint16_t)constrain((int)lroundf(RPM), 0, 6400);
+        chcBuf[chcCount].amps10 = (int16_t)constrain((int)lroundf(ampsRaw * 10.0f), -32000, 32000);
+        chcCount++;
+      }
+    }
+    // The two real ceilings. The field is open-loop here, so these are the run's own backstops —
+    // the operator is never the protection.
+    if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC) {
+      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "output reached the charge-rate limit for this speed");
+      chcAbortRequested = true;
+      return true;
+    }
+    if (BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
+      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the bus reached the charge target");
+      chcAbortRequested = true;
+      return true;
+    }
+    const int p = phase - 3;
+    const bool goingDown = (p != 1);                       // passes 1 and 3 fall, pass 2 rises
+    const float aim = goingDown ? chcIdleRpm : chcHoldRpm;
+    const bool arrived = goingDown ? (RPM <= aim + CHC_PASS_END_BAND)
+                                   : (RPM >= aim - CHC_PASS_END_BAND);
+    const bool ranOut = (nowMs - phaseStartMs >= CHC_PASS_TIMEOUT_MS) || (chcCount >= CHC_BUF_N);
+    if (arrived || ranOut) {
+      chcPassEnd[p] = chcCount;
+      if (p < 2) {
+        chcPassStart[p + 1] = chcCount;
+        phase++; phaseStartMs = nowMs; chcPhase = phase;
+        return true;
+      }
+      // Last pass. Two independent fits over overlapping spans — pass 2 is shared, which is what
+      // makes them a check on the run rather than on two different runs.
+      chcLead12 = chcFitLead(chcPassStart[0], chcPassEnd[1], &chcGapBefore, &chcGapAfter);
+      chcLead23 = chcFitLead(chcPassStart[1], chcPassEnd[2], nullptr, nullptr);
+      chcRateStats(chcPassStart[0], chcPassEnd[2]);
+      const float span = chcHoldRpm - chcIdleRpm;
+      int nGood = 0; float sum = 0.0f;
+      if (chcLead12 >= 0.0f) { sum += chcLead12; nGood++; }
+      if (chcLead23 >= 0.0f) { sum += chcLead23; nGood++; }
+      if (span < CHC_MIN_SWING_RPM) {
+        chcFinish(false, "the engine speed did not change enough to measure");
+      } else if (nGood == 0) {
+        chcFinish(false, (chcLead12 <= -1.5f || chcLead23 <= -1.5f)
+                         ? "the lead is past the 0.9 s the fit can see"
+                         : "the passes were too slow to read");
+      } else if (nGood < 2) {
+        // One answer has nothing to check it against; the two halves are the run's only self-test.
+        chcFinish(false, (chcLead12 < 0.0f) ? "passes 1+2 gave no answer to check passes 2+3 against"
+                                            : "passes 2+3 gave no answer to check passes 1+2 against");
+      } else {
+        chcLeadSec = sum / (float)nGood;
+        chcFinish(true, "");
+        queueConsoleMessageF("Charge health calibration: lead %.3f s (passes 1+2 %.3f s, 2+3 %.3f s) over %.0f rpm; pace min %.0f avg %.0f max %.0f rpm/s",
+                             chcLeadSec, chcLead12, chcLead23, span, chcRateMin, chcRateAvg, chcRateMax);
+      }
+      phase = 7; phaseStartMs = nowMs; chcPhase = 6;
+    }
+    return true;
+  }
+
+  // ── EASE back to the pre-test operating point ──
+  if (phase == 7) {
+    float frac = (float)(nowMs - phaseStartMs) / CHC_EASE_MS;
+    if (frac >= 1.0f) {
+      chcActive = 0; chcPhase = 0; chcLastEndMs = millis();
+      phase = 0; dutyOut = entryDuty;
+      return false;
+    }
+    dutyOut = holdDuty + (entryDuty - holdDuty) * frac;
+    return true;
+  }
+  return false;
 }

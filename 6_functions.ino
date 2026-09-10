@@ -348,7 +348,7 @@ void huntGovObserve(float dutyApplied, bool closedLoopOk) {
                 || TuningMode || CVTuningMode || batteryHealthTestActive
                 || systemIDActive || fieldCurveActive || fieldCutActive
                 || cvPlantFitActive || resTestActive || cvStressActive
-                || protTestActive || (altSweepActive != 0) || (ManualFieldToggle == 1)
+                || protTestActive || (altSweepActive != 0) || (chcActive != 0) || (ManualFieldToggle == 1)
                 || spDev > fmaxf(3.0f, 0.04f * (float)AlternatorNominalAmps);
   if (contam) hgContamTick = hgTick;
 }
@@ -1117,13 +1117,14 @@ void applyNominalVoltageChange(int oldV, int newV) {
     kneeMarginPct   *= dutyRatio;
     kneeStepPct     *= dutyRatio;
     kneeMaxFloorPct *= dutyRatio;
-    kneeDutyTolPct  *= dutyRatio;   // field-duty steadiness band — inverse-scale like altDutyTolPct
+    kneeDutyTolPct  *= dutyRatio;   // field-duty steadiness band — inverse-scale like altDutyLineRms
     DutyRampRate    *= dutyRatio;
     DutySlowRampRate *= dutyRatio;
     MaxDuty          = (int)lroundf(MaxDuty * dutyRatio);  // Max Field %: real per-bus cap, scales down on higher banks
     MinDuty         *= dutyRatio;  // field floor: float, keeps sub-1% resolution on higher banks
     KHard           *= dutyRatio;  // A per V of OV excess
-    altDutyTolPct   *= dutyRatio;  // alt-health field-duty steadiness band
+    altDutyLineRms  *= dutyRatio;  // alt-health field-duty straightness limit (% points)
+    altDutySlewMax  *= dutyRatio;  // …and its slew cap (% points per second) — same duty domain
     altMinDuty      *= dutyRatio;  // alt-health admission duty floor
     settingWrite(NK_kneeMarginPct,   String(kneeMarginPct, 2).c_str());
     settingWrite(NK_kneeStepPct,     String(kneeStepPct, 2).c_str());
@@ -1137,7 +1138,8 @@ void applyNominalVoltageChange(int oldV, int newV) {
     // Alt-health registry knobs persist under their registry names (NVS key = name), and the
     // CV wave amplitude under its 15-char NK_ key.
     settingWrite("altVbusTol",    String(altVbusTol, 4).c_str());
-    settingWrite("altDutyTolPct", String(altDutyTolPct, 4).c_str());
+    settingWrite("altDutyLineRms", String(altDutyLineRms, 4).c_str());
+    settingWrite("altDutySlewMax", String(altDutySlewMax, 4).c_str());
     settingWrite("altMinDuty",    String(altMinDuty, 4).c_str());
     settingWrite(NK_cvWaveAmplitudeV, String(cvWaveAmplitudeV, 2).c_str());
     settingWrite(NK_BulkVoltage, String(BulkVoltage, 2).c_str());
@@ -1200,8 +1202,9 @@ void applyNominalVoltageChange(int oldV, int newV) {
         nvs_close(nvs_h);
       }
     }
-    queueConsoleMessageF("System voltage %dV -> %dV: tachometer keep-alive floors reset to the 1%% default and their learning cleared (old floors were %dV-referenced and can exceed the new %d%% Max Field cap). Re-run the Keep-Alive Floor step.",
-                         oldV, newV, oldV, MaxDuty);
+    // %.0f for MaxDuty: it is a float, and a float in a %d slot reads garbage bits.
+    queueConsoleMessageF("System voltage %dV -> %dV: tachometer keep-alive floors reset to the %.2f%% default and their learning cleared (old floors were %dV-referenced and can exceed the new %.0f%% Max Field cap). Re-run the Keep-Alive Floor step.",
+                         oldV, newV, KNEE_BASELINE_PCT, oldV, MaxDuty);
     huntMapClearAll("system voltage class changed");  // pockets learned on the old class describe a different alternator
     updateINA228OvervoltageThreshold();
   }
@@ -1490,6 +1493,15 @@ void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason) {
       fieldCutAbortMsg[sizeof(fieldCutAbortMsg) - 1] = '\0';
     }
     fieldCutAbortRequested = true;
+  }
+  // Charge health calibration rides the same override path — latch identically. A run interrupted by
+  // a protection cut has a corrupted swing in it, so it is discarded rather than fitted.
+  if (chcActive != 0) {
+    if (!chcAbortRequested) {
+      strncpy(chcAbortMsg, reasonToString(reason), sizeof(chcAbortMsg) - 1);
+      chcAbortMsg[sizeof(chcAbortMsg) - 1] = '\0';
+    }
+    chcAbortRequested = true;
   }
   // Closed-loop verify sine sweep (Tuning→Current auto-sweep) rides the same latch. Without it the
   // sweep ran on through the cut + lockout and graded the corrupted points as a duty-rail result.
@@ -3115,7 +3127,7 @@ void AdjustFieldLearnMode() {
   // (cxOwnsBatteryNow: IN_PROGRESS + fresh heartbeat), NOT on the bare state byte: a run stopped for
   // days keeps state==1, and on the bare byte it also kept the maintenance-reboot ladder, the CV
   // wind-down governor and the limiter toggles frozen the whole time.
-  g_autoTestActive = cxOwnsBatteryNow() || (fieldCurveActive != 0) || batteryHealthTestActive || resTestActive || cvPlantFitActive || (systemIDActive != 0) || (fieldCutActive != 0) || cvStressActive || (protTestActive != 0);
+  g_autoTestActive = cxOwnsBatteryNow() || (fieldCurveActive != 0) || batteryHealthTestActive || resTestActive || cvPlantFitActive || (systemIDActive != 0) || (fieldCutActive != 0) || cvStressActive || (protTestActive != 0) || (chcActive != 0);
 
   // ========== DETERMINE GOVERNOR MODE ==========
   govMode = GOV_NORMAL_SLEW;
@@ -3140,7 +3152,7 @@ void AdjustFieldLearnMode() {
   // Field-decay ramp phase: duty slew OFF by spec — the TEST_ENTRY_RATE_A setpoint slew provides the
   // smoothness, the PID must be free to move duty as it needs. The later hold/cut/ease phases get the
   // same bypass from the sysIDRunning override path.
-  if (fieldCutCcActive || protTestCcActive) {
+  if (fieldCutCcActive || protTestCcActive || chcCcActive) {
     govMode = GOV_BYPASS_SLEW;
   }
 
@@ -3277,6 +3289,25 @@ void AdjustFieldLearnMode() {
     altSweepAbortRequested = true;   // resets altSweep_tick's static phase on the next normal tick
   }
 
+  // Charge health calibration holds the field open-loop through the same override, and needs the
+  // same teardown for the same reasons: chc_tick stops being called outside normal AUTO, so the run
+  // would resume mid-phase when normal running returned, and chcActive would stay latched for the
+  // whole lockout — blocking every other test and the wizard with it. chcFinish is static in
+  // 7_functions.ino, so the result flags are set here directly.
+  if (chcActive != 0 && (!isNormalMode || mode == MODE_NORMAL_MANUAL)) {
+    queueConsoleMessageF("Charge health calibration: ended (%s) — the field is back under the normal control path",
+                         reasonToString(reason));
+    chcActive = 0;
+    chcCcActive = false;             // the sizing phase may have owned the setpoint
+    chcLastEndMs = millis();
+    chcAbortRequested = true;        // resets chc_tick's static phase on the next normal tick
+    if (!chcResultsReady) {
+      chcOk = false;
+      chcResultsReady = true;
+      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "ended — the field left normal AUTO (%s)", reasonToString(reason));
+    }
+  }
+
   // ========== NON-NORMAL MODE: SHUTDOWN / FAULT HANDLING ==========
   // NOTE: pidLog_tick() is NOT called in the shutdown/fault path.
   if (!isNormalMode) {
@@ -3364,6 +3395,9 @@ void AdjustFieldLearnMode() {
   // fieldCutCcActive branch below; hold/cut/ease own duty here (cut level is MinDuty, the real
   // OV-clamp floor, so the effectiveMinDuty=0 bypass below is moot but harmless).
   sysIDRunning = fieldCut_tick(sysIDDutyOut, MeasuredAmps, tick.nowMs) || sysIDRunning;
+  // Charge health calibration (stage 9): field pinned open-loop while the operator swings the
+  // throttle. Same duty-override + bumpless-resume path as the field curve.
+  sysIDRunning = chc_tick(sysIDDutyOut, MeasuredAmps, tick.nowMs) || sysIDRunning;
   // Manual protection-trigger test (Settings → Emergency) — same mutex family + duty-override/bumpless
   // path. RAMP returns false (the protTestCcActive branch above drives the real current PID to
   // protTestCmdA); the load-dump/graceful/ease phases own duty here. Mode 1/4 arm protTestCutPending
@@ -3583,6 +3617,25 @@ void AdjustFieldLearnMode() {
         // target-relative OV layers (G1/G2) so the level can hold; fast-OV/INA228/hard-OC stay live.
         // fieldCut_tick watches for settle and flips to the duty-override path for hold/cut/ease.
         setpointCommand = fieldCutCmdA;
+        setpointLimited = slew_limit_f(setpointLimited, setpointCommand,
+                                       TEST_ENTRY_RATE_A, SetpointFallRate, actualDtSec);
+        voltageControlActive = false;
+        ctrlLimiter = 0;
+        targetCurrent = (OutputPIDSigSrc == 2) ? MeasuredAmps : (OutputPIDSigSrc == 1) ? g_pidMA_N
+                                                                                       : g_pidI_filtered;
+        pidInput = (double)targetCurrent;
+        pidSetpoint = (double)setpointLimited;
+        pidError = setpointLimited - targetCurrent;
+        currentPID.Compute();
+
+      } else if (chcCcActive) {
+        // Charge health calibration sizing phase (commissioning stage 9): drive the REAL current
+        // loop to chcCmdA — the share of the charge-rate column the test runs at, evaluated at the
+        // speed the operator is holding. Same shape as the field-decay ramp; chc_tick watches for
+        // settle, freezes the duty the loop landed on, and flips to the duty-override path for the
+        // three passes. voltageControlActive=false suppresses the target-relative OV layers (G1/G2)
+        // so the level can be reached; fast-OV/INA228/hard-OC stay live.
+        setpointCommand = chcCmdA;
         setpointLimited = slew_limit_f(setpointLimited, setpointCommand,
                                        TEST_ENTRY_RATE_A, SetpointFallRate, actualDtSec);
         voltageControlActive = false;
@@ -5444,16 +5497,16 @@ void AdjustFieldLearnMode() {
           bool protBinding = (fastOvClampActive && ((float)uTargetAmps < i_ceiling_pre_ov - 0.01f))
                              || postProtectRiseActive;
           uint8_t rawCode;
-          // zeroCmd is split out of the first line and placed BELOW the floor test on purpose: a
-          // Maintain / zero-float command sitting against a live keep-alive floor is exactly the
-          // case where the floor, not the zero command, is what the bank is actually seeing.
+          // 11 (min-field floor) sits below every real ceiling: it is the one code that RAISES output, so
+          // whenever a ceiling is also active the ceiling is the story — a thermal/BMS/battery derate that
+          // drives the command under the floor's output was reporting MIN FIELD, which also made
+          // rvcDeratingFromLimiter publish "not derating" to the RV-C bus during a real derate.
           // 12 (zero command) and 14 (Hi->Lo glide) sit BELOW zeroCmd's own test in this order for a
           // reason: warmupBinding and glideBinding are both computed ABOVE the Maintain/zero-float
           // assignment of uTargetAmps = 0, so either can still read true while the real story is the
           // zero command. Letting 12 answer first keeps that from surfacing as a stale ramp.
           if (CVTuningMode || inStartupRamp)                       rawCode = 0;
           else if (protBinding)                                   rawCode = 6;
-          else if (minFloorBinding)                               rawCode = 11;
           else if (zeroCmd)                                       rawCode = 12;
           else if (glideBinding)                                  rawCode = 14;
           else if (altZeroOutput)                                 rawCode = 7;
@@ -5462,6 +5515,7 @@ void AdjustFieldLearnMode() {
           else if (dvccCclBinding)                                rawCode = 8;  // BMS charge-current limit is the active ceiling
           else if (battCeilBinding)                               rawCode = 4;
           else if (thermalPenaltyAmps > 0.5f)                     rawCode = 2;
+          else if (minFloorBinding)                               rawCode = 11;  // no ceiling binds: over-delivery really is the keep-alive floor
           else if (warmupBinding)                                 rawCode = 13;  // last real ceiling before the catch-all
           else                                                    rawCode = 1;
           // Publish a change only after 5 consecutive identical ticks (~150 ms): edge-hover
@@ -6940,6 +6994,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
                          (protTestActive != 0) || protTestRequested ||
                          resTestActive || batteryHealthTestActive || cvPlantFitActive || cvStressActive ||
                          (altSweepActive != 0) || altSweepRequested ||
+                         (chcActive != 0) || chcRequested ||
                          TuningMode || CVTuningMode || faCommissionGate;
     tick.commissioningResting = (commissionState == 1) && dialogAlive && !anyTestActive;
   }
@@ -7056,7 +7111,8 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     bool sweepDrivingField = (fieldCurveActive != 0) || (systemIDActive != 0) || (fieldCutActive != 0)
                              || fieldCurveRequested || systemIDRequested || fieldCutRequested
                              || fieldCutCcActive || (protTestActive != 0) || protTestCcActive
-                             || (altSweepActive != 0) || altSweepRequested;
+                             || (altSweepActive != 0) || altSweepRequested
+                             || (chcActive != 0) || chcRequested;
     bool tachLieNow = TachLieEnable && chargingEnabledLocal && !tick.manualMode && !tick.ignoreRPM
                       && !sweepDrivingField
                       && !tick.currentDataStale
@@ -8070,7 +8126,7 @@ void rpmAxisWipeExecute() {
   pendingClearOverheatHistory  = true;  // per-RPM-bin thermal history
   faPendingMatrixClear = true;          // /famatrix.bin  (50-RPM x amp cells)
   ripTabPendingWipe    = true;          // /riptab.bin    (50-RPM bins)
-  ripFitForget(true, "RPM scaling changed");   // both fits carry the RPM they were measured at, and came from the two tables above
+  ripFitForget(true, true, "RPM scaling changed");   // both fits carry the RPM they were measured at, and came from the two tables above
   faPendingFlipWipeAll = true;          // /faflip.bin    (all 9 pages)
   rpmAxisWipePending = true;
   settingWrite(NK_RpmAxisWipePend, "1");
@@ -8150,7 +8206,7 @@ void kneeLearnInit() {
   KNEE_LD_DUTY(NK_kneeMaxFloorPct, kneeMaxFloorPct);
   KNEE_LD_F(NK_kneeRpmTolPct,   kneeRpmTolPct);
   KNEE_LD_F(NK_kneeTempTolF,    kneeTempTolF);
-  KNEE_LD_DUTY(NK_kneeDutyTolPct,  kneeDutyTolPct);   // duty-domain steadiness band — inverse-scale ×12/V like altDutyTolPct
+  KNEE_LD_DUTY(NK_kneeDutyTolPct,  kneeDutyTolPct);   // duty-domain steadiness band — inverse-scale ×12/V like altDutyLineRms
 #undef KNEE_LD_F
 #undef KNEE_LD_DUTY
 

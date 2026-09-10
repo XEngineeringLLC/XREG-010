@@ -1233,6 +1233,68 @@ a.btn-secondary {
   cursor: not-allowed;
 }
 
+/* Commissioning wizard "Details" disclosure — the technical fine print folds away on EVERY step,
+   so the panel shows the instruction and nothing else unless the reader asks. The protection
+   statement is deliberately NOT inside it. */
+#commission-modal-panel details.cx-fp > summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 11.5px;
+  color: #7f8a8e;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#commission-modal-panel details.cx-fp > summary::-webkit-details-marker { display: none; }
+#commission-modal-panel details.cx-fp > summary::before {
+  content: "\203A";
+  display: inline-block;
+  color: #2ec4b6;
+  font-size: 14px;
+  transition: transform .15s;
+}
+#commission-modal-panel details.cx-fp[open] > summary::before { transform: rotate(90deg); }
+#commission-modal-panel .cx-fp-body {
+  font-size: 11px;
+  color: #888;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
+/* The loud cue — the only thing on screen that tells the operator to do something RIGHT NOW while a
+   test is live (stage 9's three passes). Full-bleed across the 20px panel padding, big type, three
+   attention pulses on entry so it cannot be mistaken for the previous instruction still standing. */
+#commission-modal-panel .cx-cue {
+  margin: 12px -20px;
+  padding: 18px 20px 16px;
+  background: linear-gradient(180deg, #0d6a63 0%, #0a4f4a 100%);
+  border-top: 2px solid #2ec4b6;
+  border-bottom: 2px solid #2ec4b6;
+  text-align: center;
+  animation: cxCuePulse 1.1s ease-out 3;
+}
+#commission-modal-panel .cx-cue-l1 {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: #fff;
+  line-height: 1.15;
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.45);
+}
+#commission-modal-panel .cx-cue-l2 {
+  margin-top: 7px;
+  font-size: 14px;
+  color: #a9e6e1;
+}
+@keyframes cxCuePulse {
+  0%   { box-shadow: 0 0 0 0 rgba(46, 196, 182, 0.75); filter: brightness(1.35); }
+  70%  { box-shadow: 0 0 0 16px rgba(46, 196, 182, 0); filter: brightness(1); }
+  100% { box-shadow: 0 0 0 0 rgba(46, 196, 182, 0); filter: brightness(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #commission-modal-panel .cx-cue { animation: none; }
+}
+
 /* Battery-health DCIR test wizard — same dark-panel button treatment as the commissioning modal. */
 #bhw-modal-panel .btn-primary,
 #cvs-modal-panel .btn-primary {
@@ -2021,14 +2083,19 @@ a.btn-secondary {
   gap: 8px;
 }
 
-@media (min-width: 560px) {
+/* Side-by-side only where five chips (~558px, ~609px above 768) plus the ~215px Alternator
+   Enable block and the card padding actually fit; below 900px the default column layout
+   centres the toggle under the chips, the same look as a phone. Was 560px with four chips —
+   with five, the row layout never fits between 560 and ~870, so it only produced a
+   left-aligned toggle with a stray divider on iPad portrait. */
+@media (min-width: 900px) {
   .sensor-control-row {
     flex-direction: row;
     align-items: center;
     gap: 0;
     /* Neither tier can compress (max-content grid + flex-shrink:0 control), so
-       without wrap the Alternator Enable block hangs up to ~150px outside the
-       row on 560–820px screens. Wrap drops it to its own line instead. */
+       without wrap a font that renders wider than measured would hang the
+       Alternator Enable block outside the row. Wrap drops it to its own line instead. */
     flex-wrap: wrap;
     row-gap: 8px;
   }
@@ -2049,7 +2116,7 @@ a.btn-secondary {
 
 .sensor-readings-tier {
   display: grid;
-  grid-template-columns: repeat(4, max-content);
+  grid-template-columns: repeat(5, max-content);
   justify-content: space-evenly;
   align-items: stretch;
   width: 100%;
@@ -2168,15 +2235,22 @@ a.btn-secondary {
   width: 100%;
 }
 
-/* Narrow screens: collapse to 2×2 — triggered only when 4 columns would overflow. Four
-   max-content chips measure ~465px (Alt/Board/Batt temp rows, 3.5em value columns) and the
-   header card pads 16px a side, so 4-across needs ~500px; below that the row ran past the
-   card edge and the Capacitor webview zoomed out to fit it (measured 2026-09-03 at 430-460). */
-@media (max-width: 499px) {
+/* Narrow screens: collapse to two columns — triggered only when 5 across would overflow. Five
+   max-content chips measure ~558px (3.5em value columns; the Health chip's label is the
+   widest) and the header card pads 24px a side, so 5-across needs ~606px; below that the row
+   ran past the card edge and the Capacitor webview zoomed out to fit it (measured 2026-09-03
+   at 430-460 with four chips, 2026-09-09 at 520-600 with five). */
+@media (max-width: 619px) {
   .sensor-readings-tier {
     grid-template-columns: max-content max-content;
     justify-content: space-evenly;
     row-gap: 12px;
+  }
+  /* The odd fifth chip (Health) spans both tracks and centres itself, instead of sitting
+     left in column 1 under a full row. */
+  #hdr-health-duo {
+    grid-column: 1 / -1;
+    justify-self: center;
   }
 }
 
@@ -2271,7 +2345,10 @@ a.btn-secondary {
   background: rgba(214, 0, 0, 0.09);
   border-color: rgba(214, 0, 0, 0.45);
   cursor: default;
+  /* Symmetric: the ✕ sits in the right 34px, and the inherited text-align:center would otherwise
+     centre the text on the box rather than on the space it actually has. */
   padding-right: 34px;
+  padding-left: 34px;
 }
 
 .header-notice-x {
@@ -5591,6 +5668,34 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
    tap that opens the system share sheet — anchor clicks save nothing in either
    app WebView, and Safari drops programmatic clicks once the tap's activation
    expires. */
+/* ── Live-feed stall notice ───────────────────────────────────────────────────
+   Same fixed-overlay pattern as #file-toast below, at the top instead of the bottom:
+   held while the feed is down, then cleared on the same 4 s dwell once it is back.
+   Fixed + pointer-events:none is the whole point — this appears and disappears on
+   its own schedule, and anything that took layout space would shove the page down
+   every time the link hiccuped. Grey, not amber or red: nothing is wrong with the
+   boat, only with this page's connection to it. */
+#stall-toast {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  top: calc(10px + env(safe-area-inset-top));
+  max-width: min(92vw, 560px);
+  background: rgba(66, 70, 72, 0.94);
+  color: #f2f2f2;
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 9px 16px;
+  border-radius: 8px;
+  z-index: 10000;
+  opacity: 0;
+  transition: opacity 0.25s;
+  pointer-events: none;
+  text-align: center;
+}
+
+#stall-toast.show { opacity: 1; }
+
 #file-toast {
   position: fixed;
   left: 50%;
@@ -5843,10 +5948,14 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
    signal column, its unit sub-label, and the Floor cells that only output amps uses. */
 /* The cap table pins its first five columns with !important pixel widths — override for four,
    or the designed 30/24/20/26 split silently renders near-equal and Signal wraps early. */
-.c3-band-table th:nth-child(1), .c3-band-table td:nth-child(1) { width: 30% !important; }
-.c3-band-table th:nth-child(2), .c3-band-table td:nth-child(2) { width: 24% !important; }
+.c3-band-table th:nth-child(1), .c3-band-table td:nth-child(1) { width: 26% !important; }
+.c3-band-table th:nth-child(2), .c3-band-table td:nth-child(2) { width: 20% !important; }
 .c3-band-table th:nth-child(3), .c3-band-table td:nth-child(3) { width: 20% !important; }
-.c3-band-table th:nth-child(4), .c3-band-table td:nth-child(4) { width: 26% !important; }
+.c3-band-table th:nth-child(4), .c3-band-table td:nth-child(4) { width: 15% !important; }
+.c3-band-table th:nth-child(5), .c3-band-table td:nth-child(5) { width: 19% !important; }
+/* 5 columns since the straightness gate (wobble / rate limit / floor / window): the .learning-table
+   base pins 5 fixed-pixel columns with !important, so every one of them has to be overridden here
+   or the last column falls off a phone. */
 .c3-band-table td { padding: 6px 5px; vertical-align: middle; }
 .c3-band-table th:first-child { text-align: left; }
 .c3-band-table td.c3-signal { font-size: 12.5px; font-weight: 600; text-align: left; }
@@ -6044,4 +6153,13 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
     box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.5);
   }
   .why-head { cursor: default; border-radius: 14px 14px 0 0; }
+}
+
+/* Grab cursor for the panel headers makePanelDraggable takes over — it adds .drag-handle rather than
+   an inline style, so the mobile rule below can win. Dragging is off at <=600px (those panels are CSS
+   bottom sheets), so the header stops advertising itself as a handle there. Ordering matters: this
+   must stay after .why-head, which sets its own cursor at equal specificity. */
+.drag-handle { cursor: move; }
+@media (max-width: 600px) {
+  .drag-handle { cursor: default; }
 }

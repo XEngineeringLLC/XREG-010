@@ -754,449 +754,469 @@ enum Csv4Index {
   CSV4_FIELD_COUNT  // = 26
 };
 
+// CSV3 wire contract, declared ONCE. CSV3_LIST is expanded four ways: the Csv3Index enum, the
+// snprintf format string, the snprintf argument list, and the field-name list the build reads to
+// regenerate CSV3_FIELDS in web_src/script.js. Adding a setting means adding ONE line here.
+//
+// Comments in here MUST be /* */ block comments. A // comment swallows the continuation
+// backslash and truncates the macro, and every expansion truncates together and consistently --
+// so the count/order gate in compress_web.sh cannot see it. The static_assert on
+// CSV3_EXPECTED_FIELDS is what catches it, at compile time.
+#define CSV3_EXPECTED_FIELDS 431
+#define CSV3_LIST(X) \
+  /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
+  X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
+  X(BulkVoltage, "%d", SafeInt(BulkVoltage, 100)) \
+  X(wavePeriod, "%d", SafeInt(wavePeriod)) \
+  X(FloatVoltage, "%d", SafeInt(FloatVoltage, 100)) \
+  X(SwitchingFrequency, "%d", SafeInt(SwitchingFrequency)) \
+  X(yyMin, "%d", SafeInt(yyMin)) \
+  X(retired1, "%d", 0)                                                                                            /* was FieldAdjustmentInterval — dead slot, sends 0; kept so CSV3 indices never renumber */ \
+  X(ManualDutyTarget, "%d", SafeInt(ManualDutyTarget, 100)) \
+  X(PhysicalPanelOverride, "%d", SafeInt(PhysicalPanelOverride)) \
+  X(waveAmplitude, "%d", SafeInt(waveAmplitude)) \
+  X(CurrentThreshold, "%d", SafeInt(CurrentThreshold, 100)) \
+  X(PeukertExponent_scaled, "%d", SafeInt(PeukertExponent_scaled)) \
+  X(ChargeEfficiency_scaled, "%d", SafeInt(ChargeEfficiency_scaled)) \
+  X(ChargedVoltage_Scaled, "%d", SafeInt(ChargedVoltage_Scaled)) \
+  X(TailCurrent, "%d", SafeInt(TailCurrent, 10)) \
+  X(ChargedDetectionTime, "%d", SafeInt(ChargedDetectionTime)) \
+  X(IgnoreTemperature, "%d", SafeInt(IgnoreTemperature)) \
+  X(bmsLogic, "%d", SafeInt(bmsLogic)) \
+  X(bmsLogicLevelOff, "%d", SafeInt(bmsLogicLevelOff)) \
+  X(RPMScalingFactor, "%d", SafeInt(RPMScalingFactor)) \
+  X(MaximumAllowedBatteryAmps, "%d", SafeInt(MaximumAllowedBatteryAmps)) \
+  X(AlternatorNominalAmps, "%d", SafeInt(AlternatorNominalAmps)) \
+  X(LearningUpStep, "%d", SafeInt(LearningUpStep, 100)) \
+  X(LearningDownStep, "%d", SafeInt(LearningDownStep, 100)) \
+  X(xTime, "%d", SafeInt(xTime)) \
+  X(MinLearningInterval, "%d", SafeInt(MinLearningInterval)) \
+  X(SafeOperationThreshold, "%d", SafeInt(SafeOperationThreshold)) \
+  X(PidKp, "%d", SafeInt(PidKp, 1000)) \
+  X(PidKi, "%d", SafeInt(PidKi, 1000)) \
+  X(PidKd, "%d", SafeInt(PidKd, 1000)) \
+  X(PidSampleDivisor, "%d", SafeInt(PidSampleDivisor)) \
+  X(MaxTableValue, "%d", SafeInt(MaxTableValue, 100)) \
+  X(MaxPenaltyPercent, "%d", SafeInt(MaxPenaltyPercent, 100)) \
+  X(MaxPenaltyDuration, "%d", SafeInt(MaxPenaltyDuration / 1000)) \
+  X(NeighborLearningFactor, "%d", SafeInt(NeighborLearningFactor, 1000)) \
+  X(yyMax, "%d", SafeInt(yyMax)) \
+  X(LearningMemoryDuration, "%d", SafeInt(LearningMemoryDuration / 86400000)) \
+  X(TuningMode, "%d", SafeInt(TuningMode)) \
+  X(ShuntResistanceMicroOhm, "%d", SafeInt(ShuntResistanceMicroOhm)) \
+  X(InvertAltAmps, "%d", SafeInt(InvertAltAmps)) \
+  X(InvertBattAmps, "%d", SafeInt(InvertBattAmps)) \
+  X(MaxDuty, "%d", SafeInt(MaxDuty)) \
+  X(MinDuty, "%d", SafeInt(MinDuty, 100)) \
+  X(FieldResistance, "%d", SafeInt(FieldResistance, 100)) \
+  X(maxPoints, "%d", SafeInt(maxPoints)) \
+  X(AlternatorCOffset, "%d", SafeInt(AlternatorCOffset, 100)) \
+  X(BatteryCOffset, "%d", SafeInt(BatteryCOffset, 100)) \
+  X(BatteryCapacity_Ah, "%d", SafeInt(BatteryCapacity_Ah)) \
+  X(AmpSensorRange, "%d", SafeInt(AmpSensorRange)) \
+  X(R_fixed, "%d", SafeInt(R_fixed, 100)) \
+  X(Beta, "%d", SafeInt(Beta, 100)) \
+  X(T0_C, "%d", SafeInt(T0_C, 100)) \
+  X(TempSource, "%d", SafeInt(TempSource)) \
+  X(IgnitionOverride, "%d", SafeInt(IgnitionOverride)) \
+  X(FLOAT_DURATION, "%d", SafeInt(FLOAT_DURATION)) \
+  X(PulleyRatio, "%d", SafeInt(PulleyRatio, 100)) \
+  X(BatteryCurrentSource, "%d", SafeInt(BatteryCurrentSource)) \
+  X(rpmTableRPMPoints0, "%d", SafeInt(rpmTableRPMPoints[0])) \
+  X(rpmTableRPMPoints1, "%d", SafeInt(rpmTableRPMPoints[1])) \
+  X(rpmTableRPMPoints2, "%d", SafeInt(rpmTableRPMPoints[2])) \
+  X(rpmTableRPMPoints3, "%d", SafeInt(rpmTableRPMPoints[3])) \
+  X(rpmTableRPMPoints4, "%d", SafeInt(rpmTableRPMPoints[4])) \
+  X(rpmTableRPMPoints5, "%d", SafeInt(rpmTableRPMPoints[5])) \
+  X(rpmTableRPMPoints6, "%d", SafeInt(rpmTableRPMPoints[6])) \
+  X(rpmTableRPMPoints7, "%d", SafeInt(rpmTableRPMPoints[7])) \
+  X(rpmTableRPMPoints8, "%d", SafeInt(rpmTableRPMPoints[8])) \
+  X(rpmTableRPMPoints9, "%d", SafeInt(rpmTableRPMPoints[9])) \
+  X(LearningSettlingPeriod, "%d", SafeInt(LearningSettlingPeriod)) \
+  X(LearningRPMChangeThreshold, "%d", SafeInt(LearningRPMChangeThreshold)) \
+  X(LearningTempHysteresis, "%d", SafeInt(LearningTempHysteresis)) \
+  X(fuelTableRPM0, "%d", SafeInt(fuelTableRPM[0])) \
+  X(fuelTableRPM1, "%d", SafeInt(fuelTableRPM[1])) \
+  X(fuelTableRPM2, "%d", SafeInt(fuelTableRPM[2])) \
+  X(fuelTableRPM3, "%d", SafeInt(fuelTableRPM[3])) \
+  X(fuelTableRPM4, "%d", SafeInt(fuelTableRPM[4])) \
+  X(fuelTableRPM5, "%d", SafeInt(fuelTableRPM[5])) \
+  X(fuelTableRPM6, "%d", SafeInt(fuelTableRPM[6])) \
+  X(fuelTableRPM7, "%d", SafeInt(fuelTableRPM[7])) \
+  X(fuelTableRPM8, "%d", SafeInt(fuelTableRPM[8])) \
+  X(fuelTableRPM9, "%d", SafeInt(fuelTableRPM[9])) \
+  X(fuelTableGPH0, "%d", SafeInt(fuelTableGPH[0], 100)) \
+  X(fuelTableGPH1, "%d", SafeInt(fuelTableGPH[1], 100)) \
+  X(fuelTableGPH2, "%d", SafeInt(fuelTableGPH[2], 100)) \
+  X(fuelTableGPH3, "%d", SafeInt(fuelTableGPH[3], 100)) \
+  X(fuelTableGPH4, "%d", SafeInt(fuelTableGPH[4], 100)) \
+  X(fuelTableGPH5, "%d", SafeInt(fuelTableGPH[5], 100)) \
+  X(fuelTableGPH6, "%d", SafeInt(fuelTableGPH[6], 100)) \
+  X(fuelTableGPH7, "%d", SafeInt(fuelTableGPH[7], 100)) \
+  X(fuelTableGPH8, "%d", SafeInt(fuelTableGPH[8], 100)) \
+  X(fuelTableGPH9, "%d", SafeInt(fuelTableGPH[9], 100)) \
+  X(stateRevision, "%d", SafeInt(stateRevision)) \
+  X(DutyRampRate, "%d", SafeInt(DutyRampRate, 100)) \
+  X(SettleTimeBeforeCut, "%d", SafeInt(SettleTimeBeforeCut)) \
+  X(TempWarnExcess, "%d", SafeInt(TempWarnExcess, 100)) \
+  X(TempCritExcess, "%d", SafeInt(TempCritExcess, 100)) \
+  X(TempSustainedTimeout, "%d", SafeInt(TempSustainedTimeout / 1000)) \
+  X(AlternatorHardShutdownV, "%d", SafeInt(AlternatorHardShutdownV, 100)) \
+  X(VoltageDisagreeThreshold, "%d", SafeInt(VoltageDisagreeThreshold, 100)) \
+  X(VoltageDisagreeTimeout, "%d", SafeInt(VoltageDisagreeTimeout / 1000)) \
+  X(rpmMinDutyTable0, "%d", SafeInt(rpmMinDutyTable[0], 100)) \
+  X(rpmMinDutyTable1, "%d", SafeInt(rpmMinDutyTable[1], 100)) \
+  X(rpmMinDutyTable2, "%d", SafeInt(rpmMinDutyTable[2], 100)) \
+  X(rpmMinDutyTable3, "%d", SafeInt(rpmMinDutyTable[3], 100)) \
+  X(rpmMinDutyTable4, "%d", SafeInt(rpmMinDutyTable[4], 100)) \
+  X(rpmMinDutyTable5, "%d", SafeInt(rpmMinDutyTable[5], 100)) \
+  X(rpmMinDutyTable6, "%d", SafeInt(rpmMinDutyTable[6], 100)) \
+  X(rpmMinDutyTable7, "%d", SafeInt(rpmMinDutyTable[7], 100)) \
+  X(rpmMinDutyTable8, "%d", SafeInt(rpmMinDutyTable[8], 100)) \
+  X(rpmMinDutyTable9, "%d", SafeInt(rpmMinDutyTable[9], 100)) \
+  X(rpmCapCurrentTable0, "%d", SafeInt(rpmCapCurrentTable[0], 100)) \
+  X(rpmCapCurrentTable1, "%d", SafeInt(rpmCapCurrentTable[1], 100)) \
+  X(rpmCapCurrentTable2, "%d", SafeInt(rpmCapCurrentTable[2], 100)) \
+  X(rpmCapCurrentTable3, "%d", SafeInt(rpmCapCurrentTable[3], 100)) \
+  X(rpmCapCurrentTable4, "%d", SafeInt(rpmCapCurrentTable[4], 100)) \
+  X(rpmCapCurrentTable5, "%d", SafeInt(rpmCapCurrentTable[5], 100)) \
+  X(rpmCapCurrentTable6, "%d", SafeInt(rpmCapCurrentTable[6], 100)) \
+  X(rpmCapCurrentTable7, "%d", SafeInt(rpmCapCurrentTable[7], 100)) \
+  X(rpmCapCurrentTable8, "%d", SafeInt(rpmCapCurrentTable[8], 100)) \
+  X(rpmCapCurrentTable9, "%d", SafeInt(rpmCapCurrentTable[9], 100)) \
+  X(VoltageKp, "%d", SafeInt(VoltageKp, 100)) \
+  X(VoltageLoopInterval, "%d", SafeInt(VoltageLoopInterval)) \
+  X(FIELD_COLLAPSE_DELAY, "%d", SafeInt(FIELD_COLLAPSE_DELAY)) \
+  X(SetpointRiseRate, "%d", SafeInt(SetpointRiseRate, 100)) \
+  X(SetpointFallRate, "%d", SafeInt(SetpointFallRate, 100)) \
+  X(SetpointBigStepThresh, "%d", SafeInt(SetpointBigStepThresh, 100)) \
+  X(SetpointBigStepRiseRate, "%d", SafeInt(SetpointBigStepRiseRate, 100)) \
+  X(PIDTrackingGain, "%d", SafeInt(PIDTrackingGain, 100)) \
+  X(CAPSIZE_THRESHOLD_DEG, "%d", SafeInt(CAPSIZE_THRESHOLD_DEG)) \
+  X(PITCHPOLE_THRESHOLD_DEG, "%d", SafeInt(PITCHPOLE_THRESHOLD_DEG)) \
+  X(SLAM_THRESHOLD_G, "%d", SafeInt(SLAM_THRESHOLD_G, 10)) \
+  X(imuMountOrientation, "%d", SafeInt(imuMountOrientation)) \
+  X(TailCurrent_A, "%d", SafeInt(TailCurrent_A, 100)) \
+  X(RebulkVoltage, "%d", SafeInt(RebulkVoltage, 100)) \
+  X(rebulkDebounceTime, "%d", SafeInt(rebulkDebounceTime)) \
+  X(MinFloatTime, "%d", SafeInt(MinFloatTime)) \
+  X(SOC_BlockRebulk_percent, "%d", SafeInt(SOC_BlockRebulk_percent)) \
+  X(SOC_AllowRebulk_percent, "%d", SafeInt(SOC_AllowRebulk_percent)) \
+  X(DutySlowRampRate, "%d", SafeInt(DutySlowRampRate, 100)) \
+  X(ShutdownPhase2HoldMs, "%d", SafeInt(ShutdownPhase2HoldMs)) \
+  X(TempPIDKp, "%d", SafeInt(TempPIDKp, 1000)) \
+  X(TempPIDKi, "%d", SafeInt(TempPIDKi, 1000)) \
+  X(ThermalLookaheadSec, "%d", SafeInt(ThermalLookaheadSec)) \
+  X(TempPIDIntervalMs, "%d", SafeInt(TempPIDIntervalMs)) \
+  X(TempPIDFilterAlpha, "%d", SafeInt(TempPIDFilterAlpha, 1000)) \
+  X(VoltageKi, "%d", SafeInt(VoltageKi, 100)) \
+  X(rpmCapPowerTable0, "%d", (int)rpmCapPowerTable[0]) \
+  X(rpmCapPowerTable1, "%d", (int)rpmCapPowerTable[1]) \
+  X(rpmCapPowerTable2, "%d", (int)rpmCapPowerTable[2]) \
+  X(rpmCapPowerTable3, "%d", (int)rpmCapPowerTable[3]) \
+  X(rpmCapPowerTable4, "%d", (int)rpmCapPowerTable[4]) \
+  X(rpmCapPowerTable5, "%d", (int)rpmCapPowerTable[5]) \
+  X(rpmCapPowerTable6, "%d", (int)rpmCapPowerTable[6]) \
+  X(rpmCapPowerTable7, "%d", (int)rpmCapPowerTable[7]) \
+  X(rpmCapPowerTable8, "%d", (int)rpmCapPowerTable[8]) \
+  X(rpmCapPowerTable9, "%d", (int)rpmCapPowerTable[9]) \
+  X(SystemIDStepAmplitude, "%d", SafeInt(SystemIDStepAmplitude, 10)) \
+  X(HardOCTripAmps, "%d", SafeInt(HardOCTripAmps, 10)) \
+  X(HardOCDebounceMs, "%d", SafeInt(HardOCDebounceMs)) \
+  X(IExcessFrac, "%d", SafeInt(IExcessFrac, 1000))                                                                /* CV threshold fraction (×1000) */ \
+  X(IExcessFloorA, "%d", SafeInt(IExcessFloorA, 10))                                                              /* threshold floor (A ×10) */ \
+  X(IExcessKBleed, "%d", SafeInt(IExcessKBleed, 100)) \
+  X(IgnoreRPM, "%d", SafeInt(IgnoreRPM)) \
+  X(MinRPMForField, "%d", SafeInt(MinRPMForField)) \
+  X(AwBleedRate, "%d", SafeInt(AwBleedRate, 10)) \
+  X(KHard, "%d", SafeInt(KHard, 10)) \
+  X(ReseedFrac, "%d", SafeInt(ReseedFrac, 100)) \
+  X(AwSeedProtectMs, "%d", (int)AwSeedProtectMs) \
+  X(displayTempUnit, "%d", SafeInt(displayTempUnit)) \
+  X(WarmupRampRate, "%d", SafeInt(WarmupRampRate, 10)) \
+  X(OvGroup1Enable, "%d", (int)OvGroup1Enable) \
+  X(OvGroup2Enable, "%d", (int)OvGroup2Enable) \
+  X(IExcessCeilA, "%d", SafeInt(IExcessCeilA, 10))                                                                /* threshold ceiling (A ×10) */ \
+  X(IExcessTau, "%d", SafeInt(IExcessTau))                                                                        /* EMA time constant (ms, raw int) */ \
+  X(OutputPIDSigSrc, "%d", OutputPIDSigSrc) \
+  X(TdPred, "%.3f", TdPred)                                                                                       /* %.3f */ \
+  X(OvMeasMarginV, "%.3f", OvMeasMarginV)                                                                         /* %.3f */ \
+  X(OvPredMarginV, "%.3f", OvPredMarginV)                                                                         /* %.3f */ \
+  X(OutputPIDMA_N, "%d", OutputPIDMA_N) \
+  X(OutputPIDFilterTC, "%d", (int)OutputPIDFilterTC) \
+  X(VoltageFilterTC, "%d", (int)VoltageFilterTC) \
+  X(CvKdVoltFiltTC, "%d", (int)CvKdVoltFiltTC) \
+  X(CvKdDeadbandVps, "%d", SafeInt(CvKdDeadbandVps, 100)) \
+  X(VoltageKd, "%d", SafeInt(VoltageKd, 10)) \
+  X(DvdtTC, "%d", SafeInt(DvdtTC, 10)) \
+  X(CvKdArmV, "%d", SafeInt(CvKdArmV, 100)) \
+  X(StartupRiseRate, "%d", SafeInt(StartupRiseRate, 100)) \
+  X(absorptionCompleteTime, "%d", SafeInt(absorptionCompleteTime)) \
+  X(OnOff, "%d", SafeInt(OnOff)) \
+  X(ManualFieldToggle, "%d", SafeInt(ManualFieldToggle)) \
+  X(HiLow, "%d", SafeInt(HiLow)) \
+  X(LimpHome, "%d", SafeInt(LimpHome)) \
+  X(AlarmActivate, "%d", SafeInt(AlarmActivate)) \
+  X(TempAlarm, "%d", SafeInt(TempAlarm)) \
+  X(VoltageAlarmHigh, "%d", SafeInt(VoltageAlarmHigh, 100)) \
+  X(VoltageAlarmLow, "%d", SafeInt(VoltageAlarmLow, 100)) \
+  X(CurrentAlarmHigh, "%d", SafeInt(CurrentAlarmHigh)) \
+  X(AlarmTest, "%d", SafeInt(AlarmTest)) \
+  X(AlarmLatchEnabled, "%d", SafeInt(AlarmLatchEnabled)) \
+  X(MaintainMode, "%d", SafeInt(MaintainMode)) \
+  X(ManualSOCPoint, "%d", SafeInt(ManualSOCPoint, 100)) \
+  X(IgnoreLearningDuringPenalty, "%d", SafeInt(IgnoreLearningDuringPenalty)) \
+  X(LogAllLearningEvents, "%d", SafeInt(LogAllLearningEvents)) \
+  X(CloudFeatures, "%d", SafeInt(CloudFeatures)) \
+  X(AutoShuntGainCorrection, "%d", SafeInt(AutoShuntGainCorrection)) \
+  X(AutoAltCurrentZero, "%d", SafeInt(AutoAltCurrentZero)) \
+  X(WindingTempOffset, "%d", SafeInt(WindingTempOffset)) \
+  X(ManualLifePercentage, "%d", SafeInt(ManualLifePercentage)) \
+  X(UVThresholdHigh, "%d", SafeInt(UVThresholdHigh, 100)) \
+  X(weatherModeEnabled, "%d", SafeInt(weatherModeEnabled)) \
+  X(imuEnabled, "%d", SafeInt(imuEnabled ? 1 : 0)) \
+  X(AbsorptionVoltage, "%d", SafeInt(AbsorptionVoltage * 100)) \
+  X(AbsorptionTimeoutMs, "%d", SafeInt(AbsorptionTimeoutMs)) \
+  X(bulkVoltageHoldMs, "%d", SafeInt(bulkVoltageHoldMs)) \
+  X(capLimitMode, "%d", SafeInt(capLimitMode)) \
+  X(TargetVoltageMode, "%d", SafeInt(TargetVoltageMode)) \
+  X(TargetVoltageSetpoint, "%d", SafeInt(TargetVoltageSetpoint, 100)) \
+  X(RebulkCurrent_A, "%d", SafeInt(RebulkCurrent_A, 100)) \
+  X(UseFloat, "%d", SafeInt(UseFloat)) \
+  X(IExcessFracBulk, "%d", SafeInt(IExcessFracBulk, 1000))                                                        /* BULK threshold fraction (×1000) */ \
+  X(IExcessRelFrac, "%d", SafeInt(IExcessRelFrac, 1000))                                                          /* release hysteresis fraction (×1000) */ \
+  X(systemIDPlantTauMs, "%d", SafeInt(systemIDPlantTauMs))                                                        /* fitted plant time constant (ms), persisted */ \
+  X(TempAlarmLow, "%d", SafeInt(TempAlarmLow)) \
+  X(LoadDumpDtThresh, "%d", SafeInt(LoadDumpDtThresh)) \
+  X(LoadDumpDtThresh1, "%d", SafeInt(LoadDumpDtThresh1)) \
+  X(CVTuningMode, "%d", (int)CVTuningMode) \
+  X(cvWaveAmplitudeV, "%d", SafeInt(cvWaveAmplitudeV, 100)) \
+  X(cvWavePeriodSec, "%d", (int)cvWavePeriodSec) \
+  X(cvKOvershoot, "%d", SafeInt(cvKOvershoot, 10)) \
+  X(cvConsecutiveReads, "%d", (int)cvConsecutiveReads) \
+  /* 8 dead slots — kept to preserve CSV3 indices, all send 0 */ \
+  X(webgaugesinterval, "%d", SafeInt(webgaugesinterval)) \
+  X(plotTimeWindow, "%d", SafeInt(plotTimeWindow)) \
+  X(Ymin1, "%d", SafeInt(Ymin1)) \
+  X(Ymax1, "%d", SafeInt(Ymax1)) \
+  X(Ymin2, "%d", SafeInt(Ymin2, 100)) \
+  X(Ymax2, "%d", SafeInt(Ymax2, 100)) \
+  X(Ymin3, "%d", SafeInt(Ymin3)) \
+  X(Ymax3, "%d", SafeInt(Ymax3)) \
+  X(Ymin4, "%d", SafeInt(Ymin4)) \
+  X(Ymax4, "%d", SafeInt(Ymax4)) \
+  X(LoadDumpDtThresh3, "%d", SafeInt(LoadDumpDtThresh3)) \
+  X(hardwarePresent, "%d", SafeInt(hardwarePresent)) \
+  X(testProtectionsEnabled, "%d", (int)testProtectionsEnabled)                                                    /* runtime flag — not persisted, resets true (enabled) on boot */ \
+  X(IExcessArmMarginV, "%.3f", IExcessArmMarginV)                                                                 /* %.3f — iExcess voltage gate, independent of OvMeasMarginV */ \
+  X(FastSetpointRiseRate, "%d", SafeInt(FastSetpointRiseRate, 100))                                               /* ×100, 1 decimal — multiplier on setpoint rise slew during post-protection recovery */ \
+  X(FastSetpointRiseWindowMs, "%d", (int)FastSetpointRiseWindowMs)                                                /* raw ms — hard upper bound on fast-rise window */ \
+  X(FastSetpointRiseHeadroomV, "%d", SafeInt(FastSetpointRiseHeadroomV, 100))                                     /* ×100, 2 decimal — V below target at which fast-rise gate stays open */ \
+  X(SolarWatts, "%d", SafeInt(SolarWatts)) \
+  X(performanceRatio, "%d", SafeInt(performanceRatio, 100))                                                       /* ×100, 2 decimal */ \
+  X(VeData, "%d", SafeInt(VeData))                                                                                /* 0/1 */ \
+  X(NMEA0183Data, "%d", SafeInt(NMEA0183Data))                                                                    /* 0/1 */ \
+  X(NMEA2KData, "%d", SafeInt(NMEA2KData))                                                                        /* 0/1 */ \
+  X(timeAxisModeChanging, "%d", SafeInt(timeAxisModeChanging))                                                    /* 0/1 */ \
+  X(timeSourceMode, "%d", (int)timeSourceMode)                                                                    /* 0=auto, 1=NMEA-forced, 2=Phone-forced, 3=NTP-time-forced */ \
+  X(speedSourceMode, "%d", (int)speedSourceMode)                                                                  /* 0=NMEA 2000, 1=phone GPS (speed/course owner — selectable, never auto) */ \
+  /* Fast alt-current diagnostic knobs (Pattern B echo) */ \
+  X(faEnabled, "%d", (int)faEnabled)                                                                              /* 0/1 — global ON/OFF */ \
+  X(faAlarmEnable, "%d", (int)faAlarmEnable)                                                                      /* 0/1 — FAULT drives audible alarm */ \
+  X(faAnomPause, "%d", (int)faAnomPause)                                                                          /* 0/1 — freeze anomaly flipbook slots */ \
+  X(faRpmEdgeMargin, "%d", SafeInt(faRpmEdgeMargin, 10))                                                          /* RPM ×10 */ \
+  X(faAmpsDriftFloorA, "%d", SafeInt(faAmpsDriftFloorA, 100))                                                     /* A ×100 */ \
+  X(faAmpsDriftPct, "%d", SafeInt(faAmpsDriftPct, 10))                                                            /* percent ×10 */ \
+  X(faAttenUpAmps, "%d", SafeInt(faAttenUpAmps, 10))                                                              /* A ×10 */ \
+  X(faAttenDownAmps, "%d", SafeInt(faAttenDownAmps, 10))                                                          /* A ×10 */ \
+  X(faPeakMinA, "%d", SafeInt(faPeakMinA, 100))                                                                   /* A ×100 */ \
+  X(wifiNapEnabled, "%d", (int)wifiNapEnabled)                                                                    /* 0/1 — WiFi Napping standby toggle (Client only) */ \
+  X(imuHeelOffset, "%d", SafeInt(imuHeelOffsetDeg, 100))                                                          /* captured rest heel offset (deg ×100); on CSV3 so the Level Zero echo is fast */ \
+  X(imuPitchOffset, "%d", SafeInt(imuPitchOffsetDeg, 100))                                                        /* captured rest pitch offset (deg ×100) */ \
+  X(systemIDTestType, "%d", SafeInt(systemIDTestType))                                                            /* 0=step, 1=sine sweep (Plant Delay test type) */ \
+  X(systemIDSineFreqStart, "%d", SafeInt(systemIDSineFreqStart, 10))                                              /* Hz ×10 */ \
+  X(systemIDSineFreqEnd, "%d", SafeInt(systemIDSineFreqEnd, 10))                                                  /* Hz ×10 */ \
+  X(systemIDSineCycles, "%d", SafeInt(systemIDSineCycles))                                                        /* analysed cycles per sweep frequency */ \
+  X(tuningWaveform, "%d", SafeInt(tuningWaveform))                                                                /* 0=square, 1=sine manual, 2=sine auto-sweep */ \
+  X(tuningSineFreq, "%d", SafeInt(tuningSineFreq, 10))                                                            /* Hz ×10 (manual sine frequency) */ \
+  X(tuningSweepStart, "%d", SafeInt(tuningSweepStart, 10))                                                        /* Hz ×10 */ \
+  X(tuningSweepEnd, "%d", SafeInt(tuningSweepEnd, 10))                                                            /* Hz ×10 */ \
+  X(tuningSweepCycles, "%d", SafeInt(tuningSweepCycles))                                                          /* analysed cycles per sweep frequency */ \
+  X(SystemIDStabilizeAmps, "%d", SafeInt(SystemIDStabilizeAmps, 10))                                              /* A ×10 — plant-delay baseline/trough current */ \
+  X(tuningWaveFloor, "%d", SafeInt(tuningWaveFloor))                                                              /* A — Current Target Generator wave floor (trough), shared square + sine */ \
+  X(commissionState, "%d", (int)commissionState)                                                                  /* auto-commissioning state: 0=not, 1=in-progress, 2=commissioned */ \
+  X(commissionPhase, "%d", (int)commissionPhase)                                                                  /* current wizard phase: 0=Prep…9=Charge health calibration, 10=finished */ \
+  X(commissionDoneMask, "%d", (int)commissionDoneMask)                                                            /* per-stage completion bitmask (bit i = stage i done) */ \
+  X(cvHelpersEnabled, "%d", (int)cvHelpersEnabled)                                                                /* master switch: asymmetric KiDown unwind + CV D term (1=on) */ \
+  X(MinChargeTempF, "%d", SafeInt(MinChargeTempF))                                                                /* cold-charge lockout board-temp floor (°F) */ \
+  X(coldChargeLockoutEnable, "%d", (int)coldChargeLockoutEnable)                                                  /* cold-charge lockout master on/off (1=on) */ \
+  X(cvGainMode, "%d", (int)cvGainMode)                                                                            /* CV gain mode: 0=Manual, 1=Auto (α/K anchored) */ \
+  X(cvPlantK, "%d", SafeInt(cvPlantK, 10000))                                                                     /* measured plant gain K (V/A); ×10000 */ \
+  X(cvComputedKp, "%d", SafeInt(cvComputedKp, 100))                                                               /* Auto-computed Kp (12V-equiv); ×100 */ \
+  X(cvComputedKi, "%d", SafeInt(cvComputedKi, 100))                                                               /* Auto-computed Ki (12V-equiv); ×100 */ \
+  X(cvCrossover, "%d", SafeInt(cvCrossover, 100))                                                                 /* CV crossover ω_c (rad/s); ×100 */ \
+  X(cvPiZero, "%d", SafeInt(cvPiZero, 100))                                                                       /* CV PI integral zero ρ (rad/s); ×100 */ \
+  X(vTgtRampUp, "%d", SafeInt(vTgtRampUp, 1000))                                                                  /* CV voltage-target ramp UP rate (V/s); ×1000 */ \
+  X(vTgtRampDn, "%d", SafeInt(vTgtRampDn, 1000))                                                                  /* CV voltage-target ramp DOWN rate (V/s); ×1000 */ \
+  X(vTgtRampEnable, "%d", (int)vTgtRampEnable)                                                                    /* CV voltage-target slew master switch (0/1) */ \
+  X(setpointSlewEnable, "%d", (int)setpointSlewEnable)                                                            /* inner-loop current setpoint slew master switch (0/1) */ \
+  X(cvRiseGovEnable, "%d", (int)cvRiseGovEnable)                                                                  /* CV rise governor / anti-windup master switch (0/1) */ \
+  X(dutySlewEnable, "%d", (int)dutySlewEnable)                                                                    /* field duty slew master switch (0/1) */ \
+  X(CommissionTempF, "%d", isnan(CommissionTempF) ? ROLL_EMPTY : (int)lroundf(CommissionTempF * 10.0f))           /* board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset/NaN) */ \
+  X(battTempDerateEnable, "%d", (int)battTempDerateEnable)                                                        /* battery-temp gain derate master on/off (0/1) */ \
+  X(battTempCoeff, "%d", SafeInt(battTempCoeff, 10000))                                                           /* battery fractional resistance change per °C; ×10000 */ \
+  X(TempPIDKiDownFrac, "%d", SafeInt(TempPIDKiDownFrac, 1000))                                                    /* thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000 */ \
+  X(ThermalSlopeWindowSec, "%d", SafeInt(ThermalSlopeWindowSec))                                                  /* thermal slope backward-difference window (s); integer */ \
+  X(BattCurrentLimitA, "%d", SafeInt(BattCurrentLimitA, 10))                                                      /* max battery charge current (A ×10, G4); 0 = disabled — ceiling on the alternator command = limit + house-load offset */ \
+  /* measured-ripple capture admission gates (§10.8/§11) — own knobs, decoupled from the fa* detector gates */ \
+  X(ripWinMs, "%d", SafeInt(ripWinMs))                                                                            /* pk-pk capture window (ms, integer) */ \
+  X(ripDriftFloorA, "%d", SafeInt(ripDriftFloorA, 100))                                                           /* shared floor: command-travel gate + stationarity mean-shift tolerance (A ×100) */ \
+  X(ripDriftPct, "%d", SafeInt(ripDriftPct, 10))                                                                  /* command-travel gate slope (% of mean, ×10) — command gate only since §11 */ \
+  X(SocAlarmLow, "%d", SafeInt(SocAlarmLow))                                                                      /* low-SoC alarm threshold (%, integer); 0 = disabled */ \
+  X(battMaxMode, "%d", SafeInt(battMaxMode))                                                                      /* battery V/I plot sampling: 0 = window mean, 1 = max-magnitude */ \
+  X(IExcessBaseA, "%d", SafeInt(IExcessBaseA, 10))                                                                /* over-current trip-line intercept / CV base (A ×10) */ \
+  X(IExcessCcOffsetA, "%d", SafeInt(IExcessCcOffsetA, 10))                                                        /* CC trip line offset above CV (A ×10) */ \
+  X(BatteryShuntPresent, "%d", SafeInt(BatteryShuntPresent))                                                      /* 1 = INA228 battery shunt fitted; 0 = no battery-current sensor */ \
+  X(cvRecovEnable, "%d", (int)cvRecovEnable)                                                                      /* post-protection integrator-refill master switch (0/1) */ \
+  X(cvRecovSec, "%d", SafeInt(cvRecovSec, 10))                                                                    /* retired timed-window knob; slot kept (never repurpose); ×10 */ \
+  X(cvRecovEmaxV, "%d", SafeInt(cvRecovEmaxV, 1000))                                                              /* retired timed-window knob; slot kept (never repurpose); ×1000 */ \
+  X(testSlewMode, "%d", (int)testSlewMode)                                                                        /* manual CC square-wave test slew mode (0=off, 1=default rates, 2=custom) */ \
+  X(cvTestSlewMode, "%d", (int)cvTestSlewMode)                                                                    /* manual CV square-wave test slew mode (0=off, 1=default rates, 2=custom) */ \
+  X(CvKdOneSided, "%d", (int)CvKdOneSided)                                                                        /* CV D-term mode: 1=one-sided (removes current only), 0=symmetric */ \
+  X(fieldDecayTauMs, "%d", SafeInt(fieldDecayTauMs))                                                              /* commissioned field drain time, command→10% of output (ms); worst-case (longest) endpoint of the drain-vs-RPM line, or the flat value */ \
+  X(commissionManualMask, "%d", (int)commissionManualMask)                                                        /* per-stage set-by-hand bitmask (skip / mark-done-manually); pairs with commissionDoneMask */ \
+  X(CvKdMaxTrimA, "%d", SafeInt(CvKdMaxTrimA, 10))                                                                /* CV D-term back-off ceiling (A ×10); caps kdTrim so a fast rise saturates instead of flooring the field */ \
+  X(cvAlpha, "%d", SafeInt(cvAlpha, 1000))                                                                        /* CV auto-gain aggressiveness α (fraction of the deadbeat-ohmic gain); ×1000 */ \
+  X(CvKdSlopeCeil, "%d", SafeInt(CvKdSlopeCeil, 10))                                                              /* CV D-term slope ceiling (V/s real per-bus ×10) — max slope the D acts on */ \
+  X(cvComputedKd, "%d", SafeInt(cvComputedKd, 100))                                                               /* Auto-computed D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100 */ \
+  X(CvKdDbSlope, "%d", SafeInt(CvKdDbSlope, 10000))                                                               /* CV D-term deadband line slope (V/s per A ×10000) */ \
+  X(CvKdDbFloor, "%d", SafeInt(CvKdDbFloor, 100))                                                                 /* CV D-term deadband line floor (V/s ×100) */ \
+  X(CvKdDbCeil, "%d", SafeInt(CvKdDbCeil, 100))                                                                   /* CV D-term deadband line ceiling (V/s ×100) */ \
+  X(cvRecovBoostEnable, "%d", (int)cvRecovBoostEnable)                                                            /* post-protection recovery P-boost master switch (0/1) */ \
+  X(cvRecovBoostMax, "%d", SafeInt(cvRecovBoostMax, 100))                                                         /* recovery P-boost max multiplier at full shortfall; ×100 */ \
+  X(cvRecovBoostErrV, "%d", SafeInt(cvRecovBoostErrV, 1000))                                                      /* recovery P-boost full-boost shortfall (V per 12V block); ×1000 */ \
+  X(fdDrainLoMs, "%d", SafeInt(fdDrainLoMs))                                                                      /* drain-vs-RPM line: drain (ms) at fdDrainRpmLo; 0 = no line (flat fieldDecayTauMs) */ \
+  X(fdDrainHiMs, "%d", SafeInt(fdDrainHiMs))                                                                      /* drain-vs-RPM line: drain (ms) at fdDrainRpmHi */ \
+  X(fdDrainRpmLo, "%d", SafeInt(fdDrainRpmLo))                                                                    /* drain-vs-RPM line: lowest tested RPM (lookup clamps here) */ \
+  X(fdDrainRpmHi, "%d", SafeInt(fdDrainRpmHi))                                                                    /* drain-vs-RPM line: highest tested RPM (lookup clamps here) */ \
+  X(HardOCEnable, "%d", (int)HardOCEnable)                                                                        /* Group 0 hard over-current trip enable (0/1) */ \
+  X(IExcessEnable, "%d", (int)IExcessEnable)                                                                      /* Group 3 iExcess detectors enable (0/1, gates CV + bulk) */ \
+  X(BattLimitEnable, "%d", (int)BattLimitEnable)                                                                  /* Group 4 battery charge-current ceiling enable (0/1) */ \
+  X(CvKdExcessMode, "%d", (int)CvKdExcessMode)                                                                    /* CV D-term response shape (1 = slope excess over the tolerance line, 0 = legacy full-slope latch) */ \
+  X(CvStressDropV, "%d", SafeInt(CvStressDropV, 100))                                                             /* stress-test target headroom below settled idle (V 12V-equiv ×100, class-scaled at use) */ \
+  X(CvStressFailBandV, "%d", SafeInt(CvStressFailBandV, 100))                                                     /* stress-test stability fail band (V 12V-equiv ×100, class-scaled at use) */ \
+  X(CvBrakeFallRate, "%d", SafeInt(CvBrakeFallRate, 100))                                                         /* brake-tier setpoint fall rate while CV D-term removes current (A/s ×100) */ \
+  X(cvRecovKiMax, "%d", SafeInt(cvRecovKiMax, 100))                                                               /* refill Ki multiplier at release, tapering to 1x as the deficit heals; ×100 */ \
+  X(cvWindDownEnable, "%d", (int)cvWindDownEnable)                                                                /* commanded-target wind-down governor master switch (0/1) */ \
+  X(cvWindDownRate, "%d", SafeInt(cvWindDownRate, 1000))                                                          /* wind-down shed rate (fraction of MaxTableValue per second); ×1000 */ \
+  X(cvWindDownStopV, "%d", SafeInt(cvWindDownStopV, 1000))                                                        /* wind-down stop margin above commanded target (V real per-bus, class-scaled at store); ×1000 */ \
+  X(LoadDumpEnable, "%d", (int)LoadDumpEnable)                                                                    /* Group 5 load dump enable (0/1) */ \
+  X(loadServeBoostEnable, "%d", (int)loadServeBoostEnable)                                                        /* load-serve Ki boost toward measured house loads (0/1, shunt-gated) */ \
+  X(reseedCorrEnable, "%d", (int)reseedCorrEnable)                                                                /* demand-corrected reseed: load-drop subtraction + rapid-refire ratchet (0/1) */ \
+  X(HuntGovEnable, "%d", (int)HuntGovEnable)                                                                      /* hunt-governor (oscillation damper) master switch (0/1) */ \
+  X(ReseedFracNoShunt, "%d", SafeInt(ReseedFracNoShunt, 100))                                                     /* no-shunt recovery seed fraction (×100) */ \
+  X(CvRecovClimbRate, "%d", SafeInt(CvRecovClimbRate, 100))                                                       /* recovery climb floor rate, fraction of MaxTableValue/s (×100) */ \
+  X(protTestCutMs, "%d", SafeInt(protTestCutMs))                                                                  /* protection-test manual hard-cut hold (ms) */ \
+  X(protTestGapMs, "%d", SafeInt(protTestGapMs))                                                                  /* protection-test gap between repeated cuts (ms) */ \
+  X(protTestReps, "%d", SafeInt(protTestReps))                                                                    /* protection-test repeat count */ \
+  X(protTestAmps, "%d", SafeInt(protTestCmdA))                                                                    /* protection-test energize target current (A); 0 = auto-seed at fire */ \
+  X(cvRecovBoostFloorV, "%d", SafeInt(cvRecovBoostFloorV, 1000))                                                  /* recovery P-boost dead area below target (V per 12V block); ×1000 */ \
+  X(cvRecovDeepBandV, "%d", SafeInt(cvRecovDeepBandV, 1000))                                                      /* deep-recovery band (V per 12V block); ×1000 */ \
+  X(cvRecovDeepMult, "%d", SafeInt(cvRecovDeepMult, 100))                                                         /* starve-walk rate multiplier at full depth; ×100 */ \
+  X(cvRecovFlareBandV, "%d", SafeInt(cvRecovFlareBandV, 1000))                                                    /* arrival flare band (V per 12V block); ×1000 */ \
+  X(cvRecovFlareFrac, "%d", SafeInt(cvRecovFlareFrac, 100))                                                       /* arrival flare ceiling floor, fraction of recovery goal; ×100 */ \
+  X(TachLieEnable, "%d", (int)TachLieEnable)                                                                      /* tach-lie plausibility cut enable (0/1) */ \
+  X(n2kTxEnable, "%d", SafeInt(n2kTxEnable))                                                                      /* NMEA2000 transmit master (0/1) — mode applied at boot */ \
+  X(n2kDeviceInstance, "%d", SafeInt(n2kDeviceInstance))                                                          /* N2K device instance */ \
+  X(n2kBattEnable, "%d", SafeInt(n2kBattEnable))                                                                  /* battery 127508+127506 pair (0/1) */ \
+  X(n2kBattInstance, "%d", SafeInt(n2kBattInstance)) \
+  X(n2kBattCfgEnable, "%d", SafeInt(n2kBattCfgEnable))                                                            /* 127513 battery configuration (0/1) */ \
+  X(n2kAltEnable, "%d", SafeInt(n2kAltEnable))                                                                    /* alternator 127508+127506 DCType=Alternator pair (0/1) */ \
+  X(n2kAltInstance, "%d", SafeInt(n2kAltInstance)) \
+  X(n2kAltTempEnable, "%d", SafeInt(n2kAltTempEnable))                                                            /* 130312 alternator temperature (0/1) */ \
+  X(n2kTempInstance, "%d", SafeInt(n2kTempInstance)) \
+  X(n2kTempSource, "%d", SafeInt(n2kTempSource))                                                                  /* tN2kTempSource code (3 = Engine Room) */ \
+  X(n2kChgrEnable, "%d", SafeInt(n2kChgrEnable))                                                                  /* 127507 charger status (0/1) */ \
+  X(n2kChgrInstance, "%d", SafeInt(n2kChgrInstance)) \
+  X(n2kChgrCfgEnable, "%d", SafeInt(n2kChgrCfgEnable))                                                            /* 127510 charger configuration, carries field drive % (0/1) */ \
+  X(n2kChgrMode, "%d", SafeInt(n2kChgrMode))                                                                      /* tN2kChargerMode label: 0 Standalone, 1 Primary, 2 Secondary */ \
+  X(n2kEngRpmEnable, "%d", SafeInt(n2kEngRpmEnable))                                                              /* 127488 engine RPM (0/1) */ \
+  X(n2kEngInstance, "%d", SafeInt(n2kEngInstance)) \
+  X(n2kEngDynEnable, "%d", SafeInt(n2kEngDynEnable))                                                              /* 127489 engine dynamic (0/1) */ \
+  X(n2kEngBitsEnable, "%d", SafeInt(n2kEngBitsEnable))                                                            /* discrete warning bits inside 127489 (0/1) */ \
+  X(n2kRxBattInstance, "%d", SafeInt(n2kRxBattInstance))                                                          /* battery instance to ingest (127508/127506 receive) */ \
+  X(dvccEn, "%d", SafeInt(dvccEn))                                                                                /* DVCC follow master (0/1) */ \
+  X(dvccSrcType, "%d", SafeInt(dvccSrcType))                                                                      /* authority dialect: 0 Victron VE.Can (VREG), 1 RV-C */ \
+  X(dvccInst, "%d", SafeInt(dvccInst))                                                                            /* RV-C DC instance filter (0 = any) */ \
+  X(dvccSilenceS, "%d", SafeInt(dvccSilenceS))                                                                    /* silence timeout (s) */ \
+  X(dvccSettleS, "%d", SafeInt(dvccSettleS))                                                                      /* settling time (s) */ \
+  X(dvccCvlMin, "%d", SafeInt(dvccCvlMin, 100))                                                                   /* plausible-CVL window low (V ×100) */ \
+  X(dvccCvlMax, "%d", SafeInt(dvccCvlMax, 100))                                                                   /* plausible-CVL window high (V ×100) */ \
+  X(HuntCutPct, "%d", (int)HuntCutPct)                                                                            /* damper test/pocket gain, % of user Ki */ \
+  X(HuntVerifyPct, "%d", (int)HuntVerifyPct)                                                                      /* damper verify bar, % ripple reduction required */ \
+  X(HuntWingPct, "%d", (int)HuntWingPct)                                                                          /* damper pocket taper width, % of speed per side */ \
+  X(HuntCooldownMin, "%d", (int)HuntCooldownMin)                                                                  /* damper retest cooldown after a failed test (min) */ \
+  X(HuntSteadyPct, "%d", (int)HuntSteadyPct)                                                                      /* damper engine-speed steadiness tolerance (%) */ \
+  X(HuntQualifyScans, "%d", (int)HuntQualifyScans)                                                                /* damper wobble-confirm scan count (1.6 s each) */ \
+  X(HuntTrigPct, "%d", SafeInt(HuntTrigPct, 100))                                                                 /* damper detection bar: peak-bin duty swing % (x100) */ \
+  X(NMEA0183Baud, "%d", (int)NMEA0183Baud)                                                                        /* NMEA 0183 serial baud (4800 / 9600 / 19200 / 38400) */ \
+  X(NMEA0183Invert, "%d", (int)NMEA0183Invert)                                                                    /* NMEA 0183 UART polarity: 0 RS-232-level talker, 1 TTL-level talker */ \
+  X(displayVolUnit, "%d", SafeInt(displayVolUnit))                                                                /* fuel volume display preference: 0 US gallons, 1 litres */ \
+  X(gpsPositionSource, "%d", (int)gpsPositionSource)                                                              /* 0=auto, 1=NMEA-forced, 2=phone-forced (position only; the clock is CSV3_timeSourceMode) */ \
+  X(MaxFieldVolts, "%d", SafeInt(MaxFieldVolts, 10))                                                              /* field-volt cap (x10). The enforced ceiling it produces is CSV2_fieldDutyCeil — voltage-dependent, so it lives on the 5s channel, not here */ \
+  X(OvTierLoMarginV, "%.3f", OvTierLoMarginV)                                                                     /* timed OV cut LOW-tier margin above target (V, %.3f) */ \
+  X(OvTierLoDwellMs, "%d", SafeInt(OvTierLoDwellMs))                                                              /* timed OV cut LOW-tier continuous dwell (ms; 0 = tier off) */ \
+  X(OvTierMidMarginV, "%.3f", OvTierMidMarginV)                                                                   /* timed OV cut MID-tier margin above target (V, %.3f) */ \
+  X(OvTierMidDwellMs, "%d", SafeInt(OvTierMidDwellMs))                                                            /* timed OV cut MID-tier continuous dwell (ms; 0 = tier off) */ \
+  X(VoltageHardwareLimit, "%d", SafeInt(VoltageHardwareLimit, 100))                                               /* INA228 hardware shutdown voltage (x100) — top OV-ladder rung, user setting */ \
+  X(LoadDumpN1, "%d", SafeInt(LoadDumpN1))                                                                        /* load-dump tier 1 consecutive-sample count (time to act = N x ~5 ms) */ \
+  X(LoadDumpN2, "%d", SafeInt(LoadDumpN2))                                                                        /* load-dump tier 2 consecutive-sample count */ \
+  X(LoadDumpN3, "%d", SafeInt(LoadDumpN3))                                                                        /* load-dump tier 3 consecutive-sample count */ \
+  X(solarLearnEnable, "%d", SafeInt(solarLearnEnable))                                                            /* 0/1 — learn performanceRatio from each complete day's actual/forecast harvest */ \
+  X(solarUseConsEnable, "%d", SafeInt(solarUseConsEnable))                                                        /* 0/1 — size the solar-pause bar from predicted consumption */ \
+  X(solarConsMarginPct, "%d", SafeInt(solarConsMarginPct, 100))                                                   /* x100 — headroom over predicted consumption (%) */ \
+  X(solarLearnRatePct, "%d", SafeInt(solarLearnRatePct, 100))                                                     /* x100 — per-day blend weight into performanceRatio (%) */ \
+  X(rvcTxEnable, "%d", SafeInt(rvcTxEnable))                                                                      /* RV-C transmit master (0/1) — bus mode applied at boot */ \
+  X(rvcChgrEnable, "%d", SafeInt(rvcChgrEnable))                                                                  /* RV-C CHARGER_STATUS / _2 / _3 / CONFIGURATION_STATUS (0/1) */ \
+  X(rvcDcEnable, "%d", SafeInt(rvcDcEnable))                                                                      /* RV-C DC_SOURCE_STATUS_1/2/3 at the alternator instance (0/1) */ \
+  X(rvcFaultEnable, "%d", SafeInt(rvcFaultEnable))                                                                /* RV-C DM_RV diagnostic message (0/1) */ \
+  X(rvcChgrInstance, "%d", SafeInt(rvcChgrInstance))                                                              /* RV-C charger instance (49 = alternator type nibble + instance 1) */ \
+  X(rvcDcInstance, "%d", SafeInt(rvcDcInstance))                                                                  /* RV-C DC source instance for the alternator */ \
+  X(rvcDevPriority, "%d", SafeInt(rvcDevPriority))                                                                /* RV-C device priority (80 = Charger, below a BMS 120) */ \
+  /* Battery + extra temperature probes, source chain, hot-charge lockout (BATTERY_TEMP_SENSORS_SPEC.md §6) */ \
+  X(battTempProbeEnable, "%d", SafeInt(battTempProbeEnable))                                                      /* BATT-role probe feeds the battery-temperature source chain (0/1) */ \
+  X(extraTempProbeEnable, "%d", SafeInt(extraTempProbeEnable))                                                    /* EXTRA-role probe live (0/1) */ \
+  X(battTempSource, "%d", SafeInt(battTempSource))                                                                /* 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 Board, 6 None */ \
+  X(battTempProxyEnable, "%d", SafeInt(battTempProxyEnable))                                                      /* Auto may fall back to the board temperature (0/1) */ \
+  X(hotChargeLockoutEnable, "%d", SafeInt(hotChargeLockoutEnable))                                                /* hot-charge lockout master on/off (0/1) */ \
+  X(MaxChargeTempF, "%d", SafeInt(MaxChargeTempF))                                                                /* hot-charge lockout ceiling (°F) */ \
+  X(extraTempAlarmHiEnable, "%d", SafeInt(extraTempAlarmHiEnable))                                                /* EXTRA-probe high alarm (0/1) */ \
+  X(extraTempAlarmHiF, "%d", SafeInt(extraTempAlarmHiF))                                                          /* EXTRA-probe high alarm threshold (°F) */ \
+  X(extraTempAlarmLoEnable, "%d", SafeInt(extraTempAlarmLoEnable))                                                /* EXTRA-probe low alarm (0/1) */ \
+  X(extraTempAlarmLoF, "%d", SafeInt(extraTempAlarmLoF))                                                          /* EXTRA-probe low alarm threshold (°F) */ \
+  X(n2kExtraTempEnable, "%d", SafeInt(n2kExtraTempEnable))                                                        /* 130312 for the EXTRA probe (0/1) */ \
+  X(n2kExtraTempInstance, "%d", SafeInt(n2kExtraTempInstance)) \
+  X(n2kExtraTempSource, "%d", SafeInt(n2kExtraTempSource))                                                        /* tN2kTempSource code for the EXTRA probe */ \
+  X(CommissionTempSrc, "%d", SafeInt(CommissionTempSrc))                                                          /* battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown = board) */ \
+  X(sessionId, "%u", (unsigned)g_sessionId)                                                                       /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
+  X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
+  /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
+  /* setting in this block predates whatever the device is actually running. */
+
+// The four expansions of CSV3_LIST. Adding a setting means one line in the list above and nothing here.
+#define CSV3_ENUM_X(name, fmt, expr) CSV3_##name,
+#define CSV3_FMT_X(name, fmt, expr)  "," fmt
+#define CSV3_ARG_X(name, fmt, expr)  , expr
+
 enum Csv3Index {
-  // SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback
-  CSV3_TemperatureLimitF,
-  CSV3_BulkVoltage,
-  CSV3_wavePeriod,
-  CSV3_FloatVoltage,
-  CSV3_SwitchingFrequency,
-  CSV3_yyMin,
-  CSV3_retired1,  // was FieldAdjustmentInterval — dead slot, sends 0; kept so CSV3 indices never renumber
-  CSV3_ManualDutyTarget,
-  CSV3_PhysicalPanelOverride,
-  CSV3_waveAmplitude,
-  CSV3_CurrentThreshold,
-  CSV3_PeukertExponent_scaled,
-  CSV3_ChargeEfficiency_scaled,
-  CSV3_ChargedVoltage_Scaled,
-  CSV3_TailCurrent,
-  CSV3_ChargedDetectionTime,
-  CSV3_IgnoreTemperature,
-  CSV3_bmsLogic,
-  CSV3_bmsLogicLevelOff,
-  CSV3_RPMScalingFactor,
-  CSV3_MaximumAllowedBatteryAmps,
-  CSV3_AlternatorNominalAmps,
-  CSV3_LearningUpStep,
-  CSV3_LearningDownStep,
-  CSV3_xTime,
-  CSV3_MinLearningInterval,
-  CSV3_SafeOperationThreshold,
-  CSV3_PidKp,
-  CSV3_PidKi,
-  CSV3_PidKd,
-  CSV3_PidSampleDivisor,
-  CSV3_MaxTableValue,
-  CSV3_MaxPenaltyPercent,
-  CSV3_MaxPenaltyDuration,
-  CSV3_NeighborLearningFactor,
-  CSV3_yyMax,
-  CSV3_LearningMemoryDuration,
-  CSV3_TuningMode,
-  CSV3_ShuntResistanceMicroOhm,
-  CSV3_InvertAltAmps,
-  CSV3_InvertBattAmps,
-  CSV3_MaxDuty,
-  CSV3_MinDuty,
-  CSV3_FieldResistance,
-  CSV3_maxPoints,
-  CSV3_AlternatorCOffset,
-  CSV3_BatteryCOffset,
-  CSV3_BatteryCapacity_Ah,
-  CSV3_AmpSensorRange,
-  CSV3_R_fixed,
-  CSV3_Beta,
-  CSV3_T0_C,
-  CSV3_TempSource,
-  CSV3_IgnitionOverride,
-  CSV3_FLOAT_DURATION,
-  CSV3_PulleyRatio,
-  CSV3_BatteryCurrentSource,
-  CSV3_rpmTableRPMPoints_0,
-  CSV3_rpmTableRPMPoints_1,
-  CSV3_rpmTableRPMPoints_2,
-  CSV3_rpmTableRPMPoints_3,
-  CSV3_rpmTableRPMPoints_4,
-  CSV3_rpmTableRPMPoints_5,
-  CSV3_rpmTableRPMPoints_6,
-  CSV3_rpmTableRPMPoints_7,
-  CSV3_rpmTableRPMPoints_8,
-  CSV3_rpmTableRPMPoints_9,
-  CSV3_LearningSettlingPeriod,
-  CSV3_LearningRPMChangeThreshold,
-  CSV3_LearningTempHysteresis,
-  CSV3_fuelTableRPM_0,
-  CSV3_fuelTableRPM_1,
-  CSV3_fuelTableRPM_2,
-  CSV3_fuelTableRPM_3,
-  CSV3_fuelTableRPM_4,
-  CSV3_fuelTableRPM_5,
-  CSV3_fuelTableRPM_6,
-  CSV3_fuelTableRPM_7,
-  CSV3_fuelTableRPM_8,
-  CSV3_fuelTableRPM_9,
-  CSV3_fuelTableGPH_0,
-  CSV3_fuelTableGPH_1,
-  CSV3_fuelTableGPH_2,
-  CSV3_fuelTableGPH_3,
-  CSV3_fuelTableGPH_4,
-  CSV3_fuelTableGPH_5,
-  CSV3_fuelTableGPH_6,
-  CSV3_fuelTableGPH_7,
-  CSV3_fuelTableGPH_8,
-  CSV3_fuelTableGPH_9,
-  CSV3_stateRevision,
-  CSV3_DutyRampRate,
-  CSV3_SettleTimeBeforeCut,
-  CSV3_TempWarnExcess,
-  CSV3_TempCritExcess,
-  CSV3_TempSustainedTimeout,
-  CSV3_AlternatorHardShutdownV,
-  CSV3_VoltageDisagreeThreshold,
-  CSV3_VoltageDisagreeTimeout,
-  CSV3_rpmMinDutyTable_0,
-  CSV3_rpmMinDutyTable_1,
-  CSV3_rpmMinDutyTable_2,
-  CSV3_rpmMinDutyTable_3,
-  CSV3_rpmMinDutyTable_4,
-  CSV3_rpmMinDutyTable_5,
-  CSV3_rpmMinDutyTable_6,
-  CSV3_rpmMinDutyTable_7,
-  CSV3_rpmMinDutyTable_8,
-  CSV3_rpmMinDutyTable_9,
-  CSV3_rpmCapCurrentTable_0,
-  CSV3_rpmCapCurrentTable_1,
-  CSV3_rpmCapCurrentTable_2,
-  CSV3_rpmCapCurrentTable_3,
-  CSV3_rpmCapCurrentTable_4,
-  CSV3_rpmCapCurrentTable_5,
-  CSV3_rpmCapCurrentTable_6,
-  CSV3_rpmCapCurrentTable_7,
-  CSV3_rpmCapCurrentTable_8,
-  CSV3_rpmCapCurrentTable_9,
-  CSV3_VoltageKp,
-  CSV3_VoltageLoopInterval,
-  CSV3_FIELD_COLLAPSE_DELAY,
-  CSV3_SetpointRiseRate,
-  CSV3_SetpointFallRate,
-  CSV3_SetpointBigStepThresh,
-  CSV3_SetpointBigStepRiseRate,
-  CSV3_PIDTrackingGain,
-  CSV3_CAPSIZE_THRESHOLD_DEG,
-  CSV3_PITCHPOLE_THRESHOLD_DEG,
-  CSV3_SLAM_THRESHOLD_G,
-  CSV3_imuMountOrientation,
-  CSV3_TailCurrent_A,
-  CSV3_RebulkVoltage,
-  CSV3_rebulkDebounceTime,
-  CSV3_MinFloatTime,
-  CSV3_SOC_BlockRebulk_percent,
-  CSV3_SOC_AllowRebulk_percent,
-  CSV3_DutySlowRampRate,
-  CSV3_ShutdownPhase2HoldMs,
-  CSV3_TempPIDKp,
-  CSV3_TempPIDKi,
-  CSV3_ThermalLookaheadSec,
-  CSV3_TempPIDIntervalMs,
-  CSV3_TempPIDFilterAlpha,
-  CSV3_VoltageKi,
-  CSV3_rpmCapPowerTable_0,
-  CSV3_rpmCapPowerTable_1,
-  CSV3_rpmCapPowerTable_2,
-  CSV3_rpmCapPowerTable_3,
-  CSV3_rpmCapPowerTable_4,
-  CSV3_rpmCapPowerTable_5,
-  CSV3_rpmCapPowerTable_6,
-  CSV3_rpmCapPowerTable_7,
-  CSV3_rpmCapPowerTable_8,
-  CSV3_rpmCapPowerTable_9,
-  CSV3_SystemIDStepAmplitude,
-  CSV3_HardOCTripAmps,
-  CSV3_HardOCDebounceMs,
-  CSV3_IExcessFrac,    // CV threshold fraction (×1000)
-  CSV3_IExcessFloorA,  // threshold floor (A ×10)
-  CSV3_IExcessKBleed,
-  CSV3_IgnoreRPM,
-  CSV3_MinRPMForField,
-  CSV3_AwBleedRate,
-  CSV3_KHard,
-  CSV3_ReseedFrac,
-  CSV3_AwSeedProtectMs,
-  CSV3_displayTempUnit,
-  CSV3_WarmupRampRate,
-  CSV3_OvGroup1Enable,
-  CSV3_OvGroup2Enable,
-  CSV3_IExcessCeilA,   // threshold ceiling (A ×10)
-  CSV3_IExcessTau,     // EMA time constant (ms, raw int)
-  CSV3_OutputPIDSigSrc,
-  CSV3_TdPred,          // %.3f
-  CSV3_OvMeasMarginV,   // %.3f
-  CSV3_OvPredMarginV,   // %.3f
-  CSV3_OutputPIDMA_N,
-  CSV3_OutputPIDFilterTC,
-  CSV3_VoltageFilterTC,
-  CSV3_CvKdVoltFiltTC,
-  CSV3_CvKdDeadbandVps,
-  CSV3_VoltageKd,
-  CSV3_DvdtTC,
-  CSV3_CvKdArmV,
-  CSV3_StartupRiseRate,
-  CSV3_absorptionCompleteTime,
-  CSV3_OnOff,
-  CSV3_ManualFieldToggle,
-  CSV3_HiLow,
-  CSV3_LimpHome,
-  CSV3_AlarmActivate,
-  CSV3_TempAlarm,
-  CSV3_VoltageAlarmHigh,
-  CSV3_VoltageAlarmLow,
-  CSV3_CurrentAlarmHigh,
-  CSV3_AlarmTest,
-  CSV3_AlarmLatchEnabled,
-  CSV3_MaintainMode,
-  CSV3_ManualSOCPoint,
-  CSV3_IgnoreLearningDuringPenalty,
-  CSV3_LogAllLearningEvents,
-  CSV3_CloudFeatures,
-  CSV3_AutoShuntGainCorrection,
-  CSV3_AutoAltCurrentZero,
-  CSV3_WindingTempOffset,
-  CSV3_ManualLifePercentage,
-  CSV3_UVThresholdHigh,
-  CSV3_weatherModeEnabled,
-  CSV3_imuEnabled,
-  CSV3_AbsorptionVoltage,
-  CSV3_AbsorptionTimeoutMs,
-  CSV3_bulkVoltageHoldMs,
-  CSV3_capLimitMode,
-  CSV3_TargetVoltageMode,
-  CSV3_TargetVoltageSetpoint,
-  CSV3_RebulkCurrent_A,
-  CSV3_UseFloat,
-  CSV3_IExcessFracBulk,  // BULK threshold fraction (×1000)
-  CSV3_IExcessRelFrac,   // release hysteresis fraction (×1000)
-  CSV3_systemIDPlantTauMs,   // fitted plant time constant (ms), persisted
-  CSV3_TempAlarmLow,
-  CSV3_LoadDumpDtThresh,
-  CSV3_LoadDumpDtThresh1,
-  CSV3_CVTuningMode,
-  CSV3_cvWaveAmplitudeV,
-  CSV3_cvWavePeriodSec,
-  CSV3_cvKOvershoot,
-  CSV3_cvConsecutiveReads,
-  // 8 dead slots — kept to preserve CSV3 indices, all send 0
-  CSV3_webgaugesinterval,
-  CSV3_plotTimeWindow,
-  CSV3_Ymin1,
-  CSV3_Ymax1,
-  CSV3_Ymin2,
-  CSV3_Ymax2,
-  CSV3_Ymin3,
-  CSV3_Ymax3,
-  CSV3_Ymin4,
-  CSV3_Ymax4,
-  CSV3_LoadDumpDtThresh3,
-  CSV3_hardwarePresent,
-  CSV3_testProtectionsEnabled,  // runtime flag — not persisted, resets true (enabled) on boot
-  CSV3_IExcessArmMarginV,       // %.3f — iExcess voltage gate, independent of OvMeasMarginV
-  CSV3_FastSetpointRiseRate,    // ×100, 1 decimal — multiplier on setpoint rise slew during post-protection recovery
-  CSV3_FastSetpointRiseWindowMs, // raw ms — hard upper bound on fast-rise window
-  CSV3_FastSetpointRiseHeadroomV, // ×100, 2 decimal — V below target at which fast-rise gate stays open
-  CSV3_SolarWatts,
-  CSV3_performanceRatio,        // ×100, 2 decimal
-  CSV3_VeData,                  // 0/1
-  CSV3_NMEA0183Data,            // 0/1
-  CSV3_NMEA2KData,              // 0/1
-  CSV3_timeAxisModeChanging,    // 0/1
-  CSV3_timeSourceMode,       // 0=auto, 1=NMEA-forced, 2=Phone-forced, 3=NTP-time-forced
-  CSV3_speedSourceMode,         // 0=NMEA 2000, 1=phone GPS (speed/course owner — selectable, never auto)
-  // Fast alt-current diagnostic knobs (Pattern B echo)
-  CSV3_faEnabled,               // 0/1 — global ON/OFF
-  CSV3_faAlarmEnable,           // 0/1 — FAULT drives audible alarm
-  CSV3_faAnomPause,             // 0/1 — freeze anomaly flipbook slots
-  CSV3_faRpmEdgeMargin,         // RPM ×10
-  CSV3_faAmpsDriftFloorA,       // A ×100
-  CSV3_faAmpsDriftPct,          // percent ×10
-  CSV3_faAttenUpAmps,           // A ×10
-  CSV3_faAttenDownAmps,         // A ×10
-  CSV3_faPeakMinA,              // A ×100
-  CSV3_wifiNapEnabled,          // 0/1 — WiFi Napping standby toggle (Client only)
-  CSV3_imuHeelOffset,           // captured rest heel offset (deg ×100); on CSV3 so the Level Zero echo is fast
-  CSV3_imuPitchOffset,          // captured rest pitch offset (deg ×100)
-  CSV3_systemIDTestType,        // 0=step, 1=sine sweep (Plant Delay test type)
-  CSV3_systemIDSineFreqStart,   // Hz ×10
-  CSV3_systemIDSineFreqEnd,     // Hz ×10
-  CSV3_systemIDSineCycles,      // analysed cycles per sweep frequency
-  CSV3_tuningWaveform,          // 0=square, 1=sine manual, 2=sine auto-sweep
-  CSV3_tuningSineFreq,          // Hz ×10 (manual sine frequency)
-  CSV3_tuningSweepStart,        // Hz ×10
-  CSV3_tuningSweepEnd,          // Hz ×10
-  CSV3_tuningSweepCycles,       // analysed cycles per sweep frequency
-  CSV3_SystemIDStabilizeAmps,   // A ×10 — plant-delay baseline/trough current
-  CSV3_tuningWaveFloor,         // A — Current Target Generator wave floor (trough), shared square + sine
-  CSV3_commissionState,         // auto-commissioning state: 0=not, 1=in-progress, 2=commissioned
-  CSV3_commissionPhase,         // current wizard phase: 0=Prep…8=Stress test, 9=finished
-  CSV3_commissionDoneMask,      // per-stage completion bitmask (bit i = stage i done)
-  CSV3_cvHelpersEnabled,        // master switch: asymmetric KiDown unwind + CV D term (1=on)
-  CSV3_MinChargeTempF,          // cold-charge lockout board-temp floor (°F)
-  CSV3_coldChargeLockoutEnable, // cold-charge lockout master on/off (1=on)
-  CSV3_cvGainMode,              // CV gain mode: 0=Manual, 1=Auto (α/K anchored)
-  CSV3_cvPlantK,                // measured plant gain K (V/A); ×10000
-  CSV3_cvComputedKp,            // Auto-computed Kp (12V-equiv); ×100
-  CSV3_cvComputedKi,            // Auto-computed Ki (12V-equiv); ×100
-  CSV3_cvCrossover,             // CV crossover ω_c (rad/s); ×100
-  CSV3_cvPiZero,                // CV PI integral zero ρ (rad/s); ×100
-  CSV3_vTgtRampUp,              // CV voltage-target ramp UP rate (V/s); ×1000
-  CSV3_vTgtRampDn,              // CV voltage-target ramp DOWN rate (V/s); ×1000
-  CSV3_vTgtRampEnable,          // CV voltage-target slew master switch (0/1)
-  CSV3_setpointSlewEnable,      // inner-loop current setpoint slew master switch (0/1)
-  CSV3_cvRiseGovEnable,         // CV rise governor / anti-windup master switch (0/1)
-  CSV3_dutySlewEnable,          // field duty slew master switch (0/1)
-  CSV3_CommissionTempF,         // board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset/NaN)
-  CSV3_battTempDerateEnable,    // battery-temp gain derate master on/off (0/1)
-  CSV3_battTempCoeff,           // battery fractional resistance change per °C; ×10000
-  CSV3_TempPIDKiDownFrac,       // thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000
-  CSV3_ThermalSlopeWindowSec,   // thermal slope backward-difference window (s); integer
-  CSV3_BattCurrentLimitA,       // max battery charge current (A ×10, G4); 0 = disabled — ceiling on the alternator command = limit + house-load offset
-  // measured-ripple capture admission gates (§10.8/§11) — own knobs, decoupled from the fa* detector gates
-  CSV3_ripWinMs,                // pk-pk capture window (ms, integer)
-  CSV3_ripDriftFloorA,          // shared floor: command-travel gate + stationarity mean-shift tolerance (A ×100)
-  CSV3_ripDriftPct,             // command-travel gate slope (% of mean, ×10) — command gate only since §11
-  CSV3_SocAlarmLow,             // low-SoC alarm threshold (%, integer); 0 = disabled
-  CSV3_battMaxMode,             // battery V/I plot sampling: 0 = window mean, 1 = max-magnitude
-  CSV3_IExcessBaseA,            // over-current trip-line intercept / CV base (A ×10)
-  CSV3_IExcessCcOffsetA,        // CC trip line offset above CV (A ×10)
-  CSV3_BatteryShuntPresent,     // 1 = INA228 battery shunt fitted; 0 = no battery-current sensor
-  CSV3_cvRecovEnable,           // post-protection integrator-refill master switch (0/1)
-  CSV3_cvRecovSec,              // retired timed-window knob; slot kept (never repurpose); ×10
-  CSV3_cvRecovEmaxV,            // retired timed-window knob; slot kept (never repurpose); ×1000
-  CSV3_testSlewMode,           // manual CC square-wave test slew mode (0=off, 1=default rates, 2=custom)
-  CSV3_cvTestSlewMode,         // manual CV square-wave test slew mode (0=off, 1=default rates, 2=custom)
-  CSV3_CvKdOneSided,           // CV D-term mode: 1=one-sided (removes current only), 0=symmetric
-  CSV3_fieldDecayTauMs,        // commissioned field drain time, command→10% of output (ms); worst-case (longest) endpoint of the drain-vs-RPM line, or the flat value
-  CSV3_commissionManualMask,   // per-stage set-by-hand bitmask (skip / mark-done-manually); pairs with commissionDoneMask
-  CSV3_CvKdMaxTrimA,           // CV D-term back-off ceiling (A ×10); caps kdTrim so a fast rise saturates instead of flooring the field
-  CSV3_cvAlpha,                // CV auto-gain aggressiveness α (fraction of the deadbeat-ohmic gain); ×1000
-  CSV3_CvKdSlopeCeil,          // CV D-term slope ceiling (V/s real per-bus ×10) — max slope the D acts on
-  CSV3_cvComputedKd,           // Auto-computed D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100
-  CSV3_CvKdDbSlope,            // CV D-term deadband line slope (V/s per A ×10000)
-  CSV3_CvKdDbFloor,            // CV D-term deadband line floor (V/s ×100)
-  CSV3_CvKdDbCeil,             // CV D-term deadband line ceiling (V/s ×100)
-  CSV3_cvRecovBoostEnable,     // post-protection recovery P-boost master switch (0/1)
-  CSV3_cvRecovBoostMax,        // recovery P-boost max multiplier at full shortfall; ×100
-  CSV3_cvRecovBoostErrV,       // recovery P-boost full-boost shortfall (V per 12V block); ×1000
-  CSV3_fdDrainLoMs,            // drain-vs-RPM line: drain (ms) at fdDrainRpmLo; 0 = no line (flat fieldDecayTauMs)
-  CSV3_fdDrainHiMs,            // drain-vs-RPM line: drain (ms) at fdDrainRpmHi
-  CSV3_fdDrainRpmLo,           // drain-vs-RPM line: lowest tested RPM (lookup clamps here)
-  CSV3_fdDrainRpmHi,           // drain-vs-RPM line: highest tested RPM (lookup clamps here)
-  CSV3_HardOCEnable,           // Group 0 hard over-current trip enable (0/1)
-  CSV3_IExcessEnable,          // Group 3 iExcess detectors enable (0/1, gates CV + bulk)
-  CSV3_BattLimitEnable,        // Group 4 battery charge-current ceiling enable (0/1)
-  CSV3_CvKdExcessMode,         // CV D-term response shape (1 = slope excess over the tolerance line, 0 = legacy full-slope latch)
-  CSV3_CvStressDropV,          // stress-test target headroom below settled idle (V 12V-equiv ×100, class-scaled at use)
-  CSV3_CvStressFailBandV,      // stress-test stability fail band (V 12V-equiv ×100, class-scaled at use)
-  CSV3_CvBrakeFallRate,        // brake-tier setpoint fall rate while CV D-term removes current (A/s ×100)
-  CSV3_cvRecovKiMax,           // refill Ki multiplier at release, tapering to 1x as the deficit heals; ×100
-  CSV3_cvWindDownEnable,       // commanded-target wind-down governor master switch (0/1)
-  CSV3_cvWindDownRate,         // wind-down shed rate (fraction of MaxTableValue per second); ×1000
-  CSV3_cvWindDownStopV,        // wind-down stop margin above commanded target (V real per-bus, class-scaled at store); ×1000
-  CSV3_LoadDumpEnable,         // Group 5 load dump enable (0/1)
-  CSV3_loadServeBoostEnable,   // load-serve Ki boost toward measured house loads (0/1, shunt-gated)
-  CSV3_reseedCorrEnable,       // demand-corrected reseed: load-drop subtraction + rapid-refire ratchet (0/1)
-  CSV3_HuntGovEnable,          // hunt-governor (oscillation damper) master switch (0/1)
-  CSV3_ReseedFracNoShunt,      // no-shunt recovery seed fraction (×100)
-  CSV3_CvRecovClimbRate,       // recovery climb floor rate, fraction of MaxTableValue/s (×100)
-  CSV3_protTestCutMs,          // protection-test manual hard-cut hold (ms)
-  CSV3_protTestGapMs,          // protection-test gap between repeated cuts (ms)
-  CSV3_protTestReps,           // protection-test repeat count
-  CSV3_protTestAmps,           // protection-test energize target current (A); 0 = auto-seed at fire
-  CSV3_cvRecovBoostFloorV,     // recovery P-boost dead area below target (V per 12V block); ×1000
-  CSV3_cvRecovDeepBandV,       // deep-recovery band (V per 12V block); ×1000
-  CSV3_cvRecovDeepMult,        // starve-walk rate multiplier at full depth; ×100
-  CSV3_cvRecovFlareBandV,      // arrival flare band (V per 12V block); ×1000
-  CSV3_cvRecovFlareFrac,       // arrival flare ceiling floor, fraction of recovery goal; ×100
-  CSV3_TachLieEnable,          // tach-lie plausibility cut enable (0/1)
-  CSV3_n2kTxEnable,            // NMEA2000 transmit master (0/1) — mode applied at boot
-  CSV3_n2kDeviceInstance,      // N2K device instance
-  CSV3_n2kBattEnable,          // battery 127508+127506 pair (0/1)
-  CSV3_n2kBattInstance,
-  CSV3_n2kBattCfgEnable,       // 127513 battery configuration (0/1)
-  CSV3_n2kAltEnable,           // alternator 127508+127506 DCType=Alternator pair (0/1)
-  CSV3_n2kAltInstance,
-  CSV3_n2kAltTempEnable,       // 130312 alternator temperature (0/1)
-  CSV3_n2kTempInstance,
-  CSV3_n2kTempSource,          // tN2kTempSource code (3 = Engine Room)
-  CSV3_n2kChgrEnable,          // 127507 charger status (0/1)
-  CSV3_n2kChgrInstance,
-  CSV3_n2kChgrCfgEnable,       // 127510 charger configuration, carries field drive % (0/1)
-  CSV3_n2kChgrMode,            // tN2kChargerMode label: 0 Standalone, 1 Primary, 2 Secondary
-  CSV3_n2kEngRpmEnable,        // 127488 engine RPM (0/1)
-  CSV3_n2kEngInstance,
-  CSV3_n2kEngDynEnable,        // 127489 engine dynamic (0/1)
-  CSV3_n2kEngBitsEnable,       // discrete warning bits inside 127489 (0/1)
-  CSV3_n2kRxBattInstance,      // battery instance to ingest (127508/127506 receive)
-  CSV3_dvccEn,                 // DVCC follow master (0/1)
-  CSV3_dvccSrcType,            // authority dialect: 0 Victron VE.Can (VREG), 1 RV-C
-  CSV3_dvccInst,               // RV-C DC instance filter (0 = any)
-  CSV3_dvccSilenceS,           // silence timeout (s)
-  CSV3_dvccSettleS,            // settling time (s)
-  CSV3_dvccCvlMin,             // plausible-CVL window low (V ×100)
-  CSV3_dvccCvlMax,             // plausible-CVL window high (V ×100)
-  CSV3_HuntCutPct,             // damper test/pocket gain, % of user Ki
-  CSV3_HuntVerifyPct,          // damper verify bar, % ripple reduction required
-  CSV3_HuntWingPct,            // damper pocket taper width, % of speed per side
-  CSV3_HuntCooldownMin,        // damper retest cooldown after a failed test (min)
-  CSV3_HuntSteadyPct,          // damper engine-speed steadiness tolerance (%)
-  CSV3_HuntQualifyScans,       // damper wobble-confirm scan count (1.6 s each)
-  CSV3_HuntTrigPct,            // damper detection bar: peak-bin duty swing % (x100)
-  CSV3_NMEA0183Baud,           // NMEA 0183 serial baud (4800 / 9600 / 19200 / 38400)
-  CSV3_NMEA0183Invert,         // NMEA 0183 UART polarity: 0 RS-232-level talker, 1 TTL-level talker
-  CSV3_displayVolUnit,         // fuel volume display preference: 0 US gallons, 1 litres
-
-  CSV3_gpsPositionSource,      // 0=auto, 1=NMEA-forced, 2=phone-forced (position only; the clock is CSV3_timeSourceMode)
-  CSV3_MaxFieldVolts,          // field-volt cap (x10). The enforced ceiling it produces is CSV2_fieldDutyCeil — voltage-dependent, so it lives on the 5s channel, not here
-  CSV3_OvTierLoMarginV,        // timed OV cut LOW-tier margin above target (V, %.3f)
-  CSV3_OvTierLoDwellMs,        // timed OV cut LOW-tier continuous dwell (ms; 0 = tier off)
-  CSV3_OvTierMidMarginV,       // timed OV cut MID-tier margin above target (V, %.3f)
-  CSV3_OvTierMidDwellMs,       // timed OV cut MID-tier continuous dwell (ms; 0 = tier off)
-  CSV3_VoltageHardwareLimit,   // INA228 hardware shutdown voltage (x100) — top OV-ladder rung, user setting
-  CSV3_LoadDumpN1,             // load-dump tier 1 consecutive-sample count (time to act = N x ~5 ms)
-  CSV3_LoadDumpN2,             // load-dump tier 2 consecutive-sample count
-  CSV3_LoadDumpN3,             // load-dump tier 3 consecutive-sample count
-  CSV3_solarLearnEnable,       // 0/1 — learn performanceRatio from each complete day's actual/forecast harvest
-  CSV3_solarUseConsEnable,     // 0/1 — size the solar-pause bar from predicted consumption
-  CSV3_solarConsMarginPct,     // x100 — headroom over predicted consumption (%)
-  CSV3_solarLearnRatePct,      // x100 — per-day blend weight into performanceRatio (%)
-  CSV3_rvcTxEnable,            // RV-C transmit master (0/1) — bus mode applied at boot
-  CSV3_rvcChgrEnable,          // RV-C CHARGER_STATUS / _2 / _3 / CONFIGURATION_STATUS (0/1)
-  CSV3_rvcDcEnable,            // RV-C DC_SOURCE_STATUS_1/2/3 at the alternator instance (0/1)
-  CSV3_rvcFaultEnable,         // RV-C DM_RV diagnostic message (0/1)
-  CSV3_rvcChgrInstance,        // RV-C charger instance (49 = alternator type nibble + instance 1)
-  CSV3_rvcDcInstance,          // RV-C DC source instance for the alternator
-  CSV3_rvcDevPriority,         // RV-C device priority (80 = Charger, below a BMS 120)
-  // Battery + extra temperature probes, source chain, hot-charge lockout (BATTERY_TEMP_SENSORS_SPEC.md §6)
-  CSV3_battTempProbeEnable,    // BATT-role probe feeds the battery-temperature source chain (0/1)
-  CSV3_extraTempProbeEnable,   // EXTRA-role probe live (0/1)
-  CSV3_battTempSource,         // 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 Board, 6 None
-  CSV3_battTempProxyEnable,    // Auto may fall back to the board temperature (0/1)
-  CSV3_hotChargeLockoutEnable, // hot-charge lockout master on/off (0/1)
-  CSV3_MaxChargeTempF,         // hot-charge lockout ceiling (°F)
-  CSV3_extraTempAlarmHiEnable, // EXTRA-probe high alarm (0/1)
-  CSV3_extraTempAlarmHiF,      // EXTRA-probe high alarm threshold (°F)
-  CSV3_extraTempAlarmLoEnable, // EXTRA-probe low alarm (0/1)
-  CSV3_extraTempAlarmLoF,      // EXTRA-probe low alarm threshold (°F)
-  CSV3_n2kExtraTempEnable,     // 130312 for the EXTRA probe (0/1)
-  CSV3_n2kExtraTempInstance,
-  CSV3_n2kExtraTempSource,     // tN2kTempSource code for the EXTRA probe
-  CSV3_CommissionTempSrc,      // battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown = board)
-  CSV3_sessionId,              // boot identity — matches CSV1_sessionId while this cached block is from the live run
-  CSV3_sendMs,                 // millis() when this settings echo was built. CSV3 is event-driven with a 60 s
-                               // fallback, so an age much past ~60 s means the echo stopped arriving and every
-                               // setting in this block predates whatever the device is actually running.
-
+  CSV3_LIST(CSV3_ENUM_X)
   CSV3_FIELD_COUNT  // enum position is authoritative — never hand-count; CSV payload specifier count must equal this +1
 };
+static_assert(CSV3_FIELD_COUNT == CSV3_EXPECTED_FIELDS,
+              "CSV3_LIST expanded to the wrong number of fields. A lost continuation backslash "
+              "truncates the enum, the format string, the argument list and the generated JS array "
+              "TOGETHER and consistently, so the compress_web.sh count/order gate cannot see it. "
+              "Fix the macro, or bump CSV3_EXPECTED_FIELDS if a field was genuinely added.");
 
 
 enum TsIndex {
@@ -1271,7 +1291,7 @@ const char *jsonNum1(char *buf, size_t n, float v) {
 }
 void loadAPCredentials(bool forceDefaults = false) {
   if (forceDefaults) {
-    esp32_ap_ssid = "ALTERNATOR_WIFI";
+    esp32_ap_ssid = defaultApSsid();
     esp32_ap_password = "alternator123";
     Serial.println("Using default AP credentials for password recovery or first boot");
     return;
@@ -1282,10 +1302,10 @@ void loadAPCredentials(bool forceDefaults = false) {
     esp32_ap_ssid = settingRead(NK_apssid);
     esp32_ap_ssid.trim();
     if (esp32_ap_ssid.length() == 0) {
-      esp32_ap_ssid = "ALTERNATOR_WIFI";
+      esp32_ap_ssid = defaultApSsid();
     }
   } else {
-    esp32_ap_ssid = "ALTERNATOR_WIFI";
+    esp32_ap_ssid = defaultApSsid();
   }
 
   if (settingExists(NK_appass)) {
@@ -1309,7 +1329,7 @@ void setupWiFi() {
   //   GPIO45 LOW — force CONFIG mode (WiFi setup / password recovery); alternator DISABLED, deliberately:
   //                config mode means settings are unknown/unconfigured, so charging must not run
   //   GPIO46     — LOW = AP mode, HIGH = Client mode. Both run the alternator fully, so holding 46 LOW is
-  //                the credential-free emergency path: join ALTERNATOR_WIFI, browse to 192.168.4.1
+  //                the credential-free emergency path: join the ALTERNATOR_WIFI-<unit id> network, browse to 192.168.4.1
 
   // Harness wires (RJ3 pins 11/12), documented as read "during a restart". Read once: loop() re-enters
   // here from standby to raise the radio in the mode already chosen, and a live re-read could flip
@@ -1341,7 +1361,7 @@ void setupWiFi() {
   // Rationale: If user has no WiFi or WiFi router is down, they can still run the regulator in AP mode
   // This allows emergency operation: GPIO41 low = factory firmware, GPIO41 high = OTA firmware (if valid OTA exists, else factory)
   // GPIO46 low = AP mode regardless of any credentials of any kind
-  // Settings persist in userdata partition; AP credentials default to ALTERNATOR_WIFI/alternator123
+  // Settings persist in userdata partition; AP credentials default to ALTERNATOR_WIFI-<unit id>/alternator123
 
   if (requestAPMode) {
     Serial.println("=== GPIO46 LOW: OPERATIONAL AP MODE ===");
@@ -1429,16 +1449,98 @@ void setupWiFi() {
   Serial.println("=== WiFi Setup Complete ===");
 }
 
+// ── Per-unit identity ───────────────────────────────────────────────────────────────
+// More than one regulator can share a LAN (twin engines, a dealer bench). They all answer to
+// alternator.local, and whichever wins the resolver race owns the name: on 2026-09-09 the same
+// query returned two different boards 90 minutes apart, and the dashboard followed it without
+// saying anything. Everything below is derived from the eFuse UID, so it can only mean one
+// unit. alternator.local is kept exactly as it was for single-regulator installs and for the
+// tooling and docs that already use it.
+
+// Last 6 hex of the UID — short enough to read off a screen, unique across any real fleet.
+const char *regulatorUid6() {
+  static char u6[7] = "";
+  if (!u6[0]) {
+    size_t n = strlen(device_id_hex);
+    strncpy(u6, (n >= 6) ? device_id_hex + (n - 6) : device_id_hex, 6);
+    u6[6] = '\0';
+  }
+  return u6;
+}
+
+// A hostname that can only reach this board: xreg-04a7ac.local.
+const char *regulatorHostName() {
+  static char h[16] = "";
+  if (!h[0]) {
+    snprintf(h, sizeof(h), "xreg-%s", regulatorUid6());
+    for (char *p = h; *p; p++) *p = (char)tolower((unsigned char)*p);
+  }
+  return h;
+}
+
+// What a human picks from in the app. Never empty — an unnamed board still has to be
+// distinguishable from the one next to it.
+String regulatorDisplayName() {
+  return REGULATOR_NAME[0] ? String(REGULATOR_NAME) : (String("XREG-") + regulatorUid6());
+}
+
+// Two unprovisioned units in radio range would otherwise broadcast the same SSID, which is
+// exactly the out-of-the-box state of a twin-engine install.
+String defaultApSsid() {
+  return String("ALTERNATOR_WIFI-") + regulatorUid6();
+}
+
+// The friendly label rides a TXT record, not the instance name: the instance name has to stay
+// PREDICTABLE (Android's NsdManager matches services by instance name at browse time, before
+// any TXT is available), so it is the hostname and a rename never re-announces the service.
+static bool mdnsStarted = false;   // true once MDNS.begin() has succeeded (startMdnsOnce); every raw mdns_* call is gated on it
+static void mdnsRefreshName() {
+  if (!mdnsStarted) return;   // the IDF service call takes a mutex that only mdns_init creates
+  mdns_service_txt_item_set("_http", "_tcp", "name", regulatorDisplayName().c_str());
+}
+
+// alternator.local is the DELEGATED name here, not the primary one. The primary hostname has to
+// be unique per unit because it is the SRV target of the advertised service: with a shared
+// primary, resolving unit B's service hands back a name that unit A also answers to, and the
+// browse comes back pointing at the wrong board. A delegated hostname carries no netif binding,
+// so its address is re-published whenever the interface address moves (reconnect, DHCP change,
+// AP<->STA). Cheap and idempotent.
+void mdnsPublishIdentity() {
+  IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
+  if ((uint32_t)ip == 0) return;
+  static uint32_t published = 0;
+  if (published == (uint32_t)ip) return;
+  mdns_ip_addr_t a = {};
+  a.addr.type = ESP_IPADDR_TYPE_V4;
+  a.addr.u_addr.ip4.addr = (uint32_t)ip;
+  a.next = nullptr;
+  esp_err_t e = published ? mdns_delegate_hostname_set_address("alternator", &a)
+                          : mdns_delegate_hostname_add("alternator", &a);
+  if (e == ESP_OK) {
+    published = (uint32_t)ip;
+    Serial.printf("mDNS: %s.local + alternator.local -> %s\n", regulatorHostName(), ip.toString().c_str());
+  } else {
+    Serial.printf("mDNS: alternator.local delegation failed (%d) — this unit answers only to %s.local\n",
+                  (int)e, regulatorHostName());
+  }
+  mdnsRefreshName();
+}
+
 // mDNS starts once and never MDNS.end(): ESP32 core 3.3.8's mdns teardown null-derefs the
 // netif (LoadProhibited crash on wake/reconnect). mDNS stays bound to the persistent STA
 // netif across reconnects, so it keeps working without a restart.
 void startMdnsOnce() {
-  static bool mdnsStarted = false;
-  if (!mdnsStarted && MDNS.begin("alternator")) {
+  if (!mdnsStarted && MDNS.begin(regulatorHostName())) {
     Serial.println("mDNS responder started");
+    MDNS.setInstanceName(regulatorHostName());   // must precede addService — it names the instance
     MDNS.addService("http", "tcp", 80);
+    MDNS.addServiceTxt("http", "tcp", "uid", (const char *)device_id_hex);   // cast: char[] makes the char*/const char* overloads ambiguous
+    MDNS.addServiceTxt("http", "tcp", "host", regulatorHostName());
+    MDNS.addServiceTxt("http", "tcp", "fw", FIRMWARE_VERSION);
+    MDNS.addServiceTxt("http", "tcp", "name", regulatorDisplayName().c_str());
     mdnsStarted = true;
   }
+  if (mdnsStarted) mdnsPublishIdentity();   // address may have moved since the last call
 }
 
 // A failed join only prints WiFi.status()==6 ("not connected"), which can't tell a wrong
@@ -1602,9 +1704,13 @@ h1{color:#333;margin-bottom:1rem;font-size:24px}
 <p>Access the full alternator control interface:</p>
 <a href='http://192.168.4.1' class='big-button'>Open Alternator Interface</a>
 <div class='bookmark-info'><strong>For easy future access:</strong><br>Bookmark this address: <span class='ip-address'>192.168.4.1</span></div>
-<p style='margin-top:24px;font-size:14px;color:#666'><strong>Network:</strong> ALTERNATOR_WIFI<br><strong>Device IP:</strong> 192.168.4.1</p>
+<p style='margin-top:24px;font-size:14px;color:#666'><strong>Network:</strong> %APSSID%<br><strong>Device IP:</strong> 192.168.4.1</p>
 </div></body></html>)HTML";
-    request->send_P(200, "text/html", PAGE);
+    // %APSSID% is substituted live: the AP name is per-unit now, so a baked-in one would be wrong
+    // on every board but the first. One-shot captive-portal page, not in the control path.
+    String page(PAGE);
+    page.replace("%APSSID%", esp32_ap_ssid);
+    request->send(200, "text/html", page);
   });
   server.begin();
   Serial.println("Landing page ready");
@@ -1645,21 +1751,18 @@ void setupAccessPoint() {
 
     // Start mDNS in AP mode too (best-effort for alternator.local).
     // No MDNS.end() — core 3.3.8 mdns teardown null-derefs the netif (see client path); start once.
-    static bool apMdnsStarted = false;
-    if (!apMdnsStarted && MDNS.begin("alternator")) {
-      MDNS.addService("http", "tcp", 80);
-      apMdnsStarted = true;
-      Serial.println("mDNS started - alternator.local available (may not work on all devices in AP mode)");
-    } else if (!apMdnsStarted) {
-      Serial.println("mDNS failed to start in AP mode");
-    }
+    // One guard for both modes: this path and the STA path used to hold separate flags, so a
+    // device that joined WiFi and later raised the AP called MDNS.begin() twice.
+    startMdnsOnce();
+    Serial.printf("mDNS on the AP: alternator.local + %s.local (may not work on all devices in AP mode)\n",
+                  regulatorHostName());
 
     Serial.println("=== AP SETUP COMPLETE ===");
   } else {
     Serial.println("=== ACCESS POINT FAILED TO START ===");
     Serial.println("This is a critical error!");
     Serial.println("Trying with default settings as fallback...");
-    WiFi.softAP("ALTERNATOR_WIFI", "alternator123");
+    WiFi.softAP(defaultApSsid().c_str(), "alternator123");
   }
 }
 
@@ -1779,7 +1882,7 @@ void setupWiFiConfigServer() {
       esp32_ap_ssid = hotspot_ssid;
     } else {
       settingRemove(NK_apssid);  // cleared custom AP SSID -> back to default
-      esp32_ap_ssid = "ALTERNATOR_WIFI";
+      esp32_ap_ssid = defaultApSsid();
     }
 
     // Blank client SSID = user only came for AP settings — leave stored client creds untouched
@@ -1807,18 +1910,20 @@ void setupWiFiConfigServer() {
 
     Serial.printf("Verification - SSID: '%s'\n", cached_wifi_ssid);
     Serial.printf("Verification - Password: '%s'\n", cached_wifi_pass);
-    delay(1000);
 
     request->send(200, "text/plain", ssid[0] != '\0'
-                                       ? "Configuration saved! Device will restart in 3 seconds."
+                                       ? "Configuration saved! Device will restart in 2 seconds."
                                      : forgetClient
-                                       ? "Ship's WiFi credentials erased. Device will restart in 3 seconds into this setup page (charging disabled until WiFi is configured or the Hotspot Wire is used)."
-                                       : "Configuration saved (client WiFi credentials unchanged). Device will restart in 3 seconds.");
+                                       ? "Ship's WiFi credentials erased. Device will restart in 2 seconds into this setup page (charging disabled until WiFi is configured or the Hotspot Wire is used)."
+                                       : "Configuration saved (client WiFi credentials unchanged). Device will restart in 2 seconds.");
 
     Serial.println("=== CONFIGURATION SAVED - RESTARTING ===");
     settingWrite(NK_first_config_done, "1");
-    delay(3000);
-    ESP.restart();
+    // ESPAsyncWebServer 3.x writes a response only AFTER the handler returns (_runMiddlewareChain()
+    // then _send() in WebRequest.cpp), so an in-handler ESP.restart() threw the 200 away and left the
+    // portal stuck on "Saving..." forever - a chip reset sends no FIN/RST, so the browser never errors.
+    rebootRequested = true;
+    rebootRequestedAt = millis();
   });
 
   server.onNotFound([](AsyncWebServerRequest *request) {
@@ -3339,11 +3444,7 @@ void setupServer() {
   server.on("/solarledger.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
     solarLedgerCsvSend(request);
   });
-  // Emit-window sizing probe — TEMPORARY, REMOVE AFTER AUGUST 2026 (see the probe block in 7_functions).
-  server.on("/altwinstats.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
-    altWinStatsCsvSend(request);
-  });
-  // Gate-tuning capture dump: 136 B header + 17 B rows, streamed binary, decoded to CSV in the
+  // Gate-tuning capture dump: 164 B header + 17 B rows, streamed binary, decoded to CSV in the
   // browser (parseAltLogBin in script.js) and handed over with deliverFile(). Refuses while
   // recording. Clearing is a separate press (/get?altLogClear=1) so the file is safely in hand
   // before the buffer is freed.
@@ -3924,6 +4025,12 @@ void setupServer() {
     }
     vesselSetText(BATTERY_MAKE_MODEL, sizeof(BATTERY_MAKE_MODEL), doc["battery_make_model"] | "");
     vesselSetText(ALTERNATOR_BRAND_MODEL, sizeof(ALTERNATOR_BRAND_MODEL), doc["alternator_brand_model"] | "");
+    // Per-unit label. It reaches an mDNS TXT record and an unauthenticated JSON response, so the
+    // control characters are stripped once here rather than at every read site.
+    vesselSetText(REGULATOR_NAME, sizeof(REGULATOR_NAME), doc["regulator_name"] | "");
+    for (char *p = REGULATOR_NAME; *p; p++) {
+      if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7F) *p = ' ';
+    }
     SolarWatts = doc["solar_watts"];
     // Unclamped, an out-of-range value indexes past axisRemap[] and wild-reads through src[]
     uint8_t prevOrient = imuMountOrientation;
@@ -4082,14 +4189,14 @@ void setupServer() {
         Serial.printf("Active tasks: %u\n", uxTaskGetNumberOfTasks());
         Serial.println("Closing event connections...");
         events.close();
-        delay(1000);
-        Serial.println("Restarting now...");
         Serial.println("========================================");
         Serial.println("NOTE: Task termination backtrace next is expected and harmless");
         Serial.println("========================================");
         Serial.flush();
-        delay(5000);
-        ESP.restart();
+        // Deferred like every other reboot path: the 200 above is only written once this handler
+        // returns, so restarting inline discarded it and left the caller waiting on a dead socket.
+        rebootRequested = true;
+        rebootRequestedAt = millis();
         return;
       }
     }
@@ -4191,7 +4298,8 @@ void setupServer() {
                                  : (fieldCutActive != 0) ? "Field cut"
                                  : (protTestActive != 0) ? "Protection test"
                                  : cvStressActive ? "CV stress test"
-                                 : (altSweepActive != 0) ? "Gate-tuning field sweep" : nullptr;
+                                 : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode == SYS_MODE_MANUAL) {
         queueConsoleMessage("SystemID: start blocked — not allowed in manual mode (duty is fixed; test cannot drive the field)");
       } else if (!sysidModeOK) {
@@ -4265,7 +4373,8 @@ void setupServer() {
                          : (fieldCutActive != 0) ? "Field cut"
                          : (protTestActive != 0) ? "Protection test"
                          : cvStressActive ? "CV stress test"
-                         : (altSweepActive != 0) ? "Gate-tuning field sweep" : nullptr;
+                         : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
         queueConsoleMessage("Field curve: start blocked — only allowed in AUTO mode");
       } else if (busy != nullptr) {
@@ -4301,7 +4410,8 @@ void setupServer() {
                          : (fieldCutActive != 0) ? "Field cut"
                          : (protTestActive != 0) ? "Protection test"
                          : cvStressActive ? "CV stress test"
-                         : (altSweepActive != 0) ? "Gate-tuning field sweep" : nullptr;
+                         : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
         queueConsoleMessage("Field cut: start blocked — only allowed in AUTO mode");
       } else if (busy != nullptr) {
@@ -4320,6 +4430,64 @@ void setupServer() {
       foundParameter = true;
       fieldCutAbortRequested = true;
       queueConsoleMessage("Field cut: abort requested via web UI");
+    }
+
+    // ── Charge health system calibration (stage 9): one held-field throttle swing per run ──
+    if (request->hasParam("chcStart")) {
+      foundParameter = true;
+      const char *busy = (systemIDActive != 0) ? "Plant Delay test"
+                         : TuningMode ? "Current tuning"
+                         : CVTuningMode ? "Voltage tuning"
+                         : cvPlantFitActive ? "Voltage Control Autotuning"
+                         : batteryHealthTestActive ? "Battery health test"
+                         : resTestActive ? "Resonance current-check"
+                         : (fieldCurveActive != 0) ? "Field curve"
+                         : (fieldCutActive != 0) ? "Field cut"
+                         : (protTestActive != 0) ? "Protection test"
+                         : cvStressActive ? "CV stress test"
+                         : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0) ? "Charge health calibration" : nullptr;
+      // A refusal has to be latched as a failed result, not just said on the console: the wizard
+      // consumes a not-ok ready result immediately, so without this it polls for the full run
+      // timeout waiting for a run that was never armed. Not when chc itself is the blocker — that
+      // would abort the run in progress from the wizard's point of view.
+      if (sysMode != SYS_MODE_AUTO) {
+        queueConsoleMessage("Charge health calibration: start blocked — only allowed in AUTO mode");
+        if (chcActive == 0) {
+          chcOk = false; chcResultsReady = true;
+          snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — only allowed in AUTO mode");
+        }
+      } else if (chcRequested) {
+        queueConsoleMessage("Charge health calibration: start ignored (already requested)");
+      } else if (busy != nullptr) {
+        queueConsoleMessageF("Charge health calibration: start blocked — %s is active", busy);
+        if (chcActive == 0) {
+          chcOk = false; chcResultsReady = true;
+          snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — %s is active", busy);
+        }
+      } else if ((millis() - chcLastEndMs) > 2000UL) {
+        if (request->hasParam("chcPct"))
+          chcTestPct = (uint8_t)constrain(request->getParam("chcPct")->value().toInt(), 20, 80);
+        // NVS reads belong here, on the web task — never in the control tick that consumes them.
+        chcLoadCapColumn(false, chcLoTable);
+        chcLoadCapColumn(true,  chcHiTable);
+        chcReqMs = millis();
+        chcRequested = true;
+        chcResultsReady = false;
+        chcAbortMsg[0] = '\0';
+        queueConsoleMessage("Charge health calibration: requested via web UI");
+      } else {
+        queueConsoleMessage("Charge health calibration: start ignored (cooldown)");
+        if (chcActive == 0) {
+          chcOk = false; chcResultsReady = true;
+          snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — cooling down, try again in a moment");
+        }
+      }
+    }
+    if (request->hasParam("chcCancel")) {
+      foundParameter = true;
+      chcAbortRequested = true;
+      queueConsoleMessage("Charge health calibration: abort requested via web UI");
     }
 
     // ── Protection Actuation Tests (Settings → Emergency & Troubleshooting) ──
@@ -4361,7 +4529,8 @@ void setupServer() {
                          : (fieldCurveActive != 0) ? "Field curve"
                          : (fieldCutActive != 0) ? "Field cut"
                          : cvStressActive ? "CV stress test"
-                         : (altSweepActive != 0) ? "Gate-tuning field sweep" : nullptr;
+                         : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (mode < 1 || mode > 5) {
         queueConsoleMessage("Protection test: start blocked — invalid mode");
       } else if (protTestActive != 0) {
@@ -4426,7 +4595,8 @@ void setupServer() {
                          : (fieldCutActive != 0) ? "Field cut"
                          : (protTestActive != 0) ? "Protection test"
                          : cvStressActive ? "CV stress test"
-                         : (altSweepActive != 0) ? "Gate-tuning field sweep" : nullptr;
+                         : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
         queueConsoleMessage("Keep-alive onset: start blocked — only allowed in AUTO mode");
       } else if (busy != nullptr) {
@@ -4494,12 +4664,15 @@ void setupServer() {
                          : (fieldCutActive != 0) ? "Field cut"
                          : (protTestActive != 0) ? "Protection test"
                          : cvStressActive ? "CV stress test"
-                         : (altSweepActive != 0) ? "Gate-tuning field sweep" : nullptr;
+                         : (altSweepActive != 0) ? "Gate-tuning field sweep"
+                         : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
         // Same rule as the field curve: the duty override lives in the AUTO control path, and the
         // bumpless resume restores AUTO state. In MANUAL the user's fixed duty owns the field —
         // which is the throttle-sweep condition anyway, and needs no sweeper.
         queueConsoleMessage("Field sweep: start blocked — only allowed in AUTO mode");
+      } else if (altSweepRequested) {
+        queueConsoleMessage("Field sweep: start ignored (already requested)");
       } else if (busy != nullptr) {
         queueConsoleMessageF("Field sweep: start blocked — %s is active", busy);
       } else if ((millis() - altSweepLastEndMs) > 2000UL) {
@@ -4653,6 +4826,12 @@ void setupServer() {
     }
     if (request->hasParam("commissionAbort")) {
       foundParameter = true;
+      // Hoisted above the branch: every Abort must drop the analyzer gate and the ripple-fill mode, including
+      // the cancel-before-start and nothing-to-abort branches. Both are idempotent when no run was in flight.
+      faCommissionGate = false;
+      // Abort is a teardown path too: committed cells from an aborted sweep are honest data captured
+      // at level — freeze + persist, never discard (RPM_RIPPLE_TABLE_SPEC §2.2).
+      if (ripGameFill || ripTabPendingWipe) { ripGameFill = false; ripTabPendingWipe = false; ripTabPendingSave = true; }
       // One atomic cancel picks the branch — a separate "still pending?" read could be retired by the
       // worker before the cancel lands. Resume/none fall through: a resume's cancel only stops the
       // bookkeeping writes, the original snapshot is intact for the teardown below.
@@ -4670,10 +4849,6 @@ void setupServer() {
         // snapshot still takes the teardown: that IS the legacy/older-firmware run the zeroing is for.
         queueConsoleMessage("Commissioning: nothing to abort — no run is in progress, the committed tune and its record are untouched");
       } else {
-        faCommissionGate = false;
-        // Abort is a teardown path too: committed cells from an aborted sweep are honest data captured
-        // at level — freeze + persist, never discard (RPM_RIPPLE_TABLE_SPEC §2.2).
-        if (ripGameFill || ripTabPendingWipe) { ripGameFill = false; ripTabPendingWipe = false; ripTabPendingSave = true; }
         testProtectionsEnabled = commissionProtBackup;  // restore the user's manual-tuning protection setting
         bool reverted = commissionRestore();  // revert every setting to the Phase-0 snapshot
         // Bookkeeping goes back to the pre-run record (a device that was COMMISSIONED before a targeted
@@ -4686,6 +4861,7 @@ void setupServer() {
           commissionWriteDoneMask();
           commissionManualMask = 0;             // …and all hand-set flags
           commissionWriteManualMask();
+          cvStressForgetLast();                 // bit 8 went with the mask, and the revert undid the tune the verdict graded
         }
         settingRemove(NK_commissionStepSnap); // teardown: no interrupted step to revert on next boot
         settingsDirty = true;
@@ -4987,7 +5163,7 @@ void setupServer() {
       settingWrite(NK_ripWinMs, String(ripWinMs, 0).c_str());
       // Window length defines BOTH measured quantities: the min-of-halves pk-pk and the worst
       // half-window voltage slope. Drop both fits (see ripFitForget).
-      if (fabsf(ripWinMs - ripWinPrev) > 0.5f) ripFitForget(true, "Ripple capture window changed");
+      if (fabsf(ripWinMs - ripWinPrev) > 0.5f) ripFitForget(true, true, "Ripple capture window changed");
     }
     if (request->hasParam("ripDriftFloorA")) {
       foundParameter = true;
@@ -5279,6 +5455,10 @@ void setupServer() {
       }
       queueConsoleMessage(PhysicalPanelOverride ? "Physical Panel Override on: the Cable 3 switches now set the charge rate and Force Maintain Mode, and the toggles in this app are inert."
                                                 : "Physical Panel Override off: this app sets the charge rate and Force Maintain Mode. The Cable 3 switches are still reported but change nothing.");
+      // Handing the mode back to a stored Maintain choice that Target Voltage outranks looks like the app ignored the switch.
+      if (PhysicalPanelOverride == 0 && MaintainModeUserSel == 1 && TargetVoltageMode == 1) {
+        queueConsoleMessage("Your stored Force Maintain Mode choice stays off: Target Voltage mode is on and the two are mutually exclusive. Turn Target Voltage mode off to get Maintain Mode back.");
+      }
     }
     if (request->hasParam("MaintainMode")) {
       foundParameter = true;
@@ -5305,8 +5485,12 @@ void setupServer() {
       if (TargetVoltageMode) {
         // MaintainMode and TargetVoltageMode are mutually exclusive — clear the other.
         MaintainMode = 0;
-        MaintainModeUserSel = 0;  // clear the stored choice too, or switching Target Voltage back off would silently resurrect Maintain
-        settingWrite(NK_MaintainMode, "0");
+        // Only while the app owns the mode: with the panel override on the stored app choice is inert, and
+        // erasing it here would cost the user that choice the moment the override goes back off.
+        if (PhysicalPanelOverride == 0) {
+          MaintainModeUserSel = 0;  // clear the stored choice too, or switching Target Voltage back off would silently resurrect Maintain
+          settingWrite(NK_MaintainMode, "0");
+        }
       }
       queueConsoleMessageF("TargetVoltageMode %s", TargetVoltageMode ? "enabled" : "disabled");
     }
@@ -5377,7 +5561,7 @@ void setupServer() {
     if (request->hasParam("MaxFieldVolts")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxFieldVolts")->value();
-      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);
+      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as the boot-time sanity check in InitSystemSettings, which rewrites anything outside it to the class default
       settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
       // Force an immediate re-solve rather than waiting for the tick filter to drift the derived
       // ceiling past its 0.5-point deadband: a large dtSec collapses the bus filter onto the present
@@ -5722,7 +5906,7 @@ void setupServer() {
     if (request->hasParam("PeukertExponent")) {
       foundParameter = true;
       inputMessage = request->getParam("PeukertExponent")->value();
-      PeukertExponent_scaled = (int)(inputMessage.toFloat() * 100);
+      PeukertExponent_scaled = (int)lroundf(inputMessage.toFloat() * 100.0f);  // round, not truncate: float32 1.05 x 100 = 104.99999 and (int) stored 1.04
       settingWrite(NK_PeukertExponent, String(PeukertExponent_scaled).c_str());
     }
     if (request->hasParam("ChargeEfficiency")) {
@@ -5734,7 +5918,7 @@ void setupServer() {
     if (request->hasParam("ChargedVoltage")) {
       foundParameter = true;
       inputMessage = request->getParam("ChargedVoltage")->value();
-      ChargedVoltage_Scaled = (int)(inputMessage.toFloat() * 100);
+      ChargedVoltage_Scaled = (int)lroundf(inputMessage.toFloat() * 100.0f);  // round, not truncate: float32 14.2 x 100 = 1419.99998 and (int) stored 14.19
       settingWrite(NK_ChargedVoltage, String(ChargedVoltage_Scaled).c_str());
     }
     if (request->hasParam("TailCurrent")) {
@@ -6606,7 +6790,8 @@ void setupServer() {
       // Mutex: refuse turn-on if another test is already running. All four tests must run independently.
       if (requested == 1 && TuningMode == 0) {
         const char *blocker = (systemIDActive != 0) ? "Plant Delay Test"
-                              : (altSweepActive != 0) ? "Gate-tuning field sweep"
+                              : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0) ? "Charge health calibration"
                                                       : (CVTuningMode ? "Voltage tuning" : nullptr);
         if (blocker != nullptr) {
           queueConsoleMessageF("Current tuning: turn-on blocked — %s is active. Turn it off first.", blocker);
@@ -7416,9 +7601,13 @@ void setupServer() {
     if (request->hasParam("CvKdVoltFiltTC")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdVoltFiltTC")->value();
+      float kdFiltPrev = CvKdVoltFiltTC;
       CvKdVoltFiltTC = inputMessage.toFloat();
       settingWrite(NK_CvKdVoltFiltTC, String(CvKdVoltFiltTC, 0).c_str());
       queueConsoleMessageF("CV D-term voltage filter TC: %.0f ms", CvKdVoltFiltTC);
+      // slpFitAlt is the worst slope OF g_cvKdFiltV, the output of this very filter, so this TC changes the
+      // measured quantity exactly as IExcessTau does for the ripple fit. The pk-pk fit is untouched by it.
+      if (fabsf(CvKdVoltFiltTC - kdFiltPrev) > 0.5f) ripFitForget(false, true, "CV D-term voltage filter TC changed");
     }
     if (request->hasParam("cvHelpersEnabled")) {
       foundParameter = true;
@@ -7713,7 +7902,7 @@ void setupServer() {
     if (request->hasParam("IExcessCeilA")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessCeilA")->value();
-      IExcessCeilA = constrain(inputMessage.toFloat(), 5.0f, 80.0f);
+      IExcessCeilA = constrain(inputMessage.toFloat(), 5.0f, 200.0f);
       settingWrite(NK_IExcessCeilA, String(IExcessCeilA, 1).c_str());
       queueConsoleMessageF("IExcess threshold ceiling set to: %.1fA", IExcessCeilA);
       if (CVTuningMode) cvTuningParamChanged = true;
@@ -7721,7 +7910,7 @@ void setupServer() {
     if (request->hasParam("IExcessBaseA")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessBaseA")->value();
-      IExcessBaseA = constrain(inputMessage.toFloat(), 0.0f, 40.0f);
+      IExcessBaseA = constrain(inputMessage.toFloat(), 0.0f, 150.0f);
       settingWrite(NK_IExcessBaseA, String(IExcessBaseA, 1).c_str());
       queueConsoleMessageF("IExcess trip-line base set to: %.1fA", IExcessBaseA);
       if (CVTuningMode) cvTuningParamChanged = true;
@@ -7729,7 +7918,7 @@ void setupServer() {
     if (request->hasParam("IExcessCcOffsetA")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessCcOffsetA")->value();
-      IExcessCcOffsetA = constrain(inputMessage.toFloat(), 0.0f, 40.0f);
+      IExcessCcOffsetA = constrain(inputMessage.toFloat(), 0.0f, 150.0f);
       settingWrite(NK_IExcessCcOffsetA, String(IExcessCcOffsetA, 1).c_str());
       queueConsoleMessageF("IExcess CC offset set to: %.1fA above CV", IExcessCcOffsetA);
       if (CVTuningMode) cvTuningParamChanged = true;
@@ -7739,7 +7928,7 @@ void setupServer() {
     if (request->hasParam("BattCurrentLimitA")) {
       foundParameter = true;
       inputMessage = request->getParam("BattCurrentLimitA")->value();
-      BattCurrentLimitA = constrain(inputMessage.toFloat(), 0.0f, 500.0f);
+      BattCurrentLimitA = constrain(inputMessage.toFloat(), 0.0f, 2000.0f);  // battery-side limit, unrelated to the alternator ceiling: a large bank at 1C wants far more than 500
       settingWrite(NK_BattCurrentLimitA, String(BattCurrentLimitA, 1).c_str());
       if (BattCurrentLimitA > 0.0f) queueConsoleMessageF("Battery charge current limit set to: %.1fA", BattCurrentLimitA);
       else queueConsoleMessage("Battery charge current limit disabled");
@@ -7754,7 +7943,7 @@ void setupServer() {
       // The a0+a1·I fit is the pk-pk of THIS low-pass, so a tau change invalidates it. The slope fit
       // is not measured through this filter and survives; the Resonance & Ripple Map never was
       // (raw stream, own fixed window) — see ripFitForget.
-      if (fabsf(IExcessTau - iexTauPrev) > 0.05f) ripFitForget(false, "IExcess averaging TC changed");
+      if (fabsf(IExcessTau - iexTauPrev) > 0.05f) ripFitForget(true, false, "IExcess averaging TC changed");
       if (CVTuningMode) cvTuningParamChanged = true;
     }
     if (request->hasParam("IExcessRelFrac")) {
@@ -7914,14 +8103,14 @@ void setupServer() {
     if (request->hasParam("OvMeasMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("OvMeasMarginV")->value();
-      OvMeasMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 0.500f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
+      OvMeasMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));  // ceiling matches OvTierLoMarginV: the LOW tier rides this line, so a tighter cap here made the lead/AGM 0.50 recommendation unraisable
       settingWrite(NK_OvMeasMarginV, String(OvMeasMarginV, 3).c_str());
       queueConsoleMessageF("Group 2 measured-voltage trigger margin set to: %.0f mV", OvMeasMarginV * 1000.0f);
     }
     if (request->hasParam("OvPredMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("OvPredMarginV")->value();
-      OvPredMarginV = constrain(inputMessage.toFloat(), 0.050f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 1.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
+      OvPredMarginV = constrain(inputMessage.toFloat(), 0.050f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       settingWrite(NK_OvPredMarginV, String(OvPredMarginV, 3).c_str());
       queueConsoleMessageF("Group 1 prediction trigger margin set to: %.0f mV", OvPredMarginV * 1000.0f);
     }
@@ -7993,7 +8182,8 @@ void setupServer() {
       // Mutex: refuse turn-on if another test is already running. All four tests must run independently.
       if (requested == 1 && CVTuningMode == 0) {
         const char *blocker = (systemIDActive != 0) ? "Plant Delay Test"
-                              : (altSweepActive != 0) ? "Gate-tuning field sweep"
+                              : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
+                         : (chcActive != 0) ? "Charge health calibration"
                                                       : (TuningMode ? "Current tuning" : nullptr);
         if (blocker != nullptr) {
           queueConsoleMessageF("Voltage tuning: turn-on blocked — %s is active. Turn it off first.", blocker);
@@ -8309,7 +8499,13 @@ void setupServer() {
     }
 
     if (nvsPersistNow) saveNVSDataFull();   // commit storage-namespace resets/sets now (at most one save per request); otherwise they'd wait for the field-off edge and a reboot/power-cut before then would revert them
-    if (foundParameter) {
+    // The commissioning wizard's 2 s keep-alive ping changes nothing, so it must not fire the settings
+    // echo. It was pushing the whole CSV3 block every 2 s for the length of a wizard session — on the
+    // busiest link of the session — in place of the 60 s idle cadence, for bytes no client acts on.
+    // Suppressed only when the ping is the ENTIRE request; a heartbeat riding along with a real
+    // setting still echoes.
+    const bool heartbeatOnly = (request->params() == 1 && request->hasParam("commissionHeartbeat"));
+    if (foundParameter && !heartbeatOnly) {
       stateRevision++;      // Increment whenever any setting changed
       settingsDirty = true; // trigger immediate CSV3 settings echo
     }
@@ -8413,6 +8609,13 @@ void setupServer() {
       Serial.printf("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
     }
     settingsDirty = true;  // send CSV3 immediately so new client gets current settings
+    // AsyncTCP's 5 s ack timeout is wired straight to close() for an event-source client
+    // (AsyncEventSourceClient::_onTimeout), and the countdown starts at the last write that got out —
+    // so once the send window fills, a radio stall well under 5 s does not degrade the dashboard
+    // stream, it destroys it, and everything the regulator says while it is gone is discarded.
+    // 20 s rides out the stalls a phone hotspot actually produces. Cost: a client that vanishes
+    // without a FIN holds its slot 20 s before events.count() reads 0.
+    if (client->client()) client->client()->setAckTimeout(20000);
     client->send("hello!", NULL, millis(), 10000);
   });
   // MUST precede "/debug": a plain-string URI matches exact-or-prefix-with-slash and the server
@@ -8643,10 +8846,22 @@ void setupServer() {
   // Tiny always-answers identity endpoint for app-side subnet discovery: when mDNS fails
   // across a phone hotspot, the Capacitor app sweeps 172.20.10.2-14 and latches onto this
   // reply. No password, no side effects; CORS header because the app's origin is not us.
+  // The discovery floor, and the only thing that can tell two regulators apart before a client
+  // commits to one: uid is what the app pins to, name is what it shows the user, host is the
+  // per-unit mDNS name, ap is this unit's access-point SSID (per-unit now, so the app's Join
+  // button cannot offer a name that belongs to another board).
   server.on("/identify", HTTP_GET, [](AsyncWebServerRequest *request) {
-    char idBuf[128];
-    snprintf(idBuf, sizeof(idBuf), "{\"device\":\"xreg-010\",\"uid\":\"%s\",\"fw\":\"%s\"}",
-             device_id_hex, FIRMWARE_VERSION);
+    String idBuf = "{\"device\":\"xreg-010\",\"uid\":\"";
+    idBuf += device_id_hex;
+    idBuf += "\",\"fw\":\"";
+    idBuf += FIRMWARE_VERSION;
+    idBuf += "\",\"name\":";
+    cfgAppendJsonStr(idBuf, regulatorDisplayName());
+    idBuf += ",\"host\":\"";
+    idBuf += regulatorHostName();
+    idBuf += ".local\",\"ap\":";
+    cfgAppendJsonStr(idBuf, esp32_ap_ssid);
+    idBuf += "}";
     AsyncWebServerResponse *r = request->beginResponse(200, "application/json", idBuf);
     r->addHeader("Access-Control-Allow-Origin", "*");
     request->send(r);
@@ -8940,6 +9155,28 @@ void setupServer() {
                     fieldCutOk ? 1 : 0, fieldCutTauMs, fieldCutFallMs, fieldCutDrainMs, fieldCutBaseA, fieldCutFloorA,
                     fieldCutRpm, fieldCutResidPct, fcPlotN, (int)fieldCutSrc, faCalGain, faCalOffA,
                     fieldCutAbortRequested ? 1 : 0, fieldCutAbortMsg);
+    request->send(200, "application/json", buf);
+  });
+
+  // Charge health calibration status (commissioning stage 9 polls this). One small object — the
+  // captured swing never leaves the device, only the fit does.
+  server.on("/chc.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+             "{\"active\":%d,\"phase\":%d,\"ready\":%d,\"ok\":%d,\"pct\":%d,"
+             "\"targetA\":%.1f,\"capA\":%.0f,\"hiCol\":%d,\"duty\":%.1f,\"amps\":%.1f,"
+             "\"vbus\":%.2f,\"rpm\":%.0f,\"idleRpm\":%.0f,\"holdRpm\":%.0f,\"holdMs\":%lu,"
+             "\"minA\":%.1f,\"peakA\":%.0f,\"leadSec\":%.3f,\"lead12\":%.3f,\"lead23\":%.3f,"
+             "\"gapBefore\":%.1f,\"gapAfter\":%.1f,"
+             "\"rateMin\":%.0f,\"rateAvg\":%.0f,\"rateMax\":%.0f,"
+             "\"nPts\":%d,\"abort\":\"%s\"}",
+             chcActive != 0 ? 1 : 0, (int)chcPhase, chcResultsReady ? 1 : 0, chcOk ? 1 : 0, (int)chcTestPct,
+             chcTargetA, chcSizeCapA, (BatteryCapacity_Ah >= CHC_LOHI_AH) ? 1 : 0, chcHoldDuty, MeasuredAmps,
+             BatteryV, RPM, chcIdleRpm, chcHoldRpm, (unsigned long)chcHoldMs,
+             chcMinA, chcPeakA, chcLeadSec, chcLead12, chcLead23,
+             chcGapBefore, chcGapAfter,
+             chcRateMin, chcRateAvg, chcRateMax,
+             chcCount, chcAbortMsg);
     request->send(200, "application/json", buf);
   });
 
@@ -9687,6 +9924,26 @@ void SendWifiData() {
   static unsigned long lastWiFiCheck = 0;
 
   unsigned long now = millis();
+
+  // Dashboard-stream census, ahead of the WiFi gate so a radio-down window is counted too.
+  // events.send() with no listener discards silently and trySendConsoleSSE drains the queue the same
+  // way, so an outage costs every console line produced while it lasted with nothing to mark it.
+  // Report the gap on the way back: it lands in the /consolehist.txt ring, which survives outages the
+  // browser does not. 2 s floor keeps a page reload or tab swap out of the log.
+  static uint8_t  sseLastClients = 0;
+  static uint32_t sseDownSinceMs = 0;
+  static uint16_t sseDropCount = 0;
+  uint8_t sseClients = (uint8_t)events.count();
+  if (sseLastClients > 0 && sseClients == 0) {
+    sseDownSinceMs = now;
+    sseDropCount++;
+  } else if (sseLastClients == 0 && sseClients > 0 && sseDownSinceMs != 0) {
+    if (now - sseDownSinceMs >= 2000)
+      queueConsoleMessageF("Dashboard stream was down %.1fs (drop #%u) - anything said in that window reached no browser",
+                           (now - sseDownSinceMs) / 1000.0f, (unsigned)sseDropCount);
+    sseDownSinceMs = 0;
+  }
+  sseLastClients = sseClients;
 
   if (now - lastWiFiCheck > 2000) {  // Check WiFi every 2 seconds
     cachedWiFiMode = WiFi.getMode();
@@ -10670,481 +10927,26 @@ void SendWifiData() {
     /// ALL THIS SAFEINT STUFF MAY BE UNNECESSAREY BAD ADVICE, COULD HAVE JUST SENT ROUNDED FLOATS FOR 1 Byte (or bit?) xtra
     //WifiSendTime was 834uS before increasing csv3 payload size from 1100 to 1400     No change after.  Again, this separation into groups and worry about wifi packet size seems like AI nonsense.
 
+    /* Retained rationale from the previous hand-maintained format string. It recorded how
+       specifiers were grouped so hand-edited fields stayed type-aligned with their arguments.
+       CSV3_LIST now pairs each field's format with its own expression, so that alignment is
+       structural and these groupings are history, kept for the units and orderings they name:
+         +1 CvKdVoltFiltTC (int) — pairs the arg inserted after VoltageFilterTC; sits in the all-integer run before IExcessArmMarginV so every field stays type-aligned
+         damper detection bar (x100) + 2 NMEA 0183: baud, polarity
+         displayVolUnit
+         gpsPositionSource
+         MaxFieldVolts (x10)
+         timed OV tiers: LOW margin (V), LOW dwell (ms), MID margin (V), MID dwell (ms)
+         VoltageHardwareLimit (x100)
+         load-dump consecutive-sample counts N1/N2/N3
+         solar ledger toggles + margins: learn, use consumption, margin % (x100), learn rate % (x100)
+         RV-C: tx master, charger DGNs, DC source DGNs, DM_RV, charger instance, DC instance, device priority
+         +14 battery/extra temperature settings (§6 order, CommissionTempSrc last)
+         +2: sessionId, sendMs
+    */
     int     payload3Len = snprintf(payload3, PAYLOAD3_SIZE,
-                               "%d,"  // CSV3_FIELD_COUNT
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%d,"
-                               "%d,"  // +1 CvKdVoltFiltTC (int) — pairs the arg inserted after VoltageFilterTC; sits in the all-integer run before IExcessArmMarginV so every field stays type-aligned
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,"   // damper detection bar (x100) + 2 NMEA 0183: baud, polarity
-                               "%d,"         // displayVolUnit
-                               "%d,"         // gpsPositionSource
-                               "%d,"         // MaxFieldVolts (x10)
-                               "%.3f,%d,%.3f,%d,"  // timed OV tiers: LOW margin (V), LOW dwell (ms), MID margin (V), MID dwell (ms)
-                               "%d,"         // VoltageHardwareLimit (x100)
-                               "%d,%d,%d,"   // load-dump consecutive-sample counts N1/N2/N3
-                               "%d,%d,%d,%d," // solar ledger toggles + margins: learn, use consumption, margin % (x100), learn rate % (x100)
-                               "%d,%d,%d,%d,%d,%d,%d,"  // RV-C: tx master, charger DGNs, DC source DGNs, DM_RV, charger instance, DC instance, device priority
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +14 battery/extra temperature settings (§6 order, CommissionTempSrc last)
-                               "%u,%u\n",    // +2: sessionId, sendMs
-                               CSV3_FIELD_COUNT,
-                               SafeInt(TemperatureLimitF),
-                               SafeInt(BulkVoltage, 100),
-                               SafeInt(wavePeriod),
-                               SafeInt(FloatVoltage, 100),
-                               SafeInt(SwitchingFrequency),
-                               SafeInt(yyMin),
-                               0,  // CSV3_retired1
-                               SafeInt(ManualDutyTarget, 100),
-                               SafeInt(PhysicalPanelOverride),
-                               SafeInt(waveAmplitude),
-                               SafeInt(CurrentThreshold, 100),
-                               SafeInt(PeukertExponent_scaled),
-                               SafeInt(ChargeEfficiency_scaled),
-                               SafeInt(ChargedVoltage_Scaled),
-                               SafeInt(TailCurrent, 10),
-                               SafeInt(ChargedDetectionTime),
-                               SafeInt(IgnoreTemperature),
-                               SafeInt(bmsLogic),
-                               SafeInt(bmsLogicLevelOff),
-                               SafeInt(RPMScalingFactor),
-                               SafeInt(MaximumAllowedBatteryAmps),
-                               SafeInt(AlternatorNominalAmps),
-                               SafeInt(LearningUpStep, 100),
-                               SafeInt(LearningDownStep, 100),
-                               SafeInt(xTime),
-                               SafeInt(MinLearningInterval),
-                               SafeInt(SafeOperationThreshold),
-                               SafeInt(PidKp, 1000),
-                               SafeInt(PidKi, 1000),
-                               SafeInt(PidKd, 1000),
-                               SafeInt(PidSampleDivisor),
-                               SafeInt(MaxTableValue, 100),
-                               SafeInt(MaxPenaltyPercent, 100),
-                               SafeInt(MaxPenaltyDuration / 1000),
-                               SafeInt(NeighborLearningFactor, 1000),
-                               SafeInt(yyMax),
-                               SafeInt(LearningMemoryDuration / 86400000),
-                               SafeInt(TuningMode),
-                               SafeInt(ShuntResistanceMicroOhm),
-                               SafeInt(InvertAltAmps),
-                               SafeInt(InvertBattAmps),
-                               SafeInt(MaxDuty),
-                               SafeInt(MinDuty, 100),
-                               SafeInt(FieldResistance, 100),
-                               SafeInt(maxPoints),
-                               SafeInt(AlternatorCOffset, 100),
-                               SafeInt(BatteryCOffset, 100),
-                               SafeInt(BatteryCapacity_Ah),
-                               SafeInt(AmpSensorRange),
-                               SafeInt(R_fixed, 100),
-                               SafeInt(Beta, 100),
-                               SafeInt(T0_C, 100),
-                               SafeInt(TempSource),
-                               SafeInt(IgnitionOverride),
-                               SafeInt(FLOAT_DURATION),
-                               SafeInt(PulleyRatio, 100),
-                               SafeInt(BatteryCurrentSource),
-                               SafeInt(rpmTableRPMPoints[0]),
-                               SafeInt(rpmTableRPMPoints[1]),
-                               SafeInt(rpmTableRPMPoints[2]),
-                               SafeInt(rpmTableRPMPoints[3]),
-                               SafeInt(rpmTableRPMPoints[4]),
-                               SafeInt(rpmTableRPMPoints[5]),
-                               SafeInt(rpmTableRPMPoints[6]),
-                               SafeInt(rpmTableRPMPoints[7]),
-                               SafeInt(rpmTableRPMPoints[8]),
-                               SafeInt(rpmTableRPMPoints[9]),
-                               SafeInt(LearningSettlingPeriod),
-                               SafeInt(LearningRPMChangeThreshold),
-                               SafeInt(LearningTempHysteresis),
-                               SafeInt(fuelTableRPM[0]),
-                               SafeInt(fuelTableRPM[1]),
-                               SafeInt(fuelTableRPM[2]),
-                               SafeInt(fuelTableRPM[3]),
-                               SafeInt(fuelTableRPM[4]),
-                               SafeInt(fuelTableRPM[5]),
-                               SafeInt(fuelTableRPM[6]),
-                               SafeInt(fuelTableRPM[7]),
-                               SafeInt(fuelTableRPM[8]),
-                               SafeInt(fuelTableRPM[9]),
-                               SafeInt(fuelTableGPH[0], 100),
-                               SafeInt(fuelTableGPH[1], 100),
-                               SafeInt(fuelTableGPH[2], 100),
-                               SafeInt(fuelTableGPH[3], 100),
-                               SafeInt(fuelTableGPH[4], 100),
-                               SafeInt(fuelTableGPH[5], 100),
-                               SafeInt(fuelTableGPH[6], 100),
-                               SafeInt(fuelTableGPH[7], 100),
-                               SafeInt(fuelTableGPH[8], 100),
-                               SafeInt(fuelTableGPH[9], 100),
-                               SafeInt(stateRevision),
-                               SafeInt(DutyRampRate, 100),
-                               SafeInt(SettleTimeBeforeCut),
-                               SafeInt(TempWarnExcess, 100),
-                               SafeInt(TempCritExcess, 100),
-                               SafeInt(TempSustainedTimeout / 1000),
-                               SafeInt(AlternatorHardShutdownV, 100),
-                               SafeInt(VoltageDisagreeThreshold, 100),
-                               SafeInt(VoltageDisagreeTimeout / 1000),
-                               SafeInt(rpmMinDutyTable[0], 100),
-                               SafeInt(rpmMinDutyTable[1], 100),
-                               SafeInt(rpmMinDutyTable[2], 100),
-                               SafeInt(rpmMinDutyTable[3], 100),
-                               SafeInt(rpmMinDutyTable[4], 100),
-                               SafeInt(rpmMinDutyTable[5], 100),
-                               SafeInt(rpmMinDutyTable[6], 100),
-                               SafeInt(rpmMinDutyTable[7], 100),
-                               SafeInt(rpmMinDutyTable[8], 100),
-                               SafeInt(rpmMinDutyTable[9], 100),
-                               SafeInt(rpmCapCurrentTable[0], 100),
-                               SafeInt(rpmCapCurrentTable[1], 100),
-                               SafeInt(rpmCapCurrentTable[2], 100),
-                               SafeInt(rpmCapCurrentTable[3], 100),
-                               SafeInt(rpmCapCurrentTable[4], 100),
-                               SafeInt(rpmCapCurrentTable[5], 100),
-                               SafeInt(rpmCapCurrentTable[6], 100),
-                               SafeInt(rpmCapCurrentTable[7], 100),
-                               SafeInt(rpmCapCurrentTable[8], 100),
-                               SafeInt(rpmCapCurrentTable[9], 100),
-                               SafeInt(VoltageKp, 100),
-                               SafeInt(VoltageLoopInterval),
-                               SafeInt(FIELD_COLLAPSE_DELAY),
-                               SafeInt(SetpointRiseRate, 100),
-                               SafeInt(SetpointFallRate, 100),
-                               SafeInt(SetpointBigStepThresh, 100),
-                               SafeInt(SetpointBigStepRiseRate, 100),
-                               SafeInt(PIDTrackingGain, 100),
-                               SafeInt(CAPSIZE_THRESHOLD_DEG),
-                               SafeInt(PITCHPOLE_THRESHOLD_DEG),
-                               SafeInt(SLAM_THRESHOLD_G, 10),
-                               SafeInt(imuMountOrientation),
-                               SafeInt(TailCurrent_A, 100),
-                               SafeInt(RebulkVoltage, 100),
-                               SafeInt(rebulkDebounceTime),
-                               SafeInt(MinFloatTime),
-                               SafeInt(SOC_BlockRebulk_percent),
-                               SafeInt(SOC_AllowRebulk_percent),
-                               SafeInt(DutySlowRampRate, 100),
-                               SafeInt(ShutdownPhase2HoldMs),
-                               SafeInt(TempPIDKp, 1000),
-                               SafeInt(TempPIDKi, 1000),
-                               SafeInt(ThermalLookaheadSec),
-                               SafeInt(TempPIDIntervalMs),
-                               SafeInt(TempPIDFilterAlpha, 1000),
-                               SafeInt(VoltageKi, 100),
-                               (int)rpmCapPowerTable[0],
-                               (int)rpmCapPowerTable[1],
-                               (int)rpmCapPowerTable[2],
-                               (int)rpmCapPowerTable[3],
-                               (int)rpmCapPowerTable[4],
-                               (int)rpmCapPowerTable[5],
-                               (int)rpmCapPowerTable[6],
-                               (int)rpmCapPowerTable[7],
-                               (int)rpmCapPowerTable[8],
-                               (int)rpmCapPowerTable[9],
-                               SafeInt(SystemIDStepAmplitude, 10),
-                               SafeInt(HardOCTripAmps, 10),
-                               SafeInt(HardOCDebounceMs),
-                               SafeInt(IExcessFrac, 1000),
-                               SafeInt(IExcessFloorA, 10),
-                               SafeInt(IExcessKBleed, 100),
-                               SafeInt(IgnoreRPM),
-                               SafeInt(MinRPMForField),
-                               SafeInt(AwBleedRate, 10),
-                               SafeInt(KHard, 10),
-                               SafeInt(ReseedFrac, 100),
-                               (int)AwSeedProtectMs,
-                               SafeInt(displayTempUnit),
-                               SafeInt(WarmupRampRate, 10),
-                               (int)OvGroup1Enable,
-                               (int)OvGroup2Enable,
-                               SafeInt(IExcessCeilA, 10),
-                               SafeInt(IExcessTau),
-                               OutputPIDSigSrc,
-                               TdPred,
-                               OvMeasMarginV,
-                               OvPredMarginV,
-                               OutputPIDMA_N,
-                               (int)OutputPIDFilterTC,
-                               (int)VoltageFilterTC,
-                               (int)CvKdVoltFiltTC,
-                               SafeInt(CvKdDeadbandVps, 100),
-                               SafeInt(VoltageKd, 10),
-                               SafeInt(DvdtTC, 10),
-                               SafeInt(CvKdArmV, 100),
-                               SafeInt(StartupRiseRate, 100),
-                               SafeInt(absorptionCompleteTime),
-                               SafeInt(OnOff),
-                               SafeInt(ManualFieldToggle),
-                               SafeInt(HiLow),
-                               SafeInt(LimpHome),
-                               SafeInt(AlarmActivate),
-                               SafeInt(TempAlarm),
-                               SafeInt(VoltageAlarmHigh, 100),
-                               SafeInt(VoltageAlarmLow, 100),
-                               SafeInt(CurrentAlarmHigh),
-                               SafeInt(AlarmTest),
-                               SafeInt(AlarmLatchEnabled),
-                               SafeInt(MaintainMode),
-                               SafeInt(ManualSOCPoint, 100),
-                               SafeInt(IgnoreLearningDuringPenalty),
-                               SafeInt(LogAllLearningEvents),
-                               SafeInt(CloudFeatures),
-                               SafeInt(AutoShuntGainCorrection),
-                               SafeInt(AutoAltCurrentZero),
-                               SafeInt(WindingTempOffset),
-                               SafeInt(ManualLifePercentage),
-                               SafeInt(UVThresholdHigh, 100),
-                               SafeInt(weatherModeEnabled),
-                               SafeInt(imuEnabled ? 1 : 0),
-                               SafeInt(AbsorptionVoltage * 100),
-                               SafeInt(AbsorptionTimeoutMs),
-                               SafeInt(bulkVoltageHoldMs),
-                               SafeInt(capLimitMode),
-                               SafeInt(TargetVoltageMode),
-                               SafeInt(TargetVoltageSetpoint, 100),
-                               SafeInt(RebulkCurrent_A, 100),
-                               SafeInt(UseFloat),
-                               SafeInt(IExcessFracBulk, 1000),
-                               SafeInt(IExcessRelFrac, 1000),
-                               SafeInt(systemIDPlantTauMs),
-                               SafeInt(TempAlarmLow),
-                               SafeInt(LoadDumpDtThresh),
-                               SafeInt(LoadDumpDtThresh1),
-                               (int)CVTuningMode,
-                               SafeInt(cvWaveAmplitudeV, 100),
-                               (int)cvWavePeriodSec,
-                               SafeInt(cvKOvershoot, 10),
-                               (int)cvConsecutiveReads,
-                               SafeInt(webgaugesinterval),
-                               SafeInt(plotTimeWindow),
-                               SafeInt(Ymin1),
-                               SafeInt(Ymax1),
-                               SafeInt(Ymin2, 100),
-                               SafeInt(Ymax2, 100),
-                               SafeInt(Ymin3),
-                               SafeInt(Ymax3),
-                               SafeInt(Ymin4),
-                               SafeInt(Ymax4),
-                               SafeInt(LoadDumpDtThresh3),
-                               SafeInt(hardwarePresent),
-                               (int)testProtectionsEnabled,
-                               IExcessArmMarginV,
-                               SafeInt(FastSetpointRiseRate, 100),
-                               (int)FastSetpointRiseWindowMs,
-                               SafeInt(FastSetpointRiseHeadroomV, 100),
-                               SafeInt(SolarWatts),
-                               SafeInt(performanceRatio, 100),
-                               SafeInt(VeData),
-                               SafeInt(NMEA0183Data),
-                               SafeInt(NMEA2KData),
-                               SafeInt(timeAxisModeChanging),
-                               (int)timeSourceMode,
-                               (int)speedSourceMode,
-                               (int)faEnabled,
-                               (int)faAlarmEnable,
-                               (int)faAnomPause,
-                               SafeInt(faRpmEdgeMargin, 10),
-                               SafeInt(faAmpsDriftFloorA, 100),
-                               SafeInt(faAmpsDriftPct, 10),
-                               SafeInt(faAttenUpAmps, 10),
-                               SafeInt(faAttenDownAmps, 10),
-                               SafeInt(faPeakMinA, 100),
-                               (int)wifiNapEnabled,
-                               SafeInt(imuHeelOffsetDeg, 100),
-                               SafeInt(imuPitchOffsetDeg, 100),
-                               SafeInt(systemIDTestType),
-                               SafeInt(systemIDSineFreqStart, 10),
-                               SafeInt(systemIDSineFreqEnd, 10),
-                               SafeInt(systemIDSineCycles),
-                               SafeInt(tuningWaveform),
-                               SafeInt(tuningSineFreq, 10),
-                               SafeInt(tuningSweepStart, 10),
-                               SafeInt(tuningSweepEnd, 10),
-                               SafeInt(tuningSweepCycles),
-                               SafeInt(SystemIDStabilizeAmps, 10),
-                               SafeInt(tuningWaveFloor),
-                               (int)commissionState,
-                               (int)commissionPhase,
-                               (int)commissionDoneMask,
-                               (int)cvHelpersEnabled,
-                               SafeInt(MinChargeTempF),
-                               (int)coldChargeLockoutEnable,
-                               (int)cvGainMode,
-                               SafeInt(cvPlantK, 10000),
-                               SafeInt(cvComputedKp, 100),
-                               SafeInt(cvComputedKi, 100),
-                               SafeInt(cvCrossover, 100),
-                               SafeInt(cvPiZero, 100),
-                               SafeInt(vTgtRampUp, 1000),
-                               SafeInt(vTgtRampDn, 1000),
-                               (int)vTgtRampEnable,
-                               (int)setpointSlewEnable,
-                               (int)cvRiseGovEnable,
-                               (int)dutySlewEnable,
-                               isnan(CommissionTempF) ? ROLL_EMPTY : (int)lroundf(CommissionTempF * 10.0f),
-                               (int)battTempDerateEnable,
-                               SafeInt(battTempCoeff, 10000),
-                               SafeInt(TempPIDKiDownFrac, 1000),
-                               SafeInt(ThermalSlopeWindowSec),
-                               SafeInt(BattCurrentLimitA, 10),
-                               SafeInt(ripWinMs),
-                               SafeInt(ripDriftFloorA, 100),
-                               SafeInt(ripDriftPct, 10),
-                               SafeInt(SocAlarmLow),
-                               SafeInt(battMaxMode),
-                               SafeInt(IExcessBaseA, 10),
-                               SafeInt(IExcessCcOffsetA, 10),
-                               SafeInt(BatteryShuntPresent),
-                               (int)cvRecovEnable,
-                               SafeInt(cvRecovSec, 10),
-                               SafeInt(cvRecovEmaxV, 1000),
-                               (int)testSlewMode,
-                               (int)cvTestSlewMode,
-                               (int)CvKdOneSided,
-                               SafeInt(fieldDecayTauMs),
-                               (int)commissionManualMask,
-                               SafeInt(CvKdMaxTrimA, 10),
-                               SafeInt(cvAlpha, 1000),
-                               SafeInt(CvKdSlopeCeil, 10),
-                               SafeInt(cvComputedKd, 100),
-                               SafeInt(CvKdDbSlope, 10000),
-                               SafeInt(CvKdDbFloor, 100),
-                               SafeInt(CvKdDbCeil, 100),
-                               (int)cvRecovBoostEnable,
-                               SafeInt(cvRecovBoostMax, 100),
-                               SafeInt(cvRecovBoostErrV, 1000),
-                               SafeInt(fdDrainLoMs),
-                               SafeInt(fdDrainHiMs),
-                               SafeInt(fdDrainRpmLo),
-                               SafeInt(fdDrainRpmHi),
-                               (int)HardOCEnable,
-                               (int)IExcessEnable,
-                               (int)BattLimitEnable,
-                               (int)CvKdExcessMode,
-                               SafeInt(CvStressDropV, 100),
-                               SafeInt(CvStressFailBandV, 100),
-                               SafeInt(CvBrakeFallRate, 100),
-                               SafeInt(cvRecovKiMax, 100),
-                               (int)cvWindDownEnable,
-                               SafeInt(cvWindDownRate, 1000),
-                               SafeInt(cvWindDownStopV, 1000),
-                               (int)LoadDumpEnable,
-                               (int)loadServeBoostEnable,
-                               (int)reseedCorrEnable,
-                               (int)HuntGovEnable,
-                               SafeInt(ReseedFracNoShunt, 100),
-                               SafeInt(CvRecovClimbRate, 100),
-                               SafeInt(protTestCutMs),
-                               SafeInt(protTestGapMs),
-                               SafeInt(protTestReps),
-                               SafeInt(protTestCmdA),
-                               SafeInt(cvRecovBoostFloorV, 1000),
-                               SafeInt(cvRecovDeepBandV, 1000),
-                               SafeInt(cvRecovDeepMult, 100),
-                               SafeInt(cvRecovFlareBandV, 1000),
-                               SafeInt(cvRecovFlareFrac, 100),
-                               (int)TachLieEnable,
-                               SafeInt(n2kTxEnable),
-                               SafeInt(n2kDeviceInstance),
-                               SafeInt(n2kBattEnable),
-                               SafeInt(n2kBattInstance),
-                               SafeInt(n2kBattCfgEnable),
-                               SafeInt(n2kAltEnable),
-                               SafeInt(n2kAltInstance),
-                               SafeInt(n2kAltTempEnable),
-                               SafeInt(n2kTempInstance),
-                               SafeInt(n2kTempSource),
-                               SafeInt(n2kChgrEnable),
-                               SafeInt(n2kChgrInstance),
-                               SafeInt(n2kChgrCfgEnable),
-                               SafeInt(n2kChgrMode),
-                               SafeInt(n2kEngRpmEnable),
-                               SafeInt(n2kEngInstance),
-                               SafeInt(n2kEngDynEnable),
-                               SafeInt(n2kEngBitsEnable),
-                               SafeInt(n2kRxBattInstance),
-                               SafeInt(dvccEn),
-                               SafeInt(dvccSrcType),
-                               SafeInt(dvccInst),
-                               SafeInt(dvccSilenceS),
-                               SafeInt(dvccSettleS),
-                               SafeInt(dvccCvlMin, 100),
-                               SafeInt(dvccCvlMax, 100),
-                               (int)HuntCutPct,
-                               (int)HuntVerifyPct,
-                               (int)HuntWingPct,
-                               (int)HuntCooldownMin,
-                               (int)HuntSteadyPct,
-                               (int)HuntQualifyScans,
-                               SafeInt(HuntTrigPct, 100),
-                               (int)NMEA0183Baud,
-                               (int)NMEA0183Invert,
-                               SafeInt(displayVolUnit),
-                               (int)gpsPositionSource,
-                               SafeInt(MaxFieldVolts, 10),
-                               OvTierLoMarginV,             // CSV3_OvTierLoMarginV (%.3f)
-                               SafeInt(OvTierLoDwellMs),    // CSV3_OvTierLoDwellMs
-                               OvTierMidMarginV,            // CSV3_OvTierMidMarginV (%.3f)
-                               SafeInt(OvTierMidDwellMs),   // CSV3_OvTierMidDwellMs
-                               SafeInt(VoltageHardwareLimit, 100),  // CSV3_VoltageHardwareLimit
-                               SafeInt(LoadDumpN1),
-                               SafeInt(LoadDumpN2),
-                               SafeInt(LoadDumpN3),
-                               SafeInt(solarLearnEnable),           // CSV3_solarLearnEnable
-                               SafeInt(solarUseConsEnable),         // CSV3_solarUseConsEnable
-                               SafeInt(solarConsMarginPct, 100),    // CSV3_solarConsMarginPct
-                               SafeInt(solarLearnRatePct, 100),     // CSV3_solarLearnRatePct
-                               SafeInt(rvcTxEnable),                // CSV3_rvcTxEnable
-                               SafeInt(rvcChgrEnable),              // CSV3_rvcChgrEnable
-                               SafeInt(rvcDcEnable),                // CSV3_rvcDcEnable
-                               SafeInt(rvcFaultEnable),             // CSV3_rvcFaultEnable
-                               SafeInt(rvcChgrInstance),            // CSV3_rvcChgrInstance
-                               SafeInt(rvcDcInstance),              // CSV3_rvcDcInstance
-                               SafeInt(rvcDevPriority),             // CSV3_rvcDevPriority
-                               SafeInt(battTempProbeEnable),        // CSV3_battTempProbeEnable
-                               SafeInt(extraTempProbeEnable),       // CSV3_extraTempProbeEnable
-                               SafeInt(battTempSource),             // CSV3_battTempSource
-                               SafeInt(battTempProxyEnable),        // CSV3_battTempProxyEnable
-                               SafeInt(hotChargeLockoutEnable),     // CSV3_hotChargeLockoutEnable
-                               SafeInt(MaxChargeTempF),             // CSV3_MaxChargeTempF
-                               SafeInt(extraTempAlarmHiEnable),     // CSV3_extraTempAlarmHiEnable
-                               SafeInt(extraTempAlarmHiF),          // CSV3_extraTempAlarmHiF
-                               SafeInt(extraTempAlarmLoEnable),     // CSV3_extraTempAlarmLoEnable
-                               SafeInt(extraTempAlarmLoF),          // CSV3_extraTempAlarmLoF
-                               SafeInt(n2kExtraTempEnable),         // CSV3_n2kExtraTempEnable
-                               SafeInt(n2kExtraTempInstance),       // CSV3_n2kExtraTempInstance
-                               SafeInt(n2kExtraTempSource),         // CSV3_n2kExtraTempSource
-                               SafeInt(CommissionTempSrc),          // CSV3_CommissionTempSrc
-                               (unsigned)g_sessionId,   // CSV3_sessionId
-                               (unsigned)millis());     // CSV3_sendMs
+                               "%d" CSV3_LIST(CSV3_FMT_X) "\n",
+                               CSV3_FIELD_COUNT CSV3_LIST(CSV3_ARG_X));
     if (payload3Len < 0 || payload3Len >= PAYLOAD3_SIZE) {
       Serial.printf("payload3 truncated or format error: %d\n", payload3Len);
       return;
@@ -11407,6 +11209,7 @@ void saveVesselInfoToNvs() {
   vesselNvsSet(h, NK_batteryType,        BATTERY_TYPE);
   vesselNvsSet(h, NK_battMakeModel,      BATTERY_MAKE_MODEL);
   vesselNvsSet(h, NK_altBrandModel,      ALTERNATOR_BRAND_MODEL);
+  vesselNvsSet(h, NK_regName,            REGULATOR_NAME);
   vesselNvsSet(h, NK_SolarWatts,         String(SolarWatts).c_str());
   vesselNvsSet(h, NK_imuMountOrient,     String((int)imuMountOrientation).c_str());
   vesselNvsSet(h, NK_regMountLoc,        String((int)regulatorMountLoc).c_str());
@@ -11422,6 +11225,7 @@ void saveVesselInfoToNvs() {
   }
 
   vesselInfoSaved = true;
+  mdnsRefreshName();   // a rename has to reach the network now, not at the next boot
   applyChemistryOcvPreset();  // chemistry-match the rested-voltage curve before the seed reads it
   seedSocFromVoltage();  // factory-fresh path: seed was deferred until real chemistry/capacity existed
   // Refresh the cloud's user_profiles vessel projection on Save, not at the next boot/24 h

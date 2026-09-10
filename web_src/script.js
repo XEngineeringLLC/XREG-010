@@ -1147,35 +1147,18 @@ const CSV4_FIELDS = [
 // set the threshold relative to. Spans live next to each threshold input in index.html.
 const ROLL_EMPTY_SENTINEL = -1999999999;   // firmware sends -2000000000 when a 10s window had no sample
 
-// ── Battery-current "not available" ────────────────────────────────────────
-// With no battery shunt the INA current input still reads something, so the firmware sends the same
-// ROLL_EMPTY sentinel in these slots rather than that noise. Rewrite it to NaN at parse time, once,
-// so every downstream consumer inherits "no reading": readouts print "—", plots leave a gap, and the
-// analysis fits (autotune, diag) see NaN instead of a plausible-looking number.
-const BATT_NA_KEYS_CSV1 = ['Bcur'];
-const BATT_NA_KEYS_CSV2 = ['SOC_percent', 'dBcur_dt'];
-// Same treatment, same sentinel, for readings whose SENSOR can be absent: no DS18B20 bound to the
-// alternator role, no wind instrument, no paddlewheel, no target bearing. These used to ride
-// SafeInt's -1 and render as real measurements (-0.0 F, -0.0 kt, -1 deg) while banking a flat line
-// into the live temperature plot, the true-wind trend ring and the alt-health session points.
-const SENSOR_NA_KEYS_CSV1 = ['AlternatorTemperatureF'];
-const SENSOR_NA_KEYS_CSV4 = ['STWNMEA', 'TrueWindSpeedNMEA', 'TrueWindAngleNMEA', 'LeewayNMEA', 'VMGNMEA', 'VMGUpwind'];
-// Ignition-cycle watermarks plus the filtered/board/selected temperatures. A sensor absent for the
-// whole cycle left these at 0 or -1 (SafeInt) and they rendered as measured extremes —
-// 0 kt SOG, 0 deg heel, -18 C board temp. The CSV2 readout chain already prints "—" for non-finite.
-const SENSOR_NA_KEYS_CSV2 = ['wmIgn_amps_lo', 'wmIgn_amps_hi', 'wmIgn_altTempF_lo', 'wmIgn_altTempF_hi',
-    'wmIgn_IBV_lo', 'wmIgn_IBV_hi', 'wmIgn_Bcur_lo', 'wmIgn_Bcur_hi', 'wmIgn_SOC_lo', 'wmIgn_SOC_hi',
-    'wmIgn_RPM_lo', 'wmIgn_RPM_hi', 'wmIgn_SOG_lo', 'wmIgn_SOG_hi', 'wmIgn_AWS_lo', 'wmIgn_AWS_hi',
-    'wmIgn_TWS_lo', 'wmIgn_TWS_hi', 'wmIgn_heel_lo', 'wmIgn_heel_hi', 'wmIgn_pitch_lo', 'wmIgn_pitch_hi',
-    'wmIgn_vacc_lo', 'wmIgn_vacc_hi', 'wmIgn_baro_lo', 'wmIgn_baro_hi', 'wmIgn_ambient_lo',
-    'wmIgn_ambient_hi', 'wmIgn_VMGman_lo', 'wmIgn_VMGman_hi', 'wmIgn_VMGup_lo', 'wmIgn_VMGup_hi',
-    'wmIgn_battTempF_lo', 'wmIgn_battTempF_hi', 'wmIgn_extraTempF_lo', 'wmIgn_extraTempF_hi', 'tempFiltered',
-    'ambientTemp', 'TempToUse'];
-// Since SafeInt itself returns ROLL_EMPTY for NaN/Inf, EVERY field on CSV1/2/3/4 can carry the
-// sentinel, so the sweep runs over the whole parsed object and the key lists above are kept only as
-// the record of which fields the firmware ALSO guards explicitly at the call site. Nothing legitimate
-// reads below -1999999999, so a whole-object sweep cannot swallow a real value. TS carries no SafeInt
-// field and is not swept.
+// ── Absent sensor or absent shunt: "not available" ─────────────────────────
+// With no battery shunt the INA current input still reads something, and an absent alternator probe,
+// wind instrument or paddlewheel used to ride SafeInt's -1 and render as a real measurement (-0.0 F,
+// -0.0 kt, -1 deg, a flat line in the live plot). The firmware sends the ROLL_EMPTY sentinel in those
+// slots instead. Rewrite it to NaN at parse time, once, so every downstream consumer inherits "no
+// reading": readouts print "—", plots leave a gap, and the analysis fits (autotune, diag) see NaN
+// instead of a plausible-looking number. Since SafeInt itself returns ROLL_EMPTY for NaN/Inf, EVERY
+// field on CSV1/2/3/4 can carry the sentinel — the battery slots (Bcur, SOC_percent, dBcur_dt), the
+// sensor slots, and any ignition-cycle watermark whose sensor was absent for the whole cycle — so the
+// sweep runs over the whole parsed object rather than a key list. Nothing legitimate reads below
+// -1999999999, so a whole-object sweep cannot swallow a real value. TS carries no SafeInt field and is
+// not swept.
 function battNaToNaN(data, keys = Object.keys(data)) {
     for (const k of keys) {
         if (!(k in data)) continue;
@@ -1305,6 +1288,15 @@ function drawIExcessSpark(c, S) {
 // the ~10 Hz CSV1 cadence, same fixed-ring convention as the iExcess strip). No-ops when the
 // modal is closed (canvas has zero width).
 const _cxRpmSpark = { rpm: new Array(150).fill(NaN), N: 150 };
+let cxFpOpen = false;   // wizard "Details" disclosure — one setting for the whole session, all steps
+function cxFpSet(v) { cxFpOpen = !!v; }
+// Pace lane for the stage-9 passes: the corridor the trace should stay inside. Anchored at the
+// sample index and RPM where the pass began; the ring is 150 samples at the ~10 Hz CSV1 cadence,
+// so the asked-for 200 rpm/s is exactly 20 rpm per sample.
+let _cxPaceLane = null;   // { i0, rpm0, down }
+function cxPaceLane(spec) {
+    _cxPaceLane = spec ? { i0: _cxRpmSpark.N - 1, rpm0: spec.rpm, down: !!spec.down } : null;
+}
 function cxRpmSparkOnCsv1(data) {
     const rpm = Number(data.RPM);
     if (cx) {                                  // green/red in-range check for the resonance current-check
@@ -1318,6 +1310,7 @@ function cxRpmSparkOnCsv1(data) {
     }
     const S = _cxRpmSpark;
     S.rpm.push(isFinite(rpm) ? rpm : NaN); S.rpm.shift();
+    if (_cxPaceLane && --_cxPaceLane.i0 < -20) _cxPaceLane = null;   // lane scrolls out with the samples it was anchored to
     // One shared ring feeds two strips: the commissioning modal and the standalone Diag
     // stress-test modal. Draw only where laid out (modal open, not hidden by the sweep game) —
     // but the ring above must keep feeding regardless: the game reads the same ring for its trace.
@@ -1371,6 +1364,28 @@ function drawCxRpmSpark(c) {
         const x = X(i), y = Y(v); started ? g.lineTo(x, y) : g.moveTo(x, y); started = true;
     }
     g.strokeStyle = '#2ec4b6'; g.lineWidth = 1.7; g.stroke();
+    // Pace lane (stage 9 passes only). Two parallel lines from where the pass began, bracketing the
+    // asked-for rate — drawn UNDER nothing, over the auto-scaled trace, in the same X/Y mapping.
+    // The band is ±40% of the target rate: wide enough that a human throttle stays inside it, tight
+    // enough that the sub-40 rpm/s samples the fit discards fall outside.
+    if (_cxPaceLane) {
+        const L = _cxPaceLane, sgn = L.down ? -1 : 1, perSamp = (CHC_PACE_RPM_S / 10);
+        const edge = f => {
+            g.beginPath();
+            let started = false;
+            for (let i = Math.max(0, L.i0); i < N; i++) {
+                const v = L.rpm0 + sgn * perSamp * f * (i - L.i0);
+                const x = X(i), y = Y(v);
+                started ? g.lineTo(x, y) : g.moveTo(x, y); started = true;
+            }
+            if (started) g.stroke();
+        };
+        g.save();
+        g.strokeStyle = 'rgba(46,196,182,0.35)'; g.lineWidth = 1;
+        g.setLineDash([3, 3]);
+        edge(0.6); edge(1.4);
+        g.restore();
+    }
     const last = S.rpm[N - 1];
     if (isFinite(last)) { g.fillStyle = '#2ec4b6'; g.beginPath(); g.arc(X(N - 1), Y(last), 2.6, 0, 7); g.fill(); }
 }
@@ -1382,7 +1397,7 @@ let altLive = { valid:false, rpm:0, exc:0, amps:0, pred:0, pct:0, worstPct:0, ov
                 status:0, steady:false, engHours:0, coverage:0, haveCurve:0, ptCount:0,
                 source:0, paused:0, refOk:1, refDist:0, state:3,
                 sessionMean:0, sessionP10:0, sessionN:0, hiFieldAlert:0, sim:0, gAmps:0,
-                logState:0, logRows:0, logSecLeft:0, logCap:0, sweepState:0, sweepRev:0 };
+                logState:0, logRows:0, logSecLeft:0, logCap:0, sweepState:0, sweepRev:0, latchPct:0 };
 let altTrend = [];     // committed trend points: [{eng, worst, overall}]
 let _altTrendPending = false, _altTrendLastFetch = 0;
 let altTrendPlot = null;
@@ -1549,6 +1564,14 @@ function updateAltHealth() {
     pctEl.textContent = graded ? Math.round(altLive.pct)+'%' : '\u2014';
     pctEl.style.color = graded ? ALT_STATE_COLOR[st] : '';
   }
+  // Header Health chip reads the device-side latch (last graded % this boot), so it holds through
+  // the ungraded ticks where the headline above shows a dash and every browser agrees on the value.
+  const hdrEl = document.getElementById('header-health');
+  if (hdrEl) {
+    const lp = Number(altLive.latchPct);
+    const txt = (Number.isFinite(lp) && lp > 0) ? String(Math.round(lp)) : '-';
+    if (hdrEl.textContent !== txt) hdrEl.textContent = txt;
+  }
   if (statEl) {
     const usingUploaded = altLive.source >= 1;
     let txt = altLive.status===3 ? 'Disabled (Ignore Temperature)'
@@ -1686,7 +1709,8 @@ function altSessSectionCsv(){
 // Spec: Working Markdown Docs/ALT_GATE_TUNING_CAPTURE_SPEC.md. State arrives on the AltLive frame
 // (1 Hz, schema-zipped) as logState / logRows / logSecLeft / logCap / sweepState / sweepRev.
 // Buttons, not URL parameters: this is operated by hand while also managing a throttle.
-const ALTLOG_HDR_BYTES = 136;    // must match AltLogHdr in 7_functions.ino
+const ALTLOG_HDR_BYTES = 164;    // must match AltLogHdr in 7_functions.ino (ver 2)
+const ALTLOG_HDR_BYTES_V1 = 136; // ver 1 header, before the straightness gate — still readable
 const ALTLOG_ROW_BYTES = 17;     // must match AltLogRow
 const ALTLOG_CAP_ROWS = 11565;   // must match ALTLOG_CAP_ROWS in 7_functions.ino (3 x 3855 rows of 17 B)
 const ALTLOG_STATE_LABEL = ['idle', 'RECORDING', 'stopped', 'BUFFER FULL'];
@@ -1897,12 +1921,17 @@ function altSweepPress() {
                `&marginA=${encodeURIComponent(m.a)}&marginV=${encodeURIComponent(m.v)}`);
 }
 
-// 136-byte header + 17-byte rows, little-endian. Mirrors AltLogHdr / AltLogRow in 7_functions.ino —
-// change one and you must change the other.
+// Header (164 B in ver 2, 136 B in ver 1) + 17-byte rows, little-endian. Mirrors AltLogHdr /
+// AltLogRow in 7_functions.ino — change one and you must change the other. Both versions are read:
+// ver 1 files were recorded by the max-minus-min band gate, ver 2 by the straightness gate, and the
+// two share every offset up to 136 so one parser covers both off fixed offsets.
 function parseAltLogBin(buf) {
-    if (!buf || buf.byteLength < ALTLOG_HDR_BYTES + ALTLOG_ROW_BYTES) return null;
+    if (!buf || buf.byteLength < ALTLOG_HDR_BYTES_V1 + ALTLOG_ROW_BYTES) return null;
     const dv = new DataView(buf);
     if (dv.getUint32(0, true) !== 0x414C474C) return null;   // 'ALGL'
+    const ver = dv.getUint16(4, true);
+    const hdrBytes = (ver >= 2) ? ALTLOG_HDR_BYTES : ALTLOG_HDR_BYTES_V1;
+    if (buf.byteLength < hdrBytes + ALTLOG_ROW_BYTES) return null;
     const h = {
         ver: dv.getUint16(4, true), rowBytes: dv.getUint16(6, true),
         rowCount: dv.getUint32(8, true), capRows: dv.getUint32(12, true),
@@ -1911,10 +1940,10 @@ function parseAltLogBin(buf) {
         dtMs: dv.getUint16(32, true), voltClass: dv.getUint8(34),
         endReason: dv.getUint8(35), chargeStage: dv.getUint8(36),
         startTempF: dv.getFloat32(40, true), startVbus: dv.getFloat32(44, true),
-        emaSec: dv.getFloat32(48, true), rpmTol: dv.getFloat32(52, true),
-        dutyTolPct: dv.getFloat32(56, true), vbusTol: dv.getFloat32(60, true),
+        emaSec: dv.getFloat32(48, true), v1RpmTol: dv.getFloat32(52, true),
+        v1DutyTolPct: dv.getFloat32(56, true), vbusTol: dv.getFloat32(60, true),
         thermDegF: dv.getFloat32(64, true), thermSec: dv.getFloat32(68, true),
-        ampsTolPct: dv.getFloat32(72, true), ampsFloorA: dv.getFloat32(76, true),
+        v1AmpsTolPct: dv.getFloat32(72, true), v1AmpsFloorA: dv.getFloat32(76, true),
         rpmSec: dv.getFloat32(80, true), dutySec: dv.getFloat32(84, true),
         vbusSec: dv.getFloat32(88, true), ampsSec: dv.getFloat32(92, true),
         minRunSec: dv.getFloat32(96, true), emitAvgMs: dv.getUint32(100, true),
@@ -1924,12 +1953,21 @@ function parseAltLogBin(buf) {
     };
     if (h.rowBytes !== ALTLOG_ROW_BYTES) return null;
     for (let i = 120; i < 136; i++) { const c = dv.getUint8(i); if (!c) break; h.fw += String.fromCharCode(c); }
-    const avail = Math.floor((buf.byteLength - ALTLOG_HDR_BYTES) / ALTLOG_ROW_BYTES);
+    if (ver >= 2) {                       // straightness-gate block, appended after fw[16]
+        h.rpmLineRms = dv.getFloat32(136, true);
+        h.rpmRateMax = dv.getFloat32(140, true);
+        h.dutyLineRms = dv.getFloat32(144, true);
+        h.dutySlewMax = dv.getFloat32(148, true);
+        h.ampsLinePct = dv.getFloat32(152, true);
+        h.ampsLineFloorA = dv.getFloat32(156, true);
+        h.leadSec = dv.getFloat32(160, true);
+    }
+    const avail = Math.floor((buf.byteLength - hdrBytes) / ALTLOG_ROW_BYTES);
     const n = Math.min(h.rowCount, avail);
     if (n < 1) return null;
     const rows = [];
     for (let i = 0; i < n; i++) {
-        const o = ALTLOG_HDR_BYTES + i * ALTLOG_ROW_BYTES;
+        const o = hdrBytes + i * ALTLOG_ROW_BYTES;
         rows.push({
             dtMs: dv.getUint16(o, true),
             rpm: dv.getInt16(o + 2, true),
@@ -1957,8 +1995,22 @@ function altLogToCsv(d) {
            ` deviceMs=${h.startMs} durMs=${h.durMs}`);
     L.push(`# fw=${h.fw} voltClass=${h.voltClass}V startTempF=${h.startTempF.toFixed(1)}` +
            ` startVbus=${h.startVbus.toFixed(2)} chargeStage=${h.chargeStage}`);
-    L.push(`# gates: emaSec=${h.emaSec} rpmTol=${h.rpmTol} dutyTolPct=${h.dutyTolPct} vbusTol=${h.vbusTol}` +
-           ` thermDegF=${h.thermDegF} thermSec=${h.thermSec} ampsTolPct=${h.ampsTolPct} ampsFloorA=${h.ampsFloorA}`);
+    // ver 2 recorded the straightness gate, ver 1 the max-minus-min band gate it replaced. Print the
+    // one that actually shaped the file: a header must never claim a gate that did not.
+    if (h.ver >= 2) {
+        L.push(`# gates: straightness emaSec=${h.emaSec} leadSec=${h.leadSec}` +
+               ` rpmLineRms=${h.rpmLineRms} rpmRateMax=${h.rpmRateMax}` +
+               ` dutyLineRms=${h.dutyLineRms} dutySlewMax=${h.dutySlewMax}` +
+               ` ampsLinePct=${h.ampsLinePct} ampsLineFloorA=${h.ampsLineFloorA}` +
+               ` vbusTol=${h.vbusTol} thermDegF=${h.thermDegF} thermSec=${h.thermSec}`);
+        L.push('# rpm/field/amps are judged by rms departure from a fitted line over their window (any');
+        L.push('# slope within the rate limits); vbus and tempF by highest-minus-lowest. The tempF window');
+        L.push('# trails continuously and is NOT reset by the eligibility barrier. amps and vbus are');
+        L.push('# delayed by leadSec before the window statistics, so they pair with the rpm that made them.');
+    } else {
+        L.push(`# gates: bands emaSec=${h.emaSec} rpmTol=${h.v1RpmTol} dutyTolPct=${h.v1DutyTolPct} vbusTol=${h.vbusTol}` +
+               ` thermDegF=${h.thermDegF} thermSec=${h.thermSec} ampsTolPct=${h.v1AmpsTolPct} ampsFloorA=${h.v1AmpsFloorA}`);
+    }
     L.push(`# dwells: rpmSec=${h.rpmSec} dutySec=${h.dutySec} vbusSec=${h.vbusSec} ampsSec=${h.ampsSec}` +
            ` minRunSec=${h.minRunSec} emitAvgMs=${h.emitAvgMs} axisScale=${h.axisScale.join('|')}`);
     L.push('# amps/rpm/fieldPct/vbus are EMA-filtered (emaSec) as the detector sees them; tempF is raw;');
@@ -3326,6 +3378,9 @@ function drawMotorPlot(){
   }
 }
 const CSV3_FIELDS = [
+    // GENERATED from CSV3_LIST in 3_functions.ino by compress_web.sh. Do not hand-edit:
+    // the next build overwrites it. Add a CSV3 field in the macro, not here. Trailing
+    // comments are preserved across regeneration by field name.
     "TemperatureLimitF",
     "BulkVoltage",
     "wavePeriod",
@@ -3490,19 +3545,19 @@ const CSV3_FIELDS = [
     "IgnoreRPM",
     "MinRPMForField",
     "AwBleedRate",
-    "KHard",                           // 183
-    "ReseedFrac",                      // shared across all four protections
+    "KHard",  // 183
+    "ReseedFrac",  // shared across all four protections
     "AwSeedProtectMs",
     "displayTempUnit",
-    "WarmupRampRate",                  // 189
-    "OvGroup1Enable",                  // 190
+    "WarmupRampRate",  // 189
+    "OvGroup1Enable",  // 190
     "OvGroup2Enable",
     "IExcessCeilA",
     "IExcessTau",
     "OutputPIDSigSrc",
-    "TdPred",                          // raw float (%.3f)
-    "OvMeasMarginV",                   // raw float (%.3f)
-    "OvPredMarginV",                   // raw float (%.3f)
+    "TdPred",  // raw float (%.3f)
+    "OvMeasMarginV",  // raw float (%.3f)
+    "OvPredMarginV",  // raw float (%.3f)
     "OutputPIDMA_N",
     "OutputPIDFilterTC",
     "VoltageFilterTC",
@@ -3566,127 +3621,125 @@ const CSV3_FIELDS = [
     "Ymin4",
     "Ymax4",
     "LoadDumpDtThresh3",
-    "hardwarePresent",                 // moved from CSV2
-    "testProtectionsEnabled",         // runtime flag — not persisted, resets true (enabled) on boot
-    "IExcessArmMarginV",              // raw float (%.3f) — iExcess voltage gate margin
-    "FastSetpointRiseRate",           // ×100, 1 decimal — multiplier on setpoint rise slew during post-protection recovery
-    "FastSetpointRiseWindowMs",       // raw ms — hard upper bound on fast-rise window
-    "FastSetpointRiseHeadroomV",      // ×100, 2 decimal — V below target at which fast-rise gate stays open
-    "SolarWatts",                     // moved from CSV2
-    "performanceRatio",               // moved from CSV2 (÷100 for display)
-    "VeData",                         // moved from CSV2 (0/1)
-    "NMEA0183Data",                   // moved from CSV2 (0/1)
-    "NMEA2KData",                     // moved from CSV2 (0/1)
-    "timeAxisModeChanging",           // moved from CSV2 (0/1)
-    "timeSourceMode",                // 0=auto, 1=NMEA, 2=Phone, 3=NTP — the CLOCK only; position is gpsPositionSource
-    "speedSourceMode",                // 0=NMEA 2000, 1=phone GPS (speed/course owner — selectable, never auto)
-    // Fast alt-current diagnostic knobs (Pattern B echo)
-    "faEnabled",                     // 0/1 — global ON/OFF
-    "faAlarmEnable",                 // 0/1 — FAULT drives audible alarm
-    "faAnomPause",                   // 0/1 — freeze anomaly flipbook slots
-    "faRpmEdgeMargin",               // RPM ×10
-    "faAmpsDriftFloorA",             // A ×100
-    "faAmpsDriftPct",                // percent ×10
-    "faAttenUpAmps",                 // A ×10
-    "faAttenDownAmps",               // A ×10
-    "faPeakMinA",                    // A ×100
-    "wifiNapEnabled",                // 0/1 — WiFi Napping standby toggle (Client only)
-    "imuHeelOffset",                 // captured rest heel offset (deg ×100) — moved from CSV2
-    "imuPitchOffset",                // captured rest pitch offset (deg ×100)
-    "systemIDTestType",              // 0=step, 1=sine sweep (Plant Delay test type)
-    "systemIDSineFreqStart",         // Hz ×10
-    "systemIDSineFreqEnd",           // Hz ×10
-    "systemIDSineCycles",            // analysed cycles per sweep frequency
-    "tuningWaveform",                // 0=square, 1=sine manual, 2=sine auto-sweep
-    "tuningSineFreq",                // Hz ×10 (manual sine frequency)
-    "tuningSweepStart",              // Hz ×10
-    "tuningSweepEnd",                // Hz ×10
-    "tuningSweepCycles",             // analysed cycles per sweep frequency
-    "SystemIDStabilizeAmps",         // A ×10 — plant-delay baseline/trough current
-    "tuningWaveFloor",               // A — Current Target Generator wave floor (trough), shared square + sine
-    "commissionState",               // auto-commissioning state: 0=not, 1=in-progress, 2=commissioned
-    "commissionPhase",               // current wizard phase: 0=Prep…8=Stress Test, 9=finished
-    "commissionDoneMask",            // per-stage completion bitmask (bit i = stage i done)
-    "cvHelpersEnabled",              // master switch: asymmetric KiDown unwind + CV D term (1=on)
-    "MinChargeTempF",                // cold-charge lockout floor on the active battery temperature (°F)
-    "coldChargeLockoutEnable",       // cold-charge lockout master on/off (1=on)
-    "cvGainMode",                    // CV gain mode: 0=Manual, 1=Auto (α/K anchored)
-    "cvPlantK",                      // measured plant gain K (V/A); ×10000
-    "cvComputedKp",                  // Auto-computed Kp (12V-equiv); ×100
-    "cvComputedKi",                  // Auto-computed Ki (12V-equiv); ×100
-    "cvCrossover",                   // CV crossover ω_c (rad/s); ×100
-    "cvPiZero",                      // CV PI integral zero ρ (rad/s); ×100
-    "vTgtRampUp",                    // CV voltage-target ramp UP rate (V/s); ×1000
-    "vTgtRampDn",                    // CV voltage-target ramp DOWN rate (V/s); ×1000
-    "vTgtRampEnable",                // CV voltage-target slew master switch (0/1)
-    "setpointSlewEnable",            // inner-loop current setpoint slew master switch (0/1)
-    "cvRiseGovEnable",               // CV rise governor / anti-windup master switch (0/1)
-    "dutySlewEnable",                // field duty slew master switch (0/1)
-    "CommissionTempF",               // board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset)
-    "battTempDerateEnable",          // battery-temp gain derate master on/off (0/1)
-    "battTempCoeff",                 // battery fractional resistance change per °C; ×10000
-    "TempPIDKiDownFrac",             // thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000
-    "ThermalSlopeWindowSec",         // thermal slope backward-difference window (s); integer
-    "BattCurrentLimitA",             // max battery charge current (A ×10, G4); 0 = disabled — ceiling on the alternator command = limit + house-load offset
-    // measured-ripple capture admission gates (§10.8/§11) — own knobs, decoupled from the fa* detector gates
-    "ripWinMs",                      // pk-pk capture window (ms, integer)
-    "ripDriftFloorA",                // shared floor: command gate + stationarity mean-shift tolerance (A ×100)
-    "ripDriftPct",                   // command-travel gate slope (% of mean, ×10)
-    "SocAlarmLow",                   // low-SoC alarm threshold (%, integer); 0 = disabled
-    "battMaxMode",                   // battery V/I plot sampling: 0 = window mean, 1 = max-magnitude
-    "IExcessBaseA",                  // over-current trip-line intercept / CV base (A ×10)
-    "IExcessCcOffsetA",              // CC trip line offset above CV (A ×10)
+    "hardwarePresent",  // moved from CSV2
+    "testProtectionsEnabled",  // runtime flag — not persisted, resets true (enabled) on boot
+    "IExcessArmMarginV",  // raw float (%.3f) — iExcess voltage gate margin
+    "FastSetpointRiseRate",  // ×100, 1 decimal — multiplier on setpoint rise slew during post-protection recovery
+    "FastSetpointRiseWindowMs",  // raw ms — hard upper bound on fast-rise window
+    "FastSetpointRiseHeadroomV",  // ×100, 2 decimal — V below target at which fast-rise gate stays open
+    "SolarWatts",  // moved from CSV2
+    "performanceRatio",  // moved from CSV2 (÷100 for display)
+    "VeData",  // moved from CSV2 (0/1)
+    "NMEA0183Data",  // moved from CSV2 (0/1)
+    "NMEA2KData",  // moved from CSV2 (0/1)
+    "timeAxisModeChanging",  // moved from CSV2 (0/1)
+    "timeSourceMode",  // 0=auto, 1=NMEA, 2=Phone, 3=NTP — the CLOCK only; position is gpsPositionSource
+    "speedSourceMode",  // 0=NMEA 2000, 1=phone GPS (speed/course owner — selectable, never auto)
+    "faEnabled",  // 0/1 — global ON/OFF
+    "faAlarmEnable",  // 0/1 — FAULT drives audible alarm
+    "faAnomPause",  // 0/1 — freeze anomaly flipbook slots
+    "faRpmEdgeMargin",  // RPM ×10
+    "faAmpsDriftFloorA",  // A ×100
+    "faAmpsDriftPct",  // percent ×10
+    "faAttenUpAmps",  // A ×10
+    "faAttenDownAmps",  // A ×10
+    "faPeakMinA",  // A ×100
+    "wifiNapEnabled",  // 0/1 — WiFi Napping standby toggle (Client only)
+    "imuHeelOffset",  // captured rest heel offset (deg ×100) — moved from CSV2
+    "imuPitchOffset",  // captured rest pitch offset (deg ×100)
+    "systemIDTestType",  // 0=step, 1=sine sweep (Plant Delay test type)
+    "systemIDSineFreqStart",  // Hz ×10
+    "systemIDSineFreqEnd",  // Hz ×10
+    "systemIDSineCycles",  // analysed cycles per sweep frequency
+    "tuningWaveform",  // 0=square, 1=sine manual, 2=sine auto-sweep
+    "tuningSineFreq",  // Hz ×10 (manual sine frequency)
+    "tuningSweepStart",  // Hz ×10
+    "tuningSweepEnd",  // Hz ×10
+    "tuningSweepCycles",  // analysed cycles per sweep frequency
+    "SystemIDStabilizeAmps",  // A ×10 — plant-delay baseline/trough current
+    "tuningWaveFloor",  // A — Current Target Generator wave floor (trough), shared square + sine
+    "commissionState",  // auto-commissioning state: 0=not, 1=in-progress, 2=commissioned
+    "commissionPhase",  // current wizard phase: 0=Prep…9=Charge Health Calibration, 10=finished
+    "commissionDoneMask",  // per-stage completion bitmask (bit i = stage i done)
+    "cvHelpersEnabled",  // master switch: asymmetric KiDown unwind + CV D term (1=on)
+    "MinChargeTempF",  // cold-charge lockout floor on the active battery temperature (°F)
+    "coldChargeLockoutEnable",  // cold-charge lockout master on/off (1=on)
+    "cvGainMode",  // CV gain mode: 0=Manual, 1=Auto (α/K anchored)
+    "cvPlantK",  // measured plant gain K (V/A); ×10000
+    "cvComputedKp",  // Auto-computed Kp (12V-equiv); ×100
+    "cvComputedKi",  // Auto-computed Ki (12V-equiv); ×100
+    "cvCrossover",  // CV crossover ω_c (rad/s); ×100
+    "cvPiZero",  // CV PI integral zero ρ (rad/s); ×100
+    "vTgtRampUp",  // CV voltage-target ramp UP rate (V/s); ×1000
+    "vTgtRampDn",  // CV voltage-target ramp DOWN rate (V/s); ×1000
+    "vTgtRampEnable",  // CV voltage-target slew master switch (0/1)
+    "setpointSlewEnable",  // inner-loop current setpoint slew master switch (0/1)
+    "cvRiseGovEnable",  // CV rise governor / anti-windup master switch (0/1)
+    "dutySlewEnable",  // field duty slew master switch (0/1)
+    "CommissionTempF",  // board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset)
+    "battTempDerateEnable",  // battery-temp gain derate master on/off (0/1)
+    "battTempCoeff",  // battery fractional resistance change per °C; ×10000
+    "TempPIDKiDownFrac",  // thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000
+    "ThermalSlopeWindowSec",  // thermal slope backward-difference window (s); integer
+    "BattCurrentLimitA",  // max battery charge current (A ×10, G4); 0 = disabled — ceiling on the alternator command = limit + house-load offset
+    "ripWinMs",  // pk-pk capture window (ms, integer)
+    "ripDriftFloorA",  // shared floor: command gate + stationarity mean-shift tolerance (A ×100)
+    "ripDriftPct",  // command-travel gate slope (% of mean, ×10)
+    "SocAlarmLow",  // low-SoC alarm threshold (%, integer); 0 = disabled
+    "battMaxMode",  // battery V/I plot sampling: 0 = window mean, 1 = max-magnitude
+    "IExcessBaseA",  // over-current trip-line intercept / CV base (A ×10)
+    "IExcessCcOffsetA",  // CC trip line offset above CV (A ×10)
     "BatteryShuntPresent",
-    "cvRecovEnable",                 // post-protection integrator-refill master switch (0/1)
-    "cvRecovSec",                    // retired timed-window knob; slot kept (never repurpose); ×10
-    "cvRecovEmaxV",                  // retired timed-window knob; slot kept (never repurpose); ×1000
-    "testSlewMode",                  // manual CC square-wave test slew mode (0=off, 1=default, 2=custom)
-    "cvTestSlewMode",                // manual CV square-wave test slew mode (0=off, 1=default, 2=custom)
-    "CvKdOneSided",                  // CV D-term mode: 1=one-sided (removes current only), 0=two-sided (also adds below target)
-    "fieldDecayTauMs",               // commissioned field drain time (ms) — worst-case endpoint of the drain-vs-RPM line, or the flat value
-    "commissionManualMask",          // per-stage set-by-hand bitmask (skip / mark-done-manually); pairs with commissionDoneMask
-    "CvKdMaxTrimA",                  // CV D-term back-off ceiling (A ×10)
-    "cvAlpha",                       // CV auto-gain aggressiveness α (fraction of deadbeat-ohmic gain); ×1000
-    "CvKdSlopeCeil",                 // CV D-term slope ceiling (V/s real per-bus ×10)
-    "cvComputedKd",                  // Auto-computed D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100
-    "CvKdDbSlope",                   // CV D-term deadband line slope (V/s per A ×10000)
-    "CvKdDbFloor",                   // CV D-term deadband line floor (V/s ×100)
-    "CvKdDbCeil",                    // CV D-term deadband line ceiling (V/s ×100)
-    "cvRecovBoostEnable",            // post-protection recovery P-boost master switch (0/1)
-    "cvRecovBoostMax",               // recovery P-boost max multiplier at full shortfall; ×100
-    "cvRecovBoostErrV",              // recovery P-boost full-boost shortfall (V per 12V block); ×1000
-    "fdDrainLoMs",                   // drain-vs-RPM line: drain (ms) at fdDrainRpmLo; 0 = no line (flat fieldDecayTauMs)
-    "fdDrainHiMs",                   // drain-vs-RPM line: drain (ms) at fdDrainRpmHi
-    "fdDrainRpmLo",                  // drain-vs-RPM line: lowest tested RPM (lookup clamps here)
-    "fdDrainRpmHi",                  // drain-vs-RPM line: highest tested RPM (lookup clamps here)
-    "HardOCEnable",                  // Group 0 hard over-current trip enable (0/1)
-    "IExcessEnable",                 // Group 3 iExcess detectors enable (0/1)
-    "BattLimitEnable",               // Group 4 battery charge-current ceiling enable (0/1)
-    "CvKdExcessMode",                // CV D-term response shape (1 = gradual excess-over-line, 0 = legacy stepped latch)
-    "CvStressDropV",                 // stress-test target headroom below settled idle (V 12V-equiv ×100)
-    "CvStressFailBandV",             // stress-test stability fail band (V 12V-equiv ×100)
-    "CvBrakeFallRate",               // brake-tier setpoint fall rate while CV D-term removes current (A/s ×100)
-    "cvRecovKiMax",                  // refill Ki multiplier at release, tapering to 1x as the deficit heals; ×100
-    "cvWindDownEnable",              // commanded-target wind-down governor master switch (0/1)
-    "cvWindDownRate",                // wind-down shed rate (fraction of max alternator amps per second); ×1000
-    "cvWindDownStopV",               // wind-down stop margin above commanded target (V); ×1000
-    "LoadDumpEnable",                // Group 5 load dump enable (0/1)
-    "loadServeBoostEnable",          // load-serve Ki boost toward measured house loads (0/1, shunt-gated)
-    "reseedCorrEnable",              // demand-corrected reseed: load-drop subtraction + rapid-refire rebase (0/1)
-    "HuntGovEnable",                 // oscillation damper master switch (0/1)
-    "ReseedFracNoShunt",             // no-shunt recovery seed fraction (×100)
-    "CvRecovClimbRate",              // recovery climb floor rate, fraction of MaxTableValue/s (×100)
-    "protTestCutMs",                 // protection-test manual hard-cut hold (ms)
-    "protTestGapMs",                 // protection-test gap between repeated cuts (ms)
-    "protTestReps",                  // protection-test repeat count
-    "protTestAmps",                  // protection-test energize target current (A); 0 = auto-seed at fire
-    "cvRecovBoostFloorV",            // recovery P-boost dead area below target (V per 12V block); ×1000
-    "cvRecovDeepBandV",              // deep-recovery band (V per 12V block); ×1000
-    "cvRecovDeepMult",               // starve-walk rate multiplier at full depth; ×100
-    "cvRecovFlareBandV",             // arrival flare band (V per 12V block); ×1000
-    "cvRecovFlareFrac",              // arrival flare ceiling floor, fraction of recovery goal; ×100
-    "TachLieEnable",                 // tach-lie plausibility cut enable (0/1)
-    "n2kTxEnable",                   // NMEA2000 transmit master (0/1)
+    "cvRecovEnable",  // post-protection integrator-refill master switch (0/1)
+    "cvRecovSec",  // retired timed-window knob; slot kept (never repurpose); ×10
+    "cvRecovEmaxV",  // retired timed-window knob; slot kept (never repurpose); ×1000
+    "testSlewMode",  // manual CC square-wave test slew mode (0=off, 1=default, 2=custom)
+    "cvTestSlewMode",  // manual CV square-wave test slew mode (0=off, 1=default, 2=custom)
+    "CvKdOneSided",  // CV D-term mode: 1=one-sided (removes current only), 0=two-sided (also adds below target)
+    "fieldDecayTauMs",  // commissioned field drain time (ms) — worst-case endpoint of the drain-vs-RPM line, or the flat value
+    "commissionManualMask",  // per-stage set-by-hand bitmask (skip / mark-done-manually); pairs with commissionDoneMask
+    "CvKdMaxTrimA",  // CV D-term back-off ceiling (A ×10)
+    "cvAlpha",  // CV auto-gain aggressiveness α (fraction of deadbeat-ohmic gain); ×1000
+    "CvKdSlopeCeil",  // CV D-term slope ceiling (V/s real per-bus ×10)
+    "cvComputedKd",  // Auto-computed D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100
+    "CvKdDbSlope",  // CV D-term deadband line slope (V/s per A ×10000)
+    "CvKdDbFloor",  // CV D-term deadband line floor (V/s ×100)
+    "CvKdDbCeil",  // CV D-term deadband line ceiling (V/s ×100)
+    "cvRecovBoostEnable",  // post-protection recovery P-boost master switch (0/1)
+    "cvRecovBoostMax",  // recovery P-boost max multiplier at full shortfall; ×100
+    "cvRecovBoostErrV",  // recovery P-boost full-boost shortfall (V per 12V block); ×1000
+    "fdDrainLoMs",  // drain-vs-RPM line: drain (ms) at fdDrainRpmLo; 0 = no line (flat fieldDecayTauMs)
+    "fdDrainHiMs",  // drain-vs-RPM line: drain (ms) at fdDrainRpmHi
+    "fdDrainRpmLo",  // drain-vs-RPM line: lowest tested RPM (lookup clamps here)
+    "fdDrainRpmHi",  // drain-vs-RPM line: highest tested RPM (lookup clamps here)
+    "HardOCEnable",  // Group 0 hard over-current trip enable (0/1)
+    "IExcessEnable",  // Group 3 iExcess detectors enable (0/1)
+    "BattLimitEnable",  // Group 4 battery charge-current ceiling enable (0/1)
+    "CvKdExcessMode",  // CV D-term response shape (1 = gradual excess-over-line, 0 = legacy stepped latch)
+    "CvStressDropV",  // stress-test target headroom below settled idle (V 12V-equiv ×100)
+    "CvStressFailBandV",  // stress-test stability fail band (V 12V-equiv ×100)
+    "CvBrakeFallRate",  // brake-tier setpoint fall rate while CV D-term removes current (A/s ×100)
+    "cvRecovKiMax",  // refill Ki multiplier at release, tapering to 1x as the deficit heals; ×100
+    "cvWindDownEnable",  // commanded-target wind-down governor master switch (0/1)
+    "cvWindDownRate",  // wind-down shed rate (fraction of max alternator amps per second); ×1000
+    "cvWindDownStopV",  // wind-down stop margin above commanded target (V); ×1000
+    "LoadDumpEnable",  // Group 5 load dump enable (0/1)
+    "loadServeBoostEnable",  // load-serve Ki boost toward measured house loads (0/1, shunt-gated)
+    "reseedCorrEnable",  // demand-corrected reseed: load-drop subtraction + rapid-refire rebase (0/1)
+    "HuntGovEnable",  // oscillation damper master switch (0/1)
+    "ReseedFracNoShunt",  // no-shunt recovery seed fraction (×100)
+    "CvRecovClimbRate",  // recovery climb floor rate, fraction of MaxTableValue/s (×100)
+    "protTestCutMs",  // protection-test manual hard-cut hold (ms)
+    "protTestGapMs",  // protection-test gap between repeated cuts (ms)
+    "protTestReps",  // protection-test repeat count
+    "protTestAmps",  // protection-test energize target current (A); 0 = auto-seed at fire
+    "cvRecovBoostFloorV",  // recovery P-boost dead area below target (V per 12V block); ×1000
+    "cvRecovDeepBandV",  // deep-recovery band (V per 12V block); ×1000
+    "cvRecovDeepMult",  // starve-walk rate multiplier at full depth; ×100
+    "cvRecovFlareBandV",  // arrival flare band (V per 12V block); ×1000
+    "cvRecovFlareFrac",  // arrival flare ceiling floor, fraction of recovery goal; ×100
+    "TachLieEnable",  // tach-lie plausibility cut enable (0/1)
+    "n2kTxEnable",  // NMEA2000 transmit master (0/1)
     "n2kDeviceInstance",
     "n2kBattEnable",
     "n2kBattInstance",
@@ -3695,70 +3748,70 @@ const CSV3_FIELDS = [
     "n2kAltInstance",
     "n2kAltTempEnable",
     "n2kTempInstance",
-    "n2kTempSource",                 // tN2kTempSource code (3 = Engine Room)
+    "n2kTempSource",  // tN2kTempSource code (3 = Engine Room)
     "n2kChgrEnable",
     "n2kChgrInstance",
-    "n2kChgrCfgEnable",              // 127510 charger configuration, carries field drive % (0/1)
-    "n2kChgrMode",                   // tN2kChargerMode label: 0 Standalone, 1 Primary, 2 Secondary
+    "n2kChgrCfgEnable",  // 127510 charger configuration, carries field drive % (0/1)
+    "n2kChgrMode",  // tN2kChargerMode label: 0 Standalone, 1 Primary, 2 Secondary
     "n2kEngRpmEnable",
     "n2kEngInstance",
     "n2kEngDynEnable",
     "n2kEngBitsEnable",
-    "n2kRxBattInstance",             // battery instance to ingest (127508/127506 receive)
-    "dvccEn",                        // DVCC follow master (0/1)
-    "dvccSrcType",                   // authority dialect: 0 Victron VE.Can (VREG), 1 RV-C
-    "dvccInst",                      // RV-C DC instance filter (0 = any)
-    "dvccSilenceS",                  // silence timeout (s)
-    "dvccSettleS",                   // settling time (s)
-    "dvccCvlMin",                    // plausible-CVL window low (V ×100)
-    "dvccCvlMax",                    // plausible-CVL window high (V ×100)
-    "HuntCutPct",                    // damper test/pocket gain, % of user Ki
-    "HuntVerifyPct",                 // damper verify bar, % ripple reduction required
-    "HuntWingPct",                   // damper pocket taper width, % of speed per side
-    "HuntCooldownMin",               // damper retest cooldown after a failed test (min)
-    "HuntSteadyPct",                 // damper engine-speed steadiness tolerance (%)
-    "HuntQualifyScans",              // damper wobble-confirm scan count (1.6 s each)
-    "HuntTrigPct",                   // damper detection bar: peak-bin duty swing % (x100)
-    "NMEA0183Baud",                  // NMEA 0183 serial baud (4800 / 9600 / 19200 / 38400)
-    "NMEA0183Invert",                // NMEA 0183 polarity: 0 RS-232-level talker, 1 TTL-level talker
-    "displayVolUnit",                // fuel volume display preference: 0 US gallons, 1 litres
-    "gpsPositionSource",             // 0=auto, 1=NMEA, 2=Phone — position only; the clock is timeSourceMode
-    "MaxFieldVolts",                 // field-volt cap x10; the ceiling it produces is CSV2 fieldDutyCeil
-    "OvTierLoMarginV",               // timed OV cut LOW-tier margin above target (raw float V, %.3f)
-    "OvTierLoDwellMs",               // timed OV cut LOW-tier continuous dwell (ms; 0 = tier off)
-    "OvTierMidMarginV",              // timed OV cut MID-tier margin above target (raw float V, %.3f)
-    "OvTierMidDwellMs",              // timed OV cut MID-tier continuous dwell (ms; 0 = tier off)
-    "VoltageHardwareLimit",          // INA228 hardware shutdown voltage x100 — top OV-ladder rung
-    "LoadDumpN1",                    // load-dump tier 1 consecutive-sample count
-    "LoadDumpN2",                    // load-dump tier 2 consecutive-sample count
-    "LoadDumpN3",                    // load-dump tier 3 consecutive-sample count
-    "solarLearnEnable",              // 0/1 learn the performance ratio from each complete ledger day
-    "solarUseConsEnable",            // 0/1 size the solar-pause bar from predicted consumption
-    "solarConsMarginPct",            // x100 (%)
-    "solarLearnRatePct",             // x100 (%)
-    "rvcTxEnable",                   // 0/1 RV-C transmit master (bus mode applied at boot)
-    "rvcChgrEnable",                 // 0/1 RV-C charger DGNs
-    "rvcDcEnable",                   // 0/1 RV-C DC source DGNs at the alternator instance
-    "rvcFaultEnable",                // 0/1 RV-C DM_RV diagnostic message
-    "rvcChgrInstance",               // RV-C charger instance
-    "rvcDcInstance",                 // RV-C DC source instance
-    "rvcDevPriority",                // RV-C device priority
-    "battTempProbeEnable",           // 0/1 BATT-role probe feeds the battery temperature
-    "extraTempProbeEnable",          // 0/1 EXTRA-role probe reported / alarmed / transmitted
-    "battTempSource",                // 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 Board, 6 None
-    "battTempProxyEnable",           // 0/1 board temperature may stand in when Auto finds no measurement
-    "hotChargeLockoutEnable",        // hot-charge lockout master on/off (1=on)
-    "MaxChargeTempF",                // hot-charge lockout ceiling (°F)
-    "extraTempAlarmHiEnable",        // 0/1 extra-probe high alarm
-    "extraTempAlarmHiF",             // extra-probe high alarm threshold (°F)
-    "extraTempAlarmLoEnable",        // 0/1 extra-probe low alarm
-    "extraTempAlarmLoF",             // extra-probe low alarm threshold (°F)
-    "n2kExtraTempEnable",            // 0/1 PGN 130312 for the extra probe
-    "n2kExtraTempInstance",          // extra-probe temperature instance (0..252)
-    "n2kExtraTempSource",            // tN2kTempSource code for the extra probe
-    "CommissionTempSrc",             // battTempActiveSrc when CommissionTempF was stamped (0 = legacy = board)
-    "sessionId",                     // device boot identity, same in every channel this boot
-    "sendMs",                        // device millis() when this settings echo was built; event-driven with a 60 s fallback
+    "n2kRxBattInstance",  // battery instance to ingest (127508/127506 receive)
+    "dvccEn",  // DVCC follow master (0/1)
+    "dvccSrcType",  // authority dialect: 0 Victron VE.Can (VREG), 1 RV-C
+    "dvccInst",  // RV-C DC instance filter (0 = any)
+    "dvccSilenceS",  // silence timeout (s)
+    "dvccSettleS",  // settling time (s)
+    "dvccCvlMin",  // plausible-CVL window low (V ×100)
+    "dvccCvlMax",  // plausible-CVL window high (V ×100)
+    "HuntCutPct",  // damper test/pocket gain, % of user Ki
+    "HuntVerifyPct",  // damper verify bar, % ripple reduction required
+    "HuntWingPct",  // damper pocket taper width, % of speed per side
+    "HuntCooldownMin",  // damper retest cooldown after a failed test (min)
+    "HuntSteadyPct",  // damper engine-speed steadiness tolerance (%)
+    "HuntQualifyScans",  // damper wobble-confirm scan count (1.6 s each)
+    "HuntTrigPct",  // damper detection bar: peak-bin duty swing % (x100)
+    "NMEA0183Baud",  // NMEA 0183 serial baud (4800 / 9600 / 19200 / 38400)
+    "NMEA0183Invert",  // NMEA 0183 polarity: 0 RS-232-level talker, 1 TTL-level talker
+    "displayVolUnit",  // fuel volume display preference: 0 US gallons, 1 litres
+    "gpsPositionSource",  // 0=auto, 1=NMEA, 2=Phone — position only; the clock is timeSourceMode
+    "MaxFieldVolts",  // field-volt cap x10; the ceiling it produces is CSV2 fieldDutyCeil
+    "OvTierLoMarginV",  // timed OV cut LOW-tier margin above target (raw float V, %.3f)
+    "OvTierLoDwellMs",  // timed OV cut LOW-tier continuous dwell (ms; 0 = tier off)
+    "OvTierMidMarginV",  // timed OV cut MID-tier margin above target (raw float V, %.3f)
+    "OvTierMidDwellMs",  // timed OV cut MID-tier continuous dwell (ms; 0 = tier off)
+    "VoltageHardwareLimit",  // INA228 hardware shutdown voltage x100 — top OV-ladder rung
+    "LoadDumpN1",  // load-dump tier 1 consecutive-sample count
+    "LoadDumpN2",  // load-dump tier 2 consecutive-sample count
+    "LoadDumpN3",  // load-dump tier 3 consecutive-sample count
+    "solarLearnEnable",  // 0/1 learn the performance ratio from each complete ledger day
+    "solarUseConsEnable",  // 0/1 size the solar-pause bar from predicted consumption
+    "solarConsMarginPct",  // x100 (%)
+    "solarLearnRatePct",  // x100 (%)
+    "rvcTxEnable",  // 0/1 RV-C transmit master (bus mode applied at boot)
+    "rvcChgrEnable",  // 0/1 RV-C charger DGNs
+    "rvcDcEnable",  // 0/1 RV-C DC source DGNs at the alternator instance
+    "rvcFaultEnable",  // 0/1 RV-C DM_RV diagnostic message
+    "rvcChgrInstance",  // RV-C charger instance
+    "rvcDcInstance",  // RV-C DC source instance
+    "rvcDevPriority",  // RV-C device priority
+    "battTempProbeEnable",  // 0/1 BATT-role probe feeds the battery temperature
+    "extraTempProbeEnable",  // 0/1 EXTRA-role probe reported / alarmed / transmitted
+    "battTempSource",  // 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 Board, 6 None
+    "battTempProxyEnable",  // 0/1 board temperature may stand in when Auto finds no measurement
+    "hotChargeLockoutEnable",  // hot-charge lockout master on/off (1=on)
+    "MaxChargeTempF",  // hot-charge lockout ceiling (°F)
+    "extraTempAlarmHiEnable",  // 0/1 extra-probe high alarm
+    "extraTempAlarmHiF",  // extra-probe high alarm threshold (°F)
+    "extraTempAlarmLoEnable",  // 0/1 extra-probe low alarm
+    "extraTempAlarmLoF",  // extra-probe low alarm threshold (°F)
+    "n2kExtraTempEnable",  // 0/1 PGN 130312 for the extra probe
+    "n2kExtraTempInstance",  // extra-probe temperature instance (0..252)
+    "n2kExtraTempSource",  // tN2kTempSource code for the extra probe
+    "CommissionTempSrc",  // battTempActiveSrc when CommissionTempF was stamped (0 = legacy = board)
+    "sessionId",  // device boot identity, same in every channel this boot
+    "sendMs",  // device millis() when this settings echo was built; event-driven with a 60 s fallback
 ];
 const TS_FIELDS = [
     "ts_HeadingNMEA",
@@ -3876,7 +3929,18 @@ async function probeIdentify(base, timeoutMs) {
         if (!resp.ok) return null;
         const info = await resp.json();
         if (!info || info.device !== 'xreg-010') return null;
-        return { base: base, fw: (typeof info.fw === 'string') ? info.fw : null };
+        const str = v => (typeof v === 'string' && v) ? v : null;
+        // uid is the identity everything downstream pins to. Firmware older than the two-unit
+        // work answers without uid/name/host; those fields stay null and the app degrades to
+        // its old address-only behaviour rather than refusing to connect.
+        return {
+            base: base,
+            fw: str(info.fw),
+            uid: str(info.uid),
+            name: str(info.name),
+            host: str(info.host),
+            ap: str(info.ap)
+        };
     } catch (e) {
         return null;
     } finally {
@@ -3884,16 +3948,42 @@ async function probeIdentify(base, timeoutMs) {
     }
 }
 
-// Probe a list in parallel; resolves with the first {base, fw} that identifies, or null.
-function probeFirstHit(bases, timeoutMs) {
+// Probe a list in parallel and resolve with EVERY regulator that identified, not just the
+// first. First-hit-wins is what let a second unit on the same LAN take the connection over
+// silently: the winner was decided by a few ms of RTT and nothing downstream ever checked
+// which board it was. wantUid short-circuits the wait — a pinned unit answering is never
+// ambiguous, so the common single-regulator launch is as fast as it ever was.
+const DISCOVERY_STRAGGLER_MS = 450;   // after the first answer, how long to keep listening for a second unit
+const isIpBase = b => /^https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(b || '');
+
+function probeRound(bases, timeoutMs, wantUid) {
     return new Promise((resolve) => {
         let pending = bases.length;
-        let won = false;
-        if (!pending) { resolve(null); return; }
+        const hits = [];
+        let done = false, straggler = null;
+        if (!pending) { resolve(hits); return; }
+        const finish = () => {
+            if (done) return;
+            done = true;
+            if (straggler) clearTimeout(straggler);
+            resolve(hits);
+        };
         bases.forEach(base => {
             probeIdentify(base, timeoutMs).then(hit => {
-                if (hit && !won) { won = true; resolve(hit); }
-                if (--pending === 0 && !won) resolve(null);
+                if (hit) {
+                    // One unit answers on several bases (its mDNS name, its IP, the remembered
+                    // base). Fold them by uid, and keep the numeric address: a .local name can
+                    // resolve to the OTHER regulator, an IP cannot.
+                    const dup = hit.uid ? hits.find(h => h.uid === hit.uid) : null;
+                    if (dup) {
+                        if (isIpBase(hit.base) && !isIpBase(dup.base)) dup.base = hit.base;
+                    } else {
+                        hits.push(hit);
+                        if (wantUid && hit.uid === wantUid) { finish(); return; }
+                        if (!straggler) straggler = setTimeout(finish, DISCOVERY_STRAGGLER_MS);
+                    }
+                }
+                if (--pending === 0) finish();
             });
         });
     });
@@ -3926,13 +4016,31 @@ async function bindWifiNetwork() {
 
 // Android's resolver generally will not answer .local, so the native side does the mDNS
 // query and hands back an address to probe instead. Rejection = fall through unchanged.
+// Android only, and only in an app built since the two-regulator work: one mDNS browse returns
+// every regulator by its own per-unit name. Beats asking for a shared name that either unit can
+// answer to. Absent plugin or older APK → empty list, and discovery falls through to the probes
+// exactly as it did before.
+async function browseRegulatorHosts() {
+    const P = IS_CAPACITOR && window.Capacitor.Plugins && window.Capacitor.Plugins.XEngNet;
+    if (!P || !P.browseRegulators) return [];
+    try {
+        const r = await P.browseRegulators();
+        return (r && Array.isArray(r.units)) ? r.units : [];
+    } catch (e) {
+        return [];
+    }
+}
+
 async function resolveLocalHost(host) {
     const P = IS_CAPACITOR && window.Capacitor.Plugins && window.Capacitor.Plugins.XEngNet;
     if (!P || !P.resolveLocal) return null;
     try { const r = await P.resolveLocal({ host: host }); return (r && r.ip) || null; } catch (e) { return null; }
 }
 
-async function discoverDeviceBase() {
+// Returns EVERY regulator that answered, so the caller can pin one instead of taking whichever
+// replied first. wantUid (the remembered unit) ends a round early and keeps the LAN sweep going
+// past a batch that only found its neighbour.
+async function discoverDeviceBase(wantUid, exhaustive) {
     await bindWifiNetwork();   // every discovery path lands here — bind before the first probe
     // Round 1: mDNS name, the regulator's own access-point gateway, and the last
     // address that worked, all probed in parallel — extra candidates cost no time.
@@ -3940,12 +4048,38 @@ async function discoverDeviceBase() {
     // the device in round 1 instead of falling through to the /24 sweep. In WiFi
     // CONFIG mode that address serves the setup portal, which has no /identify, so
     // the probe misses and the hotspot hint banner still wins that case.
+    // A pinned unit's own mDNS name is tried FIRST and resolves past the alternator.local
+    // race entirely: two regulators both answer to alternator.local, only one answers to
+    // xreg-<uid6>.local.
+    const first = [];
+    const wantHost = localStorage.getItem('xregDeviceHost');
+    if (wantUid && wantHost) {
+        const ownIp = await resolveLocalHost(wantHost);
+        first.push(ownIp ? 'http://' + ownIp : 'http://' + wantHost);
+    }
+    // Android: every unit, by name, in one browse — so a two-regulator boat is seen as two in
+    // round 1 rather than discovered one batch at a time in the LAN sweep.
+    (await browseRegulatorHosts()).forEach(u => {
+        const b = u && u.ip ? 'http://' + u.ip : (u && u.host ? 'http://' + u.host : null);
+        if (b && first.indexOf(b) === -1) first.push(b);
+    });
     const mdnsIP = await resolveLocalHost('alternator.local');
-    const first = [mdnsIP ? 'http://' + mdnsIP : 'http://alternator.local', 'http://192.168.4.1'];
+    first.push(mdnsIP ? 'http://' + mdnsIP : 'http://alternator.local', 'http://192.168.4.1');
     const last = localStorage.getItem('xregDeviceBase');
     if (last && first.indexOf(last) === -1) first.push(last);
-    let hit = await probeFirstHit(first, 2500);
-    if (hit) return hit;
+    const found = [];
+    const merge = list => list.forEach(h => {
+        const dup = h.uid ? found.find(f => f.uid === h.uid) : null;
+        if (dup) { if (isIpBase(h.base) && !isIpBase(dup.base)) dup.base = h.base; }
+        else found.push(h);
+    });
+    // exhaustive (Switch Regulator): every round runs to its end and no probe stops on the pinned
+    // unit — the point is the list, not the first answer. Otherwise a pinned unit ends the search the
+    // moment it answers, and an unpinned launch takes the first unit that does.
+    const probeUid = exhaustive ? null : wantUid;
+    const settled = () => !exhaustive && (wantUid ? found.some(h => h.uid === wantUid) : found.length > 0);
+    merge(await probeRound(first, 2500, probeUid));
+    if (settled()) return found;
 
     setSplashText('Searching for regulator');
 
@@ -3955,13 +4089,13 @@ async function discoverDeviceBase() {
     // (the hotspot side lives on ap1/bridge interfaces).
     const hotspot = [];
     for (let h = 2; h <= 14; h++) hotspot.push('http://172.20.10.' + h);
-    hit = await probeFirstHit(hotspot, 1500);
-    if (hit) return hit;
+    merge(await probeRound(hotspot, 1500, probeUid));
+    if (settled()) return found;
 
     // Round 3: router LAN — needs our own IPv4 to pick the /24. ~11 s worst case.
     const ownIP = await getPhoneIPv4();
     console.log('[DISCOVERY] phone IPv4: ' + (ownIP || 'unavailable'));
-    if (!ownIP || ownIP.indexOf('172.20.10.') === 0) return null;
+    if (!ownIP || ownIP.indexOf('172.20.10.') === 0) return found;
     const prefix = ownIP.slice(0, ownIP.lastIndexOf('.') + 1);
     for (let start = 1; start <= 254; start += 25) {
         const batch = [];
@@ -3969,11 +4103,176 @@ async function discoverDeviceBase() {
             const cand = prefix + h;
             if (cand !== ownIP) batch.push('http://' + cand);
         }
-        hit = await probeFirstHit(batch, 1000);
-        if (hit) return hit;
+        merge(await probeRound(batch, 1000, probeUid));
+        // A pinned unit keeps the sweep running past a batch that only held its neighbour.
+        if (settled()) return found;
     }
-    return null;
+    return found;
 }
+
+
+// ── Which regulator are we talking to? ──────────────────────────────────────────────
+// The address is not the identity: DHCP moves it, and alternator.local can resolve to a
+// different board between one launch and the next. The uid from /identify is the identity,
+// and it is what gets remembered.
+
+function rememberedUid() { return localStorage.getItem('xregDeviceUid') || null; }
+
+function unitWhere(hit) {
+    return (hit && (hit.host || (hit.base || '').replace(/^https?:\/\//, ''))) || '';
+}
+function unitLabel(hit) {
+    return (hit && hit.name) || 'Regulator';
+}
+
+// Everything the UI needs to say WHICH unit this is. Called on every connect, in the app and
+// in a browser, so a wrong-regulator session is visible instead of silent.
+function applyConnectedIdentity(hit) {
+    if (!hit) return;
+    window.xregUnit = hit;
+    if (hit.name) localStorage.setItem('xregDeviceName', hit.name);
+    // The AP SSID is per-unit now, so the Join button has to learn it from the device it is
+    // actually connected to. A name the user typed themselves still wins (xregApSsid).
+    if (hit.ap) localStorage.setItem('xregApSsidDev', hit.ap);
+    const where = unitWhere(hit), label = unitLabel(hit);
+    document.querySelectorAll('.conn-dot').forEach(d => {
+        d.title = where ? label + ' \u2014 ' + where : label;
+    });
+    const set = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+    set('unitNameOut', label);
+    set('unitUidOut', hit.uid || '\u2014');
+    set('unitAddrOut', where || '\u2014');
+    const apEl = document.getElementById('regApSsid');
+    if (apEl && !localStorage.getItem('xregApSsid') && hit.ap) apEl.value = hit.ap;
+}
+
+function connectToRegulator(hit) {
+    console.log('[DISCOVERY] regulator ' + (hit.uid || 'unknown-uid') + ' at ' + hit.base + ' (fw ' + (hit.fw || 'unknown') + ')');
+    API_BASE_URL = hit.base;
+    localStorage.setItem('xregDeviceBase', hit.base);
+    if (hit.uid) localStorage.setItem('xregDeviceUid', hit.uid);
+    if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
+    syncFormActionsToDevice();
+    sseReconnectAttempts = 0;
+    setSplashText('Connecting to regulator');
+    lastDiscoveredFw = hit.fw;
+    lastDiscoveredBase = hit.base;
+    applyConnectedIdentity(hit);
+    matchAppBundleToDevice(hit.fw, hit.base);
+}
+
+// One unit, or the one we already use → connect. Anything else is a question for the user:
+// picking silently is the bug this whole path exists to fix.
+async function resolveRegulatorChoice(hits, wantUid) {
+    if (!hits.length) return null;
+    if (wantUid) {
+        const mine = hits.find(h => h.uid === wantUid);
+        if (mine) return mine;
+    }
+    // Pre-identity firmware answers with no uid at all; there is nothing to disambiguate with,
+    // so keep the old behaviour rather than trapping the user behind an unanswerable dialog.
+    if (hits.length === 1 && (!wantUid || !hits[0].uid)) return hits[0];
+    return await chooseRegulator(hits, wantUid);
+}
+
+// Picker. Resolves with the chosen hit, or null if dismissed.
+function chooseRegulator(hits, wantUid, forced) {
+    return new Promise((resolve) => {
+        // A picker already up belongs to an earlier caller: settle it with null rather than orphan its await.
+        const old = document.getElementById('regPickerDialog');
+        if (old) { if (old._dismiss) old._dismiss(); else old.remove(); }
+        const missing = wantUid && !hits.some(h => h.uid === wantUid);
+        const lastName = localStorage.getItem('xregDeviceName');
+        let lead;
+        if (forced) lead = 'Choose which regulator this app should use.';
+        else if (missing) lead = 'The regulator this app was using' + (lastName ? ' (' + lastName + ')' : '') +
+            ' did not answer. These did:';
+        else lead = 'More than one regulator answered on this network. Choose the one this app should use.';
+
+        const rows = hits.map((h, i) => {
+            const isCur = h.uid && h.uid === wantUid;
+            return '<button data-idx="' + i + '" class="reg-pick-row" style="display:block; width:100%; text-align:left; background:#2a2a2a; border:1px solid ' +
+                (isCur ? '#35d6c7' : '#484848') + '; color:#ddd; border-radius:6px; padding:10px 12px; margin-bottom:8px; cursor:pointer; font-size:13px;">' +
+                '<span style="font-weight:600; color:#fff;"></span>' +
+                '<span style="display:block; color:#8a8a8a; font-size:11px; margin-top:3px;"></span></button>';
+        }).join('');
+
+        const div = document.createElement('div');
+        div.id = 'regPickerDialog';
+        div.innerHTML = '<div id="regPickBackdrop" style="position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:10001; display:flex; align-items:center; justify-content:center;">' +
+            '<div style="background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">' +
+            '<div style="padding:10px 16px 9px; border-bottom:1px solid #333; background:#252525; border-radius:8px 8px 0 0; font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em; display:flex; align-items:center; justify-content:space-between;">' +
+            '<span>Choose Regulator</span>' +
+            '<button id="regPickClose" type="button" aria-label="Close" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button></div>' +
+            '<div style="padding:16px 18px 18px; font-size:0.92em; line-height:1.5;">' +
+            '<p id="regPickLead" style="margin:0 0 12px; color:#bbb;"></p>' +
+            '<div id="regPickRows">' + rows + '</div>' +
+            '<p style="font-size:11px; color:#777; margin:10px 0 0;">The app remembers this unit and reconnects to it by identity, not by address, so a new IP or a second regulator on the network cannot swap it out.</p>' +
+            '<div style="display:flex; justify-content:flex-end; margin-top:12px;">' +
+            '<button id="regPickCancel" type="button" style="background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em;">Not now</button></div>' +
+            '</div></div></div>';
+        document.body.appendChild(div);
+        // Every exit — a row, the X, Not now, the backdrop, Escape, or a newer picker — goes through
+        // finish(), so the promise always settles and the key listener never outlives the dialog.
+        let settled = false;
+        const onKey = (e) => { if (e.key === 'Escape') finish(null); };
+        const finish = (h) => {
+            if (settled) return;
+            settled = true;
+            document.removeEventListener('keydown', onKey);
+            div.remove();
+            resolve(h);
+        };
+        div._dismiss = () => finish(null);
+        document.addEventListener('keydown', onKey);
+        div.querySelector('#regPickClose').onclick = () => finish(null);
+        div.querySelector('#regPickCancel').onclick = () => finish(null);
+        const backdrop = div.querySelector('#regPickBackdrop');
+        backdrop.addEventListener('click', e => { if (e.target === backdrop) finish(null); });
+        // Device-supplied text goes in with textContent — a unit name is user input.
+        div.querySelector('#regPickLead').textContent = lead;
+        div.querySelectorAll('.reg-pick-row').forEach(btn => {
+            const h = hits[Number(btn.dataset.idx)];
+            const spans = btn.querySelectorAll('span');
+            spans[0].textContent = unitLabel(h) + (h.uid && h.uid === wantUid ? '  (current)' : '');
+            spans[1].textContent = [unitWhere(h), h.uid ? 'ID ' + h.uid.slice(-6) : '', h.fw ? 'fw ' + h.fw : '']
+                .filter(Boolean).join('  ·  ');
+            btn.onclick = () => finish(h);
+        });
+    });
+}
+
+// Explicit "I want the other one". Always asks, even when the remembered unit answered.
+async function switchRegulator() {
+    if (discoveryInProgress) return;
+    if (!IS_CAPACITOR) {
+        xAlert('In a browser the regulator is whatever address you opened. Browse to the other unit directly \u2014 each one answers at its own xreg-<id>.local address, shown under Setup \u25b8 System on that unit.', 'Switch Regulator');
+        return;
+    }
+    discoveryInProgress = true;
+    // The only feedback on the settings page while the full sweep runs (up to ~15 s on a router LAN).
+    const btn = document.querySelector('button[onclick="switchRegulator()"]');
+    const btnLabel = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Scanning...'; }
+    let hits = [];
+    setSplashText('Searching for regulators');
+    try { hits = await discoverDeviceBase(rememberedUid(), true); }
+    finally { discoveryInProgress = false; if (btn) { btn.disabled = false; btn.textContent = btnLabel; } }
+    if (!hits.length) { xAlert('No regulator answered on this network.', 'Switch Regulator'); return; }
+    const hit = await chooseRegulator(hits, rememberedUid(), true);
+    if (!hit) return;
+    connectToRegulator(hit);
+    initializeEventSource();
+}
+
+// Browsers do not discover — the address bar picked the unit. Ask it who it is anyway, so the
+// UI can name it and the AP fields are right for THIS board.
+async function initUnitIdentity() {
+    if (IS_CAPACITOR || DEMO_MODE) return;
+    const hit = await probeIdentify(API_BASE_URL || '', 4000);
+    if (hit) applyConnectedIdentity(hit);
+}
+document.addEventListener('DOMContentLoaded', initUnitIdentity);
 
 // Resolve where the regulator is, then open SSE. Browsers connect directly
 // (same-origin). Called at launch and from manualReconnect().
@@ -3982,20 +4281,11 @@ async function discoverAndConnect() {
     if (discoveryInProgress) return;
     discoveryInProgress = true;
     try {
-        const hit = await discoverDeviceBase();
-        if (hit) {
-            console.log('[DISCOVERY] regulator at ' + hit.base + ' (fw ' + (hit.fw || 'unknown') + ')');
-            API_BASE_URL = hit.base;
-            localStorage.setItem('xregDeviceBase', hit.base);
-            syncFormActionsToDevice();
-            sseReconnectAttempts = 0;
-            setSplashText('Connecting to regulator');
-            lastDiscoveredFw = hit.fw;
-            lastDiscoveredBase = hit.base;
-            matchAppBundleToDevice(hit.fw, hit.base);
-        } else {
-            console.log('[DISCOVERY] no regulator found');
-        }
+        const hits = await discoverDeviceBase(rememberedUid());
+        const hit = await resolveRegulatorChoice(hits, rememberedUid());
+        if (hit) connectToRegulator(hit);
+        else if (hits.length) console.log('[DISCOVERY] ' + hits.length + ' regulators answered, none chosen');
+        else console.log('[DISCOVERY] no regulator found');
     } finally {
         discoveryInProgress = false;
     }
@@ -4014,23 +4304,17 @@ async function discoverAndConnect() {
 async function rediscoverAfterLoss(quiet) {
     if (discoveryInProgress || DEMO_MODE) return;
     discoveryInProgress = true;
-    let hit = null;
+    let hits = [];
     try {
-        hit = await discoverDeviceBase();
+        hits = await discoverDeviceBase(rememberedUid());
     } finally {
         discoveryInProgress = false;
     }
     if (DEMO_MODE) return;
+    const hit = await resolveRegulatorChoice(hits, rememberedUid());
     if (hit) {
-        console.log('[DISCOVERY] regulator moved to ' + hit.base);
-        API_BASE_URL = hit.base;
-        localStorage.setItem('xregDeviceBase', hit.base);
-        syncFormActionsToDevice();
-        sseReconnectAttempts = 0;
+        connectToRegulator(hit);
         initializeEventSource();
-        lastDiscoveredFw = hit.fw;
-        lastDiscoveredBase = hit.base;
-        matchAppBundleToDevice(hit.fw, hit.base);
         return hit;
     }
     console.log('[DISCOVERY] re-scan found nothing');
@@ -4059,8 +4343,11 @@ function wifiJoinPlugin() {
 }
 
 function getRegulatorApCreds() {
+    // Priority: what the user typed, then what THIS unit reported over /identify, then the
+    // compile-time name. The firmware default is per-unit (ALTERNATOR_WIFI-<id>), so the bare
+    // constant is a last resort that only fits a pre-identity build.
     return {
-        ssid: (localStorage.getItem('xregApSsid') || AP_SSID_DEFAULT).trim(),
+        ssid: (localStorage.getItem('xregApSsid') || localStorage.getItem('xregApSsidDev') || AP_SSID_DEFAULT).trim(),
         password: (localStorage.getItem('xregApPass') || AP_PASS_DEFAULT)
     };
 }
@@ -5165,6 +5452,14 @@ function initializeEventSource() {
             closeRecovery();           // Dismiss Connection Lost dialog if it's open
             if (isOfflineMode) exitOfflineMode(); // Re-enable inputs if user had gone offline
             checkInstallIdFreshness(); // drop stale console history if the device was reflashed/reset
+            // Close the hole this outage just punched in the console. Only on a genuine reconnect —
+            // the first open of a page life has no gap to fill, and checkInstallIdFreshness may be
+            // about to clear the buffer for a reflashed device.
+            const gapMs = Date.now() - lastEventTime;
+            if (window._firstCsvPacketReceived && gapMs > 3000) {
+                const gapEnd = Date.now();
+                setTrackedTimeout(() => consoleBackfillFromDevice(gapEnd - gapMs, gapEnd), 1200);
+            }
         }, false);
 
 
@@ -7186,7 +7481,11 @@ function processCSVDataOptimized(data) {
         // ALWAYS UPDATE DATA STRUCTURES - Temperature plot data
         // Buffer holds DISPLAY units (converted at append; remapped in place on a unit flip by
         // retargetTempPlotsForUnit) so every setData/autoscale path stays unit-agnostic.
-        const altTemp = 'AlternatorTemperatureF' in data ? toDisplayTemp(parseFloat(data.AlternatorTemperatureF) / 100) : 0;
+        // null (not NaN) with no alternator probe, same convention as battCurrent above: uPlot's gap test
+        // is `!= null`, which NaN passes, and a non-finite lineTo is a no-op — so a NaN would bridge the
+        // dead span with a straight line instead of breaking the trace.
+        const altTempRaw = 'AlternatorTemperatureF' in data ? toDisplayTemp(parseFloat(data.AlternatorTemperatureF) / 100) : 0;
+        const altTemp = Number.isFinite(altTempRaw) ? altTempRaw : null;
 
         const prevY_temp = [
             temperatureData[1][temperatureData[1].length - 1],
@@ -8660,6 +8959,9 @@ async function fetchAndPopulateVesselInfo() {
         const form = document.getElementById('vessel-info-form');
         if (!form) return;
 
+        // Not part of allFieldsFilled: an unnamed unit is a named-enough unit (XREG-<id>), and
+        // requiring it would re-gate every regulator already commissioned.
+        if (form.REGULATOR_NAME) form.REGULATOR_NAME.value = data.regulator_name || '';
         form.BOAT_LENGTH_FT.value = data.boat_length_ft || '';
         form.BOAT_DISPLACEMENT_LBS.value = data.boat_displacement_lbs || '';
         form.BOAT_TYPE.value = data.boat_type || 'monohull';
@@ -8751,6 +9053,7 @@ async function handleVesselInfoSave(event) {
     }
 
     const vesselData = {
+        regulator_name: form.REGULATOR_NAME ? form.REGULATOR_NAME.value.trim() : '',
         boat_length_ft: parseFloat(form.BOAT_LENGTH_FT.value),
         boat_displacement_lbs: parseFloat(form.BOAT_DISPLACEMENT_LBS.value),
         boat_type: form.BOAT_TYPE.value,
@@ -8810,6 +9113,9 @@ async function handleVesselInfoSave(event) {
             const _prevOrient = (window.vesselInfo && window.vesselInfo.imu_mount_orientation !== undefined)
                 ? Number(window.vesselInfo.imu_mount_orientation) : null;
             window.vesselInfo = vesselData;
+            // Re-read identity rather than trusting the submitted string: a cleared name falls
+            // back to the unit's own XREG-<id>, which only the device can tell us.
+            probeIdentify(API_BASE_URL || '', 4000).then(h => { if (h) applyConnectedIdentity(h); });
             window._nominalStored = vesselData.battery_voltage;  // new baseline for the next change/warning
             applyClassScaledInputAttrs();
             updateBattHealthChemNote();  // chemistry may have just changed
@@ -9058,7 +9364,7 @@ function deriveBatteryDefaults(type, capAh, sysV, mountLoc, battProbe) {
     rows.push({ param: 'SOC_BlockRebulk_percent', label: 'SoC Block Rebulk Above (%)', value: T.socBlock });
     rows.push({ param: 'SOC_AllowRebulk_percent', label: 'SoC Allow Rebulk Below (%)', value: T.socAllow });
     if (C) {
-        const lim = Math.min(r1(T.limC * C), 500);   // /get handler clamps BattCurrentLimitA to 500 A
+        const lim = r1(T.limC * C);   // /get handler clamp widened to 2000 A, so no mirror cap here
         rows.push({ param: 'TailCurrent_A', label: 'Tail Current (A)', value: r1(T.tailC * C) });
         rows.push({ param: 'BattCurrentLimitA', label: 'Battery Charge Current Limit (A)', value: lim });
         rows.push({ param: 'MaximumAllowedBatteryAmps', label: 'High Current Alarm (Battery) (A)', value: Math.round(1.25 * lim) });
@@ -9072,14 +9378,34 @@ function deriveBatteryDefaults(type, capAh, sysV, mountLoc, battProbe) {
     // always acts before the electrical backstop. AGM/flooded: no BMS in the picture — lead-acid
     // damage is time-integrated, indifferent to brief bounded spikes, so the ceiling protects the
     // DC loads' published continuous ratings instead of the battery. The timed-tier trip lines
-    // ride 0.1/0.2 above each chemistry's shed margin (ovMeasMargin) — same relationship for all.
-    const hwLimit = ((type === 'lifepo4') ? 14.3 : 16.0) * kV;
+    // fit between the shed line and the software cut. Per PROTECTION_TIMING_OVERHAUL_SPEC the LOW tier
+    // RIDES the Group 2 shed line rather than sitting above it, which is why lithium reads 0.10/0.10/0.20:
+    // its shed-to-software-cut corridor is only 0.1 V wide, so there is nowhere above the shed line to put
+    // LOW. Lead/AGM has a 5.1 V corridor, so its tiers do sit 0.1/0.2 clear of the 0.50 shed margin.
+    // Lithium scales linearly because its rung IS per-cell: the BMS trips on the highest cell while we
+    // regulate the pack sum, so the pack-referred imbalance allowance really is N x the per-cell offset
+    // (a 50 mV outlier eats 0.75 V at 16S vs 0.15 V at 4S). The lead/AGM ceiling is the opposite — a DC
+    // LOAD rating, class-invariant in kind — so it stops scaling at the equipment: 16.0 x 4 = 64 V on a
+    // 48 V bank, above the ~60 V ceiling of most 48 V gear.
+    const hwLimit = (type === 'lifepo4') ? 14.3 * kV : Math.min(16.0 * kV, 60);
     const hardSD = hwLimit - 0.1 * kV;
+    // The three target-relative rungs are per-cell and scale, but a capped ceiling can leave no room for
+    // them: 48 V flooded at 2.43 V/cell would put MID at 61.2 V under a 60 V cap. Compress all three by
+    // one factor so MID lands just under the software cut, rather than proposing a ladder that cannot fit.
+    // No-ops at 12/24/36 V on every chemistry — only 48 V lead has a corridor short enough to bind.
+    let shedM = T.ovMeasMargin * kV;
+    let loM = ((type === 'lifepo4') ? 0.10 : 0.60) * kV;
+    let midM = ((type === 'lifepo4') ? 0.20 : 0.70) * kV;
+    const midRoom = hardSD - 0.05 * kV - T.bulkV * kV;
+    if (midRoom > 0 && midM > midRoom) {
+        const squeeze = midRoom / midM;
+        shedM *= squeeze; loM *= squeeze; midM *= squeeze;
+    }
     rows.push({ param: 'VoltageHardwareLimit', label: 'Hardware Shutdown Voltage (V)', value: r2(hwLimit) });
     rows.push({ param: 'AlternatorHardShutdownV', label: 'Alternator Hard Shutdown Voltage (V)', value: r2(hardSD) });
-    rows.push({ param: 'OvTierLoMarginV', label: 'Timed OV Cut LOW — Margin Above Target (V)', value: r2(((type === 'lifepo4') ? 0.10 : 0.60) * kV) });
-    rows.push({ param: 'OvTierMidMarginV', label: 'Timed OV Cut MID — Margin Above Target (V)', value: r2(((type === 'lifepo4') ? 0.20 : 0.70) * kV) });
-    rows.push({ param: 'OvMeasMarginV', label: 'Soft OV Trip Margin Above Target (V)', value: r2(T.ovMeasMargin * kV) });
+    rows.push({ param: 'OvTierLoMarginV', label: 'Timed OV Cut LOW — Margin Above Target (V)', value: r2(loM) });
+    rows.push({ param: 'OvTierMidMarginV', label: 'Timed OV Cut MID — Margin Above Target (V)', value: r2(midM) });
+    rows.push({ param: 'OvMeasMarginV', label: 'Soft OV Trip Margin Above Target (V)', value: r2(shedM) });
     // Flat 20 A for every chemistry and bank size; commissioning later raises it to 40 A for lead-acid/AGM.
     rows.push({ param: 'IExcessCeilA', label: 'Over-Current Trip Ceiling (Alternator) (A)', value: 20 });
     rows.push({ param: 'VoltageAlarmHigh', label: 'High Voltage Alarm (V)', value: r2(T.vAlmHi * kV) });
@@ -9153,7 +9479,7 @@ function deriveBatteryDefaults(type, capAh, sysV, mountLoc, battProbe) {
     const copy = {
         bulk: r2(T.bulkV * kV), hard: r2(hardSD), cells: cellsPer12 * kV,
         bulkCell: perCell(T.bulkV / cellsPer12), hardCell: perCell(hardSD / (cellsPer12 * kV)),
-        delta: r2(hardSD - T.bulkV * kV), limA: C ? Math.min(r1(T.limC * C), 500) : 0
+        delta: r2(hardSD - T.bulkV * kV), limA: C ? r1(T.limC * C) : 0   // the same number the BattCurrentLimitA row proposes
     };
     return { rows, useFloat, copy };
 }
@@ -9182,18 +9508,21 @@ function battDefClose(apply) {
     if (r) r(apply);
 }
 
-async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave) {
+async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, manual) {
     try {
-        const type = vessel.battery_type;
-        if (!type) return;
+        const type = vessel && vessel.battery_type;
+        if (!type) { _battDefSkipNote('No battery type is on file, so no starting values could be recommended. Set the battery type under Setup &rarr; Vessel Info first.', manual); return; }
         // deviceFirstSave (device flag) covers a stale pre-flash browser tab whose prevBatt is set.
         const firstSave = deviceFirstSave || !(prevBatt && prevBatt.type);
         const battChanged = prevBatt && prevBatt.type && (
             prevBatt.type !== type ||
             prevBatt.cap !== Number(vessel.battery_capacity_ah) ||
             prevBatt.volt !== Number(vessel.battery_voltage));
-        if (!firstSave && !battChanged) return;
-        if (type === 'other') { _battDefSkipNote('No recommendations are made for the Other battery type. Inspect every charge-stage and protection setting under Setup and adjust each one individually.'); return; }
+        // Silent on purpose: this is every ordinary re-save of unchanged vessel info, so a note here
+        // would fire on each save. The recommender is reachable on demand from System Settings, so
+        // this return is no longer a one-way door. `manual` skips the gate entirely.
+        if (!manual && !firstSave && !battChanged) return;
+        if (type === 'other') { _battDefSkipNote('No recommendations are made for the Other battery type. Inspect every charge-stage and protection setting under Setup and adjust each one individually.', manual); return; }
         // A successful /saveVesselInfo proves the device is armed (that endpoint is arm-gated);
         // this tab's mirror can be stale after a reload. Re-sync and proceed — a genuinely
         // unarmed device fails the /exportConfig below, which already shows a visible skip note.
@@ -9201,29 +9530,18 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave) {
 
         // Current values from the device (raw NVS strings)
         const r = await fetchWithTimeout(buildURL('/exportConfig'), {}, 10000);
-        if (!r.ok) { _battDefSkipNote('Could not read the current device settings (HTTP ' + r.status + '), so the recommended battery defaults were skipped. Review them any time under Setup &rarr; Battery.'); return; }
+        if (!r.ok) { _battDefSkipNote('Could not read the current device settings (HTTP ' + r.status + '), so no initial charging settings could be recommended.' + (r.status === 403 ? ' Settings are locked — unlock them and try again.' : ''), manual); return; }
         const cfg = (await r.json()).config || {};
         const battSrc = ('BatteryCurrentSource' in cfg) ? parseInt(cfg.BatteryCurrentSource, 10) : 0;  // 0 = INA228
         const battProbe = ('battTempProbeEnable' in cfg) ? parseInt(cfg.battTempProbeEnable, 10) : 0;   // 1 = BATT-role DS18B20 in use
+        const shuntPresent = ('BatteryShuntPresent' in cfg) ? parseInt(cfg.BatteryShuntPresent, 10) : 1;
 
         const der = deriveBatteryDefaults(type, Number(vessel.battery_capacity_ah), Number(vessel.battery_voltage), Number(vessel.regulator_mount_loc), battProbe);
-        if (!der) return;
+        if (!der) { _battDefSkipNote('Battery type "' + _cfgEsc(String(type)) + '" is not one this regulator has recommendations for. Set each charge-stage and protection value individually under Setup.', manual); return; }
 
         const rows = [];   // preserve der.rows order; each carries now + match so matches render inline, highlighted
         for (const row of der.rows) {
-            if (row.blob) {   // OCV curve: comma-joined string, compared numerically not as a scalar
-                const nowStr = (cfg[row.param] !== undefined && cfg[row.param] !== '') ? String(cfg[row.param]) : '';
-                rows.push({ ...row, now: nowStr, match: ocvBlobsEqual(nowStr, row.value) });
-                continue;
-            }
-            let nowUi;
-            if (cfg[row.param] !== undefined) {
-                const raw = parseFloat(cfg[row.param]);
-                nowUi = BATTDEF_FROM_STORED[row.param] ? BATTDEF_FROM_STORED[row.param](raw) : raw;
-            } else {
-                nowUi = BATTDEF_FW_DEFAULT[row.param];
-            }
-            rows.push({ ...row, now: nowUi, match: isFinite(nowUi) && Math.abs(nowUi - row.value) < 0.005 });
+            rows.push({ ...row, ...battDefRowState(cfg, row) });
         }
         const changed = rows.filter(r => !r.match);
         const unchanged = rows.length - changed.length;
@@ -9248,6 +9566,16 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave) {
         if (battProbe !== 1) {
             noticeHtml += battDefNotice('limit', 'Battery temperature source',
                 'Battery temperature is taken from the regulator board unless a battery probe, an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source provides it. The board runs warmer than its surroundings, so the cold-charge lockout is a coarse guard when it is the only source. A battery probe fitted later is assigned under Setup > Temperature, where the hot-charge lockout and battery temperature limits also live.');
+        }
+        // Float is proposed for the lead chemistries, but the /get?UseFloat handler writes 0 whenever the
+        // shunt is marked absent (the boot reconciliation does the same), so proposing 1 here only made
+        // the post-apply check report it as "did not take". Propose the value the regulator will hold,
+        // keep the float voltage/duration rows (inert until float is on), and say why.
+        if (der.useFloat === 1 && shuntPresent !== 1) {
+            const fr = der.rows.find(r => r.param === 'UseFloat');
+            if (fr) fr.value = 0;
+            noticeHtml += battDefNotice('limit', 'Float charging needs the battery shunt',
+                'Voltage Float is the usual choice for this chemistry, but the battery shunt is marked absent, and without one the regulator holds float charging off (along with State of Charge, battery health and the battery current limit), so Float Mode is proposed as No Float, the value the regulator would set anyway. Float Voltage and Float Duration are still proposed so they are in place for later. Declare the shunt under Setup > Battery, enter its resistance, and run this again to switch to Voltage Float.');
         }
         if (type === 'lifepo4' && battSrc !== 0) {
             noticeHtml += battDefNotice('info', 'Float changed to No Float',
@@ -9282,7 +9610,8 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave) {
                             + '<td style="padding:3px 0; color:#888;">' + propTxt + '</td></tr>';
                     }
                     const i = ci++;
-                    return '<tr><td style="padding:3px 6px 3px 0; text-align:center;"><input type="checkbox" class="battdef-cb" data-i="' + i + '" checked onchange="battDefCbChanged()" style="accent-color:#00a19a; margin:0; vertical-align:middle;"></td>'
+                    const pre = (manual && BATTDEF_CX_OWNED.has(c.param)) ? '' : ' checked';
+                    return '<tr><td style="padding:3px 6px 3px 0; text-align:center;"><input type="checkbox" class="battdef-cb" data-i="' + i + '"' + pre + ' onchange="battDefCbChanged()" style="accent-color:#00a19a; margin:0; vertical-align:middle;" title="' + (pre ? '' : 'Commissioning may own this value - check it only if you want the chemistry recommendation back') + '"></td>'
                         + '<td style="padding:3px 8px 3px 0; color:#9cc;">' + _cfgEsc(c.label) + '</td>'
                         + '<td style="padding:3px 8px; color:#888;">' + nowTxt + '</td>'
                         + '<td style="padding:3px 0; color:#fff;">' + propTxt + '</td></tr>';
@@ -9306,31 +9635,102 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave) {
         // One /get request — every hasParam block in the refactored handler processes independently
         const url = '/get?' + picked.map(c => c.param + '=' + encodeURIComponent(c.value)).join('&');
         const ar = await fetchWithTimeout(buildURL(url), {}, 10000);
-        const messageDiv = document.getElementById('vessel-info-message');
-        if (messageDiv) {
-            messageDiv.style.display = 'block';
-            if (ar.ok) {
-                messageDiv.style.backgroundColor = '#e8f5e9';
-                messageDiv.style.color = '#2e7d32';
-                messageDiv.textContent = 'Applied ' + picked.length + ' battery default' + (picked.length === 1 ? '' : 's') + '. Review them any time under Setup.';
-            } else {
-                messageDiv.style.backgroundColor = '#ffebee';
-                messageDiv.style.color = '#c62828';
-                messageDiv.textContent = 'Could not apply the battery defaults (HTTP ' + ar.status + '). The vessel info itself was saved.';
+        if (!ar.ok) { _battDefReport('Could not apply the recommended values (HTTP ' + ar.status + ').' + (manual ? '' : ' The vessel info itself was saved.'), false, manual); return; }
+
+        // HTTP 200 does NOT mean the writes landed: /get answers with the LAST matching handler's
+        // message, or "No message sent..." when nothing matched, so a request whose params were all
+        // unrecognised, out of a handler's constrain() range, or overwritten by another handler in the
+        // same request still comes back 200. Re-read and re-diff instead of trusting the status.
+        let stuck = [];
+        try {
+            const vr = await fetchWithTimeout(buildURL('/exportConfig'), {}, 10000);
+            if (vr.ok) {
+                const vcfg = (await vr.json()).config || {};
+                stuck = picked.filter(c => !battDefRowState(vcfg, c).match);
             }
+        } catch (ve) { diagLog('battery defaults verify read failed:', ve); }
+
+        const took = picked.length - stuck.length;
+        if (!stuck.length) {
+            _battDefReport('Applied ' + took + ' recommended value' + (took === 1 ? '' : 's') + '. Review them any time under Setup.', true, manual);
+        } else {
+            _battDefReport('Applied ' + took + ' of ' + picked.length + ' recommended values. These did not take and are still at their old value: '
+                + stuck.map(c => c.label).join('; ') + '. Set them by hand under Setup.', false, manual);
         }
     } catch (e) {
         diagLog('battery defaults proposal failed:', e);
-        _battDefSkipNote('Could not load the recommended battery defaults (' + e.message + '). Review them any time under Setup &rarr; Battery.');
+        _battDefSkipNote('Could not load the recommended initial charging settings (' + e.message + '). Review them any time under Setup &rarr; Battery.', manual);
     }
 }
 
 // Surface a battdef skip (else a silent config-fetch failure looks like a clean save) on the banner.
-function _battDefSkipNote(txt) {
+// The two rows commissioning MEASURES, so the chemistry table's generic value is a downgrade once a
+// wizard run exists. IExcessCeilA is in commissionSnapshotScalarsToBuf's revert set and the Thresholds
+// step raises it past the flat 20 A proposed here; CvKdDeadbandVps is overwritten by the Step-5 ripple
+// fit (see its declaration comment in Xregulator.ino). On a MANUAL launch these arrive unchecked so a
+// re-apply cannot silently undo a measurement — still listed, still checkable if the owner wants the
+// generic value back. Deliberately NOT included: cvAlpha / CvKdTd / cvPiZero (design constants, nothing
+// outside the /get handler writes them) and bhStepLowA / bhStepDeltaA (first-boot seed only).
+const BATTDEF_CX_OWNED = new Set(['IExcessCeilA', 'CvKdDeadbandVps']);
+
+// System Settings > Recommend Initial Charging Settings. The save-chain call fires at most once per battery
+// identity per device lifetime, so without this there is no way back to the proposal after a Skip.
+// Re-reads vessel info rather than trusting window.vesselInfo: that mirror can hold another unit's
+// battery block after switching regulators in one browser session, which is how a bench with two
+// identically-specified banks silently gets the wrong ladder.
+async function launchBatteryRecommender() {
+    if (_battDefResolve) { xAlert('The recommendation list is already open.', 'Recommend Initial Charging Settings'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock settings first', 'Recommend Initial Charging Settings'); return; }
+    let vessel = null;
+    try {
+        const r = await fetchWithTimeout(buildURL('/vessel_info.json'), {}, 5000);
+        if (r.ok) { vessel = await r.json(); window.vesselInfo = vessel; }
+    } catch (e) { diagLog('recommender vessel re-read failed:', e); }
+    if (!vessel) vessel = window.vesselInfo;
+    if (!vessel || !vessel.battery_type) {
+        xAlert('No battery type is on file yet. Fill in the battery type, capacity and system voltage under Setup > Vessel Info and save, then come back here.', 'Recommend Initial Charging Settings');
+        return;
+    }
+    await maybeProposeBatteryDefaults(vessel, null, true, true);
+}
+
+// Apply outcome. Same reachability problem as _battDefSkipNote: the banner is inside the Vessel Info
+// tab, so a manual launch gets a dialog.
+function _battDefReport(txt, ok, manual) {
     const md = document.getElementById('vessel-info-message');
-    if (!md) return;
+    if (manual || !md) { xAlert(txt, ok ? 'Recommend Initial Charging Settings' : 'Some Values Did Not Apply'); return; }
+    md.style.display = 'block';
+    md.style.backgroundColor = ok ? '#e8f5e9' : '#ffebee';
+    md.style.color = ok ? '#2e7d32' : '#c62828';
+    md.textContent = txt;
+}
+
+// `manual` = launched from the System Settings button rather than the vessel-info save chain.
+// #vessel-info-message lives inside the Vessel Info tab, so it is off-screen for a manual launch —
+// those get a dialog instead, and text with no markup in it, since xAlert renders plain text.
+function _battDefSkipNote(txt, manual) {
+    const md = document.getElementById('vessel-info-message');
+    if (manual || !md) { xAlert(String(txt).replace(/<br>/g, '\n').replace(/&rarr;/g, '>').replace(/<[^>]*>/g, ''), 'Recommend Initial Charging Settings'); return; }
     md.style.display = 'block';
     md.innerHTML += '<br><span style="color:#e6a23c;">' + txt + '</span>';
+}
+
+// One row's "what the device has now" + whether it already matches the recommendation. Extracted so
+// the post-Apply verification re-runs the SAME comparison the modal rendered — a second, hand-rolled
+// diff would drift from this one and report phantom failures.
+function battDefRowState(cfg, row) {
+    if (row.blob) {   // OCV curve: comma-joined string, compared numerically not as a scalar
+        const nowStr = (cfg[row.param] !== undefined && cfg[row.param] !== '') ? String(cfg[row.param]) : '';
+        return { now: nowStr, match: ocvBlobsEqual(nowStr, row.value) };
+    }
+    let nowUi;
+    if (cfg[row.param] !== undefined) {
+        const raw = parseFloat(cfg[row.param]);
+        nowUi = BATTDEF_FROM_STORED[row.param] ? BATTDEF_FROM_STORED[row.param](raw) : raw;
+    } else {
+        nowUi = BATTDEF_FW_DEFAULT[row.param];
+    }
+    return { now: nowUi, match: isFinite(nowUi) && Math.abs(nowUi - row.value) < 0.005 };
 }
 
 // First-save chain only: between two setup screens the page sits idle on the device (SoC-seed poll,
@@ -9742,7 +10142,7 @@ function commPrepRender(cfg) {
     const smallScreen = _isPhoneSizedScreen()
         ? '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;"><strong style="color:#e0e0e0;">Use a laptop or tablet if you can.</strong> Setup and Commissioning works on a phone, but it\'s a worse UX on a small screen.</p>'
         : '';
-    const intro = smallScreen + '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;">' + (_commPrepFirstInstall
+    const intro = cxPanelOverrideStripHtml() + smallScreen + '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;">' + (_commPrepFirstInstall
             ? 'A few things to set before commissioning measures your system. These affect how the regulator reads temperature and current. Anything you skip stays editable later under Setup.'
             : 'These are the settings commissioning measures against, filled in from the regulator. Confirm they still describe the system before the wizard re-measures it — anything you change here is written when you press Next.') + '</p>' + dvccNotice;
 
@@ -10020,6 +10420,7 @@ function rpmCapRender() {
             '</tr>';
     }
     document.getElementById('rpmcap-body').innerHTML =
+        cxPanelOverrideStripHtml() +
         '<p style="font-size:15px;line-height:1.5;margin:0 0 12px;">Set a limit for the most charge current the alternator may produce at each engine speed. Fill in two columns: <strong>High</strong> is your system\'s full capability; <strong>Low</strong> is a gentler rate used for commissioning (recommend a third of High).</p>' +
         '<div style="display:flex; align-items:center; gap:10px; margin:0 0 12px;">' +
         '<span style="font-size:12px; color:#9cc;">Limit by</span>' +
@@ -11746,10 +12147,25 @@ function renderPanelSwitchRows(hiAsserted, floatAsserted) {
 function cxPanelOverrideStrip(on) {
     const el = document.getElementById('cx-panel-override-warn');
     if (el) el.style.display = on ? 'block' : 'none';
+    for (const c of document.querySelectorAll('.cx-panel-override-clone')) c.style.display = on ? 'block' : 'none';
 }
-function cxPanelOverrideStripSync() {
+function cxPanelOverrideOn() {
     const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
-    cxPanelOverrideStrip(!!c3 && Number(c3.PhysicalPanelOverride) === 1);
+    return !!c3 && Number(c3.PhysicalPanelOverride) === 1;
+}
+function cxPanelOverrideStripSync() { cxPanelOverrideStrip(cxPanelOverrideOn()); }
+// The pre-wizard screens are their own overlays, so the wizard's strip is not on screen for them —
+// and Charge Rate Limits is exactly where the flow writes HiLow, which the Cable-3 switch owns while
+// the override is on. Clone the wizard's element so the copy can never drift; the clone drops the id
+// (ids stay unique) and carries the class cxPanelOverrideStrip drives, so it tracks the live echo too.
+function cxPanelOverrideStripHtml() {
+    const src = document.getElementById('cx-panel-override-warn');
+    if (!src) return '';
+    const el = src.cloneNode(true);
+    el.removeAttribute('id');
+    el.className = 'cx-panel-override-clone';
+    el.style.display = cxPanelOverrideOn() ? 'block' : 'none';
+    return el.outerHTML;
 }
 
 // Grey the two controls the switch panel takes over, so neither is ever a live but inert knob. The
@@ -12773,6 +13189,54 @@ function updateInlineStatus(isConnected) {
 }
 
 
+// ── Live-feed stall notice ───────────────────────────────────────────────────────────────────────
+// The page had exactly one threshold: nine seconds of silence, then the connection dot turns red and
+// every reading greys out. Below nine seconds nothing moved and nothing said why, which reads as the
+// regulator having stopped rather than the connection to it having dropped — and a stall of a few
+// seconds is the common case. This is the earlier, softer tier, and it is strictly live-display: it
+// says what is happening now and leaves as soon as it is over. The permanent record of an outage is
+// the console (the backfill marker) and the regulator's own log — not this.
+const STALL_NOTICE_MS = 3500;   // silence before the overlay appears
+const STALL_GREY_MS = 9000;     // unchanged tier: dot red + markAllReadingsStale()
+const STALL_CLEAR_MS = 4000;    // how long "flowing again" lingers — same dwell as fileToast
+let stallState = { on: false, startMs: 0, hideTimer: null };
+
+// Fixed overlay, built on demand, exactly like fileToast — nothing here may take layout space or the
+// page would jump every time the link hiccups. No dismiss control on purpose: it is not interactive
+// (pointer-events:none), it leaves on its own, and a tap target that moves under your finger during
+// commissioning is worse than the notice itself.
+function stallNoticeText(html) {
+    let t = document.getElementById('stall-toast');
+    if (!t) { t = document.createElement('div'); t.id = 'stall-toast'; document.body.appendChild(t); }
+    t.innerHTML = html;
+    t.classList.add('show');
+}
+
+function hideStallNotice() {
+    const t = document.getElementById('stall-toast');
+    if (t) t.classList.remove('show');
+    if (stallState.hideTimer) { clearTrackedTimeout(stallState.hideTimer); stallState.hideTimer = null; }
+}
+
+// gapMs is the age of the last packet received, so the number is the true age of what is on screen —
+// not the time since this overlay appeared.
+function renderStallNotice(gapMs) {
+    let t = 'No data from the regulator for <b>' + Math.round(gapMs / 1000) + ' s</b>. '
+        + 'It keeps running on its own &mdash; this is the connection, not the regulator.';
+    if (gapMs > STALL_GREY_MS) t += ' Readings are greyed out because they are that old.';
+    stallNoticeText(t);
+}
+
+// First packet back. startMs is the last packet BEFORE the outage and handleCSVData has already moved
+// lastEventTime to now, so this reports the real length of the gap, then gets out of the way.
+function endStallNotice() {
+    if (!stallState.on) return;
+    stallState.on = false;
+    stallNoticeText('Data flowing again after a <b>' + Math.round((Date.now() - stallState.startMs) / 1000) + ' s</b> gap.');
+    if (stallState.hideTimer) clearTrackedTimeout(stallState.hideTimer);
+    stallState.hideTimer = setTrackedTimeout(hideStallNotice, STALL_CLEAR_MS);
+}
+
 function resetParameter(parameterName) {
     if (!settingsUnlocked) {
         xAlert("Please unlock settings first");
@@ -12902,6 +13366,45 @@ function renderConsoleFromBuffer() {
         consoleDiv.appendChild(line);
     }
     requestAnimationFrame(() => { consoleDiv.scrollTop = consoleDiv.scrollHeight; });
+}
+
+// The regulator keeps its own 200-line console ring (/consolehist.txt) with device timestamps, and it
+// keeps writing to it while this browser's event stream is down — the stream itself discards anything
+// it cannot deliver the moment it has no listener. So after a reconnect, splice what the regulator said
+// during the gap back into the on-screen log instead of leaving a silent hole in it. Bounded by the
+// ring: an outage longer than 200 messages recovers only the tail.
+// Returns the number of lines spliced back in, or -1 if the regulator could not be asked.
+async function consoleBackfillFromDevice(gapStartMs, gapEndMs) {
+    if (DEMO_MODE) return -1;
+    let raw;
+    try {
+        const r = await fetchWithTimeout(buildURL('/consolehist.txt'), {}, 8000);
+        if (!r.ok) return -1;
+        raw = await r.text();
+    } catch (e) { return -1; }
+    const from = gapStartMs - 1500;   // a second of overlap either side: both paths can carry the boundary line
+    const recovered = [];
+    for (const line of raw.split('\n')) {
+        const i1 = line.indexOf('\t'), i2 = line.indexOf('\t', i1 + 1);
+        if (i1 < 0 || i2 < 0) continue;
+        const epoch = parseInt(line.slice(0, i1), 10);
+        if (!(epoch > 1577836800)) continue;   // device clock never synced — the line cannot be placed in time
+        const t = epoch * 1000;
+        if (t < from || t > gapEndMs) continue;
+        recovered.push({ t: t, msg: line.slice(i2 + 1), count: 1 });
+    }
+    // Same text within 2 s of a line already held = the boundary duplicate, not a repeat. Text alone is
+    // not enough: these messages legitimately repeat many times a minute.
+    const tail = window.consoleLog.slice(-60);
+    const add = recovered.filter(e => !tail.some(h => h.msg === e.msg && Math.abs(h.t - e.t) < 2000));
+    const secs = Math.round((gapEndMs - gapStartMs) / 1000);
+    window.consoleLog.push({ t: gapStartMs, msg: `--- stream down ${secs}s, ${add.length} line(s) recovered from the regulator ---`, count: 1 });
+    for (const e of add) window.consoleLog.push(e);
+    window.consoleLog.sort((a, b) => a.t - b.t);
+    while (window.consoleLog.length > CONSOLE_MAX_LINES) window.consoleLog.shift();
+    consoleLsDirty = true;
+    if (!consolePaused) renderConsoleFromBuffer();
+    return add.length;
 }
 
 // Throttled persistence: flush at most every 3s, plus on tab hide / unload.
@@ -14075,8 +14578,9 @@ function updateHeaderLimiterColors(sa) {
         el._limPill = want;
     };
     const t = window._lastAltTempF, tl = window._lastAltTempLimitF;
-    const overTemp = isFinite(t) && isFinite(tl) && t > tl + 2;
-    const nearLimit = isFinite(t) && isFinite(tl) && t > tl - 2;
+    // Number.isFinite, not isFinite: no probe latches NaN here, and isFinite(null) is true.
+    const overTemp = Number.isFinite(t) && Number.isFinite(tl) && t > tl + 2;
+    const nearLimit = Number.isFinite(t) && Number.isFinite(tl) && t > tl - 2;
     const tnum = document.getElementById('header-alt-temp');
     if (tnum) {
         if (sa.alternatorTemp > STALE_THRESHOLD_TEMP_MS) { tnum._limTint = null; }
@@ -16020,18 +16524,35 @@ window.addEventListener("load", function () {
         if (!window.stalenessWatchdogStarted) {
             window.stalenessWatchdogStarted = true;
             setTrackedInterval(function () {
+                // A hidden tab legitimately stops receiving, demo/offline mode never receives at all,
+                // and before the first packet there is no "again" to report — the boat splash owns
+                // that state. Counting any of them would put a gap on screen that never happened.
                 const timeSinceLastEvent = Date.now() - lastEventTime;
-                if (timeSinceLastEvent > 9000) { // 9 seconds without data = disconnected
+                // The grey-out tier predates the notice and ran in every state; it stays above the
+                // notice's early return so a page that never gets its first packet still greys at 9 s.
+                if (timeSinceLastEvent > STALL_GREY_MS) { // 9 seconds without data = disconnected
                     updateInlineStatus(false);
                     markAllReadingsStale(); //gray out
                 }
-            }, 2000);
+                if (document.hidden || DEMO_MODE || isOfflineMode || !window._firstCsvPacketReceived) {
+                    stallState.on = false; hideStallNotice(); return;
+                }
+                if (timeSinceLastEvent > STALL_NOTICE_MS) {
+                    if (!stallState.on) {
+                        stallState.on = true;
+                        stallState.startMs = lastEventTime;   // the last packet, not now — the count is its age
+                        if (stallState.hideTimer) { clearTrackedTimeout(stallState.hideTimer); stallState.hideTimer = null; }
+                    }
+                    renderStallNotice(timeSinceLastEvent);
+                }
+            }, 1000);
         }
 
 
         const handleCSVData = function (e) {
 
             lastEventTime = Date.now();
+            if (stallState.on) endStallNotice();   // first packet back closes the grey strip's count-up
 
             // Diagnostic: track inter-event gap to distinguish firmware/WiFi delays from client-side issues
             if (window._lastCSV1Arrival) {
@@ -16216,8 +16737,7 @@ window.addEventListener("load", function () {
                         newTextContent = (value / 60).toFixed(1);
                     }
                     else if (key === "AlternatorTemperatureF") {
-                        // NaN here = SENSOR_NA_KEYS_CSV1 rewrote the no-probe sentinel; never print "NaN"
-                        newTextContent = Number.isFinite(value) ? toDisplayTemp(value / 100).toFixed(1) : "—";
+                        newTextContent = toDisplayTemp(value / 100).toFixed(1);
                     }
                     // Currents (Alt + Batt) — 3 sig figs: integer at ≥100, 1 dec at ≥10, 2 dec below.
                     else if (key === "MeasuredAmps" || key === "Bcur") {
@@ -19153,9 +19673,10 @@ function showRecoveryOptions() {
         addressHint = `This phone reports <b>no network connection</b>. Turn WiFi on, or rejoin the boat's network, and the app will reconnect on its own.`;
     } else if (IS_CAPACITOR) {
         const lastBase = localStorage.getItem('xregDeviceBase') || 'http://alternator.local';
-        addressHint = `Last found at <b>${lastBase}</b>. Retry re-scans the network in case the regulator came back at a different address.`;
+        // The unit name is user text — placeholder here, textContent after insertion.
+        addressHint = `Last reached <b id="recoveryUnitName"></b> at <b>${lastBase}</b>. Retry re-scans the network in case the regulator came back at a different address.`;
     } else {
-        addressHint = `This browser can't scan the network for the regulator. If it reconnected at a new address, <b>http://alternator.local</b> usually finds it; otherwise look up its IP in your router or phone-hotspot device list (hotspots assign 172.20.10.2&ndash;14).`;
+        addressHint = `This browser can't scan the network for the regulator. If it reconnected at a new address, <b>http://alternator.local</b> usually finds it; otherwise look up its IP in your router or phone-hotspot device list (hotspots assign 172.20.10.2&ndash;14). With two regulators on one network, <b>alternator.local</b> can land on either one &mdash; each also answers at its own <b>xreg-&lt;id&gt;.local</b> address, shown under Setup &#9656; System.`;
     }
 
     // Access-point users have no router to fall back on: offer the one-tap join
@@ -19165,6 +19686,12 @@ function showRecoveryOptions() {
       <button onclick="joinRegulatorHotspot('recoveryJoinStatus')" style="width:100%; margin-top:10px; background:#2b3f4a; border:1px solid #3f6070; color:#9fd8e8; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;">Join Regulator WiFi</button>
       <p style="font-size:11px; color:#777; margin:6px 0 0;">Asks this phone to join <b id="recoveryJoinSsid"></b>, the hotspot the regulator broadcasts in access-point mode. Its name and password live under Setup &#9656; System.</p>
       <p id="recoveryJoinStatus" style="font-size:11px; color:#8fd9d3; margin:6px 0 0; min-height:13px;"></p>` : '';
+
+    // A boat can carry more than one regulator, and a lost connection is exactly when the app
+    // may have been following the wrong one. Offer the choice instead of re-racing for it.
+    const switchBlock = IS_CAPACITOR ? `
+      <button onclick="closeRecovery(); switchRegulator();" style="width:100%; margin-top:10px; background:#2b3f4a; border:1px solid #3f6070; color:#9fd8e8; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;">Switch Regulator</button>
+      <p style="font-size:11px; color:#777; margin:6px 0 0;">Lists every regulator answering on this network and lets you pick the one the app follows.</p>` : '';
 
     const recoveryDiv = document.createElement('div');
     recoveryDiv.id = 'recoveryDialog';
@@ -19183,6 +19710,7 @@ function showRecoveryOptions() {
         <button onclick="enterOfflineMode()" style="flex:1; background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;">Continue Offline</button>
       </div>
       ${joinBlock}
+      ${switchBlock}
       <p style="font-size:11px; color:#777; margin:12px 0 0;">If the problem persists, the device may need to be power-cycled.</p>
     </div>
   </div>
@@ -19191,6 +19719,8 @@ function showRecoveryOptions() {
     document.body.appendChild(recoveryDiv);
     const ssidEl = document.getElementById('recoveryJoinSsid');
     if (ssidEl) ssidEl.textContent = getRegulatorApCreds().ssid;
+    const unitEl = document.getElementById('recoveryUnitName');
+    if (unitEl) unitEl.textContent = localStorage.getItem('xregDeviceName') || 'the regulator';
 }
 function retryConnection() {
     closeRecovery();
@@ -19814,6 +20344,19 @@ function openLoopHighVoltageNote() {
         + 'output current.';
 }
 
+// The other open-loop mode. handleLimpHome (6_functions.ino) drives a fixed 30% duty and skips every
+// check except the master On/Off switch and the INA228 hardware over-voltage latch — keep this list in
+// step with that function. Alert, not confirm: the inline handler submits the switch either way, so
+// this is the notice that goes with a switch the user has already thrown.
+function limpHomeOpenLoopWarn() {
+    xAlert('Limp-home mode commands a fixed 30% field duty directly, bypassing the current-limiting '
+        + 'loop and every protection: no alternator temperature cut-back, no engine-speed or '
+        + 'engine-stopped cut (the field stays energized with the ignition off), no battery '
+        + 'temperature or voltage checks, and no charge stages or current limits.\n\n'
+        + 'Still enforced: the master On/Off switch and the hardware over-voltage shutdown.'
+        + openLoopHighVoltageNote(), 'Limp-home mode — protections off');
+}
+
 // Everything manual mode stops enforcing, in the firmware's own priority order (selectFieldControlMode
 // in 6_functions.ino returns MODE_NORMAL_MANUAL at PRIORITY 2, above every check below it) plus the
 // field floor, which governor_apply skips for manual. Keep this list in step with that function —
@@ -20186,27 +20729,31 @@ const SINFO = {
     altBandRpm: () => [
         ['Signal', S_RPM_ADS],
         ['Filter', sAltEma()],
-        ['Gate', 'hold within the band for the steady time — all five axes (RPM, duty, voltage, amps, temperature) must be steady at once before a point records'],    ],
+        ['Gate', 'stay within the wobble limit of the straight line drawn through the window, with that line no steeper than the rate limit — all five signals (RPM, duty, voltage, amps, temperature) must pass at once before a point records. The line may climb or fall, so a smooth pull away from idle records'],    ],
     altBandDuty: () => [
         ['Signal', S_DUTY],
         ['Filter', sAltEma()],
-        ['Gate', 'hold within the band for the steady time — one of the five axes that must all be steady at once'],    ],
+        ['Gate', 'stay within the wobble limit of its own straight line AND drift no faster than the rate limit — one of the five signals that must all pass at once'],    ],
     altBandVbus: () => [
         ['Signal', S_INA_V],
-        ['Filter', sAltEma()],
-        ['Gate', 'hold within the band for the steady time — one of the five axes that must all be steady at once'],    ],
+        ['Filter', sAltEma() + ', then held back by the output lead so it is paired with the engine speed that produced it'],
+        ['Gate', 'plain highest-minus-lowest spread across the window, no line fitted — one of the five signals that must all pass at once'],    ],
     altBandTemp: () => [
         ['Signal', 'alternator temperature — ' + svTempSensor()],
         ['Filter', 'none — judged raw, deliberately unsmoothed (thermal mass is its own filter)'],
-        ['Gate', 'full steady runs need the whole dwell; the This-Session tier automatically uses half of it (' + (function () { const v = parseFloat(getEchoText('altThermSec_echo')); return isFinite(v) ? '<b>' + (v / 2).toFixed(0) + '&nbsp;s</b>' : 'half the dwell'; })() + ')'],    ],
+        ['Gate', 'plain highest-minus-lowest spread over a look-back of this length, no line fitted. The look-back runs continuously while the engine does, so a dip in output no longer restarts it. Full steady runs need the whole window; the This-Session tier automatically uses half of it (' + (function () { const v = parseFloat(getEchoText('altThermSec_echo')); return isFinite(v) ? '<b>' + (v / 2).toFixed(0) + '&nbsp;s</b>' : 'half the window'; })() + ')'],    ],
     altBandAmps: () => [
         ['Signal', S_ADS_ALT],
-        ['Filter', sAltEma()],
-        ['Gate', 'band = the larger of the % of reading or the floor, held for the steady time — one of the five axes that must all be steady at once'],    ],
+        ['Filter', sAltEma() + ', then held back by the output lead so it is paired with the engine speed that produced it'],
+        ['Gate', 'stay within the larger of the % of reading or the floor, measured from its own straight line, at any slope — while the engine sweeps smoothly the output ramps smoothly with it, and that is the pair worth recording'],    ],
     altEmaSec: () => [
-        ['Role', 'this field IS the filter — an interval-aware moving-average low-pass (EMA) on RPM, field duty, voltage, and amps before their steadiness bands are judged; temperature is deliberately excluded'],    ],
+        ['Role', 'this field IS the filter — an interval-aware moving-average low-pass (EMA) on RPM, field duty, voltage, and amps before their steadiness limits are judged; temperature is deliberately excluded'],    ],
+    altLead: () => [
+        ['Signals', 'alternator amps (ADS1115 Hall clamp) and bus voltage (INA228), both delayed by this much before being paired with engine speed, field duty and temperature'],
+        ['Why', 'output answers where the engine is heading, not where it has been. Measured on held-field speed sweeps 2026-09-08: uncorrected, an accelerating pass reads 2–4&nbsp;A high against a decelerating pass at the same indicated speed; corrected, the two agree to 0.1–0.6&nbsp;A'],
+        ['Resolution', 'rounded to the detector\u2019s own tenth-of-a-second tick, and capped at 1&nbsp;s'],    ],
     altMinRun: () => [
-        ['Signal', 'the combined steadiness verdict of all five axes (RPM, field duty, voltage, amps, temperature) — a steady run shorter than this never emits a point'],    ],
+        ['Signal', 'the combined verdict of all five signals (RPM, field duty, voltage, amps, temperature) — a qualifying run shorter than this never emits a point'],    ],
     altAdmit: () => [
         ['Signals', 'smoothed alternator amps (ADS1115 Hall clamp) and smoothed field duty (PWM command)'],
         ['Filter', sAltEma()],    ],
@@ -22379,6 +22926,7 @@ function validateBatterySettings(proposedChanges) {
         absorptionCompleteTime: getEchoNumber('absorptionCompleteTime_echo'),
         AbsorptionTimeoutMs: getEchoNumber('AbsorptionTimeoutMs_echo'),
         rebulkDebounceTime: getEchoNumber('rebulkDebounceTime_echo'),
+        AlternatorHardShutdownV: getEchoNumber('AlternatorHardShutdownV_echo'),
     };
 
     Object.assign(state, proposedChanges);
@@ -22409,6 +22957,27 @@ function validateBatterySettings(proposedChanges) {
         Number.isFinite(state.FloatVoltage) &&
         state.RebulkVoltage >= state.FloatVoltage) {
         return { valid: false, error: 'Rebulk Voltage must be lower than Float Voltage.' };
+    }
+
+    // WARN, never block: a charge target at or above the absolute software cut is unreachable — the
+    // field is cut before the bank gets there, so absorption never completes and nothing else says why.
+    // Worth a warning because the two values live in different sections (charge stages vs Protections)
+    // and the first-boot seed places the cut for lithium (14.3/14.2 x class) whatever the chemistry, so
+    // a lead/AGM owner typing a 14.4 absorption can land above their own cut without ever seeing it.
+    {
+        const cut = state.AlternatorHardShutdownV;
+        const targets = [['Bulk Voltage', state.BulkVoltage], ['Absorption Voltage', state.AbsorptionVoltage],
+                         ['Float Voltage', (state.UseFloat == 1) ? state.FloatVoltage : NaN],
+                         ['Target Voltage', (state.TargetVoltageMode == 1) ? state.TargetVoltageSetpoint : NaN]];
+        const over = targets.filter(([, v]) => Number.isFinite(v) && Number.isFinite(cut) && v >= cut);
+        if (over.length && changedAny('BulkVoltage', 'AbsorptionVoltage', 'FloatVoltage', 'TargetVoltageSetpoint', 'AlternatorHardShutdownV')) {
+            return {
+                valid: true,
+                warning: over.map(([n2, v]) => n2 + ' (' + v.toFixed(2) + ' V)').join(' and ')
+                    + ' is at or above the Alternator Hard Shutdown Voltage (' + cut.toFixed(2) + ' V), so the field is cut before the bank reaches it. '
+                    + 'Raise the shutdown voltage above the target, or run Recommend Initial Charging Settings under System Settings to set the whole protection ladder for this battery chemistry.'
+            };
+        }
     }
 
     if (changedAny('SOC_AllowRebulk_percent', 'SOC_BlockRebulk_percent') &&
@@ -22973,7 +23542,7 @@ function getActiveTestKey() {
 function makePanelDraggable(panel, handle) {
     if (!panel || !handle || handle._dragInit) return;
     handle._dragInit = true;
-    handle.style.cursor = 'move';
+    handle.classList.add('drag-handle');   // grab cursor from the stylesheet, so the <600px rule can drop it
     let startX, startY, startL, startT;
     function onDown(e) {
         if (window.innerWidth <= 600) return;   // mobile = fixed bottom sheet, not draggable
@@ -24448,7 +25017,7 @@ function computeActionableDisturbance() {
 // existing SystemID / tuning-sweep / matrix endpoints; the operator only holds or
 // slowly changes engine speed when prompted — the regulator drives the field.
 // ============================================================================
-const CX_PHASES = ['Prep', 'Field curve', 'Current Control Autotuning', 'Verify Current Control', 'Disturbances', 'Fault Threshold Autotuning', 'Voltage Control Autotuning', 'Keep-Alive Floor & Field Decay', 'Stress Test'];
+const CX_PHASES = ['Prep', 'Field curve', 'Current Control Autotuning', 'Verify Current Control', 'Disturbances', 'Fault Threshold Autotuning', 'Voltage Control Autotuning', 'Keep-Alive Floor & Field Decay', 'Stress Test', 'Charge Health Calibration'];
 // Per-phase caption for the permanent RPM strip — the throttle instruction for THE CURRENT screen.
 // Phases 2/3 (CC sweep, Verify) are speed-referenced: commissionRender swaps in "hold near N RPM"
 // with the upstream step's actual speed (cxRpmRefFor) once one is known; these strings are the
@@ -24462,7 +25031,8 @@ const CX_RPM_LABELS = [
     'Engine RPM (last ~15 s) — engine speed doesn\'t matter on this screen',
     'Engine RPM (last ~15 s) — settle before Run, then hands off the throttle',
     'Engine RPM (last ~15 s)',
-    'Engine RPM (last ~15 s) — idle until armed, then snap the throttle'
+    'Engine RPM (last ~15 s) — idle until armed, then snap the throttle',
+    'Engine RPM (last ~15 s)'   // stage 9 rewrites this per phase (steady-speed wait vs a pass's pace lane)
 ];
 
 // ── Loose engine-speed advisories ─────────────────────────────────────────────
@@ -24524,10 +25094,10 @@ let cxFieldEpoch = 0;
 function cxFieldArm() { return ++cxFieldEpoch; }
 
 // ── Per-stage run plan (partial re-commissioning) ─────────────────────────────
-// cxPlan[i] = run stage i in the next/active wizard pass (0=Prep … 8=Stress Test). Prep (0) is
-// ALWAYS run (it snapshots the tune for safe revert + checks preconditions), so it stays true and
-// its checkbox is disabled. The wizard navigation skips any stage left false.
-let cxPlan = [true, true, true, true, true, true, true, true, true];
+// cxPlan[i] = run stage i in the next/active wizard pass (0=Prep … 9=Charge Health Calibration).
+// Prep (0) is ALWAYS run (it snapshots the tune for safe revert + checks preconditions), so it stays
+// true and its checkbox is disabled. The wizard navigation skips any stage left false.
+let cxPlan = [true, true, true, true, true, true, true, true, true, true];   // one entry per CX_PHASES stage
 // Coupling: (re)running a stage invalidates the downstream stages it feeds, so selecting one
 // force-selects them. Field curve(1) → Plant fit(2)+Verify(3)+CV plant fit(6); Plant fit(2) →
 // Verify(3)+CV plant fit(6); Verify(3) → CV plant fit(6); Disturbances(4) → Thresholds(5).
@@ -24553,6 +25123,7 @@ const CX_MANUAL_LOC = [
     'Voltage-loop gains (CV Kp/Ki). Leave CV gain mode on Auto (safe defaults) or set them under Tuning ▸ Voltage Control.',
     'Per-RPM tachometer keep-alive floor and the field drain time. Set the floor in the RPM table\'s Keep-Alive (%) column (Setup ▸ Alternator) and the drain time under Protections ▸ Field Drain Time, or re-run this step.',
     'Diagnostic verdict only — no settings are written and it does not block COMMISSIONED. Run it any time from Setup ▸ Alternator ▸ Tuning ▸ Stress Test.',
+    'Alternator output lead for the charge-health tracker — the 0.4 s default stands. Set it in the Steady-State Detection group under Tuning as "Output lead (s)", or re-run this step.',
 ];
 
 // Force-select every downstream dependent of any selected stage (transitive); Prep always on.
@@ -24572,7 +25143,7 @@ function cxApplyDeps() {
 // pre-selects everything = "select all", and a single stale step — e.g. one invalidated by an
 // upstream redo — pre-selects just that). A fully-done device (re-commission) defaults to all selected.
 function cxDefaultPlanFromMask(mask) {
-    const ALL = (1 << CX_PHASES.length) - 1;   // 0x1FF for 9 stages
+    const ALL = (1 << CX_PHASES.length) - 1;   // 0x3FF for 10 stages
     const allDone = (mask & ALL) === ALL;
     for (let i = 0; i < CX_PHASES.length; i++) cxPlan[i] = (i === 0) ? true : (allDone ? true : !(mask & (1 << i)));
     cxApplyDeps();
@@ -24715,7 +25286,8 @@ function cxPrevSelected(from) { for (let i = from - 1; i >= 1; i--) if (cxPlan[i
 // navigating away would leave it running unmonitored (only modal close tears runs down).
 function cxRunActive() {
     return !!(cx && (cx.fieldRunning || cx.kneeRunning || cx.plantRunning || cx.verifyRunning || cx.cvFitRunning ||
-                     cx.matrixOn || cx.rtFieldArmed || cx.fdRunning || (cx.cvs && cx.cvs.running)));
+                     cx.matrixOn || cx.rtFieldArmed || cx.fdRunning || (cx.chc && cx.chc.running) ||
+                     (cx.cvs && cx.cvs.running)));
 }
 
 function cxBack() {
@@ -24840,7 +25412,9 @@ function cxSafetyText(phase) {
   // Open-loop / test-current steps (Field curve, Plant fit, Verify, CV plant fit, Keep-Alive floor
   // onset ramp + field-drain cuts) run with only the fast over-voltage hard-shutdown live; the
   // rest run under full normal protection.
-  const openLoop = (phase >= 1 && phase <= 3) || phase === 6 || phase === 7;
+  // Stage 9 also holds the field open-loop, but it ends its own run on output or bus voltage well
+  // before the hard shutdown — the operator is never the protection.
+  const openLoop = (phase >= 1 && phase <= 3) || phase === 6 || phase === 7 || phase === 9;
   if (phase === 8) return 'Protections active this step: <strong>all of them, the whole time</strong>.';
   return openLoop
     ? 'Protections active this step: <strong>over-voltage only</strong>.'
@@ -24871,6 +25445,7 @@ function cxFinePrint(phase) {
     // Doc anchor keeps its original slug — the docs page carries a legacy <a id> so links from
     // already-shipped firmware still land on the section after the rename.
     case 7: return 'Two measurements at each held speed: the lowest field drive that produces any output (the tachometer keep-alive floor), and how fast output dies away after a protection cut. The field sits at its cut floor during the decay runs, so they cannot over-volt.' + cxDocLink('step-8-min-floor-field-decay');
+    case 9: return 'Holds the field at a fixed level and compares passes made in opposite directions. Output runs ahead of engine speed by a few tenths of a second — a rotor property — and the tracker needs that offset before it can grade anything recorded while the boat is moving. The field is sized at the speed you hold, which is the fastest the machine turns all run, so nothing later exceeds it. Three passes give two independent answers; if they disagree, the answer is not trusted.' + cxDocLink('step-10-charge-health-calibration');
     case 8: return 'Parks the bus at a voltage target the alternator can definitely reach; your throttle snap then pushes it over and the over-voltage protection fires. Graded on how many times it clamps, how long recovery takes, and whether it settles afterward. It writes no settings, and it ends itself.' + cxDocLink('step-9-stress-test');
     default: return '';
   }
@@ -25004,6 +25579,7 @@ function closeCommissionModal() {
         if (cx.verifyRunning) cxGet('TuningMode=0').catch(() => { });
         if (cx.cvFitRunning) { cx.cvFitDone = true; if (cx.cvFitCdTimer) { clearInterval(cx.cvFitCdTimer); cx.cvFitCdTimer = null; } if (cxPollTimer) { clearTimeout(cxPollTimer); cxPollTimer = null; } cxGet('cvPlantFitCancel=1').catch(() => { }); }
         if (cx.fdRunning) { cx.fdRunning = false; cxGet('fieldCutCancel=1').catch(() => { }); }
+        if (cx.chc && cx.chc.running) { cx.chc.running = false; cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); }
         if (cx.cvs && cx.cvs.running) { cx.cvs.running = false; cxGet('cvStressCancel=1').catch(() => { }); }
         if (cx.kneeRunning) cxGet('cancelKneeSweep=1').catch(() => { });
         // Modal close is a sweep teardown path: freeze + persist the RPM ripple table (committed cells
@@ -25077,10 +25653,17 @@ function commissionRender() {
         // Speed-referenced steps name the actual number once the upstream run has produced one.
         const ref = (cx.phase === 2 || cx.phase === 3) ? cxRpmRefFor(cx.phase) : 0;
         if (ref > 0) lbl = 'Engine RPM (last ~15 s) — hold near ' + Math.round(ref) + ' RPM during the sweep';
+        // Stage 9 names what the strip is being used for right now: finding a steady speed, then
+        // the pace lane the passes are drawn against.
+        if (cx.phase === 9 && cx.chc && cx.chc.running) {
+            const ph = (cx.chc.j && cx.chc.j.phase) || 0;
+            if (ph >= 3 && ph <= 5) lbl = 'Engine RPM (last ~15 s) — follow the shaded lane';
+            else if (ph <= 1) lbl = 'Engine RPM (last ~15 s) — waiting for a steady speed';
+        }
         rl.textContent = lbl;
     }
     const b = document.getElementById('commission-body');
-    const R = [cxRenderPrep, cxRenderField, cxRenderPlant, cxRenderVerify, cxRenderMatrix, cxRenderThresh, cxRenderCVPlant, cxRenderKnee, cxRenderStress];
+    const R = [cxRenderPrep, cxRenderField, cxRenderPlant, cxRenderVerify, cxRenderMatrix, cxRenderThresh, cxRenderCVPlant, cxRenderKnee, cxRenderStress, cxRenderChc];
     // Wrap render so a transient error can never blank/close the panel mid-flow.
     try { R[cx.phase](b); } catch (e) { console.warn('commissionRender', e); return; }
     // One muted footer under a single rule: technical "details" for this phase, then the
@@ -25089,10 +25672,15 @@ function commissionRender() {
     // The Disturbances fine print describes the sweep/map — only relevant on this step's first
     // (sweep) screen, not once the alternator-current-check sub-flow is running. Drop it there.
     if (cx.phase === 4 && (cx.matrixOn || cx.matrixCov)) details = '';
+    // Details fold away behind one word on EVERY step — the panel's job is the instruction, not the
+    // reasoning. The protection statement stays out in the open: it is one sentence, it changes per
+    // step, and it is the only thing on screen naming what is guarding the operator.
+    // Open/closed is remembered per session, so a reader who wants the detail keeps it.
     b.insertAdjacentHTML('beforeend',
-        '<div style="margin-top:14px; padding-top:10px; border-top:1px solid #2c2c2c; font-size:11px; color:#888; line-height:1.5;">' +
-        (details ? '<div style="margin-bottom:8px;">' + details + '</div>' : '') +
-        '<div>' + cxSafetyText(cx.phase) + '</div>' +
+        '<div style="margin-top:14px; padding-top:10px; border-top:1px solid #2c2c2c;">' +
+        (details ? '<details class="cx-fp"' + (cxFpOpen ? ' open' : '') + ' ontoggle="cxFpSet(this.open)">' +
+                   '<summary>Details</summary><div class="cx-fp-body">' + details + '</div></details>' : '') +
+        '<div style="margin-top:8px; font-size:11px; color:#888; line-height:1.5;">' + cxSafetyText(cx.phase) + '</div>' +
         '</div>');
     // Universal Back / Skip / Mark-done row on every runnable step (Prep drives its own Start button).
     // Hidden while a run is active — navigating away mid-measurement would leave it running unmonitored.
@@ -25251,7 +25839,7 @@ function rpmAlignCancel() {
 function rpmAlignRender() {
     const sf = getEchoNumber('RPMScalingFactor_echo');
     const pr = getEchoNumber('PulleyRatio_echo');
-    const sfVal = isFinite(sf) ? Math.round(sf) : 1330;
+    const sfVal = isFinite(sf) ? Math.round(sf) : 1470;
     const prVal = isFinite(pr) ? pr : 2.0;
     const sliderVal = Math.min(3000, Math.max(200, sfVal));
     document.getElementById('rpmalign-body').innerHTML =
@@ -28076,7 +28664,7 @@ function cvKdUpdateMarginEcho() {
 // the CV trip line runs parallel to the ripple the Safety Margin above it; the CC line is the same slope,
 // IExcessCcOffsetA above CV. Writes IExcessFrac+FracBulk (kept equal → parallel), Base, CcOffset, Floor,
 // Ceil — the same settings mirrored on Protections ▸ G3. Path B: no measured fit → hand-set only, no margin.
-const CX_THR_LIMS = { slope: [2, 50], base: [0, 40], ccoff: [0, 40], floor: [1, 20], ceil: [5, 80], margin: [0, 40] };
+const CX_THR_LIMS = { slope: [2, 50], base: [0, 150], ccoff: [0, 150], floor: [1, 20], ceil: [5, 200], margin: [0, 150] };  // mirrors the /get constrain() ranges in 3_functions.ino — widened together
 // Lithium (LiFePO4) keeps tight over-current protection (BMS-disconnect cliff). Every other chemistry —
 // AGM, flooded, unknown — tolerates brief current excursions, so the wizard recommends a much larger
 // trip-line margin AND a raised ceiling (else the ceiling clips the margin back down).
@@ -28515,6 +29103,199 @@ function cxStressArmLive(j) {
            '</strong> · bus peak <strong>' + j.peakV.toFixed(2) +
            ' V</strong> · RPM peak <strong>' + Math.round(j.rpmMax) + '</strong>';
 }
+// ── Step 10 · Charge Health Calibration — the alternator's speed lead ─────────────────────────
+// One run. The operator holds a high speed of their own choosing, the tuned current loop sizes the
+// field THERE, the duty it settled on is frozen, and three passes follow — down to idle, back up,
+// down again. Sizing at the top is the point: it is the fastest the machine turns all run, so no
+// later moment can exceed what the sizing step already proved safe. The firmware fits passes 1+2
+// and 2+3 independently; the browser averages them and writes altLeadSec.
+const CHC_DISAGREE = 0.20;           // spread/mean above which the two halves are called disagreeing
+// Firmware abort reasons a lower test current can relieve (7_functions.ino chcFinish strings). NOT the
+// "charge-rate limit at this speed is too small" refusal — lowering the share makes that one worse.
+const CHC_CEILING_RE = /output reached the charge-rate limit|bus reached the charge target|field reached its ceiling/;
+const CHC_PACE_RPM_S = 200;          // the pace asked for on screen: ~5 s per 1000 rpm
+const CHC_CUE_PULSE_MS = 3300;       // must equal the cxCuePulse animation's total run (1.1 s x 3)
+
+function cxChcInit() {
+    if (cx.chc) return;
+    let pct = 50;
+    try { const v = parseInt(localStorage.getItem('chcTestPct') || '', 10); if (v >= 20 && v <= 80) pct = v; } catch (e) { }
+    cx.chc = { started: false, running: false, pct: pct, j: null, err: null, sawActive: false, done: null, prevPct: null };
+}
+function cxChcPct(delta) {
+    const c = cx.chc;
+    c.pct = Math.max(20, Math.min(80, c.pct + delta));
+    try { localStorage.setItem('chcTestPct', String(c.pct)); } catch (e) { }
+    commissionRender();
+}
+function cxChcStart() {
+    const c = cx.chc;
+    c.started = true; c.running = true; c.err = null; c.j = null; c.sawActive = false; c.done = null; c.prevPct = null;
+    c._cuePhase = -1; c._cueAt = 0;
+    cxFieldArm();          // take field ownership → invalidates any pending deferred release
+    cxStopPoll();
+    c._t0 = performance.now();
+    cxPaceLane(null);
+    commissionRender();
+    cxGet('chcStart=1&chcPct=' + c.pct)
+        .then(() => { setTrackedTimeout(cxChcPoll, 700); })
+        .catch(e => { c.running = false; c.err = 'could not start — ' + e; commissionRender(); });
+}
+function cxChcCancel() { cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); }
+function cxChcPoll() {
+    const c = cx && cx.chc;
+    if (!c || !c.running) return;
+    // The operator paces the whole run by hand and the firmware ends itself — generous, and the
+    // wait-for-a-steady-speed phase alone is allowed two minutes.
+    const giveUp = () => (performance.now() - (c._t0 || 0) > 600000);
+    fetch(buildURL('/chc.json')).then(r => r.json()).then(j => {
+        const prevPhase = c.j ? c.j.phase : -1;
+        c.j = j;
+        if (j.active) {
+            c.sawActive = true;
+            // Each pass gets its own lane, anchored where that pass began.
+            if (j.phase !== prevPhase) {
+                if (j.phase >= 3 && j.phase <= 5) cxPaceLane({ rpm: j.rpm, down: (j.phase !== 4) });
+                else cxPaceLane(null);
+            }
+            commissionRender(); setTrackedTimeout(cxChcPoll, 700); return;
+        }
+        // A "ready" from a run we never saw active is the PREVIOUS run's latched result (start was
+        // refused: cooldown or another test) — same trap as the field-drain poll.
+        if (j.ready && (c.sawActive || !j.ok)) {
+            c.running = false;
+            cxPaceLane(null);
+            c.done = j;
+            // A run that stopped on a limit comes back one notch quieter, so Start over is a different attempt.
+            if (!j.ok && c.pct > 20 && CHC_CEILING_RE.test(String(j.abort || ''))) { c.prevPct = c.pct; cxChcPct(-10); }
+            commissionRender(); return;
+        }
+        if (giveUp()) { c.running = false; cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); c.err = 'no result (timed out) — start over'; commissionRender(); return; }
+        setTrackedTimeout(cxChcPoll, 700);
+    }).catch(() => {
+        if (giveUp()) { c.running = false; cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); c.err = 'lost connection during the run — start over'; commissionRender(); return; }
+        setTrackedTimeout(cxChcPoll, 1200);
+    });
+}
+// Round to whole feed samples (all the delay line holds), write it, and move on.
+function cxChcApply() {
+    const j = cx.chc.done;
+    if (!j || !j.ok) return;
+    const q = Math.max(0, Math.min(1.0, Math.round(j.leadSec / 0.1) * 0.1));
+    cxGet('altLeadSec=' + q.toFixed(2))
+        .then(() => cxAdvance(true))
+        .catch(e => xAlert('Could not save the calibration: ' + e));
+}
+function cxChcRestart() { cx.chc.done = null; cx.chc.started = false; cx.chc.err = null; commissionRender(); }
+
+function cxRenderChc(b) {
+    cxChcInit();
+    const c = cx.chc, j = c.j || {};
+    const card = (big, hint) => '<div style="margin:10px 0;padding:10px 12px;background:#1c2530;border-radius:6px;">' +
+        '<div style="font-size:15px;">' + big + '</div>' +
+        (hint ? '<div style="margin-top:4px;color:#9aa;font-size:13px;">' + hint + '</div>' : '') + '</div>';
+    const okBox = t => '<div style="margin:10px 0;padding:8px 10px;background:#1e2a1e;border:1px solid #3a5a3a;border-radius:6px;color:#bdb;">' + t + '</div>';
+    const warnBox = t => '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' + t + '</div>';
+    // The loud cue: full-bleed across the panel body, big type, three attention pulses on entry.
+    // These are the only messages that tell the operator to do something RIGHT NOW, mid-run.
+    if (c._cuePhase !== j.phase) { c._cuePhase = j.phase; c._cueAt = Date.now(); }
+    const cueAge = Date.now() - (c._cueAt || 0);
+    const cue = (l1, l2) => '<div class="cx-cue" style="' +
+        (cueAge < CHC_CUE_PULSE_MS ? 'animation-delay:-' + cueAge + 'ms' : 'animation:none') + '">' +
+        '<div class="cx-cue-l1">' + l1 + '</div>' +
+        (l2 ? '<div class="cx-cue-l2">' + l2 + '</div>' : '') + '</div>';
+    const live = (lab, val) => '<div style="display:flex;justify-content:space-between;font-size:13px;color:#9aa;margin:8px 0 0;font-variant-numeric:tabular-nums;">' +
+        '<span>' + lab + '</span><b style="color:#e6edef;">' + val + '</b></div>';
+    const pctRow = note => '<div style="display:flex;align-items:center;gap:8px;margin:12px 0 4px;">' +
+        '<span style="font-size:13px;color:#9aa;">Test current</span>' +
+        '<button onclick="cxChcPct(-10)" class="btn-secondary" style="width:30px;padding:4px 0;">&minus;</button>' +
+        '<span style="min-width:74px;text-align:center;color:#2ec4b6;font-weight:600;font-variant-numeric:tabular-nums;">' + c.pct + '%</span>' +
+        '<button onclick="cxChcPct(10)" class="btn-secondary" style="width:30px;padding:4px 0;">+</button></div>' +
+        '<div style="color:#9aa;font-size:12.5px;margin:0 0 12px;">' + note + '</div>';
+    let body = '';
+    if (c.err) body += warnBox('<strong>' + c.err + '</strong>');
+
+    // 1 · opening
+    if (!c.started && !c.done) {
+        body += '<p style="font-size:15px;line-height:1.5;">One steady speed, then three slow throttle passes.</p>';
+        body += pctRow(c.pct === 50
+            ? 'Half the charge-rate limit for the speed you hold. Lower it only if a run stops early and you have to repeat this exercise.'
+            : 'Share of the charge-rate limit for the speed you hold.');
+        body += '<button onclick="cxChcStart()" class="btn-primary" style="width:100%;padding:9px;">Start</button>';
+        b.innerHTML = body; return;
+    }
+
+    // running: 2 · pick the speed, 3 · sizing, 4/5/6 · the three passes, 7 · easing out
+    if (c.running) {
+        if (!j.phase || j.phase === 1) {
+            body += cue('Bring the engine to three-quarters of maximum working RPM');
+            const held = Math.max(0, Math.round((j.holdMs || 0) / 1000));
+            body += live('Holding steady', held + ' of 4 s');
+            if (j.rpm > 0 && j.idleRpm > 0 && j.rpm < j.idleRpm + 400 && j.rpm > j.idleRpm + 60)
+                body += '<div style="color:#f0a500;font-size:13px;margin-top:6px;">Too close to idle — there needs to be room to come down.</div>';
+        } else if (j.phase === 2) {
+            body += card('<strong>Keep holding that speed.</strong>', 'Bringing output up to ' + j.targetA.toFixed(0) + ' A.');
+            const frac = (j.targetA > 0) ? Math.max(0, Math.min(1, j.amps / j.targetA)) : 0;
+            body += '<div style="height:8px;background:#0f1416;border-radius:5px;overflow:hidden;margin:9px 0 4px;">' +
+                '<div style="height:100%;width:' + (frac * 100).toFixed(0) + '%;background:linear-gradient(90deg,#14b8af,#2ec4b6);border-radius:5px;"></div></div>' +
+                '<div style="display:flex;justify-content:space-between;font-size:12px;color:#8a9599;font-variant-numeric:tabular-nums;">' +
+                '<span>' + j.amps.toFixed(1) + ' A</span><span>of ' + j.targetA.toFixed(0) + ' A</span></div>';
+            body += live('Field', (j.duty > 0 ? j.duty.toFixed(1) : '—') + '%');
+        } else if (j.phase === 3) {
+            body += cue('Now bring it down to idle', 'About 5 seconds for every 1,000 rpm.');
+        } else if (j.phase === 4) {
+            body += cue('Now back up', 'Same pace, back to ' + cxRpmStr(j.holdRpm) + ' rpm.');
+        } else if (j.phase === 5) {
+            body += cue('Now back down again', 'Last one, down to idle.');
+        } else {
+            body += card('<strong>Done</strong> — handing the field back.');
+        }
+        body += '<div style="margin-top:10px;"><button onclick="cxChcCancel()" class="btn-danger-ghost btn-sm">Cancel</button></div>';
+        b.innerHTML = body; return;
+    }
+
+    // 8 · stopped early
+    const d = c.done;
+    if (!d || !d.ok) {
+        body += warnBox('<strong>Stopped early.</strong> ' + ((d && d.abort) || 'no reason reported') + '.');
+        body += pctRow(c.prevPct != null ? 'Was ' + c.prevPct + '%. Lowered one notch, since the run stopped on a limit.' : '');
+        body += '<button onclick="cxChcRestart()" class="btn-primary" style="width:100%;padding:9px;">Start over</button>';
+        b.innerHTML = body; return;
+    }
+
+    // 9 · result
+    const q = Math.max(0, Math.min(1.0, Math.round(d.leadSec / 0.1) * 0.1));
+    const halves = [d.lead12, d.lead23].filter(v => v >= 0);
+    const spread = (halves.length > 1) ? Math.abs(halves[0] - halves[1]) : 0;
+    const rel = (halves.length > 1 && d.leadSec > 0) ? spread / d.leadSec : 0;
+    const disagree = rel > CHC_DISAGREE;
+    body += disagree
+        ? warnBox('<strong>The two halves disagree.</strong> Run it again.')
+        : okBox('<strong>Measured: ' + d.leadSec.toFixed(2) + ' s</strong> — how far output runs ahead of engine speed here.');
+    const th = t => '<th style="text-align:left;font-size:11px;color:#8a9599;padding:3px 6px 3px 0;">' + t + '</th>';
+    const td = (t, cls) => '<td style="padding:4px 6px 4px 0;border-top:1px solid #2a2f33;' + (cls || '') + '">' + t + '</td>';
+    const range = cxRpmStr(d.idleRpm) + ' – ' + cxRpmStr(d.holdRpm) + ' rpm';
+    body += '<table style="width:100%;border-collapse:collapse;font-size:13px;margin:8px 0 2px;font-variant-numeric:tabular-nums;">' +
+        '<tr>' + th('From') + th('Speed range') + th('Answer') + '</tr>' +
+        '<tr>' + td('Passes 1 &amp; 2') + td(range) + td(d.lead12 >= 0 ? d.lead12.toFixed(2) + ' s' : 'none', 'color:#2ec4b6;') + '</tr>' +
+        '<tr>' + td('Passes 2 &amp; 3') + td(range) + td(d.lead23 >= 0 ? d.lead23.toFixed(2) + ' s' : 'none', 'color:#2ec4b6;') + '</tr>' +
+        '</table>';
+    const kv = (k, v) => '<hr style="border:none;border-top:1px solid #333;margin:9px 0;">' +
+        '<div style="display:flex;justify-content:space-between;font-size:13px;"><span>' + k +
+        '</span><span style="color:#2ec4b6;font-variant-numeric:tabular-nums;">' + v + '</span></div>';
+    body += kv('Field held at', d.duty.toFixed(1) + '%');
+    body += kv('Output range', d.minA.toFixed(0) + ' – ' + d.peakA.toFixed(0) + ' A');
+    // Reference only — nothing is done with the pace figures, they just say what the operator gave.
+    if (d.rateAvg >= 0)
+        body += kv('Throttle pace', 'min ' + d.rateMin.toFixed(0) + ' · avg ' + d.rateAvg.toFixed(0) +
+                   ' · max ' + d.rateMax.toFixed(0) + ' rpm/s');
+    body += kv('Stored value', q.toFixed(2) + ' s');
+    body += '<hr style="border:none;border-top:1px solid #333;margin:9px 0;">';
+    body += '<div style="margin-top:12px;"><button onclick="cxChcApply()" class="btn-primary" style="width:100%;padding:9px;">Approve and finish</button></div>';
+    body += '<div style="margin-top:8px;"><button onclick="cxChcRestart()" class="btn-secondary btn-sm">Run it again</button></div>';
+    b.innerHTML = body;
+}
+function cxRpmStr(v) { return (v > 0) ? Math.round(v).toLocaleString() : '—'; }
 function cxRenderStress(b) {
     const s = cx.cvs || (cx.cvs = {});
     const j = s.j;
@@ -28772,18 +29553,18 @@ async function cxCloudPitchDue() {
 }
 
 const CX_CLOUD_PITCH_HTML =
-    '<p style="font-size:14px; line-height:1.5; margin:0 0 12px;"><strong>One more thing worth doing</strong> &mdash; registering this regulator is free, and here\'s what it allows:</p>' +
+    '<p style="font-size:14px; line-height:1.5; margin:0 0 12px;"><strong>Registering this regulator is free</strong>, and it adds five things:</p>' +
     '<ul style="list-style:none; padding:0; margin:0; font-size:13px; line-height:1.6;">' +
-    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">Firmware updates.</strong> The mechanism for bug fixes and new features.</li>' +
-    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">History past a month.</strong> The regulator stores about 30 days of long-term records on board. Registered devices store unlimited history in the Cloud.</li>' +
-    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">Configuration Sharing</strong> lets you browse setups from similar boats and load them as a starting point.</li>' +
-    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">Leaderboards and Fleet Stats</strong> show how your boat compares to the fleet in metrics like &ldquo;days at sea&rdquo;, &ldquo;lifetime solar harvest&rdquo;, and &ldquo;highest alternator output&rdquo;.</li>' +
-    '<li style="margin-bottom:0;"><strong style="color:#2ec4b6;">Support.</strong> Logs can be pulled automatically instead of manual downloads and emails.</li>' +
+    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">Firmware updates.</strong> Bug fixes and new features reach the regulator over the air.</li>' +
+    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">History past a month.</strong> The regulator holds about 30 days of long-term records on board. Registered devices keep unlimited history in the Cloud.</li>' +
+    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">Config Sharing.</strong> Browse setups from similar boats and load one as a starting point.</li>' +
+    '<li style="margin-bottom:12px;"><strong style="color:#2ec4b6;">Leaderboards and Fleet Stats.</strong> See where your boat sits against the fleet on cruising days, lifetime solar kWh, and peak alternator amps.</li>' +
+    '<li style="margin-bottom:0;"><strong style="color:#2ec4b6;">Support.</strong> We can pull the logs off your regulator instead of asking you to download and email them.</li>' +
     '</ul>' +
     '<p style="font-size:13px; line-height:1.6; margin:16px 0 0; color:#ddd;">' +
     'Registering shows your username, boat type, and length publicly on the leaderboards.<br>' +
     'Contact info and location are never shared.<br>' +
-    'The <strong>Delete My Account</strong> button removes all stored Cloud data; the regulator keeps working locally either way.</p>';
+    'The <strong>Delete My Account</strong> button removes all stored Cloud data, and the regulator keeps working locally either way.</p>';
 
 // Terminal page, same shell as Helpful Hints. OK is the only exit — it lands on the Registration
 // form rather than committing anything, so there is nothing here to decline.
@@ -28792,7 +29573,7 @@ function cxShowCloudPitch() {
     if (!b) { cxCloudPitchNo(); return; }
     b.innerHTML = CX_CLOUD_PITCH_HTML +
         '<button onclick="cxCloudPitchGo()" class="btn-primary" style="width:100%; padding:9px; margin-top:16px;">Go to Registration now</button>' +
-        '<button onclick="cxCloudPitchNo()" class="btn-secondary" style="width:100%; padding:9px; margin-top:8px;">No thanks, I don\'t trust you yet</button>';
+        '<button onclick="cxCloudPitchNo()" class="btn-secondary" style="width:100%; padding:9px; margin-top:8px;">No Thanks</button>';
 }
 
 // showMainTab('cloudfeatures') alone re-inits the profile form; the sub-tab call is added only when
@@ -28839,7 +29620,7 @@ async function commissionStop() {
     }).catch(e => xAlert('Stop failed: ' + e));
 }
 
-// The nine wizard steps, mirrored from CX_PHASES, with a one-line plain-English purpose.
+// The ten wizard steps, mirrored from CX_PHASES, with a one-line plain-English purpose.
 // Single source for the Commissioning tab checklist; indices match the persisted commissionPhase.
 // (Tach alignment is a pre-wizard step, set on its own screen — not in this list.)
 const COMMISSION_STEPS = [
@@ -28852,12 +29633,13 @@ const COMMISSION_STEPS = [
     { name: 'Voltage Control Autotuning', desc: 'Measure how stiff the battery is and set the voltage-loop gains from it.' },
     { name: 'Keep-Alive Floor & Field Decay', desc: 'Find the lowest field that still makes current, and time how fast output dies after a cut.' },
     { name: 'Stress Test', desc: 'Fire the over-voltage protection with a throttle snap and grade the recovery.' },
+    { name: 'Charge Health Calibration', desc: 'Measure how far output runs ahead of engine speed, so the health tracker can grade readings taken under way.' },
 ];
 let cxLastState = 0;   // remembered from the last CSV3 frame, for the clear/restart confirm text
 
 // Render the whole Commissioning tab status block: badge + overall line + step checklist (with
 // per-step run checkboxes) + clear/restart button. Driven by persisted state (0/1/2), current
-// phase (0..9, 9 = finished; moves backward on Back), and the per-stage done bitmask (bit i = stage i complete).
+// phase (0..10, 10 = finished; moves backward on Back), and the per-stage done bitmask (bit i = stage i complete).
 function renderCommissionStatus(state, phase, mask, manual) {
     cxLastState = state;
     cxLastPhase = phase;
@@ -32035,19 +32817,25 @@ const RIPPLEMAP_POLL_MS = 10000;
 const RIPPLEMAP_POLL_UNTIL_CELLS = 10;
 let rippleMapPollId = null;
 
+function rippleMapPollStop() {
+    if (rippleMapPollId !== null) { clearTrackedInterval(rippleMapPollId); rippleMapPollId = null; }
+}
 function rippleMapPollSync(nCells) {
     if (nCells >= RIPPLEMAP_POLL_UNTIL_CELLS) {
-        if (rippleMapPollId !== null) { clearTrackedInterval(rippleMapPollId); rippleMapPollId = null; }
+        rippleMapPollStop();
     } else if (rippleMapPollId === null) {
-        // drawRippleMap self-gates on canvas visibility, so a tick off the Diag tab costs nothing;
-        // document.hidden covers the backgrounded Capacitor WebView, where timers still run.
+        // The first tick taken off the Diag tab stops the poll again (the visibility gate in
+        // drawRippleMap); re-entering the tab redraws and restarts it while the map is still nearly
+        // empty. document.hidden covers the backgrounded Capacitor WebView, where timers still run.
         rippleMapPollId = setTrackedInterval(() => { if (!document.hidden) drawRippleMap(); }, RIPPLEMAP_POLL_MS);
     }
 }
 
 function drawRippleMap() {
     const canvas = document.getElementById('ripplemap-canvas');
-    if (!canvas || canvas.offsetParent === null) return;
+    // Hidden canvas (off the Diag tab, section collapsed): stop the refill poll rather than let it
+    // tick for the life of the page — Clear Map starts it, and nothing else would ever end it.
+    if (!canvas || canvas.offsetParent === null) { rippleMapPollStop(); return; }
     fetch(buildURL('/famatrix.csv'), { cache: 'no-cache' }).then(r => r.text()).then(txt => {
         const rows = txt.trim().split('\n');
         rows.shift();
@@ -32067,7 +32855,12 @@ function drawRippleMap() {
         }
         rippleMapInfoDefault();
         rippleMapPollSync(rippleMapCells.length);
-    }).catch(() => { });
+    }).catch(() => {
+        // A failed fetch is the case the poll exists for (device away after Clear Map). Only the
+        // .then() above re-armed it, so once the hidden-canvas stop had fired, re-entering the tab
+        // with the device still away made exactly one attempt and then none.
+        rippleMapPollSync(rippleMapCells.length);
+    });
 }
 
 function rippleMapFrame() {

@@ -1165,6 +1165,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     Serial.println("Vessel info: never saved");
   }
+  // Deliberately outside the vesselSaved gate: the unit label is identity, not vessel data, and
+  // an unnamed board still has to answer with something unique (regulatorDisplayName's fallback).
+  if (settingExists(NK_regName)) {
+    vesselSetText(REGULATOR_NAME, sizeof(REGULATOR_NAME), settingRead(NK_regName).c_str());
+  }
 
   // Load IMU zero/level calibration (separate from vessel_info so a profile
   // re-save from the cloud never clobbers physical-mount calibration).
@@ -2842,9 +2847,17 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   // 0.2 V x class/12 below the BMS floor, software cut 0.1 x class/12 below the hardware limit) so
   // software always gets first shot and the INA228 pin is purely the electrical backstop.
   // VoltageHardwareLimit — INA228 ALERT comparator threshold (instant, electrical).
-  // First-boot seed is chemistry-aware (lithium 14.3 x class/12 — 0.2 under the surveyed BMS trip
-  // floor; else 16.0 x class/12 — protects DC loads, not the battery); the commissioning proposal
-  // refines it. Seeded BEFORE AlternatorHardShutdownV so the software-cut fallback can chain from it.
+  // The ternary below reads as chemistry-aware but the 16.0f branch is DEAD CODE, permanently.
+  // BATTERY_TYPE is only loaded from NVS inside `if (settingExists(NK_vesselSaved))` earlier in this
+  // function, and this seed runs only on the boot where the key is absent — before any vessel info
+  // exists — so BATTERY_TYPE is still its compile default "lifepo4". It never gets a second chance:
+  // once written, settingExists() is true for the life of the device, and the only path back is
+  // performDeepFactoryReset(), which erases ALL NVS including vesselSaved, so the next boot is
+  // lithium again. Lithium is the DELIBERATE choice here (tightest rung, most units are lithium).
+  // The ternary is kept only as a marker for the day this seed moves after the first vessel save.
+  // Chemistry reaches this rung through Recommend Initial Charging Settings; the Setup > Protections
+  // field edits it directly like any setting; applyNominalVoltageChange rescales it on a class change.
+  // Seeded BEFORE AlternatorHardShutdownV so the software-cut fallback can chain from it.
   if (!settingExists(NK_VoltageHardwareLimit)) {
     VoltageHardwareLimit = (batteryIsLithium() ? 14.3f : 16.0f) * seedVScale;
     settingWrite(NK_VoltageHardwareLimit, String(VoltageHardwareLimit, 2).c_str());

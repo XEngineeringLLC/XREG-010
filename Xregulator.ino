@@ -239,6 +239,7 @@ static float   altLive_vbus = 0, altLive_tF = 0, altLive_duty = 0;   // filtered
 static float   altLive_gAmps = 0;          // graded amps: episode boxcar average (same statistic the records store)
 static float   altTempSlopeFMin = 0;       // case-temp slope (F/min, fast-slow EMA pair in the fold) — thermal-transient tag
 static float   altLive_pct = 0;            // live output-% = graded amps ÷ LWLR prediction (NO clamp; may exceed 100)
+static float   altLatchPct = 0;            // header Health chip: last graded (MEASURED/ESTIMATED) % this boot, held through ungraded ticks; 0 = none yet
 static bool    altRefOk = false;           // state is MEASURED/ESTIMATED → the % is trustworthy
 static float   altRefDist = 999.0f;        // normalized distance to nearest support point (diagnostics)
 static bool    altLiveValid = false;
@@ -263,16 +264,25 @@ static bool    altHiFieldAlert = false;    // high-field-low-output alert (indep
 // operating-point drift, not raw loop dither / sensor jitter (which the filter strips):
 // Band widths are sized by each axis's measured output sensitivity (Alt_Health_Dev_Summary.md §3):
 // output smear from a band = band × dI/dx, and the four add in quadrature.
-float altDutyTolPct    = 0.4f;   // field-duty band (% points, filtered; raw CV dither ~3 p-p). 2.52 A/pt measured OPEN-loop at idle
-                                 // 2026-08-27 (the 1.76 closed-loop fit was low) — dominates the smear budget, but a record stores the
-                                 // 2 s MEAN duty and MEAN amps, which co-move down the true line, so within-run wander partly self-cancels.
-                                 // Also the dominant blocker (sole-block 30% of ticks at quiet idle): do NOT re-tighten — the July-14
-                                 // 0.3 squeeze starved emits
-float altRpmTol        = 20.0f;  // RPM band (filtered; raw idle jitter ~50 p-p). Open-loop measured 2026-08-27: 0.044 A/rpm at idle
-                                 // (0.006-0.008 at cruise revs) — 30 admitted 1.3 A = 7% of idle output, 20 admits 4.7%; quiet-idle
-                                 // p90 3 s range was 19 rpm so admission cost is small. Do NOT widen on the cruise number; the real
-                                 // fix is a regime-dependent band (campaign deliverable)
-float altVbusTol       = 0.20f;  // bus-voltage band (V, filtered). |dI/dV| < 1.8 and sign-unstable across fits — output cost is near zero
+// Since 2026-09-09 the RPM and field axes ask for STRAIGHTNESS rather than stillness: the limit is
+// the rms departure from the axis's own best-fit line over its window, so a smooth acceleration is
+// a recordable event instead of a barrier. The smear arithmetic above still applies, with the rms
+// departure standing in for the band width. Design + measurements: ALT_GATE_TUNING_CAPTURE_SPEC.md.
+float altDutyLineRms   = 0.4f;   // field-duty rms departure from its fitted line (% points, filtered; raw CV dither ~3 p-p).
+                                 // 2.52 A/pt measured OPEN-loop at idle 2026-08-27 (the 1.76 closed-loop fit was low) — dominates
+                                 // the smear budget, but a record stores the 2 s MEAN duty and MEAN amps, which co-move down the
+                                 // true line, so within-run wander partly self-cancels. Do NOT re-tighten — the July-14 0.3
+                                 // squeeze starved emits. Doubles as the tolerance for the emit-time trimmed boxcar range on field
+float altDutySlewMax   = 1.0f;   // field-duty slew cap (% points per second): the field must stay almost fixed, because a moving
+                                 // field means the regulator is chasing something and the run is not one operating point
+float altRpmLineRms    = 12.0f;  // RPM rms departure from its fitted line (filtered; raw idle jitter ~50 p-p). Open-loop measured
+                                 // 2026-08-27: 0.044 A/rpm at idle, 0.006-0.008 at cruise revs. The LINE itself may climb or fall —
+                                 // that is the whole point of the straightness form — so this bounds wobble about a ramp, not the ramp
+float altRpmRateMax    = 250.0f; // RPM slope cap (rpm per second) on that line. A cheap backstop only: replaying the 2026-09-08
+                                 // captures, removing it changes the yield by at most one point in ~200 — the rms test already
+                                 // excludes everything it would have caught
+float altVbusTol       = 0.20f;  // bus-voltage band (V, filtered) — still max−min, not a line fit. |dI/dV| < 1.8 and sign-unstable
+                                 // across fits, so output cost is near zero, and a moving bus is a load event rather than a ramp
 // Admission floors:
 float altMinAmps = 2.0f;
 float altMinDuty = 5.0f;
@@ -359,6 +369,10 @@ float IMU_DIST_BOW_FT = 0;
 float IMU_DIST_CL_FT = 0;
 float IMU_HEIGHT_WL_FT = 0;
 char HOME_PORT[51] = "";  // 50 chars + null terminator
+// Per-unit label ("Port engine"). Empty means the user never named this board, and every
+// consumer falls back to XREG-<uid6>, which is unique per unit — two regulators on one LAN
+// must never present the same name to a client.
+char REGULATOR_NAME[33] = "";
 
 // Bounded copy for every vessel-info text field above. A null src (absent JSON key) writes "".
 static void vesselSetText(char *dst, size_t cap, const char *src) {
@@ -1336,6 +1350,69 @@ float *fcPlotMs = nullptr, *fcPlotA = nullptr;     // PSRAM — decimated decay 
 int    fcPlotN = 0;
 uint32_t fieldCutLastEndMs = 0;                    // cooldown guard
 char  fieldCutAbortMsg[48] = {0};                  // human reason text on a failed/aborted run
+
+// ── Charge health system calibration (commissioning stage 9) ──────────────────────────────
+// Measures the alternator's speed lead: with the field pinned, output answers where the engine is
+// GOING, not where it is, so a rising and a falling pass through the same speeds disagree. The
+// delay that collapses that disagreement is altLeadSec, which the health tracker's admission gate
+// uses to pair output with the engine speed of that moment.
+//
+// One run: the operator holds a high speed of their own choosing, the tuned current loop brings
+// output to chcTestPct of the charge-rate column AT THAT SPEED, the duty it settled on is frozen,
+// and three passes follow — down to idle, back up, down again. Sizing at the top is the whole
+// point: it is the fastest the machine turns all run, so nothing later can exceed what the sizing
+// step already proved safe.
+#define CHC_SAMP_MS        100u    // capture cadence. MUST equal EP_FEED_DT_MS — the answer is counted in these samples and applied as that many feed ticks
+#define CHC_BUF_N          1500    // 150 s of passes at CHC_SAMP_MS (PSRAM, 4 B/sample)
+#define CHC_KMAX           9       // candidate delays searched, in CHC_SAMP_MS samples (0…0.9 s); altLeadSec clamps to 1.0 s
+#define CHC_BIN_RPM        50.0f   // speed bin width for the up/down comparison
+#define CHC_RATE_MIN       40.0f   // rpm/s below which a sample carries no direction information
+#define CHC_MIN_SWING_RPM  300.0f  // a shorter pass never opens a gap worth fitting
+#define CHC_MIN_BINS       3       // paired speed bins needed before a candidate delay is scored
+#define CHC_HOLD_STEADY_MS 4000u   // the chosen speed must sit inside the steady band this long before the field is sized
+#define CHC_HOLD_ABOVE_IDLE 400.0f // the held speed must clear idle by this, or the passes have no range
+#define CHC_WAIT_TIMEOUT_MS 120000UL  // operator never brought the speed up and held it
+#define CHC_SETTLE_MS      1200u   // current must sit inside the band this long before the duty is frozen
+#define CHC_SETTLE_TIMEOUT_MS 15000UL // …and the loop gets this long to get there at all
+#define CHC_MIN_TEST_A     3.0f    // below this there is no output to measure a lead in
+#define CHC_PASS_END_BAND  60.0f   // a pass ends this close to the speed it was aimed at
+#define CHC_PASS_TIMEOUT_MS 90000UL
+#define CHC_V_ABORT_MARGIN 0.02f   // take the field down entirely this far under the charge target
+#define CHC_I_ABORT_FRAC   0.95f   // …and at this fraction of the HIGH column at the present speed
+#define CHC_EASE_MS        1500.0f // ease the field between the frozen level and the pre-test point
+#define CHC_LOHI_AH        201     // banks at or above this size are sized off the HIGH charge-rate column
+
+volatile bool chcRequested = false;        // /get?chcStart
+volatile uint32_t chcReqMs = 0;            // when that press landed — the request expires after 30 s
+volatile bool chcAbortRequested = false;   // /get?chcCancel, or a protection cut
+uint8_t chcActive = 0;                     // 0 = idle, 1 = running
+uint8_t chcPhase = 0;                      // reported to the wizard: 0 idle, 1 waiting for a steady speed,
+                                           // 2 setting the field, 3/4/5 passes 1-3, 6 easing out
+uint8_t chcTestPct = 50;                   // share of the charge-rate column the test aims for (20…80, wizard-held)
+bool  chcCcActive = false;                 // sizing phase: the normal AUTO path drives the real current PID at chcCmdA
+float chcCmdA = 0.0f;                      // …to this level
+float chcTargetA = 0.0f;                   // the level the sizing phase is aiming for (= chcSizeCapA × chcTestPct%)
+float chcHoldDuty = 0.0f;                  // duty the current loop settled on, frozen for all three passes
+float chcIdleRpm = 0.0f;                   // speed at Start — the bottom of every pass
+float chcHoldRpm = 0.0f;                   // speed the operator held — the top of every pass, and where the field was sized
+uint32_t chcHoldMs = 0;                    // how long the speed has been steady (drives the wizard's countdown)
+float chcMinA = 0.0f, chcPeakA = 0.0f;     // output range actually seen across the passes
+float chcLeadSec = -1.0f;                  // the answer: mean of the sub-fits that produced one
+float chcLead12 = -1.0f, chcLead23 = -1.0f;   // passes 1+2 and passes 2+3, fitted independently
+float chcGapBefore = -1.0f, chcGapAfter = -1.0f;   // up/down disagreement, uncorrected and corrected
+// Throttle pace the operator actually delivered, over the samples the fit could use (|rate| at or
+// above CHC_RATE_MIN). Reported at the end for reference only — nothing consumes these.
+float chcRateMin = -1.0f, chcRateMax = -1.0f, chcRateAvg = -1.0f;
+bool  chcResultsReady = false, chcOk = false;
+char  chcAbortMsg[96] = {0};               // 64 truncated four of its own messages mid-word
+uint32_t chcLastEndMs = 0;
+struct ChcSample { uint16_t rpm; int16_t amps10; };   // 4 B — amps ×10, so ±3200 A
+static_assert(sizeof(ChcSample) == 4, "ChcSample lost its packing — the PSRAM budget assumes 4 B");
+ChcSample *chcBuf = nullptr;               // PSRAM capture buffer, filled once per run (never wraps)
+int chcCount = 0;
+int chcPassStart[3] = {0,0,0}, chcPassEnd[3] = {0,0,0};   // sample span of each pass, for the two sub-fits
+float chcSizeCapA = 0.0f, chcGuardCapA = 0.0f;   // charge-rate column at the held speed (sizes the test) / HIGH column live (guards it)
+
 // ── Manual protection-trigger test (Settings → Emergency & Troubleshooting) ────────────────
 // Reproduces each field-collapse waveform on demand so an electrical fault can be provoked in a
 // controlled bench run. Reuses the field-decay energize handoff (protTestCcActive) to bring the
@@ -2842,7 +2919,7 @@ float VoltageAlarmLow = 11.9f;        // below this value, sound alarm (V, 2 dec
 int SocAlarmLow = 10;                 // sound alarm when SoC falls below this % (0 = disabled; needs socInfoAvailable)
 int CurrentAlarmHigh = 100;           // above this value, sound alarm
 int MaximumAllowedBatteryAmps = 125;  // safety for battery, optional
-int RPMScalingFactor = 1330;          // adjust until it matches your trusted tachometer
+int RPMScalingFactor = 1470;          // adjust until it matches your trusted tachometer
 float AlternatorCOffset = 0;          // tare for alt current
 float BatteryCOffset = 0;             // tare or batt current
 int timeToFullChargeMin = NAN;
@@ -4361,6 +4438,10 @@ int defaultRPMValues[RPM_TABLE_SIZE] = { 100, 300, 600, 1100, 1500, 2000, 2650, 
 // above this ceiling. Factory reset restores defaultCapCurrentValues.
 float rpmCapCurrentTable[RPM_TABLE_SIZE] = { 0, 100, 100, 100, 100, 100, 100, 100, 100, 100 };
 float defaultCapCurrentValues[RPM_TABLE_SIZE] = { 0, 100, 100, 100, 100, 100, 100, 100, 100, 100 };
+// Charge health calibration's working copies of the two charge-rate columns (amps, or watts when
+// capLimitMode == 1), filled from NVS by the chcStart handler so the control tick never opens flash.
+// Declared here, not with the other chc globals, because they need RPM_TABLE_SIZE.
+float chcLoTable[RPM_TABLE_SIZE], chcHiTable[RPM_TABLE_SIZE];
 // Low charge-rate factory default, as a fraction of the Normal cap table. Seeds capTableLo
 // and is the fallback whenever that blob is missing; a user-edited Low table overrides it.
 #define LOW_MODE_CAP_FRACTION 0.33f
@@ -4445,6 +4526,14 @@ String manifestConfigObject();
 String exportConfigJson();
 String exportTablesObject();
 int applyImportConfig(const char *body);
+
+// Per-unit identity (3_functions.ino). Used by mDNS, /identify and the AP SSID default.
+const char *regulatorUid6();
+const char *regulatorHostName();
+String regulatorDisplayName();
+String defaultApSsid();
+void mdnsPublishIdentity();
+static void cfgAppendJsonStr(String &out, const String &val);   // defined in 8_functions.ino, used earlier by /identify
 int doCloudPOST(const char *endpointPath, const char *payload, char *responseBuf, size_t responseBufSize);  // 3_functions.ino — lean raw-TLS POST
 
 // Admin config push (4_functions.ino) — boot-time pull of a cloud-queued config
@@ -5637,7 +5726,7 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "<span class=\"opt-title\">Use the regulator as a Hotspot (Access Point)</span>"
   "<span class=\"opt-desc\">As backup, or for ships without existing WiFi networks, you may use the regualtor as a Hotspot (aka Access Point). The regulator controller will broadcast its own WiFi network which you can connect to from any device (phone, ipad, laptop, etc.).  Mostly the same functionality will exist at alternator.local, but with no internet, you won't be able to use weather mode, get software updates, see Community features, etc.  This mode is less supported.  To enter this mode on a reboot, you must connect pin 12 in RJ3 (the rightmost ethernet connector, Blue wire) to Ground.  Leave it connected to GND forever if you prefer this mode.</span>"
   "<label>New Alt. Reg. Hotspot Name (SSID):</label>"
-  "<input type=\"text\" name=\"hotspot_ssid\" placeholder=\"Leave blank for default: ALTERNATOR_WIFI\">"
+  "<input type=\"text\" name=\"hotspot_ssid\" placeholder=\"Leave blank for default: ALTERNATOR_WIFI-&lt;unit id&gt;\">"
   "<label>New Alt. Reg. Hotspot Password:</label>"
   "<input type=\"password\" name=\"ap_password\" placeholder=\"Leave blank for default: alternator123\">"
   "<div class=\"info-box\">"
@@ -5653,23 +5742,33 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "<div class=\"info-box status\" id=\"st\"></div>"
 
   "<div class=\"info-box\">"
-  "After saving, this page may become unresponsive or disappear. In any case, wait 20 seconds, then reconnect to your chosen network to access the full alternator interface at this same url (alternator.local).  Or, just use the iOS app."
+  "After saving, this page may become unresponsive or disappear. In any case, wait 25 seconds, then reconnect to your chosen network to access the full alternator interface at this same url (alternator.local).  Or, just use the iOS app."
   "</div>"
   "</form>"
   "</div>"
 
-  // Post-save countdown. This local status panel is the only feedback the user gets — the POST answer
-  // usually never lands, since the device restarts ~4s later and this page loses the AP with it. The
-  // Save button is hidden and replaced by the panel so the finished message can't read as a button
-  // waiting to be pressed.
+  // Post-save countdown. This local status panel is the only feedback the user gets. The Save button
+  // is hidden and replaced by the panel so the finished message can't read as a button waiting to be
+  // pressed. The POST answer does land now that the handler defers its restart to loop(), but the
+  // countdown still has to cover the two cases where it can't: a fetch rejection when the AP drops
+  // first, and the backstop timer below for a socket that simply goes quiet.
   "<script>"
-  "(function(){var f=document.forms[0],b=document.getElementById('sv'),s=document.getElementById('st');"
+  "(function(){var f=document.forms[0],b=document.getElementById('sv'),s=document.getElementById('st'),done=0;"
+  "function cd(pre){if(done)return;done=1;var n=25;(function t(){s.textContent=n>0?(pre+'Restarting - '+n+'s'):'Restart complete. Reconnect your device to your chosen network, then open alternator.local in a browser.';"
+  "if(n-->0)setTimeout(t,1000)})()}"
+  "function bad(m){if(done)return;done=1;s.style.color='#a00';s.textContent=m;b.style.display='';b.disabled=false}"
   "f.addEventListener('submit',function(e){e.preventDefault();b.disabled=true;b.style.display='none';"
-  "s.style.display='block';"
+  "s.style.display='block';s.style.color='';s.textContent='Saving...';"
   "var q=new URLSearchParams(new FormData(f));"
-  "fetch('/wifi',{method:'POST',body:q}).catch(function(){});"
-  "var n=25;(function t(){s.textContent=n>0?('Settings saved. Restarting - '+n+'s'):'Restart complete. Reconnect your device to your chosen network, then open alternator.local in a browser.';"
-  "if(n-->0)setTimeout(t,1000)})()});})();"
+  // Backstop: fetch() has no default timeout, so a POST that neither answers nor errors leaves
+  // 'Saving...' up forever. Wording is hedged because we never saw the 200 in that case.
+  "setTimeout(function(){cd('No answer from the regulator - it may already be restarting. ')},8000);"
+  // A 400 (short AP password) or 500 (NVS write failed) answers fast and RESOLVES the fetch, so only
+  // r.ok may start the countdown. A rejected fetch is the restart taking the AP down = really saved.
+  "fetch('/wifi',{method:'POST',body:q}).then(function(r){if(r.ok){cd('Settings saved. ');return;}"
+  "function e2(){bad('Not saved - the regulator rejected the settings (HTTP '+r.status+').')}"
+  "return r.text().then(function(t){var m=String(t).replace(/<[^>]*>/g,' ').replace(/\\s+/g,' ').trim();"
+  "if(m)bad('Not saved: '+m);else e2()},e2)},function(){cd('Settings saved. ')})});})();"
   "</script>"
 
   "</body></html>";
@@ -6191,7 +6290,7 @@ void loop() {
   g_blackBox.duty = dutyCycle;
   g_blackBox.rpm = RPM;
   g_blackBox.measAmps = MeasuredAmps;
-  g_blackBox.altTempF = (int16_t)(isnan(AlternatorTemperatureF) ? -999 : AlternatorTemperatureF);
+  g_blackBox.altTempF = (int16_t)(!isfinite(AlternatorTemperatureF) ? -999 : AlternatorTemperatureF);  // (int16_t)inf is UB, same as (int16_t)NAN
   g_blackBox.maxLoopUs = MaxLoopTime;
   g_blackBox.minHeapKB = MinFreeHeap;
   g_blackBox.sysMode = (uint8_t)sysMode;
