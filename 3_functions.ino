@@ -1553,6 +1553,7 @@ static const char *wifiDisconnectReasonStr(uint8_t reason) {
     case 5:   return "ASSOC_TOOMANY (AP at device limit)";
     case 6:   return "NOT_AUTHED";
     case 7:   return "NOT_ASSOCED";
+    case 8:   return "ASSOC_LEAVE (this device dropped the link itself)";
     case 15:  return "4WAY_HANDSHAKE_TIMEOUT (usually wrong password)";
     case 23:  return "802.1X_AUTH_FAILED";
     case 24:  return "CIPHER_SUITE_REJECTED";
@@ -1568,11 +1569,72 @@ static const char *wifiDisconnectReasonStr(uint8_t reason) {
 
 // 0 = no disconnect event received; written from the WiFi task, read by the boot-connect verdict
 static volatile uint8_t lastStaDiscReason = 0;
+// One outage's record for pollWiFiLinkState() below. An outage starts at the first disconnect event after
+// a GOT_IP; that event's reason is the cause — the reconnect engine's failed rejoins fire more events with
+// their own reasons, so those only bump the count. Events before the first GOT_IP of the boot are ignored
+// (the boot join has its own verdict log). Single aligned words written by the event task and read by the
+// loop: no lock, no allocation, no waiting on either side.
+static volatile uint32_t staUpMs         = 0;   // millis of the last GOT_IP; 0 = never up this boot
+static volatile uint32_t staOutageStartMs = 0;  // millis of the first event of the current/last outage
+static volatile uint8_t  staDropReason   = 0;   // that first event's reason
+static volatile uint16_t staDropEvents   = 0;   // events in the outage so far
+static volatile bool     staDropPending  = false;  // set at outage start, cleared once the loop has reported it
 
 static void onWiFiStaDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   uint8_t reason = info.wifi_sta_disconnected.reason;
   lastStaDiscReason = reason;
+  if (staUpMs != 0) {
+    if ((int32_t)(staUpMs - staOutageStartMs) > 0) {   // link came up since the last outage began → a new outage
+      staOutageStartMs = millis();
+      staDropReason = reason;
+      staDropEvents = 0;
+      staDropPending = true;
+    }
+    if (staDropEvents < 65535) staDropEvents = staDropEvents + 1;
+  }
   Serial.printf("WiFi STA disconnect reason: %u (%s)\n", reason, wifiDisconnectReasonStr(reason));
+}
+
+static void onWiFiStaGotIp(WiFiEvent_t event, WiFiEventInfo_t info) {
+  staUpMs = millis();
+}
+
+// The loop's 5 s link poll, called from loop() under the Client-mode radio-up gate. Drops are reported
+// from here and never from the event task: queueConsoleMessageF formats into a 256 B stack buffer and the
+// loop is where every other console writer runs. Cost is one WiFi.status() per 5 s as before, plus one
+// snprintf (and one WiFi.RSSI()) per drop — nothing on a quiet pass. A drop shorter than the poll interval
+// never shows as a status edge, so the pending record is checked on a connected pass too. While the link
+// is down the line reaches no browser live; it lands in the /consolehist.txt ring and
+// consoleBackfillFromDevice() splices it on screen once the stream is back.
+void pollWiFiLinkState() {
+  static unsigned long lastWiFiStatusCheck = 0;
+  static bool lastWiFiConnected = true;
+  if (millis() - lastWiFiStatusCheck <= 5000) return;
+  lastWiFiStatusCheck = millis();
+  bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
+  bool pending = staDropPending;
+  staDropPending = false;
+  uint8_t r = staDropReason;
+  uint32_t t0 = staOutageStartMs, up = staUpMs;
+  uint16_t n = staDropEvents;
+  bool selfDrop = (r == 8);   // ASSOC_LEAVE: this device dropped the link (standby radio-off, OTA, a forced rejoin), not an outage
+  float downS = (t0 && (int32_t)(up - t0) > 0) ? (up - t0) / 1000.0f : 0.0f;
+
+  if (lastWiFiConnected && !currentlyConnected) {
+    wifiDisconnectCount++;
+    if (pending && !selfDrop) queueConsoleMessageF("WiFi disconnected #%u: reason %u (%s)%s", wifiDisconnectCount, r, wifiDisconnectReasonStr(r), n > 1 ? " - rejoin attempts failing too" : "");
+    else if (pending)         queueConsoleMessageF("WiFi disconnected #%u: radio was switched off by this device - rejoining", wifiDisconnectCount);
+    else                      queueConsoleMessageF("WiFi disconnected #%u (no disconnect event recorded)", wifiDisconnectCount);
+  } else if (!lastWiFiConnected && currentlyConnected) {
+    wifiReconnectsTotal++;
+    if (downS > 0 && !selfDrop) queueConsoleMessageF("WiFi reconnected #%u after %.1f s (RSSI %d dBm)", wifiReconnectsTotal, downS, WiFi.RSSI());
+    else                        queueConsoleMessageF("WiFi reconnected #%u (RSSI %d dBm)", wifiReconnectsTotal, WiFi.RSSI());
+  } else if (currentlyConnected && pending && !selfDrop) {
+    // dropped and re-associated inside one poll interval — the status edges above never saw it
+    wifiDisconnectCount++;
+    queueConsoleMessageF("WiFi dropped #%u: reason %u (%s), back after %.1f s (RSSI %d dBm)", wifiDisconnectCount, r, wifiDisconnectReasonStr(r), downS, WiFi.RSSI());
+  }
+  lastWiFiConnected = currentlyConnected;
 }
 
 static const char *wifiStatusStr(int s) {
@@ -1609,6 +1671,7 @@ bool connectToWiFi(const char *ssid, const char *password, unsigned long timeout
   static bool wifiReasonLoggerRegistered = false;
   if (!wifiReasonLoggerRegistered) {
     WiFi.onEvent(onWiFiStaDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+    WiFi.onEvent(onWiFiStaGotIp, ARDUINO_EVENT_WIFI_STA_GOT_IP);
     wifiReasonLoggerRegistered = true;
   }
 
@@ -2996,6 +3059,13 @@ void setupServer() {
         return written;
       });
     response->addHeader("Cache-Control", "no-cache");
+    // Device uptime at send: the browser places ring lines on its own clock by age (millis is monotonic),
+    // so the splice after a stream outage needs no time source — the epoch column is only as good as the
+    // device's clock, and an AP-mode browser user has none. Exposed for the app's cross-origin fetch.
+    char nowBuf[16];
+    snprintf(nowBuf, sizeof(nowBuf), "%lu", (unsigned long)millis());
+    response->addHeader("X-Device-Millis", nowBuf);
+    response->addHeader("Access-Control-Expose-Headers", "X-Device-Millis");
     request->send(response);
   });
 
@@ -3256,6 +3326,13 @@ void setupServer() {
   server.on("/cxStartState", HTTP_GET, [](AsyncWebServerRequest *request) {
     const char *st = (cxStartPersistStep != 0) ? "PENDING" : (cxStartPersistFail ? "FAILED" : "IDLE");
     request->send(200, "application/json", String("{\"state\":\"") + st + "\"}");
+  });
+  // Charge Rate Limits screen: PENDING while the loop is still writing the staged cap-table blobs, FAILED
+  // if a write was refused, IDLE otherwise. rpmCapContinue polls this after /get?capBothSave and sends the
+  // HiLow switch only on IDLE — the save's HTTP 200 means accepted, not stored.
+  server.on("/capSaveState", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json",
+                  (capBothPersistStep != 0) ? "{\"state\":\"PENDING\"}" : (capBothPersistFail ? "{\"state\":\"FAILED\"}" : "{\"state\":\"IDLE\"}"));
   });
   // First-boot SoC seed record for the commissioning popup; ack=1 once the user pressed Finish.
   server.on("/socseed", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -7041,10 +7118,9 @@ void setupServer() {
         commissionClearStage(7);
         queueConsoleMessage("Learning: RPM breakpoints changed — keep-alive floors cleared, re-run the Keep-Alive Floor step");
       }
-      saveBothCapTables(hiA, hiW, loA, loW);   // synchronous: NVS fresh before any following HiLow read
+      capBothStageBegin(hiA, hiW, loA, loW);   // 6_functions.ino: the loop writes the blobs one per pass; "saved" is announced from there and /capSaveState reports it
       learningTableUpdated = true;
       stateRevision++;
-      queueConsoleMessage("Learning: Low+High cap tables saved");
     }
 
     // Fuel table handlers

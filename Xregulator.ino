@@ -4454,6 +4454,22 @@ float rpmCapPowerTable[RPM_TABLE_SIZE] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 float defaultCapPowerValues[RPM_TABLE_SIZE] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 uint8_t capLimitMode = 0;  // 0 = use amp cap (rpmCapCurrentTable), 1 = use kW cap (rpmCapPowerTable)
 
+// Charge Rate Limits screen (/get?capBothSave): the request handler stages both tables here and the loop's
+// capBothPersistService() writes ONE blob per pass — writing all five inside the handler sat on the network
+// task and froze the dashboard stream (the same disease cxStartPersistService cured for commissioning Start).
+// The spinlock covers the ~200 B copies only; NVS work never runs under it. loadCapTablesForMode() serves
+// the staged copy while a save is pending so a mode switch never reads a half-landed set. Static on purpose:
+// 200 B is not worth a PSRAM allocation plus a null path.
+struct CapBothStage {
+  int   pts[RPM_TABLE_SIZE];
+  float hiA[RPM_TABLE_SIZE], hiW[RPM_TABLE_SIZE], loA[RPM_TABLE_SIZE], loW[RPM_TABLE_SIZE];
+};
+CapBothStage capBothStage;
+portMUX_TYPE capBothMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t capBothPersistStep = 0;   // 0 idle; 1..5 = next blob (rpmPoints, capTable, capPowerTable, capTableLo, capPowerTableLo)
+volatile uint8_t capBothStageGen  = 0;     // bumped per staging; a re-stage mid-sequence restarts at blob 1 instead of advancing
+volatile bool    capBothPersistFail = false;
+
 // ===== MINIMUM FIELD DUTY TABLE =====
 // Minimum PWM duty cycle (%) applied to the field at each RPM breakpoint. Always live:
 // getMinimumFieldForRPM interpolates this table and hard-floors the result with the scalar MinDuty,
@@ -6585,6 +6601,7 @@ void loop() {
     pendingSaveUserTableEdits = false;
     saveUserTableEdits();
   }
+  capBothPersistService();  // 6_functions.ino: one staged cap-table blob per pass, no-op when idle
   if (pendingSaveVesselInfo) {
     pendingSaveVesselInfo = false;
     saveVesselInfoToNvs();
@@ -7089,25 +7106,7 @@ void loop() {
       if (currentMode == MODE_CLIENT && (Ignition == 1 || pendingShutdownFlush || (wifiWakeStart > 0 && (millis() - wifiWakeStart) < WIFI_WAKE_DURATION) || wifiNapActive)) {
         // if (currentMode == MODE_CLIENT && (Ignition == 1 || wifiWakeActive)) { // can't try to do anything wifi related unless ignition is on and clock speed is fast enough to not crash
         TIMED_CALL(ft_checkWiFiConnection, checkWiFiConnection());
-
-        // Track actual WiFi disconnects
-        static unsigned long lastWiFiStatusCheck = 0;
-        static bool lastWiFiConnected = true;
-
-        if (millis() - lastWiFiStatusCheck > 5000) {
-          bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
-
-          if (lastWiFiConnected && !currentlyConnected) {
-            wifiDisconnectCount++;
-            queueConsoleMessageF("WiFi disconnected #%u", wifiDisconnectCount);
-          } else if (!lastWiFiConnected && currentlyConnected) {
-            wifiReconnectsTotal++;
-            queueConsoleMessageF("WiFi reconnected #%u", wifiReconnectsTotal);
-          }
-
-          lastWiFiConnected = currentlyConnected;
-          lastWiFiStatusCheck = millis();
-        }
+        pollWiFiLinkState();  // 3_functions.ino: 5 s status poll; names the drop reason the WiFi event task recorded
       }
       break;  // Exit switch statement, continue with rest of loop()
   }

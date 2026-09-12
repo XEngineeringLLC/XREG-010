@@ -7376,6 +7376,17 @@ void loadLearningTableFromNVS() {
 // HiLow=1 → Normal (key "capTable"), HiLow=0 → Low Charge Rate (key "capTableLo").
 // Falls back to defaults if no saved data exists for that mode.
 void loadCapTablesForMode(int mode) {
+  // A capBothSave still draining to NVS: serve the staged set so the switch sees the new tables, not
+  // whichever blobs have landed so far.
+  bool served = false;
+  portENTER_CRITICAL(&capBothMux);
+  if (capBothPersistStep != 0) {
+    memcpy(rpmCapCurrentTable, (mode == 1) ? capBothStage.hiA : capBothStage.loA, sizeof(rpmCapCurrentTable));
+    memcpy(rpmCapPowerTable,   (mode == 1) ? capBothStage.hiW : capBothStage.loW, sizeof(rpmCapPowerTable));
+    served = true;
+  }
+  portEXIT_CRITICAL(&capBothMux);
+  if (served) return;
   nvs_handle_t nvs_handle;
   esp_err_t err = nvs_open("learning", NVS_READONLY, &nvs_handle);
   if (err != ESP_OK) {
@@ -7560,19 +7571,68 @@ void saveUserTableEdits() {
 // from the pre-commissioning Charge Rate Limits web handler. Kept separate from saveUserTableEdits
 // (which writes only the active mode) so the wizard seeds both without a live mode toggle. Written
 // synchronously in the request so a following HiLow mode switch reads fresh blobs (no NVS race).
-void saveBothCapTables(const float *hiA, const float *hiW, const float *loA, const float *loW) {
-  nvs_handle_t nvs_handle;
-  if (nvs_open("learning", NVS_READWRITE, &nvs_handle) != ESP_OK) {
-    queueConsoleMessage("Learning: both-cap save failed to open NVS");
+// Stage both cap tables plus the live RPM breakpoints for capBothPersistService(). Runs in the /get handler
+// on the network task; the copy is ~200 B under the spinlock and nothing else. A second Continue while a
+// save is still draining restarts the sequence from blob 1 with the newer values — every blob is rewritten,
+// so the set that lands is always the latest one.
+void capBothStageBegin(const float *hiA, const float *hiW, const float *loA, const float *loW) {
+  portENTER_CRITICAL(&capBothMux);
+  memcpy(capBothStage.pts, rpmTableRPMPoints, sizeof(capBothStage.pts));
+  memcpy(capBothStage.hiA, hiA, sizeof(capBothStage.hiA));
+  memcpy(capBothStage.hiW, hiW, sizeof(capBothStage.hiW));
+  memcpy(capBothStage.loA, loA, sizeof(capBothStage.loA));
+  memcpy(capBothStage.loW, loW, sizeof(capBothStage.loW));
+  capBothStageGen = capBothStageGen + 1;
+  capBothPersistFail = false;
+  capBothPersistStep = 1;
+  portEXIT_CRITICAL(&capBothMux);
+}
+
+// Retire one staged blob per loop() pass; no-op when idle. The blob is copied out under the spinlock and
+// written with the lock released. Advances only if no re-stage happened during the write, so a restarted
+// sequence is never skipped past. A refused write stops the sequence and reports FAILED on /capSaveState;
+// the tables stay live in RAM (the handler already applied the active mode's ceiling).
+void capBothPersistService() {
+  uint8_t s = capBothPersistStep;
+  if (s == 0) return;
+  const char *key = nullptr;
+  size_t len = 0;
+  union { int pts[RPM_TABLE_SIZE]; float f[RPM_TABLE_SIZE]; } local;
+  portENTER_CRITICAL(&capBothMux);
+  uint8_t gen = capBothStageGen;
+  switch (s) {
+    case 1: key = "rpmPoints";       memcpy(local.pts, capBothStage.pts, sizeof(local.pts)); len = sizeof(local.pts); break;
+    case 2: key = "capTable";        memcpy(local.f, capBothStage.hiA, sizeof(local.f));     len = sizeof(local.f);   break;
+    case 3: key = "capPowerTable";   memcpy(local.f, capBothStage.hiW, sizeof(local.f));     len = sizeof(local.f);   break;
+    case 4: key = "capTableLo";      memcpy(local.f, capBothStage.loA, sizeof(local.f));     len = sizeof(local.f);   break;
+    case 5: key = "capPowerTableLo"; memcpy(local.f, capBothStage.loW, sizeof(local.f));     len = sizeof(local.f);   break;
+    default: capBothPersistStep = 0; break;
+  }
+  portEXIT_CRITICAL(&capBothMux);
+  if (!key) return;
+
+  nvs_handle_t h;
+  esp_err_t e = nvs_open("learning", NVS_READWRITE, &h);
+  if (e == ESP_OK) {
+    e = nvs_set_blob(h, key, &local, len);
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+  }
+  if (e != ESP_OK) {
+    portENTER_CRITICAL(&capBothMux);
+    if (capBothStageGen == gen) { capBothPersistStep = 0; capBothPersistFail = true; }
+    portEXIT_CRITICAL(&capBothMux);
+    queueConsoleMessageF("Learning: Low+High cap table save FAILED at %s (err=%d) - tables are live but not stored", key, (int)e);
     return;
   }
-  nvs_set_blob(nvs_handle, "rpmPoints", rpmTableRPMPoints, sizeof(rpmTableRPMPoints));
-  nvs_set_blob(nvs_handle, "capTable", hiA, RPM_TABLE_SIZE * sizeof(float));
-  nvs_set_blob(nvs_handle, "capPowerTable", hiW, RPM_TABLE_SIZE * sizeof(float));
-  nvs_set_blob(nvs_handle, "capTableLo", loA, RPM_TABLE_SIZE * sizeof(float));
-  nvs_set_blob(nvs_handle, "capPowerTableLo", loW, RPM_TABLE_SIZE * sizeof(float));
-  nvs_commit(nvs_handle);
-  nvs_close(nvs_handle);
+  bool done = false;
+  portENTER_CRITICAL(&capBothMux);
+  if (capBothStageGen == gen) {   // no re-stage during the write → advance
+    capBothPersistStep = (s < 5) ? (s + 1) : 0;
+    done = (s == 5);
+  }
+  portEXIT_CRITICAL(&capBothMux);
+  if (done) queueConsoleMessage("Learning: Low+High cap tables saved");
 }
 
 // Immediate save of historical data (no throttle)

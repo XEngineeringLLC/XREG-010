@@ -1585,11 +1585,19 @@ function updateAltHealth() {
   // High-field-low-output alert (independent safety net \u2014 fires regardless of the record book)
   const hfEl = document.getElementById('alt-hifield-alert');
   if (hfEl) hfEl.style.display = altLive.hiFieldAlert>=1 ? '' : 'none';
-  // Session statistics over the graded, session-steady samples (mean + 10th-percentile weak tail) \u2014
-  // the same points the This Session plot dots; a real ~5% decline shows here before the trend buckets can.
+  // Graded-point counter, then the statistics over those same points (mean + 10th-percentile weak tail):
+  // the graded, session-steady samples, which are also the points the This Session plot dots. The count
+  // stands on its own line because it is the only useful number in the first minutes, before mean and
+  // percentile have the 10 samples that make them meaningful. A real ~5% decline shows in the statistics
+  // before the trend buckets can.
+  const gradedN = Math.max(0, Math.round(Number(altLive.sessionN) || 0));
+  const gradEl = document.getElementById('alt-session-graded');
+  if (gradEl) gradEl.innerHTML = gradedN > 0
+    ? ('<b style="color:var(--text-dark);font-variant-numeric:tabular-nums;">'+gradedN.toLocaleString('en-US')+'</b> graded point'+(gradedN===1?'':'s')+' this session')
+    : 'no graded points yet this session';
   const sessEl = document.getElementById('alt-session-stats');
-  if (sessEl) sessEl.textContent = (altLive.sessionN>=10)
-    ? ('this session: mean '+Math.round(altLive.sessionMean)+'% \u00b7 10th percentile '+Math.round(altLive.sessionP10)+'% \u00b7 '+Math.round(altLive.sessionN)+' graded samples')
+  if (sessEl) sessEl.textContent = (gradedN>=10)
+    ? ('mean '+Math.round(altLive.sessionMean)+'% \u00b7 10th percentile '+Math.round(altLive.sessionP10)+'%')
     : '';
   // Best-surface size + engine-hours of data gathered (no live "now %": the plot's dot already shows it).
   if (covEl) {
@@ -10468,12 +10476,15 @@ async function rpmCapContinue(mode) {
         }
         url += '&capLimitMode=' + (s.unit === 'kw' ? 1 : 0);
         // Both requests are load-bearing: proceeding past a failed one strands the wizard in the wrong
-        // mode with no sign of it. Keep the screen open and make the user retry instead.
+        // mode with no sign of it. Keep the screen open and make the user retry instead. The device stages
+        // the save and its main loop writes the blobs one per pass, so the HTTP 200 means accepted, not
+        // stored — advance only once /capSaveState reports IDLE.
         try {
             const r = await fetchWithTimeout(buildURL(url), {}, 10000);
             if (!r.ok) throw new Error('rejected (HTTP ' + r.status + ')');
+            await awaitDevicePersist('/capSaveState', 8000, 'the charge-rate limit tables');
         } catch (e) {
-            await xAlert('Saving the charge-rate limit tables failed — nothing was changed. Check the connection and press Continue again.\n\n' + e);
+            await xAlert('The regulator did not confirm the charge-rate limit tables were stored. Check the connection and press Continue again.\n\n' + e);
             return;
         }
         try {
@@ -13370,23 +13381,37 @@ function renderConsoleFromBuffer() {
 // it cannot deliver the moment it has no listener. So after a reconnect, splice what the regulator said
 // during the gap back into the on-screen log instead of leaving a silent hole in it. Bounded by the
 // ring: an outage longer than 200 messages recovers only the tail.
+// Lines are placed by AGE: the response carries the device's uptime at send (X-Device-Millis) and each
+// line carries its uptime at queue time, so a line lands at (now - age) on this browser's own clock —
+// no device time source needed, which an AP-mode browser user does not have. The epoch column is the
+// fallback for firmware without the header, and only works when the device clock was synced.
 // Returns the number of lines spliced back in, or -1 if the regulator could not be asked.
 async function consoleBackfillFromDevice(gapStartMs, gapEndMs) {
     if (DEMO_MODE) return -1;
-    let raw;
+    let raw, devNow = NaN, fetchedAt = 0;
     try {
         const r = await fetchWithTimeout(buildURL('/consolehist.txt'), {}, 8000);
         if (!r.ok) return -1;
+        fetchedAt = Date.now();
+        devNow = parseInt(r.headers.get('X-Device-Millis'), 10);
         raw = await r.text();
     } catch (e) { return -1; }
+    const byAge = Number.isFinite(devNow);
     const from = gapStartMs - 1500;   // a second of overlap either side: both paths can carry the boundary line
     const recovered = [];
     for (const line of raw.split('\n')) {
         const i1 = line.indexOf('\t'), i2 = line.indexOf('\t', i1 + 1);
         if (i1 < 0 || i2 < 0) continue;
-        const epoch = parseInt(line.slice(0, i1), 10);
-        if (!(epoch > 1577836800)) continue;   // device clock never synced — the line cannot be placed in time
-        const t = epoch * 1000;
+        let t;
+        if (byAge) {
+            const ms = parseInt(line.slice(i1 + 1, i2), 10);
+            if (!Number.isFinite(ms)) continue;
+            t = fetchedAt - ((devNow - ms) >>> 0);   // unsigned 32-bit age, correct across a millis() wrap
+        } else {
+            const epoch = parseInt(line.slice(0, i1), 10);
+            if (!(epoch > 1577836800)) continue;   // device clock never synced — the line cannot be placed in time
+            t = epoch * 1000;
+        }
         if (t < from || t > gapEndMs) continue;
         recovered.push({ t: t, msg: line.slice(i2 + 1), count: 1 });
     }
@@ -25763,29 +25788,34 @@ function cxPrepRefresh() {
     }
     btn.disabled = !engineOk || !cx.srcAck;
 }
-// The device defers the Start's flash writes to its main loop (the old in-handler burst froze the
-// whole interface ~2 s), so the HTTP 200 means "accepted", NOT "saved". Poll /cxStartState until
-// the worker reports IDLE — the state byte is committed last, so IDLE proves the entire restore
-// point (the tune Abort reverts to) is on flash. Never advance on a timeout or a FAILED report.
-function cxAwaitStartPersist(timeoutMs) {
+// Poll a device persist-state endpoint ({state: PENDING|FAILED|IDLE}) until IDLE. The device defers flash
+// writes to its main loop (an in-handler burst froze the whole interface ~2 s), so the HTTP 200 on the
+// request that staged them means "accepted", NOT "saved" — IDLE is the only proof they landed. Never
+// resolves on a timeout or a FAILED report. `what` names the record in the rejection text.
+function awaitDevicePersist(path, timeoutMs, what) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
         const tick = () => {
-            fetchWithTimeout(buildURL('/cxStartState'), { cache: 'no-store' }, 3000)
+            fetchWithTimeout(buildURL(path), { cache: 'no-store' }, 3000)
                 .then(r => r.json())
                 .then(s => {
                     if (s.state === 'IDLE') return resolve();
-                    if (s.state === 'FAILED') return reject('the device could not write the settings restore point to storage');
-                    if (Date.now() - t0 > timeoutMs) return reject('the device did not confirm the restore point in time');
+                    if (s.state === 'FAILED') return reject('the device could not write ' + what + ' to storage');
+                    if (Date.now() - t0 > timeoutMs) return reject('the device did not confirm ' + what + ' in time');
                     setTimeout(tick, 250);
                 })
                 .catch(() => {
-                    if (Date.now() - t0 > timeoutMs) return reject('the device did not confirm the restore point in time');
+                    if (Date.now() - t0 > timeoutMs) return reject('the device did not confirm ' + what + ' in time');
                     setTimeout(tick, 400);
                 });
         };
         tick();
     });
+}
+// Commissioning Start: the state byte is committed last, so IDLE proves the entire restore point (the
+// tune Abort reverts to) is on flash.
+function cxAwaitStartPersist(timeoutMs) {
+    return awaitDevicePersist('/cxStartState', timeoutMs, 'the settings restore point');
 }
 function cxStart() {
     // commissionStart stages the restore-point snapshot (kept from the original Start when resuming
