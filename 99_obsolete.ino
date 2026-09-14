@@ -1128,3 +1128,336 @@
 // field-current sense, timer), any decay-rate modulation, and any location
 // of the hardware.
 // ============================================================================
+
+
+// ============================================================================
+// IDEAS RECORDED TO PROTECT FUTURE IMPLEMENTATIONS, PART 3:
+// ENGINE AND BELT DIAGNOSTICS FROM STATOR-PHASE EDGE TIMING
+// ============================================================================
+// Added 2026-09-13. The commit date of this block in the public repository
+// https://github.com/XEngineeringLLC/XREG-010 is its publication date. Not
+// built. Same rule as Parts 1 and 2: enabling detail, numbers stated.
+//
+// ---------------------------------------------------------------------------
+// WHAT EXISTS TODAY
+// ---------------------------------------------------------------------------
+// Engine speed comes from one stator phase through a frequency-to-voltage
+// converter (LM2907) into the ADS1115, read about every 30 ms, then scaled by
+// a hand-entered factor (RPMScalingFactor) and a hand-entered pulley ratio
+// (PulleyRatio) that the operator aligns against the boat's own tachometer.
+// The converter's coupling network has a 2 s time constant, so an abrupt loss
+// of stator amplitude gives several seconds of false zero. The speed axis is
+// therefore a calibration, not a measurement, and its resolution is that of
+// an analog voltage. Separately, the fast alternator-current channel (tens of
+// kilosamples per second on the ESP32 ADC) already does ripple and rectifier
+// fault analysis on AMPLITUDE. Automotive regulator ICs measure phase
+// frequency directly and divide by a programmed pole-pair count, to about
+// 10 %. None of this resolves what happens INSIDE one revolution.
+//
+// ---------------------------------------------------------------------------
+// THE SIGNAL
+// ---------------------------------------------------------------------------
+// Timestamp every zero crossing of one stator phase in hardware and treat the
+// interval sequence as an instantaneous angular speed (IAS) signal.
+//
+// Arithmetic: a claw-pole alternator with p pole pairs puts p electrical
+// cycles per rotor revolution on each phase, so 2p zero-crossing edges per
+// rotor revolution (12 for the common p = 6). With pulley ratio r that is 2pr
+// edges per engine revolution: 30 at r = 2.5, one edge every 12 degrees of
+// crank. A four-stroke fires N/2 times per revolution, so a four-cylinder
+// gives about 15 edges per firing event and a two-cylinder about 30, which
+// resolves the speed rise and fall of every firing event several times over.
+//
+// Front end: AC-couple the phase tap through a divider into a comparator with
+// a few tens of millivolts of hysteresis (or a dedicated zero-crossing
+// detector), output to an ESP32-S3 capture peripheral: MCPWM capture for
+// edge timestamps at the 80 MHz peripheral clock (12.5 ns), PCNT where only a
+// count is needed, RMT for a raw edge stream, or a GPIO interrupt with the
+// microsecond timer. At a 125 Hz phase (4 ms between edges) 12.5 ns is 3 ppm;
+// the real noise floor is comparator threshold jitter on the stator waveform,
+// of the order of 0.01 to 0.1 % per interval, which is still ten to a hundred
+// times finer than the firing-event modulation being measured. The analog
+// converter can stay for its low-amplitude idle behaviour or be replaced; a
+// low comparator threshold also reads residual-magnetism edges with the field
+// off at cruising speed, which Part 1 D relies on.
+//
+// ---------------------------------------------------------------------------
+// A. THE TWO CORRECTIONS THAT MAKE THE SIGNAL USABLE
+// ---------------------------------------------------------------------------
+// 1. Pole-geometry correction. The p pole pairs are not identical, so each of
+//    the 2p intervals in a rotor revolution carries a fixed geometric error,
+//    up to a few percent, exactly the "tooth error" of a trigger wheel. Learn
+//    it: at steady speed, average each interval position modulo 2p over many
+//    revolutions into a per-edge correction table, then divide every measured
+//    interval by its table entry. The table is a property of the alternator
+//    and is stored per installation.
+// 2. Rotor reference from that same signature. Because the 2p-interval
+//    pattern repeats every rotor revolution, autocorrelation of the raw
+//    interval sequence peaks at lag 2p. That gives p with no user entry, and
+//    it gives every edge its index within the revolution, i.e. a virtual
+//    once-per-revolution mark with no sensor. Rotor revolutions are then
+//    counted exactly, and with the pulley ratio, engine revolutions and crank
+//    angle to within the belt's compliance.
+//
+// The belt: it is a spring between crank and rotor, and with the rotor's
+// inertia forms a resonance typically in the tens of hertz, so the rotor sees
+// the crank's torsional motion through a resonant low-pass plus any slip.
+// Two ways to live with that, both recorded: characterise the transfer per
+// installation by comparing the IAS spectrum at the firing frequency against
+// the IMU's vibration spectrum at the same frequency across engine speed (the
+// IMU sees the block, not the belt); or use only RELATIVE comparisons within
+// one engine cycle at one speed (cylinder against cylinder), where the
+// transfer cancels to first order. The regulator's own field steps also
+// modulate rotor speed; it knows exactly what it commanded, so it subtracts
+// them, or uses them deliberately (D below).
+//
+// ---------------------------------------------------------------------------
+// B. CYCLE SEGMENTATION AND PER-CYLINDER METRICS
+// ---------------------------------------------------------------------------
+// Resample the corrected IAS onto crank angle using the virtual mark and the
+// pulley ratio (order tracking), then fold by the engine cycle: one
+// revolution for a two-stroke, two for a four-stroke. Which one, and the
+// cylinder count, are read off the data: the number of speed humps per cycle
+// and whether the pattern repeats every revolution or every second one. Per
+// segment compute the speed gained across the firing event (the classic IAS
+// misfire metric) and its variance over many cycles.
+//   - Misfire: one segment's gain collapses; count events per thousand cycles.
+//   - Weak cylinder: one segment persistently below the others by more than a
+//     stated fraction (a few percent at steady load), trended over engine
+//     hours like the existing alternator-health trends.
+//   - Rough running index: variance of the per-segment gains, normalised by
+//     load and speed.
+//   - Cylinder labelling: without a reference the report reads "cylinder k of
+//     N in firing order". A one-time operator action while the engine runs
+//     (cracking one injector line, or lifting one decompression lever on
+//     engines that have them) labels segment k as that physical cylinder;
+//     the label is stored.
+//
+// ---------------------------------------------------------------------------
+// C. BELT SLIP AND BELT CONDITION
+// ---------------------------------------------------------------------------
+//   - Ratio drift: rotor revolutions are exact (A.2). Against ANY independent
+//     engine-speed source (NMEA 2000 PGN 127488, NMEA 0183, RV-C, or the IMU's
+//     firing frequency) the ratio falls below the commissioned pulley ratio by
+//     the slip fraction. Report slip in percent; alarm above a threshold.
+//   - Slip on load step, no second source needed: a field step is a torque
+//     step at the rotor. On a slipping belt the rotor decelerates against the
+//     belt while the block does not, so the IAS drops more than the IMU firing
+//     frequency does. The size of the mismatch is the slip.
+//   - Micro-slip: excess randomness in the interval sequence beyond the
+//     geometric and firing components (residual variance after A and B) is a
+//     belt-condition index; it rises before gross slip.
+//   - Tension: the belt resonance frequency scales with the square root of
+//     tension; its drift over engine hours is a tension-loss indicator, read
+//     from the IAS spectrum where an engine order crosses it.
+//   - Control action: at engine speeds where an order crosses the belt-drive
+//     resonance, cap alternator torque (field) to hold belt tension
+//     oscillation down, and tell the operator which speeds those are.
+//
+// ---------------------------------------------------------------------------
+// D. THE ENGINE AS A PLANT: GOVERNOR CHARACTERISATION BY THE REGULATOR
+// ---------------------------------------------------------------------------
+// The regulator is a controllable load on the engine. Step the field by a
+// known amount (a known electrical power step, from output current and bus
+// voltage), record the speed droop and its recovery from the IAS series, and
+// fit engine droop (rpm per kW) and the governor's time constant, per
+// installation, at several speeds. Use them to set the charge-rate ramp
+// limits and the downward slew of Part 2 F so the regulator never demands a
+// torque step the governor cannot follow, to detect governor or fuel-system
+// degradation as those numbers drift over engine hours, and to size the
+// probe of Part 1 A. Run it inside commissioning and repeat it opportunistically
+// at steady cruise.
+//
+// ---------------------------------------------------------------------------
+// E. CRANKING RELATIVE COMPRESSION
+// ---------------------------------------------------------------------------
+// During cranking apply a probe-level field (below the output knee, so no
+// electrical load on the starter) and record the IAS through the cranking
+// revolutions. Each compression stroke slows the crank in proportion to that
+// cylinder's compression; the per-cylinder dips, compared against each other
+// and against their own history, are the relative-compression test that a
+// mechanic does with a clamp meter on the starter cable, done automatically
+// at every start. Cranking is detected from the ignition input, from bus
+// voltage sag, or from the Part 1 methods.
+//
+// ---------------------------------------------------------------------------
+// F. OUTPUT
+// ---------------------------------------------------------------------------
+// Telemetry: engine speed at edge resolution, per-cylinder gain bars, misfire
+// count, rough-running index, slip percent, belt-condition index, droop and
+// governor time constant, cranking compression bars; trends over engine
+// hours; alarms on thresholds the operator sets. Engine speed with no
+// hand-entered scale where a second source exists to calibrate against.
+//
+// ---------------------------------------------------------------------------
+// PRIOR ART ACKNOWLEDGED
+// ---------------------------------------------------------------------------
+// Misfire detection from crankshaft-sensor instantaneous angular speed is old
+// and widely patented in automotive; tachometers driven from alternator
+// phase or ripple are older still; tooth-error learning on trigger wheels is
+// standard. What is recorded here is doing the IAS analysis on the alternator
+// phase inside the charge regulator: the pole-signature virtual mark and
+// automatic pole-pair count, the belt-path handling and the belt-slip and
+// tension methods, the governor characterisation using the regulator's own
+// load steps, the cranking compression test under a probe field, the
+// resonance-avoidance torque cap, and their use for charge-rate limits.
+//
+// ---------------------------------------------------------------------------
+// SCOPE OF THIS DISCLOSURE
+// ---------------------------------------------------------------------------
+// Intended to cover any edge-timing capture of any stator-derived signal
+// (phase tap, neutral, rectified ripple, or the current channel's zero
+// crossings), any geometric correction and reference derived from the
+// pole pattern, any belt-path treatment, any per-cylinder or per-cycle
+// metric derived from the interval sequence, any use of the regulator's own
+// field as the excitation for engine or belt identification, and any
+// resulting control action or report.
+// ============================================================================
+
+
+// ============================================================================
+// IDEAS RECORDED TO PROTECT FUTURE IMPLEMENTATIONS, PART 4:
+// FIELD-CURRENT MEASUREMENT ON A SINGLE-TERMINAL DRIVE, AND WHAT IT ENABLES
+// ============================================================================
+// Added 2026-09-13. The commit date of this block in the public repository
+// https://github.com/XEngineeringLLC/XREG-010 is its publication date. Not
+// built. Same rule as the other parts.
+//
+// ---------------------------------------------------------------------------
+// WHAT EXISTS TODAY
+// ---------------------------------------------------------------------------
+// Field current is calculated, not measured: field volts (duty times bus
+// voltage) divided by FieldResistance, a typed setting of 2 to 6 ohm that
+// moves 10 to 20 % with winding temperature. The minimum-field floor is
+// corrected for that drift with the CASE probe temperature as a proxy, using
+// copper's coefficient (0.00218 per degree F). Automotive regulator ICs
+// measure field current to about 0.25 A and use it for a current limit,
+// torque reporting to the engine computer, and a rotor-fault flag. This
+// block records how to measure it on a one-terminal drive and everything the
+// measurement unlocks.
+//
+// ---------------------------------------------------------------------------
+// A. SENSING TOPOLOGIES ON ONE FIELD TERMINAL
+// ---------------------------------------------------------------------------
+// 1. One low-side shunt serving BOTH wiring types. On this board the N-type
+//    jumper lands the switch's source on ground, and the P-type freewheel
+//    diode's anode is on ground. Bring both to a common node and put a shunt
+//    between that node and ground:
+//      N-type: the ON-interval current flows switch -> node -> shunt -> ground.
+//      P-type: the OFF-interval (freewheel) current flows ground -> shunt ->
+//              node -> diode -> field terminal, the opposite sign.
+//    Inductor current is continuous, so the first off-interval sample equals
+//    the last on-interval sample; the switching-edge current is captured
+//    exactly in both types, and the cycle average follows from the ripple
+//    model or from a second sample. Sampling is keyed to the PWM edge by the
+//    same timer that generates it. Ground-referenced, so an ordinary
+//    amplifier and no common-mode problem. The SIGN of the shunt current
+//    tells the firmware which wiring type is installed, so the type becomes
+//    self-detected instead of a setting.
+// 2. Half-bridge mid-node shunt with a high-common-mode, PWM-rejecting
+//    current-sense amplifier (100 V class): continuous in both types.
+// 3. Hall-effect sensor on the field wire or a board trace: isolated, both
+//    types, no change to the power stage, bandwidth of 100 kHz-class parts is
+//    ample.
+// 4. The switch's own on-resistance as the shunt (drain-source drop during
+//    the on-interval, corrected for temperature from the board probe): coarse
+//    but free.
+// 5. A current-sense output on the switch or driver IC where one exists.
+//
+// ---------------------------------------------------------------------------
+// B. GETTING R AND L OUT OF THE SAMPLES
+// ---------------------------------------------------------------------------
+//   - Steady state, cycle average: the average of L di/dt over one full PWM
+//     period is zero, so  R = duty x (Vbus - Vswitch) / I_avg  exactly, with
+//     no knowledge of L. This is the workhorse: one number per PWM period.
+//   - Within the on-interval, two samples give  V = L di/dt + i R  twice, so
+//     L and R both, per period. L feeds Part 2 (energy per event, decay
+//     prediction) and the OV early-release drain estimate continuously
+//     instead of only at commissioning.
+//   - The brush and slip-ring contact resistance (tens of milliohms) and the
+//     wiring are inside the measured R as a near-constant offset; they are
+//     calibrated into the reference value and their drift is a signal (E).
+//
+// ---------------------------------------------------------------------------
+// C. ROTOR WINDING TEMPERATURE BY RESISTANCE
+// ---------------------------------------------------------------------------
+//   T = T_ref + (R / R_ref - 1) / alpha,   alpha = 0.00393 per degree C
+//
+// The reference pair (R_ref, T_ref) is taken when the winding is known to be
+// at the case probe's temperature: at commissioning, and at any start after
+// the regulator has seen the engine off long enough for the case temperature
+// to have settled at ambient (it tracks both). A 1 % error in R is 2.5 C.
+// The winding is the hottest part of the machine and the part whose
+// insulation class sets the limit; the case probe lags it by minutes and
+// under-reads it by tens of degrees, worst at idle in a hot engine room where
+// the fan moves least air. Measuring the winding directly lets the
+// temperature limit be set on the winding, with the case probe demoted to a
+// cross-check, and it catches the fast heating case the probe cannot.
+//
+// ---------------------------------------------------------------------------
+// D. CONTROL USES
+// ---------------------------------------------------------------------------
+// 1. Inner loop in amperes. The inner control loop today outputs duty, and
+//    its plant gain (output amps per percent duty) moves with R (temperature)
+//    and with bus voltage. Closing the inner loop on measured field current
+//    removes both dependencies: commissioned gains then hold over temperature
+//    and voltage class, and the field ceiling becomes a true amp rating
+//    (Max Field Amps) rather than a duty or volts proxy.
+// 2. Floor in amperes. The minimum-field floor is defined by a field current,
+//    not a duty; with measurement it is stored and applied in amps, and the
+//    copper proxy correction is retired. The onset law knee = a + C/RPM keeps
+//    its form with C in amps.
+// 3. Alternator health. The expected-output model becomes (field current,
+//    speed, temperature) instead of (duty, speed), so the winding's
+//    resistance drift no longer has to be tolerated as model slack, and the
+//    trend detection sharpens by that margin.
+// 4. Torque and engine load. Mechanical input power is electrical output
+//    divided by the machine's efficiency at (field current, speed, output)
+//    plus field power; torque is that over shaft speed. Report it to the
+//    engine bus (NMEA 2000 PGN 127489 load fields) and feed it to the
+//    charge-rate limits and to the governor model of Part 3 D.
+// 5. Machine identification. Cold R, L, and the field-current-to-output
+//    curve fingerprint the alternator frame; seed defaults and detect a
+//    swapped alternator.
+//
+// ---------------------------------------------------------------------------
+// E. FAULT DETECTION
+// ---------------------------------------------------------------------------
+//   - Open field, lost brush contact, open field fuse: zero current at
+//     non-zero duty, detected in one PWM period instead of the seconds the
+//     output-based test of Part 1 J needs.
+//   - Shorted turns: R falls below what temperature can explain AND L falls
+//     faster than R (L scales with the square of turns, R linearly), so the
+//     L/R ratio separates a shorted rotor from a merely hot or cold one.
+//   - Brush wear and slip-ring contamination: the cold-start R_ref drifts
+//     upward over months; intermittent contact at speed shows as
+//     sub-millisecond current dropouts that the shunt sees and the output
+//     does not. Count them.
+//   - Current with the field commanded off (shorted switch, miswired jumper):
+//     alarm and refuse to run. Today invisible in N-type wiring, where the
+//     input-protection stage never sees field current.
+//   - Rotor insulation to ground is NOT visible from current alone; recorded
+//     as the limit of the method.
+//
+// ---------------------------------------------------------------------------
+// PRIOR ART ACKNOWLEDGED
+// ---------------------------------------------------------------------------
+// Automotive regulator ICs measure field current; resistance-based winding
+// temperature estimation is standard in motor drives and has been proposed
+// for automotive alternators. What is recorded here is the single low-side
+// shunt serving both wiring types by interval-keyed sampling with sign-based
+// type detection, the cycle-average R identity, the cold-start
+// self-referencing, the L/R shorted-turn discriminator, brush wear from
+// reference drift and dropout counting, the ampere-domain inner loop and
+// floor with the commissioned-gain argument, and the health, torque and
+// engine-bus uses in an aftermarket regulator.
+//
+// ---------------------------------------------------------------------------
+// SCOPE OF THIS DISCLOSURE
+// ---------------------------------------------------------------------------
+// Intended to cover any field-current sensing element in any position on a
+// single-terminal drive, any sampling keyed to the switching waveform, any
+// derivation of resistance, inductance or temperature from those samples,
+// any control loop, floor, ceiling, health model, torque estimate or fault
+// test that consumes them, and any combination with Parts 1 to 3.
+// ============================================================================
