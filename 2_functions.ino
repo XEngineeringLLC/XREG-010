@@ -757,23 +757,31 @@ void runSettingsMigrations() {
 // restore. (Positional CSV, not JSON — dependency-free, matches the codebase ethos.)
 // Field count of the positional snapshot CSV. Bump when adding a field — commissionRestore accepts only an
 // exact match, so a snapshot from a different field set is refused rather than misread slot-for-slot.
-static const int COMMISSION_SNAP_FIELDS = 14;
+static const int COMMISSION_SNAP_FIELDS = 26;
+extern float altLeadSec;   // alt-health registry knob, defined in 7_functions.ino (stage 9 writes it)
 
 // Serialize the current scalar tune into `key` as one positional CSV. 12th field = HiLow (charge-rate
 // mode — the app's stored selection HiLowUserSel, not the effective HiLow, which the switch panel owns
 // while the override is on) so a revert never strands the user in the wrong mode; fields 13/14 = IExcessBaseA/CcOffsetA (the
-// affine trip-line the Thresholds step writes). This scalar set IS the whole positional snapshot; the
-// Min% floor table is backed up separately (see the deferred-Start worker, cxStartPersistService).
+// affine trip-line the Thresholds step writes). Fields 15-26 (2026-09-14) are the rest of what the wizard
+// steps write, so Stop/Abort's "back to how it was" holds for every step: plant tau (stage 2), D-term
+// deadband base + slope (5), CV plant Ka/Kb + gain mode (6), drain worst-case + the drain-vs-RPM line (7),
+// alternator output lead (9). Appended, never inserted: commissionRestoreScalars refuses any other count.
+// This scalar set IS the whole positional snapshot; the Min% floor table is backed up separately (see the
+// deferred-Start worker, cxStartPersistService).
 void commissionSnapshotScalarsToBuf(char *buf, size_t n) {
   snprintf(buf, n,
-           "%.4f,%.4f,%.3f,%.3f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,%.3f,%d,%.1f,%.1f",
+           "%.4f,%.4f,%.3f,%.3f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,%.3f,%d,%.1f,%.1f,"
+           "%d,%.3f,%.5f,%.5f,%.5f,%d,%d,%d,%d,%d,%d,%.4f",
            PidKp, PidKi, OutputPIDFilterTC, VoltageFilterTC,
            IExcessTau, IExcessFloorA, IExcessCeilA, IExcessFrac, IExcessFracBulk,
-           SystemIDStabilizeAmps, SystemIDStepAmplitude, HiLowUserSel, IExcessBaseA, IExcessCcOffsetA);
+           SystemIDStabilizeAmps, SystemIDStepAmplitude, HiLowUserSel, IExcessBaseA, IExcessCcOffsetA,
+           (int)systemIDPlantTauMs, CvKdDeadbandVps, CvKdDbSlope, cvPlantKa, cvPlantKb, (int)cvGainMode,
+           (int)fieldDecayTauMs, (int)fdDrainLoMs, (int)fdDrainHiMs, (int)fdDrainRpmLo, (int)fdDrainRpmHi, altLeadSec);
 }
 
 void commissionSnapshotScalars(const char* key) {
-  char buf[180];
+  char buf[320];
   commissionSnapshotScalarsToBuf(buf, sizeof(buf));
   settingWrite(key, buf);
 }
@@ -827,9 +835,11 @@ bool commissionRestoreScalars(const char* key) {
   if (!settingExists(key)) return false;
   String s = settingRead(key);
   float v[COMMISSION_SNAP_FIELDS];
-  int n = sscanf(s.c_str(), "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f",
+  int n = sscanf(s.c_str(), "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f",
                  &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
-                 &v[6], &v[7], &v[8], &v[9], &v[10], &v[11], &v[12], &v[13]);
+                 &v[6], &v[7], &v[8], &v[9], &v[10], &v[11], &v[12], &v[13],
+                 &v[14], &v[15], &v[16], &v[17], &v[18], &v[19],
+                 &v[20], &v[21], &v[22], &v[23], &v[24], &v[25]);
   // Exact count only. A short read means a truncated/corrupt snapshot, or one written by a build with a
   // different field set — either way the slots no longer mean what this code assumes. Refuse rather than
   // half-apply values into live control parameters. Log here, not at the call sites: the boot path discards
@@ -863,6 +873,21 @@ bool commissionRestoreScalars(const char* key) {
   IExcessBaseA = v[12];     settingWrite(NK_IExcessBaseA, String(IExcessBaseA, 1).c_str());
   IExcessCcOffsetA = v[13]; settingWrite(NK_IExcessCcOffsetA, String(IExcessCcOffsetA, 1).c_str());
   recomputeCcGains();  // re-apply CC gains live (normalized to SYSTEM_VOLTAGE_CLASS)
+  // Fields 15-26: the same clamps as their /get handlers, so a snapshot can never re-introduce a value
+  // the handler would have refused.
+  systemIDPlantTauMs = (uint16_t)lroundf(v[14]);           settingWrite(NK_sysidPlantTau, String(systemIDPlantTauMs).c_str());
+  CvKdDeadbandVps = v[15];                                  settingWrite(NK_CvKdDeadbandVps, String(CvKdDeadbandVps, 3).c_str());
+  CvKdDbSlope = v[16];                                      settingWrite(NK_CvKdDbSlope, String(CvKdDbSlope, 5).c_str());
+  cvPlantKa = v[17];                                        settingWrite(NK_cvPlantKa, String(cvPlantKa, 5).c_str());
+  cvPlantKb = fmaxf(0.0f, v[18]);                           settingWrite(NK_cvPlantKb, String(cvPlantKb, 5).c_str());
+  cvGainMode = (v[19] >= 0.5f) ? 1 : 0;                     settingWrite(NK_cvGainMode, String((int)cvGainMode).c_str());
+  fieldDecayTauMs = (uint16_t)constrain((int)lroundf(v[20]), 5, 900);    settingWrite(NK_fieldDecayTau, String(fieldDecayTauMs).c_str());
+  fdDrainLoMs  = (uint16_t)constrain((int)lroundf(v[21]), 0, 900);      settingWrite(NK_fdDrainLoMs, String(fdDrainLoMs).c_str());
+  fdDrainHiMs  = (uint16_t)constrain((int)lroundf(v[22]), 0, 900);      settingWrite(NK_fdDrainHiMs, String(fdDrainHiMs).c_str());
+  fdDrainRpmLo = (uint16_t)constrain((int)lroundf(v[23]), 0, 10000);    settingWrite(NK_fdDrainRpmLo, String(fdDrainRpmLo).c_str());
+  fdDrainRpmHi = (uint16_t)constrain((int)lroundf(v[24]), 0, 10000);    settingWrite(NK_fdDrainRpmHi, String(fdDrainRpmHi).c_str());
+  altLeadSec = v[25];                                       settingWrite("altLeadSec", String(altLeadSec, 4).c_str());   // registry key = knob name; altEpisodeSyncCfg re-reads it every fold
+  recomputeCvGains();  // Ka/Kb/mode restored together — one re-derivation of the live CV gains
   return true;
 }
 
@@ -1062,7 +1087,7 @@ void commissionClearRpmDependents() {
 // the crash guarantee: commissionState=1 is committed LAST, so a persisted state byte proves the
 // whole restore point is on flash; a reboot mid-burst boots as "never started". The wizard polls
 // /cxStartState and advances only on IDLE — the HTTP 200 means accepted, not saved.
-static char  cxStartTuneCsv[192];   // scalar tune at the click — origin snapshot AND step baseline
+static char  cxStartTuneCsv[320];   // scalar tune at the click — origin snapshot AND step baseline
 static float cxStartMinDuty[RPM_TABLE_SIZE], cxStartKneeFloor[RPM_TABLE_SIZE], cxStartKneeKnee[RPM_TABLE_SIZE];
 static bool  cxStartKneeFrozen[RPM_TABLE_SIZE];
 static float cxStartKneeFitA;

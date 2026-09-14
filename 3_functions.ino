@@ -1457,12 +1457,18 @@ void setupWiFi() {
 // unit. alternator.local is kept exactly as it was for single-regulator installs and for the
 // tooling and docs that already use it.
 
-// Last 6 hex of the UID — short enough to read off a screen, unique across any real fleet.
+// Six hex of the UID — short enough to read off a screen, unique across any real fleet.
+// Which six matters: device_id_hex prints ESP.getEfuseMac() big-endian, and that call packs the
+// six MAC bytes LITTLE-endian, so the string is the MAC reversed — its TAIL is the OUI, shared by
+// every module, and the per-chip bytes sit right after the always-zero high half. Taking the tail
+// (pre-2026-09-14) gave two bench boards, dc:b4:d9:1a:62:28 and :58, the same "d9b4dc" — same
+// mDNS hostname, same delegated alternator.local, same default AP SSID.
 const char *regulatorUid6() {
   static char u6[7] = "";
   if (!u6[0]) {
     size_t n = strlen(device_id_hex);
-    strncpy(u6, (n >= 6) ? device_id_hex + (n - 6) : device_id_hex, 6);
+    const char *src = (n >= 12) ? device_id_hex + (n - 12) : device_id_hex;
+    strncpy(u6, src, 6);
     u6[6] = '\0';
   }
   return u6;
@@ -2409,6 +2415,13 @@ static void dvccResetAuthority() {
   if (dvccState != 5) dvccState = (dvccEn == 1) ? 1 : 0;  // preserve an UNTRUSTED latch across source edits
   dvccCfgChanged = true;  // dvccTick also clears its decode-side state (sender lock, flap history)
   dataTimestamps[IDX_DVCC] = 0;
+}
+
+// Reads the caller's run token off a test-start request. Absent = 0, which is what a caller that
+// doesn't use tokens gets: its frames then match only other token-less runs.
+static uint32_t webRunTok(AsyncWebServerRequest *request) {
+  if (!request->hasParam("tok")) return 0;
+  return (uint32_t)strtoul(request->getParam("tok")->value().c_str(), nullptr, 10);
 }
 
 void setupServer() {
@@ -4384,6 +4397,7 @@ void setupServer() {
       } else if (activeTuning != nullptr) {
         queueConsoleMessageF("SystemID: start blocked — %s is active. Turn it off before running the Plant Delay Test.", activeTuning);
       } else if (systemIDActive == 0 && (millis() - systemIDLastEndMs) > 2000UL) {
+        systemIDRunTok = webRunTok(request);
         systemIDRequested = true;
         systemIDResultsReady = false;
         systemIDAbortRequested = false;   // clear any stale abort from a prior run
@@ -4458,6 +4472,7 @@ void setupServer() {
         queueConsoleMessageF("Field curve: start blocked — %s is active", busy);
       } else if ((millis() - fieldCurveLastEndMs) > 2000UL) {
         fieldCurveOnsetMode = false;  // saturation sweep (SystemID amplitudes)
+        fieldCurveRunTok = webRunTok(request);
         fieldCurveRequested = true;
         fieldCurveResultsReady = false;
         fieldCurveAbortRequested = false;
@@ -4494,6 +4509,7 @@ void setupServer() {
       } else if (busy != nullptr) {
         queueConsoleMessageF("Field cut: start blocked — %s is active", busy);
       } else if ((millis() - fieldCutLastEndMs) > 2000UL) {
+        fieldCutRunTok = webRunTok(request);
         fieldCutRequested = true;
         fieldCutResultsReady = false;
         fieldCutAbortRequested = false;
@@ -4680,6 +4696,7 @@ void setupServer() {
         queueConsoleMessageF("Keep-alive onset: start blocked — %s is active", busy);
       } else if ((millis() - fieldCurveLastEndMs) > 2000UL) {
         fieldCurveOnsetMode = true;  // onset-stop sweep (tachometer keep-alive floor)
+        fieldCurveRunTok = webRunTok(request);
         fieldCurveRequested = true;
         fieldCurveResultsReady = false;
         fieldCurveAbortRequested = false;
@@ -4778,8 +4795,15 @@ void setupServer() {
     }
     if (request->hasParam("addKneeAnchor")) {
       foundParameter = true;
-      if (kneeSweepKneeDuty <= 0.0f) {
-        queueConsoleMessage("Keep-alive onset: no sweep result to commit");
+      // Keyed to the run that produced the result, and commits it exactly once: a sweep's completion
+      // frame reaches every poll still in flight and each one asks to commit (one held speed was filed
+      // as four anchors). The token rejects another run's result, the consume below a repeat of this
+      // one. ok gates as well as duty — the "no onset found" exit stores the ceiling duty, which is > 0.
+      const uint32_t tok = (uint32_t)strtoul(request->getParam("addKneeAnchor")->value().c_str(), nullptr, 10);
+      if (tok != fieldCurveRunTok) {
+        queueConsoleMessage("Keep-alive onset: commit ignored — it names a different sweep than the one that just ran");
+      } else if (!kneeSweepOk || kneeSweepKneeDuty <= 0.0f) {
+        queueConsoleMessage("Keep-alive onset: nothing to commit — this sweep found no clean onset, or its result was already committed");
       } else if (kneeAnchorN >= KNEE_ANCHOR_MAX) {
         queueConsoleMessage("Keep-alive onset: anchor list full");
       } else {
@@ -4796,6 +4820,8 @@ void setupServer() {
         }
         queueConsoleMessageF("Keep-alive onset: anchor %d committed (%.1f%% @ %.0f RPM, %.0fF)",
                              kneeAnchorN, kneeSweepKneeDuty, kneeSweepRPM, kneeSweepTempF);
+        kneeSweepKneeDuty = -1.0f;
+        kneeSweepOk = false;
       }
     }
     if (request->hasParam("clearKneeAnchors")) {
@@ -4941,6 +4967,7 @@ void setupServer() {
           cvStressForgetLast();                 // bit 8 went with the mask, and the revert undid the tune the verdict graded
         }
         settingRemove(NK_commissionStepSnap); // teardown: no interrupted step to revert on next boot
+        cxStepMinPctDrop();                   // the origin Min% backup above already put the column back
         settingsDirty = true;
         queueConsoleMessageF("Commissioning: aborted — %s",
                              reverted ? "settings reverted to the pre-commissioning snapshot"
@@ -4963,6 +4990,9 @@ void setupServer() {
         testProtectionsEnabled = commissionProtBackup;
         bool undone = false;
         if (commissionState == 1 && settingExists(NK_commissionStepSnap)) undone = commissionRestoreScalars(NK_commissionStepSnap);
+        // Stage 7 in progress: the keep-alive column it may have applied goes back to its entry copy too.
+        if (commissionState == 1 && commissionPhase == 7 && cxStepMinPctRestore()) undone = true;
+        cxStepMinPctDrop();
         settingRemove(NK_commissionStepSnap);
         settingsDirty = true;
         queueConsoleMessageF("Commissioning: stopped — finished steps kept%s", undone ? ", the step in progress was undone" : "");
@@ -4977,6 +5007,7 @@ void setupServer() {
       settingRemove(NK_commissionSnap);     // commit the new tune (no snapshot ⇒ reboot won't revert)
       settingRemove(NK_commissionPreRun);   // the run is committed — nothing to abort back to
       settingRemove(NK_commissionStepSnap); // run over: drop the in-flight step baseline too
+      cxStepMinPctDrop();
       commissionClearMinPctBackup();        // discard the Min% backup too — the new floors stay
       commissionRecomputeState();           // COMMISSIONED if every required stage done (stress test optional), else IN_PROGRESS (partial)
       commissionSetPhase(COMMISSION_STAGE_COUNT);  // wizard pass finished (= one past the last step)
@@ -5014,6 +5045,8 @@ void setupServer() {
       // only the step you're on; finish (p==STAGE_COUNT) and Prep (p==0) have no step to snapshot.
       if (phaseChanged && commissionState == 1 && p >= 1 && p < COMMISSION_STAGE_COUNT) {
         commissionStepSnapshot();
+        // The keep-alive column is outside the scalar snapshot — stage 7 gets its own entry copy for Stop.
+        if (p == 7) cxStepMinPctStash(); else cxStepMinPctDrop();
       }
       settingsDirty = true;
     }
@@ -5477,6 +5510,7 @@ void setupServer() {
       if (systemIDActive != 0 || fieldCurveActive != 0) {
         queueConsoleMessage("Tuning sweep: start blocked — a SystemID/Field-curve test is active");
       } else {
+        tuningRunTok = webRunTok(request);
         tuningSweepRequested = true;   // momentary — the TuningMode sine block consumes it
       }
     }
@@ -9132,10 +9166,10 @@ void setupServer() {
                       i > 0 ? "," : "",
                       tuningBode[i].freqHz, tuningBode[i].gain, tuningBode[i].phaseDeg);
     }
-    pos += snprintf(buf + pos, 2048 - pos, "],\"active\":%d,\"done\":%d,\"coh\":%.3f,\"railed\":%d,\"fs\":%.1f,"
+    pos += snprintf(buf + pos, 2048 - pos, "],\"active\":%d,\"done\":%d,\"tok\":%u,\"coh\":%.3f,\"railed\":%d,\"fs\":%.1f,"
                     "\"aborted\":%d,\"abortWhy\":%d,\"abortV\":%.2f,\"abortD\":%.1f,"
                     "\"rpmAvg\":%.0f,\"rpmMin\":%.0f,\"rpmMax\":%.0f}",
-                    tuningSweepActive ? 1 : 0, tuningSweepDone ? 1 : 0,
+                    tuningSweepActive ? 1 : 0, tuningSweepDone ? 1 : 0, (unsigned)tuningRunTok,
                     tuningSweepWorstCoh, tuningSweepDutyRailed ? 1 : 0,
                     tuningSweepFsHz > 0.0f ? tuningSweepFsHz : ch1SampleHz(),
                     tuningSweepAbortReason != 0 ? 1 : 0, (int)tuningSweepAbortReason,
@@ -9161,10 +9195,11 @@ void setupServer() {
     // "aborted" = protection-abort latch (systemIDAbortRequested), reported independently of "active":
     // a protection cut leaves systemIDActive set until systemID_tick clears it, and that tick is gated
     // out during the fault/lockout, so the plant-fit poller would otherwise wait the full 240s timeout.
-    pos += snprintf(buf + pos, 2048 - pos, "],\"active\":%d,\"ready\":%d,\"aborted\":%d,\"amp\":%.1f,\"fs\":%.1f,"
+    pos += snprintf(buf + pos, 2048 - pos, "],\"active\":%d,\"ready\":%d,\"tok\":%u,\"aborted\":%d,\"amp\":%.1f,\"fs\":%.1f,"
                     "\"rpmAvg\":%.0f,\"rpmMin\":%.0f,\"rpmMax\":%.0f}",
                     active ? 1 : 0,
                     (systemIDResultsReady && systemIDTestType == 1) ? 1 : 0,
+                    (unsigned)systemIDRunTok,
                     systemIDAbortRequested ? 1 : 0,
                     SystemIDStepAmplitude,
                     systemIDFsHz > 0.0f ? systemIDFsHz : ch1SampleHz(),
@@ -9193,11 +9228,12 @@ void setupServer() {
     // fieldCurve_tick next runs — and that tick is gated out during the fault lockout, so "active"
     // can stay 1 indefinitely. The poller checks "aborted" so it never hangs waiting for !active.
     pos += snprintf(buf + pos, 2048 - pos,
-                    "],\"active\":%d,\"ready\":%d,\"ok\":%d,\"kneeDuty\":%.1f,\"kneeAmps\":%.2f,"
+                    "],\"active\":%d,\"ready\":%d,\"ok\":%d,\"tok\":%u,\"kneeDuty\":%.1f,\"kneeAmps\":%.2f,"
                     "\"targetA\":%.1f,\"propStabA\":%.1f,\"propStepPct\":%.2f,\"ceilLimited\":%d,\"aborted\":%d,\"abort\":\"%s\","
                     "\"abortWhy\":%d,\"abortNext\":%d,\"abortV\":%.2f,\"abortD\":%.1f,"
                     "\"rpmAvg\":%.0f,\"rpmMin\":%.0f,\"rpmMax\":%.0f}",
                     fieldCurveActive != 0 ? 1 : 0, fieldCurveResultsReady ? 1 : 0, fieldCurveOk ? 1 : 0,
+                    (unsigned)fieldCurveRunTok,
                     fieldCurveKneeDuty, fieldCurveKneeAmps, fieldCurveTargetLimitA,
                     fieldCurvePropStabA, fieldCurvePropStepPct, fieldCurveCeilingLimited ? 1 : 0,
                     fieldCurveAbortRequested ? 1 : 0, fieldCurveAbortMsg,
@@ -9227,11 +9263,12 @@ void setupServer() {
                       i > 0 ? "," : "", fcPlotMs[i], fcPlotA[i]);
     }
     pos += snprintf(buf + pos, 8192 - pos,
-                    "],\"active\":%d,\"phase\":%d,\"ready\":%d,\"ok\":%d,\"tauMs\":%.1f,\"fallMs\":%.1f,\"drainMs\":%.1f,"
+                    "],\"active\":%d,\"phase\":%d,\"ready\":%d,\"ok\":%d,\"tok\":%u,\"tauMs\":%.1f,\"fallMs\":%.1f,\"drainMs\":%.1f,"
                     "\"baseA\":%.1f,\"floorA\":%.2f,\"rpm\":%.0f,\"residPct\":%.1f,\"nPts\":%d,\"src\":%d,"
                     "\"calGain\":%.4f,\"calOffA\":%.3f,\"aborted\":%d,\"abort\":\"%s\"}",
                     fieldCutActive != 0 ? 1 : 0, (int)fieldCutPhase, fieldCutResultsReady ? 1 : 0,
-                    fieldCutOk ? 1 : 0, fieldCutTauMs, fieldCutFallMs, fieldCutDrainMs, fieldCutBaseA, fieldCutFloorA,
+                    fieldCutOk ? 1 : 0, (unsigned)fieldCutRunTok,
+                    fieldCutTauMs, fieldCutFallMs, fieldCutDrainMs, fieldCutBaseA, fieldCutFloorA,
                     fieldCutRpm, fieldCutResidPct, fcPlotN, (int)fieldCutSrc, faCalGain, faCalOffA,
                     fieldCutAbortRequested ? 1 : 0, fieldCutAbortMsg);
     request->send(200, "application/json", buf);
@@ -9343,10 +9380,11 @@ void setupServer() {
     char *buf = bufPtr.get();
     int pos = 0;
     pos += snprintf(buf + pos, 1024 - pos,
-                    "{\"active\":%d,\"ready\":%d,\"ok\":%d,\"kneeDuty\":%.1f,\"rpm\":%.0f,\"tempF\":%.0f,"
+                    "{\"active\":%d,\"ready\":%d,\"ok\":%d,\"tok\":%u,\"kneeDuty\":%.1f,\"rpm\":%.0f,\"tempF\":%.0f,"
                     "\"fitResid\":%.2f,\"fitWorstIdx\":%d,\"anchors\":[",
                     (fieldCurveActive != 0 && fieldCurveOnsetMode) ? 1 : 0,
                     (fieldCurveResultsReady && fieldCurveOnsetMode) ? 1 : 0, kneeSweepOk ? 1 : 0,
+                    (unsigned)fieldCurveRunTok,
                     kneeSweepKneeDuty, kneeSweepRPM, kneeSweepTempF, kneeFitResidPct, kneeFitWorstIdx);
     for (int i = 0; i < kneeAnchorN && pos < 900; i++) {
       pos += snprintf(buf + pos, 1024 - pos, "%s{\"rpm\":%.0f,\"duty\":%.1f,\"tempF\":%.0f}",

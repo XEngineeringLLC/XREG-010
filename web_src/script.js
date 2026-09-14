@@ -9571,9 +9571,22 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
             noticeHtml = battDefNotice('warn', 'Do not charge below freezing',
                     'Charging a lithium (LiFePO4) battery below freezing (' + tFrz + ') plates the cells and permanently damages them, and the battery\'s protection circuit (BMS) can disconnect to defend itself — if it opens while the alternator is charging, the sudden loss of load can spike system voltage and damage other electronics.');
         }
-        if (battProbe !== 1) {
+        // Only raised when the board really is the stand-in. battTempProbeEnable alone would nag every
+        // install whose battery temperature arrives over NMEA 2000, VE.Direct or RV-C, so the gate is
+        // the live resolved source (CSV2 battTempActiveSrc, same codes as firmware batteryTempF) OR an
+        // explicit non-board selection, which stays configured while its bus is momentarily quiet.
+        // No CSV2 frame yet (cold tab) reads as 5 = board, so a real gap is never suppressed.
+        const battTempSel = ('battTempSource' in cfg) ? parseInt(cfg.battTempSource, 10) : 0;   // 0 Auto .. 5 Board, 6 None
+        const liveTempSrc = (g_lastCsv2 && g_lastCsv2.battTempActiveSrc !== undefined)
+            ? (Number(g_lastCsv2.battTempActiveSrc) | 0) : 5;
+        const measuredSrc = battProbe === 1 || (battTempSel >= 1 && battTempSel <= 4) || (liveTempSrc >= 1 && liveTempSrc <= 4);
+        if (!measuredSrc) {
             noticeHtml += battDefNotice('limit', 'Battery temperature source',
-                'Battery temperature is taken from the regulator board unless a battery probe, an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source provides it. The board runs warmer than its surroundings, so the cold-charge lockout is a coarse guard when it is the only source. A battery probe fitted later is assigned under Setup > Temperature, where the hot-charge lockout and battery temperature limits also live.');
+                // src 0 = nothing qualified this tick: no probe, no bus source, and the board stand-in
+                // either not selected or switched off (battTempProxyEnable). Different gap, different copy.
+                (liveTempSrc === 0)
+                ? 'No battery temperature source is reporting, so the cold-charge lockout and every temperature-dependent limit have nothing to read. Fit a battery probe — assigned under Setup > Temperature, where the hot-charge lockout and battery temperature limits also live — or feed battery temperature from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.'
+                : 'Battery temperature is taken from the regulator board unless a battery probe, an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source provides it. The board runs warmer than its surroundings, so the cold-charge lockout is a coarse guard when it is the only source. A battery probe fitted later is assigned under Setup > Temperature, where the hot-charge lockout and battery temperature limits also live.');
         }
         // Voltage float is allowed without a shunt (2026-09-09): absorption then ends on its time limit
         // instead of tail current, the way a solar controller floats with no shunt. Say which exit will
@@ -25080,15 +25093,26 @@ function cxRpmRefFor(phase) {
     return 0;
 }
 // Resume path: cx.fieldResult/cx.fit die with the page, but the device keeps the last run's
-// numbers in RAM until reboot — fetch once per wizard session.
+// numbers — fetch once per wizard session.
+// Sizing inputs ride along with the RPM references. A step re-run on its own after a reload used to
+// fall straight through to generic constants (a 60 ms plant, a 25 Hz alias cap, 10 A) and grade the
+// result without saying so; these are the same numbers measured on THIS machine. kneeAmps is the
+// honest test for "a saturation curve produced a knee" — it is reset to -1 at every sweep start and
+// only the saturation branch ever sets it, so it stays trustworthy even though `ready` is shared with
+// the onset sweep. /sysidbode's fs falls back to the live sample rate in firmware, so it is always
+// meaningful. The applied values come from the CSV3 echoes instead, which survive a reboot.
 function cxRpmRefFetch() {
     if (!cx || cx._rpmRefFetched) return;
     cx._rpmRefFetched = true;
     fetch(buildURL('/fieldcurve.json')).then(r => r.json()).then(j => {
-        if (j.ready && j.rpmAvg > 0) { cx._fcRpmAvg = j.rpmAvg; commissionRender(); }
+        if (j.rpmAvg > 0) cx._fcRpmAvg = j.rpmAvg;
+        if (j.kneeAmps > 0) cx._fcKneeA = j.kneeAmps;
+        commissionRender();
     }).catch(() => { });
     fetch(buildURL('/sysidbode')).then(r => r.json()).then(j => {
-        if (j.ready && j.rpmAvg > 0) { cx._sidRpmAvg = j.rpmAvg; commissionRender(); }
+        if (j.rpmAvg > 0) cx._sidRpmAvg = j.rpmAvg;
+        if (j.fs > 0) cx._sidFsHz = j.fs;
+        commissionRender();
     }).catch(() => { });
 }
 // Bottom-of-step context line: the engine speed a finished run actually saw.
@@ -25129,7 +25153,7 @@ function cxFieldArm() { return ++cxFieldEpoch; }
 // true and its checkbox is disabled. The wizard navigation skips any stage left false.
 let cxPlan = [true, true, true, true, true, true, true, true, true, true];   // one entry per CX_PHASES stage
 // Coupling: (re)running a stage invalidates the downstream stages it feeds, so selecting one
-// force-selects them. Field curve(1) → Plant fit(2)+Verify(3)+CV plant fit(6); Plant fit(2) →
+// force-selects (and locks) those of them that are DONE — a pending one has nothing to lose. Field curve(1) → Plant fit(2)+Verify(3)+CV plant fit(6); Plant fit(2) →
 // Verify(3)+CV plant fit(6); Verify(3) → CV plant fit(6); Disturbances(4) → Thresholds(5).
 // CV plant fit(6) measures the current→voltage plant, downstream of the whole inner current loop.
 // The Stress Test(8) verdict grades the tuned CV loop, so any retune upstream of it (1/2/3/6) stales it.
@@ -25137,7 +25161,31 @@ let cxPlan = [true, true, true, true, true, true, true, true, true, true];   // 
 // the engine is warm. Tach alignment (RPMScalingFactor/PulleyRatio) is set on a pre-wizard screen,
 // not a stage. (Mirrors commissionDependentsMask() in the firmware.)
 const CX_DEPENDENTS = { 1: [2, 3, 6, 8], 2: [3, 6, 8], 3: [6, 8], 4: [5], 6: [8] };
+// The other direction, derived from the table above (minus the Stress Test, which reads nothing it
+// needs measured): the stages whose MEASURED OUTPUT a stage reads as an input. Plant fit(2) sizes its
+// sweep from the Field curve's proposals; Verify(3) sizes its sweep from the plant fit and the curve's
+// saturation knee; Thresholds(5) reads the ripple map from Disturbances(4); CV plant fit(6) measures
+// the current→voltage plant and needs the inner loop tuned first. Selecting a stage force-selects any
+// of these NOT already done: running a step against inputs nothing ever measured grades a machine we
+// have no numbers for, silently. A prerequisite that IS done is left alone — its stored results are
+// the input. Also the taint table for the Finish summary (a measured step built on a skipped upstream).
+const CX_PREREQS = (() => {
+    const r = {};
+    for (const k in CX_DEPENDENTS) for (const d of CX_DEPENDENTS[k]) if (d !== 8) (r[d] = r[d] || []).push(+k);
+    return r;
+})();
+// Mirror of the firmware's COMMISSION_REQUIRED_MASK: stages 0..7 done = COMMISSIONED. The Stress test(8)
+// and Charge health calibration(9) are optional and never block it, so every "is the pass complete"
+// test in the wizard uses this, not the full ten-bit mask.
+const CX_REQUIRED_MASK = 0x0FF;
 let cxPlanUserSet = false;   // true once the user ticks a box, so CSV3 re-renders stop re-defaulting the plan
+// Stages the plan ticked ITSELF, and why — so unticking the step that needed them releases them again,
+// while a step the user ticked by hand stays put. Forced = done, and a ticked feeder will stale it (the
+// firmware clears its done bit when the feeder re-marks), so it is locked while that feeder is ticked.
+// Pulled = not measured, and a ticked step reads it; unlocked, because unticking it is the natural way
+// to say "not that step either" (its readers come off with it, see cxUnselectReaders).
+let cxPlanForced = new Set();
+let cxPlanPulled = new Set();
 let cxPlanMaskBasis = -1;    // done-mask the plan was last derived/edited against; a change while idle re-derives it
 let cxLastPhase = 0;         // remembered from the last CSV3 frame (for re-render after a checkbox toggle)
 let cxLastMask = 0;          // per-stage done bitmask from the last CSV3 frame
@@ -25156,18 +25204,61 @@ const CX_MANUAL_LOC = [
     'Alternator output lead for the charge-health tracker — the 0.4 s default stands. Set it in the Steady-State Detection group under Tuning as "Output lead (s)", or re-run this step.',
 ];
 
-// Force-select every downstream dependent of any selected stage (transitive); Prep always on.
-// Stage 8 (Stress test) is never force-pulled: an upstream redo stales its verdict (the firmware
-// clears its ✓), but it's an optional reference check — the plan may leave it out.
-function cxApplyDeps() {
+function cxPanelOpen() {
+    const ov = document.getElementById('commission-modal-overlay');
+    return !!(ov && ov.style.display === 'block');
+}
+// Ticked feeders that would stale stage d if they ran: d is done (a pending stage has nothing to lose)
+// and some ticked k lists it as a dependent. Stage 8 is never held this way (optional reference check).
+function cxPlanFeedersOf(d, mask) {
+    if (d === 8 || !(mask & (1 << d))) return [];
+    const out = [];
+    for (const k in CX_DEPENDENTS) if (cxPlan[+k] && CX_DEPENDENTS[k].includes(d)) out.push(+k);
+    return out;
+}
+// Ticked stages that read stage r as an input while r is still unmeasured.
+function cxPlanReadersOf(r, mask) {
+    if (mask & (1 << r)) return [];
+    const out = [];
+    for (const k in CX_PREREQS) if (cxPlan[+k] && CX_PREREQS[k].includes(r)) out.push(+k);
+    return out;
+}
+// Mask reads on the plan side are always cxEffMask(): the paused pass has marks the CSV3 echo has not
+// carried back yet, and a just-measured step read as pending would escape its lock.
+function cxPlanLocked(d) { return d !== 0 && cxPlanFeedersOf(d, cxEffMask()).length > 0; }
+// Bring the plan to a consistent state after any edit: every ticked stage's done dependents are ticked
+// (forced), every ticked stage's unmeasured prerequisites are ticked (pulled), and anything the plan
+// ticked itself that nothing needs any more comes back off. A forced stage that has since gone pending
+// (its feeder re-ran) stays ticked as an ordinary pending step; a pulled stage that has since been
+// measured comes off — its readers have their input now.
+function cxPlanSettle(mask) {
     cxPlan[0] = true;
-    let changed = true;
-    while (changed) {
-        changed = false;
-        for (const k in CX_DEPENDENTS) {
-            if (cxPlan[+k]) for (const d of CX_DEPENDENTS[k]) if (d !== 8 && !cxPlan[d]) { cxPlan[d] = true; changed = true; }
+    // A step the paused pass skipped "for now" is not pulled back in as somebody's prerequisite — that
+    // skip was warned about and accepted; re-ticking the step itself (cxToggleStage) is the way back.
+    const run = cx && (cx.paused || cx);
+    const passed = (run && run.passed) || null;
+    for (let guard = 0; guard < 32; guard++) {
+        let changed = false;
+        for (let k = 1; k < CX_PHASES.length; k++) {
+            if (!cxPlan[k]) continue;
+            for (const d of (CX_DEPENDENTS[k] || [])) if (d !== 8 && (mask & (1 << d)) && !cxPlan[d]) { cxPlan[d] = true; cxPlanForced.add(d); changed = true; }
+            for (const r of (CX_PREREQS[k] || [])) if (!(mask & (1 << r)) && !cxPlan[r] && !(passed && passed.has(r))) { cxPlan[r] = true; cxPlanPulled.add(r); changed = true; }
         }
+        for (const d of Array.from(cxPlanForced)) {
+            if (!(mask & (1 << d))) { cxPlanForced.delete(d); continue; }
+            if (!cxPlanFeedersOf(d, mask).length) { cxPlanForced.delete(d); if (cxPlan[d]) { cxPlan[d] = false; changed = true; } }
+        }
+        for (const r of Array.from(cxPlanPulled)) {
+            if ((mask & (1 << r)) || !cxPlanReadersOf(r, mask).length) { cxPlanPulled.delete(r); if (cxPlan[r]) { cxPlan[r] = false; changed = true; } }
+        }
+        if (!changed) break;
     }
+}
+// Unticking an UNMEASURED stage strands every ticked stage that reads it, so those come off too. A done
+// stage is different: unticking it only means "don't re-run it", and its stored result still feeds them.
+function cxUnselectReaders(i, mask) {
+    if (mask & (1 << i)) return;
+    for (const k of cxPlanReadersOf(i, mask)) { cxPlan[k] = false; cxPlanForced.delete(k); cxPlanPulled.delete(k); cxUnselectReaders(k, mask); }
 }
 // Default plan from the persisted done-mask: pre-select the stages NOT yet done (so a fresh device
 // pre-selects everything = "select all", and a single stale step — e.g. one invalidated by an
@@ -25176,29 +25267,34 @@ function cxDefaultPlanFromMask(mask) {
     const ALL = (1 << CX_PHASES.length) - 1;   // 0x3FF for 10 stages
     const allDone = (mask & ALL) === ALL;
     for (let i = 0; i < CX_PHASES.length; i++) cxPlan[i] = (i === 0) ? true : (allDone ? true : !(mask & (1 << i)));
-    cxApplyDeps();
+    cxPlanForced.clear(); cxPlanPulled.clear();
+    cxPlanSettle(mask);
 }
-// Reverse of cxApplyDeps: unticking a stage unticks every planned stage that feeds it (transitively),
-// otherwise the plan runs the feeder, the firmware clears this stage's done bit, and nothing re-measures
-// it — the pass ends with a silently stale step. Stage 8 is never force-pulled, so unticking it frees nothing.
-function cxUnselectFeeders(i) {
-    if (i === 8) return;
-    for (const k in CX_DEPENDENTS) {
-        const kk = +k;
-        if (cxPlan[kk] && CX_DEPENDENTS[k].includes(i)) { cxPlan[kk] = false; cxUnselectFeeders(kk); }
-    }
-}
-// Checkbox handlers (Commissioning tab). Prep can't be unchecked; selecting a step pulls in deps,
-// deselecting one drops its feeders.
+// Checkbox handlers (Commissioning tab). Prep can't be unchecked, a locked stage can't be unticked (its
+// checkbox is disabled; this is the backstop), and the plan is frozen while the wizard is open — the
+// running pass reads it live. Ticking a step the paused pass already passed is a deliberate redo.
 function cxToggleStage(i, on) {
+    if (cxPanelOpen() || i === 0) { renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask); return; }
     cxPlanUserSet = true;
-    cxPlan[i] = on || i === 0;
-    if (cxPlan[i]) cxApplyDeps(); else cxUnselectFeeders(i);
+    const run = cx && (cx.paused || cx);   // the paused run, whether cx IS it or is the Prep wrapper around it
+    if (on) {
+        cxPlan[i] = true; cxPlanForced.delete(i); cxPlanPulled.delete(i);
+        if (run && run.passed) run.passed.delete(i);
+    } else if (!cxPlanLocked(i)) {
+        cxPlan[i] = false; cxPlanForced.delete(i); cxPlanPulled.delete(i);
+        cxUnselectReaders(i, cxEffMask());
+    }
+    cxPlanSettle(cxEffMask());
     renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask);
 }
 function cxToggleSelectAll(on) {
+    if (cxPanelOpen()) { renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask); return; }
     cxPlanUserSet = true;
+    cxPlanForced.clear(); cxPlanPulled.clear();
     for (let i = 0; i < CX_PHASES.length; i++) cxPlan[i] = on || i === 0;
+    const run = cx && (cx.paused || cx);
+    if (on && run && run.passed) run.passed.clear();   // "everything" includes what this paused pass already did
+    cxPlanSettle(cxEffMask());
     renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask);
 }
 // Primary-button intent — derived purely from the ticked plan (cxPlan, post-dependency-cascade) vs
@@ -25219,15 +25315,17 @@ function cxStartIntent() {
         if (cxLastMask & (1 << i)) doneCount++;
         if (cxPlan[i]) planCount++; else allSelected = false;
     }
+    // The required steps done but the device isn't COMMISSIONED (state≠2) = a run that was never
+    // committed (Finish dropped, wizard closed at the end, or stopped after the last required step).
+    // Offer to commit it when nothing is ticked to run — or when every step is done and the default
+    // all-ticked plan stands — NOT "clear and restart", which would revert the finished work.
+    const requiredDone = (cxLastMask & CX_REQUIRED_MASK) === CX_REQUIRED_MASK;
+    if (cxLastState !== 2 && requiredDone && (planCount === 0 || (doneCount === optional && allSelected)))
+        return { label: 'Finish commissioning…', help: 'The required steps are done but the run was never saved. This commits it and marks the device commissioned — nothing is re-run or reverted.', className: 'btn-primary', disabled: false, action: 'finish' };
     if (planCount === 0)
         return { label: 'Start commissioning…', help: 'Tick at least one step to run.', className: 'btn-primary', disabled: true, action: 'open' };
     if (doneCount === 0)
         return { label: 'Start commissioning…', help: 'Only the ticked steps will run.', className: 'btn-primary', disabled: false, action: 'open' };
-    // Every step done but the device isn't COMMISSIONED (state≠2) = a completed run that was never
-    // committed (Finish dropped / wizard closed at the end). Offer to commit it — NOT "clear and
-    // restart", which would revert the finished work to the pre-commissioning snapshot.
-    if (doneCount === optional && cxLastState !== 2)
-        return { label: 'Finish commissioning…', help: 'Every step is done but the run was never saved. This commits it and marks the device commissioned — nothing is re-run or reverted.', className: 'btn-primary', disabled: false, action: 'finish' };
     if (allSelected)
         return { label: 'Clear and restart commissioning…', help: 'Every step is ticked, so this reverts to your pre-commissioning settings and runs the whole walkthrough again from the top.', className: 'btn-secondary', disabled: false, action: 'restart' };
     return { label: 'Continue commissioning…', help: 'Runs just the ticked steps and keeps everything already done. Re-running a step also re-runs the steps it feeds.', className: 'btn-primary', disabled: false, action: 'open' };
@@ -25235,6 +25333,9 @@ function cxStartIntent() {
 // Dispatch the primary button per cxStartIntent(): a wholesale redo reverts then restarts, anything
 // else opens the wizard to run the ticked plan.
 function commissionPrimaryAction() {
+    // The panel is non-blocking, so this tab stays reachable mid-run. A second entry would build a fresh
+    // session over the running one and leave its test unwatched — the wizard's own buttons own that run.
+    if (cxPanelOpen()) { fileToast('The commissioning wizard is already open — carry on there, or use its Stop or Abort button'); return; }
     const intent = cxStartIntent();
     if (intent.disabled) return;
     if (intent.action === 'restart') commissionClearAndRestart();
@@ -25254,6 +25355,21 @@ function commissionCommitUncommitted() {
 }
 // Wizard navigation honouring the plan: next selected stage in 1..last, or -1 if none remain.
 function cxNextSelected(from) { for (let i = from + 1; i < CX_PHASES.length; i++) if (cxPlan[i]) return i; return -1; }
+// Session-side mirror of what the firmware does to the masks when a stage is passed, kept on `cx` so it
+// survives a pause: `passed` = stages this pass has moved beyond (resume never re-offers them unless the
+// user re-ticks one), `doneBits`/`clearBits` = the done-mask edits this pass has made, laid over the CSV3
+// echo by cxEffMask() — the echo trails the request by a push, and Finish reads it right after.
+function cxPassStage(stage, how) {
+    if (!cx) return;
+    cx.passed = cx.passed || new Set(); cx.doneBits = cx.doneBits || 0; cx.clearBits = cx.clearBits || 0;
+    cx.passed.add(stage);
+    if (how === 'pass') return;                                   // advanced without a done mark
+    const bit = 1 << stage;
+    if (how === 'skip') { cx.doneBits &= ~bit; cx.clearBits |= bit; return; }
+    cx.doneBits |= bit; cx.clearBits &= ~bit;                    // 'done' or 'manual'
+    if (how === 'done') for (const d of (CX_DEPENDENTS[stage] || [])) { cx.doneBits &= ~(1 << d); cx.clearBits |= (1 << d); cx.passed.delete(d); }
+}
+function cxEffMask() { return cx ? ((cxLastMask | (cx.doneBits || 0)) & ~(cx.clearBits || 0)) : cxLastMask; }
 // Mark the stage we're leaving complete (firmware sets its done bit + clears its dependents), then
 // move to the next selected stage — or finish if this was the last one. markDone=false advances
 // WITHOUT setting the done bit, so a step that couldn't actually complete (e.g. a failed CV plant
@@ -25261,6 +25377,7 @@ function cxNextSelected(from) { for (let i = from + 1; i < CX_PHASES.length; i++
 function cxAdvance(markDone = true) {
     const cur = cx.phase, nx = cxNextSelected(cur);
     if (markDone && cx.handled) delete cx.handled[cur];   // measured now — drop any earlier skip/manual note for this session
+    cxPassStage(cur, markDone ? 'done' : 'pass');
     const done = markDone ? cxGet('commissionStageDone=' + cur) : Promise.resolve();
     done.finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
 }
@@ -25294,6 +25411,7 @@ function cxApplyRunBtn(applyFn, clean) {
 function cxAdvanceRun() {
     const nx = cxNextSelected(cx.phase);
     if (cx.handled) delete cx.handled[cx.phase];   // measured now — drop any earlier skip/manual note for this session
+    cxPassStage(cx.phase, 'done');
     cxGet('commissionStageDone=' + cx.phase).finally(() => {
         if (nx === -1) { cxFinish(); return; }
         cxGoto(nx);
@@ -25304,9 +25422,7 @@ function cxAdvanceRun() {
 // ── Universal step navigation: Back / Skip for now / Mark done manually ───────
 // Available on every runnable step (not Prep). Back re-enters an earlier step to redo it; Skip leaves a
 // step outstanding but flagged for manual setup; Mark-done-manually counts it done (unmeasured) so the
-// COMMISSIONED badge can be reached and the nag stops. Reverse of CX_DEPENDENTS — the upstream steps that
-// feed a given stage, used to warn at skip time and to taint a measured step built on a skipped upstream.
-const CX_UPSTREAMS = { 2: [1], 3: [1, 2], 5: [4], 6: [1, 2, 3] };
+// COMMISSIONED badge can be reached and the nag stops.
 
 // Previous planned runnable step before `from`, or -1 if `from` is the first one (Back never returns
 // to Prep — it's the start gate, not a redoable step).
@@ -25327,10 +25443,11 @@ function cxBack() {
 }
 
 // Skip the current step "for now": stays outstanding (badge keeps nagging), flagged for the Finish
-// summary. Warns first if the step feeds later ones that are still planned and unmeasured.
+// summary. Warns first if the step feeds later ones that are planned: those will run against whatever
+// this step left unmeasured, whether or not they were done before (a planned redo re-marks regardless).
 async function cxSkip(stage) {
     if (cxRunActive()) return;
-    const deps = (CX_DEPENDENTS[stage] || []).filter(d => cxPlan[d] && !(cxLastMask & (1 << d)));
+    const deps = (CX_DEPENDENTS[stage] || []).filter(d => d !== 8 && cxPlan[d]);
     if (deps.length) {
         const names = deps.map(d => CX_PHASES[d]).join(', ');
         const consequence = (stage === 4)
@@ -25342,6 +25459,7 @@ async function cxSkip(stage) {
     }
     cx.handled = cx.handled || {};
     cx.handled[stage] = 'skip';
+    cxPassStage(stage, 'skip');
     const nx = cxNextSelected(stage);
     cxGet('commissionStageSkip=' + stage).finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
 }
@@ -25355,6 +25473,7 @@ async function cxManual(stage) {
     if (!ok) return;
     cx.handled = cx.handled || {};
     cx.handled[stage] = 'manual';
+    cxPassStage(stage, 'manual');
     const nx = cxNextSelected(stage);
     cxGet('commissionStageManual=' + stage).finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
 }
@@ -25400,7 +25519,7 @@ function cxHandledSummaryRows() {
         const bit = 1 << i;
         const measured = (cxLastMask & bit) && !(cxLastManual & bit) && h[i] !== 'manual';
         if (!measured) continue;
-        const badUp = (CX_UPSTREAMS[i] || []).filter(u => h[u] === 'skip' || ((cxLastManual & (1 << u)) && !(cxLastMask & (1 << u))));
+        const badUp = (CX_PREREQS[i] || []).filter(u => h[u] === 'skip' || ((cxLastManual & (1 << u)) && !(cxLastMask & (1 << u))));
         if (badUp.length) rows.push('⚠ ' + COMMISSION_STEPS[i].name + ' was measured on top of skipped ' + badUp.map(u => COMMISSION_STEPS[u].name).join(', ') + ' — re-check it once those are set.');
     }
     return rows;
@@ -25460,6 +25579,16 @@ function cxDocLink(anchor) {
        + ' style="color:#2ec4b6; text-decoration:none; white-space:nowrap;">Full explanation ›</a>';
 }
 
+// A step's screen copy is one actionable line; the paragraph of "why" hides behind the standard
+// "i" badge. Click/tap to open (never hover — the Capacitor build has no pointer), handled by the
+// one global tooltip listener. Give it the reasoning AND the doc link, so the visible line stays
+// a single sentence for the operator who just wants the number set.
+function cxWhyTip(html) {
+  return ' <span class="tooltip" title="Why this setting"><span class="tooltip-box"'
+       + ' style="font-size:12px; line-height:1.55; text-align:left; max-width:min(340px, calc(100vw - 36px));">'
+       + html + '</span></span>';
+}
+
 // Per-phase technical fine print — the "details" the simple instructions deliberately omit.
 // Shown muted at the bottom of the panel, above the protection statement. Keep these to the
 // few facts that change what the user DOES on this screen; everything else goes in the doc.
@@ -25485,19 +25614,42 @@ function cxFinePrint(phase) {
 // curve (saturation knee / proposed stabilize current) — NOT read off the Tuning ▸ Current
 // tab, whose values are unknown/stale at commissioning time. Floor = baseline operating
 // current; amplitude = small linear perturbation; sweep range brackets the plant corner.
+// Every input resolves the same way: what THIS session measured, else what the device still holds from
+// an earlier one, else a generic constant. `generic` names the inputs that fell all the way through, so
+// the step can say out loud that it is about to grade a sweep sized for a machine we have no numbers
+// for — that used to happen silently after any page reload.
+// Names the inputs a step had to guess at. Silence when nothing was guessed: a run sized from this
+// machine's own measurements needs no commentary.
+function cxSizingNoteHtml(generic, lead) {
+    if (!generic || !generic.length) return '';
+    return '<div style="margin:0 0 10px;padding:8px 11px;background:#2e2415;border-radius:6px;color:#f0a500;font-size:13px;line-height:1.5;">' +
+        lead + ', and this device has no measurement for the ' + generic.join(', the ') + '. ' +
+        'Generic values stand in, so the run is sized for a typical alternator rather than yours. ' +
+        'Measure the missing steps first for a result that describes this machine.</div>';
+}
 function cxVerifyParams() {
-  const tau = (cx.fit && cx.fit.tauMs > 0) ? cx.fit.tauMs : 60;   // plant time constant, ms
+  const generic = [];
+  const pick = (session, device, fallback, label) => {
+    if (session > 0) return session;
+    if (device > 0) return device;
+    generic.push(label); return fallback;
+  };
+  // The persisted plant tau has no _echo element — CSV3 adopts it straight into sysidFitTauMs (see the
+  // systemIDPlantTauMs entry in the settings-echo table), which is the same value with or without a
+  // fit this session.
+  const echoStab = getEchoNumber('SystemIDStabilizeAmps_echo');
+  const tau = pick(cx.fit && cx.fit.tauMs, sysidFitTauMs, 60, 'plant time constant');   // ms
   const fc  = 1000 / (2 * Math.PI * tau);                          // plant corner, Hz
   const fStart = Math.min(1.0, Math.max(0.2, fc / 8));
   // End ~10× the corner and deliberately a bit past the expected crossover so a resonant peak
   // above the closed-loop bandwidth still lands inside the sweep. Hard-capped at what the current
   // sensor can resolve (3 samples/cycle, measured during the plant sweep) — a 25 Hz point on a
   // ~33 Hz sensor measures its own alias. Firmware clamps too; this keeps the request honest.
-  const fAlias = (cx.fit && cx.fit.fsHz > 0) ? cx.fit.fsHz / 3 : 25;
+  const fAlias = pick(cx.fit && cx.fit.fsHz, cx._sidFsHz, 75, 'current-sensor sample rate') / 3;
   const fEnd   = Math.min(25, fAlias, Math.max(15, fc * 10));
-  const knee = (cx.fieldResult && cx.fieldResult.kneeAmps  > 0) ? cx.fieldResult.kneeAmps  : 0;
-  const stab = (cx.fieldResult && cx.fieldResult.propStabA > 0) ? cx.fieldResult.propStabA
-             : (knee > 0 ? knee * 0.4 : 10);   // propStabA = 50% of the cap-at-RPM
+  const knee = pick(cx.fieldResult && cx.fieldResult.kneeAmps, cx._fcKneeA, 0, 'saturation knee');
+  const stab = pick(cx.fieldResult && cx.fieldResult.propStabA, echoStab,
+                    knee > 0 ? knee * 0.4 : 10, 'stabilize current');   // propStabA = 50% of the cap-at-RPM
   // The wave only swings UP from the floor, so floor and amplitude share the headroom to the
   // peak. Aim the peak at ~80% of the cap (1.6× the 50% baseline) for a meaty swing, but hold it
   // ≥15% below the measured saturation knee so the closed-loop response can't clip. Then split:
@@ -25506,7 +25658,7 @@ function cxVerifyParams() {
   if (knee > 0) peak = Math.min(peak, knee * 0.85);
   const floor = Math.max(3, Math.round(peak * 0.7));
   const amp   = Math.max(2, Math.round(peak - floor));
-  return { floor, amp, fStart: fStart.toFixed(2), fEnd: fEnd.toFixed(1), cycles: 2 };
+  return { floor, amp, fStart: fStart.toFixed(2), fEnd: fEnd.toFixed(1), cycles: 2, generic };
 }
 
 // Bring the dashboard tab the user should be watching into view — on phase entry and again when a
@@ -25544,6 +25696,12 @@ function cxGet(params) {
     return fetch(buildURL('/get?' + params));
 }
 
+// One per test start, sent with the start request and echoed back in that test's status frames.
+// Only an ACCEPTED start adopts it, which is what lets a poll tell this run's results from the
+// previous run's — the firmware latches results until the next accepted start, and a refused start
+// leaves the old ones sitting there looking finished. Non-zero: 0 is the firmware's "no token".
+function cxRunTok() { return 1 + Math.floor(Math.random() * 4294967294); }
+
 // ── Screen wake lock ──────────────────────────────────────────────────────────
 // Firmware tests carry a browser-poll deadman: a phone screen that sleeps mid-run aborts the
 // test as "connection lost". Hold a screen wake lock while the wizard or the standalone stress
@@ -25574,9 +25732,12 @@ function openCommissionModal() {
     // ride into a redo of the same step (a stale cx used to reopen on whatever step it last showed, Next
     // already lit). A run paused with the X — still IN_PROGRESS on the device — is kept aside; cxStart
     // resumes into it, results intact, when its step is the next one planned.
-    const paused = (cx && cx.phase > 0 && cxLastState === 1) ? cx : null;
+    // A session closed on Prep is only a wrapper around the run it was about to resume — look through it.
+    const paused = (cx && cxLastState === 1) ? ((cx.phase > 0) ? cx : (cx.paused || null)) : null;
     cx = { phase: 0, fieldApplied: false, plantApplied: false, threshApplied: false,
            handled: (paused && paused.handled) || {},   // stage → 'skip' | 'manual' for this run's Finish summary
+           passed: (paused && paused.passed) || new Set(),   // pass bookkeeping, see cxPassStage
+           doneBits: (paused && paused.doneBits) || 0, clearBits: (paused && paused.clearBits) || 0,
            paused: paused };
     document.getElementById('commission-modal-overlay').style.display = 'block';
     cxPanelOverrideStripSync();
@@ -25629,6 +25790,14 @@ function closeCommissionModal() {
         if (cx.finished) { cx = null; cxPlanUserSet = false; }
     }
     document.getElementById('commission-modal-overlay').style.display = 'none';
+    // A pause: the checklist should show what Continue will run, so the steps this pass has already passed
+    // come off the plan (a re-tick puts one back as a deliberate redo). Dependents the firmware cleared as
+    // those steps re-marked are pending now and stay ticked — cxPlanSettle only releases stages still done.
+    if (cx && cx.phase > 0 && cx.passed && cx.passed.size) {
+        for (const st of cx.passed) { cxPlan[st] = false; cxPlanForced.delete(st); cxPlanPulled.delete(st); }
+        cxPlanSettle(cxEffMask());
+        renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask);
+    }
 }
 
 // Background page plot each phase should reveal on entry, by phase index. cxShowTab switches the tab
@@ -25826,10 +25995,14 @@ function cxStart() {
     cxGet('commissionStart=1')
         .then(r => { if (!r.ok) throw ('rejected (HTTP ' + r.status + ')'); return cxAwaitStartPersist(8000); })
         .then(() => {
-            const nx = cxNextSelected(0);
-            // A run paused with the X resumes into its step with that step's results intact, but only when
-            // it is the next planned one; a redo of anything upstream (or a re-ticked plan) starts clean.
+            // First planned step this pass has not already passed (closeCommissionModal unticks those on a
+            // pause; the set is the backstop for anything ticked since). A run paused with the X resumes
+            // into its step with that step's results intact, but only when it is that next step; a redo
+            // of anything upstream (or a re-ticked plan) starts clean.
             const p = cx.paused; cx.paused = null;
+            const passed = cx.passed || new Set();
+            let nx = -1;
+            for (let i = 1; i < CX_PHASES.length; i++) if (cxPlan[i] && !passed.has(i)) { nx = i; break; }
             if (p && p.phase === nx) Object.assign(cx, p, { phase: 0, paused: null, finished: false });
             if (nx === -1) cxFinish(); else cxGoto(nx);
         })
@@ -26137,6 +26310,12 @@ function cxVerifyOvAdviceHtml() {
         '</ul></div>';
 }
 function cxVerifyAbortHtml(info) {
+    // A sweep that never ran is not a protection cut — the cut advice below would name a cause that
+    // did not happen.
+    if (info && info.text) {
+        return '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' + info.text + '</div>' +
+            '<div style="margin-top:10px;"><button onclick="cxVerifyStart()" class="btn-primary btn-sm">Re-run</button></div>';
+    }
     let h = cxRampAbortHtml('Sweep stopped', 'protection cut', info, 'Tuning sine sweep', 'run', cxVerifyOvAdviceHtml);
     h += cxCutIsOv(info.why | 0)
         ? '<div style="margin-top:10px;"><button onclick="commissionAbort()" class="btn-primary btn-sm">Abort commissioning (revert settings)</button> ' +
@@ -26190,26 +26369,42 @@ function cxFieldStart() {
     const blocked = cxFieldRunBlockReason();
     if (blocked) { cx.fieldResult = null; cx.fieldApplied = false; cx.fieldRunning = false; cx.fieldAbort = blocked; cx.fieldAbortInfo = null; commissionRender(); return; }
     cxShowTab('plots', 'displays');   // open-loop ramp → watch on Plots ▸ Short Term
+    const tok = cxRunTok();
     cx.fieldResult = null; cx.fieldApplied = false; cx.fieldAbort = null; cx.fieldAbortInfo = null; cx.fieldRunning = true; commissionRender();
-    cxGet('startFieldCurve=1').then(() => {
+    cxGet('startFieldCurve=1&tok=' + tok).then(() => {
         cxStopPoll();
-        let waited = 0, sawActive = false;
+        let waited = 0, sawActive = false, settled = false, framesSeen = 0;
+        // Run token + one-shot latch, as in cxKneeStart: a refused start (2 s cooldown, another test
+        // busy, not AUTO) leaves the LAST curve latched ready, and adopting it here would apply a
+        // previous run's proposals as this one's.
+        const settle = () => { settled = true; cxStopPoll(); };
         cxPollTimer = setInterval(() => {
             waited += 1.5;
+            if (!settled && !sawActive && framesSeen >= 3 && waited > 12) {
+                settle(); cx.fieldRunning = false;
+                cx.fieldAbort = "The sweep never ran. Confirm you are in AUTO mode with the engine turning, check Live Data \u25b8 Console, then run again.";
+                commissionRender(); return;
+            }
+            if (!settled && waited > 300) {
+                settle(); cx.fieldRunning = false;
+                cx.fieldAbort = "Lost contact with the regulator during the sweep — nothing was recorded. Reconnect, then run again.";
+                commissionRender(); return;
+            }
             fetch(buildURL('/fieldcurve.json')).then(r => r.json()).then(j => {
+                if (settled || !cx.fieldRunning) return;
+                framesSeen++;
+                if (j.tok !== tok) return;
                 if (j.active) sawActive = true;
                 if (j.aborted) {                         // protection latched an abort — may still read active=1 during the post-cut lockout, so don't wait for !active
-                    cxStopPoll(); cx.fieldRunning = false; cx.fieldAbort = j.abort || 'Protection fired — see console.';
+                    settle(); cx.fieldRunning = false; cx.fieldAbort = j.abort || 'Protection fired — see console.';
                     cx.fieldAbortInfo = cxAbortInfoFrom(j); commissionRender();
                 } else if (j.abort && !j.active) {        // a protection cut this run — reason latched in firmware
-                    cxStopPoll(); cx.fieldRunning = false; cx.fieldAbort = j.abort;
+                    settle(); cx.fieldRunning = false; cx.fieldAbort = j.abort;
                     cx.fieldAbortInfo = cxAbortInfoFrom(j); commissionRender();
                 } else if (j.ready && !j.active) {        // completed normally
-                    cxStopPoll(); cx.fieldRunning = false; cx.fieldResult = j; commissionRender();
+                    settle(); cx.fieldRunning = false; cx.fieldResult = j; commissionRender();
                 } else if (sawActive && !j.active) {      // ran then stopped, no result/reason (e.g. cancel)
-                    cxStopPoll(); cx.fieldRunning = false; commissionRender();
-                } else if (!sawActive && waited > 12) {   // never started
-                    cxStopPoll(); cx.fieldRunning = false; cx.fieldAbort = "No start reported within 12 s (this is a browser timeout, not a firmware error). Confirm you are in AUTO mode with the engine turning, then run again."; commissionRender();
+                    settle(); cx.fieldRunning = false; commissionRender();
                 }
             }).catch(() => { });
         }, 1500);
@@ -26248,6 +26443,9 @@ function cxRenderKnee(b) {
     if (!cx.fdRuns) { cx.fdRuns = [null, null, null]; cx.fdSkipped = [false, false, false]; }
     const anchors = cx.kneeAnchors || [];
     const NSTEP = CX_KNEE_STEPS.length;
+    // The curve is fitted over whatever is stored, so more anchors than guided speeds means the fit is
+    // being weighted by points no Record asked for.
+    const overfull = anchors.length > NSTEP;
     // The committed anchor leads its speed's pair: the working speed stays the last anchored one
     // until its drain run resolves (ok or skipped) — e.g. after a drain failure or a page reload.
     const fdIdx = anchors.length - 1;
@@ -26309,8 +26507,12 @@ function cxRenderKnee(b) {
             '<div style="margin-top:4px;color:#9aa;font-size:13px;">' + s.hint + '</div></div>';
         body += '<button onclick="cxKneeStart()" class="btn-primary" style="width:100%;padding:9px;">Record</button>';
     } else {
-        body += '<div style="margin:10px 0;padding:8px 10px;background:#1e2a1e;border:1px solid #3a5a3a;border-radius:6px;color:#bdb;">' +
-            'All three speeds captured. Review below, then approve.</div>';
+        body += overfull
+            ? '<div style="margin:10px 0;padding:8px 10px;background:#3a2222;border:1px solid #a55;border-radius:6px;color:#f0a500;">' +
+              anchors.length + ' onset points are stored, but this step records ' + NSTEP + '. The extra ones did not come from a ' +
+              'Record here, and the curve is fitted over all of them. Press <strong>Start over</strong> and record the three speeds again.</div>'
+            : '<div style="margin:10px 0;padding:8px 10px;background:#1e2a1e;border:1px solid #3a5a3a;border-radius:6px;color:#bdb;">' +
+              'All three speeds captured. Review below, then approve.</div>';
         // Outlier flag — the 3 points should fall on one onset = a + C/RPM curve. A large residual means
         // one hold drifted or caught a load step during that sweep.
         if (typeof cx.kneeFitResid === 'number' && cx.kneeFitResid > 2.0) {
@@ -26341,7 +26543,9 @@ function cxRenderKnee(b) {
         body += '<div style="margin:10px 0;padding:8px 10px;background:#222;border-radius:6px;font-size:13px;' + (fit ? 'color:#5a5;' : 'color:#f0a500;') + '">' + cxFdFitText(fit) + '</div>';
         body += cxFdFitChartMarkup(fit);
         body += cxFdMarkup();
-        if (cx.kneeApplied) {
+        if (overfull) {
+            body += '<div style="margin-top:12px;"><button onclick="cxKneeRestart()" class="btn-primary btn-sm">Start over</button></div>';
+        } else if (cx.kneeApplied) {
             // Applied: drop the Apply button entirely; advance is the one primary action.
             body += '<div style="margin-top:6px;"><span style="color:#5a5;">Applied — Keep-Alive column filled' + (cx.fdApplied ? ' and field drain stored' : '') + '.</span></div>' +
                 '<div style="margin-top:12px;">' + cxNextBtn(true) + ' <button onclick="cxKneeRestart()" class="btn-secondary btn-sm">Start over</button></div>';
@@ -26364,25 +26568,51 @@ function cxRenderKnee(b) {
 function cxKneeStart() {
     cxShowTab('plots', 'displays');   // onset ramp → watch on Plots ▸ Short Term
     const idx = (cx.kneeAnchors || []).length;   // the speed slot this Record fills (anchor + drain pair)
+    const tok = cxRunTok();
     cx.kneeAbort = null; cx.kneeAbortInfo = null; cx.kneeNoOnset = false; cx.kneeRunning = true; cx.fdErr = null; commissionRender();
-    cxGet('startKneeSweep=1').then(() => {
+    cxGet('startKneeSweep=1&tok=' + tok).then(() => {
         cxStopPoll();
-        let waited = 0, sawActive = false;
+        let waited = 0, sawActive = false, settled = false, framesSeen = 0;
+        // Two ways a status frame can speak for a run that is not this one, each needing its own guard:
+        // a frame from an EARLIER run (a refused start — 2 s cooldown, another test busy, not AUTO —
+        // never adopts this token, and the firmware's results stay latched looking finished), and a
+        // duplicate of this run's own completion (cxStopPoll cancels only future ticks; responses
+        // already in flight still run, and each one asked to commit — one Record filed four anchors).
+        const settle = () => { settled = true; cxStopPoll(); };
         cxPollTimer = setInterval(() => {
             waited += 1.5;
+            // Outside the token gate: a refused start produces no matching frame, so nothing inside the
+            // gate could report one. framesSeen separates "answering but not running our sweep" from
+            // "not answering" — only the first is given up on at 12 s, because frames that are merely
+            // late still carry a sweep that ran, and throwing that away loses a good point.
+            if (!settled && !sawActive && framesSeen >= 3 && waited > 12) {
+                settle(); cx.kneeRunning = false;
+                cx.kneeAbort = "The sweep never ran. Confirm you are in AUTO mode with the engine turning, check Live Data \u25b8 Console, then Record again.";
+                commissionRender(); return;
+            }
+            // Dead-link backstop, not a sweep deadline: a legitimate onset sweep runs up to ~80 s
+            // (5→92% in 2% steps at 1500 ms dwell, plus the fine-down and both eases).
+            if (!settled && waited > 300) {
+                settle(); cx.kneeRunning = false;
+                cx.kneeAbort = "Lost contact with the regulator during the sweep — nothing was recorded. Reconnect, then Record again.";
+                commissionRender(); return;
+            }
             fetch(buildURL('/kneesweep.json')).then(r => r.json()).then(j => {
+                if (settled || !cx.kneeRunning) return;
+                framesSeen++;
+                if (j.tok !== tok) return;
                 cx.kneeAnchors = j.anchors || [];
                 if (j.active) sawActive = true;
                 if (j.aborted) {                         // protection latched an abort — may still read active=1 during the post-cut lockout, so don't wait for !active
-                    cxStopPoll(); cx.kneeRunning = false; cx.kneeAbort = j.abort || 'Protection fired — see console.';
+                    settle(); cx.kneeRunning = false; cx.kneeAbort = j.abort || 'Protection fired — see console.';
                     cx.kneeAbortInfo = cxAbortInfoFrom(j); commissionRender();
                 } else if (j.abort && !j.active) {        // a protection cut this run — reason latched in firmware
-                    cxStopPoll(); cx.kneeRunning = false; cx.kneeAbort = j.abort;
+                    settle(); cx.kneeRunning = false; cx.kneeAbort = j.abort;
                     cx.kneeAbortInfo = cxAbortInfoFrom(j); commissionRender();
                 } else if (j.ready && !j.active) {        // completed — auto-commit only a CLEAN onset
-                    cxStopPoll();
+                    settle();
                     if (j.ok && j.kneeDuty > 0) {         // good point → commit, then measure the field drain at this same held speed
-                        cxGet('addKneeAnchor=1').then(() => {
+                        cxGet('addKneeAnchor=' + tok).then(() => {
                             cx.kneeRunning = false; cxKneeRefresh();
                             if (idx < CX_KNEE_STEPS.length) cxFdStart(idx); else commissionRender();
                         }).catch(e => { cx.kneeRunning = false; xAlert('Add failed: ' + e); commissionRender(); });
@@ -26390,9 +26620,7 @@ function cxKneeStart() {
                         cx.kneeRunning = false; cx.kneeNoOnset = true; cx.kneeCeilLimited = !!j.ceilLimited; commissionRender();
                     }
                 } else if (sawActive && !j.active) {      // ran then stopped, no result/reason (e.g. cancel)
-                    cxStopPoll(); cx.kneeRunning = false; commissionRender();
-                } else if (!sawActive && waited > 12) {   // never started
-                    cxStopPoll(); cx.kneeRunning = false; cx.kneeAbort = "No start reported within 12 s (this is a browser timeout, not a firmware error). Confirm you are in AUTO mode with the engine turning, then Record again."; commissionRender();
+                    settle(); cx.kneeRunning = false; commissionRender();
                 }
             }).catch(() => { });
         }, 1500);
@@ -26449,6 +26677,10 @@ function cxRenderPlant(b) {
     // (engine is already at cruise when Field curve ran this pass — Plant fit directly follows it).
     if (!cx.plantRunning && !fit) {
         const ref = cxRpmRefFor(2);
+        // Measured = done AND not hand-marked: a Field curve marked done by hand left the seeded defaults in place.
+        const fcMeasured = (cxLastMask & (1 << 1)) && !(cxLastManual & (1 << 1));
+        body += cxSizingNoteHtml(fcMeasured ? [] : ['field-duty to current map'],
+            'The sweep amplitude is sized from the Field curve');
         body += '<p style="font-size:15px;line-height:1.5;"><strong>' +
             (ref > 0 ? 'Bring the engine to about ' + Math.round(ref) + ' RPM — the speed the Field curve ran at — let it settle, then press Run'
                      : (cxPlan[1] ? 'Keep the engine at the same cruising speed as the Field curve and press Run'
@@ -26467,18 +26699,30 @@ function cxPlantStart(wide) {
     cxShowTab('plots', 'displays');   // open-loop sine sweep → watch on Plots ▸ Short Term
     cx.fit = null; cx.plantApplied = false; cx.plantRunning = true; commissionRender();
     const fStart = wide ? 0.3 : 0.5, fEnd = wide ? 30 : 20;
+    const tok = cxRunTok();
     cxGet('systemIDTestType=1&systemIDSineFreqStart=' + fStart + '&systemIDSineFreqEnd=' + fEnd)
-        .then(() => cxGet('startSystemID=1'))
+        .then(() => cxGet('startSystemID=1&tok=' + tok))
         .then(() => {
             cxStopPoll();
-            let waited = 0;
+            let waited = 0, settled = false, framesSeen = 0;
+            // Run token + one-shot latch, as in cxKneeStart: a refused start (2 s cooldown, another
+            // test busy, not AUTO) leaves the LAST sweep latched ready, and fitting it here would write
+            // a previous run's plant tau and gains.
+            const settle = () => { settled = true; cxStopPoll(); };
             cxPollTimer = setInterval(() => {
                 waited += 1.5;
+                if (!settled && framesSeen >= 3 && waited > 240) {
+                    settle(); cx.plantRunning = false;
+                    xAlert('The plant sweep never ran. Confirm you are in AUTO mode with the engine turning; open Live Data → Console to see whether the regulator rejected the request, then run again.');
+                    commissionRender(); return;
+                }
                 fetch(buildURL('/sysidbode')).then(r => r.json()).then(j => {
-                    if (j.aborted) { cxStopPoll(); cx.plantRunning = false; xAlert('Plant sweep aborted — a protection fired during the test (see console). Re-run once charging resumes.'); commissionRender(); return; }
-                    if (waited > 240 && !j.active && !j.ready) { cxStopPoll(); cx.plantRunning = false; xAlert('Plant sweep never reported starting (browser timeout, not a firmware error). Confirm you are in AUTO mode with the engine turning; open Live Data → Console to see if the regulator rejected the request, then run again.'); commissionRender(); return; }
+                    if (settled || !cx.plantRunning) return;
+                    framesSeen++;
+                    if (j.tok !== tok) return;
+                    if (j.aborted) { settle(); cx.plantRunning = false; xAlert('Plant sweep aborted — a protection fired during the test (see console). Re-run once charging resumes.'); commissionRender(); return; }
                     if (j.ready && !j.active) {
-                        cxStopPoll();
+                        settle();
                         const pts = j.pts;
                         if (pts.length >= 3) {
                             const fit = sysidFitFOPDT(pts, Math.max(1e-9, pts[0].g), j.fs);
@@ -26683,7 +26927,9 @@ function cxRenderVerify(b) {
     if (cx.verifyAbort) { b.innerHTML = cxVerifyAbortHtml(cx.verifyAbort); return; }
     if (!cx.verify) {
         const ref = cxRpmRefFor(3);
-        b.innerHTML = '<p style="font-size:15px;line-height:1.5;"><strong>' +
+        b.innerHTML = cxSizingNoteHtml(cxVerifyParams().generic,
+            'The sweep is sized from the Field curve and the Plant fit') +
+            '<p style="font-size:15px;line-height:1.5;"><strong>' +
             (ref > 0 ? 'Keep the engine near ' + Math.round(ref) + ' RPM — the speed the tune was made at — and press Run'
                      : ((cxPlan[1] || cxPlan[2]) ? 'Keep the engine at the same cruising speed and press Run'
                                                   : 'Bring the engine to a typical cruising speed, let it settle, then press Run')) +
@@ -26770,25 +27016,38 @@ function cxVerifyStart() {
     // Drive the closed-loop sweep from values computed off the plant fit + field curve, not
     // whatever happens to be on the Tuning ▸ Current tab (unknown/stale at commissioning time).
     const p = cxVerifyParams();
+    const tok = cxRunTok();
     cxGet('tuningWaveFloor=' + p.floor + '&waveAmplitude=' + p.amp +
           '&tuningSweepStart=' + p.fStart + '&tuningSweepEnd=' + p.fEnd +
           '&tuningSweepCycles=' + p.cycles + '&tuningWaveform=2&TuningMode=1')
-        .then(() => cxGet('startTuningSweep=1'))
+        .then(() => cxGet('startTuningSweep=1&tok=' + tok))
         .then(() => {
             cxStopPoll();
-            let waited = 0;
+            let waited = 0, settled = false, framesSeen = 0;
+            // Run token + one-shot latch, as in cxKneeStart: a blocked start leaves the LAST sweep's
+            // tuningSweepDone set, and grading that here would pass or fail this step on old points.
+            const settle = () => { settled = true; cxStopPoll(); };
             cxPollTimer = setInterval(() => {
                 waited += 1.5;
+                if (!settled && framesSeen >= 3 && waited > 200) {
+                    settle(); cx.verifyRunning = false;
+                    cx.verifyAbort = { text: 'The verify sweep never ran. Check Live Data \u25b8 Console for the reason, then run it again.' };
+                    cxGet('TuningMode=0').finally(() => commissionRender());
+                    return;
+                }
                 fetch(buildURL('/tuningbode')).then(r => r.json()).then(j => {
+                    if (settled || !cx.verifyRunning) return;
+                    framesSeen++;
+                    if (j.tok !== tok) return;
                     if (j.aborted) {   // protection cut the sweep — firmware latched why and discarded the run
-                        cxStopPoll();
+                        settle();
                         cx.verifyAbort = cxAbortInfoFrom(j);
                         cx.verifyRunning = false;
                         cxGet('TuningMode=0').finally(() => commissionRender());
                         return;
                     }
-                    if ((j.done && !j.active) || waited > 200) {
-                        cxStopPoll();
+                    if (j.done && !j.active) {
+                        settle();
                         const pts = j.pts || [];
                         cx.verify = cxVerifyEvaluate(pts, j.railed);   // damping + speed; trust is confirmed by eye, not scored
                         // Sweep's engine-speed stats ride along for the advisory display.
@@ -27138,9 +27397,9 @@ function cxFdStart(idx) {
     cxFieldArm();                       // take field ownership → invalidates any pending deferred release
     cxStopPoll();
     cx._fdPollStart = performance.now();
-    cx._fdSawActive = false;
+    cx._fdTok = cxRunTok();
     commissionRender();
-    cxGet('fieldCutStart=1')
+    cxGet('fieldCutStart=1&tok=' + cx._fdTok)
         .then(() => { setTrackedTimeout(cxFdPoll, 800); })
         .catch(e => { cx.fdRunning = false; cx.fdErr = 'could not start — ' + e; commissionRender(); });
 }
@@ -27150,16 +27409,26 @@ function cxFdPoll() {
     // Full run ≈ ramp (≤35 s worst case) + 5 s hold + 10 s cut + ease — allow 2 min before giving up.
     const giveUp = () => (performance.now() - (cx._fdPollStart || 0) > 120000);
     fetch(buildURL('/fieldcut.json')).then(r => r.json()).then(j => {
+        // Frames from any run but this one are not ours to read: a refused start (2 s cooldown, another
+        // test busy, not in AUTO) never adopts our token, and the firmware's last result stays latched
+        // looking finished — storing it would file another speed's drain under this slot. An accepted
+        // start adopts the token in the request handler itself, so the first frame back already carries
+        // it; 15 s without one means the start was refused, and waiting out giveUp() would just sit on
+        // "Starting…" for two minutes.
+        if (j.tok !== cx._fdTok) {
+            if (performance.now() - (cx._fdPollStart || 0) > 15000) {
+                cx.fdRunning = false; cx.fdErr = 'the test did not start — check the Console for the reason, then retry';
+                commissionRender(); return;
+            }
+            setTrackedTimeout(cxFdPoll, 800); return;
+        }
         const phaseTxt = ['Ramping to the test current…', 'Holding steady — logging the baseline…',
                           'Field cut — recording the decay…', 'Easing the field back up…'];
         cx.fdPhase = phaseTxt[j.phase] || 'Running…';
         const el = document.getElementById('fdPhase'); if (el) el.textContent = cx.fdPhase; else commissionRender();
         if (j.aborted) { cx.fdRunning = false; cx.fdErr = cxFcErrText(j.abort || 'aborted'); commissionRender(); return; }
-        if (j.active) { cx._fdSawActive = true; setTrackedTimeout(cxFdPoll, 800); return; }
-        // ready from a run we never saw active is the PREVIOUS run's latched result (start was refused:
-        // cooldown/busy) — accepting it would store stale data under this speed's slot. A failed
-        // result (!ok) can't corrupt a slot, so let it through (covers an immediate start failure like alloc).
-        if (j.ready && (cx._fdSawActive || !j.ok)) {
+        if (j.active) { setTrackedTimeout(cxFdPoll, 800); return; }
+        if (j.ready) {
             if (!j.ok) cx.fdErr = cxFcErrText(j.abort);
             else {
                 cx.fdRuns[cx.fdIdx] = { ok: true, rpm: j.rpm, drainMs: j.drainMs, tauMs: j.tauMs, baseA: j.baseA,
@@ -27449,8 +27718,8 @@ function cxRenderMatrix(b) {
     // before it commits (agree-twice), so ~6 s per pause. The wizard holds a fixed test current
     // (25% of the cap-table max ≤2000 RPM) through resTest for the whole sweep — ripple scales with
     // current, so the table is only comparable across RPM at one amperage.
-    // Deliberately silent on Start Shooting: this description renders on BOTH the pre-start screen and
-    // the running game, so naming the button here would prompt for it a screen early. The arm overlay
+    // Deliberately silent on Start Shooting: this description renders only on the pre-start screen,
+    // a screen before that button exists, so naming it here would prompt for it early. The arm overlay
     // (cxGameArmUpdate) is the only place that asks, at the moment the button actually appears.
     const sweepDesc = '<p style="font-size:15px;line-height:1.5;">This step uses a Space-Invaders-style game to map current ripple from idle to 2000 RPM. Use the throttle to kill the invaders, orange ones first, observing the shape of the Ripple Map (below the game) as you go. Once you\'re confident you\'ve captured the peaks, end the game and move on.</p>';
     const sweepStartCta = '<p style="font-size:15px;line-height:1.5;">To begin, <strong>bring the engine to idle and hit "Start Game"</strong>.</p>';
@@ -27459,8 +27728,7 @@ function cxRenderMatrix(b) {
         // invader per required 50-RPM bin, killed when its bin lands in /famatrix.csv. The ripple
         // strip under it plots /filtripple.csv as it populates — a live sanity check on the values
         // the map is admitting.
-        body += sweepDesc +
-            '<div style="position:relative;">' +
+        body += '<div style="position:relative;">' +
             '<canvas id="cxGame" style="display:block; width:100%; height:400px; background:#161618; border-radius:6px;"></canvas>' +
             '<div id="cxGameToast" style="position:absolute; z-index:2; left:50%; transform:translateX(-50%); top:12px; background:rgba(240,80,60,.92); color:#fff; font-size:12px; font-weight:600; padding:4px 12px; border-radius:12px; opacity:0; transition:opacity .25s; pointer-events:none; max-width:calc(100% - 16px); box-sizing:border-box; text-align:center;"></div>' +
             // Hold-fire band: the prose half of the pre-shooting screen, from Start Game until Start
@@ -27468,7 +27736,7 @@ function cxRenderMatrix(b) {
             // playfield — and sits in the bottom third so the card's art and numbers stay clear above it.
             // Initial display follows the live flag so a mid-sweep re-render can't flash it over the game.
             '<div id="cxGameArm" style="position:absolute; z-index:1; inset:auto 0 0 0; height:34%; display:' + (cx.matrixShooting ? 'none' : 'flex') + '; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:0 18px 10px; box-sizing:border-box; text-align:center; border-radius:6px;">' +
-              '<div id="cxGameArmMsg" style="color:#cfd2d6; font-size:14px; font-weight:600; max-width:440px; line-height:1.45;">Hold the engine at idle — measuring your idle speed to set the capture band…</div>' +
+              '<div id="cxGameArmMsg">Hold the engine at idle — measuring your idle speed to set the capture band…</div>' +
               '<button id="cxGameArmBtn" onclick="cxGameBeginShooting()" class="btn-primary" style="display:none; padding:10px 28px; font-size:15px;">Start Shooting</button>' +
             '</div>' +
             '</div>' +
@@ -27719,6 +27987,7 @@ async function cxMatrixSkip() {
     cxMatrixFieldRelease();   // clears matrixOn/rtFieldArmed so cxRunActive() is false at the next step
     cx.handled = cx.handled || {};
     cx.handled[4] = 'skip';
+    cxPassStage(4, 'skip');
     const nx = cxNextSelected(4);
     cxGet('commissionStageSkip=4').finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
 }
@@ -27912,6 +28181,7 @@ function cxGameArmUpdate(now) {
     if (!cx.rtFieldArmed) {   // idle detection — the field is not commanded yet, so there is no current to be steady at
         cxGame.armReady = false; cxGame.atTgtSince = 0;
         if (btn) btn.style.display = 'none';
+        if (msg) msg.classList.remove('cx-arm-go');
         if (msg) msg.textContent = 'Hold the engine at idle — measuring your idle speed to set the capture band…';
         return;
     }
@@ -27925,9 +28195,13 @@ function cxGameArmUpdate(now) {
     cxGame.armReady = ready;
     if (ready) {
         if (btn) btn.style.display = '';
-        if (msg) msg.innerHTML = 'Current steady at <strong>' + a.toFixed(0) + ' A</strong> — on setpoint. Press Start Shooting to begin mapping ripple.';
+        if (msg) {
+            msg.innerHTML = 'Current steady at <strong>' + a.toFixed(0) + ' A</strong> — on setpoint. Press Start Shooting to begin mapping ripple.';
+            msg.classList.add('cx-arm-go');   // arcade blink burst — the only cue that the button just appeared
+        }
     } else {
         if (btn) btn.style.display = 'none';
+        if (msg) msg.classList.remove('cx-arm-go');
         if (msg) msg.textContent = isFinite(a)
             ? 'Bringing the alternator up to the ' + tgt.toFixed(0) + ' A test current — now at ' + a.toFixed(0) + ' A…'
             : 'Bringing the alternator up to the ' + tgt.toFixed(0) + ' A test current…';
@@ -28728,8 +29002,12 @@ function cxRenderThresh(b) {
     const nonLith = cxIsNonLithium();
     const recMargin = nonLith ? 30 : 5;
     const introCopy = nonLith
-        ? 'Set the margin so the over-current trip line sits above the ripple measured in the Disturbances step. For lead-acid and AGM, 30 A is recommended: a brief spike does these batteries no harm, and a high trip lets an engine-speed blip ride through instead of cutting the charge. The voltage protections stay the fast defense.' + cxDocLink('step-6-fault-threshold-autotuning')
-        : 'Set the margin so the over-current trip line clears the ripple measured in the Disturbances step. A 5 A margin works well for most installations.' + cxDocLink('step-6-fault-threshold-autotuning');
+        ? 'Set how far the over-current trip line sits above the ripple measured in the Disturbances step. For lead-acid and AGM, 30 A is recommended.'
+          + cxWhyTip('A brief spike does lead-acid and AGM batteries no harm, and a high trip lets an engine-speed blip ride through instead of cutting the charge. The voltage protections stay the fast defense.'
+                     + cxDocLink('step-6-fault-threshold-autotuning'))
+        // Lithium copy was already one line and carries no "why" to hide, so it keeps the visible doc link.
+        : 'Set the margin so the over-current trip line clears the ripple measured in the Disturbances step. A 5 A margin works well for most installations.'
+          + cxDocLink('step-6-fault-threshold-autotuning');
     let body = '<h2 style="font-size:15px;font-weight:600;margin:0 0 4px;">Fault Threshold Autotuning</h2>' +
         '<p style="font-size:13px;color:#b7b7b7;margin:0 0 12px;line-height:1.5;">' + introCopy + '</p>' +
         '<div id="cxThrNoFit"></div>' +
@@ -28752,7 +29030,9 @@ function cxRenderThresh(b) {
         '<div style="margin-top:22px;border-top:1px solid #2c2c2c;padding-top:14px;">' +
         '<h2 style="font-size:15px;font-weight:600;margin:0 0 4px;">Voltage-Rise Tolerance (D-term deadband)</h2>' +
         '<p style="font-size:13px;color:#b7b7b7;margin:0 0 12px;line-height:1.5;">' +
-          'The damper in the voltage loop (the D term) ignores voltage moving slower than its deadband, so ordinary belt and diode ripple cannot work the field. Commissioning measured your own ripple rise rate and set that line already. The <strong>Safety Margin</strong> below is how far above it the line sits: larger means fewer nuisance engagements but a later reaction to a genuine fast rise. Change the D-term voltage filter and this must be re-run.' + cxDocLink('step-6-fault-threshold-autotuning') +
+          'Set how far the voltage-rise line sits above the rise rate commissioning measured. Larger means fewer nuisance engagements, but a later reaction to a genuine fast rise.'
+          + cxWhyTip('The damper in the voltage loop (the D term) ignores voltage moving slower than its deadband, so ordinary belt and diode ripple cannot work the field. Commissioning measured your own ripple rise rate and set that line already; the <strong>Safety Margin</strong> is how far above it the line sits. Change the D-term voltage filter and this must be re-run.'
+                     + cxDocLink('step-6-fault-threshold-autotuning')) +
         '</p>' +
         '<div id="cxDbndNoFit"></div>' +
         '<div id="cxDbndMarginRow" style="display:flex;align-items:center;gap:12px;margin:8px 0 6px;">' +
@@ -28937,16 +29217,26 @@ function cxDbndDraw() {
     });
 }
 
+// Reads the DEVICE echoes, not this session's run results: the summary states what the regulator is
+// running now, which is the thing the user wants confirmed, and it stays true across a page reload —
+// off the session objects it claimed nothing had been applied whenever the page had been refreshed
+// mid-wizard.
 function cxAppliedSummary() {
-    const r = cx.fieldResult, f = cx.fit;
     const rows = [];
-    if (r) rows.push('Field: stabilize ' + r.propStabA.toFixed(0) + ' A, step ' + r.propStepPct.toFixed(1) + '%');
-    if (f && f.ok) rows.push('Gains: Kp ' + f.Kp.toFixed(3) + ', Ki ' + f.Ki.toFixed(3) + '; filters ' + Math.round(f.tauMs / 3) + '/' + Math.round(f.tauMs) + ' ms');
+    const stab = getEchoNumber('SystemIDStabilizeAmps_echo'), step = getEchoNumber('SystemIDStepAmplitude_echo');
+    const kp = getEchoNumber('PidKp_echo'), ki = getEchoNumber('PidKi_echo');
+    const tcF = getEchoNumber('OutputPIDFilterTC_echo'), tcS = getEchoNumber('VoltageFilterTC_echo');
+    if (stab > 0 && step > 0) rows.push('Field: stabilize ' + stab.toFixed(0) + ' A, step ' + step.toFixed(1) + '%');
+    if (kp > 0 && ki > 0) {
+        let g = 'Gains: Kp ' + kp.toFixed(3) + ', Ki ' + ki.toFixed(3);
+        if (tcF > 0 && tcS > 0) g += '; filters ' + Math.round(tcF) + '/' + Math.round(tcS) + ' ms';
+        rows.push(g);
+    }
     // Over-current floor is operator-owned (Protections), echoed here not "applied" by commissioning. The
     // ceiling and trip-line margin ARE set by the Fault Threshold step, per chemistry (30 A / 40 A non-lithium).
     const flr = getEchoNumber('IExcessFloorA_echo');
     if (flr > 0) rows.push('Over-current floor (set in Protections): ' + flr.toFixed(1) + ' A');
-    return rows.length ? rows.join('<br>') : 'No settings applied yet — earlier phases were skipped.';
+    return rows.length ? rows.join('<br>') : 'The regulator is running its seeded defaults — no commissioning step has written a value yet.';
 }
 // ══════════ CV Stress Test (wizard stage 8, Step 9 + standalone Tuning-tab modal) ══════════
 // Firmware engine: /get?cvStressStart=1 → poll /cvstress.json (the poll doubles as the
@@ -29495,21 +29785,31 @@ function cxFinish() {
     // page below can't lose it); the close/reset/navigate tail moves behind the Done button.
     // cmEpoch: the browser's wall clock stamps the pass — the device's own clock may never have been set.
     cxGet('commissionDone=1&cmEpoch=' + Math.floor(Date.now() / 1000)).then(async () => {
+        // The session's own marks ride over the CSV3 echo (cxEffMask): the last step's done bit is usually
+        // still in flight here. "Complete" means the REQUIRED stages — the firmware's COMMISSIONED test —
+        // not all ten; the Stress test and Charge health calibration are optional and never block it.
+        const mask = cxEffMask();
         const _ALL = (1 << COMMISSION_STEPS.length) - 1;
-        const allDone = (cxLastMask & _ALL) === _ALL;
+        const allDone = (mask & _ALL) === _ALL;
+        const requiredDone = (mask & CX_REQUIRED_MASK) === CX_REQUIRED_MASK;
         const rows = cxHandledSummaryRows();
         if (rows.length) {
             await xAlert('Set these by hand — the wizard did not measure them:\n\n' + rows.join('\n\n'), 'Before you go');
-        } else if (!allDone) {
+        } else if (!requiredDone) {
             await xAlert('Selected steps saved. Some steps are still pending — the badge shows what remains.' +
                 (currentChargeRateMode === 'low' ? ' Staying in Low charge rate until commissioning is finished.' : ''));
+        } else if (!allDone) {
+            const opt = [8, 9].filter(i => !(mask & (1 << i))).map(i => COMMISSION_STEPS[i].name).join(' and ');
+            await xAlert('Commissioned. The optional ' + opt + ' did not run — it can be run any time from the Commissioning tab.');
         }
         // Commissioning runs in Low charge rate by default (gentler on small banks). Offer to restore
         // High so the alternator delivers full output in normal use; the Low/High tables are both set.
-        // ONLY on a fully-completed pass: a partial finish comes back for the remaining steps, and those
-        // must run in Low too (2026-07-20: this prompt after a partial pass put a stress test at the
-        // High cap). The switch failure is surfaced, never swallowed.
-        if (allDone && currentChargeRateMode === 'low' &&
+        // ONLY once the device is COMMISSIONED (required stages done): a partial finish comes back for
+        // the remaining required steps, and those must run in Low too (2026-07-20: this prompt after a
+        // partial pass put a stress test at the High cap). A later pass for an optional step re-picks its
+        // mode on the Charge Rate Limits screen, so the offer is safe once the required set is done.
+        // The switch failure is surfaced, never swallowed.
+        if (requiredDone && currentChargeRateMode === 'low' &&
             await xConfirm('You commissioned in Low charge rate. Switch to High now so the alternator delivers its full output in normal use?',
                 { title: 'Commissioning complete', okText: 'Switch to High', cancelText: 'Stay in Low' })) {
             try { await submitChargeRateModeImmediately(1); setChargeRateMode('high'); }
@@ -29685,19 +29985,20 @@ function renderCommissionStatus(state, phase, mask, manual) {
     // panel is closed — drop it so a resume can't reopen a phase the device no longer backs (an Abort
     // from another client, for instance). Gated on the panel being closed so a freshly-started flow
     // (Prep→phase 1) can't be nuked by a late CSV3 frame still carrying the pre-start state.
-    const _ov = document.getElementById('commission-modal-overlay');
-    const _panelOpen = _ov && _ov.style.display === 'block';
-    if (state === 0 && !_panelOpen && cx && cx.phase > 0) { cx = null; }
+    const _panelOpen = cxPanelOpen();
+    if (state === 0 && !_panelOpen && cx && (cx.phase > 0 || cx.paused)) { cx = null; }
 
     // Run plan: until the user touches a checkbox it is the pending stages (a fresh device pre-selects
     // all, a single stale step pre-selects just that one). A hand-edited plan is kept, but a stage that
     // goes stale on the device while nothing is open or paused (tach rescale, RPM-table edit) is added
-    // to it — never silently left out of the next pass. Every run-ending path resets cxPlanUserSet.
-    if (!cxPlanUserSet) cxDefaultPlanFromMask(cxLastMask);
+    // to it — never silently left out of the next pass. Frozen while a pass is open or paused (cx set):
+    // the wizard reads it live, and a paused pass must come back to the plan it left — closeCommissionModal
+    // has already taken the passed steps off it. Every run-ending path resets cxPlanUserSet.
+    if (!cxPlanUserSet) { if (!_panelOpen && !cx) cxDefaultPlanFromMask(cxLastMask); }
     else if (cxLastMask !== cxPlanMaskBasis && !_panelOpen && !cx) {
         const staled = cxPlanMaskBasis & ~cxLastMask;
-        for (let i = 1; i < CX_PHASES.length; i++) if (staled & (1 << i)) cxPlan[i] = true;
-        cxApplyDeps();
+        for (let i = 1; i < CX_PHASES.length; i++) if (staled & (1 << i)) { cxPlan[i] = true; cxPlanForced.delete(i); cxPlanPulled.delete(i); }
+        cxPlanSettle(cxEffMask());
     }
     cxPlanMaskBasis = cxLastMask;
 
@@ -29717,6 +30018,9 @@ function renderCommissionStatus(state, phase, mask, manual) {
     }
 
     const cl = document.getElementById('commission-checklist');
+    // Every plan-side read goes through cxEffMask(): while a pass is paused the checkboxes are live, and
+    // cxLastMask lags what the pass has just measured — a fresh done step read as pending got no lock.
+    const effMask = cxEffMask();
     if (cl) {
         cl.innerHTML = COMMISSION_STEPS.map((s, i) => {
             const done = !!(cxLastMask & (1 << i));   // ✓ now comes from the per-stage done mask
@@ -29724,8 +30028,16 @@ function renderCommissionStatus(state, phase, mask, manual) {
             // "Current" = the step the wizard is on. Done always wins, so a finished current step shows ✓.
             const current = (state === 1) && (i === phase) && (phase < COMMISSION_STEPS.length) && !done;
             const prep = (i === 0);
-            const cbAttrs = (cxPlan[i] ? 'checked ' : '') + (prep ? 'disabled ' : '');
-            const cbTitle = prep ? 'Prep always runs (snapshot + preconditions)'
+            // Locked: a ticked feeder will re-measure what this done step was built on, so it must run again
+            // and cannot be unticked on its own — untick the feeder to release it. Frozen while the wizard
+            // is open (the running pass reads the plan live).
+            const lockedBy = prep ? [] : cxPlanFeedersOf(i, effMask);
+            const locked = lockedBy.length > 0;
+            const lockNames = lockedBy.map(k => COMMISSION_STEPS[k].name).join(' and ');
+            const cbAttrs = (cxPlan[i] ? 'checked ' : '') + ((prep || locked || _panelOpen) ? 'disabled ' : '');
+            const cbTitle = _panelOpen ? 'The wizard is open — the plan is fixed until it closes'
+                          : prep ? 'Prep always runs (snapshot + preconditions)'
+                          : locked ? 'Runs again because ' + lockNames + ' is ticked — re-measuring that makes this result stale. Untick that step to release this one.'
                           : (done ? 'Run this step again in the next pass (the steps it feeds run again too)'
                                   : 'Run this step in the next commissioning pass');
             // Status badge sits at the RIGHT of the row (not between the checkbox and the name) so a
@@ -29750,11 +30062,16 @@ function renderCommissionStatus(state, phase, mask, manual) {
             } else {
                 badge = '<span style="font-size:16px;color:var(--text-muted);line-height:1;">○</span>';
             }
+            // A box the plan ticked itself says why: locked = a ticked feeder will stale it, so it must re-run;
+            // pulled = a ticked step reads it and it has not been measured.
+            let planNote = '';
+            if (locked) planNote = '<br><span style="font-size:12px;color:#b8860b;">Runs again: ' + lockNames + ' is ticked, and re-measuring it makes this step\'s result stale.</span>';
+            else if (cxPlanPulled.has(i)) planNote = '<br><span style="font-size:12px;color:#b8860b;">Added: a step you selected reads this one\'s measurements, and it has not been measured yet.</span>';
             return '<div style="display:flex;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--border);">' +
                 '<input type="checkbox" ' + cbAttrs + 'onchange="cxToggleStage(' + i + ', this.checked)" title="' + cbTitle + '" style="flex:0 0 auto;cursor:' + (prep ? 'default' : 'pointer') + ';">' +
                 '<span style="flex:1;min-width:0;line-height:1.45;">' +
                 '<span style="font-weight:' + (current ? '700' : '500') + ';">' + (i + 1) + '. ' + s.name + '</span>' +
-                '<br><span style="font-size:12px;color:var(--text-muted);">' + s.desc + '</span>' +
+                '<br><span style="font-size:12px;color:var(--text-muted);">' + s.desc + '</span>' + planNote +
                 '</span>' +
                 '<span style="flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:46px;">' + badge + '</span>' +
                 '</div>';
@@ -29762,7 +30079,7 @@ function renderCommissionStatus(state, phase, mask, manual) {
     }
     // Master "Select all steps" reflects whether every optional stage (1..last) is selected.
     const sa = document.getElementById('commission-select-all');
-    if (sa) sa.checked = cxPlan.slice(1).every(Boolean);
+    if (sa) { sa.checked = cxPlan.slice(1).every(Boolean); sa.disabled = _panelOpen; }
 
     // Primary button label/class/help adapt to the ticked plan vs. the done-mask (see cxStartIntent):
     // Start (nothing done) / Continue (partial pass or targeted redo) / Clear-and-restart (all ticked
@@ -29773,30 +30090,38 @@ function renderCommissionStatus(state, phase, mask, manual) {
     if (sb) {
         sb.textContent = intent.label;
         sb.className = intent.className;
-        sb.disabled = intent.disabled;
+        sb.disabled = intent.disabled || _panelOpen;   // an open wizard owns the run; commissionPrimaryAction is the backstop
     }
-    if (sh) sh.textContent = intent.help;
+    if (sh) sh.textContent = _panelOpen ? 'The wizard is open — carry on there, or use its Stop or Abort button.' : intent.help;
 }
 
 // Clear progress & start over: revert to the pre-commissioning snapshot (firmware also resets
-// state→0, phase→0) and reopen the wizard fresh at Prep. From a COMMISSIONED device there is no
-// snapshot to revert (it was discarded on Finish), so the current good tune simply stays as the
-// new starting point and is snapshotted again when the fresh run begins.
+// state→0, phase→0) and reopen the wizard fresh at Prep. A COMMISSIONED device has no snapshot to
+// revert (discarded on Finish) and its Abort is a firmware no-op, so nothing is sent and nothing is
+// cleared: the good tune stays as the starting point, the marks stay until each step re-measures, and
+// the fresh run snapshots it all again at Start (Abort then restores exactly this). Either way the plan
+// is pinned to every step, as user-set: the default plan would re-derive to "pending only" from the
+// first CSV3 frame during the pre-flight and the restart would run just the two optional steps.
 async function commissionClearAndRestart() {
     if (!settingsUnlocked) { xAlert('Unlock settings first.'); return; }
-    const msg = (cxLastState === 2)
-        ? 'Clear the commissioned mark and start the setup wizard over?\n\nThe wizard restarts from the beginning, using your current settings as the starting point. Nothing is permanently changed until you finish — use "Abort and revert all" to restore your starting settings at any point. Closing the wizard with the X just pauses it and keeps your progress so you can resume later.'
+    const committed = (cxLastState === 2);
+    const msg = committed
+        ? 'Run the whole setup wizard again from the beginning?\n\nEvery step is re-measured, using your current settings as the starting point. Nothing is permanently changed until you finish — use "Abort and revert all" at any point to put today\'s settings back. Closing the wizard with the X just pauses it and keeps your progress so you can resume later.'
         : 'Clear commissioning progress and revert all settings to the pre-commissioning snapshot, then start over?';
     if (!await xConfirm(msg)) return;
     cxStopPoll();
-    cxGet('commissionAbort=1').then(() => {
+    (committed ? Promise.resolve() : cxGet('commissionAbort=1')).then(() => {
         cx = null;                 // drop any stale in-session state
-        cxPlanUserSet = false;     // re-default the run plan (everything will read as not-done now)
-        // Clear the local mirror and repaint so the checklist ✓ marks flip to ○ the instant the
-        // user clicks — otherwise they linger until the next CSV3 frame round-trips the now-zeroed
-        // done-mask back (CSV3 is event-driven, so that lag is user-visible).
-        cxLastState = 0; cxLastPhase = 0; cxLastMask = 0; cxLastManual = 0;
-        renderCommissionStatus(0, 0, 0, 0);
+        cxPlanUserSet = true;
+        cxPlanForced.clear(); cxPlanPulled.clear();
+        for (let i = 0; i < CX_PHASES.length; i++) cxPlan[i] = true;
+        if (!committed) {
+            // Clear the local mirror and repaint so the checklist ✓ marks flip to ○ the instant the
+            // user clicks — otherwise they linger until the next CSV3 frame round-trips the now-zeroed
+            // done-mask back (CSV3 is event-driven, so that lag is user-visible).
+            cxLastState = 0; cxLastPhase = 0; cxLastMask = 0; cxLastManual = 0;
+        }
+        renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask, cxLastManual);
         // Wholesale restart: prerequisites → Low/High limits → TACH ALIGNMENT → wizard. The alignment
         // screen belongs in a revert-and-redo — everything else is being put back to pre-commissioning and
         // re-measured, and the engine-speed axis is what the re-measuring is done against. It opens on the

@@ -8089,6 +8089,43 @@ bool kneeCurveApply() {
   return true;
 }
 
+// Stage-7 entry copy of everything kneeCurveApply writes, so commissionStop can undo an applied-but-
+// not-advanced keep-alive column the way the step snapshot undoes the scalars (the drain line is in
+// that snapshot; the column is not). Taken by the commissionPhase handler on ENTERING stage 7, dropped
+// on entering any other stage and on Stop/Done/Abort. RAM only, deliberately: a reboot mid-step keeps
+// an applied column as valid data and simply re-runs the step, which is the existing boot rule for the
+// Min% table. Lives here, not in 2_functions, because kneeStateDirty is file-static.
+static float cxStepMinDuty[RPM_TABLE_SIZE], cxStepKneeFloor[RPM_TABLE_SIZE], cxStepKneeKnee[RPM_TABLE_SIZE], cxStepKneeTempF[RPM_TABLE_SIZE];
+static bool  cxStepKneeFrozen[RPM_TABLE_SIZE];
+static float cxStepKneeFitA, cxStepKneeFitC, cxStepKneeFitResid;
+static int   cxStepKneeFitWorst;
+static bool  cxStepMinPctValid = false;
+void cxStepMinPctStash() {
+  memcpy(cxStepMinDuty, rpmMinDutyTable, sizeof(cxStepMinDuty));
+  memcpy(cxStepKneeFloor, kneeFloor, sizeof(cxStepKneeFloor));
+  memcpy(cxStepKneeKnee, kneeKnee, sizeof(cxStepKneeKnee));
+  memcpy(cxStepKneeFrozen, kneeFrozen, sizeof(cxStepKneeFrozen));
+  memcpy(cxStepKneeTempF, kneeLearnTempF, sizeof(cxStepKneeTempF));
+  cxStepKneeFitA = kneeFitA; cxStepKneeFitC = kneeFitC; cxStepKneeFitResid = kneeFitResidPct; cxStepKneeFitWorst = kneeFitWorstIdx;
+  cxStepMinPctValid = true;
+}
+void cxStepMinPctDrop() { cxStepMinPctValid = false; }
+// Returns true when a column was put back. Persists through the same deferred paths as an Apply.
+bool cxStepMinPctRestore() {
+  if (!cxStepMinPctValid) return false;
+  memcpy(rpmMinDutyTable, cxStepMinDuty, sizeof(cxStepMinDuty));
+  memcpy(kneeFloor, cxStepKneeFloor, sizeof(cxStepKneeFloor));
+  memcpy(kneeKnee, cxStepKneeKnee, sizeof(cxStepKneeKnee));
+  memcpy(kneeFrozen, cxStepKneeFrozen, sizeof(cxStepKneeFrozen));
+  memcpy(kneeLearnTempF, cxStepKneeTempF, sizeof(cxStepKneeTempF));
+  kneeFitA = cxStepKneeFitA; kneeFitC = cxStepKneeFitC; kneeFitResidPct = cxStepKneeFitResid; kneeFitWorstIdx = cxStepKneeFitWorst;
+  cxStepMinPctValid = false;
+  kneeStateDirty = true;
+  settingsDirty = true;
+  pendingSaveUserTableEdits = true;
+  return true;
+}
+
 // Persist learned per-bin state (learning namespace blobs). Knobs persist separately via settingWrite.
 void saveKneeLearnState() {
   nvs_handle_t h;

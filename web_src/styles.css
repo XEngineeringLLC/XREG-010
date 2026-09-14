@@ -1295,6 +1295,34 @@ a.btn-secondary {
   #commission-modal-panel .cx-cue { animation: none; }
 }
 
+/* Disturbances game — the "press Start Shooting" prompt is the only prose over the title card, so it
+   has to win against the card's art. Arcade attract-mode treatment: a two-flash burst every 3 s, never
+   a continuous 1 Hz blink, which makes a whole sentence unreadable. Teal matches the card's number,
+   which also turns teal the moment the current is on setpoint. */
+#cxGameArmMsg {
+  color: #cfd2d6;
+  font-size: 14px;
+  font-weight: 600;
+  max-width: 440px;
+  line-height: 1.45;
+}
+#cxGameArmMsg.cx-arm-go {
+  color: #5fe3d6;
+  font-size: 15.5px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  text-shadow: 0 0 12px rgba(46, 196, 182, 0.55);
+  animation: cxArmGoBlink 3s steps(1, end) infinite;
+}
+#cxGameArmMsg.cx-arm-go strong { color: #fff; }
+@keyframes cxArmGoBlink {
+  0%, 8%, 16%, 100% { opacity: 1; }
+  4%, 12%           { opacity: 0.12; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #cxGameArmMsg.cx-arm-go { animation: none; }
+}
+
 /* Battery-health DCIR test wizard — same dark-panel button treatment as the commissioning modal. */
 #bhw-modal-panel .btn-primary,
 #cvs-modal-panel .btn-primary {

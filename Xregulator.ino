@@ -1116,6 +1116,7 @@ volatile bool systemIDRequested = false;       // set true by UI handler to trig
 volatile bool systemIDAbortRequested = false;  // set true by UI handler to abort in-progress test
 uint8_t systemIDActive = 0;                    // 0=idle, 1-9=current phase (sent to UI for progress)
 bool systemIDResultsReady = false;             // set true when post-processing is complete
+uint32_t systemIDRunTok = 0;                   // run token, see fieldCurveRunTok
 uint32_t systemIDLastEndMs = 0;                // millis() when last test ended (cooldown guard)
 uint8_t systemIDAbortReason = 0;               // FieldEventReason code if protection aborted the test; 0 = no abort / clean exit
 uint8_t systemIDAbortPhase = 0;                // phase (1-9) at moment of protection abort; 0 = no abort
@@ -1209,6 +1210,11 @@ volatile bool fieldCurveAbortRequested = false;// set by /get?cancelFieldCurve
 uint8_t fieldCurveActive = 0;                  // 0=idle, 1=ramping, 2=processing (sent to UI)
 bool  fieldCurveResultsReady = false;          // true when curve + proposals are ready to read
 uint32_t fieldCurveLastEndMs = 0;              // cooldown guard
+// Run token: the browser mints one per Record/Run and sends it with the start. Only an ACCEPTED start
+// adopts it, so every status frame and every commit can be matched to the run that asked for it. A
+// refused start (cooldown, busy, not AUTO) leaves the previous run's token in place and its still-latched
+// results therefore belong to a token the caller never sent. 0 = a caller that sends no token.
+uint32_t fieldCurveRunTok = 0;
 // Results (read via /fieldcurve.csv)
 float fieldCurveKneeDuty   = -1.0f;            // duty at the saturation knee (%), -1 = none found
 float fieldCurveKneeAmps   = -1.0f;
@@ -1333,6 +1339,7 @@ uint8_t fieldCutPhase = 0;                         // UI caption: 0=ramping 1=ho
 bool  fieldCutCcActive = false;                    // ramp/settle phase: the normal AUTO path drives the real current PID at fieldCutCmdA
 float fieldCutCmdA = 0.0f;                         // ramp-phase current target (= SystemIDStabilizeAmps at start)
 bool  fieldCutResultsReady = false;
+uint32_t fieldCutRunTok = 0;                       // run token, see fieldCurveRunTok
 bool  fieldCutOk = false;                          // true = a usable τ was fit this run
 float fieldCutTauMs   = -1.0f;                     // fitted decay τ this run (ms), -1 = none — QA cross-check, NOT the stored value
 float fieldCutFallMs  = -1.0f;                     // measured 90%→10% fall time (ms), -1 = none
@@ -3585,6 +3592,7 @@ uint8_t tuningSweepCycles   = 2;       // analysed cycles per frequency (1 settl
 volatile bool tuningSweepRequested = false;  // UI "Run Sweep" → start/restart the sweep
 bool    tuningSweepActive   = false;   // sweep in progress
 bool    tuningSweepDone     = false;   // sweep finished, tuningBode[] valid
+uint32_t tuningRunTok       = 0;       // run token, see fieldCurveRunTok
 #define TUNING_SWEEP_NPOINTS 10        // log-spaced sweep points
 struct TuningBodePoint { float freqHz; float gain; float phaseDeg; };  // gain = measured/reference (unitless)
 TuningBodePoint tuningBode[TUNING_SWEEP_NPOINTS] = {};
@@ -5709,6 +5717,7 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   ".badge-secondary{background:#888;color:white}"
   ".opt-title{font-weight:bold;color:#333;display:block;margin-bottom:4px}"
   ".opt-desc{font-size:14px;color:#444;line-height:1.45}"
+  ".opt-note{display:block;font-size:11px;color:#999;line-height:1.35;margin-top:6px}"
   ".option .info-box{margin-top:12px}"
   // box-sizing so full-width inputs sit flush inside the padded option boxes
   "input,select{box-sizing:border-box}"
@@ -5733,21 +5742,18 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "<input type=\"checkbox\" name=\"forget_client\" style=\"width:auto;margin:0\">"
   "Forget saved ship's WiFi"
   "</label>"
-  "<span class=\"opt-desc\">Leave the two fields above blank and check this box to erase the saved ship's WiFi credentials. Until new credentials are saved, the regulator will boot back to this setup page with charging disabled - use the Hotspot Wire (below) for normal operation without ship's WiFi. Leaving the fields blank WITHOUT checking the box keeps the saved credentials unchanged.</span>"
+  "<span class=\"opt-note\">Leave the two fields above blank and check this box to erase the saved ship's WiFi credentials. Until new credentials are saved, the regulator will boot back to this setup page with charging disabled.</span>"
   "</div>"
 
   // Non-preferred option: hotspot/AP credentials live inside the de-emphasized grey box
   "<div class=\"option option-secondary\">"
   "<span class=\"opt-badge badge-secondary\">Non-Preferred</span>"
   "<span class=\"opt-title\">Use the regulator as a Hotspot (Access Point)</span>"
-  "<span class=\"opt-desc\">As backup, or for ships without existing WiFi networks, you may use the regualtor as a Hotspot (aka Access Point). The regulator controller will broadcast its own WiFi network which you can connect to from any device (phone, ipad, laptop, etc.).  Mostly the same functionality will exist at alternator.local, but with no internet, you won't be able to use weather mode, get software updates, see Community features, etc.  This mode is less supported.  To enter this mode on a reboot, you must connect pin 12 in RJ3 (the rightmost ethernet connector, Blue wire) to Ground.  Leave it connected to GND forever if you prefer this mode.</span>"
+  "<span class=\"opt-note\">You may use the regulator as a Hotspot (aka Access Point). The regulator controller will broadcast its own WiFi network which you can connect to from any device (phone, ipad, laptop, etc.).  Mostly the same functionality will exist at alternator.local, but with no internet, you won't be able to use weather mode, get software updates, see Community features, etc.  To enter this mode on a reboot, connect pin 12 in RJ3 (the rightmost ethernet connector, Blue wire) to Ground.  For permanent Access Point mode, leave this hardwired.</span>"
   "<label>New Alt. Reg. Hotspot Name (SSID):</label>"
   "<input type=\"text\" name=\"hotspot_ssid\" placeholder=\"Leave blank for default: ALTERNATOR_WIFI-&lt;unit id&gt;\">"
   "<label>New Alt. Reg. Hotspot Password:</label>"
   "<input type=\"password\" name=\"ap_password\" placeholder=\"Leave blank for default: alternator123\">"
-  "<div class=\"info-box\">"
-  "***To boot into Hotspot mode, the Hotspot Wire (pin 12 in RJ3, the rightmost ethernet connector, Blue wire) must be connected to Ground during a restart.***"
-  "</div>"
   "</div>"
 
   "<div class=\"info-box\">"
