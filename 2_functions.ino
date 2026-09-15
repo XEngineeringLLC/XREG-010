@@ -631,6 +631,7 @@ bool fsRemove(const char *path) {
 #define NK_n2kExtraTempInstance   "n2kXTmpInst"
 #define NK_n2kExtraTempSource     "n2kXTmpSrc"
 #define NK_CommissionTempSrc      "CommissionTmpS"
+#define NK_maxWorkingRpm          "maxWorkingRpm"
 #define NK_owAddrAlt              "owAddrAlt"
 #define NK_owAddrBatt             "owAddrBatt"
 #define NK_owAddrExtra            "owAddrExtra"
@@ -2377,11 +2378,6 @@ void resetSensorWindow() {
   currentWindow->rpm_area_v_us = 0;
   currentWindow->rpm_valid_us = 0;
 
-  currentWindow->wifiStr_min = 999900;
-  currentWindow->wifiStr_max = -999900;
-  currentWindow->wifiStr_area_v_us = 0;
-  currentWindow->wifiStr_valid_us = 0;
-
   currentWindow->dutyCycle_min = 999900;
   currentWindow->dutyCycle_max = 0;
   currentWindow->dutyCycle_area_v_us = 0;
@@ -2454,10 +2450,25 @@ void resetSensorWindow() {
   currentWindow->uTargetAmps_area_v_us = 0;
   currentWindow->uTargetAmps_valid_us = 0;
 
-  currentWindow->tempMargin_min = 999900;
-  currentWindow->tempMargin_max = -999900;
-  currentWindow->tempMargin_area_v_us = 0;
-  currentWindow->tempMargin_valid_us = 0;
+  currentWindow->battTemp_min = 999900;
+  currentWindow->battTemp_max = -999900;
+  currentWindow->battTemp_area_v_us = 0;
+  currentWindow->battTemp_valid_us = 0;
+
+  currentWindow->extraTemp_min = 999900;
+  currentWindow->extraTemp_max = -999900;
+  currentWindow->extraTemp_area_v_us = 0;
+  currentWindow->extraTemp_valid_us = 0;
+
+  currentWindow->solarPower_min = 999900;
+  currentWindow->solarPower_max = -999900;
+  currentWindow->solarPower_area_v_us = 0;
+  currentWindow->solarPower_valid_us = 0;
+
+  currentWindow->solarVolt_min = 999900;
+  currentWindow->solarVolt_max = -999900;
+  currentWindow->solarVolt_area_v_us = 0;
+  currentWindow->solarVolt_valid_us = 0;
 
   currentWindow->lastUpdateTime_us = micros();
   currentWindow->windowStartTime = millis();
@@ -2677,14 +2688,6 @@ void updateSensorWindow() {
     currentWindow->rpm_valid_us += delta_us;
   }
 
-  int32_t wifiStr = WifiStrength;
-  if (wifiStr < currentWindow->wifiStr_min) currentWindow->wifiStr_min = wifiStr;
-  if (wifiStr > currentWindow->wifiStr_max) currentWindow->wifiStr_max = wifiStr;
-  if (shouldAccumulate) {
-    currentWindow->wifiStr_area_v_us += (int64_t)wifiStr * delta_us;
-    currentWindow->wifiStr_valid_us += delta_us;
-  }
-
   int32_t duty = (int32_t)(dutyCycle * 100.0);
   if (duty < currentWindow->dutyCycle_min) currentWindow->dutyCycle_min = duty;
   if (duty > currentWindow->dutyCycle_max) currentWindow->dutyCycle_max = duty;
@@ -2710,13 +2713,41 @@ void updateSensorWindow() {
     currentWindow->uTargetAmps_valid_us += delta_us;
   }
 
-  float tempMargin = TemperatureLimitF - TempToUse;
-  int32_t tempMarginScaled = (int32_t)(tempMargin * 100.0);
-  if (tempMarginScaled < currentWindow->tempMargin_min) currentWindow->tempMargin_min = tempMarginScaled;
-  if (tempMarginScaled > currentWindow->tempMargin_max) currentWindow->tempMargin_max = tempMarginScaled;
-  if (shouldAccumulate) {
-    currentWindow->tempMargin_area_v_us += (int64_t)tempMarginScaled * delta_us;
-    currentWindow->tempMargin_valid_us += delta_us;
+  // Battery temperature in use. batteryTempF() already applies each source's own freshness rule, so
+  // isfinite() is the whole gate — no IDX_ staleness check on top of it.
+  if (isfinite(battTempActiveF)) {
+    int32_t battTempScaled = (int32_t)(battTempActiveF * 100.0);
+    if (battTempScaled < currentWindow->battTemp_min) currentWindow->battTemp_min = battTempScaled;
+    if (battTempScaled > currentWindow->battTemp_max) currentWindow->battTemp_max = battTempScaled;
+    if (shouldAccumulate) {
+      currentWindow->battTemp_area_v_us += (int64_t)battTempScaled * delta_us;
+      currentWindow->battTemp_valid_us += delta_us;
+    }
+  }
+
+  if (IS_SEEN(IDX_EXTRA_TEMP) && !IS_STALE(IDX_EXTRA_TEMP) && isfinite(ExtraTempF)) {
+    int32_t extraTempScaled = (int32_t)(ExtraTempF * 100.0);
+    if (extraTempScaled < currentWindow->extraTemp_min) currentWindow->extraTemp_min = extraTempScaled;
+    if (extraTempScaled > currentWindow->extraTemp_max) currentWindow->extraTemp_max = extraTempScaled;
+    if (shouldAccumulate) {
+      currentWindow->extraTemp_area_v_us += (int64_t)extraTempScaled * delta_us;
+      currentWindow->extraTemp_valid_us += delta_us;
+    }
+  }
+
+  if (IS_SEEN(IDX_VICTRON_SOLAR) && !IS_STALE(IDX_VICTRON_SOLAR)) {   // no MPPT fitted must read absent, not a measured 0 W
+    int32_t solarW = (int32_t)(VictronSolarPower_W * 100.0);
+    if (solarW < currentWindow->solarPower_min) currentWindow->solarPower_min = solarW;
+    if (solarW > currentWindow->solarPower_max) currentWindow->solarPower_max = solarW;
+    int32_t solarV = (int32_t)(VictronSolarVoltage_V * 100.0);
+    if (solarV < currentWindow->solarVolt_min) currentWindow->solarVolt_min = solarV;
+    if (solarV > currentWindow->solarVolt_max) currentWindow->solarVolt_max = solarV;
+    if (shouldAccumulate) {
+      currentWindow->solarPower_area_v_us += (int64_t)solarW * delta_us;
+      currentWindow->solarPower_valid_us += delta_us;
+      currentWindow->solarVolt_area_v_us += (int64_t)solarV * delta_us;
+      currentWindow->solarVolt_valid_us += delta_us;
+    }
   }
 
   // A speed-source switch does not empty the 60-s ring in updateSustainedSpeed(), so for one window
@@ -2897,6 +2928,15 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   const bool hdgOk = snap.window.heading_valid_us > 0;
   char sogMinS[16], sogMaxS[16], sogAvgS[16], vmgMinS[16], vmgMaxS[16], vmgAvgS[16];
   char lwMinS[16], lwMaxS[16], lwAvgS[16], cogAvgS[16], hdgAvgS[16];
+  // Same absent-vs-zero rule for the four accumulators added in payload_v 6: battery temperature
+  // (no qualifying source), the EXTRA probe (unassigned on most boats), and VE.Direct panel power
+  // and voltage (no MPPT). A 0 uploaded as data is a lie in every one of them.
+  const bool btOk  = snap.window.battTemp_valid_us > 0;
+  const bool etOk  = snap.window.extraTemp_valid_us > 0;
+  const bool spOk  = snap.window.solarPower_valid_us > 0;
+  const bool svOk  = snap.window.solarVolt_valid_us > 0;
+  char btMinS[16], btMaxS[16], btAvgS[16], etMinS[16], etMaxS[16], etAvgS[16];
+  char spMinS[16], spMaxS[16], spAvgS[16], svMinS[16], svMaxS[16], svAvgS[16];
   int written = snprintf(
     payloadBuffer, PAYLOAD_BUFFER_SIZE,
     "{"
@@ -2913,7 +2953,9 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     // cloud speed board in place of sog_max (a single-sample peak).
     // v5 adds speed_source_phone — true when the window's standing sog_sust1m_max was
     // phone-GPS-sourced (selectable speedSourceMode), so leaderboards can disqualify.
-    "\"payload_v\":5,"
+    // v6 adds batt_temp / extra_temp / solar_power / solar_volt min-max-avg, and drops the
+    // tempMargin accumulator (derivable from alt_temp and the TemperatureLimitF setting).
+    "\"payload_v\":6,"
     "\"current_time_source\":%d,"
     // Battery
     "\"batt_volt_min\":%.2f,\"batt_volt_max\":%.2f,\"batt_volt_avg\":%.2f,"
@@ -2953,6 +2995,12 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     // + coverage. engine_on_pct 0 ⇒ engine never ran ⇒ *_onavg values meaningless (0s).
     "\"batt_volt_onavg\":%.2f,\"batt_curr_onavg\":%s,\"alt_curr_onavg\":%.2f,"
     "\"victron_curr_onavg\":%s,\"duty_cycle_onavg\":%.2f,\"engine_on_pct\":%.2f,"
+    // Battery / EXTRA-probe temperature, VE.Direct solar (payload_v 6).
+    // null when the source was absent all window — see the *Ok flags above.
+    "\"batt_temp_min\":%s,\"batt_temp_max\":%s,\"batt_temp_avg\":%s,"
+    "\"extra_temp_min\":%s,\"extra_temp_max\":%s,\"extra_temp_avg\":%s,"
+    "\"solar_power_min\":%s,\"solar_power_max\":%s,\"solar_power_avg\":%s,"
+    "\"solar_volt_min\":%s,\"solar_volt_max\":%s,\"solar_volt_avg\":%s,"
     // IMU peak motion (per-window aggregates)
     "\"imu_heel_min\":%.2f,\"imu_heel_max\":%.2f,\"imu_heel_avg\":%.2f,"
     "\"imu_pitch_min\":%.2f,\"imu_pitch_max\":%.2f,\"imu_pitch_avg\":%.2f,"
@@ -3036,6 +3084,18 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     SAFE_AVG_100(snap.window.dutyCycle_on_area_v_us, snap.window.active_us),
     snap.window.battVolt_valid_us > 0
       ? 100.0 * (double)snap.window.active_us / (double)snap.window.battVolt_valid_us : 0.0,
+    ltJsonNum(btMinS, sizeof(btMinS), snap.window.battTemp_min / 100.0, btOk),
+    ltJsonNum(btMaxS, sizeof(btMaxS), snap.window.battTemp_max / 100.0, btOk),
+    ltJsonNum(btAvgS, sizeof(btAvgS), SAFE_AVG_100(snap.window.battTemp_area_v_us, snap.window.battTemp_valid_us), btOk),
+    ltJsonNum(etMinS, sizeof(etMinS), snap.window.extraTemp_min / 100.0, etOk),
+    ltJsonNum(etMaxS, sizeof(etMaxS), snap.window.extraTemp_max / 100.0, etOk),
+    ltJsonNum(etAvgS, sizeof(etAvgS), SAFE_AVG_100(snap.window.extraTemp_area_v_us, snap.window.extraTemp_valid_us), etOk),
+    ltJsonNum(spMinS, sizeof(spMinS), snap.window.solarPower_min / 100.0, spOk),
+    ltJsonNum(spMaxS, sizeof(spMaxS), snap.window.solarPower_max / 100.0, spOk),
+    ltJsonNum(spAvgS, sizeof(spAvgS), SAFE_AVG_100(snap.window.solarPower_area_v_us, snap.window.solarPower_valid_us), spOk),
+    ltJsonNum(svMinS, sizeof(svMinS), snap.window.solarVolt_min / 100.0, svOk),
+    ltJsonNum(svMaxS, sizeof(svMaxS), snap.window.solarVolt_max / 100.0, svOk),
+    ltJsonNum(svAvgS, sizeof(svAvgS), SAFE_AVG_100(snap.window.solarVolt_area_v_us, snap.window.solarVolt_valid_us), svOk),
     // IMU values read from the frozen ImuSnapshot — values matching the moment
     // the window was rolled, not whatever imuWindow currently holds at upload time.
     snap.imu.heel_min / 100.0, snap.imu.heel_max / 100.0,
@@ -3469,7 +3529,7 @@ void popTailSnapshot() {
 // PSRAM ring survives a power-cycle when WiFi/cloud couldn't drain everything
 // during the 30-min ignition-off window.
 #define SENSOR_RING_BACKUP_MAGIC 0x53524258u  // 'SRBX'
-#define SENSOR_RING_BACKUP_VER   3u  // v3: + chargeStage byte (LT-plot cloud-stitch field)
+#define SENSOR_RING_BACKUP_VER   4u  // v4: SensorWindow dropped tempMargin and wifiStr, gained battTemp/extraTemp/solarPower/solarVolt
 
 struct SensorRingBackupHeader {
   uint32_t magic;
@@ -3933,6 +3993,152 @@ static inline size_t cfgRemain(int off) {
   return (off >= CONFIG_PAYLOAD_SIZE) ? (size_t)0 : (size_t)(CONFIG_PAYLOAD_SIZE - off);
 }
 
+// ─── CLOUD_DAILY_LIST — the 24 h scalar telemetry contract ──────────────────────────────────────
+// Declared ONCE, here, the same way CSV3 is declared once as CSV3_LIST: the JSON key, its format
+// specifier and the expression that fills it can never drift apart, because the emit below is
+// generated from this list. Add a row and the payload, the drift gate and the migration checklist
+// all see it at the same time.
+//
+// Everything here is a SCALAR — a single number per 24 h snapshot. Series, maps, tables and rings
+// are deliberately out of scope (the alt-health trend, the damper pocket map and the ripple matrix
+// stay device-side). Anything worth min/max/avg belongs in buildSnapshotJson instead, which runs
+// per window; this list is for values that either change too slowly to window (alternator health,
+// wear) or are counters that only mean anything cumulatively.
+//
+// CLOUD CONTRACT: update-config-snapshot spreads EVERY state key into the flat device_state_daily
+// INSERT, so a key with no column 500s the WHOLE daily snapshot — settings blob included. The
+// matching column MUST exist on device_state_daily before this firmware ships. cloud_drift_check.py
+// enforces that against the Seed on every build.
+//
+// X(json_key, printf_format, expression)
+#define CLOUD_DAILY_LIST(X) \
+  /* Alternator health verdict. The raw front points ride update-alt-health for the cloud re-fit; \
+     these four are the device's own conclusion, which the cloud cannot reconstruct from the front \
+     alone (scoring needs the live observations, which never leave the boat). */ \
+  X(alt_health_pct,             "%.1f",  (double)altWorstPct()) \
+  X(alt_health_status,          "%d",    (int)altStatus()) \
+  X(alt_coverage_pct,           "%.1f",  (double)altCoveragePct()) \
+  X(alt_obs_count,              "%d",    (int)altFrontCount()) \
+  /* Arrhenius wear model (5_functions.ino). Integrated at the control tick against instantaneous \
+     temperature — the cloud cannot approximate it from alt_temp_avg, because damage rate is \
+     exponential in temperature and a window mean understates every excursion. */ \
+  X(insulation_life_pct,        "%.3f",  (double)InsulationLifePercent) \
+  X(grease_life_pct,            "%.3f",  (double)GreaseLifePercent) \
+  X(brush_life_pct,             "%.3f",  (double)BrushLifePercent) \
+  X(predicted_life_hours,       "%.1f",  (double)PredictedLifeHours) \
+  /* Protection trips. SESSION counters — zeroed at boot and by the web reset buttons — so a row is \
+     "since last boot or reset", NOT a daily delta; differencing consecutive rows is only valid while \
+     last_session_duration_s keeps growing. The OV family has a lifetime twin in RTC and rides \
+     ov_telemetry instead; these have none, which is why they are worth capturing daily at all. */ \
+  X(prot_iexcess_count,         "%lu",   (unsigned long)g_iExcessCount) \
+  X(prot_ina_ov_count,          "%lu",   (unsigned long)g_inaOVCount) \
+  X(prot_hard_oc_count,         "%lu",   (unsigned long)g_hardOCCount) \
+  X(prot_volt_spike_count,      "%lu",   (unsigned long)g_voltSpikeCount) \
+  X(prot_volt_disagree_crit,    "%lu",   (unsigned long)g_voltDisagreeCritCount) \
+  X(prot_volt_disagree_warn,    "%lu",   (unsigned long)g_voltDisagreeWarnCount) \
+  X(prot_volt_implausible,      "%lu",   (unsigned long)g_voltImplausibleCount) \
+  X(prot_temp_crit_count,       "%lu",   (unsigned long)g_tempCritCount) \
+  X(prot_temp_sustained_count,  "%lu",   (unsigned long)g_tempSustainedCount) \
+  X(prot_temp_stale_count,      "%lu",   (unsigned long)g_tempStaleCount) \
+  X(prot_current_stale_count,   "%lu",   (unsigned long)g_currentStaleCount) \
+  X(prot_load_dump_count,       "%lu",   (unsigned long)g_loadDumpCount) \
+  /* Stability. Loop worsts stay in RAW MICROSECONDS (firmware-canonical, like eng_hrs seconds). */ \
+  X(last_reset_reason,          "%d",    (int)LastResetReason) \
+  X(ancient_reset_reason,       "%d",    (int)ancientResetReason) \
+  X(total_power_cycles,         "%d",    (int)totalPowerCycles) \
+  X(wifi_reconnects_total,      "%d",    (int)wifiReconnectsTotal) \
+  X(min_free_heap_kb,           "%d",    (int)MinFreeHeap) \
+  X(heap_frag_pct,              "%d",    (int)Heapfrag) \
+  X(largest_internal_block_kb,  "%lu",   (unsigned long)(LargestInternalBlock / 1024)) \
+  X(littlefs_free_kb,           "%d",    (int)LittleFsFreeKb) \
+  X(nvs_full_save_worst_ms,     "%u",    (unsigned)nvsFullSaveWorstMs) \
+  X(loop_worst_us,              "%d",    (int)MaximumLoopTime) \
+  X(loop_worst_field_on_us,     "%lu",   (unsigned long)loopFieldOnSes) \
+  X(loop_worst_80mhz_us,        "%lu",   (unsigned long)loopWorst80Ses) \
+  X(last_session_duration_s,    "%lu",   (unsigned long)LastSessionDuration) \
+  X(last_session_max_loop_us,   "%d",    (int)LastSessionMaxLoopTime) \
+  X(last_session_min_heap_kb,   "%d",    (int)lastSessionMinHeap) \
+  X(cpu_load_core0_max,         "%d",    (int)cpuLoadCore0Max) \
+  X(cpu_load_core1_max,         "%d",    (int)cpuLoadCore1Max) \
+  /* Which app slot the unit is actually running: 0 factory, 1 ota_0. Factory is never written by \
+     OTA, so a fleet unit still reporting 0 has never taken an over-the-air update. */ \
+  X(current_partition_type,     "%d",    (int)currentPartitionType) \
+  /* Black box: the previous session's last-alive snapshot, read out of RTC noinit RAM at boot. \
+     bb_valid 0 means the magic did not survive, which is itself the diagnostic — it proves the 3.3 V \
+     rail actually died rather than the firmware resetting. Until now this existed only as one \
+     console line, so a fielded unit's crash left nothing behind. */ \
+  X(bb_valid,                   "%d",    (int)(g_blackBoxPrevValid ? 1 : 0)) \
+  X(bb_up_s,                    "%lu",   (unsigned long)(g_blackBoxPrev.upMillis / 1000UL)) \
+  X(bb_batt_v,                  "%.2f",  (double)g_blackBoxPrev.ibv) \
+  X(bb_duty_pct,                "%.2f",  (double)g_blackBoxPrev.duty) \
+  X(bb_rpm,                     "%d",    (int)g_blackBoxPrev.rpm) \
+  X(bb_alt_amps,                "%.2f",  (double)g_blackBoxPrev.measAmps) \
+  X(bb_alt_temp_f,              "%d",    (int)g_blackBoxPrev.altTempF) \
+  X(bb_sys_mode,                "%d",    (int)g_blackBoxPrev.sysMode) \
+  X(bb_charge_stage,            "%d",    (int)g_blackBoxPrev.chargeStage) \
+  /* IMU install verdict + the two rare-but-dramatic lifetime event counters. imu_suspicious on \
+     sensor_history says a window's motion data is untrustworthy; imu_install_code says WHY \
+     (0 OK, 1 never zeroed, 2 mount not vertical, 3 zeroed pre-mount-check, 4 no IMU), which is the \
+     difference between a support answer and a shrug. Capsize/pitchpole are threshold events on \
+     heel and cannot be recovered from the per-window envelope. */ \
+  X(imu_install_code,           "%d",    (int)imuInstallCode()) \
+  X(imu_capsize_count,          "%lu",   (unsigned long)imu_capsize_count) \
+  X(imu_pitchpole_count,        "%lu",   (unsigned long)imu_pitchpole_count) \
+  /* Bus / sensor error counters. Session-scoped like the protection block. These are the only \
+     evidence that a fielded unit's hardware is degrading rather than its tuning. */ \
+  X(err_ads_i2c,                "%lu",   (unsigned long)adsI2CErrorCount) \
+  X(err_ina228,                 "%lu",   (unsigned long)ina228ErrorCount) \
+  X(err_imu_i2c,                "%lu",   (unsigned long)imu_i2c_error_count) \
+  X(err_imu_fifo_overrun,       "%lu",   (unsigned long)imu_fifo_overrun_count) \
+  X(err_imu_unknown_tag,        "%lu",   (unsigned long)imu_unknown_tag_count) \
+  X(err_imu_accel_dropped,      "%lu",   (unsigned long)(imuRingBuffer ? imuRingBuffer->accel_dropped : 0)) \
+  X(err_imu_gyro_dropped,       "%lu",   (unsigned long)(imuRingBuffer ? imuRingBuffer->gyro_dropped : 0)) \
+  X(err_temp_read_fail,         "%lu",   (unsigned long)tempReadFailCount) \
+  X(err_temp_crc_fail,          "%lu",   (unsigned long)tempCrcFailCount) \
+  X(err_temp_crc_recovered,     "%lu",   (unsigned long)tempCrcRecoveredCount) \
+  X(err_temp_all_ff,            "%lu",   (unsigned long)tempAllFFCount) \
+  X(err_temp_power_on_85,       "%lu",   (unsigned long)tempPowerOn85Count) \
+  X(err_temp_out_of_range,      "%lu",   (unsigned long)tempOutOfRangeCount) \
+  X(err_temp_request_fail,      "%lu",   (unsigned long)tempRequestFailCount) \
+  X(err_temp_connected_fail,    "%lu",   (unsigned long)tempConnectedFailCount) \
+  X(err_temp_resolution_fix,    "%lu",   (unsigned long)tempResolutionFixCount) \
+  X(err_temp_reread_fail,       "%lu",   (unsigned long)tempRereadFailCount) \
+  X(err_temp_res_fix_crc_fail,  "%lu",   (unsigned long)tempResolutionFixCrcFailCount) \
+  X(err_temp_enumerate_fail,    "%lu",   (unsigned long)tempEnumerateFailCount) \
+  /* 1-Wire census. ow_unassigned_count > 0 means the owner has a probe fitted and doing nothing — \
+     a support answer we currently have no way to see from here. */ \
+  X(ow_probe_count,             "%d",    (int)owProbeCount) \
+  X(ow_unassigned_count,        "%d",    (int)owUnassignedCount()) \
+  X(err_n183_checksum,          "%lu",   (unsigned long)n183ChecksumErrCount) \
+  X(n183_sentences,             "%lu",   (unsigned long)n183SentenceCount) \
+  X(n2k_tx_count,               "%lu",   (unsigned long)n2kTxCount) \
+  X(n2k_tx_drops,               "%lu",   (unsigned long)n2kTxDropCount) \
+  /* DVCC follow health — whether an external charge authority is actually being followed, and why \
+     not when it isn't. 0 off, 1 waiting, 2 settling, 3 following, 4 stale, 5 untrusted; untrust \
+     reason 0 none, 1 CVL out of window, 2 CCL implausible, 3 flapping. */ \
+  X(dvcc_state,                 "%d",    (int)dvccState) \
+  X(dvcc_untrust_reason,        "%d",    (int)dvccUntrustReason) \
+  /* VE.Direct MPPT. The analog half (panel W / V) rides the per-window payload as min/max/avg; \
+     these are the codes and the charger's own daily totals, which have no meaningful average. \
+     -1 on the three codes means VE.Direct never spoke, not "no error". */ \
+  X(victron_charge_state,       "%d",    (int)VictronChargeState) \
+  X(victron_mppt_mode,          "%d",    (int)VictronMPPTMode) \
+  X(victron_error,              "%d",    (int)VictronError) \
+  X(victron_yield_today_kwh,    "%.2f",  (double)VictronYieldToday_kWh) \
+  X(victron_max_power_today_w,  "%.1f",  (double)VictronMaxPowerToday_W) \
+  X(victron_yield_yest_kwh,     "%.2f",  (double)VictronYieldYesterday_kWh) \
+  X(victron_max_power_yest_w,   "%.1f",  (double)VictronMaxPowerYesterday_W) \
+  /* Which source batteryTempF() was actually using when the snapshot was built: 0 none, 1 probe, \
+     2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board stand-in. Names the provenance of batt_temp_* in \
+     sensor_history, which carries the numbers but not where they came from. */ \
+  X(batt_temp_src,              "%d",    (int)battTempActiveSrc) \
+  /* Lifetime count of adaptive-table updates: says whether the learning is still moving or has \
+     settled, which no snapshot of the tables themselves can tell you. */ \
+  X(total_learning_events,      "%lu",   (unsigned long)totalLearningEvents)
+
+#define CD_FMT(key, fmt, expr) ",\"" #key "\":" fmt
+#define CD_ARG(key, fmt, expr) , expr
+
 bool buildConfigPayload() {
   time_t now_ts = time(NULL);
   const char *timestampStr = formatTimestamp(now_ts);
@@ -3946,7 +4152,9 @@ bool buildConfigPayload() {
     // /exportConfig record, and update-config-snapshot projects the vessel keys → user_profiles.
     // v4 renames settings.commissioning_results → learned_state and drops its stress_test
     // (moved to the commissioning ledger, COMMISSIONING_LEDGER_SPEC.md).
-    "\"payload_v\":4,"
+    // v5 adds the CLOUD_DAILY_LIST scalar block to state{} — alternator health verdict, Arrhenius
+    // wear model, protection trips, stability + black box, bus/sensor error counters, VE.Direct MPPT.
+    "\"payload_v\":5,"
     "\"settings\":",
     device_id_hex, authToken.c_str(), timestampStr);
   if (offset < 0 || offset >= CONFIG_PAYLOAD_SIZE) return false;
@@ -4065,6 +4273,13 @@ bool buildConfigPayload() {
     accVolt4.worstOver * 1000.0f,
     (accThermBindingSec > 0.5) ? (float)(100.0 * accThermInbandSec / accThermBindingSec) : -1.0f,
     accThermWorstOverF);
+
+  // ─── 24 h scalar telemetry (CLOUD_DAILY_LIST above) ────────────────────────
+  // Format string and argument list are BOTH generated from the one list, so a row can never be
+  // half-added. Adjacent string literals concatenate, so CLOUD_DAILY_LIST(CD_FMT) is a single
+  // literal and CLOUD_DAILY_LIST(CD_ARG) is the matching comma-led argument tail.
+  offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
+                     CLOUD_DAILY_LIST(CD_FMT) CLOUD_DAILY_LIST(CD_ARG));
 
   // Close state, close root object
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "}}");

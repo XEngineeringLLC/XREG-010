@@ -1019,6 +1019,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "CommissionTempF", NK_CommissionTempF, 1 },
   { "CommissionTempSrc", NK_CommissionTempSrc, 3 },
   { "CommissionEpoch", NK_CommissionEpoch, 3 },
+  { "maxWorkingRpm", NK_maxWorkingRpm, 1 },
   { "systemIDPlantTauMs", NK_sysidPlantTau, 1 },
   { "fieldDecayTauMs", NK_fieldDecayTau, 1 },
   { "fdDrainLoMs", NK_fdDrainLoMs, 1 },
@@ -1027,7 +1028,10 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "fdDrainRpmHi", NK_fdDrainRpmHi, 1 },
   { "ripFitAlt", NK_ripFitAlt, 1 },
   { "slpFitAlt", NK_slpFitAlt, 1 },
-  { "imu_zero", NK_imu_zero, 1 },
+  // Tier 3, not 1: heel/pitch/gyro offsets measured from THIS board's own bolted-down attitude, the
+  // same class as the physical-mount set below. A raw settingWrite import would also land foreign
+  // offsets under this device's own imu_mnt_state, which is tier 3 and never travels with them.
+  { "imu_zero", NK_imu_zero, 3 },
   // Vessel Info. Param names match the /vessel_info.json view so the blob reads the same
   // either place. battery_voltage / battery_capacity_ah / solar_watts are NOT repeated here —
   // they are already BatteryVoltage / BatteryCapacity_Ah / SolarWatts above.
@@ -1074,6 +1078,9 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "LastResetReason", NK_LastResetReason, 3 },
   { "cfgSchema", NK_cfgSchema, 3 },
   { "lastAppldCfgId", NK_lastAppldCfgId, 3 },
+  // Receipt of an admin config push that applied on the previous boot ("<n>|key,key,..."), held
+  // until the dashboard acks it — pairs with lastAppldCfgId to show whether the owner ever saw it.
+  { "cfgPushNotify", NK_cfgPushNotify, 3 },
   { "imu_mnt_state", NK_imu_mnt_state, 3 },
   { "RpmAxisWipeLoc", NK_RpmAxisWipeLoc, 3 },
   { "RpmAxisWipePend", NK_RpmAxisWipePend, 3 },
@@ -1094,6 +1101,9 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "faCalOffA", NK_faCalOffA, 3 },
   { "altbaseSec", NK_altbaseSec, 3 },
   { "altRefSrc", NK_altRefSrc, 3 },
+  // Address this node claimed on the NMEA 2000 bus and persisted (5_functions.ino), reloaded as the
+  // preferred address at boot. Tier 3: importing it would aim two regulators at the same address.
+  { "n2kSrcAddr", NK_n2kSrcAddr, 3 },
   // 1-Wire role bindings (ROM codes as 16-char hex): this board's own probes, never another boat's.
   // Written by the owAssignAlt/Batt/Extra /get actions (a role loop, invisible to config_drift_check.py's
   // literal hasParam scan), so these names are listed in its MANIFEST_NON_PARAM.
@@ -1965,7 +1975,7 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
         // re-runs that exceed the fixed ΔV target, and cap-clamped steps smaller than it).
         if (cvpfChemGasses() && isfinite(cvpfPilotVbase)
             && cvpfPilotVbase + cvpfStepA * cvpfPilotK > CVPF_GASSING_V_12V * (float)SYSTEM_VOLTAGE_CLASS / 12.0f) {
-          cvpfAbort("bank too full to measure — the step would drive it into gassing, which reads the resistance low and over-tunes the loop. Draw the bank down with some loads, then re-run.");
+          cvpfAbort("bank too full to measure — this close to full, extra current stops raising the voltage in proportion, which reads the battery's resistance low and over-tunes the loop. Draw the bank down with some loads, then re-run.");
           break;
         }
         cvpfPhase = 2; cvpfPhaseStartMs = nowMs; cvpfInBandMs = 0;

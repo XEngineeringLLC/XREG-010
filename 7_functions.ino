@@ -6113,20 +6113,24 @@ inline int wmIgnCsv(float v, int scale) {
 // the boat is accelerating is smeared. Measured on the 09-08 held-field sweeps at 0.40 s here,
 // the same at every speed and field level, which is what the rotor explanation predicts.
 //
-// One run, one continuous recording. The operator brings the engine to a high speed of their own
-// choosing and holds it; the tuned current loop sizes the field THERE; the duty it settled on is
-// frozen; three passes follow — down to idle, back up, down again. Sizing at the top is the whole
-// point: it is the fastest the machine turns all run, so no later moment can exceed what the
-// sizing step already proved safe. (Sizing at idle, which this replaces, bounded the top of the
-// swing by nothing — output at fixed field is steeply nonlinear in speed just above the knee.)
-//
-// Both directions are required: a single direction cannot separate a time shift from the shape of
-// the speed curve. The third pass costs about eight seconds and yields two independent answers,
-// passes 1+2 and passes 2+3, which is the consistency check.
+// One run on one clock (chcRunMs), four throttle cycles the browser draws as a speed schedule:
+// idle → climb at CHC_PACE_RPM_S → hold at the top → ease back to idle. The top is CHC_TOP_FRAC of
+// the entered maximum working RPM, so it is known before Start. Cycle 1 opens with
+// CHC_SETTLE_IDLE_MS at idle and SIZES the field: on the climb the real current loop follows
+// chcTestPct of the charge-rate column at the present speed (bounded at every speed on the way up,
+// instead of chasing the top's target while the engine is slow), and inside the CHC_SIZE_HOLD_MS
+// top hold the duty it settled on is frozen. Cycles 2-4 run at that frozen duty and are each fitted
+// on their own — one climb and one descent is exactly what the estimator needs. Sizing at the top
+// is the whole point: it is the fastest the machine turns all run, so no later moment can exceed
+// what the sizing step already proved safe. (Sizing at idle, which this replaces, bounded the top
+// of the swing by nothing — output at fixed field is steeply nonlinear in speed just above the
+// knee.) The cycles chain on the clock with no button press between them, deliberately: a button
+// between cycles pins the frozen field while nobody is driving, which is where the 09-09 run
+// aborted.
 //
 // Duty-override contract is the fieldCut_tick family: returns TRUE only while it OWNS duty. The
-// sizing phase does NOT own duty — it returns false and drives the real current PID through the
-// chcCcActive branch in AdjustField, exactly like the field-decay ramp.
+// sizing cycle does NOT own duty until the freeze — it returns false and drives the real current
+// PID through the chcCcActive branch in AdjustField, exactly like the field-decay ramp.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 // The estimator, over one contiguous span of the capture [lo,hi). amps[i] is paired with rpm[i+k]
@@ -6254,12 +6258,42 @@ static void chcFinish(bool ok, const char *why) {
   }
 }
 
+// Where the clock is. Cycle 1 = settle, climb, sizing hold, descent; cycles 2…1+CHC_MEAS_CYCLES =
+// climb, hold, descent. Returns false once the schedule has run out.
+static bool chcSchedule(uint32_t runMs, uint8_t &cyc, uint8_t &seg) {
+  const uint32_t c1 = CHC_SETTLE_IDLE_MS + chcRampMs + CHC_SIZE_HOLD_MS + chcRampMs;
+  const uint32_t cn = chcRampMs + CHC_TOP_HOLD_MS + chcRampMs;
+  uint32_t t = runMs;
+  if (t < c1) {
+    cyc = 1;
+    seg = (t < CHC_SETTLE_IDLE_MS) ? 0
+        : (t < CHC_SETTLE_IDLE_MS + chcRampMs) ? 1
+        : (t < CHC_SETTLE_IDLE_MS + chcRampMs + CHC_SIZE_HOLD_MS) ? 2 : 3;
+    return true;
+  }
+  t -= c1;
+  const uint32_t k = t / cn;
+  if (k >= CHC_MEAS_CYCLES) { cyc = 1 + CHC_MEAS_CYCLES; seg = 3; return false; }
+  cyc = (uint8_t)(2 + k);
+  t -= k * cn;
+  seg = (t < chcRampMs) ? 1 : (t < chcRampMs + CHC_TOP_HOLD_MS) ? 2 : 3;
+  return true;
+}
+
+// Fit one measured cycle as soon as its clock window closes, so the work is spread across the run
+// instead of landing on one control tick at the end, and the wizard can show each answer as it lands.
+static void chcFitCycle(int m) {
+  chcLead[m] = chcFitLead(chcCycStart[m], chcCycEnd[m], &chcGapB[m], &chcGapA[m]);
+  queueConsoleMessageF("Charge health calibration: cycle %d fit %s (%.3f s, gap %.1f -> %.1f A)",
+                       m + 2, (chcLead[m] >= 0.0f) ? "ok" : (chcLead[m] <= -1.5f) ? "past 0.9 s" : "no answer",
+                       chcLead[m], chcGapB[m], chcGapA[m]);
+}
+
 bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
-  static uint8_t  phase = 0;          // 0 idle, 1 wait for a steady speed, 2 size the field, 3-5 passes, 7 ease-out
-  static uint32_t phaseStartMs = 0, lastSampMs = 0, holdSampMs = 0, inBandSinceMs = 0, steadySinceMs = 0;
+  static uint8_t  phase = 0;          // 0 idle, 1 settle, 2 sizing (climb + hold), 4 frozen cycles, 7 ease-out
+  static uint32_t runStartMs = 0, phaseStartMs = 0, lastSampMs = 0, inBandSinceMs = 0;
   static float    entryDuty = 1.0f, holdDuty = 0.0f, preSetpoint = 0.0f, ampsEma = 0.0f;
-  static float    holdRef = 0.0f, holdSum = 0.0f;
-  static int      holdK = 0;
+  static uint8_t  lastCyc = 0;
 
   // A teardown outside this function (6_functions.ino, when the field leaves normal AUTO) zeroes
   // chcActive while chc_tick is not being called; without this the run would resume mid-phase.
@@ -6292,201 +6326,198 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     if (chcBuf == nullptr) chcBuf = (ChcSample *)ps_malloc(CHC_BUF_N * sizeof(ChcSample));
     if (!chcBuf) { chcFinish(false, "PSRAM alloc failed"); return false; }
     chcIdleRpm = (RPM > 0) ? RPM : 0.0f;
-    chcHoldRpm = 0.0f; chcHoldMs = 0;
+    chcTopRpm = CHC_TOP_FRAC * (float)maxWorkingRpm;
+    chcRampMs = 0; chcRunMs = 0; chcCycle = 0; chcSeg = 0; chcFrozen = false;
     chcSizeCapA = 0.0f; chcTargetA = 0.0f; chcHoldDuty = 0.0f; chcCmdA = 0.0f;
     chcMinA = 0.0f; chcPeakA = 0.0f; chcCount = 0;
-    chcLeadSec = chcLead12 = chcLead23 = -1.0f;
-    chcGapBefore = chcGapAfter = -1.0f;
+    chcLeadSec = -1.0f;
+    for (int i = 0; i < 3; i++) { chcLead[i] = chcGapB[i] = chcGapA[i] = -1.0f; chcCycStart[i] = 0; chcCycEnd[i] = 0; }
     chcRateMin = chcRateMax = chcRateAvg = -1.0f;
-    for (int i = 0; i < 3; i++) { chcPassStart[i] = 0; chcPassEnd[i] = 0; }
     chcResultsReady = false; chcOk = false; chcAbortMsg[0] = '\0';
-    chcActive = 1; chcPhase = 1;
-    holdSampMs = 0; steadySinceMs = 0; holdRef = 0.0f; holdSum = 0.0f; holdK = 0;
+    // The same range guard the setup screen applies to the entered maximum, in case Start arrived
+    // from a browser that did not check, or idle is higher today than when the number was entered.
+    if (!(chcIdleRpm > 0.0f)) { chcFinish(false, "no engine speed"); return false; }
+    if (chcTopRpm < chcIdleRpm + CHC_HOLD_ABOVE_IDLE) {
+      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "%d%% of %d rpm is %.0f rpm — too close to idle (%.0f) to leave the passes any range",
+               (int)lroundf(CHC_TOP_FRAC * 100.0f), maxWorkingRpm, chcTopRpm, chcIdleRpm);
+      chcFinish(false, chcAbortMsg);
+      return false;
+    }
+    chcSizeCapA = chcCapAmpsAt(chcTopRpm, (BatteryCapacity_Ah >= CHC_LOHI_AH) ? chcHiTable : chcLoTable);
+    chcTargetA = chcSizeCapA * (float)chcTestPct * 0.01f;
+    if (chcTargetA < CHC_MIN_TEST_A) { chcFinish(false, "the charge-rate limit at the test speed is too small to measure"); return false; }
+    chcRampMs = (uint32_t)((chcTopRpm - chcIdleRpm) / CHC_PACE_RPM_S * 1000.0f);
+    if (chcRampMs < CHC_MIN_RAMP_MS) chcRampMs = CHC_MIN_RAMP_MS;
     entryDuty = (lastAppliedDuty > 1.0f) ? lastAppliedDuty : 1.0f;
-    phase = 1; phaseStartMs = nowMs;
-    queueConsoleMessageF("Charge health calibration: started, idle %.0f rpm — waiting for a steady high speed", chcIdleRpm);
-    return false;   // no field driven yet: normal charging continues while the operator picks the speed
+    chcActive = 1; chcPhase = 1; chcCycle = 1; lastCyc = 1;
+    runStartMs = nowMs; phase = 1; phaseStartMs = nowMs;
+    queueConsoleMessageF("Charge health calibration: started — idle %.0f, top %.0f rpm (%d%% of %d), %.1f s ramps; sizing for %.1f A (%d%% of the %.0f A %s column)",
+                         chcIdleRpm, chcTopRpm, (int)lroundf(CHC_TOP_FRAC * 100.0f), maxWorkingRpm, chcRampMs / 1000.0f,
+                         chcTargetA, (int)chcTestPct, chcSizeCapA, (BatteryCapacity_Ah >= CHC_LOHI_AH) ? "High" : "Low");
+    return false;   // no field driven yet: normal charging continues through the settle
   }
 
   const float vTarget = (ChargingVoltageTarget > 1.0f) ? ChargingVoltageTarget : BulkVoltage;
   chcGuardCapA = chcCapAmpsAt((RPM > 0) ? RPM : chcIdleRpm, chcHiTable);
 
-  // ── WAIT: the operator picks the speed. Steady = RPM inside a band around the first sample of
-  //   the stretch for CHC_HOLD_STEADY_MS; the band is half of the wizard's own (max−min) test, so
-  //   the two agree on what "still moving" means. Any excursion restarts the stretch. ──
-  if (phase == 1) {
-    chcPhase = 1;
-    if (holdSampMs == 0 || (uint32_t)(nowMs - holdSampMs) >= CHC_SAMP_MS) {
-      holdSampMs = nowMs;
-      float r = RPM;
-      if (!(r > 0.0f)) { steadySinceMs = 0; holdK = 0; }
-      else if (steadySinceMs == 0 || fabsf(r - holdRef) > fmaxf(15.0f, 0.025f * holdRef)) {
-        holdRef = r; steadySinceMs = nowMs; holdSum = r; holdK = 1;
-      } else { holdSum += r; holdK++; }
-    }
-    chcHoldMs = (steadySinceMs == 0) ? 0u : (uint32_t)(nowMs - steadySinceMs);
-    if (chcHoldMs >= CHC_HOLD_STEADY_MS && holdK > 0) {
-      float mean = holdSum / (float)holdK;
-      if (mean < chcIdleRpm + CHC_HOLD_ABOVE_IDLE) {
-        // Too close to idle to leave the passes any range. Keep waiting rather than failing — the
-        // wizard says so on screen and the operator just opens the throttle further.
-        steadySinceMs = 0; holdK = 0; chcHoldMs = 0;
-      } else {
-        chcHoldRpm = mean;
-        chcSizeCapA = chcCapAmpsAt(chcHoldRpm, (BatteryCapacity_Ah >= CHC_LOHI_AH) ? chcHiTable : chcLoTable);
-        chcTargetA = chcSizeCapA * (float)chcTestPct * 0.01f;
-        if (chcTargetA < CHC_MIN_TEST_A) {
-          chcFinish(false, "the charge-rate limit at this speed is too small to measure");
-          chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
-          return false;
-        }
-        entryDuty = (lastAppliedDuty > 1.0f) ? lastAppliedDuty : 1.0f;
+  if (phase != 7) {
+    chcRunMs = nowMs - runStartMs;
+    uint8_t cyc = 0, seg = 0;
+    const bool onSchedule = chcSchedule(chcRunMs, cyc, seg);
+    chcCycle = cyc; chcSeg = seg;
+
+    // ── SETTLE: the run's first ten seconds at idle. Nothing is driven; normal charging continues. ──
+    if (phase == 1) {
+      chcPhase = 1;
+      if (seg != 0) {
         preSetpoint = setpointLimited;
         ampsEma = ampsRaw; inBandSinceMs = 0;
-        chcCmdA = chcTargetA;
+        chcCmdA = chcCapAmpsAt(fminf((RPM > 0) ? RPM : chcIdleRpm, chcTopRpm), (BatteryCapacity_Ah >= CHC_LOHI_AH) ? chcHiTable : chcLoTable) * (float)chcTestPct * 0.01f;
         chcCcActive = true;   // hand the setpoint to the real current loop (branch in AdjustField)
-        phase = 2; phaseStartMs = nowMs; chcPhase = 2;
-        queueConsoleMessageF("Charge health calibration: holding %.0f rpm — sizing the field for %.1f A (%d%% of the %.0f A %s column)",
-                             chcHoldRpm, chcTargetA, (int)chcTestPct, chcSizeCapA,
-                             (BatteryCapacity_Ah >= CHC_LOHI_AH) ? "High" : "Low");
-        return false;   // sizing phase does not own duty — the real PID does
+        phase = 2; phaseStartMs = nowMs;
+        queueConsoleMessage("Charge health calibration: climbing — the current loop follows the charge-rate column up to the top");
       }
-    }
-    if (nowMs - phaseStartMs >= CHC_WAIT_TIMEOUT_MS) {
-      chcFinish(false, "no steady engine speed was held");
-      chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
       return false;
     }
-    return false;
-  }
 
-  // ── SIZE: the chcCcActive branch slews the setpoint to chcCmdA at TEST_ENTRY_RATE_A and the real
-  //   PID drives duty. Here we only WATCH: once the command has arrived and the measured current
-  //   has sat inside the band for CHC_SETTLE_MS, capture the applied duty and freeze it. ──
-  if (phase == 2) {
-    chcPhase = 2;
-    ampsEma += 0.05f * (ampsRaw - ampsEma);
-    // Both run-ending ceilings apply here too: the bank charges under the sizing current just as it
-    // does under a pass, and neither ceiling is survivable by continuing.
-    if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC || BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
-      chcCcActive = false;
-      setpointLimited = preSetpoint;
-      chcFinish(false, (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC)
-                       ? "output reached the charge-rate limit for this speed"
-                       : "the bus reached the charge target");
-      chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
-      return false;
-    }
-    bool arrived = fabsf(setpointLimited - chcCmdA) < 0.5f;
-    float band = fmaxf(2.0f, 0.08f * chcCmdA);
-    bool settled = false;
-    if (arrived && fabsf(ampsEma - chcCmdA) < band) {
-      if (inBandSinceMs == 0) inBandSinceMs = nowMs;
-      settled = (nowMs - inBandSinceMs >= CHC_SETTLE_MS);
-    } else {
-      inBandSinceMs = 0;
-    }
-    // Target unreachable (the field rails before the level): proceed on whatever real output there
-    // is — the passes only need something to watch rise and fall. Truly nothing → plain reason.
-    if (!settled && (nowMs - phaseStartMs >= CHC_SETTLE_TIMEOUT_MS)) {
-      if (ampsEma >= CHC_MIN_TEST_A) {
-        settled = true;
-        queueConsoleMessageF("Charge health calibration: %.1f A not reachable here — proceeding at %.1f A", chcCmdA, ampsEma);
-      } else {
+    // ── SIZE (cycle 1 climb + top hold): the chcCcActive branch slews the setpoint to chcCmdA at
+    //   TEST_ENTRY_RATE_A and the real PID drives duty. chcCmdA is chcTestPct of the cap column at
+    //   the PRESENT speed, never above the top's, so the command is bounded on the way up. Here we
+    //   only WATCH: once the speed is at the top, the command has arrived and the measured current
+    //   has sat inside the band for CHC_SETTLE_MS, capture the applied duty and freeze it. ──
+    if (phase == 2) {
+      chcPhase = (seg >= 2) ? 3 : 2;
+      const float *col = (BatteryCapacity_Ah >= CHC_LOHI_AH) ? chcHiTable : chcLoTable;
+      chcCmdA = chcCapAmpsAt(fminf((RPM > 0) ? RPM : chcIdleRpm, chcTopRpm), col) * (float)chcTestPct * 0.01f;
+      ampsEma += 0.05f * (ampsRaw - ampsEma);
+      // Both run-ending ceilings apply here too: the bank charges under the sizing current just as it
+      // does under a pass, and neither ceiling is survivable by continuing.
+      if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC || BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
         chcCcActive = false;
         setpointLimited = preSetpoint;
-        chcFinish(false, "the field reached its ceiling before making the test current");
+        chcFinish(false, (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC)
+                         ? "output reached the charge-rate limit for this speed"
+                         : "the bus reached the charge target");
         chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
         return false;
       }
+      const bool atTop = RPM >= chcTopRpm - fmaxf(CHC_TOL_FLOOR_RPM, CHC_TOL_FRAC * chcTopRpm);
+      const bool arrived = fabsf(setpointLimited - chcCmdA) < 0.5f;
+      const float band = fmaxf(2.0f, 0.08f * chcCmdA);
+      bool settled = false;
+      if (atTop && arrived && fabsf(ampsEma - chcCmdA) < band) {
+        if (inBandSinceMs == 0) inBandSinceMs = nowMs;
+        settled = (nowMs - inBandSinceMs >= CHC_SETTLE_MS);
+      } else {
+        inBandSinceMs = 0;
+      }
+      // The hold window has closed on the clock without a settle. At the top with real output:
+      // proceed on what there is (the field railed before the level — the cycles only need
+      // something to watch rise and fall). Otherwise the sizing did not happen at the top, and a
+      // field sized anywhere lower is the 09-09 failure, so the run ends instead.
+      if (!settled && (seg == 3 || !onSchedule)) {
+        if (atTop && ampsEma >= CHC_MIN_TEST_A) {
+          settled = true;
+          queueConsoleMessageF("Charge health calibration: %.1f A not reachable here — proceeding at %.1f A", chcCmdA, ampsEma);
+        } else {
+          chcCcActive = false;
+          setpointLimited = preSetpoint;
+          if (!atTop) snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the top speed was not reached — hold %.0f rpm through the marked stretch", chcTopRpm);
+          chcFinish(false, atTop ? "the field reached its ceiling before making the test current" : chcAbortMsg);
+          chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
+          return false;
+        }
+      }
+      if (settled) {
+        holdDuty = (lastAppliedDuty > 0.0f) ? lastAppliedDuty : MinDuty;
+        chcHoldDuty = holdDuty;
+        chcCcActive = false;
+        // Restore the pre-test setpoint BEFORE returning true: the SystemID resume snapshot fires on
+        // this tick's rising edge (after this call) and must capture the pre-test value, not the test
+        // target — otherwise test end would re-assert the test current.
+        setpointLimited = preSetpoint;
+        chcMinA = ampsRaw; chcPeakA = ampsRaw;
+        chcCount = 0; lastSampMs = 0;
+        chcFrozen = true;
+        phase = 4; phaseStartMs = nowMs; chcPhase = 4;
+        queueConsoleMessageF("Charge health calibration: settled at %.1f A at %.0f rpm — field frozen at %.1f%%, %d measured cycles between %.0f and %.0f rpm",
+                             ampsEma, RPM, holdDuty, CHC_MEAS_CYCLES, chcIdleRpm, chcTopRpm);
+        dutyOut = holdDuty;
+        return true;
+      }
+      return false;
     }
-    if (settled) {
-      holdDuty = (lastAppliedDuty > 0.0f) ? lastAppliedDuty : MinDuty;
-      chcHoldDuty = holdDuty;
-      chcCcActive = false;
-      // Restore the pre-test setpoint BEFORE returning true: the SystemID resume snapshot fires on
-      // this tick's rising edge (after this call) and must capture the pre-test value, not the test
-      // target — otherwise test end would re-assert the test current.
-      setpointLimited = preSetpoint;
-      chcMinA = ampsRaw; chcPeakA = ampsRaw;
-      chcCount = 0; lastSampMs = 0;
-      chcPassStart[0] = 0;
-      phase = 3; phaseStartMs = nowMs; chcPhase = 3;
-      queueConsoleMessageF("Charge health calibration: settled at %.1f A — field frozen at %.1f%%, three passes between %.0f and %.0f rpm",
-                           ampsEma, holdDuty, chcIdleRpm, chcHoldRpm);
+
+    // ── FROZEN: field pinned, one continuous recording across the rest of cycle 1 and the measured
+    //   cycles. Each measured cycle is fitted the tick its clock window closes. ──
+    if (phase == 4) {
+      chcPhase = 4;
       dutyOut = holdDuty;
+      if (ampsRaw > chcPeakA) chcPeakA = ampsRaw;
+      if (ampsRaw < chcMinA)  chcMinA  = ampsRaw;
+      if (lastSampMs == 0 || (uint32_t)(nowMs - lastSampMs) >= CHC_SAMP_MS) {
+        lastSampMs = nowMs;
+        if (chcCount < CHC_BUF_N) {
+          chcBuf[chcCount].rpm = (uint16_t)constrain((int)lroundf(RPM), 0, 6400);
+          chcBuf[chcCount].amps10 = (int16_t)constrain((int)lroundf(ampsRaw * 10.0f), -32000, 32000);
+          chcCount++;
+        }
+      }
+      // The two real ceilings. The field is open-loop here, so these are the run's own backstops —
+      // the operator is never the protection.
+      if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC) {
+        snprintf(chcAbortMsg, sizeof(chcAbortMsg), "output reached the charge-rate limit for this speed");
+        chcAbortRequested = true;
+        return true;
+      }
+      if (BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
+        snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the bus reached the charge target");
+        chcAbortRequested = true;
+        return true;
+      }
+      // Cycle bookkeeping off the clock: a measured cycle's window is [first sample in it, first
+      // sample of the next), and it is fitted the moment it closes.
+      if (cyc != lastCyc || !onSchedule) {
+        if (lastCyc >= 2) { const int m = lastCyc - 2; if (m < CHC_MEAS_CYCLES) { chcCycEnd[m] = chcCount; chcFitCycle(m); } }
+        if (onSchedule && cyc >= 2 && cyc - 2 < CHC_MEAS_CYCLES) chcCycStart[cyc - 2] = chcCount;
+        lastCyc = cyc;
+      }
+      if (onSchedule) return true;
+
+      // Schedule over. Closest pair of the fits that produced an answer is the run's self-check;
+      // the browser recomputes the same pair and stores the mean.
+      chcRateStats(chcCycStart[0], chcCycEnd[CHC_MEAS_CYCLES - 1]);
+      int nGood = 0; bool pastRange = false;
+      for (int i = 0; i < CHC_MEAS_CYCLES; i++) { if (chcLead[i] >= 0.0f) nGood++; if (chcLead[i] <= -1.5f) pastRange = true; }
+      const float span = chcTopRpm - chcIdleRpm;
+      if (nGood == 0) {
+        if (pastRange) chcFinish(false, "the lead is past the 0.9 s the fit can see");
+        else {
+          snprintf(chcAbortMsg, sizeof(chcAbortMsg), "no usable measurement — %.0f to %.0f A over %.0f rpm of range gave the fit nothing to read",
+                   chcMinA, chcPeakA, span);
+          chcFinish(false, chcAbortMsg);
+        }
+      } else if (nGood == 1) {
+        chcFinish(false, "only one cycle gave an answer — nothing to check it against");
+      } else {
+        int a = -1, b = -1; float best = 1e9f;
+        for (int i = 0; i < CHC_MEAS_CYCLES; i++) {
+          if (chcLead[i] < 0.0f) continue;
+          for (int k = i + 1; k < CHC_MEAS_CYCLES; k++) {
+            if (chcLead[k] < 0.0f) continue;
+            const float d = fabsf(chcLead[i] - chcLead[k]);
+            if (d < best) { best = d; a = i; b = k; }
+          }
+        }
+        chcLeadSec = 0.5f * (chcLead[a] + chcLead[b]);
+        chcFinish(true, "");
+        queueConsoleMessageF("Charge health calibration: lead %.3f s (cycles %d+%d of %.3f / %.3f / %.3f s) over %.0f rpm; pace min %.0f avg %.0f max %.0f rpm/s",
+                             chcLeadSec, a + 2, b + 2, chcLead[0], chcLead[1], chcLead[2], span, chcRateMin, chcRateAvg, chcRateMax);
+      }
+      phase = 7; phaseStartMs = nowMs; chcPhase = 6;
       return true;
     }
     return false;
-  }
-
-  // ── PASSES: field frozen, one continuous recording. Each pass ends where it was aimed; the
-  //   operator is never told to stop, only where to go next. ──
-  if (phase >= 3 && phase <= 5) {
-    dutyOut = holdDuty;
-    if (ampsRaw > chcPeakA) chcPeakA = ampsRaw;
-    if (ampsRaw < chcMinA)  chcMinA  = ampsRaw;
-    if (lastSampMs == 0 || (uint32_t)(nowMs - lastSampMs) >= CHC_SAMP_MS) {
-      lastSampMs = nowMs;
-      if (chcCount < CHC_BUF_N) {
-        chcBuf[chcCount].rpm = (uint16_t)constrain((int)lroundf(RPM), 0, 6400);
-        chcBuf[chcCount].amps10 = (int16_t)constrain((int)lroundf(ampsRaw * 10.0f), -32000, 32000);
-        chcCount++;
-      }
-    }
-    // The two real ceilings. The field is open-loop here, so these are the run's own backstops —
-    // the operator is never the protection.
-    if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC) {
-      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "output reached the charge-rate limit for this speed");
-      chcAbortRequested = true;
-      return true;
-    }
-    if (BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
-      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the bus reached the charge target");
-      chcAbortRequested = true;
-      return true;
-    }
-    const int p = phase - 3;
-    const bool goingDown = (p != 1);                       // passes 1 and 3 fall, pass 2 rises
-    const float aim = goingDown ? chcIdleRpm : chcHoldRpm;
-    const bool arrived = goingDown ? (RPM <= aim + CHC_PASS_END_BAND)
-                                   : (RPM >= aim - CHC_PASS_END_BAND);
-    const bool ranOut = (nowMs - phaseStartMs >= CHC_PASS_TIMEOUT_MS) || (chcCount >= CHC_BUF_N);
-    if (arrived || ranOut) {
-      chcPassEnd[p] = chcCount;
-      if (p < 2) {
-        chcPassStart[p + 1] = chcCount;
-        phase++; phaseStartMs = nowMs; chcPhase = phase;
-        return true;
-      }
-      // Last pass. Two independent fits over overlapping spans — pass 2 is shared, which is what
-      // makes them a check on the run rather than on two different runs.
-      chcLead12 = chcFitLead(chcPassStart[0], chcPassEnd[1], &chcGapBefore, &chcGapAfter);
-      chcLead23 = chcFitLead(chcPassStart[1], chcPassEnd[2], nullptr, nullptr);
-      chcRateStats(chcPassStart[0], chcPassEnd[2]);
-      const float span = chcHoldRpm - chcIdleRpm;
-      int nGood = 0; float sum = 0.0f;
-      if (chcLead12 >= 0.0f) { sum += chcLead12; nGood++; }
-      if (chcLead23 >= 0.0f) { sum += chcLead23; nGood++; }
-      if (span < CHC_MIN_SWING_RPM) {
-        chcFinish(false, "the engine speed did not change enough to measure");
-      } else if (nGood == 0) {
-        chcFinish(false, (chcLead12 <= -1.5f || chcLead23 <= -1.5f)
-                         ? "the lead is past the 0.9 s the fit can see"
-                         : "the passes were too slow to read");
-      } else if (nGood < 2) {
-        // One answer has nothing to check it against; the two halves are the run's only self-test.
-        chcFinish(false, (chcLead12 < 0.0f) ? "passes 1+2 gave no answer to check passes 2+3 against"
-                                            : "passes 2+3 gave no answer to check passes 1+2 against");
-      } else {
-        chcLeadSec = sum / (float)nGood;
-        chcFinish(true, "");
-        queueConsoleMessageF("Charge health calibration: lead %.3f s (passes 1+2 %.3f s, 2+3 %.3f s) over %.0f rpm; pace min %.0f avg %.0f max %.0f rpm/s",
-                             chcLeadSec, chcLead12, chcLead23, span, chcRateMin, chcRateAvg, chcRateMax);
-      }
-      phase = 7; phaseStartMs = nowMs; chcPhase = 6;
-    }
-    return true;
   }
 
   // ── EASE back to the pre-test operating point ──

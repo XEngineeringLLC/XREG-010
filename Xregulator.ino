@@ -16,7 +16,7 @@
 
 // Must be strict semver ^\d+\.\d+\.\d+$ — no suffixes, no leading v. Compared as an integer
 // major*10000 + minor*100 + patch, so the ceiling is 999.99.99 (minor/patch cannot exceed 99).
-const char *FIRMWARE_VERSION = "0.0.4";
+const char *FIRMWARE_VERSION = "0.0.5";
 
 // OTA artifacts are served from a stable URL we control: ota.xengineering.net, a thin
 // proxy on our own web host that forwards to the Supabase Storage "ota" bucket. The
@@ -1364,49 +1364,61 @@ char  fieldCutAbortMsg[48] = {0};                  // human reason text on a fai
 // delay that collapses that disagreement is altLeadSec, which the health tracker's admission gate
 // uses to pair output with the engine speed of that moment.
 //
-// One run: the operator holds a high speed of their own choosing, the tuned current loop brings
-// output to chcTestPct of the charge-rate column AT THAT SPEED, the duty it settled on is frozen,
-// and three passes follow — down to idle, back up, down again. Sizing at the top is the whole
-// point: it is the fastest the machine turns all run, so nothing later can exceed what the sizing
-// step already proved safe.
+// One run on a fixed clock: the operator follows a drawn speed schedule — idle, climb to the test
+// top (CHC_TOP_FRAC of the entered maximum working RPM), hold, ease back to idle — four times.
+// Cycle 1 sizes the field: the tuned current loop brings output to chcTestPct of the charge-rate
+// column at the top, and the duty it settled on is frozen for everything after. Cycles 2-4 run at
+// that frozen duty and are fitted independently. Sizing at the top is the whole point: it is the
+// fastest the machine turns all run, so nothing later can exceed what the sizing already proved
+// safe. There is no phase that pins the field while nobody is driving — the 09-09 abort lived in
+// one — which is why the cycles chain on the clock with no button press between them.
 #define CHC_SAMP_MS        100u    // capture cadence. MUST equal EP_FEED_DT_MS — the answer is counted in these samples and applied as that many feed ticks
-#define CHC_BUF_N          1500    // 150 s of passes at CHC_SAMP_MS (PSRAM, 4 B/sample)
+#define CHC_BUF_N          2600    // 260 s at CHC_SAMP_MS (PSRAM, 4 B/sample). Worst case: top 4000 (CHC_TOP_FRAC 0.50 x 8000 clamp) over idle 500 = 17.5 s ramps; a freeze at the start of the cycle-1 climb records climb + 8 s hold + descent + 3 x (2 ramps + 3 s) = 157 s
 #define CHC_KMAX           9       // candidate delays searched, in CHC_SAMP_MS samples (0…0.9 s); altLeadSec clamps to 1.0 s
 #define CHC_BIN_RPM        50.0f   // speed bin width for the up/down comparison
 #define CHC_RATE_MIN       40.0f   // rpm/s below which a sample carries no direction information
 #define CHC_MIN_SWING_RPM  300.0f  // a shorter pass never opens a gap worth fitting
 #define CHC_MIN_BINS       3       // paired speed bins needed before a candidate delay is scored
-#define CHC_HOLD_STEADY_MS 4000u   // the chosen speed must sit inside the steady band this long before the field is sized
-#define CHC_HOLD_ABOVE_IDLE 400.0f // the held speed must clear idle by this, or the passes have no range
-#define CHC_WAIT_TIMEOUT_MS 120000UL  // operator never brought the speed up and held it
+#define CHC_TOP_FRAC       0.50f   // the test tops out at this share of maxWorkingRpm. MUST equal CHC_TOP_FRAC in script.js
+#define CHC_PACE_RPM_S     200.0f  // schedule ramp pace (5 s per 1000 rpm). MUST equal CHC_PACE_RPM_S in script.js
+#define CHC_SETTLE_IDLE_MS 10000u  // cycle 1 opens with this long at idle
+#define CHC_SIZE_HOLD_MS   8000u   // cycle 1's top hold: the current loop settles and the duty is frozen inside this window
+#define CHC_TOP_HOLD_MS    3000u   // top hold of the measured cycles — room to turn the throttle around
+#define CHC_MIN_RAMP_MS    2000u
+#define CHC_MEAS_CYCLES    3       // measured cycles after the sizing cycle, one independent fit each
+#define CHC_TOL_FLOOR_RPM  250.0f  // "at the top" for the freeze = inside the chart's corridor cushion: max(floor, frac x top)…
+#define CHC_TOL_FRAC       0.15f   // …MUST equal CHC_LANE_FLOOR_RPM / CHC_LANE_FRAC in script.js, or the screen says in range while the firmware waits
+#define CHC_HOLD_ABOVE_IDLE 400.0f // the top must clear idle by this, or the passes have no range (checked at Start and on the setup screen)
 #define CHC_SETTLE_MS      1200u   // current must sit inside the band this long before the duty is frozen
-#define CHC_SETTLE_TIMEOUT_MS 15000UL // …and the loop gets this long to get there at all
 #define CHC_MIN_TEST_A     3.0f    // below this there is no output to measure a lead in
-#define CHC_PASS_END_BAND  60.0f   // a pass ends this close to the speed it was aimed at
-#define CHC_PASS_TIMEOUT_MS 90000UL
 #define CHC_V_ABORT_MARGIN 0.02f   // take the field down entirely this far under the charge target
 #define CHC_I_ABORT_FRAC   0.95f   // …and at this fraction of the HIGH column at the present speed
 #define CHC_EASE_MS        1500.0f // ease the field between the frozen level and the pre-test point
 #define CHC_LOHI_AH        201     // banks at or above this size are sized off the HIGH charge-rate column
 
+int maxWorkingRpm = 0;                     // NVS: the engine's maximum working RPM as entered on the stage-9 setup screen; 0 = never entered
 volatile bool chcRequested = false;        // /get?chcStart
 volatile uint32_t chcReqMs = 0;            // when that press landed — the request expires after 30 s
 volatile bool chcAbortRequested = false;   // /get?chcCancel, or a protection cut
 uint8_t chcActive = 0;                     // 0 = idle, 1 = running
-uint8_t chcPhase = 0;                      // reported to the wizard: 0 idle, 1 waiting for a steady speed,
-                                           // 2 setting the field, 3/4/5 passes 1-3, 6 easing out
+uint8_t chcPhase = 0;                      // reported to the wizard: 0 idle, 1 settle at idle, 2 sizing climb, 3 sizing hold,
+                                           // 4 frozen (measured cycles), 6 easing out
 uint8_t chcTestPct = 50;                   // share of the charge-rate column the test aims for (20…80, wizard-held)
-bool  chcCcActive = false;                 // sizing phase: the normal AUTO path drives the real current PID at chcCmdA
-float chcCmdA = 0.0f;                      // …to this level
-float chcTargetA = 0.0f;                   // the level the sizing phase is aiming for (= chcSizeCapA × chcTestPct%)
-float chcHoldDuty = 0.0f;                  // duty the current loop settled on, frozen for all three passes
-float chcIdleRpm = 0.0f;                   // speed at Start — the bottom of every pass
-float chcHoldRpm = 0.0f;                   // speed the operator held — the top of every pass, and where the field was sized
-uint32_t chcHoldMs = 0;                    // how long the speed has been steady (drives the wizard's countdown)
-float chcMinA = 0.0f, chcPeakA = 0.0f;     // output range actually seen across the passes
-float chcLeadSec = -1.0f;                  // the answer: mean of the sub-fits that produced one
-float chcLead12 = -1.0f, chcLead23 = -1.0f;   // passes 1+2 and passes 2+3, fitted independently
-float chcGapBefore = -1.0f, chcGapAfter = -1.0f;   // up/down disagreement, uncorrected and corrected
+bool  chcCcActive = false;                 // sizing cycle: the normal AUTO path drives the real current PID at chcCmdA
+float chcCmdA = 0.0f;                      // …to this level — chcTestPct of the cap column at the present speed, never above the top's
+float chcTargetA = 0.0f;                   // the level at the top (= chcSizeCapA × chcTestPct%)
+float chcHoldDuty = 0.0f;                  // duty the current loop settled on, frozen for the measured cycles
+float chcIdleRpm = 0.0f;                   // speed at Start — the bottom of every cycle
+float chcTopRpm = 0.0f;                    // CHC_TOP_FRAC × maxWorkingRpm — the top of every cycle, and where the field is sized
+uint32_t chcRampMs = 0;                    // one ramp of the schedule, (top − idle) at CHC_PACE_RPM_S
+uint32_t chcRunMs = 0;                     // ms since the run's clock started — the browser draws its chart against this
+uint8_t chcCycle = 0, chcSeg = 0;          // where the clock is: cycle 1…1+CHC_MEAS_CYCLES; segment 0 settle, 1 climb, 2 hold, 3 descent
+bool  chcFrozen = false;                   // the duty has been captured — everything from here runs open-loop
+float chcMinA = 0.0f, chcPeakA = 0.0f;     // output range actually seen across the measured cycles
+float chcLeadSec = -1.0f;                  // the answer: mean of the closest pair of cycle fits (the browser recomputes and stores it)
+float chcLead[3] = {-1.0f, -1.0f, -1.0f};  // one independent fit per measured cycle
+float chcGapB[3] = {-1.0f, -1.0f, -1.0f};  // up/down disagreement per fit, uncorrected…
+float chcGapA[3] = {-1.0f, -1.0f, -1.0f};  // …and at the fitted delay
 // Throttle pace the operator actually delivered, over the samples the fit could use (|rate| at or
 // above CHC_RATE_MIN). Reported at the end for reference only — nothing consumes these.
 float chcRateMin = -1.0f, chcRateMax = -1.0f, chcRateAvg = -1.0f;
@@ -1417,8 +1429,8 @@ struct ChcSample { uint16_t rpm; int16_t amps10; };   // 4 B — amps ×10, so �
 static_assert(sizeof(ChcSample) == 4, "ChcSample lost its packing — the PSRAM budget assumes 4 B");
 ChcSample *chcBuf = nullptr;               // PSRAM capture buffer, filled once per run (never wraps)
 int chcCount = 0;
-int chcPassStart[3] = {0,0,0}, chcPassEnd[3] = {0,0,0};   // sample span of each pass, for the two sub-fits
-float chcSizeCapA = 0.0f, chcGuardCapA = 0.0f;   // charge-rate column at the held speed (sizes the test) / HIGH column live (guards it)
+int chcCycStart[3] = {0,0,0}, chcCycEnd[3] = {0,0,0};   // sample span of each measured cycle — its fit window
+float chcSizeCapA = 0.0f, chcGuardCapA = 0.0f;   // charge-rate column at the top (sizes the test) / HIGH column live (guards it)
 
 // ── Manual protection-trigger test (Settings → Emergency & Troubleshooting) ────────────────
 // Reproduces each field-collapse waveform on demand so an electrical fault can be provoked in a
@@ -1961,7 +1973,7 @@ bool isRegistered = false;  // Registration status
 
 
 // CLOUD FEATURES - STATIC BUFFERS// For ESP32-S3 with 16GB and OPI PSRAM
-const int PAYLOAD_BUFFER_SIZE = 4096;
+const int PAYLOAD_BUFFER_SIZE = 6144;  // PSRAM. ~2.9 kB worst case at payload_v 6; headroom for the next additive block
 const int CONFIG_PAYLOAD_SIZE = 32768;  // sized for the config picker spec (~190 fields)
 const int ALT_UPLOAD_BUF_SIZE  = 256 * 1024;  // PSRAM upload buffer — holds a full alt front batch (≤4096 pts)
 const int PERF_UPLOAD_BUF_SIZE = 512 * 1024;  // PSRAM upload buffer — holds sail+motor batches (≤4096 pts EACH)
@@ -2122,12 +2134,6 @@ struct SensorWindow {
   int64_t rpm_area_v_us = 0;   // raw rpm * us
   uint64_t rpm_valid_us = 0;
 
-  // WiFi strength
-  int32_t wifiStr_min = 999900;
-  int32_t wifiStr_max = -999900;
-  int64_t wifiStr_area_v_us = 0;
-  uint64_t wifiStr_valid_us = 0;
-
   int32_t dutyCycle_min = 999900;
   int32_t dutyCycle_max = 0;
   int64_t dutyCycle_area_v_us = 0;
@@ -2207,10 +2213,31 @@ struct SensorWindow {
   int64_t uTargetAmps_area_v_us = 0;
   uint64_t uTargetAmps_valid_us = 0;
 
-  int32_t tempMargin_min = 999900;
-  int32_t tempMargin_max = -999900;
-  int64_t tempMargin_area_v_us = 0;
-  uint64_t tempMargin_valid_us = 0;
+  // Battery temperature actually in use this tick (batteryTempF(): probe / N2K / VE.Direct / RV-C /
+  // board stand-in). NAN when no source qualifies, so valid_us == 0 is the cloud's "absent" signal —
+  // same contract as victronCurr. The SOURCE code rides the 24 h snapshot, not here.
+  int32_t battTemp_min = 999900;
+  int32_t battTemp_max = -999900;
+  int64_t battTemp_area_v_us = 0;
+  uint64_t battTemp_valid_us = 0;
+
+  // EXTRA-role DS18B20 — whatever the owner assigned that probe to. Absent on most boats.
+  int32_t extraTemp_min = 999900;
+  int32_t extraTemp_max = -999900;
+  int64_t extraTemp_area_v_us = 0;
+  uint64_t extraTemp_valid_us = 0;
+
+  // VE.Direct solar panel power / voltage (PPV / VPV). Gated on IDX_VICTRON_SOLAR freshness so a
+  // boat with no MPPT reads absent rather than a flat 0 W line.
+  int32_t solarPower_min = 999900;
+  int32_t solarPower_max = -999900;
+  int64_t solarPower_area_v_us = 0;
+  uint64_t solarPower_valid_us = 0;
+
+  int32_t solarVolt_min = 999900;
+  int32_t solarVolt_max = -999900;
+  int64_t solarVolt_area_v_us = 0;
+  uint64_t solarVolt_valid_us = 0;
 
   // GPS
   double lat_current;  // Most recent smoothed latitude

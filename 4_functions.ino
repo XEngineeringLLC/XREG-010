@@ -2583,6 +2583,12 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     CommissionTempSrc = clampLoadedSetting("CommissionTempSrc", NK_CommissionTempSrc, settingRead(NK_CommissionTempSrc).toInt(), 0, 5);
   }
+  // maxWorkingRpm — entered on the stage-9 setup screen; 0 = never entered, and Start refuses until it is.
+  if (!settingExists(NK_maxWorkingRpm)) {
+    settingWrite(NK_maxWorkingRpm, String(maxWorkingRpm).c_str());
+  } else {
+    maxWorkingRpm = (int)clampLoadedSetting("maxWorkingRpm", NK_maxWorkingRpm, settingRead(NK_maxWorkingRpm).toInt(), 0, 8000);
+  }
   // Same rule for the re-commission nag state: absence = never commissioned = never nag.
   if (settingExists(NK_CommissionEpoch)) {
     CommissionEpoch = (time_t)strtoll(settingRead(NK_CommissionEpoch).c_str(), nullptr, 10);

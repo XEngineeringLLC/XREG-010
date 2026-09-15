@@ -762,7 +762,7 @@ enum Csv4Index {
 // backslash and truncates the macro, and every expansion truncates together and consistently --
 // so the count/order gate in compress_web.sh cannot see it. The static_assert on
 // CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 431
+#define CSV3_EXPECTED_FIELDS 432
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -1198,6 +1198,7 @@ enum Csv4Index {
   X(n2kExtraTempInstance, "%d", SafeInt(n2kExtraTempInstance)) \
   X(n2kExtraTempSource, "%d", SafeInt(n2kExtraTempSource))                                                        /* tN2kTempSource code for the EXTRA probe */ \
   X(CommissionTempSrc, "%d", SafeInt(CommissionTempSrc))                                                          /* battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown = board) */ \
+  X(maxWorkingRpm, "%d", SafeInt(maxWorkingRpm))                                                                  /* stage-9 setup screen; 0 = never entered */ \
   X(sessionId, "%u", (unsigned)g_sessionId)                                                                       /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
   X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
   /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
@@ -4525,7 +4526,14 @@ void setupServer() {
       queueConsoleMessage("Field cut: abort requested via web UI");
     }
 
-    // ── Charge health system calibration (stage 9): one held-field throttle swing per run ──
+    // ── Charge health system calibration (stage 9): one clock-scheduled run of four throttle cycles ──
+    // The engine's maximum working RPM, entered on the setup screen. The test top is CHC_TOP_FRAC of it.
+    if (request->hasParam("maxWorkingRpm")) {
+      foundParameter = true;
+      maxWorkingRpm = (int)constrain(request->getParam("maxWorkingRpm")->value().toInt(), 800L, 8000L);
+      settingWrite(NK_maxWorkingRpm, String(maxWorkingRpm).c_str());
+      queueConsoleMessageF("Maximum working RPM set to %d (charge health calibration tops out at %d)", maxWorkingRpm, (int)lroundf(CHC_TOP_FRAC * maxWorkingRpm));
+    }
     if (request->hasParam("chcStart")) {
       foundParameter = true;
       const char *busy = (systemIDActive != 0) ? "Plant Delay test"
@@ -4552,6 +4560,10 @@ void setupServer() {
         }
       } else if (chcRequested) {
         queueConsoleMessage("Charge health calibration: start ignored (already requested)");
+      } else if (maxWorkingRpm <= 0 && chcActive == 0) {
+        queueConsoleMessage("Charge health calibration: start blocked — enter the maximum working RPM first");
+        chcOk = false; chcResultsReady = true;
+        snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — enter the maximum working RPM first");
       } else if (busy != nullptr) {
         queueConsoleMessageF("Charge health calibration: start blocked — %s is active", busy);
         if (chcActive == 0) {
@@ -9275,22 +9287,25 @@ void setupServer() {
   });
 
   // Charge health calibration status (commissioning stage 9 polls this). One small object — the
-  // captured swing never leaves the device, only the fit does.
+  // captured swing never leaves the device, only the fits do. runMs/rampMs/idleRpm/top are the
+  // schedule the browser draws its chart against, so the screen and the firmware share one clock.
   server.on("/chc.json", HTTP_GET, [](AsyncWebServerRequest *request) {
-    char buf[640];
+    char buf[768];
     snprintf(buf, sizeof(buf),
              "{\"active\":%d,\"phase\":%d,\"ready\":%d,\"ok\":%d,\"pct\":%d,"
              "\"targetA\":%.1f,\"capA\":%.0f,\"hiCol\":%d,\"duty\":%.1f,\"amps\":%.1f,"
-             "\"vbus\":%.2f,\"rpm\":%.0f,\"idleRpm\":%.0f,\"holdRpm\":%.0f,\"holdMs\":%lu,"
-             "\"minA\":%.1f,\"peakA\":%.0f,\"leadSec\":%.3f,\"lead12\":%.3f,\"lead23\":%.3f,"
-             "\"gapBefore\":%.1f,\"gapAfter\":%.1f,"
+             "\"vbus\":%.2f,\"rpm\":%.0f,\"idleRpm\":%.0f,\"top\":%.0f,\"maxRpm\":%d,"
+             "\"rampMs\":%lu,\"runMs\":%lu,\"cyc\":%d,\"seg\":%d,\"frozen\":%d,"
+             "\"minA\":%.1f,\"peakA\":%.0f,\"leadSec\":%.3f,"
+             "\"lead\":[%.3f,%.3f,%.3f],\"gapB\":[%.1f,%.1f,%.1f],\"gapA\":[%.1f,%.1f,%.1f],"
              "\"rateMin\":%.0f,\"rateAvg\":%.0f,\"rateMax\":%.0f,"
              "\"nPts\":%d,\"abort\":\"%s\"}",
              chcActive != 0 ? 1 : 0, (int)chcPhase, chcResultsReady ? 1 : 0, chcOk ? 1 : 0, (int)chcTestPct,
              chcTargetA, chcSizeCapA, (BatteryCapacity_Ah >= CHC_LOHI_AH) ? 1 : 0, chcHoldDuty, MeasuredAmps,
-             BatteryV, RPM, chcIdleRpm, chcHoldRpm, (unsigned long)chcHoldMs,
-             chcMinA, chcPeakA, chcLeadSec, chcLead12, chcLead23,
-             chcGapBefore, chcGapAfter,
+             BatteryV, RPM, chcIdleRpm, chcTopRpm, maxWorkingRpm,
+             (unsigned long)chcRampMs, (unsigned long)chcRunMs, (int)chcCycle, (int)chcSeg, chcFrozen ? 1 : 0,
+             chcMinA, chcPeakA, chcLeadSec,
+             chcLead[0], chcLead[1], chcLead[2], chcGapB[0], chcGapB[1], chcGapB[2], chcGapA[0], chcGapA[1], chcGapA[2],
              chcRateMin, chcRateAvg, chcRateMax,
              chcCount, chcAbortMsg);
     request->send(200, "application/json", buf);

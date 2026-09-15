@@ -1751,26 +1751,40 @@ void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEvent
                                                                : FIELD_COLLAPSE_DELAY;
     if (reason == REASON_TACH_IMPLAUSIBLE) { tachLieTripRpm = RPM; tachLieLockoutArmed = true; }
     // Spam guard: with the engine off the temp feed ages past the 20s staleness threshold, so this
-    // cut/restart cycle repeats every cooldown (~2s). Announce a new reason immediately, then throttle
-    // to one heartbeat per minute so a genuinely new fault never gets buried under the idle loop.
+    // cut/restart cycle repeats every cooldown (~2s). Announce a new episode immediately, then
+    // heartbeat at 60s / 5min / 30min as that one episode grinds on, so a genuinely new fault never
+    // gets buried under the idle loop. A fixed 60s heartbeat filled the whole 200-line
+    // /consolehist.txt ring in ~100 min of unattended cycling and cost a WiFi-outage record.
+    // Console/serial text only — nothing here feeds fieldCollapseTime or activeCollapseDelay.
     static FieldEventReason lastCollapseReason = REASON_NONE;
     static uint32_t lastCollapseMsgMs = 0;
+    static uint32_t lastCollapseCutMs = 0;
     static uint32_t collapseLoopCount = 0;
-    bool newReason = (reason != lastCollapseReason);
+    static uint8_t  collapseHeartbeats = 0;   // "Still cycling" lines emitted for the current episode
+    // A gap this long between cuts means the cycle actually stopped, so the next cut is a new episode
+    // and is announced in full even when the reason is unchanged.
+    bool newEpisode = (reason != lastCollapseReason)
+                      || (uint32_t)(tick.nowMs - lastCollapseCutMs) >= 60000;
+    uint32_t collapseHeartbeatMs = (collapseHeartbeats == 0) ? 60000UL
+                                 : (collapseHeartbeats == 1) ? 300000UL
+                                                             : 1800000UL;
     collapseLoopCount++;
-    if (newReason || (uint32_t)(tick.nowMs - lastCollapseMsgMs) >= 60000) {
-      if (newReason) {
+    if (newEpisode || (uint32_t)(tick.nowMs - lastCollapseMsgMs) >= collapseHeartbeatMs) {
+      if (newEpisode) {
         queueConsoleMessageF("Charging stopped (%s) - %.1fs cooldown before restart",
                              reasonToString(reason), activeCollapseDelay / 1000.0f);
+        collapseHeartbeats = 0;
       } else {
         queueConsoleMessageF("Still cycling on %s (%lu cuts) - %.1fs cooldown, suppressing repeats",
                              reasonToString(reason), (unsigned long)collapseLoopCount,
                              activeCollapseDelay / 1000.0f);
+        if (collapseHeartbeats < 2) collapseHeartbeats++;
       }
       lastCollapseMsgMs = tick.nowMs;
       collapseLoopCount = 0;
     }
     lastCollapseReason = reason;
+    lastCollapseCutMs = tick.nowMs;
   }
 
   reportFieldModeEvent(tick.nowMs, mode, reason, tick, gpio4IsLow, dutyCycle);
@@ -3255,15 +3269,29 @@ void AdjustFieldLearnMode() {
 
   // ========== LOCKOUT TRANSITION TRACKING ==========
   bool lockoutActiveNow = tick.inLockout;
+  // Spam guard mirrors the cut announcement above: the idle stale-temp loop completes a cooldown
+  // every ~2s. A completed cooldown is only news if charging then stayed up, so the line is held
+  // for COOLDOWN_DONE_CONFIRM_MS and dropped outright if the next cut lands first — a grinding cycle
+  // then reports only through the "Still cycling" heartbeat. The once-per-minute cap stays for a
+  // fault that repeats more slowly than the confirm window. Console/serial text only: the latch
+  // gates nothing but the message, and the lockout itself clears exactly when it always did.
+  static uint32_t cooldownDonePendingMs = 0;
+  static bool     cooldownDoneNormal = false;
+  static uint32_t lastCooldownDoneMs = 0;
+  const uint32_t COOLDOWN_DONE_CONFIRM_MS = 5000;
   if (lockoutWasActive && !lockoutActiveNow) {
-    // Spam guard mirrors the cut announcement above: the idle stale-temp loop completes a cooldown
-    // every ~2s. Show recovery at most once per minute so a genuine "resumed" isn't buried under it.
-    static uint32_t lastCooldownDoneMs = 0;
+    cooldownDonePendingMs = tick.nowMs ? tick.nowMs : 1;   // 0 is the "nothing pending" sentinel
+    cooldownDoneNormal = isNormalMode;
+  } else if (lockoutActiveNow) {
+    cooldownDonePendingMs = 0;   // back in lockout inside the window — that was cycle churn, not a recovery
+  } else if (cooldownDonePendingMs != 0
+             && (uint32_t)(tick.nowMs - cooldownDonePendingMs) >= COOLDOWN_DONE_CONFIRM_MS) {
     if (lastCooldownDoneMs == 0 || (uint32_t)(tick.nowMs - lastCooldownDoneMs) >= 60000) {
-      queueConsoleMessage(isNormalMode ? "Cooldown complete - charging resumed" : "Cooldown complete");
-      serialPrintlnNB(isNormalMode ? "Cooldown complete - charging resumed" : "Cooldown complete");
+      queueConsoleMessage(cooldownDoneNormal ? "Cooldown complete - charging resumed" : "Cooldown complete");
+      serialPrintlnNB(cooldownDoneNormal ? "Cooldown complete - charging resumed" : "Cooldown complete");
       lastCooldownDoneMs = tick.nowMs;
     }
+    cooldownDonePendingMs = 0;
   }
   lockoutWasActive = lockoutActiveNow;
 

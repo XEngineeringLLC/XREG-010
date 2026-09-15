@@ -218,7 +218,7 @@
           <span id="duty-pill-wrap" class="why-tap"><span id="dutyCycleID3" style="display:none;"></span><span id="dutyCyclePercentSign" style="display:none;">%</span></span>
         </div>
         <div class="stage-row">
-          <span id="prot-note" class="prot-word why-tap" style="display:none;"><span class="pw-full">PROTECTION</span><span class="pw-short">P</span></span>
+          <span id="prot-note" class="prot-word why-tap" style="display:none;">P</span>
           <span id="battgt-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">BATT &gt; TARGET</span><span class="pw-short">B&gt;T</span></span>
           <span id="extlim-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">EXT LIMIT</span><span class="pw-short">EXT</span></span>
           <span id="minfield-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">MIN FIELD</span><span class="pw-short">MIN</span></span>
@@ -853,7 +853,7 @@
 
                 <hr />
                 <p class="card-group-title" style="margin:12px 0 10px 0;">Steps</p>
-                <p style="font-size:12px;color:var(--text-muted);margin:0 0 4px 0;">Progress is saved on the regulator, so it survives a page reload and shows the same on any device. The badge on the right of each step shows its state: <strong style="color:#2e7d32;">✓ DONE</strong> = finished, <strong style="color:#1565c0;">▶</strong> = the step you're on (RUNNING while the wizard is open, RESUME when paused), ○ = not yet run. Tick the steps to run, then press the button below — coupled steps are selected automatically.</p>
+                <p style="font-size:12px;color:var(--text-muted);margin:0 0 4px 0;">Progress is saved on the regulator, so it survives a page reload and shows the same on any device. The badge on the right of each step shows its state: <strong style="color:var(--cx-done);">✓ DONE</strong> = finished, <strong style="color:var(--cx-running);">▶</strong> = the step you're on (RUNNING while the wizard is open, RESUME when paused), ○ = not yet run. Tick the steps to run, then press the button below — coupled steps are selected automatically.</p>
                 <!-- Select-all master + per-step checkboxes rendered by renderCommissionStatus(). -->
                 <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;margin:6px 0 2px 2px;cursor:pointer;">
                   <input type="checkbox" id="commission-select-all" onchange="cxToggleSelectAll(this.checked)" checked> Select all steps
@@ -16042,7 +16042,7 @@
         <span style="display:flex; align-items:center;">
           <!-- Minimize: mobile only (CSS-gated). Collapses to a progress pill so the current plot is visible behind it. -->
           <button id="sysid-min-btn" onclick="sysidMinimize()" title="Minimize" style="background:none; border:none; color:#888; cursor:pointer; font-size:20px; padding:0 8px; line-height:1; pointer-events:auto;">—</button>
-          <button onclick="closeSystemIDModalUser()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1; pointer-events:auto;">✕</button>
+          <button onclick="closeSystemIDModalUser()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1; pointer-events:auto;">✕</button>
         </span>
       </div>
 
@@ -16238,7 +16238,7 @@
     <div id="commission-modal-panel" style="pointer-events:auto; position:absolute; top:20px; left:20px; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); overflow-y:auto;">
       <div id="commission-drag-handle" style="cursor:move; padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Commissioning</span>
-        <button onclick="closeCommissionModal()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="closeCommissionModal()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="padding:20px;">
         <!-- Physical Panel Override warning — lives in the wizard chrome, ABOVE #commission-body, so it
@@ -16249,7 +16249,7 @@
         <div id="cx-panel-override-warn" style="display:none; margin-bottom:14px; padding:9px 11px; background:rgba(240,165,0,0.08); border:1px solid rgba(240,165,0,0.4); border-radius:6px; font-size:12px; line-height:1.5; color:#e6a23c;">
           <strong>Physical Panel Override is on.</strong> The switches on data Cable 3 hold the charge rate and Force &quot;Maintain Mode&quot; &mdash; including the charge rate this wizard asks you to set. Leave the panel alone for the whole run, or turn the override off under Setup &rarr; System &rarr; Security &amp; Maintenance.
         </div>
-        <div id="commission-steps" style="display:flex; flex-wrap:wrap; gap:4px 8px; padding-bottom:12px; margin-bottom:14px; border-bottom:1px solid rgba(255,255,255,0.32); font-size:11px; color:#777;"></div>
+        <div id="commission-steps" style="display:flex; flex-wrap:wrap; gap:4px 8px; padding-bottom:12px; margin-bottom:14px; border-bottom:1px solid rgba(255,255,255,0.32); font-size:11px; color:#9a9a9a;"></div>
         <!-- Permanent RPM sparkline — lives ABOVE the per-phase #commission-body so the
              body's innerHTML re-render each phase never wipes it. Fed off CSV1 (cxRpmSparkOnCsv1).
              Hidden while the Disturbances sweep game owns the screen (cxGameStart/cxGameStop) — the game
@@ -16258,7 +16258,7 @@
              trace reads through it) — the per-phase label sentence wraps freely above without ever
              moving the number. -->
         <div id="cx-rpm-strip" style="position:relative; margin-bottom:14px; padding:8px 10px; background:#222; border-radius:6px;">
-          <div id="cx-rpm-strip-label" style="font-size:11px; color:#888; margin-bottom:4px;">Engine RPM (last ~15 s)</div>
+          <div id="cx-rpm-strip-label" style="font-size:11px; color:#9a9a9a; margin-bottom:4px;">Engine RPM (last ~15 s)</div>
           <canvas id="cxRpmSpark" style="display:block; width:100%; height:48px;"></canvas>
           <strong id="cx-rpm-spark-val" style="position:absolute; right:10px; bottom:8px; color:#2ec4b6; font-size:13px; font-variant-numeric:tabular-nums; background:rgba(30,30,30,0.55); border-radius:4px; padding:0 4px; pointer-events:none;">—</strong>
         </div>
@@ -16279,7 +16279,7 @@
     <div id="bhw-modal-panel" style="pointer-events:auto; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100vh - 100px); overflow-y:auto;">
       <div id="bhw-drag-handle" style="cursor:move; padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Battery Health Test</span>
-        <button onclick="bhwClose()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="bhwClose()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="padding:20px;">
         <div id="bhw-body" style="font-size:0.92em; line-height:1.5; color:#ddd;"></div>
@@ -16293,13 +16293,13 @@
     <div id="cvs-modal-panel" style="pointer-events:auto; position:absolute; top:20px; left:20px; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); overflow-y:auto;">
       <div id="cvs-drag-handle" style="cursor:move; padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">CV Stress Test</span>
-        <button onclick="cvsClose()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="cvsClose()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="padding:20px;">
         <!-- Same permanent RPM strip as the commissioning modal (shared ring, cxRpmSparkOnCsv1) —
              the operator holds idle until ARMED, then snaps the throttle, all without leaving the dialog. -->
         <div style="position:relative; margin-bottom:14px; padding:8px 10px; background:#222; border-radius:6px;">
-          <div style="font-size:11px; color:#888; margin-bottom:4px;">Engine RPM (last ~15 s)</div>
+          <div style="font-size:11px; color:#9a9a9a; margin-bottom:4px;">Engine RPM (last ~15 s)</div>
           <canvas id="cvsRpmSpark" style="display:block; width:100%; height:48px;"></canvas>
           <strong id="cvs-rpm-spark-val" style="position:absolute; right:10px; bottom:8px; color:#2ec4b6; font-size:13px; font-variant-numeric:tabular-nums; background:rgba(30,30,30,0.55); border-radius:4px; padding:0 4px; pointer-events:none;">—</strong>
         </div>
@@ -16315,7 +16315,7 @@
     <div id="cfgdiff-modal-panel" style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100vh - 100px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span id="cfgdiff-title" style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Review Configuration Changes</span>
-        <button onclick="cfgDiffClose(false)" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="cfgDiffClose(false)" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="overflow-y:auto; flex:1; min-height:0;">
         <div id="cfgdiff-summary" style="padding:12px 16px 0; font-size:0.9em; line-height:1.45; color:#ddd;"></div>
@@ -16336,7 +16336,7 @@
     <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Recommend Initial Charging Settings</span>
-        <button onclick="battDefClose(false)" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="battDefClose(false)" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="overflow-y:auto; flex:1; min-height:0;">
         <div id="battdef-summary" style="padding:12px 16px 0; font-size:0.9em; line-height:1.45; color:#ddd;"></div>
@@ -16379,7 +16379,7 @@
     <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:470px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:flex-start; justify-content:space-between; gap:10px; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em; line-height:1.35;">FYI Note:<br>Automatic Maintenance Restarts</span>
-        <button onclick="maintAckClose()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="maintAckClose()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="padding:18px 20px 16px; font-size:0.92em; line-height:1.5; overflow-y:auto; flex:1; min-height:0;">
         <p style="margin:0 0 15px; font-size:14px;">
@@ -16471,7 +16471,7 @@
     <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Commissioning Prerequisites</span>
-        <button onclick="commPrepClose()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="commPrepClose()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div id="commprep-body" style="padding:14px 16px; overflow-y:auto; flex:1; min-height:0;"></div>
       <div style="padding:12px 16px; border-top:1px solid #333; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
@@ -16489,7 +16489,7 @@
     <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Charge Rate Limits</span>
-        <button onclick="rpmCapCancel()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="rpmCapCancel()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div id="rpmcap-body" style="padding:14px 16px; overflow-y:auto; flex:1; min-height:0;"></div>
       <div style="padding:12px 16px; border-top:1px solid #333; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
@@ -16510,7 +16510,7 @@
     <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Tachometer Calibration</span>
-        <button onclick="rpmAlignCancel()" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+        <button onclick="rpmAlignCancel()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div id="rpmalign-body" style="padding:14px 16px; overflow-y:auto; flex:1; min-height:0;"></div>
       <div style="padding:12px 16px; border-top:1px solid #333; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
@@ -16563,7 +16563,7 @@
     <div id="socseed-modal-panel" style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">State of Charge &mdash; Commissioning Estimate</span>
-        <button onclick="socSeedClose(false)" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
+        <button onclick="socSeedClose(false)" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
       </div>
       <div id="socseed-body" style="padding:18px 20px 20px; font-size:0.92em; line-height:1.5; overflow-y:auto; flex:1; min-height:0;"></div>
     </div>
@@ -16582,7 +16582,7 @@
     <div style="background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100vh - 60px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0;">
         <span style="font-weight:600; font-size:13px; color:#fca5a5; letter-spacing:0.03em;">Scheduled Restart Coming</span>
-        <button type="button" onclick="document.getElementById('restart-popup-overlay').style.display='none';" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
+        <button type="button" onclick="document.getElementById('restart-popup-overlay').style.display='none';" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
       </div>
       <div style="padding:18px 20px 20px; font-size:0.92em; line-height:1.5; overflow-y:auto;">
         <div id="restart-popup-text" style="font-size:14px; line-height:1.5; margin-bottom:14px;">

@@ -1290,13 +1290,6 @@ function drawIExcessSpark(c, S) {
 const _cxRpmSpark = { rpm: new Array(150).fill(NaN), N: 150 };
 let cxFpOpen = false;   // wizard "Details" disclosure — one setting for the whole session, all steps
 function cxFpSet(v) { cxFpOpen = !!v; }
-// Pace lane for the stage-9 passes: the corridor the trace should stay inside. Anchored at the
-// sample index and RPM where the pass began; the ring is 150 samples at the ~10 Hz CSV1 cadence,
-// so the asked-for 200 rpm/s is exactly 20 rpm per sample.
-let _cxPaceLane = null;   // { i0, rpm0, down }
-function cxPaceLane(spec) {
-    _cxPaceLane = spec ? { i0: _cxRpmSpark.N - 1, rpm0: spec.rpm, down: !!spec.down } : null;
-}
 function cxRpmSparkOnCsv1(data) {
     const rpm = Number(data.RPM);
     if (cx) {                                  // green/red in-range check for the resonance current-check
@@ -1310,7 +1303,6 @@ function cxRpmSparkOnCsv1(data) {
     }
     const S = _cxRpmSpark;
     S.rpm.push(isFinite(rpm) ? rpm : NaN); S.rpm.shift();
-    if (_cxPaceLane && --_cxPaceLane.i0 < -20) _cxPaceLane = null;   // lane scrolls out with the samples it was anchored to
     // One shared ring feeds two strips: the commissioning modal and the standalone Diag
     // stress-test modal. Draw only where laid out (modal open, not hidden by the sweep game) —
     // but the ring above must keep feeding regardless: the game reads the same ring for its trace.
@@ -1364,28 +1356,6 @@ function drawCxRpmSpark(c) {
         const x = X(i), y = Y(v); started ? g.lineTo(x, y) : g.moveTo(x, y); started = true;
     }
     g.strokeStyle = '#2ec4b6'; g.lineWidth = 1.7; g.stroke();
-    // Pace lane (stage 9 passes only). Two parallel lines from where the pass began, bracketing the
-    // asked-for rate — drawn UNDER nothing, over the auto-scaled trace, in the same X/Y mapping.
-    // The band is ±40% of the target rate: wide enough that a human throttle stays inside it, tight
-    // enough that the sub-40 rpm/s samples the fit discards fall outside.
-    if (_cxPaceLane) {
-        const L = _cxPaceLane, sgn = L.down ? -1 : 1, perSamp = (CHC_PACE_RPM_S / 10);
-        const edge = f => {
-            g.beginPath();
-            let started = false;
-            for (let i = Math.max(0, L.i0); i < N; i++) {
-                const v = L.rpm0 + sgn * perSamp * f * (i - L.i0);
-                const x = X(i), y = Y(v);
-                started ? g.lineTo(x, y) : g.moveTo(x, y); started = true;
-            }
-            if (started) g.stroke();
-        };
-        g.save();
-        g.strokeStyle = 'rgba(46,196,182,0.35)'; g.lineWidth = 1;
-        g.setLineDash([3, 3]);
-        edge(0.6); edge(1.4);
-        g.restore();
-    }
     const last = S.rpm[N - 1];
     if (isFinite(last)) { g.fillStyle = '#2ec4b6'; g.beginPath(); g.arc(X(N - 1), Y(last), 2.6, 0, 7); g.fill(); }
 }
@@ -3818,6 +3788,7 @@ const CSV3_FIELDS = [
     "n2kExtraTempInstance",  // extra-probe temperature instance (0..252)
     "n2kExtraTempSource",  // tN2kTempSource code for the extra probe
     "CommissionTempSrc",  // battTempActiveSrc when CommissionTempF was stamped (0 = legacy = board)
+    "maxWorkingRpm",
     "sessionId",  // device boot identity, same in every channel this boot
     "sendMs",  // device millis() when this settings echo was built; event-driven with a 60 s fallback
 ];
@@ -3911,14 +3882,21 @@ function syncFormActionsToDevice() {
 document.addEventListener('DOMContentLoaded', syncFormActionsToDevice);
 
 // =====================================================================
-// Device discovery — Capacitor only (mDNS name → subnet probe)
+// Device discovery (mDNS name → subnet probe)
 // =====================================================================
 // The regulator answers GET /identify passwordless with
-// {"device":"xreg-010",...} — built for this probe. Browsers never run
-// discovery (same-origin page) and can't subnet-scan anyway; the Connection
-// Lost dialog names that limitation instead of hiding it.
+// {"device":"xreg-010",...} — built for this probe, and it answers with
+// Access-Control-Allow-Origin: *, so a browser probes other addresses
+// cross-origin exactly the way the app does. The dashboard is served over
+// plain http, so nothing is blocked as mixed content either. The difference
+// is only what happens on a hit: the app re-points API_BASE_URL, a browser
+// navigates the tab, because every endpoint except /identify is same-origin.
 
 let discoveryInProgress = false;
+const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
+// An https page (the website demo) would have every probe blocked as mixed content before it
+// left the tab, so a browser only joins the discovery path when the page itself is http.
+const CAN_DISCOVER = IS_CAPACITOR || location.protocol === 'http:';
 
 function setSplashText(msg) {
     const wfr = document.getElementById('waiting-for-regulator');
@@ -3997,15 +3975,19 @@ function probeRound(bases, timeoutMs, wantUid) {
     });
 }
 
-async function getPhoneIPv4() {
-    const plugin = IS_CAPACITOR && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorWifi;
+// Whose /24 the LAN sweep walks. In the app that is the phone's own IPv4, read natively. A
+// browser has no such API, but the page was served BY the regulator, so when it was opened by
+// address that address names the subnet the regulator was last on — the same one either way.
+async function ownSubnetIPv4() {
+    if (!IS_CAPACITOR) return IPV4_RE.test(location.hostname) ? location.hostname : null;
+    const plugin = window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorWifi;
     if (!plugin || !plugin.getIpAddress) return null;
     try {
         const r = await plugin.getIpAddress();
         const ip = r && r.ipAddress;
         // The plugin reads en0 only and returns the FIRST address family it finds,
         // which can be IPv6 — only a dotted-quad can seed a /24 sweep.
-        return (typeof ip === 'string' && /^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) ? ip : null;
+        return (typeof ip === 'string' && IPV4_RE.test(ip)) ? ip : null;
     } catch (e) {
         return null;
     }
@@ -4060,7 +4042,7 @@ async function discoverDeviceBase(wantUid, exhaustive) {
     // race entirely: two regulators both answer to alternator.local, only one answers to
     // xreg-<uid6>.local.
     const first = [];
-    const wantHost = localStorage.getItem('xregDeviceHost');
+    const wantHost = rememberedHost();
     if (wantUid && wantHost) {
         const ownIp = await resolveLocalHost(wantHost);
         first.push(ownIp ? 'http://' + ownIp : 'http://' + wantHost);
@@ -4075,6 +4057,9 @@ async function discoverDeviceBase(wantUid, exhaustive) {
     first.push(mdnsIP ? 'http://' + mdnsIP : 'http://alternator.local', 'http://192.168.4.1');
     const last = localStorage.getItem('xregDeviceBase');
     if (last && first.indexOf(last) === -1) first.push(last);
+    // Browser: the address this page was served from. A regulator that came back at the SAME
+    // place answers here in round 1 and the tab never has to move.
+    if (!IS_CAPACITOR && first.indexOf(location.origin) === -1) first.push(location.origin);
     const found = [];
     const merge = list => list.forEach(h => {
         const dup = h.uid ? found.find(f => f.uid === h.uid) : null;
@@ -4100,9 +4085,10 @@ async function discoverDeviceBase(wantUid, exhaustive) {
     merge(await probeRound(hotspot, 1500, probeUid));
     if (settled()) return found;
 
-    // Round 3: router LAN — needs our own IPv4 to pick the /24. ~11 s worst case.
-    const ownIP = await getPhoneIPv4();
-    console.log('[DISCOVERY] phone IPv4: ' + (ownIP || 'unavailable'));
+    // Round 3: router LAN — needs an address on it to pick the /24 (the phone's in the app, the
+    // one this page was opened at in a browser). ~11 s worst case.
+    const ownIP = await ownSubnetIPv4();
+    console.log('[DISCOVERY] sweep seed IPv4: ' + (ownIP || 'unavailable'));
     if (!ownIP || ownIP.indexOf('172.20.10.') === 0) return found;
     const prefix = ownIP.slice(0, ownIP.lastIndexOf('.') + 1);
     for (let start = 1; start <= 254; start += 25) {
@@ -4124,7 +4110,15 @@ async function discoverDeviceBase(wantUid, exhaustive) {
 // different board between one launch and the next. The uid from /identify is the identity,
 // and it is what gets remembered.
 
-function rememberedUid() { return localStorage.getItem('xregDeviceUid') || null; }
+// A browser's localStorage is keyed by ORIGIN, so everything remembered at the old address is
+// invisible the moment the regulator moves. The identity /identify handed this page is what
+// survives inside the loaded tab, and that tab is where the recovery path runs.
+function rememberedUid() {
+    return localStorage.getItem('xregDeviceUid') || (window.xregUnit && window.xregUnit.uid) || null;
+}
+function rememberedHost() {
+    return localStorage.getItem('xregDeviceHost') || (window.xregUnit && window.xregUnit.host) || null;
+}
 
 function unitWhere(hit) {
     return (hit && (hit.host || (hit.base || '').replace(/^https?:\/\//, ''))) || '';
@@ -4273,12 +4267,29 @@ async function switchRegulator() {
     initializeEventSource();
 }
 
-// Browsers do not discover — the address bar picked the unit. Ask it who it is anyway, so the
-// UI can name it and the AP fields are right for THIS board.
+// The address bar picked the unit, so ask it who it is: the UI can name it, the AP fields are
+// right for THIS board, and the recovery path has a uid to pin when the address moves.
+// Then move the tab onto the unit's own mDNS name. An address is a DHCP lease — a phone hotspot
+// hands out a different one every time it bounces, and a bookmark or a refresh on the stale one
+// reaches nothing, with no page left running to recover from. The name follows the regulator
+// across every address it will ever have. Runs only on a page opened BY address, so it cannot
+// loop, and it is silent when the name does not answer (most Android browsers, some locked-down
+// Windows networks) — those clients go on using the address exactly as before.
 async function initUnitIdentity() {
     if (IS_CAPACITOR || DEMO_MODE) return;
     const hit = await probeIdentify(API_BASE_URL || '', 4000);
-    if (hit) applyConnectedIdentity(hit);
+    if (!hit) return;
+    applyConnectedIdentity(hit);
+    if (hit.uid) localStorage.setItem('xregDeviceUid', hit.uid);
+    if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
+    localStorage.setItem('xregDeviceBase', location.origin);
+    if (!CAN_DISCOVER || !hit.uid || !hit.host || !IPV4_RE.test(location.hostname)) return;
+    const byName = await probeIdentify('http://' + hit.host, 2500);
+    // Same uid or nothing: on a two-regulator boat a name that lands on the other board would
+    // silently swap which unit this tab is driving.
+    if (byName && byName.uid === hit.uid) {
+        location.replace('http://' + hit.host + location.pathname + location.search + location.hash);
+    }
 }
 document.addEventListener('DOMContentLoaded', initUnitIdentity);
 
@@ -4321,6 +4332,21 @@ async function rediscoverAfterLoss(quiet) {
     if (DEMO_MODE) return;
     const hit = await resolveRegulatorChoice(hits, rememberedUid());
     if (hit) {
+        // A browser cannot simply re-point API_BASE_URL: /events and every write form are
+        // same-origin, and only /identify carries CORS headers. Moving the tab to the address
+        // that answered IS the reconnect — and it leaves the browser sitting on a live address,
+        // so the next refresh works too.
+        if (!IS_CAPACITOR) {
+            // Carry the route across: the tab may be sitting on a deep link, and the address is
+            // the only part of it that went stale.
+            const here = location.pathname + location.search + location.hash;
+            if (hit.base && hit.base !== location.origin) { location.replace(hit.base + here); return hit; }
+            // connectToRegulator() zeroes this for the app. Here the same origin answered, so the count
+            // that just exhausted is still standing and initializeEventSource() would refuse to open.
+            sseReconnectAttempts = 0;
+            initializeEventSource();
+            return hit;
+        }
         connectToRegulator(hit);
         initializeEventSource();
         return hit;
@@ -5415,10 +5441,11 @@ function initializeEventSource() {
         return;
     }
     if (sseReconnectAttempts >= MAX_SSE_RECONNECTS) {
-        // Capacitor: a hotspot bounce hands the regulator a new IP, so retries
-        // against the old one exhausting is the EXPECTED signal — re-scan the
-        // network once (rediscoverAfterLoss shows the dialog itself on failure).
-        if (IS_CAPACITOR && !DEMO_MODE && !window._rediscoveryTried) {
+        // A hotspot bounce hands the regulator a new IP, so retries against the old one
+        // exhausting is the EXPECTED signal — re-scan the network once (rediscoverAfterLoss
+        // shows the dialog itself on failure). Browsers scan too; the app re-points itself,
+        // a browser navigates to whatever answered.
+        if (!DEMO_MODE && CAN_DISCOVER && !window._rediscoveryTried) {
             window._rediscoveryTried = true;
             console.log('[DISCOVERY] SSE retries exhausted — re-scanning for the regulator');
             rediscoverAfterLoss();
@@ -5568,10 +5595,9 @@ function initializeEventSource() {
                 // Native auto-retry heals a device that comes back at the SAME
                 // address; after a hotspot bounce it retries a dead IP forever.
                 // Enough consecutive failures with no 'open' between them → stop
-                // and re-scan (Capacitor only — browsers can't scan, and native
-                // retry is their best remaining strategy).
+                // and re-scan, in the app and in a browser alike.
                 sseConnectingErrors++;
-                if (IS_CAPACITOR && !DEMO_MODE && sseConnectingErrors >= MAX_SSE_CONNECTING_ERRORS && !discoveryInProgress) {
+                if (!DEMO_MODE && CAN_DISCOVER && sseConnectingErrors >= MAX_SSE_CONNECTING_ERRORS && !discoveryInProgress) {
                     this.close();
                     sseConnectingErrors = 0;
                     if (!window._rediscoveryTried) {
@@ -9146,6 +9172,10 @@ async function handleVesselInfoSave(event) {
             // A ✕-dismiss from a pre-flash session lives in sessionStorage and would mute a
             // factory-fresh device's popup in a reused tab — a true first save re-arms it.
             if (result.firstSave === true) sessionStorage.removeItem('socSeedDismissed');
+            // Kick the deferred-seed poll off HERE, not at its step below: the firmware's Core-1 write
+            // and the rest of this chain (Prerequisites screen, battery-defaults /exportConfig) then run
+            // against the same wall clock instead of end to end. Awaited at the step that shows it.
+            const _socSeedPolled = socSeedPoll().catch(() => null);   // started now, awaited later - never let it reject unhandled
             // First install only: true once Next is pressed on the Commissioning Prerequisites screen. ✕,
             // "I'll do this later" and a failed config read leave it false — no wizard — but the rest of
             // the chain still runs.
@@ -9162,7 +9192,9 @@ async function handleVesselInfoSave(event) {
                 .then(() => { if (result.firstSave === true) return maybeShowCommPrereqs().then(go => { _goWizard = go === true; }).catch(() => { }); })
                 // async, never blocks the save result. On a first install the Prerequisites screen has just
                 // closed, so the wait box covers the populator's own /exportConfig read (~1-2 s of device time).
-                .then(() => { if (result.firstSave === true) vesselNextStepWait(true); return maybeProposeBatteryDefaults(vesselData, _prevBatt, result.firstSave === true); })
+                // Armed on EVERY save now, not just the first: changing battery type/capacity/voltage makes a
+                // later save do that same read, and that gap used to run with no indicator at all.
+                .then(() => { vesselNextStepWait(true); return maybeProposeBatteryDefaults(vesselData, _prevBatt, result.firstSave === true); })
                 // Factory-fresh device: the firmware runs its deferred SoC seed on Core 1 some time
                 // after this save responds, so poll /socseed until the snapshot lands (a single
                 // fixed delay raced the Core-1 write and could miss the popup forever). Show it and
@@ -9170,13 +9202,8 @@ async function handleVesselInfoSave(event) {
                 // modal and socSeedMaybeAutoOpen suppresses itself over that modal, so a SoC popup
                 // deferred until after the wizard opened would never appear this session.
                 .then(async () => {
-                    if (result.firstSave === true) vesselNextStepWait(true);
-                    for (let i = 0; i < 6; i++) {
-                        if (i) await new Promise(res => setTimeout(res, 1000));   // check before sleeping: a snapshot already on file costs nothing
-                        _socSeedData = null;
-                        await socSeedFetch();
-                        if (_socSeedData && _socSeedData.snap) break;
-                    }
+                    vesselNextStepWait(true);   // every save, not just the first: the wait is the same length either way
+                    await _socSeedPolled;       // usually already resolved - the poll started when the save responded
                     vesselNextStepWait(false);
                     if (_socSeedData && _socSeedData.snap && !_socSeedData.ack && !sessionStorage.getItem('socSeedDismissed')) {
                         await new Promise(res => { _socSeedResolve = res; socSeedOpen(); });
@@ -10663,6 +10690,25 @@ async function socSeedFetch() {
     return _socSeedData;
 }
 
+// Ladder for the deferred-seed poll, in ms between tries. Front-loaded on purpose: the Core-1
+// write usually lands within a few hundred ms of the save responding, and a flat 1 s tick made
+// every one of those wait out the full second. Same total budget (~4.7 s) as the flat ladder.
+const SOCSEED_POLL_MS = [150, 250, 450, 750, 1200, 1900];
+
+// Poll /socseed until the firmware's deferred Core-1 seed lands, or the ladder runs out.
+// Started early and awaited later, so Core-1 time overlaps the rest of the save chain.
+async function socSeedPoll() {
+    if (sessionStorage.getItem('socSeedDismissed')) return null;   // nothing can be shown this session - don't spend the ladder
+    for (let i = 0; ; i++) {
+        _socSeedData = null;
+        await socSeedFetch();
+        if (_socSeedData && _socSeedData.snap) break;
+        if (i >= SOCSEED_POLL_MS.length) break;
+        await new Promise(res => setTimeout(res, SOCSEED_POLL_MS[i]));
+    }
+    return _socSeedData;
+}
+
 async function socSeedMaybeAutoOpen() {
     // Don't auto-pop over the first-run chain's screens or the commissioning modal (the chain shows this
     // popup itself, in sequence); still reachable from the header SOC readout.
@@ -10717,7 +10763,7 @@ async function socSeedOpen() {
 
 function socSeedRender(s) {
     const chemName = { lifepo4: 'LiFePO4', agm: 'AGM', lead_acid: 'Lead Acid' }[String(s.chem || '').toLowerCase()] || s.chem || 'unknown';
-    const secTitle = t => '<div style="font-size:11px; font-weight:600; letter-spacing:0.06em; color:#777; text-transform:uppercase; margin:16px 0 6px;">' + t + '</div>';
+    const secTitle = t => '<div style="font-size:11px; font-weight:600; letter-spacing:0.06em; color:#9a9a9a; text-transform:uppercase; margin:16px 0 6px;">' + t + '</div>';
     const eq = (lbl, math) => '<div style="padding:7px 0; border-bottom:1px solid #2a2a2a; font-size:13px;"><span style="color:#999; font-size:12px;">' + lbl + '</span>'
         + '<span style="display:block; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; color:#8fd9d4; margin-top:2px; overflow-x:auto; white-space:nowrap;">' + math + '</span></div>';
 
@@ -10765,16 +10811,16 @@ function socSeedRender(s) {
                 + '<div style="position:relative; height:26px; border-radius:5px; background:linear-gradient(to right,#46392a 0%,#3a3a2c 35%,#2a4340 100%); border:1px solid #333;">'
                 + '<div style="position:absolute; top:-5px; bottom:-5px; left:' + pos.toFixed(0) + '%; width:2px; background:#2ec4b6; box-shadow:0 0 6px rgba(46,196,182,0.67);">'
                 + '<span style="position:absolute; top:-15px; left:50%; transform:translateX(-50%); font-size:10px; color:#2ec4b6; white-space:nowrap;">' + Number(s.vocv).toFixed(2) + ' V</span></div></div>'
-                + '<div style="display:flex; justify-content:space-between; font-size:10px; color:#666; margin-top:4px;">'
+                + '<div style="display:flex; justify-content:space-between; font-size:10px; color:#a0a0a0; margin-top:4px;">'
                 + '<span>' + Number(s.vlo).toFixed(2) + ' V<br>' + s.plo + ' %</span>'
                 + '<span style="text-align:right;">' + Number(s.vhi).toFixed(2) + ' V<br>' + s.phi + ' %</span></div>'
-                + '<div style="font-size:11px; color:#777; margin-top:6px;">' + knee + '</div></div>';
+                + '<div style="font-size:11px; color:#9a9a9a; margin-top:6px;">' + knee + '</div></div>';
         }
     }
 
     const unlocked = !!settingsUnlocked;
     const override = '<div style="margin-top:16px; padding-top:12px; border-top:1px solid #333;">'
-        + '<div style="font-size:11px; font-weight:600; letter-spacing:0.06em; color:#777; text-transform:uppercase;">Manual override</div>'
+        + '<div style="font-size:11px; font-weight:600; letter-spacing:0.06em; color:#9a9a9a; text-transform:uppercase;">Manual override</div>'
         + '<div style="display:flex; gap:8px; align-items:center; margin-top:6px;">'
         + '<input type="number" id="socseed-override" min="0" max="100" step="1" placeholder="' + s.soc + '"' + (unlocked ? '' : ' disabled')
         + ' style="flex:1; min-width:0; background:#161616; color:#ddd; border:1px solid #444; border-radius:5px; padding:7px 10px; font-size:14px; box-sizing:border-box;">'
@@ -14595,7 +14641,7 @@ function applyStaleStyleByAge(elementId, ageMs, staleThreshold = STALE_THRESHOLD
 }
 // Active-limit cue: teal pill on the governing figure's label (ctrlLimiter 1 alt current,
 // 2 thermal, 3 CV voltage, 4 battery limit, 5 field at max duty → header duty readout,
-// 6 protection → RED duty pill + PROTECTION word left of the charge stage,
+// 6 protection → brown duty digits (no fill) + a lone brown P left of the charge stage,
 // 7 battery above target → voltage pill + muted BATT > TARGET word in the same slot,
 // 10 manual field and 11 min-field floor → duty pill, 11 also gets a MIN FIELD word).
 // 10 needs no word of its own: the field-status readout already prints MANUAL.
@@ -14626,7 +14672,8 @@ function updateHeaderLimiterColors(sa) {
     pill('lbl-alt-current', sa.measuredAmps, STALE_THRESHOLD_DEFAULT_MS, lim === 1);
     pill('lbl-batt-current', sa.bcur, STALE_THRESHOLD_DEFAULT_MS, lim === 4 || lim === 8);
     pill('duty-pill-wrap', sa.dutyCycle, STALE_THRESHOLD_DEFAULT_MS, lim === 5 || lim === 10 || lim === 11);
-    // Code 6 (protection): red duty pill + red PROTECTION word inline left of the stage word
+    // Code 6 (protection): brown duty digits + a brown P inline left of the stage word. Quieter
+    // than every cut state on purpose — the field is still live, output is only being trimmed.
     const dw = document.getElementById('duty-pill-wrap');
     const want6 = (sa.dutyCycle <= STALE_THRESHOLD_DEFAULT_MS) && lim === 6;
     if (dw && dw._protPill !== want6) { dw.classList.toggle('prot-pill', want6); dw._protPill = want6; }
@@ -16060,9 +16107,10 @@ function computeStripState() {
     const txt = id => (document.getElementById(id)?.textContent || '').trim().toUpperCase();
     const fs = txt('field-status');
     const cs = txt('charge-stage');
-    // Protection (ctrlLimiter 6) outranks every stage word — same freshness gate as the expanded banner
+    // Protection (ctrlLimiter 6) deliberately does NOT claim this slot: the field is still live and
+    // the stage word is still true, so it would cost the user the charge stage for a limit that is
+    // only trimming output. syncHeaderStrip() appends the brown P marker to whatever word wins here.
     const limFresh = (performance.now() - (window._ctrlLimiterAtMs || 0)) < 5000;
-    if (limFresh && Number(window._ctrlLimiter) === 6) return { label: 'PROTECT', cls: 'st-prot' };
     if (cs === 'COMMISSIONING')                    return { label: 'SETUP', cls: 'st-test' };
     if (cs === 'PLANT TEST' || cs === 'CURR TEST') return { label: 'TEST',  cls: 'st-test' };
     if (cs === 'WAVE GEN')                         return { label: 'WAVE',  cls: 'st-test' };
@@ -16126,6 +16174,15 @@ function syncHeaderStrip() {
     if (pill) {
         const st = computeStripState();
         pill.textContent = st.label;
+        // ctrlLimiter 6: the state word keeps its meaning and takes the same brown P the expanded
+        // header shows. Same 5 s freshness gate as computeStripState / updateHeaderLimiterColors.
+        const limFresh = (performance.now() - (window._ctrlLimiterAtMs || 0)) < 5000;
+        if (limFresh && Number(window._ctrlLimiter) === 6) {
+            const mark = document.createElement('span');
+            mark.className = 'hcs-p';
+            mark.textContent = 'P';
+            pill.appendChild(mark);
+        }
         pill.className = 'hcs-pill ' + st.cls;
     }
     const cb = document.getElementById('header-alternator-enable');
@@ -19706,9 +19763,9 @@ function showRecoveryOptions() {
     // shim doesn't false-flag this pre-creation existence check.
     if (document.querySelector('#recoveryDialog')) return;
 
-    // App: Retry reloads → discovery re-scans the network, so a moved IP heals.
-    // Browser: it can't scan, and after a hotspot bounce the regulator usually
-    // has a NEW address — say so plainly instead of letting Retry spin forever.
+    // Retry re-scans the network, so a moved address heals itself. By the time this dialog is
+    // up that scan has already run once and found nothing, so the text says what is left to
+    // check rather than promising another search will help.
     let addressHint;
     if (IS_CAPACITOR && phoneIsOffline()) {
         // The phone, not the regulator, is the problem — say so instead of sending
@@ -19719,7 +19776,9 @@ function showRecoveryOptions() {
         // The unit name is user text — placeholder here, textContent after insertion.
         addressHint = `Last reached <b id="recoveryUnitName"></b> at <b>${lastBase}</b>. Retry re-scans the network in case the regulator came back at a different address.`;
     } else {
-        addressHint = `This browser can't scan the network for the regulator. If it reconnected at a new address, <b>http://alternator.local</b> usually finds it; otherwise look up its IP in your router or phone-hotspot device list (hotspots assign 172.20.10.2&ndash;14). With two regulators on one network, <b>alternator.local</b> can land on either one &mdash; each also answers at its own <b>xreg-&lt;id&gt;.local</b> address, shown under Setup &#9656; System.`;
+        addressHint = (navigator.onLine === false)
+            ? `This computer reports <b>no network connection</b>. Turn WiFi on, or rejoin the boat's network, and the page reconnects on its own.`
+            : `Searched this network and the phone-hotspot range (172.20.10.2&ndash;14); nothing answered. Retry searches again. If the regulator runs on a phone's hotspot, check the hotspot is still switched on &mdash; a phone turns it off by itself once nothing is connected to it.`;
     }
 
     // Access-point users have no router to fall back on: offer the one-tap join
@@ -19766,6 +19825,19 @@ function showRecoveryOptions() {
     if (unitEl) unitEl.textContent = localStorage.getItem('xregDeviceName') || 'the regulator';
 }
 function retryConnection() {
+    if (!IS_CAPACITOR && CAN_DISCOVER && !DEMO_MODE) {
+        // Reloading a dead address throws away the only page that can still find the regulator:
+        // the cross-origin /identify probes need a running page. Search instead, and leave the
+        // dialog up showing it — a unit that answers elsewhere navigates the tab itself.
+        const btn = document.querySelector('#recoveryDialog button[onclick="retryConnection()"]');
+        if (btn) { btn.disabled = true; btn.textContent = 'Searching\u2026'; }
+        window._rediscoveryTried = false;
+        rediscoverAfterLoss(true).then(hit => {
+            if (hit) { closeRecovery(); return; }
+            if (btn) { btn.disabled = false; btn.textContent = 'Retry Connection'; }
+        });
+        return;
+    }
     closeRecovery();
     location.reload();
 }
@@ -25075,7 +25147,7 @@ const CX_RPM_LABELS = [
     'Engine RPM (last ~15 s) — settle before Run, then hands off the throttle',
     'Engine RPM (last ~15 s)',
     'Engine RPM (last ~15 s) — idle until armed, then snap the throttle',
-    'Engine RPM (last ~15 s)'   // stage 9 rewrites this per phase (steady-speed wait vs a pass's pace lane)
+    'Engine RPM (last ~15 s)'   // stage 9 points at the schedule chart in the body while a run is live
 ];
 
 // ── Loose engine-speed advisories ─────────────────────────────────────────────
@@ -25604,7 +25676,7 @@ function cxFinePrint(phase) {
     // Doc anchor keeps its original slug — the docs page carries a legacy <a id> so links from
     // already-shipped firmware still land on the section after the rename.
     case 7: return 'Two measurements at each held speed: the lowest field drive that produces any output (the tachometer keep-alive floor), and how fast output dies away after a protection cut. The field sits at its cut floor during the decay runs, so they cannot over-volt.' + cxDocLink('step-8-min-floor-field-decay');
-    case 9: return 'Holds the field at a fixed level and compares passes made in opposite directions. Output runs ahead of engine speed by a few tenths of a second — a rotor property — and the tracker needs that offset before it can grade anything recorded while the boat is moving. The field is sized at the speed you hold, which is the fastest the machine turns all run, so nothing later exceeds it. Three passes give two independent answers; if they disagree, the answer is not trusted.' + cxDocLink('step-10-charge-health-calibration');
+    case 9: return 'Holds the field at a fixed level and compares climbs and descents through the same speeds. Output runs ahead of engine speed by a few tenths of a second — a rotor property — and the tracker needs that offset before it can grade anything recorded while the boat is moving. The field is sized at the top of the first cycle, the fastest the machine turns all run, so nothing later exceeds it. The three cycles after it each give an independent answer; the closest two are averaged and the third is set aside. If even those two disagree, the answer is not trusted.' + cxDocLink('step-10-charge-health-calibration');
     case 8: return 'Parks the bus at a voltage target the alternator can definitely reach; your throttle snap then pushes it over and the over-voltage protection fires. Graded on how many times it clamps, how long recovery takes, and whether it settles afterward. It writes no settings, and it ends itself.' + cxDocLink('step-9-stress-test');
     default: return '';
   }
@@ -25770,7 +25842,7 @@ function closeCommissionModal() {
         if (cx.verifyRunning) cxGet('TuningMode=0').catch(() => { });
         if (cx.cvFitRunning) { cx.cvFitDone = true; if (cx.cvFitCdTimer) { clearInterval(cx.cvFitCdTimer); cx.cvFitCdTimer = null; } if (cxPollTimer) { clearTimeout(cxPollTimer); cxPollTimer = null; } cxGet('cvPlantFitCancel=1').catch(() => { }); }
         if (cx.fdRunning) { cx.fdRunning = false; cxGet('fieldCutCancel=1').catch(() => { }); }
-        if (cx.chc && cx.chc.running) { cx.chc.running = false; cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); }
+        if (cx.chc && cx.chc.running) { cx.chc.running = false; cxGet('chcCancel=1').catch(() => { }); }
         if (cx.cvs && cx.cvs.running) { cx.cvs.running = false; cxGet('cvStressCancel=1').catch(() => { }); }
         if (cx.kneeRunning) cxGet('cancelKneeSweep=1').catch(() => { });
         // Modal close is a sweep teardown path: freeze + persist the RPM ripple table (committed cells
@@ -25841,9 +25913,9 @@ function commissionRender() {
         if (done && hand) return '<span style="color:#c9a227;">⊘ ' + nm + '</span>';   // hand-marked complete
         if (done) return '<span style="color:#5a5;">✓ ' + nm + '</span>';
         if (hand) return '<span style="color:#c77d1a;">⤼ ' + nm + '</span>';            // skipped, outstanding
-        if (notInPlan) return '<span style="color:#666;text-decoration:line-through;">' + nm + '</span>';
+        if (notInPlan) return '<span style="color:#8a8a8a;text-decoration:line-through;">' + nm + '</span>';
         return '<span>' + (i + 1) + '. ' + nm + '</span>';
-    }).join('<span style="color:#444;"> › </span>');
+    }).join('<span style="color:#6e6e6e;"> › </span>');
     document.getElementById('commission-abort-row').style.display = (cx.phase > 0) ? 'block' : 'none';
     cxRpmStripVis();
     const rl = document.getElementById('cx-rpm-strip-label');
@@ -25852,13 +25924,8 @@ function commissionRender() {
         // Speed-referenced steps name the actual number once the upstream run has produced one.
         const ref = (cx.phase === 2 || cx.phase === 3) ? cxRpmRefFor(cx.phase) : 0;
         if (ref > 0) lbl = 'Engine RPM (last ~15 s) — hold near ' + Math.round(ref) + ' RPM during the sweep';
-        // Stage 9 names what the strip is being used for right now: finding a steady speed, then
-        // the pace lane the passes are drawn against.
-        if (cx.phase === 9 && cx.chc && cx.chc.running) {
-            const ph = (cx.chc.j && cx.chc.j.phase) || 0;
-            if (ph >= 3 && ph <= 5) lbl = 'Engine RPM (last ~15 s) — follow the shaded lane';
-            else if (ph <= 1) lbl = 'Engine RPM (last ~15 s) — waiting for a steady speed';
-        }
+        // Stage 9's instruction is the schedule chart in the body; the strip is only the recent trace.
+        if (cx.phase === 9 && cx.chc && cx.chc.running) lbl = 'Engine RPM (last ~15 s) — follow the shaded band in the chart below';
         rl.textContent = lbl;
     }
     const b = document.getElementById('commission-body');
@@ -26467,7 +26534,7 @@ function cxRenderKnee(b) {
     for (let i = 0; i < NSTEP; i++) {
         const done = i < anchors.length && !(drainPending && i === fdIdx), cur = !done && i === step && step < NSTEP;
         dots += '<span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:50%;margin-right:6px;font-size:12px;' +
-            (done ? 'background:#2a5a2a;color:#9f9;' : cur ? 'background:#234;color:#4a9eff;border:1px solid #4a9eff;' : 'background:#222;color:#778;') + '">' +
+            (done ? 'background:#2a5a2a;color:#9f9;' : cur ? 'background:#234;color:#4a9eff;border:1px solid #4a9eff;' : 'background:#222;color:#99aaaa;') + '">' +
             (done ? '✓' : (i + 1)) + '</span>';
     }
     body += '<div style="margin:4px 0 12px;">' + dots + '</div>';
@@ -26671,7 +26738,7 @@ function cxRenderPlant(b) {
             (cx.plantApplied ? '<br><span style="color:#5a5;">Applied.</span>' : '') + '</div>';
         body += cxRpmAdvisoryHtml(fit.rpmAvg || 0, fit.rpmMin || 0, fit.rpmMax || 0, cxRpmRefFor(2),
             'the Field curve',
-            'The test sizing carried over from it, and the fitted gains track engine speed. Re-run this step near that speed — or re-run the Field curve at the speed you prefer first (a higher speed, where the engine makes more power, is a good choice), then redo this step.');
+            'This sweep was sized from that run. Re-run it nearer that speed.');
     }
     // Speed instruction: name the Field curve's measured speed once known; before that, track the plan
     // (engine is already at cruise when Field curve ran this pass — Plant fit directly follows it).
@@ -26960,7 +27027,7 @@ function cxRenderVerify(b) {
         '</div>';
     body += cxRpmAdvisoryHtml(v.rpmAvg || 0, v.rpmMin || 0, v.rpmMax || 0, cxRpmRefFor(3),
         'the autotuning sweep',
-        'The gains being checked were fitted at that speed — re-run this check near it, or redo Current Control Autotuning at the speed you prefer, then verify again.');
+        'The gains being checked were fitted at that speed. Re-run this check nearer it.');
 
     // Visual trust gate: the numbers are only as good as the sweep looked, so before advancing the user
     // eyeballs feedback-vs-command on the just-framed 30 s Current Control plot. Replaces the old coherence
@@ -27115,8 +27182,8 @@ function cvLoopOmega() { return 2 * (CV_ALPHA || 0.08) * (CV_PI_ZERO || 0.5); }
 // cap-table-bounded re-run when one exists, and names the binding limit when one doesn't.
 function cxCVRemedyPanel(r) {
     const rpmTxt = r.rpmAtFit > 0 ? ('a higher RPM than the ~' + r.rpmAtFit + ' RPM you just tested at') : 'a higher RPM';
-    const keepWarn = '<p style="font-size:13px;color:#ddd;line-height:1.45;margin-top:8px;">Keep this result and it\'s usable, but the voltage-loop gains may be slightly off. If you later see poor voltage holding while the charger is maintaining a set voltage — the <strong>Absorption</strong> stage, or <strong>Float</strong> if you use it — you\'ll need to tune those gains by hand.</p>';
-    const liNote = '<p style="font-size:13px;color:#bbb;line-height:1.45;margin-top:8px;"><em>If your bank is lithium:</em> many lithium setups don\'t hold Absorption or Float at all, so precise voltage-loop tuning may not matter for your system. That\'s a judgment call — if you\'re unsure, contact X Engineering to talk it through.</p>';
+    const keepWarn = '<p style="font-size:13px;color:#ddd;line-height:1.45;margin-top:8px;">Keeping it is fine — the voltage-loop gains may just be slightly off. If voltage holding later looks poor in <strong>Absorption</strong> (or <strong>Float</strong>, if you use it), tune those gains by hand.</p>';
+    const liNote = '<p style="font-size:13px;color:#bbb;line-height:1.45;margin-top:8px;"><em>If your bank is lithium:</em> many lithium setups hold neither Absorption nor Float, so this tuning may not matter for your system. Unsure? Contact X Engineering.</p>';
     let html = '<div style="margin:12px 0;padding:10px 12px;background:#2a2618;border:1px solid #a80;border-radius:6px;">';
     if (r.rippleLimited) {
         html += '<p style="font-size:15px;line-height:1.5;"><strong>The measurement itself came out consistent</strong> — the test step moved the battery its full ~' + r.targetMv + ' mV probe amplitude. What triggered this caution is electrical ripple under the reading at this RPM: signal-to-ripple came out ~' + r.snr + ', below the 12 we like to see.</p>' +
@@ -27128,8 +27195,10 @@ function cxCVRemedyPanel(r) {
             '<button onclick="cxCVPlantStart()" class="btn-secondary btn-sm">Re-run</button></div>' +
             liNote;
     } else if (r.canBoost) {
-        html += '<p style="font-size:15px;line-height:1.5;"><strong>The reading rode on more noise than we\'d like.</strong> The test current didn\'t change the battery\'s voltage enough to measure cleanly, so this reading is rougher than it should be.</p>' +
-            '<p style="font-size:15px;line-height:1.5;">We can push a stronger current step to get a cleaner reading — about <strong>' + r.useDI + ' A</strong>, which is within what your alternator is set up to deliver. For the alternator to actually produce that current, <strong>run the engine at ' + rpmTxt + '</strong> before you retry — settle at the new speed first, and never change speed after the test starts. The stronger step will briefly move the battery\'s voltage proportionally more; the test\'s over-voltage and gassing guards stay active.</p>' +
+        html += '<p style="font-size:15px;line-height:1.5;"><strong>The reading came out noisier than we\'d like.</strong> The test current didn\'t move the battery\'s voltage enough to measure cleanly.</p>' +
+            '<p style="font-size:15px;line-height:1.5;">A stronger step — about <strong>' + r.useDI + ' A</strong> — should read clean, and it stays within your charge current limit. Over-voltage protection stays active.' +
+            (r.deliveryShort ? ' Last run the alternator came up short of the current the test asked for, so <strong>run the engine at ' + rpmTxt + '</strong> and let it settle before you retry.' : '') +
+            ' Don\'t change engine speed once the test starts.</p>' +
             '<div style="margin-top:8px;"><button onclick="cxCVPlantStart(' + r.useDI + ')" class="btn-primary btn-sm">Use a stronger step &amp; re-run</button> <button onclick="cxCVWeakAck()" class="btn-secondary btn-sm">Keep this result</button></div>' +
             keepWarn + liNote;
     } else {
@@ -27283,6 +27352,11 @@ function cvFitFromDevice(j) {
                    // Firmware honors a boosted diMax past the fixed ΔV target (unless it OV-fell-back),
                    // so "stronger" is judged against the step actually delivered, not the 40 A ceiling.
                    canBoost: (useDI > dI + 2) && !(w & 16),
+                   // Warn bit0: the alternator returned under 60% of the commanded step. This is the ONLY
+                   // evidence we have that speed was the binding constraint — capHead is the configured cap
+                   // table at this RPM, not a measurement of what the machine can make there. Without this
+                   // bit the step was delivered in full and asking for more RPM would be a guess.
+                   deliveryShort: !!(w & 1),
                    // Ripple-limited = the ONLY weak-signal warn is SNR and the battery moved essentially
                    // the full probe amplitude: the reading is sound, the noise floor under it was high.
                    rippleLimited: ((w & 3) === 2) && dV >= 0.8 * targetDV,
@@ -27329,12 +27403,12 @@ function cxCVEdgeTable(edges) {
     const rows = {};
     edges.forEach(e => { (rows[e.pulse] = rows[e.pulse] || {})[e.up ? 'up' : 'down'] = e; });
     const cell = e => {
-        if (!e) return '<span style="color:#666;">—</span>';
+        if (!e) return '<span style="color:#8a8a8a;">—</span>';
         if (e.stat === 0) return '<strong>' + e.k.toFixed(1) + '</strong>';
         const why = e.stat === 1 ? 'no clean current step under this edge'
                   : e.stat === 2 ? 'wrong-way — a load moved under this edge'
                   : 'timing hiccup starved the window';
-        return '<span style="color:#777;" title="' + why + '">drop</span>';
+        return '<span style="color:#9a9a9a;" title="' + why + '">drop</span>';
     };
     let t = '<table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;">' +
             '<tr style="color:#9ab;text-align:right;"><th style="text-align:left;font-weight:600;padding:2px 6px;">Pulse</th>' +
@@ -27503,7 +27577,7 @@ function cxFdFitChartMarkup(fit) {
         // overflow-anchor:none — this line rewrites off live RPM; letting the browser anchor scroll to it
         // makes the whole panel creep whenever the sentence re-wraps.
         '<div id="cx-fdfit-readout" style="font-size:13px;color:#ccc;margin-top:6px;line-height:1.4;min-height:3.6em;overflow-anchor:none;"></div>' +
-        '<div style="font-size:11px;color:#777;margin-top:2px;">The marker pins to live engine speed — drag on the chart to explore the lookup.</div></div>';
+        '<div style="font-size:11px;color:#9a9a9a;margin-top:2px;">The marker pins to live engine speed — drag on the chart to explore the lookup.</div></div>';
 }
 function cxFdFitChartDraw() {
     cxFdFitChart = null;
@@ -28289,10 +28363,10 @@ function cxGameDraw(c, t, rpm, curKey, dt) {
     for (let gv = Math.ceil(lo / step) * step; gv <= hi; gv += step) {
         const y = yOf(gv);
         g.strokeStyle = '#242428'; g.beginPath(); g.moveTo(axisX, y); g.lineTo(w - 6, y); g.stroke();
-        g.fillStyle = '#666'; g.fillText(gv, axisX - 5, y);
+        g.fillStyle = '#8f8f8f'; g.fillText(gv, axisX - 5, y);
     }
     g.textAlign = 'left'; g.textBaseline = 'top'; g.fillText('RPM', 6, 6);
-    g.textAlign = 'center'; g.fillStyle = '#888'; g.font = '700 13px -apple-system, sans-serif';
+    g.textAlign = 'center'; g.fillStyle = '#a8a8a8'; g.font = '700 13px -apple-system, sans-serif';
     g.fillText('Ripple Map', w / 2, 5);
     g.font = '10px -apple-system, sans-serif';
     // current-bin band highlight
@@ -28392,7 +28466,7 @@ function cxGameRipDraw() {
     const rip = (cxGame.rip || []).filter(p => p.alt > 0 || (!noBatt && p.batt > 0));
     g.font = '10px -apple-system, sans-serif';
     if (!rip.length) {
-        g.fillStyle = '#555'; g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.fillStyle = '#9a9a9a'; g.textAlign = 'center'; g.textBaseline = 'middle';
         g.fillText('No ripple committed yet — values appear here as pauses are admitted', w / 2, h / 2);
         return;
     }
@@ -28409,14 +28483,14 @@ function cxGameRipDraw() {
     for (let v = 0; v <= yMax + 1e-6; v += yStep) {
         const y = Y(v);
         g.strokeStyle = '#242428'; g.beginPath(); g.moveTo(padL, y); g.lineTo(w - padR, y); g.stroke();
-        g.fillStyle = '#666'; g.fillText(v.toFixed(1), padL - 4, y);
+        g.fillStyle = '#8f8f8f'; g.fillText(v.toFixed(1), padL - 4, y);
     }
     g.save(); g.translate(11, (padT + (h - padB)) / 2); g.rotate(-Math.PI / 2);
-    g.textAlign = 'center'; g.fillStyle = '#888'; g.font = '9px -apple-system, sans-serif';
+    g.textAlign = 'center'; g.fillStyle = '#a8a8a8'; g.font = '9px -apple-system, sans-serif';
     g.fillText('Ripple (A)', 0, 0); g.restore();
     g.font = '10px -apple-system, sans-serif';
     // x-axis = RPM (same span as the game's y-axis, idle at the left)
-    g.fillStyle = '#666'; g.textAlign = 'center'; g.textBaseline = 'bottom';
+    g.fillStyle = '#8f8f8f'; g.textAlign = 'center'; g.textBaseline = 'bottom';
     for (let r = 500; r <= 2000; r += 500) {
         const x = Xr(r);
         g.strokeStyle = '#242428'; g.beginPath(); g.moveTo(x, padT); g.lineTo(x, h - padB); g.stroke();
@@ -29009,6 +29083,7 @@ function cxRenderThresh(b) {
         : 'Set the margin so the over-current trip line clears the ripple measured in the Disturbances step. A 5 A margin works well for most installations.'
           + cxDocLink('step-6-fault-threshold-autotuning');
     let body = '<h2 style="font-size:15px;font-weight:600;margin:0 0 4px;">Fault Threshold Autotuning</h2>' +
+        '<div id="cxThrTopGo"></div>' +
         '<p style="font-size:13px;color:#b7b7b7;margin:0 0 12px;line-height:1.5;">' + introCopy + '</p>' +
         '<div id="cxThrNoFit"></div>' +
         '<div id="cxThrMarginRow" style="display:flex;align-items:center;gap:12px;margin:8px 0 14px;">' +
@@ -29049,7 +29124,18 @@ function cxRenderThresh(b) {
         '</div>' +
         '<div style="margin-top:16px;">' + cxNextBtn(true) + '</div>';
     b.innerHTML = body;
-    loadRipFit(() => { cxThrInit(); cxThrDraw(); cxDbndInit(); cxDbndDraw(); });
+    loadRipFit(() => { cxThrInit(); cxThrDraw(); cxDbndInit(); cxDbndDraw(); cxThrTopGoRender(); });
+}
+// Top-of-step accept-and-go. Both halves of this step already wrote their recommended values on
+// entry (cxThrInit / cxDbndInit), so this is a plain advance — nothing extra to apply. Rendered from
+// the init callback, not the body string, so it cannot be pressed before those writes have landed.
+// Withheld when either half has no measured fit: there the numbers are carried-over defaults rather
+// than a recommendation, and the hand-set prompts are the actual work.
+function cxThrTopGoRender() {
+    const el = document.getElementById('cxThrTopGo'); if (!el) return;
+    if (!(cx.thr && cx.thr.rf && cx.dbnd && cx.dbnd.rf)) { el.innerHTML = ''; return; }
+    el.innerHTML = '<button onclick="cxAdvance(true)" class="btn-primary" style="width:100%;padding:10px;margin:10px 0 4px;">Move ahead with defaults (Recommended)</button>' +
+        '<div style="font-size:12px;color:#8a8a8a;margin:0 0 14px;line-height:1.45;">Both margins below are already set from your own measurements and saved. Read on only if you want to change them.</div>';
 }
 // Seed wizard-local state from the fit + current device settings; on first entry apply the per-chemistry
 // margin recommendation (5 A lithium, 30 A non-lithium) plus the matching over-current ceiling (20/40 A),
@@ -29429,23 +29515,37 @@ function cxStressArmLive(j) {
            ' V</strong> · RPM peak <strong>' + Math.round(j.rpmMax) + '</strong>';
 }
 // ── Step 10 · Charge Health Calibration — the alternator's speed lead ─────────────────────────
-// One run. The operator holds a high speed of their own choosing, the tuned current loop sizes the
-// field THERE, the duty it settled on is frozen, and three passes follow — down to idle, back up,
-// down again. Sizing at the top is the point: it is the fastest the machine turns all run, so no
-// later moment can exceed what the sizing step already proved safe. The firmware fits passes 1+2
-// and 2+3 independently; the browser averages them and writes altLeadSec.
-const CHC_DISAGREE = 0.20;           // spread/mean above which the two halves are called disagreeing
+// One run on the firmware's clock, four throttle cycles drawn as a speed schedule the operator
+// follows: idle, climb at CHC_PACE_RPM_S to the test top (CHC_TOP_FRAC of the entered maximum
+// working RPM), hold, ease back to idle. Cycle 1 sizes the field at its top hold — the fastest the
+// machine turns all run, so nothing later exceeds what the sizing already proved safe — and the
+// duty is frozen there. Cycles 2-4 run at that frozen duty and the firmware fits each one on its
+// own; the browser averages the closest pair of the three and writes altLeadSec. The cycles chain
+// with no button press between them, deliberately: a button between cycles would pin the frozen
+// field while nobody is driving, which is where the 2026-09-09 bench run aborted.
+const CHC_PAIR_DISAGREE = 0.30;      // closest pair of cycle fits differing by more than this share of their mean is flagged
 // Firmware abort reasons a lower test current can relieve (7_functions.ino chcFinish strings). NOT the
-// "charge-rate limit at this speed is too small" refusal — lowering the share makes that one worse.
+// "charge-rate limit at the test speed is too small" refusal — lowering the share makes that one worse.
 const CHC_CEILING_RE = /output reached the charge-rate limit|bus reached the charge target|field reached its ceiling/;
-const CHC_PACE_RPM_S = 200;          // the pace asked for on screen: ~5 s per 1000 rpm
-const CHC_CUE_PULSE_MS = 3300;       // must equal the cxCuePulse animation's total run (1.1 s x 3)
+const CHC_TOP_FRAC = 0.50;           // test top as a share of maxWorkingRpm. MUST equal CHC_TOP_FRAC in Xregulator.ino
+const CHC_PACE_RPM_S = 200;          // schedule ramp pace, rpm/s (5 s per 1000 rpm). MUST equal CHC_PACE_RPM_S in Xregulator.ino
+const CHC_SETTLE_S = 10, CHC_SIZE_HOLD_S = 8, CHC_TOP_HOLD_S = 3, CHC_MIN_RAMP_S = 2, CHC_CYCLES = 4;   // MUST equal CHC_SETTLE_IDLE_MS / CHC_SIZE_HOLD_MS / CHC_TOP_HOLD_MS / CHC_MIN_RAMP_MS / 1+CHC_MEAS_CYCLES in Xregulator.ino
+const CHC_HOLD_ABOVE_IDLE = 400;     // the top must clear idle by this or the passes have no range. MUST equal CHC_HOLD_ABOVE_IDLE in Xregulator.ino
+// The corridor. band(t) = [min(target over t±slack) − m, max(target over t±slack) + m], m = max(floor, frac × target(t)).
+// The time smear adds nothing on a hold, opens the ramps by ±slack×pace and rounds the corners with no
+// per-segment special-casing; the speed cushion grows with speed because tracking error does (the
+// percentage takes over above floor/frac ≈ 1670 rpm). The firmware's "at the top" test for the freeze
+// uses the same floor/frac (CHC_TOL_FLOOR_RPM / CHC_TOL_FRAC), so in range on screen = sizing allowed.
+const CHC_LANE_SLACK_S = 2.0;        // the operator may be this far ahead of or behind the schedule
+const CHC_LANE_FLOOR_RPM = 250;      // speed cushion at low speed
+const CHC_LANE_FRAC = 0.15;          // speed cushion as a share of the target speed
 
 function cxChcInit() {
     if (cx.chc) return;
     let pct = 50;
     try { const v = parseInt(localStorage.getItem('chcTestPct') || '', 10); if (v >= 20 && v <= 80) pct = v; } catch (e) { }
-    cx.chc = { started: false, running: false, pct: pct, j: null, err: null, sawActive: false, done: null, prevPct: null };
+    cx.chc = { started: false, running: false, pct: pct, j: null, err: null, sawActive: false, done: null, prevPct: null,
+               maxRpm: 0, idle: 0, top: 0, rampS: 0, trail: [], inS: 0, totS: 0, _anim: false };
 }
 function cxChcPct(delta) {
     const c = cx.chc;
@@ -29453,60 +29553,237 @@ function cxChcPct(delta) {
     try { localStorage.setItem('chcTestPct', String(c.pct)); } catch (e) { }
     commissionRender();
 }
+// The entered maximum lives on the device (NVS maxWorkingRpm, echoed on CSV3) — a vessel fact, not a
+// browser preference. The session's own entry wins until the echo catches up.
+function cxChcMaxRpm() {
+    const c = cx.chc;
+    if (c.maxRpm > 0) return c.maxRpm;
+    const v = g_lastCsv3 ? parseInt(g_lastCsv3.maxWorkingRpm, 10) : NaN;
+    return (v > 0) ? v : 0;
+}
+function cxChcSetMax() {
+    const el = document.getElementById('chcMaxRpm');
+    if (!el) return;
+    const v = Math.round(parseFloat(el.value));
+    if (!(v >= 800 && v <= 8000)) { xAlert('Enter a maximum working RPM between 800 and 8,000.'); return; }
+    cx.chc.maxRpm = v;
+    cxGet('maxWorkingRpm=' + v).catch(() => { });
+    commissionRender();
+}
+function cxChcIdleGuess() { return (isFinite(cx.liveRpm) && cx.liveRpm > 0) ? cx.liveRpm : 700; }   // 700 = preview stand-in while the engine is off; the run itself takes idle from the firmware
+// ── The schedule ──
+function cxChcProfile(c) {
+    const fmt = v => Math.round(v).toLocaleString();
+    const seg = (d, a, b, l2, size) => ({ d: d, a: a, b: b, l2: l2, size: !!size });
+    const cycles = []; let t = 0;
+    for (let k = 1; k <= CHC_CYCLES; k++) {
+        const segs = [];
+        if (k === 1) segs.push(seg(CHC_SETTLE_S, c.idle, c.idle, 'Hold at idle — the run starts from here.'));
+        segs.push(seg(c.rampS, c.idle, c.top, 'Climbing to ' + fmt(c.top) + ' rpm.'));
+        segs.push(k === 1 ? seg(CHC_SIZE_HOLD_S, c.top, c.top, 'Holding — setting the field for the rest of the run.', true)
+                          : seg(CHC_TOP_HOLD_S, c.top, c.top, 'Holding at the top.'));
+        segs.push(seg(c.rampS, c.top, c.idle, 'Easing back down to idle.'));
+        const t0 = t;
+        for (const s of segs) { s.t0 = t; t += s.d; s.t1 = t; }
+        cycles.push({ k: k, t0: t0, t1: t, segs: segs });
+    }
+    return { idle: c.idle, top: c.top, cycles: cycles, total: t };
+}
+function cxChcCycleAt(P, t) { for (const cy of P.cycles) if (t < cy.t1) return cy; return P.cycles[P.cycles.length - 1]; }
+function cxChcSegAt(P, t) { const cy = cxChcCycleAt(P, t); for (const s of cy.segs) if (t < s.t1) return s; return cy.segs[cy.segs.length - 1]; }
+function cxChcTargetAt(P, t) {
+    const s = cxChcSegAt(P, Math.max(0, Math.min(t, P.total - 1e-6)));
+    const k = (s.d <= 0) ? 1 : Math.max(0, Math.min(1, (t - s.t0) / s.d));
+    return s.a + (s.b - s.a) * k;
+}
+function cxChcBandAt(P, t) {
+    let lo = Infinity, hi = -Infinity;
+    for (let k = -CHC_LANE_SLACK_S; k <= CHC_LANE_SLACK_S + 1e-9; k += 0.125) {
+        const v = cxChcTargetAt(P, Math.max(0, Math.min(P.total, t + k)));
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    const m = Math.max(CHC_LANE_FLOOR_RPM, CHC_LANE_FRAC * cxChcTargetAt(P, t));
+    return [lo - m, hi + m];
+}
+// Seconds since the run's clock started: the firmware's own runMs, carried forward locally between
+// polls, so the chart and the control loop read the same schedule. Before the first poll lands, the
+// Start press stands in.
+function cxChcRunT(c) {
+    const j = c.j;
+    if (j && j.active && j.runMs != null) return (j.runMs + (performance.now() - c._rxAt)) / 1000;
+    return (performance.now() - c._t0) / 1000;
+}
+// ── The chart: time on X (no labels), engine speed on Y, one cycle at a time ──
+function cxChcDraw(cv, c, P, t, rpm, running) {
+    const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 300, h = cv.clientHeight || 230;
+    if (!w) return;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    const L = 44, R = 12, T = 16, B = 12;
+    const cy = cxChcCycleAt(P, t);
+    const b0 = cxChcBandAt(P, 0)[0];
+    const yLo = Math.min(P.idle, b0) - 120, yHi = P.top + Math.max(500, 0.22 * P.top);
+    const X = tt => L + (w - L - R) * ((tt - cy.t0) / (cy.t1 - cy.t0));
+    const Y = r => T + (h - T - B) * (1 - (r - yLo) / (yHi - yLo));
+    const fmt = v => Math.round(v).toLocaleString();
+    g.strokeStyle = '#20262a'; g.lineWidth = 1;
+    g.fillStyle = '#6b7679'; g.font = '11px -apple-system,sans-serif'; g.textAlign = 'right';
+    const step = (P.top - P.idle) > 2200 ? 1000 : 500;
+    for (let r = Math.ceil(yLo / step) * step; r <= yHi; r += step) {
+        g.beginPath(); g.moveTo(L, Y(r)); g.lineTo(w - R, Y(r)); g.stroke();
+        g.fillText(fmt(r), L - 6, Y(r) + 4);
+    }
+    const N = 160, band = [], tgt = [];
+    for (let i = 0; i <= N; i++) {
+        const tt = cy.t0 + (cy.t1 - cy.t0) * i / N;
+        band.push([X(tt), cxChcBandAt(P, tt)]); tgt.push([X(tt), cxChcTargetAt(P, tt)]);
+    }
+    g.beginPath();
+    band.forEach((p, i) => i ? g.lineTo(p[0], Y(p[1][1])) : g.moveTo(p[0], Y(p[1][1])));
+    for (let i = band.length - 1; i >= 0; i--) g.lineTo(band[i][0], Y(band[i][1][0]));
+    g.closePath(); g.fillStyle = 'rgba(46,196,182,.14)'; g.fill();
+    g.strokeStyle = 'rgba(46,196,182,.3)'; g.lineWidth = 1;
+    g.beginPath(); band.forEach((p, i) => i ? g.lineTo(p[0], Y(p[1][1])) : g.moveTo(p[0], Y(p[1][1]))); g.stroke();
+    g.beginPath(); band.forEach((p, i) => i ? g.lineTo(p[0], Y(p[1][0])) : g.moveTo(p[0], Y(p[1][0]))); g.stroke();
+    g.setLineDash([5, 4]); g.strokeStyle = 'rgba(46,196,182,.7)'; g.lineWidth = 1.5;
+    g.beginPath(); tgt.forEach((p, i) => i ? g.lineTo(p[0], Y(p[1])) : g.moveTo(p[0], Y(p[1]))); g.stroke();
+    g.setLineDash([]);
+    const sz = cy.segs.find(s => s.size);
+    if (sz) {
+        const x = (X(sz.t0) + X(sz.t1)) / 2;
+        g.strokeStyle = 'rgba(240,165,0,.6)'; g.setLineDash([3, 3]);
+        g.beginPath(); g.moveTo(x, T + 13); g.lineTo(x, Y(P.top) - 24); g.stroke(); g.setLineDash([]);
+        g.fillStyle = '#c9a24a'; g.font = '10.5px -apple-system,sans-serif'; g.textAlign = 'center';
+        g.fillText('field sized here', x, T + 9);
+    }
+    g.fillStyle = '#8a9599'; g.font = '11px -apple-system,sans-serif'; g.textAlign = 'right';
+    g.fillText('Cycle ' + cy.k + ' of ' + CHC_CYCLES, w - R - 2, h - B - 4);
+    if (c.trail.length > 1) {
+        g.lineWidth = 2.2; g.lineCap = 'round';
+        for (let i = 1; i < c.trail.length; i++) {
+            const a = c.trail[i - 1], b = c.trail[i];
+            if (b[0] < cy.t0 || a[0] > cy.t1) continue;
+            const bd = cxChcBandAt(P, b[0]);
+            g.strokeStyle = (b[1] >= bd[0] && b[1] <= bd[1]) ? 'rgba(230,237,239,.9)' : 'rgba(240,165,0,.95)';
+            g.beginPath(); g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); g.stroke();
+        }
+    }
+    if (running && t <= P.total && isFinite(rpm) && rpm > 0) {
+        g.strokeStyle = 'rgba(255,255,255,.13)'; g.lineWidth = 1;
+        g.beginPath(); g.moveTo(X(t), T); g.lineTo(X(t), h - B); g.stroke();
+        const bd = cxChcBandAt(P, t);
+        cxChcBoat(g, X(t), Y(rpm), (rpm >= bd[0] && rpm <= bd[1]) ? '#2ec4b6' : '#f0a500');
+    }
+}
+function cxChcBoat(g, x, y, col) {
+    g.save(); g.translate(x, y); g.lineJoin = 'round';
+    g.fillStyle = col; g.strokeStyle = col; g.lineWidth = 1.4;
+    g.beginPath(); g.moveTo(-9, 0); g.lineTo(9, 0); g.lineTo(5, 4.5); g.lineTo(-6, 4.5); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(0, -1); g.lineTo(0, -15); g.stroke();
+    g.beginPath(); g.moveTo(1, -14); g.lineTo(1, -2); g.lineTo(8, -2); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(-1, -12); g.lineTo(-1, -2); g.lineTo(-7, -2); g.closePath(); g.fill();
+    g.restore();
+}
+// The live loop: the boat, the trail, the cue and the live rows are updated in place every frame.
+// Nothing here rebuilds the panel — a poll only refreshes cx.chc.j.
+function cxChcAnim() {
+    const c = cx && cx.chc;
+    if (!c || !c.running || cx.phase !== 9) { if (c) c._anim = false; return; }
+    requestAnimationFrame(cxChcAnim);
+    const cv = document.getElementById('chcLane');
+    if (!cv) return;
+    const now = performance.now(), dt = c._lastFrame ? Math.min(0.25, (now - c._lastFrame) / 1000) : 0;
+    c._lastFrame = now;
+    const P = cxChcProfile(c), t = cxChcRunT(c), rpm = cx.liveRpm;
+    const live = isFinite(rpm) && rpm > 0, over = t > P.total;
+    if (live && !over && (!c.trail.length || t - c.trail[c.trail.length - 1][0] > 0.08)) c.trail.push([t, rpm]);
+    const tg = cxChcTargetAt(P, t), bd = cxChcBandAt(P, t);
+    const ok = live && rpm >= bd[0] && rpm <= bd[1];
+    if (!over && live) { c.totS += dt; if (ok) c.inS += dt; }
+    const cue = document.getElementById('chcCue'), l1 = document.getElementById('chcCueL1'), l2 = document.getElementById('chcCueL2');
+    if (cue) cue.classList.toggle('off', live && !ok && !over);
+    if (l1) l1.textContent = over ? 'Done — handing the field back'
+        : !live ? 'Waiting for engine speed'
+        : ok ? 'Adjust throttle to keep engine speed in desired range'
+        : (rpm > tg ? 'Too fast — ease back into the range' : 'Too slow — bring it up into the range');
+    if (l2) l2.textContent = over ? '' : ('Cycle ' + cxChcCycleAt(P, t).k + ' of ' + CHC_CYCLES + ' · ' + cxChcSegAt(P, t).l2);
+    const j = c.j || {};
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('chcRpm', live ? Math.round(rpm).toLocaleString() + ' rpm' : '—');
+    set('chcInRange', c.totS > 1 ? Math.round(100 * c.inS / c.totS) + '%' : '—');
+    set('chcAmps', isFinite(j.amps) ? j.amps.toFixed(1) + ' A' : '—');
+    set('chcDuty', j.frozen ? j.duty.toFixed(1) + '% (frozen)' : (isFinite(j.duty) && j.phase >= 2 && j.phase <= 3) ? 'sizing for ' + j.targetA.toFixed(0) + ' A' : '—');
+    cxChcDraw(cv, c, P, t, rpm, true);
+}
 function cxChcStart() {
     const c = cx.chc;
+    if (!(cxChcMaxRpm() > 0)) return;
+    c.maxRpm = cxChcMaxRpm();
     c.started = true; c.running = true; c.err = null; c.j = null; c.sawActive = false; c.done = null; c.prevPct = null;
-    c._cuePhase = -1; c._cueAt = 0;
+    c.idle = cxChcIdleGuess(); c.top = Math.round(CHC_TOP_FRAC * c.maxRpm);
+    c.rampS = Math.max(CHC_MIN_RAMP_S, (c.top - c.idle) / CHC_PACE_RPM_S);
+    c.trail = []; c.inS = 0; c.totS = 0; c._lastFrame = 0;
     cxFieldArm();          // take field ownership → invalidates any pending deferred release
     cxStopPoll();
-    c._t0 = performance.now();
-    cxPaceLane(null);
+    c._t0 = performance.now(); c._rxAt = c._t0;
     commissionRender();
+    if (!c._anim) { c._anim = true; requestAnimationFrame(cxChcAnim); }
     cxGet('chcStart=1&chcPct=' + c.pct)
         .then(() => { setTrackedTimeout(cxChcPoll, 700); })
         .catch(e => { c.running = false; c.err = 'could not start — ' + e; commissionRender(); });
 }
-function cxChcCancel() { cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); }
+function cxChcCancel() { cxGet('chcCancel=1').catch(() => { }); }
 function cxChcPoll() {
     const c = cx && cx.chc;
     if (!c || !c.running) return;
-    // The operator paces the whole run by hand and the firmware ends itself — generous, and the
-    // wait-for-a-steady-speed phase alone is allowed two minutes.
+    // The schedule is bounded (under four minutes at the highest allowed top) and the firmware ends
+    // itself — generous.
     const giveUp = () => (performance.now() - (c._t0 || 0) > 600000);
     fetch(buildURL('/chc.json')).then(r => r.json()).then(j => {
-        const prevPhase = c.j ? c.j.phase : -1;
-        c.j = j;
+        c.j = j; c._rxAt = performance.now();
         if (j.active) {
             c.sawActive = true;
-            // Each pass gets its own lane, anchored where that pass began.
-            if (j.phase !== prevPhase) {
-                if (j.phase >= 3 && j.phase <= 5) cxPaceLane({ rpm: j.rpm, down: (j.phase !== 4) });
-                else cxPaceLane(null);
-            }
-            commissionRender(); setTrackedTimeout(cxChcPoll, 700); return;
+            // The chart is drawn against the firmware's schedule, not the browser's guess of it.
+            if (j.idleRpm > 0) c.idle = j.idleRpm;
+            if (j.top > 0) c.top = j.top;
+            if (j.rampMs > 0) c.rampS = j.rampMs / 1000;
+            setTrackedTimeout(cxChcPoll, 700); return;
         }
         // A "ready" from a run we never saw active is the PREVIOUS run's latched result (start was
         // refused: cooldown or another test) — same trap as the field-drain poll.
         if (j.ready && (c.sawActive || !j.ok)) {
             c.running = false;
-            cxPaceLane(null);
             c.done = j;
             // A run that stopped on a limit comes back one notch quieter, so Start over is a different attempt.
             if (!j.ok && c.pct > 20 && CHC_CEILING_RE.test(String(j.abort || ''))) { c.prevPct = c.pct; cxChcPct(-10); }
             commissionRender(); return;
         }
-        if (giveUp()) { c.running = false; cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); c.err = 'no result (timed out) — start over'; commissionRender(); return; }
+        if (giveUp()) { c.running = false; cxGet('chcCancel=1').catch(() => { }); c.err = 'no result (timed out) — start over'; commissionRender(); return; }
         setTrackedTimeout(cxChcPoll, 700);
     }).catch(() => {
-        if (giveUp()) { c.running = false; cxPaceLane(null); cxGet('chcCancel=1').catch(() => { }); c.err = 'lost connection during the run — start over'; commissionRender(); return; }
+        if (giveUp()) { c.running = false; cxGet('chcCancel=1').catch(() => { }); c.err = 'lost connection during the run — start over'; commissionRender(); return; }
         setTrackedTimeout(cxChcPoll, 1200);
     });
+}
+// The closest pair of the cycle fits that produced an answer; the third is the outlier and is not
+// used. rel = their difference over their mean (0 when both read no lead at all).
+function cxChcPair(lead) {
+    const v = (Array.isArray(lead) ? lead : []).map((x, i) => ({ i: i, x: Number(x) })).filter(o => o.x >= 0);
+    if (v.length < 2) return { n: v.length, idx: v.map(o => o.i), mean: v.length ? v[0].x : NaN, rel: 0 };
+    let a = v[0], b = v[1];
+    for (let p = 0; p < v.length; p++) for (let q = p + 1; q < v.length; q++)
+        if (Math.abs(v[p].x - v[q].x) < Math.abs(a.x - b.x)) { a = v[p]; b = v[q]; }
+    const mean = 0.5 * (a.x + b.x);
+    return { n: v.length, idx: [a.i, b.i], mean: mean, rel: mean > 0 ? Math.abs(a.x - b.x) / mean : 0 };
 }
 // Round to whole feed samples (all the delay line holds), write it, and move on.
 function cxChcApply() {
     const j = cx.chc.done;
     if (!j || !j.ok) return;
-    const q = Math.max(0, Math.min(1.0, Math.round(j.leadSec / 0.1) * 0.1));
+    const pr = cxChcPair(j.lead);
+    if (pr.n < 2) return;
+    const q = Math.max(0, Math.min(1.0, Math.round(pr.mean / 0.1) * 0.1));
     cxGet('altLeadSec=' + q.toFixed(2))
         .then(() => cxAdvance(true))
         .catch(e => xAlert('Could not save the calibration: ' + e));
@@ -29516,108 +29793,133 @@ function cxChcRestart() { cx.chc.done = null; cx.chc.started = false; cx.chc.err
 function cxRenderChc(b) {
     cxChcInit();
     const c = cx.chc, j = c.j || {};
-    const card = (big, hint) => '<div style="margin:10px 0;padding:10px 12px;background:#1c2530;border-radius:6px;">' +
-        '<div style="font-size:15px;">' + big + '</div>' +
-        (hint ? '<div style="margin-top:4px;color:#9aa;font-size:13px;">' + hint + '</div>' : '') + '</div>';
+    const fmt = v => Math.round(v).toLocaleString();
+    const topPct = Math.round(CHC_TOP_FRAC * 100) + '%';
     const okBox = t => '<div style="margin:10px 0;padding:8px 10px;background:#1e2a1e;border:1px solid #3a5a3a;border-radius:6px;color:#bdb;">' + t + '</div>';
     const warnBox = t => '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' + t + '</div>';
-    // The loud cue: full-bleed across the panel body, big type, three attention pulses on entry.
-    // These are the only messages that tell the operator to do something RIGHT NOW, mid-run.
-    if (c._cuePhase !== j.phase) { c._cuePhase = j.phase; c._cueAt = Date.now(); }
-    const cueAge = Date.now() - (c._cueAt || 0);
-    const cue = (l1, l2) => '<div class="cx-cue" style="' +
-        (cueAge < CHC_CUE_PULSE_MS ? 'animation-delay:-' + cueAge + 'ms' : 'animation:none') + '">' +
-        '<div class="cx-cue-l1">' + l1 + '</div>' +
-        (l2 ? '<div class="cx-cue-l2">' + l2 + '</div>' : '') + '</div>';
-    const live = (lab, val) => '<div style="display:flex;justify-content:space-between;font-size:13px;color:#9aa;margin:8px 0 0;font-variant-numeric:tabular-nums;">' +
-        '<span>' + lab + '</span><b style="color:#e6edef;">' + val + '</b></div>';
+    const live = (lab, id, val) => '<div style="display:flex;justify-content:space-between;font-size:13px;color:#9aa;margin:8px 0 0;font-variant-numeric:tabular-nums;">' +
+        '<span>' + lab + '</span><b id="' + id + '" style="color:#e6edef;">' + val + '</b></div>';
     const pctRow = note => '<div style="display:flex;align-items:center;gap:8px;margin:12px 0 4px;">' +
         '<span style="font-size:13px;color:#9aa;">Test current</span>' +
         '<button onclick="cxChcPct(-10)" class="btn-secondary" style="width:30px;padding:4px 0;">&minus;</button>' +
         '<span style="min-width:74px;text-align:center;color:#2ec4b6;font-weight:600;font-variant-numeric:tabular-nums;">' + c.pct + '%</span>' +
         '<button onclick="cxChcPct(10)" class="btn-secondary" style="width:30px;padding:4px 0;">+</button></div>' +
         '<div style="color:#9aa;font-size:12.5px;margin:0 0 12px;">' + note + '</div>';
+    // The chart sits in a relative box so the Start overlay can be centred ON the plot.
+    const chart = overlay => '<div style="position:relative;margin:6px 0 0;">' +
+        '<canvas id="chcLane" style="display:block;width:100%;height:230px;border-radius:8px;background:#0f1416;"></canvas>' +
+        (overlay ? '<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;background:rgba(15,20,22,.55);border-radius:8px;text-align:center;padding:0 16px;">' + overlay + '</div>' : '') +
+        '</div>';
     let body = '';
     if (c.err) body += warnBox('<strong>' + c.err + '</strong>');
 
-    // 1 · opening
+    // 1 · setup: the maximum working RPM, the test current, the schedule preview, Start
     if (!c.started && !c.done) {
-        body += '<p style="font-size:15px;line-height:1.5;">One steady speed, then three slow throttle passes.</p>';
-        body += pctRow(c.pct === 50
-            ? 'Half the charge-rate limit for the speed you hold. Lower it only if a run stops early and you have to repeat this exercise.'
-            : 'Share of the charge-rate limit for the speed you hold.');
-        body += '<button onclick="cxChcStart()" class="btn-primary" style="width:100%;padding:9px;">Start</button>';
-        b.innerHTML = body; return;
-    }
-
-    // running: 2 · pick the speed, 3 · sizing, 4/5/6 · the three passes, 7 · easing out
-    if (c.running) {
-        if (!j.phase || j.phase === 1) {
-            body += cue('Bring the engine to three-quarters of maximum working RPM');
-            const held = Math.max(0, Math.round((j.holdMs || 0) / 1000));
-            body += live('Holding steady', held + ' of 4 s');
-            if (j.rpm > 0 && j.idleRpm > 0 && j.rpm < j.idleRpm + 400 && j.rpm > j.idleRpm + 60)
-                body += '<div style="color:#f0a500;font-size:13px;margin-top:6px;">Too close to idle — there needs to be room to come down.</div>';
-        } else if (j.phase === 2) {
-            body += card('<strong>Keep holding that speed.</strong>', 'Bringing output up to ' + j.targetA.toFixed(0) + ' A.');
-            const frac = (j.targetA > 0) ? Math.max(0, Math.min(1, j.amps / j.targetA)) : 0;
-            body += '<div style="height:8px;background:#0f1416;border-radius:5px;overflow:hidden;margin:9px 0 4px;">' +
-                '<div style="height:100%;width:' + (frac * 100).toFixed(0) + '%;background:linear-gradient(90deg,#14b8af,#2ec4b6);border-radius:5px;"></div></div>' +
-                '<div style="display:flex;justify-content:space-between;font-size:12px;color:#8a9599;font-variant-numeric:tabular-nums;">' +
-                '<span>' + j.amps.toFixed(1) + ' A</span><span>of ' + j.targetA.toFixed(0) + ' A</span></div>';
-            body += live('Field', (j.duty > 0 ? j.duty.toFixed(1) : '—') + '%');
-        } else if (j.phase === 3) {
-            body += cue('Now bring it down to idle', 'About 5 seconds for every 1,000 rpm.');
-        } else if (j.phase === 4) {
-            body += cue('Now back up', 'Same pace, back to ' + cxRpmStr(j.holdRpm) + ' rpm.');
-        } else if (j.phase === 5) {
-            body += cue('Now back down again', 'Last one, down to idle.');
-        } else {
-            body += card('<strong>Done</strong> — handing the field back.');
+        const maxRpm = cxChcMaxRpm();
+        const top = maxRpm > 0 ? Math.round(CHC_TOP_FRAC * maxRpm) : 0;
+        body += '<p style="font-size:15px;line-height:1.5;margin:0 0 6px;">What is your maximum working RPM?</p>';
+        body += '<div style="display:flex;align-items:center;gap:9px;margin:6px 0;">' +
+            '<input type="number" id="chcMaxRpm" value="' + (maxRpm > 0 ? maxRpm : '') + '" min="800" max="8000" step="50" inputmode="numeric"' +
+            ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();cxChcSetMax();}"' +
+            ' style="width:110px;background:#0f1416;border:1px solid #383e42;border-radius:6px;color:#e6edef;padding:8px 10px;font-size:16px;font-variant-numeric:tabular-nums;">' +
+            '<button onclick="cxChcSetMax()" class="btn-primary" style="padding:8px 16px;">Enter</button></div>';
+        body += '<div style="font-size:13px;color:#9aa;margin:2px 0 10px;">Test will max out at ' + topPct + ' of max (<b style="color:#2ec4b6;font-variant-numeric:tabular-nums;">' +
+            (top > 0 ? fmt(top) : '—') + '</b> RPM)</div>';
+        // Range check at entry time, against the idle the engine is showing now — the same guard the
+        // firmware applies at Start, said here so a too-low number is caught before any throttle work.
+        const idleNow = (isFinite(cx.liveRpm) && cx.liveRpm > 0) ? cx.liveRpm : 0;
+        let tooLow = false;
+        if (top > 0 && idleNow > 0 && top < idleNow + CHC_HOLD_ABOVE_IDLE) {
+            tooLow = true;
+            const need = Math.ceil((idleNow + CHC_HOLD_ABOVE_IDLE) / CHC_TOP_FRAC / 50) * 50;
+            body += warnBox('<strong>Too low for the test to have room.</strong> ' + topPct + ' of ' + fmt(maxRpm) + ' is ' + fmt(top) +
+                ' rpm, only ' + fmt(top - idleNow) + ' rpm above idle (' + fmt(idleNow) + '). The passes need at least ' + CHC_HOLD_ABOVE_IDLE +
+                ' rpm of range, so the maximum would have to be ' + fmt(need) + ' or higher.');
         }
-        body += '<div style="margin-top:10px;"><button onclick="cxChcCancel()" class="btn-danger-ghost btn-sm">Cancel</button></div>';
-        b.innerHTML = body; return;
+        body += pctRow(c.pct === 50
+            ? 'Half the charge-rate limit at the test top. Lower it only if a run stops early and you have to repeat this exercise.'
+            : 'Share of the charge-rate limit at the test top.');
+        c.idle = cxChcIdleGuess(); c.top = top;
+        c.rampS = top > 0 ? Math.max(CHC_MIN_RAMP_S, (top - c.idle) / CHC_PACE_RPM_S) : 0;
+        const overlay = !(maxRpm > 0)
+            ? '<div style="font-size:13px;color:#b9c6c8;">Enter your maximum working RPM first</div>'
+            : tooLow
+                ? '<div style="font-size:13px;color:#f0a500;">The entered maximum is too low for the test — see above</div>'
+                : '<button onclick="cxChcStart()" class="btn-primary" style="padding:13px 40px;font-size:16px;box-shadow:0 4px 18px rgba(0,0,0,.45);">Start</button>' +
+                  '<div style="font-size:12.5px;color:#b9c6c8;">Bring the engine to idle first</div>';
+        body += chart(overlay);
+        body += '<div style="font-size:12.5px;color:#8a9599;margin:8px 0 0;">The shaded band is the speed to be at; the boat is you. ' + CHC_CYCLES + ' cycles, no stopping between them.</div>';
+        b.innerHTML = body;
+        const cv = document.getElementById('chcLane');
+        if (cv && top > 0) cxChcDraw(cv, c, cxChcProfile(c), 0, NaN, false);
+        return;
     }
 
-    // 8 · stopped early
+    // 2 · running: the chart is the instruction; the cue and the live rows are updated in place by cxChcAnim
+    if (c.running) {
+        body += chart(null);
+        body += '<div id="chcCue" class="cx-cue cx-cue-lane"><div class="cx-cue-l1" id="chcCueL1">Adjust throttle to keep engine speed in desired range</div>' +
+            '<div class="cx-cue-l2" id="chcCueL2">Cycle 1 of ' + CHC_CYCLES + '</div></div>';
+        body += live('Engine speed', 'chcRpm', '—');
+        body += live('In range', 'chcInRange', '—');
+        body += live('Output', 'chcAmps', '—');
+        body += live('Field', 'chcDuty', '—');
+        body += '<div style="margin-top:10px;"><button onclick="cxChcCancel()" class="btn-danger-ghost btn-sm">Cancel</button></div>';
+        b.innerHTML = body;
+        if (!c._anim) { c._anim = true; requestAnimationFrame(cxChcAnim); }
+        return;
+    }
+
+    // 3 · stopped early. A run that finished with exactly one cycle fitted is not ok on the firmware
+    //   side (nothing to check it against) but still has answers worth showing — it takes the result
+    //   screen below, which says so and stores nothing.
     const d = c.done;
-    if (!d || !d.ok) {
+    if (!d || !(d.ok || cxChcPair(d.lead).n === 1)) {
         body += warnBox('<strong>Stopped early.</strong> ' + ((d && d.abort) || 'no reason reported') + '.');
         body += pctRow(c.prevPct != null ? 'Was ' + c.prevPct + '%. Lowered one notch, since the run stopped on a limit.' : '');
         body += '<button onclick="cxChcRestart()" class="btn-primary" style="width:100%;padding:9px;">Start over</button>';
         b.innerHTML = body; return;
     }
 
-    // 9 · result
-    const q = Math.max(0, Math.min(1.0, Math.round(d.leadSec / 0.1) * 0.1));
-    const halves = [d.lead12, d.lead23].filter(v => v >= 0);
-    const spread = (halves.length > 1) ? Math.abs(halves[0] - halves[1]) : 0;
-    const rel = (halves.length > 1 && d.leadSec > 0) ? spread / d.leadSec : 0;
-    const disagree = rel > CHC_DISAGREE;
-    body += disagree
-        ? warnBox('<strong>The two halves disagree.</strong> Run it again.')
-        : okBox('<strong>Measured: ' + d.leadSec.toFixed(2) + ' s</strong> — how far output runs ahead of engine speed here.');
+    // 4 · result: three independent answers, the closest two averaged, the third marked as not used
+    const pr = cxChcPair(d.lead);
+    const q = Math.max(0, Math.min(1.0, Math.round(pr.mean / 0.1) * 0.1));
+    if (pr.n < 2) {
+        body += warnBox('<strong>Only one cycle gave an answer</strong> — there is nothing to check it against, so nothing is stored. Run it again.');
+    } else if (pr.rel > CHC_PAIR_DISAGREE) {
+        body += warnBox('<strong>The two closest answers still differ by ' + Math.round(100 * pr.rel) + '%.</strong> Run it again.');
+    } else {
+        body += okBox('<strong>Measured: ' + pr.mean.toFixed(2) + ' s</strong> — how far output runs ahead of engine speed here' +
+            (pr.n === 2 ? ' (two of three cycles gave an answer)' : '') + '.');
+    }
     const th = t => '<th style="text-align:left;font-size:11px;color:#8a9599;padding:3px 6px 3px 0;">' + t + '</th>';
     const td = (t, cls) => '<td style="padding:4px 6px 4px 0;border-top:1px solid #2a2f33;' + (cls || '') + '">' + t + '</td>';
-    const range = cxRpmStr(d.idleRpm) + ' – ' + cxRpmStr(d.holdRpm) + ' rpm';
+    const leads = Array.isArray(d.lead) ? d.lead : [];
     body += '<table style="width:100%;border-collapse:collapse;font-size:13px;margin:8px 0 2px;font-variant-numeric:tabular-nums;">' +
-        '<tr>' + th('From') + th('Speed range') + th('Answer') + '</tr>' +
-        '<tr>' + td('Passes 1 &amp; 2') + td(range) + td(d.lead12 >= 0 ? d.lead12.toFixed(2) + ' s' : 'none', 'color:#2ec4b6;') + '</tr>' +
-        '<tr>' + td('Passes 2 &amp; 3') + td(range) + td(d.lead23 >= 0 ? d.lead23.toFixed(2) + ' s' : 'none', 'color:#2ec4b6;') + '</tr>' +
-        '</table>';
+        '<tr>' + th('Cycle') + th('Answer') + th('Used') + '</tr>';
+    for (let i = 0; i < 3; i++) {
+        const v = Number(leads[i]);
+        const used = pr.idx.indexOf(i) >= 0 && pr.n >= 2;
+        body += '<tr>' + td('Cycle ' + (i + 2)) +
+            td(v >= 0 ? v.toFixed(2) + ' s' : 'none', used ? 'color:#2ec4b6;' : 'color:#8a9599;') +
+            td(used ? 'yes' : (v >= 0 ? (pr.n >= 2 ? 'not used' : 'no cross-check') : '—'), used ? '' : 'color:#8a9599;') + '</tr>';
+    }
+    body += '</table>';
     const kv = (k, v) => '<hr style="border:none;border-top:1px solid #333;margin:9px 0;">' +
         '<div style="display:flex;justify-content:space-between;font-size:13px;"><span>' + k +
         '</span><span style="color:#2ec4b6;font-variant-numeric:tabular-nums;">' + v + '</span></div>';
+    body += kv('Speed range', fmt(d.idleRpm) + ' – ' + fmt(d.top) + ' rpm');
     body += kv('Field held at', d.duty.toFixed(1) + '%');
     body += kv('Output range', d.minA.toFixed(0) + ' – ' + d.peakA.toFixed(0) + ' A');
     // Reference only — nothing is done with the pace figures, they just say what the operator gave.
     if (d.rateAvg >= 0)
         body += kv('Throttle pace', 'min ' + d.rateMin.toFixed(0) + ' · avg ' + d.rateAvg.toFixed(0) +
                    ' · max ' + d.rateMax.toFixed(0) + ' rpm/s');
-    body += kv('Stored value', q.toFixed(2) + ' s');
+    if (pr.n >= 2) body += kv('Stored value', q.toFixed(2) + ' s');
     body += '<hr style="border:none;border-top:1px solid #333;margin:9px 0;">';
-    body += '<div style="margin-top:12px;"><button onclick="cxChcApply()" class="btn-primary" style="width:100%;padding:9px;">Approve and finish</button></div>';
-    body += '<div style="margin-top:8px;"><button onclick="cxChcRestart()" class="btn-secondary btn-sm">Run it again</button></div>';
+    if (pr.n >= 2) body += '<div style="margin-top:12px;"><button onclick="cxChcApply()" class="btn-primary" style="width:100%;padding:9px;">Approve and finish</button></div>';
+    body += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;"><button onclick="cxChcRestart()" class="' + (pr.n >= 2 ? 'btn-secondary' : 'btn-primary') + ' btn-sm">Run it again</button>' +
+        (pr.n < 2 ? cxNextBtn(false, false) : '') + '</div>';
     b.innerHTML = body;
 }
 function cxRpmStr(v) { return (v > 0) ? Math.round(v).toLocaleString() : '—'; }
@@ -30046,27 +30348,27 @@ function renderCommissionStatus(state, phase, mask, manual) {
             let badge;
             if (done && hand) {
                 // Hand-marked complete (unmeasured): counts toward COMMISSIONED but flagged so it's honest.
-                badge = '<span style="font-size:20px;font-weight:800;color:#b8860b;line-height:1;">⊘</span>' +
-                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:#b8860b;">MANUAL</span>';
+                badge = '<span style="font-size:20px;font-weight:800;color:var(--cx-manual);line-height:1;">⊘</span>' +
+                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:var(--cx-manual);">MANUAL</span>';
             } else if (done) {
-                badge = '<span style="font-size:22px;font-weight:800;color:#2e7d32;line-height:1;">✓</span>' +
-                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:#2e7d32;">DONE</span>';
+                badge = '<span style="font-size:22px;font-weight:800;color:var(--cx-done);line-height:1;">✓</span>' +
+                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:var(--cx-done);">DONE</span>';
             } else if (current) {
                 const lbl = _panelOpen ? 'RUNNING' : 'RESUME';
-                badge = '<span style="font-size:16px;color:#1565c0;line-height:1;">▶</span>' +
-                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:#1565c0;">' + lbl + '</span>';
+                badge = '<span style="font-size:16px;color:var(--cx-running);line-height:1;">▶</span>' +
+                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:var(--cx-running);">' + lbl + '</span>';
             } else if (hand) {
                 // Skipped for now: outstanding (still nags) but explicitly set aside, not merely un-reached.
-                badge = '<span style="font-size:16px;color:#c77d1a;line-height:1;">⤼</span>' +
-                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:#c77d1a;">SKIPPED</span>';
+                badge = '<span style="font-size:16px;color:var(--cx-skipped);line-height:1;">⤼</span>' +
+                        '<span style="font-size:9px;font-weight:700;letter-spacing:.06em;color:var(--cx-skipped);">SKIPPED</span>';
             } else {
                 badge = '<span style="font-size:16px;color:var(--text-muted);line-height:1;">○</span>';
             }
             // A box the plan ticked itself says why: locked = a ticked feeder will stale it, so it must re-run;
             // pulled = a ticked step reads it and it has not been measured.
             let planNote = '';
-            if (locked) planNote = '<br><span style="font-size:12px;color:#b8860b;">Runs again: ' + lockNames + ' is ticked, and re-measuring it makes this step\'s result stale.</span>';
-            else if (cxPlanPulled.has(i)) planNote = '<br><span style="font-size:12px;color:#b8860b;">Added: a step you selected reads this one\'s measurements, and it has not been measured yet.</span>';
+            if (locked) planNote = '<br><span style="font-size:12px;color:var(--cx-manual);">Runs again: ' + lockNames + ' is ticked, and re-measuring it makes this step\'s result stale.</span>';
+            else if (cxPlanPulled.has(i)) planNote = '<br><span style="font-size:12px;color:var(--cx-manual);">Added: a step you selected reads this one\'s measurements, and it has not been measured yet.</span>';
             return '<div style="display:flex;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--border);">' +
                 '<input type="checkbox" ' + cbAttrs + 'onchange="cxToggleStage(' + i + ', this.checked)" title="' + cbTitle + '" style="flex:0 0 auto;cursor:' + (prep ? 'default' : 'pointer') + ';">' +
                 '<span style="flex:1;min-width:0;line-height:1.45;">' +

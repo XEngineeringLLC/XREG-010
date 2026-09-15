@@ -172,6 +172,16 @@ body.ap-mode   #cloudfeatures .sub-tab-content {
   /* Border radius */
   --text-muted: #5f6368;
   /* Muted secondary text (AA contrast on --card-light) */
+  --accent-fill: #00807a;
+  /* Filled-pill background. These pills carry WHITE ink in light mode, and white on the brand
+     --accent is only 3.2:1 — the fill has to be darker to clear 4.5. Dark mode puts near-black
+     ink on the same pill, so it keeps the brighter accent (see .dark-mode below). */
+  --cx-done: #2e7d32;
+  --cx-running: #1565c0;
+  --cx-manual: #8a6508;
+  --cx-skipped: #95590f;
+  /* Commissioning checklist badges. No single colour clears 4.5:1 on BOTH #fff and #1e1e1e —
+     the best any colour can do on both is 4.08 — so these are a deliberate per-theme pair. */
 }
 
 /* Reserve the scrollbar gutter on every tab so the sticky header is the same width whether
@@ -379,9 +389,11 @@ textarea {
   min-height: 1.2em;
 }
 
-/* Protection cue (ctrlLimiter 6): red word inline LEFT of the charge-stage word — same line,
-   so showing/hiding it never changes header height (it grows into the brand row's empty
-   middle). Below 360px viewport the full word swaps to a lone red P so the row can't wrap. */
+/* Protection cue (ctrlLimiter 6): a lone brown P inline LEFT of the charge-stage word — same
+   line, so showing/hiding it never changes header height (it grows into the brand row's empty
+   middle). Deliberately the quietest cue in the header: the field is still live and charging,
+   a protection is only trimming output, so nothing here is red and nothing pulses. Red and
+   motion are reserved for the states where the field has actually been cut. */
 .stage-row {
   display: flex;
   align-items: baseline;
@@ -392,14 +404,11 @@ textarea {
   font-size: 11px;
   letter-spacing: 0.08em;
   font-weight: 700;
-  color: #e53935;
+  color: #7a4a14;
   white-space: nowrap;
-  animation: stage-pulse 1.5s ease-in-out infinite;
 }
-.prot-word .pw-short { display: none; }
-@media (max-width: 359px) {
-  .prot-word .pw-full { display: none; }
-  .prot-word .pw-short { display: inline; }
+.dark-mode .prot-word {
+  color: #d9a066;
 }
 
 /* Zero-output stand-down note (ctrlLimiter 7): informational, not an alarm — no pulse, muted color */
@@ -1108,7 +1117,7 @@ input[type="submit"]:active,
 .btn-primary,
 input[type="submit"] {
   background: rgba(0, 161, 154, 0.14) !important;
-  color: #00867f !important;
+  color: #00635e !important;
   border-color: rgba(0, 161, 154, 0.28);
 }
 input[type="submit"] {
@@ -1130,10 +1139,14 @@ input[type="submit"]:hover {
    action reads as the obvious thing to click against the hardcoded dark panel. The
    tonal .btn-primary looks greyed-out here, worst in light mode where the panel stays
    dark but the button keeps the dark-teal light-mode text. Scoped to these two dark
-   modals (the wizard and its RPM-alignment entry step) so the global tonal button
+   modals (the wizard and the pre-wizard screens) so the global tonal button
    (and the light-area "Start commissioning…" button) is unchanged. */
 #commission-modal-panel .btn-primary,
-#rpmalign-modal-overlay .btn-primary {
+#rpmalign-modal-overlay .btn-primary,
+#commprep-modal-overlay .btn-primary,
+#rpmcap-modal-overlay .btn-primary,
+#socseed-modal-panel .btn-primary,
+#battdef-modal-overlay .btn-primary {
   background: linear-gradient(180deg, #14b8af 0%, #00908a 100%) !important;
   color: #fff !important;
   border-color: #16c2b8 !important;
@@ -1145,7 +1158,11 @@ input[type="submit"]:hover {
   max-width: none;
 }
 #commission-modal-panel .btn-primary:hover,
-#rpmalign-modal-overlay .btn-primary:hover {
+#rpmalign-modal-overlay .btn-primary:hover,
+#commprep-modal-overlay .btn-primary:hover,
+#rpmcap-modal-overlay .btn-primary:hover,
+#socseed-modal-panel .btn-primary:hover,
+#battdef-modal-overlay .btn-primary:hover {
   background: linear-gradient(180deg, #18c4ba 0%, #00a39c 100%) !important;
   box-shadow: 0 4px 16px rgba(0, 161, 154, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.25);
 }
@@ -1217,14 +1234,24 @@ a.btn-secondary {
    an enabled one. */
 #sysid-modal-panel .btn-secondary,
 #test-panel .btn-secondary,
-#commission-modal-panel .btn-secondary {
+#commission-modal-panel .btn-secondary,
+#commprep-modal-overlay .btn-secondary,
+#rpmcap-modal-overlay .btn-secondary,
+#rpmalign-modal-overlay .btn-secondary,
+#socseed-modal-panel .btn-secondary,
+#battdef-modal-overlay .btn-secondary {
   background: rgba(255, 255, 255, 0.10);
   color: #e8e8e8;
   border: 1px solid rgba(255, 255, 255, 0.18);
 }
 #sysid-modal-panel .btn-secondary:hover,
 #test-panel .btn-secondary:hover,
-#commission-modal-panel .btn-secondary:hover {
+#commission-modal-panel .btn-secondary:hover,
+#commprep-modal-overlay .btn-secondary:hover,
+#rpmcap-modal-overlay .btn-secondary:hover,
+#rpmalign-modal-overlay .btn-secondary:hover,
+#socseed-modal-panel .btn-secondary:hover,
+#battdef-modal-overlay .btn-secondary:hover {
   background: rgba(255, 255, 255, 0.16);
 }
 #sysid-modal-panel .btn-secondary:disabled,
@@ -1240,7 +1267,7 @@ a.btn-secondary {
   list-style: none;
   cursor: pointer;
   font-size: 11.5px;
-  color: #7f8a8e;
+  color: #9aa5a9;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1256,7 +1283,7 @@ a.btn-secondary {
 #commission-modal-panel details.cx-fp[open] > summary::before { transform: rotate(90deg); }
 #commission-modal-panel .cx-fp-body {
   font-size: 11px;
-  color: #888;
+  color: #9a9a9a;
   line-height: 1.5;
   margin-top: 8px;
 }
@@ -1294,6 +1321,14 @@ a.btn-secondary {
 @media (prefers-reduced-motion: reduce) {
   #commission-modal-panel .cx-cue { animation: none; }
 }
+/* Stage 9's standing direction line lives under the schedule chart for the whole run: smaller type
+   than the one-shot cues, and an amber variant while the engine speed is outside the band. */
+#commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l1 { font-size: 19px; }
+#commission-modal-panel .cx-cue.off {
+  background: linear-gradient(180deg, #7a5208 0%, #5c3d06 100%);
+  border-color: #f0a500;
+}
+#commission-modal-panel .cx-cue.off .cx-cue-l2 { color: #f3d9a4; }
 
 /* Disturbances game — the "press Start Shooting" prompt is the only prose over the title card, so it
    has to win against the card's art. Arcade attract-mode treatment: a two-flash burst every 3 s, never
@@ -1454,6 +1489,35 @@ a.btn-secondary {
 }
 .dark-mode .btn-danger-ghost {
   color: #f08a84;
+}
+/* Same trap as .btn-secondary above: the panels are dark in both themes, so the light-theme
+   #c23a34 lands at 2.9:1 on them. Reuse the dark-mode red and lift the tint to match. */
+#sysid-modal-panel .btn-danger-ghost,
+#test-panel .btn-danger-ghost,
+#commission-modal-panel .btn-danger-ghost,
+#bhw-modal-panel .btn-danger-ghost,
+#cvs-modal-panel .btn-danger-ghost,
+#commprep-modal-overlay .btn-danger-ghost,
+#rpmcap-modal-overlay .btn-danger-ghost,
+#rpmalign-modal-overlay .btn-danger-ghost,
+#socseed-modal-panel .btn-danger-ghost,
+#battdef-modal-overlay .btn-danger-ghost {
+  background: rgba(214, 69, 62, 0.10);
+  color: #f08a84;
+  border-color: rgba(214, 69, 62, 0.34);
+}
+#sysid-modal-panel .btn-danger-ghost:hover,
+#test-panel .btn-danger-ghost:hover,
+#commission-modal-panel .btn-danger-ghost:hover,
+#bhw-modal-panel .btn-danger-ghost:hover,
+#cvs-modal-panel .btn-danger-ghost:hover,
+#commprep-modal-overlay .btn-danger-ghost:hover,
+#rpmcap-modal-overlay .btn-danger-ghost:hover,
+#rpmalign-modal-overlay .btn-danger-ghost:hover,
+#socseed-modal-panel .btn-danger-ghost:hover,
+#battdef-modal-overlay .btn-danger-ghost:hover {
+  background: rgba(214, 69, 62, 0.20);
+  border-color: rgba(214, 69, 62, 0.46);
 }
 
 /* Compact size modifier — pairs with any .btn-* class to keep a button small */
@@ -1844,7 +1908,10 @@ a.btn-secondary {
 .dark-mode #header-collapsed-strip .hcs-pill.st-off { color: #e6e6e6; }
 #header-collapsed-strip .hcs-pill.st-fault    { color: #d9534f; }
 #header-collapsed-strip .hcs-pill.st-test     { color: #a78bfa; }
-#header-collapsed-strip .hcs-pill.st-prot     { color: #d9534f; animation: stage-pulse 1.5s ease-in-out infinite; }
+/* ctrlLimiter 6 does NOT replace the state word here — the stage is still true and the field is
+   still live — it appends this marker, the strip's echo of the header's brown P. */
+#header-collapsed-strip .hcs-pill .hcs-p { margin-left: 6px; font-weight: 800; color: #7a4a14; }
+.dark-mode #header-collapsed-strip .hcs-pill .hcs-p { color: #d9a066; }
 
 /* Locked-out CTA: always visible (no @container hide rule). order:100 floats it past the grow
    spacer to the far-right edge so it reads as a passive corner prompt, not an alarm crowding the
@@ -2219,13 +2286,16 @@ a.btn-secondary {
   min-width: 5ch;
   text-align: right;
 }
-/* ctrlLimiter 5 (machine limit) = teal, 6 (protection) = red; background-only so the pill
-   never changes layout. !important beats the inline color applyStaleStyleByAge() writes on
-   #dutyCycleID3 and the cluster's .field-status-* !important tints. */
+/* ctrlLimiter 5 (machine limit) = teal filled pill. ctrlLimiter 6 (a protection is trimming
+   output) = no fill at all, brown digits: the percentage the protection is governing is the one
+   thing that changes, which is quieter than a red block and still unmissable next to the teal
+   ACTIVE word above it. Background-only / colour-only so the pill never changes layout.
+   !important beats the inline color applyStaleStyleByAge() writes on #dutyCycleID3 and the
+   cluster's .field-status-* !important tints. */
 #duty-pill-wrap.limit-pill { background: var(--accent); }
 #duty-pill-wrap.limit-pill span { color: #fff !important; }
-#duty-pill-wrap.prot-pill { background: #e53935; }
-#duty-pill-wrap.prot-pill span { color: #fff !important; }
+#duty-pill-wrap.prot-pill span { color: #7a4a14 !important; }
+.dark-mode #duty-pill-wrap.prot-pill span { color: #d9a066 !important; }
 
 .duo-num {
   font-size: 15px;
@@ -2717,6 +2787,23 @@ h2 {
   font-size: 18px;
 }
 
+/* h2 is the ONLY bare element selector in this file that sets a colour, which makes it the one
+   tag that can drag a theme variable onto a panel that is dark in BOTH themes: a bare <h2> in
+   the wizard (cxRenderThresh's two step headings) came out #333 on #1e1e1e — 1.3:1, an invisible
+   title under a fully-lit teal rule. Any heading rendered into these panels needs literal ink. */
+#sysid-modal-panel h2,
+#test-panel h2,
+#commission-modal-panel h2,
+#bhw-modal-panel h2,
+#cvs-modal-panel h2,
+#commprep-modal-overlay h2,
+#rpmcap-modal-overlay h2,
+#rpmalign-modal-overlay h2,
+#socseed-modal-panel h2,
+#battdef-modal-overlay h2 {
+  color: #e8e8e8;
+}
+
 /* Sub Tab Navigation */
 .sub-tabs {
   background: var(--card-light);
@@ -2750,7 +2837,7 @@ h2 {
 }
 
 .sub-tab.active, .tuning-tab.active {
-  background: var(--accent);
+  background: var(--accent-fill);
   color: var(--card-light);
   border-color: var(--accent);
 }
@@ -2839,7 +2926,7 @@ h2 {
 }
 
 .alt-tab-btn-primary.active {
-  background: var(--accent);
+  background: var(--accent-fill);
   color: var(--card-light);
   border-color: var(--accent);
 }
@@ -2961,8 +3048,8 @@ input:focus {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }
 .dark-mode .seg > button.on { background: #3a3f44; color: #fff; }
-.seg.accent > button.on { background: var(--accent, #00a19a); color: #fff; }
-.dark-mode .seg.accent > button.on { background: var(--accent, #00a19a); color: #fff; }
+.seg.accent > button.on { background: #00807a; color: #fff; }
+.dark-mode .seg.accent > button.on { background: #00807a; color: #fff; }
 /* `.seg-pill` — a two-way form choice as a compact segmented control: radio-backed <label>s
    rendered as pills (active = accent fill), with a single caption below that swaps via :has()
    on the enclosing .form-input. The radio stays in the DOM (visually hidden) so the form still
@@ -2987,7 +3074,7 @@ input:focus {
 }
 .seg-pill > label > input { position: absolute; opacity: 0; pointer-events: none; }
 .seg-pill > label > span { font-size: 13px; font-weight: 600; line-height: 1.2; }
-.seg-pill > label:has(input:checked) { background: var(--accent, #00a19a); color: #fff; }
+.seg-pill > label:has(input:checked) { background: #00807a; color: #fff; }
 
 .seg-pill-caption { margin-top: 8px; min-height: 34px; }
 .seg-pill-caption > .cap {
@@ -3776,12 +3863,20 @@ input:checked+.slider:before {
   --primary: gray;
   --accent: #00a19a;
   --bg-light: #121212;
-  --text-dark: gray;
-  --text-light: gray;
+  --text-dark: #d0d0d0;
+  --text-light: #ffffff;
   --card-light: #1e1e1e;
   --border: #444444;
-  --reading: gray;
+  --reading: #d0d0d0;
   --text-muted: #9aa0a6;
+  /* Body/reading text was literally `gray` (#808080): 4.7:1 on the page but only 4.2:1 on a
+     card, which is where nearly all of it sits. --text-light is ink on an accent fill, so it
+     goes white rather than dim. */
+  --accent-fill: #00a19a;
+  --cx-done: #4caf50;
+  --cx-running: #64b5f6;
+  --cx-manual: #b8860b;
+  --cx-skipped: #c77d1a;
 }
 
 /* Elements with hardcoded white backgrounds that need dark mode overrides */
@@ -4704,6 +4799,14 @@ input:checked+.slider:before {
   .dark-mode .cap-mode-toggle {
     background: rgba(255, 255, 255, 0.07);
   }
+  /* Inside the always-dark wizard modals var(--text-muted) resolves to the LIGHT palette
+     (#5f6368 on a #2e2e2e track, 2.2:1), so the inactive segment needs literal ink there. */
+  #commission-modal-panel .cap-mode-btn:not(.cap-mode-active),
+  #commprep-modal-overlay .cap-mode-btn:not(.cap-mode-active),
+  #rpmcap-modal-overlay .cap-mode-btn:not(.cap-mode-active),
+  #rpmalign-modal-overlay .cap-mode-btn:not(.cap-mode-active) {
+    color: #b0b0b0;
+  }
   .cap-mode-btn {
     padding: 5px 14px;
     font-size: 13px;
@@ -4719,12 +4822,12 @@ input:checked+.slider:before {
      text. rate-low keeps an orange fill so the low-charge state stays visually distinct.
      Same in both themes for a flat, filled look. */
   .cap-mode-btn.cap-mode-active {
-    background: var(--accent, #00a19a);
+    background: #00807a;
     color: #fff;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
   }
   .dark-mode .cap-mode-btn.cap-mode-active {
-    background: var(--accent, #00a19a);
+    background: #00807a;
     color: #fff;
   }
   #chargeRateLowBtn.cap-mode-active,
@@ -4770,7 +4873,7 @@ input:checked+.slider:before {
   #rpmcap-body .crl-mk {
     flex: 0 0 14px;
     text-align: center;
-    color: #667;
+    color: #99a;
     font-weight: 800;
   }
   @media (max-width: 430px) {
