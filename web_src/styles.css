@@ -1940,10 +1940,11 @@ a.btn-secondary {
 #header-collapsed-strip .hcs-gsep { display: inline-block; width: 1px; height: 20px; background: rgba(0, 161, 154, .32); margin: 0 3px; }
 #header-collapsed-strip .hcs-divider { display: inline-block; width: 1px; height: 18px; background: rgba(0, 161, 154, .15); }
 
-#header-collapsed-strip .hcs-toggle { width: 34px; height: 19px; border-radius: 999px; background: #bbb; position: relative; cursor: pointer; transition: background .15s; }
-#header-collapsed-strip .hcs-toggle.on { background: var(--accent); }
-#header-collapsed-strip .hcs-toggle .hcs-knob { position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .3); transition: left .15s; }
-#header-collapsed-strip .hcs-toggle.on .hcs-knob { left: 17px; }
+/* Alternator OFF / ON at strip scale — the expanded header's .onoff-switch, tightened to the strip's
+   one-line height. The tap extender grows to keep the 44px touch minimum at the smaller track height. */
+#header-collapsed-strip .onoff-switch { width: 68px; height: 19px; }
+#header-collapsed-strip .onoff-half { font-size: 10px; letter-spacing: 0.2px; }
+#header-collapsed-strip .onoff-half::before { top: -13px; bottom: -13px; }
 
 /* margin-left buys extra space from the toggle; vertical padding gives a ~40px expand tap target without changing the line height */
 #header-collapsed-strip .hcs-chevron { font-size: 16px; opacity: .55; cursor: pointer; margin-left: 12px; padding: 11px 6px; margin-top: -11px; margin-bottom: -11px; }
@@ -2006,9 +2007,7 @@ a.btn-secondary {
 
 .dark-mode #header-collapsed-strip .hcs-gsep { background: rgba(120, 200, 196, .30); }
 .dark-mode #header-collapsed-strip .hcs-divider { background: rgba(120, 200, 196, .18); }
-.dark-mode #header-collapsed-strip .hcs-toggle { background: #555a60; }
 /* must follow the line above — equal specificity, so ON would otherwise read as OFF in dark mode */
-.dark-mode #header-collapsed-strip .hcs-toggle.on { background: var(--accent); }
 
 #header-collapse-bar {
   display: flex;
@@ -6294,3 +6293,91 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 @media (max-width: 600px) {
   .drag-handle { cursor: default; }
 }
+
+/* Alternator OFF / ON (expanded header #header-onoff and collapsed strip #hcs-onoff). A sliding switch
+   built from two half-width buttons, NOT a checkbox: the knob and track colour show the regulator's own
+   OnOff (CSV1) while each half stays an absolute command, so a stale or reverted paint can never turn an
+   intended OFF into an ON. paintOnOff() in script.js owns .is-on / .is-off / .onoff-pending; with none of
+   them the track is neutral grey and the knob is hidden, which is the state before the first CSV1 frame.
+   ON fills accent and OFF fills slate — a de-energized field must never read as the "good" colour. */
+.onoff-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  width: 84px;
+  height: 25px;
+  padding: 2px;
+  border-radius: 999px;
+  background: #9ca3af;
+  box-shadow: inset 0 0 1px rgba(0, 0, 0, 0.35);
+  transition: background-color .25s;
+  -webkit-tap-highlight-color: transparent;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+}
+.onoff-switch.is-on { background: #00a19a; }
+.onoff-switch.is-off { background: #6b7280; }
+
+.onoff-knob {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(50% - 2px);
+  border-radius: 999px;
+  background: #ffffff;
+  box-sizing: border-box;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform .25s, opacity .2s;
+}
+.onoff-switch.is-on .onoff-knob,
+.onoff-switch.is-off .onoff-knob { opacity: 1; }
+.onoff-switch.is-on .onoff-knob { transform: translateX(100%); }
+
+.onoff-half {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 50%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+  transition: color .2s;
+}
+/* Vertical-only tap extender to the 44px iOS minimum. Per HALF, not per track, so an off-track tap
+   still resolves to the command directly above or below it instead of a dead zone. */
+.onoff-half::before {
+  content: "";
+  position: absolute;
+  top: -10px;
+  bottom: -10px;
+  left: 0;
+  right: 0;
+}
+/* The half under the knob reads as dark text on white */
+.onoff-switch.is-off .onoff-half[data-v="0"],
+.onoff-switch.is-on .onoff-half[data-v="1"] { color: #1f2937; }
+/* Pressed, not yet echoed. Ring colour has to read on the white knob AND on either track fill. */
+.onoff-half.onoff-pending { box-shadow: inset 0 0 0 2px #00403d; }
+.onoff-half:focus-visible { outline: 2px solid #00403d; outline-offset: 1px; }
+
+.dark-mode .onoff-switch { background: #4b5563; }
+.dark-mode .onoff-switch.is-on { background: #0f8f88; }
+.dark-mode .onoff-switch.is-off { background: #3f4753; }
+.dark-mode .onoff-knob {
+  background: #cccccc;
+  border: 1px solid #444444;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+.dark-mode .onoff-half.onoff-pending { box-shadow: inset 0 0 0 2px #7fe9df; }
+.dark-mode .onoff-half:focus-visible { outline-color: #7fe9df; }

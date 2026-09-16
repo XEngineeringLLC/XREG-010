@@ -53,6 +53,7 @@ enum Csv1Index {
   CSV1_Icv,
   CSV1_WaterDepth_ft,  // NMEA2k depth ×3.28084 (meters → feet), scaled ×10 (0.1 ft); 0 if stale
   CSV1_Ignition,       // effective ignition state (real GPIO1 wire OR force-on override) — on CSV1 so the banner tracks it at ~10 Hz, not the 5 s CSV2 cadence
+  CSV1_OnOff,          // master Alternator Enable. Here for the same reason as Ignition, and a stronger one: it is the OTHER half of chargingEnabled, so the header switch and the field-status word must come off the SAME frame. Driven from the CSV3 settings echo the switch could read OFF beside a live MANUAL 50% field for up to 60 s (settingWrite does not mark settingsDirty), which is what a bench session saw on 2026-09-15
   CSV1_mExcessEma,       // iExcess detector: averaged signed current excess over command (A ×10) — tuning trace
   CSV1_iExcessThreshold, // iExcess detector: computed fire threshold E (A ×10) — tuning trace
   CSV1_mExcessEmaPeak,   // iExcess: per-CSV1-frame peak averaged excess (A ×10) — live sparkline
@@ -71,7 +72,7 @@ enum Csv1Index {
   CSV1_sessionId,        // boot identity — same value in every channel this boot; proves a cached block is from this run
   CSV1_sendMs,           // millis() when this payload was built; a consumer ages every other channel against this one
 
-  CSV1_FIELD_COUNT  // = 52
+  CSV1_FIELD_COUNT  // = 53
 };
 
 enum Csv2Index {
@@ -762,7 +763,7 @@ enum Csv4Index {
 // backslash and truncates the macro, and every expansion truncates together and consistently --
 // so the count/order gate in compress_web.sh cannot see it. The static_assert on
 // CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 432
+#define CSV3_EXPECTED_FIELDS 433
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -1199,7 +1200,8 @@ enum Csv4Index {
   X(n2kExtraTempSource, "%d", SafeInt(n2kExtraTempSource))                                                        /* tN2kTempSource code for the EXTRA probe */ \
   X(CommissionTempSrc, "%d", SafeInt(CommissionTempSrc))                                                          /* battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown = board) */ \
   X(maxWorkingRpm, "%d", SafeInt(maxWorkingRpm))                                                                  /* stage-9 setup screen; 0 = never entered */ \
-  X(sessionId, "%u", (unsigned)g_sessionId)                                                                       /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
+  X(RemoteDiagnostics, "%d", SafeInt(RemoteDiagnostics))                                                          /* owner switch for the dashboard's support log-relay poll (0/1) */ \
+  X(sessionId, "%u", (unsigned)g_sessionId)                                                                     /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
   X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
   /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
   /* setting in this block predates whatever the device is actually running. */
@@ -2423,6 +2425,66 @@ static void dvccResetAuthority() {
 static uint32_t webRunTok(AsyncWebServerRequest *request) {
   if (!request->hasParam("tok")) return 0;
   return (uint32_t)strtoul(request->getParam("tok")->value().c_str(), nullptr, 10);
+}
+
+// Sender fingerprint for a client write that changes what the field is allowed to do (master switch,
+// field control). The OFF direction has carried one since the unexplained OnOff=0 arrivals of 2026-08;
+// ON carried none, so a field that came back on could not be traced to a client at all — the 2026-09-15
+// bench session found MANUAL 50% live with the header switch reading OFF and nothing in the log naming
+// who re-enabled it. Same shape for every line so an OFF and the ON that followed it pair up in the
+// console. The query string carries the dashboard's src/n tag (see clientWriteTrack), so a line with
+// the same src and n twice is one request delivered twice, and a different src is another tab.
+static void logClientWrite(AsyncWebServerRequest *request, const char *what) {
+  String qs;
+  for (size_t i = 0; i < request->params() && qs.length() < 120; i++) {
+    const AsyncWebParameter *p = request->getParam(i);
+    if (i) qs += '&';
+    qs += p->name();
+    qs += '=';
+    qs += p->value();
+  }
+  const AsyncWebHeader *uaH = request->getHeader("User-Agent");
+  String ua = uaH ? uaH->value() : String("-");
+  if (ua.length() > 80) ua = ua.substring(0, 80);
+  queueConsoleMessageF("%s [from %s | %s | UA %s]", what,
+                       request->client()->remoteIP().toString().c_str(), qs.c_str(), ua.c_str());
+}
+
+// Per-tab ordering guard for the writes above. The dashboard tags them with src (its page-load nonce)
+// and n (its press counter, increasing across every tagged write from that tab). A write carrying the
+// same src and an n at or below the last one applied is a duplicate delivery or a request the link held
+// back until after a later press — not a press. Bench 2026-09-15: an OnOff=1 landed 32 ms after the
+// user's OnOff=0 and re-energized the field. Returns true when the write is out of order; an in-order
+// tagged write advances the slot. Untagged writes (curl, older bundles) are never gated and never
+// advance it. The caller decides whether an out-of-order write is dropped — an OFF never is.
+// CW_SLOTS recent tabs are remembered per gated parameter (round-robin), so a stale write from one
+// tab is still caught after another tab has pressed. Built-in types only: the Arduino prototype
+// generator emits this function's prototype above any struct declared in a tab.
+#define CW_SLOTS 4
+static char g_onOffWriteSrc[CW_SLOTS * 17] = { 0 };
+static uint32_t g_onOffWriteN[CW_SLOTS] = { 0 };
+static uint8_t g_onOffWriteNext = 0;
+static char g_manualWriteSrc[CW_SLOTS * 17] = { 0 };
+static uint32_t g_manualWriteN[CW_SLOTS] = { 0 };
+static uint8_t g_manualWriteNext = 0;
+static bool clientWriteTrack(AsyncWebServerRequest *request, char *srcTab, uint32_t *nTab, uint8_t *nextSlot) {
+  if (!request->hasParam("src") || !request->hasParam("n")) return false;
+  const String &src = request->getParam("src")->value();
+  if (src.length() == 0 || src.length() > 16) return false;
+  uint32_t n = (uint32_t)strtoul(request->getParam("n")->value().c_str(), nullptr, 10);
+  for (uint8_t i = 0; i < CW_SLOTS; i++) {
+    char *slot = srcTab + i * 17;
+    if (slot[0] && strcmp(slot, src.c_str()) == 0) {
+      if (n <= nTab[i]) return true;
+      nTab[i] = n;
+      return false;
+    }
+  }
+  uint8_t i = *nextSlot;
+  *nextSlot = (uint8_t)((i + 1) % CW_SLOTS);
+  snprintf(srcTab + i * 17, 17, "%s", src.c_str());
+  nTab[i] = n;
+  return false;
 }
 
 void setupServer() {
@@ -4155,24 +4217,16 @@ void setupServer() {
         OnOff = 0;
         settingWrite(NK_OnOff, "0");
         stateRevision++;
+        // This path returns before the foundParameter block that normally raises settingsDirty, so
+        // without this an OFF never pushed a CSV3 echo — a second browser or the cloud config snapshot
+        // kept the old value until the 60 s fallback.
+        settingsDirty = true;
         // Sender fingerprint: unexplained OnOff=0 arrivals were seen on the bench (2026-08).
-        // The header form carries exactly one param, so extra params = a different sender,
-        // and IP+UA tell laptop from phone from a stale client replaying the request.
-        {
-          String qs;
-          for (size_t i = 0; i < request->params() && qs.length() < 120; i++) {
-            const AsyncWebParameter *p = request->getParam(i);
-            if (i) qs += '&';
-            qs += p->name();
-            qs += '=';
-            qs += p->value();
-          }
-          const AsyncWebHeader *uaH = request->getHeader("User-Agent");
-          String ua = uaH ? uaH->value() : String("-");
-          if (ua.length() > 80) ua = ua.substring(0, 80);
-          queueConsoleMessageF("FIELD OFF: Safety override (no arming required) [from %s | %s | UA %s]",
-                               request->client()->remoteIP().toString().c_str(), qs.c_str(), ua.c_str());
-        }
+        // The dashboard sends OnOff plus its src/n tag and nothing else, so any other param = a
+        // different sender, and IP+UA tell laptop from phone from a stale client replaying the request.
+        // Tracked so a later out-of-order ON from the same tab is recognized; never dropped itself.
+        clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext);
+        logClientWrite(request, "FIELD OFF: Safety override (no arming required)");
         request->send(200, "text/plain", "0");
         return;
       }
@@ -5550,9 +5604,18 @@ void setupServer() {
     }
     if (request->hasParam("ManualFieldToggle")) {
       foundParameter = true;
-      inputMessage = request->getParam("ManualFieldToggle")->value();
-      settingWrite(NK_ManualFieldToggle, inputMessage.c_str());
-      ManualFieldToggle = inputMessage.toInt();
+      if (clientWriteTrack(request, g_manualWriteSrc, g_manualWriteN, &g_manualWriteNext)) {
+        logClientWrite(request, "FIELD CONTROL write IGNORED: out of order for its tab (a later press already applied)");
+      } else {
+        inputMessage = request->getParam("ManualFieldToggle")->value();
+        settingWrite(NK_ManualFieldToggle, inputMessage.c_str());
+        ManualFieldToggle = inputMessage.toInt();
+        // Same fingerprint as the master switch: this is the one write that removes the protections, and
+        // it left no trace at all — the 2026-09-15 bench cut (RPM_TOO_LOW in what the user knew as
+        // Manual mode) could only be attributed to "some client".
+        logClientWrite(request, (ManualFieldToggle == 1) ? "FIELD CONTROL: MANUAL (protections bypassed)"
+                                                         : "FIELD CONTROL: PID");
+      }
     }
     if (request->hasParam("capLimitMode")) {
       foundParameter = true;
@@ -5622,9 +5685,17 @@ void setupServer() {
       // branch only runs for OnOff==1 (or any non-zero value) after
       // the arm check has passed.
       foundParameter = true;
-      inputMessage = request->getParam("OnOff")->value();
-      settingWrite(NK_OnOff, inputMessage.c_str());
-      OnOff = inputMessage.toInt();
+      if (clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext)) {
+        // A press the user has since superseded (an OFF or a later ON from the same tab was already
+        // applied). Applying it would re-energize a field the user just switched off.
+        logClientWrite(request, "OnOff=1 IGNORED: out of order for its tab (an OFF or later ON already applied)");
+      } else {
+        inputMessage = request->getParam("OnOff")->value();
+        settingWrite(NK_OnOff, inputMessage.c_str());
+        OnOff = inputMessage.toInt();
+        stateRevision++;
+        logClientWrite(request, "ALTERNATOR ENABLED: master switch ON");
+      }
     }
     if (request->hasParam("HiLow")) {
       foundParameter = true;
@@ -6318,7 +6389,7 @@ void setupServer() {
       settingWrite(NK_timeSourceMode, String(timeSourceMode).c_str());
       const char *lbl = (m == TSRC_AUTO)  ? "auto"
                       : (m == TSRC_NMEA)  ? "NMEA only"
-                      : (m == TSRC_PHONE) ? "phone only"
+                      : (m == TSRC_PHONE) ? "this device only"
                                          : "NTP time only";
       queueConsoleMessageF("Time source set to %s", lbl);
     }
@@ -6895,6 +6966,12 @@ void setupServer() {
       inputMessage = request->getParam("CloudFeatures")->value();
       settingWrite(NK_CloudFeatures, inputMessage.c_str());
       CloudFeatures = inputMessage.toInt();
+    }
+    if (request->hasParam("RemoteDiagnostics")) {
+      foundParameter = true;
+      inputMessage = request->getParam("RemoteDiagnostics")->value();
+      settingWrite(NK_RemoteDiagnostics, inputMessage.c_str());
+      RemoteDiagnostics = inputMessage.toInt();
     }
     if (request->hasParam("testProtectionsEnabled")) {
       foundParameter = true;
@@ -10167,7 +10244,7 @@ void SendWifiData() {
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +2: mExcessEmaPeak, iExcessThreshMin; +1: fieldEventReason; +4: cvPTerm, cvIterm, cvKdTrim, cvKdFiltV; +1: huntDerate; +2: huntFreqHz, huntState; +1: rpmCeilingAmps
+                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +2: mExcessEmaPeak, iExcessThreshMin; +1: fieldEventReason; +4: cvPTerm, cvIterm, cvKdTrim, cvKdFiltV; +1: huntDerate; +2: huntFreqHz, huntState; +1: rpmCeilingAmps; +1: OnOff
                                "%u,%u",  // +2: sessionId, sendMs
 
                                CSV1_FIELD_COUNT,
@@ -10209,6 +10286,7 @@ void SendWifiData() {
                                // Water depth in feet ×10 (0.1 ft resolution). 0 if NMEA depth stale or unavailable.
                                SafeInt(IS_STALE(IDX_WATER_DEPTH) ? 0 : (WaterDepth_m * 3.28084f), 10),
                                SafeInt(Ignition),  // effective ignition (override applied at top of loop)
+                               SafeInt(OnOff),     // CSV1_OnOff — master Alternator Enable, same frame as fieldActiveStatus
                                SafeInt(g_mExcessEma, 10),       // CSV1_mExcessEma — averaged current excess (A ×10)
                                SafeInt(g_iExcessThreshold, 10), // CSV1_iExcessThreshold — fire threshold E (A ×10)
                                SafeInt(g_iExcessArmedWin ? g_mExcessEmaPeak : g_mExcessEma, 10),       // CSV1_mExcessEmaPeak (A ×10)

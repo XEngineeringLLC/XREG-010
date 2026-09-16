@@ -1461,3 +1461,346 @@
 // any control loop, floor, ceiling, health model, torque estimate or fault
 // test that consumes them, and any combination with Parts 1 to 3.
 // ============================================================================
+
+
+// ============================================================================
+// IDEAS RECORDED TO PROTECT FUTURE IMPLEMENTATIONS, PART 5:
+// ALTERNATOR TEMPERATURE AND CONDITION FROM THE ELECTRICAL BEHAVIOR OF THE
+// FIELD COIL WHILE THE MACHINE IS SPINNING
+// ============================================================================
+// Added 2026-09-15. The commit date of this block in the public repository
+// https://github.com/XEngineeringLLC/XREG-010 is its publication date. Not
+// built. Same rule as Parts 1 to 4: written to be enabling, with the numbers
+// that decide whether it works stated.
+//
+// Part 4 recorded how to MEASURE field current on a single-terminal drive and
+// listed winding temperature as one of its uses. This part is the inference
+// itself, independent of how the electrical quantity is obtained: the field
+// coil of a turning alternator is treated as an instrument, read continuously
+// by the regulator that is already driving it, and the drift of its electrical
+// behavior against a baseline is read out as BOTH the temperature of the
+// machine AND its state of wear. The variants in D need no new sensor at all.
+//
+// ---------------------------------------------------------------------------
+// WHAT EXISTS TODAY
+// ---------------------------------------------------------------------------
+// Alternator temperature is a single DS18B20 probe (AlternatorTemperatureF)
+// zip-tied or bolted to the case, and everything thermal hangs off it: the
+// temperature derate, the maximum-temperature watermarks, and the copper
+// correction on the minimum-field floor. The case is not the hot part. The
+// rotor winding is, it is buried inside the machine behind an air gap, and the
+// probe lags it by minutes and under-reads it by tens of degrees. The gap is
+// worst exactly where it matters: high output at low speed in a hot engine
+// room, where the fan is moving the least air. Field current is not measured;
+// it is duty times bus voltage divided by FieldResistance, a typed setting.
+//
+// ---------------------------------------------------------------------------
+// THE GENERAL METHOD
+// ---------------------------------------------------------------------------
+// While the alternator is turning and under normal regulation, observe any
+// electrical characteristic of the field circuit -- current at a known applied
+// field voltage, its rise or fall slope, its ripple, its noise, its time
+// constants -- and compare it against a baseline captured for that same
+// machine. The deviation is decomposed into:
+//
+//   (a) a REVERSIBLE part that follows copper's temperature coefficient and a
+//       thermal model of the machine, which is the winding temperature; and
+//   (b) an IRREVERSIBLE or unmodeled residual, which is the condition of the
+//       machine: brush and slip-ring wear, shorted turns, a degrading cooling
+//       path, loose or corroded field wiring.
+//
+// The measurement is taken WITH THE ROTOR SPINNING, which is what separates
+// this from standstill winding-resistance measurement. It costs no downtime,
+// it runs every PWM period of every charge session, and several of the wear
+// signals in F exist only while the machine is turning.
+//
+// ---------------------------------------------------------------------------
+// A. THE PRIMARY OBSERVABLE: FIELD CURRENT AGAINST A KNOWN FIELD VOLTAGE
+// ---------------------------------------------------------------------------
+// Over one whole PWM period the average of L di/dt is zero, so
+//
+//     R_field = duty x (Vbus - Vswitch) / I_field_avg
+//
+// exactly, with no knowledge of inductance. One resistance number per PWM
+// period, from a field current obtained by any of the sensing topologies in
+// Part 4 A (low-side shunt, mid-node amplifier, Hall sensor, the switch's own
+// on-resistance, or a driver IC's current-sense pin).
+//
+// The signal is large. A field of 2 to 6 ohm cold, taken from 20 to 120 degC
+// rotor winding temperature, rises about 39 % in resistance, so field current
+// at a fixed duty and a fixed bus voltage falls about 28 %. This is not a
+// microvolt measurement. A 1 % error in R is 2.5 degC, so even a coarse
+// current measurement -- 2 to 3 % -- resolves the winding to better than
+// 10 degC, which is already far better than the case probe's error against
+// the winding.
+//
+// Averaging on a spinning machine, which is the part standstill methods do
+// not have to deal with:
+//   - Average over WHOLE PWM periods, keyed to the timer that generates the
+//     PWM, so the switching ripple cancels rather than aliases.
+//   - Average over several shaft revolutions as well. Armature reaction and
+//     slot-harmonic coupling superimpose an AC component on field current at
+//     shaft-related frequencies (Part 1 B); a revolution-synchronous average
+//     removes it from the DC estimate, and the residue it leaves is itself a
+//     useful signal (F.4).
+//   - Reject the sample when the operating point is moving: hold the estimate
+//     across load steps, target changes, protection events, and the first
+//     few hundred ms after any duty step, because the cycle-average identity
+//     assumes steady state within the period.
+//   - Bus voltage must be sampled coherently with the current, since it is a
+//     multiplicative term. A stale or differently-filtered Vbus is a direct
+//     percentage error in R, hence a direct degC error.
+//
+// ---------------------------------------------------------------------------
+// B. THE BASELINE, AND WHAT MAKES IT VALID
+// ---------------------------------------------------------------------------
+// The method needs one moment when the winding temperature is KNOWN, to pin
+// the pair (R_ref, T_ref). The winding is known to be at the case probe's
+// temperature whenever the machine has been off long enough to be isothermal:
+//
+//   - At commissioning, on a cold machine.
+//   - At any engine start where the regulator's own history shows the engine
+//     has been off long enough for the case probe to have settled, and the
+//     case probe agrees with any other ambient reference the system has
+//     (battery temperature probe, board temperature). Several hours is safe;
+//     the settling test is that the case probe's own rate of change has been
+//     below a small threshold for a long interval, not a fixed clock.
+//   - On a stopped rotor by deliberate excitation: apply a brief bounded
+//     field current with the engine off (the probe of Part 1) and read R with
+//     no rotation at all. This gives a clean reference uncontaminated by
+//     rotation-dependent effects, and it can be repeated on a schedule.
+//
+// Keep a rolling history of these cold references with their temperatures and
+// their dates. The single most recent one is the temperature reference; the
+// TREND across them over months is the wear signal of F.1. Store them in the
+// commissioning ledger so they survive a settings reset, and store enough of
+// them to fit a slope.
+//
+// A second, richer baseline is an OPERATING baseline: the expected resistance
+// as a function of the operating point (field current, shaft speed, output
+// current, ambient), learned over the first healthy weeks of a machine's life
+// and stored per machine. Deviation from the operating baseline, rather than
+// from the cold reference, is what makes the condition monitoring of F work
+// without demanding that the boat ever sit long enough for a cold reference.
+//
+// ---------------------------------------------------------------------------
+// C. FROM RESISTANCE TO TEMPERATURE
+// ---------------------------------------------------------------------------
+//     T_winding = T_ref + (R / R_ref - 1) / alpha
+//
+// with alpha = 0.00393 per degC for copper (0.00218 per degF, the coefficient
+// already used for the minimum-field floor correction). Aluminum-wound rotors
+// take 0.00403; the coefficient is a per-machine constant that can be typed
+// or identified during a known heating transient.
+//
+// What this buys over the case probe:
+//   - The limit can be set where the physics is. Insulation class, not case
+//     metal, is what fails: 155 degC for class F, 180 degC for class H, at
+//     the winding. A case-probe limit is a guess at that number with an
+//     unknown offset, so it is set conservatively and costs output all the
+//     time, or set optimistically and fails to protect during the one event
+//     that matters.
+//   - It sees fast heating. Rotor thermal time constants are on the order of
+//     minutes; the path from winding to case to probe adds minutes more. A
+//     hard pull from cold can put real heat in the winding before the case
+//     probe has moved at all.
+//   - It still works when the probe is missing, unplugged, or was never
+//     installed, which is a real install condition, not a hypothetical.
+//   - The case probe is not discarded: it becomes the ambient and cross-check
+//     channel, and disagreement between the two beyond what the thermal model
+//     allows is itself a fault (probe fallen off, or E).
+//
+// ---------------------------------------------------------------------------
+// D. VARIANTS THAT NEED NO FIELD-CURRENT SENSOR
+// ---------------------------------------------------------------------------
+// Everything above assumes field current is measured. It does not have to be.
+// Field resistance is observable, more coarsely, from quantities this system
+// already has, and these variants are recorded so that the disclosure is not
+// limited to hardware that adds a sensing element.
+//
+// 1. MINIMUM-FIELD FLOOR INVERSION. The per-speed minimum-duty floor is
+//    defined as the most field that still yields about zero output, which is
+//    a FIELD CURRENT threshold expressed in duty. Its position in duty is
+//    therefore proportional to R. Today the floor is corrected downward for a
+//    hot machine using the case probe as a proxy. Invert it: learn the floor
+//    by observation (the existing knee-learning machinery), and read the
+//    winding temperature out of where the learned floor sits relative to the
+//    cold-reference floor. Same hardware, no new part, and the two uses can
+//    coexist because a learned floor and an assumed floor are independently
+//    available.
+// 2. DUTY-DOMAIN PROXY IN CLOSED LOOP. At a steady operating point -- speed,
+//    bus voltage, and output current all held -- the duty the regulator must
+//    command to hold that output is a function of the field ampere-turns it
+//    has to produce, hence of R. Drift of commanded duty at an otherwise
+//    unchanged operating point is a temperature proxy. Confounded by stator
+//    heating (stator resistance also rises and cuts output at fixed field)
+//    and by saturation; usable as a corroborator or as the only channel on a
+//    board with no field sensing, not as the primary.
+// 3. TIME CONSTANT FROM THE EXISTING SWITCHING WAVEFORM. Any observable that
+//    carries the field's L/R time constant yields R once L is known, and L is
+//    nearly temperature-independent. The decay tail after a field-off event
+//    is already characterized by this firmware (the field-decay time constant
+//    work); its tau is L/R, so tau falling over a heating session is a
+//    direct, sensorless temperature reading. The same applies to the rise
+//    slope after a duty step observed on ANY channel that responds to field
+//    current, including alternator output current.
+// 4. STANDSTILL PROBE. The bounded excitation probe of Part 1, applied with
+//    the engine stopped, gives settled current and slope, hence R and L, on
+//    any topology that can observe either. Used for the cold reference of B
+//    and for a post-shutdown cool-down curve (G.2).
+//
+// ---------------------------------------------------------------------------
+// E. SEPARATING TEMPERATURE FROM CONDITION
+// ---------------------------------------------------------------------------
+// The measured resistance is not only copper:
+//
+//     R_measured = R_copper(T) + R_contact + R_wiring
+//
+// where R_contact is the two brush-to-slip-ring interfaces (tens of
+// milliohms, a fraction of a percent of a 2 to 6 ohm field) and R_wiring is
+// the field lead, its terminations, and the switch drop if not separately
+// accounted. Both are nearly temperature-independent compared with copper.
+// That difference is the separator:
+//
+//   - During a known heating or cooling TRANSIENT, fit R_measured against the
+//     thermal model. The part that swings with temperature is copper; the
+//     intercept that does not swing is (R_contact + R_wiring). The fit needs
+//     no absolute reference, only a transient with enough span.
+//   - Track that intercept over months. It is the wear channel of F.1, and
+//     removing it from R before applying the temperature law removes the slow
+//     bias that brush wear would otherwise inject into every temperature
+//     reading. Without this separation, a worn machine reads permanently hot.
+//   - A step change in the intercept between one session and the next is not
+//     wear. It is a connection: a field terminal backed off, a crimp gone
+//     high-resistance, a corroded lug. Alarm on the step, trend the slope.
+//
+// ---------------------------------------------------------------------------
+// F. CONDITION AND WEAR DIAGNOSTICS
+// ---------------------------------------------------------------------------
+// 1. BRUSH AND SLIP-RING WEAR. Brushes wear, slip rings glaze, oxidize, and
+//    groove. All three raise the contact term of E, slowly and permanently.
+//    The cold reference R_ref rises across months while the temperature-
+//    dependent fraction of R stays constant in absolute terms, so the ratio
+//    (copper share)/(total) falls. Trend it, project the crossing of a wear
+//    threshold, and report remaining service life as a date, not a flag. This
+//    is the "the alternator is wearing out" channel, and it is the one that
+//    gives useful warning before a failure rather than after it.
+// 2. SHORTED TURNS IN THE ROTOR. Resistance falls below what any plausible
+//    temperature explains. Confirm against inductance: L scales with the
+//    square of turns and R linearly, so a shorted-turn fault drops L faster
+//    than R, and the L/R ratio separates a shorted rotor from a merely cold
+//    one. Corroborate on output: a rotor with shorted turns makes less output
+//    per ampere of field, which the health model already tracks.
+// 3. OPEN FIELD, LOST BRUSH CONTACT, OPEN FUSE. Zero current at non-zero
+//    duty, in one PWM period.
+// 4. INTERMITTENT CONTACT AND MECHANICAL RUNOUT, VISIBLE ONLY WHILE SPINNING.
+//    A worn brush in a worn holder bounces; a slip ring worn oval or a rotor
+//    running out modulates contact resistance once per revolution. Both show
+//    in field current as structure at shaft frequency and its harmonics, and
+//    as sub-millisecond dropouts, neither of which exists at standstill and
+//    neither of which reaches the alternator's output in a form the output
+//    channels can see. Count the dropouts per hour and track the shaft-rate
+//    modulation index. Rising modulation at a constant average resistance is
+//    mechanical wear, and it leads the resistance trend of F.1.
+// 5. DEGRADED COOLING PATH. See G.
+// 6. THE WINDING TEMPERATURE ITSELF AS A HEALTH INDEX. An alternator that
+//    must run hotter than its own history to make the same amps at the same
+//    speed and the same ambient is degrading, whatever the mechanism. Feed
+//    the winding temperature into the existing expected-output health model
+//    as a response variable, not only as a correction term.
+// 7. CONSUMED INSULATION LIFE. Insulation life halves for roughly every
+//    10 degC of winding temperature. Integrate the actual measured winding
+//    temperature over the machine's whole service life, weighted by that law,
+//    and keep a running consumed-life fraction in non-volatile storage. This
+//    converts the temperature measurement into a maintenance number for the
+//    owner and turns every derate decision into a life-budget decision. No
+//    case probe can support this, because it never saw the real temperature.
+//
+// ---------------------------------------------------------------------------
+// G. THE THERMAL MODEL, AND COOLING-PATH DIAGNOSIS
+// ---------------------------------------------------------------------------
+// Once the winding temperature is observable, the machine's own thermal
+// behavior becomes identifiable, and its drift is another condition channel.
+//
+// 1. RISE PER WATT. Field dissipation is I_field squared times R, which is
+//    now measured directly, and total machine loss follows from output power
+//    and the efficiency model. At a steady operating point the winding's
+//    temperature rise above ambient divided by the dissipated power is a
+//    thermal resistance, and it is a strong function of airflow, hence of
+//    shaft speed. Learn the surface (rise per watt) against (RPM, ambient)
+//    during healthy operation. A machine whose surface shifts upward over
+//    time is losing its cooling path: a fan blade lost or clogged, a case
+//    caked in oil mist and dust, a blocked engine-room vent, an air gap
+//    fouled, a bearing dragging. None of that is visible to a case probe,
+//    which shifts in the same direction and hides the change.
+// 2. TIME CONSTANT. Excite a step in field dissipation and watch the
+//    exponential approach; tau is thermal mass over heat transfer. Thermal
+//    mass does not change, so tau is a second, independent read on the same
+//    cooling path. After shutdown the cool-down curve is available for free,
+//    sampled by brief standstill probes (D.4), and it isolates the natural-
+//    convection path from the fan-driven one.
+// 3. PREDICTION. With a fitted model the regulator can forecast the winding
+//    temperature a few minutes ahead from the present operating point, and
+//    derate BEFORE the limit rather than after it. A predictive derate is
+//    smooth; a reactive one is a cliff the operator notices.
+//
+// ---------------------------------------------------------------------------
+// H. ERROR BUDGET AND ACKNOWLEDGED LIMITS
+// ---------------------------------------------------------------------------
+//   - Bus voltage and duty enter R multiplicatively; their errors are
+//     percentage errors in R and therefore 2.5 degC per percent.
+//   - The switch drop must be modeled or measured, and it is itself
+//     temperature dependent; a fixed assumed drop injects a load-dependent
+//     bias into R.
+//   - Contact and lead resistance sit inside R and must be separated by E, or
+//     a worn machine reads hot forever.
+//   - The method reads the ROTOR. A shorted stator, a failed rectifier diode,
+//     or a stator hot spot is invisible here and needs the ripple and output
+//     channels. Rotor insulation resistance to ground is likewise not visible
+//     from field current at all.
+//   - The temperature reference decays in validity: a boat used daily may not
+//     offer a true cold start for weeks, and the operating baseline of B is
+//     what carries the method through that.
+//   - A belt that is slipping or thrown changes the thermal picture without
+//     changing the electrical one, which is why the cooling diagnosis of G
+//     must be gated on a confirmed speed.
+//
+// ---------------------------------------------------------------------------
+// PRIOR ART ACKNOWLEDGED
+// ---------------------------------------------------------------------------
+// Winding-resistance thermometry is old and standard: resistance-rise tests
+// on machines, DC injection for stator temperature in variable-speed motor
+// drives, and proposals for alternator rotor temperature estimation in
+// automotive regulator ICs that already measure field current. Automotive
+// regulators also flag open and shorted fields.
+//
+// What is recorded here is the combination in an aftermarket marine
+// regulator, continuously on a SPINNING machine driven by the regulator's own
+// PWM with no interruption of charging: the cold-reference and operating-
+// baseline scheme with reference trending, the thermal-transient intercept
+// that separates temperature-independent contact resistance from copper so
+// that brush wear does not masquerade as heat and heat does not masquerade as
+// wear, the shaft-rate contact-modulation index and dropout counting as a
+// mechanical wear channel that exists only under rotation, the sensorless
+// variants that read temperature out of the learned minimum-field floor, the
+// commanded duty, or the field-decay time constant, the rise-per-watt cooling
+// surface as a cooling-path diagnostic, the predictive derate, and the
+// integration of measured winding temperature into a consumed-insulation-life
+// number reported to the owner.
+//
+// ---------------------------------------------------------------------------
+// SCOPE OF THIS DISCLOSURE
+// ---------------------------------------------------------------------------
+// Intended to cover the determination of the temperature, the condition, the
+// remaining life, or the cooling state of an alternator or of any part of it,
+// in a regulator, from any electrical characteristic of the field circuit --
+// resistance, current, inductance, time constant, ripple, noise, modulation,
+// or any quantity derived from them -- measured or inferred while the machine
+// is turning, or at standstill for reference purposes, against any baseline
+// however obtained; any decomposition of that measurement into temperature
+// and condition parts; any sensorless proxy for it including duty, a learned
+// minimum-field floor, a decay time constant, or an output-derived estimate;
+// any thermal or wear model fitted to it; and any resulting derate, limit,
+// protection action, alarm, service prediction, life accounting, health grade,
+// or report to a display or a vessel data bus. Combinable with Parts 1 to 4.
+// ============================================================================

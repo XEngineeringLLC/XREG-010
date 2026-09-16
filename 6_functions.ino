@@ -22,7 +22,7 @@ static inline void serialPrintlnNB(const char *msg) {
   if ((size_t)Serial.availableForWrite() >= n + 2) Serial.println(msg);
 }
 
-void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason);
+void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason, bool rpmTriggered);
 // ==================== FIELD CONTROL HELPER FUNCTION DECLARATIONS ====================
 // Snapshot builder
 TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms);
@@ -1394,7 +1394,7 @@ uint32_t nextTachLieLockoutMs(uint32_t nowMs) {
  * Every cut path leaves identical state: GPIO4 LOW, PWM 0, PID manual,
  * telemetry updated, fieldActiveStatus cleared.
  */
-void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason) {
+void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason, bool rpmTriggered) {
   bool alreadyCut = gpio4IsLow;
   const float preCutDuty = dutyCycle;    // zeroed below the alreadyCut return; the abort latch wants the pre-cut command
   g_fieldEventReason = (uint8_t)reason;  // authoritative cut cause for the banner OFF-reason telemetry
@@ -1403,7 +1403,13 @@ void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason) {
   // Opens the tach-corruption mask window (buildTickSnapshot). NOT for the two RPM-derived cuts:
   // masking the gate that just fired would re-energize the field on a real stall or against a lying
   // tach for the length of the window.
-  if (reason != REASON_RPM_TOO_LOW && reason != REASON_TACH_IMPLAUSIBLE) g_lastFieldCutMs = tick.nowMs;
+  // rpmTriggered is the same rule for a cut whose REPORTED cause is not the tach but whose TRIGGER is:
+  // the spin-down finisher fires off rpmBelowMinimum while reporting the master switch / BMS / solar
+  // pause that actually stopped charging. Deciding on the reason word alone would open the window on
+  // the very gate that fired, and the stamp outlives the cut — charging re-enabled inside
+  // FIELDCUT_RPM_GRACE_MS would then mask both RPM gates and let the field energize on a stopped
+  // engine. No consumer other than hardCutRpmGrace reads g_lastFieldCutMs.
+  if (!rpmTriggered && reason != REASON_RPM_TOO_LOW && reason != REASON_TACH_IMPLAUSIBLE) g_lastFieldCutMs = tick.nowMs;
   // Fast OV and the timed OV tiers: arm the adaptive cooldown lockout (nextFastOvLockoutMs
   // ladder, not FIELD_COLLAPSE_DELAY) — one shared ladder so a persistent cause escalates
   // regardless of which OV rung catches it. applyImmediateCut returns before runShutdownPath's
@@ -1431,7 +1437,14 @@ void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason) {
   apply_pwm_float(0.0f);
   lastAppliedDuty = 0.0f;
   dutyCycle = 0.0f;
-  sysMode = SYS_MODE_FAULT;
+  // A stop the user or an external authority ASKED for is not a fault. Forcing SYS_MODE_FAULT here
+  // made the next tick's arbiter (which puts !chargingEnabled first) immediately correct it back to
+  // SYS_MODE_OFF, printing "Charging disabled" a second time for one switch press, and parked the
+  // dashboard in FAULT for a tick. Listed explicitly rather than keyed on tick.chargingEnabled: a
+  // hardware over-voltage or over-current outranks the disabled check in selectFieldEventReason, so
+  // it can arrive with charging already off and must still register as the fault it is.
+  sysMode = (reason == REASON_CHARGING_DISABLED || reason == REASON_BMS_DISABLED
+             || reason == REASON_SOLAR_PAUSE) ? SYS_MODE_OFF : SYS_MODE_FAULT;
   updateFieldTelemetry(0.0f, tick.currentBatteryVoltage, FieldResistance);
   fieldActiveStatus = 0;
   currentPID.SetMode(MANUAL);
@@ -2649,13 +2662,13 @@ void AdjustFieldLearnMode() {
   if (protTestCutPending && !gpio4IsLow) {
     protTestCutPending = false;
     queueConsoleMessage("Protection test: firing instant field cut (fast-OV executor)");
-    applyImmediateCut(tick, REASON_FAST_OVERVOLTAGE);
+    applyImmediateCut(tick, REASON_FAST_OVERVOLTAGE, false);
     return;
   }
   FieldEventReason preReason = selectFieldEventReason(tick);
   updateProtectionCounters(preReason);
   if (shouldImmediatelyCutGPIO4(preReason) && !gpio4IsLow) {
-    applyImmediateCut(tick, preReason);
+    applyImmediateCut(tick, preReason, false);
     return;
   }
 
@@ -2669,7 +2682,7 @@ void AdjustFieldLearnMode() {
   // the manual path fought at loop rate (GPIO4 oscillation), and manual exists precisely for
   // engine-off wiring/diagnostic tests (same doctrine as manual-beats-lockout).
   if (tick.engineFullyStopped && !tick.manualMode && !gpio4IsLow) {
-    applyImmediateCut(tick, REASON_RPM_TOO_LOW);
+    applyImmediateCut(tick, REASON_RPM_TOO_LOW, true);
     return;
   }
 
@@ -2685,7 +2698,13 @@ void AdjustFieldLearnMode() {
     if (!tick.chargingEnabled && tick.rpmBelowMinimum) {
       if (rpmBelowMinSinceMs == 0) rpmBelowMinSinceMs = tick.nowMs;
       if ((uint32_t)(tick.nowMs - rpmBelowMinSinceMs) >= RPM_BELOWMIN_CUT_MS && !gpio4IsLow) {
-        applyImmediateCut(tick, REASON_RPM_TOO_LOW);
+        // Cut with the arbiter's OWN reason, not a hard-coded RPM_TOO_LOW. The low RPM is only the
+        // permission to finish early; the CAUSE is whatever disabled charging, and preReason already
+        // holds it (priority 1a outranks the RPM gate). Hard-coding it made every master-switch OFF
+        // on a stopped engine report "Field cut immediately: RPM_TOO_LOW" and left the banner's
+        // OFF-reason (g_fieldEventReason) blaming engine speed for the user's own switch — bench,
+        // 2026-09-15. Falls back only if the arbiter somehow had nothing to say.
+        applyImmediateCut(tick, (preReason == REASON_NONE) ? REASON_RPM_TOO_LOW : preReason, true);
         return;
       }
     } else {
@@ -3054,7 +3073,7 @@ void AdjustFieldLearnMode() {
   g_fieldEventReason = (uint8_t)reason;  // steady-state / commission-rest cause (immediate cuts overwrite this in applyImmediateCut)
 
   if (shouldImmediatelyCutGPIO4(reason) && !gpio4IsLow) {
-    applyImmediateCut(tick, reason);
+    applyImmediateCut(tick, reason, false);
     return;
   }
 
@@ -3347,7 +3366,7 @@ void AdjustFieldLearnMode() {
   // ========== NORMAL MODES (MANUAL or AUTO) ==========
   // Re-check before enabling GPIO4 — fault could have arrived this tick.
   if (shouldImmediatelyCutGPIO4(reason) && !gpio4IsLow) {
-    applyImmediateCut(tick, reason);
+    applyImmediateCut(tick, reason, false);
     return;
   }
   // Hold field off while Core 0 internet operation is in progress OR while
@@ -6797,8 +6816,24 @@ bool shouldCutGPIO4AfterSettle(FieldEventReason reason, uint32_t nowMs, float ap
     case REASON_CHARGING_DISABLED:
       return true;
 
+      // Same class as CHARGING_DISABLED: both are only ever produced with chargingEnabled false, so
+      // both land in MODE_DISABLED_RAMP. Without their own cases they fell to the default below and
+      // runShutdownPath's else-branch re-asserted digitalWrite(4, HIGH) every tick forever: duty at 0
+      // and fieldActiveStatus 0 (dashboard reads "field off") while the enable line stayed up, the
+      // MT3608 12V boost stayed on and Q3's driver stayed out of UVLO. The field was one stray PWM
+      // write away from live with the UI claiming it was dead.
+    case REASON_BMS_DISABLED:
+    case REASON_SOLAR_PAUSE:
+      return true;
+
+      // Fail safe. This function is only ever called from runShutdownPath, i.e. the field is already
+      // being taken down; once duty has held 0 for SettleTimeBeforeCut, opening the gate is always
+      // the correct end state. The one case that must stay up to recover without a cut is
+      // REASON_TEMP_WARNING, which has its own case above. Reaching here now means a reason with no
+      // case at all (REASON_NONE — the "Shutdown mode with no reason specified" path), and leaving
+      // the field enabled on an unknown reason is the wrong side to fail on.
     default:
-      return false;
+      return true;
   }
 }
 

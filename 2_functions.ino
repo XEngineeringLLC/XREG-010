@@ -257,6 +257,7 @@ bool fsRemove(const char *path) {
 #define NK_R_fixed "R_fixed"
 #define NK_RebulkCurrent_A "RebulkCurrent_A"
 #define NK_RebulkVoltage "RebulkVoltage"
+#define NK_RemoteDiagnostics "RemoteDiag"
 #define NK_ReseedFrac "ReseedFrac"
 #define NK_ReseedFracNS "ReseedFracNS"
 #define NK_CvRecovClimb "CvRecovClimb"

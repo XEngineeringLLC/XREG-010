@@ -446,6 +446,7 @@ const CSV1_FIELDS = [
     "Icv",
     "WaterDepth_ft",
     "Ignition",   // rides CSV1 so the banner IGN indicator tracks at ~10 Hz
+    "OnOff",      // master Alternator Enable — same frame as fieldActiveStatus, so the header switch can never disagree with the field-status word
     "mExcessEma",        // iExcess detector: averaged current excess over command (A ×10) — tuning trace
     "iExcessThreshold",  // iExcess detector: fire threshold E (A ×10) — tuning trace
     "mExcessEmaPeak",    // iExcess: per-frame peak averaged excess (A ×10) — live sparkline
@@ -3789,6 +3790,7 @@ const CSV3_FIELDS = [
     "n2kExtraTempSource",  // tN2kTempSource code for the extra probe
     "CommissionTempSrc",  // battTempActiveSrc when CommissionTempF was stamped (0 = legacy = board)
     "maxWorkingRpm",
+    "RemoteDiagnostics",
     "sessionId",  // device boot identity, same in every channel this boot
     "sendMs",  // device millis() when this settings echo was built; event-driven with a 60 s fallback
 ];
@@ -8332,7 +8334,7 @@ function updateAllEchosOptimized(data) {
         { key: 'ManualLifePercentage', id: 'ManualLifePercentage_echo', transform: v => v },
         { key: 'BatteryCurrentSource', id: 'BatteryCurrentSource_echo', transform: v => ({0: 'INA228 Shunt', 1: 'NMEA2K', 2: 'NMEA0183', 3: 'Victron VE.Direct'}[v] ?? v) },
         { key: 'timeAxisModeChanging', id: 'timeAxisModeChanging_echo', transform: v => v == 1 ? 'UNIX' : 'Elapsed' },
-        { key: 'timeSourceMode', id: 'timeSourceMode_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'Phone only', 3:'NTP time only'}[v] ?? '?') },
+        { key: 'timeSourceMode', id: 'timeSourceMode_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'This device only', 3:'NTP time only'}[v] ?? '?') },
         { key: 'gpsPositionSource', id: 'gpsPositionSource_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'Phone only'}[v] ?? '?') },
         { key: 'speedSourceMode', id: 'speedSourceMode_echo', transform: v => ({0:'NMEA 2000', 1:'Phone GPS'}[v] ?? '?') },
         { key: 'webgaugesinterval', id: 'webgaugesinterval_echo', transform: v => v },
@@ -8355,6 +8357,7 @@ function updateAllEchosOptimized(data) {
         { key: 'rvcDevPriority', id: 'rvcDevPriority_echo', transform: v => v },
         { key: 'TuningMode', id: 'TuningMode_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'CloudFeatures', id: 'CloudFeatures_echo', transform: v => v == 1 ? 'On' : 'Off' },
+        { key: 'RemoteDiagnostics', id: 'RemoteDiagnostics_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'PidKp', id: 'PidKp_echo', transform: v => (v / 1000).toFixed(3) },
         { key: 'PidKi', id: 'PidKi_echo', transform: v => (v / 1000).toFixed(3) },
         { key: 'PidKd', id: 'PidKd_echo', transform: v => (v / 1000).toFixed(3) },
@@ -8736,26 +8739,101 @@ document.addEventListener('input', function (e) {
 }, true);
 
 //this allows user to turn the alternator OFF even without entering a passoword, for safety reasons, but not ON
-function handleAlternatorToggle(checkbox) {
-    const isGoingOn = checkbox.checked;
-    const checkboxId = checkbox.id;
-    const isLocked = !settingsUnlocked;
+// Master switch, expanded header (#header-onoff) and collapsed strip (#hcs-onoff). It looks like a
+// sliding toggle but it is two half-width buttons: the left half always sends OnOff=0 and the right half
+// always sends OnOff=1 — what the control is painting never decides what a press sends. (A checkbox
+// slider sends the opposite of whatever it happens to show, and a paint that lagged or reverted turned
+// an intended OFF into an ON — bench, 2026-09-15.) Display: the knob and the track fill are the
+// regulator's own OnOff from CSV1 (~10 Hz, the same frame as the field-status word), and the knob stays
+// hidden until the first frame rather than defaulting to a position we have not been told; the pressed
+// half holds a ring until the regulator echoes it or the echoReconcile grace runs out. Nothing in this
+// path sends on a paint, a resync, a timeout or a failure — only a press sends, and it sends once.
+// OFF is the safety override: no arming, no confirm, no condition — one fetch.
+// src/n: this tab's page-load nonce and its press counter, logged by the firmware next to the write and
+// used there to drop an ON that arrives out of order or twice (an OnOff=1 landed 32 ms after the user's
+// OnOff=0 and re-energized the field). OFF is never gated.
+let g_onOffDevice = null;   // last OnOff the regulator reported (CSV1); null until the first frame
+const g_clientTabId = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
+let g_clientWriteN = 0;
+function clientWriteTag() { return '&src=' + g_clientTabId + '&n=' + (++g_clientWriteN); }
 
-    // Always allow turning OFF (safety feature)
-    if (!isGoingOn) {
-        if (handleUserToggle(checkboxId, 'OnOff', 'OnOff')) {
-            return true;
-        }
-    }
+// A control write that never arrives looks, from the browser, exactly like one the regulator refused.
+// On 2026-09-15 a master-switch press died in the air while the device's own radio sat at -30 dBm with
+// zero reconnects and a 107 ms worst loop — the link drops whole requests while looking healthy — so a
+// press that "did not take" was a lost packet, not a firmware fault. Resend instead of losing it.
+// Two things make the resend safe, and BOTH are load-bearing:
+//   1. The URL, and therefore its n, is built ONCE by the caller. The firmware's per-tab guard discards
+//      a repeat, so a retry can never apply the command twice.
+//   2. myN !== g_clientWriteN means the user has pressed again since. Stop, and let the newer press own
+//      the outcome — a retried ON landing after a newer OFF is the 32 ms field re-energize bug in reverse.
+// Only a SILENT failure is retried. Any HTTP status is the regulator answering and is never re-sent.
+const CONTROL_WRITE_TRIES = 3;
+const CONTROL_WRITE_TIMEOUT_MS = 1600;   // ~10x the worst observed reply; 3 tries stays inside the old 5 s
+function sendControlWrite(url, myN) {
+    let attempt = 0;
+    const once = () => {
+        attempt++;
+        return fetchWithTimeout(url, {}, CONTROL_WRITE_TIMEOUT_MS)
+            .catch(err => {
+                if (myN !== g_clientWriteN) return { superseded: true };
+                if (attempt >= CONTROL_WRITE_TRIES) throw err;
+                return once();
+            });
+    };
+    return once();
+}
 
-    // Turning ON requires unlocked system
-    if (isGoingOn && isLocked) {
-        // xAlert("Settings must be unlocked to turn alternator ON");   // i find this intrusive
-        checkbox.checked = false;
-        return false;
-    }
+// v: the regulator's state (null/undefined = not yet known, knob hidden); pendingV: the press awaiting
+// its echo. Never infer v — an unknown state must look unknown, not like OFF.
+function paintOnOff(v, pendingV) {
+    const known = (v === 0 || v === 1);
+    document.querySelectorAll('#header-onoff, #hcs-onoff').forEach(sw => {
+        sw.classList.toggle('is-on', known && v === 1);
+        sw.classList.toggle('is-off', known && v === 0);
+    });
+    document.querySelectorAll('#header-onoff .onoff-half, #hcs-onoff .onoff-half').forEach(b => {
+        b.classList.toggle('onoff-pending', Number(b.dataset.v) === pendingV);
+    });
+}
 
-    return handleUserToggle(checkboxId, 'OnOff', 'OnOff');
+function alternatorSet(want) {
+    want = want ? 1 : 0;
+    if (DEMO_MODE) { g_onOffDevice = want; paintOnOff(want); return; }
+    pendingToggles.set('OnOff', { desiredValue: want, baseRev: lastSeenRev });
+    paintOnOff(g_onOffDevice, want);
+    // Drop the pending mark and show the regulator's state as last reported. Used for every non-success:
+    // the paint is only ever the device's truth, never a guess at what the write did.
+    const settle = () => { pendingToggles.delete('OnOff'); paintOnOff(g_onOffDevice); };
+    const url = buildURL('/get?OnOff=' + want + clientWriteTag());
+    const myN = g_clientWriteN;   // the press counter clientWriteTag() just minted for THIS url
+    sendControlWrite(url, myN)
+        .then(r => {
+            if (r.superseded) return;   // a newer press is in flight and owns the outcome
+            if (r.ok) return;
+            settle();
+            if (r.status === 403) {
+                // settingsUnlocked only MIRRORS a window the device owns and closes on its own 30-minute
+                // timer, so the mirror never decides anything here: the write goes out and only the
+                // device's own refusal is reported. Re-sync the mirror now that it is known stale.
+                syncArmState();
+                // xAlert("Settings must be unlocked to turn alternator ON");   // i find this intrusive
+                xAlert('The regulator refused this — its settings window has closed. Press Unlock Settings, then press ON again.',
+                       'Alternator NOT enabled');
+            } else {
+                xAlert('The regulator rejected the request (HTTP ' + r.status + '). The alternator was NOT changed.',
+                       'Alternator NOT changed');
+            }
+        })
+        .catch(() => {
+            // No answer is not a refusal: the request may well have landed (an ON the regulator logged came
+            // back to the browser as a timeout on the bench), so nothing is flipped — the filled segment
+            // shows what the regulator is actually doing.
+            settle();
+            xAlert('Sent ' + CONTROL_WRITE_TRIES + ' times and the regulator never answered, so the command most '
+                   + 'likely never reached it. The OFF / ON control shows what it is actually doing'
+                   + (want ? '.' : ' — if it still reads ON, press OFF again.'),
+                   'Alternator: no answer');
+        });
 }
 function hideSettingsAccess() {
     document.getElementById('settings-access-section').style.display = 'none';
@@ -10585,6 +10663,18 @@ function _xDlgShow(msg, opts) {
         inp.value = '';
         let settled = false;
         const done = v => { if (settled) return; settled = true; ov.style.display = 'none'; resolve(v); };
+        // Optional third action, e.g. "Go to the setting". Gets its own full-width row above
+        // Cancel/OK (btns wraps) so a descriptive label still fits at phone width. Resolves like
+        // Cancel — the caller's action replaces the submit, it never proceeds as well.
+        btns.style.flexWrap = 'wrap';
+        if (o.extra && o.extra.text) {
+            const exB = document.createElement('button');
+            exB.type = 'button';
+            exB.textContent = o.extra.text;
+            exB.style.cssText = 'flex:1 1 100%; background:transparent; border:1px solid #35d6c7; color:#35d6c7; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;';
+            exB.onclick = () => { done(o.prompt ? null : false); if (typeof o.extra.onSelect === 'function') o.extra.onSelect(); };
+            btns.appendChild(exB);
+        }
         if (o.confirm) {
             const cancel = document.createElement('button');
             cancel.textContent = o.cancelText || 'Cancel';
@@ -10626,6 +10716,31 @@ function xConfirm(msg, opts) {
     _xDlgQueue = p.then(() => { }, () => { });
     return p;
 }
+// Jump Setup to the control for a form input name and flash it. Protections cards carry their
+// label in a sibling .protections-name instead of a .form-row, so the row to flash is found per
+// layout rather than assumed.
+function goToSettingByName(inputName) {
+    const inp = document.querySelector('#settings [name="' + inputName + '"]');
+    if (!inp) return false;
+    const form = inp.closest('form');
+    const prev = form && form.previousElementSibling;
+    const row = inp.closest('.form-row')
+        || ((prev && prev.classList.contains('protections-name')) ? prev : null)
+        || inp.closest('.protections-param')
+        || inp;
+    ssRevealEl(row);
+    return true;
+}
+
+// Turns a validator's warnAction into the confirm dialog's third button. A warning that names a
+// setting living on another tab is worth acting on, not just reading — this takes the user there
+// and abandons the submit.
+function xWarnExtra(result) {
+    const a = result && result.warnAction;
+    if (!a) return undefined;
+    return { extra: { text: a.text, onSelect: () => goToSettingByName(a.name) } };
+}
+
 // For inline onsubmit handlers: an async dialog can't block a native submit, so always return
 // false and re-submit programmatically on OK (form.submit() bypasses onsubmit — no loop).
 function xConfirmSubmit(form, msg) {
@@ -12142,14 +12257,14 @@ function fieldOffReasonText(reasonCode) {
         case 9:  return 'protection lockout active';
         case 10: {
             // The firmware collapses four causes into one code: chargingEnabled = (Ignition && OnOff),
-            // cleared again by the Idle stage. Both inputs are on hand here — Ignition rides CSV1 at
-            // ~10 Hz, the enable checkbox mirrors the OnOff echo — so name the one that is actually off
-            // rather than printing the shared word. Ignition first: with the key off, the app toggle
-            // says nothing about why the field is down.
+            // cleared again by the Idle stage. Both inputs are on hand here — Ignition and OnOff both ride
+            // CSV1 at ~10 Hz (g_onOffDevice) — so name the one that is actually off rather than printing
+            // the shared word. Ignition first: with the key off, the app switch says nothing about why the
+            // field is down.
             const ign = (typeof g_lastCsv1 === 'object' && g_lastCsv1 && g_lastCsv1.Ignition !== undefined)
                 ? Number(g_lastCsv1.Ignition) : NaN;
             if (ign === 0) return 'ignition off';
-            const enableOn = (() => { const cb = document.getElementById('header-alternator-enable'); return cb ? cb.checked : true; })();
+            const enableOn = (g_onOffDevice === null) ? true : (g_onOffDevice === 1);
             if (!enableOn) return 'alternator switched off';
             if (gLastChargeStage === 7) return 'charge cycle complete — resting';
             return 'charging disabled';
@@ -15228,7 +15343,9 @@ function updateTogglesFromData(data) {
         const invertedManual = data.ManualFieldToggle === undefined ? undefined : (data.ManualFieldToggle === 0 ? 1 : 0);
         updateCheckbox("ManualFieldToggle_checkbox", invertedManual, "ManualFieldToggle");
         updateCheckbox("PhysicalPanelOverride_checkbox", data.PhysicalPanelOverride, "PhysicalPanelOverride");
-        updateCheckbox("header-alternator-enable", data.OnOff, "OnOff");
+        // The master switch (#header-onoff / #hcs-onoff) is painted from CSV1 (~10 Hz), not here: CSV3 is
+        // event-driven with a 60 s fallback and settingWrite() does not set settingsDirty, so this echo
+        // lagged the field by up to a minute. Two writers on one control would just restore that lag.
         updateCheckbox("LimpHome_checkbox", data.LimpHome, "LimpHome");
         // HiLow / charge rate mode handled via pendingToggles in CSVData3 handler
         updateCheckbox("VeData_checkbox", data.VeData, "VeData");
@@ -15320,6 +15437,10 @@ function updateTogglesFromData(data) {
         updateTuningModeUI(data.TuningMode);  // unified Begin/Stop Test button (no checkbox anymore)
         updateCheckbox("socInfoAvailable_checkbox", data.socInfoAvailable, "socInfoAvailable");
         updateCheckbox("CloudFeatures_checkbox", data.CloudFeatures, "CloudFeatures");
+        updateCheckbox("RemoteDiagnostics_checkbox", data.RemoteDiagnostics, "RemoteDiagnostics");
+        // The echo is the only source pollLogRequest has for this switch — it never reads the DOM,
+        // so a change made on another client stops/starts this app's polling too.
+        if (data.RemoteDiagnostics !== undefined) g_remoteDiagnostics = Number(data.RemoteDiagnostics);
         updateUploadNowButtonState();  // re-gray "Upload Now" if cloud just turned off/on
         updateCheckbox("wifiNapEnabled_checkbox", data.wifiNapEnabled, "wifiNapEnabled");
         // SystemID test-type selector (segmented): reflect saved value + show/hide sine params
@@ -16128,21 +16249,8 @@ function computeStripState() {
     if (fs === 'RAMP DOWN')     return { label: 'RAMP DOWN', cls: 'st-charging' };
     if (fs === 'MANUAL')        return { label: 'MANUAL', cls: 'st-manual' };
     if (fs === 'WAITING CLOUD') return { label: 'WAIT CLOUD', cls: 'st-idle' };
-    const cb = document.getElementById('header-alternator-enable');
-    const off = classifyFieldOff(Number(window._lastFieldEventReason), !!(cb && cb.checked));
+    const off = classifyFieldOff(Number(window._lastFieldEventReason), g_onOffDevice === 1);
     return { label: off.word, cls: off.pillCls };
-}
-
-// The strip's On/Off drives the exact same path as the header checkbox — including the safety rule
-// that OFF is always allowed but ON needs an unlocked system (handleAlternatorToggle reverts a
-// locked-ON attempt). stopPropagation lives on the element; here we just resync the visual after.
-function stripAltToggle(ev) {
-    if (ev) ev.stopPropagation();
-    const cb = document.getElementById('header-alternator-enable');
-    if (!cb) return;
-    cb.checked = !cb.checked;
-    if (handleAlternatorToggle(cb)) { if (cb.form) cb.form.submit(); submitMessage(); }
-    syncHeaderStrip();
 }
 
 // Header minimize: mirrors the live header values into the collapsed strip. No-op unless collapsed,
@@ -16185,9 +16293,6 @@ function syncHeaderStrip() {
         }
         pill.className = 'hcs-pill ' + st.cls;
     }
-    const cb = document.getElementById('header-alternator-enable');
-    const tog = document.getElementById('hcs-toggle');
-    if (tog) tog.classList.toggle('on', !!(cb && cb.checked));
 }
 
 function toggleHeaderCollapse() {
@@ -16776,6 +16881,19 @@ window.addEventListener("load", function () {
             const dutyCycleDisplay = document.getElementById('dutyCycleID3');
             const dutyPercentSign  = document.getElementById('dutyCyclePercentSign');
 
+            // Master Alternator Enable, painted from CSV1 — the SAME frame as fieldActiveStatus below.
+            // It used to come off the CSV3 settings echo, which settingWrite() does not mark dirty, so
+            // the switch could sit at OFF for up to 60 s beside a live MANUAL 50% field-status word.
+            // Everything downstream of here (the OFF classifier, fieldOffReasonUpdate, the reason-10
+            // banner) reads g_onOffDevice, so it must be set BEFORE them or they judge the new frame
+            // against the previous frame's switch. g_onOffDevice is always the device's truth; only the
+            // PAINT waits behind a pending press (echoReconcile), and a paint never sends anything.
+            if (data.OnOff !== undefined) {
+                g_onOffDevice = Number(data.OnOff);
+                const onoffEcho = echoReconcile('OnOff', g_onOffDevice);
+                if (onoffEcho !== null) paintOnOff(onoffEcho);   // confirmed, or grace expired: the pressed outline clears
+            }
+
             // Field OFF ≠ a fault by itself — annotate WHY, from the firmware FieldEventReason (CSV1)
             // plus the master switch and charge stage the firmware can't disambiguate on its own.
             if (data.fieldEventReason !== undefined) fieldOffReasonUpdate(data.fieldActiveStatus, parseInt(data.fieldEventReason));
@@ -16804,8 +16922,7 @@ window.addEventListener("load", function () {
                 } else {
                     // OFF splits into FAULT (red) / IDLE (slate) / OFF (gray) — same classifier and
                     // palette the minimized pill uses, so the two views always agree.
-                    const enableOn = (() => { const cb = document.getElementById('header-alternator-enable'); return cb ? cb.checked : false; })();
-                    const off = classifyFieldOff(Number(window._lastFieldEventReason), enableOn);
+                    const off = classifyFieldOff(Number(window._lastFieldEventReason), g_onOffDevice === 1);
                     fieldIndicator.textContent = off.word;
                     if (fieldWrapper) fieldWrapper.className = 'reading-value header-field-cluster ' + off.expClass;
                     if (dutyCycleDisplay) dutyCycleDisplay.style.display = 'none';
@@ -19066,6 +19183,7 @@ max-width: 100%;     /* allow full width on mobile */
     // TuningMode has no checkbox anymore — the unified Begin/Stop Test button reflects it via updateTuningModeUI().
     document.getElementById("socInfoAvailable_checkbox").checked = (document.getElementById("socInfoAvailable").value === "1");
     document.getElementById("CloudFeatures_checkbox").checked = (document.getElementById("CloudFeatures").value === "1");
+    document.getElementById("RemoteDiagnostics_checkbox").checked = (document.getElementById("RemoteDiagnostics").value === "1");
     document.getElementById("AutoAltCurrentZero_checkbox").checked = (document.getElementById("AutoAltCurrentZero").value === "1");
     document.getElementById("HardwarePresent_checkbox").checked = (document.getElementById("hardwarePresent").value === "1");
 
@@ -19624,6 +19742,14 @@ function goToCVMode() {
     showMainTab('settings');
     showSubTab('settings', 'alternator');
     showAltTab('primary', 'alt-panel-vt-mode');
+}
+
+// Battery > Safety points at the whole over-voltage ladder, not one rung. Landing element is the
+// card's title row, not the article: the card is taller than a phone screen, so centering the
+// article itself would scroll its own title off the top.
+function goToOvLadder() {
+    const card = document.getElementById('ovLadderCard');
+    ssRevealEl(card && card.querySelector('.protections-name'));
 }
 
 // Live Data > Diag is results-only; its knobs are the 6th alt-tab under Setup > Alternator.
@@ -20522,9 +20648,40 @@ function manualFieldToggleApply(cb, manual) {
     cb.checked = !manual;
     if (!handleManualFieldToggle('ManualFieldToggle_checkbox')) return;
     syncSegmented('ManualFieldToggle_checkbox');
-    const form = cb.form || cb.closest('form');
-    if (form) form.submit();
-    submitMessage();
+    if (DEMO_MODE) return;
+    // fetch, not the hidden-iframe form submit: a submit has no timeout, so on a stalled link it can
+    // land minutes later and flip the mode after the user's next press, and its answer is invisible.
+    // src/n let the firmware log the sender and drop a write that arrives out of order (same tag and
+    // guard as the master switch). A REFUSAL repaints from the last echo and is never re-sent; only a
+    // silent failure is retried, by sendControlWrite, which reuses this url so n never changes.
+    const v = manual ? 1 : 0;
+    const repaint = () => {
+        pendingToggles.delete('ManualFieldToggle');
+        const last = toggleStates['ManualFieldToggle'];          // last CSV3 echo, inverted domain (1 = PID)
+        if (last !== undefined) { cb.checked = (last === 1); syncSegmented('ManualFieldToggle_checkbox'); }
+    };
+    const url = buildURL('/get?ManualFieldToggle=' + v + clientWriteTag());
+    const myN = g_clientWriteN;
+    sendControlWrite(url, myN)
+        .then(r => {
+            if (r.superseded) return;
+            if (r.ok) return;
+            repaint();
+            if (r.status === 403) {
+                syncArmState();
+                xAlert('The regulator refused this — its settings window has closed. Press Unlock Settings, then choose the mode again.',
+                       'Field control NOT changed');
+            } else {
+                xAlert('The regulator rejected the request (HTTP ' + r.status + '). Field control was NOT changed.',
+                       'Field control NOT changed');
+            }
+        })
+        .catch(() => {
+            repaint();
+            xAlert('Sent ' + CONTROL_WRITE_TRIES + ' times and the regulator never answered, so the command most likely '
+                   + 'never reached it. The Field Control echo shows the mode it is actually in.',
+                   'Field control: no answer');
+        });
 }
 
 function handleManualFieldToggle(checkboxId) {
@@ -21720,9 +21877,12 @@ function toggleLogs() {
 // device over LAN, bundles + gzips them, and uploads to a private Supabase
 // Storage bucket via a signed URL. Fully silent, gated on cloud registration.
 // A failed upload leaves the window open → retried on the next poll.
+// The owner's Remote Diagnostics switch (Setup ▸ System) gates the poll on top of that,
+// independently of Cloud Features.
 let g_cloudToken = null;
 let g_logRelayBusy = false;
 let g_loggingActive = 1;  // last-known Stop/Start state (1=recording, 0=user-paused); stamped into bundles
+let g_remoteDiagnostics = null;  // owner's Remote Diagnostics switch from the CSV3 echo; null = not echoed yet, so nothing is asked of the cloud
 
 // Adaptive poll cadence: 60s baseline while the app is open, ramps to 10s once a
 // log request is seen, and stays fast until 1hr passes with no new request. Lets a
@@ -21888,6 +22048,9 @@ function getDiagnosticsSnapshot() {
 async function pollLogRequest() {
     if (g_logRelayBusy) return;
     try {
+        // Inside the try so the finally still reschedules: the chain has to keep ticking while the
+        // switch is off, or turning it on would need a page reload to resume polling.
+        if (g_remoteDiagnostics !== 1) return;
         const token = await ensureCloudToken();
         if (!token) return;
 
@@ -23090,7 +23253,8 @@ function validateBatterySettings(proposedChanges) {
                 valid: true,
                 warning: over.map(([n2, v]) => n2 + ' (' + v.toFixed(2) + ' V)').join(' and ')
                     + ' is at or above the Alternator Hard Shutdown Voltage (' + cut.toFixed(2) + ' V), so the field is cut before the bank reaches it. '
-                    + 'Raise the shutdown voltage above the target, or run Recommend Initial Charging Settings under System Settings to set the whole protection ladder for this battery chemistry.'
+                    + 'Raise the shutdown voltage above the target, or run Recommend Initial Charging Settings under System Settings to set the whole protection ladder for this battery chemistry.',
+                warnAction: { text: 'Take me to the shutdown voltage', name: 'AlternatorHardShutdownV' }
             };
         }
     }
@@ -23192,7 +23356,7 @@ function validateAndSubmitBatteryNumber(form, fieldName) {
     }
 
     if (result.warning) {
-        xConfirm(result.warning + '\n\nProceed anyway?').then(ok => {
+        xConfirm(result.warning + '\n\nProceed anyway?', xWarnExtra(result)).then(ok => {
             if (ok) { form.submit(); submitMessage(); }
         });
         return false;
@@ -23213,7 +23377,7 @@ async function validateAndSubmitBatteryToggle(checkbox, fieldName) {
     }
 
     if (result.warning) {
-        if (!(await xConfirm(result.warning + '\n\nProceed anyway?'))) {
+        if (!(await xConfirm(result.warning + '\n\nProceed anyway?', xWarnExtra(result)))) {
             checkbox.checked = !checkbox.checked;
             return false;
         }
@@ -25778,10 +25942,33 @@ function cxRunTok() { return 1 + Math.floor(Math.random() * 4294967294); }
 // Firmware tests carry a browser-poll deadman: a phone screen that sleeps mid-run aborts the
 // test as "connection lost". Hold a screen wake lock while the wizard or the standalone stress
 // modal is open. The OS drops the lock whenever the page hides — re-acquire on return.
-let _wakeLock = null, _wakeLockWant = false;
+// The Wake Lock API exists only in a secure context, so over the regulator's plain-HTTP origin
+// (every browser path; the app's WebView origin is secure) navigator.wakeLock is undefined.
+// Fallback there: loop a 2 s 32x32 black video that carries a silent audio track, UNMUTED
+// (the NoSleep.js technique). Unmuted is load-bearing: Chrome holds its media wake lock for an
+// off-screen video only while it is audible, and a muted video stopped keeping iOS awake in
+// iOS 15. Side effect: iOS pauses whatever else is playing audio while the wizard is open.
+let _wakeLock = null, _wakeLockWant = false, _wakeVideo = null;
+const WAKE_VIDEO_SRC = 'data:video/mp4;base64,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';
+function wakeVideoPlay(on) {
+    if (on) {
+        if (!_wakeVideo) {
+            const v = document.createElement('video');
+            v.setAttribute('title', 'XREG-010 keep awake');
+            v.setAttribute('playsinline', '');
+            v.setAttribute('loop', '');
+            v.addEventListener('ended', () => { if (_wakeLockWant) v.play().catch(() => { }); });
+            v.src = WAKE_VIDEO_SRC;
+            _wakeVideo = v;
+        }
+        if (_wakeVideo.paused) _wakeVideo.play().catch(() => { });
+    } else if (_wakeVideo && !_wakeVideo.paused) {
+        _wakeVideo.pause();
+    }
+}
 function wakeLockWant(on) {
     _wakeLockWant = on;
-    if (!navigator.wakeLock) return;
+    if (!navigator.wakeLock) { wakeVideoPlay(on); return; }
     if (on && !_wakeLock) {
         navigator.wakeLock.request('screen').then(w => {
             _wakeLock = w;
@@ -25795,6 +25982,11 @@ function wakeLockWant(on) {
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && _wakeLockWant) wakeLockWant(true);
 });
+// Unmuted play() needs a user gesture. A foreground return has none, so if the video stayed
+// paused after visibilitychange the next tap inside the wizard restarts it.
+document.addEventListener('click', () => {
+    if (_wakeLockWant && !navigator.wakeLock && _wakeVideo && _wakeVideo.paused) wakeVideoPlay(true);
+}, true);
 
 function openCommissionModal() {
     if (!settingsUnlocked) { xAlert('Unlock settings first.'); return; }
@@ -33697,6 +33889,17 @@ function ssCleanLabel(t) {
     return s.trim();
 }
 
+// Visible text of one .protections-name, with the tooltip, the "s" signal badge, the group tag and
+// every live readout removed — echoes read "?" until the first CSV frame and the Load Dump tiers
+// carry a second readout line, all of which would otherwise be indexed as part of the name.
+// Removing a span leaves its surrounding "( )" behind, so empty parens are collapsed after.
+function ssProtText(nameEl) {
+    const c = nameEl.cloneNode(true);
+    c.querySelectorAll('.tooltip, .sinfo, .protections-tag, [id$="_echo"], [id$="_live"], [id$="_tta"]')
+        .forEach(n => n.remove());
+    return c.textContent.replace(/\(\s*\)/g, ' ').replace(/\(\s+/g, '(');
+}
+
 // Panel DOM id -> human name, harvested from the switcher buttons themselves so breadcrumb
 // names always match what is printed on the tabs.
 function ssBuildPanelNames() {
@@ -33761,6 +33964,29 @@ function ssBuildIndex() {
     // data-ss-label — without this the C3 band matrix would drop out of search entirely.
     document.querySelectorAll('#settings [data-ss-label]').forEach(cell => {
         list.push({ label: cell.dataset.ssLabel, tip: '', crumbs: ssCrumbs(cell, names), el: cell });
+    });
+
+    // Protections cards use .protections-name + a sibling control block, not .form-row, so without
+    // this pass the entire over-voltage/over-current ladder — the safety settings people go looking
+    // for by name — is unsearchable. One card can hold several parameters (the Over-Voltage Ladder
+    // holds six), in which case it leads with a title row that owns no control; that title becomes
+    // the last breadcrumb so the results stay distinguishable.
+    document.querySelectorAll('#settings .protections-param').forEach(card => {
+        const rows = Array.from(card.querySelectorAll(':scope > .protections-name'));
+        const ctlFor = r => {
+            const sib = r.nextElementSibling;
+            return (sib && sib.querySelector && sib.querySelector('input, select, textarea')) ? sib : null;
+        };
+        const cardTitle = (rows.length && !ctlFor(rows[0])) ? ssCleanLabel(ssProtText(rows[0])) : '';
+        rows.forEach(r => {
+            if (!ctlFor(r)) return;
+            const label = ssCleanLabel(ssProtText(r));
+            if (label.length < 2) return;
+            const tipEl = r.querySelector('.tooltip-box');
+            const crumbs = ssCrumbs(r, names);
+            if (cardTitle) crumbs.push(cardTitle);
+            list.push({ label: label, tip: tipEl ? ssTidy(tipEl.textContent) : '', crumbs: crumbs, el: r });
+        });
     });
 
     const stop = {};
@@ -33936,11 +34162,24 @@ function ssRender() {
     if (selEl) selEl.scrollIntoView({ block: 'nearest' });
 }
 
-// Ancestor walk mirrors the goTo* helpers: collect switcher calls innermost-first, run them
-// outermost-first so main tab, sub-tab, alt-tab and inner panel are all set before scrolling.
 function ssNavigate(entry) {
     ssClose();
-    const row = entry.el;
+    ssRevealEl(entry.el);
+}
+
+// Reveal one Setup element: switch every enclosing tab/panel to it, scroll it into view, flash it.
+// Split out of ssNavigate so dialogs that name a setting on another tab can take the user there.
+// Ancestor walk mirrors the goTo* helpers: collect switcher calls innermost-first, run them
+// outermost-first so main tab, sub-tab, alt-tab and inner panel are all set before scrolling.
+function ssRevealEl(row) {
+    if (!row) return;
+    // Protections cards are display:none under a group pill that excludes them, so a jump into a
+    // filtered-out card would scroll to nothing. Put the filter back to All first.
+    const prot = row.closest ? row.closest('#alt-panel-protections') : null;
+    if (prot) {
+        const allPill = prot.querySelector('.protections-filters button[data-filter="all"]');
+        if (allPill && !allPill.classList.contains('active')) allPill.click();
+    }
     const acts = [];
     for (let el = row; el && el !== document.body; el = el.parentElement) {
         if (el.tagName === 'DETAILS') {

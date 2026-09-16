@@ -2166,6 +2166,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     CloudFeatures = settingRead(NK_CloudFeatures).toInt();
   }
+  if (!settingExists(NK_RemoteDiagnostics)) {
+    settingWrite(NK_RemoteDiagnostics, String(RemoteDiagnostics).c_str());
+  } else {
+    RemoteDiagnostics = settingRead(NK_RemoteDiagnostics).toInt();
+  }
   // A live test must NEVER auto-resume after a reboot — force OFF on boot, ignoring any stored value (write back only if it was stuck on).
   TuningMode = 0;
   if (settingExists(NK_TuningMode) && settingRead(NK_TuningMode).toInt() != 0) settingWrite(NK_TuningMode, "0");

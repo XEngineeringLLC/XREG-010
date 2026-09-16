@@ -4152,6 +4152,7 @@ int IgnoreLearningDuringPenalty = 1;
 // Diagnostics & Debugging
 int LogAllLearningEvents = 0;       // Log every learning decision
 int CloudFeatures = 1;
+int RemoteDiagnostics = 1;  // gates the dashboard's support log-relay poll; firmware only stores and echoes it
 
 // Data Management
 // Deferred saves — set by Core 0 (AsyncWebServer handlers), executed on Core 1 in main loop

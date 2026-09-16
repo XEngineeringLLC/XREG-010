@@ -970,6 +970,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "ManualSOCPoint", NK_ManualSOCPoint, 1 },
   { "ManualLifePercentage", NK_ManualLifePercentage, 1 },
   { "CloudFeatures", NK_CloudFeatures, 1 },
+  { "RemoteDiagnostics", NK_RemoteDiagnostics, 1 },
   { "FuelEfficiency", NK_FuelEfficiency, 1 },
   { "WeatherUpdateInterval", NK_WeatherUpdateInterval, 1 },
   { "WeatherTimeoutMs", NK_WeatherTimeoutMs, 1 },

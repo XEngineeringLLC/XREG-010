@@ -172,9 +172,10 @@
     <!-- Minimized status strip — one locked-height line, shown only while .header-collapsed.
          Readouts are grouped Alternator │ Battery │ Engine and reveal in priority order as the
          strip widens (see the @container rules in styles.css); it never wraps or grows taller.
-         Values, the state pill, and the toggle are mirrored from the live header by
-         syncHeaderStrip(). Only the chevron expands; the toggle is an isolated control that
-         drives the same Alternator-Enable path (stripAltToggle → handleAlternatorToggle). -->
+         Values and the state pill are mirrored from the live header by syncHeaderStrip(); the
+         OFF / ON control is painted from CSV1 by paintOnOff(). Only the chevron expands; the
+         OFF / ON switch is an isolated control that sends the same explicit commands as the
+         expanded header (alternatorSet). -->
     <div id="header-collapsed-strip">
       <!-- Connection dot: teal = live stream, red = disconnected, orange = offline mode.
            Leads the reading order — everything to its right is only live if this is teal. -->
@@ -199,9 +200,13 @@
       <!-- State word sits RIGHT of the numbers so its width changes (BULK → ABSORPTION →
            PROTECT) grow into the flex spacer and never shift the readouts -->
       <span id="hcs-pill" class="hcs-pill">—</span>
-      <!-- Alternator On/Off — isolated control; stopPropagation keeps it from expanding -->
+      <!-- Alternator OFF / ON — isolated control; stopPropagation keeps a press from expanding -->
       <span class="hcs-divider"></span>
-      <span id="hcs-toggle" class="hcs-toggle" title="Alternator On/Off" onclick="stripAltToggle(event)"><span class="hcs-knob"></span></span>
+      <span id="hcs-onoff" class="onoff-switch" role="group" aria-label="Alternator Enable" onclick="event.stopPropagation()">
+        <span class="onoff-knob" aria-hidden="true"></span>
+        <button type="button" class="onoff-half" data-v="0" title="Turn the alternator OFF" aria-label="Turn the alternator off" onclick="alternatorSet(0)">OFF</button>
+        <button type="button" class="onoff-half" data-v="1" title="Turn the alternator ON" aria-label="Turn the alternator on" onclick="alternatorSet(1)">ON</button>
+      </span>
       <!-- The only tap target that expands the header -->
       <span class="hcs-chevron" title="Expand header" onclick="toggleHeaderCollapse()">⌄</span>
     </div>
@@ -282,18 +287,22 @@
         </div>
       </div>
 
-      <!-- Alternator Enable — sits right of chips when screen is wide enough -->
+      <!-- Alternator Enable — sits right of chips when screen is wide enough.
+           Looks like a slider, behaves like two buttons: each half of the track is its own absolute
+           command (left half always sends OnOff=0, right half always sends OnOff=1), so what the
+           control is painting can never change what a press sends. A real slider sends the opposite
+           of whatever it shows, and a paint that lagged or reverted turned an intended OFF into an
+           ON. The knob sits over the regulator's own state (CSV1 OnOff, ~10 Hz) and is hidden until
+           the first frame arrives; the pressed half carries a ring until the regulator echoes it
+           (alternatorSet / paintOnOff, script.js). -->
       <div class="alternator-control-tier">
         <div class="alternator-control">
           <span class="control-label">Alternator Enable</span>
-          <form action="/get" method="GET" target="hidden-form">
-            <label class="switch">
-              <input id="header-alternator-enable" type="checkbox"
-                onchange="if(handleAlternatorToggle(this)) { this.form.submit(); submitMessage(); }" />
-              <span class="slider"></span>
-            </label>
-            <input id="OnOff" name="OnOff" type="number" value="" style="display:none;" />
-          </form>
+          <div id="header-onoff" class="onoff-switch" role="group" aria-label="Alternator Enable">
+            <span class="onoff-knob" aria-hidden="true"></span>
+            <button type="button" class="onoff-half" data-v="0" title="Turn the alternator OFF" aria-label="Turn the alternator off" onclick="alternatorSet(0)">OFF</button>
+            <button type="button" class="onoff-half" data-v="1" title="Turn the alternator ON" aria-label="Turn the alternator on" onclick="alternatorSet(1)">ON</button>
+          </div>
         </div>
       </div>
 
@@ -2790,7 +2799,7 @@
                     </form>
                   </article>
 
-                  <article class="protections-param" data-groups="g1 g2">
+                  <article class="protections-param" id="ovLadderCard" data-groups="g1 g2">
                     <div class="protections-name">
                       Over-Voltage Ladder
                       <span class="tooltip">ℹ️<span class="tooltip-box">The battery-voltage cut rungs, in the order they engage. Below them sits the Group 2 proportional shed (its Trip Margin card is above), which caps current without cutting the field. The two timed cut tiers ride above it: an excursion that stays over a tier's trip line continuously for that tier's time to act cuts the field, with the same escalating re-enable lockout as the instant cut. Brief transients get time to be resolved by the shed — no cut, nothing felt at the engine — while anything sustained is cut well before a battery protection circuit (BMS) could open its charge path. Above the timed tiers sit two absolute instant rungs: the software hard shutdown, then the hardware shutdown (a comparator inside the shunt monitor chip that cuts the field electrically, with no processor involvement — the backstop if software hangs). Keep the order: low tier at or above the shed margin, mid tier above it, software shutdown above both, hardware shutdown on top.</span></span>
@@ -7130,6 +7139,9 @@
                 cut thresholds — the timed cut tiers, the Alternator Hard Shutdown Voltage, and the Hardware Shutdown
                 Voltage — live together in the Over-Voltage Ladder card under Setup → Alternator → Protections → Detection.
               </p>
+              <p style="margin:6px 0 12px 0;">
+                <a class="xnav-link" onclick="goToOvLadder()">Shortcut to the Over-Voltage Ladder <span class="xnav-arrow">&rarr;</span></a>
+              </p>
 
               <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
@@ -9493,11 +9505,12 @@
                     ℹ️
                     <span class="tooltip-box">
                       Where the clock comes from. This is the time only — position has its own
-                      setting under Setup &#9656; Boat, so the phone can set the clock without
+                      setting under Setup &#9656; Boat, so this device can set the clock without
                       sharing where you are.<br>
-                      Auto: NMEA 2000 time when present, this phone next, internet time last.<br>
-                      NMEA only / Phone only / NTP time only: force one source.<br>
-                      In access-point mode the phone is the only clock available — there is no
+                      Auto: NMEA 2000 time when present, this device (the phone or computer running
+                      the app) next, internet time last.<br>
+                      NMEA only / This device only / NTP time only: force one source.<br>
+                      In access-point mode this device is the only clock available — there is no
                       internet and usually no bus.
                     </span>
                   </span>
@@ -9508,7 +9521,7 @@
                       onchange="this.form.submit(); submitMessage();">
                       <option value="0">Auto (recommended)</option>
                       <option value="1">NMEA only</option>
-                      <option value="2">Phone only</option>
+                      <option value="2">This device only</option>
                       <option value="3">NTP time only</option>
                     </select>
                   </form>
@@ -9531,6 +9544,25 @@
                     </label>
                     <span class="toggle-label">On</span>
                     <input id="CloudFeatures" name="CloudFeatures" type="number" value="0" style="display:none;" />
+                  </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row gate-ap">
+                <div class="form-label">Remote Diagnostics (<span id="RemoteDiagnostics_echo">?</span>):
+                  <span class="tooltip">ℹ️<span class="tooltip-box">When you ask X Engineering for help, support can request this regulator's log files. Whatever device has this app open checks for such a request about once a minute and, if one is waiting, gathers the logs from the regulator and uploads them. Off stops the checking. Nothing is ever requested unless you have asked for support.</span></span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="RemoteDiagnostics_checkbox" type="checkbox"
+                        onchange="if(handleUserToggle('RemoteDiagnostics_checkbox','RemoteDiagnostics','RemoteDiagnostics')){ this.form.submit(); submitMessage(); }" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input id="RemoteDiagnostics" name="RemoteDiagnostics" type="number" value="0" style="display:none;" />
                   </form>
                 </div>
               </div>
