@@ -2163,12 +2163,13 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Measured Zero (Engine Running):</span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">With the engine running and the
-                        alternator not charging, the current sensor should read exactly zero. Whatever it reads
-                        instead is its zero error at operating temperature, on this installation. Zero Now averages
-                        the reading for ten seconds and reports what it found, and Apply folds that number into the
-                        Alternator Current Offset above. The commissioning wizard measures this by itself during the
-                        last few steps and offers the result at the finish, when the alternator is warmest. The engine
-                        must be running above 400 RPM with the field off. A reading that is too large or too noisy is
+                        field at 0%, the current sensor should read exactly zero. Whatever it reads instead is its
+                        zero error at operating temperature, on this installation. Zero Now turns the field off by
+                        itself, waits for the rotor to drain, averages the reading for ten seconds, turns the field
+                        back on and reports what it found; Apply folds that number into the Alternator Current
+                        Offset above, where it is stored permanently. The commissioning wizard offers the same
+                        measurement at the finish, when the alternator is warmest. The engine must be running above
+                        400 RPM; charging pauses for under a minute. A reading that is too large or too noisy is
                         refused rather than applied.</span></span>
                   </div>
                   <div class="form-input">

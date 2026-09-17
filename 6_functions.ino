@@ -1812,6 +1812,9 @@ void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEvent
 // the whole AUTO/MANUAL/fault/stage machinery (the caller returns right after this), so no charging
 // stage runs, no "Charging stopped/enabled" spam, and no GPIO4 cut. A real fault never lands here —
 // selectFieldControlMode returns the fault mode instead, so this is only reached when nominal.
+// The current-sensor zero hold (REASON_ALTZERO_MEASURE) rides the same path with a ZERO target and
+// its own ramp: no field at all, so the sensor reads its zero error and nothing else. At 0% the RPM
+// pickup may well drop — buildTickSnapshot masks the RPM gates for the hold and its re-bias tail.
 void runCommissionIdle(const TickSnapshot &tick, FieldEventReason reason, float actualDtSec) {
   voltageControlActive = false;
   lastVoltageControlActive = false;  // same stale-tracker clear as runShutdownPath — the wizard's test-FAIL→rest→retry flow is the path that double-fired 2026-07-20
@@ -1823,8 +1826,9 @@ void runCommissionIdle(const TickSnapshot &tick, FieldEventReason reason, float 
 
   const float vNorm = 12.0f / fmaxf(1.0f, (float)SYSTEM_VOLTAGE_CLASS);
   const float restFloor = COMMISSION_REST_FLOOR_PCT * vNorm;   // 4 / 2 / 1.33 / 1 % @ 12 / 24 / 36 / 48 V
-  const float restRamp = COMMISSION_REST_RAMP_PCT * vNorm;     // 5 / 2.5 / 1.67 / 1.25 %/s
-  const float restTarget = restFloor;
+  const bool  zeroHold   = (reason == REASON_ALTZERO_MEASURE);
+  const float restRamp   = (zeroHold ? ALTZERO_RAMP_PCT : COMMISSION_REST_RAMP_PCT) * vNorm;   // rest: 5 / 2.5 / 1.67 / 1.25 %/s
+  const float restTarget = zeroHold ? 0.0f : restFloor;
 
   // Re-assert the field enable unconditionally: the mode arbiter guarantees no fault or lockout is
   // active when COMMISSION_IDLE is selected (lockout is priority 7, rest 7.6), but a rest resumed
@@ -3075,7 +3079,7 @@ void AdjustFieldLearnMode() {
     return;
   }
 
-  // ========== COMMISSIONING IDLE REST ==========
+  // ========== COMMISSIONING IDLE REST / CURRENT-SENSOR ZERO HOLD ==========
   // Handled here, before the AUTO/MANUAL/fault/stage machinery, so it neither runs a charging stage
   // nor logs mode transitions. sysMode is intentionally left as-is (last AUTO), so resuming a test or
   // ending the session slips back to NORMAL_AUTO with no SYS_MODE transition spam.
@@ -3083,8 +3087,9 @@ void AdjustFieldLearnMode() {
     // Rest preserves the prior AUTO sysMode — but a wizard started before the system ever reached
     // AUTO leaves sysMode at its OFF boot default with no path back (this branch returns before the
     // transition handler), so every field step is AUTO-gated off. chargingEnabled is guaranteed true
-    // here (selectFieldControlMode PRIORITY 1), so seed AUTO once.
-    if (sysMode != SYS_MODE_AUTO) {
+    // here (selectFieldControlMode PRIORITY 1), so seed AUTO once. Rest only: the zero hold may have
+    // interrupted MANUAL, and MANUAL is where it must hand back.
+    if (reason == REASON_COMMISSION_REST && sysMode != SYS_MODE_AUTO) {
       enter_sys_auto();
       pidInitialized = true;
       queueConsoleMessage("Charging enabled (AUTO)");
@@ -6421,6 +6426,7 @@ const char *reasonToString(FieldEventReason r) {
     case REASON_BATTERY_TOO_COLD: return "Battery too cold to charge";
     case REASON_BATTERY_TOO_HOT: return "Battery too hot to charge";
     case REASON_COMMISSION_REST: return "Commissioning idle (field resting)";
+    case REASON_ALTZERO_MEASURE: return "Measuring current sensor zero (field at 0%)";
     case REASON_TACH_IMPLAUSIBLE: return "TACH_IMPLAUSIBLE";
     case REASON_SOLAR_PAUSE: return "SOLAR_PAUSE";
     case REASON_BMS_DISABLED: return "BMS_OFF";
@@ -6451,6 +6457,15 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
   // because over-voltage is always disastrous. Must mirror selectFieldEventReason.
   if (tick.currentBatteryVoltage > tick.alternatorHardShutdownV) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
+  }
+
+  // PRIORITY 1.9: CURRENT-SENSOR ZERO HOLD — a requested zero measurement (altZeroCaptureService)
+  // needs the field at 0% while the engine runs. Above MANUAL so Zero Now works there too (the
+  // request is explicit and momentary); buildTickSnapshot already drops the flag whenever charging
+  // is disabled or a lockout has the field cut, so this never re-enables a gate a fault opened.
+  // Duty 0 with the enable line up, like the commissioning rest. Must mirror selectFieldEventReason.
+  if (tick.altZeroMeasuring) {
+    return MODE_COMMISSION_IDLE;
   }
 
   // PRIORITY 2: MANUAL MODE (UNRESTRICTED - bypasses all safeties when user wants manual control)
@@ -6556,6 +6571,9 @@ FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
   // Priority 1.5: Fast over-voltage — absolute ceiling, above the manual bypass and ungated.
   // Mirrors selectFieldControlMode PRIORITY 1.5. Live voltage → immediate cut + adaptive lockout.
   if (tick.currentBatteryVoltage > tick.alternatorHardShutdownV) return REASON_FAST_OVERVOLTAGE;
+
+  // Priority 1.9: Current-sensor zero hold (not a fault). Mirrors selectFieldControlMode.
+  if (tick.altZeroMeasuring) return REASON_ALTZERO_MEASURE;
 
   // Priority 2: Manual mode
   if (tick.manualMode) return REASON_MANUAL_MODE;
@@ -6834,6 +6852,21 @@ bool shouldCutGPIO4AfterSettle(FieldEventReason reason, uint32_t nowMs, float ap
 
 
 
+// Whether any test that owns the field is running or queued — the hold would fight it, so a zero
+// request made mid-test is refused outright instead of timing out 90 s later. Same union the
+// commissioning rest uses (buildTickSnapshot anyTestActive), minus faCommissionGate, which only
+// asks for live charging and is exactly what the hold interrupts. Lives here, not next to its
+// caller in 2_functions.ino, because resTestActive is declared later in that file.
+bool altZeroTestBusy() {
+  return (fieldCurveActive != 0) || (systemIDActive != 0) || (fieldCutActive != 0) ||
+         fieldCurveRequested || systemIDRequested || fieldCutRequested ||
+         (protTestActive != 0) || protTestRequested ||
+         resTestActive || batteryHealthTestActive || cvPlantFitActive || cvStressActive ||
+         (altSweepActive != 0) || altSweepRequested ||
+         (chcActive != 0) || chcRequested ||
+         TuningMode || CVTuningMode;
+}
+
 /**
  * buildTickSnapshot()
  * Constructs immutable snapshot of system state for pure decision functions
@@ -6933,7 +6966,14 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // Published for the engine start/stop console lines (5_functions.ino). The protection gates below
   // already ignore the corrupted tach; the log line did not, so a commissioning field-cut printed
   // "Engine STOPPED"/"STARTED" for an engine that never changed state.
-  bool rpmDropoutGrace = fieldCutRpmGrace || hardCutRpmGrace
+  // Current-sensor zero hold: the field is deliberately at 0% on a running engine, so the LM2907
+  // pickup may read low, zero or garbage for the whole hold and ~4.6 s after release while the field
+  // comes back and the front end re-biases. Nothing is energized under the hold (duty 0), so masking
+  // both gates exposes nothing; the tail is the same one the field-cut test uses.
+  bool altZeroRpmGrace = ((AltZeroCaptureNow == 1) && altZeroCapPhase >= ALTZERO_PH_RAMP)
+                         || (altZeroHoldEndMs != 0
+                             && (uint32_t)(currentMillis - altZeroHoldEndMs) < FIELDCUT_RPM_GRACE_MS);
+  bool rpmDropoutGrace = fieldCutRpmGrace || hardCutRpmGrace || altZeroRpmGrace
                          || ((g_lastProtClampMs != 0)
                              && ((uint32_t)(currentMillis - g_lastProtClampMs) < PROT_RPM_GRACE_MS)
                              && chargingEnabledLocal
@@ -7269,6 +7309,12 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   }
 
   tick.inLockout = (fieldCollapseTime > 0 && (tick.nowMs - fieldCollapseTime) < activeCollapseDelay);
+
+  // Current-sensor zero hold (altZeroCaptureService): wants the field at 0% while the engine runs.
+  // Only where the field would otherwise be ON — with charging disabled or a lockout in force it is
+  // already off, the measurement proceeds by itself, and the hold must not re-assert the enable line.
+  tick.altZeroMeasuring = (AltZeroCaptureNow == 1) && (altZeroCapPhase >= ALTZERO_PH_RAMP)
+                          && tick.chargingEnabled && !tick.inLockout;
 
   // Thresholds
   tick.bulkVoltage = BulkVoltage;

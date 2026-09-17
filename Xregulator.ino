@@ -2449,14 +2449,18 @@ float     altAmpsP2P = 0.0f;                // latched 0.5 s peak-to-peak of Mea
 // engine running, field commanded off. The learned temp-comp fit (zeroFitCompute) produces nothing
 // at all until it has seen a 30 °F span, which on a boat can take weeks — this gives the
 // commissioning run a same-day absolute anchor, and leaves the fit as a slow drift tracker layered
-// on top of it. Captures repeatedly through the late wizard stages and keeps the NEWEST accepted
-// window, so the value standing at Finish is automatically the last and warmest one — which is why
-// there is no temperature threshold here to pick and defend. The operator applies it (Finish
-// screen, or the Settings "Zero Now" button); nothing is written behind their back.
+// on top of it. Request-driven only (AltZeroCaptureNow: the wizard at Finish, the Setup row's Zero
+// Now). The control tick holds the field at 0% for the request (tick.altZeroMeasuring →
+// MODE_COMMISSION_IDLE with a zero target, REASON_ALTZERO_MEASURE), the rotor drains, the reading
+// is averaged, the field is released. There is no opportunistic capture: the wizard's own rest hold
+// sits at COMMISSION_REST_FLOOR_PCT, never 0, so "engine running with the field off" never happens
+// by itself during a run. The operator applies the result (Finish screen, or the Settings Apply
+// button); nothing is written behind their back.
 float    altZeroCapA      = 0.0f;   // mean MeasuredAmps over the accepted window = the delta to apply
 float    altZeroCapTempF  = NAN;    // alternator temperature at capture (NaN = probe absent)
 float    altZeroCapBoardF = NAN;    // board temperature at capture (NaN = BMP388 absent)
-int16_t  altZeroCapRpm    = 0;      // engine RPM during the window
+int16_t  altZeroCapRpm    = 0;      // engine RPM latched when the hold engaged — the last reading the tach gave
+                                    // with the field still on; at 0% field the LM2907 may read anything
 uint16_t altZeroCapN      = 0;      // samples averaged
 float    altZeroCapP2P    = 0.0f;   // worst 0.5 s peak-to-peak seen inside the window
 uint32_t altZeroCapEpoch  = 0;      // wall clock of the held capture (0 = clock never set, informational)
@@ -2465,28 +2469,39 @@ uint8_t  altZeroCapHeld   = 0;      // 1 = a capture is held for apply. NOT the 
 float    altZeroAppliedA  = 0.0f;   // delta of the last applied capture (the UI's "applied" line)
 uint32_t altZeroAppliedEpoch = 0;   // wall clock of the last apply (0 = clock never set, informational)
 uint8_t  altZeroApplied   = 0;      // 1 = a capture has been applied this power cycle
-uint8_t  altZeroRejReason = 0;      // why the last completed window was thrown out (ALTZERO_RJ_*)
-int      AltZeroCaptureNow = 0;     // momentary: 1 = run one window now, ignoring the wizard arm gate
+uint8_t  altZeroRejReason = 0;      // why the last request was thrown out (ALTZERO_RJ_*)
+int      AltZeroCaptureNow = 0;     // momentary: 1 = a measurement is requested / in progress
+uint8_t  altZeroCapPhase  = 0;      // where the request stands (ALTZERO_PH_*), for the UI's progress line
+uint32_t altZeroHoldEndMs = 0;      // millis() the hold released (0 = never): the RPM gates stay masked for
+                                    // FIELDCUT_RPM_GRACE_MS after it while the LM2907 re-biases (see fieldCutRpmGrace)
 // Rejection reasons — the UI names them, so a refusal is never a silent nothing.
 #define ALTZERO_RJ_NONE   0
 #define ALTZERO_RJ_NOISE  1   // sample noise above ALTZERO_MAX_P2P_A — a disturbance, not a zero
 #define ALTZERO_RJ_MAG    2   // |mean| above ALTZERO_MAX_MAG_A — wrong cable or real current, not drift
-#define ALTZERO_RJ_RPM    3   // engine speed moved more than ALTZERO_MAX_RPM_DRIFT mid-window
-#define ALTZERO_RJ_SHORT  4   // window broke up (field came on / RPM fell) before enough samples
+#define ALTZERO_RJ_RPM    3   // retired: the window no longer gates on live RPM (the tach is unreliable at 0% field); slot kept so the UI table stays aligned
+#define ALTZERO_RJ_SHORT  4   // the field came back on, or the window broke up, before enough samples
+#define ALTZERO_RJ_ENGINE 5   // engine not running (RPM below ALTZERO_MIN_RPM) when asked
+#define ALTZERO_RJ_BUSY   6   // a commissioning/tuning test is driving the alternator
+#define ALTZERO_RJ_FIELD  7   // the field never reached 0% under the hold (gave up at ALTZERO_FORCE_TIMEOUT_MS)
+// Request phases (altZeroCapPhase).
+#define ALTZERO_PH_IDLE   0
+#define ALTZERO_PH_ENGINE 1   // waiting for the tach to show the engine running (field still on, reading trustworthy)
+#define ALTZERO_PH_RAMP   2   // hold engaged, field ramping to 0%
+#define ALTZERO_PH_DRAIN  3   // duty at 0%, waiting out the rotor drain
+#define ALTZERO_PH_AVG    4   // averaging the reading
 #define ALTZERO_WIN_MS         10000UL // averaging window
 #define ALTZERO_SAMPLE_MS      100UL   // sampling cadence inside the window (→ ~100 samples)
 #define ALTZERO_MIN_SAMPLES    60      // too few passes landed to call the result an average
 #define ALTZERO_MIN_RPM        400     // engine genuinely running (the zero log's own gate is 200)
+#define ALTZERO_ARM_GRACE_MS   5000UL  // a request waits this long for RPM >= ALTZERO_MIN_RPM before "engine not running"
+                                       // (covers the LM2907's ~4.6 s false-zero right after a field cut)
+#define ALTZERO_RAMP_PCT       10.0f   // 12 V-base duty ramp toward 0% under the hold (%/s), class-scaled like the rest hold
 #define ALTZERO_SETTLE_MULT    3       // field-off dwell before sampling = this × the measured drain
 #define ALTZERO_SETTLE_MIN_MS  5000UL  // ... floor, for a unit whose field-decay stage never ran
 #define ALTZERO_MAX_P2P_A      2.0f    // noise ceiling: above this the reading is not a settled zero
 #define ALTZERO_MAX_MAG_A      10.0f   // a bigger field-off reading is a wiring fault, not sensor drift
-#define ALTZERO_MAX_RPM_DRIFT  150     // engine speed must hold across the window
-#define ALTZERO_ARM_STAGE      7       // commissionDoneMask bit that arms it: Min% floor & Field decay,
-                                       // the stage that runs late specifically so the engine is warm
-#define ALTZERO_FORCE_TIMEOUT_MS 90000UL // an operator-requested run gives up after this, so a request
-                                         // made with the engine off cannot leave the UI reading
-                                         // "measuring" until the next reboot
+#define ALTZERO_FORCE_TIMEOUT_MS 90000UL // a request gives up after this whatever phase it is in, so the UI
+                                         // can never sit on "measuring" until the next reboot
 
 // ===== Temperature-compensated zero correction (ZERO_DRIFT_TEMPCOMP_SPEC.md) =====
 // Daily line-fit of the zero-drift log → live correction zero(T)=c+b·(T−T_REF), EMA-smoothed across
@@ -4318,7 +4333,8 @@ enum FieldEventReason : uint8_t {
   REASON_OV_TIER_LOW,              // timed OV cut, LOW tier — filtered bus held above target + OvTierLoMarginV for OvTierLoDwellMs (AUTO/CV only)
   REASON_OV_TIER_MID,              // timed OV cut, MID tier — filtered bus held above target + OvTierMidMarginV for OvTierMidDwellMs (AUTO/CV only)
   REASON_BATTERY_TOO_HOT,          // 24 — measured battery temp (source 1..4, never the board stand-in) above MaxChargeTempF — hot-charge lockout (opt-in)
-  REASON_CHARGE_COMPLETE_IDLE      // 25 — charge cycle finished with UseFloat=0: battery full, resting in IDLE until a rebulk or a master-switch off/on. Same class as CHARGING_DISABLED everywhere; only the label differs
+  REASON_CHARGE_COMPLETE_IDLE,     // 25 — charge cycle finished with UseFloat=0: battery full, resting in IDLE until a rebulk or a master-switch off/on. Same class as CHARGING_DISABLED everywhere; only the label differs
+  REASON_ALTZERO_MEASURE           // 26 — a requested current-sensor zero measurement is holding the field at 0% with the engine running (altZeroCaptureService). Not a fault: MODE_COMMISSION_IDLE with a zero target, released when the window closes
 };
 
 
@@ -4371,6 +4387,8 @@ struct TickSnapshot {
   float battTempF;       // batteryTempF() this tick (°F); NAN = no source qualifies
   uint8_t battTempSrc;   // batteryTempF() source code (0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board)
   bool commissioningResting;  // commissioning session live + dialog alive + no test running → hold field at rest duty
+  bool altZeroMeasuring;      // a requested current-sensor zero measurement wants the field at 0% (altZeroCaptureService
+                              // phase >= ramp, charging enabled, no lockout) → MODE_COMMISSION_IDLE with a zero target
 };
 
 // ==================== CONFIGURABLE PARAMETERS ====================
@@ -6653,7 +6671,7 @@ void loop() {
     TIMED_CALL(ft_faMatrixFlush, faMatrixMaybeFlush());
   }
   TIMED_CALL(ft_zeroLogService, zeroLogService());  // Zero-drift diagnostic: sample (field-off >=5s; 1s spinning / 10min idle) + field-off-only flash flush. Cheap unless flushing.
-  altZeroCaptureService();  // untimed: a running mean at 10 Hz, gated off entirely outside a wizard run
+  altZeroCaptureService();  // untimed: a running mean at 10 Hz, a flag check when no zero request is in flight
   calculateChargeTimes();  // untimed: negligible arithmetic. Might want to move into the 2s block above and unthrottle later
   // Fast alt-current channel: bounded DMA drain (~1 ms hard cap). Unconditional and
   // out-of-band of all control — sampling is hardware-timed (DMA fills itself), this

@@ -1521,10 +1521,17 @@ function fetchZeroFitState(){
 }
 
 // ===== Measured zero (engine running, field at 0%) =====
-// Rides the same /zerofitstate poll as the fit above. The device captures by itself through the
-// late commissioning stages and holds the newest window; this paints what is held and arms Apply.
+// Rides the same /zerofitstate poll as the fit above. Zero Now asks the device for one measurement;
+// the device brings the field to 0% by itself, averages, and holds the result. This paints the
+// phase while it runs, then what is held, and arms Apply. Indexed by the firmware's ALTZERO_RJ_* /
+// ALTZERO_PH_* codes (Xregulator.ino) — keep the slots aligned.
 const ALTZERO_REJ_TEXT = ['', 'too noisy to be a zero', 'reading too large, check which cable the sensor is on',
-                          'engine speed moved mid-measurement', 'the engine stopped or the field came on'];
+                          'engine speed moved mid-measurement', 'the field came back on before it finished',
+                          'the engine is not running (it needs 400 RPM)',
+                          'a test is running on the alternator, finish it first',
+                          'the field could not be brought to 0%'];
+const ALTZERO_PHASE_TEXT = ['', 'Checking that the engine is running', 'Turning the field off',
+                            'Waiting for the rotor to drain', 'Averaging the reading'];
 function altZeroPaint(j) {
     const st = document.getElementById('altzero-status');
     const btn = document.getElementById('altzero-apply-btn');
@@ -1535,7 +1542,11 @@ function altZeroPaint(j) {
         btn.style.opacity = held ? '' : '0.45';
         btn.style.cursor = held ? '' : 'not-allowed';
     }
-    if (Number(j.capBusy) === 1) { st.textContent = 'Measuring, keep the engine running with the field off'; return; }
+    if (Number(j.capBusy) === 1) {
+        st.textContent = 'Measuring: ' + (ALTZERO_PHASE_TEXT[Number(j.capPhase)] || 'working')
+            + '. The field is held at 0%; keep the engine running.';
+        return;
+    }
     if (held) {
         const t = (j.capAltF === null || j.capAltF === undefined) ? j.capBoardF : j.capAltF;
         st.textContent = 'Measured ' + (Number(j.capA) >= 0 ? '+' : '') + Number(j.capA).toFixed(2) + ' A at '
@@ -1550,8 +1561,7 @@ function altZeroPaint(j) {
     st.textContent = (Number(j.capApplied) === 1)
         ? ('Applied ' + (Number(j.capAppliedA) >= 0 ? '+' : '') + Number(j.capAppliedA).toFixed(2)
            + ' A; offset now ' + (isFinite(off) ? off.toFixed(2) : '?') + ' A')
-        : (Number(j.capArmed) === 1 ? 'Waiting for a quiet moment with the engine running'
-                                    : 'Not measured on this installation');
+        : 'Not measured on this installation';
 }
 function altZeroNow() {
     if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
@@ -12579,6 +12589,7 @@ function fieldOffReasonText(reasonCode) {
         case 23: return 'sustained overvoltage — timed cut (mid tier)';
         case 24: return 'too hot to charge';
         case 25: return 'charge cycle complete — battery full, resting (switch off and on to charge again)';
+        case 26: return 'measuring the current sensor zero — field held at 0%';
         // 0 NONE (transient), 11 MANUAL (shown as its own status word) — no OFF annotation
         default: return '';
     }
@@ -26867,6 +26878,7 @@ function cxCutCauseText(code) {
         case 22:
         case 23: return 'sustained over-voltage protection (timed cut)';
         case 24: return 'the hot-charge lockout';
+        case 26: return 'the current-sensor zero measurement holding the field off';
         default: return '';
     }
 }
@@ -26878,7 +26890,8 @@ const CX_CUT_NAME_TO_CODE = {
     'LOCKOUT': 9, 'DISABLED': 10, 'MANUAL': 11, 'INA228 hardware overvoltage': 12,
     'HARD_OVERCURRENT': 13, 'RPM_TOO_LOW': 14, 'CURRENT_STALE': 15, 'FAST_OVERVOLTAGE': 16,
     'Battery too cold to charge': 17, 'TACH_IMPLAUSIBLE': 19, 'SOLAR_PAUSE': 20, 'BMS_OFF': 21,
-    'OV_TIER_LOW': 22, 'OV_TIER_MID': 23, 'Battery too hot to charge': 24
+    'OV_TIER_LOW': 22, 'OV_TIER_MID': 23, 'Battery too hot to charge': 24,
+    'CHARGE COMPLETE (idle - battery full)': 25, 'Measuring current sensor zero (field at 0%)': 26
 };
 function cxCutIsOv(code) { return code === 7 || code === 12 || code === 16 || code === 22 || code === 23; }
 
@@ -30646,13 +30659,14 @@ function cvsPreLive() {
 }
 
 // ===== Measured current-sensor zero (engine running, field at 0%) =====
-// The device captures the alternator sensor's zero by itself in every quiet field-off window from
-// the Min% floor & Field decay stage onward, keeping the newest, so what stands at Finish is the
-// last and warmest capture of the run. Offered here while the engine is still running; if nothing
-// was captured (that stage was skipped, or the field never rested long enough between tests) one is
-// measured on the spot. Declining costs nothing and the offset stays where it was. The number goes
-// into AlternatorCOffset as a delta; the learned temp-comp fit stays a drift tracker on top of it.
+// Measured here, at Finish, while the engine is still running and the machine is at its warmest:
+// the device brings the field to 0% by itself (a control-tick hold, REASON_ALTZERO_MEASURE), waits
+// out the rotor drain, averages the sensor for ten seconds and releases the field. Nothing is
+// captured during the run itself — the wizard's rest hold between steps sits at 4%, never 0.
+// Declining costs nothing and the offset stays where it was. The number goes into AlternatorCOffset
+// as a delta; the learned temp-comp fit stays a drift tracker on top of it.
 const CX_ALTZERO_MIN_RPM = 400;   // mirrors ALTZERO_MIN_RPM in Xregulator.ino
+const CX_ALTZERO_HOWTO = 'Setup > Alternator > Measured Zero (Engine Running) has a Zero Now button to try again any time.';
 
 function cxZeroState() {
     return fetch(buildURL('/zerofitstate')).then(r => r.json()).catch(() => null);
@@ -30664,32 +30678,39 @@ function cxAltZeroWhere(j) {
         + ((t === null || t === undefined) ? '' : ' and ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel());
 }
 
-// Arms one window and waits it out behind the shared setup wait box: a silent gap between two
-// popups in this chain reads as a finished step.
+// Requests one measurement and waits it out behind the shared setup wait box: a silent gap between
+// two popups in this chain reads as a finished step. The device owns the deadline
+// (ALTZERO_FORCE_TIMEOUT_MS, 90 s) and reports every refusal by code; the poll here only outlasts
+// it, so the only way to reach the fallback alert is a lost link.
 async function cxAltZeroRun() {
     await cxGet('AltZeroCaptureNow=1').catch(() => { });
     vesselNextStepWait(true, {
         title: 'Measuring the Sensor Zero',
-        head: 'Keep the engine running with the field off.',
-        sub: 'About fifteen seconds. Hold the throttle steady and stay on this page.'
+        head: 'Keep the engine running and hold the throttle steady.',
+        sub: 'The regulator turns the field off by itself, measures, and turns it back on. Under a minute; stay on this page.'
     });
     try {
-        const deadline = Date.now() + 60000;
+        const deadline = Date.now() + 100000;
+        let lastPhase = -1;
         while (Date.now() < deadline) {
             await new Promise(r => setTrackedTimeout(r, 1500));
             const j = await cxZeroState();
             if (!j) continue;
-            if (Number(j.capHeld) === 1) return j;
-            if (Number(j.capBusy) !== 1) {          // the firmware finished the window and refused it
+            if (Number(j.capBusy) !== 1) {          // the device finished: held a result, or refused with a reason
+                if (Number(j.capHeld) === 1) return j;
                 const rej = Number(j.capRej) || 0;
                 await xAlert('The zero could not be measured: ' + (ALTZERO_REJ_TEXT[rej] || 'the reading never settled')
-                    + '. Setup > Alternator has a Zero Now button to try again any time.', 'Not measured');
+                    + '.\n\n' + CX_ALTZERO_HOWTO, 'Not measured');
                 return null;
             }
+            const ph = Number(j.capPhase) || 0;
+            if (ph !== lastPhase) {                 // live progress: the box copy is set once at show time
+                lastPhase = ph;
+                const head = document.getElementById('nextstep-head');
+                if (head && ALTZERO_PHASE_TEXT[ph]) head.textContent = ALTZERO_PHASE_TEXT[ph] + '. Keep the engine running.';
+            }
         }
-        await xAlert('The zero measurement did not finish. It needs the engine above '
-            + CX_ALTZERO_MIN_RPM + ' RPM with the field off. Setup > Alternator has a Zero Now button '
-            + 'to try again any time.', 'Not measured');
+        await xAlert('The regulator stopped answering while it was measuring.\n\n' + CX_ALTZERO_HOWTO, 'Not measured');
         return null;
     } finally { vesselNextStepWait(false); }
 }
@@ -30703,15 +30724,17 @@ async function cxAltZeroOffer() {
         if (!(lv.rpm > CX_ALTZERO_MIN_RPM)) return;  // engine already shut down: nothing to offer
         if (!await xConfirm('The alternator current sensor has not been zeroed on this installation. '
             + 'With the engine running and the field off it should read zero, and whatever it reads '
-            + 'instead is a fixed error in every current number the regulator reports. Measuring takes '
-            + 'about fifteen seconds and needs the engine left running.',
+            + 'instead is a fixed error in every current number the regulator reports. The regulator '
+            + 'turns the field off by itself, measures for under a minute, and turns it back on. '
+            + 'Keep the engine running.',
             { title: 'Zero the current sensor', okText: 'Measure now', cancelText: 'Skip' })) return;
         j = await cxAltZeroRun();
         if (!j) return;
     }
     if (!await xConfirm('The current sensor read ' + (Number(j.capA) >= 0 ? '+' : '')
-        + Number(j.capA).toFixed(2) + ' A with the field off at ' + cxAltZeroWhere(j)
-        + ', where the true current is zero. Subtract that from every reading?',
+        + Number(j.capA).toFixed(2) + ' A with the field at 0% at ' + cxAltZeroWhere(j)
+        + ', where the true current is zero. Subtract that from every reading from now on? '
+        + 'It is stored on the regulator and survives a reboot.',
         { title: 'Current sensor zero', okText: 'Apply', cancelText: 'Leave as is' })) return;
     await cxGet('altZeroApply=1').catch(() => { });
 }

@@ -3755,6 +3755,27 @@ void zeroFitService() {
   DynamicAltCurrentZero = constrain(corr, -ZFIT_CLAMP_A, ZFIT_CLAMP_A);
 }
 
+// A change to AlternatorCOffset moves every later zero-log row by the same amount, because the log
+// stores raw minus that offset. Left alone, the daily fit's 30-day lookback straddles the seam and
+// lands between the two levels. Shift what is already recorded so past and future rows mean the
+// same thing, and the fit-history ring with them (its median is the outlier gate). The live
+// equation (zfC) is NOT touched: future rows land exactly where it already predicts. Flash copies
+// follow at the next field-off flush (zeroLogService), never here — Apply runs with the engine on.
+// Runs on the web task while Core 1 may push one row mid-loop; that row can land unshifted, which
+// is one diagnostic sample in ten thousand and not worth a mutex on the sampling path.
+void zeroHistoryShiftAmps(float delta) {
+  if (delta == 0.0f || isnan(delta)) return;
+  if (zeroLogRing) {
+    for (uint16_t i = 0; i < zeroLogCount; i++) zeroLogRing[i].amps += delta;   // count == ring size once wrapped
+    zeroLogFileRecords = 0;         // the file holds the old level: the next flush compacts the whole ring
+    prev_zeroLogHead   = 0xFFFF;
+  }
+  if (zeroFitHist) {
+    for (uint16_t i = 0; i < zeroFitHistCount; i++) zeroFitHist[i].c += delta;
+    prev_zeroFitHistHead = 0xFFFF;  // flagged for the next field-off flush
+  }
+}
+
 void handleAltZeroReset() {
   if (ResetDynamicAltZero == 1) {
     DynamicAltCurrentZero = 0.0f;

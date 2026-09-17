@@ -3474,7 +3474,7 @@ void setupServer() {
     j += ",\"capBoardF\":";     j += (isnan(altZeroCapBoardF) ? String("null") : String(altZeroCapBoardF, 1));
     j += ",\"capRej\":";        j += String((unsigned)altZeroRejReason);
     j += ",\"capBusy\":";       j += (AltZeroCaptureNow ? 1 : 0);
-    j += ",\"capArmed\":";      j += ((commissionState == 1 && (commissionDoneMask & (1 << ALTZERO_ARM_STAGE))) ? 1 : 0);
+    j += ",\"capPhase\":";      j += String((unsigned)altZeroCapPhase);
     j += ",\"capApplied\":";    j += (altZeroApplied ? 1 : 0);
     j += ",\"capAppliedA\":";   j += String(altZeroAppliedA, 3);
     j += ",\"capAppliedEp\":";  j += String((unsigned)altZeroAppliedEpoch);
@@ -6292,13 +6292,15 @@ void setupServer() {
       AlternatorCOffset = inputMessage.toFloat();
     }
     // Commissioned alternator-zero capture. Both momentary, neither is a stored setting:
-    // AltZeroCaptureNow arms one measuring window now (bypassing the wizard arm gate), altZeroApply
-    // folds the held capture into AlternatorCOffset above.
+    // AltZeroCaptureNow requests one measurement (the control tick holds the field at 0% for it),
+    // altZeroApply folds the held capture into AlternatorCOffset above. A new request discards a
+    // capture still held from an earlier one: Zero Now means a fresh number, not the old one again.
     if (request->hasParam("AltZeroCaptureNow")) {
       foundParameter = true;
-      AltZeroCaptureNow = 1;
+      altZeroCapHeld    = 0;
       altZeroRejReason  = ALTZERO_RJ_NONE;
-      queueConsoleMessage("Alt zero: measuring - keep the engine running with the field off");
+      AltZeroCaptureNow = 1;
+      queueConsoleMessage("Alt zero: requested - the field will be held at 0% for the measurement");
     }
     if (request->hasParam("altZeroApply")) {
       foundParameter = true;

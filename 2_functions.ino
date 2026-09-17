@@ -4016,109 +4016,139 @@ void zeroLogService() {
     dumpZeroLog();
     lastFlushMs = now;
   }
+  // The fit-history ring normally reaches flash only after an accepted daily fit; a shift made by
+  // zeroHistoryShiftAmps would otherwise wait up to a day (or be lost to a reboot) to land.
+  if ((rising || periodic) && zeroFitHistCount > 0 && prev_zeroFitHistHead != zeroFitHistHead) {
+    dumpZeroFit();
+  }
   prevFieldOff = ffSettled;
 }
 
-// Called every loop pass, right after zeroLogService(). Watches for a window where the alternator's
-// true output current is zero but the machine is hot and turning — engine running, field commanded
-// off long enough for the rotor to have drained — and averages the reading across it. That average
-// IS the sensor's zero error at operating temperature. Writes nothing: the result is held for the
-// operator to apply, and a later window overwrites an earlier one, so what stands at the end of a
-// commissioning run is the last and warmest capture of that run.
+// Ends a request. A hold that was engaged (phase >= ramp) stamps altZeroHoldEndMs so the RPM
+// gates stay masked through the LM2907 re-bias tail while the field comes back.
+static void altZeroEnd(uint8_t rej) {
+  if (altZeroCapPhase >= ALTZERO_PH_RAMP) altZeroHoldEndMs = millis();
+  altZeroCapPhase   = ALTZERO_PH_IDLE;
+  altZeroRejReason  = rej;
+  AltZeroCaptureNow = 0;
+}
+
+// Called every loop pass, right after zeroLogService(). Runs one requested measurement of the
+// alternator current sensor's zero: confirms the engine is turning while the tach can still be
+// trusted, then lets the control tick hold the field at 0% (tick.altZeroMeasuring), waits out the
+// rotor drain and averages the reading. With no field there is no output current, so the average
+// IS the sensor's zero error, at operating temperature, on this installation. Writes nothing: the
+// result is held for the operator to apply. Live RPM is deliberately NOT a gate once the hold is
+// on — at 0% field the LM2907 pickup may read low or zero on a running engine (that is why the
+// wizard's rest hold sits above 0%) — and the RPM recorded with the capture is the one latched
+// before the field came down.
 void altZeroCaptureService() {
   uint32_t now = millis();
-  static uint32_t lastFieldOnMs = 0;
-  static uint32_t winStartMs    = 0;      // 0 = no window open
-  static uint32_t lastSampleMs  = 0;
-  static double   sum           = 0.0;
-  static uint32_t n             = 0;
-  static float    p2pWorst      = 0.0f;
-  static int16_t  rpmMin = 0, rpmMax = 0;
+  static uint32_t reqMs        = 0;   // request accepted (0 = none in flight)
+  static uint32_t phaseMs      = 0;   // current phase entered
+  static uint32_t lastSampleMs = 0;
+  static double   sum          = 0.0;
+  static uint32_t n            = 0;
+  static float    p2pWorst     = 0.0f;
 
-  if (fieldActiveStatus > 0) lastFieldOnMs = now;
+  if (AltZeroCaptureNow != 1) { reqMs = 0; return; }
 
-  // A request made with the engine off would otherwise sit armed forever and leave the UI reading
-  // "measuring" until the next reboot, so it carries its own deadline.
-  static uint32_t forceStartMs = 0;
-  bool forced = (AltZeroCaptureNow == 1);
-  if (forced && forceStartMs == 0) forceStartMs = now;
-  if (!forced) forceStartMs = 0;
-  else if ((now - forceStartMs) >= ALTZERO_FORCE_TIMEOUT_MS) {
-    AltZeroCaptureNow = 0; forceStartMs = 0; forced = false; winStartMs = 0;
-    altZeroRejReason = ALTZERO_RJ_SHORT;
-    queueConsoleMessage("Alt zero: gave up - needs the engine running with the field off");
-  }
-
-  // Armed only through the late wizard stages, or on an explicit request. Before the field-decay
-  // stage there is no measured drain time to settle against and the engine is still cold.
-  bool armed = forced || (commissionState == 1 && (commissionDoneMask & (1 << ALTZERO_ARM_STAGE)));
-  if (!armed) { winStartMs = 0; return; }
-
-  // Settle against the drain this install actually measured in stage 7, not a guessed constant.
-  uint32_t settleMs = (uint32_t)(ALTZERO_SETTLE_MULT * fdDrainMsAtRpm(RPM));
-  if (settleMs < ALTZERO_SETTLE_MIN_MS) settleMs = ALTZERO_SETTLE_MIN_MS;
-
-  if (!(RPM >= ALTZERO_MIN_RPM && (now - lastFieldOnMs) >= settleMs)) {
-    if (winStartMs != 0) {                // broke up mid-average — say so rather than average junk
-      winStartMs = 0;
-      if (forced) {
-        AltZeroCaptureNow = 0; forceStartMs = 0;
-        altZeroRejReason  = ALTZERO_RJ_SHORT;
-        queueConsoleMessage("Alt zero: window lost - the field came on or engine speed dropped");
-      }
+  if (reqMs == 0) {                                     // fresh request from the /get handler
+    reqMs = now; phaseMs = now;
+    altZeroCapPhase = ALTZERO_PH_ENGINE;
+    if (altZeroTestBusy()) {
+      altZeroEnd(ALTZERO_RJ_BUSY); reqMs = 0;
+      queueConsoleMessage("Alt zero: refused - a test is driving the alternator, finish it first");
+      return;
     }
+  }
+  if ((now - reqMs) >= ALTZERO_FORCE_TIMEOUT_MS) {
+    uint8_t rej = (altZeroCapPhase == ALTZERO_PH_ENGINE) ? ALTZERO_RJ_ENGINE
+                : (altZeroCapPhase == ALTZERO_PH_RAMP)   ? ALTZERO_RJ_FIELD : ALTZERO_RJ_SHORT;
+    altZeroEnd(rej); reqMs = 0;
+    queueConsoleMessage("Alt zero: gave up - the measurement did not finish in time");
     return;
   }
 
-  if (winStartMs == 0) {                  // open a window
-    winStartMs = now; lastSampleMs = 0; sum = 0.0; n = 0; p2pWorst = 0.0f;
-    rpmMin = rpmMax = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
-  }
-  if (lastSampleMs == 0 || (now - lastSampleMs) >= ALTZERO_SAMPLE_MS) {
-    lastSampleMs = now;
-    // Skip a bad reading rather than fold it in: NaN fails every gate below by comparing false,
-    // so one of them would carry the whole window past the accept checks.
-    if (isnan(MeasuredAmps) || isinf(MeasuredAmps)) return;
-    sum += (double)MeasuredAmps;
-    n++;
-    if (altAmpsP2P > p2pWorst) p2pWorst = altAmpsP2P;
-    int16_t r = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
-    if (r < rpmMin) rpmMin = r;
-    if (r > rpmMax) rpmMax = r;
-  }
-  if ((now - winStartMs) < ALTZERO_WIN_MS) return;
+  switch (altZeroCapPhase) {
+    case ALTZERO_PH_ENGINE:
+      if (RPM >= ALTZERO_MIN_RPM) {
+        altZeroCapRpm   = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
+        altZeroCapPhase = ALTZERO_PH_RAMP; phaseMs = now;
+        queueConsoleMessageF("Alt zero: measuring at %d RPM - field held at 0%%", (int)altZeroCapRpm);
+      } else if ((now - phaseMs) >= ALTZERO_ARM_GRACE_MS) {
+        altZeroEnd(ALTZERO_RJ_ENGINE); reqMs = 0;
+        queueConsoleMessage("Alt zero: refused - engine not running (needs 400 RPM)");
+      }
+      return;
 
-  winStartMs = 0;                         // window closed — grade it
+    case ALTZERO_PH_RAMP:                               // the tick is bringing the duty down
+      if (fieldActiveStatus == 0) { altZeroCapPhase = ALTZERO_PH_DRAIN; phaseMs = now; }
+      return;
+
+    case ALTZERO_PH_DRAIN: {
+      if (fieldActiveStatus > 0) {                      // something re-energized it - not a zero any more
+        altZeroEnd(ALTZERO_RJ_SHORT); reqMs = 0;
+        queueConsoleMessage("Alt zero: window lost - the field came back on");
+        return;
+      }
+      // Settle against the drain this install actually measured in stage 7, not a guessed constant.
+      uint32_t settleMs = (uint32_t)(ALTZERO_SETTLE_MULT * fdDrainMsAtRpm((float)altZeroCapRpm));
+      if (settleMs < ALTZERO_SETTLE_MIN_MS) settleMs = ALTZERO_SETTLE_MIN_MS;
+      if ((now - phaseMs) >= settleMs) {
+        altZeroCapPhase = ALTZERO_PH_AVG; phaseMs = now;
+        lastSampleMs = 0; sum = 0.0; n = 0; p2pWorst = 0.0f;
+      }
+      return;
+    }
+
+    case ALTZERO_PH_AVG:
+      if (fieldActiveStatus > 0) {
+        altZeroEnd(ALTZERO_RJ_SHORT); reqMs = 0;
+        queueConsoleMessage("Alt zero: window lost - the field came back on");
+        return;
+      }
+      if (lastSampleMs == 0 || (now - lastSampleMs) >= ALTZERO_SAMPLE_MS) {
+        lastSampleMs = now;
+        // Skip a bad reading rather than fold it in: NaN fails every gate below by comparing false,
+        // so one of them would carry the whole window past the accept checks.
+        if (!(isnan(MeasuredAmps) || isinf(MeasuredAmps))) {
+          sum += (double)MeasuredAmps;
+          n++;
+          if (altAmpsP2P > p2pWorst) p2pWorst = altAmpsP2P;
+        }
+      }
+      if ((now - phaseMs) < ALTZERO_WIN_MS) return;
+      break;                                            // window closed - grade it below
+
+    default:
+      altZeroCapPhase = ALTZERO_PH_ENGINE; phaseMs = now;
+      return;
+  }
+
   float mean = (n > 0) ? (float)(sum / (double)n) : 0.0f;
   uint8_t rej = ALTZERO_RJ_NONE;
-  if      (n < ALTZERO_MIN_SAMPLES)                   rej = ALTZERO_RJ_SHORT;
-  else if (p2pWorst > ALTZERO_MAX_P2P_A)              rej = ALTZERO_RJ_NOISE;
-  else if (fabsf(mean) > ALTZERO_MAX_MAG_A)           rej = ALTZERO_RJ_MAG;
-  else if ((rpmMax - rpmMin) > ALTZERO_MAX_RPM_DRIFT) rej = ALTZERO_RJ_RPM;
-  altZeroRejReason = rej;
+  if      (n < ALTZERO_MIN_SAMPLES)         rej = ALTZERO_RJ_SHORT;
+  else if (p2pWorst > ALTZERO_MAX_P2P_A)    rej = ALTZERO_RJ_NOISE;
+  else if (fabsf(mean) > ALTZERO_MAX_MAG_A) rej = ALTZERO_RJ_MAG;
   if (rej != ALTZERO_RJ_NONE) {
-    // Only an operator-requested run reports its own refusal; the opportunistic windows that run
-    // by themselves through stages 7-9 would otherwise spam the console on every throttle move.
-    if (forced) {
-      AltZeroCaptureNow = 0; forceStartMs = 0;
-      queueConsoleMessageF("Alt zero: rejected (%s) mean=%.2fA p2p=%.2fA n=%u",
-                           (rej == ALTZERO_RJ_NOISE) ? "too noisy"
-                           : (rej == ALTZERO_RJ_MAG) ? "reading too large - check which cable the sensor is on"
-                           : (rej == ALTZERO_RJ_RPM) ? "engine speed moved" : "window too short",
-                           mean, p2pWorst, (unsigned)n);
-    }
+    altZeroEnd(rej); reqMs = 0;
+    queueConsoleMessageF("Alt zero: rejected (%s) mean=%.2fA p2p=%.2fA n=%u",
+                         (rej == ALTZERO_RJ_NOISE) ? "too noisy"
+                         : (rej == ALTZERO_RJ_MAG) ? "reading too large - check which cable the sensor is on"
+                                                   : "window too short",
+                         mean, p2pWorst, (unsigned)n);
     return;
   }
   altZeroCapA      = mean;
   altZeroCapP2P    = p2pWorst;
   altZeroCapN      = (uint16_t)((n > 65535u) ? 65535u : n);
-  altZeroCapRpm    = (int16_t)((rpmMin + rpmMax) / 2);
   altZeroCapTempF  = isinf(AlternatorTemperatureF) ? NAN : AlternatorTemperatureF;  // NaN when the
   altZeroCapBoardF = isinf(ambientTemp) ? NAN : ambientTemp;                        // probe is absent
   altZeroCapEpoch  = (uint32_t)getCurrentTimestamp();   // 0 until the clock is set - display only
   altZeroCapHeld   = 1;
-  if (forced) { AltZeroCaptureNow = 0; forceStartMs = 0; }
-  queueConsoleMessageF("Alt zero: captured %.2f A at %d RPM (n=%u, p2p=%.2f A)",
+  altZeroEnd(ALTZERO_RJ_NONE); reqMs = 0;
+  queueConsoleMessageF("Alt zero: captured %.2f A at %d RPM (n=%u, p2p=%.2f A) - field released",
                        mean, (int)altZeroCapRpm, (unsigned)altZeroCapN, p2pWorst);
 }
 
@@ -4142,6 +4172,7 @@ bool altZeroApply() {
   float before = AlternatorCOffset;
   AlternatorCOffset = before + capA;
   settingWrite(NK_AlternatorCOffset, String(AlternatorCOffset, 3).c_str());
+  zeroHistoryShiftAmps(-capA);   // every later zero-log row moves by -capA; move the recorded ones with it
 
   char tA[16], tB[16];
   if (isnan(capTA)) strcpy(tA, "null"); else snprintf(tA, sizeof(tA), "%.1f", capTA);
