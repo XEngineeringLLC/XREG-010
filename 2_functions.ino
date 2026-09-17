@@ -455,6 +455,7 @@ bool fsRemove(const char *path) {
 #define NK_altPaused "altPaused"
 #define NK_altbaseSec "altbaseSec"
 #define NK_altRefSrc "altRefSrc"
+#define NK_AltWipePend "AltWipePend"
 #define NK_bmsLogic "bmsLogic"
 #define NK_bmsLogicLevelOff "bmsLogicLevlOff"
 #define NK_bulkVoltageHoldMs "bulkVoltagHldMs"
@@ -2236,6 +2237,10 @@ void httpsTask(void *param) {
           executeResetRpmAxis();
           opSuccess = true;
           break;
+        case HTTPS_RESET_ALT_HEALTH:
+          executeResetAltHealthCloud();
+          opSuccess = true;
+          break;
         case HTTPS_CLOUD_OP:
           executeCloudOp();
           opSuccess = true;
@@ -2471,7 +2476,11 @@ void resetSensorWindow() {
   currentWindow->solarVolt_area_v_us = 0;
   currentWindow->solarVolt_valid_us = 0;
 
-  currentWindow->lastUpdateTime_us = micros();
+  // 64-bit clock, NOT micros(): micros() is 32-bit and wraps every 71.6 min. Subtracting a wrapped
+  // value in uint64 gave one ~1.8e19 us delta per wrap, which swamped every area/valid_us pair and
+  // uploaded a window of 0.00 averages beside real min/max (22 rows dead-lettered 2026-09-08/09,
+  // one per 71.6 min of uptime, "Invalid battery voltage range").
+  currentWindow->lastUpdateTime_us = (uint64_t)esp_timer_get_time();
   currentWindow->windowStartTime = millis();
 }
 
@@ -2548,13 +2557,14 @@ void resetAccelWindow() {
   imuWindow->slam_count = 0;
   imuWindow->slam_peak_max = 0;
 
-  // Timing
+  // Timing. Stays on micros(): IMUSample.timestamp_us is 32-bit micros() and the accumulator
+  // compares against it; its 100 ms dt sanity check is what absorbs the 71.6 min wrap there.
   imuWindow->lastUpdateTime_us = micros();
   imuWindow->windowStartTime = millis();
 }
 
 void updateSensorWindow() {
-  uint64_t now_us = micros();
+  uint64_t now_us = (uint64_t)esp_timer_get_time();   // same clock resetSensorWindow stamps; see there
   uint64_t delta_us;
 
   if (currentWindow->lastUpdateTime_us == 0) {
@@ -2881,8 +2891,22 @@ void updateSensorWindow() {
 // min/max init sentinels (999900 / -999900) and not a 0.0 average. A fabricated number here is
 // permanent: it lands in the cloud time series and every aggregate that reads the column.
 // Cloud rule (CLOUD_PLATFORM.md): no firmware-written column is NOT NULL, so null always ingests.
+static const char *ltJsonNumP(char *buf, size_t n, double v, bool valid, int decimals) {
+  if (valid) snprintf(buf, n, "%.*f", decimals, v);
+  else       strncpy(buf, "null", n);
+  return buf;
+}
+// Two decimals is the wire precision for every x100 accumulator. The x1000 IMU accel columns pass
+// 3 through ltJsonNumP directly, matching their min/max "%.3f"; at two decimals a 0.012 g average
+// would upload as 0.01.
 static const char *ltJsonNum(char *buf, size_t n, double v, bool valid) {
-  if (valid) snprintf(buf, n, "%.2f", v);
+  return ltJsonNumP(buf, n, v, valid, 2);
+}
+
+// Integer twin, for the INTEGER cloud columns (rpm_*). "1500.00" does insert into an INTEGER
+// column, but it reads as a float in every tool that looks at the payload afterwards.
+static const char *ltJsonInt(char *buf, size_t n, long v, bool valid) {
+  if (valid) snprintf(buf, n, "%ld", v);
   else       strncpy(buf, "null", n);
   return buf;
 }
@@ -2938,6 +2962,35 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   const bool svOk  = snap.window.solarVolt_valid_us > 0;
   char btMinS[16], btMaxS[16], btAvgS[16], etMinS[16], etMaxS[16], etAvgS[16];
   char spMinS[16], spMaxS[16], spAvgS[16], svMinS[16], svMaxS[16], svAvgS[16];
+  // The remaining ten accumulators had NO validity flag at all. Their min/max are safe — the cloud's
+  // cleanSentinelValue() nulls the 999900 defaults — but SAFE_AVG_* returns 0.0 on an empty
+  // denominator and a 0.0 average uploads as a measurement: a boat with no barometer drew a flat
+  // 0 hPa baro_avg, no alt-temp probe a 0 F line, no IMU a 0 g line, engine-off windows a 0 V onavg.
+  // Only the averages are guarded here; min/max are deliberately left alone, because they are still
+  // recorded on the first sample of a window (delta_us == 0) and that is truthful data.
+  // (The 2026-09-08/09 "Invalid battery voltage range" dead letters were NOT empty windows — they
+  // were the 32-bit micros() wrap, fixed at the clock in resetSensorWindow/updateSensorWindow.)
+  const bool bvOk   = snap.window.battVolt_valid_us    > 0;
+  const bool acOk   = snap.window.altCurr_valid_us     > 0;
+  const bool baroOk = snap.window.baro_valid_us        > 0;
+  const bool atOk   = snap.window.altTemp_valid_us     > 0;
+  const bool ttOk   = snap.window.tempTherm_valid_us   > 0;
+  const bool ambOk  = snap.window.ambTemp_valid_us     > 0;
+  const bool rpmOk  = snap.window.rpm_valid_us         > 0;
+  const bool dcOk   = snap.window.dutyCycle_valid_us   > 0;
+  const bool azOk   = snap.window.altZero_valid_us     > 0;
+  const bool utaOk  = snap.window.uTargetAmps_valid_us > 0;
+  // Engine-on averages divide by active_us, which is 0 for every window the engine never spun.
+  const bool onOk   = snap.window.active_us > 0;
+  char bvAvgS[16], acAvgS[16], baroAvgS[16], atAvgS[16], ttAvgS[16], ambAvgS[16];
+  char rpmAvgS[16], dcAvgS[16], azAvgS[16], utaAvgS[16];
+  char bvOnAvgS[16], acOnAvgS[16], dcOnAvgS[16], engPctS[16];
+  // Same rule on the IMU window: no accelerometer fitted leaves every valid_us at 0.
+  const bool heelOk = snap.imu.heel_valid_us            > 0;
+  const bool ptchOk = snap.imu.pitch_valid_us           > 0;
+  const bool vaccOk = snap.imu.vertical_accel_valid_us  > 0;
+  const bool taccOk = snap.imu.total_accel_valid_us     > 0;
+  char heelAvgS[16], ptchAvgS[16], vaccAvgS[16], taccAvgS[16];
   int written = snprintf(
     payloadBuffer, PAYLOAD_BUFFER_SIZE,
     "{"
@@ -2959,23 +3012,23 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     "\"payload_v\":6,"
     "\"current_time_source\":%d,"
     // Battery
-    "\"batt_volt_min\":%.2f,\"batt_volt_max\":%.2f,\"batt_volt_avg\":%.2f,"
+    "\"batt_volt_min\":%.2f,\"batt_volt_max\":%.2f,\"batt_volt_avg\":%s,"
     "\"batt_curr_min\":%s,\"batt_curr_max\":%s,\"batt_curr_avg\":%s,"
     // Alternator
-    "\"alt_curr_min\":%.2f,\"alt_curr_max\":%.2f,\"alt_curr_avg\":%.2f,"
-    "\"duty_cycle_min\":%.2f,\"duty_cycle_max\":%.2f,\"duty_cycle_avg\":%.2f,"
+    "\"alt_curr_min\":%.2f,\"alt_curr_max\":%.2f,\"alt_curr_avg\":%s,"
+    "\"duty_cycle_min\":%.2f,\"duty_cycle_max\":%.2f,\"duty_cycle_avg\":%s,"
     "\"victron_curr_min\":%s,\"victron_curr_max\":%s,\"victron_curr_avg\":%s,"
     "\"soc_min\":%s,\"soc_max\":%s,\"soc_avg\":%s,"
     // Engine
-    "\"rpm_min\":%d,\"rpm_max\":%d,\"rpm_avg\":%d,"
+    "\"rpm_min\":%d,\"rpm_max\":%d,\"rpm_avg\":%s,"
     // Temperatures
-    "\"alt_temp_min\":%.2f,\"alt_temp_max\":%.2f,\"alt_temp_avg\":%.2f,"
-    "\"temp_therm_min\":%.2f,\"temp_therm_max\":%.2f,\"temp_therm_avg\":%.2f,"
-    "\"amb_temp_min\":%.2f,\"amb_temp_max\":%.2f,\"amb_temp_avg\":%.2f,"
+    "\"alt_temp_min\":%.2f,\"alt_temp_max\":%.2f,\"alt_temp_avg\":%s,"
+    "\"temp_therm_min\":%.2f,\"temp_therm_max\":%.2f,\"temp_therm_avg\":%s,"
+    "\"amb_temp_min\":%.2f,\"amb_temp_max\":%.2f,\"amb_temp_avg\":%s,"
     // Pressure
-    "\"baro_min\":%.2f,\"baro_max\":%.2f,\"baro_avg\":%.2f,"
+    "\"baro_min\":%.2f,\"baro_max\":%.2f,\"baro_avg\":%s,"
     // Control loop diagnostics
-    "\"u_target_amps_min\":%.2f,\"u_target_amps_max\":%.2f,\"u_target_amps_avg\":%.2f,"
+    "\"u_target_amps_min\":%.2f,\"u_target_amps_max\":%.2f,\"u_target_amps_avg\":%s,"
     // NMEA navigation
     "\"sog_min\":%s,\"sog_max\":%s,\"sog_avg\":%s,"
     "\"sog_sust1m_max\":%.2f,"
@@ -2990,12 +3043,12 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     // awa/twa envelope; cog/heading/alt_zero avg-only; charge_stage categorical (0-7).
     "\"awa_min\":%s,\"awa_max\":%s,\"awa_avg\":%s,"
     "\"twa_min\":%s,\"twa_max\":%s,\"twa_avg\":%s,"
-    "\"cog_avg\":%s,\"heading_avg\":%s,\"alt_zero_avg\":%.2f,"
+    "\"cog_avg\":%s,\"heading_avg\":%s,\"alt_zero_avg\":%s,"
     "\"charge_stage\":%d,"
     // Engine-on-weighted averages (denominator = µs engine was spinning this window)
     // + coverage. engine_on_pct 0 ⇒ engine never ran ⇒ *_onavg values meaningless (0s).
-    "\"batt_volt_onavg\":%.2f,\"batt_curr_onavg\":%s,\"alt_curr_onavg\":%.2f,"
-    "\"victron_curr_onavg\":%s,\"duty_cycle_onavg\":%.2f,\"engine_on_pct\":%.2f,"
+    "\"batt_volt_onavg\":%s,\"batt_curr_onavg\":%s,\"alt_curr_onavg\":%s,"
+    "\"victron_curr_onavg\":%s,\"duty_cycle_onavg\":%s,\"engine_on_pct\":%s,"
     // Battery / EXTRA-probe temperature, VE.Direct solar (payload_v 6).
     // null when the source was absent all window — see the *Ok flags above.
     "\"batt_temp_min\":%s,\"batt_temp_max\":%s,\"batt_temp_avg\":%s,"
@@ -3003,10 +3056,10 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     "\"solar_power_min\":%s,\"solar_power_max\":%s,\"solar_power_avg\":%s,"
     "\"solar_volt_min\":%s,\"solar_volt_max\":%s,\"solar_volt_avg\":%s,"
     // IMU peak motion (per-window aggregates)
-    "\"imu_heel_min\":%.2f,\"imu_heel_max\":%.2f,\"imu_heel_avg\":%.2f,"
-    "\"imu_pitch_min\":%.2f,\"imu_pitch_max\":%.2f,\"imu_pitch_avg\":%.2f,"
-    "\"imu_vertical_accel_min\":%.3f,\"imu_vertical_accel_max\":%.3f,\"imu_vertical_accel_avg\":%.3f,"
-    "\"imu_total_accel_min\":%.3f,\"imu_total_accel_max\":%.3f,\"imu_total_accel_avg\":%.3f,"
+    "\"imu_heel_min\":%.2f,\"imu_heel_max\":%.2f,\"imu_heel_avg\":%s,"
+    "\"imu_pitch_min\":%.2f,\"imu_pitch_max\":%.2f,\"imu_pitch_avg\":%s,"
+    "\"imu_vertical_accel_min\":%.3f,\"imu_vertical_accel_max\":%.3f,\"imu_vertical_accel_avg\":%s,"
+    "\"imu_total_accel_min\":%.3f,\"imu_total_accel_max\":%.3f,\"imu_total_accel_avg\":%s,"
     // IMU comfort scores (point values at upload time)
     "\"imu_msi_score\":%.2f,"
     "\"imu_vomit_pct\":%.2f,"
@@ -3024,14 +3077,14 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     firmwareVersionInt,
     (int)currentTimeSource,
     snap.window.battVolt_min / 100.0, snap.window.battVolt_max / 100.0,
-    SAFE_AVG_100(snap.window.battVolt_area_v_us, snap.window.battVolt_valid_us),
+    ltJsonNum(bvAvgS, sizeof(bvAvgS), SAFE_AVG_100(snap.window.battVolt_area_v_us, snap.window.battVolt_valid_us), bvOk),
     ltJsonNum(bcMinS, sizeof(bcMinS), snap.window.battCurr_min / 100.0, bcOk),
     ltJsonNum(bcMaxS, sizeof(bcMaxS), snap.window.battCurr_max / 100.0, bcOk),
     ltJsonNum(bcAvgS, sizeof(bcAvgS), SAFE_AVG_100(snap.window.battCurr_area_v_us, snap.window.battCurr_valid_us), bcOk),
     snap.window.altCurr_min / 100.0, snap.window.altCurr_max / 100.0,
-    SAFE_AVG_100(snap.window.altCurr_area_v_us, snap.window.altCurr_valid_us),
+    ltJsonNum(acAvgS, sizeof(acAvgS), SAFE_AVG_100(snap.window.altCurr_area_v_us, snap.window.altCurr_valid_us), acOk),
     snap.window.dutyCycle_min / 100.0, snap.window.dutyCycle_max / 100.0,
-    SAFE_AVG_100(snap.window.dutyCycle_area_v_us, snap.window.dutyCycle_valid_us),
+    ltJsonNum(dcAvgS, sizeof(dcAvgS), SAFE_AVG_100(snap.window.dutyCycle_area_v_us, snap.window.dutyCycle_valid_us), dcOk),
     ltJsonNum(vcMinS, sizeof(vcMinS), snap.window.victronCurr_min / 100.0, vcOk),
     ltJsonNum(vcMaxS, sizeof(vcMaxS), snap.window.victronCurr_max / 100.0, vcOk),
     ltJsonNum(vcAvgS, sizeof(vcAvgS), SAFE_AVG_100(snap.window.victronCurr_area_v_us, snap.window.victronCurr_valid_us), vcOk),
@@ -3039,17 +3092,17 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     ltJsonNum(socMaxS, sizeof(socMaxS), snap.window.soc_max / 100.0, socOk),
     ltJsonNum(socAvgS, sizeof(socAvgS), SAFE_AVG_100(snap.window.soc_area_v_us, snap.window.soc_valid_us), socOk),
     snap.window.rpm_min, snap.window.rpm_max,
-    (int)SAFE_AVG_RAW(snap.window.rpm_area_v_us, snap.window.rpm_valid_us),
+    ltJsonInt(rpmAvgS, sizeof(rpmAvgS), (long)SAFE_AVG_RAW(snap.window.rpm_area_v_us, snap.window.rpm_valid_us), rpmOk),
     snap.window.altTemp_min / 100.0, snap.window.altTemp_max / 100.0,
-    SAFE_AVG_100(snap.window.altTemp_area_v_us, snap.window.altTemp_valid_us),
+    ltJsonNum(atAvgS, sizeof(atAvgS), SAFE_AVG_100(snap.window.altTemp_area_v_us, snap.window.altTemp_valid_us), atOk),
     snap.window.tempTherm_min / 100.0, snap.window.tempTherm_max / 100.0,
-    SAFE_AVG_100(snap.window.tempTherm_area_v_us, snap.window.tempTherm_valid_us),
+    ltJsonNum(ttAvgS, sizeof(ttAvgS), SAFE_AVG_100(snap.window.tempTherm_area_v_us, snap.window.tempTherm_valid_us), ttOk),
     snap.window.ambTemp_min / 100.0, snap.window.ambTemp_max / 100.0,
-    SAFE_AVG_100(snap.window.ambTemp_area_v_us, snap.window.ambTemp_valid_us),
+    ltJsonNum(ambAvgS, sizeof(ambAvgS), SAFE_AVG_100(snap.window.ambTemp_area_v_us, snap.window.ambTemp_valid_us), ambOk),
     snap.window.baro_min / 100.0, snap.window.baro_max / 100.0,
-    SAFE_AVG_100(snap.window.baro_area_v_us, snap.window.baro_valid_us),
+    ltJsonNum(baroAvgS, sizeof(baroAvgS), SAFE_AVG_100(snap.window.baro_area_v_us, snap.window.baro_valid_us), baroOk),
     snap.window.uTargetAmps_min / 100.0, snap.window.uTargetAmps_max / 100.0,
-    SAFE_AVG_100(snap.window.uTargetAmps_area_v_us, snap.window.uTargetAmps_valid_us),
+    ltJsonNum(utaAvgS, sizeof(utaAvgS), SAFE_AVG_100(snap.window.uTargetAmps_area_v_us, snap.window.uTargetAmps_valid_us), utaOk),
     ltJsonNum(sogMinS, sizeof(sogMinS), snap.window.sog_min / 100.0, sogOk),
     ltJsonNum(sogMaxS, sizeof(sogMaxS), snap.window.sog_max / 100.0, sogOk),
     ltJsonNum(sogAvgS, sizeof(sogAvgS), SAFE_AVG_100(snap.window.sog_area_v_us, snap.window.sog_valid_us), sogOk),
@@ -3076,15 +3129,15 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     ltJsonNum(twaAvgS, sizeof(twaAvgS), SAFE_AVG_100(snap.window.twa_area_v_us, snap.window.twa_valid_us), twaOk),
     ltJsonNum(cogAvgS, sizeof(cogAvgS), SAFE_AVG_100(snap.window.cog_area_v_us, snap.window.cog_valid_us), cogOk),
     ltJsonNum(hdgAvgS, sizeof(hdgAvgS), SAFE_AVG_100(snap.window.heading_area_v_us, snap.window.heading_valid_us), hdgOk),
-    SAFE_AVG_100(snap.window.altZero_area_v_us, snap.window.altZero_valid_us),
+    ltJsonNum(azAvgS, sizeof(azAvgS), SAFE_AVG_100(snap.window.altZero_area_v_us, snap.window.altZero_valid_us), azOk),
     (int)snap.chargeStage,
-    SAFE_AVG_100(snap.window.battVolt_on_area_v_us, snap.window.active_us),
-    ltJsonNum(bcOnAvgS, sizeof(bcOnAvgS), SAFE_AVG_100(snap.window.battCurr_on_area_v_us, snap.window.active_us), bcOk),
-    SAFE_AVG_100(snap.window.altCurr_on_area_v_us, snap.window.active_us),
-    ltJsonNum(vcOnAvgS, sizeof(vcOnAvgS), SAFE_AVG_100(snap.window.victronCurr_on_area_v_us, snap.window.active_us), vcOk),
-    SAFE_AVG_100(snap.window.dutyCycle_on_area_v_us, snap.window.active_us),
-    snap.window.battVolt_valid_us > 0
-      ? 100.0 * (double)snap.window.active_us / (double)snap.window.battVolt_valid_us : 0.0,
+    ltJsonNum(bvOnAvgS, sizeof(bvOnAvgS), SAFE_AVG_100(snap.window.battVolt_on_area_v_us, snap.window.active_us), onOk),
+    ltJsonNum(bcOnAvgS, sizeof(bcOnAvgS), SAFE_AVG_100(snap.window.battCurr_on_area_v_us, snap.window.active_us), bcOk && onOk),
+    ltJsonNum(acOnAvgS, sizeof(acOnAvgS), SAFE_AVG_100(snap.window.altCurr_on_area_v_us, snap.window.active_us), onOk),
+    ltJsonNum(vcOnAvgS, sizeof(vcOnAvgS), SAFE_AVG_100(snap.window.victronCurr_on_area_v_us, snap.window.active_us), vcOk && onOk),
+    ltJsonNum(dcOnAvgS, sizeof(dcOnAvgS), SAFE_AVG_100(snap.window.dutyCycle_on_area_v_us, snap.window.active_us), onOk),
+    ltJsonNum(engPctS, sizeof(engPctS),
+              bvOk ? 100.0 * (double)snap.window.active_us / (double)snap.window.battVolt_valid_us : 0.0, bvOk),
     ltJsonNum(btMinS, sizeof(btMinS), snap.window.battTemp_min / 100.0, btOk),
     ltJsonNum(btMaxS, sizeof(btMaxS), snap.window.battTemp_max / 100.0, btOk),
     ltJsonNum(btAvgS, sizeof(btAvgS), SAFE_AVG_100(snap.window.battTemp_area_v_us, snap.window.battTemp_valid_us), btOk),
@@ -3100,13 +3153,13 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     // IMU values read from the frozen ImuSnapshot — values matching the moment
     // the window was rolled, not whatever imuWindow currently holds at upload time.
     snap.imu.heel_min / 100.0, snap.imu.heel_max / 100.0,
-    SAFE_AVG_100(snap.imu.heel_area_v_us, snap.imu.heel_valid_us),
+    ltJsonNum(heelAvgS, sizeof(heelAvgS), SAFE_AVG_100(snap.imu.heel_area_v_us, snap.imu.heel_valid_us), heelOk),
     snap.imu.pitch_min / 100.0, snap.imu.pitch_max / 100.0,
-    SAFE_AVG_100(snap.imu.pitch_area_v_us, snap.imu.pitch_valid_us),
+    ltJsonNum(ptchAvgS, sizeof(ptchAvgS), SAFE_AVG_100(snap.imu.pitch_area_v_us, snap.imu.pitch_valid_us), ptchOk),
     snap.imu.vertical_accel_min / 1000.0, snap.imu.vertical_accel_max / 1000.0,
-    SAFE_AVG_1000(snap.imu.vertical_accel_area_v_us, snap.imu.vertical_accel_valid_us),
+    ltJsonNumP(vaccAvgS, sizeof(vaccAvgS), SAFE_AVG_1000(snap.imu.vertical_accel_area_v_us, snap.imu.vertical_accel_valid_us), vaccOk, 3),
     snap.imu.total_accel_min / 1000.0, snap.imu.total_accel_max / 1000.0,
-    SAFE_AVG_1000(snap.imu.total_accel_area_v_us, snap.imu.total_accel_valid_us),
+    ltJsonNumP(taccAvgS, sizeof(taccAvgS), SAFE_AVG_1000(snap.imu.total_accel_area_v_us, snap.imu.total_accel_valid_us), taccOk, 3),
     snap.imu.msi_score,
     snap.imu.vomit_pct,
     snap.imu.anchorage_comfort,
@@ -3932,7 +3985,11 @@ void zeroLogService() {
       lastSampleMs = now;
       ZeroLogRecord &r = zeroLogRing[zeroLogHead];
       r.epoch       = (uint32_t)getCurrentTimestamp();
-      r.amps        = MeasuredAmps;
+      // Add back what the live correction already took out, so a row means the same thing whether or
+      // not AutoAltCurrentZero is on. Without this the fit consumes its own residual and the EMA
+      // blend settles the applied correction on half the true offset. AlternatorCOffset is NOT added
+      // back: zfC's job is the drift on top of the commissioned/operator offset, not the whole zero.
+      r.amps        = MeasuredAmps + ((AutoAltCurrentZero == 1) ? DynamicAltCurrentZero : 0.0f);
       r.p2pAmps     = altAmpsP2P;
       r.rpm         = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
       r.battVx100   = (int16_t)lroundf(getBatteryVoltage() * 100.0f);
@@ -3960,6 +4017,150 @@ void zeroLogService() {
     lastFlushMs = now;
   }
   prevFieldOff = ffSettled;
+}
+
+// Called every loop pass, right after zeroLogService(). Watches for a window where the alternator's
+// true output current is zero but the machine is hot and turning — engine running, field commanded
+// off long enough for the rotor to have drained — and averages the reading across it. That average
+// IS the sensor's zero error at operating temperature. Writes nothing: the result is held for the
+// operator to apply, and a later window overwrites an earlier one, so what stands at the end of a
+// commissioning run is the last and warmest capture of that run.
+void altZeroCaptureService() {
+  uint32_t now = millis();
+  static uint32_t lastFieldOnMs = 0;
+  static uint32_t winStartMs    = 0;      // 0 = no window open
+  static uint32_t lastSampleMs  = 0;
+  static double   sum           = 0.0;
+  static uint32_t n             = 0;
+  static float    p2pWorst      = 0.0f;
+  static int16_t  rpmMin = 0, rpmMax = 0;
+
+  if (fieldActiveStatus > 0) lastFieldOnMs = now;
+
+  // A request made with the engine off would otherwise sit armed forever and leave the UI reading
+  // "measuring" until the next reboot, so it carries its own deadline.
+  static uint32_t forceStartMs = 0;
+  bool forced = (AltZeroCaptureNow == 1);
+  if (forced && forceStartMs == 0) forceStartMs = now;
+  if (!forced) forceStartMs = 0;
+  else if ((now - forceStartMs) >= ALTZERO_FORCE_TIMEOUT_MS) {
+    AltZeroCaptureNow = 0; forceStartMs = 0; forced = false; winStartMs = 0;
+    altZeroRejReason = ALTZERO_RJ_SHORT;
+    queueConsoleMessage("Alt zero: gave up - needs the engine running with the field off");
+  }
+
+  // Armed only through the late wizard stages, or on an explicit request. Before the field-decay
+  // stage there is no measured drain time to settle against and the engine is still cold.
+  bool armed = forced || (commissionState == 1 && (commissionDoneMask & (1 << ALTZERO_ARM_STAGE)));
+  if (!armed) { winStartMs = 0; return; }
+
+  // Settle against the drain this install actually measured in stage 7, not a guessed constant.
+  uint32_t settleMs = (uint32_t)(ALTZERO_SETTLE_MULT * fdDrainMsAtRpm(RPM));
+  if (settleMs < ALTZERO_SETTLE_MIN_MS) settleMs = ALTZERO_SETTLE_MIN_MS;
+
+  if (!(RPM >= ALTZERO_MIN_RPM && (now - lastFieldOnMs) >= settleMs)) {
+    if (winStartMs != 0) {                // broke up mid-average — say so rather than average junk
+      winStartMs = 0;
+      if (forced) {
+        AltZeroCaptureNow = 0; forceStartMs = 0;
+        altZeroRejReason  = ALTZERO_RJ_SHORT;
+        queueConsoleMessage("Alt zero: window lost - the field came on or engine speed dropped");
+      }
+    }
+    return;
+  }
+
+  if (winStartMs == 0) {                  // open a window
+    winStartMs = now; lastSampleMs = 0; sum = 0.0; n = 0; p2pWorst = 0.0f;
+    rpmMin = rpmMax = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
+  }
+  if (lastSampleMs == 0 || (now - lastSampleMs) >= ALTZERO_SAMPLE_MS) {
+    lastSampleMs = now;
+    // Skip a bad reading rather than fold it in: NaN fails every gate below by comparing false,
+    // so one of them would carry the whole window past the accept checks.
+    if (isnan(MeasuredAmps) || isinf(MeasuredAmps)) return;
+    sum += (double)MeasuredAmps;
+    n++;
+    if (altAmpsP2P > p2pWorst) p2pWorst = altAmpsP2P;
+    int16_t r = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
+    if (r < rpmMin) rpmMin = r;
+    if (r > rpmMax) rpmMax = r;
+  }
+  if ((now - winStartMs) < ALTZERO_WIN_MS) return;
+
+  winStartMs = 0;                         // window closed — grade it
+  float mean = (n > 0) ? (float)(sum / (double)n) : 0.0f;
+  uint8_t rej = ALTZERO_RJ_NONE;
+  if      (n < ALTZERO_MIN_SAMPLES)                   rej = ALTZERO_RJ_SHORT;
+  else if (p2pWorst > ALTZERO_MAX_P2P_A)              rej = ALTZERO_RJ_NOISE;
+  else if (fabsf(mean) > ALTZERO_MAX_MAG_A)           rej = ALTZERO_RJ_MAG;
+  else if ((rpmMax - rpmMin) > ALTZERO_MAX_RPM_DRIFT) rej = ALTZERO_RJ_RPM;
+  altZeroRejReason = rej;
+  if (rej != ALTZERO_RJ_NONE) {
+    // Only an operator-requested run reports its own refusal; the opportunistic windows that run
+    // by themselves through stages 7-9 would otherwise spam the console on every throttle move.
+    if (forced) {
+      AltZeroCaptureNow = 0; forceStartMs = 0;
+      queueConsoleMessageF("Alt zero: rejected (%s) mean=%.2fA p2p=%.2fA n=%u",
+                           (rej == ALTZERO_RJ_NOISE) ? "too noisy"
+                           : (rej == ALTZERO_RJ_MAG) ? "reading too large - check which cable the sensor is on"
+                           : (rej == ALTZERO_RJ_RPM) ? "engine speed moved" : "window too short",
+                           mean, p2pWorst, (unsigned)n);
+    }
+    return;
+  }
+  altZeroCapA      = mean;
+  altZeroCapP2P    = p2pWorst;
+  altZeroCapN      = (uint16_t)((n > 65535u) ? 65535u : n);
+  altZeroCapRpm    = (int16_t)((rpmMin + rpmMax) / 2);
+  altZeroCapTempF  = isinf(AlternatorTemperatureF) ? NAN : AlternatorTemperatureF;  // NaN when the
+  altZeroCapBoardF = isinf(ambientTemp) ? NAN : ambientTemp;                        // probe is absent
+  altZeroCapEpoch  = (uint32_t)getCurrentTimestamp();   // 0 until the clock is set - display only
+  altZeroCapHeld   = 1;
+  if (forced) { AltZeroCaptureNow = 0; forceStartMs = 0; }
+  queueConsoleMessageF("Alt zero: captured %.2f A at %d RPM (n=%u, p2p=%.2f A)",
+                       mean, (int)altZeroCapRpm, (unsigned)altZeroCapN, p2pWorst);
+}
+
+// Fold the held capture into the operator-facing offset so the live reading sits at zero at this
+// temperature. A DELTA, not an assignment: whatever else is already being subtracted (a hand-entered
+// offset, a converged fit) stays subtracted and the total lands on the truth. Returns false when
+// there is nothing held to apply.
+bool altZeroApply() {
+  // Runs on the async web task while Core 1 keeps capturing. Snapshot the held window first so the
+  // ledger row and the console line describe exactly the number that went into the offset, even if
+  // a fresh window lands mid-call.
+  if (!altZeroCapHeld) return false;
+  uint32_t epoch = altZeroCapEpoch;
+  float    capA  = altZeroCapA;
+  float    capP  = altZeroCapP2P;
+  uint16_t capN  = altZeroCapN;
+  int16_t  capR  = altZeroCapRpm;
+  float    capTA = altZeroCapTempF;
+  float    capTB = altZeroCapBoardF;
+
+  float before = AlternatorCOffset;
+  AlternatorCOffset = before + capA;
+  settingWrite(NK_AlternatorCOffset, String(AlternatorCOffset, 3).c_str());
+
+  char tA[16], tB[16];
+  if (isnan(capTA)) strcpy(tA, "null"); else snprintf(tA, sizeof(tA), "%.1f", capTA);
+  if (isnan(capTB)) strcpy(tB, "null"); else snprintf(tB, sizeof(tB), "%.1f", capTB);
+  char d[256];
+  snprintf(d, sizeof(d),
+           "{\"t\":\"alt_zero\",\"delta\":%.3f,\"off_before\":%.3f,\"off_after\":%.3f,"
+           "\"rpm\":%d,\"n\":%u,\"p2p\":%.3f,\"altF\":%s,\"boardF\":%s,\"epoch\":%u}",
+           capA, before, AlternatorCOffset, (int)capR, (unsigned)capN,
+           capP, tA, tB, (unsigned)epoch);
+  cxLedgerLogTest(d);
+
+  altZeroAppliedA     = capA;
+  altZeroAppliedEpoch = epoch;
+  altZeroApplied      = 1;
+  altZeroCapHeld      = 0;   // consumed - the next offer has to be earned by a fresh window
+  queueConsoleMessageF("Alt zero: offset %.2f A -> %.2f A (applied %.2f A)",
+                       before, AlternatorCOffset, capA);
+  return true;
 }
 
 // Dashboard "Clear" button handler. Empties the PSRAM ring and removes the
@@ -4135,7 +4336,13 @@ static inline size_t cfgRemain(int off) {
   X(batt_temp_src,              "%d",    (int)battTempActiveSrc) \
   /* Lifetime count of adaptive-table updates: says whether the learning is still moving or has \
      settled, which no snapshot of the tables themselves can tell you. */ \
-  X(total_learning_events,      "%lu",   (unsigned long)totalLearningEvents)
+  X(total_learning_events,      "%lu",   (unsigned long)totalLearningEvents) \
+  /* INA228 die temperature, session peak. The only sensor sitting AT the power stage — amb_temp_* \
+     is the BMP388 out in the bulk of the board and barely moves while Q3/D5 heat up. Rides ltJsonNum \
+     because it is NAN until the read site's warm-up + corroboration gate passes, and a literal null \
+     is what the column wants there; a fabricated 0.0 would be a permanent fake in the time series. \
+     idtMaxS is declared at the emit site below, the same way buildSnapshotJson declares bcMinS. */ \
+  X(ina_die_temp_max_f,         "%s",    ltJsonNum(idtMaxS, sizeof(idtMaxS), (double)inaDieTempMaxF, isfinite(inaDieTempMaxF)))
 
 #define CD_FMT(key, fmt, expr) ",\"" #key "\":" fmt
 #define CD_ARG(key, fmt, expr) , expr
@@ -4279,6 +4486,7 @@ bool buildConfigPayload() {
   // Format string and argument list are BOTH generated from the one list, so a row can never be
   // half-added. Adjacent string literals concatenate, so CLOUD_DAILY_LIST(CD_FMT) is a single
   // literal and CLOUD_DAILY_LIST(CD_ARG) is the matching comma-led argument tail.
+  char idtMaxS[16];   // ina_die_temp_max_f — see the row's comment in CLOUD_DAILY_LIST
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
                      CLOUD_DAILY_LIST(CD_FMT) CLOUD_DAILY_LIST(CD_ARG));
 
@@ -4891,7 +5099,11 @@ drain_headers_ah:
     if (success) {
       if (timeIsSynced) lastAltHealthSyncEpoch = (int64_t)time(NULL);   // for the "synced N ago" badge
       altClearPending();   // cloud accepted the batch (raw history) → drop the pending points
-      if (altIngestFrontCsv(ahBody)) {
+      if (rpmAxisWipePending || altCloudWipePending) {
+        // A Start Over / tach rescale landed while this upload was in flight: the reply was rebuilt from
+        // the raw rows the pending wipe is about to delete, so it must not overwrite the cleared front.
+        queueConsoleMessage("Alternator health uploaded — front NOT updated (cloud wipe pending)");
+      } else if (altIngestFrontCsv(ahBody)) {
         // Field-off-gate the flash write: a LittleFS write stalls the flash cache (both cores).
         // If the field re-engaged while this upload was in flight, skip — the in-memory front is
         // already updated, and the field-off Gate-2 edge persists it later (no data loss).

@@ -1061,10 +1061,11 @@ if (!BMP388Disconnected) {
     INADisconnected = 0;
 
     // setAverage() takes raw register value: 0=1, 1=4, 2=16, 3=64, 4=128, 5=256, 6=512, 7=1024 samples
-    INA.setMode(11);                       // Continuous shunt and bus voltage measurement
+    INA.setMode(15);                       // Continuous shunt, bus voltage AND die temperature
     INA.setAverage(4);                     // 128-sample averaging — 128 × 8.24ms = 1054ms register update
     INA.setBusVoltageConversionTime(7);    // 4120 µs conversion time
     INA.setShuntVoltageConversionTime(7);  // 4120 µs conversion time
+    INA.setTemperatureConversionTime(0);   // 50 µs — MUST stay at the minimum. ADC_CONFIG resets VTCT to 1052 µs, which drags the fast-mode cycle to 8.5 ms, past the 5 ms poll, and halves the CV loop's voltage update rate
 
     updateINA228OvervoltageThreshold();
     queueConsoleMessage("INA228 initialized: Hardware overvoltage protection enabled");
@@ -1395,6 +1396,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     // Survives reboots on purpose: a device rescaled while offline must keep suppressing front
     // sync until the cloud wipe lands, or the cloud ships the old-scaled front straight back.
     rpmAxisWipePending = (settingExists(NK_RpmAxisWipePend) && settingRead(NK_RpmAxisWipePend) == "1");
+    altCloudWipePending = (settingExists(NK_AltWipePend) && settingRead(NK_AltWipePend) == "1");   // same reason, for the alt-health Start Over
     // Reboot interrupted the local wipe → re-run it whole (every clear it drives is idempotent)
     if (settingExists(NK_RpmAxisWipeLoc) && settingRead(NK_RpmAxisWipeLoc) == "1") pendingRpmAxisWipe = true;
     if (!settingExists(NK_systemIDSineCycles)) {
@@ -1987,30 +1989,27 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     Ymax4 = settingRead(NK_Ymax4).toInt();
   }
   if (!settingExists(NK_MaxDuty)) {
-    // Max Field % is the REAL per-bus field-duty cap. The hardcoded default (99) is a 12V value, so on
-    // first creation scale it by ×(12/SYSTEM_VOLTAGE_CLASS) (→ ~50%@24V, ~25%@48V) so worst-case field
-    // current never exceeds the 12V case. WYSIWYG: the dashboard box shows the actual cap; user-adjustable.
-    MaxDuty = (int)lroundf(MaxDuty * 12.0f / (float)SYSTEM_VOLTAGE_CLASS);
+    // Max Field % is the REAL per-bus field-duty cap and is class-invariant (99 on every class): the
+    // per-class field-current protection is MaxFieldVolts below, solved against the live bus. WYSIWYG:
+    // the dashboard box shows the actual cap; user-adjustable.
     settingWrite(NK_MaxDuty, String(MaxDuty).c_str());
   } else {
     MaxDuty = settingRead(NK_MaxDuty).toInt();
   }
   if (!settingExists(NK_MaxFieldVolts)) {
-    // Max Field Volts is a VOLT-domain seed (×seedVScale → 15/30/45/60), the opposite domain from
-    // MaxDuty above: it is physical field volts, not a duty ratio. Nominal class × 1.25 sits above any
-    // bank's absorb voltage, so the derived ceiling lands over 99% and the volts cap is inert at its
-    // default on every class — identical behavior to before it existed. It binds only once an installer
-    // enters the winding's rated voltage from the alternator datasheet.
-    MaxFieldVolts *= seedVScale;
+    // Deliberately NOT class-scaled: the default is a 12V winding's full-field volts, and the winding
+    // rating belongs to the alternator, not the bank. Against a 12V bus it works out above 99% (inert);
+    // against 24/36/48V it is the binding ceiling (~52/35/26% at absorption) until the installer enters
+    // the winding's rated voltage from the alternator datasheet.
     settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
   } else {
     // A garbage NVS string (hand-edited export imported raw, or a bad admin push) parses to 0.0,
     // which pins the field ceiling at MinDuty and effectively kills charging. Enforce the web
-    // handler's [0.5, 60] window here too, and fall back to the inert class default rather than
+    // handler's [0.5, 60] window here too, and fall back to the compile default rather than
     // the window edge — a 0.5 V ceiling is still a dead field.
     MaxFieldVolts = settingRead(NK_MaxFieldVolts).toFloat();
     if (!(MaxFieldVolts >= 0.5f && MaxFieldVolts <= 60.0f)) {
-      MaxFieldVolts = 1.25f * (float)SYSTEM_VOLTAGE_CLASS;
+      MaxFieldVolts = 15.0f;
       settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
     }
   }
@@ -5520,6 +5519,49 @@ void executeResetRpmAxis() {
     queueConsoleMessage("Cloud RPM-indexed data wiped; alternator record book starts over");
   } else {
     Serial.printf("RESET_RPM_AXIS: HTTP %d - will retry\n", httpCode);
+  }
+
+  http.end();
+}
+
+// Cloud half of the alt-health Start Over: deletes this device's alt_points + alt_health rows. The
+// local half (resetAlternatorHealth) already ran; alt-health upload and sync-back stay suppressed
+// until this confirms, because update-alt-health rebuilds the front from EVERY raw row it holds and
+// its reply replaces the local front wholesale. Retried every minute until it returns 200.
+void executeResetAltHealthCloud() {
+  if (!altCloudWipePending) return;
+  if (!isRegistered || authToken.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (currentMode != MODE_CLIENT) return;
+
+  Serial.println("RESET_ALT_HEALTH: Requesting cloud wipe");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(12);   // 12 s phases: must fit httpsTask's 16 s panic WDT (see executeResetRpmAxis)
+  HTTPClient http;
+  http.setConnectTimeout(12000);
+  String url = String(SUPABASE_URL) + "/functions/v1/reset-alt-health";
+
+  if (!http.begin(client, url)) {
+    Serial.println("RESET_ALT_HEALTH: HTTP begin failed");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
+  http.setTimeout(12000);
+
+  String payload = "{\"token\":\"" + authToken + "\"}";
+  int httpCode = http.POST(payload);
+
+  if (httpCode == 200) {
+    Serial.println("RESET_ALT_HEALTH: Success - cloud alt-health history wiped, upload re-enabled");
+    altCloudWipePending = false;
+    settingWrite(NK_AltWipePend, "0");
+    queueConsoleMessage("Cloud alternator-health history wiped; record book starts clean");
+  } else {
+    Serial.printf("RESET_ALT_HEALTH: HTTP %d - will retry\n", httpCode);
   }
 
   http.end();

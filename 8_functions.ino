@@ -1085,6 +1085,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "imu_mnt_state", NK_imu_mnt_state, 3 },
   { "RpmAxisWipeLoc", NK_RpmAxisWipeLoc, 3 },
   { "RpmAxisWipePend", NK_RpmAxisWipePend, 3 },
+  { "AltWipePend", NK_AltWipePend, 3 },   // alt-health Start Over: cloud wipe still owed (lifecycle flag, never imported)
   { "SocSeedAck", NK_SocSeedAck, 3 },
   { "SocSeedSnap", NK_SocSeedSnap, 3 },
   { "commissionAgeAck", NK_cmAgeAck, 3 },

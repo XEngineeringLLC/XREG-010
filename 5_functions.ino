@@ -1486,7 +1486,7 @@ void nmea2kTransmitTick() {
             // FIELD_FAULT_REASONS set: 1-9, 12, 13, 15-17 — covers the implausible-sensor cuts)
             // while the engine turns fast enough that the field would otherwise be allowed.
             bool faultCut = gpio4IsLow && g_fieldEventReason >= 1 && g_fieldEventReason <= 17
-                            && g_fieldEventReason != REASON_CHARGING_DISABLED && g_fieldEventReason != REASON_MANUAL_MODE && g_fieldEventReason != REASON_RPM_TOO_LOW;
+                            && g_fieldEventReason != REASON_CHARGING_DISABLED && g_fieldEventReason != REASON_CHARGE_COMPLETE_IDLE && g_fieldEventReason != REASON_MANUAL_MODE && g_fieldEventReason != REASON_RPM_TOO_LOW;
             if (faultCut && RPM > MinRPMForField) s1.Bits.ChargeIndicator = 1;
           }
           SetN2kEngineDynamicParam(N2kMsg, (unsigned char)n2kEngInstance, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA,
@@ -4077,14 +4077,16 @@ void _ReadAnalogInputs_inner() {
     if (fieldGateOpen && !inaFastModeActive) {
       INA.setAverage(1);                    // 4 samples (register 1)
       INA.setBusVoltageConversionTime(4);   // 540µs
-      INA.setShuntVoltageConversionTime(4); // 540µs — total update: 4×1080µs ≈ 4.3ms
+      INA.setShuntVoltageConversionTime(4); // 540µs
+      INA.setTemperatureConversionTime(0);  // 50µs — total update: 4×1130µs ≈ 4.5ms, still inside the 5ms poll. Re-asserted every transition so an INA228 brownout (VTCT resets to 1052µs) cannot silently double the cycle
       IBV_filtered = IBV;                   // reseed EMA so CV loop starts clean
       inaReadInterval = INA_FAST_INTERVAL_MS;
       inaFastModeActive = true;
     } else if (!fieldGateOpen && inaFastModeActive) {
       INA.setAverage(4);                    // 128 samples (register 4)
       INA.setBusVoltageConversionTime(7);   // 4120µs
-      INA.setShuntVoltageConversionTime(7); // 4120µs — total update: 128×8240µs ≈ 1054ms
+      INA.setShuntVoltageConversionTime(7); // 4120µs
+      INA.setTemperatureConversionTime(0);  // 50µs — total update: 128×8290µs ≈ 1061ms, inside the 1100ms poll
       inaReadInterval = INA_SLOW_INTERVAL_MS;
       inaFastModeActive = false;
     }
@@ -4200,6 +4202,47 @@ void _ReadAnalogInputs_inner() {
                      }
                    }
                  }()));
+    }
+  }
+
+  // ── INA228 die temperature ───────────────────────────────────────────────
+  // Own 1 Hz timer, deliberately NOT in the 5ms IBV path: the die moves over seconds, so reading it
+  // there would spend 24ms/s of bus time to learn nothing extra. Cost lands inside ft_rai_total.
+  if (INADisconnected == 0) {
+    static unsigned long lastInaTempMs = 0;
+    static uint8_t inaDieWarmup = 0;     // valid samples discarded since boot
+    static float   inaDiePrevF  = NAN;   // previous sample — the corroborating witness for the max
+    if (millis() - lastInaTempMs >= INA_DIETEMP_INTERVAL_MS) {
+      lastInaTempMs = millis();
+      try {
+        float tC = INA.getTemperature();
+        if (tC > 256.0f) tC -= 512.0f;   // library reads DIETEMP unsigned; the register is 16-bit two's complement, so the upper half of its 0..511.99°C span is negative
+        inaDieTempF = (tC > -60.0f && tC < 150.0f) ? (tC * 1.8f + 32.0f) : NAN;   // outside the package's own -40..125°C rating = a bad read, not a temperature
+      } catch (...) {
+        inaDieTempF = NAN;
+      }
+      // The max is held to a stricter standard than the live readout: it uploads daily and never
+      // comes back down, so a single garbage sample would pollute the fleet record forever. A value
+      // counts only after the warm-up discard AND only if the previous sample sits within
+      // INA_DIETEMP_STEP_F of it. Earliest a reading can reach the max is the 4th sample.
+      if (!isfinite(inaDieTempF)) {
+        inaDiePrevF = NAN;               // bad read re-arms corroboration; the next sample cannot feed the max either
+      } else {
+        if (inaDieWarmup < INA_DIETEMP_WARMUP_SAMPLES) {
+          inaDieWarmup++;
+        } else if (isfinite(inaDiePrevF) && fabsf(inaDieTempF - inaDiePrevF) <= INA_DIETEMP_STEP_F) {
+          // Second line of defence: once seeded, the max climbs at most INA_DIETEMP_STEP_F per
+          // accepted sample. Corroboration alone is not enough — two IDENTICAL bad reads corroborate
+          // each other — so bound the damage instead of trying to classify every sample. A real die
+          // cannot move faster than this in a second, so a genuine peak is never under-reported;
+          // a stuck-hot read would have to persist for ten-plus consecutive seconds to matter, and
+          // by then the chip is broken rather than glitching.
+          float capped = isfinite(inaDieTempMaxF) ? fminf(inaDieTempF, inaDieTempMaxF + INA_DIETEMP_STEP_F)
+                                                  : inaDieTempF;
+          if (!isfinite(inaDieTempMaxF) || capped > inaDieTempMaxF) inaDieTempMaxF = capped;
+        }
+        inaDiePrevF = inaDieTempF;
+      }
     }
   }
 
@@ -5516,36 +5559,10 @@ void ensurePreferredBootPartition() {
     }
   }
 }
-// Close the arm window and latch the notice the next client will see. One place, so the lazy
-// endpoint check and the periodic hold service below cannot drift apart.
-static void settingsArmExpire() {
-  settingsArmed = false;
-  settingsAutoLockNotice = true;
-  settingsAutoLockedEpoch = (uint32_t)getCurrentTimestamp();  // 0 when no time source has ever landed
-  queueConsoleMessage("Settings auto-locked (30 min after the last interface disconnected)");
-}
-
-// Lazy-expiring check for the settings arm gate — every mutating endpoint calls this.
+// The settings arm gate — every mutating endpoint calls this. Nothing expires it: only an explicit
+// lock (Lock Settings, or any client's /armSettings?arm=0) or a reboot clears settingsArmed.
 bool settingsArmActive() {
-  if (!settingsArmed) return false;
-  if (millis() - settingsArmedAtMs > SETTINGS_ARM_TIMEOUT_MS) {
-    settingsArmExpire();
-    return false;
-  }
-  return true;
-}
-
-// Once per loop pass. While at least one SSE client is attached the window's start keeps moving
-// forward, so a user working in the interface is never silently rejected mid-session; the 30-min
-// countdown then runs from the moment the last client drops, which keeps a closed laptop lid or a
-// backgrounded phone app relocking on schedule.
-void serviceSettingsArmHold() {
-  if (!settingsArmed) return;
-  if (events.count() > 0) {
-    settingsArmedAtMs = millis();
-    return;
-  }
-  if (millis() - settingsArmedAtMs > SETTINGS_ARM_TIMEOUT_MS) settingsArmExpire();
+  return settingsArmed;
 }
 // Mirror every queued message into the /consolehist.txt history ring (own indices, own short
 // critical section — never nested inside the queue's).
@@ -5637,12 +5654,13 @@ bool popConsoleMessage(char *out) {
 }
 void trySendConsoleSSE(bool &sentSomething, unsigned long now) {
   if (sentSomething) return;
+  if (sseBacklogged()) return;   // lines wait in the console queue and go out after the link drains
   if (now - lastConsoleMessageTime < CONSOLE_MESSAGE_INTERVAL) return;
 
   char msg[CONSOLE_MSG_LEN];   // copy under the lock, send outside it — same discipline, one buffer
   int sent = 0;
   while (sent < 5 && popConsoleMessage(msg)) {
-    events.send(msg, "console");
+    sseSend(msg, "console");
     sent++;
   }
   if (sent == 0) return;

@@ -200,12 +200,13 @@
       <!-- State word sits RIGHT of the numbers so its width changes (BULK → ABSORPTION →
            PROTECT) grow into the flex spacer and never shift the readouts -->
       <span id="hcs-pill" class="hcs-pill">—</span>
-      <!-- Alternator OFF / ON — isolated control; stopPropagation keeps a press from expanding -->
+      <!-- Alternator OFF / ON — isolated control; stopPropagation keeps a press from expanding.
+           Same two-absolute-commands control as the expanded header; CSS hides the action words at
+           strip scale, so the fill alone carries the state here. -->
       <span class="hcs-divider"></span>
       <span id="hcs-onoff" class="onoff-switch" role="group" aria-label="Alternator Enable" onclick="event.stopPropagation()">
-        <span class="onoff-knob" aria-hidden="true"></span>
-        <button type="button" class="onoff-half" data-v="0" title="Turn the alternator OFF" aria-label="Turn the alternator off" onclick="alternatorSet(0)">OFF</button>
-        <button type="button" class="onoff-half" data-v="1" title="Turn the alternator ON" aria-label="Turn the alternator on" onclick="alternatorSet(1)">ON</button>
+        <button type="button" class="onoff-half" data-v="0" title="Turn the alternator OFF" aria-label="Turn the alternator off" onclick="alternatorSet(0)"><span class="onoff-state">OFF</span><span class="onoff-act">turn off</span></button>
+        <button type="button" class="onoff-half" data-v="1" title="Turn the alternator ON" aria-label="Turn the alternator on" onclick="alternatorSet(1)"><span class="onoff-state">ON</span><span class="onoff-act">turn on</span></button>
       </span>
       <!-- The only tap target that expands the header -->
       <span class="hcs-chevron" title="Expand header" onclick="toggleHeaderCollapse()">⌄</span>
@@ -288,20 +289,19 @@
       </div>
 
       <!-- Alternator Enable — sits right of chips when screen is wide enough.
-           Looks like a slider, behaves like two buttons: each half of the track is its own absolute
-           command (left half always sends OnOff=0, right half always sends OnOff=1), so what the
-           control is painting can never change what a press sends. A real slider sends the opposite
-           of whatever it shows, and a paint that lagged or reverted turned an intended OFF into an
-           ON. The knob sits over the regulator's own state (CSV1 OnOff, ~10 Hz) and is hidden until
-           the first frame arrives; the pressed half carries a ring until the regulator echoes it
-           (alternatorSet / paintOnOff, script.js). -->
+           Two buttons, not a slider: each half is its own absolute command (left half always sends
+           OnOff=0, right half always sends OnOff=1), so what the control is painting can never change
+           what a press sends. A real slider sends the opposite of whatever it shows, and a paint that
+           lagged or reverted turned an intended OFF into an ON. The filled half is the regulator's own
+           state (CSV1 OnOff, ~10 Hz) and prints it as a word; the hollow half prints the action a press
+           would take. Before the first frame neither is filled and both read as offers. The pressed
+           half carries a ring until the regulator echoes it (alternatorSet / paintOnOff, script.js). -->
       <div class="alternator-control-tier">
         <div class="alternator-control">
           <span class="control-label">Alternator Enable</span>
           <div id="header-onoff" class="onoff-switch" role="group" aria-label="Alternator Enable">
-            <span class="onoff-knob" aria-hidden="true"></span>
-            <button type="button" class="onoff-half" data-v="0" title="Turn the alternator OFF" aria-label="Turn the alternator off" onclick="alternatorSet(0)">OFF</button>
-            <button type="button" class="onoff-half" data-v="1" title="Turn the alternator ON" aria-label="Turn the alternator on" onclick="alternatorSet(1)">ON</button>
+            <button type="button" class="onoff-half" data-v="0" title="Turn the alternator OFF" aria-label="Turn the alternator off" onclick="alternatorSet(0)"><span class="onoff-state">OFF</span><span class="onoff-act">turn off</span></button>
+            <button type="button" class="onoff-half" data-v="1" title="Turn the alternator ON" aria-label="Turn the alternator on" onclick="alternatorSet(1)"><span class="onoff-state">ON</span><span class="onoff-act">turn on</span></button>
           </div>
         </div>
       </div>
@@ -317,18 +317,11 @@
     <div id="dvcc-banner" class="header-notice" style="display:none;"
       onclick="goToDvccFollow()" title="Open Setup &rarr; Integrations &rarr; Charge-Limit Follow"></div>
 
-    <!-- Settings relocked themselves while nothing was connected — shown to whoever arrives next.
-         Text set by renderArmLockNotice(); the &#10005; acks it on the device, not per browser. -->
-    <div id="armlock-notice" class="header-notice header-notice-alert" style="display:none;">
-      <span id="armlock-notice-text"></span>
-      <button type="button" class="header-notice-x" onclick="dismissArmLockNotice();"
-        aria-label="Dismiss">&#10005;</button>
-    </div>
 
-
-    <!-- Settings Access — the button arms the firmware's 30-min settings write window
-         (no password; LAN clients are trusted, this is an acknowledgment). The button's
-         padlock styling is the ONLY locked-state indicator; the whole tier hides once armed. -->
+    <!-- Settings Access — the button arms the firmware's settings write window (no password; LAN
+         clients are trusted, this is an acknowledgment). Armed until Lock Settings, another client's
+         lock, or a reboot — nothing relocks on a timer. The button's padlock styling is the ONLY
+         locked-state indicator; the whole tier hides once armed. -->
     <div id="settings-access-section" class="settings-access-tier">
       <div class="password-form-wrapper">
         <form onsubmit="return armSettings();">
@@ -1528,8 +1521,9 @@
                         cut-back or over-temperature shutdown, no Min Field or per-speed tachometer keep-alive floor
                         (a PWM of 0 really means zero field), no engine-speed or tachometer-plausibility cut, no
                         battery temperature or voltage checks, and no current control at all. The master On/Off
-                        switch, the hardware over-voltage shutdown and the Max Field ceiling still apply. Switching
-                        to Manual asks for confirmation and lists the full set.</span>
+                        switch, the hardware over-voltage shutdown and the field ceiling (Max Field % and Max Field
+                        Volts, whichever is lower) still apply. Switching to Manual asks for confirmation and lists
+                        the full set.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -1554,8 +1548,8 @@
                     <span class="tooltip">ℹ️<span class="tooltip-box">Direct
                         PWM duty cycle applied to the field winding when Manual mode is active, 0–100% in steps of
                         0.01, delivered as typed — Min Field and the per-speed keep-alive floor do not raise it, so 0
-                        is a genuinely dead field. Only the Max Field ceiling still caps it. Has no effect in PID
-                        mode. Use with caution — Manual mode bypasses the thermal, engine-speed, battery and current
+                        is a genuinely dead field. Only the field ceiling, Max Field % or Max Field Volts, whichever
+                        is lower, still caps it. Has no effect in PID mode. Use with caution — Manual mode bypasses the thermal, engine-speed, battery and current
                         protections.</span></span>
                   </div>
                   <div class="form-input">
@@ -1596,17 +1590,14 @@
                 <hr />
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Max Field (%) (<span id="MaxDuty_echo">?</span>):</span>
+                    <span>Max Field (%) (<span id="MaxDuty_echo">?</span>):<span id="MaxDuty_limiting" class="cap-limiting">limiting</span></span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Hard cap on
-                        commanded field duty, enforced across every mode. Set ≤99% to ensure bootstrap capacitor refresh for
-                        the gate driver — at 100% duty the high-side may not fully refresh, risking incomplete gate drive and
-                        increased MOSFET heating; 99% is effectively maximum in practice. On 24 V / 36 V / 48 V banks each
-                        duty-percent drives ~2× / ~3× / ~4× the field current, so the default is scaled down (≈50% at 24 V, ≈33% at 36 V, ≈25%
-                        at 48 V) to keep worst-case field current at the 12 V level, and it rescales automatically if you
-                        change system voltage in Vessel Info. Raise it if a large alternator needs more field and you
-                        accept the higher field current. Max Field Volts caps the same drive in volts rather than
-                        percent; whichever of the two binds first is enforced, and the result is shown as Field
-                        Ceiling below.</span></span>
+                        commanded field duty, enforced in every mode, Manual included. Set no higher than 99%: at 100%
+                        duty the gate driver's bootstrap capacitor cannot refresh, so the high-side MOSFET may not fully
+                        turn on and runs hot. This is a duty ratio, so the field current it allows rises with system
+                        voltage. Max Field Volts below caps the same drive in volts, and is what protects a 12 V
+                        winding on a 24 V or 48 V bank. Whichever of the two works out lower is enforced, and that one
+                        is marked "limiting".</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -1620,39 +1611,26 @@
                 <hr />
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Max Field Volts (V) (<span id="MaxFieldVolts_echo">?</span>):</span>
+                    <span>Max Field Volts (V) (<span id="MaxFieldVolts_echo">?</span>, <span id="MaxFieldVolts_asDuty">?</span>% now):<span id="MaxFieldVolts_limiting" class="cap-limiting">limiting</span></span>
                     <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Caps the average voltage applied
                         to the field winding, calculated from commanded duty and the measured system voltage.
                         Alternator makers often reuse one 12&nbsp;V field winding across their 24&nbsp;V and 48&nbsp;V
                         models, so the winding inside a high-voltage alternator may still be a 12&nbsp;V part — enter
-                        the field voltage from the alternator's datasheet. Whichever binds first, this or Max Field
-                        (%), is what the loop enforces; the enforced ceiling is shown below as Field Ceiling. Because
-                        this solves against the measured bus every control tick, it hands duty back as the bank sags,
-                        which a fixed duty percentage cannot. This is a heating limit, not an insulation limit: field
-                        drive is switched, so the winding still sees full system voltage on each pulse whatever the
-                        cap. And it is derived from duty and battery voltage rather than sensed at the field, so
-                        actual field volts run above it by the cable drop between battery and alternator.</span></span>
+                        the field voltage from the alternator's datasheet, and a higher rating raises the ceiling.
+                        The duty this works out to at the present system voltage is shown beside its value; whichever
+                        of this and Max Field (%) is lower is what the loop enforces, in every mode, and that one is
+                        marked "limiting". Because this solves against the measured bus every control tick, it hands
+                        duty back as the bank sags, which a fixed duty percentage cannot. This is a heating limit, not
+                        an insulation limit: field drive is switched, so the winding still sees full system voltage on
+                        each pulse whatever the cap. And it is derived from duty and battery voltage rather than sensed
+                        at the field, so actual field volts run above it by the cable drop between battery and
+                        alternator.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
                       <input name="MaxFieldVolts" type="number" step="0.1" min="0.5" max="60" />
                       <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                     </form>
-                  </div>
-                </div>
-
-                <!-- Field Ceiling (read-only: what the two caps above actually enforce) -->
-                <hr />
-                <div class="form-row">
-                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Field Ceiling (%) (<span id="fieldDutyCeil_echo">?</span>):</span>
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The field-duty ceiling actually
-                        enforced right now — the lower of Max Field (%) and the duty that Max Field Volts works out
-                        to against the present system voltage. Read-only. It moves with battery voltage whenever Max
-                        Field Volts is the binding cap, and sits equal to Max Field (%) whenever it is not.</span></span>
-                  </div>
-                  <div class="form-input">
-                    <span id="fieldDutyCeil_source" style="font-size: 14px; color: var(--text-muted);">&mdash;</span>
                   </div>
                 </div>
 
@@ -2178,6 +2156,31 @@
                     <button type="button" class="btn-secondary btn-sm"
                       onclick="downloadCsv('/zerofit.csv','Zero Fit Trend')">Download Fit Trend</button>
                   </div>
+                </div>
+
+                <hr />
+                <div class="form-row">
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>Measured Zero (Engine Running):</span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">With the engine running and the
+                        alternator not charging, the current sensor should read exactly zero. Whatever it reads
+                        instead is its zero error at operating temperature, on this installation. Zero Now averages
+                        the reading for ten seconds and reports what it found, and Apply folds that number into the
+                        Alternator Current Offset above. The commissioning wizard measures this by itself during the
+                        last few steps and offers the result at the finish, when the alternator is warmest. The engine
+                        must be running above 400 RPM with the field off. A reading that is too large or too noisy is
+                        refused rather than applied.</span></span>
+                  </div>
+                  <div class="form-input">
+                    <button type="button" class="btn-secondary" onclick="altZeroNow()"
+                      id="altzero-now-btn">Zero Now</button>
+                    <button type="button" class="btn-primary" onclick="altZeroApplyNow()"
+                      id="altzero-apply-btn" disabled
+                      style="opacity:0.45; cursor:not-allowed;">Apply</button>
+                  </div>
+                </div>
+                <div class="form-row">
+                  <div class="form-label"><span id="altzero-status" class="learning-info-label">—</span></div>
                 </div>
 
                 <hr />
@@ -2860,7 +2863,7 @@
                       <span class="tooltip">ℹ️<span class="tooltip-box">Absolute battery voltage at which the field is cut instantly — armed in every mode, including manual, comparing the raw per-tick sample so it catches fast excursions the filtered tiers ride through. The re-enable lockout is adaptive: short for an isolated event, escalating if the cut keeps re-firing, resetting after a minute without one. Set it 0.1 V (times the system-voltage class over 12) below the Hardware Shutdown Voltage, so software always acts before the hardware backstop.</span></span>
                       <span class="sinfo" data-sinfo="hardShutdownV"></span>
                     </div>
-                    <form action="/get" method="GET" target="hidden-form">
+                    <form action="/get" method="GET" target="hidden-form" onsubmit="return submitOvLadderRung(this,'sw')">
                       <div class="protections-edit-row">
                         <input name="AlternatorHardShutdownV" type="number" step="0.01" min="1" max="99" />
                         <span class="protections-unit">V</span>
@@ -2873,7 +2876,7 @@
                       <span class="tooltip">ℹ️<span class="tooltip-box">The top rung: a voltage comparator inside the battery shunt monitor chip (INA228) whose alert pin cuts the field electrically, with no processor involvement — the backstop if software ever hangs. It should never be the rung that fires; a nonzero hardware-trip count on the Diagnostics panel is worth reporting. Set it 0.2 V (times the system-voltage class over 12) below your battery's BMS charge-disconnect voltage (the highest-cell trip voltage times the cell count) so a hung regulator is still disconnected before the BMS opens the charge path under load. For lead-acid and AGM there is no BMS in the picture — place it where connected DC equipment becomes the limiting factor.</span></span>
                       <span class="sinfo" data-sinfo="hwShutdownV"></span>
                     </div>
-                    <form action="/get" method="GET" target="hidden-form">
+                    <form action="/get" method="GET" target="hidden-form" onsubmit="return submitOvLadderRung(this,'hw')">
                       <div class="protections-edit-row">
                         <input name="VoltageHardwareLimit" type="number" step="0.01" min="10" max="70" />
                         <span class="protections-unit">V</span>
@@ -3545,19 +3548,19 @@
               <span class="metric-label telemetry-label">Rise 1
                 <span class="tooltip">ℹ️<span class="tooltip-box">Time from first UP duty step to first confirmed current rise above threshold.</span></span>
               </span>
-              <span class="metric-value telemetry-value"><span id="systemIDRiseDelay_0_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value"><span id="systemIDRiseDelay_0_ID">?</span>&nbsp;ms</span>
             </div>
             <div class="metric-row telemetry-row">
               <span class="metric-label telemetry-label">Rise 2</span>
-              <span class="metric-value telemetry-value"><span id="systemIDRiseDelay_1_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value"><span id="systemIDRiseDelay_1_ID">?</span>&nbsp;ms</span>
             </div>
             <div class="metric-row telemetry-row">
               <span class="metric-label telemetry-label">Rise 3</span>
-              <span class="metric-value telemetry-value"><span id="systemIDRiseDelay_2_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value"><span id="systemIDRiseDelay_2_ID">?</span>&nbsp;ms</span>
             </div>
             <div class="metric-row telemetry-row" style="border-top:1px solid var(--border);margin-top:4px;padding-top:4px;">
               <span class="metric-label telemetry-label" style="font-weight:600;">Rise Average</span>
-              <span class="metric-value telemetry-value" style="font-weight:600;"><span id="systemIDRiseAvg_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value" style="font-weight:600;"><span id="systemIDRiseAvg_ID">?</span>&nbsp;ms</span>
             </div>
           </div>
 
@@ -3567,19 +3570,19 @@
               <span class="metric-label telemetry-label">Fall 1
                 <span class="tooltip">ℹ️<span class="tooltip-box">Time from first DOWN duty step to first confirmed current drop below threshold.</span></span>
               </span>
-              <span class="metric-value telemetry-value"><span id="systemIDFallDelay_0_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value"><span id="systemIDFallDelay_0_ID">?</span>&nbsp;ms</span>
             </div>
             <div class="metric-row telemetry-row">
               <span class="metric-label telemetry-label">Fall 2</span>
-              <span class="metric-value telemetry-value"><span id="systemIDFallDelay_1_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value"><span id="systemIDFallDelay_1_ID">?</span>&nbsp;ms</span>
             </div>
             <div class="metric-row telemetry-row">
               <span class="metric-label telemetry-label">Fall 3</span>
-              <span class="metric-value telemetry-value"><span id="systemIDFallDelay_2_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value"><span id="systemIDFallDelay_2_ID">?</span>&nbsp;ms</span>
             </div>
             <div class="metric-row telemetry-row" style="border-top:1px solid var(--border);margin-top:4px;padding-top:4px;">
               <span class="metric-label telemetry-label" style="font-weight:600;">Fall Average</span>
-              <span class="metric-value telemetry-value" style="font-weight:600;"><span id="systemIDFallAvg_ID">?</span> ms</span>
+              <span class="metric-value telemetry-value" style="font-weight:600;"><span id="systemIDFallAvg_ID">?</span>&nbsp;ms</span>
             </div>
           </div>
         </div>
@@ -3730,7 +3733,7 @@
                             is the process variable fed to the output current PID on every fresh current sample (~200 Hz, ~5 ms).</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="pidInput_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="pidInput_display">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -3739,7 +3742,7 @@
                           <span class="tooltip-box">The slew-limited current target (A) the output current PID is chasing.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="pidSetpoint_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="pidSetpoint_display">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -3748,7 +3751,7 @@
                           <span class="tooltip-box">Raw duty cycle (%) computed by the output current PID before clamping.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="pidOutput_display">?</span> %</span>
+                      <span class="metric-value telemetry-value"><span id="pidOutput_display">?</span>&nbsp;%</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -3757,7 +3760,7 @@
                           <span class="tooltip-box">Difference between setpoint and input.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="pidError_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="pidError_display">?</span>&nbsp;A</span>
                     </div>
                   </div>
 
@@ -3771,7 +3774,7 @@
                           <span class="tooltip-box">Proportional contribution.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="innerTermP_display">?</span> %</span>
+                      <span class="metric-value telemetry-value"><span id="innerTermP_display">?</span>&nbsp;%</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -3780,7 +3783,7 @@
                           <span class="tooltip-box">Integral contribution.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="innerTermI_display">?</span> %</span>
+                      <span class="metric-value telemetry-value"><span id="innerTermI_display">?</span>&nbsp;%</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -3789,7 +3792,7 @@
                           <span class="tooltip-box">Derivative contribution.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="innerTermD_display">?</span> %</span>
+                      <span class="metric-value telemetry-value"><span id="innerTermD_display">?</span>&nbsp;%</span>
                     </div>
                   </div>
 
@@ -3803,7 +3806,7 @@
                           <span class="tooltip-box">Estimated, not measured — commanded duty cycle × battery voltage. It tracks the command, so it will not show a fault in the field wiring or the drive stage.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="FieldVoltsID2">?</span> V</span>
+                      <span class="metric-value telemetry-value"><span id="FieldVoltsID2">?</span>&nbsp;V</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -3812,7 +3815,7 @@
                           <span class="tooltip-box">Estimated, not measured — field voltage divided by the entered field resistance of <span id="FieldResistance_echo_fldamps2">?</span> Ω, adjustable in Settings → Alternator → Basic → Output Control → Field Resistance. Real field resistance drifts 10–20% with rotor temperature, so treat this as an estimate.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="FieldAmpsID2">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="FieldAmpsID2">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -3821,7 +3824,7 @@
                           <span class="tooltip-box">Actual PWM duty cycle.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="dutyCycleID2">?</span> %</span>
+                      <span class="metric-value telemetry-value"><span id="dutyCycleID2">?</span>&nbsp;%</span>
                     </div>
                   </div>
 
@@ -4516,7 +4519,7 @@
                           <span class="tooltip-box">The voltage the CV loop is holding the battery to right now. Bulk voltage in bulk, absorption voltage in absorption, float voltage in float, or the Target Voltage Setpoint when Target Voltage mode is active.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="voltageTarget_display">?</span> V</span>
+                      <span class="metric-value telemetry-value"><span id="voltageTarget_display">?</span>&nbsp;V</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -4525,7 +4528,7 @@
                           <span class="tooltip-box">Active charging target minus measured battery voltage. Positive = battery below target (loop allows more current). Negative = battery above target (loop reduces current cap).</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="voltageError_display">?</span> V</span>
+                      <span class="metric-value telemetry-value"><span id="voltageError_display">?</span>&nbsp;V</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -4534,7 +4537,7 @@
                           <span class="tooltip-box">CV voltage loop output (Icv) — the current setpoint the voltage loop wants to deliver. Used as the actual setpoint whenever voltage control is active: bulk, absorption, float, Target Voltage mode, and Maintain Mode. Seeded on CV entry for bumpless transfer; clamped to [0, current ceiling]. Pulled down by Groups 1/2 when measured battery voltage is approaching or above target. In bulk the voltage error is large, so this value simply sits at the current ceiling — the loop behaves current-limited until voltage approaches target.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="Icv_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="Icv_display">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -4543,7 +4546,7 @@
                           <span class="tooltip-box">Voltage loop integrator (cv_I). Units are amps. Seeded on CV entry so the CV loop output starts at the live current setpoint with no step. Above target it unwinds 7× faster than it builds (hard-coded asymmetry on Voltage Loop Ki). During a protection event it is actively drained (anti-windup bleed) and blocked from building back up while the protection is capping current; on release it restarts at a fraction of its pre-event value (Recovery Seed Fraction). Should drift slowly toward the value that holds voltage at target. Large sustained values mean Voltage Loop Kp alone cannot reach target — Voltage Loop Ki is carrying the load.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="cv_I_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="cv_I_display">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -5519,7 +5522,7 @@
                           <span class="tooltip-box">Temperature the PID actually sees: the higher of the projected temperature (present temperature + rate of rise × Thermal Lookahead) and the present temperature, so a hot alternator is never forgiven just because the trend is flat or falling. Can exceed any temperature the sensor has ever measured when temp is rising. Zero slope is used during the ~65s slope buffer warmup after startup or reset, so the value equals the present temperature until then.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="tempPIDInput_display">?</span> <span class="temp-unit-label">°F</span></span>
+                      <span class="metric-value telemetry-value"><span id="tempPIDInput_display">?</span>&nbsp;<span class="temp-unit-label">°F</span></span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -5528,7 +5531,7 @@
                           <span class="tooltip-box">Active temperature setpoint the PID controls against. When the 60-second slope buffer is full (~65s after startup or reset), this is TemperatureLimit − 7°F (3.9°C). During warmup it is TemperatureLimit − 20°F (11°C), giving a wider margin while slope prediction is unavailable.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="tempPIDSetpoint_display">?</span> <span class="temp-unit-label">°F</span></span>
+                      <span class="metric-value telemetry-value"><span id="tempPIDSetpoint_display">?</span>&nbsp;<span class="temp-unit-label">°F</span></span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -5537,7 +5540,7 @@
                           <span class="tooltip-box">Amps subtracted from the RPM cap table ceiling (uTarget = I_cap − thermalPenalty). Positive = PID is derating current due to heat. Floored at 0 — the penalty cannot go negative; cold boost is not implemented.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="thermalPenaltyAmps_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="thermalPenaltyAmps_display">?</span>&nbsp;A</span>
                     </div>
                   </div>
 
@@ -5551,7 +5554,7 @@
                           <span class="tooltip-box">Proportional contribution to thermal penalty (A). = Kp × (projectedTemp − setpoint). PID runs in REVERSE mode: positive error (projectedTemp above setpoint) drives positive penalty (reduces current). Total penalty is floored at 0.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="outerTermP_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="outerTermP_display">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -5560,7 +5563,7 @@
                           <span class="tooltip-box">Integral accumulator (A). Builds positive while the controlled temperature (higher of projected and present) stays above setpoint. Bounded by the PID output limits (0 to MaxTableValue) — cannot go negative to boost current above the cap table.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="outerTermI_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="outerTermI_display">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -5569,7 +5572,7 @@
                           <span class="tooltip-box">Look-ahead share of the temperature response (A). The controller acts on a projected temperature (present + slope × look-ahead time) rather than the present temperature; this is the extra current reduction that projection causes. Zero when temperature is steady or falling. Shown as a contribution to the current target: negative means amps are being removed preemptively.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="outerTermLookahead_display">?</span> A</span>
+                      <span class="metric-value telemetry-value"><span id="outerTermLookahead_display">?</span>&nbsp;A</span>
                     </div>
 
                     <div class="metric-row telemetry-row">
@@ -5578,7 +5581,7 @@
                           <span class="tooltip-box">Temperature rate of change (shown in your display unit per second), computed as a backward difference over the Thermal Slope Window. Zero while the buffer fills after startup or reset. Readings implying more than ±0.5 °F/s (±0.28 °C/s) are rejected as sensor noise and the previous rate is held. Used to compute: projected temperature = current temperature + rate × Thermal Lookahead.</span>
                         </span>
                       </span>
-                      <span class="metric-value telemetry-value"><span id="thermalSlopeFPerSec_display">?</span> <span class="temp-rate-label">°F/s</span></span>
+                      <span class="metric-value telemetry-value"><span id="thermalSlopeFPerSec_display">?</span>&nbsp;<span class="temp-rate-label">°F/s</span></span>
                     </div>
                   </div>
 
@@ -6774,10 +6777,11 @@
           <div class="settings-card">
 
             <!-- System voltage (12/24/36/48 V) is set in Vessel Info; changing it there rescales the
-                 whole charge profile AND the field-duty knobs (Max Field %, Duty Ramp Rate, knee
-                 margins) so field current stays safe on higher-voltage banks. There is no separate
-                 field-duty-ceiling toggle: Max Field % below IS the real per-bus cap — set it to 99
-                 for full duty. -->
+                 whole charge profile AND the field-duty knobs (Duty Ramp Rate, knee margins) so field
+                 current stays safe on higher-voltage banks. The two field caps (Max Field %, Max Field
+                 Volts) are class-invariant: they describe the alternator, and the enforced ceiling
+                 re-derives from Max Field Volts against the live bus. Max Field % IS the real per-bus
+                 duty cap; 99 = full duty. -->
 
             <!-- Phase Definitions — one parent dropdown over the four charge-stage sections; each phase is a nested secondary dropdown -->
             <details style="margin-top: 20px;">
@@ -9642,8 +9646,8 @@
                   <span class="tooltip">
                     &#8505;&#65039;
                     <span class="tooltip-box">Scans for every regulator on this network and lets you pick which one
-                      the app follows. The app then reconnects to that unit by identity, so a changed IP address or
-                      a second regulator appearing cannot swap it out.</span>
+                      to use. The app reconnects to that unit by identity, so a changed IP address or a second
+                      regulator appearing cannot swap it out; a browser moves to that unit's own address.</span>
                   </span>
                 </div>
                 <div class="form-input">
@@ -10654,7 +10658,7 @@
           <div class="card">
             <p>Alternator Current</p>
             <p class="reading with-wm" style="font-size: 28px;">
-              <span><span id="MeasAmpsID">0</span> A</span>
+              <span><span id="MeasAmpsID">0</span>&nbsp;A</span>
               <span class="wm-inline">
                 <span><span class="arr">↑</span><span id="MeasAmpsID_hi">—</span></span>
                 <span><span class="arr">↓</span><span id="MeasAmpsID_lo">—</span></span>
@@ -10667,7 +10671,7 @@
             <div class="metric-row">
               <span class="metric-label">Alternator</span>
               <span class="with-wm">
-                <span class="metric-value" style="font-size: 20px;"><span id="AltTempID">0</span> <span class="temp-unit-label">°F</span></span>
+                <span class="metric-value" style="font-size: 20px;"><span id="AltTempID">0</span>&nbsp;<span class="temp-unit-label">°F</span></span>
                 <span class="wm-inline">
                   <span><span class="arr">↑</span><span id="AltTempID_hi">—</span></span>
                   <span><span class="arr">↓</span><span id="AltTempID_lo">—</span></span>
@@ -10676,14 +10680,14 @@
             </div>
             <div class="metric-row">
               <span class="metric-label">Thermistor</span>
-              <span class="metric-value"><span id="temperatureThermistorID">0</span> <span class="temp-unit-label">°F</span></span>
+              <span class="metric-value"><span id="temperatureThermistorID">0</span>&nbsp;<span class="temp-unit-label">°F</span></span>
             </div>
             <div class="metric-row">
               <span class="metric-label" style="display:flex;align-items:center;gap:4px;">
                 Since Last Overheat
                 <span class="tooltip">ℹ️<span class="tooltip-box">Hours elapsed since the last overheat event. Stays at 0.00 if this alternator has never overheated — the clock only starts once an overheat is actually recorded. Resets to zero on reboot, on any new overheat, and when overheat history is cleared. Does not persist across power cycles.</span></span>
               </span>
-              <span class="metric-value"><span id="timeSinceLastOverheat_display">—</span> hr</span>
+              <span class="metric-value"><span id="timeSinceLastOverheat_display">—</span>&nbsp;hr</span>
             </div>
           </div>
 
@@ -10695,27 +10699,27 @@
             <p class="card-group-title">Field Control</p>
             <div class="metric-row">
               <span class="metric-label">Command Field Duty Cycle</span>
-              <span class="metric-value"><span id="dutyCycleID">0</span> %</span>
+              <span class="metric-value"><span id="dutyCycleID">0</span>&nbsp;%</span>
             </div>
             <div class="metric-row">
               <span class="metric-label" style="display:flex;align-items:center;gap:4px;">
                 Field Volts (Calc'd)
                 <span class="tooltip">ℹ️<span class="tooltip-box">Not measured — calculated as commanded duty cycle × battery voltage. It tracks the command, so it will not show a fault in the field wiring or the drive stage.</span></span>
               </span>
-              <span class="metric-value"><span id="FieldVoltsID">0</span> V</span>
+              <span class="metric-value"><span id="FieldVoltsID">0</span>&nbsp;V</span>
             </div>
             <div class="metric-row">
               <span class="metric-label" style="display:flex;align-items:center;gap:4px;">
                 Field Amps (Calc'd)
                 <span class="tooltip">ℹ️<span class="tooltip-box">Not measured — calculated as Field Volts divided by the entered field resistance of <span id="FieldResistance_echo_fldamps">?</span> Ω, adjustable in Settings → Alternator → Basic → Output Control → Field Resistance. Real field resistance drifts 10–20% with rotor temperature, so treat this as an estimate.</span></span>
               </span>
-              <span class="metric-value"><span id="FieldAmpsID">0</span> A</span>
+              <span class="metric-value"><span id="FieldAmpsID">0</span>&nbsp;A</span>
             </div>
           </div>
 
           <div class="card">
             <p>Alt Current Zero Offset (Auto-Learned)</p>
-            <p class="reading"><span id="DynamicAltCurrentZero_display">0.00</span> A</p>
+            <p class="reading"><span id="DynamicAltCurrentZero_display">0.00</span>&nbsp;A</p>
           </div>
 
         </div> <!-- closes .grid -->
@@ -10896,7 +10900,7 @@
           <div class="card req-batt-current">
             <p>State of Charge</p>
             <p class="reading with-wm" style="font-size: 28px;">
-              <span><span id="SOC_percentID">0</span> %</span>
+              <span><span id="SOC_percentID">0</span>&nbsp;%</span>
               <span class="wm-inline">
                 <span><span class="arr">↑</span><span id="SOC_percentID_hi">—</span></span>
                 <span><span class="arr">↓</span><span id="SOC_percentID_lo">—</span></span>
@@ -10914,7 +10918,7 @@
                 </span>
               </span>
               <span class="with-wm">
-                <span class="metric-value" style="font-size: 18px;"><span id="IBVID">0</span> V</span>
+                <span class="metric-value" style="font-size: 18px;"><span id="IBVID">0</span>&nbsp;V</span>
                 <span class="wm-inline">
                   <span><span class="arr">↑</span><span id="IBVID_hi">—</span></span>
                   <span><span class="arr">↓</span><span id="IBVID_lo">—</span></span>
@@ -10928,7 +10932,7 @@
                   <span class="tooltip-box">Measured by ADS1115 uC - for redundancy</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="BatteryVID">0</span> V</span>
+              <span class="metric-value"><span id="BatteryVID">0</span>&nbsp;V</span>
             </div>
           </div>
 
@@ -10944,7 +10948,7 @@
             <div class="metric-row">
               <span class="metric-label">Battery Current</span>
               <span class="with-wm">
-                <span class="metric-value"><span id="BCurrID">0</span> A</span>
+                <span class="metric-value"><span id="BCurrID">0</span>&nbsp;A</span>
                 <span class="wm-inline">
                   <span><span class="arr">↑</span><span id="BCurrID_hi">—</span></span>
                   <span><span class="arr">↓</span><span id="BCurrID_lo">—</span></span>
@@ -10960,7 +10964,7 @@
             <div class="metric-row">
               <span class="metric-label">Battery Temperature</span>
               <span class="with-wm">
-                <span class="metric-value"><span id="battTempActive_ID">&mdash;</span> <span class="temp-unit-label">°F</span></span>
+                <span class="metric-value"><span id="battTempActive_ID">&mdash;</span>&nbsp;<span class="temp-unit-label">°F</span></span>
                 <span class="wm-inline" id="battTempProbe_wm">
                   <span><span class="arr">&uarr;</span><span id="battTempProbe_ID_hi">&mdash;</span></span>
                   <span><span class="arr">&darr;</span><span id="battTempProbe_ID_lo">&mdash;</span></span>
@@ -10977,11 +10981,11 @@
             <p class="card-group-title">Charge/Discharge Time</p>
             <div class="metric-row">
               <span class="metric-label">Time to Full Charge</span>
-              <span class="metric-value"><span id="timeToFullChargeMinID">0</span> min</span>
+              <span class="metric-value"><span id="timeToFullChargeMinID">0</span>&nbsp;min</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Time to Full Discharge</span>
-              <span class="metric-value"><span id="timeToFullDischargeMinID">0</span> min</span>
+              <span class="metric-value"><span id="timeToFullDischargeMinID">0</span>&nbsp;min</span>
             </div>
           </div>
 
@@ -11391,11 +11395,11 @@
                   <span class="tooltip-box">Available if VE.Direct Data is turned on in Setup→Integrations</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="VictronVoltageID">0</span> V</span>
+              <span class="metric-value"><span id="VictronVoltageID">0</span>&nbsp;V</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Victron Battery Current</span>
-              <span class="metric-value"><span id="VictronCurrentID">0</span> A</span>
+              <span class="metric-value"><span id="VictronCurrentID">0</span>&nbsp;A</span>
             </div>
           </div>
           <div class="card-group">
@@ -11407,15 +11411,15 @@
                   <span class="tooltip-box">Live solar panel power from a Victron MPPT over VE.Direct (PPV). Available if VE.Direct Data is turned on in Setup→Integrations.</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="VictronSolarPowerID">0</span> W</span>
+              <span class="metric-value"><span id="VictronSolarPowerID">0</span>&nbsp;W</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Solar Voltage</span>
-              <span class="metric-value"><span id="VictronSolarVoltageID">0</span> V</span>
+              <span class="metric-value"><span id="VictronSolarVoltageID">0</span>&nbsp;V</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Solar Current</span>
-              <span class="metric-value"><span id="VictronSolarCurrentID">0</span> A</span>
+              <span class="metric-value"><span id="VictronSolarCurrentID">0</span>&nbsp;A</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Charge State</span>
@@ -11431,19 +11435,19 @@
             </div>
             <div class="metric-row">
               <span class="metric-label">Yield Today</span>
-              <span class="metric-value"><span id="VictronYieldTodayID">0</span> kWh</span>
+              <span class="metric-value"><span id="VictronYieldTodayID">0</span>&nbsp;kWh</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Max Power Today</span>
-              <span class="metric-value"><span id="VictronMaxPowerTodayID">0</span> W</span>
+              <span class="metric-value"><span id="VictronMaxPowerTodayID">0</span>&nbsp;W</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Yield Yesterday</span>
-              <span class="metric-value"><span id="VictronYieldYesterdayID">0</span> kWh</span>
+              <span class="metric-value"><span id="VictronYieldYesterdayID">0</span>&nbsp;kWh</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Max Power Yesterday</span>
-              <span class="metric-value"><span id="VictronMaxPowerYesterdayID">0</span> W</span>
+              <span class="metric-value"><span id="VictronMaxPowerYesterdayID">0</span>&nbsp;W</span>
             </div>
           </div>
         </div>
@@ -11481,19 +11485,19 @@
             </p>
             <div class="metric-row">
               <span class="metric-label">Predicted Harvest</span>
-              <span class="metric-value"><span id="sledPredHarvTodayID">&mdash;</span> kWh</span>
+              <span class="metric-value"><span id="sledPredHarvTodayID">&mdash;</span>&nbsp;kWh</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Harvest So Far</span>
-              <span class="metric-value"><span id="sledActHarvTodayID">&mdash;</span> kWh</span>
+              <span class="metric-value"><span id="sledActHarvTodayID">&mdash;</span>&nbsp;kWh</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Predicted Consumption</span>
-              <span class="metric-value"><span id="sledPredConsTodayID">&mdash;</span> kWh</span>
+              <span class="metric-value"><span id="sledPredConsTodayID">&mdash;</span>&nbsp;kWh</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Consumption So Far</span>
-              <span class="metric-value"><span id="sledActConsTodayID">&mdash;</span> kWh</span>
+              <span class="metric-value"><span id="sledActConsTodayID">&mdash;</span>&nbsp;kWh</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Performance Ratio
@@ -11795,7 +11799,7 @@
                 </span>
               </span>
               <span class="with-wm">
-                <span class="metric-value" style="font-size: 18px;"><span id="VMGNMEA_ID">0</span> kts</span>
+                <span class="metric-value" style="font-size: 18px;"><span id="VMGNMEA_ID">0</span>&nbsp;kts</span>
                 <span class="wm-inline">
                   <span><span class="arr">↑</span><span id="VMGNMEA_ID_hi">—</span></span>
                   <span><span class="arr">↓</span><span id="VMGNMEA_ID_lo">—</span></span>
@@ -11840,16 +11844,16 @@
             <p class="card-group-title">Motion</p>
             <div class="metric-row">
               <span class="metric-label">Total Acceleration</span>
-              <span class="metric-value"><span id="imu_total_accel_g_ID">0.00</span> g</span>
+              <span class="metric-value"><span id="imu_total_accel_g_ID">0.00</span>&nbsp;g</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Yaw Rate</span>
-              <span class="metric-value"><span id="imu_yaw_rate_dps_ID">0.0</span> °/s</span>
+              <span class="metric-value"><span id="imu_yaw_rate_dps_ID">0.0</span>&nbsp;°/s</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Vertical Acceleration</span>
               <span class="with-wm">
-                <span class="metric-value"><span id="imu_vertical_accel_g_ID">0.00</span> g</span>
+                <span class="metric-value"><span id="imu_vertical_accel_g_ID">0.00</span>&nbsp;g</span>
                 <span class="wm-inline">
                   <span><span class="arr">↑</span><span id="imu_vertical_accel_g_ID_hi">—</span></span>
                   <span><span class="arr">↓</span><span id="imu_vertical_accel_g_ID_lo">—</span></span>
@@ -11862,19 +11866,19 @@
             <p class="card-group-title">Anchorage Comfort</p>
             <div class="metric-row">
               <span class="metric-label">Anchorage Comfort <span class="tooltip">ℹ️<span class="tooltip-box">Comfort score at anchor on a 0–100 scale (100 = flat calm). Based on rolling (heel deviation, 65% weight) and hobby-horsing (pitch deviation, 35% weight) over the last 60 seconds. Full penalty at 12° heel deviation or 8° pitch deviation. Grayed out underway — contextually meaningful only at anchor. Motion history resets on departure so passage data never skews the score. Activates below 1.3 kt.</span></span></span>
-              <span class="metric-value"><span id="imu_anchorage_comfort_ID">--</span> / 100</span>
+              <span class="metric-value"><span id="imu_anchorage_comfort_ID">--</span>&nbsp;/&nbsp;100</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Roll Deviation (2 min) <span class="tooltip">ℹ️<span class="tooltip-box">Peak-to-peak heel (roll) deviation over the last 2 minutes. Measures how much the boat rolls side to side at anchor. Color coded: green = comfortable, yellow = moderate, red = uncomfortable. Grayed out underway.</span></span></span>
-              <span class="metric-value"><span id="imu_heel_deviation_120s_ID">--</span> °</span>
+              <span class="metric-value"><span id="imu_heel_deviation_120s_ID">--</span>&nbsp;°</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Pitch Deviation (2 min) <span class="tooltip">ℹ️<span class="tooltip-box">Peak-to-peak pitch (fore-aft) deviation over the last 2 minutes. Measures how much the boat hobby-horses at anchor. Color coded: green = comfortable, yellow = moderate, red = uncomfortable. Grayed out underway.</span></span></span>
-              <span class="metric-value"><span id="imu_pitch_deviation_120s_ID">--</span> °</span>
+              <span class="metric-value"><span id="imu_pitch_deviation_120s_ID">--</span>&nbsp;°</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Yaw Swing (2 min) <span class="tooltip">ℹ️<span class="tooltip-box">Peak-to-peak heading swing over the last 2 minutes from the NMEA2000 compass. Shows how much the boat swings on its anchor rode. "--" if no compass data. Color coded: green = steady, yellow = moderate swing, red = wide swing. Grayed out underway.</span></span></span>
-              <span class="metric-value"><span id="imu_heading_swing_120s_ID">--</span> °</span>
+              <span class="metric-value"><span id="imu_heading_swing_120s_ID">--</span>&nbsp;°</span>
             </div>
           </div>
           <!-- Sea State Hours -->
@@ -11882,35 +11886,35 @@
             <p class="card-group-title"><span>Sea State Hours (Lifetime)</span> <span class="tooltip">ℹ️<span class="tooltip-box">Cumulative hours bucketed by Motion Sickness Index and speed (moving = SOG ≥ 1.5 kt). Buckets: Gentle (MSI &lt; 10), Moderate (10–30), Rough (30–70), Extreme (MSI ≥ 70). Logged once per minute.</span></span></p>
             <div class="metric-row">
               <span class="metric-label">Moving — Gentle</span>
-              <span class="metric-value"><span id="imu_min_moving_gentle_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_moving_gentle_ID">0.0</span>&nbsp;hr</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Moving — Moderate</span>
-              <span class="metric-value"><span id="imu_min_moving_moderate_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_moving_moderate_ID">0.0</span>&nbsp;hr</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Moving — Rough</span>
-              <span class="metric-value"><span id="imu_min_moving_rough_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_moving_rough_ID">0.0</span>&nbsp;hr</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Moving — Extreme</span>
-              <span class="metric-value"><span id="imu_min_moving_extreme_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_moving_extreme_ID">0.0</span>&nbsp;hr</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Stationary — Gentle</span>
-              <span class="metric-value"><span id="imu_min_stat_gentle_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_stat_gentle_ID">0.0</span>&nbsp;hr</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Stationary — Moderate</span>
-              <span class="metric-value"><span id="imu_min_stat_moderate_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_stat_moderate_ID">0.0</span>&nbsp;hr</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Stationary — Rough</span>
-              <span class="metric-value"><span id="imu_min_stat_rough_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_stat_rough_ID">0.0</span>&nbsp;hr</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Stationary — Extreme</span>
-              <span class="metric-value"><span id="imu_min_stat_extreme_ID">0.0</span> hr</span>
+              <span class="metric-value"><span id="imu_min_stat_extreme_ID">0.0</span>&nbsp;hr</span>
             </div>
           </div>
           <!-- Passage Comfort — moves to top when underway (SOG > 1.7 kt) -->
@@ -11918,7 +11922,7 @@
             <p class="card-group-title">Passage Comfort</p>
             <div class="metric-row">
               <span class="metric-label">Wave Period <span class="tooltip">ℹ️<span class="tooltip-box">Dominant wave period in seconds, auto-detected from the vertical acceleration signal. Calculated via zero-crossings of the 10 Hz-decimated vertical accel after DC (gravity) removal. Shows "--" until enough crossings are detected.</span></span></span>
-              <span class="metric-value"><span id="imu_wave_period_sec_ID">--</span> s</span>
+              <span class="metric-value"><span id="imu_wave_period_sec_ID">--</span>&nbsp;s</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Motion Sickness Index <span class="tooltip">ℹ️<span class="tooltip-box">Lawther &amp; Griffin (1987) motion sickness index. Frequency-weights vertical acceleration — peaks at 0.2 Hz (5-second waves), which causes the most sickness. Scale: 0–30 low, 30–70 moderate, 70+ severe. Not a percentage; higher is worse. Only accumulates underway (SOG ≥ 1.7 kt); grayed out at anchor. Resets to zero on departure and arrival — no cross-contamination between trips.</span></span></span>
@@ -11926,7 +11930,7 @@
             </div>
             <div class="metric-row">
               <span class="metric-label">Vomit Probability (2hr) <span class="tooltip">ℹ️<span class="tooltip-box">Estimated percentage of an average population who would vomit during a 2-hour voyage at the current sustained motion level. Derived from the Motion Sickness Index using the Lawther &amp; Griffin power-law model. Only accumulates underway (SOG ≥ 1.7 kt); grayed out at anchor.</span></span></span>
-              <span class="metric-value"><span id="imu_vomit_pct_ID">--</span> %</span>
+              <span class="metric-value"><span id="imu_vomit_pct_ID">--</span>&nbsp;%</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Heel Change (60s) <span class="tooltip">ℹ️<span class="tooltip-box">Total change in heel angle over the last 60 seconds (latest minus oldest sample). Captures slow, persistent roll shifts — e.g. a jibe or load transfer.</span></span></span>
@@ -11958,7 +11962,7 @@
             </div>
             <div class="metric-row">
               <span class="metric-label">Worst Slam</span>
-              <span class="metric-value"><span id="imu_slam_peak_lifetime_ID">0.0</span> g</span>
+              <span class="metric-value"><span id="imu_slam_peak_lifetime_ID">0.0</span>&nbsp;g</span>
             </div>
           </div>
         </div>
@@ -11972,7 +11976,7 @@
             </div>
             <div class="metric-row">
               <span class="metric-label">Slam Peak (Max) <span class="tooltip">ℹ️<span class="tooltip-box">Highest single vertical acceleration reading recorded during a slam event in the current window, in g's. Resets each window.</span></span></span>
-              <span class="metric-value"><span id="imu_slam_peak_max_ID">0.0</span> g</span>
+              <span class="metric-value"><span id="imu_slam_peak_max_ID">0.0</span>&nbsp;g</span>
             </div>
           </div>
           <!-- Event Counters - Lifetime -->
@@ -12001,15 +12005,15 @@
             <p class="card-group-title">Raw Accelerometer (g)</p>
             <div class="metric-row">
               <span class="metric-label">Accel X</span>
-              <span class="metric-value"><span id="imu_accel_x_raw_ID">0.000</span> g</span>
+              <span class="metric-value"><span id="imu_accel_x_raw_ID">0.000</span>&nbsp;g</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Accel Y</span>
-              <span class="metric-value"><span id="imu_accel_y_raw_ID">0.000</span> g</span>
+              <span class="metric-value"><span id="imu_accel_y_raw_ID">0.000</span>&nbsp;g</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Accel Z</span>
-              <span class="metric-value"><span id="imu_accel_z_raw_ID">0.000</span> g</span>
+              <span class="metric-value"><span id="imu_accel_z_raw_ID">0.000</span>&nbsp;g</span>
             </div>
           </div>
           <!-- Raw Gyroscope -->
@@ -12017,15 +12021,15 @@
             <p class="card-group-title">Raw Gyroscope (°/s)</p>
             <div class="metric-row">
               <span class="metric-label">Gyro X</span>
-              <span class="metric-value"><span id="imu_gyro_x_raw_ID">0.0</span> °/s</span>
+              <span class="metric-value"><span id="imu_gyro_x_raw_ID">0.0</span>&nbsp;°/s</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Gyro Y</span>
-              <span class="metric-value"><span id="imu_gyro_y_raw_ID">0.0</span> °/s</span>
+              <span class="metric-value"><span id="imu_gyro_y_raw_ID">0.0</span>&nbsp;°/s</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Gyro Z</span>
-              <span class="metric-value"><span id="imu_gyro_z_raw_ID">0.0</span> °/s</span>
+              <span class="metric-value"><span id="imu_gyro_z_raw_ID">0.0</span>&nbsp;°/s</span>
             </div>
           </div>
         </div>
@@ -12552,7 +12556,7 @@
                 </span>
               </span>
               <span class="metric-value with-wm" id="ambientTemp-display">
-                <span><span id="ambientTempID">0</span> <span class="temp-unit-label">°F</span></span>
+                <span><span id="ambientTempID">0</span>&nbsp;<span class="temp-unit-label">°F</span></span>
                 <span class="wm-inline">
                   <span><span class="arr">↑</span><span id="ambientTempID_hi">—</span></span>
                   <span><span class="arr">↓</span><span id="ambientTempID_lo">—</span></span>
@@ -12566,7 +12570,7 @@
                 </span>
               </span>
               <span class="metric-value with-wm" id="extraTemp-display">
-                <span><span id="extraTemp_ID">&mdash;</span> <span class="temp-unit-label">°F</span></span>
+                <span><span id="extraTemp_ID">&mdash;</span>&nbsp;<span class="temp-unit-label">°F</span></span>
                 <span class="wm-inline">
                   <span><span class="arr">&uarr;</span><span id="extraTemp_ID_hi">&mdash;</span></span>
                   <span><span class="arr">&darr;</span><span id="extraTemp_ID_lo">&mdash;</span></span>
@@ -12730,7 +12734,7 @@
                     This is the more constrained resource.</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="FreeInternalRamID">0</span> / <span
+              <span class="metric-value"><span id="FreeInternalRamID">0</span>&nbsp;/&nbsp;<span
                   id="TotalInternalRamID">0</span></span>
             </div>
             <div class="metric-row">
@@ -12749,7 +12753,7 @@
                     headroom is normal.</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="FreePSRAMID">0</span> / <span id="TotalPSRAMID">0</span></span>
+              <span class="metric-value"><span id="FreePSRAMID">0</span>&nbsp;/&nbsp;<span id="TotalPSRAMID">0</span></span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Heap Fragmentation (%)
@@ -12913,6 +12917,22 @@
                 <span class="metric-value"><span id="ina228ErrorCount_ID">0</span></span>
               </div>
               <div class="metric-row">
+                <span class="metric-label">INA228 Die Temperature
+                  <span class="tooltip">&#8505;&#65039;
+                    <span class="tooltip-box">The INA228's own on-chip temperature sensor &mdash; the only reading taken at the power stage itself. Board Temperature comes from the BMP388, which sits away from the hot parts and barely moves while the field transistor and its diode heat up. Watch this alongside Battery Voltage (INA) to tell chip self-heating apart from a real change on the battery. Accurate to about 2&nbsp;&deg;F. A dash means the chip returned no usable reading.</span>
+                  </span>
+                </span>
+                <span class="metric-value"><span id="inaDieTempF_ID">&mdash;</span>&nbsp;<span class="temp-unit-label">&deg;F</span></span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-label">INA228 Die Temperature (Peak)
+                  <span class="tooltip">&#8505;&#65039;
+                    <span class="tooltip-box">Hottest the INA228 chip has been since the last restart or Reset Peak Values. This is the number sent to the cloud once a day. It ignores the first few seconds after a restart and only accepts a reading the previous second's reading agrees with, so one bad value off the chip cannot lodge itself here permanently. A dash means nothing has qualified yet.</span>
+                  </span>
+                </span>
+                <span class="metric-value"><span id="inaDieTempMaxF_ID">&mdash;</span>&nbsp;<span class="temp-unit-label">&deg;F</span></span>
+              </div>
+              <div class="metric-row">
                 <span class="metric-label">IMU Bus-Only Fetch Worst (ms)
                   <span class="tooltip">ℹ️
                     <span class="tooltip-box">Time spent in JUST the IMU FIFO read (Get_FIFO_Sample), excluding the sample-parsing loop. Compare to the "IMU FIFO Drain" row in Function Timing the same way as the INA bus-only timer. Resets with Reset Peak Values.</span>
@@ -12973,7 +12993,7 @@
                     FIFO Overruns counter above starts incrementing. Resets with Reset Peak Values.</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="loopOver80ImuLimit_ID">0</span> of <span id="loop80IterCount_ID">0</span></span>
+              <span class="metric-value"><span id="loopOver80ImuLimit_ID">0</span>&nbsp;of&nbsp;<span id="loop80IterCount_ID">0</span></span>
             </div>
             <div class="metric-row">
               <span class="metric-label">I²C Errors
@@ -13036,7 +13056,7 @@
                     labelled "current" — now reflects the last completed call via the FuncTiming lastCall field.</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="IMUReadTime2_ID">0</span> ms</span>
+              <span class="metric-value"><span id="IMUReadTime2_ID">0</span>&nbsp;ms</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">IMU Read Time (worst 5s)
@@ -13045,7 +13065,7 @@
                     seconds alongside all other function timing windows.</span>
                 </span>
               </span>
-              <span class="metric-value"><span id="IMUReadTime_ID">0</span> ms</span>
+              <span class="metric-value"><span id="IMUReadTime_ID">0</span>&nbsp;ms</span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Accel Ring Usage
@@ -14338,7 +14358,7 @@
               <span class="tooltip-box">Live per-tick ceiling on commanded current (A) from the fast overvoltage supervisor. Equals MaxTableValue when inactive.</span>
             </span>
           </span>
-          <span class="metric-value telemetry-value"><span id="fastOvCurrentCapID">?</span> A</span>
+          <span class="metric-value telemetry-value"><span id="fastOvCurrentCapID">?</span>&nbsp;A</span>
         </div>
         <div class="metric-row telemetry-row">
           <span class="metric-label telemetry-label">Protection Events (total)

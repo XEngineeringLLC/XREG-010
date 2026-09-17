@@ -242,15 +242,22 @@ textarea {
   user-select: text;
 }
 
-/* Stable numeric layout — prevents width jitter as digits change and
-   stops units from wrapping to a new line mid-update */
+/* Readout layout. Tabular digits keep the width from jittering as digits change.
+   Wrapping is ON so a readout that holds words — a source name, a state, a reset
+   reason — breaks inside its card instead of spilling past the right edge. Number
+   and unit are joined with &nbsp; in the markup ("13.4&nbsp;V"), so a value+unit
+   pair is a single unbreakable token and the unit can never drop to its own line;
+   any new readout with a unit must use &nbsp; too. break-word is the last resort
+   for a single token wider than the card (a long token, a squeezed phone column). */
 .reading-value,
 .metric-value,
 .metric-value-compact,
 .counter-value,
 .reading,
 .reading span {
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: break-word;
+  min-width: 0;                  /* flex child: shrinkable, or break-word never gets to act */
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
 }
@@ -764,7 +771,8 @@ textarea {
   font-weight: 700;
   color: var(--accent);
   text-align: right;
-  white-space: nowrap;
+  white-space: normal;           /* same contract as .metric-value above: units are &nbsp;-joined */
+  overflow-wrap: break-word;
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
   font-family: "Courier New", monospace;
@@ -1103,6 +1111,21 @@ input[type="submit"],
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
   transition: background .15s, border-color .15s, color .15s, box-shadow .15s, transform .05s;
 }
+/* Phone widths: a long label ("Reset Temperature Sensor Counters") is wider than the
+   screen, and the base nowrap + fit-content sends it off the right edge. Capping at the
+   container and letting it wrap costs a second line; nowrap costs unreadable text. Inert
+   for a label that already fits — a button only wraps when it cannot fit on one line. */
+@media (max-width: 480px) {
+  .btn-primary,
+  input[type="submit"],
+  .btn-secondary,
+  .btn-danger,
+  .btn-danger-ghost {
+    white-space: normal;
+    max-width: 100%;
+  }
+}
+
 
 .btn-primary:active,
 input[type="submit"]:active,
@@ -1881,7 +1904,7 @@ a.btn-secondary {
    dark-mode rule. */
 #header-collapsed-strip { display: none; }
 .permanent-header.header-collapsed { padding: 0; gap: 0; }
-.permanent-header.header-collapsed > *:not(#header-collapsed-strip):not(#protections-banner):not(#dvcc-banner):not(#armlock-notice) { display: none; }
+.permanent-header.header-collapsed > *:not(#header-collapsed-strip):not(#protections-banner):not(#dvcc-banner) { display: none; }
 .permanent-header.header-collapsed #header-collapsed-strip {
   container-type: inline-size;   /* fields below reveal against THIS width */
   display: flex;
@@ -1941,9 +1964,15 @@ a.btn-secondary {
 #header-collapsed-strip .hcs-divider { display: inline-block; width: 1px; height: 18px; background: rgba(0, 161, 154, .15); }
 
 /* Alternator OFF / ON at strip scale — the expanded header's .onoff-switch, tightened to the strip's
-   one-line height. The tap extender grows to keep the 44px touch minimum at the smaller track height. */
+   one-line height. The tap extender grows to keep the 44px touch minimum at the smaller track height.
+   The strip keeps BARE OFF / ON: the action word is what costs width, and the strip's reveal rungs
+   (the @container blocks above) are measured against this control at exactly 68px — the width of the
+   sliding switch it replaced, so no threshold moves. The fill still carries the state, and a
+   deliberate enable or disable happens in the expanded header, where the wording lives. */
 #header-collapsed-strip .onoff-switch { width: 68px; height: 19px; }
-#header-collapsed-strip .onoff-half { font-size: 10px; letter-spacing: 0.2px; }
+#header-collapsed-strip .onoff-half { padding: 0 6px; font-size: 10px; letter-spacing: 0.2px; }
+#header-collapsed-strip .onoff-state { display: inline; }
+#header-collapsed-strip .onoff-act { display: none; }
 #header-collapsed-strip .onoff-half::before { top: -13px; bottom: -13px; }
 
 /* margin-left buys extra space from the toggle; vertical padding gives a ~40px expand tap target without changing the line height */
@@ -3144,7 +3173,7 @@ input:focus {
   color: var(--accent, #00a19a);
   background: rgba(0, 161, 154, 0.10);
   border: 1px solid rgba(0, 161, 154, 0.30);
-  white-space: nowrap;
+  white-space: normal;           /* badge text is words ("F11 · Violent storm"), so it wraps in a narrow card */
 }
 .wind-stats {
   display: grid;
@@ -3390,6 +3419,16 @@ hr {
   gap: 6px;
   justify-content: flex-start !important;  /* override inline space-between; keeps ℹ️ next to label text */
 }
+
+/* Which of the two field caps (Max Field %, Max Field Volts) is enforced right now. Laid out on
+   both rows always (visibility, not display) so the word moving between them never reflows. */
+.cap-limiting {
+  margin-left: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  visibility: hidden;
+}
+.cap-limiting.on { visibility: visible; }
 
 .form-input {
   display: flex;
@@ -3952,8 +3991,9 @@ input:checked+.slider:before {
 
 .dual-counter-row {
   display: flex;
+  flex-wrap: wrap;                 /* a long lifetime counter wraps its unit instead of running off a phone screen */
   align-items: center;
-  gap: 8px;
+  gap: 2px 8px;
 }
 
 .counter-label {
@@ -4031,12 +4071,15 @@ input:checked+.slider:before {
 
 .metric-row {
   display: flex;
+  flex-wrap: wrap;                 /* label + value too wide for the card (3-up grid on a tablet):
+                                      the value drops to its own line instead of hanging off the edge */
   justify-content: space-between;
   align-items: center;
-  gap: 8px;
+  gap: 2px 8px;
   padding: 6px 8px;
   border-bottom: 1px solid var(--border);
 }
+.metric-row > .metric-value { margin-left: auto; }   /* stays right-aligned on the line it wrapped onto */
 
 .metric-row:last-child {
   border-bottom: none;
@@ -4182,7 +4225,7 @@ input:checked+.slider:before {
    one metric-label column + two right-aligned value columns. */
 .interval-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 76px 76px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 76px) minmax(0, 76px);   /* value columns shrink in a narrow card instead of pushing the header past its edge */
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
@@ -4206,12 +4249,14 @@ input:checked+.slider:before {
   color: var(--text-dark);
   text-align: right;
   line-height: 1.2;
+  min-width: 0;
 }
 .interval-val {
   font-size: 14px;
   font-weight: bold;
   color: var(--reading);
   text-align: right;
+  min-width: 0;
 }
 /* Headline row (Worst All-Time pinned to top) — a tick bolder/bigger than the rest */
 .interval-row-headline {
@@ -5484,13 +5529,17 @@ body.dark-mode #alt-panel-protections .protections-tag {
 .baro-panel { margin-bottom: 10px; }
 .baro-conditions {
   display: grid;
-  grid-template-columns: minmax(110px, 1fr) minmax(140px, 1fr) minmax(170px, 1fr) minmax(120px, 1fr);
+  /* auto-fit, not four fixed tracks: the four declared minimums summed to 594px, which
+     is wider than this card at a 768-820px viewport (the 760px media query below keys off
+     the VIEWPORT, so it never fired) and the last block hung 20px past the card edge.
+     auto-fit drops to three or two columns on its own whenever the card is too narrow. */
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 12px 18px;
   align-items: center;
   padding: 4px 0 8px;
   border-bottom: 1px solid var(--border);
 }
-.baro-block { min-width: 0; }
+.baro-block { min-width: 0; box-sizing: border-box; }   /* padding-left below is INSIDE the grid track (no global border-box reset here) */
 .baro-block + .baro-block { padding-left: 18px; border-left: 1px solid var(--border); }
 @media (max-width: 760px) {
   .baro-conditions { grid-template-columns: 1fr 1fr; gap: 14px; }
@@ -6294,66 +6343,67 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   .drag-handle { cursor: default; }
 }
 
-/* Alternator OFF / ON (expanded header #header-onoff and collapsed strip #hcs-onoff). A sliding switch
-   built from two half-width buttons, NOT a checkbox: the knob and track colour show the regulator's own
-   OnOff (CSV1) while each half stays an absolute command, so a stale or reverted paint can never turn an
-   intended OFF into an ON. paintOnOff() in script.js owns .is-on / .is-off / .onoff-pending; with none of
-   them the track is neutral grey and the knob is hidden, which is the state before the first CSV1 frame.
-   ON fills accent and OFF fills slate — a de-energized field must never read as the "good" colour. */
+/* Alternator OFF / ON (expanded header #header-onoff and collapsed strip #hcs-onoff). A segmented
+   control built from two half buttons, NOT a checkbox and NOT a slider: each half stays an absolute
+   command (left always sends OnOff=0, right always OnOff=1), so a stale or reverted paint can never
+   turn an intended OFF into an ON. Three redundant channels carry the live state, so none of them has
+   to be noticed on its own: the live half is FILLED (amber OFF, teal ON) while the other stays a
+   hollow outline, and the live half prints the STATE word in caps while the other prints the ACTION
+   in lower case ("turn on"). paintOnOff() in script.js owns .is-on / .is-off / .onoff-pending; with
+   neither class every half is hollow and both read as offers, which is the honest paint before the
+   first CSV1 frame — the old neutral-grey-track-with-no-knob read as OFF to most people. OFF fills
+   amber, not slate: a de-energized field has to be unmistakable, and it must never wear the accent
+   colour that means the alternator is working. */
 .onoff-switch {
-  position: relative;
   display: inline-flex;
   align-items: stretch;
-  width: 84px;
-  height: 25px;
-  padding: 2px;
-  border-radius: 999px;
-  background: #9ca3af;
-  box-shadow: inset 0 0 1px rgba(0, 0, 0, 0.35);
-  transition: background-color .25s;
+  /* FIXED width, not content width. The two halves swap between a short state word and a long action
+     word, so a content-sized control would measure 133/118/114px across unknown/OFF/ON and shove the
+     chip row sideways every time the regulator changed state. 134px fits the widest (both action
+     words, the pre-first-frame paint); the halves take up the slack. */
+  width: 134px;
+  height: 26px;
+  border-radius: 8px;
   -webkit-tap-highlight-color: transparent;
   flex: 0 0 auto;
   box-sizing: border-box;
 }
-.onoff-switch.is-on { background: #00a19a; }
-.onoff-switch.is-off { background: #6b7280; }
-
-.onoff-knob {
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  left: 2px;
-  width: calc(50% - 2px);
-  border-radius: 999px;
-  background: #ffffff;
-  box-sizing: border-box;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
-  opacity: 0;
-  pointer-events: none;
-  transition: transform .25s, opacity .2s;
-}
-.onoff-switch.is-on .onoff-knob,
-.onoff-switch.is-off .onoff-knob { opacity: 1; }
-.onoff-switch.is-on .onoff-knob { transform: translateX(100%); }
 
 .onoff-half {
   position: relative;
-  z-index: 1;
-  flex: 1 1 50%;
+  flex: 1 1 auto;   /* absorb the slack left by the fixed track width */
   min-width: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  border-radius: 999px;
+  padding: 0 8px;
+  border: 1.5px solid #c3cad4;
+  background: #ffffff;
+  color: #8792a2;
   font-family: inherit;
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 700;
   letter-spacing: 0.4px;
   line-height: 1;
-  color: rgba(255, 255, 255, 0.9);
   cursor: pointer;
-  transition: color .2s;
+  transition: background-color .2s, border-color .2s, color .2s;
+  box-sizing: border-box;
 }
+/* One seam, always owned by the FILLED half, so a grey hairline never runs alongside a fill and the
+   seam is never doubled (two half-borders round to two device pixels on a non-retina screen) */
+.onoff-half[data-v="0"] { border-radius: 7px 0 0 7px; }
+.onoff-half[data-v="1"] { border-radius: 0 7px 7px 0; border-left-width: 0; }
+.onoff-switch.is-on .onoff-half[data-v="0"] { border-right-width: 0; }
+.onoff-switch.is-on .onoff-half[data-v="1"] { border-left-width: 1.5px; }
+.onoff-switch.is-off .onoff-half[data-v="0"] { background: #b45309; border-color: #b45309; color: #ffffff; }
+.onoff-switch.is-on  .onoff-half[data-v="1"] { background: #00a19a; border-color: #00a19a; color: #ffffff; }
+
+/* The live half says what the alternator IS; the other says what pressing it would DO. Both spans
+   ship in the markup and CSS picks one, so the swap costs no JS and cannot disagree with the fill. */
+.onoff-state { display: none; }
+.onoff-act { font-weight: 600; letter-spacing: 0; font-size: 10.5px; }
+.onoff-switch.is-off .onoff-half[data-v="0"] .onoff-state,
+.onoff-switch.is-on  .onoff-half[data-v="1"] .onoff-state { display: inline; }
+.onoff-switch.is-off .onoff-half[data-v="0"] .onoff-act,
+.onoff-switch.is-on  .onoff-half[data-v="1"] .onoff-act { display: none; }
+
 /* Vertical-only tap extender to the 44px iOS minimum. Per HALF, not per track, so an off-track tap
    still resolves to the command directly above or below it instead of a dead zone. */
 .onoff-half::before {
@@ -6364,20 +6414,13 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   left: 0;
   right: 0;
 }
-/* The half under the knob reads as dark text on white */
-.onoff-switch.is-off .onoff-half[data-v="0"],
-.onoff-switch.is-on .onoff-half[data-v="1"] { color: #1f2937; }
-/* Pressed, not yet echoed. Ring colour has to read on the white knob AND on either track fill. */
+/* Pressed, not yet echoed. Normally lands on the hollow half (the one being moved TO); the ring
+   colour still has to read if the same half is pressed twice, i.e. on the amber and teal fills. */
 .onoff-half.onoff-pending { box-shadow: inset 0 0 0 2px #00403d; }
 .onoff-half:focus-visible { outline: 2px solid #00403d; outline-offset: 1px; }
 
-.dark-mode .onoff-switch { background: #4b5563; }
-.dark-mode .onoff-switch.is-on { background: #0f8f88; }
-.dark-mode .onoff-switch.is-off { background: #3f4753; }
-.dark-mode .onoff-knob {
-  background: #cccccc;
-  border: 1px solid #444444;
-  box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
-}
+.dark-mode .onoff-half { background: #232932; border-color: #414a57; color: #8a94a2; }
+.dark-mode .onoff-switch.is-off .onoff-half[data-v="0"] { background: #a34c07; border-color: #a34c07; color: #ffffff; }
+.dark-mode .onoff-switch.is-on  .onoff-half[data-v="1"] { background: #0f8f88; border-color: #0f8f88; color: #ffffff; }
 .dark-mode .onoff-half.onoff-pending { box-shadow: inset 0 0 0 2px #7fe9df; }
 .dark-mode .onoff-half:focus-visible { outline-color: #7fe9df; }

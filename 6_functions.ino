@@ -980,14 +980,14 @@ static float g_fieldVoltBusFilt  = 0.0f;   // slow-filtered bus volts the ceilin
 static bool  g_fieldVoltFloored  = false;  // one-shot console warn latch for the MinDuty collision below
 
 // ccDutyCeiling — the upper duty bound the CC loop is allowed to reach: the lower of the two field
-// caps. MaxDuty (Max Field %) is the REAL per-bus duty cap — its default is scaled down on
-// higher-voltage banks (~50%@24V, 25%@48V) and rescaled on a voltage change, so the user-visible Max
-// Field box IS the cap the loop respects, no hidden ×12/Vbatt. g_fieldVoltDutyCeil is Max Field Volts
-// solved against the measured bus, which is the same limit in the units on the alternator datasheet.
-// A user wanting full duty sets Max Field to 99 AND leaves Max Field Volts above the bank's absorb
-// voltage (its class-scaled default already is, so the volts term is inert until deliberately lowered).
-// Everything that asks "how high may duty go" must come through here — a raw MaxDuty read silently
-// skips the volts cap. MaxDuty itself stays the persisted setting and the class-scaling target.
+// caps. MaxDuty (Max Field %) is the REAL per-bus duty cap, class-invariant (99 on every class) — the
+// user-visible Max Field box IS the cap the loop respects, no hidden ×12/Vbatt. g_fieldVoltDutyCeil is
+// Max Field Volts solved against the measured bus, which is the same limit in the units on the
+// alternator datasheet; it carries the per-class protection, because its default (a 12V winding's
+// full-field volts) works out above 99% on a 12V bus and to ~52/35/26% on 24/36/48V. A user wanting
+// full duty on a high-voltage bank raises Max Field Volts to the winding's rating (Max Field is
+// already 99). Everything that asks "how high may duty go" must come through here — a raw MaxDuty
+// read silently skips the volts cap. MaxDuty itself stays the persisted setting.
 float ccDutyCeiling() {
   return fminf(MaxDuty, g_fieldVoltDutyCeil);
 }
@@ -1048,21 +1048,23 @@ void applyCcOutputLimits() {
 // one-key class push keeps it. Call AFTER setting SYSTEM_VOLTAGE_CLASS = newV. When the class actually changes it persists the new class to NVS
 // (NK_BatteryVoltage), then rescales the PERSISTED
 // charge-voltage profile by newV/oldV (Bulk/Float/Absorption/Rebulk/Target/Charged/alarms), the
-// volt-domain protection/helper margins and V/s rates (OV margins incl. the timed-tier trip lines, Max Field Volts,
+// volt-domain protection/helper margins and V/s rates (OV margins incl. the timed-tier trip lines,
 // disagreement threshold, iExcess arm margin, fast-rise headroom, CV D-term arm/deadband thresholds, target ramps,
 // rest-settle gate, CV wave amplitude, alt-health Vbus band), rescales both absolute OV rungs
 // (AlternatorHardShutdownV, VoltageHardwareLimit) x ratio and reprograms the INA228 comparator. Writing the
 // class and the rescaled profile to NVS in the SAME call (synchronously) keeps them atomic — a reboot
 // mid-change can never strand the overvoltage trips at the wrong voltage. It always re-derives
 // both control loops' normalized gains. It also rescales the field-duty knobs (knee margin/step/
-// maxfloor + DutyRampRate + DutySlowRampRate + MaxDuty/Max Field % + MinDuty + alt-health duty
+// maxfloor + DutyRampRate + DutySlowRampRate + MinDuty + alt-health duty
 // band/floor) and the amp-per-volt gain KHard
 // (bank resistance rises with class, so the same per-cell excess needs the same amp response) in place
 // by oldV/newV and persists them, so they stay WYSIWYG in real per-bus units
 // (the live paths do not multiply by 12/Vbatt at use; nothing reads SYSTEM_VOLTAGE_CLASS at duty-clamp
 // time). Currents/times/normalized gains are voltage-independent. VoltageKd is NOT here — it is
 // runtime-normalized like VoltageKp/Ki (recomputeCvGains below re-derives VoltageKd_active for the new
-// class). CvKdMaxTrimA is NOT here either — a flat amp cap, voltage-independent by design.
+// class). CvKdMaxTrimA is NOT here either — a flat amp cap, voltage-independent by design. Neither
+// field cap is here: MaxDuty and MaxFieldVolts describe the alternator, not the bank, and the enforced
+// ceiling re-derives itself from MaxFieldVolts against the new bus (updateFieldVoltCeiling).
 // The per-RPM Min% floor table is the one commissioned artifact this RESETS rather than rescales
 // (to the 1% default, knee tracker unlearned) — see the block at the end of the function.
 void applyNominalVoltageChange(int oldV, int newV) {
@@ -1077,7 +1079,6 @@ void applyNominalVoltageChange(int oldV, int newV) {
     ChargedVoltage_Scaled = (int)lroundf(ChargedVoltage_Scaled * ratio);
     VoltageAlarmHigh      *= ratio;
     VoltageAlarmLow       *= ratio;
-    MaxFieldVolts         *= ratio;   // Max Field Volts: volt-domain, NOT the duty-domain group below
     altSweepMarginV       *= ratio;   // sweep turnaround margin: volt-domain, RAM-only (posted per run)
     // Headroom scales with class so the OV ladder keeps its order (G2 clamp at target+OvMeasMarginV
     // < the timed tiers < the absolute cuts) — all per-cell-equivalent. The two absolute rungs
@@ -1120,7 +1121,6 @@ void applyNominalVoltageChange(int oldV, int newV) {
     kneeDutyTolPct  *= dutyRatio;   // field-duty steadiness band — inverse-scale like altDutyLineRms
     DutyRampRate    *= dutyRatio;
     DutySlowRampRate *= dutyRatio;
-    MaxDuty          = (int)lroundf(MaxDuty * dutyRatio);  // Max Field %: real per-bus cap, scales down on higher banks
     MinDuty         *= dutyRatio;  // field floor: float, keeps sub-1% resolution on higher banks
     KHard           *= dutyRatio;  // A per V of OV excess
     altDutyLineRms  *= dutyRatio;  // alt-health field-duty straightness limit (% points)
@@ -1132,7 +1132,6 @@ void applyNominalVoltageChange(int oldV, int newV) {
     settingWrite(NK_kneeDutyTolPct,  String(kneeDutyTolPct, 2).c_str());
     settingWrite(NK_DutyRampRate,    String(DutyRampRate, 1).c_str());
     settingWrite(NK_DutySlowRampRate, String(DutySlowRampRate, 2).c_str());
-    settingWrite(NK_MaxDuty,         String(MaxDuty).c_str());
     settingWrite(NK_MinDuty,         String(MinDuty, 2).c_str());
     settingWrite(NK_KHard,           String(KHard, 1).c_str());
     // Alt-health registry knobs persist under their registry names (NVS key = name), and the
@@ -1150,7 +1149,6 @@ void applyNominalVoltageChange(int oldV, int newV) {
     settingWrite(NK_ChargedVoltage, String(ChargedVoltage_Scaled).c_str());
     settingWrite(NK_VoltageAlarmHigh, String(VoltageAlarmHigh, 2).c_str());
     settingWrite(NK_VoltageAlarmLow, String(VoltageAlarmLow, 2).c_str());
-    settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
     settingWrite(NK_AlternatorHardShutdownV, String(AlternatorHardShutdownV, 2).c_str());
     settingWrite(NK_VoltageHardwareLimit, String(VoltageHardwareLimit, 2).c_str());
     settingWrite(NK_OvMeasMarginV, String(OvMeasMarginV, 3).c_str());
@@ -1177,10 +1175,11 @@ void applyNominalVoltageChange(int oldV, int newV) {
     settingWrite(NK_cvPlantKa, String(cvPlantKa, 5).c_str());
     // Min% floor table: RESET, never rescaled. The duty-knee is class-invariant by design (see
     // rpmMinDutyTable in Xregulator.ino — the field-strength and rectifier-threshold effects
-    // cancel), but MaxDuty just moved by 12/newV as a real per-bus FIELD-CURRENT cap, so floors
-    // learned on the old class can now sit at or above the new cap. Two things break there: the
+    // cancel), but the enforced field ceiling moves with the class: MaxFieldVolts is class-invariant,
+    // so against the new bus it works out to a different duty (~52% at 24V, ~26% at 48V, 99% at 12V)
+    // and floors learned on the old class can now sit at or above it. Two things break there: the
     // floor outranks the cap in the duty path, and the tach-lie arm bar
-    // (rpmMinDuty + frac x (MaxDuty - rpmMinDuty)) collapses to an unsatisfiable value, silently
+    // (rpmMinDuty + frac x (ccDutyCeiling() - rpmMinDuty)) collapses to an unsatisfiable value, silently
     // disarming the phantom-RPM cut. The re-commission flag is only an advisory nag — it clears no
     // commissioned value — so the reset has to happen here. A class change also means a different
     // alternator, which invalidates the learned knee anyway. Back to the flat baseline (behaves
@@ -1202,9 +1201,8 @@ void applyNominalVoltageChange(int oldV, int newV) {
         nvs_close(nvs_h);
       }
     }
-    // %.0f for MaxDuty: it is a float, and a float in a %d slot reads garbage bits.
-    queueConsoleMessageF("System voltage %dV -> %dV: tachometer keep-alive floors reset to the %.2f%% default and their learning cleared (old floors were %dV-referenced and can exceed the new %.0f%% Max Field cap). Re-run the Keep-Alive Floor step.",
-                         oldV, newV, KNEE_BASELINE_PCT, oldV, MaxDuty);
+    queueConsoleMessageF("System voltage %dV -> %dV: tachometer keep-alive floors reset to the %.2f%% default and their learning cleared (old floors were %dV-referenced and can exceed the field ceiling Max Field Volts works out to on a %dV bus). Re-run the Keep-Alive Floor step.",
+                         oldV, newV, KNEE_BASELINE_PCT, oldV, newV);
     huntMapClearAll("system voltage class changed");  // pockets learned on the old class describe a different alternator
     updateINA228OvervoltageThreshold();
   }
@@ -1443,7 +1441,7 @@ void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason, bool r
   // dashboard in FAULT for a tick. Listed explicitly rather than keyed on tick.chargingEnabled: a
   // hardware over-voltage or over-current outranks the disabled check in selectFieldEventReason, so
   // it can arrive with charging already off and must still register as the fault it is.
-  sysMode = (reason == REASON_CHARGING_DISABLED || reason == REASON_BMS_DISABLED
+  sysMode = (reason == REASON_CHARGING_DISABLED || reason == REASON_CHARGE_COMPLETE_IDLE || reason == REASON_BMS_DISABLED
              || reason == REASON_SOLAR_PAUSE) ? SYS_MODE_OFF : SYS_MODE_FAULT;
   updateFieldTelemetry(0.0f, tick.currentBatteryVoltage, FieldResistance);
   fieldActiveStatus = 0;
@@ -5894,21 +5892,13 @@ void setDutyPercent(float percent) {
   // clamp here so boot attach and frequency changes can never fail.
   SwitchingFrequency = constrain(SwitchingFrequency, 100.0f, 19455.0f);
 
-  // Field-duty safety net for higher-voltage banks. Every duty path (Auto/manual/limp/fault) lands
-  // here, so this is the one place that hard-bounds field duty even on the open-loop paths that bypass
-  // the PID's MaxDuty limit (manual/limp/fault). MaxDuty is the real per-bus cap (its default is scaled
-  // down on 24/36/48V so worst-case field current never exceeds the 12V case); clamp to it. Gated to >12V
-  // so 12V manual mode bypasses MaxDuty (up to the 99% bootstrap cap above). Duty-ratio proxy, not a
-  // measured amp limit.
-  if (SYSTEM_VOLTAGE_CLASS > 12 && percent > MaxDuty) {
-    percent = MaxDuty;
-  }
-  // Max Field Volts arm of the same net, deliberately NOT class-gated: a winding can be under-rated
-  // for its own 12V bank, and the volts cap sits inert at its class-scaled default, so applying it on
-  // 12V costs nothing until the installer lowers it on purpose. Reads the derived global directly
-  // rather than ccDutyCeiling() so the MaxDuty gate above keeps its own class condition.
-  if (percent > g_fieldVoltDutyCeil) {
-    percent = g_fieldVoltDutyCeil;
+  // Field-duty safety net. Every duty path (Auto/manual/limp/fault) lands here, so this is the one
+  // place that hard-bounds field duty even on the open-loop paths that bypass the PID's output limits
+  // (manual/limp/fault). Both caps, on every class — the Manual-mode copy promises the field ceiling
+  // still applies, and Max Field Volts is what protects a 12V winding on a higher-voltage bus. Sits
+  // under the 99% bootstrap cap above. Duty-ratio proxy, not a measured amp limit.
+  if (percent > ccDutyCeiling()) {
+    percent = ccDutyCeiling();
   }
 
   uint32_t duty = (uint32_t)((((1UL << pwmResolution) - 1) * percent) / 100.0f);
@@ -5971,14 +5961,16 @@ void updateChargingStage() {
   // User "Restart charge cycle" button: force the machine back to Bulk (CC) and re-run the whole
   // bulk→absorption→float cycle, re-arming the tail-current and absorption timers. Same reset
   // enter_sys_auto() does on AUTO entry. Consumed here (control-loop task) rather than in the async
-  // web handler so the stage flags are only ever written from one task. Only honored while an auto
-  // charge stage owns the field: in Manual/Target-V/Maintain the flags don't drive output, and during
-  // commissioning it would fight the wizard — those cases drop the request. If the pack is already full
+  // web handler so the stage flags are only ever written from one task. Honored while an auto charge
+  // stage owns the field, and while the pack rests in IDLE (field off by design; the master-switch
+  // off/on edge and the web button are the only way out short of a voltage-sag rebulk): in
+  // Manual/Target-V/Maintain the flags don't drive output, and during commissioning it would fight
+  // the wizard — those cases drop the request. If the pack is already full
   // it climbs straight back to the target and the tail/overshoot logic returns it to float/idle in
   // seconds; the request does NOT fix a broken tail exit (steady load / no shunt) — it re-sticks there.
   if (restartChargeCycleRequested) {
     restartChargeCycleRequested = false;
-    if (fieldActiveStatus == 1 && TargetVoltageMode == 0 && MaintainMode == 0 && !commissioningOwnsBattery) {
+    if ((fieldActiveStatus == 1 || inIdleStage) && TargetVoltageMode == 0 && MaintainMode == 0 && !commissioningOwnsBattery) {
       inBulkStage = true;
       inAbsorptionStage = false;
       inIdleStage = false;
@@ -6419,6 +6411,7 @@ const char *reasonToString(FieldEventReason r) {
     case REASON_VOLTAGE_DISAGREE_WARNING: return "VOLT_DISAGREE_WARN";
     case REASON_LOCKOUT_ACTIVE: return "LOCKOUT";
     case REASON_CHARGING_DISABLED: return "DISABLED";
+    case REASON_CHARGE_COMPLETE_IDLE: return "CHARGE COMPLETE (idle - battery full)";
     case REASON_MANUAL_MODE: return "MANUAL";
     case REASON_INA_OVERVOLTAGE: return "INA228 hardware overvoltage";
     case REASON_FAST_OVERVOLTAGE: return "FAST_OVERVOLTAGE";
@@ -6557,7 +6550,8 @@ FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
 
   // Priority 1a: Disabled (user control - always show this reason if off)
   if (!tick.chargingEnabled) return tick.solarForecastPause ? REASON_SOLAR_PAUSE
-                                    : (tick.bmsBlocking ? REASON_BMS_DISABLED : REASON_CHARGING_DISABLED);
+                                    : (tick.bmsBlocking ? REASON_BMS_DISABLED
+                                    : (tick.idleHold ? REASON_CHARGE_COMPLETE_IDLE : REASON_CHARGING_DISABLED));
 
   // Priority 1.5: Fast over-voltage — absolute ceiling, above the manual bypass and ungated.
   // Mirrors selectFieldControlMode PRIORITY 1.5. Live voltage → immediate cut + adaptive lockout.
@@ -6812,8 +6806,9 @@ bool shouldCutGPIO4AfterSettle(FieldEventReason reason, uint32_t nowMs, float ap
     case REASON_LOCKOUT_ACTIVE:
       return true;
 
-      // Normal user shutdown: cut after settle (Phase 4 handles the slow ramp, we're done)
+      // Normal user shutdown, and the finished-cycle rest: cut after settle (Phase 4 handles the slow ramp)
     case REASON_CHARGING_DISABLED:
+    case REASON_CHARGE_COMPLETE_IDLE:
       return true;
 
       // Same class as CHARGING_DISABLED: both are only ever produced with chargingEnabled false, so
@@ -6883,11 +6878,14 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // Sole-cause flag for the OFF reason word — true only while the BMS is the one thing saying no,
   // so a key-off or a finished charge cycle keeps its own (more useful) reason.
   tick.bmsBlocking = !bmsPermits && (Ignition == 1 && OnOff == 1) && !inIdleStage;
-  // Idle stage (UseFloat=0, post-absorption): battery is full, stop charging.
-  // Rebulk logic in updateChargingStage() still runs and clears inIdleStage when
-  // voltage sags or discharge current threshold is hit — chargingEnabled recovers
-  // automatically on the next tick.
-  if (inIdleStage) chargingEnabledLocal = false;
+  // Idle stage (UseFloat=0, post-absorption): battery is full, stop charging. Rebulk logic in
+  // updateChargingStage() clears inIdleStage when voltage sags or the discharge-current threshold is
+  // hit, and a master-switch off/on restarts the cycle (OnOff handler → restartChargeCycleRequested).
+  // MANUAL is exempt: updateChargingStage() does not run in manual, so idle could never clear there,
+  // and a manual field command is the operator overriding the stage machine on purpose. Bench 09-16:
+  // a 24 V bank parked in IDLE left both the master switch and Manual dead with no explanation.
+  tick.idleHold = inIdleStage && chargingEnabledLocal && !tick.manualMode;
+  if (tick.idleHold) chargingEnabledLocal = false;
 
   // Weather mode: rest the alternator when the solar forecast is strong. Applied LAST so the flag
   // means "a sunny forecast is the ONLY thing holding charging off" — the banner must not blame

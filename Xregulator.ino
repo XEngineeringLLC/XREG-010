@@ -164,6 +164,7 @@ enum HttpsRequestType {
   HTTPS_GET_PENDING_CONFIG,    // admin config push: fetch a queued config at boot
   HTTPS_CLEAR_PENDING_CONFIG,  // clear the queued config after applying it
   HTTPS_RESET_RPM_AXIS,        // tach rescaled: delete the device's RPM-indexed cloud data
+  HTTPS_RESET_ALT_HEALTH,      // alt-health Start Over: delete the device's alt_points + alt_health cloud rows
   HTTPS_UPLOAD_CX_LEDGER,      // commissioning-ledger event batch → log-commissioning-event
   HTTPS_UPLOAD_USAGE,          // daily app-usage analytics blob → track-behavior
   HTTPS_CLOUD_OP               // staged registration/profile op (cloudOp slot in 3_functions.ino) — the
@@ -250,7 +251,7 @@ static uint8_t altState = FRONT_NO_REFERENCE;   // confidence state (FrontStore:
 static uint32_t altLastFoldMs = 0;         // last fold time — stale fold (field off) → live point not graded
 static float   altWorstPctLive = 0;        // P10 output-% of the in-progress trend bucket
 static float   altOverallPctLive = 0;      // current-bucket average output-%
-static uint8_t altStatusCode = 0;          // 0 normal, 3 disabled (Ignore Temperature); verdict codes 1/2 removed
+static uint8_t altStatusCode = 0;          // 0 normal, 3 disabled (Ignore Temperature), 4 waiting for commissioning, 5 waiting for Charge Health Calibration (stage 9); verdict codes 1/2 removed
 // Session statistics over the graded 1 Hz samples since boot/Start Over: mean + P10 histogram (60 × 2% bins).
 static uint16_t altSessHist[60] = {};
 static uint32_t altSessN = 0;
@@ -834,14 +835,10 @@ const uint8_t WIFI_FULL_SWEEP_EVERY = 5;           // every Nth scan sweeps all 
 // True while the LM2907 tach is known to be lying (field-cut test, hard-cut tail). Set every tick by
 // buildTickSnapshot; read by the engine start/stop console lines so they do not report a phantom.
 bool g_rpmTachMasked = false;
+// No timer: armed stays armed until the Lock Settings button, another client's lock, or a reboot.
+// The 30-minute auto-lock was removed 2026-09-16 — an unattended relock stranded a user mid-session
+// and silently refused the next write.
 bool settingsArmed = false;
-unsigned long settingsArmedAtMs = 0;
-const unsigned long SETTINGS_ARM_TIMEOUT_MS = 30UL * 60UL * 1000UL;
-// Auto-lock notice, latched when the window runs out with nothing connected so the next client
-// to arrive learns settings relocked themselves. RAM-only like the gate: a reboot locks settings
-// anyway and announces itself, so a surviving flag would only describe a window that no longer exists.
-bool settingsAutoLockNotice = false;
-uint32_t settingsAutoLockedEpoch = 0;  // 0 = no usable clock at lock time; the UI then omits the time
 
 // ===== HEAP MONITORING =====
 int rawFreeHeap = 0;      // in bytes
@@ -1762,20 +1759,23 @@ const int pwmResolution = 12;          // Error = +0.010%    PWM Resolution = ±
 float SwitchingFrequency = 400;      // Field switching frequency. Reverted from 19000 (bench 2026-08-20): 19kHz field edges coupled into the DS18B20 OneWire line (~5 CRC fails/min). The P-type bootstrap chop below ~5kHz (LM5109A C4 drained by R108, UVLO-chops long on-pulses) is benign — measured, see FIELD_DRIVE_BOOTSTRAP_DROOP.md. Ceiling stays 19455Hz (LEDC 12-bit divider limit; higher kills boot attach). Efficiency measured flat 100Hz-19kHz.
 const int MIN_SAFE_FREQUENCY = 50;     // Above most audible issues // set to 2000 later
 const int MAX_SAFE_FREQUENCY = 25000;  // Below core loss and EMI concerns
-// Max Field % is the REAL per-bus field-duty cap (no hidden scaling). Its default is scaled down at
-// first boot for higher-voltage banks (~99%@12V, ~50%@24V, ~25%@48V) and rescaled on a voltage change,
-// so worst-case field current never exceeds the 12V-at-MaxDuty case. setDutyPercent() clamps commanded
-// duty to it across the open-loop paths (manual/limp/fault) too on >12V banks. The user-visible Max
-// Field box IS the cap; set it to 99 for full duty. A duty-RATIO proxy (no field-current sensor).
+// Max Field % is the REAL per-bus field-duty cap (no hidden scaling) and is class-invariant: it is the
+// gate-driver bootstrap limit plus a user knob, nothing more. The per-class field-current protection
+// lives in MaxFieldVolts below, which solves against the live bus. setDutyPercent() clamps commanded
+// duty to it across the open-loop paths (manual/limp/fault) too, on every class. The user-visible Max
+// Field box IS the cap; 99 = full duty. A duty-RATIO proxy (no field-current sensor).
 float MaxDuty = 99.0;
-// Max Field Volts — the same ceiling expressed as physical field volts instead of a duty ratio, so it
+// Max Field Volts — the field ceiling expressed as physical field volts instead of a duty ratio, so it
 // can be typed from the alternator's datasheet. Field makers reuse one 12V winding across their 24/48V
-// models, so the winding in a high-voltage alternator may still be a 12V part. ccDutyCeiling() enforces
-// whichever of this and MaxDuty binds first; this term solves against the MEASURED bus every tick, so it
-// hands duty back as the bank sags where the class-scaled MaxDuty cannot. Thermal (I^2R) limit only —
-// the field is switched, so the winding still sees full bus volts on every on-edge whatever the cap.
-// Derived from duty x battery volts, not sensed at the field: true field volts run above it by the
-// battery-to-alternator cable drop. Hardcoded default is a 12V value, class-scaled on first creation.
+// models, so the winding in a high-voltage alternator may still be a 12V part. The default assumes
+// exactly that (what a 12V bank gives a 12V winding at full field) and is NOT class-scaled, at seed or
+// on a class change: the winding rating is a property of the alternator, not the bank. Against a 12V bus
+// it works out above 99% (inert); against 24/36/48V it is the binding cap (~52/35/26% at absorption)
+// until the installer enters a higher rating. ccDutyCeiling() enforces whichever of this and MaxDuty
+// binds first; this term solves against the MEASURED bus every tick, so it hands duty back as the bank
+// sags where a fixed duty ratio cannot. Thermal (I^2R) limit only — the field is switched, so the
+// winding still sees full bus volts on every on-edge whatever the cap. Derived from duty x battery
+// volts, not sensed at the field: true field volts run above it by the battery-to-alternator cable drop.
 float MaxFieldVolts = 15.0;
 float MinDuty = 1.0;       // field-duty floor: inner-PID outMin + soft-clamp decay floor. Compile-time default only — overwritten from NVS (voltage-scaled) at boot; per-RPM onset floor lives in rpmMinDutyTable.
 float ManualDutyTarget = 4.0f;  // manual-mode field duty %, 0.01 resolution (open-loop plant tests need sub-1% steps)
@@ -2402,7 +2402,9 @@ const unsigned long LONGTERM_DUMP_INTERVAL_MS = 15UL * 60UL * 1000UL;  // 15 min
 // Records the alternator current sensor's reading WHILE THE FIELD IS OFF, to characterize how its
 // zero point drifts vs. time / temperature / RPM. Sampled only when field-off >= 5 s: every 1 s
 // while the engine spins (RPM>=200, for fast RPM sweeps), every 10 min while the engine is off.
-// MeasuredAmps IS the raw sensor zero as long as auto-zero + manual offset are off. The field-off
+// Logged amps are ABSOLUTE, not residual: the live dynamic correction is added back before storing.
+// Logging MeasuredAmps post-subtraction made every fit after the first a fit of its own residual,
+// and the EMA blend then converged the applied correction on HALF the true offset. The field-off
 // samples here are the data source for the temperature-compensated zero correction (zeroFitCompute,
 // ZERO_DRIFT_TEMPCOMP_SPEC.md) — no separate active zeroing cycle. PSRAM ring, flushed to LittleFS
 // field-off only; /zerolog.csv reads the live ring (always complete). ZeroLogEnable default ON.
@@ -2428,7 +2430,9 @@ bool      ZeroLogEnable = true;             // master toggle (NVS NK_ZeroLogEnab
 float     altAmpsP2P = 0.0f;                // latched 0.5 s peak-to-peak of MeasuredAmps (set in ReadAnalogInputs)
 #define ZEROLOG_PATH  "/zerolog.bin"
 #define ZEROLOG_MAGIC 0x5A45524Fu           // 'ZERO'
-#define ZEROLOG_VER   2u                     // v2 added boardTempFx10; v1 files discarded on load
+#define ZEROLOG_VER   3u                     // v3 logs the ABSOLUTE zero (dynamic correction added back,
+                                             // see zeroLogService); v1/v2 files discarded on load, since
+                                             // mixing residual rows into the fit is the bug v3 removes
 #define ZEROLOG_FIELDOFF_MIN_MS  5000UL     // field must be off this long before a sample (own short gate)
 #define ZEROLOG_RUN_INTERVAL_MS  1000UL     // sample period while engine spinning (RPM>=200)
 #define ZEROLOG_IDLE_INTERVAL_MS 600000UL   // sample period while engine off (RPM<200) = 10 min
@@ -2438,6 +2442,51 @@ float     altAmpsP2P = 0.0f;                // latched 0.5 s peak-to-peak of Mea
 // NaN-derived temperature. If still NaN past the window the sensor is absent → log the blank.
 #define ZEROLOG_TEMP_GRACE_MS    30000UL    // post-reboot wait for the first valid alt-temp read
 #define ZEROLOG_TEMP_BLANK       INT16_MIN  // alt-temp "sensor absent" sentinel → CSV emits an empty cell
+
+// ===== COMMISSIONED ALTERNATOR-CURRENT ZERO (engine running, field at 0%) =====
+// The absolute zero of the alternator current sensor, measured on THIS install in the only
+// condition where true output current is guaranteed zero while the machine is hot and turning:
+// engine running, field commanded off. The learned temp-comp fit (zeroFitCompute) produces nothing
+// at all until it has seen a 30 °F span, which on a boat can take weeks — this gives the
+// commissioning run a same-day absolute anchor, and leaves the fit as a slow drift tracker layered
+// on top of it. Captures repeatedly through the late wizard stages and keeps the NEWEST accepted
+// window, so the value standing at Finish is automatically the last and warmest one — which is why
+// there is no temperature threshold here to pick and defend. The operator applies it (Finish
+// screen, or the Settings "Zero Now" button); nothing is written behind their back.
+float    altZeroCapA      = 0.0f;   // mean MeasuredAmps over the accepted window = the delta to apply
+float    altZeroCapTempF  = NAN;    // alternator temperature at capture (NaN = probe absent)
+float    altZeroCapBoardF = NAN;    // board temperature at capture (NaN = BMP388 absent)
+int16_t  altZeroCapRpm    = 0;      // engine RPM during the window
+uint16_t altZeroCapN      = 0;      // samples averaged
+float    altZeroCapP2P    = 0.0f;   // worst 0.5 s peak-to-peak seen inside the window
+uint32_t altZeroCapEpoch  = 0;      // wall clock of the held capture (0 = clock never set, informational)
+uint8_t  altZeroCapHeld   = 0;      // 1 = a capture is held for apply. NOT the epoch: getCurrentTimestamp()
+                                    // reads 0 until the clock is set, which is every AP-mode commissioning
+float    altZeroAppliedA  = 0.0f;   // delta of the last applied capture (the UI's "applied" line)
+uint32_t altZeroAppliedEpoch = 0;   // wall clock of the last apply (0 = clock never set, informational)
+uint8_t  altZeroApplied   = 0;      // 1 = a capture has been applied this power cycle
+uint8_t  altZeroRejReason = 0;      // why the last completed window was thrown out (ALTZERO_RJ_*)
+int      AltZeroCaptureNow = 0;     // momentary: 1 = run one window now, ignoring the wizard arm gate
+// Rejection reasons — the UI names them, so a refusal is never a silent nothing.
+#define ALTZERO_RJ_NONE   0
+#define ALTZERO_RJ_NOISE  1   // sample noise above ALTZERO_MAX_P2P_A — a disturbance, not a zero
+#define ALTZERO_RJ_MAG    2   // |mean| above ALTZERO_MAX_MAG_A — wrong cable or real current, not drift
+#define ALTZERO_RJ_RPM    3   // engine speed moved more than ALTZERO_MAX_RPM_DRIFT mid-window
+#define ALTZERO_RJ_SHORT  4   // window broke up (field came on / RPM fell) before enough samples
+#define ALTZERO_WIN_MS         10000UL // averaging window
+#define ALTZERO_SAMPLE_MS      100UL   // sampling cadence inside the window (→ ~100 samples)
+#define ALTZERO_MIN_SAMPLES    60      // too few passes landed to call the result an average
+#define ALTZERO_MIN_RPM        400     // engine genuinely running (the zero log's own gate is 200)
+#define ALTZERO_SETTLE_MULT    3       // field-off dwell before sampling = this × the measured drain
+#define ALTZERO_SETTLE_MIN_MS  5000UL  // ... floor, for a unit whose field-decay stage never ran
+#define ALTZERO_MAX_P2P_A      2.0f    // noise ceiling: above this the reading is not a settled zero
+#define ALTZERO_MAX_MAG_A      10.0f   // a bigger field-off reading is a wiring fault, not sensor drift
+#define ALTZERO_MAX_RPM_DRIFT  150     // engine speed must hold across the window
+#define ALTZERO_ARM_STAGE      7       // commissionDoneMask bit that arms it: Min% floor & Field decay,
+                                       // the stage that runs late specifically so the engine is warm
+#define ALTZERO_FORCE_TIMEOUT_MS 90000UL // an operator-requested run gives up after this, so a request
+                                         // made with the engine off cannot leave the UI reading
+                                         // "measuring" until the next reboot
 
 // ===== Temperature-compensated zero correction (ZERO_DRIFT_TEMPCOMP_SPEC.md) =====
 // Daily line-fit of the zero-drift log → live correction zero(T)=c+b·(T−T_REF), EMA-smoothed across
@@ -2795,7 +2844,10 @@ int LifeIndicatorColor = 0;           // 0=green, 1=yellow, 2=red
 // Timing
 unsigned long lastThermalUpdateTime = 0;
 const uint32_t INA_SLOW_INTERVAL_MS = 1100;  // field off: AVG=128, CT=4120µs → 1054ms update
-const uint32_t INA_FAST_INTERVAL_MS = 5;     // field on:  AVG=4,   CT=540µs  → 4.3ms update
+const uint32_t INA_FAST_INTERVAL_MS = 5;     // field on:  AVG=4,   CT=540µs  → 4.5ms update (bus+shunt+temp)
+const uint32_t INA_DIETEMP_INTERVAL_MS = 1000;  // die temp has a multi-second thermal time constant; 1 Hz keeps it out of the 5ms IBV path
+const uint8_t INA_DIETEMP_WARMUP_SAMPLES = 3;   // DIETEMP holds its 0°C reset value until the first conversion lands (~1.06s at AVG=128); nothing reaches the max until this many valid samples are behind it
+const float INA_DIETEMP_STEP_F = 15.0f;         // a jump bigger than this never reaches the max unless the NEXT sample repeats it: a corrupted DIETEMP read cannot corroborate itself, a real thermal rise always does
 uint32_t inaReadInterval = INA_SLOW_INTERVAL_MS;
 bool inaFastModeActive = false;
 
@@ -3303,6 +3355,19 @@ uint32_t prevSessionMaxLoopTime = 0;  // worst loop time from the session before
 // effect, no payload change. Re-armed by "Reset Peak Values". Remove once stall is closed.
 #define LOOP_DIAG_THRESH_US 10000  // only report passes over 10 ms
 uint32_t loopDiagWorstUs = 0;
+
+// ── Dashboard-stream backpressure witnesses ───────────────────────────────────
+// A client's SSE queue drains only as its TCP acks, so it backs up while the loop keeps producing
+// whenever the radio path loses a segment: lwIP waits out its retransmit timer (1.5 s, doubling)
+// with the association and the socket both still up, which the WiFi-drop and stream-drop console
+// lines cannot see. Depth is polled in SendWifiData; the library discards the NEWEST message on a
+// full queue and says so only at ESP warn level, so sseSend() counts those here. Cleared by Reset
+// Peak Values; summarised on /debug; each stall >= 1 s prints one console line.
+uint16_t sseQueueDepth = 0;        // last polled depth (messages, averaged over clients) - gates the secondary channels
+uint16_t sseQueuePeak = 0;         // deepest since reset
+uint32_t sseStallCount = 0;        // stalls >= 1 s since reset
+uint32_t sseStallLongestMs = 0;
+uint32_t sseFramesDropped = 0;     // events.send() calls not fully enqueued since reset
 
 // ── 80MHz low-power-mode loop instrumentation ─────────────────────────────────
 // Engine-off drops the CPU to 80MHz; these track loop health in that state only
@@ -4167,6 +4232,7 @@ volatile bool pendingResetBoatPerformance = false;
 volatile bool pendingClearOverheatHistory = false;
 volatile bool pendingRpmAxisWipe = false;  // /get?RPMScalingFactor changed value → local wipes run on Core 1
 volatile bool rpmAxisWipePending = false;  // NK_RpmAxisWipePend: cloud half still owed; suppresses front sync
+volatile bool altCloudWipePending = false; // NK_AltWipePend: alt-health Start Over's cloud half still owed; suppresses alt-health upload + sync-back
 volatile bool pendingSaveUserTableEdits = false;
 volatile bool pendingSaveVesselInfo = false;
 bool pendingShutdownFlush = false;     // set on ignition-off edge; cleared after full flush
@@ -4251,7 +4317,8 @@ enum FieldEventReason : uint8_t {
   REASON_BMS_DISABLED,             // the BMS on/off input is withholding permission — external command, not a fault
   REASON_OV_TIER_LOW,              // timed OV cut, LOW tier — filtered bus held above target + OvTierLoMarginV for OvTierLoDwellMs (AUTO/CV only)
   REASON_OV_TIER_MID,              // timed OV cut, MID tier — filtered bus held above target + OvTierMidMarginV for OvTierMidDwellMs (AUTO/CV only)
-  REASON_BATTERY_TOO_HOT           // 24 — measured battery temp (source 1..4, never the board stand-in) above MaxChargeTempF — hot-charge lockout (opt-in)
+  REASON_BATTERY_TOO_HOT,          // 24 — measured battery temp (source 1..4, never the board stand-in) above MaxChargeTempF — hot-charge lockout (opt-in)
+  REASON_CHARGE_COMPLETE_IDLE      // 25 — charge cycle finished with UseFloat=0: battery full, resting in IDLE until a rebulk or a master-switch off/on. Same class as CHARGING_DISABLED everywhere; only the label differs
 };
 
 
@@ -4268,6 +4335,7 @@ struct TickSnapshot {
   bool manualMode;
   bool solarForecastPause;   // charging would be on; weather mode alone is holding it off
   bool bmsBlocking;          // charging would be on; the BMS on/off input alone is holding it off
+  bool idleHold;             // charging would be on; the finished charge cycle (IDLE stage) alone is holding it off
 
   bool tempDataVeryStale;
   bool ignoreTemperature;
@@ -5627,6 +5695,8 @@ uint32_t adsSlowReadCount = 0;      // times the convert-register read took >5ms
 uint32_t inaBusReadWorstUs = 0;    // worst µs spent in the two INA228 Wire reads since reset
 uint32_t inaBusSlowCount = 0;      // INA228 bus reads > 15 ms (one Wire-timeout's worth) since reset
 uint32_t ina228ErrorCount = 0;     // INA228 reads dropped (sanity fail / exception)
+float inaDieTempF = NAN;           // INA228 internal die temperature (°F) — the only sensor AT the power stage; BMP388 board temp is bulk and lags it badly
+float inaDieTempMaxF = NAN;        // session max of inaDieTempF, zeroed at boot and by Reset Peak Values. Uploads once per 24h as device_state_daily.ina_die_temp_max_f, so a bad first read here becomes a permanent fleet record — hence the warm-up + corroboration gate at the read site
 uint32_t imuFifoFetchWorstUs = 0;  // worst µs spent in Get_FIFO_Sample since reset
 uint16_t imuFifoWorstSamples = 0;  // sample count of THAT worst fetch — 42 bytes is ~1ms at 400kHz, so a
                                    // worst at the 6-sample cap proves the stall is bus/preemption, not transfer size
@@ -6362,7 +6432,6 @@ void loop() {
   // Deferred commissioning-start persist (2_functions.ino): one staged NVS commit per pass — keeps
   // the Start's restore-point burst off the network task (in-handler it froze the SSE stream ~2 s).
   cxStartPersistService();
-  serviceSettingsArmHold();  // 5_functions.ino: an open interface holds the settings arm window open
   Ignition = !digitalRead(1);  // ! is for optocoupler (LOW = ignition ON)
   if (IgnitionOverride == 1) {
     Ignition = 1;  // force ON (bench / no ignition wire) — override can ONLY force on, never off
@@ -6495,6 +6564,17 @@ void loop() {
     xQueueSend(httpsQueue, &req, 0);  // queue-full → next retry picks it up
   }
 
+  // Cloud half of the alt-health Start Over — same contract: the cloud rebuilds the front from every raw
+  // point it holds, so until the device's rows are gone a sync-back would hand the cleared record book back.
+  static unsigned long lastAltWipeTry = 0;
+  if (altCloudWipePending && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED
+      && isRegistered && !core0Busy && WiFi.RSSI() >= -80
+      && (lastAltWipeTry == 0 || millis() - lastAltWipeTry > 60000)) {
+    lastAltWipeTry = millis();
+    HttpsRequest req = { .type = HTTPS_RESET_ALT_HEALTH };
+    xQueueSend(httpsQueue, &req, 0);
+  }
+
   // === ADMIN CONFIG PUSH: one-shot pending-config check after the OTA checks ===
   // Boot-only, like the forced-update check. Fires once after otaCheckDone so it doesn't
   // compete with the depth-2 httpsQueue; retries next loop if the queue is momentarily full.
@@ -6573,6 +6653,7 @@ void loop() {
     TIMED_CALL(ft_faMatrixFlush, faMatrixMaybeFlush());
   }
   TIMED_CALL(ft_zeroLogService, zeroLogService());  // Zero-drift diagnostic: sample (field-off >=5s; 1s spinning / 10min idle) + field-off-only flash flush. Cheap unless flushing.
+  altZeroCaptureService();  // untimed: a running mean at 10 Hz, gated off entirely outside a wizard run
   calculateChargeTimes();  // untimed: negligible arithmetic. Might want to move into the 2s block above and unthrottle later
   // Fast alt-current channel: bounded DMA drain (~1 ms hard cap). Unconditional and
   // out-of-band of all control — sampling is hardware-timed (DMA fills itself), this
@@ -7058,7 +7139,7 @@ void loop() {
         // Alt-health LEARNS with the field ON, but uploads (like all flash/HTTPS) are field-OFF:
         // records bank during charging and flush at the next field-off. buildAltHealthPayload
         // is dirty-gated, so this is a no-op when nothing new has been banked.
-        if (hardwarePresent == 1 && !rpmAxisWipePending && fieldOffSettled(10000) && millis() - lastAltHealthUploadTime >= ALTHEALTH_UPLOAD_INTERVAL) {
+        if (hardwarePresent == 1 && !rpmAxisWipePending && !altCloudWipePending && fieldOffSettled(10000) && millis() - lastAltHealthUploadTime >= ALTHEALTH_UPLOAD_INTERVAL) {
           lastAltHealthUploadTime = millis();
           if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && WiFi.RSSI() >= -80) {
             HttpsRequest req = {};

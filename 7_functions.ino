@@ -1497,8 +1497,8 @@ void altFold_tick(uint32_t nowMs) {
   if (!altFrontBuf || !altEpRing) return;
 
   // IgnoreTemperature → the ENTIRE alt-health system is disabled: no live, no points, no trend.
-  if (IgnoreTemperature) { altLiveValid = false; altSteady = false; altSessSteady = false; altStatusCode = 3; return; }
-  if (altStatusCode == 3) altStatusCode = 0;   // temp re-enabled → clear the "disabled" status
+  // (altStatusCode is owned by the 1 Hz altHealth_tick, which reports this as 3.)
+  if (IgnoreTemperature) { altLiveValid = false; altSteady = false; altSessSteady = false; return; }
 
   float rpm, tF, vbus, amps, duty;
   if (altSimMode >= 0.5f) {
@@ -1611,10 +1611,21 @@ void altFold_tick(uint32_t nowMs) {
   if (altEmitQCount < ALT_EMIT_QUEUE) altEmitQ[altEmitQCount++].sp = sp;
 }
 
+// Learning is armed only on a COMMISSIONED device whose Charge Health Calibration (commissioning stage 9)
+// is done. That stage measures altLeadSec, the admission gate's one commissioning-derived input, and the
+// wizard's own runs (held-field sweeps, usually on a cold machine) must never set best-ever records —
+// a record only ratchets up, so an early high point caps its cell until Start Over. A re-commission
+// drops commissionState to 1, so learning pauses for the run and resumes on Done with history kept.
+// "Mark done manually" on stage 9 arms it with the default lead: the operator's call.
+#define ALT_STATUS_WAIT_CX  4   // altStatusCode: not commissioned
+#define ALT_STATUS_WAIT_CHC 5   // altStatusCode: commissioned, stage 9 (Charge Health Calibration) not done
+static bool altLearnArmed() { return commissionState == 2 && (commissionDoneMask & (1u << 9)) != 0; }
+
 // Drain the emit queue (1 Hz, from altHealth_tick; same task as the fold — no lock). At most 2
 // emits per tick so a single loop() pass never blocks more than a couple ms; emits arrive at least
 // one steady-run apart, so the queue drains faster than it fills.
 static void altProcessEmits() {
+  if (!altLearnArmed()) { altEmitQCount = 0; return; }   // not armed: no record, no trend sample, no upload
   int n = (altEmitQCount < 2) ? altEmitQCount : 2;
   bool learn = (altPaused < 0.5f);   // learning active → also admit into My History; else trend-only
   for (int k = 0; k < n; k++) {
@@ -1735,6 +1746,7 @@ static AltLiveField ALT_LIVE[] = {
 };
 static const size_t ALT_LIVE_COUNT = sizeof(ALT_LIVE) / sizeof(ALT_LIVE[0]);
 static void altSendLive() {
+  if (sseBacklogged()) return;   // periodic; the next tick resends current state
   char buf[512];   // truncates rather than overruns (see the break below); sized well past the field list
   int off = 0;
   for (size_t i = 0; i < ALT_LIVE_COUNT; i++) {
@@ -1742,7 +1754,7 @@ static void altSendLive() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  events.send(buf, "AltLive");
+  sseSend(buf, "AltLive");
 }
 
 // ---- coverage / status helpers (CSV2 + dashboard) ----
@@ -2237,6 +2249,11 @@ void resetAlternatorHealth() {
   fsReleaseLock();
   settingWrite(NK_altbaseSec, String(altTrendBaselineSec, 1).c_str());
   settingWrite(NK_altRefSrc, "0");
+  // Cloud half: the cloud keeps every raw point and rebuilds the front from all of them, so without this
+  // the next sync-back would hand the cleared record book straight back. Persisted so a reset while
+  // offline still lands; executeResetAltHealthCloud retries until 200 and clears it.
+  altCloudWipePending = true;
+  settingWrite(NK_AltWipePend, "1");
   queueConsoleMessage("AltHealth: full reset (Reset / Start Over) — My History + trend + session cleared, baseline restarted");
 }
 
@@ -2348,6 +2365,7 @@ void altHealth_tick(uint32_t nowMs) {
     altFold_tick(nowMs);
   }
   altProcessEmits();                  // grade + admit queued steady runs FIRST (front fresh for the live classify)
+  altStatusCode = IgnoreTemperature ? 3 : altLearnArmed() ? 0 : (commissionState == 2 ? ALT_STATUS_WAIT_CHC : ALT_STATUS_WAIT_CX);
   // 1 Hz evaluator + OUTPUT-BLIND state classifier. A stale fold (field off) → nothing to grade.
   bool foldFresh = (altLastFoldMs != 0) && ((uint32_t)(nowMs - altLastFoldMs) < 3000u);
   if (!foldFresh) altLiveValid = false;
@@ -2489,7 +2507,7 @@ void sendAltSettings() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  events.send(buf, "AltSettings");
+  sseSend(buf, "AltSettings");
 }
 
 // Self-describing schema (served at /altschema). The dashboard fetches this ONCE and zips these
@@ -2882,6 +2900,7 @@ static PerfLiveField PERF_LIVE[] = {
 static const size_t PERF_LIVE_COUNT = sizeof(PERF_LIVE) / sizeof(PERF_LIVE[0]);
 
 static void perfSendLive() {
+  if (sseBacklogged()) return;   // periodic; the next tick resends current state
   char buf[256];
   int off = 0;
   for (size_t i = 0; i < PERF_LIVE_COUNT; i++) {
@@ -2889,7 +2908,7 @@ static void perfSendLive() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  events.send(buf, "PerfLive");
+  sseSend(buf, "PerfLive");
 }
 
 // Motoring live registry (same {name,getter} pattern; schema served alongside under "motorLive").
@@ -2919,6 +2938,7 @@ static PerfLiveField PERF_MOTOR_LIVE[] = {
 };
 static const size_t PERF_MOTOR_LIVE_COUNT = sizeof(PERF_MOTOR_LIVE) / sizeof(PERF_MOTOR_LIVE[0]);
 static void perfSendMotorLive() {
+  if (sseBacklogged()) return;   // periodic; the next tick resends current state
   char buf[256];
   int off = 0;
   for (size_t i = 0; i < PERF_MOTOR_LIVE_COUNT; i++) {
@@ -2926,7 +2946,7 @@ static void perfSendMotorLive() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  events.send(buf, "MotorLive");
+  sseSend(buf, "MotorLive");
 }
 
 // ---- persistence (Phase-0 scaffold; field-off-gated by caller) ----
@@ -3310,7 +3330,7 @@ void sendPerfSettings() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  events.send(buf, "PerfSettings");
+  sseSend(buf, "PerfSettings");
 }
 
 // Self-describing schema (served at /perfschema). The dashboard fetches this ONCE on load
@@ -5419,8 +5439,8 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     // field cut, fires before this override runs). That cut also flags fieldCurveAbortRequested,
     // so the ramp tears down cleanly. No bespoke per-target headroom abort is needed here.
     //
-    // Effective ramp ceiling: Max Field % (MaxDuty) is the real per-bus field-duty cap and setDutyPercent
-    // clamps the APPLIED duty down to it on a 24/36/48V bank. Cap the ramp at that same ceiling so we STOP
+    // Effective ramp ceiling: the field ceiling (Max Field % / Max Field Volts, whichever is lower) is the
+    // real per-bus cap and setDutyPercent clamps the APPLIED duty down to it on every class. Cap the ramp at that same ceiling so we STOP
     // there instead of marching stepDuty up into a frozen-duty region that records flat/false amps and a
     // bogus curve. If the amp target isn't reached by then, we flag fieldCurveCeilingLimited so the
     // dashboard can tell the user to raise Max Field % and re-run for the full curve.
@@ -5961,7 +5981,7 @@ void tuningSineStep(uint32_t nowMs, float dt, float &phase, float baseA, float a
     if (rpmNow < tuningSweepRpmMin) tuningSweepRpmMin = rpmNow;
     if (rpmNow > tuningSweepRpmMax) tuningSweepRpmMax = rpmNow;
     tuningSweepRpmSum += rpmNow; tuningSweepRpmN++;
-    // High rail is the live ceiling (MaxDuty ~50%@24V / ~25%@48V) — a fixed 99.5 could never
+    // High rail is the live ceiling (Max Field Volts works out to ~52%@24V / ~26%@48V at its default) — a fixed 99.5 could never
     // fire there and a clipped sweep would be accepted as a valid plant fit.
     if (dutyCycle <= MinDuty + 0.5f || dutyCycle >= ccDutyCeiling() - 0.5f) tuningSweepDutyRailed = true;
     // Integer-cycle window: settle 1 cycle, then accumulate over a WHOLE number of drive

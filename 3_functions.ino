@@ -717,6 +717,9 @@ enum Csv2Index {
 
   CSV2_fieldDutyFloor,      // enforced field-duty FLOOR x100 — governor_apply's resolved max(Min Field %, this speed's Keep-Alive %), 0 when the floor is bypassed (shutdown, sysID, protection clamp, MANUAL). Twin of CSV2_fieldDutyCeil
 
+  CSV2_inaDieTempF,         // INA228 internal die temperature (°F x10; ROLL_EMPTY = no reading)
+  CSV2_inaDieTempMaxF,      // session max of the above (°F x10; ROLL_EMPTY = nothing has cleared the warm-up + corroboration gate yet). This is the value that uploads daily
+
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
 
@@ -2467,7 +2470,14 @@ static uint8_t g_onOffWriteNext = 0;
 static char g_manualWriteSrc[CW_SLOTS * 17] = { 0 };
 static uint32_t g_manualWriteN[CW_SLOTS] = { 0 };
 static uint8_t g_manualWriteNext = 0;
-static bool clientWriteTrack(AsyncWebServerRequest *request, char *srcTab, uint32_t *nTab, uint8_t *nextSlot) {
+// isRepeat (out): why the write is being refused, which is NOT always "a later press replaced it". Since
+// 2026-09-16 the dashboard deliberately sends a SECOND copy of a control write ~500 ms after the first
+// when the first has not answered, so on a lossy link the ordinary case is now the same n arriving twice.
+// n == the last applied n is that hedge copy; n BELOW it is a genuinely superseded press. Both are
+// refused identically — only the console wording differs, and a log line that invents a press the user
+// never made is the kind of thing that costs an hour when the field misbehaves.
+static bool clientWriteTrack(AsyncWebServerRequest *request, char *srcTab, uint32_t *nTab, uint8_t *nextSlot, bool *isRepeat) {
+  if (isRepeat) *isRepeat = false;
   if (!request->hasParam("src") || !request->hasParam("n")) return false;
   const String &src = request->getParam("src")->value();
   if (src.length() == 0 || src.length() > 16) return false;
@@ -2475,7 +2485,10 @@ static bool clientWriteTrack(AsyncWebServerRequest *request, char *srcTab, uint3
   for (uint8_t i = 0; i < CW_SLOTS; i++) {
     char *slot = srcTab + i * 17;
     if (slot[0] && strcmp(slot, src.c_str()) == 0) {
-      if (n <= nTab[i]) return true;
+      if (n <= nTab[i]) {
+        if (isRepeat) *isRepeat = (n == nTab[i]);
+        return true;
+      }
       nTab[i] = n;
       return false;
     }
@@ -3450,6 +3463,22 @@ void setupServer() {
     j += ",\"applied\":";       j += (AutoAltCurrentZero ? 1 : 0);
     j += ",\"epoch\":";         j += String((unsigned)zfLastEpoch);
     j += ",\"histCount\":";     j += String((unsigned)zeroFitHistCount);
+    // Commissioned zero capture (engine running, field at 0%) — held until the operator applies it.
+    j += ",\"capHeld\":";       j += (altZeroCapHeld ? 1 : 0);
+    j += ",\"capEpoch\":";      j += String((unsigned)altZeroCapEpoch);
+    j += ",\"capA\":";          j += String(altZeroCapA, 3);
+    j += ",\"capRpm\":";        j += String((int)altZeroCapRpm);
+    j += ",\"capN\":";          j += String((unsigned)altZeroCapN);
+    j += ",\"capP2P\":";        j += String(altZeroCapP2P, 3);
+    j += ",\"capAltF\":";       j += (isnan(altZeroCapTempF)  ? String("null") : String(altZeroCapTempF, 1));
+    j += ",\"capBoardF\":";     j += (isnan(altZeroCapBoardF) ? String("null") : String(altZeroCapBoardF, 1));
+    j += ",\"capRej\":";        j += String((unsigned)altZeroRejReason);
+    j += ",\"capBusy\":";       j += (AltZeroCaptureNow ? 1 : 0);
+    j += ",\"capArmed\":";      j += ((commissionState == 1 && (commissionDoneMask & (1 << ALTZERO_ARM_STAGE))) ? 1 : 0);
+    j += ",\"capApplied\":";    j += (altZeroApplied ? 1 : 0);
+    j += ",\"capAppliedA\":";   j += String(altZeroAppliedA, 3);
+    j += ",\"capAppliedEp\":";  j += String((unsigned)altZeroAppliedEpoch);
+    j += ",\"capOffset\":";     j += String(AlternatorCOffset, 3);
     j += "}";
     request->send(200, "application/json", j);
   });
@@ -4205,6 +4234,18 @@ void setupServer() {
                   String("{\"success\":true,\"firstSave\":") + (firstSave ? "true" : "false") + "}");
   });
   server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Addressed write: the dashboard names the unit whose data it is showing (uid=). One naming
+    // another unit reached this board through an address both answer to (alternator.local with two
+    // regulators, 2026-09-15) and is refused whole - OnOff=0 included, because the board the user is
+    // looking at is the other one and this one would go dark with nothing on screen to explain it.
+    if (request->hasParam("uid")) {
+      const String &want = request->getParam("uid")->value();
+      if (want.length() && !want.equalsIgnoreCase(device_id_hex)) {
+        logClientWrite(request, "WRITE REJECTED: addressed to another regulator");
+        request->send(409, "text/plain", device_id_hex);
+        return;
+      }
+    }
     bool foundParameter = false;
     bool nvsPersistNow = false;   // set by discrete reset/set handlers that write saveNVSDataFull()-owned vars; forces ONE immediate persist at the end so a reboot before the next field-off edge can't revert the action
     String inputMessage;
@@ -4222,11 +4263,13 @@ void setupServer() {
         // kept the old value until the 60 s fallback.
         settingsDirty = true;
         // Sender fingerprint: unexplained OnOff=0 arrivals were seen on the bench (2026-08).
-        // The dashboard sends OnOff plus its src/n tag and nothing else, so any other param = a
+        // The dashboard sends OnOff plus its src/n/uid tags and nothing else, so any other param = a
         // different sender, and IP+UA tell laptop from phone from a stale client replaying the request.
         // Tracked so a later out-of-order ON from the same tab is recognized; never dropped itself.
-        clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext);
-        logClientWrite(request, "FIELD OFF: Safety override (no arming required)");
+        bool offIsRepeat = false;
+        clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext, &offIsRepeat);
+        logClientWrite(request, offIsRepeat ? "FIELD OFF: duplicate copy of a press already applied (field was already off)"
+                                            : "FIELD OFF: Safety override (no arming required)");
         request->send(200, "text/plain", "0");
         return;
       }
@@ -5604,8 +5647,10 @@ void setupServer() {
     }
     if (request->hasParam("ManualFieldToggle")) {
       foundParameter = true;
-      if (clientWriteTrack(request, g_manualWriteSrc, g_manualWriteN, &g_manualWriteNext)) {
-        logClientWrite(request, "FIELD CONTROL write IGNORED: out of order for its tab (a later press already applied)");
+      bool manualIsRepeat = false;
+      if (clientWriteTrack(request, g_manualWriteSrc, g_manualWriteN, &g_manualWriteNext, &manualIsRepeat)) {
+        logClientWrite(request, manualIsRepeat ? "FIELD CONTROL write IGNORED: duplicate copy of a press already applied"
+                                               : "FIELD CONTROL write IGNORED: out of order for its tab (a later press already applied)");
       } else {
         inputMessage = request->getParam("ManualFieldToggle")->value();
         settingWrite(NK_ManualFieldToggle, inputMessage.c_str());
@@ -5685,16 +5730,25 @@ void setupServer() {
       // branch only runs for OnOff==1 (or any non-zero value) after
       // the arm check has passed.
       foundParameter = true;
-      if (clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext)) {
+      bool onIsRepeat = false;
+      if (clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext, &onIsRepeat)) {
         // A press the user has since superseded (an OFF or a later ON from the same tab was already
         // applied). Applying it would re-energize a field the user just switched off.
-        logClientWrite(request, "OnOff=1 IGNORED: out of order for its tab (an OFF or later ON already applied)");
+        // Or — the common case since the dashboard began hedging — simply the second copy of a press
+        // that already landed. Nothing superseded it, and the log must not say otherwise.
+        logClientWrite(request, onIsRepeat ? "OnOff=1 IGNORED: duplicate copy of a press already applied"
+                                           : "OnOff=1 IGNORED: out of order for its tab (an OFF or later ON already applied)");
       } else {
         inputMessage = request->getParam("OnOff")->value();
         settingWrite(NK_OnOff, inputMessage.c_str());
+        const bool wasOff = (OnOff == 0);
         OnOff = inputMessage.toInt();
         stateRevision++;
         logClientWrite(request, "ALTERNATOR ENABLED: master switch ON");
+        // Off→on is the operator asking for a charge, so a pack resting in IDLE (charge cycle finished,
+        // UseFloat=0) restarts from BULK instead of leaving the switch dead until a voltage-sag rebulk.
+        // Consumed by updateChargingStage() on the control task.
+        if (wasOff && inIdleStage) restartChargeCycleRequested = true;
       }
     }
     if (request->hasParam("HiLow")) {
@@ -5757,7 +5811,7 @@ void setupServer() {
     if (request->hasParam("MaxFieldVolts")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxFieldVolts")->value();
-      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as the boot-time sanity check in InitSystemSettings, which rewrites anything outside it to the class default
+      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as the boot-time sanity check in InitSystemSettings, which rewrites anything outside it to the compile default
       settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
       // Force an immediate re-solve rather than waiting for the tick filter to drift the derived
       // ceiling past its 0.5-point deadband: a large dtSec collapses the bus filter onto the present
@@ -6236,6 +6290,19 @@ void setupServer() {
       inputMessage = request->getParam("AlternatorCOffset")->value();
       settingWrite(NK_AlternatorCOffset, inputMessage.c_str());
       AlternatorCOffset = inputMessage.toFloat();
+    }
+    // Commissioned alternator-zero capture. Both momentary, neither is a stored setting:
+    // AltZeroCaptureNow arms one measuring window now (bypassing the wizard arm gate), altZeroApply
+    // folds the held capture into AlternatorCOffset above.
+    if (request->hasParam("AltZeroCaptureNow")) {
+      foundParameter = true;
+      AltZeroCaptureNow = 1;
+      altZeroRejReason  = ALTZERO_RJ_NONE;
+      queueConsoleMessage("Alt zero: measuring - keep the engine running with the field off");
+    }
+    if (request->hasParam("altZeroApply")) {
+      foundParameter = true;
+      if (!altZeroApply()) queueConsoleMessage("Alt zero: nothing captured to apply");
     }
     if (request->hasParam("BatteryCOffset")) {
       foundParameter = true;
@@ -8649,6 +8716,13 @@ void setupServer() {
       // and STAYS 0 until the next field-off save fires — turns the field into a live
       // "is the save actually firing?" indicator after a reset.
       lastNVSSaveTime = 0;
+      // Dashboard-stream backpressure witnesses (/debug line + stall console lines)
+      sseQueuePeak = 0;
+      sseStallCount = 0;
+      sseStallLongestMs = 0;
+      sseFramesDropped = 0;
+      // INA228 die-temperature session max — same "since last reset" semantics as the rest of this block.
+      inaDieTempMaxF = NAN;
       // Stamp the reset moment. Dashboard reads CSV1 slot 28 = (millis()-this)/1000
       // and formats it as "last 12 min" / "last 1.4 hr" on all .session-window-label spans.
       perfCountersResetMs = millis();
@@ -8717,32 +8791,23 @@ void setupServer() {
     request->send(200, "text/plain", inputMessage);
   });
 
-  // Settings arm gate (replaced /setPassword + /checkPassword). ?arm=1 opens the 30-min
-  // write window, ?arm=0 closes it, no param just reports state — the dashboard polls this
-  // to restore/expire its unlocked UI, so a reload while armed comes back unlocked.
-  // ?ackLock=1 clears the auto-lock notice. serviceSettingsArmHold() holds the window open while
-  // any client is attached, so remainSec reads full-scale instead of counting down under a live user.
+  // Settings arm gate (replaced /setPassword + /checkPassword). ?arm=1 opens the write window,
+  // ?arm=0 closes it, no param just reports state — the dashboard polls this to keep its unlocked
+  // UI honest, so a reload while armed comes back unlocked and a lock from another client relocks
+  // every tab within a poll. Nothing times out; see settingsArmActive() in 5_functions.ino.
   server.on("/armSettings", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("arm")) {
       bool arm = request->getParam("arm")->value().toInt() != 0;
       if (arm) {
         settingsArmed = true;
-        settingsArmedAtMs = millis();
-        settingsAutoLockNotice = false;  // the user is back and re-armed: the notice has done its job
-        queueConsoleMessage("Settings ARMED: changes accepted for 30 min");
+        queueConsoleMessage("Settings ARMED: changes accepted until locked or rebooted");
       } else if (settingsArmed) {
         settingsArmed = false;
         queueConsoleMessage("Settings locked");
       }
     }
-    // The ack lands on the DEVICE, not per browser: one lock event, one notice, so a second phone
-    // is not nagged about a lock the first already cleared and a stale flag cannot outlive it.
-    if (request->hasParam("ackLock")) settingsAutoLockNotice = false;
-    bool active = settingsArmActive();
-    unsigned long remainSec = active ? (SETTINGS_ARM_TIMEOUT_MS - (millis() - settingsArmedAtMs)) / 1000UL : 0;
-    char out[128];
-    snprintf(out, sizeof(out), "{\"armed\":%d,\"remainSec\":%lu,\"lockNotice\":%d,\"lockEpoch\":%lu}",
-             active ? 1 : 0, remainSec, settingsAutoLockNotice ? 1 : 0, (unsigned long)settingsAutoLockedEpoch);
+    char out[48];
+    snprintf(out, sizeof(out), "{\"armed\":%d}", settingsArmActive() ? 1 : 0);
     request->send(200, "application/json", out);
   });
 
@@ -8865,6 +8930,7 @@ void setupServer() {
              "Web FS %s: %d/%d KB used (%d%%) - boot seed, -1 = unread\n"
              "TLS buffers -> %s (largest internal block %u B, free PSRAM %u B)\n"
              "Net task cores (0/1=pinned, 2147483647=floating, -99=not found): async_tcp=%d lwIP=%d\n"
+             "Dashboard stream: clients=%u queue=%u peak=%u/%u stalls=%lu longest=%.1fs dropped=%lu\n"
              "AdjustField worst full pass (ms): total=%.1f | thermal=%.1f snapshot=%.1f fastov=%.1f modes=%.1f control=%.1f duty=%.1f tail=%.1f\n"
              "Time source: %s (NMEA last sync: %lus ago, Phone last: %lus ago)\n"
              "GPS source:  %s (NMEA last fix: %lus ago, Phone last: %lus ago)\n"
@@ -8880,6 +8946,8 @@ void setupServer() {
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              asyncTcpCore, lwipCore,
+             (unsigned)events.count(), (unsigned)sseQueueDepth, (unsigned)sseQueuePeak, (unsigned)SSE_MAX_QUEUED_MESSAGES,
+             (unsigned long)sseStallCount, sseStallLongestMs / 1000.0f, (unsigned long)sseFramesDropped,
              aflWorstTotalUs / 1000.0f,
              aflWorstSecUs[0] / 1000.0f, aflWorstSecUs[1] / 1000.0f, aflWorstSecUs[2] / 1000.0f,
              aflWorstSecUs[3] / 1000.0f, aflWorstSecUs[4] / 1000.0f, aflWorstSecUs[5] / 1000.0f,
@@ -9063,7 +9131,10 @@ void setupServer() {
     idBuf += regulatorHostName();
     idBuf += ".local\",\"ap\":";
     cfgAppendJsonStr(idBuf, esp32_ap_ssid);
-    idBuf += "}";
+    // Own address: a browser tab opened by name has no IPv4 of its own to seed the LAN sweep with.
+    idBuf += ",\"ip\":\"";
+    idBuf += ((WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP()).toString();
+    idBuf += "\"}";
     AsyncWebServerResponse *r = request->beginResponse(200, "application/json", idBuf);
     r->addHeader("Access-Control-Allow-Origin", "*");
     request->send(r);
@@ -10123,6 +10194,18 @@ void checkWiFiConnection() {
     wifiRecon.state = WIFI_RECON_SEEKING;
   }
 }
+// Queue depth at which a client's link counts as stalled. A healthy link holds 0-1 messages (the
+// frame in flight until its ack); 4 means no ack for several frames.
+static const uint16_t SSE_BACKLOG_DEPTH = 4;
+// Every dashboard event goes out through here so a full client queue is counted instead of silent.
+void sseSend(const char *msg, const char *evt) {
+  if (events.count() == 0) return;
+  if (events.send(msg, evt) != AsyncEventSource::ENQUEUED) sseFramesDropped++;
+}
+// True while a client's queue is backed up (TCP not draining). CSV1 keeps sending so the queue budget
+// is spent on plot frames; the periodic channels wait it out and resend on their next tick, which
+// costs nothing because they carry current state, not history.
+bool sseBacklogged() { return sseQueueDepth >= SSE_BACKLOG_DEPTH; }
 void SendWifiData() {
   // Don't send WiFi data during HTTPS operations
   unsigned long start66 = micros();
@@ -10153,6 +10236,32 @@ void SendWifiData() {
     sseDownSinceMs = 0;
   }
   sseLastClients = sseClients;
+
+  // Backpressure witness, 10 Hz: a stall is logged when the queue empties again, sized from first
+  // backlog to full drain (the browser's own gap is a little shorter - it runs from the last frame
+  // that got through to the first of the burst). Console lines queued during the stall reach the
+  // browser after the drain, because trySendConsoleSSE is one of the gated channels.
+  static uint32_t sseDepthPollMs = 0, sseStallStartMs = 0, sseStallDropsAtStart = 0;
+  static uint16_t sseStallPeak = 0;
+  if (now - sseDepthPollMs >= 100) {
+    sseDepthPollMs = now;
+    sseQueueDepth = sseClients ? (uint16_t)events.avgPacketsWaiting() : 0;
+    if (sseQueueDepth > sseQueuePeak) sseQueuePeak = sseQueueDepth;
+    if (sseQueueDepth >= SSE_BACKLOG_DEPTH) {
+      if (!sseStallStartMs) { sseStallStartMs = now; sseStallPeak = 0; sseStallDropsAtStart = sseFramesDropped; }
+      if (sseQueueDepth > sseStallPeak) sseStallPeak = sseQueueDepth;
+    } else if (sseStallStartMs && sseQueueDepth == 0) {
+      uint32_t stallMs = now - sseStallStartMs;
+      sseStallStartMs = 0;
+      if (stallMs >= 1000) {
+        sseStallCount++;
+        if (stallMs > sseStallLongestMs) sseStallLongestMs = stallMs;
+        queueConsoleMessageF("Dashboard stream stalled %.1fs: the link stopped taking data (WiFi and socket stayed up; send queue peaked %u/%u, %lu frames dropped)",
+                             stallMs / 1000.0f, (unsigned)sseStallPeak, (unsigned)SSE_MAX_QUEUED_MESSAGES,
+                             (unsigned long)(sseFramesDropped - sseStallDropsAtStart));
+      }
+    }
+  }
 
   if (now - lastWiFiCheck > 2000) {  // Check WiFi every 2 seconds
     cachedWiFiMode = WiFi.getMode();
@@ -10320,7 +10429,7 @@ void SendWifiData() {
       return;
     }
 
-    events.send(payload1, "CSVData");
+    sseSend(payload1, "CSVData");
     SendWifiTime = micros() - start66;
     prev_millis5 = now;
     lastEventSourceSend = now;
@@ -10329,7 +10438,7 @@ void SendWifiData() {
   // PRIORITY 2: CSVData4 / NavStream — live nav/wind/solar/fuel at 2 Hz (500 ms).
   // High priority (right after CSV1) so these gauges aren't starved by the slower CSV2/CSV3/TS
   // channels. These fields used to ride the 5 s CSV2 cadence and looked frozen on the dial/helm.
-  if (!sentSomething && now - lastpayload4send >= 500UL && events.count() > 0) {
+  if (!sentSomething && now - lastpayload4send >= 500UL && events.count() > 0 && !sseBacklogged()) {
     static char *payload4 = nullptr;
     static const size_t PAYLOAD4_SIZE = 512;  // ~7 B/field, plus the two 10-digit stamp fields; rounded up with headroom
                                               // Was 256: SafeInt's sentinel widened from -1 to -2000000000, and 19 SafeInt
@@ -10384,7 +10493,7 @@ void SendWifiData() {
       Serial.printf("payload4 truncated or format error: %d\n", payload4Len);
       return;
     }
-    events.send(payload4, "CSVData4");
+    sseSend(payload4, "CSVData4");
     lastpayload4send = now;
     lastEventSourceSend = now;
     sentSomething = true;
@@ -10396,7 +10505,7 @@ void SendWifiData() {
   // UI phase-progress display stays within one poll tick of the actual firmware state.
   // Normal operation: every 5 s, gated behind CSV1 to avoid double-sending per tick.
   const bool sysIDRunning = (systemIDActive != 0);
-  if ((sysIDRunning || !sentSomething) && now - lastpayload2send >= (sysIDRunning ? 500UL : 5000UL) && events.count() > 0) {
+  if ((sysIDRunning || !sentSomething) && now - lastpayload2send >= (sysIDRunning ? 500UL : 5000UL) && events.count() > 0 && !sseBacklogged()) {
     static char *payload2 = nullptr;
     // Sized by the ~7 B/field rule rather than the observed frame, because an overflow returns early
     // from SendWifiData and kills CSV2 + CSV3 + TS until reboot. PSRAM.
@@ -10476,6 +10585,7 @@ void SendWifiData() {
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +10 solar ledger: today's pred/act harvest + consumption, bar, source, days, coverage, ft win/ses
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +13 battery/extra temperature: BATT probe, EXTRA probe, active F, active src, probe count, unassigned, VE.Direct T, RV-C T, derate inert, batt wm lo/hi, extra wm lo/hi
                                "%d,"            // +1 enforced field-duty floor (x100)
+                               "%d,%d,"         // +2 INA228 die temperature: live, session max (°F x10)
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -11093,6 +11203,8 @@ void SendWifiData() {
                                wmIgnCsv(wmIgn_extraTempF.lo, 1),               // CSV2_wmIgn_extraTempF_lo
                                wmIgnCsv(wmIgn_extraTempF.hi, 1),               // CSV2_wmIgn_extraTempF_hi
                                SafeInt(g_fieldDutyFloor, 100),                           // CSV2_fieldDutyFloor
+                               SafeInt(inaDieTempF, 10),                                 // CSV2_inaDieTempF
+                               SafeInt(inaDieTempMaxF, 10),                              // CSV2_inaDieTempMaxF
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost
@@ -11109,7 +11221,7 @@ void SendWifiData() {
     } else {
       // PASS 2 — send the payload built last pass (cheap ~1.3 ms; kept off the build pass).
       uint32_t _csv2s0 = micros();   // CSV2 send-cost timer (events.send → AsyncTCP)
-      events.send(payload2, "CSVData2");
+      sseSend(payload2, "CSVData2");
       csv2SendLastUs = micros() - _csv2s0;
       if (csv2SendLastUs > csv2SendWorstUs) csv2SendWorstUs = csv2SendLastUs;
       lastpayload2send = now;
@@ -11120,7 +11232,7 @@ void SendWifiData() {
   }
 
   // PRIORITY 5: CSVData3 — sent immediately when settingsDirty (event-driven), or every 60s fallback
-  if (!sentSomething && (settingsDirty || now - lastpayload3send >= 60000) && events.count() > 0) {
+  if (!sentSomething && (settingsDirty || now - lastpayload3send >= 60000) && events.count() > 0 && !sseBacklogged()) {
     static char *payload3 = nullptr;
     // ~7 B/field, and this is the tightest of the five buffers — CSV3 grows every time a setting is
     // added, so check it when adding a block of them. Overflow is caught below rather than truncating,
@@ -11162,7 +11274,7 @@ void SendWifiData() {
       return;
     }
 
-    events.send(payload3, "CSVData3");
+    sseSend(payload3, "CSVData3");
     settingsDirty = false;
     lastpayload3send = now;
     lastEventSourceSend = now;
@@ -11170,7 +11282,7 @@ void SendWifiData() {
   }
 
   // PRIORITY 6: TimestampData (staleness data - every 3 seconds)
-  if (!sentSomething && now - lastTimestampSend >= 3000 && events.count() > 0) {
+  if (!sentSomething && now - lastTimestampSend >= 3000 && events.count() > 0 && !sseBacklogged()) {
 
     static char *timestampPayload = nullptr;
     static const size_t TIMESTAMP_PAYLOAD_SIZE = 512;  // every field is an age and the weather one can be 10 digits; an overflow kills TS until reboot
@@ -11236,7 +11348,7 @@ void SendWifiData() {
       return;
     }
 
-    events.send(timestampPayload, "TimestampData");
+    sseSend(timestampPayload, "TimestampData");
     lastTimestampSend = now;
     lastEventSourceSend = now;
     sentSomething = true;

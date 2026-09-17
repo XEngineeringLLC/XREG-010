@@ -1069,6 +1069,8 @@ const CSV2_FIELDS = [
     "wmIgn_battTempF_lo", "wmIgn_battTempF_hi",     // BatteryTempProbeF (°F, int)
     "wmIgn_extraTempF_lo", "wmIgn_extraTempF_hi",   // ExtraTempF (°F, int)
     "fieldDutyFloor",          // enforced field-duty floor x100: max of Min Field % and this speed's Keep-Alive %; 0 = floor bypassed (shutdown, sysID, protection clamp, MANUAL)
+    "inaDieTempF",             // INA228 internal die temperature °F x10 (ROLL_EMPTY = no reading)
+    "inaDieTempMaxF",          // session max of the above °F x10 (ROLL_EMPTY = nothing has passed the warm-up + corroboration gate); this is what uploads daily
     "sessionId",               // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
@@ -1501,6 +1503,7 @@ async function resetZeroLog(){
 function fetchZeroFitState(){
     return fetch(buildURL('/zerofitstate')).then(r=>r.json()).then(j=>{
         if (!j) return;
+        altZeroPaint(j);
         const st = document.getElementById('zerofit-status');
         if (!st) return;
         if (Number(j.valid) !== 1) {
@@ -1515,6 +1518,52 @@ function fetchZeroFitState(){
             + ' → ' + (applied ? '' : 'would apply ') + corr.toFixed(2) + ' A'
             + (applied ? ' applied' : ' (Off)');
     }).catch(()=>{});
+}
+
+// ===== Measured zero (engine running, field at 0%) =====
+// Rides the same /zerofitstate poll as the fit above. The device captures by itself through the
+// late commissioning stages and holds the newest window; this paints what is held and arms Apply.
+const ALTZERO_REJ_TEXT = ['', 'too noisy to be a zero', 'reading too large, check which cable the sensor is on',
+                          'engine speed moved mid-measurement', 'the engine stopped or the field came on'];
+function altZeroPaint(j) {
+    const st = document.getElementById('altzero-status');
+    const btn = document.getElementById('altzero-apply-btn');
+    if (!st) return;
+    const held = Number(j.capHeld) === 1;
+    if (btn) {
+        btn.disabled = !held;
+        btn.style.opacity = held ? '' : '0.45';
+        btn.style.cursor = held ? '' : 'not-allowed';
+    }
+    if (Number(j.capBusy) === 1) { st.textContent = 'Measuring, keep the engine running with the field off'; return; }
+    if (held) {
+        const t = (j.capAltF === null || j.capAltF === undefined) ? j.capBoardF : j.capAltF;
+        st.textContent = 'Measured ' + (Number(j.capA) >= 0 ? '+' : '') + Number(j.capA).toFixed(2) + ' A at '
+            + Math.round(Number(j.capRpm)) + ' RPM'
+            + ((t === null || t === undefined) ? '' : ', ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel())
+            + '. Press Apply to fold it into the offset.';
+        return;
+    }
+    const rej = Number(j.capRej) || 0;
+    if (rej > 0) { st.textContent = 'Last attempt refused: ' + ALTZERO_REJ_TEXT[rej]; return; }
+    const off = Number(j.capOffset);
+    st.textContent = (Number(j.capApplied) === 1)
+        ? ('Applied ' + (Number(j.capAppliedA) >= 0 ? '+' : '') + Number(j.capAppliedA).toFixed(2)
+           + ' A; offset now ' + (isFinite(off) ? off.toFixed(2) : '?') + ' A')
+        : (Number(j.capArmed) === 1 ? 'Waiting for a quiet moment with the engine running'
+                                    : 'Not measured on this installation');
+}
+function altZeroNow() {
+    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    fetchWithTimeout(buildURL('/get?AltZeroCaptureNow=1'), {}, 8000)
+        .then(()=>{ setTimeout(fetchZeroFitState, 400); })
+        .catch(()=>{});
+}
+function altZeroApplyNow() {
+    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    fetchWithTimeout(buildURL('/get?altZeroApply=1'), {}, 8000)
+        .then(()=>{ setTimeout(fetchZeroFitState, 400); })
+        .catch(()=>{});
 }
 
 // Confidence-state labels + colors (firmware FrontStore::classify; OUTPUT-BLIND \u2014 position +
@@ -1545,11 +1594,16 @@ function updateAltHealth() {
   }
   if (statEl) {
     const usingUploaded = altLive.source >= 1;
+    // 4/5 = learning not armed yet (firmware altLearnArmed): the record book only starts once the device
+    // is commissioned AND step 10 has measured the speed lead. Grading against an Uploaded reference
+    // still works meanwhile; the paused suffix is moot, so it shows only while learning is live.
     let txt = altLive.status===3 ? 'Disabled (Ignore Temperature)'
+            : altLive.status===4 ? 'Waiting for commissioning'
+            : altLive.status===5 ? 'Waiting for Charge Health Calibration (commissioning step 10)'
             : !altLive.valid ? 'Not running'
             : (ALT_STATE_LABEL[st] || '');
     if (altLive.status!==3 && usingUploaded) txt += ' \u00b7 Uploaded reference';
-    if (altLive.status!==3 && altLive.paused>=1) txt += ' \u00b7 learning paused';
+    if (altLive.status===0 && altLive.paused>=1) txt += ' \u00b7 learning paused';
     statEl.textContent = txt;
     statEl.style.color = graded ? ALT_STATE_COLOR[st] : '#888';
   }
@@ -1867,14 +1921,14 @@ async function altLogDumpPress() {
     const ts = getLogTimestamp(), sfx = getLogNameSuffix();
     deliverFile(`altgate_${ts}${sfx}.csv`, altLogToCsv(d), 'text/csv');
     // The clear is arm-gated on the device (the dump itself is not), and a 19-min recording plus a
-    // drive routinely outlives the 30-min arm window — a 403 resolves the fetch, so it has to be
+    // drive can cross a lock (another client, or a reboot) — a 403 resolves the fetch, so it has to be
     // checked or the buffer silently stays held and the next Record warns about "un-dumped" rows.
     try {
         const r = await fetchWithTimeout(buildURL('/get?altLogClear=1'), {}, 5000);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
     } catch (err) {
-        xAlert('CSV saved, but the device buffer was NOT cleared (' + err + ' — the settings unlock ' +
-               'likely expired during the session). Unlock settings and press Discard to free it.');
+        xAlert('CSV saved, but the device buffer was NOT cleared (' + err + ' — settings are ' +
+               'likely locked). Unlock settings and press Discard to free it.');
     }
 }
 
@@ -3856,13 +3910,46 @@ if (typeof window.gpsManualOverride === 'undefined') {
     window.gpsManualOverride = false;
 }
 
+// ── Which unit a write is meant for ─────────────────────────────────────────────────
+// The stream is one long-lived socket and every write is its own request, so on an address two
+// units answer to (alternator.local, twin regulators) a page can show board A while its presses
+// land on board B - proven on the bench 2026-09-15. The stream says which board is on screen, so
+// its uid is what every write carries (buildURL for fetches, a hidden input for forms) and the
+// firmware refuses a write that names another unit (409). Until the first frame, the identity the
+// page connected under stands in.
+let g_streamUid = null;
+function controlUid() {
+    return g_streamUid || (IS_CAPACITOR ? rememberedUid() : ((window.xregUnit && window.xregUnit.uid) || null));
+}
+
 function buildURL(path) {
 
     if (!path.startsWith('/')) {
         path = '/' + path;
     }
+    if (path === '/get' || path.startsWith('/get?')) {
+        const uid = controlUid();
+        if (uid) path += (path.indexOf('?') === -1 ? '?' : '&') + 'uid=' + uid;
+    }
     return `${API_BASE_URL}${path}`;
 }
+
+// Forms submit GET and build their own query, so the uid rides in a hidden input, not the action.
+// Re-synced on every identity change; the capture-phase submit listener covers a form created after
+// the last sync (xConfirmSubmit's form.submit() fires no event, but the native attempt before it did).
+function syncWriteUidInputs(form) {
+    const uid = controlUid();
+    const forms = form ? [form] : document.querySelectorAll('form');
+    forms.forEach(f => {
+        if (!/\/get(\?|$)/.test(f.getAttribute('action') || '')) return;
+        let inp = f.querySelector('input[name="uid"]');
+        if (!uid) { if (inp) inp.remove(); return; }
+        if (!inp) { inp = document.createElement('input'); inp.type = 'hidden'; inp.name = 'uid'; f.appendChild(inp); }
+        inp.value = uid;
+    });
+}
+document.addEventListener('DOMContentLoaded', () => syncWriteUidInputs());
+document.addEventListener('submit', e => { if (e.target && e.target.tagName === 'FORM') syncWriteUidInputs(e.target); }, true);
 
 // Capacitor serves the page from the app's own localhost origin, so a form's relative
 // action (/get) submits to the app bundle server — the write never reaches the regulator,
@@ -3927,7 +4014,8 @@ async function probeIdentify(base, timeoutMs) {
             uid: str(info.uid),
             name: str(info.name),
             host: str(info.host),
-            ap: str(info.ap)
+            ap: str(info.ap),
+            ip: str(info.ip)
         };
     } catch (e) {
         return null;
@@ -3978,10 +4066,14 @@ function probeRound(bases, timeoutMs, wantUid) {
 }
 
 // Whose /24 the LAN sweep walks. In the app that is the phone's own IPv4, read natively. A
-// browser has no such API, but the page was served BY the regulator, so when it was opened by
-// address that address names the subnet the regulator was last on — the same one either way.
+// browser has no such API, but the page was served BY the regulator: opened by address, that
+// address names the subnet; opened by name, /identify reported the unit's own IP at load.
 async function ownSubnetIPv4() {
-    if (!IS_CAPACITOR) return IPV4_RE.test(location.hostname) ? location.hostname : null;
+    if (!IS_CAPACITOR) {
+        if (IPV4_RE.test(location.hostname)) return location.hostname;
+        const own = window.xregUnit && window.xregUnit.ip;
+        return (own && IPV4_RE.test(own)) ? own : null;
+    }
     const plugin = window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorWifi;
     if (!plugin || !plugin.getIpAddress) return null;
     try {
@@ -4122,6 +4214,10 @@ function rememberedHost() {
     return localStorage.getItem('xregDeviceHost') || (window.xregUnit && window.xregUnit.host) || null;
 }
 
+// The six characters a unit is known by everywhere (hostname xreg-<uid6>, AP SSID): the
+// firmware's regulatorUid6(), the first six of the last twelve.
+function uid6(uid) { return uid ? uid.slice(-12, -6) : ''; }
+
 function unitWhere(hit) {
     return (hit && (hit.host || (hit.base || '').replace(/^https?:\/\//, ''))) || '';
 }
@@ -4148,11 +4244,13 @@ function applyConnectedIdentity(hit) {
     set('unitAddrOut', where || '\u2014');
     const apEl = document.getElementById('regApSsid');
     if (apEl && !localStorage.getItem('xregApSsid') && hit.ap) apEl.value = hit.ap;
+    syncWriteUidInputs();
 }
 
 function connectToRegulator(hit) {
     console.log('[DISCOVERY] regulator ' + (hit.uid || 'unknown-uid') + ' at ' + hit.base + ' (fw ' + (hit.fw || 'unknown') + ')');
     API_BASE_URL = hit.base;
+    resetStreamIdentity();
     localStorage.setItem('xregDeviceBase', hit.base);
     if (hit.uid) localStorage.setItem('xregDeviceUid', hit.uid);
     if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
@@ -4239,20 +4337,17 @@ function chooseRegulator(hits, wantUid, forced) {
             const h = hits[Number(btn.dataset.idx)];
             const spans = btn.querySelectorAll('span');
             spans[0].textContent = unitLabel(h) + (h.uid && h.uid === wantUid ? '  (current)' : '');
-            spans[1].textContent = [unitWhere(h), h.uid ? 'ID ' + h.uid.slice(-6) : '', h.fw ? 'fw ' + h.fw : '']
+            spans[1].textContent = [unitWhere(h), h.uid ? 'ID ' + uid6(h.uid) : '', h.fw ? 'fw ' + h.fw : '']
                 .filter(Boolean).join('  ·  ');
             btn.onclick = () => finish(h);
         });
     });
 }
 
-// Explicit "I want the other one". Always asks, even when the remembered unit answered.
+// Explicit "I want the other one". Always asks, even when the remembered unit answered. The app
+// re-points itself; a browser moves the tab, because every endpoint but /identify is same-origin.
 async function switchRegulator() {
     if (discoveryInProgress) return;
-    if (!IS_CAPACITOR) {
-        xAlert('In a browser the regulator is whatever address you opened. Browse to the other unit directly \u2014 each one answers at its own xreg-<id>.local address, shown under Setup \u25b8 System on that unit.', 'Switch Regulator');
-        return;
-    }
     discoveryInProgress = true;
     // The only feedback on the settings page while the full sweep runs (up to ~15 s on a router LAN).
     const btn = document.querySelector('button[onclick="switchRegulator()"]');
@@ -4265,8 +4360,75 @@ async function switchRegulator() {
     if (!hits.length) { xAlert('No regulator answered on this network.', 'Switch Regulator'); return; }
     const hit = await chooseRegulator(hits, rememberedUid(), true);
     if (!hit) return;
-    connectToRegulator(hit);
-    initializeEventSource();
+    if (IS_CAPACITOR) { connectToRegulator(hit); initializeEventSource(); return; }
+    moveTabToRegulator(hit);
+}
+
+// Browser half of a switch. The unit's own name outlives any DHCP lease, so it is tried first; the
+// address that answered the scan is the fallback for a browser that cannot resolve .local names.
+// The landing page runs initUnitIdentity() and settles onto the unit's own name from there.
+async function moveTabToRegulator(hit) {
+    if (!hit || !hit.uid) return;
+    const cur = window.xregUnit && window.xregUnit.uid;
+    if (cur && cur.toUpperCase() === hit.uid.toUpperCase()) return;
+    const here = location.pathname + location.search + location.hash;
+    if (hit.host) {
+        const byName = await probeIdentify('http://' + hit.host, 2500);
+        if (byName && byName.uid === hit.uid) {
+            location.replace('http://' + hit.host + here);
+            return;
+        }
+    }
+    if (isIpBase(hit.base)) { location.replace(hit.base + here); return; }
+    xAlert('That regulator answered only at ' + unitWhere(hit) + ', which this browser cannot follow. Open it directly at http://' + (hit.host || unitWhere(hit)) + '/', 'Switch Regulator');
+}
+
+// ── Stream identity guard ────────────────────────────────────────────────────────────
+// A stream uid that differs from the identity this page connected under means the address is
+// ambiguous. The app re-finds its pinned unit by identity; a browser is offered a move to the unit
+// it is showing. Writes were already safe either way: they carry the stream uid (controlUid) and
+// the other board refuses them.
+let g_streamMismatchUid = null;   // the mismatch already handled, so one bad address raises one dialog
+function resetStreamIdentity() {
+    g_streamUid = null;
+    g_streamMismatchUid = null;
+    prevDeviceIdUpper = -1;
+    prevDeviceIdLower = -1;
+    syncWriteUidInputs();
+}
+function noteStreamUid(uid) {
+    // Only a real id counts: a zero one is a frame whose id fields were unreadable, not a unit.
+    if (!/^[0-9A-F]{16}$/.test(uid || '') || /^0+$/.test(uid) || uid === g_streamUid) return;
+    g_streamUid = uid;
+    syncWriteUidInputs();
+    const want = IS_CAPACITOR ? rememberedUid() : ((window.xregUnit && window.xregUnit.uid) || null);
+    if (!want || want.toUpperCase() === uid.toUpperCase()) { g_streamMismatchUid = null; return; }
+    if (g_streamMismatchUid === uid) return;
+    g_streamMismatchUid = uid;
+    onStreamUnitMismatch(uid, want);
+}
+async function onStreamUnitMismatch(streamUid, wantUid) {
+    console.log('[IDENTITY] stream is from ' + streamUid + ', page connected as ' + wantUid);
+    if (IS_CAPACITOR) {
+        // The address moved under the app (a lease handed to the other unit): drop this stream and
+        // re-find the pinned unit by identity. The picker takes over if it is gone.
+        if (source) { source.close(); source = null; }
+        sseReconnectAttempts = 0;
+        rediscoverAfterLoss();
+        return;
+    }
+    const ownName = 'xreg-' + uid6(streamUid).toLowerCase() + '.local';
+    const ok = await xConfirm('This page is showing regulator ID ' + uid6(streamUid) + ', but the address it was opened at also reaches regulator ID ' +
+        uid6(wantUid) + '. A command sent from here may reach the wrong one and be refused. Move this page to ' + ownName + ', which reaches only the regulator shown?',
+        { title: 'Two regulators answer here', okText: 'Move', cancelText: 'Not now' });
+    if (!ok) return;
+    if (discoveryInProgress) return;
+    discoveryInProgress = true;
+    let hits = [];
+    try { hits = await discoverDeviceBase(streamUid, false); } finally { discoveryInProgress = false; }
+    const hit = hits.find(h => h.uid && h.uid.toUpperCase() === streamUid.toUpperCase());
+    if (hit) { moveTabToRegulator(hit); return; }
+    xAlert('The regulator shown did not answer a scan. Open it directly at http://' + ownName + '/', 'Switch Regulator');
 }
 
 // The address bar picked the unit, so ask it who it is: the UI can name it, the AP fields are
@@ -4274,9 +4436,11 @@ async function switchRegulator() {
 // Then move the tab onto the unit's own mDNS name. An address is a DHCP lease — a phone hotspot
 // hands out a different one every time it bounces, and a bookmark or a refresh on the stale one
 // reaches nothing, with no page left running to recover from. The name follows the regulator
-// across every address it will ever have. Runs only on a page opened BY address, so it cannot
-// loop, and it is silent when the name does not answer (most Android browsers, some locked-down
-// Windows networks) — those clients go on using the address exactly as before.
+// across every address it will ever have, and it is the only name that reaches ONE unit:
+// alternator.local is answered by every regulator on the network. Runs on a page opened by
+// address or by that shared name, never on one already at the unit's own name, so it cannot
+// loop; silent when the name does not answer (most Android browsers, some locked-down Windows
+// networks) — those clients go on using the address exactly as before.
 async function initUnitIdentity() {
     if (IS_CAPACITOR || DEMO_MODE) return;
     const hit = await probeIdentify(API_BASE_URL || '', 4000);
@@ -4285,7 +4449,8 @@ async function initUnitIdentity() {
     if (hit.uid) localStorage.setItem('xregDeviceUid', hit.uid);
     if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
     localStorage.setItem('xregDeviceBase', location.origin);
-    if (!CAN_DISCOVER || !hit.uid || !hit.host || !IPV4_RE.test(location.hostname)) return;
+    if (!CAN_DISCOVER || !hit.uid || !hit.host) return;
+    if (location.hostname.toLowerCase() === hit.host.toLowerCase()) return;
     const byName = await probeIdentify('http://' + hit.host, 2500);
     // Same uid or nothing: on a two-regulator boat a name that lands on the other board would
     // silently swap which unit this tab is driving.
@@ -6638,15 +6803,24 @@ function updateFirmwareVersion(versionInt) {
     }
 }
 
-function updateDeviceId() {
-    const deviceIdUpper = parseInt(document.getElementById('deviceIdUpperID').textContent) >>> 0;
-    const deviceIdLower = parseInt(document.getElementById('deviceIdLowerID').textContent) >>> 0;
+// The hidden spans are filled through the batched DOM scheduler, so on the first frame they are
+// still empty when this runs: the frame's own values are the source, the spans only a fallback,
+// and an unreadable fallback is left alone rather than read as zero.
+function updateDeviceId(upper, lower) {
+    if (!Number.isFinite(upper) || !Number.isFinite(lower)) {
+        upper = parseInt(document.getElementById('deviceIdUpperID').textContent, 10);
+        lower = parseInt(document.getElementById('deviceIdLowerID').textContent, 10);
+        if (!Number.isFinite(upper) || !Number.isFinite(lower)) return;
+    }
+    const deviceIdUpper = upper >>> 0;
+    const deviceIdLower = lower >>> 0;
 
     if (deviceIdUpper !== prevDeviceIdUpper || deviceIdLower !== prevDeviceIdLower) {
         // Decode device ID (16-char hex from upper and lower 32 bits)
         const deviceIdHex = deviceIdUpper.toString(16).padStart(8, '0') +
             deviceIdLower.toString(16).padStart(8, '0');
         const macAddress = deviceIdHex.toUpperCase();  // Use all 16 chars
+        noteStreamUid(macAddress);
 
         // Update profile display + System panel (latter shown when cloud features locked)
         document.getElementById('profile-device-uid').textContent = macAddress;
@@ -7339,9 +7513,10 @@ function recomputeAutoScales(applyNow) {
 }
 
 // Shift one null column into every CSV1-fed buffer so uPlot breaks the trace at the seam, and
-// record how much time is missing there. Called when telemetry resumes after an outage — the
-// client was disconnected or backgrounded, so the ESP32 has nothing to replay (AsyncEventSource
-// does not queue for absent clients) and the missing span can only be marked, never recovered.
+// record how much time is missing there. Called from processCSVDataOptimized when the regulator's
+// own frame clock shows a hole: frames it built never got here — dropped from its send queue while
+// the link was stalled, or this client was away or backgrounded. Nothing can replay them
+// (AsyncEventSource does not queue for absent clients), so the missing span can only be marked.
 function insertStreamGap(gapSec) {
     for (const b of [currentTempData, voltageData, rpmData, temperatureData, pidTuningData, cvTuningData, cvPidData]) {
         if (!b || !b[1]) continue;
@@ -7388,19 +7563,36 @@ function processCSVDataOptimized(data) {
         // Measure actual inter-arrival time and update lerpDuration for all plots.
         // Clamp to [100, 1000]ms to avoid wild values at startup or after long gaps.
         const _arrivalNow = performance.now();
+        // Two clocks. The regulator stamps every CSV1 frame with its own millis (sendMs) and a
+        // per-frame counter (WifiHeartBeat), so a hole in THOSE means frames were built and never got
+        // here: dropped from the regulator's send queue while the link was stalled, or this client was
+        // away. A hole in arrival time alone means the frames were held by a TCP retransmit stall on
+        // the WiFi path and then delivered in one burst - nothing is missing, so no seam: a seam there
+        // would mark data as absent that is on screen. Arrival time is the fallback only when the
+        // device clock went backwards (reboot) or the frame carries no sendMs (older firmware).
+        const sendMs = Number(data.sendMs);
+        const hb = Number(data.WifiHeartBeat);
         if (processCSVDataOptimized._lastArrival > 0) {
             const measured = _arrivalNow - processCSVDataOptimized._lastArrival;
             // 4 intervals of slack absorbs ordinary SSE jitter; the 1.5 s floor keeps a fast
             // gauge interval from marking a gap on every hiccup.
             const gapLimit = Math.max(4 * (window._lastKnownInterval || 200), 1500);
-            if (measured > gapLimit) {
-                // WifiHeartBeat increments once per CSV1 frame the FIRMWARE sends, so its delta across
-                // the seam says where the frames went: ~1 = they were sent and arrived late (this tab
-                // blocked), ~gap/interval = they were sent and dropped in flight and never got here.
-                const hb = Number(data.WifiHeartBeat);
-                const hbPrev = processCSVDataOptimized._lastHb;
-                console.warn('[SSE GAP] ' + measured.toFixed(0) + ' ms | heartbeat ' + hbPrev +
-                             ' -> ' + hb + ' (delta ' + (hb - hbPrev) + ')');
+            const devDelta = sendMs - processCSVDataOptimized._lastSendMs;   // NaN when either side is unknown
+            const hbPrev = processCSVDataOptimized._lastHb;
+            const framesLost = (hb - hbPrev) - 1;                             // frames built between these two that never arrived
+            if (devDelta >= 0) {
+                // The device clock is exact, so the floor is tighter than the arrival path: a 1 s hole
+                // is ten dropped frames. Below that the positional plot just runs a few frames short.
+                if (devDelta > Math.max(4 * (window._lastKnownInterval || 200), 1000)) {
+                    console.warn('[SSE GAP] ' + Math.round(devDelta) + ' ms of frames missing | heartbeat ' + hbPrev +
+                                 ' -> ' + hb + ' (' + framesLost + ' frames never arrived) | arrival gap ' + measured.toFixed(0) + ' ms');
+                    insertStreamGap(devDelta / 1000);
+                } else if (measured > gapLimit) {
+                    console.warn('[SSE LATE] frames held ' + measured.toFixed(0) + ' ms then delivered in a burst (link retransmit stall) - nothing missing, no seam');
+                }
+            } else if (measured > gapLimit) {
+                console.warn('[SSE GAP] ' + measured.toFixed(0) + ' ms by arrival time (device clock unusable) | heartbeat ' + hbPrev +
+                             ' -> ' + hb);
                 insertStreamGap(measured / 1000);
             }
             const clamped = Math.max(100, Math.min(1000, measured));
@@ -7413,7 +7605,8 @@ function processCSVDataOptimized(data) {
             plotInterp.cvpid.lerpDuration       = clamped;
         }
         processCSVDataOptimized._lastArrival = _arrivalNow;
-        processCSVDataOptimized._lastHb = Number(data.WifiHeartBeat);
+        processCSVDataOptimized._lastHb = hb;
+        processCSVDataOptimized._lastSendMs = sendMs;
 
         // ALWAYS UPDATE DATA STRUCTURES - Current/Temperature plot data
         // null (not 0) when there is no battery shunt — uPlot renders a gap, and a flat 0 A trace
@@ -8739,20 +8932,21 @@ document.addEventListener('input', function (e) {
 }, true);
 
 //this allows user to turn the alternator OFF even without entering a passoword, for safety reasons, but not ON
-// Master switch, expanded header (#header-onoff) and collapsed strip (#hcs-onoff). It looks like a
-// sliding toggle but it is two half-width buttons: the left half always sends OnOff=0 and the right half
-// always sends OnOff=1 — what the control is painting never decides what a press sends. (A checkbox
-// slider sends the opposite of whatever it happens to show, and a paint that lagged or reverted turned
-// an intended OFF into an ON — bench, 2026-09-15.) Display: the knob and the track fill are the
-// regulator's own OnOff from CSV1 (~10 Hz, the same frame as the field-status word), and the knob stays
-// hidden until the first frame rather than defaulting to a position we have not been told; the pressed
-// half holds a ring until the regulator echoes it or the echoReconcile grace runs out. Nothing in this
+// Master switch, expanded header (#header-onoff) and collapsed strip (#hcs-onoff). A segmented pair of
+// buttons, never a slider: the left half always sends OnOff=0 and the right half always sends OnOff=1 —
+// what the control is painting never decides what a press sends. (A checkbox slider sends the opposite
+// of whatever it happens to show, and a paint that lagged or reverted turned an intended OFF into an
+// ON — bench, 2026-09-15.) Display: the filled half, its state word and its aria-pressed are the
+// regulator's own OnOff from CSV1 (~10 Hz, the same frame as the field-status word); before the first
+// frame nothing is filled and both halves read as offers, rather than defaulting to a state we have not
+// been told; the pressed half holds a ring until the regulator echoes it or the echoReconcile grace
+// runs out. Nothing in this
 // path sends on a paint, a resync, a timeout or a failure — only a press sends, and it sends once.
 // OFF is the safety override: no arming, no confirm, no condition — one fetch.
 // src/n: this tab's page-load nonce and its press counter, logged by the firmware next to the write and
 // used there to drop an ON that arrives out of order or twice (an OnOff=1 landed 32 ms after the user's
 // OnOff=0 and re-energized the field). OFF is never gated.
-let g_onOffDevice = null;   // last OnOff the regulator reported (CSV1); null until the first frame
+let g_onOffDevice = null;   // last OnOff the regulator reported (a CSV1 frame, or a write reply); null until the first of either
 const g_clientTabId = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
 let g_clientWriteN = 0;
 function clientWriteTag() { return '&src=' + g_clientTabId + '&n=' + (++g_clientWriteN); }
@@ -8769,16 +8963,56 @@ function clientWriteTag() { return '&src=' + g_clientTabId + '&n=' + (++g_client
 // Only a SILENT failure is retried. Any HTTP status is the regulator answering and is never re-sent.
 const CONTROL_WRITE_TRIES = 3;
 const CONTROL_WRITE_TIMEOUT_MS = 1600;   // ~10x the worst observed reply; 3 tries stays inside the old 5 s
-function sendControlWrite(url, myN) {
+// Hedge: send a SECOND copy of the same url while the first is still unanswered, rather than sitting out
+// the full 1600 ms timeout waiting for an answer that is never coming. A press that dies in the air is
+// the common failure, not a refusal. 500 ms because the widest loss burst in the 2026-09-16 hotspot
+// capture was two consecutive 5 Hz pings (under 400 ms) and the phone's own SYN retransmit is ~1 s — a
+// hedge fired inside the burst would just be lost alongside the original. First attempt only: past that
+// the link is bad, more copies buy less than they cost, and every duplicate that DOES land writes a line
+// into the 200-line /consolehist.txt ring. Safe by construction, not by luck — the url, and therefore its
+// n, is built once by the caller, so the firmware's clientWriteTrack drops a copy whose n it already
+// applied, and an OFF is idempotent regardless. One cost: with EVERY copy silent the no-answer alert
+// now takes ~5.3 s instead of ~4.8 s, because the hedge's copy outlives the first by its own offset.
+const CONTROL_WRITE_HEDGE_MS = 500;
+// onDeviceState (optional): called at most once with the 0/1 the regulator put in its reply body. Any
+// copy's answer serves — they carry the same command. See alternatorSet for why the reply is painted.
+function sendControlWrite(url, myN, onDeviceState) {
     let attempt = 0;
+    let reported = false;
+    const readState = r => {
+        if (!onDeviceState || reported || !r || !r.ok || typeof r.text !== 'function') return;
+        r.text().then(body => {
+            const t = String(body).trim();
+            // A copy the firmware dropped as a duplicate answers 200 with an EMPTY body (its handler
+            // never sets inputMessage). That is the guard working, not an error — but it is not a STATE
+            // either, and Number("") is 0, so a numeric parse reads an ignored ON as "the field is off"
+            // and paints it. Exact string match only; anything else carries no information.
+            if (reported || (t !== '0' && t !== '1')) return;
+            const v = Number(t);
+            reported = true;
+            onDeviceState(v);
+        }).catch(() => {});
+    };
     const once = () => {
         attempt++;
-        return fetchWithTimeout(url, {}, CONTROL_WRITE_TIMEOUT_MS)
-            .catch(err => {
-                if (myN !== g_clientWriteN) return { superseded: true };
-                if (attempt >= CONTROL_WRITE_TRIES) throw err;
-                return once();
-            });
+        let done = false;   // this attempt has an answer (or has given up); stops the hedge and a double settle
+        return new Promise((resolve, reject) => {
+            let inFlight = 1;
+            const onAnswer = r => { readState(r); if (done) return; done = true; resolve(r); };
+            const onSilence = err => { inFlight--; if (!done && inFlight === 0) { done = true; reject(err); } };
+            fetchWithTimeout(url, {}, CONTROL_WRITE_TIMEOUT_MS).then(onAnswer, onSilence);
+            if (attempt === 1) {
+                setTrackedTimeout(() => {
+                    if (done || myN !== g_clientWriteN) return;   // answered, or a newer press owns the outcome
+                    inFlight++;
+                    fetchWithTimeout(url, {}, CONTROL_WRITE_TIMEOUT_MS).then(onAnswer, onSilence);
+                }, CONTROL_WRITE_HEDGE_MS);
+            }
+        }).catch(err => {
+            if (myN !== g_clientWriteN) return { superseded: true };
+            if (attempt >= CONTROL_WRITE_TRIES) throw err;
+            return once();
+        });
     };
     return once();
 }
@@ -8793,6 +9027,10 @@ function paintOnOff(v, pendingV) {
     });
     document.querySelectorAll('#header-onoff .onoff-half, #hcs-onoff .onoff-half').forEach(b => {
         b.classList.toggle('onoff-pending', Number(b.dataset.v) === pendingV);
+        // The fill and the state word are the sighted channels; aria-pressed is the third one. Only
+        // set once the device state is known — an unknown state must announce neither half as current.
+        if (known) b.setAttribute('aria-pressed', Number(b.dataset.v) === v ? 'true' : 'false');
+        else b.removeAttribute('aria-pressed');
     });
 }
 
@@ -8806,19 +9044,64 @@ function alternatorSet(want) {
     const settle = () => { pendingToggles.delete('OnOff'); paintOnOff(g_onOffDevice); };
     const url = buildURL('/get?OnOff=' + want + clientWriteTag());
     const myN = g_clientWriteN;   // the press counter clientWriteTag() just minted for THIS url
-    sendControlWrite(url, myN)
+    // The regulator answers this write with its own OnOff, written AFTER the handler changed the
+    // variable ("0" / "1", the /get handler in 3_functions.ino). That reply is device truth in exactly
+    // the sense a CSV1 frame is, and it is causally later than the write — but it comes back on its own
+    // fresh connection instead of the stream's. The stream is what stalls: lwIP holds it through a
+    // retransmit for 1.5-4.5 s on a lossy hop, ~11 % of the time in the 2026-09-16 hotspot capture. That
+    // is where "I pressed it and nothing happened" comes from — the field had already obeyed and the echo
+    // was stuck behind a held socket. So the reply paints too. It is still never a guess: only a body of
+    // exactly 0 or 1, and only while this press is still this tab's newest. The pendingToggles entry is
+    // deliberately LEFT in place, so echoReconcile goes on shielding this paint from a CSV1 frame that was
+    // built before the write landed; the next frame that agrees settles it, and a protection that cuts the
+    // field right afterwards still shows up on its own frame.
+    const paintFromReply = v => {
+        if (myN !== g_clientWriteN) return;   // a newer press owns the paint
+        const pending = pendingToggles.get('OnOff');
+        if (!pending) return;                 // the stream already settled this press, and it is fresher than this reply
+        // Order this paint against the stream on the REGULATOR's clock, not the browser's. Every frame
+        // carries the device's own millis (sendMs); interpolating from the last one gives device-now, and
+        // the reply is already in hand, so the write was applied at or before that instant. A frame
+        // stamped EARLIER was built before the write and must not undo this paint. The first frame stamped
+        // at or after it is the stream catching up and wins outright, agreeing or not — which is what
+        // stops a SECOND writer's change from hiding behind echoReconcile's 2.5 s grace (tab A presses ON,
+        // tab B presses OFF 25 ms later: without this, A sits on its own stale ON for the whole grace).
+        // No usable device clock yet means no way to place this paint in time, so let the stream win
+        // outright instead: a brief flip to the pre-write state is survivable, a lie for 2.5 s is not.
+        const lastSend = processCSVDataOptimized._lastSendMs;
+        const lastArrival = processCSVDataOptimized._lastArrival;
+        if (Number.isFinite(lastSend) && lastArrival > 0) {
+            pending.deviceFloorMs = lastSend + (performance.now() - lastArrival);
+            // A reboot restarts sendMs near zero, so without an escape every later frame would sit below
+            // the floor forever and the switch would stop repainting. sessionId IS the boot identity, so
+            // test that directly rather than guessing with a stopwatch: the device holds a stalled client
+            // for 20 s (setAckTimeout in events.onConnect), so a frame delivered LATE can legitimately be
+            // that old, and any wall-clock backstop short enough to be useful would fire on those instead.
+            pending.floorSessionId = (g_lastCsv1 && g_lastCsv1.sessionId !== undefined) ? Number(g_lastCsv1.sessionId) : undefined;
+            pending.floorSetAt = Date.now();   // belt for the one case sessionId cannot see: 32-bit millis wrapping at ~49.7 days
+        } else {
+            pendingToggles.delete('OnOff');
+        }
+        g_onOffDevice = v;
+        paintOnOff(g_onOffDevice);
+    };
+    sendControlWrite(url, myN, paintFromReply)
         .then(r => {
             if (r.superseded) return;   // a newer press is in flight and owns the outcome
+            if (myN !== g_clientWriteN) return;   // same, for an answer that DID arrive: it is the old press's outcome, not this one's
             if (r.ok) return;
             settle();
             if (r.status === 403) {
-                // settingsUnlocked only MIRRORS a window the device owns and closes on its own 30-minute
-                // timer, so the mirror never decides anything here: the write goes out and only the
-                // device's own refusal is reported. Re-sync the mirror now that it is known stale.
+                // settingsUnlocked only MIRRORS a window the device owns, so the mirror never decides
+                // anything here: the write goes out and only the device's own refusal is reported. A 403
+                // means the device is locked — another client locked it, or it rebooted. Re-sync now.
                 syncArmState();
                 // xAlert("Settings must be unlocked to turn alternator ON");   // i find this intrusive
-                xAlert('The regulator refused this — its settings window has closed. Press Unlock Settings, then press ON again.',
+                xAlert('The regulator refused this — its settings are locked. Press Unlock Settings, then press ON again.',
                        'Alternator NOT enabled');
+            } else if (r.status === 409) {
+                xAlert('That command reached a different regulator than the one shown here, and it refused it. The alternator was NOT changed. Open this regulator at its own address (Setup \u25b8 System \u25b8 This Regulator) and try again.',
+                       'Wrong regulator');
             } else {
                 xAlert('The regulator rejected the request (HTTP ' + r.status + '). The alternator was NOT changed.',
                        'Alternator NOT changed');
@@ -8841,7 +9124,8 @@ function hideSettingsAccess() {
 function showSettingsAccess() {
     document.getElementById('settings-access-section').style.display = 'block';
 }
-// UI half of relocking — also driven by syncArmState() when the device's 30-min window expires.
+// UI half of relocking — also driven by syncArmState() when another client locks, or the device
+// rebooted (the gate is RAM-only, so a reboot always comes back locked).
 function applySettingsLockUI() {
     const section = document.getElementById('settings-section');
     if (section) section.classList.add("locked");
@@ -9864,7 +10148,7 @@ function battDefRowState(cfg, row) {
 // 12 s turns the box amber and offers a close X so a stalled chain is not a trap.
 let _vesselWaitShowTimer = null;
 let _vesselWaitTailTimer = null;
-function vesselNextStepWait(on) {
+function vesselNextStepWait(on, copy) {
     if (_vesselWaitShowTimer !== null) { clearTrackedTimeout(_vesselWaitShowTimer); _vesselWaitShowTimer = null; }
     if (_vesselWaitTailTimer !== null) { clearTrackedTimeout(_vesselWaitTailTimer); _vesselWaitTailTimer = null; }
     const ov = document.getElementById('nextstep-modal-overlay');
@@ -9878,15 +10162,27 @@ function vesselNextStepWait(on) {
         const sub = document.getElementById('nextstep-sub');
         const x = document.getElementById('nextstep-close-btn');
         // Reset every escalated field: the same box is reused for each gap in the chain.
-        title.textContent = 'Loading the Next Step';
+        const c = copy || {};
+        title.textContent = c.title || 'Loading the Next Step';
         dots.style.color = '#35d6c7';
         head.style.color = '#e8e8e8';
-        head.innerHTML = 'Setting up &mdash; the next screen opens by itself.';
-        sub.textContent = 'Regulator busy — wait a few seconds and stay on this page';
+        head.innerHTML = c.head || 'Setting up &mdash; the next screen opens by itself.';
+        sub.textContent = c.sub || 'Regulator busy — wait a few seconds and stay on this page';
         x.style.display = 'none';
         ov.style.display = 'flex';
+        // A caller with its own copy opts into its own escalation: passing no tail means the wait is
+        // expected to be long (a measurement, not a round trip) and must not go amber partway through.
+        if (copy && !c.tail) return;
         _vesselWaitTailTimer = setTrackedTimeout(() => {
             _vesselWaitTailTimer = null;
+            if (c.tail) {
+                title.textContent = c.tail.title;
+                dots.style.color = '#f0b86a';
+                head.style.color = '#f0b86a';
+                head.textContent = c.tail.head;
+                sub.textContent = c.tail.sub;
+                return;
+            }
             title.textContent = 'Still Waiting on the Regulator';
             dots.style.color = '#f0b86a';
             head.style.color = '#f0b86a';
@@ -12282,6 +12578,7 @@ function fieldOffReasonText(reasonCode) {
         case 22: return 'sustained overvoltage — timed cut (low tier)';
         case 23: return 'sustained overvoltage — timed cut (mid tier)';
         case 24: return 'too hot to charge';
+        case 25: return 'charge cycle complete — battery full, resting (switch off and on to charge again)';
         // 0 NONE (transient), 11 MANUAL (shown as its own status word) — no OFF annotation
         default: return '';
     }
@@ -15082,8 +15379,9 @@ function applySettingsUnlockUI() {
     hideSettingsAccess();
 }
 
-// The Unlock Settings button — arms the device's 30-min settings write window (the arm
-// state lives in firmware, so stale/replayed URLs from other tabs stay rejected while locked).
+// The Unlock Settings button — arms the device's settings write window (the arm state lives in
+// firmware, so stale/replayed URLs from other tabs stay rejected while locked). It stays armed
+// until Lock Settings, another client's lock, or a reboot — nothing relocks on a timer.
 function armSettings() {
     const button = document.getElementById('settings_arm_btn');
     const msg = document.getElementById('settings_arm_msg');
@@ -15100,7 +15398,6 @@ function armSettings() {
         })
         .then(j => {
             if (j && j.armed) applySettingsUnlockUI();
-            renderArmLockNotice(j);
             if (button) button.disabled = false;
         })
         .catch(err => {
@@ -15116,7 +15413,7 @@ function armSettings() {
 }
 
 // Keep the UI's lock state honest against the device: unlock after a reload into a
-// still-armed window, relock when the 30-min window expires or another client disarms.
+// still-armed window, relock when another client disarms or the device has rebooted.
 function syncArmState() {   // returns the round trip so a caller that must see a fresh mirror can await it
     if (DEMO_MODE) return Promise.resolve();
     return fetchWithTimeout(buildURL('/armSettings'), {}, 8000)   // bounded: openCommPrereqs awaits this, and a hung request would park the first-install chain
@@ -15125,40 +15422,8 @@ function syncArmState() {   // returns the round trip so a caller that must see 
             if (!j) return;
             if (j.armed && !settingsUnlocked) applySettingsUnlockUI();
             else if (!j.armed && settingsUnlocked) applySettingsLockUI();
-            renderArmLockNotice(j);
         })
         .catch(() => {});
-}
-
-// The auto-lock notice is ONE flag on the device, not one per browser: the window running out is
-// a device event, so every client that arrives sees it and any one of them can clear it. Per-client
-// (sessionStorage) would leave the device flag set forever, and a lock from last week would greet
-// every new tab. Two phones therefore see it once each, and the first ✕ settles it for both.
-let armLockAcked = false;   // local mute covering the gap between the ✕ and the device confirming
-
-function renderArmLockNotice(j) {
-    const el = document.getElementById('armlock-notice');
-    if (!el) return;
-    if (!j || !j.lockNotice) { armLockAcked = false; el.style.display = 'none'; return; }
-    if (armLockAcked) return;   // an in-flight poll answered before the ack must not bring it back
-    const ep = Number(j.lockEpoch);
-    // Same 2020 floor the device-clock readout uses: firmware sends 0 when no source has ever set
-    // the clock, and a garbage epoch must print no time rather than a 1970 date stated as fact.
-    const when = (Number.isFinite(ep) && ep > 1577836800)
-        ? ' at ' + new Date(ep * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-          + ' on ' + new Date(ep * 1000).toLocaleDateString()
-        : '';
-    const txt = document.getElementById('armlock-notice-text');
-    if (txt) txt.textContent = 'Settings locked themselves' + when
-        + ' — the 30 minute window ran out with no interface connected. Press Unlock Settings before making changes.';
-    el.style.display = 'block';
-}
-
-function dismissArmLockNotice() {
-    armLockAcked = true;
-    const el = document.getElementById('armlock-notice');
-    if (el) el.style.display = 'none';
-    if (!DEMO_MODE) fetch(buildURL('/armSettings?ackLock=1')).catch(() => { });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -16077,10 +16342,11 @@ async function confirmVoltageRescale(oldV, newV) {
         + line('Timed OV cut LOW margin', 'OvTierLoMarginV_echo') + '\n'
         + line('Timed OV cut MID margin', 'OvTierMidMarginV_echo') + '\n\n'
         + 'These field-duty settings also rescale (inversely) so field current stays constant:\n'
-        + dline('Max Field', 'MaxDuty_echo', '%') + '\n'
         + dline('Min Field', 'MinDuty_echo', '%') + '\n'
         + dline('Duty ramp rate', 'DutyRampRate_echo', '%/s') + '\n'
         + dline('Slow duty ramp rate', 'DutySlowRampRate_echo', '%/s') + '\n\n'
+        + 'Max Field % and Max Field Volts are left alone: they describe the alternator, not the bank, '
+        + 'and the field ceiling re-derives from Max Field Volts against the new system voltage.\n\n'
         + 'IT ALSO ERASES THESE, and they cannot be recovered:\n'
         + '  - Your commissioned tachometer keep-alive floor table, and the learning behind it. It goes back '
         + 'to the flat 1% default and the Keep-Alive Floor step has to be run again.\n'
@@ -16890,8 +17156,29 @@ window.addEventListener("load", function () {
             // PAINT waits behind a pending press (echoReconcile), and a paint never sends anything.
             if (data.OnOff !== undefined) {
                 g_onOffDevice = Number(data.OnOff);
-                const onoffEcho = echoReconcile('OnOff', g_onOffDevice);
-                if (onoffEcho !== null) paintOnOff(onoffEcho);   // confirmed, or grace expired: the pressed outline clears
+                // deviceFloorMs is set only when a write REPLY painted the switch (alternatorSet): the
+                // device clock at the moment the regulator answered, so the write was already applied by
+                // then. A frame stamped before that is older than what is on screen and is dropped. The
+                // first frame stamped at or after it is newer than the reply and wins whether it agrees or
+                // not, so another client's change lands on the next frame instead of waiting out the grace.
+                const onoffPending = pendingToggles.get('OnOff');
+                const onoffFloor = onoffPending ? onoffPending.deviceFloorMs : undefined;
+                const frameSendMs = Number(data.sendMs);
+                if (onoffFloor !== undefined && Number.isFinite(frameSendMs)) {
+                    // Two escapes from a floor the device clock can no longer be compared against: a
+                    // different boot (sendMs restarted), and 30 s of wall clock for a millis wrap. 30 s
+                    // clears the device's own 20 s hold on a stalled client, so a legitimately held frame
+                    // is still judged on its stamp rather than let through by the clock running out.
+                    const rebooted = onoffPending.floorSessionId !== undefined
+                                     && Number(data.sessionId) !== onoffPending.floorSessionId;
+                    if (frameSendMs >= onoffFloor || rebooted || Date.now() - onoffPending.floorSetAt > 30000) {
+                        pendingToggles.delete('OnOff');
+                        paintOnOff(g_onOffDevice);
+                    }
+                } else {
+                    const onoffEcho = echoReconcile('OnOff', g_onOffDevice);
+                    if (onoffEcho !== null) paintOnOff(onoffEcho);   // confirmed, or grace expired: the pressed outline clears
+                }
             }
 
             // Field OFF ≠ a fault by itself — annotate WHY, from the firmware FieldEventReason (CSV1)
@@ -17422,6 +17709,11 @@ window.addEventListener("load", function () {
                     else if (key === "tempPIDInput_d" || key === "tempPIDSetpoint_d") {
                         newTextContent = toDisplayTemp(value / 100).toFixed(1);
                     }
+                    // INA228 die temperature °F ×10 — a tenth is worth showing here: this is the
+                    // channel used to tell chip self-heating apart from a real bus-voltage change
+                    else if (key === "inaDieTempF" || key === "inaDieTempMaxF") {
+                        newTextContent = toDisplayTemp(value / 10).toFixed(1);
+                    }
                     // Values scaled by 100 on server (existing)
                     else if (["IBVMax", "ChargeCycles", "ChargeCycles_AllTime", "thermalPenaltyAmps", "MeasuredAmpsMax", "SOC_percent", "VictronCurrent", "performanceRatio", "UVThresholdHigh",
                         "PeakVoltage_AllTime", "MinVoltage", "MinVoltage_AllTime", "AvgSOC_AllTime", "AvgSpeed_AllTime", "InsulationLifePercent", "GreaseLifePercent",
@@ -17648,6 +17940,8 @@ window.addEventListener("load", function () {
                 ["SOC_percentID", "SOC_percent"],
                 ["header-soc", "SOC_percent"],
                 ["ambientTempID", "ambientTemp"],
+                ["inaDieTempF_ID", "inaDieTempF"],
+                ["inaDieTempMaxF_ID", "inaDieTempMaxF"],
                 ["baroPressureID", "baroPressure"],
                 ["firmwareVersionIntID", "firmwareVersionInt"],
                 ["deviceIdUpperID", "deviceIdUpper"],
@@ -18144,30 +18438,42 @@ window.addEventListener("load", function () {
                 const tRaw = Number(data.n2kRxBattTempF);
                 set2('n2kRxBattTempF_ID', (data.n2kRxBattTempF === undefined || tRaw <= NA) ? '—' : toDisplayTemp(tRaw / 10).toFixed(1) + ' ' + tempUnitLabel());
                 const soc = Number(data.n2kRxSoc);
-                set2('n2kRxSoc_ID', (data.n2kRxSoc === undefined || soc < 0) ? '—' : soc + ' %');
+                set2('n2kRxSoc_ID', (data.n2kRxSoc === undefined || soc < 0) ? '—' : soc + '\u00A0%');
             })();
 
-            // Field Ceiling — Setup → the read-only row under the two field caps. Naming which cap is
-            // binding is the whole point of the row: the Max Field (%) box stopped being the sole
-            // enforced ceiling when Max Field Volts arrived, so without this the loop obeys a bound
-            // neither box shows. Compared with a tolerance because the volts term is a filtered
-            // quotient and lands a hair off an integer Max Field %.
+            // Field caps — Setup → the Max Field (%) and Max Field Volts rows. The loop enforces the
+            // lower of the two (CSV2 fieldDutyCeil), so mark the one that is limiting right now and show
+            // what the volts cap works out to against the live bus beside its value: without that the
+            // loop obeys a bound neither box shows. Compared with a tolerance because the volts term is
+            // a filtered quotient and lands a hair off an integer Max Field %. The echo span, NOT
+            // getElementById('MaxDuty') — that resolves to the legacy hidden input at the bottom of
+            // index.html, which nothing populates (always "0"). Same idiom as altSweepSyncCeiling.
             (function () {
-                const el = document.getElementById('fieldDutyCeil_echo');
-                if (!el || data.fieldDutyCeil === undefined) return;
+                if (data.fieldDutyCeil === undefined) return;
                 const ceil = Number(data.fieldDutyCeil) / 100;
                 if (!Number.isFinite(ceil) || ceil < 0) return;
-                el.textContent = ceil.toFixed(1);
-                const src = document.getElementById('fieldDutyCeil_source');
-                if (src) {
-                    // The echo span, NOT getElementById('MaxDuty') — that resolves to the legacy
-                    // hidden input at the bottom of index.html, which nothing populates (always "0",
-                    // so the volts branch could never be reached). Same idiom as altSweepSyncCeiling.
-                    const maxDuty = parseFloat(getField('MaxDuty_echo'));
-                    const txt = (Number.isFinite(maxDuty) && ceil < maxDuty - 0.05)
-                        ? 'set by Max Field Volts' : 'set by Max Field (%)';
-                    if (src.textContent !== txt) src.textContent = txt;
+                const maxDuty = parseFloat(getField('MaxDuty_echo'));
+                const voltsLimiting = Number.isFinite(maxDuty) && ceil < maxDuty - 0.05;
+                const tagD = document.getElementById('MaxDuty_limiting');
+                const tagV = document.getElementById('MaxFieldVolts_limiting');
+                if (tagD) tagD.classList.toggle('on', !voltsLimiting);
+                if (tagV) tagV.classList.toggle('on', voltsLimiting);
+                const asDuty = document.getElementById('MaxFieldVolts_asDuty');
+                if (!asDuty) return;
+                // While the volts cap is limiting, the enforced ceiling IS its duty — use it exactly.
+                // Otherwise solve 100 × volts / bus here, capped at the 99% bootstrap limit like the
+                // firmware term; the bus is the INA228 reading the firmware solves against (IBV), off
+                // the 1 s frame rather than the firmware's 2 s filter, so it can differ by ripple.
+                let d = NaN;
+                if (voltsLimiting) {
+                    d = ceil;
+                } else {
+                    const mfv  = parseFloat(getField('MaxFieldVolts_echo'));
+                    const busV = parseFloat(getField('IBVID') ?? getField('BatteryVID'));
+                    if (Number.isFinite(mfv) && Number.isFinite(busV) && busV > 1) d = Math.min(99, 100 * mfv / busV);
                 }
+                const txt = Number.isFinite(d) ? d.toFixed(1) : '?';
+                if (asDuty.textContent !== txt) asDuty.textContent = txt;
             })();
 
             // NMEA 0183 link health — Live Data → Integrations. The two counters are the whole point:
@@ -18337,7 +18643,7 @@ window.addEventListener("load", function () {
             const thermBindS = parseFloat(data.accThermBindS) || 0;
             const thermInbS = parseFloat(data.accThermInbandS) || 0;
             const thermCont = 100 * thermInbS / Math.max(thermBindS, 0.001);
-            accCell('accThermTrk', thermCont.toFixed(1) + ' %', thermCont, 95, 85, true, thermBindS);
+            accCell('accThermTrk', thermCont.toFixed(1) + '\u00A0%', thermCont, 95, 85, true, thermBindS);
             accCovLine('accThermSess_c', thermBindS > 0 || (parseInt(data.accThermSess) || 0) > 0
                 ? String(parseInt(data.accThermSess) || 0) : '—');
             accCovLine('accThermCov', (parseInt(data.accThermSess) || 0) + ' containment session'
@@ -18455,7 +18761,7 @@ window.addEventListener("load", function () {
             updateTestActivePanel();
 
             updateFirmwareVersion(data.firmwareVersionInt);
-            updateDeviceId();
+            updateDeviceId(data.deviceIdUpper, data.deviceIdLower);
         }, false);
 
         // CSVData4 / NavStream — live nav/wind/solar/fuel at 2 Hz (500 ms); updates the dial/compass/
@@ -20665,6 +20971,7 @@ function manualFieldToggleApply(cb, manual) {
     sendControlWrite(url, myN)
         .then(r => {
             if (r.superseded) return;
+            if (myN !== g_clientWriteN) return;   // an answer to a press a newer one has already replaced
             if (r.ok) return;
             repaint();
             if (r.status === 403) {
@@ -23396,6 +23703,70 @@ function validateAndSubmitFieldCollapseDelay(form) {
     }
     submitMessage();
     return true;
+}
+
+// ── Over-voltage ladder: the two rungs move together ─────────────────────────
+// The software cut (AlternatorHardShutdownV) must sit 0.05 V x class/12 under the hardware backstop
+// (VoltageHardwareLimit), and the /get handler clamps it on every write — so typing a software cut at
+// or above the backstop put the old value straight back in the echo with nothing on this page saying
+// why (the clamp only speaks on the console). Same rule here, ahead of the submit: offer the joint
+// move, which the handler reads as one request and so cannot clamp against the value being replaced,
+// or say plainly that the backstop is at its ceiling. Band and ceiling mirror 3_functions.ino.
+const OV_LADDER_HW_MAX = 70;     // firmware constrain() on VoltageHardwareLimit
+function ovLadderBand() { return 0.05 * ((parseInt(window._nominalStored, 10) || 12) / 12); }
+
+function submitOvLadderRung(form, rung) {
+    const isSw = (rung === 'sw');
+    const name = isSw ? 'AlternatorHardShutdownV' : 'VoltageHardwareLimit';
+    const input = form.querySelector('[name="' + name + '"]');
+    if (!input) return true;
+    const v = parseFloat(input.value);
+    if (!Number.isFinite(v)) { showValidationError('Please enter a valid number.'); return false; }
+    const band = ovLadderBand();
+    const r2 = n => n.toFixed(2);
+
+    if (isSw) {
+        const hw = getEchoNumber('VoltageHardwareLimit_echo');
+        if (!Number.isFinite(hw) || v <= hw - band + 1e-6) { submitMessage(); return true; }
+        const needHw = Math.round((v + band) * 100) / 100;
+        if (needHw > OV_LADDER_HW_MAX) {
+            showValidationError(r2(v) + ' V was not set. The Alternator Hard Shutdown Voltage has to stay '
+                + r2(band) + ' V below the Hardware Shutdown Voltage, and that backstop is already at its '
+                + r2(OV_LADDER_HW_MAX) + ' V maximum — so the software cut can go no higher than '
+                + r2(OV_LADDER_HW_MAX - band) + ' V.');
+            return false;
+        }
+        xConfirm('The Alternator Hard Shutdown Voltage has to stay ' + r2(band) + ' V below the Hardware Shutdown Voltage ('
+            + r2(hw) + ' V), so software always cuts the field before the hardware backstop does.\n\n'
+            + 'Set both: Alternator Hard Shutdown ' + r2(v) + ' V, Hardware Shutdown ' + r2(needHw) + ' V?\n\n'
+            + 'The hardware rung is the last line of defence — keep it below your battery\'s BMS charge-disconnect voltage.',
+            { title: 'Raise the hardware backstop too?', okText: 'Set both', cancelText: 'Cancel' })
+            .then(ok => { if (ok) ovLadderJointSubmit(form, 'VoltageHardwareLimit', needHw); });
+        return false;
+    }
+
+    // Hardware rung: dropping it onto the software cut drags that cut down with it.
+    const sw = getEchoNumber('AlternatorHardShutdownV_echo');
+    if (!Number.isFinite(sw) || sw <= v - band + 1e-6) { submitMessage(); return true; }
+    const newSw = Math.round((v - band) * 100) / 100;
+    xConfirm('Setting the Hardware Shutdown Voltage to ' + r2(v) + ' V also lowers the Alternator Hard Shutdown Voltage from '
+        + r2(sw) + ' V to ' + r2(newSw) + ' V — the software cut has to stay ' + r2(band) + ' V below the hardware backstop.',
+        { title: 'This moves both rungs', okText: 'Set both', cancelText: 'Cancel' })
+        .then(ok => { if (ok) ovLadderJointSubmit(form, 'AlternatorHardShutdownV', newSw); });
+    return false;
+}
+
+// The second rung rides the same hidden-iframe submit as the visible one, so both arrive in ONE /get.
+// form.submit() serializes synchronously, so the field can leave again on the next tick.
+function ovLadderJointSubmit(form, name, value) {
+    const extra = document.createElement('input');
+    extra.type = 'hidden';
+    extra.name = name;
+    extra.value = value.toFixed(2);
+    form.appendChild(extra);
+    form.submit();
+    submitMessage();
+    setTimeout(() => extra.remove(), 0);
 }
 
 function updateFloatVisibility(pendingVal) {
@@ -30274,6 +30645,77 @@ function cvsPreLive() {
                : ' <span style="color:#f0a500;">(start the engine first)</span>');
 }
 
+// ===== Measured current-sensor zero (engine running, field at 0%) =====
+// The device captures the alternator sensor's zero by itself in every quiet field-off window from
+// the Min% floor & Field decay stage onward, keeping the newest, so what stands at Finish is the
+// last and warmest capture of the run. Offered here while the engine is still running; if nothing
+// was captured (that stage was skipped, or the field never rested long enough between tests) one is
+// measured on the spot. Declining costs nothing and the offset stays where it was. The number goes
+// into AlternatorCOffset as a delta; the learned temp-comp fit stays a drift tracker on top of it.
+const CX_ALTZERO_MIN_RPM = 400;   // mirrors ALTZERO_MIN_RPM in Xregulator.ino
+
+function cxZeroState() {
+    return fetch(buildURL('/zerofitstate')).then(r => r.json()).catch(() => null);
+}
+
+function cxAltZeroWhere(j) {
+    const t = (j.capAltF === null || j.capAltF === undefined) ? j.capBoardF : j.capAltF;
+    return Math.round(Number(j.capRpm)) + ' RPM'
+        + ((t === null || t === undefined) ? '' : ' and ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel());
+}
+
+// Arms one window and waits it out behind the shared setup wait box: a silent gap between two
+// popups in this chain reads as a finished step.
+async function cxAltZeroRun() {
+    await cxGet('AltZeroCaptureNow=1').catch(() => { });
+    vesselNextStepWait(true, {
+        title: 'Measuring the Sensor Zero',
+        head: 'Keep the engine running with the field off.',
+        sub: 'About fifteen seconds. Hold the throttle steady and stay on this page.'
+    });
+    try {
+        const deadline = Date.now() + 60000;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTrackedTimeout(r, 1500));
+            const j = await cxZeroState();
+            if (!j) continue;
+            if (Number(j.capHeld) === 1) return j;
+            if (Number(j.capBusy) !== 1) {          // the firmware finished the window and refused it
+                const rej = Number(j.capRej) || 0;
+                await xAlert('The zero could not be measured: ' + (ALTZERO_REJ_TEXT[rej] || 'the reading never settled')
+                    + '. Setup > Alternator has a Zero Now button to try again any time.', 'Not measured');
+                return null;
+            }
+        }
+        await xAlert('The zero measurement did not finish. It needs the engine above '
+            + CX_ALTZERO_MIN_RPM + ' RPM with the field off. Setup > Alternator has a Zero Now button '
+            + 'to try again any time.', 'Not measured');
+        return null;
+    } finally { vesselNextStepWait(false); }
+}
+
+async function cxAltZeroOffer() {
+    let j = await cxZeroState();
+    if (!j) return;                                  // endpoint unreachable: never hold up Finish
+    if (Number(j.capHeld) !== 1) {
+        if (Number(j.capApplied) === 1) return;      // already applied this run, nothing new captured
+        const lv = cxLive();
+        if (!(lv.rpm > CX_ALTZERO_MIN_RPM)) return;  // engine already shut down: nothing to offer
+        if (!await xConfirm('The alternator current sensor has not been zeroed on this installation. '
+            + 'With the engine running and the field off it should read zero, and whatever it reads '
+            + 'instead is a fixed error in every current number the regulator reports. Measuring takes '
+            + 'about fifteen seconds and needs the engine left running.',
+            { title: 'Zero the current sensor', okText: 'Measure now', cancelText: 'Skip' })) return;
+        j = await cxAltZeroRun();
+        if (!j) return;
+    }
+    if (!await xConfirm('The current sensor read ' + (Number(j.capA) >= 0 ? '+' : '')
+        + Number(j.capA).toFixed(2) + ' A with the field off at ' + cxAltZeroWhere(j)
+        + ', where the true current is zero. Subtract that from every reading?',
+        { title: 'Current sensor zero', okText: 'Apply', cancelText: 'Leave as is' })) return;
+    await cxGet('altZeroApply=1').catch(() => { });
+}
+
 function cxFinish() {
     // commissionDone persists the new tune the moment Finish fires (so a ✕ on the Helpful Hints
     // page below can't lose it); the close/reset/navigate tail moves behind the Done button.
@@ -30296,6 +30738,8 @@ function cxFinish() {
             const opt = [8, 9].filter(i => !(mask & (1 << i))).map(i => COMMISSION_STEPS[i].name).join(' and ');
             await xAlert('Commissioned. The optional ' + opt + ' did not run — it can be run any time from the Commissioning tab.');
         }
+        // Before anything that might end with the engine shut down: the sensor zero needs it running.
+        await cxAltZeroOffer();
         // Commissioning runs in Low charge rate by default (gentler on small banks). Offer to restore
         // High so the alternator delivers full output in normal use; the Low/High tables are both set.
         // ONLY once the device is COMMISSIONED (required stages done): a partial finish comes back for
@@ -34606,7 +35050,7 @@ function solarLedgerOnCsv2(data) {
     const days = Number(data.sledDaysValid);
     setTxt('sledDaysValidID', Number.isFinite(days) ? String(days) : '—');
     const cov = Number(data.sledCoverageMin);
-    setTxt('sledCoverageID', Number.isFinite(cov) ? (cov / 60).toFixed(1) + ' h' : '—');
+    setTxt('sledCoverageID', Number.isFinite(cov) ? (cov / 60).toFixed(1) + '\u00A0h' : '—');
     // Setup > Solar: which bar the 2-of-3 rule is using right now.
     const need = Number(data.sledNeedKwh) / 100, src = Number(data.sledNeedSource);
     const el = document.getElementById('solar-need-line');
