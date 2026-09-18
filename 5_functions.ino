@@ -1388,7 +1388,7 @@ void nmea2kTransmitTick() {
       case SLOT_BATT:
         if (n2kBattEnable == 1) {
           sidBatt = (uint8_t)((sidBatt + 1) % 253);
-          // Battery temperature: the BATT probe only — never the board stand-in, never a re-broadcast network value
+          // Battery temperature: the BATT probe only — never a re-broadcast network value
           bool battProbeOk = battTempProbeEnable == 1 && tempProbeFresh(IDX_BATT_TEMP_PROBE) && isfinite(BatteryTempProbeF);
           SetN2kDCBatStatus(N2kMsg, (unsigned char)n2kBattInstance, getBatteryVoltage(),
                             HAS_BATT_SHUNT ? (double)Bcur : N2kDoubleNA,
@@ -2431,7 +2431,10 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
     // we know it's fully charged regardless of what's charging it
     // Units: BatteryCurrent_scaled is A×100. TailCurrent is % of capacity, so the
     // threshold in A×100 is (TailCurrent/100 × Capacity) × 100 = TailCurrent × Capacity.
-    if ((abs(BatteryCurrent_scaled) <= (TailCurrent * BatteryCapacity_Ah)) && (Voltage_scaled >= ChargedVoltage_Scaled)) {
+    // Full charge is a charge decision, so it follows BatteryVoltageSource. Voltage_scaled stays the
+    // measured INA228 value the power/energy figures are built from.
+    const int ChargeDecisionV_scaled = (int)(getChargeDecisionVoltage() * 100.0f);
+    if ((abs(BatteryCurrent_scaled) <= (TailCurrent * BatteryCapacity_Ah)) && (ChargeDecisionV_scaled >= ChargedVoltage_Scaled)) {
       FullChargeTimer += elapsedSeconds;
 
       if (FullChargeTimer >= ChargedDetectionTime) {
@@ -2446,8 +2449,9 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
         static unsigned long lastFullChargeMessage = 0;
         if (!FullChargeDetected || millis() - lastFullChargeMessage > 60000) {
           char msg[128];
-          queueConsoleMessageF("BATTERY: Full charge detected - SoC reset to 100%% (V=%.2fV >= %.2fV, I=%.2fA, Timer=%.1fs)",
-                               Voltage_scaled / 100.0, ChargedVoltage_Scaled / 100.0,
+          queueConsoleMessageF("BATTERY: Full charge detected - SoC reset to 100%% (V=%.2fV >= %.2fV src=%s, I=%.2fA, Timer=%.1fs)",
+                               ChargeDecisionV_scaled / 100.0, ChargedVoltage_Scaled / 100.0,
+                               chargeDecisionVoltageSourceName(),
                                BatteryCurrent_scaled / 100.0, FullChargeTimer);
           lastFullChargeMessage = millis();
         }
@@ -3019,6 +3023,55 @@ float getTargetAmps() {
 float getFiltV() {
   // Never use for safety checks — use IBV directly.
   return IBV_filtered;
+}
+
+// True only while the selected external battery-voltage sensor is usable. Plausibility window is the
+// INA228 read's, so a garbage frame cannot move a charge stage.
+static bool chargeDecisionExternalV(float &out) {
+  int idx;
+  switch (BatteryVoltageSource) {
+    case 1:  out = n2kRxBattV;    idx = IDX_N2K_BATT;        break;
+    case 3:  out = VictronVoltage; idx = IDX_VICTRON_VOLTAGE; break;
+    default: return false;
+  }
+  if (!IS_SEEN(idx) || IS_STALE(idx)) return false;
+  if (!isfinite(out)) return false;
+  return (out > 5.0f) && (out < fminf(85.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f)));
+}
+
+// Battery volts the bulk/absorption/float/rebulk DECISIONS use. Every control loop, protection and
+// dynamic measurement stays on IBV/getFiltV(); only the stage thresholds may follow an external sensor,
+// which is what a long Regulator Ground Wire needs.
+float getChargeDecisionVoltage() {
+  if (BatteryVoltageSource == 0) return getFiltV();
+  float ext;
+  const bool ok = chargeDecisionExternalV(ext);
+  static bool fellBack = false;
+  static uint32_t lastFallbackMsgMs = 0;
+  const uint32_t nowMs = millis();
+  if (!ok) {
+    if (!fellBack || (uint32_t)(nowMs - lastFallbackMsgMs) >= 60000UL) {
+      queueConsoleMessageF("Charge decisions: %s battery voltage is unavailable, using the onboard sensor",
+                           BatteryVoltageSource == 1 ? "NMEA 2000" : "Victron");
+      lastFallbackMsgMs = nowMs;
+    }
+    fellBack = true;
+    return getFiltV();
+  }
+  if (fellBack) {
+    queueConsoleMessageF("Charge decisions: %s battery voltage is back",
+                         BatteryVoltageSource == 1 ? "NMEA 2000" : "Victron");
+    fellBack = false;
+    lastFallbackMsgMs = nowMs;
+  }
+  return ext;
+}
+
+// Which sensor actually decided, for the console/log lines - the fallback reports the onboard name.
+const char *chargeDecisionVoltageSourceName() {
+  float ext;
+  if (!chargeDecisionExternalV(ext)) return "INA228";
+  return (BatteryVoltageSource == 1) ? "NMEA 2000" : "Victron";
 }
 
 // Channel 3 topology per docs/hardware/analoginputsADS1115.md:
@@ -4136,6 +4189,16 @@ void _ReadAnalogInputs_inner() {
                      if (inaBusDt > inaBusReadWorstUs) inaBusReadWorstUs = inaBusDt;
                      if (inaBusDt > 15000UL) inaBusSlowCount++;          // ≥1 Wire-timeout's worth = bus stall
 
+                     // Regulator Ground Wire on the LOAD side of a shunt in the battery negative lead: charging current
+                     // leaves the negative post through the shunt toward the bus bar, so board ground sits I*Rshunt
+                     // BELOW the post and IBV reads HIGH while charging (low while discharging). The INA228's own
+                     // differential reading IS that drop (charging-positive once InvertBattAmps is applied), so it is
+                     // subtracted. Raw shunt volts only - the current-path calibrations (BatteryCOffset,
+                     // DynamicShuntGainFactor) must not leak into a voltage.
+                     if (ShuntGroundComp && HAS_BATT_SHUNT && !isnan(ShuntVoltage_mV)) {
+                       IBV -= (InvertBattAmps ? -1.0f : 1.0f) * ShuntVoltage_mV / 1000.0f;
+                     }
+
                      if (!isnan(IBV) && IBV > 5.0 && IBV < fminf(85.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f)) && !isnan(ShuntVoltage_mV)) {  // garbage-reject ceiling scales with class, capped at INA228 85V full scale
                        Bcur = (ShuntResistanceMicroOhm > 0) ? (ShuntVoltage_mV * 1000.0f / ShuntResistanceMicroOhm) : 0.0f;
                        Bcur = Bcur + BatteryCOffset;
@@ -4637,19 +4700,8 @@ void _ReadAnalogInputs_inner() {
                          if (isfinite(newTemp) && newTemp > -40.0f && newTemp < 85.0f) {  // BMP388 rated range in °C
                            ambientTemp = newTemp * 1.8f + 32.0f;  // convert °C to °F for storage
                            MARK_FRESH(IDX_AMBIENT_TEMP);
-                           // Board temp drifted → refresh the battery-temp gain derate (the board is the
-                           // batteryTempF() stand-in when no battery measurement qualifies; buildTickSnapshot
-                           // carries the same trigger for whichever source is active). Gated to a ≥5°F move
-                           // (~2.8°C ≈ 6% gain change at 0.024/°C — finer steps are noise vs the board
-                           // stand-in's own error) and only when a commissioned reference exists.
-                           // recomputeCvGains is already called cross-core from Core-0 web handlers; this
-                           // task is also Core 0.
-                           static float lastDerateTempF = NAN;
-                           if (battTempDerateEnable && !isnan(CommissionTempF) &&
-                               (isnan(lastDerateTempF) || fabsf(ambientTemp - lastDerateTempF) >= 5.0f)) {
-                             lastDerateTempF = ambientTemp;
-                             recomputeCvGains();
-                           }
+                           // No derate trigger here: the CV battery-temp derate reads battTempActiveF only,
+                           // so board drift cannot move it. buildTickSnapshot carries the sole trigger.
                          }
                        }
 
@@ -5973,10 +6025,11 @@ void seedSocFromVoltage() {
     // them. Reff per 100Ah 12V block including polarization: LFP ~6 mΩ, lead-acid ~12 mΩ;
     // parallel Ah divides it, series blocks multiply it. Clamped so a bogus current reading
     // can't wreck the seed.
-    // Reff also scales with temperature (~doubles per −20°C, both chemistries). ambientTemp is
-    // still NAN here on a cold boot (BMP388 runs a 4s cycle in ReadAnalogInputs and discards
-    // its first sample), so take one blocking forced conversion — ~50ms once, only on the
-    // fresh-NVS path, and the board hasn't self-heated yet so it's the best proxy it ever is.
+    // Reff also scales with temperature (~doubles per −20°C, both chemistries). This is the BOARD
+    // temperature, not a battery temperature: it runs at boot, before any probe or network source has
+    // reported, and the board has not self-heated yet so it is closest to true ambient here. ambientTemp is
+    // still NAN on a cold boot (BMP388 runs a 4s cycle in ReadAnalogInputs and discards its first sample),
+    // so take one blocking forced conversion — ~50ms once, only on the fresh-NVS path.
     boardTempF = ambientTemp;
     if (isnan(boardTempF) && !BMP388Disconnected) {
       bmp388.startForcedConversion();

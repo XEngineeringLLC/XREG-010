@@ -1677,13 +1677,13 @@ volatile bool restartChargeCycleRequested = false;  // web /get?RestartChargeCyc
 // CH1 samples (5-25 ms, assume ~30 ms). The only gate that ever used it is commented out in
 // 99_obsolete.ino. NVS key NK_FieldAdjustmentInterval and CSV3 slot retired with it — never reuse.
 float TemperatureLimitF = 175;       // measured at the case probe; internal/metal temps run roughly +40 to +50 °F above this depending on sensor installation. Strategy rationale: docs Charging Strategy page
-// Cold-charge lockout: board temp (BMP388 ambientTemp, °F) is a proxy for battery temp and reads
-// warmer than ambient, so set MinChargeTempF with margin. Default ON (lithium); lead-acid can opt out.
+// Cold-charge lockout: acts on the measured battery temperature (batteryTempF(), sources 1..4) and
+// fails open when none qualifies. Default ON (lithium); lead-acid can opt out.
 bool  coldChargeLockoutEnable = true;    // master on/off for the cold-charge lockout (default ON)
-float MinChargeTempF = 40.0f;            // board-temp floor below which charging is locked out (°F)
+float MinChargeTempF = 40.0f;            // battery-temperature floor below which charging is locked out (°F)
 const float ColdChargeHysteresisF = 2.0f;// °F rise above MinChargeTempF before charging re-arms (anti-chatter)
-// Hot-charge lockout, mirror of the cold one. Acts only on a MEASURED battery temperature (source 1..4);
-// the board stand-in never drives it. Spec: Working Markdown Docs/BATTERY_TEMP_SENSORS_SPEC.md §5.
+// Hot-charge lockout, mirror of the cold one. Acts only on a measured battery temperature (source 1..4).
+// Spec: Working Markdown Docs/BATTERY_TEMP_SENSORS_SPEC.md §5.
 int   hotChargeLockoutEnable = 0;        // master on/off for the hot-charge lockout (default OFF)
 float MaxChargeTempF = 122.0f;           // battery-temperature ceiling above which charging is locked out (°F)
 const float HotChargeHysteresisF = 2.0f; // °F fall below MaxChargeTempF before charging re-arms (anti-chatter)
@@ -1692,8 +1692,7 @@ const float HotChargeHysteresisF = 2.0f; // °F fall below MaxChargeTempF before
 // source; buildTickSnapshot mirrors its result into battTempActiveF/battTempActiveSrc once per tick.
 int   battTempProbeEnable = 0;      // 1 = the BATT-role DS18B20 feeds BatteryTempProbeF + IDX_BATT_TEMP_PROBE
 int   extraTempProbeEnable = 0;     // 1 = the EXTRA-role DS18B20 feeds ExtraTempF + IDX_EXTRA_TEMP
-int   battTempSource = 0;           // 0 Auto (probe, NMEA 2000, VE.Direct, RV-C, then board if proxy enabled), 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 Board, 6 None
-int   battTempProxyEnable = 1;      // Auto may fall back to the board temperature (BMP388 ambientTemp) when no battery measurement qualifies
+int   battTempSource = 0;           // 0 Auto (probe, NMEA 2000, VE.Direct, RV-C), 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 6 None. 5 (board) retired 2026-09-18; a stored 5 loads as Auto
 int   extraTempAlarmHiEnable = 0;   // EXTRA-probe high alarm on/off
 float extraTempAlarmHiF = 150.0f;   // EXTRA-probe high alarm threshold (°F)
 int   extraTempAlarmLoEnable = 0;   // EXTRA-probe low alarm on/off
@@ -1701,10 +1700,10 @@ float extraTempAlarmLoF = 32.0f;    // EXTRA-probe low alarm threshold (°F)
 float BatteryTempProbeF = NAN;      // BATT-role probe (°F); written by TempTask only, NAN until the first good read
 float ExtraTempF = NAN;             // EXTRA-role probe (°F); written by TempTask only
 float battTempActiveF = NAN;        // batteryTempF() result of the current tick (°F); NAN = no source qualifies
-uint8_t battTempActiveSrc = 0;      // 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T), 4 RV-C (DC_SOURCE_STATUS_2), 5 board temperature
+uint8_t battTempActiveSrc = 0;      // 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T), 4 RV-C (DC_SOURCE_STATUS_2); 5 retired, never emitted
 float VictronBattTempF = NAN;       // VE.Direct "T" field (°F), BMV/SmartShunt with a temperature sensor
 float rvcRxBattTempF = NAN;         // RV-C DC_SOURCE_STATUS_2 source temperature (°F) at the dvccInst instance
-bool  cvTempDerateInert = false;    // battery-temp source class (measured vs board) differs from CommissionTempSrc's class; derate returns 1.0 until the CV fit is re-run
+bool  cvTempDerateInert = false;    // CommissionTempSrc is not a measured source (legacy 0, or the retired board stamp 5); derate returns 1.0 until the CV fit is re-run
 int ManualFieldToggle = 0;           // 0 = Auto (PID) — fresh-flash default. Set to 1 for manual field control (debugging).
 int PhysicalPanelOverride = 0;       // 0 (default) = the app owns HiLow and MaintainMode and the Cable 3 panel wires only report; 1 = the panel wires own both modes and the app toggles go inert
 int MaintainMode = 0;                // Set to 1 to target 0 amps at battery
@@ -1782,6 +1781,7 @@ float ManualDutyTarget = 4.0f;  // manual-mode field duty %, 0.01 resolution (op
 int InvertAltAmps = 0;     // change sign of alternator amp reading
 int InvertBattAmps = 0;    // change sign of battery amp reading
 int BatteryShuntPresent = 1;  // 1 = INA228 battery shunt fitted (default). 0 = no battery-current sensor: Bcur meaningless, every battery-current consumer takes its safe/off branch and the UI hides those features.
+int ShuntGroundComp = 0;   // 1 = add the INA228 shunt drop back into IBV. Board ground is the Regulator Ground Wire; landed on the LOAD side of a shunt in the battery negative lead it sits I*Rshunt off the battery post, so IBV reads low while charging.
 uint32_t Freq = 0;         // ESP32 switching Frequency in case we want to report it for debugging
 
 //Variables to store measurements
@@ -2213,8 +2213,8 @@ struct SensorWindow {
   int64_t uTargetAmps_area_v_us = 0;
   uint64_t uTargetAmps_valid_us = 0;
 
-  // Battery temperature actually in use this tick (batteryTempF(): probe / N2K / VE.Direct / RV-C /
-  // board stand-in). NAN when no source qualifies, so valid_us == 0 is the cloud's "absent" signal —
+  // Battery temperature actually in use this tick (batteryTempF(): probe / N2K / VE.Direct / RV-C).
+  // NAN when no source qualifies, so valid_us == 0 is the cloud's "absent" signal —
   // same contract as victronCurr. The SOURCE code rides the 24 h snapshot, not here.
   int32_t battTemp_min = 999900;
   int32_t battTemp_max = -999900;
@@ -3419,6 +3419,7 @@ uint32_t restartRemainingSec = 0;
 const unsigned long RESTART_WARNING_WINDOW_MS = 600000UL;  // 10 minutes
 
 int BatteryCurrentSource = 0;  // 0=INA228, 1=NMEA2K Batt, 2=NMEA0183 Batt, 3=Victron Batt
+int BatteryVoltageSource = 0;  // battery volts for CHARGE DECISIONS only: 0=INA228, 1=NMEA2K Batt (127508), 3=Victron Batt. Control loops and protections always read IBV.
 int timeAxisModeChanging = 0;  // toggle the time axis on and off in Plots.  Off = less janky but less info
 
 int maxPoints;                 //number of points plotted per plot (X axis length)
@@ -4085,14 +4086,14 @@ float   cvAlpha      = 0.05f;     // fraction of deadbeat 1/K; coupled to the ~0
 float   cvCrossover  = 0.20f;     // rad/s — retired ω_c input, inert; NVS key + CSV3 slot kept (never repurpose)
 float   cvPiZero     = 0.50f;     // rad/s — PI integral zero ρ; Ki = ρ·Kp
 float   CvKdTd       = 0.85f;     // s — derivative time; Auto-mode Kd = Td·Kp (D analog of ρ), so Kd inherits Kp's α/K plant anchor and scales per-install through the wizard
-// Battery-temperature gain derate. Board temp (ambientTemp, °F) is a PROXY for battery temp; as the
-// battery cools its internal resistance — which IS the CV plant gain K_dc — rises, so gains computed at
+// Battery-temperature gain derate, on the measured battery temperature (batteryTempF(), sources 1..4).
+// As the battery cools its internal resistance — which IS the CV plant gain K_dc — rises, so gains computed at
 // the commissioning temperature run too hot when it's colder (and sluggish when warmer). We counter-
 // scale Kp AND Ki by the resistance ratio R(T_commission)/R(T_now), holding the loop bandwidth ω and
 // damping ρ put (NOT a λ/ω change). CommissionTempF is stamped when the CV plant fit is applied; NaN =
 // never commissioned → no derate. See recomputeCvGains()/computeCvTempScale() in 6_functions.ino.
-float   CommissionTempF      = NAN;   // battery temp (°F, batteryTempF() source; board temp on legacy stamps) when K_dc was measured; reference for the derate
-int     CommissionTempSrc    = 0;     // battTempActiveSrc at the moment CommissionTempF was stamped; 0 = legacy/unknown = treat as board (5)
+float   CommissionTempF      = NAN;   // measured battery temp (°F, batteryTempF() source) when K_dc was measured; reference for the derate
+int     CommissionTempSrc    = 0;     // battTempActiveSrc at the moment CommissionTempF was stamped; 0 = legacy/unknown, 5 = retired board stamp — either makes the derate inert
 bool    battTempDerateEnable = true;  // master on/off for the battery-temp gain derate
 float   battTempCoeff        = 0.024f; // fractional resistance change per °C BELOW 25°C (R rises as T falls); cvResistanceRatio()
                                        // halves it above 25°C. One value for every chemistry — LFP and lead-acid measure
@@ -4325,14 +4326,14 @@ enum FieldEventReason : uint8_t {
   REASON_RPM_TOO_LOW,
   REASON_CURRENT_STALE,
   REASON_FAST_OVERVOLTAGE,         // absolute OV ceiling — fires in ALL modes incl. MANUAL (live per-tick, immediate cut)
-  REASON_BATTERY_TOO_COLD,         // board temp (battery proxy) below MinChargeTempF — cold-charge lockout (opt-in, lithium protection)
+  REASON_BATTERY_TOO_COLD,         // measured battery temp below MinChargeTempF — cold-charge lockout (opt-in, lithium protection)
   REASON_COMMISSION_REST,          // commissioning idle-rest hold between guided steps (not a fault)
   REASON_TACH_IMPLAUSIBLE,         // field driven hard, zero alternator output while tach claims running — open field drive (ON/OFF/wiring/gate-drive), dead alternator, or false RPM (tach noise)
   REASON_SOLAR_PAUSE,              // weather mode is resting the alternator on a strong solar forecast — deliberate, not a fault
   REASON_BMS_DISABLED,             // the BMS on/off input is withholding permission — external command, not a fault
   REASON_OV_TIER_LOW,              // timed OV cut, LOW tier — filtered bus held above target + OvTierLoMarginV for OvTierLoDwellMs (AUTO/CV only)
   REASON_OV_TIER_MID,              // timed OV cut, MID tier — filtered bus held above target + OvTierMidMarginV for OvTierMidDwellMs (AUTO/CV only)
-  REASON_BATTERY_TOO_HOT,          // 24 — measured battery temp (source 1..4, never the board stand-in) above MaxChargeTempF — hot-charge lockout (opt-in)
+  REASON_BATTERY_TOO_HOT,          // 24 — measured battery temp (source 1..4) above MaxChargeTempF — hot-charge lockout (opt-in)
   REASON_CHARGE_COMPLETE_IDLE,     // 25 — charge cycle finished with UseFloat=0: battery full, resting in IDLE until a rebulk or a master-switch off/on. Same class as CHARGING_DISABLED everywhere; only the label differs
   REASON_ALTZERO_MEASURE           // 26 — a requested current-sensor zero measurement is holding the field at 0% with the engine running (altZeroCaptureService). Not a fault: MODE_COMMISSION_IDLE with a zero target, released when the window closes
 };
@@ -4382,10 +4383,10 @@ struct TickSnapshot {
 
   bool inAbsorptionStage;
 
-  bool batteryTooCold;   // cold-charge lockout active (board temp proxy < MinChargeTempF, with hysteresis)
-  bool batteryTooHot;    // hot-charge lockout active (measured battery temp > MaxChargeTempF, with hysteresis; never from the board stand-in)
+  bool batteryTooCold;   // cold-charge lockout active (measured battery temp < MinChargeTempF, with hysteresis)
+  bool batteryTooHot;    // hot-charge lockout active (measured battery temp > MaxChargeTempF, with hysteresis)
   float battTempF;       // batteryTempF() this tick (°F); NAN = no source qualifies
-  uint8_t battTempSrc;   // batteryTempF() source code (0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board)
+  uint8_t battTempSrc;   // batteryTempF() source code (0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C)
   bool commissioningResting;  // commissioning session live + dialog alive + no test running → hold field at rest duty
   bool altZeroMeasuring;      // a requested current-sensor zero measurement wants the field at 0% (altZeroCaptureService
                               // phase >= ramp, charging enabled, no lockout) → MODE_COMMISSION_IDLE with a zero target

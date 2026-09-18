@@ -706,7 +706,7 @@ enum Csv2Index {
   CSV2_BatteryTempProbeF,   // BATT-role DS18B20 (°F x10; ROLL_EMPTY = no reading yet)
   CSV2_ExtraTempF,          // EXTRA-role DS18B20 (°F x10; ROLL_EMPTY = no reading yet)
   CSV2_battTempActiveF,     // batteryTempF() result this tick (°F x10; ROLL_EMPTY = no source qualifies)
-  CSV2_battTempActiveSrc,   // 0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board temperature
+  CSV2_battTempActiveSrc,   // 0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C (5 retired, never emitted)
   CSV2_owProbeCount,        // DS18B20s in the 1-Wire registry
   CSV2_owUnassignedCount,   // present probes with no role
   CSV2_VictronBattTempF,    // VE.Direct "T" battery temperature (°F x10; ROLL_EMPTY = none)
@@ -766,7 +766,7 @@ enum Csv4Index {
 // backslash and truncates the macro, and every expansion truncates together and consistently --
 // so the count/order gate in compress_web.sh cannot see it. The static_assert on
 // CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 433
+#define CSV3_EXPECTED_FIELDS 434
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -1066,7 +1066,7 @@ enum Csv4Index {
   X(setpointSlewEnable, "%d", (int)setpointSlewEnable)                                                            /* inner-loop current setpoint slew master switch (0/1) */ \
   X(cvRiseGovEnable, "%d", (int)cvRiseGovEnable)                                                                  /* CV rise governor / anti-windup master switch (0/1) */ \
   X(dutySlewEnable, "%d", (int)dutySlewEnable)                                                                    /* field duty slew master switch (0/1) */ \
-  X(CommissionTempF, "%d", isnan(CommissionTempF) ? ROLL_EMPTY : (int)lroundf(CommissionTempF * 10.0f))           /* board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset/NaN) */ \
+  X(CommissionTempF, "%d", isnan(CommissionTempF) ? ROLL_EMPTY : (int)lroundf(CommissionTempF * 10.0f))           /* measured battery temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset/NaN) */ \
   X(battTempDerateEnable, "%d", (int)battTempDerateEnable)                                                        /* battery-temp gain derate master on/off (0/1) */ \
   X(battTempCoeff, "%d", SafeInt(battTempCoeff, 10000))                                                           /* battery fractional resistance change per °C; ×10000 */ \
   X(TempPIDKiDownFrac, "%d", SafeInt(TempPIDKiDownFrac, 1000))                                                    /* thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000 */ \
@@ -1190,8 +1190,7 @@ enum Csv4Index {
   /* Battery + extra temperature probes, source chain, hot-charge lockout (BATTERY_TEMP_SENSORS_SPEC.md §6) */ \
   X(battTempProbeEnable, "%d", SafeInt(battTempProbeEnable))                                                      /* BATT-role probe feeds the battery-temperature source chain (0/1) */ \
   X(extraTempProbeEnable, "%d", SafeInt(extraTempProbeEnable))                                                    /* EXTRA-role probe live (0/1) */ \
-  X(battTempSource, "%d", SafeInt(battTempSource))                                                                /* 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 Board, 6 None */ \
-  X(battTempProxyEnable, "%d", SafeInt(battTempProxyEnable))                                                      /* Auto may fall back to the board temperature (0/1) */ \
+  X(battTempSource, "%d", SafeInt(battTempSource))                                                                /* 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 6 None (5 retired) */ \
   X(hotChargeLockoutEnable, "%d", SafeInt(hotChargeLockoutEnable))                                                /* hot-charge lockout master on/off (0/1) */ \
   X(MaxChargeTempF, "%d", SafeInt(MaxChargeTempF))                                                                /* hot-charge lockout ceiling (°F) */ \
   X(extraTempAlarmHiEnable, "%d", SafeInt(extraTempAlarmHiEnable))                                                /* EXTRA-probe high alarm (0/1) */ \
@@ -1201,9 +1200,11 @@ enum Csv4Index {
   X(n2kExtraTempEnable, "%d", SafeInt(n2kExtraTempEnable))                                                        /* 130312 for the EXTRA probe (0/1) */ \
   X(n2kExtraTempInstance, "%d", SafeInt(n2kExtraTempInstance)) \
   X(n2kExtraTempSource, "%d", SafeInt(n2kExtraTempSource))                                                        /* tN2kTempSource code for the EXTRA probe */ \
-  X(CommissionTempSrc, "%d", SafeInt(CommissionTempSrc))                                                          /* battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown = board) */ \
+  X(CommissionTempSrc, "%d", SafeInt(CommissionTempSrc))                                                          /* battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown, 5 = retired board stamp) */ \
   X(maxWorkingRpm, "%d", SafeInt(maxWorkingRpm))                                                                  /* stage-9 setup screen; 0 = never entered */ \
   X(RemoteDiagnostics, "%d", SafeInt(RemoteDiagnostics))                                                          /* owner switch for the dashboard's support log-relay poll (0/1) */ \
+  X(ShuntGroundComp, "%d", SafeInt(ShuntGroundComp))                                                        /* add the INA228 shunt drop back into IBV (0/1) */ \
+  X(BatteryVoltageSource, "%d", SafeInt(BatteryVoltageSource))                                                /* charge-decision battery volts: 0 INA228, 1 NMEA 2000, 3 Victron */ \
   X(sessionId, "%u", (unsigned)g_sessionId)                                                                     /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
   X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
   /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
@@ -5180,9 +5181,9 @@ void setupServer() {
       inputMessage = request->getParam("coldChargeLockoutEnable")->value();
       coldChargeLockoutEnable = inputMessage.toInt() != 0;
       settingWrite(NK_coldChargeLockoutEnable, String((int)coldChargeLockoutEnable).c_str());
-      queueConsoleMessageF("Cold-charge lockout (board-temp battery proxy): %s", coldChargeLockoutEnable ? "ENABLED" : "DISABLED");
+      queueConsoleMessageF("Cold-charge lockout (measured battery temperature): %s", coldChargeLockoutEnable ? "ENABLED" : "DISABLED");
     }
-    // Cold-charge lockout temperature floor (board temp °F, stored raw)
+    // Cold-charge lockout temperature floor (battery temperature °F, stored raw)
     if (request->hasParam("MinChargeTempF")) {
       foundParameter = true;
       inputMessage = request->getParam("MinChargeTempF")->value();
@@ -5206,14 +5207,9 @@ void setupServer() {
     if (request->hasParam("battTempSource")) {
       foundParameter = true;
       inputMessage = request->getParam("battTempSource")->value();
-      battTempSource = constrain(inputMessage.toInt(), 0, 6);  // 0 Auto .. 5 Board, 6 None
+      battTempSource = constrain(inputMessage.toInt(), 0, 6);  // 0 Auto, 1..4 pinned sources, 6 None
+      if (battTempSource == 5) battTempSource = 0;               // 5 (board) retired 2026-09-18 — falls back to Auto
       settingWrite(NK_battTempSource, String(battTempSource).c_str());
-    }
-    if (request->hasParam("battTempProxyEnable")) {
-      foundParameter = true;
-      inputMessage = request->getParam("battTempProxyEnable")->value();
-      battTempProxyEnable = (inputMessage.toInt() != 0) ? 1 : 0;
-      settingWrite(NK_battTempProxyEnable, String(battTempProxyEnable).c_str());
     }
     // Hot-charge lockout — mirror of the cold one; acts only on a measured battery temperature (source 1..4).
     if (request->hasParam("hotChargeLockoutEnable")) {
@@ -5777,6 +5773,13 @@ void setupServer() {
       inputMessage = request->getParam("InvertBattAmps")->value();
       settingWrite(NK_InvertBattAmps, inputMessage.c_str());
       InvertBattAmps = inputMessage.toInt();
+    }
+    if (request->hasParam("ShuntGroundComp")) {
+      foundParameter = true;
+      inputMessage = request->getParam("ShuntGroundComp")->value();
+      ShuntGroundComp = (inputMessage.toInt() != 0) ? 1 : 0;
+      settingWrite(NK_ShuntGroundComp, ShuntGroundComp ? "1" : "0");
+      queueConsoleMessageF("Shunt resistance compensation: %s", ShuntGroundComp ? "On" : "Off");
     }
     if (request->hasParam("BatteryShuntPresent")) {
       foundParameter = true;
@@ -6874,6 +6877,16 @@ void setupServer() {
       BatteryCurrentSource = inputMessage.toInt();
       queueConsoleMessageF("Battery current source changed to: %d", BatteryCurrentSource);
     }
+    if (request->hasParam("BatteryVoltageSource")) {
+      foundParameter = true;
+      inputMessage = request->getParam("BatteryVoltageSource")->value();
+      int vsrc = inputMessage.toInt();
+      if (vsrc != 1 && vsrc != 3) vsrc = 0;   // 2 (NMEA 0183) has no received battery voltage to read
+      BatteryVoltageSource = vsrc;
+      settingWrite(NK_BatteryVoltageSource, String(BatteryVoltageSource).c_str());
+      queueConsoleMessageF("Battery voltage source for charge decisions: %s",
+                           BatteryVoltageSource == 1 ? "NMEA 2000" : BatteryVoltageSource == 3 ? "Victron VE.Direct" : "onboard INA228");
+    }
     if (request->hasParam("totalPowerCycles")) {
       foundParameter = true;
       inputMessage = request->getParam("totalPowerCycles")->value();
@@ -7758,18 +7771,12 @@ void setupServer() {
       foundParameter = true;
       cvPlantKa = request->getParam("cvPlantKa")->value().toFloat();
       settingWrite(NK_cvPlantKa, String(cvPlantKa, 5).c_str());
-      // Stamp the battery temperature and its source at the moment the curve was measured — the reference for
-      // the battery-temp gain derate (computeCvTempScale compares source classes, measured vs board). The
-      // batteryTempF() result of the current tick when it has one; the live board reading otherwise (source 5);
-      // neither → leave the prior stamp (no false reference).
-      if (isfinite(battTempActiveF)) {
+      // Stamp the measured battery temperature and its source at the moment the curve was measured — the
+      // reference for the battery-temp gain derate. No qualifying source → leave the prior stamp rather than
+      // inventing a reference; computeCvTempScale then keeps the derate inert until a fit runs with one.
+      if (isfinite(battTempActiveF) && battTempActiveSrc >= 1 && battTempActiveSrc <= 4) {
         CommissionTempF = battTempActiveF;
         CommissionTempSrc = (int)battTempActiveSrc;
-        settingWrite(NK_CommissionTempF, String(CommissionTempF, 2).c_str());
-        settingWrite(NK_CommissionTempSrc, String(CommissionTempSrc).c_str());
-      } else if (!IS_STALE(IDX_AMBIENT_TEMP) && isfinite(ambientTemp)) {
-        CommissionTempF = ambientTemp;
-        CommissionTempSrc = 5;
         settingWrite(NK_CommissionTempF, String(CommissionTempF, 2).c_str());
         settingWrite(NK_CommissionTempSrc, String(CommissionTempSrc).c_str());
       }
@@ -11265,7 +11272,7 @@ void SendWifiData() {
          load-dump consecutive-sample counts N1/N2/N3
          solar ledger toggles + margins: learn, use consumption, margin % (x100), learn rate % (x100)
          RV-C: tx master, charger DGNs, DC source DGNs, DM_RV, charger instance, DC instance, device priority
-         +14 battery/extra temperature settings (§6 order, CommissionTempSrc last)
+         +13 battery/extra temperature settings (§6 order, CommissionTempSrc last)
          +2: sessionId, sendMs
     */
     int     payload3Len = snprintf(payload3, PAYLOAD3_SIZE,

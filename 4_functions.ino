@@ -1515,6 +1515,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     BatteryShuntPresent = settingRead(NK_BatteryShuntPresent).toInt();
   }
+  if (!settingExists(NK_ShuntGroundComp)) {
+    settingWrite(NK_ShuntGroundComp, String(ShuntGroundComp).c_str());
+  } else {
+    ShuntGroundComp = (settingRead(NK_ShuntGroundComp).toInt() != 0) ? 1 : 0;
+  }
   if (!settingExists(NK_LimpHome)) {
     settingWrite(NK_LimpHome, String(LimpHome).c_str());
   } else {
@@ -2132,6 +2137,12 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     BatteryCurrentSource = settingRead(NK_BatteryCurrentSource).toInt();
   }
+  if (!settingExists(NK_BatteryVoltageSource)) {
+    settingWrite(NK_BatteryVoltageSource, String(BatteryVoltageSource).c_str());
+  } else {
+    BatteryVoltageSource = settingRead(NK_BatteryVoltageSource).toInt();
+    if (BatteryVoltageSource != 1 && BatteryVoltageSource != 3) BatteryVoltageSource = 0;
+  }
 
   if (!settingExists(NK_timeAxisModeChanging)) {
     settingWrite(NK_timeAxisModeChanging, String(timeAxisModeChanging).c_str());
@@ -2576,12 +2587,13 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   }
   if (settingExists(NK_ripFitAlt))  ripFitDecode(settingRead(NK_ripFitAlt),  ripFitAlt);   // measured ripple projection (§3.3); absent → nPts=0 → plot shows threshold only
   if (settingExists(NK_slpFitAlt))  ripFitDecode(settingRead(NK_slpFitAlt),  slpFitAlt);   // measured voltage-slope projection (D-term deadband); same absent semantics
-  // CommissionTempF — board temp stamped when the CV plant fit was applied; reference for the battery-
-  // temp gain derate. No default write: absence = never commissioned = no derate (stays NaN).
+  // CommissionTempF — measured battery temp stamped when the CV plant fit was applied; reference for the
+  // battery-temp gain derate. No default write: absence = never commissioned = no derate (stays NaN).
   if (settingExists(NK_CommissionTempF)) {
     CommissionTempF = settingRead(NK_CommissionTempF).toFloat();
   }
-  // CommissionTempSrc — battTempActiveSrc at that stamp; 0 = legacy/unknown = treated as the board class.
+  // CommissionTempSrc — battTempActiveSrc at that stamp. Only 1..4 anchor the derate; 0 (legacy/unknown)
+  // and 5 (the retired board stamp) leave it inert. 5 still loads so an old stamp is recognised as such.
   if (!settingExists(NK_CommissionTempSrc)) {
     settingWrite(NK_CommissionTempSrc, String(CommissionTempSrc).c_str());
   } else {
@@ -2648,11 +2660,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     settingWrite(NK_battTempSource, String(battTempSource).c_str());
   } else {
     battTempSource = clampLoadedSetting("battTempSource", NK_battTempSource, settingRead(NK_battTempSource).toInt(), 0, 6);
-  }
-  if (!settingExists(NK_battTempProxyEnable)) {
-    settingWrite(NK_battTempProxyEnable, String(battTempProxyEnable).c_str());
-  } else {
-    battTempProxyEnable = settingRead(NK_battTempProxyEnable).toInt() != 0 ? 1 : 0;
+    if (battTempSource == 5) battTempSource = 0;   // 5 (board) retired 2026-09-18 — a stored 5 reads as Auto
   }
   if (!settingExists(NK_hotChargeLockoutEnable)) {
     settingWrite(NK_hotChargeLockoutEnable, String(hotChargeLockoutEnable).c_str());

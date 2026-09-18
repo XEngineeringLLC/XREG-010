@@ -734,7 +734,7 @@
                     <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                       <span>Mounting Location:</span>
                       <span class="tooltip">ℹ️
-                        <span class="tooltip-box">A battery's internal resistance rises as it cools, and that resistance <strong>is</strong> the quantity the voltage loop's gains were tuned against at commissioning. With a measured battery temperature (battery probe, NMEA 2000 battery monitor, VE.Direct monitor with a temperature sensor, or RV-C source) the regulator corrects for this directly and the mounting location does not matter. Without one, the regulator board temperature stands in: mounted near the bank — or any space that tracks it — the board follows the batteries closely enough to correct for this. Otherwise (example: regulator in engine room, batteries in bilge), the stand-in reports a hot battery and pushes the gains the wrong way.</span>
+                        <span class="tooltip-box">Where the regulator itself is installed. It is recorded with the vessel information, and no control loop reads it. Battery temperature always comes from a measured source (battery probe, NMEA 2000 battery monitor, VE.Direct monitor with a temperature sensor, or RV-C source), so the mounting location does not change how the voltage loop corrects for battery temperature.</span>
                       </span>
                     </div>
                     <div class="form-input">
@@ -749,8 +749,8 @@
                         </label>
                       </div>
                       <div class="seg-pill-caption">
-                        <span class="cap cap-0">Board temperature can optionally stand in for battery temperature when no battery measurement is installed</span>
-                        <span class="cap cap-1">Board temperature cannot stand in for battery temperature — choose one under Setup &rarr; Battery &rarr; Battery Temperature (a probe is assigned under Setup &rarr; Temperature)</span>
+                        <span class="cap cap-0">Regulator is in the battery compartment</span>
+                        <span class="cap cap-1">Regulator is somewhere other than the battery compartment</span>
                       </div>
                     </div>
                   </div>
@@ -5244,7 +5244,7 @@
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Battery-Temp Gain Derate (<span id="battTempDerateEnable_echo">?</span>):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">Voltage Control Autotuning measures the battery's internal resistance (the plant gain K_dc) at <strong>one</strong> temperature — the battery temperature at commissioning. A battery's resistance <strong>rises as it gets colder</strong>, which would make those gains run too aggressively in the cold (more overshoot, exactly when over-voltage matters most) and too sluggishly when warmer. With this <strong>On</strong>, the loop scales Kp <em>and</em> Ki by the estimated resistance ratio between the commissioning temperature and the present battery temperature — keeping the loop's speed and damping roughly constant across temperature. This is a gain scale, <strong>not</strong> a change to the response-time target or Ki/Kp ratio. The battery temperature comes from the source selected under Setup &rarr; Battery &rarr; Battery Temperature: a battery probe, NMEA 2000, VE.Direct or RV-C measurement, or the regulator board standing in when none is available. The derate uses only the <strong>change</strong> since commissioning, so a constant board-warmer-than-battery offset in the stand-in cancels out as long as it stays roughly stable. If the source changes class between a measurement and the stand-in after commissioning, the derate goes inert until Voltage Control Autotuning is re-run. The absolute over-voltage protections are independent and always live. Set the strength with the coefficient below. Off = use the commissioned gains unchanged at all temperatures.</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">Voltage Control Autotuning measures the battery's internal resistance (the plant gain K_dc) at <strong>one</strong> temperature &mdash; the battery temperature at commissioning. A battery's resistance <strong>rises as it gets colder</strong>, which would make those gains run too aggressively in the cold (more overshoot, exactly when over-voltage matters most) and too sluggishly when warmer. With this <strong>On</strong>, the loop scales Kp <em>and</em> Ki by the estimated resistance ratio between the commissioning temperature and the present battery temperature, keeping the loop's speed and damping roughly constant across temperature. This is a gain scale, <strong>not</strong> a change to the response-time target or Ki/Kp ratio. The battery temperature comes from the source selected under Setup &rarr; Battery &rarr; Battery Temperature: a battery probe, NMEA 2000, VE.Direct or RV-C measurement. With no measured battery temperature the scale stays at 1.00. If the plant fit was anchored before a measured source was fitted, the derate stays inert until Voltage Control Autotuning is re-run. The absolute over-voltage protections are independent and always live. Set the strength with the coefficient below. Off = use the commissioned gains unchanged at all temperatures.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -5844,7 +5844,7 @@
                   climbing quickly, which checks overshoot during the approach to target. Anti-windup freezes upward integration whenever the current
                   ceiling — not voltage — is the binding constraint, so the integrator does not load up while unable to act.
                   The loop gains are set by the commissioning wizard's autotuning rather than tuned by hand (see below), and
-                  can be automatically re-scaled with battery temperature (measured, or the regulator board standing in) to hold
+                  can be automatically re-scaled with the measured battery temperature to hold
                   the loop's speed and damping constant as the battery's internal resistance changes with temperature.
                 </p>
                 <p style="margin: 0 0 15px 0; line-height: 1.5; color: var(--text-dark);">
@@ -7223,7 +7223,7 @@
 
 
 
-            <!-- Battery Temperature Section. Source chain + the two charge-temperature lockouts.
+            <!-- Battery Temperature Section. Measured source chain + the two charge-temperature lockouts.
                  The probe itself is identified and enabled in Setup > Temperature. -->
             <details open style="margin-top: 20px;">
               <summary
@@ -7234,7 +7234,7 @@
               <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Battery Temperature Source (<span id="battTempSource_echo">?</span>):</span>
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which measurement stands for battery temperature. Automatic takes the first available in this order: battery probe, NMEA 2000 battery status (PGN 127508), VE.Direct battery monitor, RV-C source, then the regulator board temperature if the stand-in below is allowed. Any single source disables the fallback chain and reports no temperature while that source is missing or stale. None disables battery temperature entirely. The board temperature is a stand-in only: the board runs warmer than its surroundings, so the cold-charge lockout is a coarse guard when it is the only source, and the hot-charge lockout never acts on it.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which measurement the regulator reads as battery temperature. Automatic takes the first available in this order: battery probe, NMEA 2000 battery status (PGN 127508), VE.Direct battery monitor, RV-C source. Any single source disables the fallback chain and reports no temperature while that source is missing or stale. None disables battery temperature entirely. Every option is a measurement taken at the bank; with none of them reporting, the cold and hot charge lockouts stay inactive and the voltage-loop gain derate stays at 1.00.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -7244,30 +7244,9 @@
                       <option value="2">NMEA 2000</option>
                       <option value="3">VE.Direct</option>
                       <option value="4">RV-C</option>
-                      <option value="5">Board temperature</option>
                       <option value="6">None</option>
                     </select>
                     <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
-                  </form>
-                </div>
-              </div>
-
-              <hr />
-              <div class="form-row">
-                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                  <span>Use board temperature when no battery measurement is available (<span id="battTempProxyEnable_echo">?</span>):</span>
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">On: with the source set to Automatic, the regulator board temperature stands in for battery temperature whenever no probe, NMEA 2000, VE.Direct or RV-C measurement is available; the board runs warmer than its surroundings, so the stand-in is a coarse guard. Off: no stand-in, so the cold-charge lockout and the voltage-loop gain derate stay inactive until a measurement arrives (not recommended unless a battery temperature source is installed).</span></span>
-                </div>
-                <div class="form-input">
-                  <form action="/get" method="GET" target="hidden-form">
-                    <span class="toggle-label">Off</span>
-                    <label class="switch">
-                      <input id="battTempProxyEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('battTempProxyEnable_checkbox', 'battTempProxyEnable', 'battTempProxyEnable')) { this.form.submit(); submitMessage(); }" />
-                      <span class="slider round"></span>
-                    </label>
-                    <span class="toggle-label">On</span>
-                    <input id="battTempProxyEnable" name="battTempProxyEnable" type="number" value="" style="display:none;" />
                   </form>
                 </div>
               </div>
@@ -7308,7 +7287,7 @@
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Min Charge Temp (<span class="temp-unit-label">°F</span>) (<span id="MinChargeTempF_echo">?</span>):</span>
                   <span class="tooltip">&#8505;&#65039;
-                    <span class="tooltip-box">Battery-temperature floor for the Cold-Charge Lockout: below it charging is disabled. With a measured battery temperature (probe, NMEA 2000, VE.Direct or RV-C) set it at the battery's own cutoff, conventionally 32 &deg;F (0 &deg;C) for lithium. When the regulator board is the stand-in, set it higher: the board runs warmer than the battery, so the stand-in reads above the true battery temperature. Re-arms after the temperature climbs about 2 &deg;F (1 &deg;C) back above this floor. Has no effect unless the lockout is On.</span>
+                    <span class="tooltip-box">Battery-temperature floor for the Cold-Charge Lockout: below it charging is disabled. Set it at the battery's own cutoff, conventionally 32 &deg;F (0 &deg;C) for lithium. Re-arms after the temperature climbs about 2 &deg;F (1 &deg;C) back above this floor. Has no effect unless the lockout is On, and nothing happens without a measured battery temperature (probe, NMEA 2000, VE.Direct or RV-C).</span>
                   </span>
                 </div>
                 <div class="form-input">
@@ -7347,7 +7326,7 @@
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Max Charge Temp (<span class="temp-unit-label">°F</span>) (<span id="MaxChargeTempF_echo">?</span>):</span>
                   <span class="tooltip">&#8505;&#65039;
-                    <span class="tooltip-box">Battery-temperature ceiling for the Hot-Charge Lockout: above it charging is disabled. Set it at the battery manufacturer's maximum charge temperature. Re-arms after the temperature falls about 2 &deg;F (1 &deg;C) back below this ceiling. Acts only on a measured battery temperature, never on the board stand-in. Has no effect unless the lockout is On.</span>
+                    <span class="tooltip-box">Battery-temperature ceiling for the Hot-Charge Lockout: above it charging is disabled. Set it at the battery manufacturer's maximum charge temperature. Re-arms after the temperature falls about 2 &deg;F (1 &deg;C) back below this ceiling. Acts only on a measured battery temperature (probe, NMEA 2000, VE.Direct or RV-C). Has no effect unless the lockout is On.</span>
                   </span>
                 </div>
                 <div class="form-input">
@@ -7543,6 +7522,30 @@
                 </div>
               </div>
 
+              <hr />
+              <div class="form-row gate-batt-current">
+                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                  <span>Shunt Resistance Compensation (<span id="ShuntGroundComp_echo">?</span>):</span>
+                  <span class="tooltip">
+                    &#8505;&#65039;
+                    <span class="tooltip-box">On: the battery voltage reading is corrected for the shunt's own voltage drop, which is what a Regulator Ground Wire landed on the load side of a shunt in the battery negative lead adds to it. Off: for a Regulator Ground Wire landed on the battery negative post, or a shunt in the positive lead.</span>
+                  </span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="ShuntGroundComp_checkbox" type="checkbox"
+                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'ShuntGroundComp').then(ok => { if (ok && handleUserToggle('ShuntGroundComp_checkbox', 'ShuntGroundComp', 'ShuntGroundComp')) { cb.form.submit(); submitMessage(); } });" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input id="ShuntGroundComp" name="ShuntGroundComp" type="number" value="" style="display:none;" />
+                  </form>
+                </div>
+              </div>
+
+              <hr />
             </details>
 
             <!-- How It Works -->
@@ -7781,6 +7784,24 @@
                       <button type="button" class="cap-mode-btn" data-val="3" onclick="abSegSelectClick(this)">Victron</button>
                     </div>
                     <input id="BatteryCurrentSource_val" name="BatteryCurrentSource" type="hidden" value="0" />
+                  </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                  <span>Battery Voltage Source (<span id="BatteryVoltageSource_echo">?</span>):</span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Chooses the battery voltage used to decide bulk, absorption, float, and rebulk. The onboard INA228 always drives the control loops and protections. Choose an external source when the Regulator Ground Wire is long enough to shift the onboard reading; the regulator falls back to the onboard sensor whenever the external source is stale.</span></span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <div class="cap-mode-toggle ab-seg-select" data-seg-name="BatteryVoltageSource">
+                      <button type="button" class="cap-mode-btn" data-val="0" onclick="abSegSelectClick(this)">Onboard</button>
+                      <button type="button" class="cap-mode-btn" data-val="1" onclick="abSegSelectClick(this)">NMEA 2000</button>
+                      <button type="button" class="cap-mode-btn" data-val="3" onclick="abSegSelectClick(this)">Victron</button>
+                    </div>
+                    <input id="BatteryVoltageSource_val" name="BatteryVoltageSource" type="hidden" value="0" />
                   </form>
                 </div>
               </div>
@@ -10960,7 +10981,7 @@
 
           <div class="card-group">
             <p class="card-group-title"><span>Temperature</span>
-              <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The battery temperature the regulator is using and where it comes from: the battery probe, NMEA 2000 battery status, a VE.Direct monitor, an RV-C source, or the regulator board standing in when no measurement is available. The source is chosen under Setup &rarr; Battery &rarr; Battery Temperature. Greyed when the active source has stopped reporting.</span></span>
+              <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The battery temperature the regulator is using and where it comes from: the battery probe, NMEA 2000 battery status, a VE.Direct monitor, or an RV-C source. The source is chosen under Setup &rarr; Battery &rarr; Battery Temperature. Greyed when the active source has stopped reporting.</span></span>
             </p>
             <div class="metric-row">
               <span class="metric-label">Battery Temperature</span>

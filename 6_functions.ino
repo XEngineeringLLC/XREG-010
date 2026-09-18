@@ -113,16 +113,16 @@ float clamp_f(float x, float lo, float hi) {
 // retired — see 2_functions.ino); the fit confidence record lives in the cvfit.csv download.
 
 // computeCvTempScale — battery-temperature gain derate factor (see the globals block in Xregulator.ino).
-// battTempActiveF (°F, the batteryTempF() source of this tick: probe / NMEA 2000 / VE.Direct / RV-C, else
-// the board temperature as a stand-in) is the battery temp; the battery's internal resistance — which IS
+// battTempActiveF (°F, the batteryTempF() source of this tick: probe / NMEA 2000 / VE.Direct / RV-C) is
+// the measured battery temp; the battery's internal resistance — which IS
 // the CV plant gain K_dc — rises as it cools, so gains set at the commissioning temperature run too hot
 // when colder. Returns R(T_commission)/R(T_now): both ends go through cvResistanceRatio(), so the
 // saturation there — not a clamp on the ratio — is what bounds the result. That makes the bite point an
 // absolute temperature instead of a function of whatever the source happened to read when the fit was
 // applied. Returns 1.0 when disabled, never commissioned, or no source qualifies — never amplifies blindly.
-// Source CLASS rule: a measured source (1..4) and the board stand-in (5) read different temperatures for
-// the same pack, so the anchor only holds inside the class it was stamped in (CommissionTempSrc, 0 =
-// legacy stamp = board). A class change makes the derate inert (1.0, cvTempDerateInert) until the fit is re-run.
+// Anchor rule: the stamp has to be a measured source too (CommissionTempSrc 1..4). A legacy stamp (0) or
+// one from the retired board stand-in (5) read a different temperature than the pack, so it makes the
+// derate inert (1.0, cvTempDerateInert) until the fit is re-run against a measured source.
 // This is a Kp+Ki scale, NOT a λ/ω change — ω and ρ are held fixed.
 static const float CVTS_T_MIN_C = -40.0f, CVTS_T_MAX_C = 70.0f;   // BMP388 rated span; also the charging envelope
 static const float CVTS_WARM_RATIO = 0.5f;
@@ -157,30 +157,28 @@ bool tempProbeFresh(uint8_t idx) {
 }
 
 // Source codes shared with CSV2 battTempActiveSrc and the UI:
-// 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T field), 4 RV-C (DC_SOURCE_STATUS_2), 5 board temperature
+// 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T field), 4 RV-C (DC_SOURCE_STATUS_2). 5 is retired
+// and never emitted; the remaining codes keep their values so stored settings and CSV2 stay valid.
 float batteryTempF(uint8_t *srcOut) {
   // Every gate is evaluated each call so tempProbeFresh's idle tracker keeps running whatever the selection.
   bool okProbe = tempProbeFresh(IDX_BATT_TEMP_PROBE) && battTempProbeEnable == 1 && isfinite(BatteryTempProbeF);
   bool okVe    = tempProbeFresh(IDX_VE_BATT_TEMP) && isfinite(VictronBattTempF);
   bool okRvc   = tempProbeFresh(IDX_RVC_BATT_TEMP) && isfinite(rvcRxBattTempF);
   bool okN2k   = !IS_STALE(IDX_N2K_BATT) && isfinite(n2kRxBattTempF);
-  bool okBoard = !IS_STALE(IDX_AMBIENT_TEMP) && isfinite(ambientTemp);
   uint8_t src = 0;
   float t = NAN;
   switch (battTempSource) {
-    case 0:  // Auto: first qualifying measurement, the board only as an opt-in stand-in
+    case 0:  // Auto: first qualifying measurement, no fallback
       if (okProbe)      { src = 1; t = BatteryTempProbeF; }
       else if (okN2k)   { src = 2; t = n2kRxBattTempF; }
       else if (okVe)    { src = 3; t = VictronBattTempF; }
       else if (okRvc)   { src = 4; t = rvcRxBattTempF; }
-      else if (okBoard && battTempProxyEnable == 1) { src = 5; t = ambientTemp; }
       break;
     case 1: if (okProbe) { src = 1; t = BatteryTempProbeF; } break;
     case 2: if (okN2k)   { src = 2; t = n2kRxBattTempF; }   break;
     case 3: if (okVe)    { src = 3; t = VictronBattTempF; } break;
     case 4: if (okRvc)   { src = 4; t = rvcRxBattTempF; }   break;
-    case 5: if (okBoard) { src = 5; t = ambientTemp; }      break;
-    default: break;  // 6 = none
+    default: break;  // 5 retired (board stand-in, removed 2026-09-18); 6 = none
   }
   if (srcOut) *srcOut = src;
   return t;
@@ -192,7 +190,6 @@ const char *battTempSrcName(uint8_t src) {
     case 2: return "NMEA 2000";
     case 3: return "VE.Direct";
     case 4: return "RV-C";
-    case 5: return "board temperature";
     default: return "none";
   }
 }
@@ -201,10 +198,8 @@ float computeCvTempScale() {
   cvTempDerateInert = false;
   if (!battTempDerateEnable) return 1.0f;
   if (isnan(CommissionTempF)) return 1.0f;
-  if (battTempActiveSrc == 0 || !isfinite(battTempActiveF)) return 1.0f;
-  bool nowMeasured  = (battTempActiveSrc >= 1 && battTempActiveSrc <= 4);
-  bool commMeasured = (CommissionTempSrc >= 1 && CommissionTempSrc <= 4);
-  if (nowMeasured != commMeasured) { cvTempDerateInert = true; return 1.0f; }
+  if (battTempActiveSrc < 1 || battTempActiveSrc > 4 || !isfinite(battTempActiveF)) return 1.0f;
+  if (CommissionTempSrc < 1 || CommissionTempSrc > 4) { cvTempDerateInert = true; return 1.0f; }
   float tCommC = clamp_f((CommissionTempF  - 32.0f) / 1.8f, CVTS_T_MIN_C, CVTS_T_MAX_C);
   float tNowC  = clamp_f((battTempActiveF - 32.0f) / 1.8f, CVTS_T_MIN_C, CVTS_T_MAX_C);
   // Asymmetric: a boost raises loop gain, and an over-large coefficient inflates it further, so the boost
@@ -213,7 +208,7 @@ float computeCvTempScale() {
 }
 
 // recomputeCvGains — derive VoltageKp_active/VoltageKi_active from the gain mode + measured stiffness.
-// Call after any related setting change, on battery-temp drift (board or measured source), and at boot. Computed in 12V-equivalent
+// Call after any related setting change, on measured battery-temp drift, and at boot. Computed in 12V-equivalent
 // space (same numbers on 12/24/36/48 V), then ×vNorm bakes back to pack space; the battery-temp derate is
 // the final multiplier in BOTH modes (the plant shifts with temperature however the gains were chosen).
 void recomputeCvGains() {
@@ -1590,7 +1585,7 @@ void enter_sys_auto() {
   inIdleStage = false;
   floatStartTime = 0;
   queueConsoleMessageF(
-    "enter_sys_auto: starting in BULK (%.2fV)", getBatteryVoltage());
+    "enter_sys_auto: starting in BULK (%.2fV src=%s)", getChargeDecisionVoltage(), chargeDecisionVoltageSourceName());
 
   // Always seed from alternator current regardless of MaintainMode
   float actualCurrent = max(0.0f, getTargetAmps());
@@ -5941,7 +5936,9 @@ static const char *bcurForLog() {
 
 void updateChargingStage() {
   const uint32_t now = millis();
-  const float v = getFiltV();
+  // Stage thresholds only. Control loops, protections and every dynamic measurement stay on getFiltV().
+  const float v = getChargeDecisionVoltage();
+  const char *vsrc = chargeDecisionVoltageSourceName();
   const int soc = SOC_percent / 100;  // SOC_percent is %×100; the rebulk gates compare in plain percent
 
   // While a commissioning run is live (IN_PROGRESS and the wizard dialog heartbeat is still fresh) the
@@ -5983,7 +5980,7 @@ void updateChargingStage() {
       absorptionTailTimer = 0;
       rebulkTimer = 0;
       floatStartTime = now;
-      queueConsoleMessageF("Stage: RESTART→BULK (user request) | battV=%.2fV bulkTarget=%.2fV", v, BulkVoltage);
+      queueConsoleMessageF("Stage: RESTART→BULK (user request) | battV=%.2fV src=%s bulkTarget=%.2fV", v, vsrc, BulkVoltage);
     } else {
       queueConsoleMessage("Restart charge cycle ignored: no auto charge stage active");
     }
@@ -6008,8 +6005,8 @@ void updateChargingStage() {
       absorptionTailTimer = 0;
       bulkVoltageHoldTimer = 0;
       queueConsoleMessageF(
-        "Stage: BULK→ABSORPTION (hold timer) | battV=%.2fV bulkTarget=%.2fV absTarget=%.2fV tailCurrent=%.1fA timeout=%.0fmin",
-        v, BulkVoltage, AbsorptionVoltage, TailCurrent_A,
+        "Stage: BULK→ABSORPTION (hold timer) | battV=%.2fV src=%s bulkTarget=%.2fV absTarget=%.2fV tailCurrent=%.1fA timeout=%.0fmin",
+        v, vsrc, BulkVoltage, AbsorptionVoltage, TailCurrent_A,
         (float)AbsorptionTimeoutMs / 60000.0f);
     }
 
@@ -6103,8 +6100,8 @@ void updateChargingStage() {
         rebulkTimer = 0;
         const char *nextStage = (EFFECTIVE_USE_FLOAT == 0) ? "IDLE" : (EFFECTIVE_USE_FLOAT == 2) ? "FLOAT (zero-current)" : "FLOAT";
         queueConsoleMessageF(
-          "Stage: ABSORPTION→%s (tail current) | battV=%.2fV Bcur=%s tailThresh=%.1fA",
-          nextStage, v, bcurForLog(), TailCurrent_A);
+          "Stage: ABSORPTION→%s (tail current) | battV=%.2fV src=%s Bcur=%s tailThresh=%.1fA",
+          nextStage, v, vsrc, bcurForLog(), TailCurrent_A);
       }
     } else {
       absorptionTailTimer = 0;
@@ -6119,11 +6116,11 @@ void updateChargingStage() {
       rebulkTimer = 0;
       const char *nextStage = (EFFECTIVE_USE_FLOAT == 0) ? "IDLE" : (EFFECTIVE_USE_FLOAT == 2) ? "FLOAT (zero-current)" : "FLOAT";
       queueConsoleMessageF(
-        "Stage: ABSORPTION→%s (%s) | atVoltage=%.0fmin of %.0fmin, elapsed=%.0fmin | battV=%.2fV Bcur=%s",
+        "Stage: ABSORPTION→%s (%s) | atVoltage=%.0fmin of %.0fmin, elapsed=%.0fmin | battV=%.2fV src=%s Bcur=%s",
         nextStage,
         (absorbHeldMs >= AbsorptionTimeoutMs) ? "absorption time used up" : "absorption ran too long below target voltage",
         (float)absorbHeldMs / 60000.0f, (float)AbsorptionTimeoutMs / 60000.0f,
-        (float)(uint32_t)(now - absorptionStartTime) / 60000.0f, v, bcurForLog());
+        (float)(uint32_t)(now - absorptionStartTime) / 60000.0f, v, vsrc, bcurForLog());
     }
 
   } else if (inIdleStage) {
@@ -6159,8 +6156,8 @@ void updateChargingStage() {
           const char *why = (Bcur < -RebulkCurrent_A) ? "discharge current threshold"
                                                       : "voltage sag confirmed";
           queueConsoleMessageF(
-            "Stage: IDLE→BULK (%s) | battV=%.2fV Bcur=%s tIdle=%lus",
-            why, v, bcurForLog(), (unsigned long)(tIdle / 1000));
+            "Stage: IDLE→BULK (%s) | battV=%.2fV src=%s Bcur=%s tIdle=%lus",
+            why, v, vsrc, bcurForLog(), (unsigned long)(tIdle / 1000));
         }
       } else {
         rebulkTimer = 0;
@@ -6246,8 +6243,8 @@ void updateChargingStage() {
                         : (Bcur < -RebulkCurrent_A) ? "discharge current threshold"
                                                     : "voltage sag confirmed";
       queueConsoleMessageF(
-        "Stage: FLOAT→BULK (%s) | battV=%.2fV rebulkV=%.2fV tFloat=%lus",
-        why, v, RebulkVoltage, (unsigned long)(tFloat / 1000));
+        "Stage: FLOAT→BULK (%s) | battV=%.2fV src=%s rebulkV=%.2fV tFloat=%lus",
+        why, v, vsrc, RebulkVoltage, (unsigned long)(tFloat / 1000));
     }
   }
 }
@@ -6501,9 +6498,9 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
 
-  // PRIORITY 3.6: HOT-CHARGE LOCKOUT (opt-in — a MEASURED battery temperature above MaxChargeTempF; the
-  // board stand-in never drives it). Same graceful ramp + lockout as the cold check, below MANUAL for the
-  // same reason — mirrors selectFieldEventReason. Hysteresis and the source gate live in buildTickSnapshot.
+  // PRIORITY 3.6: HOT-CHARGE LOCKOUT (opt-in — a measured battery temperature above MaxChargeTempF).
+  // Same graceful ramp + lockout as the cold check, below MANUAL for the same reason — mirrors
+  // selectFieldEventReason. Hysteresis and the source gate live in buildTickSnapshot.
   if (tick.batteryTooHot) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
@@ -7042,8 +7039,8 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     tick.batteryTooCold = coldLatched;
   }
 
-  // Hot-charge lockout: mirror of the cold latch. Only a measured battery source (1..4) may drive it —
-  // the board stand-in runs warmer than the pack and would lock charging out on a warm day.
+  // Hot-charge lockout: mirror of the cold latch. The explicit 1..4 source gate stays so a future
+  // non-measured source cannot silently start locking charging out on a warm day.
   {
     static bool hotLatched = false;
     if (hotChargeLockoutEnable == 1 && tick.battTempSrc >= 1 && tick.battTempSrc <= 4 && isfinite(tick.battTempF)) {
@@ -7058,14 +7055,14 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     tick.batteryTooHot = hotLatched;
   }
 
-  // Battery temperature moved >= 5 F, or its source class (measured / board / none) changed -> refresh the
-  // CV gain derate, at most once per 30 s. Mirrors the BMP388 drift trigger in 5_functions.ino;
-  // recomputeCvGains is arithmetic only, so it is safe on the control core.
+  // Battery temperature moved >= 5 F, or it appeared/disappeared -> refresh the CV gain derate, at most
+  // once per 30 s. This is the only derate trigger; recomputeCvGains is arithmetic only, so it is safe on
+  // the control core.
   {
     static float    lastDerateTempF = NAN;
     static uint8_t  lastDerateClass = 0;
     static uint32_t lastDerateMs = 0;
-    uint8_t cls = (tick.battTempSrc >= 1 && tick.battTempSrc <= 4) ? 1 : ((tick.battTempSrc == 5) ? 2 : 0);
+    uint8_t cls = (tick.battTempSrc >= 1 && tick.battTempSrc <= 4) ? 1 : 0;
     bool moved = isfinite(tick.battTempF)
                  && (isnan(lastDerateTempF) || fabsf(tick.battTempF - lastDerateTempF) >= 5.0f);
     if (battTempDerateEnable && !isnan(CommissionTempF) && (moved || cls != lastDerateClass)

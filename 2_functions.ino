@@ -141,6 +141,7 @@ bool fsRemove(const char *path) {
 #define NK_BatteryCapacity_Ah "BatteryCapctyAh"
 #define NK_BatteryCurrentSource "BatteryCrrntSrc"
 #define NK_BatteryVoltage "BatteryVoltage"   // 12/24/36/48 nominal bank class
+#define NK_BatteryVoltageSource "BatteryVoltSrc"
 #define NK_Beta "Beta"
 #define NK_BulkVoltage "BulkVoltage"
 #define NK_CAPSIZE_THRESHOLD_DEG "CAPSIZETHRESHOL"
@@ -275,6 +276,7 @@ bool fsRemove(const char *path) {
 #define NK_SetpointBigStepRiseRate "SetpntBigStpRt"
 #define NK_SettleTimeBeforeCut "SettleTimeBfrCt"
 #define NK_ShuntResistanceMicroOhm "ShntRsstncMcrOh"
+#define NK_ShuntGroundComp "ShuntGroundComp"
 #define NK_ShutdownPhase2HoldMs "ShtdwnPhs2HldMs"
 #define NK_cvHelpersEnabled "cvHelpersEn"
 #define NK_cvGainMode "cvGainMode"
@@ -350,7 +352,8 @@ bool fsRemove(const char *path) {
 #define NK_ripDriftPct "ripDriftPct"
 // RETIRED NVS keys — never reuse these key strings for a new setting (old devices still hold
 // stored values under them): "cvPlantTau", "cvPlantL" (removed 2026-07-03; τ/L fit retired);
-// "cvPlantK" (2026-07-08 — the single-point gain became the derived Ka + Kb·√t curve).
+// "cvPlantK" (2026-07-08 — the single-point gain became the derived Ka + Kb·√t curve);
+// "battTmpProxyEn" (2026-09-18 — the board-temperature battery stand-in was removed).
 #define NK_CommissionTempF "CommissionTmpF"
 #define NK_CommissionEpoch "CommissionEpch"
 #define NK_cmAgeAck "cmAgeAck"
@@ -622,7 +625,7 @@ bool fsRemove(const char *path) {
 #define NK_battTempProbeEnable    "battTmpPrbEn"
 #define NK_extraTempProbeEnable   "extraTmpPrbEn"
 #define NK_battTempSource         "battTmpSrc"
-#define NK_battTempProxyEnable    "battTmpProxyEn"
+// #define NK_battTempProxyEnable "battTmpProxyEn"   // RETIRED 2026-09-18 with the board-temperature battery stand-in — key reserved, never reuse
 #define NK_hotChargeLockoutEnable "hotChrgLock"
 #define NK_MaxChargeTempF         "MaxChargeTempF"
 #define NK_extraTempAlarmHiEnable "xTmpAlmHiEn"
@@ -4362,7 +4365,7 @@ static inline size_t cfgRemain(int off) {
   X(victron_yield_yest_kwh,     "%.2f",  (double)VictronYieldYesterday_kWh) \
   X(victron_max_power_yest_w,   "%.1f",  (double)VictronMaxPowerYesterday_W) \
   /* Which source batteryTempF() was actually using when the snapshot was built: 0 none, 1 probe, \
-     2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board stand-in. Names the provenance of batt_temp_* in \
+     2 NMEA 2000, 3 VE.Direct, 4 RV-C. Names the provenance of batt_temp_* in \
      sensor_history, which carries the numbers but not where they came from. */ \
   X(batt_temp_src,              "%d",    (int)battTempActiveSrc) \
   /* Lifetime count of adaptive-table updates: says whether the learning is still moving or has \

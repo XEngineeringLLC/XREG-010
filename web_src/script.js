@@ -1060,7 +1060,7 @@ const CSV2_FIELDS = [
     "BatteryTempProbeF",       // BATT-role DS18B20 (°F x10; ROLL_EMPTY = no reading)
     "ExtraTempF",              // EXTRA-role DS18B20 (°F x10; ROLL_EMPTY = no reading)
     "battTempActiveF",         // battery temperature in use this tick (°F x10; ROLL_EMPTY = none)
-    "battTempActiveSrc",       // 0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 board stand-in
+    "battTempActiveSrc",       // 0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C (5 retired, never emitted)
     "owProbeCount",            // 1-Wire probes present on the last enumeration
     "owUnassignedCount",       // present probes with no role
     "VictronBattTempF",        // VE.Direct T field (°F x10; ROLL_EMPTY = none)
@@ -3719,7 +3719,7 @@ const CSV3_FIELDS = [
     "setpointSlewEnable",  // inner-loop current setpoint slew master switch (0/1)
     "cvRiseGovEnable",  // CV rise governor / anti-windup master switch (0/1)
     "dutySlewEnable",  // field duty slew master switch (0/1)
-    "CommissionTempF",  // board temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset)
+    "CommissionTempF",  // measured battery temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset)
     "battTempDerateEnable",  // battery-temp gain derate master on/off (0/1)
     "battTempCoeff",  // battery fractional resistance change per °C; ×10000
     "TempPIDKiDownFrac",  // thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000
@@ -3841,8 +3841,7 @@ const CSV3_FIELDS = [
     "rvcDevPriority",  // RV-C device priority
     "battTempProbeEnable",  // 0/1 BATT-role probe feeds the battery temperature
     "extraTempProbeEnable",  // 0/1 EXTRA-role probe reported / alarmed / transmitted
-    "battTempSource",  // 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 5 Board, 6 None
-    "battTempProxyEnable",  // 0/1 board temperature may stand in when Auto finds no measurement
+    "battTempSource",  // 0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 6 None (5 retired)
     "hotChargeLockoutEnable",  // hot-charge lockout master on/off (1=on)
     "MaxChargeTempF",  // hot-charge lockout ceiling (°F)
     "extraTempAlarmHiEnable",  // 0/1 extra-probe high alarm
@@ -3852,9 +3851,11 @@ const CSV3_FIELDS = [
     "n2kExtraTempEnable",  // 0/1 PGN 130312 for the extra probe
     "n2kExtraTempInstance",  // extra-probe temperature instance (0..252)
     "n2kExtraTempSource",  // tN2kTempSource code for the extra probe
-    "CommissionTempSrc",  // battTempActiveSrc when CommissionTempF was stamped (0 = legacy = board)
+    "CommissionTempSrc",  // battTempActiveSrc when CommissionTempF was stamped (0 = legacy, 5 = retired board stamp)
     "maxWorkingRpm",
     "RemoteDiagnostics",
+    "ShuntGroundComp",
+    "BatteryVoltageSource",
     "sessionId",  // device boot identity, same in every channel this boot
     "sendMs",  // device millis() when this settings echo was built; event-driven with a 60 s fallback
 ];
@@ -8531,11 +8532,13 @@ function updateAllEchosOptimized(data) {
         { key: 'absorptionCompleteTime', id: 'absorptionCompleteTime_echo', transform: v => Math.round(v / 1000) },
         { key: 'FLOAT_DURATION', id: 'FLOAT_DURATION_echo', transform: v => (v / 3600).toFixed(2) },
         { key: 'AutoShuntGainCorrection', id: 'AutoShuntGainCorrection_echo', transform: v => v == 1 ? 'On' : 'Off' },
+        { key: 'ShuntGroundComp', id: 'ShuntGroundComp_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'AutoAltCurrentZero', id: 'AutoAltCurrentZero_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'WindingTempOffset', id: 'WindingTempOffset_echo', transform: v => Math.round(toDisplayTempDelta(v)) },
         { key: 'PulleyRatio', id: 'PulleyRatio_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'ManualLifePercentage', id: 'ManualLifePercentage_echo', transform: v => v },
         { key: 'BatteryCurrentSource', id: 'BatteryCurrentSource_echo', transform: v => ({0: 'INA228 Shunt', 1: 'NMEA2K', 2: 'NMEA0183', 3: 'Victron VE.Direct'}[v] ?? v) },
+        { key: 'BatteryVoltageSource', id: 'BatteryVoltageSource_echo', transform: v => ({0: 'Onboard INA228', 1: 'NMEA 2000', 3: 'Victron VE.Direct'}[v] ?? v) },
         { key: 'timeAxisModeChanging', id: 'timeAxisModeChanging_echo', transform: v => v == 1 ? 'UNIX' : 'Elapsed' },
         { key: 'timeSourceMode', id: 'timeSourceMode_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'This device only', 3:'NTP time only'}[v] ?? '?') },
         { key: 'gpsPositionSource', id: 'gpsPositionSource_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'Phone only'}[v] ?? '?') },
@@ -8692,7 +8695,6 @@ function updateAllEchosOptimized(data) {
         { key: 'battTempProbeEnable',    id: 'battTempProbeEnable_echo',    transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'extraTempProbeEnable',   id: 'extraTempProbeEnable_echo',   transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'battTempSource',         id: 'battTempSource_echo',         transform: v => (BATT_TEMP_SOURCE_OPTION_NAMES[v] ?? v) },
-        { key: 'battTempProxyEnable',    id: 'battTempProxyEnable_echo',    transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'hotChargeLockoutEnable', id: 'hotChargeLockoutEnable_echo', transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'MaxChargeTempF',         id: 'MaxChargeTempF_echo',         transform: v => Math.round(toDisplayTemp(v)) },
         { key: 'extraTempAlarmHiEnable', id: 'extraTempAlarmHiEnable_echo', transform: v => v == 1 ? 'ON' : 'OFF' },
@@ -8855,6 +8857,7 @@ function updateAllEchosOptimized(data) {
 
     // BatteryCurrentSource is a segmented A/B control (not a <select>)
     if ('BatteryCurrentSource' in data) syncSegmentedSelect('BatteryCurrentSource', data.BatteryCurrentSource);
+    if ('BatteryVoltageSource' in data) syncSegmentedSelect('BatteryVoltageSource', data.BatteryVoltageSource);
     if ('NMEA0183Baud' in data) syncSegmentedSelect('NMEA0183Baud', data.NMEA0183Baud);
     if ('NMEA0183Invert' in data) syncSegmentedSelect('NMEA0183Invert', data.NMEA0183Invert);
 
@@ -9819,17 +9822,13 @@ function deriveBatteryDefaults(type, capAh, sysV, mountLoc, battProbe) {
     rows.push({ param: 'VoltageAlarmLow', label: 'Low Voltage Alarm (V)', value: r2(T.vAlmLo * kV) });
     rows.push({ param: 'SocAlarmLow', label: 'Low State of Charge Alarm (%)', value: T.socAlm });
     rows.push({ param: 'coldChargeLockoutEnable', label: 'Cold-Charge Lockout', value: T.cold, show: v => v ? 'On' : 'Off' });
-    // With a battery probe the derate reads the battery itself, so it is On wherever the regulator sits,
-    // and the hot lockout has a measurement to act on (it never acts on the board stand-in). Without a
-    // probe the board stands in, and an engine-room board temp is not a battery proxy — it reads hot
-    // while the bank is still cold, which would push the gains UP exactly when the plant is stiffest.
-    // Off beats a proxy that inverts.
+    // A battery probe is what gives the derate and the hot lockout something to read, so both are proposed
+    // only with one fitted. With no measured battery temperature neither can act anyway, so nothing is
+    // proposed and whatever is stored stays; mountLoc no longer decides anything here.
     if (battProbe === 1) {
         rows.push({ param: 'battTempDerateEnable', label: 'Battery-Temp Gain Derate', value: 1, show: v => v ? 'On' : 'Off' });
         rows.push({ param: 'hotChargeLockoutEnable', label: 'Hot-Charge Lockout', value: T.hot, show: v => v ? 'On' : 'Off' });
         rows.push({ param: 'MaxChargeTempF', label: 'Max Charge Temp (' + tempUnitLabel() + ')', value: T.hotF, show: v => String(Math.round(toDisplayTemp(v))) });
-    } else if (mountLoc === 0 || mountLoc === 1) {
-        rows.push({ param: 'battTempDerateEnable', label: 'Battery-Temp Gain Derate', value: mountLoc === 0 ? 1 : 0, show: v => v ? 'On' : 'Off' });
     }
     rows.push({ param: 'PeukertExponent', label: 'Peukert Exponent', value: T.peukert });
     rows.push({ param: 'ChargeEfficiency', label: 'Charge Efficiency (%)', value: T.chgEff });
@@ -9956,7 +9955,7 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
         const typeName = { lifepo4: 'LiFePO4', agm: 'AGM', lead_acid: 'Lead Acid' }[type] || type;
         const capTxt = (Number(vessel.battery_capacity_ah) > 0) ? Number(vessel.battery_capacity_ah) + ' Ah, ' : '';
         // Charge targets/limits don't yet move with temperature (setpoint temp-comp is unbuilt; the
-        // battery temperature itself now comes from the Setup > Temperature source chain). Inline here
+        // battery temperature itself comes from the measured source chain). Inline here
         // (one message, in context) rather than a separate popup after this modal.
         const _tc = (typeof displayTempUnit !== 'undefined' && displayTempUnit === 1);
         let noticeHtml = '';
@@ -9970,22 +9969,18 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
             noticeHtml = battDefNotice('warn', 'Do not charge below freezing',
                     'Charging a lithium (LiFePO4) battery below freezing (' + tFrz + ') plates the cells and permanently damages them, and the battery\'s protection circuit (BMS) can disconnect to defend itself — if it opens while the alternator is charging, the sudden loss of load can spike system voltage and damage other electronics.');
         }
-        // Only raised when the board really is the stand-in. battTempProbeEnable alone would nag every
-        // install whose battery temperature arrives over NMEA 2000, VE.Direct or RV-C, so the gate is
-        // the live resolved source (CSV2 battTempActiveSrc, same codes as firmware batteryTempF) OR an
-        // explicit non-board selection, which stays configured while its bus is momentarily quiet.
-        // No CSV2 frame yet (cold tab) reads as 5 = board, so a real gap is never suppressed.
-        const battTempSel = ('battTempSource' in cfg) ? parseInt(cfg.battTempSource, 10) : 0;   // 0 Auto .. 5 Board, 6 None
+        // Raised only when nothing measured is reporting. battTempProbeEnable alone would nag every install
+        // whose battery temperature arrives over NMEA 2000, VE.Direct or RV-C, so the gate is the live
+        // resolved source (CSV2 battTempActiveSrc, same codes as firmware batteryTempF) OR an explicit
+        // pinned selection, which stays configured while its bus is momentarily quiet. No CSV2 frame yet
+        // (cold tab) reads as 0, so a real gap is never suppressed.
+        const battTempSel = ('battTempSource' in cfg) ? parseInt(cfg.battTempSource, 10) : 0;   // 0 Auto, 1..4 pinned, 6 None
         const liveTempSrc = (g_lastCsv2 && g_lastCsv2.battTempActiveSrc !== undefined)
-            ? (Number(g_lastCsv2.battTempActiveSrc) | 0) : 5;
+            ? (Number(g_lastCsv2.battTempActiveSrc) | 0) : 0;
         const measuredSrc = battProbe === 1 || (battTempSel >= 1 && battTempSel <= 4) || (liveTempSrc >= 1 && liveTempSrc <= 4);
         if (!measuredSrc) {
             noticeHtml += battDefNotice('limit', 'Battery temperature source',
-                // src 0 = nothing qualified this tick: no probe, no bus source, and the board stand-in
-                // either not selected or switched off (battTempProxyEnable). Different gap, different copy.
-                (liveTempSrc === 0)
-                ? 'No battery temperature source is reporting, so the cold-charge lockout and every temperature-dependent limit have nothing to read. Fit a battery probe — assigned under Setup > Temperature, where the hot-charge lockout and battery temperature limits also live — or feed battery temperature from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.'
-                : 'Battery temperature is taken from the regulator board unless a battery probe, an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source provides it. The board runs warmer than its surroundings, so the cold-charge lockout is a coarse guard when it is the only source. A battery probe fitted later is assigned under Setup > Temperature, where the hot-charge lockout and battery temperature limits also live.');
+                'No battery temperature source is reporting, so the cold and hot charge lockouts and the voltage-loop gain derate have nothing to read. Fit one of the ring-lug probes from the kit to a battery terminal — it is assigned under Setup > Temperature, where the hot-charge lockout and the battery temperature limits also live — or feed battery temperature in from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.');
         }
         // Voltage float is allowed without a shunt (2026-09-09): absorption then ends on its time limit
         // instead of tail current, the way a solar controller floats with no shunt. Say which exit will
@@ -10218,6 +10213,10 @@ let _commPrepTsInit = 0;         // TempSource at open (0 = DS18B20, 1 = Thermis
 let _commPrepTempSrc = 0;        // live TempSource selection
 let _commPrepShuntInit = 1;      // BatteryShuntPresent at open (1 = INA228 fitted, 0 = none)
 let _commPrepShuntPresent = 1;   // live shunt-present selection
+let _commPrepGndCompInit = 0;    // ShuntGroundComp at open (1 = correct battery volts for the shunt drop)
+let _commPrepGndComp = 0;        // live shunt-ground-compensation selection
+let _commPrepVSrcInit = 0;       // BatteryVoltageSource at open (0 = onboard, 1 = NMEA 2000, 3 = Victron)
+let _commPrepVSrc = 0;           // live charge-decision voltage source selection
 let _commPrepFloatInit = '';     // UseFloat at open (Other-only charge block); written only if the select changed
 let _commPrepRpmActive = false;  // deep-linked into the RPM editor from the wizard: suppress the live blue row highlight
 let _commPrepFirstInstall = true; // false on a re-commission: different intro copy
@@ -10522,6 +10521,17 @@ async function openCommPrereqs(firstInstall, deferHandoff, showAlign) {
 // once the battery-defaults, SoC and restart-ack screens are done; resolves true only if Next was pressed.
 function maybeShowCommPrereqs() { return openCommPrereqs(true, true); }
 
+// Live battery-temperature line for the prerequisites screen. Reads the same CSV2 source code the
+// dashboard does (0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C); anything outside 1..4 is "none".
+function commPrepBattTempText() {
+    const c2 = g_lastCsv2 || {};
+    const src = Number(c2.battTempActiveSrc) | 0;
+    if (src < 1 || src > 4) return 'none installed';
+    const f = tempX10(c2.battTempActiveF);
+    const name = battTempSrcName(src);
+    return Number.isFinite(f) ? (name + ', ' + toDisplayTemp(f).toFixed(1) + ' ' + tempUnitLabel()) : name;
+}
+
 function commPrepRender(cfg) {
     const numF = k => (cfg[k] !== undefined && cfg[k] !== '') ? parseFloat(cfg[k]) : NaN;
     const raw = k => { const v = numF(k); return isFinite(v) ? String(v) : ''; };
@@ -10533,6 +10543,13 @@ function commPrepRender(cfg) {
 
     const shuntPresent = (numF('BatteryShuntPresent') === 0) ? 0 : 1;   // default fitted
     _commPrepShuntInit = shuntPresent; _commPrepShuntPresent = shuntPresent;
+
+    const gndComp = (numF('ShuntGroundComp') === 1) ? 1 : 0;
+    _commPrepGndCompInit = gndComp; _commPrepGndComp = gndComp;
+
+    const vsrcRaw = numF('BatteryVoltageSource');
+    const vsrc = (vsrcRaw === 1 || vsrcRaw === 3) ? vsrcRaw : 0;
+    _commPrepVSrcInit = vsrc; _commPrepVSrc = vsrc;
 
     // The charge block (Bulk/Absorption/Float/current/protection) appears ONLY for Other — every other
     // chemistry got these proposed by the battery-defaults populator, which bails for Other and leaves
@@ -10588,6 +10605,24 @@ function commPrepRender(cfg) {
         '</div>' +
         '<div style="font-size:11px; color:#888; margin-top:5px; line-height:1.4;">Set this before commissioning. Without a shunt: state of charge, the battery-current limit, and zero-current float turn off, and absorption can no longer end on tapering current — it runs until its time limit instead, then float (if enabled) holds the float voltage. The alternator-current limit protects the battery (as best it can — it\'s unaware of other charging sources). This mode is NOT RECOMMENDED and for skilled use only.</div>' +
         '</div>';
+
+    const gndCompSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Shunt resistance compensation</label>' +
+        '<div class="cap-mode-toggle" style="background:rgba(255,255,255,0.07); border-color:#444;">' +
+        '<button type="button" id="commprep-gc-1" class="cap-mode-btn' + (gndComp === 1 ? ' cap-mode-active' : '') + '" onclick="commPrepGndComp(1)">On</button>' +
+        '<button type="button" id="commprep-gc-0" class="cap-mode-btn' + (gndComp === 0 ? ' cap-mode-active' : '') + '" onclick="commPrepGndComp(0)">Off</button>' +
+        '</div><div style="' + capCss + '">Turn on only if the Regulator Ground Wire lands on the load side of a shunt in the battery negative lead.</div></div>';
+
+    const vSrcBtn = (val, label) => '<button type="button" id="commprep-vs-' + val + '" class="cap-mode-btn' + (vsrc === val ? ' cap-mode-active' : '') + '" onclick="commPrepVoltSrc(' + val + ')">' + label + '</button>';
+    const vSrcSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery voltage for charge decisions</label>' +
+        '<div class="cap-mode-toggle" style="flex-wrap:wrap; background:rgba(255,255,255,0.07); border-color:#444;">' +
+        vSrcBtn(0, 'Onboard') + vSrcBtn(1, 'NMEA 2000') + vSrcBtn(3, 'Victron') +
+        '</div><div style="' + capCss + '">The onboard sensor drives all control loops regardless. Choose an external source when the Regulator Ground Wire is long.</div></div>';
+
+    // Read-only: which measured battery-temperature source is live right now. Painted from the last CSV2
+    // frame here and kept current by renderBattTempReadouts while the screen is open. Never gates Next.
+    const battTempSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery temperature</label>' +
+        '<div id="commprep-batttemp" style="font-size:13px; color:#ddd;">' + commPrepBattTempText() + '</div>' +
+        '<div style="' + capCss + '">Temperature compensation and the cold and hot charge lockouts need a measured battery temperature. The kit\'s ring-lug probe goes on a battery terminal.</div></div>';
 
     const thermistor = '<div id="commprep-thermistor" style="display:' + (ts === 1 ? '' : 'none') + '; margin:0 0 14px; padding:10px 12px; background:#191919; border:1px solid #333; border-radius:6px;">' +
         field('Thermistor Series Resistor R_fixed (Ω)', 'commprep-rfixed', raw('R_fixed'), '1', '0', '1000000') +
@@ -10661,8 +10696,8 @@ function commPrepRender(cfg) {
                  'A case temperature, not a winding temperature — the case runs 40–50 °F cooler than the windings inside.') + hr +
         grpHdr('Battery') + shuntSeg +
         '<div id="commprep-shunt-row" style="display:' + (shuntPresent === 1 ? '' : 'none') + ';">' +
-        field('Shunt Resistance (µΩ)', 'commprep-shunt', raw('ShuntResistanceMicroOhm'), '1', '1', '5000') + shuntHelp +
-        '</div>' + hr +
+        field('Shunt Resistance (µΩ)', 'commprep-shunt', raw('ShuntResistanceMicroOhm'), '1', '1', '5000') + shuntHelp + gndCompSeg +
+        '</div>' + vSrcSeg + battTempSeg + hr +
         otherBlock;
     commPrepPaintCta();
     _commPrepOwSig = null;                                    // rows were just wiped with the body
@@ -10718,6 +10753,21 @@ function commPrepShuntPresent(v) {
     if (row) row.style.display = (v === 1) ? '' : 'none';
 }
 
+function commPrepGndComp(v) {
+    _commPrepGndComp = v;
+    const b1 = document.getElementById('commprep-gc-1'), b0 = document.getElementById('commprep-gc-0');
+    if (b1) b1.classList.toggle('cap-mode-active', v === 1);
+    if (b0) b0.classList.toggle('cap-mode-active', v === 0);
+}
+
+function commPrepVoltSrc(v) {
+    _commPrepVSrc = v;
+    [0, 1, 3].forEach(k => {
+        const b = document.getElementById('commprep-vs-' + k);
+        if (b) b.classList.toggle('cap-mode-active', k === v);
+    });
+}
+
 // Float Voltage / Float Duration are inert unless Voltage Float (UseFloat=1) is selected — reveal only then.
 function commPrepFloatMode(v) {
     const sub = document.getElementById('commprep-floatsub');
@@ -10757,6 +10807,8 @@ function commPrepCollectChanges() {
     // Write shunt-present before the wizard starts so its side effects (zero-current float demoted, SoC/limit off) settle
     // ahead of commissioning, instead of being toggled mid-run.
     if (_commPrepShuntPresent !== _commPrepShuntInit) out.push({ param: 'BatteryShuntPresent', value: _commPrepShuntPresent });
+    if (_commPrepGndComp !== _commPrepGndCompInit) out.push({ param: 'ShuntGroundComp', value: _commPrepGndComp });
+    if (_commPrepVSrc !== _commPrepVSrcInit) out.push({ param: 'BatteryVoltageSource', value: _commPrepVSrc });
     return out;
 }
 
@@ -15651,6 +15703,7 @@ function updateTogglesFromData(data) {
         updateCheckbox("InvertAltAmps_checkbox", data.InvertAltAmps, "InvertAltAmps");
         updateCheckbox("InvertBattAmps_checkbox", data.InvertBattAmps, "InvertBattAmps");
         updateCheckbox("BatteryShuntPresent_checkbox", data.BatteryShuntPresent, "BatteryShuntPresent");
+        updateCheckbox("ShuntGroundComp_checkbox", data.ShuntGroundComp, "ShuntGroundComp");
         // Single point that drives the whole no-shunt UI: body.no-batt-current greys every
         // .gate-batt-current setting and hides every .req-batt-current readout (styles.css).
         // Only touch it when the echo is actually present.
@@ -15773,7 +15826,6 @@ function updateTogglesFromData(data) {
         updateCheckbox("hotChargeLockoutEnable_checkbox", data.hotChargeLockoutEnable, "hotChargeLockoutEnable");
         updateCheckbox("battTempProbeEnable_checkbox", data.battTempProbeEnable, "battTempProbeEnable");
         updateCheckbox("extraTempProbeEnable_checkbox", data.extraTempProbeEnable, "extraTempProbeEnable");
-        updateCheckbox("battTempProxyEnable_checkbox", data.battTempProxyEnable, "battTempProxyEnable");
         updateCheckbox("extraTempAlarmHiEnable_checkbox", data.extraTempAlarmHiEnable, "extraTempAlarmHiEnable");
         updateCheckbox("extraTempAlarmLoEnable_checkbox", data.extraTempAlarmLoEnable, "extraTempAlarmLoEnable");
         updateCheckbox("cvGainMode_checkbox", data.cvGainMode, "cvGainMode");
@@ -15945,7 +15997,8 @@ function previewCvAlpha() {
 // (g_lastCsv3) and the live battery temperature, its source, the applied scale and the inert flag from
 // CSV2 (g_lastCsv2) — two channels, so it reads the caches rather than the single `data` arg. Honours
 // the °F/°C toggle via toDisplayTemp(). CommissionTempF is sent °F×10 with -32768 = unset;
-// CommissionTempSrc 0 = legacy = board; cvTempDerateScale is ×1000; battTempActiveF is °F×10 with ROLL_EMPTY = none.
+// CommissionTempSrc 0 = legacy, 5 = the retired board stamp (either leaves the derate inert); cvTempDerateScale
+// is ×1000; battTempActiveF is °F×10 with ROLL_EMPTY = none.
 function renderBattTempDerate() {
     const el = document.getElementById('battTempDerate_status');
     if (!el) return;
@@ -15957,14 +16010,17 @@ function renderBattTempDerate() {
         return;
     }
     const commF = rawComm / 10;
-    const commSrc = (c3.CommissionTempSrc !== undefined) ? (parseInt(c3.CommissionTempSrc, 10) || 5) : 5;
-    let s = 'Commissioned at <strong>' + toDisplayTemp(commF).toFixed(0) + lbl + '</strong> (' + battTempSrcName(commSrc) + ')';
+    const commSrc = (c3.CommissionTempSrc !== undefined) ? (parseInt(c3.CommissionTempSrc, 10) || 0) : 0;
+    // 0 (legacy stamp) and 5 (the retired board stand-in) are both "not a measurement" — say so rather
+    // than printing battTempSrcName's "none", which reads as if the fit had no temperature at all.
+    const commSrcTxt = (commSrc >= 1 && commSrc <= 4) ? battTempSrcName(commSrc) : 'not a measured source';
+    let s = 'Commissioned at <strong>' + toDisplayTemp(commF).toFixed(0) + lbl + '</strong> (' + commSrcTxt + ')';
     const battF = tempX10(c2.battTempActiveF);
     const src = Number(c2.battTempActiveSrc) | 0;
-    if (isFinite(battF)) s += ', battery now <strong>' + toDisplayTemp(battF).toFixed(0) + lbl + '</strong> from ' + battTempSrcName(src) + (src === 5 ? ' (stand-in)' : '');
+    if (isFinite(battF)) s += ', battery now <strong>' + toDisplayTemp(battF).toFixed(0) + lbl + '</strong> from ' + battTempSrcName(src);
     else s += ', no battery temperature available now';
     if (Number(c2.cvTempDerateInert) === 1) {
-        s += '. <strong>Battery temperature source changed since commissioning — re-run Voltage Control Autotuning to re-anchor the derate.</strong> The commissioned gains run uncorrected until then.';
+        s += '. <strong>The plant fit was not anchored to a measured battery temperature — re-run Voltage Control Autotuning to re-anchor the derate.</strong> The commissioned gains run uncorrected until then.';
         el.innerHTML = s;
         return;
     }
@@ -15981,10 +16037,11 @@ function renderBattTempDerate() {
 
 // ===== Battery / Extra temperature (Setup > Temperature) =====
 // Source codes shared with CSV2 battTempActiveSrc and the firmware batteryTempF() accessor:
-// 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T field), 4 RV-C (DC_SOURCE_STATUS_2), 5 board stand-in.
-const BATT_TEMP_SRC_NAMES = ['none', 'probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'board temperature'];
-// battTempSource setting labels (index = wire code): 0 Automatic .. 6 None.
-const BATT_TEMP_SOURCE_OPTION_NAMES = ['Automatic', 'Battery probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'Board temperature', 'None'];
+// 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T field), 4 RV-C (DC_SOURCE_STATUS_2). Code 5 (the
+// board stand-in) was retired 2026-09-18; the slot stays so the remaining codes keep their values.
+const BATT_TEMP_SRC_NAMES = ['none', 'probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'none'];
+// battTempSource setting labels (index = wire code): 0 Automatic, 1..4 pinned sources, 6 None.
+const BATT_TEMP_SOURCE_OPTION_NAMES = ['Automatic', 'Battery probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'Automatic', 'None'];
 const TEMP_NA_X10 = -9999;   // pre-0.0.5 firmware sent this for NAN on the CSV2 x10 temperature
                              // fields; they now send ROLL_EMPTY. Kept as a FLOOR (n <= TEMP_NA_X10)
                              // so this bundle still reads an older device correctly.
@@ -16003,7 +16060,6 @@ function battTempActiveAgeMs(src) {
         case 2: return a('n2kBatt');
         case 3: return a('veBattTemp');
         case 4: return a('rvcBattTemp');
-        case 5: return a('ambientTemp');
         default: return 999999;
     }
 }
@@ -16020,8 +16076,9 @@ function renderBattTempReadouts(data) {
     const src = Number(data.battTempActiveSrc) | 0;
     const have = Number.isFinite(battF);
     _battTempActiveSrc = have ? src : 0;
-    const srcTxt = battTempSrcName(src) + (src === 5 ? ' (stand-in)' : '');
+    const srcTxt = battTempSrcName(src);
     set('battTempStatus_ID', have ? 'Battery temperature ' + fmt(battF) + ' ' + lbl + ' from ' + srcTxt : 'No battery temperature available');
+    set('commprep-batttemp', commPrepBattTempText());   // prerequisites screen, only present while that dialog is open
     set('battTempActive_ID', fmt(battF));
     set('battTempActiveSrc_ID', have ? srcTxt : 'none');
     const wm = document.getElementById('battTempProbe_wm');   // probe watermarks only mean something while the probe is the source
@@ -19481,7 +19538,6 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("dvccEn_checkbox").checked = (document.getElementById("dvccEn").value === "1");
     document.getElementById("battTempProbeEnable_checkbox").checked = (document.getElementById("battTempProbeEnable").value === "1");
     document.getElementById("extraTempProbeEnable_checkbox").checked = (document.getElementById("extraTempProbeEnable").value === "1");
-    document.getElementById("battTempProxyEnable_checkbox").checked = (document.getElementById("battTempProxyEnable").value === "1");
     document.getElementById("hotChargeLockoutEnable_checkbox").checked = (document.getElementById("hotChargeLockoutEnable").value === "1");
     document.getElementById("extraTempAlarmHiEnable_checkbox").checked = (document.getElementById("extraTempAlarmHiEnable").value === "1");
     document.getElementById("extraTempAlarmLoEnable_checkbox").checked = (document.getElementById("extraTempAlarmLoEnable").value === "1");
@@ -33706,8 +33762,9 @@ function bhSet(id, t) { const e = document.getElementById(id); if (e) e.textCont
 
 // DCIR normalized to a 25°C (77°F) reference. Resistance rises as the bank cools, so a cold run
 // reads high; this brings every row onto a common footing so the trend isn't just temperature.
-// Board temp is a warm-biased proxy, so this is an APPROXIMATE correction (same model as the
-// battery-temp CV-gain derate). ~0.6%/°F ≈ 1%/°C.
+// The recorded temperature is the measured battery temperature when the test had one and the board
+// temperature otherwise, so this is an APPROXIMATE correction (same model as the battery-temp CV-gain
+// derate). ~0.6%/°F ≈ 1%/°C.
 const BH_TREF_F = 77, BH_TEMPCO_PER_F = 0.006;
 function bhDcir25(dcir, tF) {
   if (!(dcir > 0) || !isFinite(tF)) return null;
