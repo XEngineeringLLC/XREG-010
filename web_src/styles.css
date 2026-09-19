@@ -3896,6 +3896,19 @@ input:checked+.slider:before {
   }
 }
 
+/* Stale readings — body.readings-stale, set by the 9 s stall watchdog (setReadingsStale in
+   script.js) and cleared by the next CSV packet. Scoped to the readout CONTAINERS, never to
+   the individual value classes: the header was rebuilt as .reading-duo and the old
+   per-element selector silently stopped matching anything, so the stall notice promised a
+   grey-out that never happened. A readout added inside these blocks fades with the rest. */
+body.readings-stale .sensor-readings-tier,
+body.readings-stale #header-collapsed-strip .hcs-m,
+body.readings-stale .reading,
+body.readings-stale .reading-value {
+  opacity: 0.4;
+  font-style: italic;
+}
+
 /* Dark Mode */
 .dark-mode {
   --primary: gray;
@@ -6139,6 +6152,18 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .c3-band-table th:first-child { text-align: left; }
 .c3-band-table td.c3-signal { font-size: 12.5px; font-weight: 600; text-align: left; }
 .c3-band-table td.c3-na { color: var(--text-muted); text-align: center; }
+/* Output amps is the only row with two floors (wobble in A, rate in A/s) and the table is pinned to
+   five columns that already only just fit a phone — so they stack in the one cell with a caption
+   between them rather than buying a sixth column that would push the last one off screen. */
+.c3-band-table td.c3-twin { padding-top: 4px; padding-bottom: 4px; }
+.c3-band-table td.c3-twin .c3-twin-cap {
+  display: block;
+  font-size: 9.5px;
+  color: var(--text-muted);
+  text-align: right;
+  margin: 3px 0 1px;
+  line-height: 1;
+}
 .c3-unit { font-size: 10px; font-weight: 400; color: var(--text-muted); margin-top: 2px; }
 
 /* Setup > Temperature: 1-Wire probe table (owRender in script.js). Scrolls inside its own wrap on

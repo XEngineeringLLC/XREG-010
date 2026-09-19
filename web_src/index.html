@@ -6300,8 +6300,8 @@
                              widths here are dead on arrival. -->
                         <th>Signal</th>
                         <th>Wobble <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How far the reading may stray from the straight line drawn through the window. The line itself is free to climb or fall, so a smooth acceleration passes and only genuine roughness fails. Bus voltage and temperature have no line: for those two this is the plain highest-minus-lowest spread. Judged on the smoothed signal, so size it for real operating-point movement, not sensor noise.</span></span></th>
-                        <th>Rate limit <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The steepest that straight line may be. Engine speed is allowed to sweep; the field is held nearly fixed, because a moving field means the regulator is chasing something and the stretch is not one operating point. 0 means no limit on the slope.</span></span></th>
-                        <th>Floor <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Output amps only: its wobble limit is a percentage of the reading, so at low output it would collapse to nothing. This is the smallest it may shrink to.</span></span></th>
+                        <th>Rate limit <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The steepest that straight line may be. Engine speed is allowed to sweep; the field is held nearly fixed, because a moving field means the regulator is chasing something and the stretch is not one operating point. The output gets its own limit, in percent of the reading per second, and that is the one that decides how far a record taken on the move can drift &mdash; how much output moves while it is being averaged is what a wrongly paired reading turns into. 0 means no limit on the slope.</span></span></th>
+                        <th>Floor <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Output amps only: both of its limits are percentages of the reading, so at low output they would collapse to nothing. These are the smallest each may shrink to &mdash; wobble in amps, rate in amps per second.</span></span></th>
                         <th>Window (s) <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How much of the recent past each signal is judged over. All five must pass at the same moment.</span></span></th>
                       </tr>
                     </thead>
@@ -6310,7 +6310,7 @@
                       <tr><td class="c3-signal">Field duty <span class="sinfo" data-sinfo="altBandDuty"></span><div class="c3-unit">%</div></td><td data-ss-label="Field-duty wobble limit (%)"><input name="altDutyLineRms" data-echo="altDutyLineRms" type="number" step="0.1" style="width:100%" /><span id="altDutyLineRms_echo" style="display:none">?</span></td><td data-ss-label="Field-duty rate limit (%/s)"><input name="altDutySlewMax" data-echo="altDutySlewMax" type="number" step="0.1" style="width:100%" /><span id="altDutySlewMax_echo" style="display:none">?</span></td><td class="c3-na">&mdash;</td><td data-ss-label="Field-duty window (s)"><input name="altDutySec" data-echo="altDutySec" type="number" step="0.5" style="width:100%" /><span id="altDutySec_echo" style="display:none">?</span></td></tr>
                       <tr><td class="c3-signal">Bus voltage <span class="sinfo" data-sinfo="altBandVbus"></span><div class="c3-unit">V</div></td><td data-ss-label="Bus-voltage spread (V)"><input name="altVbusTol" data-echo="altVbusTol" type="number" step="0.001" style="width:100%" /><span id="altVbusTol_echo" style="display:none">?</span></td><td class="c3-na">&mdash;</td><td class="c3-na">&mdash;</td><td data-ss-label="Bus-voltage window (s)"><input name="altVbusSec" data-echo="altVbusSec" type="number" step="0.5" style="width:100%" /><span id="altVbusSec_echo" style="display:none">?</span></td></tr>
                       <tr><td class="c3-signal">Temperature <span class="sinfo" data-sinfo="altBandTemp"></span><span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How much alternator temperature may drift, and over how long a look-back, before a run counts as a full steady run &mdash; the points that get the orange ring and that update the reference surface and the engine-hours trend. It is a plain look-back over the last stretch of running, so a dip in output no longer restarts the clock. The This Session plot automatically uses half this window for its lighter "brief point" gate, so there is only one number to set.</span></span><div class="c3-unit"><span class="temp-unit-label">&deg;F</span></div></td><td data-ss-label="Temperature spread"><input name="altThermDegF" data-echo="altThermDegF" type="number" step="0.5" style="width:100%" /><span id="altThermDegF_echo" style="display:none">?</span></td><td class="c3-na">&mdash;</td><td class="c3-na">&mdash;</td><td data-ss-label="Temperature window, full (s)"><input name="altThermSec" data-echo="altThermSec" type="number" step="1" style="width:100%" /><span id="altThermSec_echo" style="display:none">?</span></td></tr>
-                      <tr><td class="c3-signal">Output amps <span class="sinfo" data-sinfo="altBandAmps"></span><span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The alternator output must itself follow a straight line before a point is recorded, and that line may have any slope: while engine speed sweeps smoothly the output rides its own smooth ramp, and that pair is exactly the measurement worth keeping. The limit scales with the reading so one setting works at low float current and full bulk current; the floor takes over at low output.</span></span><div class="c3-unit">% of reading</div></td><td data-ss-label="Output-amps wobble limit (% of reading)"><input name="altAmpsLinePct" data-echo="altAmpsLinePct" type="number" step="0.1" style="width:100%" /><span id="altAmpsLinePct_echo" style="display:none">?</span></td><td class="c3-na">&mdash;</td><td data-ss-label="Output-amps wobble floor (A)"><input name="altAmpsLineFlrA" data-echo="altAmpsLineFlrA" type="number" step="0.1" style="width:100%" /><span id="altAmpsLineFlrA_echo" style="display:none">?</span></td><td data-ss-label="Output-amps window (s)"><input name="altAmpsSec" data-echo="altAmpsSec" type="number" step="0.5" style="width:100%" /><span id="altAmpsSec_echo" style="display:none">?</span></td></tr>
+                      <tr><td class="c3-signal">Output amps <span class="sinfo" data-sinfo="altBandAmps"></span><span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The alternator output must itself follow a straight line before a point is recorded, and that line may have a slope: while engine speed sweeps smoothly the output rides its own smooth ramp, and that pair is exactly the measurement worth keeping. What the rate limit bounds is how steep that ramp may be, and it is the setting that decides how far a record taken on the move can drift &mdash; the output pairing is never perfect, and the error it leaves is the ramp rate multiplied by how far out the pairing is. Both limits scale with the reading so one setting works at low float current and full bulk current; the floors take over at low output.</span></span><div class="c3-unit">% of reading</div></td><td data-ss-label="Output-amps wobble limit (% of reading)"><input name="altAmpsLinePct" data-echo="altAmpsLinePct" type="number" step="0.1" style="width:100%" /><span id="altAmpsLinePct_echo" style="display:none">?</span></td><td data-ss-label="Output-amps rate limit (% of reading per second)"><input name="altAmpsSlewPct" data-echo="altAmpsSlewPct" type="number" step="0.1" style="width:100%" /><span id="altAmpsSlewPct_echo" style="display:none">?</span></td><td data-ss-label="Output-amps wobble floor (A)" class="c3-twin"><input name="altAmpsLineFlrA" data-echo="altAmpsLineFlrA" type="number" step="0.05" style="width:100%" /><span id="altAmpsLineFlrA_echo" style="display:none">?</span><span class="c3-twin-cap">A/s</span><input name="altAmpsSlewFlrA" data-echo="altAmpsSlewFlrA" type="number" step="0.05" style="width:100%" data-ss-label="Output-amps rate floor (A/s)" /><span id="altAmpsSlewFlrA_echo" style="display:none">?</span></td><td data-ss-label="Output-amps window (s)"><input name="altAmpsSec" data-echo="altAmpsSec" type="number" step="0.5" style="width:100%" /><span id="altAmpsSec_echo" style="display:none">?</span></td></tr>
                     </tbody>
                   </table>
                   <div style="display:flex;justify-content:flex-end;margin-top:10px;">
@@ -6423,7 +6423,7 @@
                 </p>
                 <div class="form-row">
                   <div class="form-label">Recorder (<span id="altlog-state">idle</span>):
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">This only watches and records &mdash; the regulator runs as it always does. 192 KB of memory is claimed when you press Record and released when you dump or discard, so it costs nothing the rest of the time. The buffer holds 19.3 minutes and never wraps: at capacity it stops and keeps every row, rather than eating the beginning of a deliberate capture. A warning lands in the console with one minute left. A recording is fluid: press Record, then do whatever you like &mdash; a sweep, your own throttle, or just driving. The rows carry flag columns for all of it, so the file splits offline on what actually happened rather than on anything you had to press.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">This only watches and records &mdash; the regulator runs as it always does. 192 KB of memory is claimed when you press Record and released when you transfer or discard, so it costs nothing the rest of the time. The buffer holds 18.2 minutes and never wraps: at capacity it stops and keeps every row, rather than eating the beginning of a deliberate capture. A warning lands in the console with one minute left. A recording is fluid: press Record, then do whatever you like &mdash; a sweep, your own throttle, or just driving. The rows carry flag columns for all of it, so the file splits offline on what actually happened rather than on anything you had to press.</span></span>
                     <span id="altlog-countdown" style="display:block;font-size:0.85em;opacity:0.75;font-weight:normal;margin-top:2px;font-variant-numeric:tabular-nums;">&mdash;</span>
                   </div>
                   <div class="form-input" style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -6528,10 +6528,10 @@
                 <hr>
                 <div class="form-row">
                   <div class="form-label">Captured session
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Dump converts the recording to a CSV file with a header naming every gate setting that shaped it, hands it to you, and then frees the buffer. Do it after each run and press Record again &mdash; the campaign never has to fit in memory.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Transfer converts the recording to a CSV file with a header naming every gate setting that shaped it, hands it to you, and then frees the buffer. Do it after each run and press Record again &mdash; the campaign never has to fit in memory.</span></span>
                   </div>
                   <div class="form-input" style="display:flex;gap:6px;flex-wrap:wrap;">
-                    <input type="button" id="altlog-dump-btn" value="Dump to file" class="btn-primary" onclick="altLogDumpPress()" />
+                    <input type="button" id="altlog-dump-btn" value="Transfer to my device" class="btn-primary" onclick="altLogDumpPress()" />
                     <input type="button" id="altlog-discard-btn" value="Discard" class="btn-danger" onclick="altLogDiscardPress()" />
                   </div>
                 </div>
@@ -7304,7 +7304,7 @@
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Hot-Charge Lockout (<span id="hotChargeLockoutEnable_echo">?</span>):</span>
                   <span class="tooltip">&#8505;&#65039;
-                    <span class="tooltip-box">On: charging stops (the field ramps to zero and cuts) while a measured battery temperature (probe, NMEA 2000, VE.Direct or RV-C) is above Max Charge Temp, the alarm sounds if alarms are enabled, and charging resumes once the temperature falls about 2 &deg;F (1 &deg;C) back below the ceiling; the board-temperature stand-in never triggers this lockout, so it stays inactive without a measurement. Off: charging continues regardless of battery temperature.</span>
+                    <span class="tooltip-box">On: charging stops (the field ramps to zero and cuts) while a measured battery temperature (probe, NMEA 2000, VE.Direct or RV-C) is above Max Charge Temp, the alarm sounds if alarms are enabled, and charging resumes once the temperature falls about 2 &deg;F (1 &deg;C) back below the ceiling; with no measured battery temperature the lockout stays inactive. Off: charging continues regardless of battery temperature.</span>
                   </span>
                 </div>
                 <div class="form-input">
@@ -14615,7 +14615,7 @@
             title="Jump to Setup &rarr; Alternator &rarr; Diag with the Charging System Health card showing: steady-state gates, curve-fit knobs, reference source, Pause / Continue learning, and Reset / Start Over. Reset needs settings unlocked." />
           <input type="button" value="Gate Tuning Capture" class="btn-secondary"
             onclick="goToGateTuningCapture()"
-            title="Jump to Setup &rarr; Alternator &rarr; Diag with the Gate Tuning Capture panel open: the recorder, the field sweeper and its turnaround margins, Min and Manual Field %, and the CSV dump. Running a sweep needs settings unlocked." />
+            title="Jump to Setup &rarr; Alternator &rarr; Diag with the Gate Tuning Capture panel open: the recorder, the field sweeper and its turnaround margins, Min and Manual Field %, and the CSV transfer. Running a sweep needs settings unlocked." />
           <input type="file" id="alt-load-file" accept=".csv,text/csv,text/plain" style="display:none;" onchange="altUploadCsvFile(this)" />
         </span>
         </div>
@@ -15336,8 +15336,9 @@
                       </form>
                     </div>
                     <p style="opacity: 0.7; font-size: 12px; margin: 0 0 6px 0;">
-                      Oldest row is the baseline. <strong>@25°C</strong> normalizes for board temperature so runs are
-                      comparable; <strong>Δ base</strong> is the temp-corrected change since the baseline (the aging
+                      Oldest row is the baseline. <strong>@25°C</strong> normalizes for battery temperature so runs are
+                      comparable; a run made with no measured battery temperature shows &mdash; there and keeps its raw
+                      value. <strong>Δ base</strong> is the temp-corrected change since the baseline (the aging
                       signal). <strong>Fit</strong> ✓ = the scored steps agreed; ⚠ = scattered, treat that row with care.
                     </p>
                     <div style="overflow-x: auto;">
@@ -15354,7 +15355,7 @@
                             <th>Dwell (s)</th>
                             <th>SoC</th>
                             <th>Batt V</th>
-                            <th>Board <span class="temp-unit-label">°F</span></th>
+                            <th>Batt <span class="temp-unit-label">°F</span></th>
                             <th>Step</th>
                             <th>Steps</th>
                           </tr>
@@ -15469,7 +15470,7 @@
 
                       <hr />
                       <div class="form-row">
-                        <div class="form-label"><span>Temperature normalization (0=off, 1=on) (<span id="capTempNorm_echo">?</span>):</span></div>
+                        <div class="form-label"><span>Battery temperature normalization (0=off, 1=on) (<span id="capTempNorm_echo">?</span>):</span></div>
                         <div class="form-input"><form action="/get" method="GET" target="hidden-form"><input name="capTempNorm" type="number" step="1" min="0" max="1" /><input type="submit" value="Set" class="btn-primary" /></form></div>
                       </div>
 

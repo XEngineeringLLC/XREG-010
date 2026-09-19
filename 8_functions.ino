@@ -1753,7 +1753,7 @@ void bhComputeDcir() {
   r.epoch      = timeIsSynced ? (timeBase + (millis() - timeBaseMillis) / 1000) : 0;
   r.dcir_mOhm  = Rsum / Rn;
   r.soh_pct    = (bhCapCount > 0) ? bhCapRing[(bhCapHead - 1 + bhCapCap) % bhCapCap].capPct : NAN;
-  r.boardTempF = isfinite(battTempActiveF) ? battTempActiveF : ambientTemp;  // battery temperature when a source qualifies, else the board (°F); field name unchanged
+  r.battTempF  = battTempActiveF;   // measured battery source only (°F); NAN when none — the board temperature is NOT a substitute
   r.soc_pct    = SOC_percent / 100.0f;
   r.battV      = IBV;
   r.stepLowA   = bhStepLowA;
@@ -1767,14 +1767,20 @@ void bhComputeDcir() {
   bhLastResultDcir = r.dcir_mOhm;
   bhTestState = 2;
   bhResultsDirty = true;   // NVS persist deferred to field-off — a test always ends field-on
-  queueConsoleMessageF("BATT HEALTH: DCIR = %.2f mOhm (%d/%u edges, SoC %.0f%%, %.1f%s, fit %luus)",
-                       r.dcir_mOhm, Rn, bhNumEdges, r.soc_pct, dispTempF(r.boardTempF), dispTempUnit(), (unsigned long)(micros() - bhT0));
+  char tbuf[24];
+  if (isfinite(r.battTempF)) snprintf(tbuf, sizeof(tbuf), "%.1f%s", dispTempF(r.battTempF), dispTempUnit());
+  else                       snprintf(tbuf, sizeof(tbuf), "no batt temp");
+  queueConsoleMessageF("BATT HEALTH: DCIR = %.2f mOhm (%d/%u edges, SoC %.0f%%, %s, fit %luus)",
+                       r.dcir_mOhm, Rn, bhNumEdges, r.soc_pct, tbuf, (unsigned long)(micros() - bhT0));
+  char tjson[16];
+  if (isfinite(r.battTempF)) snprintf(tjson, sizeof(tjson), "%.1f", r.battTempF);
+  else                       strcpy(tjson, "null");   // %.1f of NAN would emit bare nan and break the ledger row's JSON
   char ev[288];
   snprintf(ev, sizeof(ev),
            "{\"test\":\"batt_health\",\"ok\":1,\"dcir_mohm\":%.2f,\"spread_mohm\":%.2f,\"edges_used\":%d,"
-           "\"edges_cfg\":%u,\"soc_pct\":%.1f,\"board_temp_f\":%.1f,\"batt_v\":%.2f,"
+           "\"edges_cfg\":%u,\"soc_pct\":%.1f,\"batt_temp_f\":%s,\"batt_v\":%.2f,"
            "\"low_a\":%.1f,\"delta_a\":%.1f,\"dwell_ms\":%u}",
-           r.dcir_mOhm, r.fitSpread_mOhm, Rn, (unsigned)bhNumEdges, r.soc_pct, r.boardTempF, r.battV,
+           r.dcir_mOhm, r.fitSpread_mOhm, Rn, (unsigned)bhNumEdges, r.soc_pct, tjson, r.battV,
            r.stepLowA, r.stepDeltaA, (unsigned)r.dwellMsUsed);
   cxLedgerLogTest(ev);
 }
@@ -2807,7 +2813,7 @@ void capTrackOnFull(uint32_t epoch, float tempC) {
     capLowAnchorValid = false; return;            // implausible vs rated → discard
   }
   uint8_t conf = (capLastDvdtMv10 < 0.5f * capSettleRateMv10 && span >= capMinSpan + 10.0f) ? 1 : 0;
-  capAppendPoint(epoch, measuredAh, capLowAnchorSoC, isnan(tempC) ? 0.0f : tempC, conf);
+  capAppendPoint(epoch, measuredAh, capLowAnchorSoC, tempC, conf);   // NAN stays NAN: 0 °C is a real temperature
   capLowAnchorValid = false;                       // consume the anchor
 }
 
@@ -2875,7 +2881,7 @@ void bhDeserializeResults(const String &blob) {
     r.epoch      = bhTokU32(blob, pos);
     r.dcir_mOhm  = bhTok(blob, pos);
     r.soh_pct    = bhTok(blob, pos);
-    r.boardTempF = bhTok(blob, pos);
+    bhTok(blob, pos); r.battTempF = NAN;   // legacy slot held the BOARD temperature — consumed, not carried forward
     r.soc_pct    = bhTok(blob, pos);
     r.battV      = bhTok(blob, pos);
     r.stepLowA   = bhTok(blob, pos);
@@ -2957,8 +2963,18 @@ void bhInitSettings() {
   // removed only AFTER that blob write succeeds (in bhFlushCapNVS), so a reboot before the first
   // flush can't lose the migrated history.
   {
-    uint32_t nRes = readPsramBlob(BHRES_PATH, BHRES_MAGIC, BHRES_VER,
+    // v1 rows stamped the BOARD temperature into what is now battTempF. Peek the version first —
+    // readPsramBlob deletes a file whose version does not match — then blank that one field and let
+    // the next field-off flush rewrite the ring as v2. DCIR, SoH and the run parameters are kept.
+    bool bhResLegacy = (psramBlobVersion(BHRES_PATH, BHRES_MAGIC) == BHRES_VER_BOARDTEMP);
+    uint32_t nRes = readPsramBlob(BHRES_PATH, BHRES_MAGIC,
+                                  bhResLegacy ? BHRES_VER_BOARDTEMP : BHRES_VER,
                                   bhResults, sizeof(BattHealthResult), bhResultCap, nullptr, false);
+    if (bhResLegacy && nRes > 0) {
+      for (uint32_t i = 0; i < nRes; i++) bhResults[i].battTempF = NAN;
+      bhResultsDirty = true;
+      Serial.printf("bhInit: migrated %u DCIR rows to v2 (board-temperature column blanked)\n", (unsigned)nRes);
+    }
     bhResultCount = (int)nRes;
     bhResultHead  = (nRes >= (uint32_t)bhResultCap) ? 0 : (int)nRes;
     if (nRes == 0 && settingExists(NK_bhResults)) {
@@ -3013,7 +3029,7 @@ String bhBuildStatusJson() {
     j += "{\"epoch\":" + String(r.epoch);
     j += ",\"dcir\":" + String(r.dcir_mOhm, 2);
     j += ",\"soh\":" + (isnan(r.soh_pct) ? String("null") : String(r.soh_pct, 1));
-    j += ",\"tF\":" + String(r.boardTempF, 1);
+    j += ",\"tF\":" + (isnan(r.battTempF) ? String("null") : String(r.battTempF, 1));
     j += ",\"soc\":" + String(r.soc_pct, 1);
     j += ",\"v\":" + String(r.battV, 2);
     j += ",\"low\":" + String(r.stepLowA, 1);

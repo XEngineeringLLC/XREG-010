@@ -191,6 +191,7 @@ struct Episode {
   bool      extOk[NAXIS + 1] = {};         // EP_EXTERNAL axes: the caller's verdict for this tick
   float     slopeMax[NAXIS + 1] = {};      // EP_STRAIGHT: |slope| cap per second (≤ 0 = uncapped)
   float     tolPct[NAXIS + 1] = {};        // EP_STRAIGHT: tolerance as % of the window mean, floored at cfg tol (0 = absolute only)
+  float     slopePct[NAXIS + 1] = {};      // EP_STRAIGHT: |slope| cap as % of the window mean per second, floored at slopeMax (0 = absolute only)
   bool      emitTrimSkip[NAXIS + 1] = {};  // axes the emit-time trimmed-range re-test does NOT apply to
 
   MonoDeque maxDQ[NAXIS + 1], minDQ[NAXIS + 1];   // per axis + [NAXIS] = output band: sliding window max/min
@@ -302,9 +303,14 @@ struct Episode {
           float rel = tolPct[a] * 0.01f * fabsf(fit[a]->mean);
           if (rel > tol) tol = rel;
         }
+        float slim = slopeMax[a];                   // absolute cap…
+        if (slopePct[a] > 0) {                      // …raised to a share of the reading per second where that is larger
+          float rels = slopePct[a] * 0.01f * fabsf(fit[a]->mean);
+          if (rels > slim) slim = rels;
+        }
         dwellOk = ((uint32_t)(ls.tMs - dataStartMs) >= win);
         inBand  = (nf >= 3) && (fit[a]->rms <= tol)
-                  && (slopeMax[a] <= 0.0f || fabsf(fit[a]->slope) <= slopeMax[a]);
+                  && (slim <= 0.0f || fabsf(fit[a]->slope) <= slim);
       } else {
         uint32_t win = (uint32_t)(cfg[a].steadySec * 1000.0f);
         uint32_t winMax = (uint32_t)((dqCap[a] - 2) * EP_FEED_DT_MS);   // can't window more than the ring holds
@@ -334,9 +340,14 @@ struct Episode {
           float rel = tolPct[NAXIS] * 0.01f * fabsf(fit[NAXIS]->mean);
           if (rel > tol) tol = rel;
         }
+        float slim = slopeMax[NAXIS];
+        if (slopePct[NAXIS] > 0) {
+          float rels = slopePct[NAXIS] * 0.01f * fabsf(fit[NAXIS]->mean);
+          if (rels > slim) slim = rels;
+        }
         dwellOk = ((uint32_t)(ls.tMs - dataStartMs) >= win);
         inBand  = (nf >= 3) && (fit[NAXIS]->rms <= tol)
-                  && (slopeMax[NAXIS] <= 0.0f || fabsf(fit[NAXIS]->slope) <= slopeMax[NAXIS]);
+                  && (slim <= 0.0f || fabsf(fit[NAXIS]->slope) <= slim);
       } else {
         uint32_t win = (uint32_t)(outCfg.steadySec * 1000.0f);
         uint32_t winMax = (uint32_t)((dqCap[NAXIS] - 2) * EP_FEED_DT_MS);
@@ -868,9 +879,14 @@ float altRpmSec       = 3.0f;    // RPM steady time (s)
 float altDutySec      = 3.0f;    // field-duty % steady time (s)
 float altVbusSec      = 3.0f;    // bus-voltage steady time (s)
 float altThermDegF    = 4.0f;    // temperature deviation bound (°F) — record only at thermal equilibrium. 0.105 A/°F at cruise; also gates the altThermSec dwell, so it is the biggest yield knob
-float altThermSec     = 40.0f;   // STEADY_TEMP_SEC — FULL-steady temp dwell (s). Feeds the surface + trend + orange ring.
+float altThermSec     = 20.0f;   // STEADY_TEMP_SEC — FULL-steady temp dwell (s). Feeds the surface + trend + orange ring.
                                  // 80→40 2026-08-20: at 80 the normal warm-up ramp (~1.5-2 °F/min) ate half the 4 °F band
                                  // and starved records for whole sessions. NVS-held — bench device needs a live set too.
+                                 // 40→20 2026-09-19: at 40 it was the second-largest sole-blocker (490 of 7,587 eligible ticks
+                                 // on the 09-18 drive) and buying nothing measurable — 40 vs 20 vs 10 moved p90 smear by under
+                                 // 0.15 points on all three captures while 40 cost 16-28% of the records. The dwell was the
+                                 // brake, not the 4 °F band: at 20 s a 5 °F/min warm-up spans 1.7 °F and the band never binds.
+                                 // What still protects a warming machine is tempF being a book axis and tSlope riding every record.
 // SESSION-steady temp dwell is DERIVED as half of altThermSec (see altSessTempDwell()) — no separate
 // knob, so the session gate auto-tracks whenever the full dwell above is changed.
 static inline float altSessTempDwell() { return altThermSec * 0.5f; }
@@ -885,6 +901,15 @@ float altTrendMinSamp   = 2.0f;     // MIN_SAMPLES — a bucket needs ≥ this m
 float altAmpsLinePct  = 0.5f;    // output-amps rms departure from its own line, % of the window mean
 float altAmpsLineFloorA = 0.4f;  // …with this absolute floor (A), which governs below ~80 A. Registry name is
                                  // altAmpsLineFlrA — the NVS key caps at 15 characters
+// Output SLOPE cap (2026-09-19). Smear from a moving operating point is (output ramp rate) × (residual
+// lead error), so bounding the ramp bounds the smear at its source; the speed and field straightness
+// bands only ever proxied for it. Offline replay of three 10 Hz captures (09-18 drive, 09-09 night,
+// 09-14 evening): with this in place altRpmLineRms could go 12 → 48 and the gate still banked 20/16/38%
+// MORE records while p95 smear fell 3.4→2.9 / 3.8→2.1 / 4.5→2.9 percent. Relative like the wobble limit
+// above, and for the same reason — an absolute A/s cap sized at a 20 A float would strangle a 90 A bulk.
+float altAmpsSlewPct  = 1.0f;    // output-line slope cap, % of the window mean per second
+float altAmpsSlewFloorA = 0.15f; // …with this absolute floor (A/s), which governs below 15 A. Registry name is
+                                 // altAmpsSlewFlrA — the NVS key caps at 15 characters
 float altAmpsSec      = 3.0f;    // output-amps straightness window (s)
 float altEmaSec       = 0.5f;    // EMA time constant (s) on detector inputs RPM/duty/Vbus/amps (0 = off)
 float altLeadSec      = 0.40f;   // output lead: amps and bus volts are delayed this long relative to RPM, field
@@ -918,6 +943,8 @@ static AltSetting ALT_SETTINGS[] = {
   {"altTrendMinSamp", &altTrendMinSamp},                               // MIN_SAMPLES (bucket commit gate)
   {"altAmpsLinePct", &altAmpsLinePct},
   {"altAmpsLineFlrA", &altAmpsLineFloorA},                             // 15-char NVS cap (var is altAmpsLineFloorA)
+  {"altAmpsSlewPct", &altAmpsSlewPct},
+  {"altAmpsSlewFlrA", &altAmpsSlewFloorA},                             // 15-char NVS cap (var is altAmpsSlewFloorA)
   {"altAmpsSec", &altAmpsSec},
   {"altEmaSec", &altEmaSec}, {"altLeadSec", &altLeadSec},
   {"altMinRunSec", &altMinRunSec}, {"altRefRadius", &altRefRadius},
@@ -1095,6 +1122,8 @@ static void altEpisodeSyncCfg(float ampsFilt) {
   altEpisode.cfg[3] = { altThermDegF,   altThermSec };  // temp (°F) — verdict from altThermGate; tol still gates the emit trim test
   altEpisode.outCfg = { altAmpsLineFloorA, altAmpsSec };// output amps — straightness, floor…
   altEpisode.tolPct[ALT_NAXIS] = altAmpsLinePct;        // …raised to this share of the window mean where that is larger
+  altEpisode.slopeMax[ALT_NAXIS] = altAmpsSlewFloorA;   // output slope cap — absolute A/s floor…
+  altEpisode.slopePct[ALT_NAXIS] = altAmpsSlewPct;      // …raised to this share of the window mean per second
   altEpisode.minRunMs = (altMinRunSec > 0) ? (uint32_t)(altMinRunSec * 1000.0f) : 0;
   // Lead pairing in whole feed ticks. Clamped to 0..EP_LEAD_MAX-1 by setDelay; a changed delay
   // restarts the line rather than mixing two alignments in one window.
@@ -1130,13 +1159,18 @@ static bool altCapWarned = false;   // once per boot OR per Start Over (cleared 
 // 1.5006 Hz bus disturbance (5 Hz Nyquist), which a 2 Hz log would fold straight into the band the
 // smear measurement lives in.
 #define ALTLOG_DT_MS       100u    // 10 Hz — the cadence the gate itself evaluates at (EP_FEED_DT_MS)
+// 3 blocks, fixed, and deliberately not more: 192 KB is a footprint this device is known to carry, and
+// a longer window is not worth spending PSRAM nobody has measured headroom for. A capture that runs out
+// just ends — Transfer it and press Record again. Many short files cost nothing: each one carries the
+// settings that shaped it, and session id + start epoch keep a campaign in order.
 #define ALTLOG_BLOCKS      3
-#define ALTLOG_BLOCK_ROWS  3855    // rows per 64 KB block at 17 B/row (65,535 B — the 1 B remainder
+#define ALTLOG_BLOCK_ROWS  3640    // rows per 64 KB block at 18 B/row (65,520 B — the 16 B remainder
                                    // is left unused rather than splitting a row across two blocks)
-#define ALTLOG_CAP_ROWS    ((uint32_t)ALTLOG_BLOCKS * ALTLOG_BLOCK_ROWS)   // 11565 rows = 19.3 min
+#define ALTLOG_CAP_ROWS    ((uint32_t)ALTLOG_BLOCKS * ALTLOG_BLOCK_ROWS)   // 10920 rows = 18.2 min
+                                   // (19.3 min before the per-axis gate byte widened a row 17 B → 18 B)
 #define ALTLOG_STALE_MS    300u    // fold older than this → field is off / control path not running
 
-// 17 B/row. Every axis is stored 20-100x finer than the band it gates, so quantization can never be
+// 18 B/row. Every axis is stored 20-100x finer than the band it gates, so quantization can never be
 // mistaken for movement. Saturating stores (altQI16/altQU16): amps clip at ±327.67 A (a 500 A
 // install running above that logs a flat line, which is visible; it does not wrap), bus volts at
 // 65.535 V (above any 48 V-class cut), temp at ±3276.7 °F. A NaN case temp stores 0 — implausible on
@@ -1158,13 +1192,22 @@ struct __attribute__((packed)) AltLogRow {
   uint8_t  flags;     // b0 field on, b1 manual mode, b2 sweeper active, b3 sweep direction (1=down),
                       // b4 protection binding, b5 detector eligible, b6 detector full-steady,
                       // b7 this sweep reversed early — a control limit or Reverse now, not its ceiling
+  uint8_t  gate;      // the detector's own PER-AXIS verdict for this sample: b0 speed, b1 field, b2 bus
+                      // volts, b3 temperature, b4 output amps, b5 = a record was emitted since the last
+                      // row, b6 = the stage-9 charge-health calibration is driving the field (held-duty
+                      // speed passes — the ONE thing in a capture that can re-measure the output lead,
+                      // and nothing else in the flags byte marks it).
+                      // flags b6 is only the AND of b0..b4, so without this byte an offline replay
+                      // has to re-derive which axis blocked and can only be checked in aggregate —
+                      // 2026-09-19 that left 3.1% of rows unexplained and the blame table a reconstruction.
+                      // Zero while the fold is stale (field off): the axes hold pre-shutdown values there
   // No segment index. A recording is deliberately FLUID — one press of Record, then whatever the
   // operator does: a sweep, throttle movements, ordinary driving, in any order. Nothing on the device
   // knows where one "run" ends and the next begins, and nothing needs to: these flag bits already mark
   // every transition the analysis can split on (sweeper on/off, up leg vs down, manual vs auto, field
   // on vs off), and dtMs marks any real gap. A counter on top of that was a second, weaker copy.
 };
-static_assert(sizeof(AltLogRow) == 17, "AltLogRow lost its packing — the 192 KB budget assumes 17 B");
+static_assert(sizeof(AltLogRow) == 18, "AltLogRow lost its packing — ALTLOG_BLOCK_ROWS assumes 18 B");
 
 // 192 KB as 3 × 64 KB blocks, NOT one allocation. Free PSRAM measured 848 KB (2026-08-23) and a
 // single contiguous request that size is not safe at that level: cvLog's 334 KB is one
@@ -1181,6 +1224,7 @@ static bool     altLogWarned60 = false;   // one-shot 60-s-remaining console war
 static double   altLogRawSum = 0.0;       // CH1 accumulator for THIS row's ampsRaw mean
 static uint32_t altLogRawN = 0;
 static uint32_t altLogCh1Seen = 0;        // last ch1AtCount consumed — edge-detects a fresh conversion
+static int      altLogEmitSeen = 0;       // last altFrontEmitCount consumed — edge-detects a banked record
 static bool     altEligibleNow = false;   // detector eligibility, exported from altFold_tick for flags b5
 // Every button press is a REQUEST consumed on the control loop, never an action taken on the web
 // task: allocation, freeing and the state machine all run on the one task that also writes rows, so
@@ -1225,7 +1269,7 @@ static void altLogStopRec(uint8_t reason) {
   altLogState = (reason == 2) ? 3 : 2;
   altLogEndReason = reason;
   float secs = (float)(millis() - altLogStartMs) / 1000.0f;
-  queueConsoleMessageF("Gate capture: %s at %lu rows (%.0f s) — Dump to keep it",
+  queueConsoleMessageF("Gate capture: %s at %lu rows (%.0f s) — Transfer to keep it",
                        (reason == 2) ? "BUFFER FULL, recording stopped" : "stopped",
                        (unsigned long)altLogRows, secs);
 }
@@ -1251,6 +1295,7 @@ static bool altLogStartRec() {
   altLogEpoch = timeIsSynced ? (uint32_t)time(NULL) : 0;
   altLogRows = 0; altLogEndReason = 0; altLogWarned60 = false;
   altLogRawSum = 0.0; altLogRawN = 0; altLogCh1Seen = ch1AtCount;
+  altLogEmitSeen = altFrontEmitCount;   // so the first row does not claim every record banked before Record
   altLogStartTempF = TempToUse;
   altLogStartVbus = getBatteryVoltage();
   altLogChargeStage = (uint8_t)chargeStageDisplay;
@@ -1316,6 +1361,21 @@ void altLog_tick(uint32_t nowMs) {
   float rawAmps = (altLogRawN > 0) ? (float)(altLogRawSum / (double)altLogRawN) : amps;
   altLogRawSum = 0.0; altLogRawN = 0;
 
+  // Per-axis verdict, straight off the detector. Only meaningful while the fold is fresh — with the
+  // field off the Episode holds its pre-shutdown axis flags, and a stale verdict on an off stretch is
+  // worse than none. The emit bit edge-detects altFrontEmitCount, so it marks the row a record landed
+  // on (emits are ≥ 1 s apart and rows are 100 ms, so it can never merge two).
+  uint8_t gt = 0;
+  if (foldFresh) {
+    if (altEpisode.axisSteady[0])         gt |= 0x01;
+    if (altEpisode.axisSteady[1])         gt |= 0x02;
+    if (altEpisode.axisSteady[2])         gt |= 0x04;
+    if (altEpisode.axisSteady[3])         gt |= 0x08;
+    if (altEpisode.axisSteady[ALT_NAXIS]) gt |= 0x10;
+  }
+  if (altFrontEmitCount != altLogEmitSeen) { gt |= 0x20; altLogEmitSeen = altFrontEmitCount; }
+  if (chcActive != 0)                      gt |= 0x40;
+
   uint8_t fl = 0;
   bool manualNow = (sysMode == SYS_MODE_MANUAL);
   if (!gpio4IsLow)                 fl |= 0x01;
@@ -1341,6 +1401,7 @@ void altLog_tick(uint32_t nowMs) {
   r->amps    = altQI16(amps, 100.0f);
   r->ampsRaw = altQI16(rawAmps, 100.0f);
   r->flags   = fl;
+  r->gate    = gt;
   altLogRows++;
 
   altLogSecLeft = (float)(ALTLOG_CAP_ROWS - altLogRows) / 10.0f;
@@ -1383,8 +1444,10 @@ struct __attribute__((packed)) AltLogHdr {
   char     fw[16];
   // ---- appended in ver 2 (straightness gate) ----
   float    rpmLineRms, rpmRateMax, dutyLineRms, dutySlewMax, ampsLinePct, ampsLineFloorA, leadSec;
+  // ---- appended in ver 3 (output slope cap + the per-axis gate byte on every row) ----
+  float    ampsSlewPct, ampsSlewFloorA;
 };
-static_assert(sizeof(AltLogHdr) == 164, "AltLogHdr size changed — parseAltLogBin() in script.js must match");
+static_assert(sizeof(AltLogHdr) == 172, "AltLogHdr size changed — parseAltLogBin() in script.js must match");
 
 // /altlog.bin — header then rows, streamed. Refused while recording: a growing row count under a
 // chunked reader would hand out a file whose header disagrees with its body.
@@ -1423,7 +1486,7 @@ void altLogBinSend(AsyncWebServerRequest *request) {
   AltLogHdr h;
   memset(&h, 0, sizeof(h));
   h.magic = 0x414C474Cu;   // 'ALGL'
-  h.ver = 2;               // 2 = straightness gate (ver 1 was the max−min band gate)
+  h.ver = 3;               // 3 = output slope cap + per-axis gate byte (2 = straightness gate, 1 = max−min bands)
   h.rowBytes = (uint16_t)sizeof(AltLogRow);
   h.rowCount = altLogRows;
   h.capRows = ALTLOG_CAP_ROWS;
@@ -1445,6 +1508,7 @@ void altLogBinSend(AsyncWebServerRequest *request) {
   h.dutyLineRms = altDutyLineRms; h.dutySlewMax = altDutySlewMax;
   h.ampsLinePct = altAmpsLinePct; h.ampsLineFloorA = altAmpsLineFloorA;
   h.leadSec = altLeadSec;
+  h.ampsSlewPct = altAmpsSlewPct; h.ampsSlewFloorA = altAmpsSlewFloorA;
   // v1RpmTol / v1DutyTolPct / v1AmpsTolPct / v1AmpsFloorA stay at the memset 0 — those settings no
   // longer exist, and a file must not claim a gate that did not shape it.
   h.emitAvgMs = (uint32_t)ALT_EMIT_AVG_MS;
@@ -2499,7 +2563,7 @@ bool altSettingsHandle(AsyncWebServerRequest *request) {
   return handled;
 }
 void sendAltSettings() {
-  char buf[448];   // ~215 B at the current 31 knobs and their defaults; sized so a few large values
+  char buf[448];   // ~230 B at the current 33 knobs and their defaults; sized so a few large values
                    // (rate caps, trend bucket seconds) cannot reach the truncation guard below
   int off = 0;
   for (size_t i = 0; i < ALT_SETTING_COUNT; i++) {

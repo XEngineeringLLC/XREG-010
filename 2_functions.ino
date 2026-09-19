@@ -715,7 +715,7 @@ long clampLoadedSetting(const char *name, const char *nvsKey, long value, long l
   return clamped;
 }
 
-#define SETTINGS_SCHEMA_VERSION 3
+#define SETTINGS_SCHEMA_VERSION 4
 
 // Cumulative settings-schema migration chain. Runs once at boot, right after the last NVS
 // settings loader (initWeatherModeSettings), so steps see the fully seeded key set — a step
@@ -726,6 +726,10 @@ long clampLoadedSetting(const char *name, const char *nvsKey, long value, long l
 //  - Pure additions need NO step: a missing key falls back to its hardcoded default at load.
 //  - Steps must be idempotent: the schema stamp is written LAST, so a power cut mid-step
 //    re-runs that whole step on the next boot.
+// Defined later in the merged sketch (Xregulator.ino / 7_functions.ino), so step 3->4 needs them
+// declared here — an .ino merge hoists function prototypes, never variable declarations.
+extern float altRpmLineRms;
+extern float altThermSec;
 void runSettingsMigrations() {
   int stored = settingRead(NK_cfgSchema).toInt();  // absent key reads "" -> 0 = pre-schema device
   while (stored < SETTINGS_SCHEMA_VERSION) {
@@ -748,6 +752,18 @@ void runSettingsMigrations() {
         settingRemove("altDutyTolPct");
         settingRemove("altAmpsTolPct");
         settingRemove("altAmpsFloorA");
+        break;
+      case 3:
+        // 3->4: the 2026-09-19 gate retune. The admission gate's smear is set by how fast the OUTPUT is
+        // ramping, not by how straight engine speed is, so altRpmLineRms loosens 12 -> 48 and the new
+        // altAmpsSlewPct / altAmpsSlewFlrA pair takes over the job; altThermSec halves 40 -> 20 because
+        // the dwell was blocking records without bounding anything. altSettingsLoad() seeds every registry
+        // knob into NVS on first boot and reads NVS thereafter, so a re-flash alone leaves a fielded device
+        // on the old numbers — the two changed knobs are rewritten here, in NVS and in the RAM globals
+        // altSettingsLoad() already filled (it runs earlier in setup). The new pair needs no step: a key
+        // that does not exist yet takes its hardcoded default.
+        altRpmLineRms = 48.0f; settingWrite("altRpmLineRms", String(altRpmLineRms, 4).c_str());
+        altThermSec   = 20.0f; settingWrite("altThermSec",   String(altThermSec, 4).c_str());
         break;
     }
     stored++;
@@ -1328,6 +1344,21 @@ uint32_t writePsramBlob(const char *path, uint32_t magic, uint32_t version,
 // deletes the file and returns 0. Returns records restored (≤ destCapacity), and
 // the stored userWord via `userWordOut` if non-null. `deleteAfter` removes the
 // file post-restore (rings set true to avoid double-upload; grids set false).
+// Header-only peek: what version is the blob on disk? readPsramBlob DELETES a file whose version
+// does not match, so a migrating caller must ask first rather than try the old version speculatively.
+// 0 = absent, unreadable, or not this magic.
+uint32_t psramBlobVersion(const char *path, uint32_t magic) {
+  if (!fsExists(path)) return 0;
+  fsTakeLock();
+  File f = LittleFS.open(path, "r");
+  if (!f) { fsReleaseLock(); return 0; }
+  PsramBlobHeader hdr;
+  bool ok = (f.readBytes((char *)&hdr, sizeof(hdr)) == sizeof(hdr) && hdr.magic == magic);
+  f.close();
+  fsReleaseLock();
+  return ok ? hdr.version : 0;
+}
+
 uint32_t readPsramBlob(const char *path, uint32_t magic, uint32_t version,
                        void *destBase, size_t recordSize, uint32_t destCapacity,
                        uint32_t *userWordOut, bool deleteAfter) {

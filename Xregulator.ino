@@ -276,9 +276,12 @@ float altDutyLineRms   = 0.4f;   // field-duty rms departure from its fitted lin
                                  // squeeze starved emits. Doubles as the tolerance for the emit-time trimmed boxcar range on field
 float altDutySlewMax   = 1.0f;   // field-duty slew cap (% points per second): the field must stay almost fixed, because a moving
                                  // field means the regulator is chasing something and the run is not one operating point
-float altRpmLineRms    = 12.0f;  // RPM rms departure from its fitted line (filtered; raw idle jitter ~50 p-p). Open-loop measured
+float altRpmLineRms    = 48.0f;  // RPM rms departure from its fitted line (filtered; raw idle jitter ~50 p-p). Open-loop measured
                                  // 2026-08-27: 0.044 A/rpm at idle, 0.006-0.008 at cruise revs. The LINE itself may climb or fall —
-                                 // that is the whole point of the straightness form — so this bounds wobble about a ramp, not the ramp
+                                 // that is the whole point of the straightness form — so this bounds wobble about a ramp, not the ramp.
+                                 // 12 → 48 on 2026-09-19: a 5,184-setting replay of three captures says this band is NOT what bounds
+                                 // smear — altAmpsSlewPct is — and at 12 it was the single largest sole-blocker (650 of 7,587 eligible
+                                 // ticks on the 09-18 drive, vs 54 at 48). Do not re-tighten it without removing the output slope cap
 float altRpmRateMax    = 250.0f; // RPM slope cap (rpm per second) on that line. A cheap backstop only: replaying the 2026-09-08
                                  // captures, removing it changes the yield by at most one point in ~200 — the rms test already
                                  // excludes everything it would have caught
@@ -1699,6 +1702,7 @@ int   extraTempAlarmLoEnable = 0;   // EXTRA-probe low alarm on/off
 float extraTempAlarmLoF = 32.0f;    // EXTRA-probe low alarm threshold (°F)
 float BatteryTempProbeF = NAN;      // BATT-role probe (°F); written by TempTask only, NAN until the first good read
 float ExtraTempF = NAN;             // EXTRA-role probe (°F); written by TempTask only
+float batteryTempF(uint8_t *srcOut);   // 6_functions.ino — callers earlier in the concatenation order (the SoC seed) need this
 float battTempActiveF = NAN;        // batteryTempF() result of the current tick (°F); NAN = no source qualifies
 uint8_t battTempActiveSrc = 0;      // 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T), 4 RV-C (DC_SOURCE_STATUS_2); 5 retired, never emitted
 float VictronBattTempF = NAN;       // VE.Direct "T" field (°F), BMV/SmartShunt with a temperature sensor
@@ -3500,7 +3504,7 @@ struct BattHealthResult {
   uint32_t epoch;        // 0 if clock wasn't synced when the test ran
   float    dcir_mOhm;
   float    soh_pct;      // NaN until a capacity point exists
-  float    boardTempF;
+  float    battTempF;    // measured battery temperature at the run (°F); NAN = no measured source, and then no 25°C normalization is possible
   float    soc_pct;
   float    battV;
   float    stepLowA;
@@ -3514,7 +3518,7 @@ struct BattCapPoint {        // one OCV-anchored capacity measurement (X axis = 
   float    capacityAh;       // measured full capacity (temp-normalized if enabled)
   float    capPct;           // % vs the chosen reference (rated or first-measured)
   float    socLow;           // OCV-anchored low SoC used for this measurement (%)
-  float    tempC;            // board temp at the full anchor
+  float    tempC;            // measured battery temperature at the full anchor (°C); NAN = none, which disables temp normalization
   uint8_t  conf;             // 0 = low confidence, 1 = high
 };
 
@@ -3558,7 +3562,8 @@ float    bhBaselineCapacityAh = 0.0f;       // first measured capacity (used whe
 #define BHCAP_VER   1u
 #define BHRES_PATH  "/bhres.bin"
 #define BHRES_MAGIC 0x42485253u  // 'BHRS'
-#define BHRES_VER   1u
+#define BHRES_VER   2u           // v2 = battTempF is a measured BATTERY temperature; v1 stamped the board temperature there
+#define BHRES_VER_BOARDTEMP 1u   // legacy rows: bhInitSettings reads them, blanks that field to NAN, rewrites as v2
 
 // ── Capacity tracker (OCV-anchored). Replaces the old circular coulomb-derived version. ──
 // Low SoC comes from a RESTED open-circuit-voltage reading mapped through capOcvVolt[] —
@@ -5791,6 +5796,7 @@ uint32_t writePsramBlob(const char *path, uint32_t magic, uint32_t version,
 uint32_t readPsramBlob(const char *path, uint32_t magic, uint32_t version,
                        void *destBase, size_t recordSize, uint32_t destCapacity,
                        uint32_t *userWordOut, bool deleteAfter);
+uint32_t psramBlobVersion(const char *path, uint32_t magic);   // header peek; never deletes (readPsramBlob discards on mismatch)
 // App-usage analytics (2_functions.ino)
 bool usageMergeDelta(const char *body);
 bool buildUsagePayload(char *buf, uint32_t cap);

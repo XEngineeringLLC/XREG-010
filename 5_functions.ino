@@ -2420,9 +2420,11 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
 
     // Capacity tracker (OCV-anchored): rest detection, low-OCV anchor capture, Ah bridge.
     // Uses the FILTERED INA228 voltage (getFiltV) — rest/OCV is a slow read where filtering
-    // is correct (not a safety path). Board temp °F → °C for the temp coefficient.
+    // is correct (not a safety path). The temp coefficient is a property of the BANK, so it takes the
+    // measured battery temperature (°F → °C) and NAN when there is none — normalization then switches
+    // itself off (capTrackOnFull) instead of correcting by a board reading.
     capTrackTick(BatteryCurrent_scaled / 100.0f, getFiltV(),
-                 isnan(ambientTemp) ? NAN : (ambientTemp - 32.0f) / 1.8f, elapsedSeconds);
+                 isfinite(battTempActiveF) ? (battTempActiveF - 32.0f) / 1.8f : NAN, elapsedSeconds);
 
     // =================================================================
     //     FULL CHARGE DETECTION - WORKS FROM ANY CHARGING SOURCE
@@ -2460,7 +2462,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
         // OCV-anchored — capTrackOnFull validates the low anchor + span and emits a dated point.
         if (!FullChargeDetected) {
           uint32_t nowEpoch = timeIsSynced ? (timeBase + (millis() - timeBaseMillis) / 1000) : 0;
-          capTrackOnFull(nowEpoch, isnan(ambientTemp) ? NAN : (ambientTemp - 32.0f) / 1.8f);
+          capTrackOnFull(nowEpoch, isfinite(battTempActiveF) ? (battTempActiveF - 32.0f) / 1.8f : NAN);
           // Shunt gain correction — once per full-charge event (this block, not the every-2s tick),
           // fed the pre-reset SHADOW count. Battery current always comes from INA228.
           if (AutoShuntGainCorrection == 1) {
@@ -6011,7 +6013,8 @@ void seedSocFromVoltage() {
 
   // Hoisted so the /socseed snapshot below can record them; snapVlo/plo..vhi/phi are the
   // OCV-table bracket (or lead-acid ladder rung) the lookup actually landed in.
-  float iBat = 0.0f, boardTempF = NAN, rTempScale = 1.0f, vOcv = 0.0f;
+  float iBat = 0.0f, battSeedTempF = NAN, rTempScale = 1.0f, vOcv = 0.0f;
+  uint8_t battSeedTempSrc = 0;         // batteryTempF() source behind battSeedTempF, stamped into the snapshot
   float snapVlo = 0.0f, snapVhi = 0.0f;
   int snapPlo = 0, snapPhi = 0;
   bool isLithium = false;
@@ -6025,26 +6028,13 @@ void seedSocFromVoltage() {
     // them. Reff per 100Ah 12V block including polarization: LFP ~6 mΩ, lead-acid ~12 mΩ;
     // parallel Ah divides it, series blocks multiply it. Clamped so a bogus current reading
     // can't wreck the seed.
-    // Reff also scales with temperature (~doubles per −20°C, both chemistries). This is the BOARD
-    // temperature, not a battery temperature: it runs at boot, before any probe or network source has
-    // reported, and the board has not self-heated yet so it is closest to true ambient here. ambientTemp is
-    // still NAN on a cold boot (BMP388 runs a 4s cycle in ReadAnalogInputs and discards its first sample),
-    // so take one blocking forced conversion — ~50ms once, only on the fresh-NVS path.
-    boardTempF = ambientTemp;
-    if (isnan(boardTempF) && !BMP388Disconnected) {
-      bmp388.startForcedConversion();
-      float t, p, a;
-      uint32_t t0 = millis();
-      while (millis() - t0 < 250) {
-        if (bmp388.getMeasurements(t, p, a)) {
-          if (isfinite(t) && t > -40.0f && t < 85.0f) boardTempF = t * 1.8f + 32.0f;
-          break;
-        }
-        delay(5);
-      }
-    }
-    if (!isnan(boardTempF)) {
-      float tC = (boardTempF - 32.0f) / 1.8f;
+    // Reff also scales with temperature (~doubles per −20°C, both chemistries). That resistance belongs
+    // to the BANK, so only a measured battery temperature scales it (probe / NMEA 2000 / VE.Direct / RV-C).
+    // The seed runs at boot, where a probe has often not reported yet: no battery temperature means the
+    // scale stays 1.00 and the estimate is simply uncorrected. The board temperature is not a stand-in.
+    battSeedTempF = batteryTempF(&battSeedTempSrc);
+    if (isfinite(battSeedTempF)) {
+      float tC = (battSeedTempF - 32.0f) / 1.8f;
       rTempScale = constrain(expf(0.035f * (25.0f - tC)), 0.5f, 3.0f);
     }
 
@@ -6076,8 +6066,11 @@ void seedSocFromVoltage() {
         }
       }
     }
-    Serial.printf("SOC SEED: estimated %d%% from %.2fV terminal, %.1fA, %.0f°F (Rx%.2f) -> %.2fV OCV (%s curve, %s Reff)\n",
-                  estimatedSoC, voltage, iBat, isnan(boardTempF) ? -99.0f : boardTempF, rTempScale,
+    char tseed[32];
+    if (isfinite(battSeedTempF)) snprintf(tseed, sizeof(tseed), "%.0f°F %s", battSeedTempF, battTempSrcName(battSeedTempSrc));
+    else                         strcpy(tseed, "no batt temp");
+    Serial.printf("SOC SEED: estimated %d%% from %.2fV terminal, %.1fA, %s (Rx%.2f) -> %.2fV OCV (%s curve, %s Reff)\n",
+                  estimatedSoC, voltage, iBat, tseed, rTempScale,
                   vOcv, BATTERY_TYPE, isLithium ? "Li" : "Pb");
   } else {
     Serial.printf("SOC SEED: no valid voltage (%.2fV) - defaulting to 50%%\n", voltage);
@@ -6096,7 +6089,8 @@ void seedSocFromVoltage() {
   String snap = String("{\"fb\":") + ((voltage > 5.0f) ? "0" : "1")
               + ",\"v\":" + String(voltage, 3)
               + ",\"i\":" + String(iBat, 2)
-              + ",\"tF\":" + (isnan(boardTempF) ? String("null") : String(boardTempF, 1))
+              + ",\"tF\":" + (isnan(battSeedTempF) ? String("null") : String(battSeedTempF, 1))
+              + ",\"tsrc\":" + String((int)battSeedTempSrc)
               + ",\"rs\":" + String(rTempScale, 3)
               + ",\"cap\":" + String(BatteryCapacity_Ah)
               + ",\"sysV\":" + String((int)SYSTEM_VOLTAGE_CLASS)

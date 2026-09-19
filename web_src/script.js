@@ -1718,12 +1718,18 @@ function altSetPaused(p){
 // BEFRONT1 block — every other line is label-prefixed, so its bare-float row parser skips them.
 function altExportHealthDataset(){
   const get = u => fetchWithTimeout(buildURL(u),{},10000).then(r=>r.text()).catch(()=>'');
-  Promise.all([get('/altcurve.csv'), get('/altdebug.csv')]).then(([ref, dbg])=>{
-    ref = (ref||'').replace(/\s+$/,''); dbg = (dbg||'').replace(/\s+$/,'');
+  Promise.all([get('/altcurve.csv'), get('/altdebug.csv'), get('/altsess.csv')]).then(([ref, dbg, sess])=>{
+    ref = (ref||'').replace(/\s+$/,''); dbg = (dbg||'').replace(/\s+$/,''); sess = (sess||'').replace(/\s+$/,'');
     if(ref.length < 8 && dbg.length < 8){ xAlert('No alternator health data to export yet.'); return; }
     const parts = [];
     if(ref) parts.push(ref);
     if(dbg) parts.push(dbg);
+    // The device's OWN session ring, label-prefixed. The SESSPT block below is the browser's copy and
+    // holds only what this page was connected for — on 2026-09-18 that was 54 of 265 graded points, and
+    // the missing ones were the whole first half of the drive. The ring is 1440 points deep and survives
+    // a page reload, so an export taken after the fact still carries the run.
+    if(sess) parts.push(sess.split('\n').map(l => l.startsWith('#') ? '# DEVSESS ' + l.replace(/^#\s*/,'')
+                                                                    : 'DEVSESS,' + l).join('\n'));
     parts.push(altSessSectionCsv());
     const txt = parts.join('\n') + '\n';
     const d=new Date(), p=n=>String(n).padStart(2,'0');
@@ -1752,10 +1758,12 @@ function altSessSectionCsv(){
 // Spec: Working Markdown Docs/ALT_GATE_TUNING_CAPTURE_SPEC.md. State arrives on the AltLive frame
 // (1 Hz, schema-zipped) as logState / logRows / logSecLeft / logCap / sweepState / sweepRev.
 // Buttons, not URL parameters: this is operated by hand while also managing a throttle.
-const ALTLOG_HDR_BYTES = 164;    // must match AltLogHdr in 7_functions.ino (ver 2)
+const ALTLOG_HDR_BYTES = 172;    // must match AltLogHdr in 7_functions.ino (ver 3)
+const ALTLOG_HDR_BYTES_V2 = 164; // ver 2 header, before the output slope cap — still readable
 const ALTLOG_HDR_BYTES_V1 = 136; // ver 1 header, before the straightness gate — still readable
-const ALTLOG_ROW_BYTES = 17;     // must match AltLogRow
-const ALTLOG_CAP_ROWS = 11565;   // must match ALTLOG_CAP_ROWS in 7_functions.ino (3 x 3855 rows of 17 B)
+const ALTLOG_ROW_BYTES = 18;     // must match AltLogRow (ver 3 added the per-axis gate byte)
+const ALTLOG_ROW_BYTES_V2 = 17;  // ver 1 and 2 rows, before that byte
+const ALTLOG_CAP_ROWS = 10920;   // must match ALTLOG_CAP_ROWS in 7_functions.ino (3 x 3640 rows of 18 B)
 const ALTLOG_STATE_LABEL = ['idle', 'RECORDING', 'stopped', 'BUFFER FULL'];
 const ALTSWEEP_STATE_LABEL = ['idle', 'ramping up', 'ramping down', 'easing out'];
 // Both halves zero-padded, so the string is the same width at 0:07 as at 18:12 — the readout must
@@ -1794,7 +1802,7 @@ function altCaptureRender() {
             cd.textContent = `${altLogMMSS(left)} left`;
             cd.style.color = (left <= 60) ? '#e07b39' : '';
         } else if (st === 2 || st === 3) {
-            cd.textContent = `${altLogMMSS(Math.round(rows / 10))} recorded — dump or discard`;
+            cd.textContent = `${altLogMMSS(Math.round(rows / 10))} recorded — transfer or discard`;
             cd.style.color = (st === 3) ? '#e07b39' : '';
         } else {
             cd.textContent = `${altLogMMSS(Math.round(cap / 10))} capacity`;
@@ -1803,7 +1811,7 @@ function altCaptureRender() {
     }
     const rb = document.getElementById('altlog-record-btn');
     if (rb) rb.value = recording ? 'Stop' : 'Record';
-    // Dump and Discard only once a recording is finished and still held; Reverse now only while a
+    // Transfer and Discard only once a recording is finished and still held; Reverse now only while a
     // ramp is on its way up. A button that cannot do anything reads as inert, not as a live control.
     altCapEnable('altlog-dump-btn', st === 2 || st === 3);
     altCapEnable('altlog-discard-btn', st === 2 || st === 3);
@@ -1892,7 +1900,7 @@ function altLogRecordPress() {
     if (st === 1) { altCapPost('altLogStop=1'); return; }
     if (st === 2 || st === 3) {
         if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
-        xConfirm(`Recording will discard the ${altLive.logRows | 0} rows already captured — they have not been dumped. Continue?`)
+        xConfirm(`Recording will discard the ${altLive.logRows | 0} rows already captured — they have not been transferred. Continue?`)
             .then(ok => { if (ok) altCapPost('altLogRecord=1'); });
         return;
     }
@@ -1910,7 +1918,7 @@ function altLogDiscardPress() {
 // Fetch, decode, hand over the CSV, and only then clear the device buffer — a failed transfer must
 // never be the reason a deliberate capture is gone.
 async function altLogDumpPress() {
-    if (DEMO_MODE) { xAlert('Demo mode — no regulator is connected, so there is nothing to dump.'); return; }
+    if (DEMO_MODE) { xAlert('Demo mode — no regulator is connected, so there is nothing to transfer.'); return; }
     const st = altLive.logState | 0;
     if (st === 1) { xAlert('Press Stop first — the file has to match a finished session.'); return; }
     if (st === 0) { xAlert('Nothing recorded yet.'); return; }
@@ -1930,9 +1938,9 @@ async function altLogDumpPress() {
     }
     const ts = getLogTimestamp(), sfx = getLogNameSuffix();
     deliverFile(`altgate_${ts}${sfx}.csv`, altLogToCsv(d), 'text/csv');
-    // The clear is arm-gated on the device (the dump itself is not), and a 19-min recording plus a
+    // The clear is arm-gated on the device (the transfer itself is not), and an 18-min recording plus a
     // drive can cross a lock (another client, or a reboot) — a 403 resolves the fetch, so it has to be
-    // checked or the buffer silently stays held and the next Record warns about "un-dumped" rows.
+    // checked or the buffer silently stays held and the next Record warns about un-transferred rows.
     try {
         const r = await fetchWithTimeout(buildURL('/get?altLogClear=1'), {}, 5000);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1964,17 +1972,21 @@ function altSweepPress() {
                `&marginA=${encodeURIComponent(m.a)}&marginV=${encodeURIComponent(m.v)}`);
 }
 
-// Header (164 B in ver 2, 136 B in ver 1) + 17-byte rows, little-endian. Mirrors AltLogHdr /
-// AltLogRow in 7_functions.ino — change one and you must change the other. Both versions are read:
-// ver 1 files were recorded by the max-minus-min band gate, ver 2 by the straightness gate, and the
-// two share every offset up to 136 so one parser covers both off fixed offsets.
+// Header (172 B in ver 3, 164 B in ver 2, 136 B in ver 1) + rows of 18 B (ver 3) or 17 B, little-
+// endian. Mirrors AltLogHdr / AltLogRow in 7_functions.ino — change one and you must change the
+// other. All three versions are read: ver 1 files were recorded by the max-minus-min band gate,
+// ver 2 by the straightness gate, ver 3 by that plus the output slope cap, and each version only
+// APPENDS, so every earlier offset is unchanged and one parser covers all three off fixed offsets.
 function parseAltLogBin(buf) {
-    if (!buf || buf.byteLength < ALTLOG_HDR_BYTES_V1 + ALTLOG_ROW_BYTES) return null;
+    if (!buf || buf.byteLength < ALTLOG_HDR_BYTES_V1 + ALTLOG_ROW_BYTES_V2) return null;
     const dv = new DataView(buf);
     if (dv.getUint32(0, true) !== 0x414C474C) return null;   // 'ALGL'
     const ver = dv.getUint16(4, true);
-    const hdrBytes = (ver >= 2) ? ALTLOG_HDR_BYTES : ALTLOG_HDR_BYTES_V1;
-    if (buf.byteLength < hdrBytes + ALTLOG_ROW_BYTES) return null;
+    // Each version's header and row are FIXED sizes, and older files stay readable: the offsets of
+    // everything ver 1 and 2 wrote are unchanged, and each later version only appends.
+    const hdrBytes = (ver >= 3) ? ALTLOG_HDR_BYTES : (ver >= 2) ? ALTLOG_HDR_BYTES_V2 : ALTLOG_HDR_BYTES_V1;
+    const rowBytes = (ver >= 3) ? ALTLOG_ROW_BYTES : ALTLOG_ROW_BYTES_V2;
+    if (buf.byteLength < hdrBytes + rowBytes) return null;
     const h = {
         ver: dv.getUint16(4, true), rowBytes: dv.getUint16(6, true),
         rowCount: dv.getUint32(8, true), capRows: dv.getUint32(12, true),
@@ -1994,7 +2006,7 @@ function parseAltLogBin(buf) {
                     dv.getFloat32(112, true), dv.getFloat32(116, true)],
         fw: '',
     };
-    if (h.rowBytes !== ALTLOG_ROW_BYTES) return null;
+    if (h.rowBytes !== rowBytes) return null;
     for (let i = 120; i < 136; i++) { const c = dv.getUint8(i); if (!c) break; h.fw += String.fromCharCode(c); }
     if (ver >= 2) {                       // straightness-gate block, appended after fw[16]
         h.rpmLineRms = dv.getFloat32(136, true);
@@ -2005,12 +2017,16 @@ function parseAltLogBin(buf) {
         h.ampsLineFloorA = dv.getFloat32(156, true);
         h.leadSec = dv.getFloat32(160, true);
     }
-    const avail = Math.floor((buf.byteLength - hdrBytes) / ALTLOG_ROW_BYTES);
+    if (ver >= 3) {                       // output slope cap, appended after the ver-2 block
+        h.ampsSlewPct = dv.getFloat32(164, true);
+        h.ampsSlewFloorA = dv.getFloat32(168, true);
+    }
+    const avail = Math.floor((buf.byteLength - hdrBytes) / rowBytes);
     const n = Math.min(h.rowCount, avail);
     if (n < 1) return null;
     const rows = [];
     for (let i = 0; i < n; i++) {
-        const o = hdrBytes + i * ALTLOG_ROW_BYTES;
+        const o = hdrBytes + i * rowBytes;
         rows.push({
             dtMs: dv.getUint16(o, true),
             rpm: dv.getInt16(o + 2, true),
@@ -2021,12 +2037,13 @@ function parseAltLogBin(buf) {
             amps: dv.getInt16(o + 12, true) / 100,
             ampsRaw: dv.getInt16(o + 14, true) / 100,
             flags: dv.getUint8(o + 16),
+            gate: (ver >= 3) ? dv.getUint8(o + 17) : null,   // null = this file predates the per-axis byte
         });
     }
     return { hdr: h, rows, truncated: (n < h.rowCount) };
 }
 
-// The header exists because dump-and-restart makes many small files instead of one large one: a
+// The header exists because transfer-and-restart makes many small files instead of one large one: a
 // mid-campaign settings change would otherwise make two files silently incomparable.
 function altLogToCsv(d) {
     const h = d.hdr;
@@ -2045,6 +2062,7 @@ function altLogToCsv(d) {
                ` rpmLineRms=${h.rpmLineRms} rpmRateMax=${h.rpmRateMax}` +
                ` dutyLineRms=${h.dutyLineRms} dutySlewMax=${h.dutySlewMax}` +
                ` ampsLinePct=${h.ampsLinePct} ampsLineFloorA=${h.ampsLineFloorA}` +
+               (h.ver >= 3 ? ` ampsSlewPct=${h.ampsSlewPct} ampsSlewFloorA=${h.ampsSlewFloorA}` : '') +
                ` vbusTol=${h.vbusTol} thermDegF=${h.thermDegF} thermSec=${h.thermSec}`);
         L.push('# rpm/field/amps are judged by rms departure from a fitted line over their window (any');
         L.push('# slope within the rate limits); vbus and tempF by highest-minus-lowest. The tempF window');
@@ -2066,7 +2084,16 @@ function altLogToCsv(d) {
     L.push('# manual, fieldOn) and on dt_ms, which carry every transition the device can actually see.');
     L.push('# sweep=1 marks only the constant-rate ramp legs: the ease-in/out transitions at the ends of a');
     L.push('# run move duty far faster than the ramp rate and are deliberately NOT flagged as sweep rows.');
-    L.push('t_s,dt_ms,rpm,fieldPct,vbus,tempF,tSlope_Fmin,amps,ampsRaw,fieldOn,manual,sweep,sweepDown,protection,eligible,steady,sweepRevEarly');
+    if (h.ver >= 3) {
+        L.push('# st_* are the detector\'s OWN per-axis verdicts at that sample, not a reconstruction: steady is');
+        L.push('# their AND. emitted=1 marks the row a record was banked on. Blank on a stale fold (field off),');
+        L.push('# where the axis flags still hold their pre-shutdown values and would read as a verdict.');
+        L.push('# chc=1 marks the stage-9 charge-health calibration: held-duty speed passes, and the only');
+        L.push('# stretch of a capture from which the output lead (leadSec) can be re-measured. Closed-loop');
+        L.push('# driving cannot give it — the regulator moves field and speed together and the two confound.');
+    }
+    L.push('t_s,dt_ms,rpm,fieldPct,vbus,tempF,tSlope_Fmin,amps,ampsRaw,fieldOn,manual,sweep,sweepDown,protection,eligible,steady,sweepRevEarly' +
+           (h.ver >= 3 ? ',st_rpm,st_field,st_vbus,st_temp,st_amps,emitted,chc' : ''));
     let t = 0;   // first row is t=0: time is relative to the start of the file
     for (let i = 0; i < d.rows.length; i++) {
         const r = d.rows[i];
@@ -2075,7 +2102,12 @@ function altLogToCsv(d) {
                 r.tSlope.toFixed(2), r.amps.toFixed(2), r.ampsRaw.toFixed(2),
                 (r.flags & 1) ? 1 : 0, (r.flags & 2) ? 1 : 0, (r.flags & 4) ? 1 : 0, (r.flags & 8) ? 1 : 0,
                 (r.flags & 16) ? 1 : 0, (r.flags & 32) ? 1 : 0, (r.flags & 64) ? 1 : 0,
-                (r.flags & 128) ? 1 : 0].join(','));
+                (r.flags & 128) ? 1 : 0]
+               .concat(r.gate == null ? []
+                       : [(r.gate & 1) ? 1 : 0, (r.gate & 2) ? 1 : 0, (r.gate & 4) ? 1 : 0,
+                          (r.gate & 8) ? 1 : 0, (r.gate & 16) ? 1 : 0, (r.gate & 32) ? 1 : 0,
+                          (r.gate & 64) ? 1 : 0])
+               .join(','));
     }
     return L.join('\n') + '\n';
 }
@@ -9980,7 +10012,7 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
         const measuredSrc = battProbe === 1 || (battTempSel >= 1 && battTempSel <= 4) || (liveTempSrc >= 1 && liveTempSrc <= 4);
         if (!measuredSrc) {
             noticeHtml += battDefNotice('limit', 'Battery temperature source',
-                'No battery temperature source is reporting, so the cold and hot charge lockouts and the voltage-loop gain derate have nothing to read. Fit one of the ring-lug probes from the kit to a battery terminal — it is assigned under Setup > Temperature, where the hot-charge lockout and the battery temperature limits also live — or feed battery temperature in from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.');
+                'No battery temperature source is reporting, so the cold and hot charge lockouts, the voltage-loop gain derate, and the temperature corrections on the battery-health figures have nothing to read. Fit one of the ring-lug probes from the kit to a battery terminal — it is assigned under Setup > Temperature, where the hot-charge lockout and the battery temperature limits also live — or feed battery temperature in from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.');
         }
         // Voltage float is allowed without a shunt (2026-09-09): absorption then ends on its time limit
         // instead of tail current, the way a solar controller floats with no shunt. Say which exit will
@@ -10647,7 +10679,7 @@ function commPrepRender(cfg) {
         '<div style="display:flex; align-items:center; gap:10px; margin-top:8px;">' +
         '<button type="button" id="commprep-ow-scan" onclick="commPrepOwScan()" style="background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:5px; padding:5px 12px; cursor:pointer; font-size:0.8em;">Rescan</button>' +
         '<span id="commprep-ow-status" style="font-size:11px; color:#888;"></span></div>' +
-        '<div style="' + capCss + '">Alternator feeds the over-temperature protection. Battery supplies the battery temperature the charge lockouts and the voltage-loop gain derate use. Extra is any other temperature you want to watch, shown on Live Data with its own alarms.</div>' +
+        '<div style="' + capCss + '">Alternator feeds the over-temperature protection. Battery supplies the battery temperature the charge lockouts, the voltage-loop gain derate, and the battery-health temperature corrections use. Extra is any other temperature you want to watch, shown on Live Data with its own alarms.</div>' +
         '</div>' + hr + '</div>';
 
     // FLOAT_DURATION is stored/exported in seconds; the input edits hours (firmware re-multiplies on write).
@@ -11245,7 +11277,7 @@ function socSeedRender(s) {
     const inputs = '<div style="display:grid; grid-template-columns:1fr auto; row-gap:5px; column-gap:12px; font-size:13px;">'
         + '<span style="color:#999;">Battery terminal voltage</span><span style="text-align:right;">' + Number(s.v).toFixed(2) + ' V</span>'
         + '<span style="color:#999;">Battery current (&minus; = discharging)</span><span style="text-align:right;">' + Number(s.i).toFixed(1) + ' A</span>'
-        + '<span style="color:#999;">Board temperature</span><span style="text-align:right;">' + (s.tF == null ? 'unavailable' : Math.round(toDisplayTemp(s.tF)) + ' ' + tempUnitLabel()) + '</span>'
+        + '<span style="color:#999;">Battery temperature</span><span style="text-align:right;">' + (s.tF == null ? 'none measured' : Math.round(toDisplayTemp(s.tF)) + ' ' + tempUnitLabel() + (s.tsrc ? ' (' + battTempSrcName(s.tsrc) + ')' : '')) + '</span>'
         + '<span style="color:#999;">Chemistry</span><span style="text-align:right;">' + _cfgEsc(chemName) + '</span>'
         + '<span style="color:#999;">Bank capacity</span><span style="text-align:right;">' + (s.cap > 0 ? s.cap + ' Ah, ' : '') + s.sysV + ' V</span>'
         + '</div>';
@@ -11260,7 +11292,7 @@ function socSeedRender(s) {
     } else {
         calc = secTitle('Calculation');
         calc += eq('Internal resistance, scaled for temperature',
-            s.tF == null ? 'R scale = 1.00 (no temperature reading)'
+            s.tF == null ? 'R scale = 1.00 (no measured battery temperature)'
                 : 'R scale = e^(0.035 &times; (25 &minus; ' + ((s.tF - 32) / 1.8).toFixed(1) + ' &deg;C)) = ' + Number(s.rs).toFixed(2));
         if (s.cap > 0) {
             const rBase = s.lith ? 6 : 12;
@@ -13739,7 +13771,7 @@ function updateInlineStatus(isConnected) {
 // says what is happening now and leaves as soon as it is over. The permanent record of an outage is
 // the console (the backfill marker) and the regulator's own log — not this.
 const STALL_NOTICE_MS = 3500;   // silence before the overlay appears
-const STALL_GREY_MS = 9000;     // unchanged tier: dot red + markAllReadingsStale()
+const STALL_GREY_MS = 9000;     // unchanged tier: dot red + setReadingsStale(true)
 const STALL_CLEAR_MS = 4000;    // how long "flowing again" lingers — same dwell as fileToast
 let stallState = { on: false, startMs: 0, hideTimer: null };
 
@@ -14071,12 +14103,14 @@ function updateAlarmStatus(data) {
 }
 
 //Graying when wifi disconnects
-function markAllReadingsStale() {
-    document.querySelectorAll('.reading span, .reading-value').forEach(element => {
-        element.style.opacity = "0.4";
-        element.style.color = "#999999";
-        element.style.fontStyle = "italic";
-    });
+// One body class, not per-element inline styles. The old version enumerated value classes
+// ('.reading span, .reading-value'); the header was rebuilt as .reading-duo, nothing matched
+// any more, and the stall notice went on promising a grey-out that never happened. It also had
+// no counterpart, so the one element that did still match stayed faded until a page reload.
+// Which elements fade is now a container-scoped rule in styles.css (.readings-stale).
+function setReadingsStale(stale) {
+    if (document.body.classList.contains('readings-stale') === stale) return;
+    document.body.classList.toggle('readings-stale', stale);
 }
 
 function initPlotDataStructures() {
@@ -17071,7 +17105,7 @@ window.addEventListener("load", function () {
                 // notice's early return so a page that never gets its first packet still greys at 9 s.
                 if (timeSinceLastEvent > STALL_GREY_MS) { // 9 seconds without data = disconnected
                     updateInlineStatus(false);
-                    markAllReadingsStale(); //gray out
+                    setReadingsStale(true); //gray out
                 }
                 if (document.hidden || DEMO_MODE || isOfflineMode || !window._firstCsvPacketReceived) {
                     stallState.on = false; hideStallNotice(); return;
@@ -17091,6 +17125,10 @@ window.addEventListener("load", function () {
         const handleCSVData = function (e) {
 
             lastEventTime = Date.now();
+            // Unconditional, unlike the notice below: the grey tier also fires with no notice on
+            // screen (hidden tab, offline mode, before the first packet), so it cannot be cleared
+            // from endStallNotice.
+            setReadingsStale(false);
             if (stallState.on) endStallNotice();   // first packet back closes the grey strip's count-up
 
             // Diagnostic: track inter-event gap to distinguish firmware/WiFi delays from client-side issues
@@ -21391,7 +21429,8 @@ const SINFO = {
     altBandAmps: () => [
         ['Signal', S_ADS_ALT],
         ['Filter', sAltEma() + ', then held back by the output lead so it is paired with the engine speed that produced it'],
-        ['Gate', 'stay within the larger of the % of reading or the floor, measured from its own straight line, at any slope — while the engine sweeps smoothly the output ramps smoothly with it, and that is the pair worth recording'],    ],
+        ['Gate', 'stay within the larger of the % of reading or the floor, measured from its own straight line — while the engine sweeps smoothly the output ramps smoothly with it, and that is the pair worth recording'],
+        ['Rate', 'that line may not be steeper than the larger of the rate limit (% of reading per second) or its floor. This is the setting that bounds how far a record taken on the move can drift: the output pairing is never exact, and what a residual error costs is that error multiplied by the ramp rate'],    ],
     altEmaSec: () => [
         ['Role', 'this field IS the filter — an interval-aware moving-average low-pass (EMA) on RPM, field duty, voltage, and amps before their steadiness limits are judged; temperature is deliberately excluded'],    ],
     altLead: () => [
@@ -33762,12 +33801,13 @@ function bhSet(id, t) { const e = document.getElementById(id); if (e) e.textCont
 
 // DCIR normalized to a 25°C (77°F) reference. Resistance rises as the bank cools, so a cold run
 // reads high; this brings every row onto a common footing so the trend isn't just temperature.
-// The recorded temperature is the measured battery temperature when the test had one and the board
-// temperature otherwise, so this is an APPROXIMATE correction (same model as the battery-temp CV-gain
-// derate). ~0.6%/°F ≈ 1%/°C.
+// Only a MEASURED battery temperature can do it: tF is null on a run that had none, and those rows
+// keep their raw DCIR with no @25 value rather than being corrected by something that is not the bank.
+// ~0.6%/°F ≈ 1%/°C, the same model as the battery-temp CV-gain derate.
+// Number.isFinite, not isFinite: isFinite(null) is true (null coerces to 0) and would "normalize" from 0 °F.
 const BH_TREF_F = 77, BH_TEMPCO_PER_F = 0.006;
 function bhDcir25(dcir, tF) {
-  if (!(dcir > 0) || !isFinite(tF)) return null;
+  if (!(dcir > 0) || !Number.isFinite(tF)) return null;
   return dcir * Math.exp(BH_TEMPCO_PER_F * (tF - BH_TREF_F));
 }
 
@@ -33943,7 +33983,7 @@ function bhwRenderDone(b) {
     html = '<p style="font-size:15px;"><strong>Done.</strong></p>' +
       '<div style="margin:10px 0;padding:10px 12px;background:#1b2a1b;border:1px solid #356b35;border-radius:6px;line-height:1.8;">' +
       '<div style="font-size:24px;font-weight:700;color:#2ec4b6;">' + res.dcir.toFixed(2) + ' mΩ</div>' +
-      '<div style="font-size:13px;color:#bcd;">' + dcir25.toFixed(2) + ' mΩ at 25 °C · fit ' + (fitOk ? '<span style="color:#5a5;">✓</span>' : '<span style="color:#f0a500;">⚠</span>') + ' · ' + res.edges + ' steps</div>' +
+      '<div style="font-size:13px;color:#bcd;">' + (dcir25 ? dcir25.toFixed(2) + ' mΩ at 25 °C' : 'no battery temperature, not normalized') + ' · fit ' + (fitOk ? '<span style="color:#5a5;">✓</span>' : '<span style="color:#f0a500;">⚠</span>') + ' · ' + res.edges + ' steps</div>' +
       (isBase ? '<div style="font-size:12px;color:#9b9;margin-top:4px;">Stored as the 100% baseline.</div>' : '') + '</div>' +
       '<div style="font-size:12px;color:#888;line-height:1.5;">Internal resistance depends on temperature and state of charge — compare runs taken at a similar state of charge. The full history is on the Health panel.</div>';
   } else {
@@ -34004,7 +34044,7 @@ function pollBatteryHealth() {
             '<td>' + (r.dwell ? (r.dwell / 1000).toFixed(1) : '—') + '</td>' +
             '<td>' + r.soc.toFixed(0) + '%</td>' +
             '<td>' + r.v.toFixed(2) + '</td>' +
-            '<td>' + toDisplayTemp(r.tF).toFixed(0) + '</td>' +
+            '<td>' + (Number.isFinite(r.tF) ? toDisplayTemp(r.tF).toFixed(0) : '—') + '</td>' +
             '<td>' + r.low.toFixed(0) + '→' + (r.low + r.delta).toFixed(0) + 'A</td>' +
             '<td>' + r.edges + '</td></tr>';
         }
