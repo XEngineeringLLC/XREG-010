@@ -151,6 +151,14 @@ void updateSystemHealthStats() {
   }
 }
 
+// ArduinoJson 7 documents grow on the default heap; this allocator puts them in PSRAM.
+struct PsramJsonAllocator : ArduinoJson::Allocator {
+  void *allocate(size_t n) override { return ps_malloc(n); }
+  void deallocate(void *p) override { free(p); }
+  void *reallocate(void *p, size_t n) override { return ps_realloc(p, n); }
+};
+static PsramJsonAllocator psramJsonAllocator;
+
 bool executeFetchWeatherData() {
   // Called by HTTPS task on Core 0
   Serial.println(">>> executeFetchWeatherData() ENTERED");
@@ -176,9 +184,12 @@ bool executeFetchWeatherData() {
 
   HTTPClient http;
 
-  char url[256];
+  char url[320];
+  // daily sum = the pause decision's forecast; hourly = the ledger's per-hour learning basis (three local
+  // days, unix stamps so the ledger maps slots onto its own local-day rule rather than the API's zone).
   snprintf(url, sizeof(url),
-           "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f&daily=shortwave_radiation_sum&timezone=auto",
+           "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f&daily=shortwave_radiation_sum"
+           "&hourly=shortwave_radiation&forecast_days=3&timeformat=unixtime&timezone=auto",
            LatitudeNMEA, LongitudeNMEA);
 
   Serial.print("Open-Meteo URL: ");
@@ -195,8 +206,13 @@ bool executeFetchWeatherData() {
     queueConsoleMessageF("GPS: %.6f,%.6f", LatitudeNMEA, LongitudeNMEA);
     Serial.printf("Response Code: %d\n", httpResponseCode);
 
-    DynamicJsonDocument doc(4096);
-    DeserializationError error = deserializeJson(doc, payload);
+    // The filter admits only the arrays read below; the rest of the reply never enters the document.
+    JsonDocument filter;
+    filter["daily"]["shortwave_radiation_sum"] = true;
+    filter["hourly"]["time"] = true;
+    filter["hourly"]["shortwave_radiation"] = true;
+    JsonDocument doc(&psramJsonAllocator);
+    DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
     if (error) {
       snprintf(weatherLastError, sizeof(weatherLastError), "JSON parse error: %s", error.c_str());
       weatherDataValid = 0;
@@ -220,6 +236,25 @@ bool executeFetchWeatherData() {
     UVToday = mjToday * MJ_TO_KWH_CONVERSION;
     UVTomorrow = mjTomorrow * MJ_TO_KWH_CONVERSION;
     UVDay2 = mjDay2 * MJ_TO_KWH_CONVERSION;
+    // Hourly table for the ledger (sledCaptureHourly): slot k = mean W/m² of the hour ENDING at time[k],
+    // Open-Meteo's convention. wxHourT0 is stamped last: the ledger on Core 1 reads 0 as "no table".
+    JsonArray hTime = doc["hourly"]["time"];
+    JsonArray hRad  = doc["hourly"]["shortwave_radiation"];
+    portENTER_CRITICAL(&wxHourMux);   // sledCaptureHourly (Core 1) reads the table whole under the same lock
+    wxHourT0 = 0;
+    if (wxHourWm2 && hTime.size() >= 24 && hRad.size() == hTime.size()) {
+      uint16_t n = (hRad.size() > WX_HOURS) ? WX_HOURS : (uint16_t)hRad.size();
+      for (uint16_t k = 0; k < n; k++) {
+        if (hRad[k].isNull()) { wxHourWm2[k] = NAN; continue; }   // a hole in the model stays a hole, never a 0 W/m² promise
+        float v = hRad[k].as<float>();
+        wxHourWm2[k] = (v < 0.0f) ? 0.0f : v;
+      }
+      wxHourN  = n;
+      wxHourT0 = (time_t)hTime[0].as<long long>();
+    } else {
+      wxHourN = 0;
+    }
+    portEXIT_CRITICAL(&wxHourMux);
     // Order is load-bearing: stamp the fetch age BEFORE publishing validity. analyzeWeatherMode()
     // runs on the other core and voids any forecast whose stamp is stale or 0, so a valid-but-
     // unstamped instant is enough to throw this forecast away for the whole next interval.
@@ -307,9 +342,9 @@ void updateWeatherMode() {
     return;
   }
 
-  // Internet fetch requires field off for 75s. Do not advance nextWeatherUpdate
-  // while blocked — it fires promptly once the gate opens.
-  if (!fieldOffSettled(15000)) {
+  // Internet fetch requires the field cut for 75s (fieldCutSettled, the hardware line: no fetch with
+  // the field on). Do not advance nextWeatherUpdate while blocked — it fires promptly once the gate opens.
+  if (!fieldCutSettled(55000)) {
     return;
   }
 
@@ -346,12 +381,20 @@ void solarLedgerInit() {
     if (!sledRing) { Serial.println("FATAL: sledRing ps_malloc failed"); return; }
     memset(sledRing, 0, SLED_SIZE * sizeof(SolarLedgerRec));
   }
+  if (!wxHourWm2) {
+    wxHourWm2 = (float *)ps_malloc(WX_HOURS * sizeof(float));
+    if (!wxHourWm2) Serial.println("solarLedgerInit: wxHourWm2 ps_malloc failed (hourly learning off)");
+  }
   uint32_t n = readPsramBlob(SLED_PATH, SLED_MAGIC, SLED_VER, sledRing, sizeof(SolarLedgerRec), SLED_SIZE, NULL, false);
   sledCount = (uint16_t)n;
   sledHead  = (n >= SLED_SIZE) ? 0 : (uint16_t)n;
   SolarLedgerLive lv = {};
   if (readPsramBlob(SLED_LIVE_PATH, SLED_MAGIC ^ 1u, SLED_VER, &lv, sizeof(SolarLedgerLive), 1, NULL, false) == 1) {
     sledLive = lv;   // the day in progress resumes with its midnight baselines intact
+    // The blob can be 30 min old while SolarChargedEnergy_AllTime restores from an older NVS save, so
+    // the hour in progress has no trustworthy baseline: it never qualifies, and the next pass re-bases.
+    if (sledLive.curHour >= 0 && sledLive.curHour < 24) sledLive.hourBad[sledLive.curHour] = 1;
+    sledLive.curHour = -1;
   } else {
     memset(&sledLive, 0, sizeof(sledLive));
     sledLive.predHarvKwh = sledLive.predIrrKwh = sledLive.predConsKwh = NAN;
@@ -409,6 +452,73 @@ float sledLiveActConsKwh() {
 }
 int sledTele(float kwh) { return isnan(kwh) ? -1 : (int)lroundf(kwh * 100.0f); }   // CSV2 encoding: -1 = unknown
 
+// ── Per-hour learning basis ─────────────────────────────────────────────────────────────────────
+// A whole-day actual/forecast ratio is only honest when the sun set the harvest all day. The moment
+// the battery is the limit (absorb, float, an external charge-current limit) the MPPT throttles and
+// the day reads as "bad panels". So the day is judged hour by hour: only hours where the MPPT was
+// freely tracking the whole time, the device watched the whole time, and a forecast exists are summed
+// into the ratio. Hourly forecast = Open-Meteo shortwave_radiation, the W/m² mean of the hour ENDING
+// at each slot's time; local hour h spans [h:00, h+1:00), so its slot is the one ending at h+1:00.
+static bool sledCaptureHourly(SolarLedgerLive &L, uint32_t today) {
+  if (!wxHourWm2) return false;
+  L.hourFcMask = 0;
+  portENTER_CRITICAL(&wxHourMux);   // the fetch task refills the table in one critical section; read it whole
+  if (wxHourT0 == 0 || wxHourN == 0) { portEXIT_CRITICAL(&wxHourMux); return false; }
+  for (int h = 0; h < 24; h++) {
+    time_t tEnd = (time_t)today * 86400 + (time_t)(h + 1) * 3600 - (time_t)usageTzOffsetS;
+    long k = lround((double)(tEnd - wxHourT0) / 3600.0);   // nearest slot: a half-hour zone lands 30 min off, close enough
+    L.hourFcWh[h] = 0;
+    if (k < 0 || k >= (long)wxHourN) continue;
+    if (isnan(wxHourWm2[k])) continue;   // a null API slot: no forecast held for this hour
+    float wh = wxHourWm2[k] * (float)SolarWatts / STC_IRRADIANCE;   // W/m² x 1 h x array W / 1000 W/m² = Wh at ratio 1.0
+    if (wh < 0.0f) wh = 0.0f;
+    if (wh > 65535.0f) wh = 65535.0f;
+    L.hourFcWh[h] = (uint16_t)lroundf(wh);
+    L.hourFcMask |= (1UL << h);
+  }
+  portEXIT_CRITICAL(&wxHourMux);
+  if (L.hourFcMask) L.flags |= SLED_F_HOURLY;
+  return L.hourFcMask != 0;
+}
+static void sledHourClose(SolarLedgerLive &L) {
+  double wh = SolarChargedEnergy_AllTime - L.hourBaseWh;
+  if (wh < 0) wh = 0;
+  if (wh > 65535.0) wh = 65535.0;
+  L.hourActWh[L.curHour] = (uint16_t)lround(wh);
+}
+// 1 Hz. "Freely tracking" = VE.Direct MPPT mode 2 (a controller too old to send it: charge state 3, bulk).
+// One bad second disqualifies the hour; a silent link counts as bad, since an unseen throttle is still a throttle.
+static void sledHourService(time_t ep, uint32_t now, bool minuteTick) {
+  SolarLedgerLive &L = sledLive;
+  if (L.dayIdx == 0) return;
+  int hour = (int)(((ep + usageTzOffsetS) % 86400) / 3600);
+  if (hour < 0 || hour > 23) return;
+  if (hour != L.curHour) {
+    if (L.curHour >= 0 && L.curHour < 24) sledHourClose(L);
+    L.curHour = (int8_t)hour;
+    L.hourBaseWh = SolarChargedEnergy_AllTime;
+  }
+  bool veFresh  = dataTimestamps[IDX_VICTRON_SOLAR] != 0 && now - dataTimestamps[IDX_VICTRON_SOLAR] < 120000UL;
+  bool tracking = veFresh && (VictronMPPTMode >= 0 ? VictronMPPTMode == 2 : VictronChargeState == 3);
+  if (!tracking && L.hourBad[hour] < 255) L.hourBad[hour]++;
+  if (minuteTick && L.hourSeen[hour] < 255) L.hourSeen[hour]++;
+}
+// Sums the qualifying hours. Used at day close (the record) and by the CSV export's live row.
+static void sledQualify(const SolarLedgerLive &L, uint32_t *mask, float *predKwh, float *actKwh) {
+  *mask = 0; *predKwh = NAN; *actKwh = NAN;
+  if (!(L.flags & SLED_F_HOURLY)) return;
+  uint32_t predWh = 0, actWh = 0;
+  for (int h = 0; h < 24; h++) {
+    if (!(L.hourFcMask & (1UL << h))) continue;
+    if (L.hourSeen[h] < SLED_HOUR_MIN_SEEN || L.hourBad[h] != 0) continue;
+    *mask |= (1UL << h);
+    predWh += L.hourFcWh[h];
+    actWh  += L.hourActWh[h];
+  }
+  *predKwh = predWh / 1000.0f;
+  *actKwh  = actWh / 1000.0f;
+}
+
 static void solarLedgerOpenDay(uint32_t today) {
   SolarLedgerLive &L = sledLive;
   memset(&L, 0, sizeof(L));
@@ -435,6 +545,8 @@ static void solarLedgerOpenDay(uint32_t today) {
   }
   L.predConsKwh = solarLedgerPredictCons(today);
   if (HAS_BATT_SHUNT) L.flags |= SLED_F_SHUNT;
+  L.curHour = -1;
+  sledCaptureHourly(L, today);   // same freeze rule as the daily number: the table held at midnight
   sledLiveDirty = true;
 }
 
@@ -453,11 +565,14 @@ static void solarLedgerCloseDay() {
   r.actHarvKwh  = sledLiveActHarvKwh();
   r.actConsKwh  = sledLiveActConsKwh();
   r.ratioAfter  = NAN;
-  // Learn: the day's actual/forecast ratio blended slowly into performanceRatio. Only a full day with
-  // a real forecast, a live VE.Direct link and a meaningful promise can teach anything.
-  if (solarLearnEnable == 1 && (r.flags & SLED_F_FORECAST) && !(r.flags & SLED_F_PARTIAL)
-      && !isnan(r.actHarvKwh) && r.predIrrKwh >= SLED_MIN_IRR_KWH) {
-    float dayRatio = r.actHarvKwh / r.predIrrKwh;
+  if (L.curHour >= 0 && L.curHour < 24) sledHourClose(L);   // the hour in progress at midnight finalises here
+  sledQualify(L, &r.qualHours, &r.qualPredKwh, &r.qualActKwh);
+  // Learn: actual/forecast over the QUALIFYING hours only (sledHourService), blended slowly into
+  // performanceRatio. A whole-day ratio learnt "the panels are bad" from "the battery was full by noon";
+  // discarding the battery-limited hours is what removes that. A day with no qualifying hour, or too
+  // small a promise across them, teaches nothing.
+  if (solarLearnEnable == 1 && r.qualHours != 0 && r.qualPredKwh >= SLED_MIN_QUAL_WH / 1000.0f) {
+    float dayRatio = r.qualActKwh / r.qualPredKwh;
     if (dayRatio < SLED_RATIO_MIN) dayRatio = SLED_RATIO_MIN;
     if (dayRatio > SLED_RATIO_MAX) dayRatio = SLED_RATIO_MAX;
     float a = solarLearnRatePct / 100.0f;
@@ -471,7 +586,8 @@ static void solarLedgerCloseDay() {
     r.flags |= SLED_F_LEARNED;
     sledRatioDirty = true;    // NVS write waits for field-cut in the service
     settingsDirty = true;     // CSV3 echoes the new ratio now
-    queueConsoleMessageF("Solar: day ratio %.2f, performance ratio now %.2f", dayRatio, performanceRatio);
+    queueConsoleMessageF("Solar: ratio %.2f from %d sun-limited hour(s), performance ratio now %.2f",
+                         dayRatio, __builtin_popcount(r.qualHours), performanceRatio);
   }
   sledRing[sledHead] = r;
   sledHead = (sledHead + 1) % SLED_SIZE;
@@ -514,11 +630,13 @@ void solarLedgerService() {
   if (sledClockValid(ep)) {
     uint32_t today = sledLocalDay(ep);
     if (sledLive.dayIdx != 0 && sledLive.dayIdx != today) solarLedgerCloseDay();
+    bool minuteTick = false;
     if (sledLive.dayIdx == 0) {
       solarLedgerOpenDay(today);
       lastMinuteMs = now;
     } else if (now - lastMinuteMs >= 60000) {
       lastMinuteMs = now;
+      minuteTick = true;
       if (sledLive.coverageMin < 1440) sledLive.coverageMin++;
       if (dataTimestamps[IDX_VICTRON_SOLAR] != 0 && now - dataTimestamps[IDX_VICTRON_SOLAR] < 600000UL) sledLive.flags |= SLED_F_VEDIRECT;
       if (!HAS_BATT_SHUNT) sledLive.flags &= ~SLED_F_SHUNT;   // a shunt unconfigured mid-day voids the day's consumption
@@ -528,8 +646,11 @@ void solarLedgerService() {
         sledLive.predHarvKwh = sledLive.predIrrKwh * performanceRatio;
         sledLive.flags |= SLED_F_FORECAST | SLED_F_SAMEDAY;
       }
+      // Same for the hourly table: the first one that covers today, never replaced after.
+      if (!(sledLive.flags & SLED_F_HOURLY)) sledCaptureHourly(sledLive, today);
       sledLiveDirty = true;
     }
+    sledHourService(ep, now, minuteTick);
   }
   if (!fieldCutSettled(10000)) return;
   bool liveDue = sledLiveDirty && (lastLiveFlushMs == 0 || now - lastLiveFlushMs >= SLED_LIVE_FLUSH_MS);
@@ -568,12 +689,12 @@ void solarLedgerCsvSend(AsyncWebServerRequest *request) {
           if (st.done) return written;
           if (st.idx == 0) {
             time_t ep = time(NULL);
-            st.len = snprintf(st.line, sizeof(st.line), "# sledger v1 today=%lu tz=%ld n=%lu ratio=%.3f need=%.2f needSrc=%d learn=%d useCons=%d\n",
+            st.len = snprintf(st.line, sizeof(st.line), "# sledger v2 today=%lu tz=%ld n=%lu ratio=%.3f need=%.2f needSrc=%d learn=%d useCons=%d\n",
                               (unsigned long)(sledClockValid(ep) ? sledLocalDay(ep) : 0), (long)usageTzOffsetS,
                               (unsigned long)st.total, performanceRatio, sledNeedKwh, sledNeedSource,
                               solarLearnEnable, solarUseConsEnable);
           } else if (st.idx == 1) {
-            st.len = snprintf(st.line, sizeof(st.line), "day,predHarv,predIrr,actHarv,predCons,actCons,alt,ratio,covMin,flags\n");
+            st.len = snprintf(st.line, sizeof(st.line), "day,predHarv,predIrr,actHarv,predCons,actCons,alt,ratio,covMin,flags,qualPred,qualAct,qualHours\n");
           } else {
             uint32_t i = st.idx - 2;
             SolarLedgerRec r;
@@ -585,13 +706,15 @@ void solarLedgerCsvSend(AsyncWebServerRequest *request) {
               r.predConsKwh = sledLive.predConsKwh; r.actHarvKwh = sledLiveActHarvKwh(); r.actConsKwh = sledLiveActConsKwh();
               r.altKwh = sledLiveAltKwh(); r.ratioAfter = NAN; r.coverageMin = sledLive.coverageMin;
               r.flags = sledLive.flags | SLED_F_LIVE;
+              sledQualify(sledLive, &r.qualHours, &r.qualPredKwh, &r.qualActKwh);
             } else { st.done = true; return written; }
-            char c1[16], c2[16], c3[16], c4[16], c5[16], c6[16], c7[16];
+            char c1[16], c2[16], c3[16], c4[16], c5[16], c6[16], c7[16], c8[16], c9[16];
             sledCell(c1, sizeof(c1), r.predHarvKwh); sledCell(c2, sizeof(c2), r.predIrrKwh); sledCell(c3, sizeof(c3), r.actHarvKwh);
             sledCell(c4, sizeof(c4), r.predConsKwh); sledCell(c5, sizeof(c5), r.actConsKwh); sledCell(c6, sizeof(c6), r.altKwh);
-            sledCell(c7, sizeof(c7), r.ratioAfter);
-            st.len = snprintf(st.line, sizeof(st.line), "%lu,%s,%s,%s,%s,%s,%s,%s,%u,%u\n",
-                              (unsigned long)r.dayIdx, c1, c2, c3, c4, c5, c6, c7, (unsigned)r.coverageMin, (unsigned)r.flags);
+            sledCell(c7, sizeof(c7), r.ratioAfter); sledCell(c8, sizeof(c8), r.qualPredKwh); sledCell(c9, sizeof(c9), r.qualActKwh);
+            st.len = snprintf(st.line, sizeof(st.line), "%lu,%s,%s,%s,%s,%s,%s,%s,%u,%u,%s,%s,%lu\n",
+                              (unsigned long)r.dayIdx, c1, c2, c3, c4, c5, c6, c7, (unsigned)r.coverageMin, (unsigned)r.flags,
+                              c8, c9, (unsigned long)r.qualHours);
           }
           if (st.len > (int)sizeof(st.line) - 1) st.len = sizeof(st.line) - 1;
           st.idx++; st.pos = 0;
@@ -2641,7 +2764,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (!settingExists(NK_MinChargeTempF)) {
     settingWrite(NK_MinChargeTempF, String(MinChargeTempF).c_str());
   } else {
-    MinChargeTempF = settingRead(NK_MinChargeTempF).toFloat();
+    MinChargeTempF = constrain(settingRead(NK_MinChargeTempF).toFloat(), -40.0f, 120.0f);
   }
   // Battery + extra temperature probes, battery-temperature source chain, hot-charge lockout
   // (BATTERY_TEMP_SENSORS_SPEC.md §6)
@@ -2670,7 +2793,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (!settingExists(NK_MaxChargeTempF)) {
     settingWrite(NK_MaxChargeTempF, String(MaxChargeTempF).c_str());
   } else {
-    MaxChargeTempF = settingRead(NK_MaxChargeTempF).toFloat();
+    MaxChargeTempF = constrain(settingRead(NK_MaxChargeTempF).toFloat(), 32.0f, 200.0f);
   }
   if (!settingExists(NK_extraTempAlarmHiEnable)) {
     settingWrite(NK_extraTempAlarmHiEnable, String(extraTempAlarmHiEnable).c_str());
@@ -2680,7 +2803,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (!settingExists(NK_extraTempAlarmHiF)) {
     settingWrite(NK_extraTempAlarmHiF, String(extraTempAlarmHiF).c_str());
   } else {
-    extraTempAlarmHiF = settingRead(NK_extraTempAlarmHiF).toFloat();
+    extraTempAlarmHiF = constrain(settingRead(NK_extraTempAlarmHiF).toFloat(), -40.0f, 300.0f);
   }
   if (!settingExists(NK_extraTempAlarmLoEnable)) {
     settingWrite(NK_extraTempAlarmLoEnable, String(extraTempAlarmLoEnable).c_str());
@@ -2690,7 +2813,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (!settingExists(NK_extraTempAlarmLoF)) {
     settingWrite(NK_extraTempAlarmLoF, String(extraTempAlarmLoF).c_str());
   } else {
-    extraTempAlarmLoF = settingRead(NK_extraTempAlarmLoF).toFloat();
+    extraTempAlarmLoF = constrain(settingRead(NK_extraTempAlarmLoF).toFloat(), -40.0f, 300.0f);
   }
   // 1-Wire role addresses: 16-char lowercase hex ROM code per role, "" = unassigned. Loaded straight into
   // tempRoleAddr[]; owEnumerate() (initializeHardware, later TempTask) binds the bus slots.
@@ -5374,13 +5497,14 @@ void executeCheckForcedUpdate() {
           forcedFwVersionInt = major * 10000 + minor * 100 + patch;
         }
 
-        // Already running the forced version — the post-install clear POST must have
-        // failed (network blip before reboot). Drop the flag locally so no stale
-        // "Update Now" modal shows, and queue a clear to self-heal the DB row. Safe
-        // because versions are monotonic (downgrades refused), so equality is the
-        // only "already satisfied" case. Best-effort: a dropped clear retries next boot.
-        if (forcedFwVersionInt == firmwareVersionInt) {
-          Serial.println("FORCED_UPDATE: Already on forced version — clearing stale flag");
+        // Already at or past the forced version — the post-install clear POST must have
+        // failed (network blip before reboot), or the flag names an older build than the
+        // one running. Drop the flag locally so no stale "Update Now" modal shows, and
+        // queue a clear to self-heal the DB row. ">=" is the cloud's own clear rule in
+        // update-firmware-version; downgrades are refused anyway. Best-effort: a dropped
+        // clear retries next boot.
+        if (forcedFwVersionInt > 0 && forcedFwVersionInt <= firmwareVersionInt) {
+          Serial.println("FORCED_UPDATE: Already at or past forced version — clearing stale flag");
           hasForcedUpdate = false;
           forcedFwVersionInt = 0;
           forcedUpdateDeadline = 0;
@@ -5577,19 +5701,45 @@ void executeResetAltHealthCloud() {
 // Extract a flat top-level "field":"value" string from a JSON body (returns "" for
 // missing or null). Used for the short id fields in the pending-config response; the
 // big config blob itself is handled by applyImportConfig's string scan, not ArduinoJson.
-static String jsonStringField(const String &body, const char *field) {
+static String jsonStringField(const char *body, const char *field) {
   String needle = "\"";
   needle += field;
   needle += "\"";
-  int i = body.indexOf(needle);
-  if (i < 0) return "";
-  i += needle.length();
-  while (i < (int)body.length() && (body[i] == ' ' || body[i] == '\t' || body[i] == ':')) i++;
-  if (i >= (int)body.length() || body[i] != '"') return "";   // null or non-string -> none
-  i++;
-  int j = body.indexOf('"', i);
-  if (j < 0) return "";
-  return body.substring(i, j);
+  const char *p = strstr(body, needle.c_str());
+  if (!p) return "";
+  p += needle.length();
+  while (*p == ' ' || *p == '\t' || *p == ':') p++;
+  if (*p != '"') return "";   // null or non-string -> none
+  p++;
+  const char *q = strchr(p, '"');
+  if (!q) return "";
+  String out;
+  out.reserve(q - p);
+  while (p < q) out += *p++;
+  return out;
+}
+
+// A pushed config is applied only from a body that closes: doCloudPOST drops bytes past its buffer
+// silently and a read timeout ends the body early, while applyImportConfig extracts keys from
+// whatever text it is given, so a cut body would apply the surviving keys and reboot.
+static bool cfgBodyComplete(const char *s) {
+  int depth = 0;
+  bool inStr = false, esc = false;
+  char lastSig = 0;
+  for (; *s; s++) {
+    char c = *s;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c == '\\') esc = true;
+      else if (c == '"') inStr = false;
+      continue;
+    }
+    if (c == '"') inStr = true;
+    else if (c == '{' || c == '[') depth++;
+    else if (c == '}' || c == ']') depth--;
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') lastSig = c;
+  }
+  return depth == 0 && !inStr && lastSig == '}';
 }
 
 // Admin config push (boot-only): ask the cloud whether a config is queued for this device.
@@ -5606,30 +5756,35 @@ void executeGetPendingConfig() {
   // http.begin(client,url) pattern uses far more internal RAM (CLAUDE.md) and getString() can hang,
   // which made this call return -1 when contiguous RAM was tight (e.g. right after the registration
   // handshake). doCloudPOST adds the anon-key Bearer + Content-Type itself. Response holds the full
-  // config blob (exportConfigJson reserves 20 KB), so stage it in a 24 KB PSRAM scratch buffer,
-  // copy to the String the parsing below expects, and free the scratch immediately.
-  String response;
-  int httpCode = -1;
-  {
-    const size_t CAP = 24576;
-    char *scratch = (char *)ps_malloc(CAP);
-    if (!scratch) {
-      Serial.println("PENDING_CONFIG: ps_malloc failed");
-      return;
-    }
-    String payload = "{\"token\":\"" + authToken + "\"}";
-    httpCode = doCloudPOST("/functions/v1/get-pending-config", payload.c_str(), scratch, CAP);
-    if (httpCode == 200) response = String(scratch);
-    free(scratch);
+  // config blob (a full export is ~14 KB and grows with every setting), so stage it in a 64 KB PSRAM
+  // scratch buffer and parse straight from it: no String copy into internal heap.
+  const size_t CAP = 65536;
+  char *scratch = (char *)ps_malloc(CAP);
+  if (!scratch) {
+    Serial.println("PENDING_CONFIG: ps_malloc failed");
+    return;
   }
+  String payload = "{\"token\":\"" + authToken + "\"}";
+  int httpCode = doCloudPOST("/functions/v1/get-pending-config", payload.c_str(), scratch, CAP);
   if (httpCode != 200) {
     Serial.printf("PENDING_CONFIG: HTTP %d\n", httpCode);
+    free(scratch);
+    return;
+  }
+  size_t bodyLen = strlen(scratch);
+  if (bodyLen >= CAP - 1 || !cfgBodyComplete(scratch)) {
+    // Neither applied nor cleared server-side, so the next boot fetches it again.
+    Serial.printf("PENDING_CONFIG: body incomplete (%u bytes%s), not applied\n",
+                  (unsigned)bodyLen, (bodyLen >= CAP - 1) ? ", buffer full" : "");
+    queueConsoleMessage("Config push: download incomplete, not applied; retries next boot");
+    free(scratch);
     return;
   }
 
-  String pid = jsonStringField(response, "pending_config_id");
+  String pid = jsonStringField(scratch, "pending_config_id");
   if (pid.length() == 0) {
     Serial.println("PENDING_CONFIG: none queued");
+    free(scratch);
     return;
   }
 
@@ -5637,6 +5792,7 @@ void executeGetPendingConfig() {
   if (pid == lastApplied) {
     // Already applied — self-heal a server flag the previous boot's clear may have missed.
     Serial.println("PENDING_CONFIG: already applied; self-healing flag");
+    free(scratch);
     pendingConfigClearId = pid;
     executeClearPendingConfig();
     return;
@@ -5650,8 +5806,9 @@ void executeGetPendingConfig() {
   // so there is no live client to tell.
   String changed = "";
   cfgImportChangedNames = &changed;
-  int n = applyImportConfig(response.c_str());
+  int n = applyImportConfig(scratch);
   cfgImportChangedNames = nullptr;
+  free(scratch);
   if (n < 0) {
     Serial.println("PENDING_CONFIG: malformed blob, not applied");
     return;

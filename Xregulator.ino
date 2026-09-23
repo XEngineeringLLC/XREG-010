@@ -108,6 +108,7 @@ struct FadJob;          // pulse-pattern detector state machine (full definition
 struct FadResult;       // function bodies in 8_functions.ino) — forward-declared so their
                         // auto-generated prototypes (FadJob*/FadResult* params) compile
 struct ZFitResult;      // zeroFitRegress() return type (full def near ZeroFitRecord) — same reason
+struct SolarLedgerLive; // the sled*() hour helpers (4_functions.ino) take it by reference (full def near sledRing) — same reason
 struct RipFit;          // measured ripple projection (full def below); forward-declared so the auto-prototypes
                         // of ripFitEncode(const RipFit&)/ripFitDecode(...) don't precede its definition
 // cxStartPersistCancel()'s verdict (2_functions.ino) — defined up here, not next to the machine, so the
@@ -729,6 +730,10 @@ unsigned long lastConfigSnapshotTime = 0;
 // projection (update-config-snapshot) is fresh on Save instead of next-boot. Cleared only when
 // a payload is actually queued, so a failed gate retries next pass.
 bool configSnapshotRequested = true;
+// Wait before retrying a snapshot that found no connection or no response: 0 = no retry pending (the
+// gate's 60 s throttle applies), then 60 s doubling to a 1 h cap. Cleared by success and by every
+// fresh request, so a user-triggered snapshot is never held behind an old streak.
+unsigned long configSnapshotRetryMs = 0;
 unsigned long queueDrainHoldStart = 0;  // millis() when we started waiting for queue to drain before low power; 0 = not waiting
 
 // App-usage analytics: page dwell / button-press counters POSTed by the web UI to /track,
@@ -1544,6 +1549,10 @@ int WeatherTimeoutMs = 10000;          // HTTP timeout in milliseconds
 int currentWeatherMode = 0;           // 0=normal, 1=high solar, 2=low solar
 unsigned long nextWeatherUpdate = 0;  // When next update is due
 time_t weatherFetchEpoch = 0;         // wall clock of the last successful forecast fetch (0 = none this boot) — tells the ledger which local day "tomorrow" meant
+float   *wxHourWm2 = nullptr;         // ps_malloc'd in solarLedgerInit(): WX_HOURS hourly shortwave radiation, W/m² mean of the hour ENDING at wxHourT0 + k*3600 (Open-Meteo's convention)
+time_t   wxHourT0  = 0;               // unix time of slot 0; 0 = no hourly forecast held. Refilled with the table under wxHourMux, so the ledger (Core 1) never reads a half-filled one
+uint16_t wxHourN   = 0;               // slots filled
+portMUX_TYPE wxHourMux = portMUX_INITIALIZER_UNLOCKED;   // the fetch (Core 0) writes the three above inside it; sledCaptureHourly (Core 1) reads inside it
 
 // ── Solar energy ledger: predicted vs actual harvest + consumption, one record per LOCAL day ──
 // Closes the loop on Defer to Solar. The forecast for day X is frozen the evening before (the number
@@ -1555,20 +1564,23 @@ time_t weatherFetchEpoch = 0;         // wall clock of the last successful forec
 #define SLED_PATH           "/solarledger.bin"
 #define SLED_LIVE_PATH      "/solarlive.bin"
 #define SLED_MAGIC          0x534C4547u   // 'SLEG'
-#define SLED_VER            1u
+#define SLED_VER            2u            // v2: hourly forecast + per-hour actual/qualification in the live day; learning-basis columns in the record
 #define SLED_MIN_COVER_MIN  1200          // a day feeds learning/prediction only if the device was awake >= 20 h of it
-#define SLED_MIN_IRR_KWH    0.30f         // forecast (at ratio 1.0) below this can't ratio-learn — a near-zero promise makes the ratio noise
 #define SLED_RATIO_MIN      0.15f
 #define SLED_RATIO_MAX      1.20f
 #define SLED_LIVE_FLUSH_MS  1800000UL     // live-day state to flash at most every 30 min while the field is cut
 #define SLED_PRED_WINDOW    30            // consumption prediction looks back at most this many ledger days
 #define SLED_PRED_MEDIAN_N  7             // ...and takes the median of the newest N complete days (mean when fewer exist)
+#define SLED_MIN_QUAL_WH    150           // the qualifying hours must promise at least this much (at ratio 1.0) before a day can ratio-learn
+#define SLED_HOUR_MIN_SEEN  55            // minute samples an hour needs (of 60) to count as fully observed
+#define WX_HOURS            72            // hourly forecast slots kept from a fetch: three local days
 #define SLED_F_FORECAST 0x01   // predHarvKwh came from a real forecast
 #define SLED_F_VEDIRECT 0x02   // VE.Direct frames were seen during the day
 #define SLED_F_SHUNT    0x04   // battery shunt configured (consumption is measurable)
 #define SLED_F_LEARNED  0x08   // this day moved performanceRatio
-#define SLED_F_PARTIAL  0x10   // coverage below SLED_MIN_COVER_MIN — excluded from learning and prediction
+#define SLED_F_PARTIAL  0x10   // coverage below SLED_MIN_COVER_MIN — excluded from the consumption prediction (learning is per hour and judges each hour's own coverage)
 #define SLED_F_SAMEDAY  0x20   // forecast only arrived after midnight (device booted late) — a full-day number, but not the one any overnight pause acted on
+#define SLED_F_HOURLY   0x40   // an hourly forecast was captured for the day; learning needs it (per-hour actual vs forecast, battery-limited hours discarded)
 #define SLED_F_LIVE     0x80   // CSV export only: the day still in progress
 struct SolarLedgerRec {
   uint32_t dayIdx;        // local calendar day number: (epoch + usageTzOffsetS) / 86400
@@ -1579,6 +1591,9 @@ struct SolarLedgerRec {
   float actConsKwh;       // house loads = alternator + solar + battery discharge - battery charge (NAN = not measurable)
   float altKwh;           // alternator share of the day's sources
   float ratioAfter;       // performanceRatio after this day's learning step (NAN = day did not learn)
+  float qualPredKwh;      // forecast over the qualifying hours at ratio 1.0 = the learning basis (NAN = no hourly forecast)
+  float qualActKwh;       // panel-power integral over those same hours
+  uint32_t qualHours;     // bit h set = local hour h qualified: MPPT freely tracking all hour, device awake all hour, forecast held
   uint16_t coverageMin;   // minutes of the day the device was awake and accumulating
   uint8_t  flags;         // SLED_F_*
   uint8_t  pad;
@@ -1589,7 +1604,13 @@ struct SolarLedgerLive {  // the day in progress — persisted so a reboot resum
   float predHarvKwh, predIrrKwh, predConsKwh;
   uint16_t coverageMin;
   uint8_t  flags;
-  uint8_t  pad;
+  int8_t   curHour;        // local hour being accumulated (-1 = none yet this day)
+  double   hourBaseWh;     // SolarChargedEnergy_AllTime when curHour began
+  uint32_t hourFcMask;     // bit h = hourFcWh[h] holds a real forecast
+  uint16_t hourFcWh[24];   // forecast Wh per local hour at ratio 1.0 (W/m² x array watts / 1000)
+  uint16_t hourActWh[24];  // panel-power integral per local hour, finalised when the hour ends
+  uint8_t  hourSeen[24];   // minute samples taken in the hour
+  uint8_t  hourBad[24];    // 1 Hz samples where the MPPT was not freely tracking or VE.Direct was silent; one disqualifies the hour
 };
 SolarLedgerRec *sledRing = nullptr;   // ps_malloc'd in solarLedgerInit()
 uint16_t sledHead = 0;                // next write slot
@@ -2327,6 +2348,7 @@ volatile int32_t sensorRingInFlightIndex = -1;  // ring index currently being up
 portMUX_TYPE sensorRingMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool forceCloudFlushPending = false;   // set by /get?forceCloudFlush=1, cleared after drain attempt
 volatile bool sensorRingAnnouncedEmpty = false; // throttle for "all data uploaded" console — fires once per drain-to-empty
+volatile bool sensorRingBackupStale = false;    // the Phase-4 ring dump on flash is older than the ring (an upload drain emptied it): deleted at the next field-cut flash pass, never on the upload task
 
 // Barometric pressure history — 10-min cadence, 7 days. Feeds the Other-tab barometer
 // (3hr tendency for Zambretti + plot of pressure trend). Beyond 1 week → cloud.
@@ -2544,7 +2566,7 @@ uint32_t altZeroHoldEndMs = 0;      // millis() the hold released (0 = never): t
 #define ZFIT_RETRY_MS         3600000UL  // if a compute HELD (no spread/noisy), retry in 1 h not 24 h
 #define ZFIT_PATH  "/zerofit.bin"
 #define ZFIT_MAGIC 0x5A464954u           // 'ZFIT'
-#define ZFIT_VER   1u
+#define ZFIT_VER   2u                    // v2 with ZEROLOG_VER 3: fits built from residual (v2-log) rows were biased by ~half; zeroFitInit clears the live equation with a discarded history
 
 struct ZeroFitRecord {        // one accepted daily fit
   uint32_t epoch;             // wall-clock seconds of the fit
@@ -2646,7 +2668,7 @@ bool sensorUploadInProgress = false;
 // core0Busy — "hold the field off while a long Core 0 op is in flight." AdjustFieldLearnMode()
 // early-returns on it, so it freezes the ENTIRE control loop (voltage PI + inner current PID),
 // not just the field-enable line.
-// Set it ONLY from ops that are themselves gated on fieldOffSettled() (>= 60 s field-off): httpsTask,
+// Set it ONLY from ops that are themselves gated on fieldCutSettled() (>= 60 s with the field hardware-cut): httpsTask,
 // syncTimeFromNTP, OTA. Anything that can fire during active charging must NOT set it — that blinds
 // the protections and the PID for the full duration of the op.
 // Readers: TempTask, testInternetSpeed, scheduled restart, OTA orchestration, the AFLM gate.
@@ -3040,8 +3062,8 @@ int MaximumAllowedBatteryAmps = 125;  // safety for battery, optional
 int RPMScalingFactor = 1470;          // adjust until it matches your trusted tachometer
 float AlternatorCOffset = 0;          // tare for alt current
 float BatteryCOffset = 0;             // tare or batt current
-int timeToFullChargeMin = NAN;
-int timeToFullDischargeMin = NAN;
+int timeToFullChargeMin = -999;  // -999 = not applicable, the same marker calculateChargeTimes() writes
+int timeToFullDischargeMin = -999;  // same marker as its charge twin
 
 
 // fields 52-57 in CSVData2 are reserved zeros (Reset* flags were always 0; buttons use hasParam, not these vars)
@@ -3400,6 +3422,9 @@ uint16_t sseQueuePeak = 0;         // deepest since reset
 uint32_t sseStallCount = 0;        // stalls >= 1 s since reset
 uint32_t sseStallLongestMs = 0;
 uint32_t sseFramesDropped = 0;     // events.send() calls not fully enqueued since reset
+static const size_t PAYLOAD3_SIZE = 8192;   // settings echo (CSV3) frame buffer, PSRAM; ~7 B/field, 410 fields today
+uint16_t csv3LastLen = 0;          // last CSV3 frame length; peak since reset. The margin against PAYLOAD3_SIZE, on /debug
+uint16_t csv3PeakLen = 0;
 
 // ── 80MHz low-power-mode loop instrumentation ─────────────────────────────────
 // Engine-off drops the CPU to 80MHz; these track loop health in that state only
@@ -4264,6 +4289,8 @@ volatile bool pendingResetAlternatorHealth = false;
 volatile bool pendingResetBoatPerformance = false;
 volatile bool pendingClearOverheatHistory = false;
 volatile bool pendingRpmAxisWipe = false;  // /get?RPMScalingFactor changed value → local wipes run on Core 1
+volatile float pendingZeroShiftA = 0.0f;   // altZeroApply (web task) stages the zero-log ring shift; zeroLogService applies it on Core 1
+portMUX_TYPE zeroShiftMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool rpmAxisWipePending = false;  // NK_RpmAxisWipePend: cloud half still owed; suppresses front sync
 volatile bool altCloudWipePending = false; // NK_AltWipePend: alt-health Start Over's cloud half still owed; suppresses alt-health upload + sync-back
 volatile bool pendingSaveUserTableEdits = false;
@@ -6595,7 +6622,7 @@ void loop() {
   if (otaCheckDone && millis() - lastForcedRecheck >= FORCED_RECHECK_INTERVAL_MS
       && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered
       && currentPartitionType != 0 && !core0Busy && !otaInProgress
-      && fieldOffSettled(20000) && WiFi.RSSI() >= -80) {
+      && fieldCutSettled(60000) && WiFi.RSSI() >= -80) {
     HttpsRequest verReq = { .type = HTTPS_UPDATE_FW_VERSION };
     HttpsRequest forcedReq = { .type = HTTPS_CHECK_FORCED_UPDATE };
     if (xQueueSend(httpsQueue, &verReq, 0) == pdTRUE
@@ -6874,7 +6901,7 @@ void loop() {
               saveVesselInfoToNvs();
             }
             shutdownNVSFlushDone = true;
-            shutdownCloudDeadlineMs = millis() + 1800000;  // 30-min window: fieldOffSettled() gates fire at 60-75s after field off; 30 min gives full time for NTP, uploads, weather, and buffer drain
+            shutdownCloudDeadlineMs = millis() + 1800000;  // 30-min window: fieldCutSettled() gates fire at 60-80s after the field is cut; 30 min gives full time for NTP, uploads, weather, and buffer drain
           } else if (shutdownCloudDeadlineMs && (int32_t)(millis() - shutdownCloudDeadlineMs) < 0) {  // rollover-safe "now < deadline"
             // Phase 3: hold 240MHz and WiFi for the full 30-min window unconditionally.
             // Lets the CloudFeatures block continue uploading, and keeps WiFi open to verify the drain.
@@ -7112,17 +7139,20 @@ void loop() {
           return;  // Skip during OTA
         }
         unsigned long currentMillisz = millis();
-        // Check time sync every 12 hours — requires field off for 60s (fieldOffSettled)
-        if (fieldOffSettled(0)) TIMED_CALL(ft_checkTimeSync, checkTimeSync());
+        // Check time sync every 12 hours. Every internet op in this block waits on fieldCutSettled, the
+        // hardware field-cut line, never the duty-based fieldOffSettled (which reads "off" during a live
+        // duty-0 hold): no upload or fetch with the field on unless a button asked for it. The extra
+        // keeps each op at its old delay after the cut (fieldCutSettled floor is 20s, fieldOffSettled was 60s).
+        if (fieldCutSettled(40000)) TIMED_CALL(ft_checkTimeSync, checkTimeSync());
 
-        // Upload buffered records every BUFFER_UPLOAD_INTERVAL — requires field off for 70s.
-        // Bumped from 65s to 70s so the buffered upload's TLS handshake doesn't land on top
-        // of the field-off NVS drain (fires at 5s). 60s baseline + 10s extra = 70s total.
+        // Upload buffered records every BUFFER_UPLOAD_INTERVAL — requires the field cut for 70s
+        // (20s floor + 50s) so the buffered upload's TLS handshake doesn't land on top of the
+        // field-off NVS drain (fires at 5s).
         // The "Upload Cloud Now" dashboard button sets forceCloudFlushPending = true which
         // bypasses BOTH the field-off settle AND the 13s interval throttle so records drain
         // back-to-back (still rate-limited by the HTTPS queue depth on Core 0).
         bool flushBypass = forceCloudFlushPending;
-        if ((fieldOffSettled(10000) || flushBypass)
+        if ((fieldCutSettled(50000) || flushBypass)
             && (flushBypass || currentMillisz - lastBufferUploadAttempt >= BUFFER_UPLOAD_INTERVAL - 7)) {
           lastBufferUploadAttempt = currentMillisz;
           if (bufferedRecordCount > 0) {
@@ -7136,13 +7166,15 @@ void loop() {
           }
         }
         
-        // Configuration Snapshot — requires field off for 10s. Sim mode (HardwarePresent=0):
+        // Configuration Snapshot — requires the field cut for 70s. Sim mode (HardwarePresent=0):
         // skip — never push fake stats/state/leaderboard data to the cloud.
         // Fires on the 24 h backstop OR on configSnapshotRequested (boot / vessel save /
-        // registration), at most once per minute so a persistently-failing gate can't spin.
-        if (hardwarePresent == 1 && fieldOffSettled(10000)
+        // registration / an upload that found no connection), at most once per minute so a
+        // persistently-failing gate can't spin, and behind configSnapshotRetryMs after a transport failure.
+        if (hardwarePresent == 1 && fieldCutSettled(50000)
             && (millis() - lastConfigSnapshotTime >= CONFIG_SNAPSHOT_INTERVAL
-                || (configSnapshotRequested && millis() - lastConfigSnapshotTime >= 60000))) {
+                || (configSnapshotRequested
+                    && millis() - lastConfigSnapshotTime >= max(configSnapshotRetryMs, 60000UL)))) {
           lastConfigSnapshotTime = millis();
           if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered) {
             if (WiFi.RSSI() >= -80) {
@@ -7171,7 +7203,7 @@ void loop() {
         // Boat-performance aggregates → cloud (field-off gated; sim never uploads).
         // rpmAxisWipePending: the upload RESPONSE carries the cloud-rebuilt front, which would
         // overwrite the local wipe with old-scaled points. Stay silent until the cloud wipe lands.
-        if (hardwarePresent == 1 && !rpmAxisWipePending && fieldOffSettled(10000) && millis() - lastBoatPerfUploadTime >= BOATPERF_UPLOAD_INTERVAL) {
+        if (hardwarePresent == 1 && !rpmAxisWipePending && fieldCutSettled(50000) && millis() - lastBoatPerfUploadTime >= BOATPERF_UPLOAD_INTERVAL) {
           lastBoatPerfUploadTime = millis();
           if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && WiFi.RSSI() >= -80) {
             HttpsRequest req = {};
@@ -7193,7 +7225,7 @@ void loop() {
         // Alt-health LEARNS with the field ON, but uploads (like all flash/HTTPS) are field-OFF:
         // records bank during charging and flush at the next field-off. buildAltHealthPayload
         // is dirty-gated, so this is a no-op when nothing new has been banked.
-        if (hardwarePresent == 1 && !rpmAxisWipePending && !altCloudWipePending && fieldOffSettled(10000) && millis() - lastAltHealthUploadTime >= ALTHEALTH_UPLOAD_INTERVAL) {
+        if (hardwarePresent == 1 && !rpmAxisWipePending && !altCloudWipePending && fieldCutSettled(50000) && millis() - lastAltHealthUploadTime >= ALTHEALTH_UPLOAD_INTERVAL) {
           lastAltHealthUploadTime = millis();
           if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && WiFi.RSSI() >= -80) {
             HttpsRequest req = {};
@@ -7261,6 +7293,7 @@ void loop() {
           huntLedgerService();  // hunt-episode records queued in RAM by the control path → flash, here only
           huntMapService();     // damper pocket map — same rule: flash only here, never in the control path
           owRoleService();      // 1-Wire role auto-binds queued by TempTask (Core 0 never writes NVS) → flash, here only
+          if (sensorRingBackupStale) { sensorRingBackupStale = false; sensorRingDropBackupFile(); }  // Phase-4 ring dump outlived by an upload drain (executeUploadPayload flags it): delete here, never on the upload task
         }
       }
       TIMED_CALL(ft_ch1_compute_stats, ch1_compute_stats());

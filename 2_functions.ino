@@ -2234,9 +2234,19 @@ void httpsTask(void *param) {
         case HTTPS_UPLOAD_PAYLOAD:
           opSuccess = executeUploadPayload(request.payload);
           break;
-        case HTTPS_UPLOAD_CONFIG:
-          opSuccess = executeUploadConfig(request.payload);
+        case HTTPS_UPLOAD_CONFIG: {
+          int code = executeUploadConfig(request.payload);
+          opSuccess = (code == 200);
+          // The loop cleared the request at queue time. No connection or no response re-arms it behind
+          // a doubling wait; a 4xx/5xx would repeat on every retry, so it waits for the 24 h backstop.
+          if (opSuccess) configSnapshotRetryMs = 0;
+          else if (code <= 0) {
+            configSnapshotRetryMs = (configSnapshotRetryMs == 0) ? 60000UL
+                                  : (configSnapshotRetryMs >= 1800000UL ? 3600000UL : configSnapshotRetryMs * 2);
+            configSnapshotRequested = true;
+          }
           break;
+        }
         case HTTPS_UPLOAD_BOATPERF:
           opSuccess = executeUploadBoatPerf(request.payload);
           break;
@@ -3010,6 +3020,9 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   // recorded on the first sample of a window (delta_us == 0) and that is truthful data.
   // (The 2026-09-08/09 "Invalid battery voltage range" dead letters were NOT empty windows — they
   // were the 32-bit micros() wrap, fixed at the clock in resetSensorWindow/updateSensorWindow.)
+  // The x1000 IMU accel min/max and the wave period are the exception: their sentinels scale to
+  // 999.9 / -999.9 / 0 and -1, which the cloud's list does not know, so they are nulled here BY
+  // SENTINEL (a window's single real sample still uploads).
   const bool bvOk   = snap.window.battVolt_valid_us    > 0;
   const bool acOk   = snap.window.altCurr_valid_us     > 0;
   const bool baroOk = snap.window.baro_valid_us        > 0;
@@ -3031,6 +3044,7 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   const bool vaccOk = snap.imu.vertical_accel_valid_us  > 0;
   const bool taccOk = snap.imu.total_accel_valid_us     > 0;
   char heelAvgS[16], ptchAvgS[16], vaccAvgS[16], taccAvgS[16];
+  char vaccMinS[16], vaccMaxS[16], taccMinS[16], taccMaxS[16], wpS[16];
   int written = snprintf(
     payloadBuffer, PAYLOAD_BUFFER_SIZE,
     "{"
@@ -3098,13 +3112,13 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     // IMU peak motion (per-window aggregates)
     "\"imu_heel_min\":%.2f,\"imu_heel_max\":%.2f,\"imu_heel_avg\":%s,"
     "\"imu_pitch_min\":%.2f,\"imu_pitch_max\":%.2f,\"imu_pitch_avg\":%s,"
-    "\"imu_vertical_accel_min\":%.3f,\"imu_vertical_accel_max\":%.3f,\"imu_vertical_accel_avg\":%s,"
-    "\"imu_total_accel_min\":%.3f,\"imu_total_accel_max\":%.3f,\"imu_total_accel_avg\":%s,"
+    "\"imu_vertical_accel_min\":%s,\"imu_vertical_accel_max\":%s,\"imu_vertical_accel_avg\":%s,"
+    "\"imu_total_accel_min\":%s,\"imu_total_accel_max\":%s,\"imu_total_accel_avg\":%s,"
     // IMU comfort scores (point values at upload time)
     "\"imu_msi_score\":%.2f,"
     "\"imu_vomit_pct\":%.2f,"
     "\"imu_anchorage_comfort\":%.2f,"
-    "\"imu_wave_period_sec\":%.2f,"
+    "\"imu_wave_period_sec\":%s,"
     "\"imu_slam_count_window\":%u,"
     "\"imu_slam_peak_max_window\":%.3f,"
     // true = this window's IMU data is not trustworthy (install unvalidated/bad, or implausible heel/pitch
@@ -3196,14 +3210,16 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     ltJsonNum(heelAvgS, sizeof(heelAvgS), SAFE_AVG_100(snap.imu.heel_area_v_us, snap.imu.heel_valid_us), heelOk),
     snap.imu.pitch_min / 100.0, snap.imu.pitch_max / 100.0,
     ltJsonNum(ptchAvgS, sizeof(ptchAvgS), SAFE_AVG_100(snap.imu.pitch_area_v_us, snap.imu.pitch_valid_us), ptchOk),
-    snap.imu.vertical_accel_min / 1000.0, snap.imu.vertical_accel_max / 1000.0,
+    ltJsonNumP(vaccMinS, sizeof(vaccMinS), snap.imu.vertical_accel_min / 1000.0, snap.imu.vertical_accel_min != 999900, 3),
+    ltJsonNumP(vaccMaxS, sizeof(vaccMaxS), snap.imu.vertical_accel_max / 1000.0, snap.imu.vertical_accel_max != -999900, 3),
     ltJsonNumP(vaccAvgS, sizeof(vaccAvgS), SAFE_AVG_1000(snap.imu.vertical_accel_area_v_us, snap.imu.vertical_accel_valid_us), vaccOk, 3),
-    snap.imu.total_accel_min / 1000.0, snap.imu.total_accel_max / 1000.0,
+    ltJsonNumP(taccMinS, sizeof(taccMinS), snap.imu.total_accel_min / 1000.0, snap.imu.total_accel_min != 999900, 3),
+    ltJsonNumP(taccMaxS, sizeof(taccMaxS), snap.imu.total_accel_max / 1000.0, snap.imu.total_accel_max != 0, 3),
     ltJsonNumP(taccAvgS, sizeof(taccAvgS), SAFE_AVG_1000(snap.imu.total_accel_area_v_us, snap.imu.total_accel_valid_us), taccOk, 3),
     snap.imu.msi_score,
     snap.imu.vomit_pct,
     snap.imu.anchorage_comfort,
-    snap.imu.wave_period / 1000.0,
+    ltJsonNum(wpS, sizeof(wpS), snap.imu.wave_period / 1000.0, snap.imu.wave_period != -1000),
     (unsigned int)snap.imu.slam_count,
     snap.imu.slam_peak_max / 1000.0,
     snap.imu.suspicious ? "true" : "false");
@@ -3256,12 +3272,14 @@ void uploadBufferedRecords() {
   esp_task_wdt_reset();
 }
 // Defined here, ahead of the ring dump/restore section that owns it, because the drain-to-empty
-// path in executeUploadPayload below deletes the file.
+// path in executeUploadPayload below flags the file stale.
 #define SENSOR_RING_BACKUP_PATH  "/sensor_ring_backup.bin"
-// The ring just emptied by consumption, so the Phase-4 dump on flash is stale: left in place it is
-// restored at the next boot and every record is re-POSTed. Raw remove: fsExists() would re-take the
-// non-recursive fsMutex and block 5 s. Runs on httpsTask (Core 0).
-static void sensorRingDropBackupFile() {
+// The ring emptied by consumption, so the Phase-4 dump on flash is stale: left in place it is
+// restored at the next boot and every record is re-POSTed (the cloud answers a repeat with success,
+// so that costs bandwidth, not data). Raw remove: fsExists() would re-take the non-recursive fsMutex
+// and block 5 s. Runs ONLY from the loop's field-cut flash pass (sensorRingBackupStale): the upload
+// task's last response can land seconds after the field re-engaged, and flash never moves with the field on.
+void sensorRingDropBackupFile() {
   fsTakeLock();
   LittleFS.remove(SENSOR_RING_BACKUP_PATH);
   fsReleaseLock();
@@ -3461,7 +3479,7 @@ done_headers:
         if (!sensorRingAnnouncedEmpty) {
           queueConsoleMessage("Cloud sync: all data uploaded");
           sensorRingAnnouncedEmpty = true;
-          sensorRingDropBackupFile();
+          sensorRingBackupStale = true;   // a Phase-4 dump on flash is now older than the ring: the field-cut pass deletes it
         }
       } else {
         // Throttle the "N queued" progress chatter to at most one per minute.
@@ -3479,7 +3497,7 @@ done_headers:
       Serial.printf("HTTP %d: dropping bad-data ring slot\n", httpCode);
       popTailSnapshot();
       // A drain can end on a rejected record too, and the dump is just as stale then (see the 200 branch).
-      if (ringIsEmpty() && !sensorRingAnnouncedEmpty) { sensorRingAnnouncedEmpty = true; sensorRingDropBackupFile(); }
+      if (ringIsEmpty() && !sensorRingAnnouncedEmpty) { sensorRingAnnouncedEmpty = true; sensorRingBackupStale = true; }
       snprintf(messageBuffer, MESSAGE_BUFFER_SIZE, "Cleared bad data (%u queued)", (unsigned)sensorRingCount);
       queueConsoleMessage(messageBuffer);
       sensorRingInFlightIndex = -1;
@@ -3675,6 +3693,7 @@ uint16_t dumpSensorRingToLittleFS() {
   }
   f.close();
   fsReleaseLock();
+  sensorRingBackupStale = false;   // a fresh dump is never stale
   Serial.printf("dumpSensorRingToLittleFS: wrote %u snapshots\n", written);
   return written;
 }
@@ -4003,6 +4022,14 @@ void zeroLogResetAll() {
 // (RAM only), and flushes to flash field-off only (60s-settled, every 30 min, new-data-gated — same
 // flash discipline as dumpLongTermRing). The flush is the only flash write; sampling is trivial.
 void zeroLogService() {
+  // A shift staged by altZeroApply lands here, on the core that appends to and fits from these rings.
+  if (pendingZeroShiftA != 0.0f) {
+    portENTER_CRITICAL(&zeroShiftMux);
+    float shift = pendingZeroShiftA;
+    pendingZeroShiftA = 0.0f;
+    portEXIT_CRITICAL(&zeroShiftMux);
+    zeroHistoryShiftAmps(shift);
+  }
   if (!zeroLogRing || !ZeroLogEnable) return;
   uint32_t now = millis();
 
@@ -4212,7 +4239,11 @@ bool altZeroApply() {
   float before = AlternatorCOffset;
   AlternatorCOffset = before + capA;
   settingWrite(NK_AlternatorCOffset, String(AlternatorCOffset, 3).c_str());
-  zeroHistoryShiftAmps(-capA);   // every later zero-log row moves by -capA; move the recorded ones with it
+  // Every later zero-log row moves by -capA and the recorded ones must move with it, but on Core 1,
+  // which owns the rings (zeroLogService appends, zeroFitCompute reads): stage the delta, never walk them here.
+  portENTER_CRITICAL(&zeroShiftMux);
+  pendingZeroShiftA = pendingZeroShiftA - capA;
+  portEXIT_CRITICAL(&zeroShiftMux);
 
   char tA[16], tB[16];
   if (isnan(capTA)) strcpy(tA, "null"); else snprintf(tA, sizeof(tA), "%.1f", capTA);
@@ -4339,16 +4370,18 @@ static inline size_t cfgRemain(int off) {
   /* Black box: the previous session's last-alive snapshot, read out of RTC noinit RAM at boot. \
      bb_valid 0 means the magic did not survive, which is itself the diagnostic — it proves the 3.3 V \
      rail actually died rather than the firmware resetting. Until now this existed only as one \
-     console line, so a fielded unit's crash left nothing behind. */ \
+     console line, so a fielded unit's crash left nothing behind. Every row but bb_valid is null while \
+     the RTC copy is invalid: the floats are then whatever the RAM held, and a NaN prints "nan", which \
+     is not JSON and would 400 the whole snapshot. bb_alt_temp_f also nulls the -999 "no probe" marker. */ \
   X(bb_valid,                   "%d",    (int)(g_blackBoxPrevValid ? 1 : 0)) \
-  X(bb_up_s,                    "%lu",   (unsigned long)(g_blackBoxPrev.upMillis / 1000UL)) \
-  X(bb_batt_v,                  "%.2f",  (double)g_blackBoxPrev.ibv) \
-  X(bb_duty_pct,                "%.2f",  (double)g_blackBoxPrev.duty) \
-  X(bb_rpm,                     "%d",    (int)g_blackBoxPrev.rpm) \
-  X(bb_alt_amps,                "%.2f",  (double)g_blackBoxPrev.measAmps) \
-  X(bb_alt_temp_f,              "%d",    (int)g_blackBoxPrev.altTempF) \
-  X(bb_sys_mode,                "%d",    (int)g_blackBoxPrev.sysMode) \
-  X(bb_charge_stage,            "%d",    (int)g_blackBoxPrev.chargeStage) \
+  X(bb_up_s,                    "%s",    ltJsonInt(bbUpS, sizeof(bbUpS), (long)(g_blackBoxPrev.upMillis / 1000UL), g_blackBoxPrevValid)) \
+  X(bb_batt_v,                  "%s",    ltJsonNum(bbVS, sizeof(bbVS), (double)g_blackBoxPrev.ibv, g_blackBoxPrevValid && isfinite((double)g_blackBoxPrev.ibv))) \
+  X(bb_duty_pct,                "%s",    ltJsonNum(bbDS, sizeof(bbDS), (double)g_blackBoxPrev.duty, g_blackBoxPrevValid && isfinite((double)g_blackBoxPrev.duty))) \
+  X(bb_rpm,                     "%s",    ltJsonInt(bbRpmS, sizeof(bbRpmS), (long)g_blackBoxPrev.rpm, g_blackBoxPrevValid)) \
+  X(bb_alt_amps,                "%s",    ltJsonNum(bbAS, sizeof(bbAS), (double)g_blackBoxPrev.measAmps, g_blackBoxPrevValid && isfinite((double)g_blackBoxPrev.measAmps))) \
+  X(bb_alt_temp_f,              "%s",    ltJsonInt(bbTS, sizeof(bbTS), (long)g_blackBoxPrev.altTempF, g_blackBoxPrevValid && g_blackBoxPrev.altTempF != -999)) \
+  X(bb_sys_mode,                "%s",    ltJsonInt(bbModeS, sizeof(bbModeS), (long)g_blackBoxPrev.sysMode, g_blackBoxPrevValid)) \
+  X(bb_charge_stage,            "%s",    ltJsonInt(bbStgS, sizeof(bbStgS), (long)g_blackBoxPrev.chargeStage, g_blackBoxPrevValid)) \
   /* IMU install verdict + the two rare-but-dramatic lifetime event counters. imu_suspicious on \
      sensor_history says a window's motion data is untrustworthy; imu_install_code says WHY \
      (0 OK, 1 never zeroed, 2 mount not vertical, 3 zeroed pre-mount-check, 4 no IMU), which is the \
@@ -4558,6 +4591,7 @@ bool buildConfigPayload() {
   // half-added. Adjacent string literals concatenate, so CLOUD_DAILY_LIST(CD_FMT) is a single
   // literal and CLOUD_DAILY_LIST(CD_ARG) is the matching comma-led argument tail.
   char idtMaxS[16];   // ina_die_temp_max_f — see the row's comment in CLOUD_DAILY_LIST
+  char bbUpS[16], bbVS[16], bbDS[16], bbRpmS[16], bbAS[16], bbTS[16], bbModeS[16], bbStgS[16];   // bb_* rows, same null pattern
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
                      CLOUD_DAILY_LIST(CD_FMT) CLOUD_DAILY_LIST(CD_ARG));
 
@@ -4570,10 +4604,12 @@ bool buildConfigPayload() {
   }
   return true;
 }
-bool executeUploadConfig(const char *payload) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (WiFi.RSSI() < -80) return false;
-  if (!isRegistered || authToken.isEmpty()) return false;
+// Returns the HTTP status; 0 = no response, -1 = a precondition (WiFi, signal, registration) failed.
+// httpsTask re-arms the snapshot only for those two, never for a 4xx/5xx.
+int executeUploadConfig(const char *payload) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  if (WiFi.RSSI() < -80) return -1;
+  if (!isRegistered || authToken.isEmpty()) return -1;
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -4588,7 +4624,7 @@ bool executeUploadConfig(const char *payload) {
   IPAddress hostIP;  // pre-resolve: keep DNS out of the connect's unfed-WDT window (see executeUploadPayload)
   if (!WiFi.hostByName(host, hostIP)) {
     Serial.println("Config: DNS fail");
-    return false;
+    return 0;
   }
   esp_task_wdt_reset();
 
@@ -4597,14 +4633,14 @@ bool executeUploadConfig(const char *payload) {
   if (!client.connect(host, port, CONNECT_TIMEOUT)) {
     Serial.println("Config: Connect fail");
     client.stop();
-    return false;
+    return 0;
   }
 
   // Defensive global timeout check after connect/handshake
   if (millis() - start > GLOBAL_TIMEOUT) {
     Serial.println("Config: Connect exceeded global timeout");
     client.stop();
-    return false;
+    return 0;
   }
 
   esp_task_wdt_reset();
@@ -4626,7 +4662,7 @@ bool executeUploadConfig(const char *payload) {
   if (sent != payloadLen) {
     Serial.println("Config: Payload send fail");
     client.stop();
-    return false;
+    return 0;
   }
   esp_task_wdt_reset();
 
@@ -4697,7 +4733,7 @@ done_headers_cfg:
   if (httpCode == 0) {
     Serial.println("Config: No response received (timeout)");
     queueConsoleMessage("Config upload failed (timeout)");
-    return false;
+    return 0;
   }
 
   //Serial.printf("Config: HTTP %d\n", httpCode); //this was useful debugging
@@ -4714,7 +4750,7 @@ done_headers_cfg:
     queueConsoleMessage(messageBuffer);
   }
 
-  return success;
+  return httpCode;
 }
 
 // Mirrors executeUploadConfig() exactly (proven HTTPS pattern) — only the endpoint + result

@@ -3695,8 +3695,18 @@ void zeroFitInit() {
     memset(zeroFitHist, 0, ZFIT_HIST_SIZE * sizeof(ZeroFitRecord));
   }
   uint32_t uw = 0;
+  const bool hadFile = fsExists(ZFIT_PATH);
   uint32_t n = readPsramBlob(ZFIT_PATH, ZFIT_MAGIC, ZFIT_VER,
                              zeroFitHist, sizeof(ZeroFitRecord), ZFIT_HIST_SIZE, &uw, false);
+  if (hadFile && n == 0) {
+    // The history was discarded (format version bump, or a corrupt file). The live equation in NVS was
+    // fitted from the same rows, so it goes with it: correction 0 until the first clean fit. loadNVSData
+    // ran before this, so the clear sticks and the next NVS flush writes it.
+    zfValid = 0; zfC = 0.0f; zfB = 0.0f; zfR2 = 0.0f; zfSensor = ZF_BOARD;
+    zfLastEpoch = 0; zfFlipStreak = 0; zfFlipPending = ZF_BOARD;
+    DynamicAltCurrentZero = 0.0f;
+    Serial.println("zeroFitInit: history discarded, live zero equation cleared");
+  }
   zeroFitHistCount = (uint16_t)n;
   zeroFitHistHead  = (n >= ZFIT_HIST_SIZE) ? 0 : (uint16_t)n;
   prev_zeroFitHistHead = zeroFitHistHead;
@@ -3816,8 +3826,8 @@ void zeroFitService() {
 // same thing, and the fit-history ring with them (its median is the outlier gate). The live
 // equation (zfC) is NOT touched: future rows land exactly where it already predicts. Flash copies
 // follow at the next field-off flush (zeroLogService), never here — Apply runs with the engine on.
-// Runs on the web task while Core 1 may push one row mid-loop; that row can land unshifted, which
-// is one diagnostic sample in ten thousand and not worth a mutex on the sampling path.
+// Runs on Core 1 from zeroLogService (altZeroApply stages the delta in pendingZeroShiftA from the
+// web task), the same pass that appends rows and runs the daily fit, so nothing straddles the shift.
 void zeroHistoryShiftAmps(float delta) {
   if (delta == 0.0f || isnan(delta)) return;
   if (zeroLogRing) {

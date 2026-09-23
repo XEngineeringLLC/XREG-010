@@ -1019,7 +1019,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "cvPlantKa", NK_cvPlantKa, 1 },
   { "cvPlantKb", NK_cvPlantKb, 1 },
   { "CommissionTempF", NK_CommissionTempF, 1 },
-  { "CommissionTempSrc", NK_CommissionTempSrc, 3 },
+  { "CommissionTempSrc", NK_CommissionTempSrc, 1 },   // with CommissionTempF: computeCvTempScale trusts the pair, so the recipient needs the DONOR's provenance
   { "CommissionEpoch", NK_CommissionEpoch, 3 },
   { "maxWorkingRpm", NK_maxWorkingRpm, 1 },
   { "systemIDPlantTauMs", NK_sysidPlantTau, 1 },

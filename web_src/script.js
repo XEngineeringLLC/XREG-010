@@ -3978,7 +3978,9 @@ function isArmGatedPath(path) {
 // The token is per unit (the app moves between units; a browser origin is one unit anyway).
 function armTokKey() { return 'xregArmTok:' + (controlUid() || ''); }
 function armTokenGet() { try { return localStorage.getItem(armTokKey()) || ''; } catch (e) { return ''; } }
-function armTokenSet(tok) { try { if (tok) localStorage.setItem(armTokKey(), tok); else localStorage.removeItem(armTokKey()); } catch (e) { } }
+// Also refreshes the hidden tok inputs: a programmatic form.submit() fires no submit event, so the
+// capture-phase listener below never sees it and the form would post whatever token it had at load.
+function armTokenSet(tok) { try { if (tok) localStorage.setItem(armTokKey(), tok); else localStorage.removeItem(armTokKey()); } catch (e) { } syncWriteUidInputs(); }
 
 function buildURL(path) {
 
@@ -7464,6 +7466,7 @@ async function triggerForcedUpdate(versionStr) {
 
         form.appendChild(versionInput);
         document.body.appendChild(form);
+        syncWriteUidInputs(form);   // a GET form drops the action's query string: uid and the arm token must be inputs
         form.submit();
         document.body.removeChild(form);
     }
@@ -15669,9 +15672,11 @@ async function armDevice(reason) {
         if (g_pwRequired && !pw) {
             pw = await xPrompt((note ? note + '\n\n' : '') + 'This regulator asks for its settings password before it accepts changes.',
                 { title: 'Settings password', okText: 'Unlock', password: true, placeholder: 'Password' });
+            pw = (pw || '').trim();   // the firmware trims before hashing: send and remember exactly what it stored
             if (!pw) return false;
         }
-        const r = await fetchWithTimeout(buildURL('/armSettings?arm=1' + (pw ? '&pw=' + encodeURIComponent(pw) : '')), {}, 8000);
+        // POST: the password rides in the body, never in a URL (same rule as /setPassword).
+        const r = await fetchWithTimeout(buildURL('/armSettings'), { method: 'POST', body: new URLSearchParams(pw ? { arm: '1', pw: pw } : { arm: '1' }) }, 8000);
         const j = await r.json().catch(() => null);
         if (!j) throw new Error('HTTP ' + r.status);
         g_pwRequired = !!j.pw;
@@ -15723,15 +15728,18 @@ async function passwordSet() {
     let cur = '';
     if (changing) {
         cur = pwRemembered() || await xPrompt('Enter the current settings password.', { title: 'Settings password', okText: 'Continue', password: true });
+        cur = (cur || '').trim();
         if (!cur) return;
     }
-    const a = await xPrompt(changing ? 'Enter the new settings password (4 to 32 characters).'
+    let a = await xPrompt(changing ? 'Enter the new settings password (4 to 32 characters).'
         : 'Choose a settings password (4 to 32 characters). Unlock Settings will ask for it once on each phone or browser, then remember it there. Live readings stay visible without it, and turning the alternator off never needs it.',
         { title: 'Settings password', okText: 'Continue', password: true });
     if (a === null) return;
+    a = a.trim();   // the firmware trims before hashing: what is remembered must be what it stored
     if (a.length < 4 || a.length > 32) { xAlert('The password must be 4 to 32 characters. Nothing was changed.', 'Settings password'); return; }
-    const b = await xPrompt('Type it once more.', { title: 'Settings password', okText: changing ? 'Change' : 'Turn On', password: true });
+    let b = await xPrompt('Type it once more.', { title: 'Settings password', okText: changing ? 'Change' : 'Turn On', password: true });
     if (b === null) return;
+    b = b.trim();
     if (a !== b) { xAlert('The two entries did not match. Nothing was changed.', 'Settings password'); return; }
     let r = null;
     try { r = await fetchWithTimeout(buildURL('/setPassword'), { method: 'POST', body: new URLSearchParams({ new: a, cur: cur }) }, 8000); } catch (e) { }
@@ -15755,7 +15763,7 @@ async function passwordSet() {
 
 async function passwordOff() {
     if (!(await ensureArmed())) return;
-    const cur = pwRemembered() || await xPrompt('Enter the current settings password.', { title: 'Settings password', okText: 'Continue', password: true });
+    const cur = (pwRemembered() || await xPrompt('Enter the current settings password.', { title: 'Settings password', okText: 'Continue', password: true }) || '').trim();
     if (!cur) return;
     const ok = await xConfirm('Turn the settings password off? Anyone on this network will again be able to press Unlock Settings and change anything.', { title: 'Settings password', okText: 'Turn Off', cancelText: 'Keep It' });
     if (!ok) return;
@@ -15879,9 +15887,9 @@ async function remotePairWrite(other, me, add) {
     const label = other.name || 'the other regulator';
     const id = await probeIdentify(base, 4000);
     if (!id || (other.uid && id.uid && id.uid.toUpperCase() !== other.uid.toUpperCase())) return { ok: false, why: label + ' did not answer at ' + where + '.' };
-    const armJson = async q => {
+    const armJson = async (q, body) => {   // arm=1 goes as a POST body so the password never rides in a URL
         let r = null;
-        try { r = await fetchWithTimeout(base + '/armSettings' + q, {}, 8000); } catch (e) { }
+        try { r = await fetchWithTimeout(base + '/armSettings' + q, body ? { method: 'POST', body: new URLSearchParams(body) } : {}, 8000); } catch (e) { }
         return r ? await r.json().catch(() => null) : null;
     };
     const before = await armJson('');
@@ -15891,10 +15899,10 @@ async function remotePairWrite(other, me, add) {
         let pw = pwRemembered() || '';
         for (let attempt = 0; attempt < 3; attempt++) {
             if (!pw) {
-                pw = await xPrompt('Enter the settings password of ' + (id.name || label) + '.', { title: 'Settings password', okText: 'Continue', password: true });
+                pw = (await xPrompt('Enter the settings password of ' + (id.name || label) + '.', { title: 'Settings password', okText: 'Continue', password: true }) || '').trim();
                 if (!pw) return { ok: false, why: 'Cancelled.' };
             }
-            const j = await armJson('?arm=1&pw=' + encodeURIComponent(pw));
+            const j = await armJson('', { arm: '1', pw: pw });
             if (!j) return { ok: false, why: label + ' stopped answering.' };
             if (j.armed) { tok = j.tok || ''; break; }
             if (j.err === 'locked') return { ok: false, why: label + ' refuses passwords for the next ' + (j.wait || 60) + ' seconds after too many wrong tries.' };
@@ -15902,7 +15910,7 @@ async function remotePairWrite(other, me, add) {
         }
         if (!tok) return { ok: false, why: 'The password for ' + label + ' was not accepted.' };
     } else if (!before.armed) {
-        const j = await armJson('?arm=1');
+        const j = await armJson('', { arm: '1' });
         if (!j || !j.armed) return { ok: false, why: label + ' would not unlock its settings.' };
         relock = true;
     }
@@ -27517,7 +27525,7 @@ function cxFieldStart() {
     cxShowTab('plots', 'displays');   // open-loop ramp → watch on Plots ▸ Short Term
     const tok = cxRunTok();
     cx.fieldResult = null; cx.fieldApplied = false; cx.fieldAbort = null; cx.fieldAbortInfo = null; cx.fieldRunning = true; commissionRender();
-    cxGet('startFieldCurve=1&tok=' + tok).then(() => {
+    cxGet('startFieldCurve=1&run=' + tok).then(() => {
         cxStopPoll();
         let waited = 0, sawActive = false, settled = false, framesSeen = 0;
         // Run token + one-shot latch, as in cxKneeStart: a refused start (2 s cooldown, another test
@@ -27716,7 +27724,7 @@ function cxKneeStart() {
     const idx = (cx.kneeAnchors || []).length;   // the speed slot this Record fills (anchor + drain pair)
     const tok = cxRunTok();
     cx.kneeAbort = null; cx.kneeAbortInfo = null; cx.kneeNoOnset = false; cx.kneeRunning = true; cx.fdErr = null; commissionRender();
-    cxGet('startKneeSweep=1&tok=' + tok).then(() => {
+    cxGet('startKneeSweep=1&run=' + tok).then(() => {
         cxStopPoll();
         let waited = 0, sawActive = false, settled = false, framesSeen = 0;
         // Two ways a status frame can speak for a run that is not this one, each needing its own guard:
@@ -27847,7 +27855,7 @@ function cxPlantStart(wide) {
     const fStart = wide ? 0.3 : 0.5, fEnd = wide ? 30 : 20;
     const tok = cxRunTok();
     cxGet('systemIDTestType=1&systemIDSineFreqStart=' + fStart + '&systemIDSineFreqEnd=' + fEnd)
-        .then(() => cxGet('startSystemID=1&tok=' + tok))
+        .then(() => cxGet('startSystemID=1&run=' + tok))
         .then(() => {
             cxStopPoll();
             let waited = 0, settled = false, framesSeen = 0;
@@ -28166,7 +28174,7 @@ function cxVerifyStart() {
     cxGet('tuningWaveFloor=' + p.floor + '&waveAmplitude=' + p.amp +
           '&tuningSweepStart=' + p.fStart + '&tuningSweepEnd=' + p.fEnd +
           '&tuningSweepCycles=' + p.cycles + '&tuningWaveform=2&TuningMode=1')
-        .then(() => cxGet('startTuningSweep=1&tok=' + tok))
+        .then(() => cxGet('startTuningSweep=1&run=' + tok))
         .then(() => {
             cxStopPoll();
             let waited = 0, settled = false, framesSeen = 0;
@@ -28552,7 +28560,7 @@ function cxFdStart(idx) {
     cx._fdPollStart = performance.now();
     cx._fdTok = cxRunTok();
     commissionRender();
-    cxGet('fieldCutStart=1&tok=' + cx._fdTok)
+    cxGet('fieldCutStart=1&run=' + cx._fdTok)
         .then(() => { setTrackedTimeout(cxFdPoll, 800); })
         .catch(e => { cx.fdRunning = false; cx.fdErr = 'could not start — ' + e; commissionRender(); });
 }
@@ -35558,7 +35566,8 @@ function usageFetchStats() {
 // Firmware books one record per local day: the harvest the forecast promised (frozen the evening
 // before), the harvest the panels delivered, the consumption predicted from history, the consumption
 // drawn. /solarledger.csv serves the closed days oldest-first plus the day in progress (flag 0x80).
-const SLED_F = { FORECAST: 1, VEDIRECT: 2, SHUNT: 4, LEARNED: 8, PARTIAL: 16, SAMEDAY: 32, LIVE: 128 };
+const SLED_F = { FORECAST: 1, VEDIRECT: 2, SHUNT: 4, LEARNED: 8, PARTIAL: 16, SAMEDAY: 32, HOURLY: 64, LIVE: 128 };
+function sledHourCount(mask) { let n = 0; for (let b = mask >>> 0; b; b &= b - 1) n++; return n; }   // qualHours is a 24-bit mask of local hours
 let sledRows = [];
 let sledMeta = {};
 let sledLastFetchMs = 0;
@@ -35608,7 +35617,8 @@ function solarLedgerFetch() {
             const c = ln.split(',');
             if (c.length < 10) continue;
             rows.push({ day: +c[0], predHarv: num(c[1]), predIrr: num(c[2]), actHarv: num(c[3]), predCons: num(c[4]),
-                        actCons: num(c[5]), alt: num(c[6]), ratio: num(c[7]), covMin: +c[8], flags: +c[9] });
+                        actCons: num(c[5]), alt: num(c[6]), ratio: num(c[7]), covMin: +c[8], flags: +c[9],
+                        qualPred: num(c[10]), qualAct: num(c[11]), qualHours: c.length > 12 ? (+c[12] || 0) : 0 });
         }
         sledRows = rows; sledMeta = meta;
         solarLedgerRender();
@@ -35638,7 +35648,8 @@ function solarLedgerRender() {
         const opts = {
             width: plotFitWidth(el, 320), height: 220,
             series: [
-                { label: 'Day', value: (u, v) => (rows[v] ? sledDayLabel(rows[v].day) + (rows[v].flags & SLED_F.LIVE ? ' (today so far)' : (rows[v].flags & SLED_F.PARTIAL ? ' (partial day)' : '')) : '') },
+                { label: 'Day', value: (u, v) => (rows[v] ? sledDayLabel(rows[v].day) + (rows[v].flags & SLED_F.LIVE ? ' (today so far)' : (rows[v].flags & SLED_F.PARTIAL ? ' (partial day)' : ''))
+                        + (rows[v].flags & SLED_F.LEARNED ? ' (ratio from ' + sledHourCount(rows[v].qualHours) + ' sun-limited h)' : '') : '') },
                 { label: 'Actual', stroke: actColor, fill: actColor + '66', width: 1, paths: uPlot.paths.bars({ size: [0.6, 40] }), points: { show: false }, value: fmtKwh },
                 { label: 'Predicted', stroke: predColor, width: 2, points: { show: true, size: 6 }, value: fmtKwh },
             ],

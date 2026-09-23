@@ -2687,6 +2687,7 @@ void executeCloudOp() {
               // Fill the new profile's vessel columns now — registration is identity-only, the
               // snapshot's settings jsonb is what carries the vessel record to the cloud.
               configSnapshotRequested = true;
+              configSnapshotRetryMs = 0;
             }
           }
         }
@@ -2754,11 +2755,12 @@ static void dvccResetAuthority() {
   dataTimestamps[IDX_DVCC] = 0;
 }
 
-// Reads the caller's run token off a test-start request. Absent = 0, which is what a caller that
-// doesn't use tokens gets: its frames then match only other token-less runs.
+// Reads the caller's run token (run=) off a test-start request. Absent = 0, which is what a caller
+// that doesn't use tokens gets: its frames then match only other token-less runs. Its own name on
+// the wire: tok= is the settings arm token, and a /get carries both on a password-protected unit.
 static uint32_t webRunTok(AsyncWebServerRequest *request) {
-  if (!request->hasParam("tok")) return 0;
-  return (uint32_t)strtoul(request->getParam("tok")->value().c_str(), nullptr, 10);
+  if (!request->hasParam("run")) return 0;
+  return (uint32_t)strtoul(request->getParam("run")->value().c_str(), nullptr, 10);
 }
 
 // Sender fingerprint for a client write that changes what the field is allowed to do (master switch,
@@ -4580,6 +4582,7 @@ void setupServer() {
       }
     }
     bool foundParameter = false;
+    bool heartbeat = false;       // commissionHeartbeat= seen: answered, never counted as a setting write (see the CSV3 echo at the end)
     bool nvsPersistNow = false;   // set by discrete reset/set handlers that write saveNVSDataFull()-owned vars; forces ONE immediate persist at the end so a reboot before the next field-off edge can't revert the action
     String inputMessage;
 
@@ -5496,7 +5499,7 @@ void setupServer() {
     // at a low duty between steps; on a clean close it pings =0 to drop the hold and resume charging
     // immediately. A missing ping (crash / Wi-Fi drop) goes stale on its own after the firmware timeout.
     if (request->hasParam("commissionHeartbeat")) {
-      foundParameter = true;
+      heartbeat = true;
       lastCommissionHeartbeatMs = (request->getParam("commissionHeartbeat")->value().toInt() != 0)
                                   ? millis() : 0;   // 0 = explicit exit → stale now → charging resumes
     }
@@ -5519,8 +5522,8 @@ void setupServer() {
     if (request->hasParam("MinChargeTempF")) {
       foundParameter = true;
       inputMessage = request->getParam("MinChargeTempF")->value();
-      settingWrite(NK_MinChargeTempF, inputMessage.c_str());
-      MinChargeTempF = inputMessage.toFloat();
+      MinChargeTempF = constrain(inputMessage.toFloat(), -40.0f, 120.0f);
+      settingWrite(NK_MinChargeTempF, String(MinChargeTempF, 0).c_str());
     }
     // Battery + extra temperature probes, battery-temperature source chain, hot-charge lockout
     // (BATTERY_TEMP_SENSORS_SPEC.md §6). Temperatures arrive in °F (the UI converts).
@@ -5554,8 +5557,8 @@ void setupServer() {
     if (request->hasParam("MaxChargeTempF")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxChargeTempF")->value();
-      settingWrite(NK_MaxChargeTempF, inputMessage.c_str());
-      MaxChargeTempF = inputMessage.toFloat();
+      MaxChargeTempF = constrain(inputMessage.toFloat(), 32.0f, 200.0f);   // the form's range; stored raw, a bad value (0 from a non-number) would lock charging out
+      settingWrite(NK_MaxChargeTempF, String(MaxChargeTempF, 0).c_str());
     }
     if (request->hasParam("extraTempAlarmHiEnable")) {
       foundParameter = true;
@@ -5566,8 +5569,8 @@ void setupServer() {
     if (request->hasParam("extraTempAlarmHiF")) {
       foundParameter = true;
       inputMessage = request->getParam("extraTempAlarmHiF")->value();
-      settingWrite(NK_extraTempAlarmHiF, inputMessage.c_str());
-      extraTempAlarmHiF = inputMessage.toFloat();
+      extraTempAlarmHiF = constrain(inputMessage.toFloat(), -40.0f, 300.0f);
+      settingWrite(NK_extraTempAlarmHiF, String(extraTempAlarmHiF, 0).c_str());
     }
     if (request->hasParam("extraTempAlarmLoEnable")) {
       foundParameter = true;
@@ -5578,8 +5581,8 @@ void setupServer() {
     if (request->hasParam("extraTempAlarmLoF")) {
       foundParameter = true;
       inputMessage = request->getParam("extraTempAlarmLoF")->value();
-      settingWrite(NK_extraTempAlarmLoF, inputMessage.c_str());
-      extraTempAlarmLoF = inputMessage.toFloat();
+      extraTempAlarmLoF = constrain(inputMessage.toFloat(), -40.0f, 300.0f);
+      settingWrite(NK_extraTempAlarmLoF, String(extraTempAlarmLoF, 0).c_str());
     }
     // 1-Wire probe registry actions. A scan is a request to TempTask (it owns the bus); a role assignment
     // writes NVS right here (explicit user action, the one exception to the field-off flash rule) and
@@ -9062,6 +9065,7 @@ void setupServer() {
       sseStallCount = 0;
       sseStallLongestMs = 0;
       sseFramesDropped = 0;
+      csv3PeakLen = 0;
       // INA228 die-temperature session max — same "since last reset" semantics as the rest of this block.
       inaDieTempMaxF = NAN;
       // Stamp the reset moment. Dashboard reads CSV1 slot 28 = (millis()-this)/1000
@@ -9119,15 +9123,14 @@ void setupServer() {
     // The commissioning wizard's 2 s keep-alive ping changes nothing, so it must not fire the settings
     // echo. It was pushing the whole CSV3 block every 2 s for the length of a wizard session — on the
     // busiest link of the session — in place of the 60 s idle cadence, for bytes no client acts on.
-    // Suppressed only when the ping is the ENTIRE request; a heartbeat riding along with a real
-    // setting still echoes.
-    const bool heartbeatOnly = (request->params() == 1 && request->hasParam("commissionHeartbeat"));
-    if (foundParameter && !heartbeatOnly) {
+    // The ping never sets foundParameter, so a heartbeat riding along with a real setting still echoes
+    // and one riding with only the uid=/tok= every dashboard request carries does not.
+    if (foundParameter) {
       stateRevision++;      // Increment whenever any setting changed
       settingsDirty = true; // trigger immediate CSV3 settings echo
     }
     if (!foundParameter) {
-      inputMessage = "No message sent, the request_hasParam found no match";
+      inputMessage = heartbeat ? "heartbeat" : "No message sent, the request_hasParam found no match";
     }
     request->send(200, "text/plain", inputMessage);
   });
@@ -9136,15 +9139,17 @@ void setupServer() {
   // ?arm=0 closes it, no param just reports state — the dashboard polls this to keep its unlocked
   // UI honest, so a reload while armed comes back unlocked and a lock from another client relocks
   // every tab within a poll. Nothing times out; see settingsArmActive() in 5_functions.ino.
-  // With the settings password on (pwRequired): arm=1 needs pw= and answers with tok=, which the
+  // With the settings password on (pwRequired): arm=1 is a POST whose body carries pw (never a URL a
+  // log or a proxy could keep, the same rule as /setPassword) and answers with tok=, which the
   // dashboard then puts on every mutating request; arm=0 needs a live tok; and "armed" in the reply
   // is THIS client's standing, not the global flag, so a page without the password stays locked.
-  server.on("/armSettings", HTTP_GET, [](AsyncWebServerRequest *request) {
+  server.on("/armSettings", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request) {
     int code = 200;
     const char *issued = nullptr;
     uint32_t waitS = 0;
-    if (request->hasParam("arm")) {
-      bool arm = request->getParam("arm")->value().toInt() != 0;
+    const bool armInBody = request->hasParam("arm", true);
+    if (armInBody || request->hasParam("arm")) {
+      bool arm = (armInBody ? request->getParam("arm", true) : request->getParam("arm"))->value().toInt() != 0;
       if (arm && !pwRequired) {
         settingsArmed = true;
         queueConsoleMessage("Settings ARMED: changes accepted until locked or rebooted");
@@ -9153,20 +9158,27 @@ void setupServer() {
         if (pwLockUntilMs && (int32_t)(pwLockUntilMs - now) > 0) {
           code = 429;
           waitS = (pwLockUntilMs - now + 999) / 1000;
-        } else if (pwVerify(request->hasParam("pw") ? request->getParam("pw")->value().c_str() : nullptr)) {
-          pwFailCount = 0;
-          pwLockUntilMs = 0;
-          settingsArmed = true;
-          issued = armTokenIssue();
-          queueConsoleMessageF("Settings ARMED with password from %s: changes accepted until locked or rebooted",
-                               request->client()->remoteIP().toString().c_str());
         } else {
-          code = 403;
-          if (++pwFailCount >= 5) {
-            pwLockUntilMs = now + 60000UL;
+          const char *pw = request->hasParam("pw", true) ? request->getParam("pw", true)->value().c_str() : nullptr;
+          if (pwVerify(pw)) {
             pwFailCount = 0;
+            pwLockUntilMs = 0;
+            settingsArmed = true;
+            issued = armTokenIssue();
+            queueConsoleMessageF("Settings ARMED with password from %s: changes accepted until locked or rebooted",
+                                 request->client()->remoteIP().toString().c_str());
+          } else {
+            code = 403;
+            // Only a presented wrong password is a strike: a request without one is the app learning that
+            // a password exists (or a stale bundle), not a guess.
+            if (pw && *pw) {
+              if (++pwFailCount >= 5) {
+                pwLockUntilMs = now + 60000UL;
+                pwFailCount = 0;
+              }
+              queueConsoleMessageF("Unlock Settings REFUSED: wrong password from %s", request->client()->remoteIP().toString().c_str());
+            }
           }
-          queueConsoleMessageF("Unlock Settings REFUSED: wrong password from %s", request->client()->remoteIP().toString().c_str());
         }
       } else if (settingsArmed) {
         if (pwRequired && !armTokenValid(request)) {
@@ -9383,7 +9395,7 @@ void setupServer() {
              "Web FS %s: %d/%d KB used (%d%%) - boot seed, -1 = unread\n"
              "TLS buffers -> %s (largest internal block %u B, free PSRAM %u B)\n"
              "Net task cores (0/1=pinned, 2147483647=floating, -99=not found): async_tcp=%d lwIP=%d\n"
-             "Dashboard stream: clients=%u queue=%u peak=%u/%u stalls=%lu longest=%.1fs dropped=%lu\n"
+             "Dashboard stream: clients=%u queue=%u peak=%u/%u stalls=%lu longest=%.1fs dropped=%lu csv3=%uB peak=%uB of %uB\n"
              "AdjustField worst full pass (ms): total=%.1f | thermal=%.1f snapshot=%.1f fastov=%.1f modes=%.1f control=%.1f duty=%.1f tail=%.1f\n"
              "Time source: %s (NMEA last sync: %lus ago, Phone last: %lus ago)\n"
              "GPS source:  %s (NMEA last fix: %lus ago, Phone last: %lus ago)\n"
@@ -9401,6 +9413,7 @@ void setupServer() {
              asyncTcpCore, lwipCore,
              (unsigned)events.count(), (unsigned)sseQueueDepth, (unsigned)sseQueuePeak, (unsigned)SSE_MAX_QUEUED_MESSAGES,
              (unsigned long)sseStallCount, sseStallLongestMs / 1000.0f, (unsigned long)sseFramesDropped,
+             (unsigned)csv3LastLen, (unsigned)csv3PeakLen, (unsigned)PAYLOAD3_SIZE,
              aflWorstTotalUs / 1000.0f,
              aflWorstSecUs[0] / 1000.0f, aflWorstSecUs[1] / 1000.0f, aflWorstSecUs[2] / 1000.0f,
              aflWorstSecUs[3] / 1000.0f, aflWorstSecUs[4] / 1000.0f, aflWorstSecUs[5] / 1000.0f,
@@ -11695,11 +11708,9 @@ void SendWifiData() {
   // PRIORITY 5: CSVData3 — sent immediately when settingsDirty (event-driven), or every 60s fallback
   if (!sentSomething && (settingsDirty || now - lastpayload3send >= 60000) && events.count() > 0 && !sseBacklogged()) {
     static char *payload3 = nullptr;
-    // ~7 B/field, and this is the tightest of the five buffers — CSV3 grows every time a setting is
-    // added, so check it when adding a block of them. Overflow is caught below rather than truncating,
-    // but the catch returns early from SendWifiData, which stops CSV3 for good and skips TS on any pass
-    // CSV3 is due. Raise this before that happens, not after.
-    static const size_t PAYLOAD3_SIZE = 3000;
+    // Overflow is caught below rather than truncating, but the catch returns early from SendWifiData,
+    // which stops CSV3 for good and skips TS on any pass CSV3 is due. The frame's live and peak
+    // lengths ride the /debug line (csv3LastLen / csv3PeakLen) so the margin is measured, not guessed.
     if (!payload3) {
       payload3 = (char *)ps_malloc(PAYLOAD3_SIZE);  // allocated to PSRAM
       if (!payload3) {
@@ -11734,6 +11745,8 @@ void SendWifiData() {
       Serial.printf("payload3 truncated or format error: %d\n", payload3Len);
       return;
     }
+    csv3LastLen = (uint16_t)payload3Len;
+    if (csv3LastLen > csv3PeakLen) csv3PeakLen = csv3LastLen;
 
     sseSend(payload3, "CSVData3");
     settingsDirty = false;
@@ -12012,5 +12025,6 @@ void saveVesselInfoToNvs() {
   // Refresh the cloud's user_profiles vessel projection on Save, not at the next boot/24 h
   // backstop — the snapshot's settings jsonb is the only carrier of the vessel record.
   configSnapshotRequested = true;
+  configSnapshotRetryMs = 0;
 }
 
