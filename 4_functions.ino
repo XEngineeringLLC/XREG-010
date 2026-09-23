@@ -1156,7 +1156,6 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     vesselSetText(ALTERNATOR_BRAND_MODEL, sizeof(ALTERNATOR_BRAND_MODEL), settingRead(NK_altBrandModel).c_str());
     // Unclamped, an out-of-range value indexes past axisRemap[] and wild-reads through src[]
     imuMountOrientation    = (uint8_t)constrain(settingRead(NK_imuMountOrient).toInt(), 0, IMU_ORIENT_COUNT - 1);
-    regulatorMountLoc      = (uint8_t)constrain(settingRead(NK_regMountLoc).toInt(), 0, 1);
     IMU_DIST_BOW_FT        = settingRead(NK_imuDistBowFt).toFloat();
     IMU_DIST_CL_FT         = settingRead(NK_imuDistClFt).toFloat();
     IMU_HEIGHT_WL_FT       = settingRead(NK_imuHtWlFt).toFloat();

@@ -54,6 +54,7 @@ bool usingFactoryWebFiles = false;       // Track which web partition is mounted
 #include "freertos/task.h"               // for stack usage
 #define configGENERATE_RUN_TIME_STATS 1  // for CPU use tracking
 #include <mbedtls/md.h>                  // security
+#include <mbedtls/sha256.h>              // settings-password hash (pwStore/pwVerify, 3_functions.ino)
 #include <vector>                        // Console message queue system
 #include <String>                        // Console message queue system
 #include <memory>                        // shared_ptr lifetime for streamed binary endpoint buffers (/fastscope.bin)
@@ -842,6 +843,18 @@ bool g_rpmTachMasked = false;
 // The 30-minute auto-lock was removed 2026-09-16 — an unattended relock stranded a user mid-session
 // and silently refused the next write.
 bool settingsArmed = false;
+// Optional password on that gate (Setup > System). Off: the gate above, unchanged. On: arming needs
+// the password and hands the client a token every mutating request must carry, so one unlock no
+// longer opens the gate for every page on the network (shared marina WiFi). Salt + hash only; the
+// password itself is never stored. Tokens are RAM-only, like the arm.
+bool pwRequired = false;
+char pwSaltHex[17] = "";
+char pwHashHex[65] = "";
+#define ARM_TOKENS 4   // one per unlocked client; a fifth unlock retires the oldest
+char armTok[ARM_TOKENS][17] = { "", "", "", "" };
+uint8_t armTokNext = 0;
+uint8_t pwFailCount = 0;
+uint32_t pwLockUntilMs = 0;   // five wrong passwords buy a 60 s refusal of every attempt
 
 // ===== HEAP MONITORING =====
 int rawFreeHeap = 0;      // in bytes
@@ -4111,7 +4124,6 @@ float   battTempCoeff        = 0.024f; // fractional resistance change per °C B
 time_t  CommissionEpoch      = 0;
 bool    commissionAgeAck     = false; // user pressed Silence on the age prompt; cleared by the next pass
 bool    commissionChangeFlag = false; // tuning-affecting Vessel Info change since the last pass
-uint8_t regulatorMountLoc    = 0;     // 0 = battery compartment (board temp tracks the bank), 1 = engine room
 float   cvTempDerateScale    = 1.0f;  // live multiplier recomputeCvGains() applies to the active gains (dashboard diag)
 // CV voltage-target slew (bidirectional ramp). ChargingVoltageTarget ramps toward ...Req at these rates so a
 // COMMANDED target change (absorption→float, manual setpoint) no longer steps instantly and trips fast-OV; the
@@ -4677,6 +4689,21 @@ const char *regulatorHostName();
 String regulatorDisplayName();
 String defaultApSsid();
 void mdnsPublishIdentity();
+// Access control + multi-regulator (3_functions.ino unless noted)
+bool settingsArmActive(AsyncWebServerRequest *request);   // 5_functions.ino
+bool armTokenValid(AsyncWebServerRequest *request);
+const char *armTokenIssue();
+void armTokensClear();
+bool pwVerify(const char *pw);
+bool pwStore(const char *pw);
+void pwClear();
+void accessInit();
+void accessRecoveryClear();
+bool pairListAdd(const char *uid, const char *name);
+bool pairListRemove(const char *uid);
+void pairListAppendJson(String &out);
+void peerListAppendJson(String &out);
+void startPeerBrowseTask();
 static void cfgAppendJsonStr(String &out, const String &val);   // defined in 8_functions.ino, used earlier by /identify
 int doCloudPOST(const char *endpointPath, const char *payload, char *responseBuf, size_t responseBufSize);  // 3_functions.ino — lean raw-TLS POST
 
@@ -6264,6 +6291,7 @@ void setup() {
   bhInitSettings();           // Battery Health: DCIR test config + persisted DCIR/capacity blobs
   initWeatherModeSettings();  // Add weather mode settings--- otherwise similar to line above (InitSystemSettings)
   runSettingsMigrations();    // settings-schema migration chain — must stay after the last NVS settings loader
+  accessInit();               // settings password + paired-regulator list (own NVS keys, outside the CSV3 echo on purpose)
   loadTuningLog();            // restore last session's tuning records from LittleFS
   loadCVTuningLog();          // restore CV tuning records from LittleFS
   loadSystemIDLog();          // restore plant-delay (SystemID) records from LittleFS
@@ -6307,6 +6335,7 @@ void setup() {
   // (~4KB observed peak via /debug stackHWM); 12KB keeps a ~3x margin.
   xTaskCreatePinnedToCore(httpsTask, "HTTPS", 12288, NULL, 1, &httpsTaskHandle, 0);
   Serial.println("HTTPS task created on Core 0");
+  startPeerBrowseTask();      // mDNS browse for the other regulators on the network (one 3 s blocking query per 30 s, core 0)
 
   // Rectifier fault detector compute — Core 0, priority 1 (same as TempTask/HTTPS, below the
   // network tasks). Moves the analysis off the Core-1 control loop, which used to freeze in

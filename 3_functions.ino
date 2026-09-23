@@ -1357,6 +1357,7 @@ void setupWiFi() {
     Serial.println("=== GPIO45 LOW: FORCED CONFIGURATION MODE ===");
     Serial.println("=== ALTERNATOR DISABLED FOR SAFETY - Use GPIO46 LOW for emergency operation ===");
     loadAPCredentials(true);  // Force defaults for password recovery
+    accessRecoveryClear();    // same physical-access rule for the settings password (Setup > System)
     setupAccessPoint();
     setupWiFiConfigServer();  // Always serve config interface when GPIO45 is low.  This can be used to reset lost passwords
     currentMode = MODE_CONFIG;
@@ -1507,9 +1508,11 @@ String defaultApSsid() {
 // PREDICTABLE (Android's NsdManager matches services by instance name at browse time, before
 // any TXT is available), so it is the hostname and a rename never re-announces the service.
 static bool mdnsStarted = false;   // true once MDNS.begin() has succeeded (startMdnsOnce); every raw mdns_* call is gated on it
+static void mdnsRefreshPair();     // defined with the pair list below; startMdnsOnce publishes the list once the service exists
 static void mdnsRefreshName() {
   if (!mdnsStarted) return;   // the IDF service call takes a mutex that only mdns_init creates
   mdns_service_txt_item_set("_http", "_tcp", "name", regulatorDisplayName().c_str());
+  mdns_service_txt_item_set("_xreg", "_tcp", "name", regulatorDisplayName().c_str());
 }
 
 // alternator.local is the DELEGATED name here, not the primary one. The primary hostname has to
@@ -1551,9 +1554,336 @@ void startMdnsOnce() {
     MDNS.addServiceTxt("http", "tcp", "host", regulatorHostName());
     MDNS.addServiceTxt("http", "tcp", "fw", FIRMWARE_VERSION);
     MDNS.addServiceTxt("http", "tcp", "name", regulatorDisplayName().c_str());
+    // Private service type for the peer browse (peerBrowseOnce): a marina network's _http._tcp is
+    // full of printers and TVs and a browse caps at 20 answers. Same TXT as the http service.
+    MDNS.addService("xreg", "tcp", 80);
+    MDNS.addServiceTxt("xreg", "tcp", "uid", (const char *)device_id_hex);
+    MDNS.addServiceTxt("xreg", "tcp", "host", regulatorHostName());
+    MDNS.addServiceTxt("xreg", "tcp", "fw", FIRMWARE_VERSION);
+    MDNS.addServiceTxt("xreg", "tcp", "name", regulatorDisplayName().c_str());
     mdnsStarted = true;
+    mdnsRefreshPair();   // "pair" TXT on both services: the uid6 list of this boat's other regulators
   }
   if (mdnsStarted) mdnsPublishIdentity();   // address may have moved since the last call
+}
+
+// ── Access: settings password, paired regulators, network peers ─────────────────────────────────
+// Password: the arm gate is untouched until Setup > System turns the password on. With it on,
+// /armSettings needs pw= and answers with a token; every mutating request then carries tok=
+// (settingsArmActive checks it), so an unlock belongs to the client that typed the password rather
+// than to every page on the network. Only a salted SHA-256 is stored. Five wrong tries buy a 60 s
+// lockout; a pin-11 recovery boot clears the requirement, the same physical-access rule that already
+// resets the hotspot credentials.
+static void copyField(char *dst, size_t n, const String &src) {
+  strncpy(dst, src.c_str(), n - 1);
+  dst[n - 1] = '\0';
+}
+
+static void sha256Hex(const char *salt, const char *pw, char out[65]) {
+  String in = String(salt) + String(pw);
+  unsigned char d[32];
+  mbedtls_sha256((const unsigned char *)in.c_str(), in.length(), d, 0);
+  for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", d[i]);
+  out[64] = '\0';
+}
+
+bool pwVerify(const char *pw) {
+  if (!pwRequired) return true;
+  if (!pw || !*pw) return false;
+  char h[65];
+  sha256Hex(pwSaltHex, pw, h);
+  uint8_t diff = 0;   // constant-time: an early exit would leak how much of the hash matched
+  for (int i = 0; i < 64; i++) diff |= (uint8_t)(h[i] ^ pwHashHex[i]);
+  return diff == 0;
+}
+
+void armTokensClear() {
+  for (int i = 0; i < ARM_TOKENS; i++) armTok[i][0] = '\0';
+}
+
+const char *armTokenIssue() {
+  char *t = armTok[armTokNext];
+  armTokNext = (uint8_t)((armTokNext + 1) % ARM_TOKENS);
+  snprintf(t, 17, "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  return t;
+}
+
+bool armTokenValid(AsyncWebServerRequest *request) {
+  if (!request || !request->hasParam("tok")) return false;
+  const String &t = request->getParam("tok")->value();
+  if (t.length() != 16) return false;
+  for (int i = 0; i < ARM_TOKENS; i++)
+    if (armTok[i][0] && t.equals(armTok[i])) return true;
+  return false;
+}
+
+bool pwStore(const char *pw) {
+  char salt[17], h[65];
+  snprintf(salt, sizeof(salt), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  sha256Hex(salt, pw, h);
+  if (!settingWrite(NK_pwSalt, salt) || !settingWrite(NK_pwHash, h) || !settingWrite(NK_pwReq, "1")) return false;
+  strcpy(pwSaltHex, salt);
+  strcpy(pwHashHex, h);
+  pwRequired = true;
+  armTokensClear();   // every unlocked page re-arms with the new password
+  return true;
+}
+
+void pwClear() {
+  settingWrite(NK_pwReq, "0");
+  settingRemove(NK_pwHash);
+  settingRemove(NK_pwSalt);
+  pwRequired = false;
+  pwSaltHex[0] = '\0';
+  pwHashHex[0] = '\0';
+  armTokensClear();
+}
+
+void accessRecoveryClear() {
+  if (settingExists(NK_pwReq) && settingRead(NK_pwReq).toInt() == 1) {
+    pwClear();
+    Serial.println("ACCESS: settings password cleared (pin 11 recovery boot)");
+  }
+}
+
+// Paired regulators: the units the owner said are on this boat (Setup > System > Regulators on this
+// boat). Stored as uid<US>name records joined by <RS>, so a name can hold any printable text. Both
+// units store each other; the dashboard writes both sides (its own over the same origin, the other's
+// cross-origin after arming it), so neither firmware has to trust a claim made by the other.
+#define PAIR_MAX 8
+struct PairedUnit { char uid[17]; char name[33]; };
+static PairedUnit pairList[PAIR_MAX];
+static uint8_t pairCount = 0;
+static const char PAIR_RS = '\x1e', PAIR_US = '\x1f';
+
+static void pairListLoad() {
+  pairCount = 0;
+  String s = settingRead(NK_pairList);
+  int pos = 0;
+  while (pos < (int)s.length() && pairCount < PAIR_MAX) {
+    int end = s.indexOf(PAIR_RS, pos);
+    if (end < 0) end = s.length();
+    String rec = s.substring(pos, end);
+    int us = rec.indexOf(PAIR_US);
+    String uid = us < 0 ? rec : rec.substring(0, us);
+    String name = us < 0 ? String() : rec.substring(us + 1);
+    if (uid.length() == 16) {
+      copyField(pairList[pairCount].uid, sizeof(pairList[pairCount].uid), uid);
+      copyField(pairList[pairCount].name, sizeof(pairList[pairCount].name), name);
+      pairCount++;
+    }
+    pos = end + 1;
+  }
+}
+
+static bool pairListSave() {
+  String s;
+  for (int i = 0; i < pairCount; i++) {
+    if (i) s += PAIR_RS;
+    s += pairList[i].uid;
+    s += PAIR_US;
+    s += pairList[i].name;
+  }
+  return settingWrite(NK_pairList, s.c_str());
+}
+
+// Six-character form of a paired uid: the same characters regulatorUid6() picks for this unit.
+static void uid6Of(const char *uid16, char out[7]) {
+  size_t n = strlen(uid16);
+  const char *src = (n >= 12) ? uid16 + (n - 12) : uid16;
+  strncpy(out, src, 6);
+  out[6] = '\0';
+  for (char *c = out; *c; c++) *c = (char)tolower((unsigned char)*c);
+}
+
+static void pairListUid6Csv(char *out, size_t n) {
+  out[0] = '\0';
+  for (int i = 0; i < pairCount; i++) {
+    char u6[7];
+    uid6Of(pairList[i].uid, u6);
+    size_t len = strlen(out);
+    snprintf(out + len, n - len, "%s%s", i ? "," : "", u6);
+  }
+}
+
+// The pair list rides the mDNS TXT of both services, so any unit's browse can group the boat's
+// regulators together without asking each one.
+static void mdnsRefreshPair() {
+  if (!mdnsStarted) return;
+  char csv[PAIR_MAX * 7 + 1];
+  pairListUid6Csv(csv, sizeof(csv));
+  mdns_service_txt_item_set("_http", "_tcp", "pair", csv);
+  mdns_service_txt_item_set("_xreg", "_tcp", "pair", csv);
+}
+
+static bool uidIsHex16(const char *u) {
+  if (!u || strlen(u) != 16) return false;
+  for (int i = 0; i < 16; i++)
+    if (!isxdigit((unsigned char)u[i])) return false;
+  return true;
+}
+
+bool pairListAdd(const char *uid, const char *name) {
+  if (!uidIsHex16(uid) || strcasecmp(uid, device_id_hex) == 0) return false;
+  int k = -1;
+  for (int i = 0; i < pairCount; i++)
+    if (strcasecmp(pairList[i].uid, uid) == 0) k = i;
+  if (k < 0) {
+    if (pairCount >= PAIR_MAX) return false;
+    k = pairCount++;
+    for (int i = 0; i < 16; i++) pairList[k].uid[i] = (char)toupper((unsigned char)uid[i]);
+    pairList[k].uid[16] = '\0';
+  }
+  copyField(pairList[k].name, sizeof(pairList[k].name), String(name ? name : ""));
+  bool ok = pairListSave();
+  mdnsRefreshPair();
+  return ok;
+}
+
+bool pairListRemove(const char *uid) {
+  if (!uid) return false;
+  int k = -1;
+  for (int i = 0; i < pairCount; i++)
+    if (strcasecmp(pairList[i].uid, uid) == 0) k = i;
+  if (k < 0) return true;   // already absent: the remove is satisfied
+  for (int i = k; i + 1 < pairCount; i++) pairList[i] = pairList[i + 1];
+  pairCount--;
+  bool ok = pairListSave();
+  mdnsRefreshPair();
+  return ok;
+}
+
+void pairListAppendJson(String &out) {
+  out += '[';
+  for (int i = 0; i < pairCount; i++) {
+    if (i) out += ',';
+    out += "{\"uid\":\"";
+    out += pairList[i].uid;
+    out += "\",\"name\":";
+    cfgAppendJsonStr(out, String(pairList[i].name));
+    out += '}';
+  }
+  out += ']';
+}
+
+void accessInit() {
+  String req = settingRead(NK_pwReq);
+  copyField(pwSaltHex, sizeof(pwSaltHex), settingRead(NK_pwSalt));
+  copyField(pwHashHex, sizeof(pwHashHex), settingRead(NK_pwHash));
+  pwRequired = (req.toInt() == 1) && strlen(pwSaltHex) == 16 && strlen(pwHashHex) == 64;
+  if (req.toInt() == 1 && !pwRequired) {
+    settingWrite(NK_pwReq, "0");   // half a record (interrupted store) must not lock the owner out
+    Serial.println("ACCESS: settings-password record incomplete, requirement cleared");
+  }
+  pairListLoad();
+  Serial.printf("ACCESS: settings password %s, %u paired regulator(s)\n", pwRequired ? "ON" : "off", (unsigned)pairCount);
+}
+
+// Peers: every other regulator this unit can hear on the network, from a browse of the private
+// _xreg._tcp service. Own core-0 task because one query blocks ~3 s. The result is pre-rendered
+// JSON behind a mutex, so /identify only copies it. Everything here is network input: bounded,
+// escaped by cfgAppendJsonStr, rendered as text by the dashboard.
+#define PEER_MAX 12
+#define PEER_STALE_MS 120000UL   // one missed 30 s query must not flicker a unit out of the list
+#define PEERS_JSON_CAP 3072
+struct PeerUnit { char uid[17]; char host[24]; char ip[16]; char fw[12]; char name[33]; char pair[PAIR_MAX * 7 + 1]; uint32_t seenMs; };
+static PeerUnit *peers = nullptr;   // ps_calloc'd in startPeerBrowseTask
+static uint8_t peerCount = 0;
+static char *peersJson = nullptr;   // ps_malloc'd, PEERS_JSON_CAP
+static SemaphoreHandle_t peerMux = nullptr;
+static TaskHandle_t peerTaskHandle = nullptr;
+
+static void peerBrowseOnce() {
+  int n = MDNS.queryService("xreg", "tcp");
+  uint32_t now = millis();
+  for (int i = 0; i < n; i++) {
+    String uid = MDNS.txt(i, "uid");
+    if (!uidIsHex16(uid.c_str()) || uid.equalsIgnoreCase(device_id_hex)) continue;
+    int k = -1, oldest = 0;
+    for (int j = 0; j < peerCount; j++) {
+      if (uid.equalsIgnoreCase(peers[j].uid)) { k = j; break; }
+      if (peers[j].seenMs < peers[oldest].seenMs) oldest = j;
+    }
+    if (k < 0) k = (peerCount < PEER_MAX) ? peerCount++ : oldest;
+    PeerUnit &p = peers[k];
+    copyField(p.uid, sizeof(p.uid), uid);
+    String host = MDNS.hostname(i);
+    if (host.length() && host.indexOf(".local") < 0) host += ".local";
+    copyField(p.host, sizeof(p.host), host);
+    copyField(p.ip, sizeof(p.ip), MDNS.address(i).toString());
+    copyField(p.fw, sizeof(p.fw), MDNS.txt(i, "fw"));
+    copyField(p.name, sizeof(p.name), MDNS.txt(i, "name"));
+    copyField(p.pair, sizeof(p.pair), MDNS.txt(i, "pair"));
+    p.seenMs = now;
+  }
+  for (int j = 0; j < peerCount;) {
+    if (now - peers[j].seenMs > PEER_STALE_MS) {
+      for (int m = j; m + 1 < peerCount; m++) peers[m] = peers[m + 1];
+      peerCount--;
+    } else {
+      j++;
+    }
+  }
+  String out;
+  out.reserve(64 + peerCount * 220);
+  out += '[';
+  for (int j = 0; j < peerCount; j++) {
+    if (j) out += ',';
+    out += "{\"uid\":\"";
+    out += peers[j].uid;   // hex-checked above
+    out += "\",\"host\":";
+    cfgAppendJsonStr(out, String(peers[j].host));
+    out += ",\"ip\":";
+    cfgAppendJsonStr(out, String(peers[j].ip));
+    out += ",\"fw\":";
+    cfgAppendJsonStr(out, String(peers[j].fw));
+    out += ",\"name\":";
+    cfgAppendJsonStr(out, String(peers[j].name));
+    out += ",\"pair\":";
+    cfgAppendJsonStr(out, String(peers[j].pair));
+    out += ",\"age\":";
+    out += String((now - peers[j].seenMs) / 1000);
+    out += '}';
+  }
+  out += ']';
+  if (out.length() >= PEERS_JSON_CAP) out = "[]";   // PEER_MAX keeps it well under; this is the guarantee, not a path
+  if (peerMux && xSemaphoreTake(peerMux, pdMS_TO_TICKS(200)) == pdTRUE) {
+    strcpy(peersJson, out.c_str());
+    xSemaphoreGive(peerMux);
+  }
+}
+
+static void peerBrowseTask(void *) {
+  bool first = true;
+  for (;;) {
+    if (!mdnsStarted) { vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
+    vTaskDelay(pdMS_TO_TICKS(first ? 5000 : 30000));
+    first = false;
+    if ((uint32_t)WiFi.localIP() == 0 && (uint32_t)WiFi.softAPIP() == 0) continue;
+    peerBrowseOnce();
+  }
+}
+
+void startPeerBrowseTask() {
+  peers = (PeerUnit *)ps_calloc(PEER_MAX, sizeof(PeerUnit));
+  peersJson = (char *)ps_malloc(PEERS_JSON_CAP);
+  if (!peers || !peersJson) {
+    Serial.println("PEERS: PSRAM alloc failed, peer list disabled");
+    return;
+  }
+  strcpy(peersJson, "[]");
+  peerMux = xSemaphoreCreateMutex();
+  if (xTaskCreatePinnedToCore(peerBrowseTask, "PeerBrowse", 5120, NULL, 1, &peerTaskHandle, 0) != pdPASS)
+    Serial.println("PEERS: task create failed");
+}
+
+void peerListAppendJson(String &out) {
+  if (peersJson && peerMux && xSemaphoreTake(peerMux, pdMS_TO_TICKS(50)) == pdTRUE) {
+    out += peersJson;
+    xSemaphoreGive(peerMux);
+  } else {
+    out += "[]";
+  }
 }
 
 // A failed join only prints WiFi.status()==6 ("not connected"), which can't tell a wrong
@@ -2440,9 +2770,12 @@ static uint32_t webRunTok(AsyncWebServerRequest *request) {
 // the same src and n twice is one request delivered twice, and a different src is another tab.
 static void logClientWrite(AsyncWebServerRequest *request, const char *what) {
   String qs;
+  bool anyParam = false;
   for (size_t i = 0; i < request->params() && qs.length() < 120; i++) {
     const AsyncWebParameter *p = request->getParam(i);
-    if (i) qs += '&';
+    if (p->name() == "tok" || p->name() == "pw") continue;   // the console reaches every client on the network
+    if (anyParam) qs += '&';
+    anyParam = true;
     qs += p->name();
     qs += '=';
     qs += p->value();
@@ -2520,7 +2853,7 @@ void setupServer() {
 
 
   server.on("/factoryReset", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -2977,7 +3310,7 @@ void setupServer() {
   // Clear System for the oscillation damper: learned pockets + episode ledger + any test in
   // flight, together. The web UI fronts this with an explicit confirm.
   server.on("/huntclear", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -3725,7 +4058,7 @@ void setupServer() {
   // Same ingest path as cloud-sync/Load-saved.
   server.on("/perfUploadFront", HTTP_POST,
     [](AsyncWebServerRequest *request) {
-      if (!settingsArmActive()) {
+      if (!settingsArmActive(request)) {
         perfUploadBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
       }
       if (perfUploadBuf.length() < 8 || perfUploadBuf.indexOf("BEFRONT1") < 0) {
@@ -3752,7 +4085,7 @@ void setupServer() {
   // request handler arm-gates once the body is complete, then altUploadFrontCsv() applies it.
   server.on("/altUploadFront", HTTP_POST,
     [](AsyncWebServerRequest *request) {
-      if (!settingsArmActive()) {
+      if (!settingsArmActive(request)) {
         altUploadBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
       }
       if (altUploadBuf.length() < 8 || altUploadBuf.indexOf("BEFRONT1") < 0) {
@@ -3777,7 +4110,7 @@ void setupServer() {
   // Config Sharing — export the cloneable settings set as one JSON blob (for download
   // or cloud submission). Arm-gated like the upload endpoints.
   server.on("/exportConfig", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed"); return;
     }
     request->send(200, "application/json", exportConfigJson());
@@ -3819,7 +4152,7 @@ void setupServer() {
   // (suppress with ?noReboot=1). Mirrors /perfUploadFront's body-accumulator pattern.
   server.on("/importConfig", HTTP_POST,
     [](AsyncWebServerRequest *request) {
-      if (!settingsArmActive()) {
+      if (!settingsArmActive(request)) {
         importConfigBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
       }
       if (importConfigBuf.length() < 2) {
@@ -4150,7 +4483,7 @@ void setupServer() {
     request->send(200, "application/json", out);
   });
   server.on("/saveVesselInfo", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(401, "application/json", "{\"success\":false,\"error\":\"Settings not armed\"}");
       return;
     }
@@ -4222,7 +4555,6 @@ void setupServer() {
       imuMountState = IMU_MOUNT_UNKNOWN;   // verdict was judged in the old frame; next Zero re-latches it
       settingRemove(NK_imu_mnt_state);
     }
-    regulatorMountLoc = doc["regulator_mount_loc"] | 0;
     IMU_DIST_BOW_FT = doc["imu_dist_bow_ft"];
     IMU_DIST_CL_FT = doc["imu_dist_cl_ft"];
     IMU_HEIGHT_WL_FT = doc["imu_height_wl_ft"];
@@ -4277,7 +4609,7 @@ void setupServer() {
       // If turning ON, fall through to arm check below
     }
 
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       // Console line so a rejected write is visible — a stale/replayed URL lands here silently.
       queueConsoleMessage("Settings write REJECTED: not armed (press Unlock Settings first)");
       request->send(403, "text/plain", "Settings not armed");
@@ -8804,19 +9136,131 @@ void setupServer() {
   // ?arm=0 closes it, no param just reports state — the dashboard polls this to keep its unlocked
   // UI honest, so a reload while armed comes back unlocked and a lock from another client relocks
   // every tab within a poll. Nothing times out; see settingsArmActive() in 5_functions.ino.
+  // With the settings password on (pwRequired): arm=1 needs pw= and answers with tok=, which the
+  // dashboard then puts on every mutating request; arm=0 needs a live tok; and "armed" in the reply
+  // is THIS client's standing, not the global flag, so a page without the password stays locked.
   server.on("/armSettings", HTTP_GET, [](AsyncWebServerRequest *request) {
+    int code = 200;
+    const char *issued = nullptr;
+    uint32_t waitS = 0;
     if (request->hasParam("arm")) {
       bool arm = request->getParam("arm")->value().toInt() != 0;
-      if (arm) {
+      if (arm && !pwRequired) {
         settingsArmed = true;
         queueConsoleMessage("Settings ARMED: changes accepted until locked or rebooted");
+      } else if (arm) {
+        uint32_t now = millis();
+        if (pwLockUntilMs && (int32_t)(pwLockUntilMs - now) > 0) {
+          code = 429;
+          waitS = (pwLockUntilMs - now + 999) / 1000;
+        } else if (pwVerify(request->hasParam("pw") ? request->getParam("pw")->value().c_str() : nullptr)) {
+          pwFailCount = 0;
+          pwLockUntilMs = 0;
+          settingsArmed = true;
+          issued = armTokenIssue();
+          queueConsoleMessageF("Settings ARMED with password from %s: changes accepted until locked or rebooted",
+                               request->client()->remoteIP().toString().c_str());
+        } else {
+          code = 403;
+          if (++pwFailCount >= 5) {
+            pwLockUntilMs = now + 60000UL;
+            pwFailCount = 0;
+          }
+          queueConsoleMessageF("Unlock Settings REFUSED: wrong password from %s", request->client()->remoteIP().toString().c_str());
+        }
       } else if (settingsArmed) {
-        settingsArmed = false;
-        queueConsoleMessage("Settings locked");
+        if (pwRequired && !armTokenValid(request)) {
+          code = 403;
+        } else {
+          settingsArmed = false;
+          armTokensClear();
+          queueConsoleMessage("Settings locked");
+        }
       }
     }
-    char out[48];
-    snprintf(out, sizeof(out), "{\"armed\":%d}", settingsArmActive() ? 1 : 0);
+    String out = "{\"armed\":";
+    out += (issued || settingsArmActive(request)) ? "1" : "0";
+    out += ",\"pw\":";
+    out += pwRequired ? "1" : "0";
+    if (issued) {
+      out += ",\"tok\":\"";
+      out += issued;
+      out += '"';
+    }
+    if (code == 403) out += ",\"err\":\"password\"";
+    if (code == 429) {
+      out += ",\"err\":\"locked\",\"wait\":";
+      out += String(waitS);
+    }
+    out += '}';
+    request->send(code, "application/json", out);
+  });
+
+  // Settings password (Setup > System). Arm-gated like every other mutation, and a change or a
+  // turn-off also needs the current password, so a page left unlocked cannot silently change it.
+  // POST body only: the password never rides in a URL a log or a proxy could keep.
+  server.on("/setPassword", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!settingsArmActive(request)) {
+      request->send(403, "application/json", "{\"ok\":0,\"err\":\"armed\"}");
+      return;
+    }
+    String cur = request->hasParam("cur", true) ? request->getParam("cur", true)->value() : String();
+    if (pwRequired && !pwVerify(cur.c_str())) {
+      request->send(403, "application/json", "{\"ok\":0,\"err\":\"password\"}");
+      return;
+    }
+    if (request->hasParam("off", true) && request->getParam("off", true)->value().toInt() == 1) {
+      pwClear();
+      queueConsoleMessage("Settings password turned OFF");
+      request->send(200, "application/json", "{\"ok\":1,\"pw\":0}");
+      return;
+    }
+    String nw = request->hasParam("new", true) ? request->getParam("new", true)->value() : String();
+    nw.trim();
+    if (nw.length() < 4 || nw.length() > 32) {
+      request->send(400, "application/json", "{\"ok\":0,\"err\":\"length\"}");
+      return;
+    }
+    if (!pwStore(nw.c_str())) {
+      request->send(500, "application/json", "{\"ok\":0,\"err\":\"store\"}");
+      return;
+    }
+    queueConsoleMessage("Settings password set: Unlock Settings now asks for it");
+    String out = "{\"ok\":1,\"pw\":1,\"tok\":\"";
+    out += armTokenIssue();   // pwStore retired every token; this client stays unlocked
+    out += "\"}";
+    request->send(200, "application/json", out);
+  });
+
+  // The boat's other regulators (Setup > System > Regulators on this boat). The dashboard writes
+  // both units, so each side is a plain arm-gated store of the other's uid and name.
+  server.on("/pair", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!settingsArmActive(request)) {
+      request->send(403, "text/plain", "Settings not armed");
+      return;
+    }
+    String uid = request->hasParam("uid") ? request->getParam("uid")->value() : String();
+    String name = request->hasParam("name") ? request->getParam("name")->value() : String();
+    if (!pairListAdd(uid.c_str(), name.c_str())) {
+      request->send(400, "text/plain", "Not a regulator id, this unit, or the list is full");
+      return;
+    }
+    queueConsoleMessageF("Paired with regulator %s", name.length() ? name.c_str() : uid.c_str());
+    String out = "{\"ok\":1,\"paired\":";
+    pairListAppendJson(out);
+    out += '}';
+    request->send(200, "application/json", out);
+  });
+  server.on("/unpair", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!settingsArmActive(request)) {
+      request->send(403, "text/plain", "Settings not armed");
+      return;
+    }
+    String uid = request->hasParam("uid") ? request->getParam("uid")->value() : String();
+    pairListRemove(uid.c_str());
+    String out = "{\"ok\":1,\"paired\":";
+    pairListAppendJson(out);
+    out += '}';
     request->send(200, "application/json", out);
   });
 
@@ -9075,7 +9519,7 @@ void setupServer() {
 
   // Cloud Features
   server.on("/checkRegistration", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -9100,7 +9544,7 @@ void setupServer() {
   // /deleteAllData). "code" is the HTTP status the old synchronous handler would have sent;
   // "body" is its exact JSON reply.
   server.on("/cloudOpState", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -9128,7 +9572,9 @@ void setupServer() {
   // The discovery floor, and the only thing that can tell two regulators apart before a client
   // commits to one: uid is what the app pins to, name is what it shows the user, host is the
   // per-unit mDNS name, ap is this unit's access-point SSID (per-unit now, so the app's Join
-  // button cannot offer a name that belongs to another board).
+  // button cannot offer a name that belongs to another board). pwreq says whether Unlock Settings
+  // will ask for a password, paired is this boat's other regulators, peers is every other regulator
+  // this unit currently hears on the network — the dashboard's picker is built from those two.
   server.on("/identify", HTTP_GET, [](AsyncWebServerRequest *request) {
     String idBuf = "{\"device\":\"xreg-010\",\"uid\":\"";
     idBuf += device_id_hex;
@@ -9143,7 +9589,13 @@ void setupServer() {
     // Own address: a browser tab opened by name has no IPv4 of its own to seed the LAN sweep with.
     idBuf += ",\"ip\":\"";
     idBuf += ((WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP()).toString();
-    idBuf += "\"}";
+    idBuf += "\",\"pwreq\":";
+    idBuf += pwRequired ? "1" : "0";
+    idBuf += ",\"paired\":";
+    pairListAppendJson(idBuf);
+    idBuf += ",\"peers\":";
+    peerListAppendJson(idBuf);
+    idBuf += "}";
     AsyncWebServerResponse *r = request->beginResponse(200, "application/json", idBuf);
     r->addHeader("Access-Control-Allow-Origin", "*");
     request->send(r);
@@ -9165,7 +9617,7 @@ void setupServer() {
   });
   // Cloud Features
   server.on("/registerProfile", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -9189,7 +9641,7 @@ void setupServer() {
   });
 
   server.on("/updateProfile", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -9223,7 +9675,7 @@ void setupServer() {
   });
 
   server.on("/deleteAllData", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!settingsArmActive()) {
+    if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -11495,7 +11947,6 @@ void migrateVesselInfoFile() {
   vesselNvsSet(h, NK_battMakeModel,  (const char *)(doc["battery_make_model"] | ""));
   vesselNvsSet(h, NK_altBrandModel,  (const char *)(doc["alternator_brand_model"] | ""));
   vesselNvsSet(h, NK_imuMountOrient, String((int)(doc["imu_mount_orientation"] | 0)).c_str());
-  vesselNvsSet(h, NK_regMountLoc,    String((int)(doc["regulator_mount_loc"] | 0)).c_str());
   vesselNvsSet(h, NK_imuDistBowFt,   String((float)(doc["imu_dist_bow_ft"] | 0.0f), 2).c_str());
   vesselNvsSet(h, NK_imuDistClFt,    String((float)(doc["imu_dist_cl_ft"] | 0.0f), 2).c_str());
   vesselNvsSet(h, NK_imuHtWlFt,      String((float)(doc["imu_height_wl_ft"] | 0.0f), 2).c_str());
@@ -11543,7 +11994,6 @@ void saveVesselInfoToNvs() {
   vesselNvsSet(h, NK_regName,            REGULATOR_NAME);
   vesselNvsSet(h, NK_SolarWatts,         String(SolarWatts).c_str());
   vesselNvsSet(h, NK_imuMountOrient,     String((int)imuMountOrientation).c_str());
-  vesselNvsSet(h, NK_regMountLoc,        String((int)regulatorMountLoc).c_str());
   vesselNvsSet(h, NK_imuDistBowFt,       String(IMU_DIST_BOW_FT, 2).c_str());
   vesselNvsSet(h, NK_imuDistClFt,        String(IMU_DIST_CL_FT, 2).c_str());
   vesselNvsSet(h, NK_imuHtWlFt,          String(IMU_HEIGHT_WL_FT, 2).c_str());

@@ -1052,7 +1052,6 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "battery_make_model", NK_battMakeModel, 1 },
   { "alternator_brand_model", NK_altBrandModel, 1 },
   { "imu_mount_orientation", NK_imuMountOrient, 3 },
-  { "regulator_mount_loc", NK_regMountLoc, 3 },
   { "imu_dist_bow_ft", NK_imuDistBowFt, 3 },
   { "imu_dist_cl_ft", NK_imuDistClFt, 3 },
   { "imu_height_wl_ft", NK_imuHtWlFt, 3 },
@@ -1130,13 +1129,22 @@ static bool cfgRegistrySkipped(const char *name) {
   return false;
 }
 
-// Append val as a JSON string literal (quotes + backslash escaped).
+// Append val as a JSON string literal (quotes + backslash escaped, control characters as \u00XX —
+// a regulator name or another unit's mDNS record can carry anything).
 static void cfgAppendJsonStr(String &out, const String &val) {
   out += '"';
   for (size_t i = 0; i < val.length(); i++) {
     char c = val[i];
-    if (c == '"' || c == '\\') out += '\\';
-    out += c;
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if ((unsigned char)c < 0x20) {
+      char e[8];
+      snprintf(e, sizeof(e), "\\u%04x", (unsigned)(unsigned char)c);
+      out += e;
+    } else {
+      out += c;
+    }
   }
   out += '"';
 }
@@ -1363,7 +1371,6 @@ String vesselInfoJson() {
   j += ",\"alternator_brand_model\":";  cfgAppendJsonStr(j, ALTERNATOR_BRAND_MODEL);
   j += ",\"solar_watts\":";             j += String(SolarWatts);
   j += ",\"imu_mount_orientation\":";   j += String((unsigned)imuMountOrientation);
-  j += ",\"regulator_mount_loc\":";     j += String((unsigned)regulatorMountLoc);
   j += ",\"imu_dist_bow_ft\":";         j += String(IMU_DIST_BOW_FT, 2);
   j += ",\"imu_dist_cl_ft\":";          j += String(IMU_DIST_CL_FT, 2);
   j += ",\"imu_height_wl_ft\":";        j += String(IMU_HEIGHT_WL_FT, 2);

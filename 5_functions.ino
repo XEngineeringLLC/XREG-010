@@ -5636,8 +5636,12 @@ void ensurePreferredBootPartition() {
 }
 // The settings arm gate — every mutating endpoint calls this. Nothing expires it: only an explicit
 // lock (Lock Settings, or any client's /armSettings?arm=0) or a reboot clears settingsArmed.
-bool settingsArmActive() {
-  return settingsArmed;
+// With the settings password on, the arm belongs to the clients holding a token from /armSettings,
+// so the request itself is what is checked.
+bool settingsArmActive(AsyncWebServerRequest *request) {
+  if (!settingsArmed) return false;
+  if (!pwRequired) return true;
+  return armTokenValid(request);
 }
 // Mirror every queued message into the /consolehist.txt history ring (own indices, own short
 // critical section — never nested inside the queue's).

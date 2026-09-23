@@ -528,6 +528,12 @@ bool fsRemove(const char *path) {
 #define NK_pass "pass"
 #define NK_apssid "apssid"
 #define NK_appass "appass"
+// Access control (accessInit, 3_functions.ino): the settings-password requirement, its salt and
+// SHA-256 (never the password itself), and the boat's paired regulators (pairListSave format).
+#define NK_pwReq "pwReq"
+#define NK_pwSalt "pwSalt"
+#define NK_pwHash "pwHash"
+#define NK_pairList "pairList"
 #define NK_first_config_done "firstconfigdone"
 #define NK_imu_zero "imu_zero"
 #define NK_imu_mnt_state "imu_mnt_state"
@@ -578,7 +584,7 @@ bool fsRemove(const char *path) {
 #define NK_battMakeModel   "battMakeModel"
 #define NK_altBrandModel   "altBrandModel"
 #define NK_imuMountOrient  "imuMountOrient"
-#define NK_regMountLoc     "regMountLoc"
+// #define NK_regMountLoc  "regMountLoc"   // RETIRED 2026-09-22 with the Regulator Location field (nothing ever read it once the board-temperature battery stand-in went) — key reserved, never reuse
 #define NK_imuDistBowFt    "imuDistBowFt"
 #define NK_imuDistClFt     "imuDistClFt"
 #define NK_imuHtWlFt       "imuHtWlFt"

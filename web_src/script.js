@@ -1646,6 +1646,8 @@ function updateAltHealth() {
   if (modeLbl) modeLbl.textContent = [altLive.source>=1 ? 'Uploaded reference' : '',
                                       altLive.paused>=1 ? 'learning paused' : '']
                                      .filter(Boolean).join(' · ');
+  const modeWrap = document.getElementById('alt-mode-wrap');
+  if (modeWrap && modeLbl) modeWrap.style.display = modeLbl.textContent ? '' : 'none';
   setSegEcho('altSource', ['alt-src-hist','alt-src-file'], altLive.source>=1?1:0);
   setSegEcho('altPaused', ['alt-learn-on','alt-learn-off'], altLive.paused>=1?1:0);
   setSegEcho('altSimMode', ['alt-sim-off','alt-sim-on'], altLive.sim>=1?1:0);   // simulator segmented toggle in Setup (mirrors Vessel Performance)
@@ -3965,6 +3967,19 @@ function controlUid() {
     return g_streamUid || (IS_CAPACITOR ? rememberedUid() : ((window.xregUnit && window.xregUnit.uid) || null));
 }
 
+// Endpoints behind the settings arm gate. With the settings password on they also need the token
+// /armSettings handed this client, so buildURL puts it on these and syncWriteUidInputs on the forms.
+const ARM_GATED_PATHS = ['/get', '/armSettings', '/factoryReset', '/huntclear', '/perfUploadFront', '/altUploadFront',
+    '/exportConfig', '/importConfig', '/saveVesselInfo', '/checkRegistration', '/cloudOpState', '/registerProfile',
+    '/updateProfile', '/deleteAllData', '/setPassword', '/pair', '/unpair'];
+function isArmGatedPath(path) {
+    return ARM_GATED_PATHS.indexOf(path.split('?')[0]) !== -1;
+}
+// The token is per unit (the app moves between units; a browser origin is one unit anyway).
+function armTokKey() { return 'xregArmTok:' + (controlUid() || ''); }
+function armTokenGet() { try { return localStorage.getItem(armTokKey()) || ''; } catch (e) { return ''; } }
+function armTokenSet(tok) { try { if (tok) localStorage.setItem(armTokKey(), tok); else localStorage.removeItem(armTokKey()); } catch (e) { } }
+
 function buildURL(path) {
 
     if (!path.startsWith('/')) {
@@ -3973,6 +3988,10 @@ function buildURL(path) {
     if (path === '/get' || path.startsWith('/get?')) {
         const uid = controlUid();
         if (uid) path += (path.indexOf('?') === -1 ? '?' : '&') + 'uid=' + uid;
+    }
+    if (isArmGatedPath(path)) {
+        const tok = armTokenGet();
+        if (tok) path += (path.indexOf('?') === -1 ? '?' : '&') + 'tok=' + tok;
     }
     return `${API_BASE_URL}${path}`;
 }
@@ -3986,9 +4005,16 @@ function syncWriteUidInputs(form) {
     forms.forEach(f => {
         if (!/\/get(\?|$)/.test(f.getAttribute('action') || '')) return;
         let inp = f.querySelector('input[name="uid"]');
-        if (!uid) { if (inp) inp.remove(); return; }
-        if (!inp) { inp = document.createElement('input'); inp.type = 'hidden'; inp.name = 'uid'; f.appendChild(inp); }
-        inp.value = uid;
+        if (!uid) { if (inp) inp.remove(); }
+        else {
+            if (!inp) { inp = document.createElement('input'); inp.type = 'hidden'; inp.name = 'uid'; f.appendChild(inp); }
+            inp.value = uid;
+        }
+        const tok = armTokenGet();
+        let tin = f.querySelector('input[name="tok"]');
+        if (!tok) { if (tin) tin.remove(); return; }
+        if (!tin) { tin = document.createElement('input'); tin.type = 'hidden'; tin.name = 'tok'; f.appendChild(tin); }
+        tin.value = tok;
     });
 }
 document.addEventListener('DOMContentLoaded', () => syncWriteUidInputs());
@@ -4058,7 +4084,10 @@ async function probeIdentify(base, timeoutMs) {
             name: str(info.name),
             host: str(info.host),
             ap: str(info.ap),
-            ip: str(info.ip)
+            ip: str(info.ip),
+            pwreq: info.pwreq === 1 || info.pwreq === '1',
+            paired: Array.isArray(info.paired) ? info.paired.filter(x => x && typeof x.uid === 'string') : [],
+            peers: Array.isArray(info.peers) ? info.peers.filter(x => x && typeof x.uid === 'string') : []
         };
     } catch (e) {
         return null;
@@ -4287,7 +4316,27 @@ function applyConnectedIdentity(hit) {
     set('unitAddrOut', where || '\u2014');
     const apEl = document.getElementById('regApSsid');
     if (apEl && !localStorage.getItem('xregApSsid') && hit.ap) apEl.value = hit.ap;
+    if (typeof hit.pwreq === 'boolean') g_pwRequired = hit.pwreq;
+    renderBoatCard();
+    renderAccessCard();
     syncWriteUidInputs();
+}
+
+// A peer entry from /identify (another unit, as this one hears it over mDNS) in the shape the
+// picker and the connect path use for a unit that answered /identify itself.
+function peerAsHit(p) {
+    return {
+        base: 'http://' + (p.ip || p.host), fw: p.fw || null, uid: p.uid, name: p.name || null,
+        host: p.host || null, ip: p.ip || null, pair: p.pair || '', fromPeer: true
+    };
+}
+
+// Re-read the connected unit's /identify (pairings, peers, password state change over time).
+async function refreshUnitIdentity() {
+    if (DEMO_MODE) return null;
+    const hit = await probeIdentify(API_BASE_URL || '', 4000);
+    if (hit && hit.uid) applyConnectedIdentity(hit);
+    return hit;
 }
 
 function connectToRegulator(hit) {
@@ -4317,11 +4366,36 @@ async function resolveRegulatorChoice(hits, wantUid) {
     // Pre-identity firmware answers with no uid at all; there is nothing to disambiguate with,
     // so keep the old behaviour rather than trapping the user behind an unanswerable dialog.
     if (hits.length === 1 && (!wantUid || !hits[0].uid)) return hits[0];
-    return await chooseRegulator(hits, wantUid);
+    return await chooseRegulator(hits, wantUid, false, { mineUid: wantUid });
 }
 
-// Picker. Resolves with the chosen hit, or null if dismissed.
-function chooseRegulator(hits, wantUid, forced) {
+// Which units belong together. Every unit advertises the uid6 list of the regulators paired with it
+// (pair from mDNS TXT, paired from its own /identify); a group is the union of those claims. A
+// stranger's unit on a marina network claims nothing about ours, so it lands in a group of its own.
+function groupHits(hits) {
+    const key = h => uid6(h.uid || '').toLowerCase();
+    const pairOf = h => {
+        if (typeof h.pair === 'string' && h.pair) return h.pair.split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+        return (h.paired || []).map(x => uid6(x.uid).toLowerCase());
+    };
+    const parent = {};
+    const find = k => { while (parent[k] !== k) { parent[k] = parent[parent[k]]; k = parent[k]; } return k; };
+    hits.forEach(h => { parent[key(h)] = key(h); });
+    hits.forEach(h => pairOf(h).forEach(o => {
+        if (parent[o] === undefined) return;
+        const a = find(key(h)), b = find(o);
+        if (a !== b) parent[a] = b;
+    }));
+    const groups = {};
+    hits.forEach(h => { const r = find(key(h)); (groups[r] = groups[r] || []).push(h); });
+    return Object.keys(groups).map(k => groups[k]);
+}
+
+// Picker. Resolves with the chosen hit, null if dismissed, or 'rescan' when opts.rescan offered a
+// network search and the user took it. opts.mineUid names the unit the caller already speaks for:
+// its group is captioned as this boat and everything else goes under a separate heading.
+function chooseRegulator(hits, wantUid, forced, opts) {
+    opts = opts || {};
     return new Promise((resolve) => {
         // A picker already up belongs to an earlier caller: settle it with null rather than orphan its await.
         const old = document.getElementById('regPickerDialog');
@@ -4329,31 +4403,54 @@ function chooseRegulator(hits, wantUid, forced) {
         const missing = wantUid && !hits.some(h => h.uid === wantUid);
         const lastName = localStorage.getItem('xregDeviceName');
         let lead;
-        if (forced) lead = 'Choose which regulator this app should use.';
-        else if (missing) lead = 'The regulator this app was using' + (lastName ? ' (' + lastName + ')' : '') +
+        if (opts.lead) lead = opts.lead;
+        else if (forced) lead = 'Choose which regulator to use.';
+        else if (missing) lead = 'The regulator this ' + (IS_CAPACITOR ? 'app' : 'browser') + ' was using' + (lastName ? ' (' + lastName + ')' : '') +
             ' did not answer. These did:';
-        else lead = 'More than one regulator answered on this network. Choose the one this app should use.';
+        else lead = 'More than one regulator answered on this network. Choose the one to use.';
 
-        const rows = hits.map((h, i) => {
+        const mine = (opts.mineUid || '').toUpperCase();
+        const inGroup = (g, uid) => !!uid && g.some(h => (h.uid || '').toUpperCase() === uid);
+        let groups = groupHits(hits);
+        // This boat first, then the units set up together, then singles.
+        groups.sort((a, b) => (inGroup(b, mine) - inGroup(a, mine)) || (b.length > 1) - (a.length > 1));
+
+        const rowHtml = (h, i) => {
             const isCur = h.uid && h.uid === wantUid;
             return '<button data-idx="' + i + '" class="reg-pick-row" style="display:block; width:100%; text-align:left; background:#2a2a2a; border:1px solid ' +
                 (isCur ? '#35d6c7' : '#484848') + '; color:#ddd; border-radius:6px; padding:10px 12px; margin-bottom:8px; cursor:pointer; font-size:13px;">' +
                 '<span style="font-weight:600; color:#fff;"></span>' +
                 '<span style="display:block; color:#8a8a8a; font-size:11px; margin-top:3px;"></span></button>';
-        }).join('');
+        };
+        let rows = '', otherHeadingDone = false;
+        groups.forEach(g => {
+            const isMine = mine && inGroup(g, mine);
+            if (mine && !isMine && !otherHeadingDone) {
+                rows += '<div style="font-size:11px; color:#777; margin:10px 0 6px; letter-spacing:0.03em;">OTHER REGULATORS ON THIS NETWORK</div>';
+                otherHeadingDone = true;
+            }
+            const boxed = g.length > 1;
+            if (boxed) rows += '<div style="border:1px solid #3a3a3a; border-radius:8px; padding:8px 8px 0; margin-bottom:8px;">' +
+                '<div style="font-size:11px; color:' + (isMine ? '#35d6c7' : '#999') + '; margin:0 0 8px 2px;">' +
+                (isMine ? 'This boat' : 'Set up together as one boat') + '</div>';
+            g.forEach(h => { rows += rowHtml(h, hits.indexOf(h)); });
+            if (boxed) rows += '</div>';
+        });
 
         const div = document.createElement('div');
         div.id = 'regPickerDialog';
         div.innerHTML = '<div id="regPickBackdrop" style="position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:10001; display:flex; align-items:center; justify-content:center;">' +
-            '<div style="background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">' +
+            '<div style="background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); max-height:calc(100vh - 60px); overflow-y:auto; border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">' +
             '<div style="padding:10px 16px 9px; border-bottom:1px solid #333; background:#252525; border-radius:8px 8px 0 0; font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em; display:flex; align-items:center; justify-content:space-between;">' +
-            '<span>Choose Regulator</span>' +
+            '<span id="regPickTitle"></span>' +
             '<button id="regPickClose" type="button" aria-label="Close" style="background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button></div>' +
             '<div style="padding:16px 18px 18px; font-size:0.92em; line-height:1.5;">' +
             '<p id="regPickLead" style="margin:0 0 12px; color:#bbb;"></p>' +
             '<div id="regPickRows">' + rows + '</div>' +
-            '<p style="font-size:11px; color:#777; margin:10px 0 0;">The app remembers this unit and reconnects to it by identity, not by address, so a new IP or a second regulator on the network cannot swap it out.</p>' +
-            '<div style="display:flex; justify-content:flex-end; margin-top:12px;">' +
+            '<p style="font-size:11px; color:#777; margin:10px 0 0;">' + (opts.note || ('This ' + (IS_CAPACITOR ? 'app' : 'browser') +
+                ' remembers the unit and reconnects to it by identity, not by address, so a new IP or another regulator on the network cannot swap it out.')) + '</p>' +
+            '<div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px; flex-wrap:wrap;">' +
+            (opts.rescan ? '<button id="regPickRescan" type="button" style="background:transparent; border:1px solid #35d6c7; color:#35d6c7; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:0.9em;">Search the network</button>' : '') +
             '<button id="regPickCancel" type="button" style="background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em;">Not now</button></div>' +
             '</div></div></div>';
         document.body.appendChild(div);
@@ -4370,18 +4467,22 @@ function chooseRegulator(hits, wantUid, forced) {
         };
         div._dismiss = () => finish(null);
         document.addEventListener('keydown', onKey);
+        div.querySelector('#regPickTitle').textContent = opts.title || 'Choose Regulator';
         div.querySelector('#regPickClose').onclick = () => finish(null);
         div.querySelector('#regPickCancel').onclick = () => finish(null);
+        const rescanBtn = div.querySelector('#regPickRescan');
+        if (rescanBtn) rescanBtn.onclick = () => finish('rescan');
         const backdrop = div.querySelector('#regPickBackdrop');
         backdrop.addEventListener('click', e => { if (e.target === backdrop) finish(null); });
-        // Device-supplied text goes in with textContent — a unit name is user input.
+        // Device-supplied text goes in with textContent — a unit name is user input, and a peer's
+        // name arrived over the network.
         div.querySelector('#regPickLead').textContent = lead;
         div.querySelectorAll('.reg-pick-row').forEach(btn => {
             const h = hits[Number(btn.dataset.idx)];
             const spans = btn.querySelectorAll('span');
             spans[0].textContent = unitLabel(h) + (h.uid && h.uid === wantUid ? '  (current)' : '');
             spans[1].textContent = [unitWhere(h), h.uid ? 'ID ' + uid6(h.uid) : '', h.fw ? 'fw ' + h.fw : '']
-                .filter(Boolean).join('  ·  ');
+                .filter(Boolean).join('  \u00b7  ');
             btn.onclick = () => finish(h);
         });
     });
@@ -4389,20 +4490,41 @@ function chooseRegulator(hits, wantUid, forced) {
 
 // Explicit "I want the other one". Always asks, even when the remembered unit answered. The app
 // re-points itself; a browser moves the tab, because every endpoint but /identify is same-origin.
+// The connected unit already hears its neighbours over mDNS, so the list is instant; the full
+// subnet sweep only runs when it hears nothing, or on request from the picker.
 async function switchRegulator() {
     if (discoveryInProgress) return;
-    discoveryInProgress = true;
-    // The only feedback on the settings page while the full sweep runs (up to ~15 s on a router LAN).
     const btn = document.querySelector('button[onclick="switchRegulator()"]');
-    const btnLabel = btn ? btn.textContent : '';
-    if (btn) { btn.disabled = true; btn.textContent = 'Scanning...'; }
-    let hits = [];
-    setSplashText('Searching for regulators');
-    try { hits = await discoverDeviceBase(rememberedUid(), true); }
-    finally { discoveryInProgress = false; if (btn) { btn.disabled = false; btn.textContent = btnLabel; } }
+    const me = await refreshUnitIdentity();
+    let hits = me && me.uid ? [me].concat((me.peers || []).map(peerAsHit)) : [];
+    let allowRescan = hits.length > 1;
+    if (hits.length <= 1) hits = await sweepAllRegulators(btn);
     if (!hits.length) { xAlert('No regulator answered on this network.', 'Switch Regulator'); return; }
-    const hit = await chooseRegulator(hits, rememberedUid(), true);
-    if (!hit) return;
+    let hit = await chooseRegulator(hits, rememberedUid(), true, { mineUid: me && me.uid, rescan: allowRescan });
+    if (hit === 'rescan') {
+        hits = await sweepAllRegulators(btn);
+        if (!hits.length) { xAlert('No regulator answered on this network.', 'Switch Regulator'); return; }
+        hit = await chooseRegulator(hits, rememberedUid(), true, { mineUid: me && me.uid });
+    }
+    if (!hit || hit === 'rescan') return;
+    openRegulator(hit);
+}
+
+// The whole-network search behind Switch Regulator and Add a Regulator: every round of
+// discoverDeviceBase runs to its end. Up to ~15 s on a router LAN; the button says so.
+async function sweepAllRegulators(btn) {
+    if (discoveryInProgress) return [];
+    discoveryInProgress = true;
+    const label = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Scanning...'; }
+    setSplashText('Searching for regulators');
+    try { return await discoverDeviceBase(rememberedUid(), true); }
+    finally { discoveryInProgress = false; if (btn) { btn.disabled = false; btn.textContent = label; } }
+}
+
+// Go to a unit: the app re-points itself, a browser moves the tab.
+function openRegulator(hit) {
+    if (!hit || !hit.uid) return;
     if (IS_CAPACITOR) { connectToRegulator(hit); initializeEventSource(); return; }
     moveTabToRegulator(hit);
 }
@@ -4484,16 +4606,44 @@ async function onStreamUnitMismatch(streamUid, wantUid) {
 // address or by that shared name, never on one already at the unit's own name, so it cannot
 // loop; silent when the name does not answer (most Android browsers, some locked-down Windows
 // networks) — those clients go on using the address exactly as before.
+// A browser's pick at the shared name, kept at that origin: alternator.local is served by whichever
+// unit won the resolver race, but localStorage there belongs to the name, so the choice survives
+// no matter which board served the page.
+function sharedChoiceGet() { try { return localStorage.getItem('xregChosenUid') || null; } catch (e) { return null; } }
+function sharedChoiceSet(uid) { try { if (uid) localStorage.setItem('xregChosenUid', uid.toUpperCase()); } catch (e) { } }
+
 async function initUnitIdentity() {
     if (IS_CAPACITOR || DEMO_MODE) return;
     const hit = await probeIdentify(API_BASE_URL || '', 4000);
     if (!hit) return;
     applyConnectedIdentity(hit);
+    syncArmState();   // identity known: the arm poll can now carry this unit's token
     if (hit.uid) localStorage.setItem('xregDeviceUid', hit.uid);
     if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
     localStorage.setItem('xregDeviceBase', location.origin);
     if (!CAN_DISCOVER || !hit.uid || !hit.host) return;
     if (location.hostname.toLowerCase() === hit.host.toLowerCase()) return;
+    // The shared name on a network with more than one regulator: this browser's earlier choice
+    // wins, otherwise the question is asked. A resolver race must not decide which engine a page
+    // drives, and on shared marina WiFi the winner may be another boat's unit entirely.
+    if (location.hostname.toLowerCase() === 'alternator.local' && hit.peers && hit.peers.length) {
+        const chosen = sharedChoiceGet();
+        let target = null;
+        if (chosen && chosen === hit.uid.toUpperCase()) target = hit;
+        else if (chosen) { const p = hit.peers.find(x => (x.uid || '').toUpperCase() === chosen); if (p) target = peerAsHit(p); }
+        if (!target) {
+            let all = [hit].concat(hit.peers.map(peerAsHit));
+            const lead = 'More than one regulator is on this network. Which one is yours? An unnamed unit shows the six characters from its hotspot name and label. Units set up together are shown together.';
+            let pick = await chooseRegulator(all, chosen, true, { lead: lead, rescan: true, note: 'This browser remembers the answer. Bookmark the page it lands on to skip the question.' });
+            if (pick === 'rescan') {
+                const swept = await sweepAllRegulators(null);
+                swept.forEach(h => { if (!all.some(a => a.uid === h.uid)) all.push(h); });
+                pick = await chooseRegulator(all, chosen, true, { lead: lead, note: 'This browser remembers the answer. Bookmark the page it lands on to skip the question.' });
+            }
+            if (pick && pick !== 'rescan') { sharedChoiceSet(pick.uid); target = pick; }
+        }
+        if (target && target.uid.toUpperCase() !== hit.uid.toUpperCase()) { moveTabToRegulator(target); return; }
+    }
     const byName = await probeIdentify('http://' + hit.host, 2500);
     // Same uid or nothing: on a two-regulator boat a name that lands on the other board would
     // silently swap which unit this tab is driving.
@@ -6759,8 +6909,9 @@ function confirmUpdate(form, version) {
         // UpdateToVersion is arm-gated in firmware (a stale/replayed update URL must never
         // reboot the device); the OK click above is the acknowledgment, so arm just-in-time.
         // The arm window is RAM-only and dies at the update reboot seconds later.
-        fetchWithTimeout(buildURL('/armSettings?arm=1'), {}, 8000)
-            .then(() => {
+        armDevice('Starting a firmware update.')
+            .then(ok => {
+                if (!ok) return;   // password prompt cancelled or refused: nothing starts
                 kickOffAppWebUpdate(version);  // No-op in browser; in iOS app downloads matching web bundle in parallel
                 showUpdateInProgressOverlay(version);  // Same modal the forced-update path shows
                 form.submit();
@@ -7208,7 +7359,7 @@ function cfgPushShowPending(count, note) {
         // triggerForcedUpdate) or an unarmed dashboard gets a silent 403 while this popup
         // claims "Restarting". The panel stays up until arming succeeds.
         try {
-            await fetchWithTimeout(buildURL('/armSettings?arm=1'), {}, 8000);
+            if (!(await armDevice('Restarting the regulator.'))) return;
         } catch (e) {
             xAlert('Could not reach the device to restart it. Check the connection and try again.');
             return;
@@ -7290,7 +7441,7 @@ async function triggerForcedUpdate(versionStr) {
         // UpdateToVersion is arm-gated in firmware; the OK click above is the acknowledgment,
         // so arm just-in-time. The arm window is RAM-only and dies at the update reboot.
         try {
-            await fetchWithTimeout(buildURL('/armSettings?arm=1'), {}, 8000);
+            if (!(await armDevice('Starting a firmware update.'))) return;
         } catch (e) {
             xAlert('Could not reach the device to start the update. Check the connection and try again.');
             return;
@@ -9182,6 +9333,7 @@ function applySettingsLockUI() {
 }
 function lockSettingsManually() {
     if (!DEMO_MODE) fetch(buildURL('/armSettings?arm=0')).catch(() => {});
+    armTokenSet(null);
     applySettingsLockUI();
 }
 // Tooltip / "s"-badge open-close — this one handler owns ALL of it (no inline onclicks):
@@ -9427,10 +9579,6 @@ async function fetchAndPopulateVesselInfo() {
             }
         });
 
-        form.querySelectorAll('input[name="regulatorMountLoc"]').forEach(radio => {
-            if (parseInt(radio.value) === data.regulator_mount_loc) radio.checked = true;
-        });
-
         form.IMU_DIST_BOW_FT.value = data.imu_dist_bow_ft || '';
         form.IMU_DIST_CL_FT.value = data.imu_dist_cl_ft || '';
         form.IMU_HEIGHT_WL_FT.value = data.imu_height_wl_ft || '';
@@ -9451,7 +9599,6 @@ async function fetchAndPopulateVesselInfo() {
             data.alternator_brand_model !== undefined &&
             data.solar_watts !== undefined &&
             data.imu_mount_orientation !== undefined &&
-            data.regulator_mount_loc !== undefined &&
             data.imu_dist_bow_ft !== undefined &&
             data.imu_dist_cl_ft !== undefined &&
             data.imu_height_wl_ft !== undefined;
@@ -9487,11 +9634,6 @@ async function handleVesselInfoSave(event) {
         xAlert('Please select a mounting orientation');
         return;
     }
-    const selectedMountLoc = form.querySelector('input[name="regulatorMountLoc"]:checked');
-    if (!selectedMountLoc) {
-        xAlert('Please select where the regulator is mounted');
-        return;
-    }
 
     const vesselData = {
         regulator_name: form.REGULATOR_NAME ? form.REGULATOR_NAME.value.trim() : '',
@@ -9510,7 +9652,6 @@ async function handleVesselInfoSave(event) {
         alternator_brand_model: form.ALTERNATOR_BRAND_MODEL.value,
         solar_watts: parseInt(form.SOLAR_WATTS.value),
         imu_mount_orientation: parseInt(selectedOrientation.value),
-        regulator_mount_loc: parseInt(selectedMountLoc.value),
         imu_dist_bow_ft: parseFloat(form.IMU_DIST_BOW_FT.value),
         imu_dist_cl_ft: parseFloat(form.IMU_DIST_CL_FT.value),
         imu_height_wl_ft: parseFloat(form.IMU_HEIGHT_WL_FT.value)
@@ -9766,7 +9907,7 @@ function ocvBlobsEqual(a, b) {
     return true;
 }
 
-function deriveBatteryDefaults(type, capAh, sysV, mountLoc, battProbe) {
+function deriveBatteryDefaults(type, capAh, sysV, battProbe) {
     // bulkV/absV lean gentle for stress/lifetime: LiFePO4 13.9 V ≈ high-90s% SoC well below 14.4+;
     // AGM at 14.4; flooded higher (14.6) because it needs the extra to counter stratification and its
     // dominant killer is UNDERcharge (sulfation), not overcharge. limC is the opposite philosophy: high
@@ -9856,7 +9997,7 @@ function deriveBatteryDefaults(type, capAh, sysV, mountLoc, battProbe) {
     rows.push({ param: 'coldChargeLockoutEnable', label: 'Cold-Charge Lockout', value: T.cold, show: v => v ? 'On' : 'Off' });
     // A battery probe is what gives the derate and the hot lockout something to read, so both are proposed
     // only with one fitted. With no measured battery temperature neither can act anyway, so nothing is
-    // proposed and whatever is stored stays; mountLoc no longer decides anything here.
+    // proposed and whatever is stored stays.
     if (battProbe === 1) {
         rows.push({ param: 'battTempDerateEnable', label: 'Battery-Temp Gain Derate', value: 1, show: v => v ? 'On' : 'Off' });
         rows.push({ param: 'hotChargeLockoutEnable', label: 'Hot-Charge Lockout', value: T.hot, show: v => v ? 'On' : 'Off' });
@@ -9974,7 +10115,7 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
         const battProbe = ('battTempProbeEnable' in cfg) ? parseInt(cfg.battTempProbeEnable, 10) : 0;   // 1 = BATT-role DS18B20 in use
         const shuntPresent = ('BatteryShuntPresent' in cfg) ? parseInt(cfg.BatteryShuntPresent, 10) : 1;
 
-        const der = deriveBatteryDefaults(type, Number(vessel.battery_capacity_ah), Number(vessel.battery_voltage), Number(vessel.regulator_mount_loc), battProbe);
+        const der = deriveBatteryDefaults(type, Number(vessel.battery_capacity_ah), Number(vessel.battery_voltage), battProbe);
         if (!der) { _battDefSkipNote('Battery type "' + _cfgEsc(String(type)) + '" is not one this regulator has recommendations for. Set each charge-stage and protection value individually under Setup.', manual); return; }
 
         const rows = [];   // preserve der.rows order; each carries now + match so matches render inline, highlighted
@@ -11050,6 +11191,9 @@ function _xDlgShow(msg, opts) {
         btns.innerHTML = '';
         const inp = document.getElementById('xdlg-input');
         inp.style.display = o.prompt ? 'block' : 'none';
+        inp.type = o.password ? 'password' : 'text';
+        inp.placeholder = o.placeholder || '';
+        inp.autocomplete = o.password ? 'current-password' : 'off';
         inp.value = '';
         let settled = false;
         const done = v => { if (settled) return; settled = true; ov.style.display = 'none'; resolve(v); };
@@ -11076,6 +11220,7 @@ function _xDlgShow(msg, opts) {
         okB.textContent = o.okText || 'OK';
         okB.style.cssText = 'flex:1; background:linear-gradient(180deg,#35d6c7,#23a99c); color:#06302d; font-weight:700; font-size:13px; border:none; border-radius:5px; padding:9px 16px; cursor:pointer;';
         okB.onclick = () => done(o.prompt ? inp.value : true);
+        inp.onkeydown = e => { if (e.key === 'Enter') okB.click(); };
         btns.appendChild(okB);
         ov.style.display = 'flex';
         if (o.prompt) inp.focus(); else okB.focus();
@@ -15488,13 +15633,9 @@ function armSettings() {
     if (DEMO_MODE) { applySettingsUnlockUI(); return false; }
 
     if (button) button.disabled = true;
-    fetchWithTimeout(buildURL('/armSettings?arm=1'), {}, 8000)
-        .then(response => {
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response.json();
-        })
-        .then(j => {
-            if (j && j.armed) applySettingsUnlockUI();
+    armDevice()
+        .then(ok => {
+            if (ok) applySettingsUnlockUI();
             if (button) button.disabled = false;
         })
         .catch(err => {
@@ -15509,6 +15650,270 @@ function armSettings() {
     return false;
 }
 
+// ── Settings password (Setup > System) ────────────────────────────────────────────────
+// Off: the arm gate as it always was. On: /armSettings wants the password and answers with a token
+// that buildURL then carries on every arm-gated request, so the unlock is this client's alone. The
+// password is remembered per unit on this device after the first unlock; a rejection forgets it.
+let g_pwRequired = false;
+function pwKey() { return 'xregPw:' + (controlUid() || ''); }
+function pwRemembered() { try { return localStorage.getItem(pwKey()) || null; } catch (e) { return null; } }
+function pwRemember(pw) { try { localStorage.setItem(pwKey(), pw); } catch (e) { } }
+function pwForget() { try { localStorage.removeItem(pwKey()); } catch (e) { } }
+
+// Arms the connected regulator for this client. Resolves true when armed; false when the user
+// cancelled the password prompt or the unit refused; rejects only when the unit did not answer.
+async function armDevice(reason) {
+    let pw = g_pwRequired ? pwRemembered() : null;
+    let note = reason || '';
+    for (let attempt = 0; attempt < 4; attempt++) {
+        if (g_pwRequired && !pw) {
+            pw = await xPrompt((note ? note + '\n\n' : '') + 'This regulator asks for its settings password before it accepts changes.',
+                { title: 'Settings password', okText: 'Unlock', password: true, placeholder: 'Password' });
+            if (!pw) return false;
+        }
+        const r = await fetchWithTimeout(buildURL('/armSettings?arm=1' + (pw ? '&pw=' + encodeURIComponent(pw) : '')), {}, 8000);
+        const j = await r.json().catch(() => null);
+        if (!j) throw new Error('HTTP ' + r.status);
+        g_pwRequired = !!j.pw;
+        renderAccessCard();
+        if (j.armed) {
+            if (j.tok) armTokenSet(j.tok);
+            if (pw) pwRemember(pw);
+            return true;
+        }
+        if (j.err === 'locked') {
+            await xAlert('Too many wrong passwords. This regulator refuses every attempt for the next ' + (j.wait || 60) + ' seconds.', 'Settings password');
+            return false;
+        }
+        if (j.err === 'password') {
+            if (pw) note = 'That password was not accepted.';
+            pwForget();
+            pw = null;
+            continue;
+        }
+        if (!j.pw) { pw = null; continue; }   // password turned off under us: plain arm on the next pass
+        return false;
+    }
+    return false;
+}
+
+// Something that changes the unit (pairing, the password itself) from a page that may still be
+// locked: arm first, showing the unlocked UI so the page's state stays honest.
+async function ensureArmed(reason) {
+    if (settingsUnlocked || DEMO_MODE) return true;
+    let ok = false;
+    try { ok = await armDevice(reason); } catch (e) { xAlert('Could not reach the regulator. Check the connection and try again.'); return false; }
+    if (ok) applySettingsUnlockUI();
+    return ok;
+}
+
+function renderAccessCard() {
+    const st = document.getElementById('pwStateOut');
+    if (!st) return;
+    st.textContent = g_pwRequired ? 'On' : 'Off';
+    const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+    show('pwSetBtn', !g_pwRequired);
+    show('pwChangeBtn', g_pwRequired);
+    show('pwOffBtn', g_pwRequired);
+}
+
+async function passwordSet() {
+    if (!(await ensureArmed())) return;
+    const changing = g_pwRequired;
+    let cur = '';
+    if (changing) {
+        cur = pwRemembered() || await xPrompt('Enter the current settings password.', { title: 'Settings password', okText: 'Continue', password: true });
+        if (!cur) return;
+    }
+    const a = await xPrompt(changing ? 'Enter the new settings password (4 to 32 characters).'
+        : 'Choose a settings password (4 to 32 characters). Unlock Settings will ask for it once on each phone or browser, then remember it there. Live readings stay visible without it, and turning the alternator off never needs it.',
+        { title: 'Settings password', okText: 'Continue', password: true });
+    if (a === null) return;
+    if (a.length < 4 || a.length > 32) { xAlert('The password must be 4 to 32 characters. Nothing was changed.', 'Settings password'); return; }
+    const b = await xPrompt('Type it once more.', { title: 'Settings password', okText: changing ? 'Change' : 'Turn On', password: true });
+    if (b === null) return;
+    if (a !== b) { xAlert('The two entries did not match. Nothing was changed.', 'Settings password'); return; }
+    let r = null;
+    try { r = await fetchWithTimeout(buildURL('/setPassword'), { method: 'POST', body: new URLSearchParams({ new: a, cur: cur }) }, 8000); } catch (e) { }
+    const j = r ? await r.json().catch(() => null) : null;
+    if (j && j.ok) {
+        g_pwRequired = true;
+        if (j.tok) armTokenSet(j.tok);
+        pwRemember(a);
+        renderAccessCard();
+        xAlert(changing ? 'The settings password was changed. Other phones and browsers will ask for the new one at their next unlock.'
+            : 'The settings password is on. Unlock Settings now asks for it. If it is ever lost, ground pin 11 at boot: that clears it together with the WiFi credentials.', 'Settings password');
+    } else if (j && j.err === 'password') {
+        pwForget();
+        xAlert('The current password was not accepted. Nothing was changed.', 'Settings password');
+    } else if (j && j.err === 'armed') {
+        xAlert('Settings are locked. Press Unlock Settings and try again.', 'Settings password');
+    } else {
+        xAlert('The regulator did not accept the password' + (r ? ' (HTTP ' + r.status + ')' : ': no answer') + '.', 'Settings password');
+    }
+}
+
+async function passwordOff() {
+    if (!(await ensureArmed())) return;
+    const cur = pwRemembered() || await xPrompt('Enter the current settings password.', { title: 'Settings password', okText: 'Continue', password: true });
+    if (!cur) return;
+    const ok = await xConfirm('Turn the settings password off? Anyone on this network will again be able to press Unlock Settings and change anything.', { title: 'Settings password', okText: 'Turn Off', cancelText: 'Keep It' });
+    if (!ok) return;
+    let r = null;
+    try { r = await fetchWithTimeout(buildURL('/setPassword'), { method: 'POST', body: new URLSearchParams({ off: '1', cur: cur }) }, 8000); } catch (e) { }
+    const j = r ? await r.json().catch(() => null) : null;
+    if (j && j.ok) {
+        g_pwRequired = false;
+        pwForget();
+        armTokenSet(null);
+        renderAccessCard();
+        xAlert('The settings password is off.', 'Settings password');
+    } else if (j && j.err === 'password') {
+        pwForget();
+        xAlert('The current password was not accepted. Nothing was changed.', 'Settings password');
+    } else {
+        xAlert('The regulator did not turn the password off' + (r ? ' (HTTP ' + r.status + ')' : ': no answer') + '.', 'Settings password');
+    }
+}
+
+// ── Regulators on this boat (Setup > System) ──────────────────────────────────────────
+function renderBoatCard() {
+    const rows = document.getElementById('boatPairedRows');
+    if (!rows) return;
+    const u = window.xregUnit || {};
+    const paired = u.paired || [], peers = u.peers || [];
+    rows.innerHTML = '';
+    if (!paired.length) {
+        const empty = document.createElement('div');
+        empty.className = 'form-row';
+        empty.innerHTML = '<div class="form-label" style="color:#8a8a8a;">No other regulator has been added to this boat.</div>';
+        rows.appendChild(empty);
+        rows.appendChild(document.createElement('hr'));
+        return;
+    }
+    paired.forEach(p => {
+        const live = peers.find(x => (x.uid || '').toUpperCase() === p.uid.toUpperCase());
+        const row = document.createElement('div');
+        row.className = 'form-row';
+        row.innerHTML = '<div class="form-label"><span class="boat-name"></span>' +
+            '<span class="boat-where" style="display:block; font-size:11px; color:#8a8a8a; font-weight:normal;"></span></div>' +
+            '<div class="form-input" style="display:flex; gap:8px; flex-wrap:wrap;">' +
+            '<button type="button" class="btn-primary boat-open">Open</button>' +
+            '<button type="button" class="btn-primary boat-remove">Remove</button></div>';
+        row.querySelector('.boat-name').textContent = (live && live.name) || p.name || ('XREG-' + uid6(p.uid).toUpperCase());
+        row.querySelector('.boat-where').textContent = (live ? (live.host || live.ip) : 'not answering right now') + '  \u00b7  ID ' + uid6(p.uid);
+        const openBtn = row.querySelector('.boat-open');
+        if (live) openBtn.onclick = () => openRegulator(peerAsHit(live)); else openBtn.style.display = 'none';
+        row.querySelector('.boat-remove').onclick = () => removeBoatRegulator(p, live ? peerAsHit(live) : null);
+        rows.appendChild(row);
+        rows.appendChild(document.createElement('hr'));
+    });
+}
+
+async function addBoatRegulator() {
+    const me = await refreshUnitIdentity();
+    if (!me || !me.uid) { xAlert('Could not read this regulator\'s identity. Check the connection and try again.', 'Add a Regulator'); return; }
+    const already = (me.paired || []).map(p => p.uid.toUpperCase());
+    const notMineOrPaired = h => h.uid && h.uid.toUpperCase() !== me.uid.toUpperCase() && already.indexOf(h.uid.toUpperCase()) === -1;
+    let candidates = (me.peers || []).map(peerAsHit).filter(notMineOrPaired);
+    const lead = 'Pick the regulator that belongs to this boat. An unnamed unit shows the six characters from its hotspot name and label. Units already set up together are shown together.';
+    const note = 'Both units will remember the pairing. A regulator on another boat should not be added: it would then show up as part of this boat.';
+    let pick;
+    if (candidates.length) {
+        pick = await chooseRegulator(candidates, null, true, { title: 'Add a Regulator to This Boat', lead: lead, note: note, rescan: true });
+    } else {
+        const go = await xConfirm('This regulator does not hear any other regulator on the network right now. A unit set up in the last minute may not have been noticed yet. Search the whole network?',
+            { title: 'Add a Regulator', okText: 'Search', cancelText: 'Cancel' });
+        pick = go ? 'rescan' : null;
+    }
+    if (pick === 'rescan') {
+        candidates = (await sweepAllRegulators(null)).filter(notMineOrPaired);
+        if (!candidates.length) { xAlert('No other regulator answered on this network.', 'Add a Regulator'); return; }
+        pick = await chooseRegulator(candidates, null, true, { title: 'Add a Regulator to This Boat', lead: lead, note: note });
+    }
+    if (!pick || pick === 'rescan') return;
+    await pairWithRegulator(me, pick);
+}
+
+// Stores the pairing on both units. This unit first (same origin, its own arm), then the other at
+// its own address; a failure there undoes the first half, so the two lists never disagree.
+async function pairWithRegulator(me, other) {
+    if (!(await ensureArmed('Adding a regulator to this boat changes this unit\'s settings.'))) return;
+    let r = null;
+    try { r = await fetchWithTimeout(buildURL('/pair?uid=' + encodeURIComponent(other.uid) + '&name=' + encodeURIComponent(other.name || '')), {}, 8000); } catch (e) { }
+    if (!r || !r.ok) { xAlert('This regulator refused the pairing (' + (r ? 'HTTP ' + r.status : 'no answer') + ').', 'Add a Regulator'); return; }
+    const res = await remotePairWrite(other, me, true);
+    if (!res.ok) {
+        try { await fetchWithTimeout(buildURL('/unpair?uid=' + encodeURIComponent(other.uid)), {}, 8000); } catch (e) { }
+        await refreshUnitIdentity();
+        xAlert(res.why + ' Nothing was paired.', 'Add a Regulator');
+        return;
+    }
+    await refreshUnitIdentity();
+    xAlert((other.name || 'That regulator') + ' is now part of this boat. Both units remember it.', 'Add a Regulator');
+}
+
+async function removeBoatRegulator(p, live) {
+    const label = p.name || ('XREG-' + uid6(p.uid).toUpperCase());
+    const ok = await xConfirm('Remove ' + label + ' from this boat?' + (live ? '' : ' It is not answering right now, so it will keep listing this regulator until you remove it there too.'),
+        { title: 'Regulators on This Boat', okText: 'Remove', cancelText: 'Keep' });
+    if (!ok) return;
+    if (!(await ensureArmed('Removing a regulator from this boat changes this unit\'s settings.'))) return;
+    let r = null;
+    try { r = await fetchWithTimeout(buildURL('/unpair?uid=' + encodeURIComponent(p.uid)), {}, 8000); } catch (e) { }
+    if (!r || !r.ok) { xAlert('This regulator refused the change (' + (r ? 'HTTP ' + r.status : 'no answer') + ').', 'Regulators on This Boat'); return; }
+    if (live) {
+        const res = await remotePairWrite(live, window.xregUnit, false);
+        if (!res.ok) xAlert(res.why + ' It still lists this regulator; remove it there as well.', 'Regulators on This Boat');
+    }
+    await refreshUnitIdentity();
+}
+
+// Writes the pairing (add=true) or its removal on the OTHER unit, at its own address. Unlocks it
+// first: with its settings password on, this unit's remembered password is tried before asking
+// (one password per boat is the normal case) and the token-gated unlock is left as is; without
+// one, a unit that was locked is relocked after the write so it is never left open.
+async function remotePairWrite(other, me, add) {
+    const base = other.base || ('http://' + (other.ip || other.host));
+    const where = base.replace(/^https?:\/\//, '');
+    const label = other.name || 'the other regulator';
+    const id = await probeIdentify(base, 4000);
+    if (!id || (other.uid && id.uid && id.uid.toUpperCase() !== other.uid.toUpperCase())) return { ok: false, why: label + ' did not answer at ' + where + '.' };
+    const armJson = async q => {
+        let r = null;
+        try { r = await fetchWithTimeout(base + '/armSettings' + q, {}, 8000); } catch (e) { }
+        return r ? await r.json().catch(() => null) : null;
+    };
+    const before = await armJson('');
+    if (!before) return { ok: false, why: label + ' did not answer at ' + where + '.' };
+    let tok = '', relock = false;
+    if (before.pw) {
+        let pw = pwRemembered() || '';
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (!pw) {
+                pw = await xPrompt('Enter the settings password of ' + (id.name || label) + '.', { title: 'Settings password', okText: 'Continue', password: true });
+                if (!pw) return { ok: false, why: 'Cancelled.' };
+            }
+            const j = await armJson('?arm=1&pw=' + encodeURIComponent(pw));
+            if (!j) return { ok: false, why: label + ' stopped answering.' };
+            if (j.armed) { tok = j.tok || ''; break; }
+            if (j.err === 'locked') return { ok: false, why: label + ' refuses passwords for the next ' + (j.wait || 60) + ' seconds after too many wrong tries.' };
+            pw = '';
+        }
+        if (!tok) return { ok: false, why: 'The password for ' + label + ' was not accepted.' };
+    } else if (!before.armed) {
+        const j = await armJson('?arm=1');
+        if (!j || !j.armed) return { ok: false, why: label + ' would not unlock its settings.' };
+        relock = true;
+    }
+    const q = add ? '/pair?uid=' + encodeURIComponent(me.uid) + '&name=' + encodeURIComponent(me.name || '')
+        : '/unpair?uid=' + encodeURIComponent(me.uid);
+    let r2 = null;
+    try { r2 = await fetchWithTimeout(base + q + (tok ? '&tok=' + tok : ''), {}, 8000); } catch (e) { }
+    if (relock) await armJson('?arm=0');
+    return (r2 && r2.ok) ? { ok: true } : { ok: false, why: label + ' refused to store the change' + (r2 ? ' (HTTP ' + r2.status + ')' : '') + '.' };
+}
+
 // Keep the UI's lock state honest against the device: unlock after a reload into a
 // still-armed window, relock when another client disarms or the device has rebooted.
 function syncArmState() {   // returns the round trip so a caller that must see a fresh mirror can await it
@@ -15517,6 +15922,7 @@ function syncArmState() {   // returns the round trip so a caller that must see 
         .then(r => r.ok ? r.json() : null)
         .then(j => {
             if (!j) return;
+            if (typeof j.pw !== 'undefined') { g_pwRequired = !!j.pw; renderAccessCard(); }
             if (j.armed && !settingsUnlocked) applySettingsUnlockUI();
             else if (!j.armed && settingsUnlocked) applySettingsLockUI();
         })
@@ -15526,6 +15932,8 @@ function syncArmState() {   // returns the round trip so a caller that must see 
 document.addEventListener('DOMContentLoaded', () => {
     syncArmState();
     setInterval(syncArmState, 30000);
+    // The boat card shows who is answering right now, so it follows the same slow tick while it is on screen.
+    setInterval(() => { const c = document.getElementById('boatCard'); if (c && c.offsetParent !== null && !discoveryInProgress) refreshUnitIdentity(); }, 30000);
 });
 
 // Native settings submits land in the hidden-form iframe. A named iframe's second-and-later
@@ -17865,7 +18273,7 @@ window.addEventListener("load", function () {
                     else if (["Icv", "cv_I"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);    // *100 int -> amps
                     }
-                    else if (key === "voltageControlActive" || key === "loadDumpActive") {
+                    else if (key === "voltageControlActive" || key === "loadDumpActive" || key === "tempPIDActive") {
                         newTextContent = value === 1 ? "YES" : "NO";
                     }
                     else if (key === "currentPartitionType") {
@@ -17889,7 +18297,7 @@ window.addEventListener("load", function () {
                     else if (key === "EngineFuelUsed" || key === "EngineFuelUsed_AllTime") {
                         newTextContent = toDisplayVol(value / 100).toFixed(2);
                     }
-                    else if (key.startsWith("ft_") || key === "VeTime2") {
+                    else if (key.startsWith("ft_") || key === "VeTime" || key === "VeTime2") {
                         newTextContent = (value / 1000).toFixed(1);
                     }
                     else if (key === "AlternatorFuelUsed" || key === "AlternatorFuelUsed_AllTime") {
@@ -19187,7 +19595,7 @@ window.addEventListener("load", function () {
                         newTextContent = (value / 3600).toFixed(2);
                     }
                     // Function timing values sent as raw µs — divide by 1000 to display ms
-                    else if (key.startsWith("ft_") || key === "VeTime2") {
+                    else if (key.startsWith("ft_") || key === "VeTime" || key === "VeTime2") {
                         newTextContent = (value / 1000).toFixed(1);
                     }
                     else {

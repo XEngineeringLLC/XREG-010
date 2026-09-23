@@ -726,36 +726,6 @@
                   </div>
                 </div>
 
-                <!-- Regulator Location Subsection -->
-                <div class="pri-subsection">
-                  <h4 class="pri-subsection-title">Regulator Location</h4>
-
-                  <div class="form-row">
-                    <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
-                      <span>Mounting Location:</span>
-                      <span class="tooltip">ℹ️
-                        <span class="tooltip-box">Where the regulator itself is installed. It is recorded with the vessel information, and no control loop reads it. Battery temperature always comes from a measured source (battery probe, NMEA 2000 battery monitor, VE.Direct monitor with a temperature sensor, or RV-C source), so the mounting location does not change how the voltage loop corrects for battery temperature.</span>
-                      </span>
-                    </div>
-                    <div class="form-input">
-                      <div class="seg seg-pill">
-                        <label>
-                          <input type="radio" name="regulatorMountLoc" value="0" required>
-                          <span>Near Battery</span>
-                        </label>
-                        <label>
-                          <input type="radio" name="regulatorMountLoc" value="1" required>
-                          <span>Somewhere Else</span>
-                        </label>
-                      </div>
-                      <div class="seg-pill-caption">
-                        <span class="cap cap-0">Regulator is in the battery compartment</span>
-                        <span class="cap cap-1">Regulator is somewhere other than the battery compartment</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
                 <!-- Location in Vessel Subsection -->
                 <div class="pri-subsection">
                   <h4 class="pri-subsection-title">Location in Vessel</h4>
@@ -6231,7 +6201,7 @@
                 <summary class="tuning-section-title">Reference &amp; Learning Mode</summary>
                 <div class="form-row">
                   <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
-                    <span>Reference source (<span id="alt-mode-label">?</span>):</span>
+                    <span>Reference source<span id="alt-mode-wrap"> (<span id="alt-mode-label">?</span>)</span>:</span>
                     <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which reference surface grades the live % and the trend. "My History" is what this device learned. "Uploaded File" is a borrowed surface from Load CSV &mdash; selecting it defaults Pause ON, but you can Continue to keep learning My History while graded against the uploaded one. Learning never modifies an uploaded surface.</span></span>
                   </div>
                   <div class="form-input">
@@ -9678,6 +9648,61 @@
               </div>
             </details>
 
+            <!-- The boat's other regulators: /identify's paired list, with live status from its peers
+                 list (renderBoatCard). Pairing writes both units (pairWithRegulator), so either
+                 unit's page shows the same list. -->
+            <details id="boatCard" open style="margin-top: 20px;">
+              <summary
+                style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
+                Regulators on This Boat</summary>
+
+              <div id="boatPairedRows"></div>
+
+              <div class="form-row">
+                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                  <span>Add a Regulator:</span>
+                  <span class="tooltip">
+                    &#8505;&#65039;
+                    <span class="tooltip-box">Lists the other regulators on this network so you can mark one as part
+                      of this boat. Paired units are shown together, and first, whenever the dashboard asks which
+                      regulator to use, and a stranger's unit on shared marina WiFi is never mixed in with them. Both
+                      units remember the pairing; Remove takes it off both.</span>
+                  </span>
+                </div>
+                <div class="form-input">
+                  <button type="button" class="btn-primary" onclick="addBoatRegulator()">Add a Regulator to This Boat</button>
+                </div>
+              </div>
+            </details>
+
+            <!-- Optional password on the settings arm gate. State comes from /identify (pwreq) and the
+                 /armSettings poll; the buttons drive /setPassword (passwordSet, passwordOff). -->
+            <details id="accessCard" open style="margin-top: 20px;">
+              <summary
+                style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
+                Settings Password</summary>
+
+              <div class="form-row">
+                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                  <span>Password for Changes (<span id="pwStateOut">?</span>):</span>
+                  <span class="tooltip">
+                    &#8505;&#65039;
+                    <span class="tooltip-box">Off: anyone on the same network can press Unlock Settings and change
+                      anything, which is fine on a boat's own WiFi. On: Unlock Settings asks for this password first,
+                      and the unlock belongs to the phone or browser that typed it. Live readings stay visible either
+                      way, and turning the alternator off never needs a password. Each device remembers the password
+                      after its first unlock. If it is lost, ground pin 11 at boot: that clears it along with the WiFi
+                      credentials.</span>
+                  </span>
+                </div>
+                <div class="form-input" style="display: flex; gap: 8px; flex-wrap: wrap;">
+                  <button type="button" class="btn-primary" id="pwSetBtn" onclick="passwordSet()">Set Password</button>
+                  <button type="button" class="btn-primary" id="pwChangeBtn" onclick="passwordSet()" style="display: none;">Change Password</button>
+                  <button type="button" class="btn-primary" id="pwOffBtn" onclick="passwordOff()" style="display: none;">Turn Off</button>
+                </div>
+              </div>
+            </details>
+
             <!-- App-only. Joining a named network needs NEHotspotConfiguration, which exists
                  only in the iOS app; initRegulatorApUi() unhides this card when the plugin is
                  present. The values are stored on this phone, not on the regulator — the AP
@@ -11003,11 +11028,11 @@
             <p class="card-group-title">Charge/Discharge Time</p>
             <div class="metric-row">
               <span class="metric-label">Time to Full Charge</span>
-              <span class="metric-value"><span id="timeToFullChargeMinID">0</span>&nbsp;min</span>
+              <span class="metric-value"><span id="timeToFullChargeMinID">0</span></span>
             </div>
             <div class="metric-row">
               <span class="metric-label">Time to Full Discharge</span>
-              <span class="metric-value"><span id="timeToFullDischargeMinID">0</span>&nbsp;min</span>
+              <span class="metric-value"><span id="timeToFullDischargeMinID">0</span></span>
             </div>
           </div>
 
@@ -15406,7 +15431,7 @@
                         <thead><tr><th>SoC %</th><th>Rested V</th></tr></thead>
                         <tbody id="capOcvBody"><tr><td colspan="2">…</td></tr></tbody>
                       </table>
-                      <div style="display: flex; gap: 8px; margin: 6px 0;">
+                      <div style="display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0;">
                         <button type="button" class="btn-primary" onclick="submitCapOcv()">Save curve</button>
                         <button type="button" class="btn-secondary" onclick="loadCapOcvPreset('lifepo4')">LiFePO4</button>
                         <button type="button" class="btn-secondary" onclick="loadCapOcvPreset('lead_acid')">Lead-Acid</button>
