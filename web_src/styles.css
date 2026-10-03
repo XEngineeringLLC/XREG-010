@@ -53,9 +53,17 @@ body.no-batt-current #livedata-diag .diag-panel-tabs { display: none !important;
    controls it is explaining. The note is a direct child and is excluded here. */
 body.no-batt-current .gate-batt-current > *:not(.gate-note),
 body.no-extra-temp   .gate-extra-temp   > *:not(.gate-note),
+body.no-batt-temp    .gate-batt-temp    > *:not(.gate-note),
 body.ap-mode         .gate-ap           > *:not(.gate-note),
 body.cloud-off       .gate-cloud        > *:not(.gate-note) {
   opacity: 0.45;
+}
+body.no-batt-temp .gate-batt-temp input,
+body.no-batt-temp .gate-batt-temp select,
+body.no-batt-temp .gate-batt-temp label.switch,
+body.no-batt-temp .gate-batt-temp .btn-primary,
+body.no-batt-temp .gate-batt-temp .btn-secondary {
+  pointer-events: none;
 }
 /* Inert, but only the form controls: filter chips and <summary> stay clickable so a greyed
    card can still be opened and read. */
@@ -130,9 +138,75 @@ body.ap-mode .ap-only-row { display: block; }
 
 body.no-batt-current .gate-note-shunt,
 body.no-extra-temp   .gate-note-extra,
+body.no-batt-temp    .gate-note-batt-temp,
 body.ap-mode         .gate-note-ap,
 body.cloud-off       .gate-note-cloud {
   display: block;
+}
+/* The LiFePO4 sentence inside the cold-lockout note exists only for that chemistry (class set from vessel info). */
+.gate-note-batt-temp .lfp-only { display: none; }
+body.chem-lifepo4 .gate-note-batt-temp .lfp-only { display: inline; }
+
+/* ===== Run Without Failed Sensors (Setup > System modal, SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §4.6) ===== */
+.rwfs-row {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr auto 1.6fr;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 9px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.rwfs-row + .rwfs-row { border-top-color: #2c2c2c; border-radius: 0; }
+.rwfs-row.rwfs-cause { border-color: rgba(214, 0, 0, 0.55); background: rgba(214, 0, 0, 0.07); border-radius: 6px; }
+.rwfs-head { color: #9cc; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; padding: 0 8px 4px; }
+.rwfs-name { font-weight: 600; color: #e6e6e6; }
+.rwfs-cause .rwfs-name::after { content: "This is what stopped charging"; display: block; font-weight: 400; color: #ff6666; font-size: 11px; }
+.rwfs-status { color: #ccc; }
+.rwfs-status.ok { color: #5a5; }
+.rwfs-status.bad { color: #ff6666; font-weight: 600; }
+.rwfs-status.na { color: #999; }
+.rwfs-run label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
+.rwfs-run input[type="checkbox"] { width: 17px; height: 17px; accent-color: #00a19a; margin: 0; }
+.rwfs-what { color: #aaa; font-size: 12px; }
+.rwfs-sub { grid-column: 1 / -1; padding: 6px 0 0; }
+.rwfs-sub input[type="number"] { width: 110px; background: #161616; color: #ddd; border: 1px solid #444; border-radius: 5px; padding: 6px 8px; font-size: 14px; }
+.rwfs-sub .cap { font-size: 11px; color: #888; margin-top: 4px; line-height: 1.4; }
+.rwfs-ack { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: #e6a23c; line-height: 1.45; }
+.rwfs-ack input[type="checkbox"] { flex: none; margin-top: 2px; width: 16px; height: 16px; accent-color: #e6a23c; }
+.rwfs-summary { margin: 12px 0 0; padding: 10px 12px; background: #191919; border: 1px solid #333; border-radius: 6px; font-size: 12.5px; line-height: 1.5; color: #ccc; }
+.rwfs-summary b { color: #e6e6e6; }
+.rwfs-summary .lost { color: #ff8a80; }
+.rwfs-summary .kept { color: #5a5; }
+.rwfs-btn { border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 0.9em; border: 1px solid #555; background: #3a3a3a; color: #ddd; }
+.rwfs-btn.primary { background: #2e7d32; border-color: #4a4; color: #fff; font-weight: 600; }
+.rwfs-btn:disabled { opacity: 0.45; cursor: default; }
+@media (max-width: 480px) {
+  .rwfs-row { grid-template-columns: 1fr 1fr; }
+  .rwfs-what { grid-column: 1 / -1; }
+  .rwfs-head { display: none; }
+}
+/* Header notice buttons (sensor banner) */
+.header-notice .hn-btn {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 9px;
+  border-radius: 5px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  vertical-align: middle;
+  min-height: 36px;
+}
+.rwfs-close { min-width: 36px; min-height: 36px; }
+@media (max-width: 600px) {
+  .header-notice .hn-btn { min-height: 44px; padding: 8px 12px; margin: 4px 4px 0 0; }
+  .rwfs-close { min-width: 44px; min-height: 44px; }
 }
 /* AP mode forces Cloud Features off, so both notes would qualify at once. AP is the more
    specific reason and the only actionable one, so it wins. */
@@ -1344,9 +1418,23 @@ a.btn-secondary {
 @media (prefers-reduced-motion: reduce) {
   #commission-modal-panel .cx-cue { animation: none; }
 }
-/* Stage 9's standing direction line lives under the schedule chart for the whole run: smaller type
-   than the one-shot cues, and an amber variant while the engine speed is outside the band. */
-#commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l1 { font-size: 19px; }
+/* Stage 9's standing direction line sits ABOVE the schedule chart in every state: smaller type than
+   the one-shot cues, and an amber variant while the engine speed is outside the band. Each line
+   reserves two rows (the tallest either wraps to in the 430px panel) and centres its text in them,
+   so the chart under the cue never moves when the words change. */
+#commission-modal-panel .cx-cue.cx-cue-lane { margin: 0 -20px 4px; padding: 10px 20px; }
+#commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l1,
+#commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l2 {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l1 { font-size: 19px; min-height: 2.3em; }
+#commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l2 { margin-top: 4px; line-height: 1.4; min-height: 2.8em; }
+/* Before Start the same block is plain text: the instruction is there to read, not yet to act on. */
+#commission-modal-panel .cx-cue.cx-cue-idle { background: none; border-color: transparent; animation: none; }
+#commission-modal-panel .cx-cue.cx-cue-idle .cx-cue-l1 { text-shadow: none; }
+#commission-modal-panel .cx-cue.cx-cue-idle .cx-cue-l2 { color: #9aa; }
 #commission-modal-panel .cx-cue.off {
   background: linear-gradient(180deg, #7a5208 0%, #5c3d06 100%);
   border-color: #f0a500;
@@ -1904,7 +1992,7 @@ a.btn-secondary {
    dark-mode rule. */
 #header-collapsed-strip { display: none; }
 .permanent-header.header-collapsed { padding: 0; gap: 0; }
-.permanent-header.header-collapsed > *:not(#header-collapsed-strip):not(#protections-banner):not(#dvcc-banner) { display: none; }
+.permanent-header.header-collapsed > *:not(#header-collapsed-strip):not(#protections-banner):not(#dvcc-banner):not(#sensor-banner) { display: none; }
 .permanent-header.header-collapsed #header-collapsed-strip {
   container-type: inline-size;   /* fields below reveal against THIS width */
   display: flex;
@@ -6289,7 +6377,6 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .why-close { flex: 0 0 auto; background: none; border: none; color: #888; font-size: 18px; line-height: 1; padding: 0 2px; cursor: pointer; }
 .why-close:hover { color: #ddd; }
 .why-body { padding: 12px 13px 13px; }
-.why-now,
 .why-ext-grid {
   display: grid;
   grid-template-columns: 11.5em 6.5ch 3.2ch;
@@ -6297,13 +6384,26 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   row-gap: 5px;
   align-items: baseline;
 }
-/* The live numbers are a card, so the prose below them reads as a separate answer. */
-.why-now {
-  padding: 9px 11px;
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 8px;
-}
+/* Alternator = Battery + House tiles. The battery/house parts hide together when there is no battery current. */
+.why-flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 6px; margin-top: 13px; }
+.why-tile { background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.07); border-radius: 8px; padding: 7px 6px 8px; text-align: center; min-width: 0; }
+.why-tl { font-size: 11px; color: #9a9a9a; text-transform: uppercase; letter-spacing: 0.06em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.why-tv { font-size: 20px; font-weight: 700; color: #2ec4b6; font-variant-numeric: tabular-nums; white-space: nowrap; margin-top: 1px; }
+.why-tv small { font-size: 13px; font-weight: 500; color: #8d8d8d; }
+.why-op { color: #777; font-size: 16px; font-weight: 600; }
+.why-meta { display: flex; justify-content: center; flex-wrap: wrap; gap: 4px 22px; margin-top: 9px; font-size: 12.5px; color: #8f8f8f; }
+.why-meta b { color: #cfcfcf; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.why-sect { margin: 15px 0 7px 2px; font-size: 11px; color: #9a9a9a; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+.why-lims { display: flex; flex-direction: column; gap: 6px; }
+.why-lrow { padding: 8px 11px; border-radius: 8px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05); }
+.why-lmain { display: flex; align-items: center; gap: 10px; }
+.why-lname { flex: 1 1 auto; min-width: 0; color: #a8a8a8; }
+.why-lval { font-variant-numeric: tabular-nums; font-weight: 600; color: #a8a8a8; white-space: nowrap; }
+.why-lrow.why-bind { background: color-mix(in srgb, var(--why-tone) 12%, transparent); border-color: color-mix(in srgb, var(--why-tone) 45%, transparent); }
+.why-lrow.why-bind .why-lname { color: #f0f0f0; font-weight: 600; }
+.why-lrow.why-bind .why-lval { color: var(--why-tone); font-weight: 700; }
+.why-pill { flex: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #1b1b1b; background: var(--why-tone); border-radius: 999px; padding: 2px 8px; white-space: nowrap; }
+.why-lsub { margin-top: 3px; font-size: 12px; color: #b9b9b9; }
 /* "your setting: 14.40 V" gets its own line under each row rather than a fourth column: at this
    panel width the column truncated, and the media query that used to rescue it keys off the
    VIEWPORT, which says nothing about a 400px panel on a wide desktop. */
@@ -6313,7 +6413,6 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .why-u { color: #8d8d8d; white-space: nowrap; }
 .why-own { color: #999; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; min-height: 1.25em; }
 .why-verdict {
-  margin-top: 11px;
   padding: 9px 11px;
   border-left: 3px solid var(--why-tone);
   border-radius: 0 8px 8px 0;
@@ -6334,8 +6433,8 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .why-ext-note { color: #999; font-size: 12.5px; margin-top: 8px; }
 @media (max-width: 380px) {
   .why-panel { font-size: 12.5px; }
-  .why-now,
   .why-ext-grid { grid-template-columns: 10em 6.5ch 3.2ch; }
+  .why-tv { font-size: 18px; }
 }
 /* 320px screens: the two-sentence headlines (field maxed, protection) need this to stay on two lines. */
 @media (max-width: 340px) {

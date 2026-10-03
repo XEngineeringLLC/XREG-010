@@ -165,6 +165,7 @@ bool fsRemove(const char *path) {
 // #define NK_FieldAdjustmentInterval "FldAdjstmntIntr"
 #define NK_FieldResistance "FieldResistance"
 #define NK_FloatVoltage "FloatVoltage"
+#define NK_GeneralFaultAlarm "GenFaultAlarm"
 #define NK_FuelEfficiency "FuelEfficiency"
 #define NK_HardOCDebounceMs "HardOCDebouncMs"
 #define NK_HardOCEnable "HardOCEnable"
@@ -186,6 +187,11 @@ bool fsRemove(const char *path) {
 #define NK_IgnoreLearningDuringPenalty "IgnrLrnngDrngPn"
 #define NK_IgnoreRPM "IgnoreRPM"
 #define NK_IgnoreTemperature "IgnoreTemperatr"
+#define NK_IgnoreAltCurrent "IgnoreAltCur"
+#define NK_IgnoreBattVMain "IgnBattVMain"
+#define NK_IgnoreBattV2 "IgnBattV2"
+#define NK_LimpDutyPct "LimpDutyPct"
+#define NK_NoRpmCurrentA "NoRpmCurA"
 #define NK_InstallId       "InstallId"       // random device identity; survives reflash, regenerated only when NVS is erased
 #define NK_InvertAltAmps "InvertAltAmps"
 #define NK_InvertBattAmps "InvertBattAmps"
@@ -278,6 +284,8 @@ bool fsRemove(const char *path) {
 #define NK_ShuntResistanceMicroOhm "ShntRsstncMcrOh"
 #define NK_ShuntGroundComp "ShuntGroundComp"
 #define NK_ShutdownPhase2HoldMs "ShtdwnPhs2HldMs"
+#define NK_ShutdownRampTauS "ShutdnRampTauS"
+#define NK_NoOutputAmps "NoOutputAmps"
 #define NK_cvHelpersEnabled "cvHelpersEn"
 #define NK_cvGainMode "cvGainMode"
 #define NK_cvCrossover "cvCrossover"
@@ -1687,7 +1695,10 @@ void owEnumerate() {
       if (owProbes[i].present && memcmp(owProbes[i].addr, tempRoleAddr[r], sizeof(DeviceAddress)) == 0) { tempRoleSlot[r] = (int8_t)i; break; }
     }
   }
-  if (tempRoleSlot[TR_ALT] < 0 && nFound == 1 && TempSource == 0 && battTempProbeEnable == 0 && extraTempProbeEnable == 0) {
+  // Only a role that has NEVER been assigned auto-binds. A stored alternator probe that is absent is a fault
+  // to report, not a slot to fill: the lone remaining probe (on the battery or in the engine room) was
+  // silently bound as the alternator probe and persisted over the real one's address (audit 2026-09-27).
+  if (tempRoleSlot[TR_ALT] < 0 && !tempRoleAssigned[TR_ALT] && nFound == 1 && TempSource == 0 && battTempProbeEnable == 0 && extraTempProbeEnable == 0) {
     int8_t only = -1;
     for (uint8_t i = 0; i < owProbeCount; i++) if (owProbes[i].present) { only = (int8_t)i; break; }
     if (only >= 0 && tempRoleSlot[TR_BATT] != only && tempRoleSlot[TR_EXTRA] != only) {
@@ -1788,6 +1799,14 @@ static void owMirrorAltResult(bool good, float tempF) {
 // owRoleService() in loop().
 // Reads core0Busy as a courtesy but must NEVER set it — TempTask runs during active charging, and
 // core0Busy gates AdjustFieldLearnMode, so setting it would freeze both control loops ~190-750 ms every 5 s.
+// CRC-8 of eight zero bytes is 0, which matches byte 8, so a scratchpad that sampled every data bit low (a
+// slow rising edge on a long run while presence still answers) passes the CRC and decodes as a valid 32.0 F.
+// Not a reading, on every probe path.
+static bool owScratchAllZero(const uint8_t *sp) {
+  for (int b = 0; b < 9; b++) if (sp[b] != 0) return false;
+  return true;
+}
+
 void TempTask(void *parameter) {
   // NO watchdog registration - keep it separate from main loop watchdog
 
@@ -1799,6 +1818,8 @@ void TempTask(void *parameter) {
   static uint8_t connFailStreak = 0;  // consecutive isConnected() misses before forcing re-enumeration
   static uint8_t roleMissStreak[TR_COUNT] = { 0, 0, 0 };  // BATT/EXTRA only: consecutive cycles a bound role gave no good read; 3 forces re-enumeration
   static bool engineWasRunning = false;
+  static uint8_t tempConsecFail = 0;          // consecutive cycles with no good ALT read; an empty bus search counts too
+  static unsigned long lastTempFailAlert = 0;
 
 // Config byte derived from global resolution (9..12 bit -> 0x1F/0x3F/0x5F/0x7F); target is 12-bit (0x7F)
 #define DS18B20_CFG_BYTE (0x1F | ((resolution - 9) << 5))
@@ -1837,10 +1858,19 @@ void TempTask(void *parameter) {
         uint8_t presentNow = 0;
         for (uint8_t i = 0; i < owProbeCount; i++) if (owProbes[i].present) presentNow++;
         if (presentNow == 0) {
-          // While charging (RPM>=200) the 20s control-staleness gate is armed, so a failed enumerate must
+          // An empty bus with a role bound IS a failed read of that role (a lone unplugged alternator
+          // probe never reached the counter below this point).
+          if (tempRoleAssigned[TR_ALT] || tempRoleAssigned[TR_BATT] || tempRoleAssigned[TR_EXTRA]) {
+            if (++tempConsecFail >= 5 && (millis() - lastTempFailAlert > 60000)) {
+              queueConsoleMessage("DS18B20 WARNING: 5+ consecutive read failures — check sensor connection");
+              lastTempFailAlert = millis();
+              tempConsecFail = 0;
+            }
+          }
+          // While charging the 20s control-staleness gate is armed, so a failed enumerate must
           // retry fast — stacked 5s delays here are what cut the field on a brief bus glitch. Engine-off
           // keeps the slow retry to save standby power (field is already off, staleness can't cut it).
-          vTaskDelay(pdMS_TO_TICKS(RPM >= 200 ? 1000 : 5000));
+          vTaskDelay(pdMS_TO_TICKS(g_engineSpinningNow ? 1000 : 5000));
           continue;
         }
         sensorEnumerated = true;  // no alternator probe but others answer: read them; the ALT miss streak keeps re-searching
@@ -1854,7 +1884,9 @@ void TempTask(void *parameter) {
     }
 
     {  // engine start forces an immediate cycle so the first control ticks see a fresh alternator temperature
-      bool engineRunning = (RPM >= 200);
+      // §1.1: the INSTANTANEOUS spinning signal, not engineRunning's 15 s hold — the reading must be fresh
+      // by the time that hold opens the 20 s staleness window.
+      bool engineRunning = g_engineSpinningNow;
       if (engineRunning && !engineWasRunning) lastTempRead = 0;
       engineWasRunning = engineRunning;
     }
@@ -1862,8 +1894,8 @@ void TempTask(void *parameter) {
     uint32_t pollInterval = lastReadWasSuccess ? 5000 : 1000;
     // Engine off: throttle unwatched reads to save standby power. Watched stays at 5s so the
     // client's 12s stale threshold keeps margin (a 10s poll grayed the gauge on any hiccup).
-    if (RPM < 200) pollInterval = (events.count() > 0) ? 5000 : 60000;
-    if (now - lastTempRead < pollInterval) {
+    if (!g_engineSpinningNow) pollInterval = (events.count() > 0) ? 5000 : 60000;
+    if (lastTempRead != 0 && now - lastTempRead < pollInterval) {   // 0 = never read (boot) or engine just started: read now
       tempStaleSkipCount++;
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
@@ -1935,16 +1967,16 @@ void TempTask(void *parameter) {
     if (altOk) {
       if (sensors.readScratchPad(tempDeviceAddress, scratchPad)) {
 
-        // CHECK 1: CRC validation
+        // CHECK 1: CRC validation (an all-zero scratchpad passes CRC-8 by arithmetic; owScratchAllZero treats it as a failure)
         uint8_t crc = OneWire::crc8(scratchPad, 8);
-        if (crc != scratchPad[8]) {
+        if (crc != scratchPad[8] || owScratchAllZero(scratchPad)) {
           tempCrcFailCount++;
 
           // Immediate single retry
           vTaskDelay(pdMS_TO_TICKS(2));
           if (sensors.readScratchPad(tempDeviceAddress, scratchPad)) {
             uint8_t crc2 = OneWire::crc8(scratchPad, 8);
-            if (crc2 != scratchPad[8]) {
+            if (crc2 != scratchPad[8] || owScratchAllZero(scratchPad)) {
               goto altDone;
             } else {
               tempCrcRecoveredCount++;
@@ -2036,7 +2068,8 @@ void TempTask(void *parameter) {
 
           AlternatorTemperatureF = tempF;
           lastValidTemp = tempF;
-          tempTaskHealthy = true;
+          // tempTaskHealthy is owned by checkTempTaskHealth(): setting it here raced the 5 s check and left
+          // tempTaskAlarm latched on after a recovery (audit 2026-09-27).
           thisReadSucceeded = true;
           MARK_FRESH(IDX_ALTERNATOR_TEMP);
           wmIgnUpdate(wmIgn_altTempF, AlternatorTemperatureF);  // ignition-cycle watermark
@@ -2075,10 +2108,10 @@ altDone:
           for (int b = 0; b < 9; b++) {
             if (scratchPad[b] != 0xFF) { allFF = false; break; }
           }
-          bool crcOk = !allFF && (OneWire::crc8(scratchPad, 8) == scratchPad[8]);
+          bool crcOk = !allFF && !owScratchAllZero(scratchPad) && (OneWire::crc8(scratchPad, 8) == scratchPad[8]);
           if (!allFF && !crcOk) {  // one in-place re-roll, same rationale as the ALT CRC retry
             vTaskDelay(pdMS_TO_TICKS(2));
-            crcOk = sensors.readScratchPad(owProbes[i].addr, scratchPad) && (OneWire::crc8(scratchPad, 8) == scratchPad[8]);
+            crcOk = sensors.readScratchPad(owProbes[i].addr, scratchPad) && !owScratchAllZero(scratchPad) && (OneWire::crc8(scratchPad, 8) == scratchPad[8]);
           }
           if (allFF) {
             absent = true;  // nothing answered this ROM: gone from the bus (all-0xFF never passes CRC, so it is tested first)
@@ -2144,8 +2177,6 @@ cleanup:
 
     // Alert on persistent sensor failure — 5 consecutive non-success reads
     {
-      static uint8_t tempConsecFail = 0;
-      static unsigned long lastTempFailAlert = 0;
       if (thisReadSucceeded || !altExpected) {
         tempConsecFail = 0;
       } else {
@@ -2395,7 +2426,7 @@ void resetSensorWindow() {
   currentWindow->battCurr_valid_us = 0;
 
   currentWindow->altCurr_min = 999900;
-  currentWindow->altCurr_max = 0;
+  currentWindow->altCurr_max = -999900;   // an idle offset reads slightly negative; 0 clipped every all-negative window
   currentWindow->altCurr_area_v_us = 0;
   currentWindow->altCurr_valid_us = 0;
 
@@ -2440,6 +2471,10 @@ void resetSensorWindow() {
   currentWindow->dutyCycle_valid_us = 0;
 
   currentWindow->active_us = 0;
+  currentWindow->battVolt_on_us = 0;
+  currentWindow->battCurr_on_us = 0;
+  currentWindow->altCurr_on_us = 0;
+  currentWindow->victronCurr_on_us = 0;
   currentWindow->battVolt_on_area_v_us = 0;
   currentWindow->battCurr_on_area_v_us = 0;
   currentWindow->altCurr_on_area_v_us = 0;
@@ -2632,41 +2667,56 @@ void updateSensorWindow() {
   // Engine-running-weighted accumulators — engine spinning (tach gate), NOT field-on,
   // so the on-avg stays stable across bulk/absorption/float.
   bool engineOn = engineSpinning();
+  if (shouldAccumulate && engineOn) currentWindow->active_us += delta_us;
 
-  int32_t battVolt = (int32_t)(getBatteryVoltage() * 100.0);
-  if (battVolt < currentWindow->battVolt_min) currentWindow->battVolt_min = battVolt;
-  if (battVolt > currentWindow->battVolt_max) currentWindow->battVolt_max = battVolt;
-  if (shouldAccumulate) {
-    currentWindow->battVolt_area_v_us += (int64_t)battVolt * delta_us;
-    currentWindow->battVolt_valid_us += delta_us;
-    if (engineOn) {
-      currentWindow->active_us += delta_us;
-      currentWindow->battVolt_on_area_v_us += (int64_t)battVolt * delta_us;
+  // Battery voltage — only a fresh, trusted INA228 reading (§10.1): with commit-on-valid a dead chip
+  // leaves its last good value in IBV, and an owner-ignored main voltage is not data either.
+  if (ibvFresh() && !IgnoreBattVMain) {
+    int32_t battVolt = (int32_t)(getBatteryVoltage() * 100.0);
+    if (battVolt < currentWindow->battVolt_min) currentWindow->battVolt_min = battVolt;
+    if (battVolt > currentWindow->battVolt_max) currentWindow->battVolt_max = battVolt;
+    if (shouldAccumulate) {
+      currentWindow->battVolt_area_v_us += (int64_t)battVolt * delta_us;
+      currentWindow->battVolt_valid_us += delta_us;
+      if (engineOn) {
+        currentWindow->battVolt_on_us += delta_us;
+        currentWindow->battVolt_on_area_v_us += (int64_t)battVolt * delta_us;
+      }
     }
   }
 
   // Battery current - CONDITIONAL on the shunt (same pattern as baro/alt-temp below). No shunt ->
   // Bcur is INA input noise and SOC_percent is a frozen NVS value; leaving the window untouched
   // keeps *_valid_us at 0, which the uploader turns into JSON null instead of invented numbers.
-  if (HAS_BATT_SHUNT) {
+  // Bcur is always the INA228 shunt, so its own stamp decides freshness, not BatteryCurrentSource (§10.6).
+  if (HAS_BATT_SHUNT && bcurFresh()) {
     int32_t battCurr = (int32_t)(Bcur * 100.0);
     if (battCurr < currentWindow->battCurr_min) currentWindow->battCurr_min = battCurr;
     if (battCurr > currentWindow->battCurr_max) currentWindow->battCurr_max = battCurr;
     if (shouldAccumulate) {
       currentWindow->battCurr_area_v_us += (int64_t)battCurr * delta_us;
       currentWindow->battCurr_valid_us += delta_us;
-      if (engineOn) currentWindow->battCurr_on_area_v_us += (int64_t)battCurr * delta_us;
+      if (engineOn) {
+        currentWindow->battCurr_on_us += delta_us;
+        currentWindow->battCurr_on_area_v_us += (int64_t)battCurr * delta_us;
+      }
     }
   }
 
-  // Alternator current
-  int32_t altCurr = (int32_t)(MeasuredAmps * 100.0);
-  if (altCurr < currentWindow->altCurr_min) currentWindow->altCurr_min = altCurr;
-  if (altCurr > currentWindow->altCurr_max) currentWindow->altCurr_max = altCurr;
-  if (shouldAccumulate) {
-    currentWindow->altCurr_area_v_us += (int64_t)altCurr * delta_us;
-    currentWindow->altCurr_valid_us += delta_us;
-    if (engineOn) currentWindow->altCurr_on_area_v_us += (int64_t)altCurr * delta_us;
+  // Alternator current — only a fresh reading (§10.5): with commit-on-valid a dead sensor leaves its
+  // last good value in MeasuredAmps, and an untouched window uploads null rather than a held number.
+  if (altAmpsFresh()) {
+    int32_t altCurr = (int32_t)(MeasuredAmps * 100.0);
+    if (altCurr < currentWindow->altCurr_min) currentWindow->altCurr_min = altCurr;
+    if (altCurr > currentWindow->altCurr_max) currentWindow->altCurr_max = altCurr;
+    if (shouldAccumulate) {
+      currentWindow->altCurr_area_v_us += (int64_t)altCurr * delta_us;
+      currentWindow->altCurr_valid_us += delta_us;
+      if (engineOn) {
+        currentWindow->altCurr_on_us += delta_us;
+        currentWindow->altCurr_on_area_v_us += (int64_t)altCurr * delta_us;
+      }
+    }
   }
 
   if (IS_SEEN(IDX_VICTRON_CURRENT) && !IS_STALE(IDX_VICTRON_CURRENT)) {   // no VE.Direct shunt fitted must read absent, not a measured 0.0 A
@@ -2676,7 +2726,10 @@ void updateSensorWindow() {
     if (shouldAccumulate) {
       currentWindow->victronCurr_area_v_us += (int64_t)victronCurr * delta_us;
       currentWindow->victronCurr_valid_us += delta_us;
-      if (engineOn) currentWindow->victronCurr_on_area_v_us += (int64_t)victronCurr * delta_us;
+      if (engineOn) {
+        currentWindow->victronCurr_on_us += delta_us;
+        currentWindow->victronCurr_on_area_v_us += (int64_t)victronCurr * delta_us;
+      }
     }
   }
 
@@ -2709,7 +2762,10 @@ void updateSensorWindow() {
   } else {
     TempToUse = temperatureThermistor;
   }
-  if (!isnan(TempToUse) && TempToUse != -99) {
+  // A held reading is not data: the selected source must have committed within 90 s (engine-off poll is 60 s).
+  uint32_t altTempTs = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
+  bool altTempFresh = altTempTs != 0 && (uint32_t)(millis() - altTempTs) <= 90000UL;
+  if (!isnan(TempToUse) && TempToUse != -99 && altTempFresh) {
     int32_t altTemp = (int32_t)(TempToUse * 100.0);
     if (altTemp < currentWindow->altTemp_min) currentWindow->altTemp_min = altTemp;
     if (altTemp > currentWindow->altTemp_max) currentWindow->altTemp_max = altTemp;
@@ -2741,12 +2797,15 @@ void updateSensorWindow() {
     }
   }
 
-  int32_t rpm = (int32_t)RPM;
-  if (rpm < currentWindow->rpm_min) currentWindow->rpm_min = rpm;
-  if (rpm > currentWindow->rpm_max) currentWindow->rpm_max = rpm;
-  if (shouldAccumulate) {
-    currentWindow->rpm_area_v_us += (int64_t)rpm * delta_us;
-    currentWindow->rpm_valid_us += delta_us;
+  // An ignored engine speed is not data, and engineSpinning() already reports it as stopped.
+  if (!IgnoreRPM) {
+    int32_t rpm = (int32_t)RPM;
+    if (rpm < currentWindow->rpm_min) currentWindow->rpm_min = rpm;
+    if (rpm > currentWindow->rpm_max) currentWindow->rpm_max = rpm;
+    if (shouldAccumulate) {
+      currentWindow->rpm_area_v_us += (int64_t)rpm * delta_us;
+      currentWindow->rpm_valid_us += delta_us;
+    }
   }
 
   int32_t duty = (int32_t)(dutyCycle * 100.0);
@@ -2977,7 +3036,7 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   const char *timestampStr = formatTimestamp(finalTs);
   // Battery current + SoC upload as null when the window never saw a shunt (BatteryShuntPresent=0
   // or no shunt resistance): the accumulators are skipped upstream, so valid_us == 0 is the signal.
-  // engine-on avg rides the same flag — active_us can be non-zero while battCurr never accumulated.
+  // engine-on avg rides its own battCurr_on_us — active_us can be non-zero while battCurr never accumulated.
   const bool bcOk  = snap.window.battCurr_valid_us > 0;
   const bool socOk = snap.window.soc_valid_us > 0;
   char bcMinS[16], bcMaxS[16], bcAvgS[16], bcOnAvgS[16], socMinS[16], socMaxS[16], socAvgS[16];
@@ -3018,11 +3077,18 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   // 0 hPa baro_avg, no alt-temp probe a 0 F line, no IMU a 0 g line, engine-off windows a 0 V onavg.
   // Only the averages are guarded here; min/max are deliberately left alone, because they are still
   // recorded on the first sample of a window (delta_us == 0) and that is truthful data.
+  // Exception: battery voltage, alternator current and rpm skip their whole block while stale or
+  // ignored, and their max sentinel is 0, a value the cloud cannot tell from a reading; an untouched
+  // pair (min still above max) uploads null.
   // (The 2026-09-08/09 "Invalid battery voltage range" dead letters were NOT empty windows — they
   // were the 32-bit micros() wrap, fixed at the clock in resetSensorWindow/updateSensorWindow.)
   // The x1000 IMU accel min/max and the wave period are the exception: their sentinels scale to
   // 999.9 / -999.9 / 0 and -1, which the cloud's list does not know, so they are nulled here BY
   // SENTINEL (a window's single real sample still uploads).
+  const bool bvMmOk  = snap.window.battVolt_min <= snap.window.battVolt_max;
+  const bool acMmOk  = snap.window.altCurr_min  <= snap.window.altCurr_max;
+  const bool rpmMmOk = snap.window.rpm_min      <= snap.window.rpm_max;
+  char bvMinS[16], bvMaxS[16], acMinS[16], acMaxS[16], rpmMinS[16], rpmMaxS[16];
   const bool bvOk   = snap.window.battVolt_valid_us    > 0;
   const bool acOk   = snap.window.altCurr_valid_us     > 0;
   const bool baroOk = snap.window.baro_valid_us        > 0;
@@ -3033,7 +3099,8 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
   const bool dcOk   = snap.window.dutyCycle_valid_us   > 0;
   const bool azOk   = snap.window.altZero_valid_us     > 0;
   const bool utaOk  = snap.window.uTargetAmps_valid_us > 0;
-  // Engine-on averages divide by active_us, which is 0 for every window the engine never spun.
+  // Engine-on averages divide by active_us (duty) or the channel's own *_on_us, 0 for every window
+  // the engine never spun; engine-on percent divides by dutyCycle_valid_us, which never skips a tick.
   const bool onOk   = snap.window.active_us > 0;
   char bvAvgS[16], acAvgS[16], baroAvgS[16], atAvgS[16], ttAvgS[16], ambAvgS[16];
   char rpmAvgS[16], dcAvgS[16], azAvgS[16], utaAvgS[16];
@@ -3066,15 +3133,15 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     "\"payload_v\":6,"
     "\"current_time_source\":%d,"
     // Battery
-    "\"batt_volt_min\":%.2f,\"batt_volt_max\":%.2f,\"batt_volt_avg\":%s,"
+    "\"batt_volt_min\":%s,\"batt_volt_max\":%s,\"batt_volt_avg\":%s,"
     "\"batt_curr_min\":%s,\"batt_curr_max\":%s,\"batt_curr_avg\":%s,"
     // Alternator
-    "\"alt_curr_min\":%.2f,\"alt_curr_max\":%.2f,\"alt_curr_avg\":%s,"
+    "\"alt_curr_min\":%s,\"alt_curr_max\":%s,\"alt_curr_avg\":%s,"
     "\"duty_cycle_min\":%.2f,\"duty_cycle_max\":%.2f,\"duty_cycle_avg\":%s,"
     "\"victron_curr_min\":%s,\"victron_curr_max\":%s,\"victron_curr_avg\":%s,"
     "\"soc_min\":%s,\"soc_max\":%s,\"soc_avg\":%s,"
     // Engine
-    "\"rpm_min\":%d,\"rpm_max\":%d,\"rpm_avg\":%s,"
+    "\"rpm_min\":%s,\"rpm_max\":%s,\"rpm_avg\":%s,"
     // Temperatures
     "\"alt_temp_min\":%.2f,\"alt_temp_max\":%.2f,\"alt_temp_avg\":%s,"
     "\"temp_therm_min\":%.2f,\"temp_therm_max\":%.2f,\"temp_therm_avg\":%s,"
@@ -3130,12 +3197,14 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     timestampStr,
     firmwareVersionInt,
     (int)currentTimeSource,
-    snap.window.battVolt_min / 100.0, snap.window.battVolt_max / 100.0,
+    ltJsonNum(bvMinS, sizeof(bvMinS), snap.window.battVolt_min / 100.0, bvMmOk),
+    ltJsonNum(bvMaxS, sizeof(bvMaxS), snap.window.battVolt_max / 100.0, bvMmOk),
     ltJsonNum(bvAvgS, sizeof(bvAvgS), SAFE_AVG_100(snap.window.battVolt_area_v_us, snap.window.battVolt_valid_us), bvOk),
     ltJsonNum(bcMinS, sizeof(bcMinS), snap.window.battCurr_min / 100.0, bcOk),
     ltJsonNum(bcMaxS, sizeof(bcMaxS), snap.window.battCurr_max / 100.0, bcOk),
     ltJsonNum(bcAvgS, sizeof(bcAvgS), SAFE_AVG_100(snap.window.battCurr_area_v_us, snap.window.battCurr_valid_us), bcOk),
-    snap.window.altCurr_min / 100.0, snap.window.altCurr_max / 100.0,
+    ltJsonNum(acMinS, sizeof(acMinS), snap.window.altCurr_min / 100.0, acMmOk),
+    ltJsonNum(acMaxS, sizeof(acMaxS), snap.window.altCurr_max / 100.0, acMmOk),
     ltJsonNum(acAvgS, sizeof(acAvgS), SAFE_AVG_100(snap.window.altCurr_area_v_us, snap.window.altCurr_valid_us), acOk),
     snap.window.dutyCycle_min / 100.0, snap.window.dutyCycle_max / 100.0,
     ltJsonNum(dcAvgS, sizeof(dcAvgS), SAFE_AVG_100(snap.window.dutyCycle_area_v_us, snap.window.dutyCycle_valid_us), dcOk),
@@ -3145,7 +3214,8 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     ltJsonNum(socMinS, sizeof(socMinS), snap.window.soc_min / 100.0, socOk),
     ltJsonNum(socMaxS, sizeof(socMaxS), snap.window.soc_max / 100.0, socOk),
     ltJsonNum(socAvgS, sizeof(socAvgS), SAFE_AVG_100(snap.window.soc_area_v_us, snap.window.soc_valid_us), socOk),
-    snap.window.rpm_min, snap.window.rpm_max,
+    ltJsonInt(rpmMinS, sizeof(rpmMinS), (long)snap.window.rpm_min, rpmMmOk),
+    ltJsonInt(rpmMaxS, sizeof(rpmMaxS), (long)snap.window.rpm_max, rpmMmOk),
     ltJsonInt(rpmAvgS, sizeof(rpmAvgS), (long)SAFE_AVG_RAW(snap.window.rpm_area_v_us, snap.window.rpm_valid_us), rpmOk),
     snap.window.altTemp_min / 100.0, snap.window.altTemp_max / 100.0,
     ltJsonNum(atAvgS, sizeof(atAvgS), SAFE_AVG_100(snap.window.altTemp_area_v_us, snap.window.altTemp_valid_us), atOk),
@@ -3185,13 +3255,13 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     ltJsonNum(hdgAvgS, sizeof(hdgAvgS), SAFE_AVG_100(snap.window.heading_area_v_us, snap.window.heading_valid_us), hdgOk),
     ltJsonNum(azAvgS, sizeof(azAvgS), SAFE_AVG_100(snap.window.altZero_area_v_us, snap.window.altZero_valid_us), azOk),
     (int)snap.chargeStage,
-    ltJsonNum(bvOnAvgS, sizeof(bvOnAvgS), SAFE_AVG_100(snap.window.battVolt_on_area_v_us, snap.window.active_us), onOk),
-    ltJsonNum(bcOnAvgS, sizeof(bcOnAvgS), SAFE_AVG_100(snap.window.battCurr_on_area_v_us, snap.window.active_us), bcOk && onOk),
-    ltJsonNum(acOnAvgS, sizeof(acOnAvgS), SAFE_AVG_100(snap.window.altCurr_on_area_v_us, snap.window.active_us), onOk),
-    ltJsonNum(vcOnAvgS, sizeof(vcOnAvgS), SAFE_AVG_100(snap.window.victronCurr_on_area_v_us, snap.window.active_us), vcOk && onOk),
+    ltJsonNum(bvOnAvgS, sizeof(bvOnAvgS), SAFE_AVG_100(snap.window.battVolt_on_area_v_us, snap.window.battVolt_on_us), snap.window.battVolt_on_us > 0),
+    ltJsonNum(bcOnAvgS, sizeof(bcOnAvgS), SAFE_AVG_100(snap.window.battCurr_on_area_v_us, snap.window.battCurr_on_us), snap.window.battCurr_on_us > 0),
+    ltJsonNum(acOnAvgS, sizeof(acOnAvgS), SAFE_AVG_100(snap.window.altCurr_on_area_v_us, snap.window.altCurr_on_us), snap.window.altCurr_on_us > 0),
+    ltJsonNum(vcOnAvgS, sizeof(vcOnAvgS), SAFE_AVG_100(snap.window.victronCurr_on_area_v_us, snap.window.victronCurr_on_us), snap.window.victronCurr_on_us > 0),
     ltJsonNum(dcOnAvgS, sizeof(dcOnAvgS), SAFE_AVG_100(snap.window.dutyCycle_on_area_v_us, snap.window.active_us), onOk),
     ltJsonNum(engPctS, sizeof(engPctS),
-              bvOk ? 100.0 * (double)snap.window.active_us / (double)snap.window.battVolt_valid_us : 0.0, bvOk),
+              dcOk ? 100.0 * (double)snap.window.active_us / (double)snap.window.dutyCycle_valid_us : 0.0, dcOk),
     ltJsonNum(btMinS, sizeof(btMinS), snap.window.battTemp_min / 100.0, btOk),
     ltJsonNum(btMaxS, sizeof(btMaxS), snap.window.battTemp_max / 100.0, btOk),
     ltJsonNum(btAvgS, sizeof(btAvgS), SAFE_AVG_100(snap.window.battTemp_area_v_us, snap.window.battTemp_valid_us), btOk),
@@ -3845,17 +3915,17 @@ void pushLongTermRecord() {
   // ×2 (0.5% steps), ROUNDED — a window with <0.25% engine time rounds to 0 and is
   // treated as "engine never ran" (XFF-style discard; the min/max band keeps any spike).
   // Divisors mirror the LT_ENV calls above. rec zero-init leaves activeFrac 0 otherwise.
-  if (currentWindow->battVolt_valid_us > 0 && currentWindow->active_us > 0) {
-    uint64_t obs = currentWindow->battVolt_valid_us;
+  if (currentWindow->dutyCycle_valid_us > 0 && currentWindow->active_us > 0) {
+    uint64_t obs = currentWindow->dutyCycle_valid_us;
     uint64_t fr = (currentWindow->active_us * 200ULL + obs / 2) / obs;
     rec.activeFrac = (fr > 200) ? 200 : (uint8_t)fr;
     int64_t on_us = (int64_t)currentWindow->active_us;
-    rec.onAvg[0] = ltScale((int32_t)(currentWindow->battVolt_on_area_v_us / on_us), 1);
-    // Battery current rides its own envelope bit: with no shunt the accumulator is skipped, so
-    // active_us alone would publish a fabricated 0 A engine-on average.
-    if (rec.validMask & (1u << 1)) rec.onAvg[1] = ltScale((int32_t)(currentWindow->battCurr_on_area_v_us / on_us), 10);
-    rec.onAvg[2] = ltScale((int32_t)(currentWindow->altCurr_on_area_v_us / on_us), 10);
-    if (rec.validMask & (1u << 3)) rec.onAvg[3] = ltScale((int32_t)(currentWindow->victronCurr_on_area_v_us / on_us), 10);  // VE.Direct: same absent-sensor rule
+    // Each gated channel divides by its own engine-on time: a sensor absent or stale for part of the
+    // engine-on span would otherwise average its missing samples in as 0.
+    if (currentWindow->battVolt_on_us > 0) rec.onAvg[0] = ltScale((int32_t)(currentWindow->battVolt_on_area_v_us / (int64_t)currentWindow->battVolt_on_us), 1);
+    if (currentWindow->battCurr_on_us > 0) rec.onAvg[1] = ltScale((int32_t)(currentWindow->battCurr_on_area_v_us / (int64_t)currentWindow->battCurr_on_us), 10);
+    if (currentWindow->altCurr_on_us > 0) rec.onAvg[2] = ltScale((int32_t)(currentWindow->altCurr_on_area_v_us / (int64_t)currentWindow->altCurr_on_us), 10);
+    if (currentWindow->victronCurr_on_us > 0) rec.onAvg[3] = ltScale((int32_t)(currentWindow->victronCurr_on_area_v_us / (int64_t)currentWindow->victronCurr_on_us), 10);
     rec.onAvg[4] = ltScale((int32_t)(currentWindow->dutyCycle_on_area_v_us / on_us), 1);
   }
 
@@ -3885,7 +3955,7 @@ void uploadSensorHistory() {
   // fixed-cadence timeline stays gap-free); reads the closing window before reset.
   pushLongTermRecord();
 
-  if (currentWindow->battVolt_valid_us == 0) {  // no data collected this window
+  if (currentWindow->dutyCycle_valid_us == 0) {  // no data collected this window
     resetSensorWindow();
     resetAccelWindow();
     return;
@@ -4048,6 +4118,7 @@ void zeroLogService() {
       // (rendered as an empty CSV cell) rather than block the log forever or invent a value.
       bool tempValid = !isnan(AlternatorTemperatureF);
       if (!tempValid && now < ZEROLOG_TEMP_GRACE_MS) return;
+      if (!altAmpsFresh()) return;   // a held (stale) current is not a zero-drift sample (§10.5); the sample waits
 
       lastSampleMs = now;
       ZeroLogRecord &r = zeroLogRing[zeroLogHead];
@@ -4179,7 +4250,7 @@ void altZeroCaptureService() {
         lastSampleMs = now;
         // Skip a bad reading rather than fold it in: NaN fails every gate below by comparing false,
         // so one of them would carry the whole window past the accept checks.
-        if (!(isnan(MeasuredAmps) || isinf(MeasuredAmps))) {
+        if (!(isnan(MeasuredAmps) || isinf(MeasuredAmps)) && altAmpsFresh()) {   // a held (stale) reading is not a sample (§10.5)
           sum += (double)MeasuredAmps;
           n++;
           if (altAmpsP2P > p2pWorst) p2pWorst = altAmpsP2P;
@@ -4345,7 +4416,11 @@ static inline size_t cfgRemain(int off) {
   X(prot_temp_sustained_count,  "%lu",   (unsigned long)g_tempSustainedCount) \
   X(prot_temp_stale_count,      "%lu",   (unsigned long)g_tempStaleCount) \
   X(prot_current_stale_count,   "%lu",   (unsigned long)g_currentStaleCount) \
+  X(prot_volt_stale_count,      "%lu",   (unsigned long)g_voltStaleCount) \
+  X(prot_volt2_stale_count,     "%lu",   (unsigned long)g_volt2StaleCount) \
+  X(prot_batt_temp_lost_count,  "%lu",   (unsigned long)g_battTempLostCount) \
   X(prot_load_dump_count,       "%lu",   (unsigned long)g_loadDumpCount) \
+  X(sensor_fault_mask,          "%d",    (int)g_sensorFaultMask) \
   /* Stability. Loop worsts stay in RAW MICROSECONDS (firmware-canonical, like eng_hrs seconds). */ \
   X(last_reset_reason,          "%d",    (int)LastResetReason) \
   X(ancient_reset_reason,       "%d",    (int)ancientResetReason) \
@@ -5973,6 +6048,7 @@ static void ripForensicPush(uint8_t det, uint16_t rpm, int ampLo, float meanA, u
 // cell's amp axis; the battery figure rides in the same cell (its own current is logged only in the ring).
 void faFiltRippleUpdate(float bcur, float macur, float rpm) {
   uint32_t now = millis();
+  if (IgnoreRPM) { filtRippleArmed = false; return; }   // the map is RPM-indexed; nothing to file a window under (§4.8)
   if (!filtRippleArmed) {  // seed the EMAs, start a fresh window, measure next time
     altFiltEma = macur; battFiltEma = bcur;
     altAdmEma = macur; battAdmEma = bcur;
@@ -6527,6 +6603,7 @@ static void faWindowFinalize() {
     } else {
       gated = rpmSteady && ampsSteady && binValid;
     }
+    if (IgnoreRPM) gated = false;   // matrix/flipbook are RPM-binned; the RPM-free detector below still runs (§4.8)
     // Detector arming is RPM-FREE (see faMaybeArmDetector): a clean, current-steady window with
     // real current flowing is enough — no RPM-steadiness or valid-bin requirement. This keeps
     // fault detection working when the tach is dead or erratic, the failure modes that motivated

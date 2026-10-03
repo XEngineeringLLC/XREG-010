@@ -16,7 +16,7 @@
 
 // Must be strict semver ^\d+\.\d+\.\d+$ — no suffixes, no leading v. Compared as an integer
 // major*10000 + minor*100 + patch, so the ceiling is 999.99.99 (minor/patch cannot exceed 99).
-const char *FIRMWARE_VERSION = "0.0.5";
+const char *FIRMWARE_VERSION = "0.0.6";
 
 // OTA artifacts are served from a stable URL we control: ota.xengineering.net, a thin
 // proxy on our own web host that forwards to the Supabase Storage "ota" bucket. The
@@ -360,6 +360,9 @@ float BOAT_DISPLACEMENT_LBS = 0;
 // can only tear. Same reason HOME_PORT below has always been a char array. 50 chars + NUL matches
 // the form's maxlength.
 char BOAT_TYPE[51] = "monohull";
+// Vessel Info Type: Monohull and Catamaran are sailboats; every other value is a motorboat. Blank is monohull, as in
+// the web Vessel Info form and the default.
+bool boatIsSail() { return BOAT_TYPE[0] == '\0' || strcmp(BOAT_TYPE, "monohull") == 0 || strcmp(BOAT_TYPE, "catamaran") == 0; }
 char BOAT_MAKE_MODEL[51] = "";
 uint16_t BOAT_YEAR = 2025;
 char ENGINE_MAKE[51] = "";
@@ -1734,7 +1737,7 @@ int   extraTempAlarmHiEnable = 0;   // EXTRA-probe high alarm on/off
 float extraTempAlarmHiF = 150.0f;   // EXTRA-probe high alarm threshold (°F)
 int   extraTempAlarmLoEnable = 0;   // EXTRA-probe low alarm on/off
 float extraTempAlarmLoF = 32.0f;    // EXTRA-probe low alarm threshold (°F)
-float BatteryTempProbeF = NAN;      // BATT-role probe (°F); written by TempTask only, NAN until the first good read
+float BatteryTempProbeF = NAN;      // BATT-role probe (°F); written by TempTask (and ReadAnalogInputs_Fake in sim), NAN until the first good read
 float ExtraTempF = NAN;             // EXTRA-role probe (°F); written by TempTask only
 float batteryTempF(uint8_t *srcOut);   // 6_functions.ino — callers earlier in the concatenation order (the SoC seed) need this
 float battTempActiveF = NAN;        // batteryTempF() result of the current tick (°F); NAN = no source qualifies
@@ -2125,7 +2128,7 @@ struct SensorWindow {
 
   // Alternator current
   int32_t altCurr_min = 999900;
-  int32_t altCurr_max = 0;
+  int32_t altCurr_max = -999900;
   int64_t altCurr_area_v_us = 0;
   uint64_t altCurr_valid_us = 0;
 
@@ -2177,10 +2180,14 @@ struct SensorWindow {
   int64_t dutyCycle_area_v_us = 0;
   uint64_t dutyCycle_valid_us = 0;
 
-  // Engine-running-weighted accumulators (gated by engineSpinning()). All five source
-  // channels accumulate unconditionally every tick, so ONE shared on-denominator
-  // (active_us) serves them all — per-field on_valid_us would be five copies of it.
+  // Engine-running-weighted accumulators (gated by engineSpinning()). active_us counts every
+  // engine-on tick and is the denominator for the unconditional duty channel and the coverage
+  // figure; the four freshness/presence-gated channels carry their own *_on_us denominators.
   uint64_t active_us = 0;  // window µs with engine spinning (coverage numerator)
+  uint64_t battVolt_on_us = 0;
+  uint64_t battCurr_on_us = 0;
+  uint64_t altCurr_on_us = 0;
+  uint64_t victronCurr_on_us = 0;
   int64_t battVolt_on_area_v_us = 0;
   int64_t battCurr_on_area_v_us = 0;
   int64_t altCurr_on_area_v_us = 0;
@@ -2954,6 +2961,9 @@ int ResetAlarmLatch = 0;        // Momentary reset command
 unsigned long alarmTestStartTime = 0;
 const unsigned long ALARM_TEST_DURATION = 2000;  // 2 seconds test duration
 int Alarm_Status;                                // for alarm mirror light on Client
+bool alarmSilenced = false;                      // Silence button (owner ruling 2026-09-27): buzzer muted for the condition sounding now; Alarm_Status reads 2 while muted. Clears when nothing sounds for 10 s or a condition outside alarmSilencedBits is raised
+uint32_t alarmSilencedBits = 0;                 // CheckAlarms alarmBits at the moment of Silence; any bit outside this set sounds again
+int SilenceAlarm = 0;                            // Momentary silence command (/get?SilenceAlarm=1, allowed without arming like OnOff=0)
 
 //More Settings
 // SOC Parameters
@@ -2976,6 +2986,35 @@ int ShuntResistanceMicroOhm = 100;    // Shunt resistance in microohms
 int ChargedDetectionTime = 180;       // Time at charged state to consider 100% (seconds) (3 mins, industry standard for lithium)
 int IgnoreTemperature = 0;            // If no temp sensor, set to 1
 int IgnoreRPM = 0;                    // If RPM sensor absent or malfunctioning, set to 1 to bypass RPM gate
+// Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §4.1). All persist in NVS.
+int IgnoreAltCurrent = 0;             // run without alternator current: voltage-only regulation (tier 2)
+int IgnoreBattVMain = 0;              // run without the INA228 bus voltage: fixed duty capped by the ADS1115 reading (tier 3) or plain fixed duty (tier 4)
+int IgnoreBattV2 = 0;                 // run without the ADS1115 battery voltage: plausibility on IBV alone, no disagreement checks
+float LimpDutyPct = 30.0f;            // field duty cap (tier 2) / fixed duty (tiers 3-4), % of THIS bus; 12 V default, seeded x(12/class) and rescaled on a class change like the other duty knobs
+float NoRpmCurrentA = 0.0f;           // alternator current limit while engine speed is ignored, A (replaces the RPM table)
+// Derived every tick in buildTickSnapshot (6_functions.ino); read by CSV2, CheckAlarms, TempTask, the bus senders.
+bool g_engineRunning = false;         // §1.1 engineRunning: spinning held 15 s (the staleness consumers)
+bool g_engineSpinningNow = false;     // §1.1 instantaneous: RPM >= 200, or the effective ignition when engine speed is ignored (TempTask cadence)
+uint16_t g_sensorFaultMask = 0;       // §1.2 bits: 0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228
+uint16_t g_sensorSteadyMask = 0;      // §4.7: bit set once the matching fault bit has been clear continuously for 10 min
+uint16_t g_reqFaultBits = 0;          // §11: the fault mask expanded to SENSORS (a dead ADS1115 = engine speed + alt current + second V [+ thermistor]), minus owner overrides / Not fitted. Debounced conditions only
+uint8_t  g_reqFaultCount = 0;         // §11: popcount of g_reqFaultBits (a voltage disagreement counts only when neither voltage bit is set). 1 = that sensor's own reason cuts (owner ruling 2026-10-02: no automatic degrade; the owner chooses on Run Without Failed Sensors), >= 2 = REASON_MULTI_SENSOR_FAULT
+#define SF_ALT_TEMP        (1u << 0)
+#define SF_ENGINE_SPEED    (1u << 1)
+#define SF_ALT_CURRENT     (1u << 2)
+#define SF_BATT_V_MAIN     (1u << 3)
+#define SF_BATT_V_SECOND   (1u << 4)
+#define SF_BATT_V_DISAGREE (1u << 5)
+#define SF_BATT_TEMP       (1u << 6)
+#define SF_ADS1115         (1u << 7)
+#define SF_INA228          (1u << 8)
+uint8_t g_battTempState = 0;          // §2.6: 0 not expected, 1 reading, 2 lost, 3 waiting for the first reading (field held off)
+uint8_t g_battCurState = 0;           // §11.6 battery current (optional, declared by BatteryShuntPresent): 0 not declared, 1 reading, 2 lost 10 s (alarm + header line, never a cut)
+uint8_t g_limpTier = 0;               // §4.2
+bool g_altAmpsOutOfRange = false;     // CH1 reading outside the sensor's sane window (held value in MeasuredAmps)
+bool g_ibvStale = false;              // §10.1 stale condition, computed in _ReadAnalogInputs_inner
+bool g_inaQuietConfig = false;        // inaApplyConfig()/updateINA228OvervoltageThreshold(): skip the info lines during a runtime re-arm
+bool g_battVStale = false;            // §10.2 stale condition
 int MinRPMForField = 125;             // Field is cut when RPM is below this threshold (RPM). Engine (crank) RPM. Floored to no lower than the 100-RPM noise floor in ReadAnalogInputs — values <=100 collapse to that floor.
 // Engine-stopped fast field cut: when RPM is a confirmed zero, drop the field immediately
 // instead of letting the graceful shutdown ramp keep it energized. At true 0 RPM the
@@ -3017,7 +3056,6 @@ uint32_t rpmZeroSinceMs = 0;         // millis() when RPM first hit 0 (0 = not c
 // ccDutyCeiling(), not raw MaxDuty, so a Max Field Volts cap lowers the bar with the reachable duty
 // instead of parking it above anything the loop can command.
 #define TACH_LIE_HEADROOM_FRAC 0.15f  // arm bar = rpmMinDuty + this fraction of (ccDutyCeiling() - rpmMinDuty)
-#define TACH_LIE_MAX_AMPS 2.0f       // |alternator amps| below this = no output; commanded amps above this = loop demanding
 #define TACH_LIE_DWELL_MS 3000       // condition must persist this long — outlasts ramp/settling transients
 #define TACH_LIE_RELEASE_BLANK_MS 6000  // no rev-up release decision until the LM2907 settles post-cut: covers the ~40 ms collapse spike (~570 ms after cut, observed) and the full ~4.6 s re-bias interval (doc figure)
 #define TACH_LIE_RELEASE_HOLD_MS 300    // rev-up must hold this long continuously (~10 tach samples) — a lone spike frees nothing
@@ -3052,6 +3090,7 @@ int bmsLogicLevelOff = 0;             // set to 0 if the BMS gives a low signal 
 bool chargingEnabled;                 // defined from other variables
 bool bmsSignalActive = false;         // Read from GPIO42 (live pin state, published on CSV4 for the Integrations status row)
 int AlarmActivate = 0;                // set to 1 to enable alarm conditions
+int GeneralFaultAlarm = 1;            // Alarms page (owner ruling 2026-09-27): sound for faults with no threshold of their own (sensor/chip faults, TempTask stall, INA228 hardware OV latch). 0 = only the thresholds on that page and the charge lockouts
 int TempAlarm = 190;                  // above this value, sound alarm
 int TempAlarmLow = 32;                // below this value, sound alarm (0 = disabled)
 float VoltageAlarmHigh = 14.8f;       // above this value, sound alarm (V, 2 decimals)
@@ -3466,7 +3505,7 @@ int timeAxisModeChanging = 0;  // toggle the time axis on and off in Plots.  Off
 
 int maxPoints;                 //number of points plotted per plot (X axis length)
 int Ymin1 = -10, Ymax1 = 50;    // Current plot
-float Ymin2 = 12.0, Ymax2 = 16.0;  // Voltage plot
+float Ymin2 = 10.0, Ymax2 = 15.0;  // Voltage plot, 12V window; seeded x(class/12) on first creation
 int Ymin3 = 0, Ymax3 = 4000;   // RPM plot
 int Ymin4 = 50, Ymax4 = 250;   // Temperature plot
 
@@ -4379,7 +4418,12 @@ enum FieldEventReason : uint8_t {
   REASON_OV_TIER_MID,              // timed OV cut, MID tier — filtered bus held above target + OvTierMidMarginV for OvTierMidDwellMs (AUTO/CV only)
   REASON_BATTERY_TOO_HOT,          // 24 — measured battery temp (source 1..4) above MaxChargeTempF — hot-charge lockout (opt-in)
   REASON_CHARGE_COMPLETE_IDLE,     // 25 — charge cycle finished with UseFloat=0: battery full, resting in IDLE until a rebulk or a master-switch off/on. Same class as CHARGING_DISABLED everywhere; only the label differs
-  REASON_ALTZERO_MEASURE           // 26 — a requested current-sensor zero measurement is holding the field at 0% with the engine running (altZeroCaptureService). Not a fault: MODE_COMMISSION_IDLE with a zero target, released when the window closes
+  REASON_ALTZERO_MEASURE,          // 26 — a requested current-sensor zero measurement is holding the field at 0% with the engine running (altZeroCaptureService). Not a fault: MODE_COMMISSION_IDLE with a zero target, released when the window closes
+  REASON_BATT_TEMP_LOST,           // 27 — an expected battery temperature (battTempSource != Not fitted) has no qualifying reading past the boot grace — graceful ramp + settle cut until it returns or the owner sets Not fitted
+  REASON_VOLTAGE_STALE,            // 28 — no valid INA228 bus-voltage read committed within the stale limit (10 invalid reads field-on / 3 field-off) — immediate cut, critical tier
+  REASON_VOLTAGE2_STALE,           // 29 — no valid ADS1115 CH0 battery-voltage read committed within 500 ms — critical ramp
+  REASON_BATT_TEMP_WAIT,           // 30 — an expected battery temperature has not delivered its first reading yet (boot / source-change grace, §2.3): field held off quietly — no alarm, no fault, no lockout; becomes BATT_TEMP_LOST at 90 s
+  REASON_MULTI_SENSOR_FAULT        // 31 — two or more required sensors faulted at once (§11: g_reqFaultCount >= 2, owner overrides and Not fitted excluded) — immediate cut, 30 s lockout, clears after the count has been <= 1 for 10 s
 };
 
 
@@ -4434,6 +4478,20 @@ struct TickSnapshot {
   bool commissioningResting;  // commissioning session live + dialog alive + no test running → hold field at rest duty
   bool altZeroMeasuring;      // a requested current-sensor zero measurement wants the field at 0% (altZeroCaptureService
                               // phase >= ramp, charging enabled, no lockout) → MODE_COMMISSION_IDLE with a zero target
+  // Sensor-fault / run-without-sensors state (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md)
+  bool engineRunning;         // §1.1: RPM >= 200 held 15 s, or the effective ignition when engine speed is ignored
+  bool ignoreAltCurrent;
+  bool ignoreBattVMain;
+  bool ignoreBattV2;
+  bool limpHome;
+  uint8_t limpTier;           // §4.2: 0 normal, 1 closed-loop minus dependent reasons, 2 voltage-only, 3 fixed duty + second-voltage cap, 4 fixed duty
+  bool battTempExpected;      // §2.2: battTempSource != 6
+  uint8_t battTempState;      // §2.6: 0 not expected, 1 reading, 2 lost, 3 waiting for the first reading (field held off)
+  bool ibvStale;              // §10.1 REASON_VOLTAGE_STALE condition (before override suppression)
+  bool battVStale;            // §10.2 REASON_VOLTAGE2_STALE condition (before override suppression)
+  bool voltageFeedbackOk;     // a fresh, trusted battery voltage is feeding the OV rungs (IBV, or the second reading in tier 3); false = fast OV / OV tiers cannot act
+  bool hardOverCurrent;       // HardOCTripAmps exceeded on a FRESH alternator-current sample for HardOCDebounceMs (debounce lives in buildTickSnapshot; both ladders read the flag)
+  bool multiSensorFault;      // §11: two or more required sensors faulted (g_reqFaultCount >= 2), held through the 10 s clear dwell
 };
 
 // ==================== CONFIGURABLE PARAMETERS ====================
@@ -4829,7 +4887,10 @@ ShutdownPhase shutdownPhase = SHUTDOWN_PHASE_NONE;
 uint32_t shutdownPhaseEntryMs = 0;
 uint32_t shutdownPhase2EntryMs = 0;
 // Tunable parameters (expose in web UI)
-float DutySlowRampRate = 0.5f;      // %/sec - Phase 3 slow ramp to 0
+float DutySlowRampRate = 0.5f;      // %/sec - Phase 3 tail: the slowest the proportional decay may go, so the ramp reaches 0
+float ShutdownRampTauS = 4.0f;      // s - Phase 3 proportional decay time constant; ~2x the LM2907 coupling re-centering (20uF x 104.7k = 2.1 s) so the input tracks the shrinking stator swing. 0 = tail rate only
+float NoOutputAmps = 2.0f;          // A - alternator current at or below this counts as no output (shutdown output-while-off shed, tach-lie)
+#define OUTPUT_WHILE_OFF_DWELL_MS 300  // alternator amps above NoOutputAmps must hold this long during a shutdown ramp before the field sheds at DutyRampRate
 uint32_t ShutdownPhase2HoldMs = 500;  // ms - hold at rpmMinDuty before slow ramp (0 = skip)
 
 // ===== TEMPERATURE LOOP PID (replaces thermal model) =====
@@ -5276,6 +5337,9 @@ uint32_t g_tempCritCount = 0;
 uint32_t g_tempSustainedCount = 0;
 uint32_t g_tempStaleCount = 0;
 uint32_t g_currentStaleCount = 0;
+uint32_t g_voltStaleCount = 0;
+uint32_t g_volt2StaleCount = 0;
+uint32_t g_battTempLostCount = 0;
 
 // CV loop tunable parameters live in the CV LOOP PARAMETERS block above
 
@@ -6513,9 +6577,23 @@ void loop() {
   // Deferred commissioning-start persist (2_functions.ino): one staged NVS commit per pass — keeps
   // the Start's restore-point burst off the network task (in-handler it froze the SSE stream ~2 s).
   cxStartPersistService();
-  Ignition = !digitalRead(1);  // ! is for optocoupler (LOW = ignition ON)
-  if (IgnitionOverride == 1) {
-    Ignition = 1;  // force ON (bench / no ignition wire) — override can ONLY force on, never off
+  {
+    // Asymmetric debounce: OFF is taken at once (a stop request is safety), ON must hold 1 s. A feed
+    // hovering at the opto threshold otherwise restarted the charge cycle in BULK and re-ran the full
+    // shutdown flash flush on every flicker (audit 2026-09-27). Written once, so Core 1 never sees
+    // the raw-then-forced transient.
+    static uint32_t ignOnSinceMs = 0;
+    static bool ignFirstPass = true;  // a key already ON at boot is taken at once: lastIgnitionState starts at 1, so a debounced 0 here read as an OFF edge and ran the full shutdown flush on every boot
+    bool rawOn = !digitalRead(1);  // ! is for optocoupler (LOW = ignition ON)
+    int ignNext;
+    if (!rawOn) { ignOnSinceMs = 0; ignNext = 0; }
+    else {
+      if (ignOnSinceMs == 0) ignOnSinceMs = millis() ? millis() : 1;
+      ignNext = (Ignition == 1 || ignFirstPass || (uint32_t)(millis() - ignOnSinceMs) >= 1000UL) ? 1 : 0;
+    }
+    ignFirstPass = false;
+    if (IgnitionOverride == 1) ignNext = 1;  // force ON (bench / no ignition wire) — override can ONLY force on, never off
+    Ignition = ignNext;
   }
   // IgnitionOverride != 1 (Auto, default): no override — honor the real GPIO1 reading above
 
@@ -6952,6 +7030,9 @@ void loop() {
         queueDrainHoldStart = 0;
         Serial.println("Ignition ON - Normal operation mode");
         lastIgnitionState = 1;
+        // Edge only: rewriting the heartbeat every pass with the ignition on meant checkTempTaskHealth
+        // could never see a hung TempTask while motoring (audit 2026-09-27).
+        if (tempTaskHandle != NULL) lastTempTaskHeartbeat = millis();  // restart the 20s window so the health check doesn't trip before the task posts its first beat
       }
       wifiWakeStart = 0;               // Clear wake mode
       lastWifiWakeActive = false;      // Reset wake mode tracking
@@ -6959,8 +7040,7 @@ void loop() {
       setCpuFrequencyMhz(240);         // Ensure full speed
       if (tempTaskHandle != NULL) {
         vTaskResume(tempTaskHandle);  // RESUME BACKGROUND TASKS AFTER SPEEDING UP CPU
-        tempTaskSuspended = false;
-        lastTempTaskHeartbeat = millis();  // restart the 20s window so the health check doesn't trip before the task posts its first beat
+        if (tempTaskSuspended) { tempTaskSuspended = false; lastTempTaskHeartbeat = millis(); }
       }
       if (wifiNapActive) {       // was napping — radio is associated, just exit modem sleep
         WiFi.setSleep(false);

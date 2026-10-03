@@ -17,6 +17,13 @@
 // Battery-temperature source chain helpers (defined in 6_functions.ino next to computeCvTempScale)
 bool tempProbeFresh(uint8_t idx);
 const char *battTempSrcName(uint8_t src);
+// Sensor-fault helpers (6_functions.ino, next to reasonToString) — the auto prototypes miss these
+bool fieldReasonIsFault(FieldEventReason r);
+uint16_t sensorOverriddenBits();
+uint16_t sensorBitsForReason(FieldEventReason r);
+const char *sensorFaultName(uint8_t bit);
+void sensorFaultNames(uint16_t bits, char *out, size_t n);
+const char *reasonToString(FieldEventReason r);
 
 void SystemTime(const tN2kMsg &N2kMsg) {
   unsigned char SID;
@@ -62,6 +69,13 @@ void Rudder(const tN2kMsg &N2kMsg) {
     OutputStream->println(N2kMsg.PGN);
   }
 }
+// §10.8: a received field is usable only when it is available AND inside a plausibility window. The
+// library's N2kIsNA catches 0xFFFF alone; 0xFFFE (out of range) and the other reserved codes decode as
+// real numbers (a 0xFFFE battery temperature reads ~720 °F, a 0xFFFE SOG ~1273 kn).
+static inline bool n2kIn(double v, double lo, double hi) {
+  return !N2kIsNA(v) && !isnan(v) && v >= lo && v <= hi;
+}
+static const double N2K_TWO_PI = 6.2832;
 //*****************************************************************************
 void Heading(const tN2kMsg &N2kMsg) {
   static unsigned long lastHeadingUpdate = 0;
@@ -74,11 +88,11 @@ void Heading(const tN2kMsg &N2kMsg) {
   double Variation;
 
   if (ParseN2kHeading(N2kMsg, SID, Heading, Deviation, Variation, HeadingReference)) {
-    if (N2kIsNA(Heading)) return;        // F-RES-04: skip NA field, otherwise -1e9 leaks into HeadingNMEA
+    if (!n2kIn(Heading, 0.0, N2K_TWO_PI)) return;        // F-RES-04: skip NA / reserved field, otherwise -1e9 leaks into HeadingNMEA
     HeadingNMEA = Heading * 180.0 / PI;
     HeadingRefNMEA = (HeadingReference == N2khr_true) ? 0
                    : (HeadingReference == N2khr_magnetic) ? 1 : -1;
-    HeadingVariationDeg = N2kIsNA(Variation) ? NAN : (float)(Variation * 180.0 / PI);
+    HeadingVariationDeg = n2kIn(Variation, -PI, PI) ? (float)(Variation * 180.0 / PI) : NAN;
     MARK_FRESH(IDX_HEADING_NMEA);
 
     // Uncomment below to get serial monitor output back
@@ -161,18 +175,20 @@ void COGSOG(const tN2kMsg &N2kMsg) {
 
   if (ParseN2kCOGSOGRapid(N2kMsg, SID, HeadingReference, COG, SOG)) {
     // F-RES-04: bail entirely if both fields NA; otherwise update each independently.
-    if (N2kIsNA(COG) && N2kIsNA(SOG)) return;
+    const bool cogOk = n2kIn(COG, 0.0, N2K_TWO_PI);
+    const bool sogOk = n2kIn(SOG, 0.0, 30.9);   // 60 kn
+    if (!cogOk && !sogOk) return;
     // When the user has selected phone GPS as the speed/course source, NMEA writes are
     // suppressed entirely (freshness stamps still land, for /debug diagnostics) so the
     // record chain and leaderboard flag never mix sources.
-    if (!N2kIsNA(COG)) {
+    if (cogOk) {
       lastNmea2kCogMs = millis();
       if (speedSourceMode != SPD_SRC_PHONE) {
         COGNMEA = COG * 180.0 / PI;
         MARK_FRESH(IDX_COG_NMEA);
       }
     }
-    if (!N2kIsNA(SOG)) {
+    if (sogOk) {
       lastNmea2kSogMs = millis();
       if (speedSourceMode != SPD_SRC_PHONE) {
         SOGNMEA = SOG * 1.94384;     // m/s → knots
@@ -367,10 +383,13 @@ void BatteryStatus(const tN2kMsg &N2kMsg) {
   // onto N2K. V/A are display/telemetry only; T is a batteryTempF() candidate (source 2) for the
   // charge lockouts and the CV derate. Missing fields stay NAN, never fabricated.
   if (BatteryInstance == n2kRxBattInstance) {
-    if (N2kIsNA(BatteryVoltage) && N2kIsNA(BatteryCurrent) && N2kIsNA(BatteryTemperature)) return;
-    n2kRxBattV = N2kIsNA(BatteryVoltage) ? NAN : (float)BatteryVoltage;
-    n2kRxBattA = N2kIsNA(BatteryCurrent) ? NAN : (float)BatteryCurrent;
-    n2kRxBattTempF = N2kIsNA(BatteryTemperature) ? NAN : (float)KelvinToF(BatteryTemperature);
+    const bool vOk = n2kIn(BatteryVoltage, 0.0, 70.0 * ((double)SYSTEM_VOLTAGE_CLASS / 12.0));
+    const bool aOk = n2kIn(BatteryCurrent, -2000.0, 2000.0);
+    const bool tOk = n2kIn(BatteryTemperature, 233.15, 358.15);   // -40..85 °C
+    if (!vOk && !aOk && !tOk) return;
+    n2kRxBattV = vOk ? (float)BatteryVoltage : NAN;
+    n2kRxBattA = aOk ? (float)BatteryCurrent : NAN;
+    n2kRxBattTempF = tOk ? (float)KelvinToF(BatteryTemperature) : NAN;
     MARK_FRESH(IDX_N2K_BATT);
   }
   if (NMEA2KVerbose == 1) {
@@ -391,7 +410,7 @@ void Speed(const tN2kMsg &N2kMsg) {
   if (ParseN2kBoatSpeed(N2kMsg, SID, SOW, SOG, SWRT)) {
     // Surface speed-through-water (SOW) for the boat-performance polar — removes current,
     // unlike SOG. SOG stays sourced from the COG/SOG rapid PGN (its canonical source).
-    if (!N2kIsNA(SOW)) {
+    if (n2kIn(SOW, 0.0, 30.9)) {   // 60 kn
       STWNMEA = SOW * 1.94384;      // m/s → knots
       MARK_FRESH(IDX_STW_NMEA);
     }
@@ -415,7 +434,10 @@ void WindSpeed(const tN2kMsg &N2kMsg) {
   tN2kWindReference WindReference;
 
   if (ParseN2kWindSpeed(N2kMsg, SID, WindSpeed, WindAngle, WindReference)) {
-    // F-RES-04: bail entirely if both fields NA; otherwise update each independently.
+    // F-RES-04: bail entirely if both fields NA; otherwise update each independently. An out-of-window
+    // field (0xFFFE and friends) is treated exactly like NA.
+    if (!n2kIn(WindSpeed, 0.0, 77.2)) WindSpeed = N2kDoubleNA;   // 150 kn
+    if (!n2kIn(WindAngle, 0.0, N2K_TWO_PI)) WindAngle = N2kDoubleNA;
     if (N2kIsNA(WindSpeed) && N2kIsNA(WindAngle)) return;
 
     // PGN 130306 carries either apparent OR true wind — branch on WindReference so
@@ -491,8 +513,8 @@ void WaterDepth(const tN2kMsg &N2kMsg) {
     // Store effective depth (transducer + offset if available; raw transducer otherwise).
     // Offset > 0 = depth below waterline; Offset < 0 = depth below keel. Either way the sum is the
     // physical water depth at the transducer position.
-    if (!N2kIsNA(DepthBelowTransducer)) {
-      double effectiveDepth_m = DepthBelowTransducer + (N2kIsNA(Offset) ? 0.0 : Offset);
+    if (n2kIn(DepthBelowTransducer, 0.0, 2000.0)) {
+      double effectiveDepth_m = DepthBelowTransducer + (n2kIn(Offset, -100.0, 100.0) ? Offset : 0.0);
       if (effectiveDepth_m >= 0) {
         WaterDepth_m = (float)effectiveDepth_m;
         MARK_FRESH(IDX_WATER_DEPTH);
@@ -1167,6 +1189,7 @@ tN2kChargerMode n2kChargerModeSetting() {
 // test as the stale alarm / temp-stale field cut — without it a sensor that dies mid-run
 // transmits its last good value forever and the MFD data-lost alarm can never fire.
 float n2kAltTempF() {
+  if (IgnoreTemperature || LimpHome) return NAN;   // running without the alternator temperature: nothing goes on the bus
   unsigned long ts = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
   if (ts == 0 || (millis() - ts) > 20000) return NAN;
   if (TempSource == 0) return AlternatorTemperatureF;
@@ -1287,6 +1310,11 @@ static bool rvcActiveFault(uint8_t &msb, uint8_t &lsb, uint8_t &fmi, bool &red) 
         msb = 1; lsb = 2; fmi = 1; return true;  // battery temperature below normal range
       case REASON_BATTERY_TOO_HOT:
         msb = 1; lsb = 2; fmi = 0; return true;  // battery temperature above normal range
+      case REASON_BATT_TEMP_LOST:
+        msb = 1; lsb = 2; fmi = 9; return true;  // battery temperature not updating at proper rate
+      case REASON_VOLTAGE_STALE:
+      case REASON_VOLTAGE2_STALE:
+        msb = 1; lsb = 0; fmi = 9; return true;  // DC voltage not updating at proper rate
       case REASON_TEMP_CRITICAL:
       case REASON_TEMP_WARNING:
       case REASON_TEMP_SUSTAINED:
@@ -1295,7 +1323,9 @@ static bool rvcActiveFault(uint8_t &msb, uint8_t &lsb, uint8_t &fmi, bool &red) 
         msb = 2; lsb = 0; fmi = 9; return true;  // alternator temperature not updating
       case REASON_TACH_IMPLAUSIBLE:
         msb = 2; lsb = 3; fmi = 2; return true;  // engine speed erratic or invalid
-      default: break;                            // disabled / manual / low RPM / rest / solar / BMS are not faults
+      case REASON_MULTI_SENSOR_FAULT:
+        msb = 1; lsb = 0; fmi = 12; return true; // two or more required sensors gone: bad intelligent device or component
+      default: break;                            // disabled / manual / low RPM / rest / solar / BMS / battery-temperature wait are not faults
     }
   }
   red = false;
@@ -1390,8 +1420,9 @@ void nmea2kTransmitTick() {
           sidBatt = (uint8_t)((sidBatt + 1) % 253);
           // Battery temperature: the BATT probe only — never a re-broadcast network value
           bool battProbeOk = battTempProbeEnable == 1 && tempProbeFresh(IDX_BATT_TEMP_PROBE) && isfinite(BatteryTempProbeF);
-          SetN2kDCBatStatus(N2kMsg, (unsigned char)n2kBattInstance, getBatteryVoltage(),
-                            HAS_BATT_SHUNT ? (double)Bcur : N2kDoubleNA,
+          SetN2kDCBatStatus(N2kMsg, (unsigned char)n2kBattInstance,
+                            ibvFresh() ? getBatteryVoltage() : N2kDoubleNA,
+                            (HAS_BATT_SHUNT && dataTimestamps[IDX_BCUR] != 0 && (uint32_t)(millis() - dataTimestamps[IDX_BCUR]) <= 2500UL) ? (double)Bcur : N2kDoubleNA,
                             battProbeOk ? FToKelvin(BatteryTempProbeF) : N2kDoubleNA,
                             sidBatt);
           composed = true;
@@ -1409,7 +1440,9 @@ void nmea2kTransmitTick() {
         if (n2kAltEnable == 1) {
           float tF = n2kAltTempF();
           sidAlt = (uint8_t)((sidAlt + 1) % 253);
-          SetN2kDCBatStatus(N2kMsg, (unsigned char)n2kAltInstance, (double)BatteryV, (double)MeasuredAmps,
+          SetN2kDCBatStatus(N2kMsg, (unsigned char)n2kAltInstance,
+                            battVFresh() ? (double)BatteryV : N2kDoubleNA,
+                            (altAmpsFresh() && !IgnoreAltCurrent) ? (double)MeasuredAmps : N2kDoubleNA,
                             isfinite(tF) ? FToKelvin(tF) : N2kDoubleNA, sidAlt);
           composed = true;
         }
@@ -1466,7 +1499,7 @@ void nmea2kTransmitTick() {
         break;
       case SLOT_ENG_RAPID:
         if (n2kEngRpmEnable == 1) {
-          SetN2kEngineParamRapid(N2kMsg, (unsigned char)n2kEngInstance, (double)RPM);
+          SetN2kEngineParamRapid(N2kMsg, (unsigned char)n2kEngInstance, IgnoreRPM ? N2kDoubleNA : (double)RPM);
           composed = true;
         }
         break;
@@ -1482,15 +1515,15 @@ void nmea2kTransmitTick() {
             float v = getBatteryVoltage();
             // same class-scaled disconnected-sensor floor as CheckAlarms
             if (VoltageAlarmLow > 0 && v < VoltageAlarmLow && v > 8.0f * SYSTEM_VOLTAGE_CLASS / 12.0f) s1.Bits.LowSystemVoltage = 1;
-            // Charge Indicator = not charging when it should be: protective field cut (the JS
-            // FIELD_FAULT_REASONS set: 1-9, 12, 13, 15-17 — covers the implausible-sensor cuts)
-            // while the engine turns fast enough that the field would otherwise be allowed.
-            bool faultCut = gpio4IsLow && g_fieldEventReason >= 1 && g_fieldEventReason <= 17
-                            && g_fieldEventReason != REASON_CHARGING_DISABLED && g_fieldEventReason != REASON_CHARGE_COMPLETE_IDLE && g_fieldEventReason != REASON_MANUAL_MODE && g_fieldEventReason != REASON_RPM_TOO_LOW;
+            // Charge Indicator = not charging when it should be: protective field cut (the same set as
+            // the JS FIELD_FAULT_REASONS — every sensor / over-voltage / over-current / temperature
+            // reason; never a deliberate state) while the engine turns fast enough that the field
+            // would otherwise be allowed.
+            bool faultCut = gpio4IsLow && fieldReasonIsFault((FieldEventReason)g_fieldEventReason);
             if (faultCut && RPM > MinRPMForField) s1.Bits.ChargeIndicator = 1;
           }
           SetN2kEngineDynamicParam(N2kMsg, (unsigned char)n2kEngInstance, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA,
-                                   (double)BatteryV, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA,
+                                   battVFresh() ? (double)BatteryV : N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA,
                                    N2kInt8NA, N2kInt8NA, s1, 0);
           composed = true;
         }
@@ -1538,8 +1571,8 @@ void nmea2kTransmitTick() {
           N2kMsg.AddByte((unsigned char)rvcChgrInstance);
           N2kMsg.AddByte((unsigned char)rvcDcInstance);
           N2kMsg.AddByte((unsigned char)rvcDevPriority);
-          N2kMsg.Add2ByteUInt(rvcVoltsU16(BatteryV));      // measured at the charger = alternator side
-          N2kMsg.Add2ByteUInt(rvcAmpsU16(MeasuredAmps));   // delivered by the charger
+          N2kMsg.Add2ByteUInt(rvcVoltsU16(battVFresh() ? BatteryV : NAN));      // measured at the charger = alternator side
+          N2kMsg.Add2ByteUInt(rvcAmpsU16((altAmpsFresh() && !IgnoreAltCurrent) ? MeasuredAmps : NAN));   // delivered by the charger
           N2kMsg.AddByte(rvcTempU8(rvcAltTempC()));        // the charging element's own temperature
           composed = true;
         }
@@ -1580,10 +1613,10 @@ void nmea2kTransmitTick() {
           rvcBeginMsg(N2kMsg, 0x1FFFDUL);
           N2kMsg.AddByte((unsigned char)rvcDcInstance);
           N2kMsg.AddByte((unsigned char)rvcDevPriority);
-          N2kMsg.Add2ByteUInt(rvcVoltsU16(BatteryV));
+          N2kMsg.Add2ByteUInt(rvcVoltsU16(battVFresh() ? BatteryV : NAN));
           // Spec 6.5.2b: positive = current flowing FROM the source, so alternator output is
           // positive as measured. No sign flip (that would only apply to a battery instance).
-          N2kMsg.Add4ByteUInt(rvcAmpsU32(MeasuredAmps));
+          N2kMsg.Add4ByteUInt(rvcAmpsU32((altAmpsFresh() && !IgnoreAltCurrent) ? MeasuredAmps : NAN));
           composed = true;
         }
         break;
@@ -1956,7 +1989,7 @@ void checkAndRestart() {
 
   float vScale = SYSTEM_VOLTAGE_CLASS / 12.0f;
   bool vValid = (IBV > 5.0f);  // a dead/absent INA228 reads ~0 V; sensor-dead must not block the ladder forever
-  bool engineOff = !engineSpinning();
+  bool engineOff = !engineSpinning() && !g_engineSpinningNow;   // g_engineSpinningNow follows ignition when engine speed is ignored, where engineSpinning() is always false
   bool fieldOff = (fieldActiveStatus == 0);
   bool noClient = (events.count() == 0);
   bool cloudReachable = (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered);
@@ -2059,7 +2092,7 @@ void checkAndRestart() {
 
     // Save final sensor window if it has data — push into PSRAM ring so the
     // shutdown Phase 4 dump (or next-tick cloud upload) preserves it.
-    if (currentWindow->battVolt_valid_us > 0) {
+    if (currentWindow->dutyCycle_valid_us > 0) {
       Serial.println("Pushing final sensor window into ring before restart");
       time_t collectionTime = computeCollectionTime();
       pushSensorSnapshot(collectionTime);
@@ -2261,7 +2294,7 @@ void UpdateEngineFuel(unsigned long elapsedMillis) {
   // reached true steady speed for that throttle), mpg is averaged over the next fuelCurveSampleSec and
   // that average freezes the bin (overwriting). Then the settle->sample cycle restarts while still
   // steady, so a long cruise refreshes the bin. ANY band break / stop / no-GPS reseeds from scratch.
-  if (currentNMPG > 0.0f && SOGNMEA > 0.0f && !IS_STALE(IDX_SOG_NMEA)) {
+  if (!IgnoreRPM && currentNMPG > 0.0f && SOGNMEA > 0.0f && !IS_STALE(IDX_SOG_NMEA)) {   // ignored tach: no RPM-indexed bins (§4.8)
     uint32_t nowMs = millis();
     float r = RPM, s = SOGNMEA;
     bool inBand = false;
@@ -2340,14 +2373,18 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
   float batteryPower_W = BatteryPower_scaled / 100.0f;
   float energyDelta_Wh = (batteryPower_W * elapsedSeconds) / 3600.0f;
   // Battery-side tracking (charge/discharge energy, coulomb/SoC, capacity tracker,
-  // full-charge detection) all need a real Bcur — gate on the shunt. The alternator
+  // full-charge detection) all need a real Bcur — gate on the shunt, and on a fresh reading
+  // (§10.6: a dead INA228 or unplugged VE.Direct must not integrate its last value forever).
+  // A stale interval is dropped, not back-filled: the current during a read gap is unknown, and the
+  // 2.5 s window (2 x the slow-mode read) means only a real gap ever lands here. The alternator
   // stats and voltage averaging below run on every config.
-  if (HAS_BATT_SHUNT) {
+  if (HAS_BATT_SHUNT && battCurrentFresh()) {
     static float chargedEnergyAccumulator = 0.0f;
     static float dischargedEnergyAccumulator = 0.0f;
     static float chargedEnergyAccumulator_AllTime = 0.0f;
     static float dischargedEnergyAccumulator_AllTime = 0.0f;
-    if (BatteryCurrent_scaled > 0) {
+    const bool battEnergyOk = ibvFresh() && !IgnoreBattVMain;   // energy also needs a live, trusted bus voltage (as altEnergyOk below); coulomb counting does not
+    if (battEnergyOk && BatteryCurrent_scaled > 0) {
       chargedEnergyAccumulator += energyDelta_Wh;
       chargedEnergyAccumulator_AllTime += energyDelta_Wh;
       if (chargedEnergyAccumulator >= 1.0f) {
@@ -2358,7 +2395,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
         ChargedEnergy_AllTime += (int)chargedEnergyAccumulator_AllTime;
         chargedEnergyAccumulator_AllTime -= (int)chargedEnergyAccumulator_AllTime;
       }
-    } else if (BatteryCurrent_scaled < 0) {
+    } else if (battEnergyOk && BatteryCurrent_scaled < 0) {
       dischargedEnergyAccumulator += abs(energyDelta_Wh);
       dischargedEnergyAccumulator_AllTime += abs(energyDelta_Wh);
       if (dischargedEnergyAccumulator >= 1.0f) {
@@ -2484,7 +2521,10 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
   // =================================================================
   // These metrics are ONLY about the alternator's contribution
 
-  alternatorIsOn = (MeasuredAmps > CurrentThreshold);
+  // A held (stale) or owner-ignored reading earns no on-time, energy or fuel (§10.5); the energy terms
+  // also need a live, trusted bus voltage (tiers 3/4 hold IBV). LimpHome ignores every sensor.
+  alternatorIsOn = altAmpsFresh() && !IgnoreAltCurrent && !LimpHome && (MeasuredAmps > CurrentThreshold);
+  const bool altEnergyOk = alternatorIsOn && ibvFresh() && !IgnoreBattVMain;
 
   if (alternatorIsOn) {
     alternatorOnAccumulator += elapsedMillis;
@@ -2497,7 +2537,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
 
     static float alternatorEnergyAccumulator = 0.0f;
     static float alternatorEnergyAccumulator_AllTime = 0.0f;
-    float alternatorPower_W = (currentBatteryVoltage * MeasuredAmps);
+    float alternatorPower_W = altEnergyOk ? (currentBatteryVoltage * MeasuredAmps) : 0.0f;
     if (alternatorPower_W > alt_power_max_alltime_w) alt_power_max_alltime_w = alternatorPower_W;  // leaderboard: peak alt power
     float altEnergyDelta_Wh = (alternatorPower_W * elapsedSeconds) / 3600.0f;
 
@@ -2635,7 +2675,7 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
 
           distanceAccumulator += (float)distanceDelta_nm;
           distanceAccumulator_AllTime += (float)distanceDelta_nm;
-          if (RPM < 50 && Ignition == 0) sailingDistAccumulator_AllTime += (float)distanceDelta_nm;  // under sail = engine off (matches sailing_days gate)
+          if (boatIsSail() && RPM < 50 && Ignition == 0) sailingDistAccumulator_AllTime += (float)distanceDelta_nm;  // under sail = sailboat + engine off (matches sailing_days gate)
 
           if (distanceAccumulator >= 0.01f) {
             TotalDistance += distanceAccumulator;
@@ -2848,7 +2888,7 @@ void UpdateAnchorageDetection(bool gpsValid) {
 // Single source of truth for "engine is spinning" (tach gate). Feeds run-hour
 // accounting AND the sensor-window engine-on-weighted accumulators.
 bool engineSpinning() {
-  return RPM > 100 && RPM < 20000;
+  return !IgnoreRPM && RPM > 100 && RPM < 20000;   // ignored tach: no hours, starts or engine-on statistics (§4.8)
 }
 
 void UpdateEngineRuntime(unsigned long elapsedMillis) {
@@ -2947,11 +2987,11 @@ double calculateHaversineDistance(double lat1, double lon1, double lat2, double 
 
 /**
  * UpdateSailingMetrics - Track sailing time and calculate ratio
- * Sailing conditions: SOG > 0.5 knots AND RPM < 50 AND Ignition == 0
+ * Sailing conditions: sailboat (Vessel Info Type) AND SOG > 0.5 knots AND RPM < 50 AND Ignition == 0
  */
 void UpdateSailingMetrics(unsigned long elapsedMillis) {
   bool isSailing = false;
-  if (!IS_STALE(IDX_SOG_NMEA) && SOGNMEA > 0.5 && RPM < 50 && Ignition == 0) {
+  if (boatIsSail() && !IS_STALE(IDX_SOG_NMEA) && SOGNMEA > 0.5 && RPM < 50 && Ignition == 0) {
     isSailing = true;
   }
 
@@ -3017,6 +3057,37 @@ float getBatteryVoltage() {
   // INA228 bus voltage — more accurate (20-bit, no divider drift) and faster in field-on mode.
   // BatteryV (ADS1115) is retained separately for the cross-sensor disagreement check only.
   return IBV;
+}
+// Freshness of the held sensor globals (§10.5 / §10.2 / §10.6): with commit-on-valid a dead sensor
+// leaves its last good value in place, so every accumulator and bus transmitter asks first.
+// Windows are >= 2 x the source's read interval plus margin, so a normal cadence never reads stale.
+// Fake hardware (bench without harnesses) stamps its own values and is always fresh.
+bool altAmpsFresh() {
+  if (hardwarePresent == 0) return true;
+  uint32_t ts = dataTimestamps[IDX_MEASURED_AMPS];
+  return ts != 0 && (uint32_t)(millis() - ts) <= 1000UL;
+}
+bool battVFresh() {
+  if (hardwarePresent == 0) return true;
+  uint32_t ts = dataTimestamps[IDX_BATTERY_V];
+  return ts != 0 && (uint32_t)(millis() - ts) <= 500UL;
+}
+bool ibvFresh() {   // INA228 slow mode reads every 1.1 s
+  if (hardwarePresent == 0) return true;
+  uint32_t ts = dataTimestamps[IDX_IBV];
+  return ts != 0 && (uint32_t)(millis() - ts) <= 2500UL;
+}
+bool bcurFresh() {   // the INA228 shunt reading (Bcur) itself, whatever BatteryCurrentSource selects
+  if (hardwarePresent == 0) return true;
+  uint32_t ts = dataTimestamps[IDX_BCUR];
+  return ts != 0 && (uint32_t)(millis() - ts) <= 2500UL;
+}
+bool battCurrentFresh() {
+  if (hardwarePresent == 0) return true;
+  int idx = (BatteryCurrentSource == 3) ? IDX_VICTRON_CURRENT : IDX_BCUR;
+  uint32_t ts = dataTimestamps[idx];
+  uint32_t lim = (BatteryCurrentSource == 3) ? 3000UL : 2500UL;   // VE.Direct ~1 s frames; INA slow mode 1.1 s
+  return ts != 0 && (uint32_t)(millis() - ts) <= lim;
 }
 float getTargetAmps() {
   return MeasuredAmps;
@@ -3098,6 +3169,7 @@ void CheckAlarms() {
   bool currentAlarmCondition = false;
   bool outputAlarmState = false;
   const char *alarmReason = "";
+  uint32_t alarmBits = 0;     // one bit per condition raised this pass (sensor faults: g_reqFaultBits << 20); Silence compares sets, since alarmReason holds only the last block's text
 
   // ========== ALARM TEST MODE ==========
   if (AlarmTest == 1) {
@@ -3108,7 +3180,7 @@ void CheckAlarms() {
 
     if (millis() - alarmTestStartTime < ALARM_TEST_DURATION) {
       currentAlarmCondition = true;
-      alarmReason = "Alarm test active";
+      alarmReason = "Alarm test active"; alarmBits |= 1UL << 0;
     } else {
       AlarmTest = 0;
       alarmTestStartTime = 0;
@@ -3124,10 +3196,17 @@ void CheckAlarms() {
       TempToUse = temperatureThermistor;
     }
 
+    // A held reading from a dead probe must not sound for hours (audit 2026-09-27): the selected source must
+    // have stamped within the running / at-rest poll window, and every way of running without the sensor
+    // (owner override, LimpHome) silences these two.
+    const uint32_t altTempTs = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
+    const bool altTempTrusted = !IgnoreTemperature && !LimpHome
+                                && altTempTs != 0 && (millis() - altTempTs) <= (g_engineRunning ? 20000UL : 90000UL);
+
     static unsigned long lastTempAlarmMsgMs = 0;
-    if (TempAlarm > 0 && TempToUse > TempAlarm) {
+    if (altTempTrusted && TempAlarm > 0 && TempToUse > TempAlarm) {
       currentAlarmCondition = true;
-      alarmReason = "High alternator temperature";
+      alarmReason = "High alternator temperature"; alarmBits |= 1UL << 1;
       if (millis() - lastTempAlarmMsgMs >= 30000) {
         lastTempAlarmMsgMs = millis();
         queueConsoleMessageF("High alternator temperature: %.1f%s (limit: %.0f%s)",
@@ -3140,9 +3219,9 @@ void CheckAlarms() {
     static unsigned long lastTempLowAlarmMsgMs = 0;
     // -99 is the thermistor's disconnected sentinel (Channel3V < 0.05 V — the shipping ground
     // jumper) — the stale-sensor alarm owns that case; without the guard it reads as "cold".
-    if (TempAlarmLow > 0 && TempToUse != -99 && TempToUse < TempAlarmLow) {
+    if (altTempTrusted && TempAlarmLow > 0 && TempToUse != -99 && TempToUse < TempAlarmLow) {
       currentAlarmCondition = true;
-      alarmReason = "Low alternator temperature";
+      alarmReason = "Low alternator temperature"; alarmBits |= 1UL << 2;
       if (millis() - lastTempLowAlarmMsgMs >= 30000) {
         lastTempLowAlarmMsgMs = millis();
         queueConsoleMessageF("Low alternator temperature: %.1f%s (limit: %.0f%s)",
@@ -3156,7 +3235,7 @@ void CheckAlarms() {
     static unsigned long lastColdChargeAlarmMsgMs = 0;
     if (coldChargeLockoutEnable && isfinite(battTempActiveF) && battTempActiveF < MinChargeTempF) {
       currentAlarmCondition = true;
-      alarmReason = "Battery too cold to charge";
+      alarmReason = "Battery too cold to charge"; alarmBits |= 1UL << 3;
       if (millis() - lastColdChargeAlarmMsgMs >= 30000) {
         lastColdChargeAlarmMsgMs = millis();
         queueConsoleMessageF("Cold-charge lockout: battery temperature %.1f%s (%s) below %.0f%s floor — charging disabled",
@@ -3172,7 +3251,7 @@ void CheckAlarms() {
     if (hotChargeLockoutEnable == 1 && battTempActiveSrc >= 1 && battTempActiveSrc <= 4
         && isfinite(battTempActiveF) && battTempActiveF > MaxChargeTempF) {
       currentAlarmCondition = true;
-      alarmReason = "Battery too hot to charge";
+      alarmReason = "Battery too hot to charge"; alarmBits |= 1UL << 4;
       if (millis() - lastHotChargeAlarmMsgMs >= 30000) {
         lastHotChargeAlarmMsgMs = millis();
         queueConsoleMessageF("Hot-charge lockout: battery temperature %.1f%s (%s) above %.0f%s ceiling — charging disabled",
@@ -3188,7 +3267,7 @@ void CheckAlarms() {
     static unsigned long lastExtraHiAlarmMsgMs = 0;
     if (extraTempAlarmHiEnable == 1 && extraTempOk && ExtraTempF > extraTempAlarmHiF) {
       currentAlarmCondition = true;
-      alarmReason = "Extra temperature high";
+      alarmReason = "Extra temperature high"; alarmBits |= 1UL << 5;
       if (millis() - lastExtraHiAlarmMsgMs >= 30000) {
         lastExtraHiAlarmMsgMs = millis();
         queueConsoleMessageF("Extra temperature high: %.1f%s (limit: %.0f%s)",
@@ -3200,7 +3279,7 @@ void CheckAlarms() {
     static unsigned long lastExtraLoAlarmMsgMs = 0;
     if (extraTempAlarmLoEnable == 1 && extraTempOk && ExtraTempF < extraTempAlarmLoF) {
       currentAlarmCondition = true;
-      alarmReason = "Extra temperature low";
+      alarmReason = "Extra temperature low"; alarmBits |= 1UL << 6;
       if (millis() - lastExtraLoAlarmMsgMs >= 30000) {
         lastExtraLoAlarmMsgMs = millis();
         queueConsoleMessageF("Extra temperature low: %.1f%s (limit: %.0f%s)",
@@ -3218,7 +3297,7 @@ void CheckAlarms() {
     static unsigned long lastFaFaultAlarmMsgMs = 0;
     if (faAlarmEnable && faLastFaultMs != 0 && (millis() - faLastFaultMs < 120000UL)) {
       currentAlarmCondition = true;
-      alarmReason = "Alternator current pulse-pattern fault";
+      alarmReason = "Alternator current pulse-pattern fault"; alarmBits |= 1UL << 7;
       if (millis() - lastFaFaultAlarmMsgMs >= 30000) {
         lastFaFaultAlarmMsgMs = millis();
         queueConsoleMessageF("Alternator current pulse-pattern fault (class k=%u) -- check rectifier/stator", faDetectLastK);
@@ -3232,7 +3311,7 @@ void CheckAlarms() {
     static unsigned long lastVoltHighMsgMs = 0;
     if (VoltageAlarmHigh > 0 && currentVoltage > VoltageAlarmHigh) {
       currentAlarmCondition = true;
-      alarmReason = "High battery voltage";
+      alarmReason = "High battery voltage"; alarmBits |= 1UL << 8;
       if (millis() - lastVoltHighMsgMs >= 30000) {
         lastVoltHighMsgMs = millis();
         queueConsoleMessageF("High battery voltage: %.2fV (limit: %.2fV)",
@@ -3247,7 +3326,7 @@ void CheckAlarms() {
     // 24/36/48V) so it stays a "sensor disconnected" floor and never sits above a real low-V alarm point.
     if (VoltageAlarmLow > 0 && currentVoltage < VoltageAlarmLow && currentVoltage > 8.0 * SYSTEM_VOLTAGE_CLASS / 12.0f) {
       currentAlarmCondition = true;
-      alarmReason = "Low battery voltage";
+      alarmReason = "Low battery voltage"; alarmBits |= 1UL << 9;
       if (millis() - lastVoltLowMsgMs >= 30000) {
         lastVoltLowMsgMs = millis();
         queueConsoleMessageF("Low battery voltage: %.2fV (limit: %.2fV)",
@@ -3261,7 +3340,7 @@ void CheckAlarms() {
     // SOC_percent is %×100; socInfoAvailable gates this the same way as the rebulk SoC gates
     if (HAS_BATT_SHUNT && SocAlarmLow > 0 && socInfoAvailable && SOC_percent < SocAlarmLow * 100) {
       currentAlarmCondition = true;
-      alarmReason = "Low battery state of charge";
+      alarmReason = "Low battery state of charge"; alarmBits |= 1UL << 10;
       if (millis() - lastSocLowMsgMs >= 30000) {
         lastSocLowMsgMs = millis();
         queueConsoleMessageF("Low battery state of charge: %.1f%% (limit: %d%%)",
@@ -3272,9 +3351,9 @@ void CheckAlarms() {
     }
 
     static unsigned long lastCurHighMsgMs = 0;
-    if (CurrentAlarmHigh > 0 && MeasuredAmps > CurrentAlarmHigh) {
+    if (CurrentAlarmHigh > 0 && altAmpsFresh() && !IgnoreAltCurrent && !LimpHome && MeasuredAmps > CurrentAlarmHigh) {   // never on a held or ignored reading
       currentAlarmCondition = true;
-      alarmReason = "High alternator current";
+      alarmReason = "High alternator current"; alarmBits |= 1UL << 11;
       if (millis() - lastCurHighMsgMs >= 30000) {
         lastCurHighMsgMs = millis();
         queueConsoleMessageF("High alternator current: %.1fA (limit: %.0fA)",
@@ -3285,9 +3364,9 @@ void CheckAlarms() {
     }
 
     static unsigned long lastBatCurMsgMs = 0;
-    if (HAS_BATT_SHUNT && MaximumAllowedBatteryAmps > 0 && abs(Bcur) > MaximumAllowedBatteryAmps) {
+    if (HAS_BATT_SHUNT && bcurFresh() && MaximumAllowedBatteryAmps > 0 && abs(Bcur) > MaximumAllowedBatteryAmps) {   // never on a held reading
       currentAlarmCondition = true;
-      alarmReason = "High battery current";
+      alarmReason = "High battery current"; alarmBits |= 1UL << 12;
       if (millis() - lastBatCurMsgMs >= 30000) {
         lastBatCurMsgMs = millis();
         queueConsoleMessageF("High battery current: %.1fA (limit: %.0fA)",
@@ -3299,10 +3378,11 @@ void CheckAlarms() {
   }
 
   // ========== TEMP TASK FAILURE ALARM ==========
-  // Safety alarm — fires regardless of AlarmActivate. Throttled console reminder every 30s.
-  if (tempTaskAlarm) {
+  // General-fault class (GeneralFaultAlarm, Alarms page). The condition is raised regardless of AlarmActivate;
+  // the output stage below still needs AlarmActivate. Throttled console reminder every 30s.
+  if (tempTaskAlarm && GeneralFaultAlarm == 1) {
     currentAlarmCondition = true;
-    alarmReason = "TempTask failure — temperature monitoring lost";
+    alarmReason = "TempTask failure — temperature monitoring lost"; alarmBits |= 1UL << 13;
     static unsigned long lastTempAlarmMsg = 0;
     if (millis() - lastTempAlarmMsg >= 30000) {
       lastTempAlarmMsg = millis();
@@ -3312,22 +3392,96 @@ void CheckAlarms() {
 
   // ========== TEMP DATA STALE ALARM ==========
   // Fires when no valid reading for 20s (sensor disconnected or persistent comm failure).
-  // Gated by AlarmActivate. Complements the field cut that fires at the same threshold.
-  if (AlarmActivate == 1) {
+  // Gated by AlarmActivate, on the engine running (at rest TempTask polls only every 60 s, so the
+  // 20 s rule alarmed with the engine off) and on the sensor not being ignored — the same window
+  // as the field cut. Complements the field cut that fires at the same threshold.
+  if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     uint32_t tempIdx = (TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP;
     uint32_t ts = dataTimestamps[tempIdx];
-    bool tempStale = (ts != 0 && (millis() - ts) > 20000) ||
-                     (ts == 0 && millis() > 60000);  // never-connected grace period matches tick logic
+    bool tempStale = g_engineRunning && !IgnoreTemperature && !LimpHome &&
+                     ((ts != 0 && (millis() - ts) > 20000) ||
+                      (ts == 0 && millis() > 60000));  // never-connected grace period matches tick logic
     static unsigned long lastTempStaleAlarmMsg = 0;
     if (tempStale) {
       currentAlarmCondition = true;
-      alarmReason = "Temperature sensor not responding";
+      alarmReason = "Temperature sensor not responding"; alarmBits |= 1UL << 14;
       if (millis() - lastTempStaleAlarmMsg >= 30000) {
         lastTempStaleAlarmMsg = millis();
         queueConsoleMessage("ALARM: No temperature reading for 20s — sensor may be disconnected.");
       }
     } else {
       lastTempStaleAlarmMsg = 0;
+    }
+  }
+
+  // ========== REQUIRED-SENSOR FAULT ALARM (§3.3 as amended by §11) ==========
+  // Driven by the required-fault set, not by the reason holding the field off: with two faults the ladder
+  // shows one, and a fault that lands while the key is off showed nothing. Owner-overridden and Not-fitted
+  // sensors never alarm. Silent at
+  // rest (engine off and key off): the header line carries it until the next start. General-fault class
+  // (GeneralFaultAlarm, Alarms page, owner ruling 2026-09-27).
+  if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
+    static unsigned long lastSensorFaultMsgMs = 0;
+    static char sensorAlarmText[240];
+    const bool awake = g_engineRunning || (Ignition == 1 && OnOff == 1);
+    if (g_reqFaultBits && awake) {
+      char names[200];
+      sensorFaultNames(g_reqFaultBits | (g_sensorFaultMask & (SF_ADS1115 | SF_INA228)), names, sizeof(names));
+      const char *tail;
+      if (g_reqFaultCount >= 2) tail = " - charging stopped";
+      else                      tail = " - charging stopped until it reads again or you choose to run without it";
+      snprintf(sensorAlarmText, sizeof(sensorAlarmText), "Sensor fault%s: %s%s", (g_reqFaultCount >= 2) ? "s" : "", names, tail);
+      currentAlarmCondition = true;
+      alarmReason = sensorAlarmText; alarmBits |= (uint32_t)g_reqFaultBits << 20;
+      if (millis() - lastSensorFaultMsgMs >= 30000) {
+        lastSensorFaultMsgMs = millis();
+        queueConsoleMessageF("ALARM: %s. Setup > System > Run Without Failed Sensors for the options.", sensorAlarmText);
+      }
+    } else {
+      lastSensorFaultMsgMs = 0;
+    }
+  }
+
+  // ========== BATTERY TEMPERATURE LOST ALARM (§2.3) ==========
+  // Only while BATT_TEMP_LOST is the one thing holding the field off (a key-off or a LimpHome run with the
+  // reading missing sounds nothing); the block above already names it, this one adds the Automatic-source
+  // wording. Not with a second fault present, whose combined text must stand. General-fault class.
+  if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
+    static unsigned long lastBattTempLostMsgMs = 0;
+    if (g_battTempState == 2 && gpio4IsLow && g_fieldEventReason == REASON_BATT_TEMP_LOST && g_reqFaultCount <= 1) {
+      currentAlarmCondition = true;
+      alarmReason = "Battery temperature sensor not responding — charging stopped"; alarmBits |= 1UL << 15;
+      if (millis() - lastBattTempLostMsgMs >= 30000) {
+        lastBattTempLostMsgMs = millis();
+        queueConsoleMessage(battTempSource == 0
+                              ? "ALARM: No battery temperature found — charging stopped. Choose Not fitted under Setup > Battery > Battery Temperature if this boat has none."
+                              : "ALARM: Battery temperature sensor not responding — charging stopped until it reports again or the source is set to Not fitted.");
+      }
+    } else {
+      lastBattTempLostMsgMs = 0;
+    }
+  }
+
+  // ========== BATTERY CURRENT LOST ALARM (§11.6, optional sensor declared present) ==========
+  // Owner ruling 2026-09-27: a declared shunt (INA228 or VE.Direct) that stops reporting alarms and is named in
+  // the header line; charging continues on voltage alone (state of charge, the tail-current absorption exit, the
+  // current rebulk and the battery charge-current limit all wait for a fresh reading). Never a cut. Silent while
+  // the INA228 itself is the named fault (the sensor-fault block above already covers the chip), and silent at
+  // rest like the block above. General-fault class.
+  if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
+    static unsigned long lastBattCurLostMsgMs = 0;
+    const bool awake = g_engineRunning || (Ignition == 1 && OnOff == 1);
+    const bool inaOwnsIt = (BatteryCurrentSource != 3) && (g_reqFaultBits & SF_BATT_V_MAIN);
+    if (g_battCurState == 2 && awake && !inaOwnsIt) {
+      currentAlarmCondition = true;
+      alarmReason = "Battery current sensor not responding - charging continues on voltage alone"; alarmBits |= 1UL << 16;
+      if (millis() - lastBattCurLostMsgMs >= 30000) {
+        lastBattCurLostMsgMs = millis();
+        queueConsoleMessageF("ALARM: %s not responding - state of charge, the tail-current absorption exit, the current rebulk and the battery charge limit are waiting for it; charging continues on voltage alone.",
+                             (BatteryCurrentSource == 3) ? "VE.Direct battery current" : "Battery shunt (INA228 current)");
+      }
+    } else {
+      lastBattCurLostMsgMs = 0;
     }
   }
 
@@ -3351,8 +3505,7 @@ void CheckAlarms() {
       uint32_t latchAge = millis() - inaOvervoltageTime;
       static bool earlyCheckDone = false;
 
-      currentAlarmCondition = true;
-      alarmReason = "INA228 hardware overvoltage";
+      if (GeneralFaultAlarm == 1) { currentAlarmCondition = true; alarmReason = "INA228 hardware overvoltage"; alarmBits |= 1UL << 17; }   // the latch itself runs regardless
 
       // Periodic reminder while latch is held — every 5s to avoid spam
       static unsigned long lastOVMessage = 0;
@@ -3418,8 +3571,7 @@ void CheckAlarms() {
           // Still present — hold latch, will recheck on next 10s boundary
           // by resetting inaOvervoltageTime so the 10s check re-arms.
           inaOvervoltageTime = millis();
-          currentAlarmCondition = true;
-          alarmReason = "INA228 hardware overvoltage still present";
+          if (GeneralFaultAlarm == 1) { currentAlarmCondition = true; alarmReason = "INA228 hardware overvoltage still present"; alarmBits |= 1UL << 17; }
           queueConsoleMessageF(
             "INA228 OV SUSTAINED [10s check]: busV=%.3fV limit=%.3fV | "
             "BUSOL bit still set. Latch held. Will recheck in 10s.",
@@ -3441,10 +3593,9 @@ void CheckAlarms() {
         if (!inaOvervoltageLatched) {
           inaOvervoltageLatched = true;
           inaOvervoltageTime = millis();
-          currentAlarmCondition = true;
+          if (GeneralFaultAlarm == 1) { currentAlarmCondition = true; alarmReason = "INA228 hardware overvoltage"; alarmBits |= 1UL << 17; }
 
           float busV = INA.getBusVoltage();
-          alarmReason = "INA228 hardware overvoltage";
 
           // Note: busV here may be lower than the actual peak because
           // the INA228 averaged value lags the instantaneous reading
@@ -3479,17 +3630,43 @@ void CheckAlarms() {
     outputAlarmState = currentAlarmCondition;
   }
 
+  // ========== SILENCE ==========
+  // The Silence button (owner ruling 2026-09-27: the buzzer is continuous, with a software silence) mutes the
+  // buzzer for the condition sounding now. It clears by itself when nothing has sounded for 10 s (a held latch
+  // included) or when a condition outside the silenced set is raised, so a second fault landing during a silenced one
+  // sounds again. A latch whose condition has ended (no bits) stays silenced until Reset Latch.
+  if (SilenceAlarm == 1) {
+    SilenceAlarm = 0;
+    if (outputAlarmState && AlarmActivate == 1) {
+      alarmSilenced = true;
+      alarmSilencedBits = alarmBits;
+      queueConsoleMessageF("ALARM SILENCED: %s (sounds again for a different condition)", alarmReason[0] ? alarmReason : "latched alarm");
+    }
+  }
+  // "Nothing sounding" must hold 10 s: the threshold alarms have no hysteresis, so one 250 ms pass under the line
+  // otherwise ended the silence and the next pass sounded the same condition again.
+  static uint32_t alarmQuietSinceMs = 0;
+  if (outputAlarmState) alarmQuietSinceMs = 0;
+  else if (alarmQuietSinceMs == 0) alarmQuietSinceMs = millis() ? millis() : 1;
+  const bool quietHeld = !outputAlarmState && (uint32_t)(millis() - alarmQuietSinceMs) >= 10000UL;
+  if (alarmSilenced && (quietHeld || AlarmActivate != 1 || (alarmBits & ~alarmSilencedBits) != 0)) {
+    alarmSilenced = false;
+    alarmSilencedBits = 0;
+  }
+
   // ========== FINAL OUTPUT CONTROL ==========
   bool finalOutput = false;
+  bool armedOutput = false;   // what would sound with no Silence in force
   if (AlarmTest == 1) {
     finalOutput = true;  // Force HIGH regardless of alarm state — test drives output directly
   } else if (AlarmActivate == 1) {
-    finalOutput = outputAlarmState;
+    armedOutput = outputAlarmState;
+    finalOutput = outputAlarmState && !alarmSilenced;
   }
 
   digitalWrite(21, finalOutput ? HIGH : LOW);
   alarmOutputState = finalOutput;           // Keep shared state in sync
-  Alarm_Status = alarmOutputState ? 1 : 0;  // Set after finalOutput is computed
+  Alarm_Status = finalOutput ? 1 : (armedOutput ? 2 : 0);  // 2 = condition present, buzzer silenced
 
   // ========== CONSOLE MESSAGING ==========
   if (currentAlarmCondition != previousAlarmState) {
@@ -3542,9 +3719,15 @@ void logDashboardValues() {
       strncpy(socStr,  "n/a", sizeof(socStr));
       strncpy(bcurStr, "n/a", sizeof(bcurStr));
     }
-    queueConsoleMessageF("DASHBOARD: IBV=%.2fV SoC=%s AltI=%.1fA BattI=%s AltT=%d°F RPM=%d",
-                         IBV, socStr, MeasuredAmps, bcurStr,
-                         (int)AlternatorTemperatureF, (int)RPM);
+    // (int)NAN prints 2147483647 on this core; absent probe / out-of-range amps sensor read "n/a".
+    char altIStr[12], altTStr[12];
+    unsigned long ampsTs = dataTimestamps[IDX_MEASURED_AMPS];
+    if (ampsTs != 0 && millis() - ampsTs <= 10000) snprintf(altIStr, sizeof(altIStr), "%.1fA", MeasuredAmps);
+    else                                           strncpy(altIStr, "n/a", sizeof(altIStr));
+    if (isfinite(AlternatorTemperatureF)) snprintf(altTStr, sizeof(altTStr), "%d°F", (int)AlternatorTemperatureF);
+    else                                  strncpy(altTStr, "n/a", sizeof(altTStr));
+    queueConsoleMessageF("DASHBOARD: IBV=%.2fV SoC=%s AltI=%s BattI=%s AltT=%s RPM=%d",
+                         IBV, socStr, altIStr, bcurStr, altTStr, (int)RPM);
   }
 }
 
@@ -4051,8 +4234,10 @@ void updateINA228OvervoltageThreshold() {
   const double LSB = 0.003125;                                           // 3.125 mV/LSB
   uint16_t thresholdLSB = (uint16_t)(VoltageHardwareLimit / LSB + 0.5);  // Round instead of truncate
 
-  queueConsoleMessageF("INA228 threshold calc: %.3fV / %.6f = %u LSB", VoltageHardwareLimit, LSB, (unsigned)thresholdLSB);
-  queueConsoleMessageF("INA228 effective threshold: %.3fV", (double)thresholdLSB * LSB);
+  if (!g_inaQuietConfig) {
+    queueConsoleMessageF("INA228 threshold calc: %.3fV / %.6f = %u LSB", VoltageHardwareLimit, LSB, (unsigned)thresholdLSB);
+    queueConsoleMessageF("INA228 effective threshold: %.3fV", (double)thresholdLSB * LSB);
+  }
 
   INA.setBusOvervoltageTH(thresholdLSB);
   INA.setBusUndervoltageTH(0x0000);  // under-voltage threshold deliberately disabled
@@ -4065,7 +4250,7 @@ void updateINA228OvervoltageThreshold() {
   uint16_t readback_BOVL = INA.getBusOvervoltageTH();
   uint16_t readback_BUVL = INA.getBusUndervoltageTH();
 
-  queueConsoleMessageF("INA228 readback: BOVL=0x%04X (%.3fV), BUVL=0x%04X",
+  if (!g_inaQuietConfig) queueConsoleMessageF("INA228 readback: BOVL=0x%04X (%.3fV), BUVL=0x%04X",
                        (unsigned)readback_BOVL, (double)readback_BOVL * LSB, (unsigned)readback_BUVL);
 
   if (readback_BOVL != thresholdLSB) {
@@ -4076,7 +4261,7 @@ void updateINA228OvervoltageThreshold() {
     queueConsoleMessageF("WARNING: BUVL not cleared - still 0x%04X", (unsigned)readback_BUVL);
   }
 
-  queueConsoleMessageF(
+  if (!g_inaQuietConfig) queueConsoleMessageF(
     "INA228: Overvoltage threshold=%.2fV | SLOW_ALERT ON (averaged compare; ~4.3ms in fast charging mode)",
     VoltageHardwareLimit);
 }
@@ -4151,6 +4336,15 @@ void ReadAnalogInputs() {
   TIMED_CALL(ft_rai_total, _ReadAnalogInputs_inner());
 }
 
+// ADS1115 per-channel consecutive invalid reads (I2C failure or a value outside the channel's window),
+// indexed by mux channel; reset by a commit. The §10.2/§10.3 stale rules read them.
+static uint8_t adsMissRun[4] = { 0, 0, 0, 0 };
+static uint32_t adsLastStepMs = 0;   // last ADS_READ_RESULT step — the wall-clock backstops count only while this is recent
+
+uint16_t inaExpectedBovlLsb() {
+  return (uint16_t)(VoltageHardwareLimit / 0.003125 + 0.5);   // 3.125 mV/LSB, same rounding as updateINA228OvervoltageThreshold
+}
+
 void _ReadAnalogInputs_inner() {
 
   // ── INA228 Battery Monitor ────────────────────────────────────────────────
@@ -4178,8 +4372,17 @@ void _ReadAnalogInputs_inner() {
     }
   }
 
-  if (millis() - lastINARead_local >= inaReadInterval) {
-    if (INADisconnected == 0) {
+  // Consecutive invalid INA228 reads (I2C error, NaN, outside the plausibility window). The §10.1 stale
+  // rule counts reads rather than wall-clock because reads only happen from loop(): a long loop pass
+  // must not read as a dead chip. Saturates at 255.
+  static uint8_t inaMissRun = 0;
+  static bool inaMissRunFieldOn = false;   // the current miss run began with the field on: it keeps the field-on threshold even after a cut
+  static bool inaLastMissI2c = false;      // the latest miss was an I2C error (NACK) rather than a read outside the window
+  // A chip that reads as disconnected is still polled at the slow cadence so it can come back; its
+  // first valid read re-arms it (inaApplyConfig) — a power-cycled chip has lost its ALERT threshold.
+  if (millis() - lastINARead_local >= inaReadInterval
+      && (INADisconnected == 0 || millis() - lastINARead_local >= INA_SLOW_INTERVAL_MS)) {
+    {
       lastINARead_local = millis();
       // Track intervals only while INA228 is in fast mode (~5ms cadence).
       // Gating on inaFastModeActive (not fieldActiveStatus) avoids logging a
@@ -4193,13 +4396,19 @@ void _ReadAnalogInputs_inner() {
 
       // ft_rai_ina228 / AnalogReadTime aliases: worstWindow + lastCall updated by macro
       TIMED_CALL(ft_rai_ina228, ([&]() {
+                   bool busOk = false;
                    try {
                      uint32_t inaBusT0 = micros();
-                     IBV = INA.getBusVoltage();
-                     ShuntVoltage_mV = INA.getShuntVoltage() * 1000;
+                     // Read into locals; the globals are committed only when the read is valid (§10.1).
+                     // The library returns 0 on an I2C error and flags it in getLastError().
+                     float busV = INA.getBusVoltage();
+                     int busErr = INA.getLastError();
+                     float shuntMv = INA.getShuntVoltage() * 1000;
+                     int shuntErr = INA.getLastError();
                      uint32_t inaBusDt = micros() - inaBusT0;            // time in JUST the two Wire reads
                      if (inaBusDt > inaBusReadWorstUs) inaBusReadWorstUs = inaBusDt;
                      if (inaBusDt > 15000UL) inaBusSlowCount++;          // ≥1 Wire-timeout's worth = bus stall
+                     bool shuntOk = (shuntErr == 0) && !isnan(shuntMv);
 
                      // Regulator Ground Wire on the LOAD side of a shunt in the battery negative lead: charging current
                      // leaves the negative post through the shunt toward the bus bar, so board ground sits I*Rshunt
@@ -4207,27 +4416,56 @@ void _ReadAnalogInputs_inner() {
                      // differential reading IS that drop (charging-positive once InvertBattAmps is applied), so it is
                      // subtracted. Raw shunt volts only - the current-path calibrations (BatteryCOffset,
                      // DynamicShuntGainFactor) must not leak into a voltage.
-                     if (ShuntGroundComp && HAS_BATT_SHUNT && !isnan(ShuntVoltage_mV)) {
-                       IBV -= (InvertBattAmps ? -1.0f : 1.0f) * ShuntVoltage_mV / 1000.0f;
+                     if (ShuntGroundComp && HAS_BATT_SHUNT && shuntOk) {
+                       busV -= (InvertBattAmps ? -1.0f : 1.0f) * shuntMv / 1000.0f;
                      }
 
-                     if (!isnan(IBV) && IBV > 5.0 && IBV < fminf(85.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f)) && !isnan(ShuntVoltage_mV)) {  // garbage-reject ceiling scales with class, capped at INA228 85V full scale
-                       Bcur = (ShuntResistanceMicroOhm > 0) ? (ShuntVoltage_mV * 1000.0f / ShuntResistanceMicroOhm) : 0.0f;
-                       Bcur = Bcur + BatteryCOffset;
-                       if (InvertBattAmps == 1) {
-                         Bcur = -Bcur;
-                       }
-                       // battery current always from INA228
-                       if (AutoShuntGainCorrection == 1) {
-                         Bcur = Bcur * DynamicShuntGainFactor;
-                       }
-                       BatteryCurrent_scaled = Bcur * 100;
+                     busOk = (busErr == 0) && !isnan(busV) && busV > 5.0 && busV < fminf(85.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));  // garbage-reject ceiling scales with class, capped at INA228 85V full scale
+                     if (!busOk) inaLastMissI2c = (busErr != 0);
+                     // Sticky for the whole miss run: a chip reset whose LAST dropped read answers (power-on register 0,
+                     // out of window) or that falls between two polls left BOVL at its power-on maximum = hardware OV off
+                     // for up to 30 s (audit 2026-09-27). inaLastMissI2c keeps its "latest miss" meaning for the
+                     // disconnected line below.
+                     static bool inaMissRunHadI2c = false;
+                     if (!busOk && busErr != 0) inaMissRunHadI2c = true;
+                     // The chip ANSWERED (in range or not): it is connected again, whatever it is reading.
+                     if (busErr == 0 && INADisconnected != 0) {
+                       INADisconnected = 0;
+                       INA.begin();
+                       inaApplyConfig();
+                       queueConsoleMessage("INA228 responding again — chip re-initialized, hardware overvoltage protection re-armed");
+                     }
+                     if (busOk) {
+                       IBV = busV;
                        MARK_FRESH(IDX_IBV);
-                       MARK_FRESH(IDX_BCUR);
-
-                       // Accumulate every valid INA228 sample for the CSV1 window aggregation.
-                       aggIbv.add(IBV);
-                       aggBcur.add(Bcur);
+                       aggIbv.add(IBV);   // every valid INA228 sample feeds the CSV1 window aggregation
+                       if (inaMissRun > 0 && inaMissRunHadI2c) {
+                         // A reset shorter than the 3 s disconnect line resumes at power-on defaults (BOVL at
+                         // maximum = hardware OV off), so every miss run that saw an I2C miss re-arms the chip (§1.4).
+                         g_inaQuietConfig = true;
+                         inaApplyConfig();
+                         g_inaQuietConfig = false;
+                         queueConsoleMessageF("INA228 back after %u dropped reads — configuration and hardware overvoltage threshold re-applied", (unsigned)inaMissRun);
+                       }
+                       inaMissRunHadI2c = false;
+                       // A shunt NACK with a good bus read must not commit a current made of BatteryCOffset alone.
+                       if (shuntOk) {
+                         ShuntVoltage_mV = shuntMv;
+                         Bcur = (ShuntResistanceMicroOhm > 0) ? (ShuntVoltage_mV * 1000.0f / ShuntResistanceMicroOhm) : 0.0f;
+                         Bcur = Bcur + BatteryCOffset;
+                         if (InvertBattAmps == 1) {
+                           Bcur = -Bcur;
+                         }
+                         // battery current always from INA228
+                         if (AutoShuntGainCorrection == 1) {
+                           Bcur = Bcur * DynamicShuntGainFactor;
+                         }
+                         BatteryCurrent_scaled = Bcur * 100;
+                         MARK_FRESH(IDX_BCUR);
+                         aggBcur.add(Bcur);
+                       } else {
+                         ina228ErrorCount++;
+                       }
 
                        // IBV EMA — used by getFiltV() and CV loop error terms
                        // dBcur/dt — positive value = load dump (loads disconnected, OV risk)
@@ -4256,7 +4494,7 @@ void _ReadAnalogInputs_inner() {
                          // load-dump gate-tuning readout shows a number that reads like a measurement.
                          static float bcurPrev = 0.0f;
                          static uint32_t bcurPrevMs = 0;
-                         if (HAS_BATT_SHUNT) {
+                         if (HAS_BATT_SHUNT && shuntOk) {
                            if (bcurPrevMs > 0) {
                              uint32_t dtBcur = nowIna - bcurPrevMs;
                              if (dtBcur >= 3 && dtBcur < 2000) {
@@ -4264,17 +4502,17 @@ void _ReadAnalogInputs_inner() {
                                rollUpdate(ROLL_LDSLEW, g_dBcur_dt);   // load-dump slew gate-tuning readout
                              }
                            }
-                         } else {
+                           bcurPrev = Bcur;
+                           bcurPrevMs = nowIna;
+                         } else if (!HAS_BATT_SHUNT) {
                            g_dBcur_dt = 0.0f;
                          }
-                         bcurPrev = Bcur;
-                         bcurPrevMs = nowIna;
                        }
 
                        // Fold this fast Bcur sample (+ co-sampled MeasuredAmps) into the measured
                        // filtered-ripple capture (§3.1). ALWAYS-ON: peak IExcessTau-filtered pk-pk per
                        // FaCell for the map + Protections plot; the 3-level test ring appends only when armed.
-                       faFiltRippleUpdate(Bcur, MeasuredAmps, RPM);
+                       if (shuntOk && altAmpsFresh()) faFiltRippleUpdate(Bcur, MeasuredAmps, RPM);
 
                        if (IBV > IBVMax)              { IBVMax              = IBV; }
                        if (IBV > PeakVoltage_AllTime) { PeakVoltage_AllTime = IBV; }
@@ -4283,9 +4521,9 @@ void _ReadAnalogInputs_inner() {
                        wmIgnUpdate(wmIgn_IBV,  IBV);   // ignition-cycle watermarks (lo + hi)
                        // No shunt -> leave the battery-current watermark at NAN so the records row
                        // renders empty instead of the hi/lo excursions of an unconnected input.
-                       if (HAS_BATT_SHUNT) wmIgnUpdate(wmIgn_Bcur, Bcur);
+                       if (HAS_BATT_SHUNT && shuntOk) wmIgnUpdate(wmIgn_Bcur, Bcur);
                      } else {
-                       ina228ErrorCount++;   // implausible read — dropped (no MARK_FRESH)
+                       ina228ErrorCount++;   // I2C error or implausible read — dropped (no MARK_FRESH), IBV holds
                      }
 
                    } catch (...) {
@@ -4297,7 +4535,42 @@ void _ReadAnalogInputs_inner() {
                        lastINAFailureWarning = millis();
                      }
                    }
+                   if (busOk) inaMissRun = 0;
+                   else {
+                     if (inaMissRun == 0) inaMissRunFieldOn = !gpio4IsLow;
+                     if (inaMissRun < 255) inaMissRun++;
+                   }
                  }()));
+    }
+  }
+
+  // §10.1 / §1.4: main battery voltage stale. Read-count rule with a wall-clock backstop; the flag
+  // feeds REASON_VOLTAGE_STALE and sensorFaultMask bit 3 (buildTickSnapshot). 3 s of I2C misses also
+  // names the chip (INADisconnected) for the UI and mask bit 8; the next answered read clears it. A read
+  // that answers but sits outside the window (a bench with no battery) is stale, not a dead chip.
+  {
+    uint32_t nowMs = millis();
+    static bool prevFieldOn = false;
+    static uint32_t fieldOnMs = 0;
+    bool fieldOn = !gpio4IsLow;
+    if (fieldOn && !prevFieldOn) fieldOnMs = nowMs;
+    prevFieldOn = fieldOn;
+    uint32_t ibvAge = (dataTimestamps[IDX_IBV] == 0) ? nowMs : (nowMs - dataTimestamps[IDX_IBV]);
+    // The field-on backstop counts from the later of the last valid read and the field-on edge, so a
+    // slow-mode read age carried into the first field-on tick cannot trip it.
+    uint32_t sinceValid = (fieldOn && (nowMs - fieldOnMs) < ibvAge) ? (nowMs - fieldOnMs) : ibvAge;
+    bool fieldOnRule = fieldOn || (inaMissRun > 0 && inaMissRunFieldOn);
+    g_ibvStale = (inaMissRun >= (fieldOnRule ? 10 : 3)) || (sinceValid > (fieldOnRule ? 1000UL : 5000UL));
+    static uint32_t lastOutOfRangeMsgMs = 0;
+    if (ibvAge > 3000UL && INADisconnected == 0) {
+      if (inaLastMissI2c) {
+        INADisconnected = 1;
+        queueConsoleMessageF("INA228 not responding: no valid bus-voltage read for %.1f s (%lu dropped reads) — main battery voltage lost",
+                             ibvAge / 1000.0f, (unsigned long)ina228ErrorCount);
+      } else if ((uint32_t)(nowMs - lastOutOfRangeMsgMs) >= 30000UL) {
+        lastOutOfRangeMsgMs = nowMs;
+        queueConsoleMessageF("INA228 reading out of range for %.1f s — main battery voltage not updated (chip is answering)", ibvAge / 1000.0f);
+      }
     }
   }
 
@@ -4308,6 +4581,18 @@ void _ReadAnalogInputs_inner() {
     static unsigned long lastInaTempMs = 0;
     static uint8_t inaDieWarmup = 0;     // valid samples discarded since boot
     static float   inaDiePrevF  = NAN;   // previous sample — the corroborating witness for the max
+    // §1.4: read the hardware OV threshold back every 30 s; a chip that lost it (reset between polls) is re-armed.
+    static unsigned long lastBovlCheckMs = 0;
+    if (millis() - lastBovlCheckMs >= 30000UL) {
+      lastBovlCheckMs = millis();
+      uint16_t bovl = INA.getBusOvervoltageTH();
+      if (INA.getLastError() == 0 && bovl != inaExpectedBovlLsb()) {
+        queueConsoleMessageF("INA228 hardware overvoltage threshold read back as 0x%04X, expected 0x%04X — re-applying", (unsigned)bovl, (unsigned)inaExpectedBovlLsb());
+        g_inaQuietConfig = true;
+        inaApplyConfig();
+        g_inaQuietConfig = false;
+      }
+    }
     if (millis() - lastInaTempMs >= INA_DIETEMP_INTERVAL_MS) {
       lastInaTempMs = millis();
       try {
@@ -4351,17 +4636,25 @@ void _ReadAnalogInputs_inner() {
   //
   // ft_rai_ads_state measures cost per state step (not a full logical read cycle),
   // which is the correct unit for a non-blocking state machine.
-  if (ADS1115Disconnected != 0) {
-    static unsigned long lastADSWarning = 0;
-    if (millis() - lastADSWarning > 10000) {
-      queueConsoleMessage("theADS1115 was not connected and triggered a return");
-      lastADSWarning = millis();
-    }
-    return;  // Early exit - no MARK_FRESH calls
-  }
-
   unsigned long now = millis();
 
+  if (ADS1115Disconnected != 0) {
+    // §1.4: re-init every 30 s while disconnected; the channels hold their last committed values and
+    // go stale, RPM reads as a stopped engine. The BMP388 block below still runs.
+    static unsigned long lastAdsRetryMs = 0;
+    if (now - lastAdsRetryMs >= 30000UL) {
+      lastAdsRetryMs = now;
+      if (adc.testConnection()) {
+        adsApplyConfig();
+        adsState = ADS_IDLE;
+        ADS1115Disconnected = 0;
+        adsLastStepMs = now;   // the wall-clock stale rules count from here, so the 30 s-old held values stay stale until the first real commit
+        queueConsoleMessage("ADS1115 responding again — re-initialized; engine speed, alternator current, second battery voltage and thermistor reads resumed");
+      } else {
+        queueConsoleMessage("ADS1115 not responding — engine speed reads 0, alternator current / second battery voltage / thermistor are stale; retrying in 30 s");
+      }
+    }
+  } else
   TIMED_CALL(ft_rai_ads_state, ([&]() {
                switch (adsState) {
 
@@ -4410,11 +4703,13 @@ void _ReadAnalogInputs_inner() {
 
                      bool readOK = (endStatus == 0) && (bytesReceived == 2) && (Wire.available() >= 2);
 
+                     adsLastStepMs = millis();   // the state machine is stepping: the wall-clock stale backstops may count
                      if (readOK) {
                        Raw = (int16_t)((Wire.read() << 8) | Wire.read());
                      } else {
                        // Drain whatever is in the buffer to leave I2C bus clean
                        while (Wire.available()) Wire.read();
+                       if (adsTriggeredChannel < 4 && adsMissRun[adsTriggeredChannel] < 255) adsMissRun[adsTriggeredChannel]++;
                        adsI2CErrorCount++;
                        queueConsoleMessage("ADS1115 I2C read error ch" + String(adsTriggeredChannel) + " endStatus=" + String(endStatus) + " bytes=" + String(bytesReceived));
                      }
@@ -4438,13 +4733,21 @@ void _ReadAnalogInputs_inner() {
                      if (readOK) {
                        switch (adsTriggeredChannel) {
                          case 0:
-                           Channel0V = Raw / 32768.0 * 6.144 * 21.0401;  // divider 1,000,000Ω / 49.9kΩ, scale ≈21.0401
-                           BatteryV = Channel0V;
-                           if (BatteryV > 5.0 && BatteryV < fminf(125.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f))) {  // Sanity check — ceiling scales with class, capped near the ADS divider range
-                             MARK_FRESH(IDX_BATTERY_V);
-                             battVFreshFlag = true;
-                             adsGapUpdate(0, now);  // CH0 battV inter-sample gap meter
-                             aggBattV.add(BatteryV);
+                           {
+                             // Commit-on-valid (§10.2): BatteryV holds its last good value through a bad read and
+                             // goes stale, which REASON_VOLTAGE2_STALE acts on.
+                             float v0 = Raw / 32768.0 * 6.144 * 21.0401;  // divider 1,000,000Ω / 49.9kΩ, scale ≈21.0401
+                             if (v0 > 5.0 && v0 < fminf(125.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f))) {  // Sanity check — ceiling scales with class, capped near the ADS divider range
+                               Channel0V = v0;
+                               BatteryV = v0;
+                               MARK_FRESH(IDX_BATTERY_V);
+                               battVFreshFlag = true;
+                               adsGapUpdate(0, now);  // CH0 battV inter-sample gap meter
+                               aggBattV.add(BatteryV);
+                               adsMissRun[0] = 0;
+                             } else if (adsMissRun[0] < 255) {
+                               adsMissRun[0]++;
+                             }
                            }
                            break;
 
@@ -4477,18 +4780,38 @@ void _ReadAnalogInputs_inner() {
                            {
                              static const float kAmpScale[]  = {100.0f, 150.0f, 250.0f};
                              static const float kSanityLim[] = {250.0f, 370.0f, 600.0f};
+                             // Lower bound is 20 % of full scale, not the mirror of the upper one: an alternator cannot
+                             // source negative current beyond offset and noise, while an unplugged or unpowered sensor
+                             // reads -250 / -375 / -625 A (0 V in) and a reversed clamp reads the true current negated.
+                             // The symmetric window committed the 200 A case as a valid -249 A (audit 2026-09-27).
+                             static const float kNegLim[]    = {40.0f, 60.0f, 100.0f};
                              int rIdx = (AmpSensorRange >= 0 && AmpSensorRange <= 2) ? AmpSensorRange : 1;
-                             MeasuredAmps = (Channel1V - 2.5f) * kAmpScale[rIdx];
+                             float ampsCand = (Channel1V - 2.5f) * kAmpScale[rIdx];
 
                            if (InvertAltAmps == 1) {
-                             MeasuredAmps = MeasuredAmps * -1;
+                             ampsCand = ampsCand * -1;
                            }
-                           MeasuredAmps = MeasuredAmps - AlternatorCOffset;
+                           ampsCand = ampsCand - AlternatorCOffset;
                            if (AutoAltCurrentZero == 1) {
-                             MeasuredAmps = MeasuredAmps - DynamicAltCurrentZero;
+                             ampsCand = ampsCand - DynamicAltCurrentZero;
                            }
 
-                           if (MeasuredAmps > -kSanityLim[rIdx] && MeasuredAmps < kSanityLim[rIdx]) {  // Sanity check
+                           // Out of range = sensor unpowered/unplugged (0 V in reads ~-625 A on the 500 A range).
+                           // Never publish it: MeasuredAmps holds the last sane value, the UI greys it by age,
+                           // and REASON_CURRENT_STALE cuts the field after 10 s.
+                           const bool ampsSane = ampsCand > -kNegLim[rIdx] && ampsCand < kSanityLim[rIdx];
+                           g_altAmpsOutOfRange = !ampsSane;
+                           {
+                             static bool ampsWasSane = true;
+                             if (ampsSane != ampsWasSane) {
+                               ampsWasSane = ampsSane;
+                               if (ampsSane) queueConsoleMessageF("Alternator current sensor back in range (%.1f A)", ampsCand);
+                               else          queueConsoleMessageF("Alternator current sensor out of range: %.2f V in = %.0f A, reading ignored", Channel1V, ampsCand);
+                             }
+                           }
+
+                           if (ampsSane) {
+                             MeasuredAmps = ampsCand;
                              MARK_FRESH(IDX_MEASURED_AMPS);
                              wmIgnUpdate(wmIgn_amps, MeasuredAmps);  // ignition-cycle watermark
                              aggAltCur.add(MeasuredAmps);
@@ -4513,9 +4836,9 @@ void _ReadAnalogInputs_inner() {
                            }
 
                            // ── Current amplitude ring + moving averages ──────────────────────────────
-                           // Runs every confirmed CH1 hit. Feeds MA and dI/dt to the fast current
+                           // Runs every in-range CH1 sample. Feeds MA and dI/dt to the fast current
                            // rise supervisor in AdjustFieldLearnMode.
-                           {
+                           if (ampsSane) {
                              uint32_t now_i = millis();
                              iAmpRing[iAmpHead] = { now_i, MeasuredAmps };
                              iAmpHead = (iAmpHead + 1) % I_RING_SIZE;
@@ -4540,14 +4863,18 @@ void _ReadAnalogInputs_inner() {
                            // one-tick lag is acceptable for analysis.
                            cvLog_tick(millis());
 
-                           if (MeasuredAmps > MeasuredAmpsMax)         { MeasuredAmpsMax         = MeasuredAmps; }
-                           if (MeasuredAmps > MeasuredAmpsMax_AllTime) { MeasuredAmpsMax_AllTime = MeasuredAmps; }
+                           if (ampsSane) {
+                             if (MeasuredAmps > MeasuredAmpsMax)         { MeasuredAmpsMax         = MeasuredAmps; }
+                             if (MeasuredAmps > MeasuredAmpsMax_AllTime) { MeasuredAmpsMax_AllTime = MeasuredAmps; }
+                           }
                            }  // end AmpSensorRange scale block
                            break;
 
                          case 2:
-                           Channel2V = Raw / 32768.0 * 2 * 6.144 * RPMScalingFactor;
-                           RPM = Channel2V;
+                           {
+                           // Commit-on-valid (§10.3): the candidate lives in rpmCand until it passes every check;
+                           // RPM, RPMMax and the lifetime maximum only ever see committed values.
+                           float rpmCand = Raw / 32768.0 * 2 * 6.144 * RPMScalingFactor;
                            // DEBUG — RPM-glitch hunt (the phantom "Engine STARTED RPM=3321" with a clean
                            // plot). A real start ramps; a lone jump from ~0 to a high value in one read is
                            // the glitch. Logs the raw ADS conversion code so we can read the actual bad
@@ -4556,15 +4883,15 @@ void _ReadAnalogInputs_inner() {
                            // Remove once root cause is identified.
                            {
                              static float prevRPMdbg = 0.0f;
-                             if (prevRPMdbg < 100.0f && RPM > 1000.0f) {
+                             if (prevRPMdbg < 100.0f && rpmCand > 1000.0f) {
                                queueConsoleMessageF("RPM GLITCH: RPM=%d rawCode=%d (0x%04X) scale=%d endStatus=%d bytes=%d mux=0x%04X",
-                                                    (int)RPM, (int)Raw, (uint16_t)Raw, RPMScalingFactor,
+                                                    (int)rpmCand, (int)Raw, (uint16_t)Raw, RPMScalingFactor,
                                                     (int)endStatus, (int)bytesReceived, (unsigned)adsMuxCodes[adsTriggeredChannel]);
                                Serial.printf("RPM GLITCH: RPM=%d rawCode=%d (0x%04X) scale=%d endStatus=%d bytes=%d mux=0x%04X\n",
-                                             (int)RPM, (int)Raw, (uint16_t)Raw, RPMScalingFactor,
+                                             (int)rpmCand, (int)Raw, (uint16_t)Raw, RPMScalingFactor,
                                              (int)endStatus, (int)bytesReceived, (unsigned)adsMuxCodes[adsTriggeredChannel]);
                              }
-                             prevRPMdbg = RPM;
+                             prevRPMdbg = rpmCand;
                            }
                            // Lone-sample glitch rejection: a real start ramps across >=2 samples (~30ms
                            // apart via the ADS round-robin); a single <100 -> >1000 jump is field-PWM
@@ -4575,24 +4902,32 @@ void _ReadAnalogInputs_inner() {
                            {
                              static float rpmLastAccepted = 0.0f;
                              static bool rpmJumpPending = false;
-                             if (rpmLastAccepted < 100.0f && RPM > 1000.0f && !rpmJumpPending) {
+                             if (rpmLastAccepted < 100.0f && rpmCand > 1000.0f && !rpmJumpPending) {
                                rpmJumpPending = true;
-                               RPM = rpmLastAccepted;
+                               rpmCand = rpmLastAccepted;
                              } else {
                                rpmJumpPending = false;
-                               rpmLastAccepted = RPM;
+                               rpmLastAccepted = rpmCand;
                              }
                            }
-                           if (RPM > RPMMax)         { RPMMax         = RPM; }
-                           if (RPM > RPMMax_AllTime) { RPMMax_AllTime = RPM; }
-                           if (RPM < 100) {
-                             RPM = 0;
+                           if (rpmCand < 100) {
+                             rpmCand = 0;
                            }
-                           if (RPM >= 0 && RPM < 10000) {  // Sanity check
+                           if (rpmCand >= 0 && rpmCand < 10000) {  // Sanity check
+                             Channel2V = rpmCand;
+                             RPM = rpmCand;
+                             if (IgnoreRPM == 0) {   // an ignored tach is by the owner's word untrustworthy; RPMMax_AllTime has no reset path
+                               if (RPM > RPMMax)         { RPMMax         = RPM; }
+                               if (RPM > RPMMax_AllTime) { RPMMax_AllTime = RPM; }
+                             }
                              MARK_FRESH(IDX_RPM);
                              wmIgnUpdate(wmIgn_RPM, RPM);  // ignition-cycle watermark
                              adsGapUpdate(2, now);  // CH2 RPM inter-sample gap meter
                              aggRpm.add(RPM);
+                             adsMissRun[2] = 0;
+                           } else if (adsMissRun[2] < 255) {
+                             adsMissRun[2]++;
+                           }
                            }
                            break;
 
@@ -4606,30 +4941,28 @@ void _ReadAnalogInputs_inner() {
                            // installed by default, so most units have Channel 3 tied to GND and
                            // V_node = 0V. A 0.05V floor cleanly distinguishes "no usable sensor"
                            // (grounded or floating-leakage) from any real reading.
-                           if (Channel3V < 0.05f) {
-                             temperatureThermistor = -99;
-                             break;
-                           }
+                           // Commit-on-valid (§10.4): the -99 marker is no longer written as a temperature;
+                           // temperatureThermistor holds the last committed reading and goes stale.
+                           if (Channel3V < 0.05f) break;
 
+                           {
                            float thermC = thermistorTempC(Channel3V);
                            if (thermC <= -98.5f) {  // -99.0f error sentinel (°C domain) — converting it would yield -146°F, which passes every != -99 check downstream
-                             temperatureThermistor = -99;
                              break;
                            }
-                           temperatureThermistor = (int)(thermC * 1.8f + 32.0f);  // °C → °F
+                           int thermF = (int)(thermC * 1.8f + 32.0f);  // °C → °F
 
-                           if (temperatureThermistor > 500) {
-                             temperatureThermistor = -99;
-                           }
                            if (Channel3V > 0 && Channel3V < 3.3f) {  // legitimate ADC range
                              MARK_FRESH(IDX_CHANNEL3V);
                              aggCh3.add(Channel3V);
                            }
-                           if (temperatureThermistor > -58 && temperatureThermistor < 392) {  // °F bounds
+                           if (thermF > -58 && thermF < 392) {  // °F bounds
+                             temperatureThermistor = thermF;
                              MARK_FRESH(IDX_THERMISTOR_TEMP);
 
                              if (temperatureThermistor > MaxTemperatureThermistor)         MaxTemperatureThermistor         = temperatureThermistor;
                              if (temperatureThermistor > MaxTemperatureThermistor_AllTime) MaxTemperatureThermistor_AllTime = temperatureThermistor;
+                           }
                            }
                            break;
                        }
@@ -4661,6 +4994,19 @@ void _ReadAnalogInputs_inner() {
                }
              }()));
 
+  // §10.2 / §10.3 / §1.4: per-channel stale rules counted in ADS cycles (a long loop pass is not a dead
+  // input), with a 3 s wall-clock backstop that only counts while the state machine is actually
+  // stepping. CH0 (second battery voltage): 4 cycles -> REASON_VOLTAGE2_STALE / mask bit 4. CH2 (engine
+  // speed): 10 cycles, or no ADS1115 at all, reads as a stopped engine for every consumer (RPM table,
+  // MinRPMForField gate, engine-stopped cut).
+  {
+    uint32_t nowMs = millis();
+    bool stepping = (ADS1115Disconnected == 0) && ((uint32_t)(nowMs - adsLastStepMs) < 1000UL);
+    uint32_t ageV = (dataTimestamps[IDX_BATTERY_V] == 0) ? nowMs : (nowMs - dataTimestamps[IDX_BATTERY_V]);
+    uint32_t ageR = (dataTimestamps[IDX_RPM] == 0) ? nowMs : (nowMs - dataTimestamps[IDX_RPM]);
+    g_battVStale = (ADS1115Disconnected != 0) || adsMissRun[0] >= 4 || (stepping && ageV > 3000UL);
+    if (ADS1115Disconnected != 0 || adsMissRun[2] >= 10 || (stepping && ageR > 3000UL)) RPM = 0;
+  }
 
   // ── BMP388 forced-mode non-blocking state machine ────────────────────────
   // x32 pressure, x2 temperature, IIR filter enabled
@@ -5001,10 +5347,19 @@ void ReadAnalogInputs_Fake() {
     if (fakeTemp > 110) fakeTemp = 110;
     temperatureThermistor = (int)(fakeTemp * 1.8f + 32.0f);
     ambientTemp = (fakeTemp - (5 + random(-20, 20) / 10.0)) * 1.8f + 32.0f;
-    // Floored well clear of MinChargeTempF (40°F): the walk above can reach ~37°F, and once
-    // IDX_AMBIENT_TEMP is marked fresh the cold-charge lockout acts on it and would kill the
-    // field in sim. Without the MARK_FRESH the board-temp and baro readouts stay grayed forever.
+    // Floored at 60°F only so the board-temperature readout looks plausible; the board temperature no
+    // longer stands in for the battery (removed 2026-09-18), so no lockout reads it. Without the
+    // MARK_FRESH the board-temp and baro readouts stay grayed forever.
     if (ambientTemp < 60.0f) ambientTemp = 60.0f;
+
+    // Battery temperature as source 1 (probe): without it the default Automatic source reports
+    // BATT_TEMP_LOST and stops charging 90 s after boot. Held at 20-30°C so neither lockout trips.
+    static float fakeBattTempC = 25.0f;
+    fakeBattTempC += (random(-5, 6) / 10.0f);
+    if (fakeBattTempC < 20.0f) fakeBattTempC = 20.0f;
+    if (fakeBattTempC > 30.0f) fakeBattTempC = 30.0f;
+    BatteryTempProbeF = fakeBattTempC * 1.8f + 32.0f;
+    MARK_FRESH(IDX_BATT_TEMP_PROBE);
 
     float tempC = fakeTemp + 10 + random(-20, 20) / 10.0;
     AlternatorTemperatureF = tempC * 9.0 / 5.0 + 32.0;
@@ -5448,8 +5803,8 @@ void calculateDerivedMetrics() {
   // Session min/max watermarks for both VMGs (dashboard ↑/↓ sidebars)
   wmIgnUpdate(wmIgn_VMGman, VMGNMEA);
   wmIgnUpdate(wmIgn_VMGup, VMGUpwind);
-  // Lifetime best upwind VMG — only while the engine is effectively off (sailing, RPM<50), so motoring can't pad the record.
-  if (isfinite(VMGUpwind) && RPM < 50.0f && VMGUpwind > best_upwind_vmg_alltime) {
+  // Lifetime best upwind VMG — sailboats only, and only while the engine is effectively off (sailing, RPM<50), so motoring can't pad the record.
+  if (boatIsSail() && isfinite(VMGUpwind) && RPM < 50.0f && VMGUpwind > best_upwind_vmg_alltime) {
     best_upwind_vmg_alltime = VMGUpwind;
   }
 

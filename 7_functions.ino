@@ -1396,7 +1396,7 @@ void altLog_tick(uint32_t nowMs) {
   r->rpm     = altQI16(rpm, 1.0f);
   r->duty    = altQU16(duty, 100.0f);
   r->vbus    = altQU16(vbus, 1000.0f);
-  r->tempF   = altQI16(TempToUse, 10.0f);
+  r->tempF   = isnan(TempToUse) ? (int16_t)-32768 : altQI16(TempToUse, 10.0f);   // absent probe = blank in the dump, never 0.0 °F (§10.4)
   r->tSlope  = altQI16(altTempSlopeFMin, 100.0f);
   r->amps    = altQI16(amps, 100.0f);
   r->ampsRaw = altQI16(rawAmps, 100.0f);
@@ -1561,8 +1561,9 @@ void altFold_tick(uint32_t nowMs) {
   if (!altFrontBuf || !altEpRing) return;
 
   // IgnoreTemperature → the ENTIRE alt-health system is disabled: no live, no points, no trend.
-  // (altStatusCode is owned by the 1 Hz altHealth_tick, which reports this as 3.)
-  if (IgnoreTemperature) { altLiveValid = false; altSteady = false; altSessSteady = false; return; }
+  // (altStatusCode is owned by the 1 Hz altHealth_tick, which reports this as 3.) IgnoreRPM the same:
+  // engine speed is one of the surface axes (§4.8).
+  if (IgnoreTemperature || IgnoreRPM) { altLiveValid = false; altSteady = false; altSessSteady = false; return; }
 
   float rpm, tF, vbus, amps, duty;
   if (altSimMode >= 0.5f) {
@@ -2429,7 +2430,7 @@ void altHealth_tick(uint32_t nowMs) {
     altFold_tick(nowMs);
   }
   altProcessEmits();                  // grade + admit queued steady runs FIRST (front fresh for the live classify)
-  altStatusCode = IgnoreTemperature ? 3 : altLearnArmed() ? 0 : (commissionState == 2 ? ALT_STATUS_WAIT_CHC : ALT_STATUS_WAIT_CX);
+  altStatusCode = (IgnoreTemperature || IgnoreRPM) ? 3 : altLearnArmed() ? 0 : (commissionState == 2 ? ALT_STATUS_WAIT_CHC : ALT_STATUS_WAIT_CX);
   // 1 Hz evaluator + OUTPUT-BLIND state classifier. A stale fold (field off) → nothing to grade.
   bool foldFresh = (altLastFoldMs != 0) && ((uint32_t)(nowMs - altLastFoldMs) < 3000u);
   if (!foldFresh) altLiveValid = false;
@@ -2531,7 +2532,7 @@ void altSeedClassKnobs() {
 bool altSettingsHandle(AsyncWebServerRequest *request) {
   bool handled = false;
   for (size_t i = 0; i < ALT_SETTING_COUNT; i++) {
-    if (request->hasParam(ALT_SETTINGS[i].name)) {
+    if (paramOk(request, ALT_SETTINGS[i].name)) {   // every registry knob is a float: the §10.9 gate applies
       *ALT_SETTINGS[i].ptr = request->getParam(ALT_SETTINGS[i].name)->value().toFloat();
       char key[16];
       snprintf(key, sizeof(key), "%s", ALT_SETTINGS[i].name);  // NVS key = registry name (15-char cap)
@@ -2779,6 +2780,7 @@ void perfFold_tick(uint32_t nowMs) {
   uint8_t src = (perfSpeedSrc >= 1.5f) ? 2 : 1;
   float headwind = aws * cosf(awa * (float)PI / 180.0f);   // fore-aft apparent component (+ = headwind)
   bool motoring = (rpm > perfRpmFloor);
+  bool sailBoat = boatIsSail();   // a motorboat below the RPM floor is drifting: neither front learns
 
   // ── live point export (10 Hz): conditions only; prediction/state/% run at 1 Hz in boatPerf_tick.
   //    valid = "inputs usable" — the confidence state decides whether a % is shown. ──
@@ -2787,22 +2789,23 @@ void perfFold_tick(uint32_t nowMs) {
     motorLiveSrc = src; motorLiveValid = haveSpd; perfLiveValid = false;
   } else {
     perfLive_ws = aws; perfLive_wa = awa; perfLive_spd = spd; perfLive_pitch = sea;
-    perfLiveSrc = src; perfLiveValid = (haveSpd && aws >= perfMinWindSpeed); motorLiveValid = false;
+    perfLiveSrc = src; perfLiveValid = (sailBoat && haveSpd && aws >= perfMinWindSpeed); motorLiveValid = false;
   }
 
   if (hardwarePresent != 1 && perfSimMode < 0.5f) { perfSteady = false; perfSettleSec = -1.0f; return; }   // display only
   if (perfPaused >= 0.5f) { perfSteady = false; perfSettleSec = -1.0f; return; }                           // paused: no learning
+  if (IgnoreRPM && perfSimMode < 0.5f) { perfSteady = false; perfSettleSec = -1.0f; return; }             // no engine speed: motoring cannot be told from sailing, neither front learns (§4.8)
 
   // ── data-maturity hours: time spent actually moving in each mode (only while learning) ──
   if (perfDtMs > 0 && spd >= perfMinBoatSpeed) {
     if (motoring) perfMotorSeconds += perfDtMs / 1000.0;
-    else          perfSailSeconds  += perfDtMs / 1000.0;
+    else if (sailBoat) perfSailSeconds += perfDtMs / 1000.0;
   }
 
   // ── feed both Episodes; the inactive one gets an ineligible break so runs don't span a mode change ──
   FrontPoint<PERF_NAXIS> ep;
 
-  bool sailLearn = (sailFront.source != 1);
+  bool sailLearn = sailBoat && (sailFront.source != 1);
   bool sailElig = sailLearn && !motoring && haveSpd && spd >= perfMinBoatSpeed && aws >= perfMinWindSpeed;
   RawSample<PERF_NAXIS> ss; ss.x[0] = aws; ss.x[1] = awa; ss.x[2] = sea; ss.out = spd; ss.tMs = nowMs;
   ss.ex[0] = 0; ss.ex[1] = 0;   // sail keeps raw AWS/AWA as surface axes x0/x1 already — no extras needed
@@ -3362,7 +3365,7 @@ bool perfSettingsHandle(AsyncWebServerRequest *request) {
   bool handled = false;
   float oldSpeedSrc = perfSpeedSrc;
   for (size_t i = 0; i < PERF_SETTING_COUNT; i++) {
-    if (request->hasParam(PERF_SETTINGS[i].name)) {
+    if (paramOk(request, PERF_SETTINGS[i].name)) {   // every registry knob is a float: the §10.9 gate applies
       *PERF_SETTINGS[i].ptr = request->getParam(PERF_SETTINGS[i].name)->value().toFloat();
       char key[16];
       snprintf(key, sizeof(key), "%s", PERF_SETTINGS[i].name);  // NVS key = registry name truncated to the 15-char cap
@@ -3468,18 +3471,20 @@ void cvLog_tick(uint32_t nowMs) {
   CvLogEntry &e = cvLog[cvLogHead];
 
   e.ts = nowMs;
-  e.battV = (int16_t)(IBV * 100.0f);
-  e.targV = (int16_t)(ChargingVoltageTarget * 100.0f);
-  e.vErrorMv = (int16_t)((ChargingVoltageTarget - IBV) * 1000.0f);
+  // Every narrowed field is clamped (§10.7): (int16_t) of an out-of-range float is undefined, and
+  // vErrorMv overflows at 36/48 V whenever the error passes 32.7 V (IBV 0 after boot).
+  e.battV = (int16_t)clamp_f(IBV * 100.0f, -32767.0f, 32767.0f);
+  e.targV = (int16_t)clamp_f(ChargingVoltageTarget * 100.0f, -32767.0f, 32767.0f);
+  e.vErrorMv = (int16_t)clamp_f((ChargingVoltageTarget - IBV) * 1000.0f, -32767.0f, 32767.0f);
   e.dvdt_x1000 = (int16_t)clamp_f(g_fastOvDvdt * 1000.0f, -32767.0f, 32767.0f);
-  e.vPred = (int16_t)(g_fastOvVpred * 100.0f);
-  e.fastOvCap = (int16_t)(g_fastOvCurrentCap * 10.0f);
+  e.vPred = (int16_t)clamp_f(g_fastOvVpred * 100.0f, -32767.0f, 32767.0f);
+  e.fastOvCap = (int16_t)clamp_f(g_fastOvCurrentCap * 10.0f, -32767.0f, 32767.0f);
   e.cv_I_x10 = (int16_t)clamp_f(cv_I * 10.0f, -32767.0f, 32767.0f);
   e.Icv_x10 = (int16_t)clamp_f(Icv * 10.0f, -32767.0f, 32767.0f);
   e.uTarget = (int16_t)clamp_f((float)uTargetAmps * 10.0f, -32767.0f, 32767.0f);
   e.spLimited = (int16_t)clamp_f(setpointLimited * 10.0f, -32767.0f, 32767.0f);
   e.iMeas = (int16_t)clamp_f(MeasuredAmps * 10.0f, -32767.0f, 32767.0f);
-  e.duty = (int16_t)(dutyCycle * 10.0f);
+  e.duty = (int16_t)clamp_f(dutyCycle * 10.0f, -32767.0f, 32767.0f);
 
   e.flags = 0;
   if (g_fastOvClampActive) e.flags |= (1 << 0);
@@ -6326,10 +6331,30 @@ void chcLoadCapColumn(bool high, float *out) {
 // One column's ceiling in AMPS at one speed, read the way the control path reads it: watts over bus
 // volts in kW mode, and never above the alternator rating (MaxTableValue), which every normal command
 // path also applies.
+// The bus for the charge-test backstops: the second reading, else the main one, else NAN. With the second reading
+// ignored or stale the run used to lose its "bus reached the charge target" abort entirely.
+static float chcBusV() {
+  if (battVFresh()) return BatteryV;
+  if (ibvFresh() && !IgnoreBattVMain) return IBV;
+  return NAN;
+}
+
 static float chcCapAmpsAt(float rpm, const float *table) {
   float a = interpolateRPMTable(rpm, table);
-  if (capLimitMode == 1) a = (BatteryV > 0.5f) ? a / BatteryV : 0.0f;
+  if (capLimitMode == 1) {
+    const float v = chcBusV();
+    a = (v > 0.5f) ? a / v : 0.0f;   // no fresh voltage = a zero ceiling (fails safe): a held value must not size the run
+  }
   return fminf(a, (float)MaxTableValue);
+}
+
+// The charge-rate limit a run would size from if Start were pressed now — the setup screen shows the
+// test current in amps before any run exists. Reads flash (chcLoadCapColumn): web task only.
+float chcPreviewCapA() {
+  if (maxWorkingRpm <= 0) return 0.0f;
+  float col[RPM_TABLE_SIZE];
+  chcLoadCapColumn(BatteryCapacity_Ah >= CHC_LOHI_AH, col);
+  return chcCapAmpsAt(CHC_TOP_FRAC * (float)maxWorkingRpm, col);
 }
 
 static void chcFinish(bool ok, const char *why) {
@@ -6476,12 +6501,12 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       ampsEma += 0.05f * (ampsRaw - ampsEma);
       // Both run-ending ceilings apply here too: the bank charges under the sizing current just as it
       // does under a pass, and neither ceiling is survivable by continuing.
-      if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC || BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
+      if (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC || !(chcBusV() <= vTarget - CHC_V_ABORT_MARGIN)) {
         chcCcActive = false;
         setpointLimited = preSetpoint;
         chcFinish(false, (ampsRaw > chcGuardCapA * CHC_I_ABORT_FRAC)
                          ? "output reached the charge-rate limit for this speed"
-                         : "the bus reached the charge target");
+                         : (isnan(chcBusV()) ? "no fresh battery voltage" : "the bus reached the charge target"));
         chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
         return false;
       }
@@ -6554,8 +6579,9 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
         chcAbortRequested = true;
         return true;
       }
-      if (BatteryV > vTarget - CHC_V_ABORT_MARGIN) {
-        snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the bus reached the charge target");
+      const float busV = chcBusV();
+      if (!(busV <= vTarget - CHC_V_ABORT_MARGIN)) {   // NAN (no fresh voltage at all) aborts too
+        snprintf(chcAbortMsg, sizeof(chcAbortMsg), isnan(busV) ? "no fresh battery voltage" : "the bus reached the charge target");
         chcAbortRequested = true;
         return true;
       }

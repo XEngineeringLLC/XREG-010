@@ -804,6 +804,8 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "HardOCDebounceMs", NK_HardOCDebounceMs, 1 },
   { "SettleTimeBeforeCut", NK_SettleTimeBeforeCut, 1 },
   { "ShutdownPhase2HoldMs", NK_ShutdownPhase2HoldMs, 1 },
+  { "ShutdownRampTauS", NK_ShutdownRampTauS, 1 },
+  { "NoOutputAmps", NK_NoOutputAmps, 1 },
   { "ReseedFrac", NK_ReseedFrac, 1 },
   { "ReseedFracNoShunt", NK_ReseedFracNS, 1 },
   { "CvRecovClimbRate", NK_CvRecovClimb, 1 },
@@ -850,6 +852,11 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "IgnoreLearningDuringPenalty", NK_IgnoreLearningDuringPenalty, 1 },
   { "IgnoreRPM", NK_IgnoreRPM, 1 },
   { "IgnoreTemperature", NK_IgnoreTemperature, 1 },
+  { "IgnoreAltCurrent", NK_IgnoreAltCurrent, 1 },
+  { "IgnoreBattVMain", NK_IgnoreBattVMain, 1 },
+  { "IgnoreBattV2", NK_IgnoreBattV2, 1 },
+  { "LimpDutyPct", NK_LimpDutyPct, 1 },
+  { "NoRpmCurrentA", NK_NoRpmCurrentA, 1 },
   { "MaxPenaltyDuration", NK_MaxPenaltyDuration, 1 },
   { "MaxPenaltyPercent", NK_MaxPenaltyPercent, 1 },
   { "SafeOperationThreshold", NK_SafeOperationThreshold, 1 },
@@ -902,6 +909,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "VoltageDisagreeTimeout", NK_VoltageDisagreeTimeout, 1 },
   { "AlarmActivate", NK_AlarmActivate, 1 },
   { "AlarmLatchEnabled", NK_AlarmLatchEnabled, 1 },
+  { "GeneralFaultAlarm", NK_GeneralFaultAlarm, 1 },
   { "CurrentAlarmHigh", NK_CurrentAlarmHigh, 1 },
   { "VoltageAlarmHigh", NK_VoltageAlarmHigh, 1 },
   { "VoltageAlarmLow", NK_VoltageAlarmLow, 1 },
@@ -1410,6 +1418,41 @@ String exportConfigJson() {
 
 // Extract a flat top-level value for "key" from a JSON object starting at 'from'.
 // Quote-delimited needle prevents prefix collisions (e.g. TailCurrent vs TailCurrent_A).
+// §10.9: a FLOAT-valued token is acceptable only if the whole trimmed string parses with strtof and the
+// result is finite in float precision. Rejects "nan", "inf", "nanx", "infx", "1e39", "3.5e38", "1e308",
+// "", and plain text. Applied only where the consumer is a float (paramOk for /get handlers that toFloat,
+// the alt-health / boat-perf registry knobs, numeric config-import rows) — never to ids or names.
+bool floatTokenValid(const char *s) {
+  if (!s) return false;
+  while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+  if (!*s) return false;
+  char *end = nullptr;
+  float v = strtof(s, &end);
+  if (end == s) return false;
+  while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+  if (*end != '\0') return false;
+  return isfinite(v) != 0;
+}
+// A config-import row is numeric when the value it REPLACES parses as a number; a text row (a boat named
+// "Infinity", an SSID, an id) is never judged. New keys with nothing stored are left alone as well.
+static bool importRowIsNumeric(const char *nvsKey) {
+  String cur = settingRead(nvsKey);
+  return cur.length() > 0 && floatTokenValid(cur.c_str());
+}
+
+// Number-shaped but not finite in float precision ("1e39", "nan", "-inf", "nanx"). Text and blanks are not
+// number-shaped, so a text row that happens to hold "1998" still accepts a name or an empty value.
+static bool importValueNonFinite(const char *s) {
+  while (*s == ' ' || *s == '\t') s++;
+  const char *t = (*s == '+' || *s == '-') ? s + 1 : s;
+  if (strncasecmp(t, "nan", 3) == 0 || strncasecmp(t, "inf", 3) == 0) return true;
+  char *end = nullptr;
+  double v = strtod(s, &end);
+  if (end == s) return false;
+  while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+  return *end == '\0' && !isfinite((float)v);
+}
+
 // Quoted values fold \" and \\ escapes back (cfgAppendJsonStr produces them — e.g. the
 // imu_zero value is itself a JSON string with quotes).
 static bool cfgJsonExtract(const char *from, const char *key, String &val) {
@@ -1588,6 +1631,10 @@ int applyImportConfig(const char *body) {
       }
     }
     if (found) {
+      if (importRowIsNumeric(CONFIG_MANIFEST[i].nvsKey) && importValueNonFinite(val.c_str())) {   // "nan"/"inf"/"1e39" would be stored and read back as a real value
+        queueConsoleMessageF("IMPORT WARNING: ignoring non-finite value \"%s\" for %s", val.c_str(), CONFIG_MANIFEST[i].param);
+        continue;
+      }
       if (settingWrite(CONFIG_MANIFEST[i].nvsKey, val.c_str())) {
         applied++;
         cfgImportNoteChanged(CONFIG_MANIFEST[i].param);
@@ -1620,6 +1667,7 @@ int applyImportConfig(const char *body) {
       if (cfgJsonExtract(cfg, REG[i].name, val)) { \
         char key[16]; \
         snprintf(key, sizeof(key), "%s", REG[i].name); \
+        if (!floatTokenValid(val.c_str())) { queueConsoleMessageF("IMPORT WARNING: ignoring non-finite value \"%s\" for %s", val.c_str(), REG[i].name); continue; } \
         if (settingWrite(key, val.c_str())) { applied++; cfgImportNoteChanged(REG[i].name); } \
       } \
     }

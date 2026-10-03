@@ -80,7 +80,18 @@ void reportFieldModeEvent(uint32_t nowMs, FieldControlMode mode, FieldEventReaso
 const char *modeToString(FieldControlMode mode);
 const char *reasonToString(FieldEventReason r);
 // Control loop sub-path helpers
-void handleLimpHome(uint32_t currentMillis, const TickSnapshot &tick);
+void runReducedSensorControl(const TickSnapshot &tick, FieldEventReason reason, float actualDtSec);
+void reducedCtlLeaveTiers34();
+bool reasonSuppressedByOverride(FieldEventReason r, const TickSnapshot &t);
+uint16_t sensorOverriddenBits();
+uint16_t sensorBitsForReason(FieldEventReason r);
+const char *sensorFaultName(uint8_t bit);
+void sensorFaultNames(uint16_t bits, char *out, size_t n);
+float smallestRpmTableAmps();
+float largestRpmTableMinDuty();
+static inline bool immediateCutNow(FieldEventReason reason, const TickSnapshot &tick);
+bool fieldReasonIsFault(FieldEventReason r);
+bool voltageInPlausibleWindow(float v);
 void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEventReason reason,
                      float actualDtSec, bool exitingNormal);
 void runCommissionIdle(const TickSnapshot &tick, FieldEventReason reason, float actualDtSec);
@@ -142,14 +153,12 @@ static float cvResistanceRatio(float tC) {
 }
 
 // tempProbeFresh — idle-aware age gate for the battery / extra temperature feeds, the same shape as the
-// tempDataVeryStale rule in buildTickSnapshot: 20 s once the engine has been >= 200 RPM for 15 s, 90 s
-// otherwise (TempTask stretches its poll to 60 s with the engine off). A false result never cuts the
-// field — every consumer fails open or to neutral.
+// tempDataVeryStale rule in buildTickSnapshot: 20 s once the engine has been running for 15 s, 90 s
+// otherwise (TempTask stretches its poll to 60 s with the engine off). A false result on the battery
+// probe is what REASON_BATT_TEMP_LOST acts on (§2.3); the extra probe stays advisory.
 bool tempProbeFresh(uint8_t idx) {
-  static uint32_t lastBelowRunRpmMs = 0;
   uint32_t now = millis();
-  if (RPM < 200) lastBelowRunRpmMs = now;
-  bool running = (RPM >= 200) && ((uint32_t)(now - lastBelowRunRpmMs) >= 15000UL);
+  bool running = g_engineRunning;   // §1.1: computed once per tick in buildTickSnapshot (ignition stands in for an ignored tach)
   uint32_t ts = dataTimestamps[idx];
   if (ts == 0) return false;
   uint32_t age = (ts > now) ? 0 : (now - ts);   // a Core-0 stamp can lead this Core-1 clock read by a few ms
@@ -161,7 +170,8 @@ bool tempProbeFresh(uint8_t idx) {
 // and never emitted; the remaining codes keep their values so stored settings and CSV2 stay valid.
 float batteryTempF(uint8_t *srcOut) {
   // Every gate is evaluated each call so tempProbeFresh's idle tracker keeps running whatever the selection.
-  bool okProbe = tempProbeFresh(IDX_BATT_TEMP_PROBE) && battTempProbeEnable == 1 && isfinite(BatteryTempProbeF);
+  // Fake hardware simulates a probe reading whether or not the probe is enabled (ReadAnalogInputs_Fake).
+  bool okProbe = tempProbeFresh(IDX_BATT_TEMP_PROBE) && (battTempProbeEnable == 1 || hardwarePresent == 0) && isfinite(BatteryTempProbeF);
   bool okVe    = tempProbeFresh(IDX_VE_BATT_TEMP) && isfinite(VictronBattTempF);
   bool okRvc   = tempProbeFresh(IDX_RVC_BATT_TEMP) && isfinite(rvcRxBattTempF);
   bool okN2k   = !IS_STALE(IDX_N2K_BATT) && isfinite(n2kRxBattTempF);
@@ -1121,6 +1131,7 @@ void applyNominalVoltageChange(int oldV, int newV) {
     altDutyLineRms  *= dutyRatio;  // alt-health field-duty straightness limit (% points)
     altDutySlewMax  *= dutyRatio;  // …and its slew cap (% points per second) — same duty domain
     altMinDuty      *= dutyRatio;  // alt-health admission duty floor
+    LimpDutyPct     = constrain(LimpDutyPct * dutyRatio, 0.0f, 99.0f);  // reduced-sensor tier duty cap / fixed duty
     settingWrite(NK_kneeMarginPct,   String(kneeMarginPct, 2).c_str());
     settingWrite(NK_kneeStepPct,     String(kneeStepPct, 2).c_str());
     settingWrite(NK_kneeMaxFloorPct, String(kneeMaxFloorPct, 2).c_str());
@@ -1129,6 +1140,7 @@ void applyNominalVoltageChange(int oldV, int newV) {
     settingWrite(NK_DutySlowRampRate, String(DutySlowRampRate, 2).c_str());
     settingWrite(NK_MinDuty,         String(MinDuty, 2).c_str());
     settingWrite(NK_KHard,           String(KHard, 1).c_str());
+    settingWrite(NK_LimpDutyPct,     String(LimpDutyPct, 1).c_str());
     // Alt-health registry knobs persist under their registry names (NVS key = name), and the
     // CV wave amplitude under its 15-char NK_ key.
     settingWrite("altVbusTol",    String(altVbusTol, 4).c_str());
@@ -1421,10 +1433,17 @@ void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason, bool r
   if (reason == REASON_TACH_IMPLAUSIBLE && fieldCollapseTime == 0) {
     fieldCollapseTime = tick.nowMs;
     activeCollapseDelay = nextTachLieLockoutMs(tick.nowMs);
-    tachLieTripRpm = RPM;
+    // Engine speed ignored: the trip RPM is meaningless (0 or a phantom), and the rev-up release must stay out
+    // of reach if the owner un-ignores engine speed mid-lockout (07-28 rule: only tier expiry or a real rev-up
+    // past 1.5x the trip RPM frees it). An unreachable value leaves tier expiry as the only release.
+    tachLieTripRpm = tick.ignoreRPM ? 1e9f : RPM;
     tachLieLockoutArmed = true;
-    queueConsoleMessageF("Field commanded but no alternator output: %d RPM, %.0f%% field, %.1fA out - open field drive (ON/OFF switch off, field wire loose, gate-drive/Q3 fault), dead alternator, or false RPM (tach noise). Lockout %.1fs (sustained rev-up releases early)",
-                         (int)RPM, dutyCycle, MeasuredAmps, activeCollapseDelay / 1000.0f);
+    if (tick.ignoreRPM)
+      queueConsoleMessageF("Field commanded but no alternator output: %.0f%% field, %.1fA out, engine speed ignored - engine stopped with the key on, dead alternator, or open field drive (ON/OFF switch off, field wire loose, gate-drive/Q3 fault). Lockout %.1fs, then one more try; switch the alternator off if the engine is stopped",
+                           dutyCycle, MeasuredAmps, activeCollapseDelay / 1000.0f);
+    else
+      queueConsoleMessageF("Field commanded but no alternator output: %d RPM, %.0f%% field, %.1fA out - open field drive (ON/OFF switch off, field wire loose, gate-drive/Q3 fault), dead alternator, or false RPM (tach noise). Lockout %.1fs (sustained rev-up releases early)",
+                           (int)RPM, dutyCycle, MeasuredAmps, activeCollapseDelay / 1000.0f);
   }
   if (alreadyCut) return;  // hardware already cut — skip logging, don't spam
   apply_pwm_float(0.0f);
@@ -1597,43 +1616,154 @@ void enter_sys_auto() {
 // Each function handles one complete early-exit case from AdjustFieldLearnMode.
 // None of these touch the CV integrator (cv_I), bumpless tracker, or iExcess state.
 
-// handleLimpHome — Emergency limp-home path. Bypasses all safeties except INA228.
-// Call only when LimpHome==1. Caller returns immediately after.
-void handleLimpHome(uint32_t currentMillis, const TickSnapshot &tick) {
-  ctrlLimiter = 0;
-  if (OnOff == 0) {
-    digitalWrite(4, LOW);
-    gpio4IsLow = true;
-    apply_pwm_float(0.0f);
-    lastAppliedDuty = 0.0f;
-    dutyCycle = 0.0f;
-    return;
+// runReducedSensorControl — Run Without Failed Sensors tiers 2-4 (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md
+// §4.3-§4.5). Reached only from the normal AUTO branch of AdjustFieldLearnMode with GPIO4 already
+// enabled: every reason not suppressed by §1.3 has taken the shutdown or immediate-cut path first,
+// so nothing here fights a protection. Replaces handleLimpHome, which re-raised GPIO4 every 100 ms
+// against whatever cut reason was still true.
+//   tier 2  voltage-only regulation on the 12 V-equivalent error to (target - OvTierLoMarginV/2): duty rate =
+//           clamp(4 x e, 0, +2) %/s under that point, clamp(20 x e, -30, 0) %/s over it, x (12/class) (identity
+//           at 12 V; a duty point moves class/12 times the field current on a higher bus). Builds slowly, sheds
+//           fast, and settles half a low-tier margin under the target so the timed OV tiers are the backstop,
+//           not the regulator. Duty capped at min(LimpDutyPct, field ceiling). The charge-stage machine
+//           keeps running on IBV; voltageControlActive stays true so the timed OV tiers stay armed.
+//   tier 3  fixed LimpDutyPct while the second battery voltage is under the Bulk Voltage cap, 0 above
+//           it, back once it is 0.3 V x class/12 under the cap and 5 s have passed.
+//   tier 4  fixed LimpDutyPct.
+// slewChargingVoltageTarget — THE charge-target slew, shared by the normal CV path (AUTO body) and tier 2
+// so the two can never drift. Rate-limits the REAL ChargingVoltageTarget toward the commanded req at
+// rampUp / rampDn (V/s). ChargingVoltageTarget is what both the CV PI error and the RELATIVE over-voltage
+// protections read, so this limits only how fast the trip points move — the absolute backstops
+// (AlternatorHardShutdownV, the INA228 comparator) are unaffected. snap = bumpless seed, no ramp.
+static void slewChargingVoltageTarget(float req, bool snap, float rampUp, float rampDn, bool busPaced, float actualDtSec) {
+  if (snap) {
+    ChargingVoltageTarget = req;            // snap (disabled / idle / CV entry)
+  } else if (req > ChargingVoltageTarget) {
+    float step = (rampUp > 0.0f) ? (rampUp * actualDtSec) : 1.0e9f;
+    ChargingVoltageTarget = fminf(req, ChargingVoltageTarget + step);
+  } else if (req < ChargingVoltageTarget) {
+    // Snap-to-proximity: collapse the inert dead band in one tick, but never below the
+    // commanded setpoint (fmaxf) nor below IBV+margin — so measured stays under target and the
+    // relative OV protections can't trip. vTgtRampDn then owns the final approach. Self-arming:
+    // fires only while target >> measured (saturated); stays disengaged once measured is near
+    // target, which is exactly the delicate absorption→float-on-a-full-battery case.
+    float fastFloor = IBV + 0.2f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
+    if (ChargingVoltageTarget > fastFloor) {
+      ChargingVoltageTarget = fmaxf(req, fastFloor);
+    }
+    float step = (rampDn > 0.0f) ? (rampDn * actualDtSec) : 1.0e9f;
+    float tgtDn = ChargingVoltageTarget - step;
+    // Bus-paced floor: a fixed glide outruns delivery on a soft plant (lithium 7.5 mV/A bench:
+    // 150 mV/s glide vs 68 mV/s achievable bus opened the gap to the G2 margin — 4 fires,
+    // 2026-07-22 131Drop log). Hold the descent while the bus lags more than the lead. Pace on
+    // getFiltV, never g_ovIbvFilt: ripple troughs on the comparator's own signal would ratchet
+    // the floor down and crests re-open the gap. Tests keep their deliberate target trajectories —
+    // except the stress test's settle, which pins one target and waits (nothing graded): it keeps
+    // the floor, because CvStressDropV (0.10) equals the shipped OvMeasMarginV (0.100) and an
+    // unpaced landing puts the still-settled bus exactly on the G2 line.
+    if (busPaced) {
+      float paceFloor = getFiltV() - CV_TGT_PACE_LEAD_V * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
+      tgtDn = fminf(fmaxf(tgtDn, paceFloor), ChargingVoltageTarget);
+    }
+    ChargingVoltageTarget = fmaxf(req, tgtDn);
   }
-  static uint32_t lastLimpTick = 0;
-  static uint32_t lastLimpReport = 0;
-  if (currentMillis - lastLimpTick >= 100) {
-    lastLimpTick = currentMillis;
-    // Respect INA228 hardware OV latch even in limp home — prevents
-    // oscillation against the PRE-GATE cut. Hardware ALERT pin already
-    // pulled GPIO4 low; don't fight it.
-    if (!inaOvervoltageLatched) {
-      digitalWrite(4, HIGH);
-      gpio4IsLow = false;
-      apply_pwm_float(30.0f);
+}
+
+// Tier-2 charge target (§4.3): the same request the normal CV path uses (stage target from
+// updateChargingStage, Maintain, Target-Voltage, the external CVL clamp) through the same
+// slewChargingVoltageTarget, so a target drop (absorption -> float) cannot outrun the bus and walk the
+// timed OV tiers up their lockout ladder. snap only when arriving from tier 3/4 (no valid target there);
+// from tiers 0/1 the target continues from wherever the normal path left it.
+static void tier2ChargeTarget(float actualDtSec, bool snap) {
+  float req = ChargingVoltageTargetReq;
+  if (TargetVoltageMode == 1) req = TargetVoltageSetpoint;
+  if (MaintainMode == 1) req = BulkVoltage;
+  if (dvccEn == 1 && dvccState == 3 /*FOLLOWING*/ && !cxOwnsBatteryNow() && !isnan(dvccCvlV) && dvccCvlV < req) req = dvccCvlV;
+  ChargingVoltageTargetReq = req;
+  slewChargingVoltageTarget(req, snap || vTgtRampEnable == 0, vTgtRampUp, vTgtRampDn, true, actualDtSec);
+  voltageTargetSlewed = ChargingVoltageTarget;
+}
+
+static bool s_tierCapHold = false;   // tier 3 cap hold; survives 3<->4 transitions, cleared on leaving tiers 3/4
+static uint8_t s_reducedLastTier = 0; // 0 once the normal path takes back control, so a later tier 2 never inherits a stale "from tier 3/4" snap
+void reducedCtlLeaveTiers34() { s_tierCapHold = false; s_reducedLastTier = 0; }
+
+void runReducedSensorControl(const TickSnapshot &tick, FieldEventReason reason, float actualDtSec) {
+  static float tierDuty = 0.0f;
+  static uint32_t capDropMs = 0;
+  static uint32_t lastReportMs = 0;
+
+  const bool entering = (tick.limpTier != s_reducedLastTier);
+  const bool fromTier34 = entering && (s_reducedLastTier >= 3);
+  // Bumpless: a tier change, or any other path having moved the duty (a cut zeroes it), restarts the
+  // tier's own integrator from where the field actually is.
+  if (entering || fabsf(tierDuty - lastAppliedDuty) > 1.0f) tierDuty = lastAppliedDuty;
+  if (tick.limpTier < 3) s_tierCapHold = false;
+  s_reducedLastTier = tick.limpTier;
+
+  uTargetAmps = 0;
+  setpointLimited = 0.0f;
+  ctrlLimiter = 0;
+  cvWindDownActive = false;
+  voltageControlActive = (tick.limpTier == 2);
+  lastVoltageControlActive = voltageControlActive;
+
+  float request;
+  float floorDuty;
+  int gov;
+  if (tick.limpTier == 2) {
+    tier2ChargeTarget(actualDtSec, fromTier34);
+    // Regulate half a low-tier margin UNDER the target so the natural overshoot lands short of the timed OV
+    // low tier line (ChargingVoltageTarget + OvTierLoMarginV, which reads the unshifted target), and shed
+    // five times faster than the build: a stiff bank otherwise walks straight into the tier cut.
+    float e = (voltageTargetSlewed - 0.5f * OvTierLoMarginV - tick.currentBatteryVoltage) * 12.0f / fmaxf(1.0f, (float)SYSTEM_VOLTAGE_CLASS);
+    // Duty-%/s drives class/12 times the field current on a higher bus, so the law scales by 12/class.
+    const float dScale = 12.0f / fmaxf(1.0f, (float)SYSTEM_VOLTAGE_CLASS);
+    float rate = (e >= 0.0f) ? clamp_f(4.0f * dScale * e, 0.0f, 2.0f * dScale)
+                             : clamp_f(20.0f * dScale * e, -30.0f * dScale, 0.0f);
+    tierDuty = clamp_f(tierDuty + rate * actualDtSec, 0.0f, fminf(LimpDutyPct, ccDutyCeiling()));
+    request = tierDuty;
+    floorDuty = fminf(tick.rpmMinDuty, LimpDutyPct);   // keep-alive floor as in normal AUTO (0 while engine speed is ignored), never above the owner's cap (§4.3)
+    gov = GOV_BYPASS_SLEW;
+  } else {
+    if (tick.limpTier == 3) {
+      float capV = tick.bulkVoltage;
+      float hystV = 0.3f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
+      if (!s_tierCapHold && tick.currentBatteryVoltage > capV) { s_tierCapHold = true; capDropMs = tick.nowMs; }
+      else if (s_tierCapHold && tick.currentBatteryVoltage < capV - hystV && (uint32_t)(tick.nowMs - capDropMs) >= 5000UL) s_tierCapHold = false;
+      request = s_tierCapHold ? 0.0f : LimpDutyPct;
+    } else {
+      request = LimpDutyPct;       // tier 4: no reading to judge the cap by; the hold is kept for a return to tier 3
     }
-    lastAppliedDuty = 30.0f;
-    dutyCycle = 30.0f;
-    currentPID.SetMode(MANUAL);
-    pidOutput = 30.0;
-    currentPID.ResetIntegratorTo(30.0);
-    // alarmOutputState cleared by CheckAlarms — do not write GPIO38 here
-    updateFieldTelemetry(30.0f, tick.currentBatteryVoltage, FieldResistance);
-    fieldActiveStatus = 1;
-    if (currentMillis - lastLimpReport >= 30000) {
-      lastLimpReport = currentMillis;
-      queueConsoleMessage("LIMP HOME MODE: 30% duty, all safeties bypassed");
-      serialPrintlnNB("LIMP HOME MODE: 30% duty, all safeties bypassed");
-    }
+    tierDuty = request;
+    floorDuty = 0.0f;              // a fixed duty is the owner's number; no keep-alive floor under it
+    gov = GOV_NORMAL_SLEW;         // DutyRampRate eases the cap steps (LM2907 coupling-cap protection)
+  }
+
+  float applied = governor_apply(lastAppliedDuty, request, gov, floorDuty, true, actualDtSec);
+  currentPID.SetMode(MANUAL);
+  currentPID.ResetIntegratorTo((double)applied);
+  pidOutput = (double)applied;
+  lastAppliedDuty = applied;
+  dutyCycle = applied;
+  pidLog_dutyRequest = request;
+  pidLog_dutyApplied = applied;
+
+  updateFieldTelemetry(applied, tick.currentBatteryVoltage, FieldResistance);
+  fieldActiveStatus = (applied > 0.01f) ? 1 : 0;
+  chargeStageDisplay = getChargeStageDisplayCode();
+  reportFieldModeEvent(tick.nowMs, MODE_NORMAL_AUTO_PID, reason, tick, gpio4IsLow, dutyCycle);
+
+  if ((uint32_t)(tick.nowMs - lastReportMs) >= 30000UL) {
+    lastReportMs = tick.nowMs;
+    if (tick.limpTier == 2)
+      queueConsoleMessageF("Running without alternator current: voltage-only regulation, field %.1f%% (cap %.0f%%), bus %.2fV target %.2fV",
+                           applied, LimpDutyPct, tick.currentBatteryVoltage, voltageTargetSlewed);
+    else if (tick.limpTier == 3)
+      queueConsoleMessageF("Running without the main battery voltage: fixed field %.1f%% capped by the second reading %.2fV (cap %.2fV)%s",
+                           applied, tick.currentBatteryVoltage, tick.bulkVoltage, s_tierCapHold ? " - holding at 0%" : "");
+    else
+      queueConsoleMessageF("Fixed field %.1f%% with every sensor ignored - only the INA228 hardware over-voltage alert protects the bank", applied);
   }
 }
 
@@ -1664,8 +1794,12 @@ void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEvent
   float effectiveMin = 0.0f;
   float dutyRequest = 0.0f;
 
-  // Critical faults skip the slow ramp entirely
-  bool isCriticalFault = (reason == REASON_VOLTAGE_DISAGREE_CRITICAL || reason == REASON_VOLTAGE_IMPLAUSIBLE);
+  // Critical faults skip the slow ramp entirely. REASON_VOLTAGE2_STALE takes the phased ramp only while the
+  // main reading supervises it (spec §10.2); in tier 3 the second reading was the only voltage, so it goes
+  // straight to zero like the other unsupervised cases.
+  bool isCriticalFault = (reason == REASON_VOLTAGE_DISAGREE_CRITICAL || reason == REASON_VOLTAGE_IMPLAUSIBLE
+                          || reason == REASON_VOLTAGE_STALE || reason == REASON_MULTI_SENSOR_FAULT
+                          || (reason == REASON_VOLTAGE2_STALE && tick.ignoreBattVMain));
 
   if (isCriticalFault) {
     shutdownPhase = SHUTDOWN_PHASE_4;
@@ -1692,10 +1826,32 @@ void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEvent
       }
     }
 
-    // Phase 3: slow ramp from rpmMinDuty to 0
+    // Phase 3: ramp from rpmMinDuty to 0.
+    // Below the output point the stator swing shrinks with the field, and the LM2907's 20 uF coupling cap
+    // re-centers through 100k in ~2.1 s: a swing that shrinks faster leaves pin 1 off-center and the tach
+    // reads a false zero for ~4.6 s. Proportional decay keeps every step the same fraction of what is left;
+    // DutySlowRampRate is the tail floor so it actually reaches 0.
+    // Above the output point the battery pins the swing, so shedding there costs the tach nothing: a lower
+    // live floor (engine sped up) and real output while off both shed at DutyRampRate.
     if (shutdownPhase == SHUTDOWN_PHASE_3) {
-      float slowDuty = slew_limit_f(lastAppliedDuty, 0.0f,
-                                    DutySlowRampRate, DutySlowRampRate, actualDtSec);
+      static uint32_t outputSinceMs = 0;
+      static uint32_t outputForEntryMs = 0;  // a dwell timer left running by an earlier ramp must not count toward this one
+      if (outputForEntryMs != shutdownPhaseEntryMs) { outputForEntryMs = shutdownPhaseEntryMs; outputSinceMs = 0; }
+      bool altAmpsTrusted = !tick.ignoreAltCurrent && !tick.limpHome && !tick.currentDataStale;
+      if (altAmpsTrusted && MeasuredAmps > NoOutputAmps) {
+        if (outputSinceMs == 0) outputSinceMs = tick.nowMs;
+      } else {
+        outputSinceMs = 0;
+      }
+      bool outputWhileOff = outputSinceMs != 0 && (uint32_t)(tick.nowMs - outputSinceMs) >= OUTPUT_WHILE_OFF_DWELL_MS;
+
+      float rate = (ShutdownRampTauS > 0.0f) ? fmaxf(lastAppliedDuty / ShutdownRampTauS, DutySlowRampRate) : DutySlowRampRate;
+      if (outputWhileOff) rate = fmaxf(rate, DutyRampRate);
+      float slowDuty = slew_limit_f(lastAppliedDuty, 0.0f, rate, rate, actualDtSec);
+      if (tick.rpmMinDuty > 0.0f && tick.rpmMinDuty < slowDuty) {
+        float fastDuty = slew_limit_f(lastAppliedDuty, 0.0f, DutyRampRate, DutyRampRate, actualDtSec);
+        slowDuty = fmaxf(tick.rpmMinDuty, fastDuty);
+      }
       effectiveMin = 0.0f;
       dutyRequest = slowDuty;
       if (lastAppliedDuty <= 0.01f) {
@@ -1755,7 +1911,7 @@ void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEvent
                            || reason == REASON_OV_TIER_MID)    ? nextFastOvLockoutMs(tick.nowMs)
                         : (reason == REASON_TACH_IMPLAUSIBLE)  ? nextTachLieLockoutMs(tick.nowMs)
                                                                : FIELD_COLLAPSE_DELAY;
-    if (reason == REASON_TACH_IMPLAUSIBLE) { tachLieTripRpm = RPM; tachLieLockoutArmed = true; }
+    if (reason == REASON_TACH_IMPLAUSIBLE) { tachLieTripRpm = tick.ignoreRPM ? 1e9f : RPM; tachLieLockoutArmed = true; }   // unreachable trip RPM while engine speed is ignored (see applyImmediateCut)
     // Spam guard: with the engine off the temp feed ages past the 20s staleness threshold, so this
     // cut/restart cycle repeats every cooldown (~2s). Announce a new episode immediately, then
     // heartbeat at 60s / 5min / 30min as that one episode grinds on, so a genuinely new fault never
@@ -2564,6 +2720,8 @@ void AdjustFieldLearnMode() {
   thermalLog_tick(currentMillis);
   uint32_t aflM0 = micros();  // end of section 0: thermal log
 
+  static uint32_t passCount = 0;
+  passCount++;
   uint32_t actualDtMs = (lastControlTickMs == 0) ? 62 : (currentMillis - lastControlTickMs);
   if (actualDtMs > 500) actualDtMs = 500;
   if (actualDtMs == 0) actualDtMs = 1;  // floor prevents 0-div in slew calcs when tick runs twice in same ms
@@ -2745,8 +2903,8 @@ void AdjustFieldLearnMode() {
     float zeroBandA = fmaxf(2.0f, 0.01f * zeroFullScaleA);
     static uint32_t altZeroSinceMs = 0;
     float zeroHystV = 0.05f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
-    bool zeroLegs = voltageControlActive && !tick.currentDataStale
-                    && MeasuredAmps < zeroBandA;
+    bool zeroLegs = voltageControlActive && !tick.currentDataStale && !tick.ignoreAltCurrent
+                    && MeasuredAmps < zeroBandA;   // an ignored current sensor must not stand the OV tiers down (tier 2 relies on them)
     bool inBandNow = zeroLegs && ((altZeroOutput || altZeroSinceMs != 0)
                                     ? (g_ovIbvFilt > ChargingVoltageTarget - zeroHystV)
                                     : (IBV > ChargingVoltageTarget));
@@ -2877,6 +3035,8 @@ void AdjustFieldLearnMode() {
 
     g_fastOvHardActive = false;
     g_fastOvVpred = IBV;
+    const bool shutdownRampLive = !gpio4IsLow && ChargingVoltageTarget > 0.0f
+                                  && (shutdownPhase == SHUTDOWN_PHASE_1 || shutdownPhase == SHUTDOWN_PHASE_3);
 
     if (ibvFreshFlag) {
       ibvFreshFlag = false;
@@ -2924,7 +3084,8 @@ void AdjustFieldLearnMode() {
       // engaging the bypass drops the clamp on the same tick — no stranded latch to de-assert.
       // altZeroOutput (zero-output stand-down, computed above) rides the same gates: at ~0 A
       // delivered a fire cannot move the bus, so G1/G2 stand down until real output returns.
-      if (testProtectionsEnabled && !TuningMode && !batteryHealthTestActive && !altZeroOutput && IBV > ChargingVoltageTarget - PRED_GUARD) {
+      // Tier 2 (§4.3) has no current command for G1/G2 to cap; they would only pollute g_fastOvHardCount.
+      if (testProtectionsEnabled && !TuningMode && !batteryHealthTestActive && !altZeroOutput && tick.limpTier != 2 && IBV > ChargingVoltageTarget - PRED_GUARD) {
         if (OvGroup1Enable && Vpred > V_HARD) {
           float hardCap = fmaxf(0.0f, setpointLimited - KHard * (Vpred - V_HARD));
           // record reason only when this layer actually lowers the cap (equiv. to fminf)
@@ -2936,7 +3097,7 @@ void AdjustFieldLearnMode() {
 
       // Lifetime soft-exceed counter tracks the EXACT Group-2 trigger below (not g_fastOvClampCount,
       // which counts all protections), so the count means "the soft current-cap actually engaged."
-      bool g2SoftNow = (testProtectionsEnabled && !TuningMode && !batteryHealthTestActive && !altZeroOutput && OvGroup2Enable && ibvFilt > ChargingVoltageTarget + OvMeasMarginV);
+      bool g2SoftNow = (testProtectionsEnabled && !TuningMode && !batteryHealthTestActive && !altZeroOutput && tick.limpTier != 2 && OvGroup2Enable && ibvFilt > ChargingVoltageTarget + OvMeasMarginV);
       static bool g2SoftPrev = false;
       if (g2SoftNow && !g2SoftPrev) g_ovTel.softExceedCount++;
       g2SoftPrev = g2SoftNow;
@@ -2959,38 +3120,44 @@ void AdjustFieldLearnMode() {
         fastOvClampActive = true;
         g_fastOvHardActive = true;
       }
-
-      // ── Timed OV cut tiers (LOW/MID) ──────────────────────────────────────
-      // Sustained-violation field cuts on the same filtered bus as G2 (ripple-honest, slewed-
-      // target-relative). Trip = held CONTINUOUSLY above target + margin for the tier's dwell;
-      // any tick below the line resets that tier's timer — no hysteresis, so ripple crests
-      // crossing momentarily reset rather than accumulate, and a commanded target drop glides
-      // the trip lines with the reference. Dwells are sized so every sustained violation is cut
-      // inside 0.4 s: a BMS charge disconnect needs >= 0.5 s and ~100 ms of the budget is field
-      // de-energization. Gates are identical to G1/G2 (tests/tuning/zero-output stand-down),
-      // so MANUAL keeps instant-only protection and the absolute rungs stay always-on. Dwell 0
-      // disables that tier. Both timers run independently; whichever expires first cuts, via
-      // the reason arbiter (REASON_OV_TIER_LOW/MID -> shouldImmediatelyCutGPIO4 immediate cut +
-      // the SAME adaptive fast-OV lockout ladder, so a persistent cause escalates regardless of
-      // which rung catches it). The g_ovTierTrip latch clears once the filtered bus is back
-      // under that tier's line — after a cut the bus falls and the condition drops.
-      {
-        bool tierGate = testProtectionsEnabled && !TuningMode && !batteryHealthTestActive && !altZeroOutput;
-        bool loAbove  = tierGate && OvTierLoDwellMs  > 0 && ibvFilt > ChargingVoltageTarget + OvTierLoMarginV;
-        bool midAbove = tierGate && OvTierMidDwellMs > 0 && ibvFilt > ChargingVoltageTarget + OvTierMidMarginV;
-        if (loAbove)  { if (tierLoSinceMs  == 0) tierLoSinceMs  = currentMillis; } else tierLoSinceMs  = 0;
-        if (midAbove) { if (tierMidSinceMs == 0) tierMidSinceMs = currentMillis; } else tierMidSinceMs = 0;
-        if (!gpio4IsLow) {  // a cut can remove nothing while the field is already electrically off
-          // MID checked first: if both dwells expire on the same tick the higher rung names the cut.
-          if (midAbove && (uint32_t)(currentMillis - tierMidSinceMs) >= OvTierMidDwellMs) g_ovTierTrip = 2;
-          else if (loAbove && (uint32_t)(currentMillis - tierLoSinceMs) >= OvTierLoDwellMs) g_ovTierTrip = 1;
-        }
-        if (g_ovTierTrip == 1 && !loAbove)  g_ovTierTrip = 0;
-        if (g_ovTierTrip == 2 && !midAbove) g_ovTierTrip = 0;
-      }
     } else {
       ovActive = false;  // !voltageControlActive (idle only — MaintainMode sets voltageControlActive=true)
-      ibvFilt = IBV;     // track raw while idle so CV entry starts the level filter from the live bus
+      if (!shutdownRampLive) ibvFilt = IBV;  // track raw while idle so CV entry starts the level filter from the live bus
+    }
+
+    // ── Timed OV cut tiers (LOW/MID) ──────────────────────────────────────
+    // Sustained-violation field cuts on the same filtered bus as G2 (ripple-honest, slewed-
+    // target-relative). Trip = held CONTINUOUSLY above target + margin for the tier's dwell;
+    // any tick below the line resets that tier's timer — no hysteresis, so ripple crests
+    // crossing momentarily reset rather than accumulate, and a commanded target drop glides
+    // the trip lines with the reference. Dwells are sized so every sustained violation is cut
+    // inside 0.4 s: a BMS charge disconnect needs >= 0.5 s and ~100 ms of the budget is field
+    // de-energization. Gates are identical to G1/G2 (tests/tuning/zero-output stand-down),
+    // so MANUAL keeps instant-only protection and the absolute rungs stay always-on. Dwell 0
+    // disables that tier. Both timers run independently; whichever expires first cuts, via
+    // the reason arbiter (REASON_OV_TIER_LOW/MID -> shouldImmediatelyCutGPIO4 immediate cut +
+    // the SAME adaptive fast-OV lockout ladder, so a persistent cause escalates regardless of
+    // which rung catches it). The g_ovTierTrip latch clears once the filtered bus is back
+    // under that tier's line — after a cut the bus falls and the condition drops.
+    // Also armed through a shutdown ramp while the field is still energized: the ramp ignores the
+    // owner's target, so an unwanted charge above it must still be cut (arbiter priority 0.5).
+    if (voltageControlActive || shutdownRampLive) {
+      // altZeroOutput is CV-only; in the ramp the same stand-down is "no alternator output" (untrusted amps = armed).
+      bool rampOutput = tick.currentDataStale || tick.ignoreAltCurrent || MeasuredAmps > NoOutputAmps;
+      bool tierGate = testProtectionsEnabled && !TuningMode && !batteryHealthTestActive && !altZeroOutput
+                      && (voltageControlActive || rampOutput);
+      bool loAbove  = tierGate && OvTierLoDwellMs  > 0 && ibvFilt > ChargingVoltageTarget + OvTierLoMarginV;
+      bool midAbove = tierGate && OvTierMidDwellMs > 0 && ibvFilt > ChargingVoltageTarget + OvTierMidMarginV;
+      if (loAbove)  { if (tierLoSinceMs  == 0) tierLoSinceMs  = currentMillis; } else tierLoSinceMs  = 0;
+      if (midAbove) { if (tierMidSinceMs == 0) tierMidSinceMs = currentMillis; } else tierMidSinceMs = 0;
+      if (!gpio4IsLow) {  // a cut can remove nothing while the field is already electrically off
+        // MID checked first: if both dwells expire on the same tick the higher rung names the cut.
+        if (midAbove && (uint32_t)(currentMillis - tierMidSinceMs) >= OvTierMidDwellMs) g_ovTierTrip = 2;
+        else if (loAbove && (uint32_t)(currentMillis - tierLoSinceMs) >= OvTierLoDwellMs) g_ovTierTrip = 1;
+      }
+      if (g_ovTierTrip == 1 && !loAbove)  g_ovTierTrip = 0;
+      if (g_ovTierTrip == 2 && !midAbove) g_ovTierTrip = 0;
+    } else {
       tierLoSinceMs = 0;
       tierMidSinceMs = 0;
       g_ovTierTrip = 0;
@@ -3022,34 +3189,23 @@ void AdjustFieldLearnMode() {
   }
   g_fastOvHardActive_prev = g_fastOvHardActive;
 
-  // ========== EMERGENCY LIMP HOME MODE (runs every loop) ==========
-  // WARNING: BYPASSES ALL SAFETY SYSTEMS EXCEPT INA228 HARDCODED
-  if (LimpHome == 1) {
-    handleLimpHome(currentMillis, tick);
-    return;
-  }
-  uint32_t aflM2 = micros();  // end of section 2: temp warning + fast-OV supervisor + limp gate
+  // (Limp home no longer has its own early exit: every reduced-sensor tier, LimpHome included, runs
+  // through runReducedSensorControl inside the normal branch below, behind the same pre-gate as
+  // everything else — §4.5.)
+  uint32_t aflM2 = micros();  // end of section 2: temp warning + fast-OV supervisor
 
-  // ========== GATE ON FRESH CH1 DATA ==========
-  // PidSampleDivisor=1: PID runs every CH1 sample (fresh CH1 measured 5–25ms apart, assume ~30ms)
-  // PidSampleDivisor=2: every other sample, etc.
-  static uint8_t ch1SampleCount = 0;
-
-  if (!ch1FreshFlag) {
-    // Manual mode does not need current sensor data — let it through.
-    if (!tick.manualMode) {
-      return;
-    }
-  } else {
-    ch1SampleCount++;
-    if (ch1SampleCount < PidSampleDivisor) {
-      ch1FreshFlag = false;
-      return;
-    }
-    ch1FreshFlag = false;
-    ch1SampleCount = 0;
-  }
-  lastControlTickMs = currentMillis;
+  // Per-pass dt for the paths that now run on EVERY pass below (shutdown ramp, commissioning rest). The CH1
+  // gate — and with it lastControlTickMs / actualDtSec, which pace the closed-loop body — sits inside the
+  // normal branch. Audit 2026-09-27: with the gate above the dispatch, a current sensor going bad while any
+  // ramp reason held the top of the ladder (switch off, BMS, idle, battery-temperature lockouts, stale
+  // alternator temperature) returned here every pass, so runShutdownPath never ran and the field froze at
+  // its last duty; the published reason (g_fieldEventReason) froze with it.
+  static uint32_t lastPassMs = 0;
+  uint32_t passDtMs = (lastPassMs == 0) ? 62 : (currentMillis - lastPassMs);
+  if (passDtMs > 500) passDtMs = 500;
+  if (passDtMs == 0) passDtMs = 1;
+  lastPassMs = currentMillis;
+  const float passDtSec = (float)passDtMs / 1000.0f;
 
   // ── Reset per-tick pidLog capture globals ────────────────────────────────
   // Written at specific points below; read by pidLog_tick() at end of normal
@@ -3069,7 +3225,7 @@ void AdjustFieldLearnMode() {
   FieldEventReason reason = selectFieldEventReason(tick);
   g_fieldEventReason = (uint8_t)reason;  // steady-state / commission-rest cause (immediate cuts overwrite this in applyImmediateCut)
 
-  if (shouldImmediatelyCutGPIO4(reason) && !gpio4IsLow) {
+  if (immediateCutNow(reason, tick) && !gpio4IsLow) {
     applyImmediateCut(tick, reason, false);
     return;
   }
@@ -3089,7 +3245,7 @@ void AdjustFieldLearnMode() {
       pidInitialized = true;
       queueConsoleMessage("Charging enabled (AUTO)");
     }
-    runCommissionIdle(tick, reason, actualDtSec);
+    runCommissionIdle(tick, reason, passDtSec);
     prevMode = mode;
     return;
   }
@@ -3114,7 +3270,11 @@ void AdjustFieldLearnMode() {
   // temporarily raises ChargingVoltageTarget above the real stage target, which
   // can trigger bulk→absorption transitions and cause the absorption tail timer
   // to expire mid-test, killing voltageControlActive.
-  if (MaintainMode != 1 && TargetVoltageMode != 1 && !CVTuningMode && !tick.manualMode) {
+  // Tiers 3/4 have no main voltage for the stage machine to decide on (§4.4); runReducedSensorControl
+  // parks the flags in bulk instead. A stale IBV freezes it the same way: with the field cut for
+  // VOLTAGE_STALE the absorption and bulk-hold timers must not advance on a held reading and park the
+  // bank in FLOAT or IDLE (audit 2026-09-27).
+  if (MaintainMode != 1 && TargetVoltageMode != 1 && !CVTuningMode && !tick.manualMode && tick.limpTier < 3 && !tick.ibvStale) {
     updateChargingStage();
   }
 
@@ -3201,8 +3361,10 @@ void AdjustFieldLearnMode() {
   if (tick.currentBatteryVoltage > (tick.alternatorHardShutdownV + 0.5f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f))) {
     govMode = GOV_BYPASS_SLEW;
   }
-  // Voltage sensor failure: bypass slew
-  if (!tick.voltagePlausible || tick.voltageDisagreementCritical) {
+  // Voltage sensor failure: bypass slew. An owner-overridden disagreement is not a failure: with a reading ignored
+  // the other one stays dead or far off for the whole run, and this would drop the duty ramp limit throughout.
+  if ((!tick.voltagePlausible && !reasonSuppressedByOverride(REASON_VOLTAGE_IMPLAUSIBLE, tick))
+      || (tick.voltageDisagreementCritical && !reasonSuppressedByOverride(REASON_VOLTAGE_DISAGREE_CRITICAL, tick))) {
     govMode = GOV_BYPASS_SLEW;
   }
 
@@ -3228,14 +3390,14 @@ void AdjustFieldLearnMode() {
   }
 
   // ========== MODE TRANSITION HANDLING ==========
-  bool isNormalMode = (mode == MODE_NORMAL_AUTO_PID || mode == MODE_NORMAL_MANUAL) && !shouldImmediatelyCutGPIO4(reason);
+  bool isNormalMode = (mode == MODE_NORMAL_AUTO_PID || mode == MODE_NORMAL_MANUAL) && !immediateCutNow(reason, tick);
   bool wasNormalMode = (prevMode == MODE_NORMAL_AUTO_PID || prevMode == MODE_NORMAL_MANUAL);
   bool enteringNormal = !wasNormalMode && isNormalMode;
   bool exitingNormal = wasNormalMode && !isNormalMode;
 
   SystemMode newSysMode;
   if (!tick.chargingEnabled) newSysMode = SYS_MODE_OFF;
-  else if (shouldImmediatelyCutGPIO4(reason)) newSysMode = SYS_MODE_FAULT;
+  else if (immediateCutNow(reason, tick)) newSysMode = SYS_MODE_FAULT;
   else if (mode == MODE_NORMAL_MANUAL) newSysMode = SYS_MODE_MANUAL;
   else if (mode == MODE_NORMAL_AUTO_PID) newSysMode = SYS_MODE_AUTO;
   else newSysMode = SYS_MODE_FAULT;
@@ -3356,17 +3518,47 @@ void AdjustFieldLearnMode() {
   // ========== NON-NORMAL MODE: SHUTDOWN / FAULT HANDLING ==========
   // NOTE: pidLog_tick() is NOT called in the shutdown/fault path.
   if (!isNormalMode) {
-    runShutdownPath(tick, mode, reason, actualDtSec, exitingNormal);
+    runShutdownPath(tick, mode, reason, passDtSec, exitingNormal);
     prevMode = mode;
     return;
   }
 
   // ========== NORMAL MODES (MANUAL or AUTO) ==========
   // Re-check before enabling GPIO4 — fault could have arrived this tick.
-  if (shouldImmediatelyCutGPIO4(reason) && !gpio4IsLow) {
+  if (immediateCutNow(reason, tick) && !gpio4IsLow) {
     applyImmediateCut(tick, reason, false);
     return;
   }
+
+  // Any pass that left before this point (shutdown, cut, commissioning rest, lockout) breaks the run, and the next
+  // closed-loop tick paces as a nominal one: the gap since the last tick would otherwise reach the 500 ms cap and
+  // let the slew governors step duty ~20 points at once.
+  static uint32_t lastNormalPass = 0;
+  if (lastNormalPass != passCount - 1) lastControlTickMs = 0;
+  lastNormalPass = passCount;
+
+  // ========== GATE ON FRESH CH1 DATA ==========
+  // PidSampleDivisor=1: PID runs every CH1 sample (fresh CH1 measured 5–25ms apart, assume ~30ms)
+  // PidSampleDivisor=2: every other sample, etc. Only the closed-loop body below needs a current sample;
+  // every shutdown, cut and rest path has already run above this line, and the published reason is current.
+  static uint8_t ch1SampleCount = 0;
+  if (!ch1FreshFlag) {
+    // Manual mode does not need current sensor data — let it through. Neither do the reduced-sensor
+    // tiers (2-4), whose whole point is a dead or ignored CH1.
+    if (!tick.manualMode && tick.limpTier < 2) {
+      return;
+    }
+  } else {
+    ch1SampleCount++;
+    if (ch1SampleCount < PidSampleDivisor) {
+      ch1FreshFlag = false;
+      return;
+    }
+    ch1FreshFlag = false;
+    ch1SampleCount = 0;
+  }
+  if (lastControlTickMs == 0) { actualDtMs = 62; actualDtSec = 0.062f; }
+  lastControlTickMs = currentMillis;
   // Hold field off while Core 0 internet operation is in progress OR while
   // there are still pending HTTPS uploads in the queue (so the field can't
   // "blip" through between consecutive queued uploads). Sets fieldActiveStatus
@@ -3418,6 +3610,41 @@ void AdjustFieldLearnMode() {
   if (!setpointInitialized) {
     setpointLimited = max(0.0f, getTargetAmps());
     setpointInitialized = true;
+  }
+
+  // ========== RUN WITHOUT FAILED SENSORS: tiers 2-4 (§4.3-§4.5) ==========
+  // Placed here, inside the normal branch: every unsuppressed reason has already taken the shutdown
+  // ramp or the immediate cut above, so a tier can never re-raise a field a protection holds off.
+  // MANUAL keeps precedence (bench tool). The inner PID is parked while a tier owns the field and
+  // re-entered through enter_sys_auto() on the way back, otherwise Compute() would run on a MANUAL
+  // PID and freeze the duty.
+  {
+    static bool reducedCtlWasActive = false;
+    if (tick.limpTier >= 2 && sysMode == SYS_MODE_AUTO) {
+      if (!reducedCtlWasActive) {
+        reducedCtlWasActive = true;
+        queueConsoleMessageF("%s: tier %d takes the field (%s)",
+                             "Run Without Failed Sensors", (int)tick.limpTier,
+                             tick.limpTier == 2 ? "voltage-only regulation, duty capped" : tick.limpTier == 3 ? "fixed duty, capped by the second battery voltage" : "fixed duty");
+      }
+      runReducedSensorControl(tick, reason, actualDtSec);
+      prevMode = mode;
+      return;
+    }
+    if (reducedCtlWasActive) {
+      reducedCtlWasActive = false;
+      reducedCtlLeaveTiers34();
+      voltageControlActive = false;
+      lastVoltageControlActive = false;
+      cvWindDownActive = false;
+      // MANUAL took the field (bench tool): hand it over as-is. enter_sys_auto() here would flip
+      // sysMode back to AUTO for one tick.
+      if (sysMode == SYS_MODE_AUTO) {
+        enter_sys_auto();
+        pidInitialized = true;
+        queueConsoleMessage("Run Without Failed Sensors: field handed back to normal closed-loop control");
+      }
+    }
   }
 
   // ========== SYSTEM ID OVERRIDE ==========
@@ -3855,7 +4082,7 @@ void AdjustFieldLearnMode() {
           if (fabsf(e) > tuningScore.worstErrorA) tuningScore.worstErrorA = fabsf(e);
           tuningScore.rpmSum += RPM;
           float tempSample = isnan(AlternatorTemperatureF) ? TempToUse : AlternatorTemperatureF;
-          if (!isnan(tempSample)) { tuningScore.tempSum += tempSample; tuningScore.tempSampleCount++; }
+          if (!isnan(tempSample) && tempSample > -90.0f) { tuningScore.tempSum += tempSample; tuningScore.tempSampleCount++; }   // -99 = thermistor never read (§10.4)
           tuningScore.avgSampleCount++;
           if (tuningScore.activeTimeSec > 0.0f) {
             tuningScore.score = tuningScore.errorAccum / tuningScore.activeTimeSec;
@@ -3904,12 +4131,24 @@ void AdjustFieldLearnMode() {
         // HiLow is applied at table-load time (loadCapTablesForMode), not by runtime halving.
 
         float I_cap;
-        if (capLimitMode == 1 && tick.currentBatteryVoltage > 0.5f) {
+        if (tick.ignoreRPM) {
+          I_cap = NoRpmCurrentA;   // §4.8: one owner-set limit replaces both RPM tables while engine speed is ignored
+          if (!(I_cap > 0.0f)) {
+            // Not configured (an override set before this setting existed): the smallest non-zero limit in the
+            // active amps table stands in, said once, so the alternator is not commanded to 0 A in silence.
+            float smallest = smallestRpmTableAmps();
+            I_cap = smallest;
+            static bool noRpmCapNoted = false;
+            if (!noRpmCapNoted) {
+              noRpmCapNoted = true;
+              queueConsoleMessageF("Engine speed is ignored with no current limit set — using the smallest RPM-table limit, %.0f A. Set the limit under Setup > System > Run Without Failed Sensors.", smallest);
+            }
+          }
+        } else if (capLimitMode == 1 && tick.currentBatteryVoltage > 0.5f) {
           I_cap = interpolateRPMTable(RPM, rpmCapPowerTable) / tick.currentBatteryVoltage;
         } else {
           I_cap = getCapCurrentForRPM(RPM);
         }
-
         g_I_cap = I_cap;  // expose RPM table ceiling globally for thermal scoring gate
         float I_cmd = I_cap - thermalPenaltyAmps;
         I_cmd = fminf(I_cmd, (float)MaxTableValue);
@@ -3976,7 +4215,8 @@ void AdjustFieldLearnMode() {
         // source's contribution. Only the resulting ceiling is floored at 0.
         // Gated on a configured INA228 battery shunt; 0 = feature disabled.
         static float loadOffsetFilt = 0.0f;  // EMA of MeasuredAmps − Bcur (A; negative = other sources exceed loads)
-        {
+        const bool bcurLive = bcurFresh();   // a held shunt reading (§10.6) must not feed the offset or the shunt-basis ceilings
+        if (bcurLive) {
           const float ldoTC = 0.25f;  // s
           static bool ldoInit = false;
           float instLoad = MeasuredAmps - Bcur;
@@ -3988,7 +4228,9 @@ void AdjustFieldLearnMode() {
         }
         bool battCeilBinding = false;  // battery charge-current ceiling won the min-select this tick (banner limiter code 4)
         if (BattLimitEnable && BattCurrentLimitA > 0.0f && BatteryCurrentSource == 0 && ShuntResistanceMicroOhm > 0 && BatteryShuntPresent) {
-          float battCeilAlt = fmaxf(0.0f, BattCurrentLimitA + loadOffsetFilt);
+          // Shunt quiet: the house-load offset is unknowable, so the battery limit caps alternator amps directly
+          // (charge current can never exceed alternator output) until the reading returns.
+          float battCeilAlt = bcurLive ? fmaxf(0.0f, BattCurrentLimitA + loadOffsetFilt) : BattCurrentLimitA;
           // Console note when the battery limit is the binding ceiling AND output is actually riding it
           // (e.g. absorption approaching target slowly, or bulk capped below the RPM table): once after
           // 5 s sustained, reminder at most every 10 min. Diagnosis aid, throttled against spam.
@@ -4023,7 +4265,7 @@ void AdjustFieldLearnMode() {
         // rides the existing rate-governed ramp when the authority raises it again.
         bool dvccCclBinding = false;
         if (dvccEn == 1 && dvccState == 3 /*FOLLOWING*/ && !cxOwnsBatteryNow() && !isnan(dvccCclA)) {
-          bool shuntBasis = (BatteryCurrentSource == 0 && ShuntResistanceMicroOhm > 0 && BatteryShuntPresent);
+          bool shuntBasis = (BatteryCurrentSource == 0 && ShuntResistanceMicroOhm > 0 && BatteryShuntPresent && bcurLive);
           float dvccCeil = shuntBasis ? fmaxf(0.0f, dvccCclA + loadOffsetFilt) : fmaxf(0.0f, dvccCclA);
           if (dvccCeil < uTargetAmps) {
             uTargetAmps = dvccCeil;
@@ -4601,37 +4843,10 @@ void AdjustFieldLearnMode() {
         float cvRampDn = (cvManualTest && cvTestSlewMode == 1) ? vtDflt : vTgtRampDn;
         bool forceSnap = (!voltageControlActive || enteringCV) ||
                          (tgtSlewOff && !cvWaveExitWindDown);
-        if (forceSnap) {
-          ChargingVoltageTarget = ChargingVoltageTargetReq;            // snap (disabled / idle / CV entry)
-        } else if (ChargingVoltageTargetReq > ChargingVoltageTarget) {
-          float step = (cvRampUp > 0.0f) ? (cvRampUp * actualDtSec) : 1.0e9f;
-          ChargingVoltageTarget = fminf(ChargingVoltageTargetReq, ChargingVoltageTarget + step);
-        } else if (ChargingVoltageTargetReq < ChargingVoltageTarget) {
-          // Snap-to-proximity: collapse the inert dead band in one tick, but never below the
-          // commanded setpoint (fmaxf) nor below IBV+margin — so measured stays under target and the
-          // relative OV protections can't trip. vTgtRampDn then owns the final approach. Self-arming:
-          // fires only while target >> measured (saturated); stays disengaged once measured is near
-          // target, which is exactly the delicate absorption→float-on-a-full-battery case.
-          float fastFloor = IBV + 0.2f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
-          if (ChargingVoltageTarget > fastFloor) {
-            ChargingVoltageTarget = fmaxf(ChargingVoltageTargetReq, fastFloor);
-          }
-          float step = (cvRampDn > 0.0f) ? (cvRampDn * actualDtSec) : 1.0e9f;
-          float tgtDn = ChargingVoltageTarget - step;
-          // Bus-paced floor: a fixed glide outruns delivery on a soft plant (lithium 7.5 mV/A bench:
-          // 150 mV/s glide vs 68 mV/s achievable bus opened the gap to the G2 margin — 4 fires,
-          // 2026-07-22 131Drop log). Hold the descent while the bus lags more than the lead. Pace on
-          // getFiltV, never g_ovIbvFilt: ripple troughs on the comparator's own signal would ratchet
-          // the floor down and crests re-open the gap. Tests keep their deliberate target trajectories —
-          // except the stress test's settle, which pins one target and waits (nothing graded): it keeps
-          // the floor, because CvStressDropV (0.10) equals the shipped OvMeasMarginV (0.100) and an
-          // unpaced landing puts the still-settled bus exactly on the G2 line.
-          if (!cvManualTest && (!g_autoTestActive || cvStressForceCV)) {
-            float paceFloor = getFiltV() - CV_TGT_PACE_LEAD_V * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
-            tgtDn = fminf(fmaxf(tgtDn, paceFloor), ChargingVoltageTarget);
-          }
-          ChargingVoltageTarget = fmaxf(ChargingVoltageTargetReq, tgtDn);
-        }
+        // One shared slew (slewChargingVoltageTarget, next to tier2ChargeTarget) so tier 2 and this path
+        // cannot drift; the snap-to-proximity and bus-paced-floor rationale lives with it.
+        slewChargingVoltageTarget(ChargingVoltageTargetReq, forceSnap, cvRampUp, cvRampDn,
+                                  (!cvManualTest && (!g_autoTestActive || cvStressForceCV)), actualDtSec);
         if (cvWaveExitWindDown &&
             (!voltageControlActive || ChargingVoltageTarget <= ChargingVoltageTargetReq + 0.001f)) {
           cvWaveExitWindDown = false;
@@ -5412,7 +5627,7 @@ void AdjustFieldLearnMode() {
           cvTuningScore.activeTimeSec += actualDtSec;
           cvTuningScore.rpmSum += RPM;
           float tempSample = isnan(AlternatorTemperatureF) ? TempToUse : AlternatorTemperatureF;
-          if (!isnan(tempSample)) { cvTuningScore.tempSum += tempSample; cvTuningScore.tempSampleCount++; }
+          if (!isnan(tempSample) && tempSample > -90.0f) { cvTuningScore.tempSum += tempSample; cvTuningScore.tempSampleCount++; }   // -99 = thermistor never read (§10.4)
           cvTuningScore.avgSampleCount++;
         }
 
@@ -5635,7 +5850,7 @@ void AdjustFieldLearnMode() {
   // (knee - margin). Observer only; gated to normal AUTO charging (no fault/shutdown/manual/sysID).
   {
     bool kneeModeOk = (sysMode == SYS_MODE_AUTO) && !sysIDRunning && !cvPlantFitActive && tick.chargingEnabled
-                      && !tick.inLockout && !IgnoreTemperature && (hardwarePresent == 1)
+                      && !tick.inLockout && !IgnoreTemperature && !IgnoreRPM && (hardwarePresent == 1)
                       && !tick.currentDataStale;   // cvPlantFitActive: floor-bypassed test operation must not train the knee
     kneeLearnObserve(RPM, dutyNewFloat, TempToUse, MeasuredAmps,
                      dutyRequest, tick.rpmMinDuty, kneeModeOk);
@@ -5940,6 +6155,9 @@ void updateChargingStage() {
   const float v = getChargeDecisionVoltage();
   const char *vsrc = chargeDecisionVoltageSourceName();
   const int soc = SOC_percent / 100;  // SOC_percent is %×100; the rebulk gates compare in plain percent
+  // A held (stale) shunt reading can neither end absorption nor trigger a current rebulk (§10.6).
+  const bool bcurOk = bcurFresh();
+  const bool bcurRebulk = HAS_BATT_SHUNT && bcurOk && RebulkCurrent_A > 0.0f && Bcur < -RebulkCurrent_A;   // Bcur is still computed with no shunt declared (a -1 mV offset read -10 A and rebulked every MinFloatTime)
 
   // While a commissioning run is live (IN_PROGRESS and the wizard dialog heartbeat is still fresh) the
   // field is owned by the wizard — resting between steps (COMMISSION_IDLE) or driven by the running
@@ -6023,7 +6241,7 @@ void updateChargingStage() {
     const bool atAbsorbV = (v >= (AbsorptionVoltage - ABS_V_TAIL_BAND));
     // No battery shunt → Bcur is meaningless (reads ~0), which would false-trip tail on tick 1 and drop
     // the bank out of absorption instantly. Disable the tail path; absorption then ends on AbsorptionTimeoutMs.
-    const bool tailReached = HAS_BATT_SHUNT && !thermallyConstrained && atAbsorbV && (Bcur <= TailCurrent_A);
+    const bool tailReached = HAS_BATT_SHUNT && bcurOk && !thermallyConstrained && atAbsorbV && (Bcur <= TailCurrent_A);
 
     // AbsorptionTimeoutMs counts time actually spent AT the absorption voltage, not wall clock. Entering
     // absorption only proves the bank hit the voltage once — it says nothing about who put it there, so a
@@ -6134,10 +6352,12 @@ void updateChargingStage() {
                            v, bcurForLog(), (unsigned long)(tIdle / 1000), RebulkVoltage, RebulkCurrent_A);
     }
 
-    const bool rebulkCondition = (v < RebulkVoltage) || (RebulkCurrent_A > 0.0f && Bcur < -RebulkCurrent_A);
+    const bool rebulkCondition = (v < RebulkVoltage) || bcurRebulk;
 
     bool allowRebulk = true;
-    if (socInfoAvailable) {
+    // SOC_percent stops integrating when the battery current is stale or the shunt is gone; a frozen 100 %
+    // would then block every rebulk, voltage sag included (audit 2026-09-27). Voltage rebulk alone stands in.
+    if (socInfoAvailable && HAS_BATT_SHUNT && battCurrentFresh()) {
       if (soc >= SOC_BlockRebulk_percent) allowRebulk = false;
       if (soc <= SOC_AllowRebulk_percent) allowRebulk = true;
     }
@@ -6153,7 +6373,7 @@ void updateChargingStage() {
           absorptionTailTimer = 0;
           rebulkTimer = 0;
           floatStartTime = now;
-          const char *why = (Bcur < -RebulkCurrent_A) ? "discharge current threshold"
+          const char *why = bcurRebulk ? "discharge current threshold"
                                                       : "voltage sag confirmed";
           queueConsoleMessageF(
             "Stage: IDLE→BULK (%s) | battV=%.2fV src=%s Bcur=%s tIdle=%lus",
@@ -6210,12 +6430,14 @@ void updateChargingStage() {
       }
     }
 
-    const bool rebulkCondition = (v < RebulkVoltage) || (RebulkCurrent_A > 0.0f && Bcur < -RebulkCurrent_A);
+    const bool rebulkCondition = (v < RebulkVoltage) || bcurRebulk;
 
     bool sagConfirmed = false;
 
     bool allowRebulk = true;
-    if (socInfoAvailable) {
+    // SOC_percent stops integrating when the battery current is stale or the shunt is gone; a frozen 100 %
+    // would then block every rebulk, voltage sag included (audit 2026-09-27). Voltage rebulk alone stands in.
+    if (socInfoAvailable && HAS_BATT_SHUNT && battCurrentFresh()) {
       if (soc >= SOC_BlockRebulk_percent) allowRebulk = false;
       if (soc <= SOC_AllowRebulk_percent) allowRebulk = true;
     }
@@ -6240,7 +6462,7 @@ void updateChargingStage() {
       rebulkTimer = 0;
       floatStartTime = now;
       const char *why = floatTimedOut               ? "float duration expired"
-                        : (Bcur < -RebulkCurrent_A) ? "discharge current threshold"
+                        : bcurRebulk ? "discharge current threshold"
                                                     : "voltage sag confirmed";
       queueConsoleMessageF(
         "Stage: FLOAT→BULK (%s) | battV=%.2fV src=%s rebulkV=%.2fV tFloat=%lus",
@@ -6429,8 +6651,168 @@ const char *reasonToString(FieldEventReason r) {
     case REASON_BMS_DISABLED: return "BMS_OFF";
     case REASON_OV_TIER_LOW: return "OV_TIER_LOW";
     case REASON_OV_TIER_MID: return "OV_TIER_MID";
+    case REASON_BATT_TEMP_LOST: return "Battery temperature sensor not responding";
+    case REASON_VOLTAGE_STALE: return "VOLTAGE_STALE";
+    case REASON_VOLTAGE2_STALE: return "VOLTAGE2_STALE";
+    case REASON_BATT_TEMP_WAIT: return "Waiting for the first battery temperature reading";
+    case REASON_MULTI_SENSOR_FAULT: return "MULTI_SENSOR_FAULT";
 
     default: return "UNKNOWN";
+  }
+}
+
+// Fault-class reasons: every sensor, over-voltage, over-current and temperature cause. Never a
+// deliberate state (switch, BMS, solar, idle, manual, commissioning rest, lockout, zero hold, battery-temperature wait).
+// Mirrors the JS FIELD_FAULT_REASONS set; the N2K engine-bit sender reads it.
+bool fieldReasonIsFault(FieldEventReason r) {
+  switch (r) {
+    case REASON_TEMP_STALE: case REASON_TEMP_CRITICAL: case REASON_TEMP_WARNING: case REASON_TEMP_SUSTAINED:
+    case REASON_VOLTAGE_IMPLAUSIBLE: case REASON_VOLTAGE_DISAGREE_CRITICAL: case REASON_VOLTAGE_SPIKE:
+    case REASON_VOLTAGE_DISAGREE_WARNING: case REASON_LOCKOUT_ACTIVE: case REASON_INA_OVERVOLTAGE:
+    case REASON_HARD_OVERCURRENT: case REASON_CURRENT_STALE: case REASON_FAST_OVERVOLTAGE:
+    case REASON_BATTERY_TOO_COLD: case REASON_TACH_IMPLAUSIBLE: case REASON_OV_TIER_LOW:
+    case REASON_OV_TIER_MID: case REASON_BATTERY_TOO_HOT: case REASON_BATT_TEMP_LOST:
+    case REASON_VOLTAGE_STALE: case REASON_VOLTAGE2_STALE: case REASON_MULTI_SENSOR_FAULT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// ===== Sensor fault mask (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §1.2) =====
+// The SF_* bit defines live in Xregulator.ino beside g_sensorFaultMask (5_functions.ino reads them too).
+
+const char *sensorFaultName(uint8_t bit) {
+  switch (bit) {
+    case 0: return "alternator temperature";
+    case 1: return "engine speed";
+    case 2: return "alternator current";
+    case 3: return "main battery voltage";
+    case 4: return "second battery voltage";
+    case 5: return "battery voltage readings disagree";
+    case 6: return "battery temperature";
+    case 7: return "ADS1115 analog input chip";
+    case 8: return "INA228 battery monitor chip";
+    default: return "sensor";
+  }
+}
+
+// Plain-English list of the sensors in a fault-bit set, for the alarm text and console. A chip bit names
+// the chip once with the readings it carries, instead of listing them as three unrelated failures.
+void sensorFaultNames(uint16_t bits, char *out, size_t n) {
+  out[0] = '\0';
+  size_t len = 0;
+  auto add = [&](const char *s) {
+    int w = snprintf(out + len, (len < n) ? n - len : 0, "%s%s", len ? ", " : "", s);
+    if (w > 0) len += (size_t)w;
+  };
+  if (bits & SF_ADS1115) {
+    add(TempSource == 1 ? "ADS1115 analog input chip (engine speed, alternator current, second battery voltage, thermistor)"
+                        : "ADS1115 analog input chip (engine speed, alternator current, second battery voltage)");
+    bits &= ~(SF_ENGINE_SPEED | SF_ALT_CURRENT | SF_BATT_V_SECOND | (TempSource == 1 ? SF_ALT_TEMP : 0));
+  }
+  if (bits & SF_INA228) {
+    add("INA228 battery monitor chip (main battery voltage)");
+    bits &= ~SF_BATT_V_MAIN;
+  }
+  if (bits & (SF_BATT_V_MAIN | SF_BATT_V_SECOND)) bits &= ~SF_BATT_V_DISAGREE;   // a relationship, not a third sensor
+  for (uint8_t b = 0; b < 7; b++) if (bits & (1u << b)) add(sensorFaultName(b));
+}
+
+// Smallest non-zero row of the active amps table: the low-speed (worst cooling) limit. Stands in for a
+// missing NoRpmCurrentA.
+float smallestRpmTableAmps() {
+  float smallest = 0.0f;
+  for (int i = 0; i < RPM_TABLE_SIZE; i++) {
+    float a = rpmCapCurrentTable[i];
+    if (a > 0.0f && (smallest <= 0.0f || a < smallest)) smallest = a;
+  }
+  return smallest;
+}
+
+// Largest row of the min-duty table (the idle floor): the no-output cut's arm-bar base while engine speed is
+// ignored, clamped like getMinimumFieldForRPM (scalar Min Field % below, the field ceiling above).
+float largestRpmTableMinDuty() {
+  float largest = 0.0f;
+  for (int i = 0; i < RPM_TABLE_SIZE; i++) if (rpmMinDutyTable[i] > largest) largest = rpmMinDutyTable[i];
+  return fminf(fmaxf(largest, MinDuty), ccDutyCeiling());
+}
+
+// Mask bits whose sensor the owner has chosen to run without (§3.3: overridden sensors never alarm).
+uint16_t sensorOverriddenBits() {
+  uint16_t m = 0;
+  if (LimpHome) return 0x1FF;
+  if (IgnoreTemperature) m |= SF_ALT_TEMP;
+  if (IgnoreRPM) m |= SF_ENGINE_SPEED;
+  if (IgnoreAltCurrent) m |= SF_ALT_CURRENT;
+  if (IgnoreBattVMain) m |= SF_BATT_V_MAIN | SF_INA228;
+  if (IgnoreBattV2) m |= SF_BATT_V_SECOND;
+  if (IgnoreBattVMain || IgnoreBattV2) m |= SF_BATT_V_DISAGREE;
+  // the chip bits are only "overridden" once every reading that chip feeds is ignored
+  if (IgnoreRPM && IgnoreAltCurrent && IgnoreBattV2) m |= SF_ADS1115;
+  return m;
+}
+
+// Which mask bits a field-off reason is about (§3.3 alarm: reason holding the field off + a
+// non-overridden bit in its group = a sensor fault worth sounding).
+uint16_t sensorBitsForReason(FieldEventReason r) {
+  switch (r) {
+    case REASON_TEMP_STALE:                 return SF_ALT_TEMP;
+    case REASON_RPM_TOO_LOW:                return SF_ENGINE_SPEED | SF_ADS1115;
+    case REASON_TACH_IMPLAUSIBLE:           return SF_ENGINE_SPEED | SF_ALT_CURRENT;   // "field driven, zero output" is equally a stuck-at-zero current sensor
+    case REASON_CURRENT_STALE:
+    case REASON_HARD_OVERCURRENT:           return SF_ALT_CURRENT | SF_ADS1115;
+    case REASON_VOLTAGE_STALE:              return SF_BATT_V_MAIN | SF_INA228;
+    case REASON_VOLTAGE2_STALE:             return SF_BATT_V_SECOND | SF_ADS1115;
+    case REASON_VOLTAGE_IMPLAUSIBLE:
+    case REASON_VOLTAGE_DISAGREE_CRITICAL:
+    case REASON_VOLTAGE_DISAGREE_WARNING:   return SF_BATT_V_MAIN | SF_BATT_V_SECOND | SF_BATT_V_DISAGREE | SF_ADS1115 | SF_INA228;
+    case REASON_MULTI_SENSOR_FAULT:         return 0x1FF;
+    default:                                return 0;
+  }
+}
+
+// ===== §1.3: the single reason -> sensor dependency rule =====
+// A cut or ramp reason is skipped if and only if it depends on a sensor the owner has chosen to run
+// without. Both priority ladders, the immediate-cut pre-gate, the engine-stopped / spin-down cuts and
+// the tier paths all ask this one function. LimpHome ("ignore every sensor") suppresses every sensor
+// reason; the deliberate states (switch, BMS, solar, idle, lockout, manual, commissioning) never are.
+bool reasonSuppressedByOverride(FieldEventReason r, const TickSnapshot &t) {
+  switch (r) {
+    case REASON_TEMP_STALE:
+    case REASON_TEMP_CRITICAL:
+    case REASON_TEMP_WARNING:
+    case REASON_TEMP_SUSTAINED:
+      return t.ignoreTemperature || t.limpHome;
+    case REASON_RPM_TOO_LOW:
+      return t.ignoreRPM || t.limpHome;
+    case REASON_TACH_IMPLAUSIBLE:      // needs only the alternator current: with engine speed ignored it is the "field on, no output" cut that catches a stalled engine (audit 2026-09-27)
+      return t.ignoreAltCurrent || t.limpHome;
+    case REASON_CURRENT_STALE:
+    case REASON_HARD_OVERCURRENT:
+      return t.ignoreAltCurrent || t.limpHome;
+    case REASON_VOLTAGE_DISAGREE_CRITICAL:
+    case REASON_VOLTAGE_DISAGREE_WARNING:
+      return t.ignoreBattVMain || t.ignoreBattV2 || t.limpHome;
+    case REASON_VOLTAGE_IMPLAUSIBLE:   // judged on whichever reading is not ignored (isVoltageSensorPlausible): in tier 3 a second reading gone to ~0 V (lead off, still fresh) cuts
+      return (t.ignoreBattVMain && t.ignoreBattV2) || t.limpHome;
+    case REASON_VOLTAGE_STALE:
+    case REASON_INA_OVERVOLTAGE:       // firmware latch only; the ALERT pin still acts in hardware
+      return t.ignoreBattVMain || t.limpHome;
+    case REASON_VOLTAGE2_STALE:
+      return t.ignoreBattV2 || t.limpHome;
+    case REASON_FAST_OVERVOLTAGE:      // skipped only with no trusted fresh voltage at all (tier 3 reads the second sensor natively)
+      return !t.voltageFeedbackOk;
+    case REASON_OV_TIER_LOW:           // the timed tiers run inside the CV loop on IBV: gone with the main reading (inert in tiers 3/4 anyway)
+    case REASON_OV_TIER_MID:
+      return t.ignoreBattVMain || t.limpHome;
+    case REASON_BATTERY_TOO_COLD:
+    case REASON_BATTERY_TOO_HOT:
+    case REASON_BATT_TEMP_LOST:
+    case REASON_BATT_TEMP_WAIT:
+      return t.limpHome;
+    default:
+      return false;
   }
 }
 
@@ -6440,6 +6822,26 @@ const char *reasonToString(FieldEventReason r) {
  * Priority: Disabled (user off switch) > Manual (unrestricted) > Critical > Warning > Lockout > Auto
  */
 FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
+
+  // PRIORITY 0.5 (mirrors selectFieldEventReason): the INA228 hardware latch, the hard over-current trip
+  // (debounced on a fresh sample in buildTickSnapshot) and an over-voltage while the field is still
+  // ENERGIZED all outrank a switch-off. A BMS that drops its enable line as it opens its charge FET
+  // arrives together with the very spike the fast-OV rung exists for, and the disabled ramp is not a cut
+  // (audit 2026-09-27). Once GPIO4 is low the disabled word wins again, so an off alternator on a bus that
+  // another source pushes high does not walk the OV lockout ladder.
+  if (tick.inaOvervoltageLatched && !reasonSuppressedByOverride(REASON_INA_OVERVOLTAGE, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
+  if (tick.hardOverCurrent && !reasonSuppressedByOverride(REASON_HARD_OVERCURRENT, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
+  if (!gpio4IsLow && tick.currentBatteryVoltage > tick.alternatorHardShutdownV && !reasonSuppressedByOverride(REASON_FAST_OVERVOLTAGE, tick)) {
+    return MODE_WARNING_RAMP_AND_LOCKOUT;
+  }
+  // Timed OV tiers latch during a shutdown ramp too (FAST OV block): output the ramp is still making above the target.
+  if (!gpio4IsLow && g_ovTierTrip != 0 && !reasonSuppressedByOverride(REASON_OV_TIER_LOW, tick)) {
+    return MODE_WARNING_RAMP_AND_LOCKOUT;
+  }
 
   // PRIORITY 1: DISABLED (user On/Off switch - always respected)
   if (!tick.chargingEnabled) {
@@ -6452,7 +6854,8 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
   // ladder, 0.5s escalating to 10s). Deliberately ABOVE the manual
   // branch (manual otherwise bypasses all safeties) and NOT gated by testProtectionsEnabled,
   // because over-voltage is always disastrous. Must mirror selectFieldEventReason.
-  if (tick.currentBatteryVoltage > tick.alternatorHardShutdownV) {
+  // Every sensor reason below carries the §1.3 override test through reasonSuppressedByOverride.
+  if (tick.currentBatteryVoltage > tick.alternatorHardShutdownV && !reasonSuppressedByOverride(REASON_FAST_OVERVOLTAGE, tick)) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
 
@@ -6470,15 +6873,31 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
     return MODE_NORMAL_MANUAL;
   }
 
+  // PRIORITY 2.05: MAIN BATTERY VOLTAGE STALE — no valid INA228 reading feeds the over-voltage rungs, so
+  // nothing can supervise AUTO; immediate cut (§10.1). Below MANUAL by owner ruling 2026-10-02: manual is a
+  // bench tool and must run with the chip dead; the UI states that manual then has no over-voltage
+  // protection, hardware ALERT included. Must mirror selectFieldEventReason.
+  if (tick.ibvStale && !reasonSuppressedByOverride(REASON_VOLTAGE_STALE, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
+
   // PRIORITY 2.1: TIMED OV TIERS — sustained-violation cut latched by the FAST OV block
   // (detector is AUTO/CV-gated like G1/G2, so this is below MANUAL by construction; the latch
   // clears once the filtered bus drops back under the tier line). Immediate cut + adaptive
   // fast-OV lockout via shouldImmediatelyCutGPIO4. Must mirror selectFieldEventReason.
-  if (g_ovTierTrip != 0) {
+  if (g_ovTierTrip != 0 && !reasonSuppressedByOverride(REASON_OV_TIER_LOW, tick)) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
 
-  // PRIORITY 3: RPM GATE (field must be cut when engine is not running)
+  // PRIORITY 2.5: TWO OR MORE REQUIRED SENSORS FAULTED (spec §11). Above the RPM gate so a dead ADS1115
+  // (RPM forced to 0) is reported as the chip fault it is, not as "engine not running". Immediate cut,
+  // 30 s lockout, clears 10 s after the count drops to one. Mirrors selectFieldEventReason.
+  if (tick.multiSensorFault) {
+    return MODE_CRITICAL_RAMP;
+  }
+
+  // PRIORITY 3: RPM GATE (field must be cut when engine is not running). rpmBelowMinimum already
+  // carries the §1.3 test (buildTickSnapshot).
   if (tick.rpmBelowMinimum) {
     return MODE_CRITICAL_RAMP;
   }
@@ -6490,39 +6909,69 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
     return MODE_CRITICAL_RAMP;
   }
 
+  // PRIORITY 3.3: IMMEDIATE-CUT SENSOR FAULTS, ranked above the graceful battery-temperature reasons.
+  // Only the top reason decides the cut, so an immediate reason ranked under a ramp reason was never
+  // selected while that ramp ran: a current sensor dying during a battery-temperature ramp left the
+  // field at its last duty (audit 2026-09-27). Mirrors selectFieldEventReason.
+  if (tick.currentDataStale && !reasonSuppressedByOverride(REASON_CURRENT_STALE, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
+  if (tick.tempToUseF > (tick.tempLimitF + tick.tempCritExcessF) && !reasonSuppressedByOverride(REASON_TEMP_CRITICAL, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
+
   // PRIORITY 3.5: COLD-CHARGE LOCKOUT (opt-in lithium protection — battery temperature below floor).
   // Graceful ramp-to-zero + lockout (not an instantaneous emergency, so no hard chop); the field
   // settle-cut path finishes the disconnect. Below MANUAL (manual stays unrestricted), so it only
   // applies in AUTO — mirrors selectFieldEventReason. Hysteresis lives in buildTickSnapshot.
-  if (tick.batteryTooCold) {
+  if (tick.batteryTooCold && !reasonSuppressedByOverride(REASON_BATTERY_TOO_COLD, tick)) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
 
   // PRIORITY 3.6: HOT-CHARGE LOCKOUT (opt-in — a measured battery temperature above MaxChargeTempF).
   // Same graceful ramp + lockout as the cold check, below MANUAL for the same reason — mirrors
   // selectFieldEventReason. Hysteresis and the source gate live in buildTickSnapshot.
-  if (tick.batteryTooHot) {
+  if (tick.batteryTooHot && !reasonSuppressedByOverride(REASON_BATTERY_TOO_HOT, tick)) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
 
-  // PRIORITY 4: CRITICAL CONDITIONS (auto mode only)
-  if (tick.tempDataVeryStale && !tick.ignoreTemperature) {
+  // PRIORITY 3.7: BATTERY TEMPERATURE LOST (§2.3) — an expected battery temperature with no
+  // qualifying reading past the boot grace. Same graceful ramp as the lockouts; clears when a reading
+  // returns or the owner declares Not fitted. Mirrors selectFieldEventReason.
+  if (tick.battTempState == 2 && !reasonSuppressedByOverride(REASON_BATT_TEMP_LOST, tick)) {
+    return MODE_WARNING_RAMP_AND_LOCKOUT;
+  }
+
+  // PRIORITY 3.8: BATTERY TEMPERATURE WAIT (§2.3) — the expected source has not delivered its first
+  // reading yet (boot, or a source change). Held off like a switch-off: no lockout, no alarm, no fault,
+  // so charging starts the tick the reading lands. Owner ruling 2026-09-26: never charge blind, not even
+  // for the 90 s grace. Mirrors selectFieldEventReason.
+  if (tick.battTempState == 3 && !reasonSuppressedByOverride(REASON_BATT_TEMP_WAIT, tick)) {
+    return MODE_DISABLED_RAMP;
+  }
+
+  // PRIORITY 4: CRITICAL CONDITIONS (auto mode only). VOLTAGE_STALE moved to 2.05, CURRENT_STALE and
+  // TEMP_CRITICAL to 3.3 (immediate cuts belong above the ramps).
+  if (tick.tempDataVeryStale && !reasonSuppressedByOverride(REASON_TEMP_STALE, tick)) {
     return MODE_CRITICAL_RAMP;
   }
-  if (!tick.voltagePlausible || tick.voltageDisagreementCritical) {
+  if (tick.battVStale && !reasonSuppressedByOverride(REASON_VOLTAGE2_STALE, tick)) {
     return MODE_CRITICAL_RAMP;
   }
-  if (!tick.ignoreTemperature && tick.tempToUseF > (tick.tempLimitF + tick.tempCritExcessF)) {
+  if (!tick.voltagePlausible && !reasonSuppressedByOverride(REASON_VOLTAGE_IMPLAUSIBLE, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
+  if (tick.voltageDisagreementCritical && !reasonSuppressedByOverride(REASON_VOLTAGE_DISAGREE_CRITICAL, tick)) {
     return MODE_CRITICAL_RAMP;
   }
 
   // PRIORITY 5: WARNING CONDITIONS (all start lockout)
   // (The AlternatorHardShutdownV over-voltage check lives at PRIORITY 1.5 as the fast-OV
   //  immediate cut — armed in every mode and ungated — so it is not repeated here.)
-  if (tick.voltageDisagreementWarning) {
+  if (tick.voltageDisagreementWarning && !reasonSuppressedByOverride(REASON_VOLTAGE_DISAGREE_WARNING, tick)) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
-  if (!tick.ignoreTemperature && tick.tempToUseF > (tick.tempLimitF + tick.tempWarnExcessF)) {
+  if (tick.tempToUseF > (tick.tempLimitF + tick.tempWarnExcessF) && !reasonSuppressedByOverride(REASON_TEMP_WARNING, tick)) {
     return MODE_WARNING_RAMP_AND_LOCKOUT;
   }
 
@@ -6548,17 +6997,15 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
  * PURE function - MUST match selectFieldControlMode() priority exactly
  */
 FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
-  // Priority 1: Hardware overvoltage - overrides everything
-  if (tick.inaOvervoltageLatched) return REASON_INA_OVERVOLTAGE;
-
-  if (HardOCEnable && MeasuredAmps > HardOCTripAmps) {
-    if (hardOCStartMs == 0) hardOCStartMs = tick.nowMs;
-    if ((tick.nowMs - hardOCStartMs) >= HardOCDebounceMs) {
-      return REASON_HARD_OVERCURRENT;
-    }
-  } else {
-    hardOCStartMs = 0;
-  }
+  // Priority 0.5 (mirrors selectFieldControlMode): hardware overvoltage latch (firmware latch; skipped only
+  // when the owner runs without the INA228 reading, §1.3 — the ALERT pin still acts in hardware), hard
+  // over-current (debounced on a FRESH sample in buildTickSnapshot: this function is called twice per tick
+  // and must not own state), and an over-voltage while the field is still energized — all above a switch-off.
+  if (tick.inaOvervoltageLatched && !reasonSuppressedByOverride(REASON_INA_OVERVOLTAGE, tick)) return REASON_INA_OVERVOLTAGE;
+  if (tick.hardOverCurrent && !reasonSuppressedByOverride(REASON_HARD_OVERCURRENT, tick)) return REASON_HARD_OVERCURRENT;
+  if (!gpio4IsLow && tick.currentBatteryVoltage > tick.alternatorHardShutdownV && !reasonSuppressedByOverride(REASON_FAST_OVERVOLTAGE, tick)) return REASON_FAST_OVERVOLTAGE;
+  if (!gpio4IsLow && g_ovTierTrip == 2 && !reasonSuppressedByOverride(REASON_OV_TIER_MID, tick)) return REASON_OV_TIER_MID;
+  if (!gpio4IsLow && g_ovTierTrip == 1 && !reasonSuppressedByOverride(REASON_OV_TIER_LOW, tick)) return REASON_OV_TIER_LOW;
 
   // Priority 1a: Disabled (user control - always show this reason if off)
   if (!tick.chargingEnabled) return tick.solarForecastPause ? REASON_SOLAR_PAUSE
@@ -6567,7 +7014,7 @@ FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
 
   // Priority 1.5: Fast over-voltage — absolute ceiling, above the manual bypass and ungated.
   // Mirrors selectFieldControlMode PRIORITY 1.5. Live voltage → immediate cut + adaptive lockout.
-  if (tick.currentBatteryVoltage > tick.alternatorHardShutdownV) return REASON_FAST_OVERVOLTAGE;
+  if (tick.currentBatteryVoltage > tick.alternatorHardShutdownV && !reasonSuppressedByOverride(REASON_FAST_OVERVOLTAGE, tick)) return REASON_FAST_OVERVOLTAGE;
 
   // Priority 1.9: Current-sensor zero hold (not a fault). Mirrors selectFieldControlMode.
   if (tick.altZeroMeasuring) return REASON_ALTZERO_MEASURE;
@@ -6575,35 +7022,51 @@ FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
   // Priority 2: Manual mode
   if (tick.manualMode) return REASON_MANUAL_MODE;
 
-  // Priority 2.1: Timed OV tiers — mirrors selectFieldControlMode. MID before LOW (higher rung).
-  if (g_ovTierTrip == 2) return REASON_OV_TIER_MID;
-  if (g_ovTierTrip == 1) return REASON_OV_TIER_LOW;
+  // Priority 2.05: main battery voltage stale — below MANUAL (owner ruling 2026-10-02: manual runs with the
+  // INA228 dead, the UI states it then has no over-voltage protection). Mirrors selectFieldControlMode.
+  if (tick.ibvStale && !reasonSuppressedByOverride(REASON_VOLTAGE_STALE, tick)) return REASON_VOLTAGE_STALE;
 
-  // Priority 3: RPM gate
+  // Priority 2.1: Timed OV tiers — mirrors selectFieldControlMode. MID before LOW (higher rung).
+  if (g_ovTierTrip == 2 && !reasonSuppressedByOverride(REASON_OV_TIER_MID, tick)) return REASON_OV_TIER_MID;
+  if (g_ovTierTrip == 1 && !reasonSuppressedByOverride(REASON_OV_TIER_LOW, tick)) return REASON_OV_TIER_LOW;
+
+  // Priority 2.5: two or more required sensors faulted (§11) — mirrors selectFieldControlMode.
+  if (tick.multiSensorFault) return REASON_MULTI_SENSOR_FAULT;
+
+  // Priority 3: RPM gate (rpmBelowMinimum already carries the §1.3 test)
   if (tick.rpmBelowMinimum) return REASON_RPM_TOO_LOW;
 
   // Priority 3.2: Tach-lie plausibility — mirrors selectFieldControlMode.
   if (tick.tachImplausible) return REASON_TACH_IMPLAUSIBLE;
 
-  // Priority 3.5: Cold-charge lockout (opt-in lithium protection). Mirrors selectFieldControlMode.
-  if (tick.batteryTooCold) return REASON_BATTERY_TOO_COLD;
-
-  // Priority 3.6: Hot-charge lockout (opt-in, measured battery source only). Mirrors selectFieldControlMode.
-  if (tick.batteryTooHot) return REASON_BATTERY_TOO_HOT;
-
-  // Priority 4: Critical (auto mode only)
-  if (tick.tempDataVeryStale && !tick.ignoreTemperature) return REASON_TEMP_STALE;
-  if (tick.currentDataStale) return REASON_CURRENT_STALE;
-  if (!tick.voltagePlausible) return REASON_VOLTAGE_IMPLAUSIBLE;
-  if (tick.voltageDisagreementCritical) return REASON_VOLTAGE_DISAGREE_CRITICAL;
-  if (!tick.ignoreTemperature && tick.tempToUseF > (tick.tempLimitF + tick.tempCritExcessF)) {
+  // Priority 3.3: immediate-cut sensor faults above the graceful battery-temperature reasons — mirrors selectFieldControlMode.
+  if (tick.currentDataStale && !reasonSuppressedByOverride(REASON_CURRENT_STALE, tick)) return REASON_CURRENT_STALE;
+  if (tick.tempToUseF > (tick.tempLimitF + tick.tempCritExcessF) && !reasonSuppressedByOverride(REASON_TEMP_CRITICAL, tick)) {
     return REASON_TEMP_CRITICAL;
   }
 
+  // Priority 3.5: Cold-charge lockout (opt-in lithium protection). Mirrors selectFieldControlMode.
+  if (tick.batteryTooCold && !reasonSuppressedByOverride(REASON_BATTERY_TOO_COLD, tick)) return REASON_BATTERY_TOO_COLD;
+
+  // Priority 3.6: Hot-charge lockout (opt-in, measured battery source only). Mirrors selectFieldControlMode.
+  if (tick.batteryTooHot && !reasonSuppressedByOverride(REASON_BATTERY_TOO_HOT, tick)) return REASON_BATTERY_TOO_HOT;
+
+  // Priority 3.7: Battery temperature lost (§2.3). Mirrors selectFieldControlMode.
+  if (tick.battTempState == 2 && !reasonSuppressedByOverride(REASON_BATT_TEMP_LOST, tick)) return REASON_BATT_TEMP_LOST;
+
+  // Priority 3.8: Battery temperature wait (§2.3). Mirrors selectFieldControlMode.
+  if (tick.battTempState == 3 && !reasonSuppressedByOverride(REASON_BATT_TEMP_WAIT, tick)) return REASON_BATT_TEMP_WAIT;
+
+  // Priority 4: Critical (auto mode only). VOLTAGE_STALE is at 2.05, CURRENT_STALE and TEMP_CRITICAL at 3.3.
+  if (tick.tempDataVeryStale && !reasonSuppressedByOverride(REASON_TEMP_STALE, tick)) return REASON_TEMP_STALE;
+  if (tick.battVStale && !reasonSuppressedByOverride(REASON_VOLTAGE2_STALE, tick)) return REASON_VOLTAGE2_STALE;
+  if (!tick.voltagePlausible && !reasonSuppressedByOverride(REASON_VOLTAGE_IMPLAUSIBLE, tick)) return REASON_VOLTAGE_IMPLAUSIBLE;
+  if (tick.voltageDisagreementCritical && !reasonSuppressedByOverride(REASON_VOLTAGE_DISAGREE_CRITICAL, tick)) return REASON_VOLTAGE_DISAGREE_CRITICAL;
+
   // Priority 5: Warning
   // (AlternatorHardShutdownV over-voltage is handled at Priority 1.5 as REASON_FAST_OVERVOLTAGE.)
-  if (tick.voltageDisagreementWarning) return REASON_VOLTAGE_DISAGREE_WARNING;
-  if (!tick.ignoreTemperature && tick.tempToUseF > (tick.tempLimitF + tick.tempWarnExcessF)) {
+  if (tick.voltageDisagreementWarning && !reasonSuppressedByOverride(REASON_VOLTAGE_DISAGREE_WARNING, tick)) return REASON_VOLTAGE_DISAGREE_WARNING;
+  if (tick.tempToUseF > (tick.tempLimitF + tick.tempWarnExcessF) && !reasonSuppressedByOverride(REASON_TEMP_WARNING, tick)) {
     if (tempWarningStartMs > 0 && (tick.nowMs - tempWarningStartMs > TempSustainedTimeout)) {
       return REASON_TEMP_SUSTAINED;
     }
@@ -6650,6 +7113,9 @@ void updateProtectionCounters(FieldEventReason reason) {
       case REASON_TEMP_SUSTAINED: g_tempSustainedCount++; break;
       case REASON_TEMP_STALE: g_tempStaleCount++; break;
       case REASON_CURRENT_STALE: g_currentStaleCount++; break;
+      case REASON_VOLTAGE_STALE: g_voltStaleCount++; break;
+      case REASON_VOLTAGE2_STALE: g_volt2StaleCount++; break;
+      case REASON_BATT_TEMP_LOST: g_battTempLostCount++; break;
       default: break;
     }
     prevReason = reason;
@@ -6748,10 +7214,20 @@ bool shouldImmediatelyCutGPIO4(FieldEventReason reason) {
   // (CURRENT_STALE also outranks TEMP_CRITICAL in selectFieldEventReason, so
   // a non-cutting stale reason would mask the temp-critical cut too.)
   if (reason == REASON_CURRENT_STALE) return true;
+  if (reason == REASON_VOLTAGE_STALE) return true;   // no valid main voltage: nothing can supervise a ramp (§10.1)
+  if (reason == REASON_MULTI_SENSOR_FAULT) return true;  // §11: with two sensors gone nothing is guaranteed to supervise a ramp
   if (reason == REASON_TEMP_CRITICAL) {
     return true;
   }
   return false;
+}
+
+// Tick-aware wrapper for the cut sites: VOLTAGE2_STALE is a phased ramp while IBV supervises it, but in
+// tier 3 the second reading IS the only voltage, so losing it must cut at once (audit 2026-09-27). The same
+// holds for VOLTAGE_IMPLAUSIBLE there: a lead off still reads ~0 V and fresh, and nothing else watches the bus.
+static inline bool immediateCutNow(FieldEventReason reason, const TickSnapshot &tick) {
+  return shouldImmediatelyCutGPIO4(reason)
+      || ((reason == REASON_VOLTAGE2_STALE || reason == REASON_VOLTAGE_IMPLAUSIBLE) && tick.ignoreBattVMain);
 }
 
 /**
@@ -6804,6 +7280,9 @@ bool shouldCutGPIO4AfterSettle(FieldEventReason reason, uint32_t nowMs, float ap
     case REASON_RPM_TOO_LOW:
     case REASON_BATTERY_TOO_COLD:   // cold-charge lockout: ramp to zero, then cut once settled
     case REASON_BATTERY_TOO_HOT:    // hot-charge lockout: same path
+    case REASON_BATT_TEMP_LOST:     // expected battery temperature missing: same path
+    case REASON_VOLTAGE_STALE:      // normally cut immediately; defensive if it ever reaches settle
+    case REASON_VOLTAGE2_STALE:     // critical ramp, then cut
       return true;
 
     // Temperature sustained: cut after 2-minute timeout
@@ -6834,6 +7313,11 @@ bool shouldCutGPIO4AfterSettle(FieldEventReason reason, uint32_t nowMs, float ap
       // write away from live with the UI claiming it was dead.
     case REASON_BMS_DISABLED:
     case REASON_SOLAR_PAUSE:
+      return true;
+
+      // Battery-temperature wait (§2.3): produced with chargingEnabled TRUE but lands in MODE_DISABLED_RAMP
+      // like the two above. Cut once settled, no lockout, so the field returns the tick the reading lands.
+    case REASON_BATT_TEMP_WAIT:
       return true;
 
       // Fail safe. This function is only ever called from runShutdownPath, i.e. the field is already
@@ -6870,6 +7354,7 @@ bool altZeroTestBusy() {
  */
 TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   TickSnapshot tick = {};
+  static bool s_multiSensorFault = false;   // §11 latch: set at count >= 2, cleared 10 s after the count is back to <= 1 (written at the end of this function)
 
   tick.nowMs = currentMillis;
   tick.dt_ms = dt_ms;
@@ -6879,19 +7364,79 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // Voltage sensors
   tick.batteryV = BatteryV;
   tick.ibv = IBV;
-  tick.currentBatteryVoltage = getBatteryVoltage();
 
-  // Re-solve the Max Field Volts ceiling before any consumer of ccDutyCeiling() runs this tick.
-  updateFieldVoltCeiling(tick.currentBatteryVoltage, (float)dt_ms / 1000.0f);
+  // Control state. The ignore flags are the owner's Run Without Failed Sensors overrides only: there is no
+  // automatic degrade (owner ruling 2026-10-02). Everything downstream — tier, suppression,
+  // voltageFeedbackOk — reads these.
+  tick.manualMode = (ManualFieldToggle == 1);
+  tick.multiSensorFault = s_multiSensorFault;
+  tick.ignoreTemperature = (IgnoreTemperature != 0);
+  tick.ignoreRPM = (IgnoreRPM != 0);
+  tick.ignoreAltCurrent = (IgnoreAltCurrent != 0);
+  tick.ignoreBattVMain = (IgnoreBattVMain != 0);
+  tick.ignoreBattV2 = (IgnoreBattV2 != 0);
+  tick.limpHome = (LimpHome != 0);
+
+  // §1.1: "spinning" is instantaneous (RPM >= 200, or the effective ignition — IgnitionOverride already
+  // folded into Ignition — when engine speed is ignored) and paces TempTask. engineRunning is spinning
+  // held 15 s, the tach rule the temperature staleness gate has always used: the last engine-off
+  // sample can be 60 s old, so the staleness consumers (stale cut, stale alarm, tempProbeFresh) wait.
+  {
+    static uint32_t lastNotSpinningMs = 0;
+    bool spinningNow = tick.ignoreRPM ? (Ignition == 1) : (RPM >= 200);
+    if (!spinningNow) lastNotSpinningMs = currentMillis;
+    tick.engineRunning = spinningNow && ((uint32_t)(currentMillis - lastNotSpinningMs) >= 15000UL);
+    g_engineSpinningNow = spinningNow;
+    g_engineRunning = tick.engineRunning;
+  }
+
+  // §10.1 / §10.2 stale flags are computed in _ReadAnalogInputs_inner (read-count rules).
+  tick.ibvStale = g_ibvStale;
+  tick.battVStale = g_battVStale;
+
+  // §4.2 running tier. Tier 3 vs 4 is decided by FRESHNESS of a committed second reading, never by the
+  // plausibility upper bound: a fresh BatteryV above the class window is an over-voltage for the fast-OV
+  // rung to act on, not a failed sensor (the commit window already spans up to 70 V x class/12).
+  {
+    bool battV2Usable = !tick.ignoreBattV2 && ADS1115Disconnected == 0 && !g_battVStale;
+    if (tick.limpHome)             tick.limpTier = 4;
+    else if (tick.ignoreBattVMain) tick.limpTier = battV2Usable ? 3 : 4;
+    else if (tick.ignoreAltCurrent) tick.limpTier = 2;
+    else if (tick.ignoreTemperature || tick.ignoreRPM || tick.ignoreBattV2 || IgnitionOverride == 1) tick.limpTier = 1;
+    else                           tick.limpTier = 0;
+    g_limpTier = tick.limpTier;
+    // Fast OV and the timed tiers are skipped only when NO trusted fresh voltage feeds them (§1.3):
+    // LimpHome, or the main reading ignored with the second one ignored or stale.
+    tick.voltageFeedbackOk = !tick.limpHome && (!tick.ignoreBattVMain || battV2Usable);
+    // §4.4: tiers 3/4 have no main voltage for the stage machine. Park it in bulk on ENTRY (before the
+    // idleHold test below), so a bank left in IDLE can charge under a fixed duty.
+    static uint8_t lastTierForStage = 0;
+    if (tick.limpTier >= 3 && lastTierForStage < 3 && !tick.manualMode) {
+      inIdleStage = false; inAbsorptionStage = false; inBulkStage = true;
+    }
+    lastTierForStage = tick.limpTier;
+  }
+
+  // Tier 3 (§4.4): the second reading IS the battery voltage this tick — priority 1.5 and the volts
+  // ceiling read it natively. Tier 4 has no usable voltage: the ceiling is solved against the class
+  // nominal x 1.15 (§4.5) and the voltage reasons are suppressed by §1.3.
+  tick.currentBatteryVoltage = (tick.limpTier == 3) ? BatteryV : getBatteryVoltage();
+
+  // Re-solve the Max Field Volts ceiling before any consumer of ccDutyCeiling() runs this tick. Tier 4, or a
+  // stale main voltage (manual may run then, owner ruling 2026-10-02), solves against class nominal x 1.15 so a
+  // held reading cannot steer the cap.
+  // Own per-call dt: dt_ms is the closed-loop tick gap, which grows across every pass between ticks (and sits at
+  // the 500 ms cap outside normal mode), so feeding it per pass collapsed the 2 s bus filter to tens of ms.
+  static uint32_t lastCeilMs = 0;
+  uint32_t ceilDtMs = (lastCeilMs == 0) ? 0 : (currentMillis - lastCeilMs);
+  lastCeilMs = currentMillis;
+  if (ceilDtMs > 500) ceilDtMs = 500;
+  updateFieldVoltCeiling((tick.limpTier == 4 || tick.ibvStale) ? (float)SYSTEM_VOLTAGE_CLASS * 1.15f : tick.currentBatteryVoltage,
+                         (float)ceilDtMs / 1000.0f);
 
   tick.batteryCurrentA = Bcur;
 
-  tick.rpmMinDuty = getMinimumFieldForRPM(RPM);
-
-  // Control state
-  tick.manualMode = (ManualFieldToggle == 1);
-  tick.ignoreTemperature = (IgnoreTemperature != 0);
-  tick.ignoreRPM = (IgnoreRPM != 0);
+  tick.rpmMinDuty = tick.ignoreRPM ? 0.0f : getMinimumFieldForRPM(RPM);   // §4.8: no tach to keep alive
 
   // Charging enabled (with BMS and weather mode overrides)
   bool chargingEnabledLocal = (Ignition == 1 && OnOff == 1);
@@ -6914,7 +7459,8 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // MANUAL is exempt: updateChargingStage() does not run in manual, so idle could never clear there,
   // and a manual field command is the operator overriding the stage machine on purpose. Bench 09-16:
   // a 24 V bank parked in IDLE left both the master switch and Manual dead with no explanation.
-  tick.idleHold = inIdleStage && chargingEnabledLocal && !tick.manualMode;
+  // Tiers 3/4 are exempt: without the main voltage the stage machine does not run, so IDLE can never clear.
+  tick.idleHold = inIdleStage && chargingEnabledLocal && !tick.manualMode && tick.limpTier < 3;
   if (tick.idleHold) chargingEnabledLocal = false;
 
   // Weather mode: rest the alternator when the solar forecast is strong. Applied LAST so the flag
@@ -6977,8 +7523,9 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
                              && (RPM <= 0.0f));
   // Engine confirmed stopped: RPM held at exactly 0 for >= RPM_ZERO_CUT_MS. RPM is already
   // floored to 0 below 100 in ReadAnalogInputs, so RPM <= 0 means a true zero. Skipped when
-  // IgnoreRPM is set (no trustworthy RPM signal). Drives the immediate-cut override below.
-  if (!tick.ignoreRPM && RPM <= 0.0f) {
+  // the owner runs without engine speed (§1.3). Drives the immediate-cut override below.
+  const bool rpmReasonSuppressed = reasonSuppressedByOverride(REASON_RPM_TOO_LOW, tick);
+  if (!rpmReasonSuppressed && RPM <= 0.0f) {
     if (rpmZeroSinceMs == 0) rpmZeroSinceMs = currentMillis;
   } else {
     rpmZeroSinceMs = 0;
@@ -6992,7 +7539,14 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // arm it — only a true zero-hold stop does. Real starts pass through the dwell unnoticed
   // beyond the ~2 s charging delay.
   if (tick.engineFullyStopped) rpmRestartPending = true;
-  if (!tick.ignoreRPM && RPM >= (float)MinRPMForField) {
+  // Engine speed turned back on mid-run (IgnoreRPM 1 -> 0) re-confirms the engine the same way a stop does: a
+  // phantom present at that moment would otherwise pass the RPM gate with no dwell.
+  {
+    static bool prevRpmIgnored = false;
+    if (prevRpmIgnored && !tick.ignoreRPM) rpmRestartPending = true;
+    prevRpmIgnored = tick.ignoreRPM;
+  }
+  if (!rpmReasonSuppressed && RPM >= (float)MinRPMForField) {
     if (rpmAboveMinSinceMs == 0) rpmAboveMinSinceMs = currentMillis;
     if (rpmRestartPending && (uint32_t)(currentMillis - rpmAboveMinSinceMs) >= RPM_RESTART_CONFIRM_MS) {
       rpmRestartPending = false;
@@ -7001,7 +7555,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   } else {
     rpmAboveMinSinceMs = 0;
   }
-  tick.rpmBelowMinimum = (!tick.ignoreRPM && !rpmDropoutGrace
+  tick.rpmBelowMinimum = (!rpmReasonSuppressed && !rpmDropoutGrace
                           && (RPM < (float)MinRPMForField || rpmRestartPending));
 
   // Temperature selection
@@ -7023,8 +7577,29 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   battTempActiveF = tick.battTempF;
   battTempActiveSrc = tick.battTempSrc;
 
-  // Cold-charge lockout: latched with ColdChargeHysteresisF to stop chatter at the threshold.
-  // Fail-open when no battery temperature source qualifies (NAN) so a dead sensor can't brick charging.
+  // §2.2 / §2.3 / §2.6: expected = any source but Not fitted (owner ruling: Automatic with nothing
+  // reporting is a fault). State 3 (grace) covers the first 90 s after boot and after a source
+  // change, so a probe or bus that has not yet delivered its first reading is not "lost" — but it is
+  // not charged on either: REASON_BATT_TEMP_WAIT holds the field off quietly (owner ruling 2026-09-26).
+  {
+    static int      lastBattTempSrcSetting = -1;
+    static bool     battTempEverSeen = false;
+    static uint32_t battTempGraceUntilMs = 90000UL;
+    if (battTempSource != lastBattTempSrcSetting) {
+      if (lastBattTempSrcSetting != -1) { battTempEverSeen = false; battTempGraceUntilMs = currentMillis + 90000UL; }
+      lastBattTempSrcSetting = battTempSource;
+    }
+    tick.battTempExpected = (battTempSource != 6);
+    if (!tick.battTempExpected)                 tick.battTempState = 0;
+    else if (isfinite(tick.battTempF))          { tick.battTempState = 1; battTempEverSeen = true; }
+    else if (!battTempEverSeen && (int32_t)(battTempGraceUntilMs - currentMillis) > 0) tick.battTempState = 3;
+    else                                        tick.battTempState = 2;
+    g_battTempState = tick.battTempState;
+  }
+
+  // Cold-charge lockout: latched with ColdChargeHysteresisF to stop chatter at the threshold. A
+  // missing reading holds the latch (§2.4) — BATT_TEMP_LOST owns that case; the latch clears only on
+  // a real reading past the hysteresis, or when the owner declares Not fitted or switches it off.
   {
     static bool coldLatched = false;
     if (coldChargeLockoutEnable && isfinite(tick.battTempF)) {
@@ -7033,7 +7608,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
       } else if (tick.battTempF >= MinChargeTempF + ColdChargeHysteresisF) {
         coldLatched = false;
       }
-    } else {
+    } else if (!coldChargeLockoutEnable || !tick.battTempExpected) {
       coldLatched = false;
     }
     tick.batteryTooCold = coldLatched;
@@ -7049,7 +7624,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
       } else if (tick.battTempF <= MaxChargeTempF - HotChargeHysteresisF) {
         hotLatched = false;
       }
-    } else {
+    } else if (hotChargeLockoutEnable != 1 || !tick.battTempExpected) {
       hotLatched = false;
     }
     tick.batteryTooHot = hotLatched;
@@ -7116,17 +7691,22 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     tempDataVeryStale = (tempAge > 20000);
   }
 
-  if (isnan(tempSelected) || tempSelected < -50.0f || tempSelected > 400.0f) {
+  const bool altTempValueBad = (isnan(tempSelected) || tempSelected < -50.0f || tempSelected > 400.0f);
+  const bool altTempAgeStale = tempDataVeryStale;
+  if (altTempValueBad) {
     tempDataVeryStale = true;
   }
+  // Before the first reading tempSelected is NaN by construction, not a fault: the sensor fault mask
+  // gets the same 60 s never-connected grace as the stale rule above, so a page opened at boot shows no banner.
+  const bool altTempAwaitingFirst = (tempTimestamp == 0 && tick.nowMs <= 60000);
 
   // Idle-aware gate: below running speed the temp task stretches its poll (5s/60s in 2_functions.ino),
   // so the feed reads "stale" by the 20s rule BY DESIGN — field is off, nothing to protect, and a
   // CRITICAL stale cut would just loop the 2s cooldown. Suppression holds 15s past spin-up because
   // the last engine-off sample can be 60s old; a genuinely dead sensor still cuts 15s after start.
-  static uint32_t lastBelowRunRpmMs = 0;
-  if (RPM < 200) lastBelowRunRpmMs = tick.nowMs;
-  if (RPM < 200 || (uint32_t)(tick.nowMs - lastBelowRunRpmMs) < 15000UL) {
+  // §1.1: keyed on engineRunning, so a boat running with engine speed ignored (or a dead ADS1115
+  // frozen at 0 RPM) still gets the cut.
+  if (!tick.engineRunning) {
     tempDataVeryStale = false;
   }
 
@@ -7186,6 +7766,16 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     tick.currentDataStale = curStale;
   }
 
+  // Hard over-current: HardOCDebounceMs on a FRESH sample only — a held value from a dead sensor must not sit
+  // on top of the ladder for ever. The debounce state lives here so both ladders read one flag and
+  // selectFieldEventReason (called twice per tick) owns no state.
+  {
+    bool hardOcNow = HardOCEnable && altAmpsFresh() && MeasuredAmps > HardOCTripAmps;
+    if (hardOcNow) { if (hardOCStartMs == 0) hardOCStartMs = currentMillis ? currentMillis : 1; }
+    else hardOCStartMs = 0;
+    tick.hardOverCurrent = hardOcNow && (uint32_t)(currentMillis - hardOCStartMs) >= HardOCDebounceMs;
+  }
+
   // Tach-lie plausibility: tach claims running + loop COMMANDING current + field driven well above
   // the per-RPM onset floor + zero alternator output, held TACH_LIE_DWELL_MS. Impossible with a live
   // alternator above cut-in, so one of: the RPM signal is noise (field-PWM coupling sustains it — the
@@ -7211,13 +7801,25 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
                              || fieldCutCcActive || (protTestActive != 0) || protTestCcActive
                              || (altSweepActive != 0) || altSweepRequested
                              || (chcActive != 0) || chcRequested;
-    bool tachLieNow = TachLieEnable && chargingEnabledLocal && !tick.manualMode && !tick.ignoreRPM
+    // With engine speed ignored the RPM leg is dropped and the ignition is the "engine on" claim: the same
+    // "field driven hard, nothing comes out" test is then the only thing that catches a stalled engine with
+    // the key on (audit 2026-09-27; without it the loop chased NoRpmCurrentA into a stationary rotor until key-off).
+    // With the ignition ALSO forced on (IgnitionOverride) there is no engine-on claim at all and this detector is
+    // the only stop: an engine-off boat with the switch on probes the field for TACH_LIE_DWELL_MS once per lockout
+    // tier (15..120 s). A lockout taken in this regime releases only by tier expiry (no rev-up to see).
+    // Arm-bar base: the keep-alive floor, DEFINED as the most field that still makes ~0 A (07-28). With engine
+    // speed ignored that floor is forced to 0 (nothing to keep alive), which would put the bar inside the
+    // zero-output band; the min-duty table's largest row (the idle floor) stands in so the bar stays above it
+    // (history check 2026-10-02).
+    const float tachLieFloor = tick.ignoreRPM ? largestRpmTableMinDuty() : tick.rpmMinDuty;
+    bool tachLieNow = TachLieEnable && chargingEnabledLocal && !tick.manualMode
+                      && !reasonSuppressedByOverride(REASON_TACH_IMPLAUSIBLE, tick)   // needs the alternator current
                       && !sweepDrivingField
                       && !tick.currentDataStale
-                      && RPM >= (float)MinRPMForField
-                      && setpointLimited > TACH_LIE_MAX_AMPS
-                      && dutyCycle >= tick.rpmMinDuty + TACH_LIE_HEADROOM_FRAC * fmaxf(0.0f, ccDutyCeiling() - tick.rpmMinDuty)
-                      && fabsf(MeasuredAmps) < TACH_LIE_MAX_AMPS;
+                      && (tick.ignoreRPM || RPM >= (float)MinRPMForField)
+                      && setpointLimited > NoOutputAmps
+                      && dutyCycle >= tachLieFloor + TACH_LIE_HEADROOM_FRAC * fmaxf(0.0f, ccDutyCeiling() - tachLieFloor)
+                      && fabsf(MeasuredAmps) < NoOutputAmps;
     if (tachLieNow) {
       if (tachLieSinceMs == 0) tachLieSinceMs = currentMillis;
     } else {
@@ -7318,6 +7920,110 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   tick.alternatorHardShutdownV = AlternatorHardShutdownV;
   tick.testProtectionsEnabled = testProtectionsEnabled;
   tick.inAbsorptionStage = inAbsorptionStage;
+
+  // §1.2 sensor fault mask — real status of every sensor, overrides or not — and the §4.7 steady
+  // mask (bit set once its fault bit has been clear continuously for 10 min).
+  {
+    uint16_t m = 0;
+    if ((altTempAgeStale && tick.engineRunning) || (altTempValueBad && !altTempAwaitingFirst)) m |= SF_ALT_TEMP;
+    if (((tachLieLockoutArmed || tick.tachImplausible) && !tick.ignoreRPM) || ADS1115Disconnected != 0) m |= SF_ENGINE_SPEED;   // with engine speed ignored a no-output trip is a stall or a dead alternator, not a sensor fault
+    if (tick.currentDataStale || g_altAmpsOutOfRange || ADS1115Disconnected != 0) m |= SF_ALT_CURRENT;
+    if (tick.ibvStale || INADisconnected != 0) m |= SF_BATT_V_MAIN;
+    if (tick.battVStale || ADS1115Disconnected != 0) m |= SF_BATT_V_SECOND;
+    // Disagreement is a relationship between two FRESH readings; a held IBV against a live BatteryV is the
+    // main sensor's fault (bit 3), not a disagreement.
+    if (!tick.ibvStale && !tick.battVStale && voltageInPlausibleWindow(IBV) && voltageInPlausibleWindow(BatteryV)
+        && (tick.voltageDisagreementCritical || tick.voltageDisagreementWarning)) m |= SF_BATT_V_DISAGREE;
+    if (tick.battTempState == 2) m |= SF_BATT_TEMP;
+    if (ADS1115Disconnected != 0) m |= SF_ADS1115;
+    if (INADisconnected != 0) m |= SF_INA228;
+    g_sensorFaultMask = m;
+
+    // A DS18B20 that died mid-run holds its last value, so at rest bit 0 clears on the engine gate alone:
+    // "clear" for the steady prompt and the automatic exit means the selected source has actually stamped a
+    // reading within the at-rest poll window.
+    const uint32_t altTs = dataTimestamps[tempFromAlt ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
+    const bool altTempReadRecently = (altTs != 0) && ((uint32_t)(currentMillis - altTs) <= 90000UL);
+
+    static uint32_t clearSinceMs[9] = { 0 };
+    uint16_t steady = 0;
+    for (uint8_t b = 0; b < 9; b++) {
+      bool clear = !(m & (1u << b)) && (b != 0 || altTempReadRecently);
+      if (!clear) {
+        clearSinceMs[b] = 0;
+      } else {
+        if (clearSinceMs[b] == 0) clearSinceMs[b] = currentMillis ? currentMillis : 1;
+        if ((uint32_t)(currentMillis - clearSinceMs[b]) >= 600000UL) steady |= (1u << b);
+      }
+    }
+    g_sensorSteadyMask = steady;
+
+    // ===== §11 required-fault count (owner ruling 2026-09-27) =====
+    // Counted per SENSOR, not per bit: a dead chip is every reading it carried. Debounced conditions only —
+    // the instant out-of-range flag would let one glitch sample enter a tier or fire the multi-fault cut.
+    // Owner overrides and Not fitted are "intentionally missing" and never count.
+    uint16_t f = 0;
+    if ((altTempAgeStale && tick.engineRunning) || (altTempValueBad && !altTempAwaitingFirst)) f |= SF_ALT_TEMP;
+    if ((tachLieLockoutArmed || tick.tachImplausible) && !tick.ignoreRPM) f |= SF_ENGINE_SPEED;
+    if (tick.currentDataStale) f |= SF_ALT_CURRENT;
+    if (tick.ibvStale || INADisconnected != 0) f |= SF_BATT_V_MAIN;
+    if (tick.battVStale) f |= SF_BATT_V_SECOND;
+    if (tick.battTempState == 2) f |= SF_BATT_TEMP;
+    if (ADS1115Disconnected != 0) f |= SF_ENGINE_SPEED | SF_ALT_CURRENT | SF_BATT_V_SECOND | ((TempSource == 1) ? SF_ALT_TEMP : 0);
+    if ((m & SF_BATT_V_DISAGREE) && !(f & (SF_BATT_V_MAIN | SF_BATT_V_SECOND))) f |= SF_BATT_V_DISAGREE;
+    f &= ~sensorOverriddenBits();
+    f &= (SF_ALT_TEMP | SF_ENGINE_SPEED | SF_ALT_CURRENT | SF_BATT_V_MAIN | SF_BATT_V_SECOND | SF_BATT_V_DISAGREE | SF_BATT_TEMP);
+    g_reqFaultBits = f;
+    g_reqFaultCount = (uint8_t)__builtin_popcount((unsigned)f);
+
+    // Two or more: cut and hold (REASON_MULTI_SENSOR_FAULT next tick); release 10 s after the count is back to <= 1
+    // so a harness flapping between one and two faults does not cycle the field.
+    static uint32_t multiClearSinceMs = 0;
+    if (g_reqFaultCount >= 2) {
+      if (!s_multiSensorFault) {
+        char names[200];
+        sensorFaultNames(f, names, sizeof(names));
+        queueConsoleMessageF("Sensor faults: %s - two or more required sensors are gone, charging stopped", names);
+      }
+      s_multiSensorFault = true;
+      multiClearSinceMs = 0;
+    } else if (s_multiSensorFault) {
+      if (multiClearSinceMs == 0) multiClearSinceMs = currentMillis ? currentMillis : 1;
+      if ((uint32_t)(currentMillis - multiClearSinceMs) >= 10000UL) {
+        s_multiSensorFault = false;
+        queueConsoleMessage("Multi-sensor fault cleared: at most one required sensor is faulted now");
+      }
+    }
+  }
+
+  // §11.6 battery current (owner ruling 2026-09-27): an OPTIONAL sensor the owner declared present, so its loss
+  // is never a cut and never counts toward g_reqFaultCount. Lost = the selected source (INA228 shunt or
+  // VE.Direct) has stamped since boot, or 90 s have passed, and nothing fresh for 10 s. The alarm and the header
+  // line name it; every consumer (SoC, tail current, current rebulk, battery charge limit) already waits for a
+  // fresh reading.
+  {
+    static uint32_t battCurStaleSinceMs = 0;
+    uint8_t st = 0;
+    if (HAS_BATT_SHUNT) {
+      const uint32_t ts = dataTimestamps[(BatteryCurrentSource == 3) ? IDX_VICTRON_CURRENT : IDX_BCUR];
+      const bool everSeen = (ts != 0) || (currentMillis > 90000UL);
+      if (battCurrentFresh() || !everSeen) {
+        battCurStaleSinceMs = 0;
+        st = 1;
+      } else {
+        if (battCurStaleSinceMs == 0) battCurStaleSinceMs = currentMillis ? currentMillis : 1;
+        st = ((uint32_t)(currentMillis - battCurStaleSinceMs) >= 10000UL) ? 2 : 1;
+      }
+    } else {
+      battCurStaleSinceMs = 0;
+    }
+    if (st != g_battCurState) {
+      if (st == 2) queueConsoleMessageF("Battery current lost: %s has not reported for 10 s - state of charge, the tail-current absorption exit, the current rebulk and the battery charge limit wait for it; charging continues on voltage",
+                                        (BatteryCurrentSource == 3) ? "the VE.Direct feed" : "the INA228 shunt");
+      else if (g_battCurState == 2) queueConsoleMessage("Battery current reading again");
+    }
+    g_battCurState = st;
+  }
 
   return tick;
 }
@@ -7800,6 +8506,7 @@ void updateRPMBucketHistory(uint32_t nowMs) {
 
   if (isnan(TempToUse) || TempToUse < -50.0f || TempToUse > 400.0f) return;
   if (dtMs == 0) return;
+  if (IgnoreRPM) return;   // no trustworthy bucket to charge the history to (§4.8)
 
   int bucket = currentRPMTableIndex;
   if (bucket < 0 || bucket >= RPM_TABLE_SIZE) return;
@@ -8481,9 +9188,8 @@ String kneeLearnStateJson() {
  *
  * @return true if at least one voltage sensor shows plausible reading
  */
-bool isVoltageSensorPlausible() {
-  float minPlausible, maxPlausible;
-
+// The per-class plausibility window both battery-voltage readings are judged against.
+void voltagePlausibleWindow(float &minPlausible, float &maxPlausible) {
   // Use the user-entered nominal bank class (SYSTEM_VOLTAGE_CLASS) directly — not an autodetect from
   // BulkVoltage, which can mis-bucket and "F up" near class boundaries.
   if (SYSTEM_VOLTAGE_CLASS >= 48) {
@@ -8503,12 +9209,23 @@ bool isVoltageSensorPlausible() {
     minPlausible = 4.5f;   // Dead battery - 0.5V buffer
     maxPlausible = 15.5f;  // Max charging + 0.5V buffer
   }
+}
 
-  // Check BatteryV sensor
-  bool batteryVPlausible = (BatteryV >= minPlausible && BatteryV <= maxPlausible && !isnan(BatteryV));
+bool voltageInPlausibleWindow(float v) {
+  float lo, hi;
+  voltagePlausibleWindow(lo, hi);
+  return !isnan(v) && v >= lo && v <= hi;
+}
 
-  // Check IBV sensor
-  bool ibvPlausible = (IBV >= minPlausible && IBV <= maxPlausible && !isnan(IBV));
+bool isVoltageSensorPlausible() {
+  float minPlausible, maxPlausible;
+  voltagePlausibleWindow(minPlausible, maxPlausible);
+
+  // Check BatteryV sensor — not consulted while the owner runs without the second reading (§4.8)
+  bool batteryVPlausible = !IgnoreBattV2 && (BatteryV >= minPlausible && BatteryV <= maxPlausible && !isnan(BatteryV));
+
+  // Check IBV sensor — likewise not consulted while the owner runs without the main reading
+  bool ibvPlausible = !IgnoreBattVMain && (IBV >= minPlausible && IBV <= maxPlausible && !isnan(IBV));
 
   // Valid if at least one sensor is plausible
   // If BOTH are implausible, that's a critical fault
@@ -8594,6 +9311,20 @@ void tempFilterUpdate(uint32_t nowMs) {
 
 void tempPID_tick(uint32_t nowMs, float actualDtSec) {
 
+  // Running without the alternator temperature (§3.2, owner override): zero penalty, loop parked, a clean
+  // re-seed when it clears.
+  if (IgnoreTemperature) {
+    if (tempPIDActive || thermalPenaltyAmps != 0.0f) {
+      thermalPenaltyAmps = 0.0f;
+      prevThermalPenalty = 0.0f;
+      thermalPenaltyLastValid = 0.0f;
+      thermalIntegral = 0.0f;
+      tempPIDActive = false;
+      thermalPreserveSlopeOnResume = false;
+    }
+    return;
+  }
+
   // --- Hard reset path (requested externally, e.g. from web UI command) ---
   if (tempPIDResetRequested) {
     tempPIDResetRequested = false;
@@ -8616,7 +9347,9 @@ void tempPID_tick(uint32_t nowMs, float actualDtSec) {
 
   // Stage bounds from inBulkStage/inAbsorptionStage directly, NOT voltageControlActive:
   // that flag is reassigned AFTER this fn returns, so it is one stage-transition tick stale.
-  const float capCurrent = getCapCurrentForRPM(RPM);
+  // With engine speed ignored the RPM table is not the ceiling in force (NoRpmCurrentA is, via g_I_cap); at
+  // RPM 0 the table's first row is 0 A and clamped the whole derate to nothing (audit 2026-09-27).
+  const float capCurrent = (IgnoreRPM && g_I_cap > 0.0f) ? g_I_cap : getCapCurrentForRPM(RPM);
   const float penaltyMax = (float)MaxTableValue;
   const bool inPureBulk = (inBulkStage && !inAbsorptionStage);
   const float penaltyMin = 0.0f;  // penalty is derate-only: I_cmd = I_cap − penalty

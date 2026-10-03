@@ -1071,6 +1071,15 @@ const CSV2_FIELDS = [
     "fieldDutyFloor",          // enforced field-duty floor x100: max of Min Field % and this speed's Keep-Alive %; 0 = floor bypassed (shutdown, sysID, protection clamp, MANUAL)
     "inaDieTempF",             // INA228 internal die temperature °F x10 (ROLL_EMPTY = no reading)
     "inaDieTempMaxF",          // session max of the above °F x10 (ROLL_EMPTY = nothing has passed the warm-up + corroboration gate); this is what uploads daily
+    "voltStaleCount",          // session count of VOLTAGE_STALE field events (main battery voltage, INA228)
+    "volt2StaleCount",         // session count of VOLTAGE2_STALE field events (second battery voltage, ADS1115)
+    "battTempLostCount",       // session count of BATT_TEMP_LOST field events
+    "sensorFaultMask",         // bit0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228 — real status, overrides or not
+    "battTempState",           // 0 not expected (Not fitted), 1 reading, 2 lost (charging stopped), 3 waiting for the first reading (field held off)
+    "limpTier",                // 0 normal, 1 closed-loop minus dependent reasons, 2 voltage-only, 3 fixed duty + second-voltage cap, 4 fixed duty
+    "sensorSteadyMask",        // same bits as sensorFaultMask, set once that fault has been clear for 10 min (the "reading again" prompt)
+    "reqFaultCount",           // §11: required sensors faulted right now (chip loss counts its readings; owner overrides and Not fitted excluded); 2+ = charging stopped
+    "battCurState",            // §11.6 battery current (declared shunt / VE.Direct): 0 not declared, 1 reading, 2 lost (alarm + header line; charging continues on voltage)
     "sessionId",               // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
@@ -1303,6 +1312,8 @@ function cxRpmSparkOnCsv1(data) {
         cx.liveAmps = isFinite(a) ? a / 100 : NaN;
         if (cx.rtestState === 'leveling') cxRtTick();
         cxFdFitCursorLive();
+        const idleEl = document.getElementById('chcIdleNow');   // stage 9 setup: live speed under the Start button
+        if (idleEl) idleEl.textContent = cxChcIdleNowText();
     }
     const S = _cxRpmSpark;
     S.rpm.push(isFinite(rpm) ? rpm : NaN); S.rpm.shift();
@@ -1318,6 +1329,7 @@ function cxRpmSparkOnCsv1(data) {
     }
     const hint = document.getElementById('cx-settle-hint');
     if (hint) hint.style.display = cxRpmUnsettled() ? '' : 'none';
+    if (cx) cxDriveGateRefresh();
 }
 // Throttle-settle check for the Run-button hint: unsettled = RPM spanned more than 5% of its mean
 // (min 30 RPM) over the last ~3 s of the ring. False with no data or engine effectively stopped —
@@ -2034,7 +2046,7 @@ function parseAltLogBin(buf) {
             rpm: dv.getInt16(o + 2, true),
             duty: dv.getUint16(o + 4, true) / 100,
             vbus: dv.getUint16(o + 6, true) / 1000,
-            tempF: dv.getInt16(o + 8, true) / 10,
+            tempF: (dv.getInt16(o + 8, true) === -32768) ? NaN : dv.getInt16(o + 8, true) / 10,   // -32768 = probe absent (blank cell)
             tSlope: dv.getInt16(o + 10, true) / 100,   // case-temp rate, °F/min
             amps: dv.getInt16(o + 12, true) / 100,
             ampsRaw: dv.getInt16(o + 14, true) / 100,
@@ -2100,7 +2112,7 @@ function altLogToCsv(d) {
     for (let i = 0; i < d.rows.length; i++) {
         const r = d.rows[i];
         if (i) t += r.dtMs;
-        L.push([(t / 1000).toFixed(3), r.dtMs, r.rpm, r.duty.toFixed(2), r.vbus.toFixed(3), r.tempF.toFixed(1),
+        L.push([(t / 1000).toFixed(3), r.dtMs, r.rpm, r.duty.toFixed(2), r.vbus.toFixed(3), (Number.isFinite(r.tempF) ? r.tempF.toFixed(1) : ''),
                 r.tSlope.toFixed(2), r.amps.toFixed(2), r.ampsRaw.toFixed(2),
                 (r.flags & 1) ? 1 : 0, (r.flags & 2) ? 1 : 0, (r.flags & 4) ? 1 : 0, (r.flags & 8) ? 1 : 0,
                 (r.flags & 16) ? 1 : 0, (r.flags & 32) ? 1 : 0, (r.flags & 64) ? 1 : 0,
@@ -3113,7 +3125,8 @@ function perfSet(key, val){
   else    echoSettingWrite(key+'='+val, what);
 }
 
-let perfView = 0;   // 0 = sailing, 1 = motoring (client-side display toggle)
+let perfView = 1;   // 0 = sailing, 1 = motoring (client-side display toggle)
+let perfViewPicked = false;   // owner clicked the toggle this page load; vessel-info refreshes leave it alone
 function setTxt(id, t){ const el=document.getElementById(id); if(el) el.textContent=t; }
 // Rows are authored as <hr> then row, so a row hidden on its own strands its separator.
 function setRowVisible(id, show){
@@ -3141,6 +3154,20 @@ function setPerfView(v){
   const windTog=document.getElementById('perf-wind-toggle'); if(windTog) windTog.style.display = v===0?'':'none';
   renderPerf();
   if(v===0) queuePerfPlotUpdate(); else queueMotorPlotUpdate();
+}
+function pickPerfView(v){ perfViewPicked = true; setPerfView(v); }
+// Vessel Info Type: Monohull and Catamaran are sailboats, every other value a motorboat. Blank or not yet loaded is
+// monohull, as in the Vessel Info form and the firmware default, so a failed /vessel_info.json does not hide the sail views.
+function boatIsSail(){ const t = (window.vesselInfo && window.vesselInfo.boat_type) || 'monohull'; return t==='monohull' || t==='catamaran'; }
+function applyBoatTypeUI(){
+  const sail = boatIsSail();
+  const tog=document.getElementById('perf-view-toggle'); if(tog) tog.style.display = sail?'':'none';
+  const vmg=document.getElementById('vt-vmg-leeway'); if(vmg) vmg.style.display = sail?'':'none';
+  const tun=document.getElementById('perf-sail-tuning'); if(tun) tun.style.display = sail?'':'none';
+  setRowVisible('best-upwind-vmg-row', sail);
+  setRowVisible('perf-minws-row', sail);
+  if(!sail){ if(perfView!==1) setPerfView(1); }
+  else if(!perfViewPicked && perfView!==0) setPerfView(0);
 }
 // Header settle status. settleSec = dwell s remaining (firmware); 0 = settled, <0 = not eligible (chip cleared).
 // Firmware sends only the remaining seconds, so the ring fraction is tracked against the peak seen this run.
@@ -3656,6 +3683,7 @@ const CSV3_FIELDS = [
     "CurrentAlarmHigh",
     "AlarmTest",
     "AlarmLatchEnabled",
+    "GeneralFaultAlarm",
     "MaintainMode",
     "ManualSOCPoint",
     "IgnoreLearningDuringPenalty",
@@ -3890,6 +3918,13 @@ const CSV3_FIELDS = [
     "RemoteDiagnostics",
     "ShuntGroundComp",
     "BatteryVoltageSource",
+    "IgnoreAltCurrent",
+    "IgnoreBattVMain",
+    "IgnoreBattV2",
+    "LimpDutyPct",
+    "NoRpmCurrentA",
+    "ShutdownRampTauS",
+    "NoOutputAmps",
     "sessionId",  // device boot identity, same in every channel this boot
     "sendMs",  // device millis() when this settings echo was built; event-driven with a 60 s fallback
 ];
@@ -7684,7 +7719,7 @@ function recomputeAutoScales(applyNow) {
         }
     }
     if (autoScaleVoltage && !autoScaleVoltageLocked) {
-        _autoScaleVoltageLeft  = computeScaleRange(voltageData, [1, 2], 0.5, 0.10, undefined, vc, voltagePlot);
+        _autoScaleVoltageLeft  = computeScaleRange(voltageData, [1, 2], 0.5 * (window._nominalStored || 12) / 12, 0.10, undefined, vc, voltagePlot);
         _autoScaleVoltageRight = computeScaleRange(voltageData, [3], 20, 0.10, 0, vc, voltagePlot);
         if (applyNow && voltagePlot) {
             if (_autoScaleVoltageLeft)  voltagePlot.setScale('voltage', _autoScaleVoltageLeft);
@@ -8615,8 +8650,7 @@ function updateAllEchosOptimized(data) {
         { key: 'ManualDutyTarget', id: 'ManualDutyTarget_echo_gate', transform: v => (v / 100).toFixed(2) },
         { key: 'PhysicalPanelOverride', id: 'PhysicalPanelOverride_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'OnOff', id: 'OnOff_echo', transform: v => v == 1 ? 'On' : 'Off' },
-        { key: 'ManualFieldToggle', id: 'ManualFieldToggle_echo', transform: v => v === 0 ? 1 : 0 },
-        { key: 'LimpHome', id: 'LimpHome_echo', transform: v => v == 1 ? 'On' : 'Off' },
+        { key: 'ManualFieldToggle', id: 'ManualFieldToggle_echo', transform: v => v == 1 ? 'Manual' : 'PID' },
         { key: 'VeData', id: 'VeData_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'NMEA0183Data', id: 'NMEA0183Data_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'NMEA2KData', id: 'NMEA2KData_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
@@ -8667,14 +8701,13 @@ function updateAllEchosOptimized(data) {
         { key: 'ChargedVoltage_Scaled', id: 'ChargedVoltage_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'TailCurrent', id: 'TailCurrent_echo', transform: v => (v / 10).toFixed(1) },
         { key: 'ChargedDetectionTime', id: 'ChargedDetectionTime_echo', transform: v => v },
-        { key: 'IgnoreTemperature', id: 'IgnoreTemperature_echo', transform: v => v == 1 ? 'Yes' : 'No' },
-        { key: 'IgnoreRPM', id: 'IgnoreRPM_echo', transform: v => v == 1 ? 'Yes' : 'No' },
         { key: 'MinRPMForField', id: 'MinRPMForField_echo', transform: v => v },
         { key: 'bmsLogic', id: 'bmsLogic_echo', transform: v => v == 1 ? 'On' : 'Off' },
         // 0 = charge while the input is energized. That reads LOW at the ESP32 (the opto inverts),
         // which is what the old Low/High labels meant — and what installers read backwards.
         { key: 'bmsLogicLevelOff', id: 'bmsLogicLevelOff_echo', transform: v => v == 0 ? 'Present' : 'Absent' },
         { key: 'AlarmActivate', id: 'AlarmActivate_echo', transform: v => v == 1 ? 'On' : 'Off' },
+        { key: 'GeneralFaultAlarm', id: 'GeneralFaultAlarm_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'TempAlarm', id: 'TempAlarm_echo', transform: v => Number(v) === 0 ? 'Off' : Math.round(toDisplayTemp(v)) },
         { key: 'TempAlarmLow', id: 'TempAlarmLow_echo', transform: v => Number(v) === 0 ? 'Off' : Math.round(toDisplayTemp(v)) },
         { key: 'VoltageAlarmHigh', id: 'VoltageAlarmHigh_echo', transform: v => (v / 100).toFixed(2) },  // ×100 → V
@@ -8707,7 +8740,6 @@ function updateAllEchosOptimized(data) {
         { key: 'Beta', id: 'Beta_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'T0_C', id: 'T0_C_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'TempSource', id: 'TempSource_echo', transform: v => v == 0 ? 'Digital' : 'Thermistor' },
-        { key: 'IgnitionOverride', id: 'IgnitionOverride_echo', transform: v => v == 1 ? 'Force On' : 'Auto' },
         { key: 'AmpSensorRange', id: 'AmpSensorRange_echo', transform: v => (['±200A', '±300A', '±500A'][v] ?? v) },
         { key: 'AlarmLatchEnabled', id: 'AlarmLatchEnabled_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'AlarmTest', id: 'AlarmTest_echo', transform: v => v == 1 ? 'Active' : '---' },
@@ -8755,6 +8787,8 @@ function updateAllEchosOptimized(data) {
         { key: 'PidKd', id: 'PidKd_echo', transform: v => (v / 1000).toFixed(3) },
         { key: 'DutySlowRampRate', id: 'DutySlowRampRate_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'ShutdownPhase2HoldMs', id: 'ShutdownPhase2HoldMs_echo', transform: v => Math.round(v) },
+        { key: 'ShutdownRampTauS', id: 'ShutdownRampTauS_echo', transform: v => (v / 100).toFixed(1) },
+        { key: 'NoOutputAmps', id: 'NoOutputAmps_echo', transform: v => (v / 100).toFixed(1) },
         { key: 'PidSampleDivisor', id: 'PidSampleDivisor_echo', transform: v => v },
         // xTime has no text echo — the X window is the highlighted button (updatePIDXButtons)
         { key: 'MaxTableValue', id: 'MaxTableValue_echo', transform: v => (v / 100).toFixed(2) },
@@ -9551,6 +9585,7 @@ async function fetchAndPopulateVesselInfo() {
 
         const data = await response.json();
         window.vesselInfo = data;
+        applyBoatTypeUI();
 
         const form = document.getElementById('vessel-info-form');
         if (!form) return;
@@ -9698,6 +9733,7 @@ async function handleVesselInfoSave(event) {
             const _prevOrient = (window.vesselInfo && window.vesselInfo.imu_mount_orientation !== undefined)
                 ? Number(window.vesselInfo.imu_mount_orientation) : null;
             window.vesselInfo = vesselData;
+            applyBoatTypeUI();
             // Re-read identity rather than trusting the submitted string: a cleared name falls
             // back to the unit's own XREG-<id>, which only the device can tell us.
             probeIdentify(API_BASE_URL || '', 4000).then(h => { if (h) applyConnectedIdentity(h); });
@@ -9997,11 +10033,11 @@ function deriveBatteryDefaults(type, capAh, sysV, battProbe) {
     rows.push({ param: 'VoltageAlarmHigh', label: 'High Voltage Alarm (V)', value: r2(T.vAlmHi * kV) });
     rows.push({ param: 'VoltageAlarmLow', label: 'Low Voltage Alarm (V)', value: r2(T.vAlmLo * kV) });
     rows.push({ param: 'SocAlarmLow', label: 'Low State of Charge Alarm (%)', value: T.socAlm });
-    rows.push({ param: 'coldChargeLockoutEnable', label: 'Cold-Charge Lockout', value: T.cold, show: v => v ? 'On' : 'Off' });
-    // A battery probe is what gives the derate and the hot lockout something to read, so both are proposed
-    // only with one fitted. With no measured battery temperature neither can act anyway, so nothing is
-    // proposed and whatever is stored stays.
+    // A battery temperature from ANY source (probe, NMEA 2000, VE.Direct, RV-C — the caller's measuredSrc)
+    // is what gives the lockouts and the derate something to read, so all four rows are proposed only with
+    // one fitted. With none, nothing is proposed and whatever is stored stays.
     if (battProbe === 1) {
+        rows.push({ param: 'coldChargeLockoutEnable', label: 'Cold-Charge Lockout', value: T.cold, show: v => v ? 'On' : 'Off' });
         rows.push({ param: 'battTempDerateEnable', label: 'Battery-Temp Gain Derate', value: 1, show: v => v ? 'On' : 'Off' });
         rows.push({ param: 'hotChargeLockoutEnable', label: 'Hot-Charge Lockout', value: T.hot, show: v => v ? 'On' : 'Off' });
         rows.push({ param: 'MaxChargeTempF', label: 'Max Charge Temp (' + tempUnitLabel() + ')', value: T.hotF, show: v => String(Math.round(toDisplayTemp(v))) });
@@ -10118,7 +10154,15 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
         const battProbe = ('battTempProbeEnable' in cfg) ? parseInt(cfg.battTempProbeEnable, 10) : 0;   // 1 = BATT-role DS18B20 in use
         const shuntPresent = ('BatteryShuntPresent' in cfg) ? parseInt(cfg.BatteryShuntPresent, 10) : 1;
 
-        const der = deriveBatteryDefaults(type, Number(vessel.battery_capacity_ah), Number(vessel.battery_voltage), battProbe);
+        // Battery temperature fitted by ANY source (§2.7): the probe enable, an explicit pinned selection, or the
+        // live resolved source (CSV2 battTempActiveSrc, same codes as firmware batteryTempF). A cold tab with
+        // no CSV2 frame yet reads as 0, so a real gap is never suppressed.
+        const battTempSel = ('battTempSource' in cfg) ? parseInt(cfg.battTempSource, 10) : 0;   // 0 Auto, 1..4 pinned, 6 Not fitted
+        const liveTempSrc = (g_lastCsv2 && g_lastCsv2.battTempActiveSrc !== undefined)
+            ? (Number(g_lastCsv2.battTempActiveSrc) | 0) : 0;
+        const measuredSrc = battProbe === 1 || (battTempSel >= 1 && battTempSel <= 4) || (liveTempSrc >= 1 && liveTempSrc <= 4);
+
+        const der = deriveBatteryDefaults(type, Number(vessel.battery_capacity_ah), Number(vessel.battery_voltage), measuredSrc ? 1 : 0);
         if (!der) { _battDefSkipNote('Battery type "' + _cfgEsc(String(type)) + '" is not one this regulator has recommendations for. Set each charge-stage and protection value individually under Setup.', manual); return; }
 
         const rows = [];   // preserve der.rows order; each carries now + match so matches render inline, highlighted
@@ -10143,27 +10187,21 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
         } else if (type === 'lifepo4') {
             const tFrz = _tc ? '0 °C' : '32 °F';
             noticeHtml = battDefNotice('warn', 'Do not charge below freezing',
-                    'Charging a lithium (LiFePO4) battery below freezing (' + tFrz + ') plates the cells and permanently damages them, and the battery\'s protection circuit (BMS) can disconnect to defend itself — if it opens while the alternator is charging, the sudden loss of load can spike system voltage and damage other electronics.');
+                    'Charging a lithium (LiFePO4) battery below freezing (' + tFrz + ') plates the cells and permanently damages them, and the battery\'s protection circuit (BMS) can disconnect to defend itself — if it opens while the alternator is charging, the sudden loss of load can spike system voltage and damage other electronics.'
+                    + (battTempSel === 6 ? ' No battery temperature is fitted on this boat, so charging below freezing is left to the battery\'s own BMS, and a BMS disconnect while charging can spike system voltage.' : ''));
         }
-        // Raised only when nothing measured is reporting. battTempProbeEnable alone would nag every install
-        // whose battery temperature arrives over NMEA 2000, VE.Direct or RV-C, so the gate is the live
-        // resolved source (CSV2 battTempActiveSrc, same codes as firmware batteryTempF) OR an explicit
-        // pinned selection, which stays configured while its bus is momentarily quiet. No CSV2 frame yet
-        // (cold tab) reads as 0, so a real gap is never suppressed.
-        const battTempSel = ('battTempSource' in cfg) ? parseInt(cfg.battTempSource, 10) : 0;   // 0 Auto, 1..4 pinned, 6 None
-        const liveTempSrc = (g_lastCsv2 && g_lastCsv2.battTempActiveSrc !== undefined)
-            ? (Number(g_lastCsv2.battTempActiveSrc) | 0) : 0;
-        const measuredSrc = battProbe === 1 || (battTempSel >= 1 && battTempSel <= 4) || (liveTempSrc >= 1 && liveTempSrc <= 4);
-        if (!measuredSrc) {
+        // Only when a source is expected and nothing reports — never for Not fitted (§2.7). A missing
+        // expected battery temperature stops charging, so this is a setup fact, not a nag.
+        if (battTempSel !== 6 && !(liveTempSrc >= 1 && liveTempSrc <= 4)) {
             noticeHtml += battDefNotice('limit', 'Battery temperature source',
-                'No battery temperature source is reporting, so the cold and hot charge lockouts, the voltage-loop gain derate, and the temperature corrections on the battery-health figures have nothing to read. Fit one of the ring-lug probes from the kit to a battery terminal — it is assigned under Setup > Temperature, where the hot-charge lockout and the battery temperature limits also live — or feed battery temperature in from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.');
+                'No battery temperature is reporting. Charging will not run until one does, or until the source is set to Not fitted under Setup > Battery > Battery Temperature (the cold and hot charge lockouts and their limits live there too). Fit one of the ring-lug probes from the kit to the battery\'s negative terminal and assign it to Battery, or feed battery temperature in from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.');
         }
         // Voltage float is allowed without a shunt (2026-09-09): absorption then ends on its time limit
         // instead of tail current, the way a solar controller floats with no shunt. Say which exit will
-        // run, and that the time limit is therefore the setting to get right.
+        // run.
         if (der.useFloat === 1 && shuntPresent !== 1) {
             noticeHtml += battDefNotice('info', 'Float without a shunt runs on time',
-                'The battery shunt is marked absent, so the regulator cannot see the battery\'s own current. Absorption will end on its time limit (Absorption Timeout under Setup > Battery) instead of on tail current, and float then holds the float voltage. With no shunt that time limit is the setting to get right for this bank. Declaring the shunt and entering its resistance switches the exit to tail current.');
+                'The battery shunt is marked absent, so the regulator cannot see the battery\'s own current. Absorption will end on its time limit (Absorption Timeout under Setup > Battery) instead of on tail current, and float then holds the float voltage. Declaring the shunt and entering its resistance switches the exit to tail current.');
         }
         if (type === 'lifepo4' && battSrc !== 0) {
             noticeHtml += battDefNotice('info', 'Float changed to No Float',
@@ -10272,7 +10310,7 @@ async function launchBatteryRecommender() {
     let vessel = null;
     try {
         const r = await fetchWithTimeout(buildURL('/vessel_info.json'), {}, 5000);
-        if (r.ok) { vessel = await r.json(); window.vesselInfo = vessel; }
+        if (r.ok) { vessel = await r.json(); window.vesselInfo = vessel; applyBoatTypeUI(); }
     } catch (e) { diagLog('recommender vessel re-read failed:', e); }
     if (!vessel) vessel = window.vesselInfo;
     if (!vessel || !vessel.battery_type) {
@@ -10514,7 +10552,7 @@ function commPrepOwRender(j) {
         absent('batt', 'battery', true);
         absent('extra', 'other', true);
         if (roles.batt && _commPrepCfg && Number(_commPrepCfg.battTempSource) === 6) {
-            lines.push('Battery Temperature Source is set to None under Setup > Battery, so the battery sensor is not read.');
+            lines.push('Battery Temperature Source is set to Not fitted under Setup > Battery, so the battery sensor is not read.');
         }
         if (!probes.length && _commPrepTempSrc === 0) lines.push('Commissioning will run with no alternator temperature, and the over-temperature protection cannot act.');
         const txt = lines.join(' ');
@@ -10529,6 +10567,7 @@ function commPrepOwRender(j) {
         if (st.textContent !== txt) st.textContent = txt;
     }
     commPrepOwGate(j);
+    commPrepBattTempGate(j);
 }
 // Blocking gate. Only the alternator blocks: commissioning drives the alternator hard and the
 // over-temperature protection has nothing to act on without it. A missing battery or other sensor is a
@@ -10702,10 +10741,61 @@ function maybeShowCommPrereqs() { return openCommPrereqs(true, true); }
 function commPrepBattTempText() {
     const c2 = g_lastCsv2 || {};
     const src = Number(c2.battTempActiveSrc) | 0;
-    if (src < 1 || src > 4) return 'none installed';
+    if (src < 1 || src > 4) return (Number(c2.battTempState) === 0) ? 'Not fitted' : 'none found';
     const f = tempX10(c2.battTempActiveF);
     const name = battTempSrcName(src);
     return Number.isFinite(f) ? (name + ', ' + toDisplayTemp(f).toFixed(1) + ' ' + tempUnitLabel()) : name;
+}
+// §2.8 required choice: the source is not Not fitted, no probe holds the Battery role and nothing is
+// reporting. Next is blocked in the commPrepOwGate amber-box style until one of the three clears it.
+function commPrepBattTempGate(j) {
+    const body = document.getElementById('commprep-body');
+    const start = document.getElementById('commprep-start-btn');
+    if (!body) return;
+    const c2 = g_lastCsv2 || {};
+    const src = Number(c2.battTempActiveSrc) | 0;
+    const reporting = (src >= 1 && src <= 4) && Number.isFinite(tempX10(c2.battTempActiveF));
+    const roles = (j && j.roles) || {};
+    const stored = (_commPrepCfg && _commPrepCfg.battTempSource !== undefined) ? Number(_commPrepCfg.battTempSource) : 0;
+    const missing = stored !== 6 && !roles.batt && !reporting && g_lastCsv2 !== null;
+    let box = document.getElementById('commprep-batttemp-gate');
+    if (!missing) {
+        if (box) box.remove();
+        if (start && start.disabled && !document.getElementById('commprep-owgate')) commPrepPaintCta();
+        return;
+    }
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'commprep-batttemp-gate';
+        box.style.cssText = 'margin:8px 0 0; padding:11px 12px; background:rgba(230,162,60,0.06); border:1px solid rgba(230,162,60,0.32); border-radius:6px; font-size:12px; line-height:1.5; color:#e6a23c;';
+        const live = document.getElementById('commprep-batttemp');   // the Battery group's live line (§2.8): the choice sits under it
+        if (live && live.parentElement) live.parentElement.appendChild(box);
+        else body.insertBefore(box, body.firstChild);
+    }
+    const html = '<strong>No battery temperature found.</strong> A battery temperature that is expected but missing stops charging, so commissioning could not run. '
+        + 'If this boat has none, say so; otherwise assign a probe to Battery in the sensor table or rescan.'
+        + '<div style="display:flex; gap:10px; margin-top:9px; flex-wrap:wrap;">'
+        + '<button type="button" onclick="commPrepBattTempNotFitted()" class="btn-secondary" style="border-radius:5px; padding:6px 14px; cursor:pointer; font-size:0.85em;">Not fitted on this boat</button>'
+        + '<button type="button" onclick="commPrepOwScan()" class="btn-secondary" style="border-radius:5px; padding:6px 14px; cursor:pointer; font-size:0.85em;">Rescan</button></div>';
+    if (box.innerHTML !== html) box.innerHTML = html;
+    if (start) {
+        if (settingsUnlocked) { start.disabled = true; start.style.opacity = '0.45'; start.style.cursor = 'default'; start.title = 'Say whether this boat has a battery temperature sensor first'; }
+        else if (start.disabled) commPrepPaintCta();
+    }
+}
+async function commPrepBattTempNotFitted() {
+    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    try {
+        const r = await fetchWithTimeout(buildURL('/get?battTempSource=6'), {}, 8000);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (_commPrepCfg) _commPrepCfg.battTempSource = 6;
+        const el = document.getElementById('commprep-batttemp');
+        if (el) el.textContent = 'Not fitted';
+        commPrepBattTempGate(_commPrepOwLast);
+    } catch (e) {
+        diagLog('prerequisites battTempSource=6 failed:', e);
+        xAlert('Could not save the choice. Check the connection and try again.');
+    }
 }
 
 function commPrepRender(cfg) {
@@ -10765,7 +10855,7 @@ function commPrepRender(cfg) {
         ? '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;"><strong style="color:#e0e0e0;">Use a laptop or tablet if you can.</strong> Setup and Commissioning works on a phone, but it\'s a worse UX on a small screen.</p>'
         : '';
     const intro = cxPanelOverrideStripHtml() + smallScreen + '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;">' + (_commPrepFirstInstall
-            ? 'A few things to set before commissioning measures your system. These affect how the regulator reads temperature and current. Anything you skip stays editable later under Setup.'
+            ? 'A few things to set before commissioning begins. Anything you skip stays editable later under Setup.'
             : 'These are the settings commissioning measures against, filled in from the regulator. Confirm they still describe the system before the wizard re-measures it — anything you change here is written when you press Next.') + '</p>' + dvccNotice;
 
     const seg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Alternator Temperature Source</label>' +
@@ -10792,13 +10882,14 @@ function commPrepRender(cfg) {
     const vSrcSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery voltage for charge decisions</label>' +
         '<div class="cap-mode-toggle" style="flex-wrap:wrap; background:rgba(255,255,255,0.07); border-color:#444;">' +
         vSrcBtn(0, 'Onboard') + vSrcBtn(1, 'NMEA 2000') + vSrcBtn(3, 'Victron') +
-        '</div><div style="' + capCss + '">The onboard sensor drives all control loops regardless. Choose an external source when the Regulator Ground Wire is long.</div></div>';
+        '</div><div style="' + capCss + '">The onboard sensor drives all control loops regardless. Choose an external source if the Regulator Ground Wire is longer than 6 ft or smaller than 12 AWG.</div></div>';
 
-    // Read-only: which measured battery-temperature source is live right now. Painted from the last CSV2
-    // frame here and kept current by renderBattTempReadouts while the screen is open. Never gates Next.
+    // Which measured battery-temperature source is live right now. Painted from the last CSV2 frame here
+    // and kept current by renderBattTempReadouts while the screen is open. The "none found" choice (Not
+    // fitted / Rescan) is commPrepBattTempGate, run on every probe poll.
     const battTempSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery temperature</label>' +
         '<div id="commprep-batttemp" style="font-size:13px; color:#ddd;">' + commPrepBattTempText() + '</div>' +
-        '<div style="' + capCss + '">Temperature compensation and the cold and hot charge lockouts need a measured battery temperature. The kit\'s ring-lug probe goes on a battery terminal.</div></div>';
+        '<div style="' + capCss + '">The cold and hot charge lockouts and the voltage-loop temperature correction need a measured battery temperature. The kit\'s ring-lug probe goes on the battery\'s negative terminal, never the positive.</div></div>';
 
     const thermistor = '<div id="commprep-thermistor" style="display:' + (ts === 1 ? '' : 'none') + '; margin:0 0 14px; padding:10px 12px; background:#191919; border:1px solid #333; border-radius:6px;">' +
         field('Thermistor Series Resistor R_fixed (Ω)', 'commprep-rfixed', raw('R_fixed'), '1', '0', '1000000') +
@@ -11365,7 +11456,7 @@ async function socSeedPoll() {
 async function socSeedMaybeAutoOpen() {
     // Don't auto-pop over the first-run chain's screens or the commissioning modal (the chain shows this
     // popup itself, in sequence); still reachable from the header SOC readout.
-    const overModal = ['commprep-modal-overlay', 'battdef-modal-overlay', 'nextstep-modal-overlay', 'commission-modal-overlay'].some(id => {
+    const overModal = ['commprep-modal-overlay', 'battdef-modal-overlay', 'nextstep-modal-overlay', 'commission-modal-overlay', 'rwfs-modal-overlay'].some(id => {
         const el = document.getElementById(id);
         return el && (el.style.display === 'flex' || el.style.display === 'block');
     });
@@ -12814,7 +12905,9 @@ function fieldOffReasonText(reasonCode) {
         case 16: return 'overvoltage lockout';
         case 17: return 'too cold to charge';
         case 18: return 'commissioning — field resting';
-        case 19: return 'field on but no alternator output — check field wiring, ON/OFF switch, or alternator (may be a false RPM signal)';
+        case 19: return (typeof rwfsFlags === 'object' && rwfsFlags.IgnoreRPM === 1)
+            ? 'field on but no alternator output — engine stopped with the key on, dead alternator, or open field circuit (engine speed is ignored)'
+            : 'field on but no alternator output — check field wiring, ON/OFF switch, or alternator (may be a false RPM signal)';
         case 20: return 'resting — solar forecast is strong (Defer to Solar)';
         case 21: return 'BMS on/off signal is withholding permission to charge';
         case 22: return 'sustained overvoltage — timed cut (low tier)';
@@ -12822,6 +12915,11 @@ function fieldOffReasonText(reasonCode) {
         case 24: return 'too hot to charge';
         case 25: return 'charge cycle complete — battery full, resting (switch off and on to charge again)';
         case 26: return 'measuring the current sensor zero — field held at 0%';
+        case 27: return 'battery temperature sensor not responding';
+        case 28: return 'main battery voltage sensor not responding';
+        case 29: return 'second battery voltage sensor not responding';
+        case 30: return 'waiting for the first battery temperature reading';
+        case 31: { const n = (typeof rwfsFaultNames === 'function') ? rwfsFaultNames() : ''; return 'two or more sensors failed' + (n ? ' (' + n + ')' : ''); }
         // 0 NONE (transient), 11 MANUAL (shown as its own status word) — no OFF annotation
         default: return '';
     }
@@ -13830,6 +13928,14 @@ function handleResetLatch() {
     submitMessage();
     return true;
 }
+// Silence the buzzer for the condition sounding now (firmware clears it when the condition ends or a different
+// one lands). Allowed without unlocking settings, like the OFF switch: it changes no setting.
+async function silenceAlarm() {
+    try {
+        const r = await fetchWithTimeout(buildURL('/get?SilenceAlarm=1'), {}, 10000);
+        if (!r.ok) xAlert('The regulator refused the request (HTTP ' + r.status + ').');
+    } catch (e) { diagLog('silence alarm failed:', e); }
+}
 
 
 async function factoryReset() {
@@ -14235,13 +14341,19 @@ function updateAlarmStatus(data) {
 
     if (!alarmLed || !alarmText) return;
 
-    const isAlarming = data.Alarm_Status === 1;
-
-    if (isAlarming) {
+    // 0 silent, 1 sounding, 2 condition present but silenced (Silence button; clears when the condition ends
+    // or a different one lands).
+    const st = Number(data.Alarm_Status);
+    if (st === 1) {
         alarmLed.style.backgroundColor = '#ff0000';
         alarmLed.style.boxShadow = '0 0 15px rgba(255, 0, 0, 0.8)';
         alarmText.textContent = 'Alarming!';
         alarmText.style.color = '#ff0000';
+    } else if (st === 2) {
+        alarmLed.style.backgroundColor = '#f0a500';
+        alarmLed.style.boxShadow = '0 0 12px rgba(240, 165, 0, 0.7)';
+        alarmText.textContent = 'Silenced (condition still present)';
+        alarmText.style.color = '#f0a500';
     } else {
         alarmLed.style.backgroundColor = '#00a19a';
         alarmLed.style.boxShadow = '0 0 10px rgba(0, 161, 154, 0.5)';
@@ -16124,7 +16236,6 @@ function updateTogglesFromData(data) {
         // The master switch (#header-onoff / #hcs-onoff) is painted from CSV1 (~10 Hz), not here: CSV3 is
         // event-driven with a 60 s fallback and settingWrite() does not set settingsDirty, so this echo
         // lagged the field by up to a minute. Two writers on one control would just restore that lag.
-        updateCheckbox("LimpHome_checkbox", data.LimpHome, "LimpHome");
         // HiLow / charge rate mode handled via pendingToggles in CSVData3 handler
         updateCheckbox("VeData_checkbox", data.VeData, "VeData");
         updateCheckbox("NMEA0183Data_checkbox", data.NMEA0183Data, "NMEA0183Data");
@@ -16145,11 +16256,12 @@ function updateTogglesFromData(data) {
         updateCheckbox("rvcDcEnable_checkbox", data.rvcDcEnable, "rvcDcEnable");
         updateCheckbox("rvcFaultEnable_checkbox", data.rvcFaultEnable, "rvcFaultEnable");
         updateCheckbox("dvccEn_checkbox", data.dvccEn, "dvccEn");
-        updateCheckbox("IgnoreTemperature_checkbox", data.IgnoreTemperature, "IgnoreTemperature");
-        updateCheckbox("IgnoreRPM_checkbox", data.IgnoreRPM, "IgnoreRPM");
+        // The override toggles live only in the Run Without Failed Sensors modal (rwfsRender reads the echo cache).
+        rwfsOnSettingsEcho(data);
         updateCheckbox("bmsLogic_checkbox", data.bmsLogic, "bmsLogic");
         updateCheckbox("bmsLogicLevelOff_checkbox", data.bmsLogicLevelOff, "bmsLogicLevelOff");
         updateCheckbox("AlarmActivate_checkbox", data.AlarmActivate, "AlarmActivate");
+        updateCheckbox("GeneralFaultAlarm_checkbox", data.GeneralFaultAlarm, "GeneralFaultAlarm");
         updateCheckbox("InvertAltAmps_checkbox", data.InvertAltAmps, "InvertAltAmps");
         updateCheckbox("InvertBattAmps_checkbox", data.InvertBattAmps, "InvertBattAmps");
         updateCheckbox("BatteryShuntPresent_checkbox", data.BatteryShuntPresent, "BatteryShuntPresent");
@@ -16169,7 +16281,6 @@ function updateTogglesFromData(data) {
         // Same shape for the Extra probe: its alarms live in Setup > Alarms and grey out there
         // while the probe is off, instead of only existing when it is on.
         if ('extraTempProbeEnable' in data) document.body.classList.toggle('no-extra-temp', String(data.extraTempProbeEnable) === '0');
-        updateCheckbox("IgnitionOverride_checkbox", data.IgnitionOverride, "IgnitionOverride");  // unchecked = Auto (0/2), checked = Force On (1)
         updateCheckbox("TempSource_checkbox", data.TempSource, "TempSource");
         updateCheckbox("AlarmLatchEnabled_checkbox", data.AlarmLatchEnabled, "AlarmLatchEnabled");
         updateCheckbox("MaintainMode_checkbox", data.MaintainMode, "MaintainMode");
@@ -16325,31 +16436,6 @@ function handleUserToggle(checkboxId, hiddenInputId, dataKey) {
     return false;
 }
 
-// Ignore RPM only removes the RPM field-cut; it does NOT set a charge current. With no RPM signal the
-// regulator reads RPM as 0, so the current ceiling comes from the first row of the RPM Table, and that
-// row defaults to 0 A -> the alternator targets 0 A and never charges. Warn + offer a deep-link on toggle-on.
-function warnIgnoreRpmNeedsCap() {
-    const box = document.getElementById('rpmCapCurrentTable0_input');
-    const cur = box ? parseFloat(box.value) : NaN;
-    const hiBtn = document.getElementById('chargeRateHighBtn');
-    const rateName = (hiBtn && hiBtn.classList.contains('cap-mode-active')) ? 'High' : 'Low';
-    let msg;
-    if (isFinite(cur) && cur > 0) {
-        msg = 'Ignore RPM lets the field turn on without a valid RPM signal, but it does not set a charge current on its own.\n\n'
-            + 'The current target comes from the first row of the table of current limits vs. RPM (Setup ▸ Alternator ▸ RPM Table). '
-            + 'Your ' + rateName + ' table’s first row reads ' + cur + ' A, which will charge — but each charge rate keeps its own table, so confirm the other rate’s first row is also non-zero.\n\n'
-            + 'Open the RPM Table to check?';
-    } else {
-        msg = 'Ignore RPM lets the field turn on without a valid RPM signal, but it does not set a charge current on its own.\n\n'
-            + 'With no RPM signal the regulator reads the first row of the table of current limits vs. RPM (Setup ▸ Alternator ▸ RPM Table). '
-            + 'That row’s Limit (A) is currently 0 — the factory default — so the alternator is commanded to 0 A and will not charge, even with Ignore RPM on.\n\n'
-            + 'To charge with no RPM signal, set a non-zero Limit (A) in the first row, for both charge rates (High and Low).\n\n'
-            + 'Open the RPM Table now?';
-    }
-    xConfirm(msg, { title: 'Ignore RPM — needs a current limit', okText: 'Open RPM Table', cancelText: 'Not now' })
-        .then(go => { if (go) gotoRpmTableHighlightFirstAmps(); });
-}
-
 // Deep-link to Setup > Alternator > RPM Table and flash the first-row Limit (A) box. The box shows the
 // active charge rate only (High/Low keep separate tables), so the warning copy tells the user to check both.
 function gotoRpmTableHighlightFirstAmps() {
@@ -16490,8 +16576,8 @@ function renderBattTempDerate() {
 // 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T field), 4 RV-C (DC_SOURCE_STATUS_2). Code 5 (the
 // board stand-in) was retired 2026-09-18; the slot stays so the remaining codes keep their values.
 const BATT_TEMP_SRC_NAMES = ['none', 'probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'none'];
-// battTempSource setting labels (index = wire code): 0 Automatic, 1..4 pinned sources, 6 None.
-const BATT_TEMP_SOURCE_OPTION_NAMES = ['Automatic', 'Battery probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'Automatic', 'None'];
+// battTempSource setting labels (index = wire code): 0 Automatic, 1..4 pinned sources, 6 Not fitted.
+const BATT_TEMP_SOURCE_OPTION_NAMES = ['Automatic', 'Battery probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'Automatic', 'Not fitted'];
 const TEMP_NA_X10 = -9999;   // pre-0.0.5 firmware sent this for NAN on the CSV2 x10 temperature
                              // fields; they now send ROLL_EMPTY. Kept as a FLOOR (n <= TEMP_NA_X10)
                              // so this bundle still reads an older device correctly.
@@ -16527,7 +16613,8 @@ function renderBattTempReadouts(data) {
     const have = Number.isFinite(battF);
     _battTempActiveSrc = have ? src : 0;
     const srcTxt = battTempSrcName(src);
-    set('battTempStatus_ID', have ? 'Battery temperature ' + fmt(battF) + ' ' + lbl + ' from ' + srcTxt : 'No battery temperature available');
+    set('battTempStatus_ID', have ? 'Battery temperature ' + fmt(battF) + ' ' + lbl + ' from ' + srcTxt : rwfsBattTempStatusText(data));
+    { const b = document.getElementById('battTempNotFitted_btn'); if (b) b.style.display = (Number(data.battTempState) === 2) ? '' : 'none'; }
     set('commprep-batttemp', commPrepBattTempText());   // prerequisites screen, only present while that dialog is open
     set('battTempActive_ID', fmt(battF));
     set('battTempActiveSrc_ID', have ? srcTxt : 'none');
@@ -16840,8 +16927,9 @@ async function confirmVoltageRescale(oldV, newV) {
     };
     // Field-duty knobs scale by the INVERSE ratio (oldV/newV) so the field CURRENT they govern stays
     // constant across banks; unit is %/s (or %), not volts.
-    const dline = (label, echoId, unit) => {
-        const o = getEchoNumber(echoId);
+    // src is an echo element id, or a number for a knob with no echo span (the Run Without Failed Sensors cache).
+    const dline = (label, src, unit) => {
+        const o = (typeof src === 'number') ? src : getEchoNumber(src);
         return '  ' + label + ': ' + fmt(o) + ' → ' + fmt(o / ratio) + ' ' + unit;
     };
     const msg = 'Changing system voltage from ' + oldV + 'V to ' + newV + 'V (×'
@@ -16862,7 +16950,8 @@ async function confirmVoltageRescale(oldV, newV) {
         + 'These field-duty settings also rescale (inversely) so field current stays constant:\n'
         + dline('Min Field', 'MinDuty_echo', '%') + '\n'
         + dline('Duty ramp rate', 'DutyRampRate_echo', '%/s') + '\n'
-        + dline('Slow duty ramp rate', 'DutySlowRampRate_echo', '%/s') + '\n\n'
+        + dline('Shutdown final ramp rate', 'DutySlowRampRate_echo', '%/s') + '\n'
+        + dline('Run Without Failed Sensors field duty cap', rwfsFlags.seen ? rwfsFlags.LimpDutyPct : NaN, '%') + '\n\n'
         + 'Max Field % and Max Field Volts are left alone: they describe the alternator, not the bank, '
         + 'and the field ceiling re-derives from Max Field Volts against the new system voltage.\n\n'
         + 'IT ALSO ERASES THESE, and they cannot be recovered:\n'
@@ -16993,15 +17082,15 @@ function setCapMode(mode) {
 
 // Field-OFF reasons that are protective shut-downs (fault-class) rather than a normal rest —
 // mirrors the fault codes in fieldOffReasonText(). Used to colour a fault red vs a normal OFF gray.
-const FIELD_FAULT_REASONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 24]);
+const FIELD_FAULT_REASONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 19, 22, 23, 24, 27, 28, 29, 31]);
 
 // Single OFF-state classifier shared by the minimized pill AND the expanded status word so the two
 // can never disagree. reason 10 while enabled = engine-on-but-not-charging (IDLE); faults = FAULT.
-// 20 (solar-forecast rest) and 21 (BMS on/off signal) are the same shape as 10: switched on,
-// running, deliberately not charging.
+// 20 (solar-forecast rest), 21 (BMS on/off signal) and 30 (waiting for the first battery temperature
+// reading) are the same shape as 10: switched on, running, deliberately not charging.
 function classifyFieldOff(reason, enabled) {
     if (FIELD_FAULT_REASONS.has(reason)) return { word: 'FAULT', pillCls: 'st-fault', expClass: 'field-status-fault' };
-    if ((reason === 10 || reason === 20 || reason === 21) && enabled) return { word: 'IDLE',  pillCls: 'st-idle',  expClass: 'field-status-idle' };
+    if ((reason === 10 || reason === 20 || reason === 21 || reason === 30) && enabled) return { word: 'IDLE',  pillCls: 'st-idle',  expClass: 'field-status-idle' };
     return { word: 'OFF', pillCls: 'st-off', expClass: 'field-status-inactive' };
 }
 
@@ -17052,7 +17141,12 @@ function syncHeaderStrip() {
     const copy = (fromId, toId) => {
         const from = document.getElementById(fromId);
         const to = document.getElementById(toId);
-        if (from && to) to.textContent = from.textContent;
+        if (from && to) {
+            to.textContent = from.textContent;
+            // an "ignored" readout (engine speed / alternator current) carries no unit in the strip either
+            const u = to.nextElementSibling;
+            if (u && u.tagName === 'I') u.style.visibility = from.classList.contains('is-ignored') ? 'hidden' : '';
+        }
     };
     copy('header-voltage', 'hcs-volt');
     copy('header-soc', 'hcs-soc');
@@ -17705,7 +17799,7 @@ window.addEventListener("load", function () {
 
             // Field OFF ≠ a fault by itself — annotate WHY, from the firmware FieldEventReason (CSV1)
             // plus the master switch and charge stage the firmware can't disambiguate on its own.
-            if (data.fieldEventReason !== undefined) fieldOffReasonUpdate(data.fieldActiveStatus, parseInt(data.fieldEventReason));
+            if (data.fieldEventReason !== undefined) { fieldOffReasonUpdate(data.fieldActiveStatus, parseInt(data.fieldEventReason)); rwfsOnCsv1(data); }
 
             if (fieldIndicator) {
                 if (data.fieldActiveStatus === 1) {
@@ -17748,6 +17842,10 @@ window.addEventListener("load", function () {
                     if (!Number.isFinite(num)) {
 
                         newTextContent = "—";
+                    }
+                    // An ignored sensor's readout says so rather than showing a number nothing acts on (§4.8)
+                    else if ((key === "RPM" && rwfsFlags.IgnoreRPM) || (key === "MeasuredAmps" && rwfsFlags.IgnoreAltCurrent)) {
+                        newTextContent = "ignored";
                     }
                     // Values scaled by 1000 on server
                     else if (["imu_vertical_accel_g", "imu_total_accel_g"].includes(key)) {
@@ -17818,6 +17916,7 @@ window.addEventListener("load", function () {
                     if (lastValues.get(cacheKey) !== newTextContent) {
                         lastValues.set(cacheKey, newTextContent);
                         scheduleDOMUpdateOptimized(elementId, newTextContent);
+                        if (key === "RPM" || key === "MeasuredAmps") rwfsUnitHide(elementId, newTextContent === "ignored");
                     }
                 }
             };
@@ -17952,6 +18051,7 @@ window.addEventListener("load", function () {
             noteStreamRx('csv2');
             renderBattTempDerate();   // live battery temp + applied derate scale arrive on CSV2
             renderBattTempReadouts(data);
+            rwfsOnCsv2(data);         // sensor fault mask / battery-temperature state / tier: banner, gates, modal rows
             try { whyPanelRefreshOpen(); } catch (e) { }   // Limit panel: external limits/state + thermal derate ride CSV2
             renderLoopBlame(data);    // worst field-on pass attribution line
             renderImuInstallWarning(data.imuInstallCode);
@@ -18670,7 +18770,6 @@ window.addEventListener("load", function () {
 
                 // Firmware diagnostics (moved from CSV3 otherFields — all in CSV2_FIELDS)
                 ["currentRPMTableIndex_display", "currentRPMTableIndex"],
-                ["pidInitialized_display", "pidInitialized"],
                 ["overheatCount0_display", "overheatCount0"],
                 ["overheatCount1_display", "overheatCount1"],
                 ["overheatCount2_display", "overheatCount2"],
@@ -18834,6 +18933,9 @@ window.addEventListener("load", function () {
                 ["tempSustainedCountID", "tempSustainedCount"],
                 ["tempStaleCountID", "tempStaleCount"],
                 ["currentStaleCountID", "currentStaleCount"],
+                ["voltStaleCountID", "voltStaleCount"],
+                ["volt2StaleCountID", "volt2StaleCount"],
+                ["battTempLostCountID", "battTempLostCount"],
                 // CH1 / INA timing stats
                 ["ch1_last_ms_ID", "ch1_last_ms"],
                 ["ch1_avg_10s_ID", "ch1_avg_10s"],
@@ -19970,7 +20072,6 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("ManualFieldToggle_checkbox").checked = (document.getElementById("ManualFieldToggle").value === "0");
     document.getElementById("PhysicalPanelOverride_checkbox").checked = (document.getElementById("PhysicalPanelOverride").value === "1");
     //document.getElementById("OnOff_checkbox").checked = (document.getElementById("OnOff").value === "1");
-    document.getElementById("LimpHome_checkbox").checked = (document.getElementById("LimpHome").value === "1");
     document.getElementById("VeData_checkbox").checked = (document.getElementById("VeData").value === "1");
     document.getElementById("NMEA0183Data_checkbox").checked = (document.getElementById("NMEA0183Data").value === "1");
     document.getElementById("NMEA2KData_checkbox").checked = (document.getElementById("NMEA2KData").value === "1");
@@ -19995,15 +20096,13 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("hotChargeLockoutEnable_checkbox").checked = (document.getElementById("hotChargeLockoutEnable").value === "1");
     document.getElementById("extraTempAlarmHiEnable_checkbox").checked = (document.getElementById("extraTempAlarmHiEnable").value === "1");
     document.getElementById("extraTempAlarmLoEnable_checkbox").checked = (document.getElementById("extraTempAlarmLoEnable").value === "1");
-    document.getElementById("IgnoreTemperature_checkbox").checked = (document.getElementById("IgnoreTemperature").value === "1");
-    document.getElementById("IgnoreRPM_checkbox").checked = (document.getElementById("IgnoreRPM").value === "1");
     document.getElementById("bmsLogic_checkbox").checked = (document.getElementById("bmsLogic").value === "1");
     document.getElementById("bmsLogicLevelOff_checkbox").checked = (document.getElementById("bmsLogicLevelOff").value === "1");
     document.getElementById("AlarmActivate_checkbox").checked = (document.getElementById("AlarmActivate").value === "1");
+    document.getElementById("GeneralFaultAlarm_checkbox").checked = (document.getElementById("GeneralFaultAlarm").value === "1");
     document.getElementById("InvertAltAmps_checkbox").checked = (document.getElementById("InvertAltAmps").value === "1");
     document.getElementById("InvertBattAmps_checkbox").checked = (document.getElementById("InvertBattAmps").value === "1");
     document.getElementById("BatteryShuntPresent_checkbox").checked = (document.getElementById("BatteryShuntPresent").value === "1");
-    document.getElementById("IgnitionOverride_checkbox").checked = (document.getElementById("IgnitionOverride").value === "1");
     document.getElementById("TempSource_checkbox").checked = (document.getElementById("TempSource").value === "1");
     document.getElementById("timeAxisModeChanging_checkbox").checked = (document.getElementById("timeAxisModeChanging").value === "1");
     document.getElementById("weatherModeEnabled_checkbox").checked = (document.getElementById("weatherModeEnabled").value === "1");
@@ -21412,17 +21511,497 @@ function openLoopHighVoltageNote() {
         + 'output current.';
 }
 
-// The other open-loop mode. handleLimpHome (6_functions.ino) drives a fixed 30% duty and skips every
-// check except the master On/Off switch and the INA228 hardware over-voltage latch — keep this list in
-// step with that function. Alert, not confirm: the inline handler submits the switch either way, so
-// this is the notice that goes with a switch the user has already thrown.
-function limpHomeOpenLoopWarn() {
-    xAlert('Limp-home mode commands a fixed 30% field duty directly, bypassing the current-limiting '
-        + 'loop and every protection: no alternator temperature cut-back, no engine-speed or '
-        + 'engine-stopped cut (the field stays energized with the ignition off), no battery '
-        + 'temperature or voltage checks, and no charge stages or current limits.\n\n'
-        + 'Still enforced: the master On/Off switch and the hardware over-voltage shutdown.'
-        + openLoopHighVoltageNote(), 'Limp-home mode — protections off');
+// (The limp-home warning is now the summary box of the Run Without Failed Sensors screen — rwfsSummary.)
+
+// ===== Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §2.6, §4.6-§4.8, §6) =====
+// One data model for the Setup > System card, the #sensor-banner header line, the modal and the
+// commissioning Prep gate. Inputs: the CSV3 settings echo (the six override keys + the two numbers), CSV2
+// (sensorFaultMask, battTempState, limpTier, sensorSteadyMask) and CSV1 (fieldEventReason, Ignition).
+const RWFS_KEYS = ['IgnoreTemperature', 'IgnoreRPM', 'IgnitionOverride', 'IgnoreAltCurrent', 'IgnoreBattVMain', 'IgnoreBattV2', 'LimpHome'];
+const rwfsFlags = { IgnoreTemperature: 0, IgnoreRPM: 0, IgnitionOverride: 0, IgnoreAltCurrent: 0, IgnoreBattVMain: 0, IgnoreBattV2: 0, LimpHome: 0,
+                    LimpDutyPct: 30, NoRpmCurrentA: 0, seen: false };
+let rwfsMask = 0, rwfsSteady = 0, rwfsTier = 0, rwfsBattState = NaN, rwfsReason = 0, rwfsFieldOff = false, rwfsIgnition = NaN;
+let rwfsReqCount = 0;   // §11: CSV2 reqFaultCount
+let rwfsBattCurState = NaN, rwfsAlarm = 0;   // §11.6 CSV2 battCurState; CSV1 Alarm_Status (the banner's Silence button)
+let rwfsOpenedFromBanner = false;
+let _rwfsPretick = null;      // keys pre-ticked when the modal opens from the banner (the sensor that stopped charging)
+let _rwfsStructKey = '';      // what the row markup was last built for; a change rebuilds, anything else updates in place
+// Rows in the spec's order. bit = sensorFaultMask bit; key = the override setting (null = cannot be ignored).
+const RWFS_ROWS = [
+    { key: 'IgnoreTemperature', name: 'Alternator temperature', bit: 0,
+      what: 'Stops every over-temperature trip, the stale-sensor cut, the thermal derate, the alternator-temperature alarms, NMEA 2000 alternator temperature, alternator health and Auto Min% learning.' },
+    { key: 'IgnoreRPM', name: 'Engine speed', bit: 1,
+      what: 'Stops the Min RPM gate and the engine-stopped cut. The current limit becomes the amps entered below, the keep-alive floor goes to 0, and engine hours, the RPM tables and every speed-indexed learner pause. The field-on-with-no-output cut still runs on the alternator current, so a stalled engine with the key on is still caught.' },
+    { key: 'IgnitionOverride', name: 'Ignition wire', bit: -1,
+      what: 'The ignition is treated as always on: no ignition-off standby and no ignition-off charge permission; only the alternator switch withholds charging.' },
+    { key: 'IgnoreAltCurrent', name: 'Alternator current', bit: 2,
+      what: 'Voltage-only regulation under a field duty cap: no current loop, no over-current trips, no current limits (RPM table, battery, external), no load-dump protection.' },
+    { key: 'IgnoreBattVMain', name: 'Main battery voltage', bit: 3,
+      what: '' },   // depends on the second reading — rwfsMainVText()
+    { key: 'IgnoreBattV2', name: 'Second battery voltage', bit: 4,
+      what: 'No two-sensor disagreement check; plausibility is judged on the main reading alone.' },
+    { key: null, name: 'Battery temperature', bit: 6,
+      what: 'Cannot be ignored. A boat with no battery temperature sensor declares it Not fitted under Setup > Battery.' },
+];
+// Is the second reading usable as the tier-3 cap / fast-OV feedback (fresh, chip alive, not ignored in the draft)?
+function rwfsSecondVUsable(d) {
+    const ign = d ? d.IgnoreBattV2 : rwfsFlags.IgnoreBattV2;
+    return !ign && !(rwfsMask & ((1 << 4) | (1 << 7)));
+}
+// §4.8 main-voltage row: what is lost depends on whether the second reading can stand in (tier 3) or not (tier 4).
+// A second reading that is not reading but not ignored still holds the field off (firmware suppresses
+// REASON_VOLTAGE2_STALE only through IgnoreBattV2), so plain fixed duty runs only once it is ignored too.
+function rwfsMainVText(d) {
+    if (rwfsSecondVUsable(d)) return 'Fixed field duty capped by the second battery voltage reading; the fast over-voltage cut keeps running on that reading. Lost: the timed over-voltage tiers, the INA228 firmware latch, voltage plausibility and disagreement checks, and the charge stages.';
+    const ign2 = d ? d.IgnoreBattV2 : rwfsFlags.IgnoreBattV2;
+    if (!ign2) return 'Charging stays off: the second battery voltage is not reading, so there is no voltage to run on. Tick Second battery voltage as well for plain fixed field duty with no usable battery voltage, or wait for that reading to return.';
+    return 'Plain fixed field duty with no usable battery voltage (the second reading is ignored too): no fast over-voltage cut, no timed over-voltage tiers, no INA228 firmware latch, no plausibility or disagreement checks, no charge stages. Only the INA228 hardware alert remains.';
+}
+// §11 mirror of the firmware's required-fault set: the fault mask expanded to SENSORS (a dead chip is every
+// reading it carries), minus the owner's overrides and Not fitted. NAMES only; the count comes from the
+// firmware in CSV2 (reqFaultCount).
+const RWFS_BIT_NAMES = ['alternator temperature', 'engine speed', 'alternator current', 'main battery voltage', 'second battery voltage', 'battery voltage readings disagree', 'battery temperature', 'ADS1115 analog input chip', 'INA228 battery monitor chip'];
+function rwfsThermistorSelected() { return Number(g_lastCsv3 && g_lastCsv3.TempSource) === 1; }
+function rwfsCountedBits() {
+    if (rwfsFlags.LimpHome) return 0;
+    let f = rwfsMask & 0x7F;
+    if (rwfsMask & (1 << 7)) f |= (1 << 1) | (1 << 2) | (1 << 4) | (rwfsThermistorSelected() ? 1 : 0);
+    if (rwfsMask & (1 << 8)) f |= (1 << 3);
+    if (f & ((1 << 3) | (1 << 4))) f &= ~(1 << 5);
+    if (rwfsFlags.IgnoreTemperature) f &= ~1;
+    if (rwfsFlags.IgnoreRPM) f &= ~(1 << 1);
+    if (rwfsFlags.IgnoreAltCurrent) f &= ~(1 << 2);
+    if (rwfsFlags.IgnoreBattVMain) f &= ~((1 << 3) | (1 << 5));
+    if (rwfsFlags.IgnoreBattV2) f &= ~((1 << 4) | (1 << 5));
+    return f;
+}
+function rwfsFaultNames(bits) {
+    let b = (bits === undefined) ? rwfsCountedBits() : bits;
+    const out = [];
+    const adsBits = (1 << 1) | (1 << 2) | (1 << 4) | (rwfsThermistorSelected() ? 1 : 0);
+    if ((rwfsMask & (1 << 7)) && (b & adsBits)) { out.push('ADS1115 analog input chip (engine speed, alternator current, second battery voltage' + (rwfsThermistorSelected() ? ', thermistor' : '') + ')'); b &= ~adsBits; }
+    if ((rwfsMask & (1 << 8)) && (b & (1 << 3))) { out.push('INA228 battery monitor chip (main battery voltage)'); b &= ~(1 << 3); }
+    for (let i = 0; i < 7; i++) if (b & (1 << i)) out.push(RWFS_BIT_NAMES[i]);
+    return out.join(', ');
+}
+// Which rows a fault points at (outline + "This is what stopped charging"); pretick = tick the box when opened
+// from the banner; note = a line under the rows. Reason-specific first, where the reason carries information the
+// mask does not (a disagreement or a tach-lie involves two readings); otherwise every counted failed sensor is
+// outlined and the box is pre-ticked only for a single fault (two or more is the owner's choice of which to drop).
+function rwfsCauseFor(r) {
+    switch (r) {
+        case 2: case 3: case 4: return (rwfsMask & 1) ? { rows: [0], pretick: true } : { rows: [], pretick: false };
+        case 19: return (rwfsFlags.IgnoreRPM === 1)
+            // Engine speed already ignored: this cut is the only thing that stops the field when the engine stalls with
+            // the key on, so ignoring the alternator current as well must not be the suggested way out.
+            ? { rows: [3], pretick: false, note: 'The field is driven hard but no alternator current is measured. Engine speed is already ignored, so this is an engine stopped with the key on, a dead alternator, or an open field circuit. Do not ignore the alternator current as well: this cut is the only thing that stops the field when the engine stalls with the key on.' }
+            : { rows: [1, 3], pretick: false, note: 'The field is driven hard but no alternator current is measured: a false engine-speed signal, a current sensor stuck at zero, or an open field circuit / dead alternator. Run without the one you can rule out.' };
+        case 5:  return { rows: [4, 5], pretick: false, note: 'Both battery-voltage readings are outside the plausible range.' };
+        case 6: case 8: return { rows: [4, 5], pretick: false, note: 'The two battery-voltage readings disagree. Run without the one you trust less.' };
+        default: break;
+    }
+    const f = rwfsCountedBits();
+    const rows = [];
+    RWFS_ROWS.forEach((row, i) => { if (row.bit >= 0 && (f & (1 << row.bit))) rows.push(i); });
+    if (f & (1 << 5)) { if (!rows.includes(4)) rows.push(4); if (!rows.includes(5)) rows.push(5); }
+    return { rows, pretick: rows.length === 1 && rwfsReqCount === 1 };
+}
+function rwfsBattTempState() { return (g_lastCsv2 && g_lastCsv2.battTempState !== undefined) ? Number(g_lastCsv2.battTempState) : NaN; }
+// A readout showing "ignored" hides the unit markup beside it: the Live Data value's own unit span
+// (.vt-unit / .rd-unit), the header chip's .duo-unit cell, or the strip's <i>.
+function rwfsUnitHide(elementId, on) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    el.classList.toggle('is-ignored', on);
+    let unit = el.nextElementSibling;
+    if (!(unit && (unit.classList.contains('vt-unit') || unit.classList.contains('rd-unit') || unit.tagName === 'I'))) {
+        unit = (el.parentElement && el.parentElement.classList.contains('duo-num')) ? el.parentElement.nextElementSibling : null;
+    }
+    if (unit) unit.style.visibility = on ? 'hidden' : '';
+}
+function rwfsBattTempStatusText(data) {
+    const st = Number(data && data.battTempState);
+    const src = (typeof toggleStates === 'object' && toggleStates.battTempSource !== undefined) ? Number(toggleStates.battTempSource)
+              : ((g_lastCsv3 && g_lastCsv3.battTempSource !== undefined) ? Number(g_lastCsv3.battTempSource) : NaN);
+    if (st === 0) return 'Not fitted';
+    if (st === 3) return 'Waiting for the first reading';
+    if (st === 2) return (src === 0) ? 'No battery temperature found — charging stopped. Choose Not fitted if this boat has none.'
+                                     : 'Not responding — charging stopped';
+    return 'No battery temperature available';
+}
+function rwfsChemLfp() {
+    const v = window.vesselInfo;
+    return !!(v && String(v.battery_type || '').toLowerCase() === 'lifepo4');
+}
+async function battTempSetNotFitted() {
+    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    const ok = await xConfirm('Set the battery temperature source to Not fitted? The cold and hot charge lockouts and the voltage-loop temperature correction then stay off until a source is chosen again.'
+        + (rwfsChemLfp() ? '\n\nThis is a LiFePO4 bank: without a battery temperature, charging below freezing is left to the battery\'s own BMS, and a BMS disconnect while charging can spike system voltage.' : ''),
+        { title: 'Battery temperature: Not fitted', okText: 'Set to Not fitted', cancelText: 'Keep the source' });
+    if (!ok) return;
+    try {
+        const r = await fetchWithTimeout(buildURL('/get?battTempSource=6'), {}, 8000);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+    } catch (e) { diagLog('battTempSource=6 failed:', e); xAlert('Could not save the choice. Check the connection and try again.'); }
+}
+// §2.9: the Setup > Battery Set button. Fitting a source after commissioning on a device whose plant fit was
+// not anchored to a measured battery temperature: say once that the autotune needs re-running. Never blocks.
+function battTempSourceSubmit(form) {
+    try {
+        const sel = form.querySelector('select[name="battTempSource"]');
+        const next = sel ? Number(sel.value) : NaN;
+        const prev = (g_lastCsv3 && g_lastCsv3.battTempSource !== undefined) ? Number(g_lastCsv3.battTempSource) : NaN;
+        const c3 = g_lastCsv3 || {};
+        const commissioned = Number(c3.commissionState) === 2;
+        const cts = Number(c3.CommissionTempSrc);
+        if (prev === 6 && next !== 6 && commissioned && !(cts >= 1 && cts <= 4)) {
+            xAlert('Re-run Voltage Control Autotuning so the voltage loop can correct for battery temperature. Until then it runs on the commissioned gains.', 'Battery temperature source fitted');
+        }
+    } catch (e) { }
+    return true;
+}
+function rwfsOnSettingsEcho(data) {
+    let changed = false;
+    for (const k of RWFS_KEYS) if (data[k] !== undefined) { const v = Number(data[k]) === 1 ? 1 : 0; if (v !== rwfsFlags[k]) changed = true; rwfsFlags[k] = v; }
+    if (data.LimpDutyPct !== undefined && Number.isFinite(Number(data.LimpDutyPct))) rwfsFlags.LimpDutyPct = Number(data.LimpDutyPct) / 10;
+    if (data.NoRpmCurrentA !== undefined && Number.isFinite(Number(data.NoRpmCurrentA))) rwfsFlags.NoRpmCurrentA = Number(data.NoRpmCurrentA) / 10;
+    if (data.IgnoreTemperature !== undefined) rwfsFlags.seen = true;
+    const el = document.getElementById('rwfs_status_echo');
+    if (el) { const t = rwfsActiveList().length ? ('Running without: ' + rwfsActiveList().join(', ')) : 'All sensors in use'; if (el.textContent !== t) el.textContent = t; }
+    if (changed && rwfsModalOpen()) rwfsRender(false);
+    updateSensorBanner();
+}
+function rwfsOnCsv2(data) {
+    rwfsMask = Number(data.sensorFaultMask) || 0;
+    rwfsSteady = Number(data.sensorSteadyMask) || 0;
+    rwfsTier = Number(data.limpTier) || 0;
+    rwfsReqCount = Number(data.reqFaultCount) || 0;
+    if (data.battCurState !== undefined) rwfsBattCurState = Number(data.battCurState);
+    rwfsBattState = Number(data.battTempState);
+    if (data.battTempState !== undefined) document.body.classList.toggle('no-batt-temp', rwfsBattState === 0);
+    document.body.classList.toggle('chem-lifepo4', rwfsChemLfp());
+    if (rwfsModalOpen()) rwfsRender(false);
+    updateSensorBanner();
+}
+let _rwfsCsv1LastMs = 0;
+function rwfsOnCsv1(data) {
+    rwfsReason = parseInt(data.fieldEventReason) || 0;
+    rwfsFieldOff = !(Number(data.fieldActiveStatus) >= 1 && Number(data.fieldActiveStatus) <= 4);
+    if (data.Ignition !== undefined) rwfsIgnition = Number(data.Ignition);
+    if (data.Alarm_Status !== undefined) rwfsAlarm = Number(data.Alarm_Status);
+    const now = Date.now();
+    if (now - _rwfsCsv1LastMs < 1000) return;   // CSV1 is 10 Hz; the banner and the modal only need ~1 Hz
+    _rwfsCsv1LastMs = now;
+    if (rwfsModalOpen()) rwfsRender(false);
+    updateSensorBanner();
+}
+function rwfsActiveList() {
+    const out = [];
+    for (const r of RWFS_ROWS) if (r.key && rwfsFlags[r.key] === 1) out.push(r.name.toLowerCase());
+    if (rwfsFlags.LimpHome === 1) out.push('every sensor (fixed duty)');
+    return out;
+}
+function rwfsModalOpen() { const ov = document.getElementById('rwfs-modal-overlay'); return !!ov && ov.style.display === 'flex'; }
+
+// Header line, driven by the firmware's required-fault set (CSV2 sensorFaultMask + reqFaultCount),
+// not by the one reason the ladder shows: two or more faults are named together, and a fault that lands with the
+// key off is still named (quiet style). No automatic run exists (owner ruling 2026-10-02): a fault stops charging
+// until it reads again or the owner chooses Options. Then: a sensor reading again after an override > any override active.
+function updateSensorBanner() {
+    const el = document.getElementById('sensor-banner');
+    if (!el) return;
+    if (!rwfsFlags.seen) return;   // CSV2 can beat the settings echo; until the overrides are known an ignored sensor would show as failed
+    let html = '', alert = false;
+    const f = rwfsCountedBits();
+    const names = rwfsFaultNames(f);
+    const notFitBtn = (f & (1 << 6)) ? ' <button type="button" class="hn-btn" onclick="battTempSetNotFitted()">Set to Not fitted</button>' : '';
+    const optBtn = ' <button type="button" class="hn-btn" onclick="rwfsOpen(true)">Options</button>';
+    if (rwfsReqCount >= 2) {
+        html = 'Charging stopped: ' + rwfsReqCount + ' sensors failed (' + names + ').' + notFitBtn + optBtn;
+        alert = true;
+    } else if (rwfsFieldOff && rwfsReason === 19 && !(f & ~(1 << 1))) {
+        html = (rwfsFlags.IgnoreRPM === 1
+            ? 'Charging stopped: field on but no alternator output. Engine speed is ignored, so this is an engine stopped with the key on, a dead alternator, or an open field circuit. The field retries once per lockout; switch the alternator off if the engine is stopped.'
+            : 'Charging stopped: field on but no alternator output (false engine-speed signal, current sensor stuck at zero, or open field circuit).') + optBtn;
+        alert = true;
+    } else if (rwfsFieldOff && rwfsReason === 5 && !f) {
+        html = 'Charging stopped: both battery-voltage readings are implausible.' + optBtn;
+        alert = true;
+    } else if (f) {
+        let state = 'not responding';
+        if (f & (1 << 5)) state = 'readings disagree';
+        else if (rwfsReason === 5 || rwfsReason === 19) state = 'implausible';
+        const stopping = rwfsFieldOff && FIELD_FAULT_REASONS.has(rwfsReason);
+        html = (stopping ? 'Charging stopped: ' + names + ' ' + state + '. Repair it, or choose Options to run without it.'
+                         : 'Sensor fault: ' + names + ' ' + state + '.') + notFitBtn + optBtn;
+        alert = stopping;
+    } else if (rwfsBattCurState === 2) {
+        // §11.6: an optional sensor the owner declared present has gone quiet. Never stops charging; named so
+        // the owner knows why state of charge and the current-based stage logic are standing still.
+        html = 'Battery current not responding. Charging continues on voltage alone: state of charge, the tail-current absorption exit, the current rebulk and the battery charge-current limit are waiting for the reading.';
+        alert = true;
+    } else {
+        // §4.7 "reading again": an overridden sensor whose fault bit has been clear for 10 min. Engine speed is
+        // excluded — with the tach ignored the only detectable fault is chip loss, so "reading again" says nothing.
+        let again = null;
+        for (const r of RWFS_ROWS) if (r.key && r.bit >= 0 && r.key !== 'IgnoreRPM' && rwfsFlags[r.key] === 1 && (rwfsSteady & (1 << r.bit))) { again = r; break; }
+        if (again) {
+            html = again.name + ' is reading normally again. <button type="button" class="hn-btn" onclick="rwfsStopOne(\'' + again.key + '\')">Stop ignoring it</button>';
+        } else if (rwfsActiveList().length) {
+            html = 'Running without: ' + rwfsActiveList().join(', ') + '. <button type="button" class="hn-btn" onclick="rwfsOpen(false)">Review</button>';
+        }
+    }
+    // The buzzer is sounding for what this line names: offer the software silence right here.
+    if (html && alert && rwfsAlarm === 1) html += ' <button type="button" class="hn-btn" onclick="silenceAlarm()">Silence</button>';
+    if (html) { if (el.innerHTML !== html) el.innerHTML = html; }
+    el.classList.toggle('header-notice-alert', alert);
+    const disp = html ? 'block' : 'none';
+    if (el.style.display !== disp) el.style.display = disp;
+}
+
+// ----- the modal -----
+function rwfsOpen(fromBanner) {
+    rwfsOpenedFromBanner = !!fromBanner;
+    _rwfsPretick = null;
+    if (fromBanner) {
+        _rwfsPretick = {};
+        const c = rwfsCauseFor(rwfsReason);
+        if (c.pretick && rwfsFieldOff) for (const i of c.rows) if (RWFS_ROWS[i].key) _rwfsPretick[RWFS_ROWS[i].key] = 1;
+        if (!Object.keys(_rwfsPretick).length) _rwfsPretick = null;
+    }
+    _rwfsStructKey = '';
+    document.getElementById('rwfs-modal-overlay').style.display = 'flex';
+    rwfsRender(true);
+}
+function rwfsClose() { document.getElementById('rwfs-modal-overlay').style.display = 'none'; _rwfsPretick = null; }
+// The draft the checkboxes hold. Re-rendering from an echo must not undo an unsent tick, so the draft
+// is read back from the DOM whenever the rows are rebuilt. A pretick (opened from the banner) seeds it.
+function rwfsDraft(fresh) {
+    const d = {};
+    for (const k of RWFS_KEYS) {
+        const cb = document.getElementById('rwfs-cb-' + k);
+        d[k] = (!fresh && cb) ? (cb.checked ? 1 : 0) : ((_rwfsPretick && _rwfsPretick[k]) ? 1 : rwfsFlags[k]);
+    }
+    const cap = document.getElementById('rwfs-cap'); d.LimpDutyPct = (!fresh && cap) ? cap.value : '';
+    const cur = document.getElementById('rwfs-nrpm'); d.NoRpmCurrentA = (!fresh && cur) ? cur.value : '';
+    d.ackEng = !fresh && !!(document.getElementById('rwfs-ack-eng') || {}).checked;
+    d.ackLimp = !fresh && !!(document.getElementById('rwfs-ack-limp') || {}).checked;
+    return d;
+}
+function rwfsSmallestTableAmps() {
+    let best = NaN;
+    for (let i = 0; i < 10; i++) {
+        const el = document.getElementById('rpmCapCurrentTable' + i + '_input');
+        const v = el ? parseFloat(el.value) : NaN;
+        if (Number.isFinite(v) && v > 0 && (!Number.isFinite(best) || v < best)) best = v;
+    }
+    return best;
+}
+function rwfsStatusFor(r) {
+    if (r.key === 'IgnitionOverride') return rwfsFlags.IgnitionOverride ? { t: 'Cannot be checked (forced on)', c: 'na' }
+                                                                        : { t: 'Cannot be checked (' + (rwfsIgnition === 1 ? 'ON' : rwfsIgnition === 0 ? 'OFF' : '?') + ')', c: 'na' };
+    if (r.key === null) {
+        if (rwfsBattState === 0) return { t: 'Not fitted', c: 'na' };
+        if (rwfsBattState === 1) return { t: 'OK', c: 'ok' };
+        if (rwfsBattState === 3) return { t: 'Waiting for the first reading', c: 'na' };
+        if (rwfsBattState === 2) return { t: 'Not responding', c: 'bad' };
+        return { t: '—', c: 'na' };
+    }
+    if ((r.bit === 3 || r.bit === 4) && (rwfsMask & (1 << 5)) && !(rwfsMask & (1 << r.bit))) return { t: 'Readings disagree', c: 'bad' };
+    if (r.bit === 1 && (rwfsMask & (1 << 1)) && !(rwfsMask & (1 << 7))) return { t: 'Implausible', c: 'bad' };
+    if (rwfsMask & (1 << r.bit)) return { t: 'Not responding', c: 'bad' };
+    if (r.bit >= 0 && (rwfsMask & (1 << 7)) && (r.bit === 1 || r.bit === 2 || r.bit === 4 || (r.bit === 0 && rwfsThermistorSelected()))) return { t: 'Not responding (ADS1115 chip)', c: 'bad' };
+    if (r.bit === 3 && (rwfsMask & (1 << 8))) return { t: 'Not responding (INA228 chip)', c: 'bad' };
+    return { t: 'OK', c: 'ok' };
+}
+// The row markup is built once per structure (which rows and conditional inputs exist) and otherwise
+// updated in place: a rebuild every second would drop focus and close the phone keyboard in the inputs.
+function rwfsRender(fresh) {
+    const box = document.getElementById('rwfs-rows');
+    if (!box) return;
+    const draft = rwfsDraft(!!fresh);
+    const val = k => draft[k];
+    const cause = (rwfsFieldOff || rwfsCountedBits()) ? rwfsCauseFor(rwfsReason) : { rows: [], pretick: false };
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const limp = val('LimpHome');
+    const engAndIgn = val('IgnoreRPM') && val('IgnitionOverride');
+    const capInput = val('IgnoreAltCurrent') || val('IgnoreBattVMain') || limp;
+    const structKey = [val('IgnoreRPM') ? 1 : 0, engAndIgn ? 1 : 0, limp ? 1 : 0, capInput ? 1 : 0, rwfsBattState].join('|');
+    if (fresh || structKey !== _rwfsStructKey) {
+        _rwfsStructKey = structKey;
+        let h = '';
+        RWFS_ROWS.forEach((r, i) => {
+            let run;
+            if (r.key) {
+                run = '<label><input type="checkbox" id="rwfs-cb-' + r.key + '"' + (val(r.key) ? ' checked' : '') + ' onchange="rwfsRender(false)"> Ignore</label>';
+            } else if (rwfsBattState === 2) {
+                run = '<button type="button" class="rwfs-btn" onclick="battTempSetNotFitted()">Set to Not fitted</button>';
+            } else if (rwfsBattState === 0) {
+                run = '<span class="rwfs-status na">Setup &gt; Battery</span>';
+            } else {
+                run = '<span class="rwfs-status na">—</span>';
+            }
+            h += '<div class="rwfs-row" id="rwfs-row-' + i + '">'
+               + '<span class="rwfs-name">' + esc(r.name) + '</span>'
+               + '<span class="rwfs-status" id="rwfs-st-' + i + '"></span>'
+               + '<span class="rwfs-run">' + run + '</span>'
+               + '<span class="rwfs-what" id="rwfs-what-' + i + '">' + esc(r.key === 'IgnoreBattVMain' ? rwfsMainVText(draft) : r.what) + '</span>';
+            if (r.key === 'IgnoreRPM' && val('IgnoreRPM')) {
+                let pre = (draft.NoRpmCurrentA !== '') ? draft.NoRpmCurrentA : (rwfsFlags.NoRpmCurrentA > 0 ? rwfsFlags.NoRpmCurrentA : rwfsSmallestTableAmps());
+                if (!Number.isFinite(Number(pre))) pre = '';
+                h += '<div class="rwfs-sub"><label style="font-size:12px; color:#9cc; display:block; margin-bottom:4px;">Alternator current limit without engine speed (A)</label>'
+                   + '<input type="number" id="rwfs-nrpm" min="1" step="1" value="' + esc(pre) + '" oninput="rwfsSummary()">'
+                   + '<div class="cap">Required. With no engine speed the RPM table cannot set a limit, so this one number caps the alternator at every speed, in both charge rates.</div></div>';
+            }
+            h += '</div>';
+        });
+        h += '<div id="rwfs-cause-note" class="rwfs-sub" style="display:none; color:#ff8a80; font-size:12.5px; padding:6px 8px;"></div>';
+        if (engAndIgn) {
+            h += '<div class="rwfs-row"><div class="rwfs-sub rwfs-ack"><input type="checkbox" id="rwfs-ack-eng"' + (draft.ackEng ? ' checked' : '') + ' onchange="rwfsSummary()">'
+               + '<span>Nothing will tell the regulator the engine has stopped. The field stays on and drains the battery until you switch the alternator off. I understand.</span></div></div>';
+        }
+        // last row, separated: fixed duty, ignore every sensor
+        h += '<div class="rwfs-row" style="margin-top:10px; border-top:2px solid #444;">'
+           + '<span class="rwfs-name">Fixed duty, ignore every sensor</span>'
+           + '<span class="rwfs-status na" id="rwfs-st-limp"></span>'
+           + '<span class="rwfs-run"><label><input type="checkbox" id="rwfs-cb-LimpHome"' + (limp ? ' checked' : '') + ' onchange="rwfsRender(false)"> Use</label></span>'
+           + '<span class="rwfs-what">The field runs at the duty below with no sensor consulted at all. Only the INA228 hardware over-voltage alert remains, and only while that chip is powered.</span>';
+        if (limp) {
+            h += '<div class="rwfs-sub rwfs-ack"><input type="checkbox" id="rwfs-ack-limp"' + (draft.ackLimp ? ' checked' : '') + ' onchange="rwfsSummary()">'
+               + '<span>Every protection except the hardware over-voltage alert is off. I understand.</span></div>';
+        }
+        h += '</div>';
+        if (capInput) {
+            let pre = (draft.LimpDutyPct !== '') ? draft.LimpDutyPct : rwfsFlags.LimpDutyPct;
+            h += '<div class="rwfs-row"><div class="rwfs-sub"><label style="font-size:12px; color:#9cc; display:block; margin-bottom:4px;">Field duty cap (%)</label>'
+               + '<input type="number" id="rwfs-cap" min="0" max="99" step="1" value="' + esc(pre) + '" oninput="rwfsSummary()">'
+               + '<div class="cap">At a fixed field the output rises with engine speed. Start low; raise it only if charging is too slow at cruising speed.</div></div></div>';
+        }
+        box.innerHTML = h;
+    }
+    // In-place updates: status cells, the cause outline, the main-voltage text, the cause note.
+    RWFS_ROWS.forEach((r, i) => {
+        const st = rwfsStatusFor(r);
+        const el = document.getElementById('rwfs-st-' + i);
+        if (el) { if (el.textContent !== st.t) el.textContent = st.t; el.className = 'rwfs-status ' + st.c; }
+        const row = document.getElementById('rwfs-row-' + i);
+        if (row) {
+            row.classList.toggle('rwfs-cause', cause.rows.includes(i));
+        }
+        if (r.key === 'IgnoreBattVMain') { const w = document.getElementById('rwfs-what-' + i); const t = rwfsMainVText(draft); if (w && w.textContent !== t) w.textContent = t; }
+    });
+    const limpSt = document.getElementById('rwfs-st-limp');
+    if (limpSt) { const t = rwfsFlags.LimpHome ? 'Active' : '—'; if (limpSt.textContent !== t) limpSt.textContent = t; }
+    const note = document.getElementById('rwfs-cause-note');
+    if (note) { const t = cause.note || ''; if (note.textContent !== t) note.textContent = t; note.style.display = t ? '' : 'none'; }
+    rwfsSummary();
+}
+// Tier + protections lost, mirrored from the firmware rule (buildTickSnapshot limpTier + reasonSuppressedByOverride).
+function rwfsSummary() {
+    const s = document.getElementById('rwfs-summary');
+    if (!s) return;
+    const d = rwfsDraft(false);
+    const nsv = parseInt(window._nominalStored, 10) || 12;
+    let tier, mode;
+    const v2ok = rwfsSecondVUsable(d);
+    const capTxt = (d.LimpDutyPct || rwfsFlags.LimpDutyPct);
+    if (d.LimpHome) { tier = 4; mode = 'Fixed field duty of ' + capTxt + '% with every sensor ignored.'; }
+    else if (d.IgnoreBattVMain) {
+        tier = v2ok ? 3 : 4;
+        mode = tier === 3     ? 'Fixed field duty of ' + capTxt + '%, held at 0% whenever the second battery voltage reads above the Bulk Voltage setting.'
+             : d.IgnoreBattV2 ? 'Fixed field duty of ' + capTxt + '% with no usable battery voltage at all.'
+                              : 'Charging stays off: the second battery voltage is not reading and is not ignored, so there is no voltage to run on. Tick Second battery voltage as well for fixed field duty of ' + capTxt + '%, or wait for that reading to return.';
+    }
+    else if (d.IgnoreAltCurrent) { tier = 2; mode = 'Voltage-only regulation: the field duty rises slowly and falls fast on the voltage error, capped at ' + capTxt + '%. Charge stages still run on the main battery voltage.'; }
+    else if (d.IgnoreTemperature || d.IgnoreRPM || d.IgnitionOverride || d.IgnoreBattV2) { tier = 1; mode = 'Normal closed-loop regulation; only the protections that depend on the ignored sensor are removed.'; }
+    else { tier = 0; mode = 'Normal regulation with every sensor in use.'; }
+    const lost = [], kept = [];
+    const add = (cond, txt) => (cond ? lost : kept).push(txt);
+    const all = !!d.LimpHome;
+    const noFeedback = all || (d.IgnoreBattVMain && !v2ok);
+    add(all || d.IgnoreTemperature, 'over-temperature trips and the thermal derate');
+    add(all || d.IgnoreRPM, 'Min RPM gate and the engine-stopped cut');
+    add(all || d.IgnoreAltCurrent, 'field-on-with-no-output (tach plausibility) cut');
+    add(all || d.IgnitionOverride, 'ignition-off standby and ignition-off charge permission');
+    add(all || d.IgnoreAltCurrent, 'current limits, over-current trips and load-dump protection');
+    add(all || d.IgnoreBattVMain || d.IgnoreBattV2, 'two-sensor voltage disagreement check');
+    add(all || d.IgnoreBattVMain, 'voltage plausibility check and the charge stages');
+    add(noFeedback, 'fast over-voltage cut');
+    add(all || d.IgnoreBattVMain, 'timed over-voltage tiers and the INA228 over-voltage firmware latch');
+    add(all, 'battery temperature lockouts');
+    let html = '<div><b>Resulting mode:</b> ' + mode + '</div>';
+    if (lost.length) html += '<div style="margin-top:6px;"><span class="lost"><b>Lost:</b> ' + lost.join('; ') + '.</span></div>';
+    if (kept.length) html += '<div style="margin-top:4px;"><span class="kept"><b>Still active:</b> ' + kept.join('; ') + '.</span></div>';
+    if (d.IgnoreBattVMain || d.LimpHome) html += '<div style="margin-top:6px; color:#ff8a80;">Over-voltage protection then depends on the INA228\'s hardware alert, which only works while that chip is powered. If the INA228 is the part that failed, there is no over-voltage protection.</div>';
+    if (nsv > 12 && tier >= 2) html += '<div style="margin-top:6px;">' + String(openLoopHighVoltageNote()).replace(/^\n+/, '') + '</div>';
+    if (s.innerHTML !== html) s.innerHTML = html;
+    // Apply is live only when every required input is present.
+    const btn = document.getElementById('rwfs-apply-btn');
+    if (btn) btn.disabled = !!rwfsValidate(d);
+}
+function rwfsValidate(d) {
+    if (d.IgnoreRPM && !(parseFloat(d.NoRpmCurrentA) > 0)) return 'Enter the alternator current limit to use without engine speed.';
+    if ((d.IgnoreAltCurrent || d.IgnoreBattVMain || d.LimpHome) && !(parseFloat(d.LimpDutyPct) >= 0 && parseFloat(d.LimpDutyPct) <= 99)) return 'Enter a field duty cap between 0 and 99%.';
+    if (d.IgnoreRPM && d.IgnitionOverride && !d.ackEng) return 'Tick the acknowledgement for running without engine speed and the ignition wire.';
+    if (d.LimpHome && !d.ackLimp) return 'Tick the acknowledgement for fixed duty with every sensor ignored.';
+    return '';
+}
+// The ignition override is stored as 1 = forced on, 2 = Auto (any value other than 1 reads as Auto in firmware).
+function rwfsKeyValue(k, v) { return (k === 'IgnitionOverride' && v !== 1) ? 2 : v; }
+async function rwfsApply() {
+    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    const d = rwfsDraft(false);
+    const why = rwfsValidate(d);
+    if (why) { xAlert(why); return; }
+    const params = [];
+    for (const k of RWFS_KEYS) if (d[k] !== rwfsFlags[k]) params.push(k + '=' + rwfsKeyValue(k, d[k]));
+    if (d.IgnoreRPM && parseFloat(d.NoRpmCurrentA) !== rwfsFlags.NoRpmCurrentA) params.push('NoRpmCurrentA=' + parseFloat(d.NoRpmCurrentA));
+    if ((d.IgnoreAltCurrent || d.IgnoreBattVMain || d.LimpHome) && parseFloat(d.LimpDutyPct) !== rwfsFlags.LimpDutyPct) params.push('LimpDutyPct=' + parseFloat(d.LimpDutyPct));
+    if (!params.length) { rwfsClose(); return; }
+    const removing = RWFS_KEYS.some(k => d[k] === 1 && rwfsFlags[k] !== 1);
+    if (removing) {
+        const s = document.getElementById('rwfs-summary');
+        const ok = await xConfirm('Apply these choices? The regulator will keep them until you clear them here.\n\n' + (s ? s.innerText : ''),
+            { title: 'Run Without Failed Sensors', okText: 'Apply', cancelText: 'Cancel' });
+        if (!ok) return;
+    }
+    try {
+        const r = await fetchWithTimeout(buildURL('/get?' + params.join('&')), {}, 10000);
+        if (!r.ok) { xAlert(r.status === 403 ? 'The regulator refused this — its settings window has closed. Press Unlock Settings and try again.' : 'The regulator refused the change (HTTP ' + r.status + ').'); return; }
+        rwfsClose();
+    } catch (e) { diagLog('rwfs apply failed:', e); xAlert('Could not reach the regulator. Check the connection and try again.'); }
+}
+async function rwfsStopAll() {
+    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    const ok = await xConfirm('Stop ignoring every sensor? Each protection comes back the moment its sensor is read again; a sensor that is still failed stops charging.', { title: 'Run Without Failed Sensors', okText: 'Stop ignoring all', cancelText: 'Cancel' });
+    if (!ok) return;
+    try {
+        const r = await fetchWithTimeout(buildURL('/get?' + RWFS_KEYS.map(k => k + '=' + rwfsKeyValue(k, 0)).join('&')), {}, 10000);
+        if (!r.ok) { xAlert('The regulator refused the change (HTTP ' + r.status + ').'); return; }
+        rwfsClose();
+    } catch (e) { diagLog('rwfs clear failed:', e); xAlert('Could not reach the regulator. Check the connection and try again.'); }
+}
+async function rwfsStopOne(key) {
+    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    try {
+        const r = await fetchWithTimeout(buildURL('/get?' + key + '=' + rwfsKeyValue(key, 0)), {}, 10000);
+        if (!r.ok) xAlert('The regulator refused the change (HTTP ' + r.status + ').');
+    } catch (e) { diagLog('rwfs stop-one failed:', e); }
+}
+// §6: the commissioning Prep gate. Returns '' when every sensor is in use and reading, else the reason.
+function rwfsCommissioningBlock() {
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    if (!c3) return '';
+    const ign = ['IgnoreTemperature', 'IgnoreRPM', 'IgnoreAltCurrent', 'IgnoreBattVMain', 'IgnoreBattV2', 'LimpHome']
+        .filter(k => Number(c3[k]) === 1)
+        .map(k => k === 'LimpHome' ? 'every sensor (fixed duty)' : (RWFS_ROWS.find(r => r.key === k) || { name: k }).name.toLowerCase());
+    if (ign.length) return 'Commissioning needs every sensor. Stop running without: ' + ign.join(', ') + ' (Setup > System > Run Without Failed Sensors).';
+    const names = [];
+    for (const b of [0, 2, 3, 4, 5, 7, 8]) if (rwfsMask & (1 << b)) {
+        names.push(['alternator temperature', 'engine speed', 'alternator current', 'main battery voltage', 'second battery voltage', 'battery voltage readings (disagree)', 'battery temperature', 'ADS1115 analog input chip', 'INA228 battery monitor chip'][b]);
+    }
+    if (names.length) return names.join(', ') + ' ' + (names.length === 1 ? 'is' : 'are') + ' not reading.';
+    return '';
 }
 
 // Everything manual mode stops enforcing, in the firmware's own priority order (selectFieldControlMode
@@ -21445,7 +22024,8 @@ function manualFieldBypassText() {
         + '• The whole current-control loop: no charge current target, no battery current limit, no '
         + 'externally sent limits, no charge stages.\n\n'
         + 'Still enforced: the master On/Off switch, the hardware over-voltage shutdown (Alternator Hard '
-        + 'Shutdown V), and the Max Field % / Max Field Volts ceiling.'
+        + 'Shutdown V), and the Max Field % / Max Field Volts ceiling. If the INA228 battery monitor is not '
+        + 'reading, Manual has no over-voltage protection at all: the hardware shutdown is that chip.'
         + openLoopHighVoltageNote();
 }
 
@@ -24010,6 +24590,12 @@ function getEchoNumber(id) {
     return Number.isFinite(n) ? n : NaN;
 }
 
+// On/off echoes print words (On/Off, ON/OFF), not 1/0, so getEchoNumber reads them as NaN.
+function getEchoOnOff(id) {
+    const t = getEchoText(id, '').toLowerCase();
+    return t === 'on' ? 1 : (t === 'off' ? 0 : NaN);
+}
+
 function showValidationError(message) {
     xAlert(message);
 }
@@ -24022,8 +24608,8 @@ function validateBatterySettings(proposedChanges) {
         FloatVoltage: getEchoNumber('FloatVoltage_echo'),
         RebulkVoltage: getEchoNumber('RebulkVoltage_echo'),
         TargetVoltageSetpoint: getEchoNumber('TargetVoltageSetpoint_echo'),
-        TargetVoltageMode: getEchoNumber('TargetVoltageMode_echo'),
-        MaintainMode: getEchoNumber('MaintainMode_echo'),
+        TargetVoltageMode: getEchoOnOff('TargetVoltageMode_echo'),
+        MaintainMode: getEchoOnOff('MaintainMode_echo'),
         UseFloat: (function () { const s = document.querySelector('select[name="UseFloat"]'); const v = s ? parseInt(s.value, 10) : NaN; return v; })(),  // echo is text (mode name); read the synced select instead
         SOC_BlockRebulk_percent: getEchoNumber('SOC_BlockRebulk_percent_echo'),
         SOC_AllowRebulk_percent: getEchoNumber('SOC_AllowRebulk_percent_echo'),
@@ -24756,6 +25342,151 @@ function makePanelDraggable(panel, handle) {
     window.addEventListener('resize', () => positionFloatingPanel(panel));
 }
 
+// Every other popup drags by its title bar with no per-popup wiring. A popup panel is the child of a
+// full-viewport position:fixed layer (dimmed backdrop or click-through overlay); its title bar is the
+// panel's first element child. Moved with a translate so the layer's flex/margin centering is untouched;
+// the offset is dropped once the panel is hidden or removed, so it reopens in its normal place.
+// A press on a dimmed backdrop that lands over another popup's title bar drags THAT popup, so stacked
+// popups can both be moved while the backdrop still blocks everything else beneath it.
+(function initUniversalPopupDrag() {
+    if (IS_CAPACITOR) return;   // browsers only (owner ruling 2026-10-03): the apps keep native touch scrolling, with no page-wide non-passive touchstart
+    const NO_DRAG = 'button, a, input, select, textarea, label, [contenteditable="true"]';
+    // Visible viewport without scrollbars: what an inset:0 fixed layer actually spans.
+    const vpW = () => document.documentElement.clientWidth || window.innerWidth;
+    const vpH = () => document.documentElement.clientHeight || window.innerHeight;
+    function isLayer(el) {
+        if (!el || el.nodeType !== 1 || el === document.body || el === document.documentElement) return false;
+        if (getComputedStyle(el).position !== 'fixed') return false;
+        const r = el.getBoundingClientRect();
+        return r.width >= vpW() - 2 && r.height >= vpH() - 2;
+    }
+    // makePanelDraggable / sysidInitDrag set _dragInit on the handles they own.
+    function ownedHandle(el) {
+        for (let n = el; n && n !== document.body; n = n.parentElement) if (n._dragInit) return n;
+        return null;
+    }
+    function titleBarAt(el) {
+        for (let n = el; n && n.parentElement && n !== document.body; n = n.parentElement) {
+            if (isLayer(n.parentElement) && !isLayer(n)) {
+                const bar = n.firstElementChild;
+                // A title bar spans the panel and is a minority of its height: not a full-scene backdrop
+                // (the "Connecting to regulator" sky) or a small first child (the minimized test pill's dot).
+                const isBar = bar && bar.offsetWidth >= n.offsetWidth / 2 && bar.offsetHeight < n.offsetHeight / 2;
+                return isBar && bar.contains(el) ? { panel: n, bar } : null;
+            }
+        }
+        return null;
+    }
+    function applyOffset(panel) {
+        panel.style.transform = 'translate(' + panel._popDx + 'px,' + panel._popDy + 'px) ' + panel._popBase;
+    }
+    function resetOffset(panel) {
+        panel.style.transform = panel._popOrigInline;
+        delete panel._popDx; delete panel._popDy;
+    }
+    // Pull a dragged panel back on-screen after the window or the panel itself changes size.
+    function reclamp(panel) {
+        if (panel._popDx === undefined) return;
+        const r = panel.getBoundingClientRect();
+        if (!r.width && !r.height) { resetOffset(panel); return; }
+        const vw = vpW(), vh = vpH();
+        let sx = 0, sy = 0;
+        if (r.width <= vw) sx = r.left < 0 ? -r.left : (r.right > vw ? vw - r.right : 0);
+        if (r.top < 0 && panel._popDy < 0) sy = Math.min(-r.top, -panel._popDy);
+        else if (r.height <= vh && r.bottom > vh && panel._popDy > 0) sy = Math.max(vh - r.bottom, -panel._popDy);
+        if (sx || sy) { panel._popDx += sx; panel._popDy += sy; applyOffset(panel); }
+    }
+    const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(es => es.forEach(e => reclamp(e.target))) : null;
+    const dragged = new Set();
+    window.addEventListener('resize', () => dragged.forEach(p => { if (p.isConnected) reclamp(p); else dragged.delete(p); }));
+
+    let drag = null;
+    function onDown(e) {
+        if (drag) return;
+        if (e.type === 'mousedown' && (e.button !== 0 || !e.isTrusted)) return;
+        if (e.touches && e.touches.length !== 1) return;
+        const t = e.target;
+        if (!t || t.nodeType !== 1 || t.closest(NO_DRAG) || ownedHandle(t)) return;
+        const pt = e.touches ? e.touches[0] : e;
+        let hit = null, forwardTo = null;
+        if (isLayer(t)) {
+            const stack = document.elementsFromPoint(pt.clientX, pt.clientY);
+            const under = stack.slice(stack.indexOf(t) + 1).find(el => !isLayer(el));
+            if (!under || under.closest(NO_DRAG)) return;
+            forwardTo = ownedHandle(under);
+            if (!forwardTo) hit = titleBarAt(under);
+        } else {
+            hit = titleBarAt(t);
+        }
+        if (!hit && !forwardTo) return;
+        drag = { x: pt.clientX, y: pt.clientY, moved: false };
+        if (hit) {
+            const p = hit.panel, r = p.getBoundingClientRect(), vw = vpW(), vh = vpH();
+            if (p._popDx === undefined) {
+                p._popOrigInline = p.style.transform;
+                const cs = getComputedStyle(p).transform;
+                p._popBase = cs && cs !== 'none' ? cs : '';
+                p._popDx = 0; p._popDy = 0;
+                dragged.add(p);
+                if (ro) ro.observe(p);
+            }
+            // Fully on-screen when it fits; a panel taller than the window keeps its title bar on-screen.
+            const barH = hit.bar.offsetHeight;
+            drag.panel = p;
+            drag.dx0 = p._popDx; drag.dy0 = p._popDy;
+            drag.minX = Math.min(0, -r.left);
+            drag.maxX = Math.max(0, vw - r.right);
+            drag.minY = Math.min(0, -r.top);
+            drag.maxY = Math.max(0, r.height <= vh ? vh - r.bottom : vh - r.top - barH);
+        } else {
+            // A helper-owned panel beneath a backdrop: start its own drag; it tracks the real moves.
+            forwardTo.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: pt.clientX, clientY: pt.clientY, button: 0 }));
+        }
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup',   onUp);
+        document.addEventListener('touchmove', onMove, { passive: false });
+        document.addEventListener('touchend',  onUp);
+        document.addEventListener('touchcancel', onUp);
+        e.preventDefault();
+    }
+    function onMove(e) {
+        const pt = e.touches ? e.touches[0] : e;
+        const dx = pt.clientX - drag.x, dy = pt.clientY - drag.y;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
+        if (drag.panel) {
+            drag.panel._popDx = drag.dx0 + Math.min(drag.maxX, Math.max(drag.minX, dx));
+            drag.panel._popDy = drag.dy0 + Math.min(drag.maxY, Math.max(drag.minY, dy));
+            applyOffset(drag.panel);
+        }
+        e.preventDefault();
+    }
+    function onUp() {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup',   onUp);
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend',  onUp);
+        document.removeEventListener('touchcancel', onUp);
+        // A drag that started on a backdrop must not count as the backdrop click that closes its popup.
+        // Self-removing on that click or the next press, since a drag that ends off the popup fires no click.
+        if (drag.moved) {
+            const off = () => { window.removeEventListener('click', eat, true); window.removeEventListener('mousedown', off, true); };
+            const eat = ev => { ev.stopPropagation(); ev.preventDefault(); off(); };
+            window.addEventListener('click', eat, true);
+            window.addEventListener('mousedown', off, true);
+        }
+        drag = null;
+    }
+    // Grab cursor on any title bar the handler above would drag.
+    document.addEventListener('mouseover', e => {
+        const t = e.target;
+        if (!t || t.nodeType !== 1 || t.closest(NO_DRAG) || ownedHandle(t)) return;
+        const hit = titleBarAt(t);
+        if (hit && !hit.bar._popCursor) { hit.bar._popCursor = true; hit.bar.style.cursor = 'move'; }
+    });
+    document.addEventListener('mousedown',  onDown);
+    document.addEventListener('touchstart', onDown, { passive: false });
+})();
+
 // Keep a floating panel usable after a viewport resize/rotate. Two modes:
 //  • Un-dragged commissioning panels (_leftPlace) re-anchor to the top-left: left-justified,
 //    vertically centered when they fit, else pinned to the top so the header (✕) is never
@@ -25057,24 +25788,41 @@ const SYSID_PHASE_NAMES = {
 };
 
 // FieldEventReason codes from firmware enum — must match Xregulator.ino enum FieldEventReason
+// Indexed by the firmware FieldEventReason enum (Xregulator.ino) — the same codes fieldOffReasonText
+// takes. Kept 1:1 with that enum; an earlier copy was off by one and stopped at 16.
 const SYSID_ABORT_REASONS = {
     0:  'no abort recorded',
-    1:  'auto-zero active',
-    2:  'temperature data stale',
-    3:  'temperature critical',
-    4:  'temperature warning',
-    5:  'temperature sustained over limit',
-    6:  'battery voltage implausible',
-    7:  'voltage sensor disagreement (critical)',
-    8:  'voltage spike',
-    9:  'voltage sensor disagreement (warning)',
-    10: 'lockout active',
-    11: 'charging disabled',
-    12: 'switched to manual mode',
-    13: 'hard overvoltage shutdown (INA228)',
-    14: 'hard overcurrent shutdown',
-    15: 'RPM dropped below minimum',
-    16: 'current sensor data stale'
+    1:  'temperature data stale',
+    2:  'temperature critical',
+    3:  'temperature warning',
+    4:  'temperature sustained over limit',
+    5:  'battery voltage implausible',
+    6:  'voltage sensor disagreement (critical)',
+    7:  'voltage spike',
+    8:  'voltage sensor disagreement (warning)',
+    9:  'lockout active',
+    10: 'charging disabled',
+    11: 'switched to manual mode',
+    12: 'hard overvoltage shutdown (INA228)',
+    13: 'hard overcurrent shutdown',
+    14: 'RPM dropped below minimum',
+    15: 'current sensor data stale',
+    16: 'fast overvoltage cut',
+    17: 'battery too cold to charge',
+    18: 'commissioning rest',
+    19: 'field on but no alternator output (tach implausible)',
+    20: 'solar-forecast pause',
+    21: 'BMS on/off signal withheld permission',
+    22: 'sustained overvoltage (low tier)',
+    23: 'sustained overvoltage (mid tier)',
+    24: 'battery too hot to charge',
+    25: 'charge cycle complete (idle)',
+    26: 'current-sensor zero measurement',
+    27: 'battery temperature sensor not responding',
+    28: 'main battery voltage sensor not responding',
+    29: 'second battery voltage sensor not responding',
+    30: 'waiting for the first battery temperature reading',
+    31: 'two or more required sensors failed'
 };
 
 function sysidInitDrag() {
@@ -25509,17 +26257,21 @@ function sysidClampPanel() {
 }
 
 function sysidUpdatePreflight() {
-    const rpm     = parseFloat(getField("RPMID") ?? 0);
+    // An overridden reading shows "ignored" in its readout: not a number, and this test needs every
+    // sensor (commissioning-class tools are blocked by any override), so say that instead of parsing it.
+    const rpmIgnored  = (typeof rwfsFlags === 'object') && rwfsFlags.IgnoreRPM === 1;
+    const ampsIgnored = (typeof rwfsFlags === 'object') && rwfsFlags.IgnoreAltCurrent === 1;
+    const rpm     = rpmIgnored ? NaN : parseFloat(getField("RPMID") ?? 0);
     const minRpm  = parseFloat(getField("MinRPMForField_echo") ?? 500);
-    const amps    = parseFloat(getField("MeasAmpsID") ?? 0);
+    const amps    = ampsIgnored ? NaN : parseFloat(getField("MeasAmpsID") ?? 0);
     const battV   = parseFloat(getField("IBVID") ?? getField("BatteryVID") ?? 0);
     // Class-scaled: a fixed 11.0V floor is trivially true on 24/36/48V banks (no low-bus screen),
     // and an unscaled 14.8 fallback would read a healthy 24/36/48V bus as "above bulk".
     const nomK    = (parseInt(window._nominalStored, 10) || 12) / 12;
     const bulkV   = parseFloat(getField("BulkVoltage_echo") ?? (14.8 * nomK));
 
-    const rpmOK   = rpm >= minRpm;
-    const ampsOK  = amps > 2.0;
+    const rpmOK   = !rpmIgnored && rpm >= minRpm;
+    const ampsOK  = !ampsIgnored && amps > 2.0;
     const voltOK  = battV > 11.0 * nomK && battV < (bulkV - 0.3 * nomK);
 
     const stage   = gLastChargeStage;
@@ -25559,8 +26311,11 @@ function sysidUpdatePreflight() {
 
     const allOK   = rpmOK && ampsOK && voltOK && modeOK && testsOK;
 
-    document.getElementById('sysid-check-rpm').textContent   = (rpmOK  ? '✅' : '❌') + ' Engine running (RPM: ' + rpm.toFixed(0) + ' / min ' + minRpm.toFixed(0) + ')';
-    document.getElementById('sysid-check-amps').textContent  = (ampsOK ? '✅' : '❌') + ' Alternator producing current (' + amps.toFixed(1) + 'A)';
+    const rwfsHint = ' — stop ignoring it under Setup > System > Run Without Failed Sensors; this test needs every sensor';
+    document.getElementById('sysid-check-rpm').textContent   = rpmIgnored ? ('❌ Engine speed is being ignored' + rwfsHint)
+        : ((rpmOK  ? '✅' : '❌') + ' Engine running (RPM: ' + rpm.toFixed(0) + ' / min ' + minRpm.toFixed(0) + ')');
+    document.getElementById('sysid-check-amps').textContent  = ampsIgnored ? ('❌ Alternator current is being ignored' + rwfsHint)
+        : ((ampsOK ? '✅' : '❌') + ' Alternator producing current (' + amps.toFixed(1) + 'A)');
     document.getElementById('sysid-check-volt').textContent  = (voltOK ? '✅' : '❌') + ' Battery voltage OK (' + battV.toFixed(2) + 'V)';
     document.getElementById('sysid-check-mode').textContent  = modeMsg;
     document.getElementById('sysid-check-tests').textContent = testsMsg;
@@ -25973,7 +26728,7 @@ function showSysidBodeResults() {
                 sysidFitKp = fit.Kp;
                 sysidFitKi = fit.Ki;
                 // Persist the fitted tau on the device + refresh the actionable-disturbance readout.
-                if (settingsUnlocked) cxGet('systemIDPlantTauMs=' + Math.round(fit.tauMs));
+                if (settingsUnlocked) cxGet('systemIDPlantTauMs=' + Math.round(fit.tauMs)).catch(() => { });   // readout aid only, never a setting the user is told was saved
                 updatePlantTauReadout(fit.tauMs);
                 const tcFast = Math.max(1, Math.round(fit.tauMs / 3));
                 const tcSlow = Math.max(1, Math.round(fit.tauMs));
@@ -26204,7 +26959,7 @@ const CX_RPM_LABELS = [
     'Engine RPM (last ~15 s) — settle before Run, then hands off the throttle',
     'Engine RPM (last ~15 s)',
     'Engine RPM (last ~15 s) — idle until armed, then snap the throttle',
-    'Engine RPM (last ~15 s)'   // stage 9 points at the schedule chart in the body while a run is live
+    'Engine RPM (last ~15 s)'   // never shown: the strip is hidden on stage 9 (cxRpmStripVis)
 ];
 
 // ── Loose engine-speed advisories ─────────────────────────────────────────────
@@ -26505,10 +27260,13 @@ function cxEffMask() { return cx ? ((cxLastMask | (cx.doneBits || 0)) & ~(cx.cle
 // fit on a weak alternator) doesn't get a ✓ or push the device to a false COMMISSIONED badge.
 function cxAdvance(markDone = true) {
     const cur = cx.phase, nx = cxNextSelected(cur);
-    if (markDone && cx.handled) delete cx.handled[cur];   // measured now — drop any earlier skip/manual note for this session
-    cxPassStage(cur, markDone ? 'done' : 'pass');
     const done = markDone ? cxGet('commissionStageDone=' + cur) : Promise.resolve();
-    done.finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
+    // The session marks follow the device's: a refused or lost mark stays on this step, so Next can be pressed again.
+    done.then(() => {
+        if (markDone && cx.handled) delete cx.handled[cur];   // measured now — drop any earlier skip/manual note for this session
+        cxPassStage(cur, markDone ? 'done' : 'pass');
+        if (nx === -1) cxFinish(); else cxGoto(nx);
+    }).catch(e => { xAlert('This step could not be marked done: ' + e + '. Nothing moved on; try again.'); commissionRender(); });
 }
 // Shared "Next →"/"Finish" button for the per-phase render functions — only emitted once the step's
 // action is done, so it's always clickable (no disabled-greyed Next cluttering earlier states).
@@ -26532,20 +27290,20 @@ const CX_AUTORUN = { 2: () => cxPlantStart(false), 3: () => cxVerifyStart() };
 function cxApplyRunBtn(applyFn, clean) {
     const nx = cxNextSelected(cx.phase);
     if (clean && CX_AUTORUN[nx])
-        return '<button onclick="' + applyFn + '(true)" class="btn-primary btn-sm">Apply &amp; run ' + CX_PHASES[nx] + ' →</button> ' +
+        return '<button onclick="' + applyFn + '(true)" class="btn-primary btn-sm cx-run">Apply &amp; run ' + CX_PHASES[nx] + ' →</button> ' +
                '<button onclick="' + applyFn + '()" class="btn-secondary btn-sm">Apply only</button>';
     return '<button onclick="' + applyFn + '()" class="btn-primary btn-sm">Apply</button>';
 }
 // cxAdvance(true) plus an immediate start of the next stage's test.
 function cxAdvanceRun() {
-    const nx = cxNextSelected(cx.phase);
-    if (cx.handled) delete cx.handled[cx.phase];   // measured now — drop any earlier skip/manual note for this session
-    cxPassStage(cx.phase, 'done');
-    cxGet('commissionStageDone=' + cx.phase).finally(() => {
+    const cur = cx.phase, nx = cxNextSelected(cur);
+    cxGet('commissionStageDone=' + cur).then(() => {
+        if (cx.handled) delete cx.handled[cur];   // measured now — drop any earlier skip/manual note for this session
+        cxPassStage(cur, 'done');
         if (nx === -1) { cxFinish(); return; }
         cxGoto(nx);
-        if (CX_AUTORUN[nx]) CX_AUTORUN[nx]();
-    });
+        if (CX_AUTORUN[nx] && !cxDriveOffReason()) CX_AUTORUN[nx]();
+    }).catch(e => { xAlert('The values were applied, but this step could not be marked done: ' + e + '. Nothing moved on; try again.'); commissionRender(); });
 }
 
 // ── Universal step navigation: Back / Skip for now / Mark done manually ───────
@@ -26586,11 +27344,13 @@ async function cxSkip(stage) {
             { title: 'Skip step', okText: 'Skip it', cancelText: 'Keep going' });
         if (!ok) return;
     }
-    cx.handled = cx.handled || {};
-    cx.handled[stage] = 'skip';
-    cxPassStage(stage, 'skip');
     const nx = cxNextSelected(stage);
-    cxGet('commissionStageSkip=' + stage).finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
+    cxGet('commissionStageSkip=' + stage).then(() => {
+        cx.handled = cx.handled || {};
+        cx.handled[stage] = 'skip';
+        cxPassStage(stage, 'skip');
+        if (nx === -1) cxFinish(); else cxGoto(nx);
+    }).catch(e => xAlert('The step could not be skipped: ' + e + '.'));
 }
 
 // Mark the current step done BY HAND (unmeasured). Confirms first — it can push the device to a green
@@ -26600,11 +27360,13 @@ async function cxManual(stage) {
     const ok = await xConfirm(CX_PHASES[stage] + ' will be marked complete without measuring it. It counts toward "Commissioned" and the reminder stops. You are responsible for setting its value by hand — the summary at the end tells you where.\n\nMark it done?',
         { title: 'Mark done manually', okText: 'Mark done', cancelText: 'Cancel' });
     if (!ok) return;
-    cx.handled = cx.handled || {};
-    cx.handled[stage] = 'manual';
-    cxPassStage(stage, 'manual');
     const nx = cxNextSelected(stage);
-    cxGet('commissionStageManual=' + stage).finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
+    cxGet('commissionStageManual=' + stage).then(() => {
+        cx.handled = cx.handled || {};
+        cx.handled[stage] = 'manual';
+        cxPassStage(stage, 'manual');
+        if (nx === -1) cxFinish(); else cxGoto(nx);
+    }).catch(e => xAlert('The step could not be marked done: ' + e + '.'));
 }
 
 // Persistent nav row appended to every runnable step's body (Prep has its own Start flow).
@@ -26672,6 +27434,33 @@ function cxLive() {
   };
 }
 function cxBulkV() { const v = getEchoNumber('BulkVoltage_echo'); return (v > 0) ? v : NaN; }
+// Firmware charging permission is Ignition && OnOff: with either off it never drives the field, so no
+// field test can run. CSV1 Ignition is the effective value (IgnitionOverride already applied).
+// Blocks only on a reported off; Prep's Start separately requires both confirmed ON.
+function cxDriveOffReason() {
+  const c = (typeof g_lastCsv1 === 'object' && g_lastCsv1) ? g_lastCsv1 : {};
+  const ign = (c.Ignition !== undefined && c.Ignition !== '') ? Number(c.Ignition) : NaN;
+  if (ign === 0) return 'The ignition input is off, so the regulator will not drive the field. Turn the key on, or check the ignition wire.';
+  if (g_onOffDevice === 0) return 'Alternator Enable is OFF. Switch it on (top right) to run this test.';
+  return null;
+}
+// Every button that starts a field-driving test. Gated live off CSV1 so a test can't be fired into a
+// field the firmware won't drive.
+const CX_RUN_FNS = ['cxFieldStart', 'cxKneeStart', 'cxPlantStart', 'cxVerifyStart', 'cxCVPlantStart', 'cxFdStart',
+                    'cxMatrixStart', 'cxStressStart', 'cxChcStart'];
+function cxDriveGateRefresh() {
+  const b = document.getElementById('commission-body');
+  if (!cx || cx.phase < 1 || !b) return;
+  const why = cxRunActive() ? null : cxDriveOffReason();
+  const el = document.getElementById('cx-drive-gate');
+  if (el) { el.style.display = why ? '' : 'none'; if (why) el.textContent = why; }
+  b.querySelectorAll('button').forEach(btn => {
+    const oc = btn.getAttribute('onclick') || '';
+    if (!btn.classList.contains('cx-run') && !CX_RUN_FNS.some(f => oc.startsWith(f + '('))) return;
+    if (why) { if (!btn.disabled) { btn.disabled = true; btn.dataset.driveGated = '1'; } }
+    else if (btn.dataset.driveGated) { btn.disabled = false; delete btn.dataset.driveGated; }
+  });
+}
 function cxHardV() { const v = getEchoNumber('AlternatorHardShutdownV_echo'); return (v > 0) ? v : NaN; }
 
 // The one true protection statement, per phase. The open-loop / test-current phases — Field curve (1),
@@ -26733,7 +27522,7 @@ function cxFinePrint(phase) {
     // Doc anchor keeps its original slug — the docs page carries a legacy <a id> so links from
     // already-shipped firmware still land on the section after the rename.
     case 7: return 'Two measurements at each held speed: the lowest field drive that produces any output (the tachometer keep-alive floor), and how fast output dies away after a protection cut. The field sits at its cut floor during the decay runs, so they cannot over-volt.' + cxDocLink('step-8-min-floor-field-decay');
-    case 9: return 'Holds the field at a fixed level and compares climbs and descents through the same speeds. Output runs ahead of engine speed by a few tenths of a second — a rotor property — and the tracker needs that offset before it can grade anything recorded while the boat is moving. The field is sized at the top of the first cycle, the fastest the machine turns all run, so nothing later exceeds it. The three cycles after it each give an independent answer; the closest two are averaged and the third is set aside. If even those two disagree, the answer is not trusted.' + cxDocLink('step-10-charge-health-calibration');
+    case 9: return 'Holds the field at a fixed level and compares climbs and descents through the same speeds. Output runs ahead of engine speed by a few tenths of a second, and the charging system health tracker needs that offset before it can grade anything recorded while the boat is moving.' + cxDocLink('step-10-charge-health-calibration');
     case 8: return 'Parks the bus at a voltage target the alternator can definitely reach; your throttle snap then pushes it over and the over-voltage protection fires. Graded on how many times it clamps, how long recovery takes, and whether it settles afterward. It writes no settings, and it ends itself.' + cxDocLink('step-9-stress-test');
     default: return '';
   }
@@ -26820,9 +27609,33 @@ function cxShowTab(main, sub) {
   } catch (e) { /* tab not present — non-fatal */ }
 }
 
-// Every commissioning write goes through here (single /get chokepoint).
+// Every commissioning write goes through here (single /get chokepoint). A refusal rejects like a lost
+// connection: the firmware answers 403 while settings are locked and 409 when a different regulator
+// answered, and reading those as success let the wizard show values stored and tests stopped that were not.
 function cxGet(params) {
-    return fetch(buildURL('/get?' + params));
+    return fetch(buildURL('/get?' + params)).then(r => {
+        if (r.ok) return r;
+        const why = r.status === 403 ? 'settings are locked'
+                  : r.status === 409 ? 'a different regulator answered'
+                  : 'the regulator refused it (HTTP ' + r.status + ')';
+        const e = new Error(why); e.toString = () => why;
+        throw e;
+    });
+}
+// Stop and clean-up writes: each one is sent in order even after an earlier one failed, so one lost or
+// refused write never leaves the rest of a test running. Resolves to the writes that did not land.
+async function cxSendEach(list) {
+    const failed = [];
+    for (const p of list) {
+        try { await cxGet(p); } catch (e) { failed.push(p.split('=')[0] + ': ' + e); }
+    }
+    return failed;
+}
+function cxReportStopFailure(what, failed) {
+    if (!failed || !failed.length) return;
+    xAlert(what + ' was not confirmed by the regulator:\n\n' + failed.join('\n') +
+        '\n\nUnlock settings if they are locked and try again. Switching the alternator off from the header always works.',
+        'Stop not confirmed');
 }
 
 // One per test start, sent with the start request and echoed back in that test's status frames.
@@ -26920,32 +27733,36 @@ function closeCommissionModal() {
     // Stop the idle-rest heartbeat and explicitly drop the hold, so a clean close resumes normal
     // charging immediately instead of waiting out the firmware's 5 s staleness timeout.
     if (cxHeartbeatTimer) { clearInterval(cxHeartbeatTimer); cxHeartbeatTimer = null; }
-    cxGet('commissionHeartbeat=0').catch(() => { });
+    // Every stop is sent in order whether or not the one before it landed; the rest-hold drop goes last.
+    const stops = [];
     if (cx) {
-        if (cx.fieldRunning) cxGet('cancelFieldCurve=1').catch(() => { });
-        if (cx.plantRunning) cxGet('cancelSystemID=1').catch(() => { });
-        if (cx.verifyRunning) cxGet('TuningMode=0').catch(() => { });
-        if (cx.cvFitRunning) { cx.cvFitDone = true; if (cx.cvFitCdTimer) { clearInterval(cx.cvFitCdTimer); cx.cvFitCdTimer = null; } if (cxPollTimer) { clearTimeout(cxPollTimer); cxPollTimer = null; } cxGet('cvPlantFitCancel=1').catch(() => { }); }
-        if (cx.fdRunning) { cx.fdRunning = false; cxGet('fieldCutCancel=1').catch(() => { }); }
-        if (cx.chc && cx.chc.running) { cx.chc.running = false; cxGet('chcCancel=1').catch(() => { }); }
-        if (cx.cvs && cx.cvs.running) { cx.cvs.running = false; cxGet('cvStressCancel=1').catch(() => { }); }
-        if (cx.kneeRunning) cxGet('cancelKneeSweep=1').catch(() => { });
+        if (cx.fieldRunning) stops.push('cancelFieldCurve=1');
+        if (cx.plantRunning) stops.push('cancelSystemID=1');
+        if (cx.verifyRunning) stops.push('TuningMode=0');
+        if (cx.cvFitRunning) { cx.cvFitDone = true; if (cx.cvFitCdTimer) { clearInterval(cx.cvFitCdTimer); cx.cvFitCdTimer = null; } if (cxPollTimer) { clearTimeout(cxPollTimer); cxPollTimer = null; } stops.push('cvPlantFitCancel=1'); }
+        if (cx.fdRunning) { cx.fdRunning = false; stops.push('fieldCutCancel=1'); }
+        if (cx.chc && cx.chc.running) { cx.chc.running = false; stops.push('chcCancel=1'); }
+        if (cx.cvs && cx.cvs.running) { cx.cvs.running = false; stops.push('cvStressCancel=1'); }
+        if (cx.kneeRunning) stops.push('cancelKneeSweep=1');
         // Modal close is a sweep teardown path: freeze + persist the RPM ripple table (committed cells
         // from a cut-short sweep are honest data). The rtFieldArmed block below releases the field —
         // the game runs with rtFieldArmed set for exactly that reason.
-        if (cx.matrixOn) { cxGet('ripGameFill=0').catch(() => { }); cxGet('faCommissionGate=0').catch(() => { }); }
+        if (cx.matrixOn) stops.push('ripGameFill=0');
         // The current-check and the sweep game both COMMAND the field — ramp the current to 0 first,
         // then release field-control + gate, so closing the wizard mid-test exits gently (the deadman is the
         // backstop for involuntary closes; this is the clean path for a deliberate X).
-        if (cx.rtFieldArmed) {
-            cxGet('resTestTargetA=0').then(() => cxGet('resTest=0')).catch(() => { });
-            cxGet('bcurRtest=0').catch(() => { });
-            cxGet('faCommissionGate=0').catch(() => { });
-        }
+        if (cx.rtFieldArmed) stops.push('resTestTargetA=0', 'resTest=0', 'bcurRtest=0');
+        if (cx.matrixOn || cx.rtFieldArmed) stops.push('faCommissionGate=0');
         cx.fieldRunning = cx.plantRunning = cx.verifyRunning = cx.cvFitRunning = cx.kneeRunning = cx.matrixOn = cx.matrixShooting = cx.rtFieldArmed = false;
         // Past Finish (Helpful Hints / cloud pitch page) there is nothing to resume — an X here is Done.
         if (cx.finished) { cx = null; cxPlanUserSet = false; }
     }
+    const testStops = stops.length;
+    stops.push('commissionHeartbeat=0');
+    cxSendEach(stops).then(failed => {
+        // The rest-hold drop alone failing is harmless: the firmware lets it lapse in 5 s.
+        if (testStops) cxReportStopFailure('Stopping the test on close', failed);
+    });
     document.getElementById('commission-modal-overlay').style.display = 'none';
     // A pause: the checklist should show what Continue will run, so the steps this pass has already passed
     // come off the plan (a re-tick puts one back as a deliberate redo). Dependents the firmware cleared as
@@ -27009,8 +27826,6 @@ function commissionRender() {
         // Speed-referenced steps name the actual number once the upstream run has produced one.
         const ref = (cx.phase === 2 || cx.phase === 3) ? cxRpmRefFor(cx.phase) : 0;
         if (ref > 0) lbl = 'Engine RPM (last ~15 s) — hold near ' + Math.round(ref) + ' RPM during the sweep';
-        // Stage 9's instruction is the schedule chart in the body; the strip is only the recent trace.
-        if (cx.phase === 9 && cx.chc && cx.chc.running) lbl = 'Engine RPM (last ~15 s) — follow the shaded band in the chart below';
         rl.textContent = lbl;
     }
     const b = document.getElementById('commission-body');
@@ -27036,6 +27851,10 @@ function commissionRender() {
     // Universal Back / Skip / Mark-done row on every runnable step (Prep drives its own Start button).
     // Hidden while a run is active — navigating away mid-measurement would leave it running unmonitored.
     if (!cxRunActive() && cx.phase >= 1 && cx.phase < CX_PHASES.length) b.insertAdjacentHTML('beforeend', cxNavFooter());
+    if (cx.phase >= 1) {
+        b.insertAdjacentHTML('afterbegin', '<div id="cx-drive-gate" style="display:none;margin:0 0 10px;padding:8px 10px;background:#332211;border:1px solid rgba(240,165,0,0.4);border-radius:6px;color:#f0a500;font-size:14px;line-height:1.5;"></div>');
+        cxDriveGateRefresh();
+    }
     positionFloatingPanel(panel);   // re-center/-top for this phase's height (skips if dragged)
     if (panel && keepScroll) panel.scrollTop = Math.min(keepScroll, Math.max(0, panel.scrollHeight - panel.clientHeight));
 }
@@ -27044,13 +27863,15 @@ function commissionRender() {
 function cxRenderPrep(b) {
     b.innerHTML =
         '<p style="font-size:15px;line-height:1.5;"><strong>If not already running, start the engine and warm it up.</strong> The next steps involve running the engine at cruising speeds for a few minutes.</p>' +
-        '<p style="font-size:15px;line-height:1.5;">If this is your first time commissioning and the default values give poor initial control, you may disable the alternator during warm-up (toggle in the top-right corner).</p>' +
+        '<p style="font-size:15px;line-height:1.5;">If this is your first time commissioning and the default values give poor initial control, you may disable the alternator during warm-up (toggle in the top-right corner). Switch it back on before pressing Start.</p>' +
         '<p style="font-size:15px;line-height:1.5;"><strong>Verify charging headroom</strong> — it\'s best to begin with a battery bank in the 20–70% state-of-charge (SOC) range, to avoid tripping safeties during automatic routines.</p>' +
         '<div style="margin:10px 0; padding:8px 10px; background:#222; border-radius:6px; font-size:13px; line-height:1.7;">' +
         '<div>Engine: <span id="cx-prep-rpm">…</span></div>' +
+        '<div>Ignition: <span id="cx-prep-ign">…</span></div>' +
         '<div>Field: <span id="cx-prep-field">…</span></div>' +
         '<div>Charging headroom: <span id="cx-prep-headroom">…</span></div>' +
         '<div>Battery shunt: <span id="cx-prep-shunt">…</span></div>' +
+        '<div>Sensors: <span id="cx-prep-sensors">…</span></div>' +
         '</div>' +
         // Ack gate: another charger regulating the same bus (or a cycling load) corrupts the voltage-response
         // fits — the tune then misbehaves when that source is absent. Acknowledged once per wizard entry.
@@ -27077,10 +27898,17 @@ function cxPrepRefresh() {
     const engineOk = !isNaN(L.rpm) && L.rpm > 300;
     rpmEl.innerHTML = isNaN(L.rpm) ? '<span style="color:#f0a500;">no RPM</span>'
         : '<strong style="color:' + (engineOk ? '#5a5' : '#f0a500') + ';">' + Math.round(L.rpm) + ' RPM</strong>' + (engineOk ? '' : ' (start the engine)');
-    const fEl = document.getElementById('cx-prep-field');
-    if (fEl) fEl.innerHTML = (L.onoff === true)
+    const c1 = (typeof g_lastCsv1 === 'object' && g_lastCsv1) ? g_lastCsv1 : {};
+    const ignOn = Number(c1.Ignition) === 1;
+    const fieldOn = g_onOffDevice === 1;
+    const iEl = document.getElementById('cx-prep-ign');
+    if (iEl) iEl.innerHTML = ignOn
         ? '<strong style="color:#5a5;">ON</strong>'
-        : '<strong style="color:#f0a500;">OFF</strong> (toggle in the top right to enable field)';
+        : '<strong style="color:#f0a500;">OFF</strong> (turn the key on, or check the ignition wire)';
+    const fEl = document.getElementById('cx-prep-field');
+    if (fEl) fEl.innerHTML = fieldOn
+        ? '<strong style="color:#5a5;">ON</strong>'
+        : '<strong style="color:#f0a500;">OFF</strong> (switch it on in the top right before starting)';
     // Headroom is advisory only — color warns, but it never blocks commissioning.
     // Green = comfortable room, orange = tight, red = almost no room (OV trip likely).
     if (isNaN(L.busV) || isNaN(bulk)) { hrEl.innerHTML = '<span style="color:#f0a500;">unknown (no live voltage)</span>'; }
@@ -27107,7 +27935,11 @@ function cxPrepRefresh() {
         else
             shEl.innerHTML = '<span style="color:#888;">no INA228 battery shunt configured — battery-side features (charge limit, tail detection) unavailable.</span>';
     }
-    btn.disabled = !engineOk || !cx.srcAck;
+    // §6: every required sensor in use and reading. Blocks Start like engineOk; the reason lands in the box.
+    const sensorBlock = rwfsCommissioningBlock();
+    const snEl = document.getElementById('cx-prep-sensors');
+    if (snEl) snEl.innerHTML = sensorBlock ? '<span style="color:#f0a500;">' + sensorBlock + '</span>' : '<strong style="color:#5a5;">all in use and reading</strong>';
+    btn.disabled = !engineOk || !ignOn || !fieldOn || !cx.srcAck || !!sensorBlock;
 }
 // Poll a device persist-state endpoint ({state: PENDING|FAILED|IDLE}) until IDLE. The device defers flash
 // writes to its main loop (an in-handler burst froze the whole interface ~2 s), so the HTTP 200 on the
@@ -27145,7 +27977,7 @@ function cxStart() {
     const label = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = 'Saving restore point…'; }
     cxGet('commissionStart=1')
-        .then(r => { if (!r.ok) throw ('rejected (HTTP ' + r.status + ')'); return cxAwaitStartPersist(8000); })
+        .then(() => cxAwaitStartPersist(8000))
         .then(() => {
             // First planned step this pass has not already passed (closeCommissionModal unticks those on a
             // pause; the set is the backstop for anything ticked since). A run paused with the X resumes
@@ -27301,7 +28133,7 @@ async function cxRpmAlignWriteSf() {
         return;
     }
     let r = null;
-    try { r = await cxGet('RPMScalingFactor=' + n); } catch (e) { r = null; }
+    try { r = await fetch(buildURL('/get?RPMScalingFactor=' + n)); } catch (e) { r = null; }
     if (!r || !r.ok) {
         restore();  // device rejected it — don't leave the control showing a value it never took
         await xAlert(r && r.status === 409
@@ -27338,7 +28170,7 @@ function cxRpmAlignWritePr() {
     if (!el) return;
     const n = parseFloat(el.value);
     if (!isFinite(n) || n <= 0) return;
-    cxGet('PulleyRatio=' + n.toFixed(2)).catch(() => { });
+    cxGet('PulleyRatio=' + n.toFixed(2)).catch(e => xAlert('The pulley ratio could not be saved: ' + e + '.', 'Not changed'));
 }
 // 1 s refresh: live RPM readout + reflect the device value back into the controls when the user is not
 // editing them, so an edit made on the Setup ▸ Engine RPM fields shows here too (one source of truth).
@@ -27484,6 +28316,8 @@ function cxRenderField(b) {
     let body = '';
     if (cx.fieldRunning) {
         body += '<p style="color:#4a9eff;">Running field-% ramp… keep RPM roughly steady — best effort, it doesn\'t have to be perfect.</p>';
+    } else if (cx.fieldBlocked) {
+        body += '<div style="margin:10px 0;padding:8px 10px;background:#332211;border:1px solid rgba(240,165,0,0.4);border-radius:6px;color:#f0a500;">Not started: ' + cx.fieldBlocked + '</div>';
     } else if (cx.fieldAbort) {
         body += cxRampAbortHtml('Ramp stopped', cx.fieldAbort, cx.fieldAbortInfo, 'Field curve', 'run', true);
     } else if (r) {
@@ -27513,15 +28347,20 @@ function cxRenderField(b) {
 // instead of firing the test and waiting out the 12 s "no start" timeout. We do NOT force a re-bulk —
 // a resting battery simply has nothing to measure. Signal is the fresh CSV1 fieldEventReason.
 function cxFieldRunBlockReason() {
+    const drive = cxDriveOffReason();
+    if (drive) return drive;
     const r = window._lastFieldEventReason;
     if (r === undefined || r === 0 || r === 18) return null;   // NONE / commissioning-rest → runnable
-    const why = (r === 11) ? 'manual field mode is on' : (fieldOffReasonText(r) || 'the field is not under active charging control');
-    return 'The regulator is not charging right now (' + why + '). This test can only run while the alternator is actively charging in AUTO — a resting battery has nothing to measure. It will be available again once a charge cycle is underway.';
+    if (r === 11) return 'Manual field mode is on. Switch back to AUTO to run this test.';
+    if (r === 10 || r === 20 || r === 25)
+        return 'The regulator is not charging right now (' + fieldOffReasonText(r) + '). This test can only run while the alternator is actively charging in AUTO — a resting battery has nothing to measure. It will be available again once a charge cycle is underway.';
+    return 'The regulator is holding the field off (' + (fieldOffReasonText(r) || 'reason ' + r) + '). Clear that, then run again.';
 }
 
 function cxFieldStart() {
     const blocked = cxFieldRunBlockReason();
-    if (blocked) { cx.fieldResult = null; cx.fieldApplied = false; cx.fieldRunning = false; cx.fieldAbort = blocked; cx.fieldAbortInfo = null; commissionRender(); return; }
+    if (blocked) { cx.fieldResult = null; cx.fieldApplied = false; cx.fieldRunning = false; cx.fieldAbort = null; cx.fieldAbortInfo = null; cx.fieldBlocked = blocked; commissionRender(); return; }
+    cx.fieldBlocked = null;
     cxShowTab('plots', 'displays');   // open-loop ramp → watch on Plots ▸ Short Term
     const tok = cxRunTok();
     cx.fieldResult = null; cx.fieldApplied = false; cx.fieldAbort = null; cx.fieldAbortInfo = null; cx.fieldRunning = true; commissionRender();
@@ -27574,8 +28413,8 @@ function cxFieldApply(run = false) {
 
 // ── Step 8 · Keep-Alive floor — GUIDED onset sweeps at 3 DESCENDING RPMs → Keep-Alive column ──
 // Runs near the END of the wizard (CX_PHASES index 7, right before the Stress Test) so the engine is fully
-// warm from the earlier steps before the first hold at maximum working RPM. Independent of every
-// other stage (nothing feeds it, it feeds nothing).
+// warm from the earlier steps before the first hold at maximum working RPM. Nothing feeds it, and it
+// feeds one thing: that first hold's speed becomes stage 9's maximum working RPM (cxKneeTopRpm).
 // TWO measurements per held speed, walking DOWN the throttle (max working RPM → mid → idle):
 //  1. Onset knee — the field ramp in onset-stop mode (firmware: fieldCurveOnsetMode). Each clean
 //     sweep auto-commits as an anchor; the firmware warm-starts each sweep from the previous point
@@ -27666,7 +28505,7 @@ function cxRenderKnee(b) {
               anchors.length + ' onset points are stored, but this step records ' + NSTEP + '. The extra ones did not come from a ' +
               'Record here, and the curve is fitted over all of them. Press <strong>Start over</strong> and record the three speeds again.</div>'
             : '<div style="margin:10px 0;padding:8px 10px;background:#1e2a1e;border:1px solid #3a5a3a;border-radius:6px;color:#bdb;">' +
-              'All three speeds captured. Review below, then approve.</div>';
+              'All three speeds captured.</div>';
         // Outlier flag — the 3 points should fall on one onset = a + C/RPM curve. A large residual means
         // one hold drifted or caught a load step during that sweep.
         if (typeof cx.kneeFitResid === 'number' && cx.kneeFitResid > 2.0) {
@@ -27675,6 +28514,29 @@ function cxRenderKnee(b) {
                 'These three don\'t sit on one curve (off by ' + cx.kneeFitResid.toFixed(1) + '% at <strong>' + wlabel + '</strong>). ' +
                 'Likely a drifting hold or a load change during that automatic current sweep. You can still approve, but Start over is cheap now that automatic current sweeps are warm-started.</div>';
         }
+    }
+
+    // Review: one merged table stays in view and everything else folds under it, so the one button is
+    // the obvious next action. Recording and overfull screens keep the full tables in view.
+    const review = step >= NSTEP && !overfull;
+    if (review) {
+        const mrows = anchors.map((a, i) => {
+            const r = cx.fdRuns[i];
+            const drain = (r && r.ok) ? Math.round(r.drainMs) + ' ms' : (cx.fdSkipped[i] ? 'skipped' : '—');
+            return '<tr><td>' + (CX_KNEE_STEPS[i] ? CX_KNEE_STEPS[i].tag : '—') + '</td><td style="text-align:right;">' + a.rpm.toFixed(0) +
+                '</td><td style="text-align:right;">' + a.duty.toFixed(1) + '%</td><td style="text-align:right;">' + drain + '</td></tr>';
+        }).join('');
+        body += '<table style="width:100%;margin:4px 0 14px;font-size:13px;border-collapse:collapse;"><tr style="text-align:left;color:#9aa;">' +
+            '<th>Speed</th><th style="text-align:right;">RPM</th><th style="text-align:right;">Keep-alive</th><th style="text-align:right;">Drain</th></tr>' + mrows + '</table>';
+        if (cx.kneeApplied) {
+            body += '<div style="margin-bottom:10px;"><span style="color:#5a5;">Applied — Keep-Alive column filled' + (cx.fdApplied ? ' and field drain stored' : '') + '.</span></div>' +
+                cxNextBtn(true).replace('btn-primary btn-sm"', 'btn-primary" style="width:100%;padding:12px;font-size:15px;"');
+        } else {
+            body += '<button onclick="cxKneeApply(true)" class="btn-primary" style="width:100%;padding:12px;font-size:15px;">Apply and continue (Recommended)</button>';
+        }
+        body += '<div style="text-align:center;margin-top:8px;"><button onclick="cxKneeRestart()" style="background:none;border:none;color:#9aa0a8;font-size:13px;text-decoration:underline;cursor:pointer;">Start over</button></div>';
+        body += '<details id="cxKneeDetails"' + (cx.kneeDetOpen ? ' open' : '') + ' ontoggle="cxKneeDetailsToggle(this)" style="margin-top:12px;border-top:1px solid #2c2c2c;padding-top:8px;">' +
+            '<summary style="cursor:pointer;font-size:13px;color:#9fb0af;">Show the details and graphs</summary>';
     }
 
     // Captured-so-far tables, labelled by which guided target produced each point.
@@ -27699,19 +28561,12 @@ function cxRenderKnee(b) {
         body += cxFdMarkup();
         if (overfull) {
             body += '<div style="margin-top:12px;"><button onclick="cxKneeRestart()" class="btn-primary btn-sm">Start over</button></div>';
-        } else if (cx.kneeApplied) {
-            // Applied: drop the Apply button entirely; advance is the one primary action.
-            body += '<div style="margin-top:6px;"><span style="color:#5a5;">Applied — Keep-Alive column filled' + (cx.fdApplied ? ' and field drain stored' : '') + '.</span></div>' +
-                '<div style="margin-top:12px;">' + cxNextBtn(true) + ' <button onclick="cxKneeRestart()" class="btn-secondary btn-sm">Start over</button></div>';
-        } else {
-            body += '<div style="margin-top:12px;">' +
-                '<button onclick="cxKneeApply()" class="btn-primary btn-sm">Apply</button> ' +
-                '<button onclick="cxKneeRestart()" class="btn-secondary btn-sm">Start over</button></div>';
         }
         body += '<details style="margin-top:12px;border-top:1px solid #2c2c2c;padding-top:8px;"><summary style="cursor:pointer;font-size:13px;color:#9fb0af;">Manual drain override</summary>' +
             '<div style="margin-top:8px;"><label style="display:block;font-size:11px;color:#a7b0af;margin-bottom:3px;">Field drain time (ms) — one flat value at every speed; replaces the fitted line</label>' +
             '<input type="number" id="fdManual" step="1" min="5" max="900" onchange="cxFdManual(this.value)" ' +
             'style="width:120px;background:#161616;border:1px solid #383838;border-radius:6px;color:#ddd;padding:6px 8px;font-size:14px;"></div></details>';
+        if (review) body += '</details>';
     } else if (anchors.length) {
         body += '<div style="margin-top:8px;"><button onclick="cxKneeRestart()" class="btn-secondary btn-sm">Start over</button></div>';
     }
@@ -27783,25 +28638,42 @@ function cxKneeStart() {
 // Cancel a running onset sweep: fire the firmware abort, stop the poll, and re-render immediately
 // (the firmware's fieldCurveAbortRequested path winds the ramp down on its own).
 function cxKneeCancel() {
-    cxGet('cancelKneeSweep=1').catch(() => { });
+    cxSendEach(['cancelKneeSweep=1']).then(f => cxReportStopFailure('Cancelling the sweep', f));
     cxStopPoll(); cx.kneeRunning = false; commissionRender();
 }
 // Single Apply for the whole stage: the firmware fits the Keep-Alive column across the anchors
 // (applyKneeCurve, onset = a + C/RPM), then one request stores the drain-vs-RPM result — the
 // fieldDecayTauMs handler flattens any old line first and the endpoint params in the SAME request
 // commission the new one (see the /get handler ordering in 3_functions.ino).
-function cxKneeApply() {
+// go = advance to the next stage once both writes land; a failed write stays on this screen with its alert.
+function cxKneeApply(go) {
     const fit = cxFdFit();
-    cxGet('applyKneeCurve=1').then(() => {
+    const after = () => { if (go) cxAdvance(true); else commissionRender(); };
+    // The anchors live in RAM only, so the maximum working RPM they imply is stored now (NVS maxWorkingRpm).
+    const top = cxKneeTopRpm(cx.kneeAnchors);
+    cxGet('applyKneeCurve=1' + (top ? '&maxWorkingRpm=' + top : '')).then(() => {
         cx.kneeApplied = true;
-        if (!fit) { commissionRender(); return; }
+        if (top && cx.chc) cx.chc.maxRpm = top;
+        if (!fit) { after(); return; }
         let p = 'fieldDecayTauMs=' + fit.worst;
         if (!fit.flat) p += '&fdDrainLoMs=' + fit.loMs + '&fdDrainHiMs=' + fit.hiMs + '&fdDrainRpmLo=' + fit.rpmLo + '&fdDrainRpmHi=' + fit.rpmHi;
-        cxGet(p).then(() => { cx.fdApplied = true; commissionRender(); })
+        cxGet(p).then(() => { cx.fdApplied = true; after(); })
             .catch(e => xAlert('Drain apply failed: ' + e));
     }).catch(e => xAlert('Apply failed: ' + e));
 }
+// Open state survives re-renders; uPlot measures its width at build, so the decay plot is rebuilt on open.
+function cxKneeDetailsToggle(det) {
+    cx.kneeDetOpen = det.open;
+    if (det.open) cxFdDraw();
+}
 function cxKneeRestart() { cxGet('clearKneeAnchors=1').then(() => { cx.kneeApplied = false; cx.kneeNoOnset = false; cx.kneeCeilLimited = false; cx.kneeAbort = null; cx.kneeFitResid = undefined; cx.kneeFitWorstIdx = -1; cx.fdRuns = [null, null, null]; cx.fdSkipped = [false, false, false]; cx.fdErr = null; cx.fdApplied = false; cxKneeRefresh(); }).catch(e => xAlert('Clear failed: ' + e)); }
+// The first hold of this step is "your maximum working RPM", so its highest anchor is the measured
+// answer to the question step 10 used to ask. Rounded to 50 and held to the firmware's 800..8000; 0 = no anchors.
+function cxKneeTopRpm(anchors) {
+    let m = 0;
+    for (const a of (anchors || [])) if (a && a.rpm > m) m = a.rpm;
+    return m > 0 ? Math.max(800, Math.min(8000, Math.round(m / 50) * 50)) : 0;
+}
 function cxKneeRefresh() {
     fetch(buildURL('/kneesweep.json')).then(r => r.json()).then(j => {
         cx.kneeAnchors = j.anchors || [];
@@ -27887,7 +28759,7 @@ function cxPlantStart(wide) {
                             if (fit.ok) {
                                 sysidFitTauMs = fit.tauMs; sysidFitKp = fit.Kp; sysidFitKi = fit.Ki;
                                 // Persist the fitted tau on the device + refresh the actionable-disturbance readout.
-                                if (settingsUnlocked) cxGet('systemIDPlantTauMs=' + Math.round(fit.tauMs));
+                                if (settingsUnlocked) cxGet('systemIDPlantTauMs=' + Math.round(fit.tauMs)).catch(() => { });   // readout aid only, never a setting the user is told was saved
                                 updatePlantTauReadout(fit.tauMs);
                             }
                             cx.plantRunning = false; commissionRender();
@@ -28186,7 +29058,7 @@ function cxVerifyStart() {
                 if (!settled && framesSeen >= 3 && waited > 200) {
                     settle(); cx.verifyRunning = false;
                     cx.verifyAbort = { text: 'The verify sweep never ran. Check Live Data \u25b8 Console for the reason, then run it again.' };
-                    cxGet('TuningMode=0').finally(() => commissionRender());
+                    cxSendEach(['TuningMode=0']).then(f => { cxReportStopFailure('Leaving the tuning test', f); commissionRender(); });
                     return;
                 }
                 fetch(buildURL('/tuningbode')).then(r => r.json()).then(j => {
@@ -28197,7 +29069,7 @@ function cxVerifyStart() {
                         settle();
                         cx.verifyAbort = cxAbortInfoFrom(j);
                         cx.verifyRunning = false;
-                        cxGet('TuningMode=0').finally(() => commissionRender());
+                        cxSendEach(['TuningMode=0']).then(f => { cxReportStopFailure('Leaving the tuning test', f); commissionRender(); });
                         return;
                     }
                     if (j.done && !j.active) {
@@ -28208,11 +29080,14 @@ function cxVerifyStart() {
                         cx.verify.rpmAvg = j.rpmAvg || 0; cx.verify.rpmMin = j.rpmMin || 0; cx.verify.rpmMax = j.rpmMax || 0;
                         cx.verifyRunning = false;
                         setPIDXTime(30);   // frame the whole sweep so the user can eyeball feedback vs command before accepting
-                        cxGet('TuningMode=0').finally(() => commissionRender());  // leave closed-loop tuning
+                        cxSendEach(['TuningMode=0']).then(f => { cxReportStopFailure('Leaving the tuning test', f); commissionRender(); });  // leave closed-loop tuning
                     }
                 }).catch(() => { });
             }, 1500);
-        }).catch(e => { cx.verifyRunning = false; xAlert('Verify start failed: ' + e); commissionRender(); });
+        }).catch(e => {
+            cx.verifyRunning = false; commissionRender();
+            cxSendEach(['TuningMode=0']).then(f => { xAlert('Verify start failed: ' + e); cxReportStopFailure('Leaving the tuning test', f); });
+        });
 }
 function cxDetune() {
     // Base the detune on the device's LIVE gains, not the session fit: sysidFitKp/Ki are page
@@ -28224,9 +29099,15 @@ function cxDetune() {
     const kp = baseKp * 0.8, ki = baseKi * 0.8;
     if (!(kp > 0) || !(ki > 0)) { xAlert('Cannot soften: no valid current-loop gains available (run the plant sweep first).'); return; }
     sysidFitKp = kp; sysidFitKi = ki;
-    cxGet('PidKp=' + kp.toFixed(4)).then(() => cxGet('PidKi=' + ki.toFixed(4))).then(() => cxVerifyStart());
+    cxGet('PidKp=' + kp.toFixed(4)).then(() => cxGet('PidKi=' + ki.toFixed(4))).then(() => cxVerifyStart())
+        .catch(e => xAlert('The softened gains could not be saved: ' + e + '. The previous gains are still in use.'));
 }
-function cxVerifyDone() { cxGet('TuningMode=0').finally(() => cxAdvance()); }
+function cxVerifyDone() {
+    cxSendEach(['TuningMode=0']).then(f => {
+        if (f.length) { cxReportStopFailure('Leaving the tuning test', f); return; }
+        cxAdvance();
+    });
+}
 
 // ── Stage 6 · CV plant fit — current square wave → battery-voltage fit → plant K for the α/K auto gains ──
 // Reuses the proven current-tuning square wave (TuningMode, tuningWaveform=0) to COMMAND current; the
@@ -28608,7 +29489,7 @@ function cxFdPoll() {
 
 // Cancel a running drain measurement: the firmware abort winds the run down and the poll surfaces
 // "test cancelled" with Retry / Skip. Skip leaves the slot empty — cxFdFit works with what remains.
-function cxFdCancel() { cxGet('fieldCutCancel=1').catch(() => { }); }
+function cxFdCancel() { cxSendEach(['fieldCutCancel=1']).then(f => cxReportStopFailure('Cancelling the drain measurement', f)); }
 function cxFdSkip(idx) { cx.fdSkipped[idx] = true; cx.fdErr = null; commissionRender(); }
 
 // The stored value is the DRAIN time (cut → 10% of output), not the fitted τ — the over-voltage
@@ -29126,11 +30007,19 @@ async function cxMatrixDone() {
 // epoch guard skips the release writes if a newer flow grabbed the field during the 2.5 s wind-down.
 function cxMatrixFieldRelease() {
     cx.matrixOn = false; cx.matrixShooting = false; cxStopPoll(); cx.rtLastCmd = 0; cx.rtFieldArmed = false;
+    cxFieldWindDown(['ripGameFill=0', 'resTestTargetA=0'], ['resTest=0', 'faCommissionGate=0'], 'Stopping the ripple sweep');
+}
+// Gentle field release shared by the sweep game and the current-check: the first writes command 0 A, the
+// 2.5 s wait lets the slew reach it, then the second writes release control. Every write is sent even if
+// one before it failed; the release is skipped only when a newer flow took the field during the wait.
+function cxFieldWindDown(first, release, what) {
     const ep = cxFieldEpoch;
-    cxGet('ripGameFill=0')
-        .then(() => cxGet('resTestTargetA=0')).then(() => new Promise(r => setTimeout(r, 2500)))
-        .then(() => { if (cxFieldEpoch !== ep) return; return cxGet('resTest=0').then(() => cxGet('faCommissionGate=0')); })
-        .catch(() => { });
+    (async () => {
+        const failed = await cxSendEach(first);
+        await new Promise(r => setTimeout(r, 2500));
+        if (cxFieldEpoch === ep) failed.push(...await cxSendEach(release));
+        cxReportStopFailure(what, failed);
+    })();
 }
 function cxMatrixStop() {
     cxMatrixFieldRelease();
@@ -29146,11 +30035,13 @@ async function cxMatrixSkip() {
         { title: 'Skip ripple map', okText: 'Skip it', cancelText: 'Keep going' });
     if (!ok) return;
     cxMatrixFieldRelease();   // clears matrixOn/rtFieldArmed so cxRunActive() is false at the next step
-    cx.handled = cx.handled || {};
-    cx.handled[4] = 'skip';
-    cxPassStage(4, 'skip');
     const nx = cxNextSelected(4);
-    cxGet('commissionStageSkip=4').finally(() => { if (nx === -1) cxFinish(); else cxGoto(nx); });
+    cxGet('commissionStageSkip=4').then(() => {
+        cx.handled = cx.handled || {};
+        cx.handled[4] = 'skip';
+        cxPassStage(4, 'skip');
+        if (nx === -1) cxFinish(); else cxGoto(nx);
+    }).catch(e => { xAlert('The step could not be skipped: ' + e + '.'); commissionRender(); });
 }
 
 // ── "RPM Invaders" — the guided sweep as a game ───────────────────────────────
@@ -29284,10 +30175,11 @@ function cxGameStop() {
     cxRpmStripVis();
 }
 // RPM strip is hidden during the Disturbances sweep game (draws its own trace) and on the read-only
-// Thresholds review (phase 5) — no test runs there, so live RPM steadiness is moot.
+// Thresholds review (phase 5) — no test runs there, so live RPM steadiness is moot. Also on Charge
+// Health Calibration (phase 9): its schedule chart and Engine speed readouts already carry the speed.
 function cxRpmStripVis() {
     const strip = document.getElementById('cx-rpm-strip');
-    if (strip) strip.style.display = (cxGame.active || (cx && cx.phase === 5)) ? 'none' : '';
+    if (strip) strip.style.display = (cxGame.active || (cx && (cx.phase === 5 || cx.phase === 9))) ? 'none' : '';
 }
 // Called from cxMatrixPoll with the parsed /filtripple.csv rows. Kill ground truth is the RPM ripple
 // table's per-bin ALT state: pending (altSt 1) kills the near invader, commit (altSt 2) kills both
@@ -29726,13 +30618,15 @@ function cxRtReady() {  // user is holding the resonant RPM → arm field-comman
     // Arm ripple capture + field-commanding, then command level 1.
     cxFieldArm();   // take field ownership → invalidates any pending sweep/current-check deferred release
     cxGet('faCommissionGate=1').then(() => cxGet('bcurRtest=1')).then(() => cxGet('resTest=1'))
-        .then(() => cxRtSetLevel(0));
+        .then(() => cxRtSetLevel(0))
+        .catch(e => { xAlert('The current check could not start: ' + e + '.'); cxRtAbort(); });
 }
 function cxRtSetLevel(idx) {
     cx.rtLevel = idx; cx.rtWinN = 0; cx.rtRingAt = 0; cx.rtBarSig = null; cx.rtCapturing = false; cx.rtLastCmd = Date.now();  // reset window count + keepalive stamp (ring itself is cleared below)
     // Clear the ring at each level: the 64-slot ring would otherwise fill across 3 levels and freeze with
     // stale data (level 3 would capture nothing). bcurRtest=1 zeroes the count → each level starts fresh.
-    cxGet('bcurRtest=1').then(() => cxGet('resTestTargetA=' + cx.rtLevels[idx].toFixed(1)));
+    cxGet('bcurRtest=1').then(() => cxGet('resTestTargetA=' + cx.rtLevels[idx].toFixed(1)))
+        .catch(e => { const m = document.getElementById('cx-rt-msg'); if (m) m.textContent = 'Could not set this level: ' + e + '. Abort and run the check again.'; });
     commissionRender();
 }
 // Current-check progress as a segmented bar per level (3 levels × CX_RT_MIN_WINS steady windows) —
@@ -29754,7 +30648,7 @@ function cxRtBarsHtml() {
 function cxRtTick() {
     const now = Date.now();
     // Keepalive: refresh the firmware deadman every ~3 s so a closed/crashed wizard auto-releases field control.
-    if (cx.rtLastCmd && now - cx.rtLastCmd > 3000) { cxGet('resTestTargetA=' + cx.rtLevels[cx.rtLevel].toFixed(1)); cx.rtLastCmd = now; }
+    if (cx.rtLastCmd && now - cx.rtLastCmd > 3000) { cxGet('resTestTargetA=' + cx.rtLevels[cx.rtLevel].toFixed(1)).catch(() => { }); cx.rtLastCmd = now; }
     const rpmEl = document.getElementById('cx-rt-rpm'), msgEl = document.getElementById('cx-rt-msg');
     if (!rpmEl) return;
     const rpm = cx.liveRpm, inRange = isFinite(rpm) && Math.abs(rpm - cx.rtestRpm) <= CX_RT_BAND;
@@ -29817,9 +30711,7 @@ function cxRtFinish() {
     cxStopPoll(); cx.rtLastCmd = 0; cx.rtFieldArmed = false;  // stop the keepalive; field released below
     // Gentle exit: ramp the commanded current to 0 and wait long enough for the slew to actually reach it
     // (~2.5 s covers a high last level at SetpointFallRate), THEN release (slew carries it back to AUTO).
-    const ep = cxFieldEpoch;   // release only if no newer flow (e.g. an immediate Retry) grabs the field during the wind-down
-    cxGet('resTestTargetA=0').then(() => new Promise(r => setTimeout(r, 2500)))
-        .then(() => { if (cxFieldEpoch !== ep) return; return cxGet('resTest=0').then(() => cxGet('bcurRtest=0')).then(() => cxGet('faCommissionGate=0')); });
+    cxFieldWindDown(['resTestTargetA=0'], ['resTest=0', 'bcurRtest=0', 'faCommissionGate=0'], 'Ending the current check');   // release skipped if a newer flow (e.g. an immediate Retry) grabs the field
     const pts = cx.rtPts;
     // Least-squares ripple = a0 + a1·I, clamping a1 ≥ 0 (ripple can't credibly fall with current; a noisy
     // negative slope must never LOWER a safety floor) → on clamp, fall back to a flat mean.
@@ -29852,7 +30744,8 @@ function cxRtFinish() {
         if (fs) cx.rtest.slp = { b0: fs.a0, b1: fs.a1, n: sPts.length };
         cxGet('ripFitAlt=' + encodeURIComponent(enc(pts, fa.a0, fa.a1, q => q.ia || 0, q => q.pa || 0)))
             .then(() => fs ? cxGet('slpFitAlt=' + encodeURIComponent(enc(sPts, fs.a0, fs.a1, q => q.ia || 0, q => q.sv || 0))) : null)
-            .then(() => { cxRipFit = null; if (cx) { cx.thr = null; cx.dbnd = null; } loadRipFit(() => renderRipplePlots()); });  // new fit → refresh plots + re-arm the Step-8 recommendations
+            .then(() => { cxRipFit = null; if (cx) { cx.thr = null; cx.dbnd = null; } loadRipFit(() => renderRipplePlots()); })  // new fit → refresh plots + re-arm the Step-8 recommendations
+            .catch(e => { if (cx) { cx.rtestState = 'failed'; cx.rtFailMsg = 'The measurement could not be saved: ' + e + '. Retry the check.'; commissionRender(); } });
     } else {
         const iLo = fa.lo, iHi = fa.hi;
         cx.rtestState = 'failed';
@@ -29862,9 +30755,7 @@ function cxRtFinish() {
 }
 function cxRtAbort() {
     cxStopPoll(); cx.rtLastCmd = 0; cx.rtFieldArmed = false;  // stop the keepalive; field released below
-    const ep = cxFieldEpoch;   // release only if no newer flow grabs the field during the wind-down
-    cxGet('resTestTargetA=0').then(() => new Promise(r => setTimeout(r, 2500)))
-        .then(() => { if (cxFieldEpoch !== ep) return; return cxGet('resTest=0').then(() => cxGet('bcurRtest=0')).then(() => cxGet('faCommissionGate=0')); });
+    cxFieldWindDown(['resTestTargetA=0'], ['resTest=0', 'bcurRtest=0', 'faCommissionGate=0'], 'Stopping the current check');
     cx.rtestState = 'idle';
     commissionRender();
 }
@@ -30050,7 +30941,7 @@ function protApplySlope() {
     const el = document.getElementById('protSlopeInput'); const v = el ? parseFloat(el.value) : NaN;
     if (!isFinite(v)) { xAlert('Enter a slope percent first.'); return; }
     const s = Math.min(50, Math.max(2, v));
-    cxGet('IExcessFrac=' + s.toFixed(1) + '&IExcessFracBulk=' + s.toFixed(1)).then(() => setTimeout(renderRipplePlots, 400)).catch(() => {});
+    cxGet('IExcessFrac=' + s.toFixed(1) + '&IExcessFracBulk=' + s.toFixed(1)).then(() => setTimeout(renderRipplePlots, 400)).catch(e => xAlert('The slope could not be saved: ' + e + '.', 'Not changed'));
 }
 // Protections ▸ G3 Safety-Margin Set — derives the parallel trip line from the measured ripple fit:
 // slope = ripple slope, CV base = ripple-at-idle + margin. Needs a Step-7 current-check fit.
@@ -30061,7 +30952,7 @@ function protApplyMargin() {
         const rf = cxRipFit && cxRipFit.alt;
         if (!rf || !(rf.n > 0)) { xAlert('No measured ripple yet — run Commissioning ▸ Step 5 (current-check) first, or set the Slope and CV base directly.'); return; }
         const base = Math.min(40, Math.max(0, rf.a0 + m)), slope = Math.min(50, Math.max(2, rf.a1 * 100));
-        cxGet('IExcessBaseA=' + base.toFixed(1) + '&IExcessFrac=' + slope.toFixed(1) + '&IExcessFracBulk=' + slope.toFixed(1)).then(() => setTimeout(renderRipplePlots, 400)).catch(() => {});
+        cxGet('IExcessBaseA=' + base.toFixed(1) + '&IExcessFrac=' + slope.toFixed(1) + '&IExcessFracBulk=' + slope.toFixed(1)).then(() => setTimeout(renderRipplePlots, 400)).catch(e => xAlert('The safety margin could not be saved: ' + e + '.', 'Not changed'));
     };
     if (!cxRipFit) loadRipFit(doApply); else doApply();
 }
@@ -30117,7 +31008,7 @@ function cvKdApplyMargin() {
         const rf = cxRipFit && cxRipFit.slp;
         if (!rf || !(rf.n > 0)) { xAlert('No measured voltage slope yet — run Commissioning ▸ Step 5 (current-check) first, or set the Voltage-Rise Tolerance base and slope directly.'); return; }
         const base = Math.min(dbndCeil(), Math.max(0, rf.a0 + m)), slope = Math.max(0, rf.a1);
-        cxGet('CvKdDeadbandVps=' + base.toFixed(2) + '&CvKdDbSlope=' + slope.toFixed(5)).then(() => setTimeout(renderSlopeDeadbandPlot, 400)).catch(() => {});
+        cxGet('CvKdDeadbandVps=' + base.toFixed(2) + '&CvKdDbSlope=' + slope.toFixed(5)).then(() => setTimeout(renderSlopeDeadbandPlot, 400)).catch(e => xAlert('The safety margin could not be saved: ' + e + '.', 'Not changed'));
     };
     if (!cxRipFit) loadRipFit(doApply); else doApply();
 }
@@ -30169,8 +31060,12 @@ function cxRenderThresh(b) {
         // Lithium copy was already one line and carries no "why" to hide, so it keeps the visible doc link.
         : 'Set the margin so the over-current trip line clears the ripple measured in the Disturbances step. A 5 A margin works well for most installations.'
           + cxDocLink('step-6-fault-threshold-autotuning');
+    cx.thrEdited = false;
     let body = '<h2 style="font-size:15px;font-weight:600;margin:0 0 4px;">Fault Threshold Autotuning</h2>' +
-        '<div id="cxThrTopGo"></div>' +
+        '<div id="cxThrQuick"></div>' +
+        // Opens by default so the first draws get a real canvas width; cxThrGoRender folds it when both fits exist.
+        '<details id="cxThrDetails" open ontoggle="cxThrDetailsToggle(this)" oninput="cx.thrEdited = true; cxThrGoRender()">' +
+        '<summary id="cxThrDetailsSum" style="cursor:pointer;font-size:13px;color:#9fb0af;margin:4px 0 12px;">Adjust the margins and see the graphs</summary>' +
         '<p style="font-size:13px;color:#b7b7b7;margin:0 0 12px;line-height:1.5;">' + introCopy + '</p>' +
         '<div id="cxThrNoFit"></div>' +
         '<div id="cxThrMarginRow" style="display:flex;align-items:center;gap:12px;margin:8px 0 14px;">' +
@@ -30209,20 +31104,36 @@ function cxRenderThresh(b) {
           cxThrLegItem('#4a9eff', 'Voltage-Rise Tolerance', false) +
         '</div>' +
         '</div>' +
-        '<div style="margin-top:16px;">' + cxNextBtn(true) + '</div>';
+        '</details>' +
+        '<div id="cxThrGo" style="margin-top:16px;">' + cxNextBtn(true) + '</div>';
     b.innerHTML = body;
-    loadRipFit(() => { cxThrInit(); cxThrDraw(); cxDbndInit(); cxDbndDraw(); cxThrTopGoRender(); });
+    loadRipFit(() => { cxThrInit(); cxThrDraw(); cxDbndInit(); cxDbndDraw(); cxThrGoRender(true); });
 }
-// Top-of-step accept-and-go. Both halves of this step already wrote their recommended values on
-// entry (cxThrInit / cxDbndInit), so this is a plain advance — nothing extra to apply. Rendered from
-// the init callback, not the body string, so it cannot be pressed before those writes have landed.
+// Accept-and-go. Both halves of this step already wrote their recommended values on entry
+// (cxThrInit / cxDbndInit), so this is a plain advance — nothing extra to apply. Rendered from the
+// init callback, not the body string, so it cannot be pressed before those writes have landed.
 // Withheld when either half has no measured fit: there the numbers are carried-over defaults rather
-// than a recommendation, and the hand-set prompts are the actual work.
-function cxThrTopGoRender() {
-    const el = document.getElementById('cxThrTopGo'); if (!el) return;
-    if (!(cx.thr && cx.thr.rf && cx.dbnd && cx.dbnd.rf)) { el.innerHTML = ''; return; }
-    el.innerHTML = '<button onclick="cxAdvance(true)" class="btn-primary" style="width:100%;padding:10px;margin:10px 0 4px;">Move ahead with defaults (Recommended)</button>' +
-        '<div style="font-size:12px;color:#8a8a8a;margin:0 0 14px;line-height:1.45;">Both margins below are already set from your own measurements and saved. Read on only if you want to change them.</div>';
+// than a recommendation, the details stay open, and the hand-set prompts are the actual work.
+// The "defaults" label holds only while the owner has not touched a margin; after that it is plain Next.
+function cxThrGoRender(fold) {
+    const go = document.getElementById('cxThrGo'); if (!go) return;
+    const q = document.getElementById('cxThrQuick');
+    const det = document.getElementById('cxThrDetails');
+    const rec = !!(cx.thr && cx.thr.rf && cx.dbnd && cx.dbnd.rf);
+    if (det && fold) det.open = !rec;
+    if (q) q.innerHTML = rec ? '<p style="font-size:13px;color:#b7b7b7;margin:0 0 10px;line-height:1.5;">Both safety margins are already set from your own measurements and saved.</p>' : '';
+    const sum = document.getElementById('cxThrDetailsSum'); if (sum) sum.style.display = rec ? '' : 'none';
+    const useDefaults = rec && !cx.thrEdited;
+    const k = useDefaults ? 'defaults' : 'next';
+    if (go.dataset.k === k) return;
+    go.dataset.k = k;
+    go.innerHTML = useDefaults
+        ? '<button onclick="cxAdvance(true)" class="btn-primary" style="width:100%;padding:12px;font-size:15px;">Move ahead with defaults (Recommended)</button>'
+        : cxNextBtn(true);
+}
+// A canvas inside a closed <details> has no width, so the plots are redrawn each time it opens.
+function cxThrDetailsToggle(det) {
+    if (det.open) { cxThrDraw(); cxDbndDraw(); }
 }
 // Seed wizard-local state from the fit + current device settings; on first entry apply the per-chemistry
 // margin recommendation (5 A lithium, 30 A non-lithium) plus the matching over-current ceiling (20/40 A),
@@ -30305,7 +31216,7 @@ function cxThrWrite(keys) {
         else if (k === 'floor') q.push('IExcessFloorA=' + st.floor.toFixed(1));
         else if (k === 'ceil') q.push('IExcessCeilA=' + st.ceil.toFixed(1));
     });
-    if (q.length) cxGet(q.join('&')).catch(() => {});
+    if (q.length) cxGet(q.join('&')).catch(e => xAlert('The trip-line values could not be saved: ' + e + '. The plot shows values the regulator does not have yet; change them again once it answers.', 'Not saved'));
 }
 
 // ── Thresholds step, part 2: D-term deadband line from the measured voltage-slope fit ─────────
@@ -30367,7 +31278,7 @@ function cxDbndMarginInput(v) {
 }
 function cxDbndWrite() {
     const st = cx.dbnd; if (!st || !isFinite(st.base)) return;
-    cxGet('CvKdDeadbandVps=' + st.base.toFixed(2) + '&CvKdDbSlope=' + (st.slope || 0).toFixed(5)).catch(() => {});
+    cxGet('CvKdDeadbandVps=' + st.base.toFixed(2) + '&CvKdDbSlope=' + (st.slope || 0).toFixed(5)).catch(e => xAlert('The voltage-rise tolerance could not be saved: ' + e + '. The plot shows values the regulator does not have yet; change them again once it answers.', 'Not saved'));
 }
 function cxDbndHandSet() {
     const el = document.getElementById('cxDbndHand'); const v = el ? parseFloat(el.value) : NaN;
@@ -30561,6 +31472,7 @@ function cvsFix(kind) {
 }
 
 // ── Wizard step (stage index 8) ──
+function cxStressCancel() { cxSendEach(['cvStressCancel=1']).then(f => cxReportStopFailure('Cancelling the stress test', f)); }
 function cxStressStart() {
     if (!cx.cvs) cx.cvs = {};
     cx.cvs.running = true; cx.cvs.err = null; cx.cvs.j = null; cx.cvs.ph = 0; cx.cvs._sawActive = false;
@@ -30632,7 +31544,41 @@ function cxChcInit() {
     let pct = 50;
     try { const v = parseInt(localStorage.getItem('chcTestPct') || '', 10); if (v >= 20 && v <= 80) pct = v; } catch (e) { }
     cx.chc = { started: false, running: false, pct: pct, j: null, err: null, sawActive: false, done: null, prevPct: null,
-               maxRpm: 0, idle: 0, top: 0, rampS: 0, trail: [], inS: 0, totS: 0, _anim: false };
+               maxRpm: 0, idle: 0, top: 0, rampS: 0, trail: [], inS: 0, totS: 0, _anim: false,
+               capA: 0, capHi: false, step8Top: 0, advOpen: false };
+}
+function cxChcAdvSet(open) { if (cx && cx.chc) cx.chc.advOpen = open; }
+function cxChcIdleNowText() {
+    return 'Engine speed ' + ((cx && isFinite(cx.liveRpm) && cx.liveRpm > 0) ? Math.round(cx.liveRpm).toLocaleString() + ' rpm' : '—');
+}
+// Setup-screen facts only the device has: the charge-rate limit at the test top (/chc.json topCapA,
+// from the same code that sizes the run) and whether a maximum working RPM is on file. With none on
+// file, step 8's highest held speed is adopted — cxKneeApply normally stores it; this covers anchors
+// that were captured but never applied. The on-file check reads /chc.json, not the CSV3 echo, which
+// may not have arrived yet and would make a stored maximum look absent.
+function cxChcSetupFetch(force) {
+    const c = cx.chc, now = performance.now();
+    const onSetup = () => cx && cx.phase === 9 && cx.chc === c && !c.started && !c.done;
+    if (cx.kneeAnchors !== undefined) c.step8Top = cxKneeTopRpm(cx.kneeAnchors);
+    else if (!c._s8Asked) {
+        c._s8Asked = true;
+        fetch(buildURL('/kneesweep.json')).then(r => r.json()).then(j => {
+            c.step8Top = cxKneeTopRpm(j.anchors);
+            if (onSetup()) { cxChcSetupFetch(true); commissionRender(); }
+        }).catch(() => { });
+    }
+    if (!force && c._setupAt && now - c._setupAt < 5000) return;
+    c._setupAt = now;
+    fetch(buildURL('/chc.json')).then(r => r.json()).then(j => {
+        if (!onSetup()) return;
+        const capA = Number(j.topCapA) || 0, hi = !!j.hiCol, changed = capA !== c.capA || hi !== c.capHi;
+        c.capA = capA; c.capHi = hi;
+        if (!(Number(j.maxRpm) > 0) && !(c.maxRpm > 0) && c.step8Top > 0) {
+            c.maxRpm = c.step8Top;
+            cxGet('maxWorkingRpm=' + c.step8Top).then(() => cxChcSetupFetch(true)).catch(() => { c.maxRpm = 0; commissionRender(); });   // not stored: drop the session value so the next setup read tries again
+            commissionRender();
+        } else if (changed) commissionRender();
+    }).catch(() => { });
 }
 function cxChcPct(delta) {
     const c = cx.chc;
@@ -30653,8 +31599,10 @@ function cxChcSetMax() {
     if (!el) return;
     const v = Math.round(parseFloat(el.value));
     if (!(v >= 800 && v <= 8000)) { xAlert('Enter a maximum working RPM between 800 and 8,000.'); return; }
+    const prev = cx.chc.maxRpm;
     cx.chc.maxRpm = v;
-    cxGet('maxWorkingRpm=' + v).catch(() => { });
+    cxGet('maxWorkingRpm=' + v).then(() => cxChcSetupFetch(true))   // the limit shown under Test current is read at the new top
+        .catch(e => { cx.chc.maxRpm = prev; commissionRender(); xAlert('The maximum working RPM could not be saved: ' + e + '.', 'Not changed'); });
     commissionRender();
 }
 function cxChcIdleGuess() { return (isFinite(cx.liveRpm) && cx.liveRpm > 0) ? cx.liveRpm : 700; }   // 700 = preview stand-in while the engine is off; the run itself takes idle from the firmware
@@ -30746,30 +31694,180 @@ function cxChcDraw(cv, c, P, t, rpm, running) {
     }
     g.fillStyle = '#8a9599'; g.font = '11px -apple-system,sans-serif'; g.textAlign = 'right';
     g.fillText('Cycle ' + cy.k + ' of ' + CHC_CYCLES, w - R - 2, h - B - 4);
-    if (c.trail.length > 1) {
+    // This cycle's trail in screen space: [x0, y0, x1, y1, in band].
+    const tr = [];
+    for (let i = 1; i < c.trail.length; i++) {
+        const a = c.trail[i - 1], b = c.trail[i];
+        if (b[0] < cy.t0 || a[0] > cy.t1) continue;
+        const bd = cxChcBandAt(P, b[0]);
+        tr.push([X(a[0]), Y(a[1]), X(b[0]), Y(b[1]), b[1] >= bd[0] && b[1] <= bd[1]]);
+    }
+    if (tr.length) {
+        // Water under the trail: the trail redrawn 7 times, each copy lower and fainter, so the trail reads as the sea surface.
+        g.lineWidth = 2.1; g.lineCap = 'butt'; g.lineJoin = 'round';
+        for (let j = 7; j >= 1; j--) {
+            const dy = j * 1.7, al = (0.17 * (1 - (j - 1) / 7)).toFixed(3);
+            for (let i = 0; i < tr.length; i++) {
+                const s = tr[i];
+                if (!i || s[4] !== tr[i - 1][4]) {
+                    if (i) g.stroke();
+                    g.strokeStyle = 'rgba(' + (s[4] ? CHC_RGB_IN : CHC_RGB_OUT) + ',' + al + ')';
+                    g.beginPath(); g.moveTo(s[0], s[1] + dy);
+                }
+                g.lineTo(s[2], s[3] + dy);
+            }
+            g.stroke();
+        }
         g.lineWidth = 2.2; g.lineCap = 'round';
-        for (let i = 1; i < c.trail.length; i++) {
-            const a = c.trail[i - 1], b = c.trail[i];
-            if (b[0] < cy.t0 || a[0] > cy.t1) continue;
-            const bd = cxChcBandAt(P, b[0]);
-            g.strokeStyle = (b[1] >= bd[0] && b[1] <= bd[1]) ? 'rgba(230,237,239,.9)' : 'rgba(240,165,0,.95)';
-            g.beginPath(); g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); g.stroke();
+        for (const s of tr) {
+            g.strokeStyle = s[4] ? 'rgba(230,237,239,.9)' : 'rgba(240,165,0,.95)';
+            g.beginPath(); g.moveTo(s[0], s[1]); g.lineTo(s[2], s[3]); g.stroke();
         }
     }
     if (running && t <= P.total && isFinite(rpm) && rpm > 0) {
         g.strokeStyle = 'rgba(255,255,255,.13)'; g.lineWidth = 1;
         g.beginPath(); g.moveTo(X(t), T); g.lineTo(X(t), h - B); g.stroke();
         const bd = cxChcBandAt(P, t);
-        cxChcBoat(g, X(t), Y(rpm), (rpm >= bd[0] && rpm <= bd[1]) ? '#2ec4b6' : '#f0a500');
+        // Bow-up angle: where the trail has been heading over the last ~0.6 s, scaled down and capped so a steep
+        // ramp on a narrow phone chart cannot stand the boat on end. Eased, so a stepped RPM feed does not snap it.
+        let want = 0;
+        for (let i = c.trail.length - 1; i >= 0; i--) {
+            const p = c.trail[i];
+            if (p[0] < cy.t0) break;
+            if (t - p[0] >= 0.6) { want = Math.max(-0.35, Math.min(0.35, -0.6 * Math.atan2(Y(rpm) - Y(p[1]), X(t) - X(p[0])))); break; }
+        }
+        const now = performance.now(), dt = c._boatAt ? Math.min(0.25, (now - c._boatAt) / 1000) : 0;
+        c._boatAt = now;
+        c._pitch = (c._pitch || 0) + (want - (c._pitch || 0)) * (1 - Math.exp(-dt / 0.3));
+        cxChcBoat(g, X(t), Y(rpm), (rpm >= bd[0] && rpm <= bd[1]) ? CHC_RGB_IN : CHC_RGB_OUT,
+            window.vesselInfo && window.vesselInfo.boat_type, c._pitch, now / 1000);
     }
 }
-function cxChcBoat(g, x, y, col) {
-    g.save(); g.translate(x, y); g.lineJoin = 'round';
-    g.fillStyle = col; g.strokeStyle = col; g.lineWidth = 1.4;
-    g.beginPath(); g.moveTo(-9, 0); g.lineTo(9, 0); g.lineTo(5, 4.5); g.lineTo(-6, 4.5); g.closePath(); g.fill();
-    g.beginPath(); g.moveTo(0, -1); g.lineTo(0, -15); g.stroke();
-    g.beginPath(); g.moveTo(1, -14); g.lineTo(1, -2); g.lineTo(8, -2); g.closePath(); g.fill();
-    g.beginPath(); g.moveTo(-1, -12); g.lineTo(-1, -2); g.lineTo(-7, -2); g.closePath(); g.fill();
+// ── The marker: a silhouette of the owner's Boat Type (Vessel Info) riding a wave ──
+const CHC_RGB_IN = '46,196,182', CHC_RGB_OUT = '240,165,0';   // in band / out of band
+const CHC_BOAT_BG = '#0f1416';       // MUST equal the chcLane canvas background in cxRenderChc
+const CHC_BOAT_SCALE = 26 / 30;      // the art below is ~30 px long; shown 26 px long
+const CHC_REDUCE_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+// SVG path data, bow toward +x, waterline at y = 0. Keys MUST equal the BOAT_TYPE option values in index.html.
+// body = marker colour; ink = cut-outs in the chart background; far = offset of the second hull (body[0]
+// again, dimmer); trim = standing bow-up angle, rad.
+const CHC_BOAT_ART = {
+    monohull: {
+        body: ['M-13,-3.4Q0,-2.7 15,-4.8Q13.4,-0.6 9.2,3.2L-9.4,3.2Q-12.5,2 -13,-3.4Z',
+               'M-7,-3L-5.6,-5.7L3.4,-6L6.2,-3.6Z',
+               'M1,-3.8L1,-28.4L2.1,-28.4L2.1,-3.8Z',
+               'M-0.2,-26.6Q-8.6,-19 -11.8,-7.6L-0.2,-7.6Z',
+               'M3.3,-25L14.4,-6L3.6,-7.4Z'],
+        ink: ['M-4.6,-5L2.8,-5.2L3.3,-4.3L-5,-4.1Z']
+    },
+    catamaran: {
+        far: [3.4, -2.4],
+        body: ['M-14,-2.8L13.6,-3.2L14.8,-0.6Q13.8,2.4 10.6,2.9L-11.6,2.9Q-13.6,2.2 -14,-2.8Z',
+               'M-9.6,-2.8L-7,-8.4Q-6.4,-9.6 -5,-9.6L4.2,-9.6Q5.6,-9.6 6.4,-8.6L10.4,-3.1Z',
+               'M-0.9,-9.4L-0.9,-29.6L0.2,-29.6L0.2,-9.4Z',
+               'M-2,-28L-5.4,-27.4Q-10.4,-19.5 -12.6,-11.2L-2,-11.2Z',
+               'M1.4,-25L13.2,-3.8L1.8,-11Z'],
+        ink: ['M-5.6,-8.2L4.6,-8.2L7.4,-5.4L-6.8,-5.4Z']
+    },
+    trawler: {
+        body: ['M-14,-4.8Q0,-4.2 9.6,-6.2L15.8,-8.8Q14.8,-2 11,3.2L-12.6,3.2Z',
+               'M-11.2,-4.4L-11.2,-9.8L-2,-9.8L-2,-4.4Z',
+               'M-3,-4.4L-3,-14.2L6.8,-14.2L6,-10L9,-5.6Z',
+               'M-4.8,-15.4L8.4,-15.4L8.4,-14.2L-4.8,-14.2Z',
+               'M-1.4,-15L-1.4,-23.6L-0.4,-23.6L-0.4,-15Z',
+               'M-1,-19.6L-9.6,-14.6L-9.2,-13.9L-0.8,-18.6Z',
+               'M-3,-21.8L1.2,-21.8L1.2,-20.8L-3,-20.8Z'],
+        ink: ['M-1.6,-12.8L1.4,-12.8L1.4,-10.4L-1.6,-10.4Z',
+              'M2.4,-12.8L5.3,-12.8L4.9,-10.4L2.4,-10.4Z',
+              'M-9.8,-8.4L-3.8,-8.4L-3.8,-6.6L-9.8,-6.6Z',
+              'M-13.5,-2.6L13.4,-3.9L13.6,-3.2L-13.4,-1.9Z']
+    },
+    powerboat: {
+        trim: 0.09,
+        body: ['M-13.6,-4.6L7,-5.6Q13,-5.9 17.2,-7.2Q13.4,-0.2 7,2.8L-12.8,2.8Z',
+               'M-8,-4.6L-5.4,-9.4L1,-9.6L7.6,-5.5Z',
+               'M-11.8,-4.6L-9.6,-9.2L-8.2,-9.2L-9.6,-4.6Z',
+               'M-13.8,-6.8L-16.8,-6.4L-17,-3L-15.8,-2.6L-15.9,2.6L-14.4,2.6L-14.2,-2.8L-13.6,-3Z'],
+        ink: ['M-4.6,-8.5L0.6,-8.7L4.6,-6L-5.6,-5.8Z',
+              'M-13.2,-2.4L11.6,-3.9L12,-3.2L-13.1,-1.7Z']
+    },
+    other: {
+        body: ['M-12.4,-4Q2,-3.4 13.8,-5.4Q12.2,-0.2 8.6,3L-10.2,3Q-12.2,1.6 -12.4,-4Z',
+               'M-2.4,-3.8L-0.6,-7.8L5,-7.8L7.6,-4.4Z',
+               'M-6.6,-3.6L-6.6,-15L-5.6,-15L-5.6,-3.6Z',
+               'M-6.6,-15L-13.4,-13.2L-6.6,-11.4Z'],
+        ink: ['M-0.2,-6.8L4.4,-6.8L5.8,-4.9L-1,-4.9Z']
+    }
+};
+function cxChcBoatArt(type) {
+    // Nothing on file = monohull, the Vessel Info form's own default; a value with no art = the plain launch.
+    const a = (type && Object.prototype.hasOwnProperty.call(CHC_BOAT_ART, type)) ? CHC_BOAT_ART[type]
+        : (type ? CHC_BOAT_ART.other : CHC_BOAT_ART.monohull);
+    if (!a.p) { a.p = a.body.map(d => new Path2D(d)); a.q = a.ink.map(d => new Path2D(d)); }
+    return a;
+}
+function cxChcBoatPaint(g, a, rgb) {
+    // Dark halo first: keeps the marker readable where it crosses the white trail and the band edges.
+    g.lineJoin = 'round'; g.strokeStyle = CHC_BOAT_BG; g.lineWidth = 2.2;
+    if (a.far) {
+        g.save(); g.translate(a.far[0], a.far[1]);
+        g.stroke(a.p[0]); g.fillStyle = CHC_BOAT_BG; g.fill(a.p[0]);
+        g.fillStyle = 'rgba(' + rgb + ',.5)'; g.fill(a.p[0]);
+        g.restore();
+    }
+    a.p.forEach(p => g.stroke(p));
+    g.fillStyle = 'rgb(' + rgb + ')'; a.p.forEach(p => g.fill(p));
+    g.fillStyle = CHC_BOAT_BG; a.q.forEach(p => g.fill(p));
+}
+// (x, y) is the true engine-speed point and stays on the waterline; the chop heaves the hull about 2 px either way.
+// pitch = bow-up angle, rad: the water under the hull tilts with it, so a climb reads as the face of a swell.
+function cxChcBoat(g, x, y, rgb, type, pitch, tau) {
+    const S = CHC_BOAT_SCALE, a = cxChcBoatArt(type), tt = CHC_REDUCE_MOTION ? 0.2 : tau;
+    const W = 44 * S, A = 2.1 * S, k = 2 * Math.PI / (36 * S), ph = tt * 2 * Math.PI * 0.8, m = Math.tan(pitch);
+    const E = u => { const e = Math.cos(Math.PI * u / (2 * W)); return e * e; };   // fades the water out at both ends
+    const ys = u => y - (m * u + A * Math.sin(k * u + ph)) * E(u);                  // the water surface
+    g.save();
+    // water body: 2 px strips, each fading downward from the surface
+    const D = 13 * S, bx = Math.round(x);
+    const gr = g.createLinearGradient(0, 0, 0, D);
+    gr.addColorStop(0, 'rgba(' + rgb + ',.42)'); gr.addColorStop(1, 'rgba(' + rgb + ',0)');
+    g.fillStyle = gr;
+    for (let u = -Math.floor(W / 2) * 2; u < W; u += 2) {
+        const yy = ys(u + 1);
+        g.globalAlpha = E(u + 1);
+        g.translate(bx + u, yy); g.fillRect(0, 0, 2, D); g.translate(-(bx + u), -yy);
+    }
+    const sg = g.createLinearGradient(x - W, 0, x + W, 0);
+    sg.addColorStop(0, 'rgba(' + rgb + ',0)'); sg.addColorStop(0.3, 'rgba(' + rgb + ',.95)');
+    sg.addColorStop(0.7, 'rgba(' + rgb + ',.95)'); sg.addColorStop(1, 'rgba(' + rgb + ',0)');
+    g.strokeStyle = sg; g.lineCap = 'butt'; g.lineJoin = 'round';
+    // a second, fainter wave behind the hull gives the water some depth
+    const yb = u => y - 2.4 * S - (m * u + 0.7 * A * Math.sin(0.8 * k * u + 0.7 * ph + 2.1)) * E(u);
+    g.globalAlpha = 0.42; g.lineWidth = 1.2 * S;
+    g.beginPath();
+    for (let u = -W; u <= W; u += 2) u === -W ? g.moveTo(x + u, yb(u)) : g.lineTo(x + u, yb(u));
+    g.stroke();
+    g.globalAlpha = 1; g.lineWidth = 1.7 * S;
+    g.beginPath();
+    for (let u = -W; u <= W; u += 2) u === -W ? g.moveTo(x + u, ys(u)) : g.lineTo(x + u, ys(u));
+    g.stroke();
+    // the vessel, clipped at the surface so the hull sits in the water rather than on it
+    g.save();
+    g.beginPath(); g.moveTo(x - W, y - 400);
+    for (let u = -W; u <= W; u += 2) g.lineTo(x + u, ys(u) - 0.2 * S);
+    g.lineTo(x + W, y - 400); g.closePath(); g.clip();
+    g.translate(x, ys(0) + 0.7 * S);
+    g.rotate(-(pitch + (a.trim || 0)) - 0.45 * Math.atan(A * k * Math.cos(ph)));
+    g.scale(S, S);
+    cxChcBoatPaint(g, a, rgb);
+    g.restore();
+    // foam drifting aft of the stern
+    g.strokeStyle = '#e6edef'; g.lineWidth = 1.1 * S; g.lineCap = 'round';
+    for (let i = 0; i < 3; i++) {
+        const f = (tt * 0.9 + i / 3) % 1, u = -(15 + f * 23) * S;
+        g.globalAlpha = 0.6 * (1 - f) * E(u);
+        g.beginPath(); g.moveTo(x + u, ys(u) - 0.7 * S); g.lineTo(x + u - 3 * S, ys(u - 3 * S) - 0.7 * S); g.stroke();
+    }
     g.restore();
 }
 // The live loop: the boat, the trail, the cue and the live rows are updated in place every frame.
@@ -30792,7 +31890,7 @@ function cxChcAnim() {
     if (cue) cue.classList.toggle('off', live && !ok && !over);
     if (l1) l1.textContent = over ? 'Done — handing the field back'
         : !live ? 'Waiting for engine speed'
-        : ok ? 'Adjust throttle to keep engine speed in desired range'
+        : ok ? 'Adjust throttle to keep engine speed in range band'
         : (rpm > tg ? 'Too fast — ease back into the range' : 'Too slow — bring it up into the range');
     if (l2) l2.textContent = over ? '' : ('Cycle ' + cxChcCycleAt(P, t).k + ' of ' + CHC_CYCLES + ' · ' + cxChcSegAt(P, t).l2);
     const j = c.j || {};
@@ -30820,7 +31918,7 @@ function cxChcStart() {
         .then(() => { setTrackedTimeout(cxChcPoll, 700); })
         .catch(e => { c.running = false; c.err = 'could not start — ' + e; commissionRender(); });
 }
-function cxChcCancel() { cxGet('chcCancel=1').catch(() => { }); }
+function cxChcCancel() { cxSendEach(['chcCancel=1']).then(f => cxReportStopFailure('Cancelling the charge test', f)); }
 function cxChcPoll() {
     const c = cx && cx.chc;
     if (!c || !c.running) return;
@@ -30846,10 +31944,10 @@ function cxChcPoll() {
             if (!j.ok && c.pct > 20 && CHC_CEILING_RE.test(String(j.abort || ''))) { c.prevPct = c.pct; cxChcPct(-10); }
             commissionRender(); return;
         }
-        if (giveUp()) { c.running = false; cxGet('chcCancel=1').catch(() => { }); c.err = 'no result (timed out) — start over'; commissionRender(); return; }
+        if (giveUp()) { c.running = false; cxChcCancel(); c.err = 'no result (timed out) — start over'; commissionRender(); return; }
         setTrackedTimeout(cxChcPoll, 700);
     }).catch(() => {
-        if (giveUp()) { c.running = false; cxGet('chcCancel=1').catch(() => { }); c.err = 'lost connection during the run — start over'; commissionRender(); return; }
+        if (giveUp()) { c.running = false; cxChcCancel(); c.err = 'lost connection during the run — start over'; commissionRender(); return; }
         setTrackedTimeout(cxChcPoll, 1200);
     });
 }
@@ -30881,16 +31979,15 @@ function cxRenderChc(b) {
     cxChcInit();
     const c = cx.chc, j = c.j || {};
     const fmt = v => Math.round(v).toLocaleString();
-    const topPct = Math.round(CHC_TOP_FRAC * 100) + '%';
     const okBox = t => '<div style="margin:10px 0;padding:8px 10px;background:#1e2a1e;border:1px solid #3a5a3a;border-radius:6px;color:#bdb;">' + t + '</div>';
     const warnBox = t => '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' + t + '</div>';
     const live = (lab, id, val) => '<div style="display:flex;justify-content:space-between;font-size:13px;color:#9aa;margin:8px 0 0;font-variant-numeric:tabular-nums;">' +
         '<span>' + lab + '</span><b id="' + id + '" style="color:#e6edef;">' + val + '</b></div>';
     const pctRow = note => '<div style="display:flex;align-items:center;gap:8px;margin:12px 0 4px;">' +
         '<span style="font-size:13px;color:#9aa;">Test current</span>' +
-        '<button onclick="cxChcPct(-10)" class="btn-secondary" style="width:30px;padding:4px 0;">&minus;</button>' +
+        '<button onclick="cxChcPct(-10)" class="btn-secondary" style="width:34px;max-width:none;padding:6px 0;">&minus;</button>' +
         '<span style="min-width:74px;text-align:center;color:#2ec4b6;font-weight:600;font-variant-numeric:tabular-nums;">' + c.pct + '%</span>' +
-        '<button onclick="cxChcPct(10)" class="btn-secondary" style="width:30px;padding:4px 0;">+</button></div>' +
+        '<button onclick="cxChcPct(10)" class="btn-secondary" style="width:34px;max-width:none;padding:6px 0;">+</button></div>' +
         '<div style="color:#9aa;font-size:12.5px;margin:0 0 12px;">' + note + '</div>';
     // The chart sits in a relative box so the Start overlay can be centred ON the plot.
     const chart = overlay => '<div style="position:relative;margin:6px 0 0;">' +
@@ -30900,53 +31997,78 @@ function cxRenderChc(b) {
     let body = '';
     if (c.err) body += warnBox('<strong>' + c.err + '</strong>');
 
-    // 1 · setup: the maximum working RPM, the test current, the schedule preview, Start
+    // The one instruction slot, above the chart in every state: plain text before Start, the lit cue while
+    // a run is live (cxChcAnim rewrites both lines and flips it amber). styles.css fixes its heights, so
+    // the chart under it never moves when the words change.
+    const cue = (lit, l2) => '<div id="chcCue" class="cx-cue cx-cue-lane' + (lit ? '' : ' cx-cue-idle') + '">' +
+        '<div class="cx-cue-l1" id="chcCueL1">Adjust throttle to keep engine speed in range band</div>' +
+        '<div class="cx-cue-l2" id="chcCueL2">' + l2 + '</div></div>';
+    const maxInput = v => '<input type="number" id="chcMaxRpm" value="' + (v > 0 ? v : '') + '" min="800" max="8000" step="50" inputmode="numeric"' +
+        ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();cxChcSetMax();}"' +
+        ' style="width:104px;background:#0f1416;border:1px solid #383e42;border-radius:6px;color:#e6edef;padding:8px 10px;font-size:16px;font-variant-numeric:tabular-nums;">';
+
+    // 1 · setup: the schedule preview with Start on it. The maximum working RPM normally arrives from
+    //   step 8 (cxKneeTopRpm) and, with the test current, sits in Advanced; it is asked on the chart only
+    //   when the device has none on file, or the one on file leaves the test no room.
     if (!c.started && !c.done) {
+        cxChcSetupFetch(false);
         const maxRpm = cxChcMaxRpm();
         const top = maxRpm > 0 ? Math.round(CHC_TOP_FRAC * maxRpm) : 0;
-        body += '<p style="font-size:15px;line-height:1.5;margin:0 0 6px;">What is your maximum working RPM?</p>';
-        body += '<div style="display:flex;align-items:center;gap:9px;margin:6px 0;">' +
-            '<input type="number" id="chcMaxRpm" value="' + (maxRpm > 0 ? maxRpm : '') + '" min="800" max="8000" step="50" inputmode="numeric"' +
-            ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();cxChcSetMax();}"' +
-            ' style="width:110px;background:#0f1416;border:1px solid #383e42;border-radius:6px;color:#e6edef;padding:8px 10px;font-size:16px;font-variant-numeric:tabular-nums;">' +
-            '<button onclick="cxChcSetMax()" class="btn-primary" style="padding:8px 16px;">Enter</button></div>';
-        body += '<div style="font-size:13px;color:#9aa;margin:2px 0 10px;">Test will max out at ' + topPct + ' of max (<b style="color:#2ec4b6;font-variant-numeric:tabular-nums;">' +
-            (top > 0 ? fmt(top) : '—') + '</b> RPM)</div>';
-        // Range check at entry time, against the idle the engine is showing now — the same guard the
-        // firmware applies at Start, said here so a too-low number is caught before any throttle work.
+        // Range check against the idle the engine is showing now — the same guard the firmware applies
+        // at Start, said here so a too-low number is caught before any throttle work.
         const idleNow = (isFinite(cx.liveRpm) && cx.liveRpm > 0) ? cx.liveRpm : 0;
-        let tooLow = false;
-        if (top > 0 && idleNow > 0 && top < idleNow + CHC_HOLD_ABOVE_IDLE) {
-            tooLow = true;
-            const need = Math.ceil((idleNow + CHC_HOLD_ABOVE_IDLE) / CHC_TOP_FRAC / 50) * 50;
-            body += warnBox('<strong>Too low for the test to have room.</strong> ' + topPct + ' of ' + fmt(maxRpm) + ' is ' + fmt(top) +
-                ' rpm, only ' + fmt(top - idleNow) + ' rpm above idle (' + fmt(idleNow) + '). The passes need at least ' + CHC_HOLD_ABOVE_IDLE +
-                ' rpm of range, so the maximum would have to be ' + fmt(need) + ' or higher.');
-        }
-        body += pctRow(c.pct === 50
-            ? 'Half the charge-rate limit at the test top. Lower it only if a run stops early and you have to repeat this exercise.'
-            : 'Share of the charge-rate limit at the test top.');
+        const tooLow = top > 0 && idleNow > 0 && top < idleNow + CHC_HOLD_ABOVE_IDLE;
+        const ready = maxRpm > 0 && !tooLow;
         c.idle = cxChcIdleGuess(); c.top = top;
         c.rampS = top > 0 ? Math.max(CHC_MIN_RAMP_S, (top - c.idle) / CHC_PACE_RPM_S) : 0;
-        const overlay = !(maxRpm > 0)
-            ? '<div style="font-size:13px;color:#b9c6c8;">Enter your maximum working RPM first</div>'
-            : tooLow
-                ? '<div style="font-size:13px;color:#f0a500;">The entered maximum is too low for the test — see above</div>'
-                : '<button onclick="cxChcStart()" class="btn-primary" style="padding:13px 40px;font-size:16px;box-shadow:0 4px 18px rgba(0,0,0,.45);">Start</button>' +
-                  '<div style="font-size:12.5px;color:#b9c6c8;">Bring the engine to idle first</div>';
+        body += cue(false, ready ? CHC_CYCLES + ' cycles, idle to ' + fmt(top) + ' rpm' : '&nbsp;');
+        let overlay;
+        if (ready) {
+            overlay = '<div style="font-size:16px;font-weight:600;color:#e6edef;">Bring the engine to idle</div>' +
+                '<button onclick="cxChcStart()" class="btn-primary" style="padding:13px 40px;font-size:16px;box-shadow:0 4px 18px rgba(0,0,0,.45);">Start</button>' +
+                '<div id="chcIdleNow" style="font-size:12.5px;color:#b9c6c8;font-variant-numeric:tabular-nums;">' + cxChcIdleNowText() + '</div>';
+        } else {
+            const need = Math.ceil((idleNow + CHC_HOLD_ABOVE_IDLE) / CHC_TOP_FRAC / 50) * 50;
+            overlay = '<div style="font-size:16px;font-weight:600;color:#e6edef;">What is your maximum working RPM?</div>' +
+                '<div style="display:flex;align-items:center;gap:9px;">' + maxInput(maxRpm) +
+                '<button onclick="cxChcSetMax()" class="btn-primary" style="padding:9px 16px;">Enter</button></div>' +
+                (tooLow
+                    ? '<div style="font-size:12.5px;line-height:1.45;color:#f0a500;"><strong>' + fmt(maxRpm) + ' is too low.</strong> The test tops out at half of it, ' + fmt(top) +
+                      ' rpm, and needs ' + CHC_HOLD_ABOVE_IDLE + ' rpm above idle (' + fmt(idleNow) + '). Enter ' + fmt(need) + ' or higher.</div>'
+                    : '<div style="font-size:12.5px;color:#b9c6c8;">The highest engine speed you normally run</div>');
+        }
         body += chart(overlay);
-        body += '<div style="font-size:12.5px;color:#8a9599;margin:8px 0 0;">The shaded band is the speed to be at; the boat is you. ' + CHC_CYCLES + ' cycles, no stopping between them.</div>';
+        if (ready) {
+            const capA = c.capA > 0 ? c.capA : 0, amps = capA * c.pct / 100;
+            const row = (lab, ctl) => '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:12px;">' +
+                '<span style="font-size:13px;font-weight:600;color:#e6edef;">' + lab + '</span><span style="display:flex;align-items:center;gap:8px;">' + ctl + '</span></div>';
+            const help = t => '<div style="font-size:12.5px;line-height:1.5;color:#9aa;margin:6px 0 0;">' + t + '</div>';
+            body += '<div style="margin-top:12px;padding-top:10px;border-top:1px solid #2c2c2c;">' +
+                '<details class="cx-fp"' + (c.advOpen ? ' open' : '') + ' ontoggle="cxChcAdvSet(this.open)"><summary>Advanced</summary>' +
+                row('Maximum working RPM', maxInput(maxRpm) + '<button onclick="cxChcSetMax()" class="btn-secondary" style="padding:8px 14px;">Set</button>') +
+                help((c.step8Top > 0 && c.step8Top === maxRpm ? 'The highest speed you held in step 8. ' : '') + 'The test tops out at half of it, ' + fmt(top) + ' rpm.') +
+                '<hr style="border:none;border-top:1px solid #333;margin:12px 0 0;">' +
+                row('Test current',
+                    '<button onclick="cxChcPct(-10)" class="btn-secondary" style="width:34px;max-width:none;padding:6px 0;">&minus;</button>' +
+                    '<span style="min-width:54px;text-align:center;color:#2ec4b6;font-weight:700;font-variant-numeric:tabular-nums;">' + c.pct + '%</span>' +
+                    '<button onclick="cxChcPct(10)" class="btn-secondary" style="width:34px;max-width:none;padding:6px 0;">+</button>' +
+                    (capA > 0 ? '<span style="min-width:44px;text-align:right;color:#e6edef;font-weight:600;font-variant-numeric:tabular-nums;">' + amps.toFixed(0) + ' A</span>' : '')) +
+                help('The alternator output at the top of the test, where the field is fixed for the rest of the run. It is a share of your charge rate limit at that speed' +
+                    (capA > 0 ? ': the ' + (c.capHi ? 'High' : 'Low') + ' column of your Charge Rate Limits table allows ' + capA.toFixed(0) + ' A at ' + fmt(top) +
+                                ' rpm, so ' + c.pct + '% is ' + amps.toFixed(0) + ' A.' : '.') +
+                    ' If a run stops on a limit, the next run is set one step lower for you.') +
+                '</details></div>';
+        }
         b.innerHTML = body;
         const cv = document.getElementById('chcLane');
-        if (cv && top > 0) cxChcDraw(cv, c, cxChcProfile(c), 0, NaN, false);
+        if (cv && ready) cxChcDraw(cv, c, cxChcProfile(c), 0, NaN, false);   // no preview behind the question: a too-low top draws a squashed schedule under the text
         return;
     }
 
     // 2 · running: the chart is the instruction; the cue and the live rows are updated in place by cxChcAnim
     if (c.running) {
+        body += cue(true, 'Cycle 1 of ' + CHC_CYCLES);
         body += chart(null);
-        body += '<div id="chcCue" class="cx-cue cx-cue-lane"><div class="cx-cue-l1" id="chcCueL1">Adjust throttle to keep engine speed in desired range</div>' +
-            '<div class="cx-cue-l2" id="chcCueL2">Cycle 1 of ' + CHC_CYCLES + '</div></div>';
         body += live('Engine speed', 'chcRpm', '—');
         body += live('In range', 'chcInRange', '—');
         body += live('Output', 'chcAmps', '—');
@@ -31020,14 +32142,14 @@ function cxRenderStress(b) {
             '<div style="font-size:14.5px;line-height:1.5;">Accelerate as briskly as you can to about <strong>half of max RPM</strong>, then straight back to idle — a rapid throttle blip, not a hold. A protection trip is expected — that is what is being graded.</div></div>' +
             '<div id="cvsArmLive" style="font-size:13.5px;margin:8px 0;">' + cxStressArmLive(j) + '</div>' +
             '<div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap;">' +
-            '<button onclick="cxGet(\'cvStressCancel=1\')" class="btn-danger-ghost btn-sm">Cancel</button></div>' +
+            '<button onclick="cxStressCancel()" class="btn-danger-ghost btn-sm">Cancel</button></div>' +
             '<p style="font-size:12.5px;color:#8a8a8a;margin-top:6px;">The test ends itself a few seconds after the voltage settles back at the target — you don\'t press anything. Cancel only to abort.</p>';
         return;
     }
     if (s.running) {
         b.innerHTML = '<p style="color:#4a9eff;">Setting up — keep the engine at idle.</p>' +
             '<p id="cvsPhase" style="font-size:13px;color:#ddd;margin-top:-2px;">' + cvsPhaseText(j ? j.phase : 0, j) + '</p>' +
-            '<button onclick="cxGet(\'cvStressCancel=1\')" class="btn-danger-ghost btn-sm">Cancel</button>';
+            '<button onclick="cxStressCancel()" class="btn-danger-ghost btn-sm">Cancel</button>';
         return;
     }
     let body = '';
@@ -31186,7 +32308,7 @@ function cxZeroState() {
 function cxAltZeroWhere(j) {
     const t = (j.capAltF === null || j.capAltF === undefined) ? j.capBoardF : j.capAltF;
     return Math.round(Number(j.capRpm)) + ' RPM'
-        + ((t === null || t === undefined) ? '' : ' and ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel());
+        + ((t === null || t === undefined) ? '' : ', ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel());
 }
 
 // Requests one measurement and waits it out behind the shared setup wait box: a silent gap between
@@ -31194,7 +32316,8 @@ function cxAltZeroWhere(j) {
 // (ALTZERO_FORCE_TIMEOUT_MS, 90 s) and reports every refusal by code; the poll here only outlasts
 // it, so the only way to reach the fallback alert is a lost link.
 async function cxAltZeroRun() {
-    await cxGet('AltZeroCaptureNow=1').catch(() => { });
+    try { await cxGet('AltZeroCaptureNow=1'); }
+    catch (e) { await xAlert('The zero measurement could not start: ' + e + '.\n\n' + CX_ALTZERO_HOWTO, 'Not measured'); return null; }
     vesselNextStepWait(true, {
         title: 'Measuring the Sensor Zero',
         head: 'Keep the engine running and hold the throttle steady.',
@@ -31233,21 +32356,17 @@ async function cxAltZeroOffer() {
         if (Number(j.capApplied) === 1) return;      // already applied this run, nothing new captured
         const lv = cxLive();
         if (!(lv.rpm > CX_ALTZERO_MIN_RPM)) return;  // engine already shut down: nothing to offer
-        if (!await xConfirm('The alternator current sensor has not been zeroed on this installation. '
-            + 'With the engine running and the field off it should read zero, and whatever it reads '
-            + 'instead is a fixed error in every current number the regulator reports. The regulator '
-            + 'turns the field off by itself, measures for under a minute, and turns it back on. '
-            + 'Keep the engine running.',
+        if (!await xConfirm('The alternator current sensor hasn\'t been zeroed. The regulator will '
+            + 'turn the field off for under a minute to measure its offset. Keep the engine running.',
             { title: 'Zero the current sensor', okText: 'Measure now', cancelText: 'Skip' })) return;
         j = await cxAltZeroRun();
         if (!j) return;
     }
-    if (!await xConfirm('The current sensor read ' + (Number(j.capA) >= 0 ? '+' : '')
-        + Number(j.capA).toFixed(2) + ' A with the field at 0% at ' + cxAltZeroWhere(j)
-        + ', where the true current is zero. Subtract that from every reading from now on? '
-        + 'It is stored on the regulator and survives a reboot.',
+    if (!await xConfirm('Measured offset: ' + (Number(j.capA) >= 0 ? '+' : '')
+        + Number(j.capA).toFixed(2) + ' A (field off, ' + cxAltZeroWhere(j)
+        + '). Correct all future readings by this amount?',
         { title: 'Current sensor zero', okText: 'Apply', cancelText: 'Leave as is' })) return;
-    await cxGet('altZeroApply=1').catch(() => { });
+    await cxGet('altZeroApply=1').catch(e => xAlert('The zero could not be applied: ' + e + '.\n\n' + CX_ALTZERO_HOWTO, 'Not applied'));
 }
 
 function cxFinish() {
@@ -31300,7 +32419,7 @@ const CX_HELPFUL_HINTS_HTML =
       '<li style="margin-bottom:7px;"><strong style="color:#2ec4b6;">Client Mode:</strong> low-power doze is automatically woken when you open the App interface.</li>' +
       '<li><strong style="color:#2ec4b6;">AP (Hotspot) Mode:</strong> WiFi shuts down 30 minutes after last use. Wake up with the WiFi Wake button (5 minute increments) or Ignition On.</li>' +
       '</ul></li>' +
-    '<li style="margin-bottom:0; color:#2ec4b6; font-weight:600;">After clicking Done, take a few minutes to explore the rest of the interface, tab by tab. There are many other settings not touched by Commissioning / the recommendation tools which you should sanity check and be aware of.</li>' +
+    '<li style="margin-bottom:0; color:#2ec4b6; font-weight:600;">After clicking Done, take a few minutes to explore the rest of the interface, tab by tab. There are many other settings not touched by Commissioning or Recommend Initial Charging Settings which you should sanity check and be aware of.</li>' +
     '</ul>';
 // Terminal Helpful Hints page, drawn into the commissioning modal body after Finish. No per-phase
 // poll or RPM strip (the run is over); the abort row is hidden so it can't revert the saved tune.
@@ -34399,7 +35518,7 @@ function bhwRenderDone(b) {
     html = '<p style="font-size:15px;"><strong>Done.</strong></p>' +
       '<div style="margin:10px 0;padding:10px 12px;background:#1b2a1b;border:1px solid #356b35;border-radius:6px;line-height:1.8;">' +
       '<div style="font-size:24px;font-weight:700;color:#2ec4b6;">' + res.dcir.toFixed(2) + ' mΩ</div>' +
-      '<div style="font-size:13px;color:#bcd;">' + (dcir25 ? dcir25.toFixed(2) + ' mΩ at 25 °C' : 'no battery temperature, not normalized') + ' · fit ' + (fitOk ? '<span style="color:#5a5;">✓</span>' : '<span style="color:#f0a500;">⚠</span>') + ' · ' + res.edges + ' steps</div>' +
+      '<div style="font-size:13px;color:#bcd;">' + (dcir25 ? dcir25.toFixed(2) + ' mΩ at 25 °C' : (rwfsBattTempState() === 0 ? 'no battery temperature on this boat' : 'no battery temperature, not normalized')) + ' · fit ' + (fitOk ? '<span style="color:#5a5;">✓</span>' : '<span style="color:#f0a500;">⚠</span>') + ' · ' + res.edges + ' steps</div>' +
       (isBase ? '<div style="font-size:12px;color:#9b9;margin-top:4px;">Stored as the 100% baseline.</div>' : '') + '</div>' +
       '<div style="font-size:12px;color:#888;line-height:1.5;">Internal resistance depends on temperature and state of charge — compare runs taken at a similar state of charge. The full history is on the Health panel.</div>';
   } else {
@@ -34485,7 +35604,8 @@ function pollBatteryHealth() {
     // capacity config echoes
     const cfg = j.capCfg || {};
     bhSet('capBankAh_echo', cfg.capacityAh + ' Ah');
-    bhSet('capRefMode_echo', cfg.refMode == 1 ? '1 (first reading)' : '0 (rated)');
+    bhSet('capRefMode_echo', cfg.refMode == 1 ? 'First reading' : 'Rated');
+    syncSegmentedSelect('capRefMode', cfg.refMode == 1 ? 1 : 0);
     bhSet('capRestFrac_echo', cfg.restFrac);
     bhSet('capRestFloor_echo', cfg.restFloor + ' min');
     bhSet('capSettleRate_echo', cfg.settleRate + ' mV/10min');
@@ -34493,7 +35613,8 @@ function pollBatteryHealth() {
     bhSet('capFullSoc_echo', cfg.fullSoc + '%');
     bhSet('capMinSpan_echo', cfg.minSpan + '%');
     bhSet('capChgEff_echo', (Number(cfg.chgEff) * 100).toFixed(1) + '%');
-    bhSet('capTempNorm_echo', cfg.tempNorm == 1 ? 'on' : 'off');
+    bhSet('capTempNorm_echo', cfg.tempNorm == 1 ? 'On' : 'Off');
+    syncSegmentedSelect('capTempNorm', cfg.tempNorm == 1 ? 1 : 0);
     bhSet('capTempCoeff_echo', cfg.tempCoeff + ' %/°C');
     bhSet('capTempRef_echo', Math.round(toDisplayTempFromC(Number(cfg.tempRef))) + ' ' + tempUnitLabel());
     if (j.ocv && j.ocvSoc) renderCapOcvTable(j.ocv, j.ocvSoc, Number(cfg.socLowMax));
@@ -35768,6 +36889,65 @@ function _whyLimitAuthority(c2) {
     return 'Sent by an external charge authority, not set here — a battery BMS, or a gateway passing on its charge limits.';
 }
 
+// Block C — every ceiling on alternator current, each in alternator amps, the one the firmware says is binding
+// (ctrlLimiter) marked. Mirrors the firmware min-select: RPM table − temperature, warm-up ramp, battery charge
+// limit + house, external CCL (+ house with a shunt). Rows only appear/disappear on real events; the temperature
+// row has hysteresis so a penalty hovering near zero cannot flicker it.
+let _whyTempRowOn = false;
+function _whyRenderLimits(lim, d) {
+    const box = document.getElementById('why-lims');
+    if (!box) return;
+    const { c1, c2, f, amps, rpmTxt, rpm, alt, cap, haveBatt, houseR } = d;
+    const rows = [];
+    if (c1) {
+        const capR = Math.round(cap);
+        const ignoreRpm = !!(typeof rwfsFlags === 'object' && rwfsFlags.IgnoreRPM);
+        rows.push({ name: ignoreRpm ? 'Limit with engine speed ignored' : 'RPM table at ' + rpmTxt(rpm) + ' RPM', val: amps(cap), bind: lim === 1 });
+
+        const pen = f(c2, 'thermalPenaltyAmps', 100);
+        if (Number.isFinite(pen)) _whyTempRowOn = _whyTempRowOn ? pen > 0.25 : pen > 1.0;
+        if (_whyTempRowOn || lim === 2) {
+            const penR = Math.round(Number.isFinite(pen) ? pen : 0);
+            rows.push({ name: 'Temperature', val: String(Math.max(0, capR - penR)), bind: lim === 2,
+                        sub: capR + ' A from the table, minus ' + penR + ' A for temperature' });
+        }
+
+        const wRate = parseFloat(getEchoText('WarmupRampRate_echo', ''));
+        const wCeil = f(c2, 'warmupCeiling', 1);
+        if (lim === 13 || (wRate > 0 && Number.isFinite(wCeil) && wCeil < cap - 0.5)) {
+            rows.push({ name: 'Warm-up ramp', val: amps(wCeil), bind: lim === 13,
+                        sub: (wRate > 0 ? 'Climbing ' + wRate.toFixed(1) + ' A/s toward ' : 'Climbing toward ') + capR + ' A' });
+        }
+
+        // Firmware gates this ceiling on an INA228 shunt; with the shunt quiet it caps alternator amps directly.
+        const battLim = parseFloat(getEchoText('BattCurrentLimitA_echo', ''));
+        const battLimOn = getEchoText('BattLimitEnable_echo', '') !== 'OFF' && battLim > 0
+                       && getEchoText('BatteryCurrentSource_echo', '') === 'INA228 Shunt'
+                       && !document.body.classList.contains('no-batt-current');
+        const houseTxt = h => h >= 0 ? ', plus ' + h + ' A for house loads' : ', minus ' + (-h) + ' A from other charge sources';
+        if (battLimOn) {
+            const bl = Math.round(battLim);
+            rows.push({ name: 'Battery charge limit', val: haveBatt ? String(Math.max(0, bl + houseR)) : String(bl), bind: lim === 4,
+                        sub: haveBatt ? bl + ' A into the battery' + houseTxt(houseR) : bl + ' A, applied to alternator current while the battery reading is unavailable' });
+        }
+
+        const ccl = f(c2, 'dvccRxCcl', 10);
+        if (Number(c2.dvccState) === 3 && Number.isFinite(ccl) && ccl > -1000000) {
+            const cl = Math.round(ccl);
+            const viaShunt = haveBatt && getEchoText('BatteryCurrentSource_echo', '') === 'INA228 Shunt';
+            rows.push({ name: 'External charge limit', val: viaShunt ? String(Math.max(0, cl + houseR)) : String(cl), bind: lim === 8,
+                        sub: viaShunt ? cl + ' A into the battery' + houseTxt(houseR) : cl + ' A, applied to alternator current (no battery shunt)' });
+        }
+    }
+    const esc = t => String(t).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+    const html = rows.map(r =>
+        '<div class="why-lrow' + (r.bind ? ' why-bind' : '') + '"><div class="why-lmain"><span class="why-lname">' + esc(r.name) + '</span>'
+        + (r.bind ? '<span class="why-pill">Limiting</span>' : '')
+        + '<span class="why-lval">' + esc(r.val) + '&nbsp;A</span></div>'
+        + (r.sub ? '<div class="why-lsub">' + esc(r.sub) + '</div>' : '') + '</div>').join('');
+    if (box._html !== html) { box.innerHTML = html; box._html = html; }
+}
+
 function whyPanelRender() {
     const set = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
     const hide = (id, h) => { const el = document.getElementById(id); if (el) el.classList.toggle('why-gone', !!h); };
@@ -35784,10 +36964,21 @@ function whyPanelRender() {
     const f = (o, k, s) => { if (!o || o[k] === undefined) return NaN; const v = Number(o[k]); return Number.isFinite(v) ? v / s : NaN; };
 
     // Block A — right now
-    const rpm  = f(c1, 'RPM', 1), alt = f(c1, 'MeasuredAmps', 100), ask = f(c1, 'uTargetAmps', 100), duty = f(c1, 'dutyCycle', 100);
+    const rpm  = f(c1, 'RPM', 1), alt = f(c1, 'MeasuredAmps', 100), duty = f(c1, 'dutyCycle', 100);
     const ibv  = f(c1, 'IBV', 100), vt = f(c1, 'voltageTarget', 100), altT = f(c1, 'AlternatorTemperatureF', 100);
     const cap  = f(c1, 'rpmCeilingAmps', 100), bcur = f(c1, 'Bcur', 100);
-    set('why-rpm', rpmTxt(rpm)); set('why-alt', amps(alt)); set('why-ask', amps(ask)); set('why-duty', amps(duty));
+    set('why-rpm', rpmTxt(rpm)); set('why-alt', amps(alt)); set('why-duty', amps(duty));
+
+    // Alternator = Battery + House, from the ROUNDED tiles so the three always add up on screen. "House" is
+    // alternator minus battery, i.e. house loads minus any other charge source — the same quantity the
+    // firmware adds to battery-side limits (loadOffsetFilt). Negative = other sources out-produce the loads.
+    const haveBatt = Number.isFinite(bcur) && Number.isFinite(alt) && !document.body.classList.contains('no-batt-current');
+    const altR = Math.round(alt), battR = Math.round(bcur), houseR = altR - battR;
+    document.querySelectorAll('#why-flow .why-batt-part').forEach(el => el.classList.toggle('why-gone', !haveBatt));
+    set('why-batt', haveBatt ? String(battR) : NA);
+    set('why-house', haveBatt ? String(Math.abs(houseR)) : NA);
+    set('why-house-l', haveBatt && houseR < 0 ? 'Other charging' : 'House');
+    set('why-op2', haveBatt && houseR < 0 ? '\u2212' : '+');
 
     // Block B/C — headline and where it is set
     const limFresh = (now - (window._ctrlLimiterAtMs || 0)) < 5000;   // same gate as updateHeaderLimiterColors
@@ -35918,6 +37109,7 @@ function whyPanelRender() {
              : (lim === 6) ? 'tone-alarm'
              : (lim >= 1 && lim <= 10) ? 'tone-limit' : '';   // unknown code falls through to grey, like no data
     }
+    _whyRenderLimits(running ? lim : NaN, { c1, c2, f, amps, rpmTxt, rpm, alt, cap, haveBatt, houseR });
     set('why-headline', head);
     set('why-where', where);
     hide('why-where', !where);

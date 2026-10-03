@@ -1101,6 +1101,27 @@ void initIMUStructures() {
 
   Serial.println("IMU structures initialized");
 }
+
+// INA228 register configuration. Boot and every runtime recovery (a chip that lost power has lost its
+// ALERT threshold, so the OV comparator must be re-armed with the rest).
+void inaApplyConfig() {
+  // setAverage() takes raw register value: 0=1, 1=4, 2=16, 3=64, 4=128, 5=256, 6=512, 7=1024 samples
+  INA.setMode(15);                       // Continuous shunt, bus voltage AND die temperature
+  INA.setAverage(4);                     // 128-sample averaging — 128 × 8.24ms = 1054ms register update
+  INA.setBusVoltageConversionTime(7);    // 4120 µs conversion time
+  INA.setShuntVoltageConversionTime(7);  // 4120 µs conversion time
+  INA.setTemperatureConversionTime(0);   // 50 µs — MUST stay at the minimum. ADC_CONFIG resets VTCT to 1052 µs, which drags the fast-mode cycle to 8.5 ms, past the 5 ms poll, and halves the CV loop's voltage update rate
+  updateINA228OvervoltageThreshold();
+  inaFastModeActive = false;             // the read path re-selects fast mode on its next pass while the field gate is open
+  inaReadInterval = INA_SLOW_INTERVAL_MS;
+}
+
+// ADS1115 configuration. Boot and the 30 s runtime re-init while it reads as disconnected.
+void adsApplyConfig() {
+  adc.setGain(ADS1115_REG_CONFIG_PGA_6_144V);       // ±6.144V range
+  adc.setSampleRate(ADS1115_REG_CONFIG_DR_860SPS);  // 860 SPS, 1.16ms per conversion
+}
+
 void initializeHardware() {
 
   Serial.println("Starting hardware initialization...");
@@ -1175,22 +1196,14 @@ if (!BMP388Disconnected) {
   Serial1.begin(19200, SERIAL_8N1, 7, -1, 1);  // Victron VEDirect
   applyNMEA0183Serial();  // Serial2 / GPIO6 at the user's baud + polarity. InitSystemSettings() has already run, so NVS values are live here.
 
-  // INA228 Battery Voltage/Current Sensor
+  // INA228 Battery Voltage/Current Sensor (chip config lives in inaApplyConfig so a runtime recovery re-applies it)
   if (!INA.begin()) {
     Serial.println("Could not connect INA228. Fix and Reboot");
     queueConsoleMessage("WARNING: Could not connect INA228 Battery Voltage/Amp measuring chip");
     INADisconnected = 1;
   } else {
     INADisconnected = 0;
-
-    // setAverage() takes raw register value: 0=1, 1=4, 2=16, 3=64, 4=128, 5=256, 6=512, 7=1024 samples
-    INA.setMode(15);                       // Continuous shunt, bus voltage AND die temperature
-    INA.setAverage(4);                     // 128-sample averaging — 128 × 8.24ms = 1054ms register update
-    INA.setBusVoltageConversionTime(7);    // 4120 µs conversion time
-    INA.setShuntVoltageConversionTime(7);  // 4120 µs conversion time
-    INA.setTemperatureConversionTime(0);   // 50 µs — MUST stay at the minimum. ADC_CONFIG resets VTCT to 1052 µs, which drags the fast-mode cycle to 8.5 ms, past the 5 ms poll, and halves the CV loop's voltage update rate
-
-    updateINA228OvervoltageThreshold();
+    inaApplyConfig();
     queueConsoleMessage("INA228 initialized: Hardware overvoltage protection enabled");
   }
 
@@ -1214,8 +1227,7 @@ if (!BMP388Disconnected) {
   } else {
     ADS1115Disconnected = 0;
   }
-  adc.setGain(ADS1115_REG_CONFIG_PGA_6_144V);       // ±6.144V range
-  adc.setSampleRate(ADS1115_REG_CONFIG_DR_860SPS);  // 860 SPS, 1.16ms per conversion
+  adsApplyConfig();
 
   delay(100);  // Give chip time to configure
   if (!adc.testConnection()) {
@@ -1929,6 +1941,35 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     IgnoreRPM = settingRead(NK_IgnoreRPM).toInt();
   }
+  if (!settingExists(NK_IgnoreAltCurrent)) {
+    settingWrite(NK_IgnoreAltCurrent, String(IgnoreAltCurrent).c_str());
+  } else {
+    IgnoreAltCurrent = settingRead(NK_IgnoreAltCurrent).toInt() ? 1 : 0;
+  }
+  if (!settingExists(NK_IgnoreBattVMain)) {
+    settingWrite(NK_IgnoreBattVMain, String(IgnoreBattVMain).c_str());
+  } else {
+    IgnoreBattVMain = settingRead(NK_IgnoreBattVMain).toInt() ? 1 : 0;
+  }
+  if (!settingExists(NK_IgnoreBattV2)) {
+    settingWrite(NK_IgnoreBattV2, String(IgnoreBattV2).c_str());
+  } else {
+    IgnoreBattV2 = settingRead(NK_IgnoreBattV2).toInt() ? 1 : 0;
+  }
+  if (!settingExists(NK_LimpDutyPct)) {
+    LimpDutyPct = constrain(LimpDutyPct * seedDScale, 0.0f, 99.0f);
+    settingWrite(NK_LimpDutyPct, String(LimpDutyPct, 1).c_str());
+  } else {
+    LimpDutyPct = settingRead(NK_LimpDutyPct).toFloat();
+    if (!isfinite(LimpDutyPct)) LimpDutyPct = 30.0f * seedDScale;
+    LimpDutyPct = constrain(LimpDutyPct, 0.0f, 99.0f);
+  }
+  if (!settingExists(NK_NoRpmCurrentA)) {
+    settingWrite(NK_NoRpmCurrentA, String(NoRpmCurrentA, 1).c_str());
+  } else {
+    NoRpmCurrentA = settingRead(NK_NoRpmCurrentA).toFloat();
+    if (!isfinite(NoRpmCurrentA) || NoRpmCurrentA < 0.0f) NoRpmCurrentA = 0.0f;
+  }
   if (!settingExists(NK_MinRPMForField)) {
     settingWrite(NK_MinRPMForField, String(MinRPMForField).c_str());
   } else {
@@ -2182,6 +2223,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     settingWrite(NK_AlarmLatchEnabled, String(AlarmLatchEnabled).c_str());
   } else {
     AlarmLatchEnabled = settingRead(NK_AlarmLatchEnabled).toInt();
+  }
+  if (!settingExists(NK_GeneralFaultAlarm)) {
+    settingWrite(NK_GeneralFaultAlarm, String(GeneralFaultAlarm).c_str());
+  } else {
+    GeneralFaultAlarm = settingRead(NK_GeneralFaultAlarm).toInt() ? 1 : 0;
   }
   if (!settingExists(NK_absorptionCompleteTime)) {
     settingWrite(NK_absorptionCompleteTime, String(absorptionCompleteTime).c_str());
@@ -2873,7 +2919,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (!settingExists(NK_TempPIDIntervalMs)) {
     settingWrite(NK_TempPIDIntervalMs, String(TempPIDIntervalMs).c_str());
   } else {
-    TempPIDIntervalMs = settingRead(NK_TempPIDIntervalMs).toInt();
+    long tpi = settingRead(NK_TempPIDIntervalMs).toInt();
+    TempPIDIntervalMs = (uint32_t)constrain(tpi, 500L, 60000L);   // 0 makes the thermal slope NaN; UI range is 500..60000
   }
 
   if (!settingExists(NK_TempPIDFilterAlpha)) {
@@ -2898,6 +2945,16 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     settingWrite(NK_DutySlowRampRate, String(DutySlowRampRate, 2).c_str());
   } else {
     DutySlowRampRate = settingRead(NK_DutySlowRampRate).toFloat();
+  }
+  if (!settingExists(NK_ShutdownRampTauS)) {
+    settingWrite(NK_ShutdownRampTauS, String(ShutdownRampTauS, 2).c_str());
+  } else {
+    ShutdownRampTauS = clamp_f(settingRead(NK_ShutdownRampTauS).toFloat(), 0.0f, 60.0f);   // same range as /get: config import stores whatever it is handed
+  }
+  if (!settingExists(NK_NoOutputAmps)) {
+    settingWrite(NK_NoOutputAmps, String(NoOutputAmps, 2).c_str());
+  } else {
+    NoOutputAmps = clamp_f(settingRead(NK_NoOutputAmps).toFloat(), 0.1f, 50.0f);   // same range as /get; 0 or below disabled the tach-implausible cut
   }
   if (!settingExists(NK_ShutdownPhase2HoldMs)) {
     settingWrite(NK_ShutdownPhase2HoldMs, String(ShutdownPhase2HoldMs).c_str());
@@ -4086,7 +4143,8 @@ void updateAccelMetrics() {
     } else if (!capsize_reported && (now - capsize_start > 1000)) {  // fires once per event
       imu_capsize_count++;
       queueConsoleMessageF("CAPSIZE EVENT: %.1f deg", cf_heel);
-      saveNVSDataFull();  // boat may lose power — commit lifetime counter now (sync)
+      // Persisted by the next saveNVSDataFull() at the field-cut-settled flash pass: no flash writes from the
+      // control loop, and a wet or mis-mounted IMU hovering at the threshold re-fired this every second.
       capsize_reported = true;
     }
   } else {
@@ -4101,7 +4159,8 @@ void updateAccelMetrics() {
     } else if (!pitchpole_reported && (now - pitchpole_start > 1000)) {  // fires once per event
       imu_pitchpole_count++;
       queueConsoleMessageF("PITCHPOLE EVENT: %.1f deg", cf_pitch);
-      saveNVSDataFull();  // boat may lose power — commit lifetime counter now (sync)
+      // Persisted by the next saveNVSDataFull() at the field-cut-settled flash pass: no flash writes from the
+      // control loop, and a wet or mis-mounted IMU hovering at the threshold re-fired this every second.
       pitchpole_reported = true;
     }
   } else {

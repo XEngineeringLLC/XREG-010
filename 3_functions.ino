@@ -15,6 +15,30 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 
+
+// hasParam() plus the §10.9 float gate, used ONLY by handlers that parse the value with toFloat(): the
+// whole trimmed token must be a finite float ("nan", "inf", "1e39", "nanx", "" and text are refused), the
+// handler block is skipped as if the parameter were absent, a console line names it once, and every other
+// parameter in the same request is still processed. Ids, tokens and text parameters stay on plain
+// hasParam(): strtod reads a hex id like "0001e315" as infinity.
+bool paramOk(AsyncWebServerRequest *request, const char *name) {
+  if (!request->hasParam(name)) return false;
+  const String &v = request->getParam(name)->value();
+  if (!floatTokenValid(v.c_str())) {
+    static char lastName[40] = "";
+    static String lastValue;
+    static uint32_t lastMs = 0;
+    bool same = (strcmp(lastName, name) == 0) && (lastValue == v) && (millis() - lastMs < 2000UL);   // the same parameter is often tested twice per request
+    if (!same) {
+      strncpy(lastName, name, sizeof(lastName) - 1); lastName[sizeof(lastName) - 1] = '\0';
+      lastValue = v; lastMs = millis();
+      queueConsoleMessageF("WRITE REJECTED: %s=\"%s\" is not a finite number", name, v.c_str());
+    }
+    return false;
+  }
+  return true;
+}
+
 enum Csv1Index {
   // LiveStream: fast-changing sensor readings sent at webgaugesinterval
   CSV1_AlternatorTemperatureF,
@@ -720,6 +744,18 @@ enum Csv2Index {
   CSV2_inaDieTempF,         // INA228 internal die temperature (°F x10; ROLL_EMPTY = no reading)
   CSV2_inaDieTempMaxF,      // session max of the above (°F x10; ROLL_EMPTY = nothing has cleared the warm-up + corroboration gate yet). This is the value that uploads daily
 
+  CSV2_voltStaleCount,      // session count of REASON_VOLTAGE_STALE field events (main battery voltage, INA228)
+  CSV2_volt2StaleCount,     // session count of REASON_VOLTAGE2_STALE field events (second battery voltage, ADS1115)
+  CSV2_battTempLostCount,   // session count of REASON_BATT_TEMP_LOST field events
+
+  // Sensor faults / Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §1.2, §2.6, §4.2, §4.7)
+  CSV2_sensorFaultMask,     // bit0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228 — computed regardless of overrides
+  CSV2_battTempState,       // 0 not expected (source Not fitted), 1 reading, 2 lost (charging stopped), 3 waiting for the first reading (field held off)
+  CSV2_limpTier,            // 0 normal, 1 closed-loop minus dependent reasons, 2 voltage-only, 3 fixed duty + second-voltage cap, 4 fixed duty
+  CSV2_sensorSteadyMask,    // same bits as sensorFaultMask; set once that fault bit has been clear continuously for 10 min (the "reading again" prompt)
+  CSV2_reqFaultCount,       // §11: number of required sensors faulted (chip loss expanded to its readings; owner overrides and Not fitted excluded); >= 2 = REASON_MULTI_SENSOR_FAULT
+  CSV2_battCurState,        // §11.6 battery current (declared shunt / VE.Direct): 0 not declared, 1 reading, 2 lost 10 s (alarm + header line; charging continues on voltage)
+
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
 
@@ -766,7 +802,7 @@ enum Csv4Index {
 // backslash and truncates the macro, and every expansion truncates together and consistently --
 // so the count/order gate in compress_web.sh cannot see it. The static_assert on
 // CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 434
+#define CSV3_EXPECTED_FIELDS 442
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -967,6 +1003,7 @@ enum Csv4Index {
   X(CurrentAlarmHigh, "%d", SafeInt(CurrentAlarmHigh)) \
   X(AlarmTest, "%d", SafeInt(AlarmTest)) \
   X(AlarmLatchEnabled, "%d", SafeInt(AlarmLatchEnabled)) \
+  X(GeneralFaultAlarm, "%d", SafeInt(GeneralFaultAlarm)) \
   X(MaintainMode, "%d", SafeInt(MaintainMode)) \
   X(ManualSOCPoint, "%d", SafeInt(ManualSOCPoint, 100)) \
   X(IgnoreLearningDuringPenalty, "%d", SafeInt(IgnoreLearningDuringPenalty)) \
@@ -1205,7 +1242,14 @@ enum Csv4Index {
   X(RemoteDiagnostics, "%d", SafeInt(RemoteDiagnostics))                                                          /* owner switch for the dashboard's support log-relay poll (0/1) */ \
   X(ShuntGroundComp, "%d", SafeInt(ShuntGroundComp))                                                        /* add the INA228 shunt drop back into IBV (0/1) */ \
   X(BatteryVoltageSource, "%d", SafeInt(BatteryVoltageSource))                                                /* charge-decision battery volts: 0 INA228, 1 NMEA 2000, 3 Victron */ \
-  X(sessionId, "%u", (unsigned)g_sessionId)                                                                     /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
+  X(IgnoreAltCurrent, "%d", SafeInt(IgnoreAltCurrent))                                                          /* run without alternator current (0/1) — voltage-only regulation */ \
+  X(IgnoreBattVMain, "%d", SafeInt(IgnoreBattVMain))                                                            /* run without the INA228 bus voltage (0/1) — fixed duty */ \
+  X(IgnoreBattV2, "%d", SafeInt(IgnoreBattV2))                                                                  /* run without the ADS1115 battery voltage (0/1) */ \
+  X(LimpDutyPct, "%d", SafeInt(LimpDutyPct, 10))                                                                /* field duty cap / fixed duty for the reduced-sensor tiers, % x10 */ \
+  X(NoRpmCurrentA, "%d", SafeInt(NoRpmCurrentA, 10))                                                            /* alternator current limit while engine speed is ignored, A x10 */ \
+  X(ShutdownRampTauS, "%d", SafeInt(ShutdownRampTauS, 100))                                                      /* shutdown ramp proportional decay time constant, s x100 */ \
+  X(NoOutputAmps, "%d", SafeInt(NoOutputAmps, 100))                                                              /* alternator amps at or below this = no output, A x100 */ \
+  X(sessionId, "%u", (unsigned)g_sessionId)                                                                   /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
   X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
   /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
   /* setting in this block predates whatever the device is actually running. */
@@ -4612,6 +4656,15 @@ void setupServer() {
       // If turning ON, fall through to arm check below
     }
 
+    // Silence is allowed without arming, like OFF: it changes no setting, and a locked app must still be
+    // able to quiet the buzzer. CheckAlarms consumes the flag on its next 250 ms pass.
+    if (request->hasParam("SilenceAlarm")) {
+      SilenceAlarm = 1;
+      logClientWrite(request, "ALARM: silence requested (no arming required)");
+      request->send(200, "text/plain", "1");
+      return;
+    }
+
     if (!settingsArmActive(request)) {
       // Console line so a rejected write is visible — a stale/replayed URL lands here silently.
       queueConsoleMessage("Settings write REJECTED: not armed (press Unlock Settings first)");
@@ -4725,7 +4778,7 @@ void setupServer() {
       }
     }
 
-    if (request->hasParam("SystemIDStepAmplitude")) {
+    if (paramOk(request, "SystemIDStepAmplitude")) {
       foundParameter = true;
       inputMessage = request->getParam("SystemIDStepAmplitude")->value();
       settingWrite(NK_SystemIDStepAmplitude, inputMessage.c_str());
@@ -4737,13 +4790,13 @@ void setupServer() {
       settingWrite(NK_systemIDTestType, inputMessage.c_str());
       systemIDTestType = (uint8_t)inputMessage.toInt();
     }
-    if (request->hasParam("systemIDSineFreqStart")) {
+    if (paramOk(request, "systemIDSineFreqStart")) {
       foundParameter = true;
       inputMessage = request->getParam("systemIDSineFreqStart")->value();
       settingWrite(NK_systemIDSineFreqStart, inputMessage.c_str());
       systemIDSineFreqStart = inputMessage.toFloat();
     }
-    if (request->hasParam("systemIDSineFreqEnd")) {
+    if (paramOk(request, "systemIDSineFreqEnd")) {
       foundParameter = true;
       inputMessage = request->getParam("systemIDSineFreqEnd")->value();
       settingWrite(NK_systemIDSineFreqEnd, inputMessage.c_str());
@@ -4802,7 +4855,7 @@ void setupServer() {
       settingWrite(NK_systemIDSineCycles, inputMessage.c_str());
       systemIDSineCycles = (uint8_t)inputMessage.toInt();
     }
-    if (request->hasParam("SystemIDStabilizeAmps")) {
+    if (paramOk(request, "SystemIDStabilizeAmps")) {
       foundParameter = true;
       inputMessage = request->getParam("SystemIDStabilizeAmps")->value();
       settingWrite(NK_SystemIDStabilizeAmps, inputMessage.c_str());
@@ -4850,9 +4903,9 @@ void setupServer() {
     }
 
     // ── CV plant fit (firmware voltage-loop identification, commissioning Step 7) ──
-    if (request->hasParam("cvPlantFitStart")) {
+    if (paramOk(request, "cvPlantFitStart")) {
       foundParameter = true;
-      float diMaxReq = request->hasParam("diMax") ? request->getParam("diMax")->value().toFloat() : 0.0f;
+      float diMaxReq = paramOk(request, "diMax") ? request->getParam("diMax")->value().toFloat() : 0.0f;
       if (!cvpfStartTest(diMaxReq)) queueConsoleMessageF("CV plant-fit: cannot start — %s", cvpfAbortMsg);
     }
     if (request->hasParam("cvPlantFitCancel")) {
@@ -4861,7 +4914,7 @@ void setupServer() {
     }
 
     // ── CV stress test (commissioning stage 8 / standalone from Tuning ▸ Stress Test) ──
-    if (request->hasParam("CvStressDropV")) {
+    if (paramOk(request, "CvStressDropV")) {
       foundParameter = true;
       inputMessage = request->getParam("CvStressDropV")->value();
       // floor: a non-positive drop parks the CV target AT/ABOVE idle — unreachable, inverts the test's "guaranteed reachable" premise
@@ -4869,7 +4922,7 @@ void setupServer() {
       settingWrite(NK_CvStressDropV, String(CvStressDropV, 2).c_str());
       queueConsoleMessageF("CV stress test target headroom: %.2f V below settled idle", CvStressDropV);
     }
-    if (request->hasParam("CvStressFailBandV")) {
+    if (paramOk(request, "CvStressFailBandV")) {
       foundParameter = true;
       inputMessage = request->getParam("CvStressFailBandV")->value();
       CvStressFailBandV = clamp_f(inputMessage.toFloat(), 0.05f, 1.0f);
@@ -5046,7 +5099,7 @@ void setupServer() {
       foundParameter = true;
       queueConsoleMessageF("Protection test: repeats = %u", protTestReps);
     }
-    if (request->hasParam("protTestAmps")) {
+    if (paramOk(request, "protTestAmps")) {
       float ptAmps = request->getParam("protTestAmps")->value().toFloat();
       protTestCmdA = (ptAmps < 5.0f) ? 0.0f : constrain(ptAmps, 5.0f, 100.0f);  // 0 = auto-seed at fire, and the only way BACK to auto
       foundParameter = true;
@@ -5181,16 +5234,16 @@ void setupServer() {
     }
     if (request->hasParam("altSweepStart")) {
       foundParameter = true;
-      if (request->hasParam("rate")) altSweepRatePctS = request->getParam("rate")->value().toFloat();
-      if (request->hasParam("from")) altSweepFromPct  = request->getParam("from")->value().toFloat();
-      if (request->hasParam("to"))   altSweepToPct    = request->getParam("to")->value().toFloat();
+      if (paramOk(request, "rate")) altSweepRatePctS = request->getParam("rate")->value().toFloat();
+      if (paramOk(request, "from")) altSweepFromPct  = request->getParam("from")->value().toFloat();
+      if (paramOk(request, "to"))   altSweepToPct    = request->getParam("to")->value().toFloat();
       // Turnaround margins. 0 is legal and means "turn around on the limit itself" — the ramp then
       // relies on the hard-cut layer alone, which is the behaviour the margins exist to avoid, so it
       // is allowed but never the default. Upper clamps keep a fat-fingered entry from making the
       // span shorter than the 1% minimum and refusing every sweep.
-      if (request->hasParam("marginA"))
+      if (paramOk(request, "marginA"))
         altSweepMarginA = constrain(request->getParam("marginA")->value().toFloat(), 0.0f, 100.0f);
-      if (request->hasParam("marginV"))
+      if (paramOk(request, "marginV"))
         altSweepMarginV = constrain(request->getParam("marginV")->value().toFloat(),
                                     0.0f, 2.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       const char *busy = (systemIDActive != 0) ? "Plant Delay test"
@@ -5519,11 +5572,11 @@ void setupServer() {
       queueConsoleMessageF("Cold-charge lockout (measured battery temperature): %s", coldChargeLockoutEnable ? "ENABLED" : "DISABLED");
     }
     // Cold-charge lockout temperature floor (battery temperature °F, stored raw)
-    if (request->hasParam("MinChargeTempF")) {
+    if (paramOk(request, "MinChargeTempF")) {
       foundParameter = true;
       inputMessage = request->getParam("MinChargeTempF")->value();
       MinChargeTempF = constrain(inputMessage.toFloat(), -40.0f, 120.0f);
-      settingWrite(NK_MinChargeTempF, String(MinChargeTempF, 0).c_str());
+      settingWrite(NK_MinChargeTempF, String(MinChargeTempF, 1).c_str());   // one decimal: a Celsius entry arrives as e.g. 35.6 (convertTempFormIfNeeded)
     }
     // Battery + extra temperature probes, battery-temperature source chain, hot-charge lockout
     // (BATTERY_TEMP_SENSORS_SPEC.md §6). Temperatures arrive in °F (the UI converts).
@@ -5554,11 +5607,11 @@ void setupServer() {
       settingWrite(NK_hotChargeLockoutEnable, String(hotChargeLockoutEnable).c_str());
       queueConsoleMessageF("Hot-charge lockout (measured battery temperature): %s", hotChargeLockoutEnable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("MaxChargeTempF")) {
+    if (paramOk(request, "MaxChargeTempF")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxChargeTempF")->value();
       MaxChargeTempF = constrain(inputMessage.toFloat(), 32.0f, 200.0f);   // the form's range; stored raw, a bad value (0 from a non-number) would lock charging out
-      settingWrite(NK_MaxChargeTempF, String(MaxChargeTempF, 0).c_str());
+      settingWrite(NK_MaxChargeTempF, String(MaxChargeTempF, 1).c_str());
     }
     if (request->hasParam("extraTempAlarmHiEnable")) {
       foundParameter = true;
@@ -5566,11 +5619,11 @@ void setupServer() {
       extraTempAlarmHiEnable = (inputMessage.toInt() != 0) ? 1 : 0;
       settingWrite(NK_extraTempAlarmHiEnable, String(extraTempAlarmHiEnable).c_str());
     }
-    if (request->hasParam("extraTempAlarmHiF")) {
+    if (paramOk(request, "extraTempAlarmHiF")) {
       foundParameter = true;
       inputMessage = request->getParam("extraTempAlarmHiF")->value();
       extraTempAlarmHiF = constrain(inputMessage.toFloat(), -40.0f, 300.0f);
-      settingWrite(NK_extraTempAlarmHiF, String(extraTempAlarmHiF, 0).c_str());
+      settingWrite(NK_extraTempAlarmHiF, String(extraTempAlarmHiF, 1).c_str());
     }
     if (request->hasParam("extraTempAlarmLoEnable")) {
       foundParameter = true;
@@ -5578,11 +5631,11 @@ void setupServer() {
       extraTempAlarmLoEnable = (inputMessage.toInt() != 0) ? 1 : 0;
       settingWrite(NK_extraTempAlarmLoEnable, String(extraTempAlarmLoEnable).c_str());
     }
-    if (request->hasParam("extraTempAlarmLoF")) {
+    if (paramOk(request, "extraTempAlarmLoF")) {
       foundParameter = true;
       inputMessage = request->getParam("extraTempAlarmLoF")->value();
       extraTempAlarmLoF = constrain(inputMessage.toFloat(), -40.0f, 300.0f);
-      settingWrite(NK_extraTempAlarmLoF, String(extraTempAlarmLoF, 0).c_str());
+      settingWrite(NK_extraTempAlarmLoF, String(extraTempAlarmLoF, 1).c_str());
     }
     // 1-Wire probe registry actions. A scan is a request to TempTask (it owns the bus); a role assignment
     // writes NVS right here (explicit user action, the one exception to the field-off flash rule) and
@@ -5688,23 +5741,23 @@ void setupServer() {
       faAnomPause = (request->getParam("faAnomPause")->value().toInt() != 0);
       settingWrite(NK_faAnomPause, faAnomPause ? "1" : "0");
     }
-    if (request->hasParam("faRpmEdgeMargin")) {
+    if (paramOk(request, "faRpmEdgeMargin")) {
       foundParameter = true;
       faRpmEdgeMargin = request->getParam("faRpmEdgeMargin")->value().toFloat();
       settingWrite(NK_faRpmEdgeMargin, String(faRpmEdgeMargin, 1).c_str());
     }
-    if (request->hasParam("faAmpsDriftFloorA")) {
+    if (paramOk(request, "faAmpsDriftFloorA")) {
       foundParameter = true;
       faAmpsDriftFloorA = request->getParam("faAmpsDriftFloorA")->value().toFloat();
       settingWrite(NK_faAmpsDriftFloorA, String(faAmpsDriftFloorA, 2).c_str());
     }
-    if (request->hasParam("faAmpsDriftPct")) {
+    if (paramOk(request, "faAmpsDriftPct")) {
       foundParameter = true;
       faAmpsDriftPct = request->getParam("faAmpsDriftPct")->value().toFloat();
       settingWrite(NK_faAmpsDriftPct, String(faAmpsDriftPct, 1).c_str());
     }
     // Measured-ripple capture admission gates (§10.8/§11) — own knobs, decoupled from the fa* detector gates
-    if (request->hasParam("ripWinMs")) {
+    if (paramOk(request, "ripWinMs")) {
       foundParameter = true;
       // Floor 500 ms: each HALF-window (§11 stationarity/min-of-halves) must hold ≥1 cycle of the lowest
       // resolvable disturbance; ceiling 4 s bounds capture latency. Also sizes the min-sample gate.
@@ -5715,27 +5768,27 @@ void setupServer() {
       // half-window voltage slope. Drop both fits (see ripFitForget).
       if (fabsf(ripWinMs - ripWinPrev) > 0.5f) ripFitForget(true, true, "Ripple capture window changed");
     }
-    if (request->hasParam("ripDriftFloorA")) {
+    if (paramOk(request, "ripDriftFloorA")) {
       foundParameter = true;
       ripDriftFloorA = clamp_f(request->getParam("ripDriftFloorA")->value().toFloat(), 0.0f, 50.0f);
       settingWrite(NK_ripDriftFloorA, String(ripDriftFloorA, 2).c_str());
     }
-    if (request->hasParam("ripDriftPct")) {
+    if (paramOk(request, "ripDriftPct")) {
       foundParameter = true;
       ripDriftPct = clamp_f(request->getParam("ripDriftPct")->value().toFloat(), 0.0f, 50.0f);
       settingWrite(NK_ripDriftPct, String(ripDriftPct, 1).c_str());
     }
-    if (request->hasParam("faAttenUpAmps")) {
+    if (paramOk(request, "faAttenUpAmps")) {
       foundParameter = true;
       faAttenUpAmps = request->getParam("faAttenUpAmps")->value().toFloat();
       settingWrite(NK_faAttenUpAmps, String(faAttenUpAmps, 1).c_str());
     }
-    if (request->hasParam("faAttenDownAmps")) {
+    if (paramOk(request, "faAttenDownAmps")) {
       foundParameter = true;
       faAttenDownAmps = request->getParam("faAttenDownAmps")->value().toFloat();
       settingWrite(NK_faAttenDownAmps, String(faAttenDownAmps, 1).c_str());
     }
-    if (request->hasParam("faPeakMinA")) {
+    if (paramOk(request, "faPeakMinA")) {
       foundParameter = true;
       faPeakMinA = request->getParam("faPeakMinA")->value().toFloat();
       settingWrite(NK_faPeakMinA, String(faPeakMinA, 2).c_str());
@@ -5751,27 +5804,27 @@ void setupServer() {
         kneeRebuildOwnedTable();
       }
     }
-    if (request->hasParam("kneeMarginPct")) {
+    if (paramOk(request, "kneeMarginPct")) {
       foundParameter = true;
       kneeMarginPct = request->getParam("kneeMarginPct")->value().toFloat();
       settingWrite(NK_kneeMarginPct, String(kneeMarginPct, 2).c_str());
     }
-    if (request->hasParam("kneeOnsetA")) {
+    if (paramOk(request, "kneeOnsetA")) {
       foundParameter = true;
       kneeOnsetA = request->getParam("kneeOnsetA")->value().toFloat();
       settingWrite(NK_kneeOnsetA, String(kneeOnsetA, 2).c_str());
     }
-    if (request->hasParam("kneeReArmA")) {
+    if (paramOk(request, "kneeReArmA")) {
       foundParameter = true;
       kneeReArmA = request->getParam("kneeReArmA")->value().toFloat();
       settingWrite(NK_kneeReArmA, String(kneeReArmA, 2).c_str());
     }
-    if (request->hasParam("kneeDwellSec")) {
+    if (paramOk(request, "kneeDwellSec")) {
       foundParameter = true;
       kneeDwellSec = request->getParam("kneeDwellSec")->value().toFloat();
       settingWrite(NK_kneeDwellSec, String(kneeDwellSec, 1).c_str());
     }
-    if (request->hasParam("kneeStepPct")) {
+    if (paramOk(request, "kneeStepPct")) {
       foundParameter = true;
       kneeStepPct = request->getParam("kneeStepPct")->value().toFloat();
       settingWrite(NK_kneeStepPct, String(kneeStepPct, 2).c_str());
@@ -5781,27 +5834,27 @@ void setupServer() {
       kneeTempComp = (request->getParam("kneeTempComp")->value().toInt() != 0);
       settingWrite(NK_kneeTempComp, kneeTempComp ? "1" : "0");
     }
-    if (request->hasParam("kneeTempRefF")) {
+    if (paramOk(request, "kneeTempRefF")) {
       foundParameter = true;
       kneeTempRefF = request->getParam("kneeTempRefF")->value().toFloat();
       settingWrite(NK_kneeTempRefF, String(kneeTempRefF, 1).c_str());
     }
-    if (request->hasParam("kneeMaxFloorPct")) {
+    if (paramOk(request, "kneeMaxFloorPct")) {
       foundParameter = true;
       kneeMaxFloorPct = request->getParam("kneeMaxFloorPct")->value().toFloat();
       settingWrite(NK_kneeMaxFloorPct, String(kneeMaxFloorPct, 2).c_str());
     }
-    if (request->hasParam("kneeRpmTolPct")) {
+    if (paramOk(request, "kneeRpmTolPct")) {
       foundParameter = true;
       kneeRpmTolPct = request->getParam("kneeRpmTolPct")->value().toFloat();
       settingWrite(NK_kneeRpmTolPct, String(kneeRpmTolPct, 1).c_str());
     }
-    if (request->hasParam("kneeTempTolF")) {
+    if (paramOk(request, "kneeTempTolF")) {
       foundParameter = true;
       kneeTempTolF = request->getParam("kneeTempTolF")->value().toFloat();
       settingWrite(NK_kneeTempTolF, String(kneeTempTolF, 1).c_str());
     }
-    if (request->hasParam("kneeDutyTolPct")) {
+    if (paramOk(request, "kneeDutyTolPct")) {
       foundParameter = true;
       kneeDutyTolPct = request->getParam("kneeDutyTolPct")->value().toFloat();
       settingWrite(NK_kneeDutyTolPct, String(kneeDutyTolPct, 2).c_str());
@@ -5825,7 +5878,7 @@ void setupServer() {
       wifiNapEnabled = (request->getParam("wifiNapEnabled")->value().toInt() != 0);
       settingWrite(NK_wifiNapEnabled, wifiNapEnabled ? "1" : "0");
     }
-    if (request->hasParam("altSimMode")) {
+    if (paramOk(request, "altSimMode")) {
       foundParameter = true;
       altSimMode = request->getParam("altSimMode")->value().toFloat();  // bench simulator (not persisted)
     }
@@ -5838,7 +5891,7 @@ void setupServer() {
       foundParameter = true;
       pendingResetBoatPerformance = true;  // deferred to Core 1 to avoid SSE gap (Clear all data)
     }
-    if (request->hasParam("perfSimMode")) {
+    if (paramOk(request, "perfSimMode")) {
       foundParameter = true;
       perfSimMode = request->getParam("perfSimMode")->value().toFloat();  // bench NMEA simulator (not persisted)
     }
@@ -5848,7 +5901,7 @@ void setupServer() {
       sendPerfSettings();
     }
 
-    if (request->hasParam("ManualDutyTarget")) {
+    if (paramOk(request, "ManualDutyTarget")) {
       foundParameter = true;
       inputMessage = request->getParam("ManualDutyTarget")->value();
       ManualDutyTarget = constrain(inputMessage.toFloat(), 0.0f, 100.0f);
@@ -5860,13 +5913,13 @@ void setupServer() {
       settingWrite(NK_socInfoAvailable, inputMessage.c_str());
       socInfoAvailable = inputMessage.toInt();
     }
-    if (request->hasParam("TailCurrent_A")) {
+    if (paramOk(request, "TailCurrent_A")) {
       foundParameter = true;
       inputMessage = request->getParam("TailCurrent_A")->value();
       settingWrite(NK_TailCurrent_A, inputMessage.c_str());
       TailCurrent_A = inputMessage.toFloat();
     }
-    if (request->hasParam("RebulkVoltage")) {
+    if (paramOk(request, "RebulkVoltage")) {
       foundParameter = true;
       inputMessage = request->getParam("RebulkVoltage")->value();
       settingWrite(NK_RebulkVoltage, inputMessage.c_str());
@@ -5898,7 +5951,7 @@ void setupServer() {
       settingWrite(NK_SOC_AllowRebulk_percent, inputMessage.c_str());
       SOC_AllowRebulk_percent = inputMessage.toInt();
     }
-    if (request->hasParam("BulkVoltage")) {
+    if (paramOk(request, "BulkVoltage")) {
       foundParameter = true;
       inputMessage = request->getParam("BulkVoltage")->value();
       settingWrite(NK_BulkVoltage, inputMessage.c_str());
@@ -5921,19 +5974,19 @@ void setupServer() {
       tuningWaveform = inputMessage.toInt();
       if (TuningMode) tuningParamChanged = true;
     }
-    if (request->hasParam("tuningSineFreq")) {
+    if (paramOk(request, "tuningSineFreq")) {
       foundParameter = true;
       inputMessage = request->getParam("tuningSineFreq")->value();
       settingWrite(NK_tuningSineFreq, inputMessage.c_str());
       tuningSineFreq = inputMessage.toFloat();
     }
-    if (request->hasParam("tuningSweepStart")) {
+    if (paramOk(request, "tuningSweepStart")) {
       foundParameter = true;
       inputMessage = request->getParam("tuningSweepStart")->value();
       settingWrite(NK_tuningSweepStart, inputMessage.c_str());
       tuningSweepStart = inputMessage.toFloat();
     }
-    if (request->hasParam("tuningSweepEnd")) {
+    if (paramOk(request, "tuningSweepEnd")) {
       foundParameter = true;
       inputMessage = request->getParam("tuningSweepEnd")->value();
       settingWrite(NK_tuningSweepEnd, inputMessage.c_str());
@@ -5964,7 +6017,7 @@ void setupServer() {
       SwitchingFrequency = requestedFreq;
       queueConsoleMessageF("Frequency target set to %dHz", requestedFreq);
     }
-    if (request->hasParam("FloatVoltage")) {
+    if (paramOk(request, "FloatVoltage")) {
       foundParameter = true;
       inputMessage = request->getParam("FloatVoltage")->value();
       settingWrite(NK_FloatVoltage, inputMessage.c_str());
@@ -6146,7 +6199,7 @@ void setupServer() {
       }
       queueConsoleMessageF("Max Duty updated to: %d%%", MaxDuty);
     }
-    if (request->hasParam("MaxFieldVolts")) {
+    if (paramOk(request, "MaxFieldVolts")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxFieldVolts")->value();
       MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as the boot-time sanity check in InitSystemSettings, which rewrites anything outside it to the compile default
@@ -6157,7 +6210,7 @@ void setupServer() {
       updateFieldVoltCeiling(getBatteryVoltage(), 999.0f);
       queueConsoleMessageF("Max Field Volts updated to: %.1fV (field ceiling now %.1f%%)", MaxFieldVolts, ccDutyCeiling());
     }
-    if (request->hasParam("MinDuty")) {
+    if (paramOk(request, "MinDuty")) {
       foundParameter = true;
       inputMessage = request->getParam("MinDuty")->value();
       settingWrite(NK_MinDuty, inputMessage.c_str());
@@ -6443,7 +6496,7 @@ void setupServer() {
       dvccSettleS = constrain(inputMessage.toInt(), 5, 600);
       settingWrite(NK_dvccSettleS, String(dvccSettleS).c_str());
     }
-    if (request->hasParam("dvccCvlMin")) {
+    if (paramOk(request, "dvccCvlMin")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccCvlMin")->value();
       // Constrained + cross-checked: toFloat() of garbage is 0.0, and an empty/inverted window
@@ -6456,7 +6509,7 @@ void setupServer() {
         queueConsoleMessage("DVCC: CVL window low must be below the high bound - not applied");
       }
     }
-    if (request->hasParam("dvccCvlMax")) {
+    if (paramOk(request, "dvccCvlMax")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccCvlMax")->value();
       float vMax = constrain(inputMessage.toFloat(), DVCC_CVL_ABS_MIN, DVCC_CVL_ABS_MAX);
@@ -6485,31 +6538,31 @@ void setupServer() {
       tuningWaveFloor = inputMessage.toInt();
       if (TuningMode) tuningParamChanged = true;
     }
-    if (request->hasParam("CurrentThreshold")) {
+    if (paramOk(request, "CurrentThreshold")) {
       foundParameter = true;
       inputMessage = request->getParam("CurrentThreshold")->value();
       settingWrite(NK_CurrentThreshold, inputMessage.c_str());
       CurrentThreshold = inputMessage.toFloat();
     }
-    if (request->hasParam("PeukertExponent")) {
+    if (paramOk(request, "PeukertExponent")) {
       foundParameter = true;
       inputMessage = request->getParam("PeukertExponent")->value();
       PeukertExponent_scaled = (int)lroundf(inputMessage.toFloat() * 100.0f);  // round, not truncate: float32 1.05 x 100 = 104.99999 and (int) stored 1.04
       settingWrite(NK_PeukertExponent, String(PeukertExponent_scaled).c_str());
     }
-    if (request->hasParam("ChargeEfficiency")) {
+    if (paramOk(request, "ChargeEfficiency")) {
       foundParameter = true;
       inputMessage = request->getParam("ChargeEfficiency")->value();
       settingWrite(NK_ChargeEfficiency, inputMessage.c_str());
       ChargeEfficiency_scaled = (int)round(inputMessage.toFloat() * 10);  // store as % × 10
     }
-    if (request->hasParam("ChargedVoltage")) {
+    if (paramOk(request, "ChargedVoltage")) {
       foundParameter = true;
       inputMessage = request->getParam("ChargedVoltage")->value();
       ChargedVoltage_Scaled = (int)lroundf(inputMessage.toFloat() * 100.0f);  // round, not truncate: float32 14.2 x 100 = 1419.99998 and (int) stored 14.19
       settingWrite(NK_ChargedVoltage, String(ChargedVoltage_Scaled).c_str());
     }
-    if (request->hasParam("TailCurrent")) {
+    if (paramOk(request, "TailCurrent")) {
       foundParameter = true;
       inputMessage = request->getParam("TailCurrent")->value();
       settingWrite(NK_TailCurrent, inputMessage.c_str());
@@ -6532,6 +6585,31 @@ void setupServer() {
       inputMessage = request->getParam("IgnoreRPM")->value();
       settingWrite(NK_IgnoreRPM, inputMessage.c_str());
       IgnoreRPM = inputMessage.toInt();
+    }
+    if (request->hasParam("IgnoreAltCurrent")) {
+      foundParameter = true;
+      IgnoreAltCurrent = request->getParam("IgnoreAltCurrent")->value().toInt() ? 1 : 0;
+      settingWrite(NK_IgnoreAltCurrent, String(IgnoreAltCurrent).c_str());
+    }
+    if (request->hasParam("IgnoreBattVMain")) {
+      foundParameter = true;
+      IgnoreBattVMain = request->getParam("IgnoreBattVMain")->value().toInt() ? 1 : 0;
+      settingWrite(NK_IgnoreBattVMain, String(IgnoreBattVMain).c_str());
+    }
+    if (request->hasParam("IgnoreBattV2")) {
+      foundParameter = true;
+      IgnoreBattV2 = request->getParam("IgnoreBattV2")->value().toInt() ? 1 : 0;
+      settingWrite(NK_IgnoreBattV2, String(IgnoreBattV2).c_str());
+    }
+    if (paramOk(request, "LimpDutyPct")) {
+      foundParameter = true;
+      LimpDutyPct = constrain(request->getParam("LimpDutyPct")->value().toFloat(), 0.0f, 99.0f);
+      settingWrite(NK_LimpDutyPct, String(LimpDutyPct, 1).c_str());
+    }
+    if (paramOk(request, "NoRpmCurrentA")) {
+      foundParameter = true;
+      NoRpmCurrentA = fmaxf(0.0f, request->getParam("NoRpmCurrentA")->value().toFloat());
+      settingWrite(NK_NoRpmCurrentA, String(NoRpmCurrentA, 1).c_str());
     }
     if (request->hasParam("MinRPMForField")) {
       foundParameter = true;
@@ -6569,13 +6647,13 @@ void setupServer() {
       settingWrite(NK_TempAlarmLow, inputMessage.c_str());
       TempAlarmLow = inputMessage.toInt();
     }
-    if (request->hasParam("VoltageAlarmHigh")) {
+    if (paramOk(request, "VoltageAlarmHigh")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageAlarmHigh")->value();
       settingWrite(NK_VoltageAlarmHigh, inputMessage.c_str());
       VoltageAlarmHigh = inputMessage.toFloat();
     }
-    if (request->hasParam("VoltageAlarmLow")) {
+    if (paramOk(request, "VoltageAlarmLow")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageAlarmLow")->value();
       settingWrite(NK_VoltageAlarmLow, inputMessage.c_str());
@@ -6617,13 +6695,13 @@ void setupServer() {
       }
       if (axisMoved) pendingRpmAxisWipe = true;  // Core 1 runs the wipe
     }
-    if (request->hasParam("FieldResistance")) {
+    if (paramOk(request, "FieldResistance")) {
       foundParameter = true;
       inputMessage = request->getParam("FieldResistance")->value();
       settingWrite(NK_FieldResistance, inputMessage.c_str());
       FieldResistance = inputMessage.toFloat();
     }
-    if (request->hasParam("AlternatorCOffset")) {
+    if (paramOk(request, "AlternatorCOffset")) {
       foundParameter = true;
       inputMessage = request->getParam("AlternatorCOffset")->value();
       settingWrite(NK_AlternatorCOffset, inputMessage.c_str());
@@ -6644,7 +6722,7 @@ void setupServer() {
       foundParameter = true;
       if (!altZeroApply()) queueConsoleMessage("Alt zero: nothing captured to apply");
     }
-    if (request->hasParam("BatteryCOffset")) {
+    if (paramOk(request, "BatteryCOffset")) {
       foundParameter = true;
       inputMessage = request->getParam("BatteryCOffset")->value();
       settingWrite(NK_BatteryCOffset, inputMessage.c_str());
@@ -6657,19 +6735,19 @@ void setupServer() {
       AmpSensorRange = inputMessage.toInt();
       queueConsoleMessageF("AmpSensorRange changed to: %d", AmpSensorRange);
     }
-    if (request->hasParam("R_fixed")) {
+    if (paramOk(request, "R_fixed")) {
       foundParameter = true;
       inputMessage = request->getParam("R_fixed")->value();
       settingWrite(NK_R_fixed, inputMessage.c_str());
       R_fixed = inputMessage.toFloat();
     }
-    if (request->hasParam("Beta")) {
+    if (paramOk(request, "Beta")) {
       foundParameter = true;
       inputMessage = request->getParam("Beta")->value();
       settingWrite(NK_Beta, inputMessage.c_str());
       Beta = inputMessage.toFloat();
     }
-    if (request->hasParam("T0_C")) {
+    if (paramOk(request, "T0_C")) {
       foundParameter = true;
       inputMessage = request->getParam("T0_C")->value();
       settingWrite(NK_T0_C, inputMessage.c_str());
@@ -6692,6 +6770,12 @@ void setupServer() {
       inputMessage = request->getParam("AlarmLatchEnabled")->value();
       settingWrite(NK_AlarmLatchEnabled, inputMessage.c_str());
       AlarmLatchEnabled = inputMessage.toInt();
+    }
+    if (request->hasParam("GeneralFaultAlarm")) {
+      foundParameter = true;
+      inputMessage = request->getParam("GeneralFaultAlarm")->value();
+      GeneralFaultAlarm = inputMessage.toInt() ? 1 : 0;
+      settingWrite(NK_GeneralFaultAlarm, String(GeneralFaultAlarm).c_str());
     }
     if (request->hasParam("AlarmTest")) {
       foundParameter = true;
@@ -6755,7 +6839,7 @@ void setupServer() {
       absorptionCompleteTime = seconds * 1000UL;
       settingWrite(NK_absorptionCompleteTime, String(absorptionCompleteTime).c_str());
     }
-    if (request->hasParam("FLOAT_DURATION")) {
+    if (paramOk(request, "FLOAT_DURATION")) {
       foundParameter = true;
       inputMessage = request->getParam("FLOAT_DURATION")->value();
       float hours = inputMessage.toFloat();
@@ -6774,13 +6858,13 @@ void setupServer() {
       if (!BatteryShuntPresent && UseFloat == 2) UseFloat = 1;
       settingWrite(NK_UseFloat, String(UseFloat).c_str());
     }
-    if (request->hasParam("RebulkCurrent_A")) {
+    if (paramOk(request, "RebulkCurrent_A")) {
       foundParameter = true;
       inputMessage = request->getParam("RebulkCurrent_A")->value();
       RebulkCurrent_A = inputMessage.toFloat();
       settingWrite(NK_RebulkCurrent_A, String(RebulkCurrent_A).c_str());
     }
-    if (request->hasParam("VMGTargetBearing")) {
+    if (paramOk(request, "VMGTargetBearing")) {
       foundParameter = true;
       inputMessage = request->getParam("VMGTargetBearing")->value();
       VMGTargetBearing = constrain(inputMessage.toFloat(), -1.0f, 359.0f);  // -1 = not set
@@ -6992,19 +7076,19 @@ void setupServer() {
       settingWrite(NK_MaximumAllowedBatteryAmps, inputMessage.c_str());
       MaximumAllowedBatteryAmps = inputMessage.toInt();
     }
-    if (request->hasParam("LoadDumpDtThresh")) {
+    if (paramOk(request, "LoadDumpDtThresh")) {
       foundParameter = true;
       inputMessage = request->getParam("LoadDumpDtThresh")->value();
       LoadDumpDtThresh = inputMessage.toFloat();
       settingWrite(NK_LoadDumpDtThresh, String(LoadDumpDtThresh).c_str());
     }
-    if (request->hasParam("LoadDumpDtThresh1")) {
+    if (paramOk(request, "LoadDumpDtThresh1")) {
       foundParameter = true;
       inputMessage = request->getParam("LoadDumpDtThresh1")->value();
       LoadDumpDtThresh1 = inputMessage.toFloat();
       settingWrite(NK_LoadDumpDtThresh1, String(LoadDumpDtThresh1).c_str());
     }
-    if (request->hasParam("LoadDumpDtThresh3")) {
+    if (paramOk(request, "LoadDumpDtThresh3")) {
       foundParameter = true;
       inputMessage = request->getParam("LoadDumpDtThresh3")->value();
       LoadDumpDtThresh3 = inputMessage.toFloat();
@@ -7033,7 +7117,7 @@ void setupServer() {
       inputMessage = request->getParam("SocSeedAck")->value();
       settingWrite(NK_SocSeedAck, inputMessage.c_str());
     }
-    if (request->hasParam("ManualSOCPoint")) {
+    if (paramOk(request, "ManualSOCPoint")) {
       foundParameter = true;
       inputMessage = request->getParam("ManualSOCPoint")->value();
       settingWrite(NK_ManualSOCPoint, inputMessage.c_str());
@@ -7066,7 +7150,7 @@ void setupServer() {
       }
     }
 
-    if (request->hasParam("VoltageKp")) {
+    if (paramOk(request, "VoltageKp")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageKp")->value();
       settingWrite(NK_VoltageKp, inputMessage.c_str());
@@ -7093,13 +7177,13 @@ void setupServer() {
       settingWrite(NK_Ymax1, inputMessage.c_str());
       Ymax1 = inputMessage.toInt();
     }
-    if (request->hasParam("Ymin2")) {
+    if (paramOk(request, "Ymin2")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymin2")->value();
       settingWrite(NK_Ymin2, inputMessage.c_str());
       Ymin2 = inputMessage.toFloat();
     }
-    if (request->hasParam("Ymax2")) {
+    if (paramOk(request, "Ymax2")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymax2")->value();
       settingWrite(NK_Ymax2, inputMessage.c_str());
@@ -7153,7 +7237,7 @@ void setupServer() {
       queueConsoleMessage("Alt Zero: Reset requested from web interface");
       inputMessage = "1";
     }
-    if (request->hasParam("WindingTempOffset")) {
+    if (paramOk(request, "WindingTempOffset")) {
       foundParameter = true;
       inputMessage = request->getParam("WindingTempOffset")->value();
       settingWrite(NK_WindingTempOffset, inputMessage.c_str());
@@ -7171,7 +7255,7 @@ void setupServer() {
       settingWrite(NK_displayVolUnit, inputMessage.c_str());
       displayVolUnit = (uint8_t)inputMessage.toInt();
     }
-    if (request->hasParam("PulleyRatio")) {
+    if (paramOk(request, "PulleyRatio")) {
       foundParameter = true;
       inputMessage = request->getParam("PulleyRatio")->value();
       settingWrite(NK_PulleyRatio, inputMessage.c_str());
@@ -7242,7 +7326,7 @@ void setupServer() {
       settingWrite(NK_plotTimeWindow, inputMessage.c_str());
       plotTimeWindow = inputMessage.toInt();
     }
-    if (request->hasParam("LatitudeNMEA") && request->hasParam("LongitudeNMEA")) {
+    if (paramOk(request, "LatitudeNMEA") && paramOk(request, "LongitudeNMEA")) {
       foundParameter = true;
       // Engage the sticky manual override: these coords now beat boat NMEA and
       // phone GPS until the user clears it (clearGpsManual). resolveSources()
@@ -7272,7 +7356,7 @@ void setupServer() {
       weatherModeEnabled = inputMessage.toInt();
       queueConsoleMessageF("Weather Mode %s", weatherModeEnabled ? "enabled" : "disabled");
     }
-    if (request->hasParam("UVThresholdHigh")) {
+    if (paramOk(request, "UVThresholdHigh")) {
       foundParameter = true;
       inputMessage = request->getParam("UVThresholdHigh")->value();
       settingWrite(NK_UVThresholdHigh, inputMessage.c_str());
@@ -7285,7 +7369,7 @@ void setupServer() {
       SolarWatts = inputMessage.toInt();
       weatherRecomputePredicted();
     }
-    if (request->hasParam("performanceRatio")) {
+    if (paramOk(request, "performanceRatio")) {
       foundParameter = true;
       inputMessage = request->getParam("performanceRatio")->value();
       settingWrite(NK_performanceRatio, inputMessage.c_str());
@@ -7305,13 +7389,13 @@ void setupServer() {
       settingWrite(NK_solarUseConsEnable, inputMessage.c_str());
       solarUseConsEnable = inputMessage.toInt();
     }
-    if (request->hasParam("solarConsMarginPct")) {
+    if (paramOk(request, "solarConsMarginPct")) {
       foundParameter = true;
       inputMessage = request->getParam("solarConsMarginPct")->value();
       settingWrite(NK_solarConsMarginPct, inputMessage.c_str());
       solarConsMarginPct = inputMessage.toFloat();
     }
-    if (request->hasParam("solarLearnRatePct")) {
+    if (paramOk(request, "solarLearnRatePct")) {
       foundParameter = true;
       inputMessage = request->getParam("solarLearnRatePct")->value();
       settingWrite(NK_solarLearnRatePct, inputMessage.c_str());
@@ -7354,19 +7438,19 @@ void setupServer() {
       pendingClearOverheatHistory = true;  // deferred to Core 1 to avoid SSE gap
       inputMessage = "1";
     }
-    if (request->hasParam("CAPSIZE_THRESHOLD_DEG")) {
+    if (paramOk(request, "CAPSIZE_THRESHOLD_DEG")) {
       foundParameter = true;
       inputMessage = request->getParam("CAPSIZE_THRESHOLD_DEG")->value();
       settingWrite(NK_CAPSIZE_THRESHOLD_DEG, inputMessage.c_str());
       CAPSIZE_THRESHOLD_DEG = inputMessage.toFloat();
     }
-    if (request->hasParam("PITCHPOLE_THRESHOLD_DEG")) {
+    if (paramOk(request, "PITCHPOLE_THRESHOLD_DEG")) {
       foundParameter = true;
       inputMessage = request->getParam("PITCHPOLE_THRESHOLD_DEG")->value();
       settingWrite(NK_PITCHPOLE_THRESHOLD_DEG, inputMessage.c_str());
       PITCHPOLE_THRESHOLD_DEG = inputMessage.toFloat();
     }
-    if (request->hasParam("SLAM_THRESHOLD_G")) {
+    if (paramOk(request, "SLAM_THRESHOLD_G")) {
       foundParameter = true;
       inputMessage = request->getParam("SLAM_THRESHOLD_G")->value();
       settingWrite(NK_SLAM_THRESHOLD_G, inputMessage.c_str());
@@ -7446,12 +7530,12 @@ void setupServer() {
       foundParameter = true;   // wizard Abort — only meaningful mid-run; the loop resumes normal slew-limited AUTO control
       if (bhTestState == 1) bhAbort("cancelled by user");
     }
-    if (request->hasParam("bhStepLowA")) {
+    if (paramOk(request, "bhStepLowA")) {
       foundParameter = true;
       bhStepLowA = request->getParam("bhStepLowA")->value().toFloat();
       settingWrite(NK_bhStepLowA, String(bhStepLowA, 1).c_str());
     }
-    if (request->hasParam("bhStepDeltaA")) {
+    if (paramOk(request, "bhStepDeltaA")) {
       foundParameter = true;
       bhStepDeltaA = request->getParam("bhStepDeltaA")->value().toFloat();
       if (bhStepDeltaA < 5.0f) bhStepDeltaA = 5.0f;
@@ -7467,7 +7551,7 @@ void setupServer() {
       if (bhDwellMs < bhMinDwellMs()) bhDwellMs = bhMinDwellMs();
       settingWrite(NK_bhDwellMs, String(bhDwellMs).c_str());
     }
-    if (request->hasParam("bhDwellSec")) {
+    if (paramOk(request, "bhDwellSec")) {
       foundParameter = true;   // UI is seconds, internal is ms
       bhDwellMs = (uint32_t)(request->getParam("bhDwellSec")->value().toFloat() * 1000.0f);
       if (bhDwellMs < bhMinDwellMs()) bhDwellMs = bhMinDwellMs();
@@ -7504,16 +7588,16 @@ void setupServer() {
       queueConsoleMessage("BATT HEALTH: resistance-test history cleared");
     }
     // ── Capacity tracker config + OCV table ──
-    if (request->hasParam("capRestFrac"))   { foundParameter = true; capRestCurrentFrac = request->getParam("capRestFrac")->value().toFloat();   settingWrite(NK_capRestFrac, String(capRestCurrentFrac, 4).c_str()); }
+    if (paramOk(request, "capRestFrac"))   { foundParameter = true; capRestCurrentFrac = request->getParam("capRestFrac")->value().toFloat();   settingWrite(NK_capRestFrac, String(capRestCurrentFrac, 4).c_str()); }
     if (request->hasParam("capRestFloor"))  { foundParameter = true; capRestFloorMin    = (uint16_t)request->getParam("capRestFloor")->value().toInt(); settingWrite(NK_capRestFloor, String(capRestFloorMin).c_str()); }
-    if (request->hasParam("capSettleRate")) { foundParameter = true; capSettleRateMv10  = request->getParam("capSettleRate")->value().toFloat(); settingWrite(NK_capSettleRate, String(capSettleRateMv10, 2).c_str()); }
-    if (request->hasParam("capSocLowMax"))  { foundParameter = true; capSocLowMax       = request->getParam("capSocLowMax")->value().toFloat();  settingWrite(NK_capSocLowMax, String(capSocLowMax, 1).c_str()); }
-    if (request->hasParam("capMinSpan"))    { foundParameter = true; capMinSpan         = request->getParam("capMinSpan")->value().toFloat();    settingWrite(NK_capMinSpan, String(capMinSpan, 1).c_str()); }
-    if (request->hasParam("capFullSoc"))    { foundParameter = true; capFullSoc         = request->getParam("capFullSoc")->value().toFloat();    settingWrite(NK_capFullSoc, String(capFullSoc, 1).c_str()); }
+    if (paramOk(request, "capSettleRate")) { foundParameter = true; capSettleRateMv10  = request->getParam("capSettleRate")->value().toFloat(); settingWrite(NK_capSettleRate, String(capSettleRateMv10, 2).c_str()); }
+    if (paramOk(request, "capSocLowMax"))  { foundParameter = true; capSocLowMax       = request->getParam("capSocLowMax")->value().toFloat();  settingWrite(NK_capSocLowMax, String(capSocLowMax, 1).c_str()); }
+    if (paramOk(request, "capMinSpan"))    { foundParameter = true; capMinSpan         = request->getParam("capMinSpan")->value().toFloat();    settingWrite(NK_capMinSpan, String(capMinSpan, 1).c_str()); }
+    if (paramOk(request, "capFullSoc"))    { foundParameter = true; capFullSoc         = request->getParam("capFullSoc")->value().toFloat();    settingWrite(NK_capFullSoc, String(capFullSoc, 1).c_str()); }
     if (request->hasParam("capRefMode"))    { foundParameter = true; capRefMode         = (uint8_t)request->getParam("capRefMode")->value().toInt(); settingWrite(NK_capRefMode, String(capRefMode).c_str()); }
     if (request->hasParam("capTempNorm"))   { foundParameter = true; capTempNormEnable  = (uint8_t)request->getParam("capTempNorm")->value().toInt(); settingWrite(NK_capTempNorm, String(capTempNormEnable).c_str()); }
-    if (request->hasParam("capTempCoeff"))  { foundParameter = true; capTempCoeffPctC   = request->getParam("capTempCoeff")->value().toFloat();  settingWrite(NK_capTempCoeff, String(capTempCoeffPctC, 3).c_str()); }
-    if (request->hasParam("capTempRef"))    { foundParameter = true; capTempRefC        = request->getParam("capTempRef")->value().toFloat();   settingWrite(NK_capTempRef, String(capTempRefC, 1).c_str()); }
+    if (paramOk(request, "capTempCoeff"))  { foundParameter = true; capTempCoeffPctC   = request->getParam("capTempCoeff")->value().toFloat();  settingWrite(NK_capTempCoeff, String(capTempCoeffPctC, 3).c_str()); }
+    if (paramOk(request, "capTempRef"))    { foundParameter = true; capTempRefC        = request->getParam("capTempRef")->value().toFloat();   settingWrite(NK_capTempRef, String(capTempRefC, 1).c_str()); }
     if (request->hasParam("capOcv")) {
       foundParameter = true;   // full OCV table as a comma-joined string of CAP_OCV_ROWS rested voltages
       String body = request->getParam("capOcv")->value();
@@ -7550,28 +7634,28 @@ void setupServer() {
       char paramName[32];
 
       snprintf(paramName, sizeof(paramName), "rpmTableRPMPoints%d", i);
-      if (request->hasParam(paramName)) {
+      if (paramOk(request, paramName)) {
         foundParameter = true;
         rpmTableRPMPoints[i] = request->getParam(paramName)->value().toInt();
         tableChangedThisRequest = true;
       }
 
       snprintf(paramName, sizeof(paramName), "rpmCapCurrentTable%d", i);
-      if (request->hasParam(paramName)) {
+      if (paramOk(request, paramName)) {
         foundParameter = true;
         rpmCapCurrentTable[i] = request->getParam(paramName)->value().toFloat();
         tableChangedThisRequest = true;
       }
 
       snprintf(paramName, sizeof(paramName), "rpmCapKW%d", i);
-      if (request->hasParam(paramName)) {
+      if (paramOk(request, paramName)) {
         foundParameter = true;
         rpmCapPowerTable[i] = request->getParam(paramName)->value().toFloat() * 1000.0f;
         tableChangedThisRequest = true;
       }
 
       snprintf(paramName, sizeof(paramName), "rpmMinDutyTable%d", i);
-      if (request->hasParam(paramName)) {
+      if (paramOk(request, paramName)) {
         foundParameter = true;
         rpmMinDutyTable[i] = request->getParam(paramName)->value().toFloat();
         tableChangedThisRequest = true;
@@ -7630,7 +7714,7 @@ void setupServer() {
     // request, independent of the live HiLow mode. Only the active mode's live ceiling is refreshed
     // here (so the running alternator honors the edit immediately); the mode switch itself rides a
     // separate HiLow request so its ceiling glide runs. Both blobs are written on Core 1.
-    if (request->hasParam("capBothSave")) {
+    if (paramOk(request, "capBothSave")) {
       foundParameter = true;
       char pn[32];
       bool ptsChanged = false;
@@ -7638,13 +7722,13 @@ void setupServer() {
       for (int i = 0; i < RPM_TABLE_SIZE; i++) {
         hiA[i] = rpmCapCurrentTable[i]; loA[i] = rpmCapCurrentTable[i];
         hiW[i] = rpmCapPowerTable[i];   loW[i] = rpmCapPowerTable[i];
-        snprintf(pn, sizeof(pn), "rpmCapHi%d", i);    if (request->hasParam(pn)) hiA[i] = request->getParam(pn)->value().toFloat();
-        snprintf(pn, sizeof(pn), "rpmCapLo%d", i);    if (request->hasParam(pn)) loA[i] = request->getParam(pn)->value().toFloat();
-        snprintf(pn, sizeof(pn), "rpmCapPwrHi%d", i); if (request->hasParam(pn)) hiW[i] = request->getParam(pn)->value().toFloat() * 1000.0f;
-        snprintf(pn, sizeof(pn), "rpmCapPwrLo%d", i); if (request->hasParam(pn)) loW[i] = request->getParam(pn)->value().toFloat() * 1000.0f;
+        snprintf(pn, sizeof(pn), "rpmCapHi%d", i);    if (paramOk(request, pn)) hiA[i] = request->getParam(pn)->value().toFloat();
+        snprintf(pn, sizeof(pn), "rpmCapLo%d", i);    if (paramOk(request, pn)) loA[i] = request->getParam(pn)->value().toFloat();
+        snprintf(pn, sizeof(pn), "rpmCapPwrHi%d", i); if (paramOk(request, pn)) hiW[i] = request->getParam(pn)->value().toFloat() * 1000.0f;
+        snprintf(pn, sizeof(pn), "rpmCapPwrLo%d", i); if (paramOk(request, pn)) loW[i] = request->getParam(pn)->value().toFloat() * 1000.0f;
 
         snprintf(pn, sizeof(pn), "rpmTableRPMPoints%d", i);
-        if (request->hasParam(pn)) {
+        if (paramOk(request, pn)) {
           int v = request->getParam(pn)->value().toInt();
           if (v != rpmTableRPMPoints[i]) { ptsChanged = true; rpmTableRPMPoints[i] = v; }
         }
@@ -7669,7 +7753,7 @@ void setupServer() {
       char paramName[32];
 
       snprintf(paramName, sizeof(paramName), "fuelTableRPM%d", i);
-      if (request->hasParam(paramName)) {
+      if (paramOk(request, paramName)) {
         foundParameter = true;
         float value = request->getParam(paramName)->value().toFloat();
         fuelTableRPM[i] = value;
@@ -7677,7 +7761,7 @@ void setupServer() {
       }
 
       snprintf(paramName, sizeof(paramName), "fuelTableGPH%d", i);
-      if (request->hasParam(paramName)) {
+      if (paramOk(request, paramName)) {
         foundParameter = true;
         float value = request->getParam(paramName)->value().toFloat();
         fuelTableGPH[i] = value;
@@ -7699,19 +7783,19 @@ void setupServer() {
       settingWrite(NK_AlternatorNominalAmps, inputMessage.c_str());
       AlternatorNominalAmps = inputMessage.toInt();
     }
-    if (request->hasParam("LearningUpStep")) {
+    if (paramOk(request, "LearningUpStep")) {
       foundParameter = true;
       inputMessage = request->getParam("LearningUpStep")->value();
       settingWrite(NK_LearningUpStep, inputMessage.c_str());
       LearningUpStep = inputMessage.toFloat();
     }
-    if (request->hasParam("LearningDownStep")) {
+    if (paramOk(request, "LearningDownStep")) {
       foundParameter = true;
       inputMessage = request->getParam("LearningDownStep")->value();
       settingWrite(NK_LearningDownStep, inputMessage.c_str());
       LearningDownStep = inputMessage.toFloat();
     }
-    if (request->hasParam("xTime")) {
+    if (paramOk(request, "xTime")) {
       foundParameter = true;
       inputMessage = request->getParam("xTime")->value();
       settingWrite(NK_xTime, inputMessage.c_str());
@@ -7724,7 +7808,7 @@ void setupServer() {
       settingWrite(NK_MinLearningInterval, String(temp).c_str());
       MinLearningInterval = temp;
     }
-    if (request->hasParam("SetpointRiseRate")) {
+    if (paramOk(request, "SetpointRiseRate")) {
       foundParameter = true;
       inputMessage = request->getParam("SetpointRiseRate")->value();
       settingWrite(NK_SetpointRiseRate, inputMessage.c_str());
@@ -7732,7 +7816,7 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("SetpointBigStepThresh")) {
+    if (paramOk(request, "SetpointBigStepThresh")) {
       foundParameter = true;
       inputMessage = request->getParam("SetpointBigStepThresh")->value();
       settingWrite(NK_SetpointBigStepThresh, inputMessage.c_str());
@@ -7740,7 +7824,7 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("SetpointBigStepRiseRate")) {
+    if (paramOk(request, "SetpointBigStepRiseRate")) {
       foundParameter = true;
       inputMessage = request->getParam("SetpointBigStepRiseRate")->value();
       settingWrite(NK_SetpointBigStepRiseRate, inputMessage.c_str());
@@ -7748,7 +7832,7 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("SetpointFallRate")) {
+    if (paramOk(request, "SetpointFallRate")) {
       foundParameter = true;
       inputMessage = request->getParam("SetpointFallRate")->value();
       settingWrite(NK_SetpointFallRate, inputMessage.c_str());
@@ -7756,7 +7840,7 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("CvBrakeFallRate")) {
+    if (paramOk(request, "CvBrakeFallRate")) {
       foundParameter = true;
       inputMessage = request->getParam("CvBrakeFallRate")->value();
       CvBrakeFallRate = fmaxf(SetpointFallRate, inputMessage.toFloat());  // a brake rate below the normal fall rate is meaningless
@@ -7765,14 +7849,14 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("StartupRiseRate")) {
+    if (paramOk(request, "StartupRiseRate")) {
       foundParameter = true;
       inputMessage = request->getParam("StartupRiseRate")->value();
       settingWrite(NK_StartupRiseRate, inputMessage.c_str());
       StartupRiseRate = inputMessage.toFloat();
       queueConsoleMessageF("Startup rise rate set to: %.2f A/sec", StartupRiseRate);
     }
-    if (request->hasParam("PIDTrackingGain")) {
+    if (paramOk(request, "PIDTrackingGain")) {
       foundParameter = true;
       inputMessage = request->getParam("PIDTrackingGain")->value();
       float temp = inputMessage.toFloat();
@@ -7788,7 +7872,7 @@ void setupServer() {
       settingWrite(NK_SafeOperationThreshold, String(temp).c_str());
       SafeOperationThreshold = temp;
     }
-    if (request->hasParam("PidKp")) {
+    if (paramOk(request, "PidKp")) {
       foundParameter = true;
       inputMessage = request->getParam("PidKp")->value();
       settingWrite(NK_PidKp, inputMessage.c_str());
@@ -7799,13 +7883,13 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       queueConsoleMessageF("PID Kp updated to: %.6f", PidKp);
     }
-    if (request->hasParam("AbsorptionVoltage")) {
+    if (paramOk(request, "AbsorptionVoltage")) {
       foundParameter = true;
       inputMessage = request->getParam("AbsorptionVoltage")->value();
       AbsorptionVoltage = inputMessage.toFloat();
       settingWrite(NK_AbsorptionVoltage, inputMessage.c_str());
     }
-    if (request->hasParam("TargetVoltageSetpoint")) {
+    if (paramOk(request, "TargetVoltageSetpoint")) {
       foundParameter = true;
       inputMessage = request->getParam("TargetVoltageSetpoint")->value();
       TargetVoltageSetpoint = inputMessage.toFloat();
@@ -7819,14 +7903,14 @@ void setupServer() {
       AbsorptionTimeoutMs = minutes * 60000UL;
       settingWrite(NK_AbsorptionTimeoutMs, String(AbsorptionTimeoutMs).c_str());
     }
-    if (request->hasParam("bulkVoltageHoldMs")) {
+    if (paramOk(request, "bulkVoltageHoldMs")) {
       foundParameter = true;
       inputMessage = request->getParam("bulkVoltageHoldMs")->value();
       float seconds = inputMessage.toFloat();
       bulkVoltageHoldMs = (uint32_t)(seconds * 1000.0f);
       settingWrite(NK_bulkVoltageHoldMs, String(bulkVoltageHoldMs).c_str());
     }
-    if (request->hasParam("VoltageKi")) {
+    if (paramOk(request, "VoltageKi")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageKi")->value();
       VoltageKi = inputMessage.toFloat();
@@ -7851,7 +7935,7 @@ void setupServer() {
                              inputMessage.c_str(), request->client()->remoteIP().toString().c_str());
       }
     }
-    if (request->hasParam("cvAlpha")) {  // CV auto-gain aggressiveness α — Kp = α / measured stiffness K
+    if (paramOk(request, "cvAlpha")) {  // CV auto-gain aggressiveness α — Kp = α / measured stiffness K
       foundParameter = true;
       cvAlpha = clamp_f(request->getParam("cvAlpha")->value().toFloat(), 0.02f, 0.50f);
       settingWrite(NK_cvAlpha, String(cvAlpha, 3).c_str());
@@ -7859,7 +7943,7 @@ void setupServer() {
       queueConsoleMessageF("CV aggressiveness alpha: %.2f", cvAlpha);
     }
     // Legacy — inert in AUTO under the ohmic-anchor rule; kept so a bench curl / stale page can't 404.
-    if (request->hasParam("cvCrossover")) {  // CV crossover ω_c (rad/s)
+    if (paramOk(request, "cvCrossover")) {  // CV crossover ω_c (rad/s)
       foundParameter = true;
       cvCrossover = clamp_f(request->getParam("cvCrossover")->value().toFloat(), 0.05f, 0.80f);  // 0.80 ≈ 5 s, fast end of the seconds control
       settingWrite(NK_cvCrossover, String(cvCrossover, 3).c_str());
@@ -7868,7 +7952,7 @@ void setupServer() {
     }
     // User-facing CV Response Time in seconds → ω_c = 4/sec (settle ≈ 4 time constants). Stored as cvCrossover;
     // the dashboard relabels ω_c as seconds, but ω_c stays the internal/NVS unit so recomputeCvGains is unchanged.
-    if (request->hasParam("cvRespS")) {
+    if (paramOk(request, "cvRespS")) {
       foundParameter = true;
       float respS = request->getParam("cvRespS")->value().toFloat();
       cvCrossover = clamp_f((respS > 0.0f) ? (4.0f / respS) : 0.20f, 0.05f, 0.80f);
@@ -7876,7 +7960,7 @@ void setupServer() {
       recomputeCvGains();
       queueConsoleMessageF("CV response time: %.0f s (crossover %.2f rad/s)", 4.0f / cvCrossover, cvCrossover);
     }
-    if (request->hasParam("cvPiZero")) {  // CV PI integral zero ρ (rad/s) — Ki = ρ·Kp
+    if (paramOk(request, "cvPiZero")) {  // CV PI integral zero ρ (rad/s) — Ki = ρ·Kp
       foundParameter = true;
       cvPiZero = clamp_f(request->getParam("cvPiZero")->value().toFloat(), 0.2f, 1.5f);
       settingWrite(NK_cvPiZero, String(cvPiZero, 3).c_str());
@@ -7890,7 +7974,7 @@ void setupServer() {
       recomputeCvGains();
       queueConsoleMessageF("Battery-temp gain derate: %s", battTempDerateEnable ? "ON" : "OFF");
     }
-    if (request->hasParam("battTempCoeff")) {  // battery fractional resistance change per °C (R rises as T falls)
+    if (paramOk(request, "battTempCoeff")) {  // battery fractional resistance change per °C (R rises as T falls)
       foundParameter = true;
       battTempCoeff = clamp_f(request->getParam("battTempCoeff")->value().toFloat(), 0.0f, 0.10f);
       settingWrite(NK_battTempCoeff, String(battTempCoeff, 4).c_str());
@@ -7964,7 +8048,7 @@ void setupServer() {
       HuntQualifyScans = (uint8_t)constrain(request->getParam("HuntQualifyScans")->value().toInt(), HUNT_QUALIFY_SCANS_MIN, HUNT_QUALIFY_SCANS_MAX);
       settingWrite(NK_HuntQualifyScans, String((int)HuntQualifyScans).c_str());
     }
-    if (request->hasParam("HuntTrigPct")) {
+    if (paramOk(request, "HuntTrigPct")) {
       foundParameter = true;
       HuntTrigPct = fmaxf(request->getParam("HuntTrigPct")->value().toFloat(), HUNT_TRIG_PCT_MIN);
       settingWrite(NK_HuntTrigPct, String(HuntTrigPct, 2).c_str());
@@ -7974,19 +8058,19 @@ void setupServer() {
       HuntSteadyPct = (uint8_t)constrain(request->getParam("HuntSteadyPct")->value().toInt(), HUNT_STEADY_PCT_MIN, HUNT_STEADY_PCT_MAX);
       settingWrite(NK_HuntSteadyPct, String((int)HuntSteadyPct).c_str());
     }
-    if (request->hasParam("cvRecovSec")) {  // retired timed-window knob — writes the inert global (UI field removed)
+    if (paramOk(request, "cvRecovSec")) {  // retired timed-window knob — writes the inert global (UI field removed)
       foundParameter = true;
       cvRecovSec = clamp_f(request->getParam("cvRecovSec")->value().toFloat(), 0.5f, 30.0f);
       settingWrite(NK_cvRecovSec, String(cvRecovSec, 2).c_str());
       queueConsoleMessageF("CV recovery time: %.1f s", cvRecovSec);
     }
-    if (request->hasParam("cvRecovEmaxV")) {  // retired timed-window knob — writes the inert global (UI field removed)
+    if (paramOk(request, "cvRecovEmaxV")) {  // retired timed-window knob — writes the inert global (UI field removed)
       foundParameter = true;
       cvRecovEmaxV = clamp_f(request->getParam("cvRecovEmaxV")->value().toFloat(), 0.05f, 2.0f);
       settingWrite(NK_cvRecovEmaxV, String(cvRecovEmaxV, 3).c_str());
       queueConsoleMessageF("CV recovery error cap: %.2f V", cvRecovEmaxV);
     }
-    if (request->hasParam("cvRecovKiMax")) {  // refill Ki multiplier at release, tapering to 1x as the deficit heals
+    if (paramOk(request, "cvRecovKiMax")) {  // refill Ki multiplier at release, tapering to 1x as the deficit heals
       foundParameter = true;
       cvRecovKiMax = clamp_f(request->getParam("cvRecovKiMax")->value().toFloat(), 1.0f, 10.0f);
       settingWrite(NK_cvRecovKiMax, String(cvRecovKiMax, 2).c_str());
@@ -7998,43 +8082,43 @@ void setupServer() {
       settingWrite(NK_cvRecovBoostEnable, String((int)cvRecovBoostEnable).c_str());
       queueConsoleMessageF("CV recovery P-boost: %s", cvRecovBoostEnable ? "ON" : "OFF");
     }
-    if (request->hasParam("cvRecovBoostMax")) {  // recovery P-boost max multiplier at full shortfall
+    if (paramOk(request, "cvRecovBoostMax")) {  // recovery P-boost max multiplier at full shortfall
       foundParameter = true;
       cvRecovBoostMax = clamp_f(request->getParam("cvRecovBoostMax")->value().toFloat(), 1.0f, 8.0f);
       settingWrite(NK_cvRecovBoostMax, String(cvRecovBoostMax, 2).c_str());
       queueConsoleMessageF("CV recovery P-boost max: %.2fx", cvRecovBoostMax);
     }
-    if (request->hasParam("cvRecovBoostErrV")) {  // shortfall (V per 12V block) at which the boost reaches max
+    if (paramOk(request, "cvRecovBoostErrV")) {  // shortfall (V per 12V block) at which the boost reaches max
       foundParameter = true;
       cvRecovBoostErrV = clamp_f(request->getParam("cvRecovBoostErrV")->value().toFloat(), 0.1f, 5.0f);
       settingWrite(NK_cvRecovBoostErrV, String(cvRecovBoostErrV, 3).c_str());
       queueConsoleMessageF("CV recovery P-boost full-boost shortfall: %.2f V", cvRecovBoostErrV);
     }
-    if (request->hasParam("cvRecovBoostFloorV")) {  // dead area (V per 12V block): no boost within this shortfall of target
+    if (paramOk(request, "cvRecovBoostFloorV")) {  // dead area (V per 12V block): no boost within this shortfall of target
       foundParameter = true;
       cvRecovBoostFloorV = clamp_f(request->getParam("cvRecovBoostFloorV")->value().toFloat(), 0.0f, 5.0f);
       settingWrite(NK_cvRecovBoostFloorV, String(cvRecovBoostFloorV, 3).c_str());
       queueConsoleMessageF("CV recovery P-boost dead area: %.2f V", cvRecovBoostFloorV);
     }
-    if (request->hasParam("cvRecovDeepBandV")) {  // deep-recovery band (V per 12V block): beyond this shortfall the walk speeds up and episode boost stays live
+    if (paramOk(request, "cvRecovDeepBandV")) {  // deep-recovery band (V per 12V block): beyond this shortfall the walk speeds up and episode boost stays live
       foundParameter = true;
       cvRecovDeepBandV = clamp_f(request->getParam("cvRecovDeepBandV")->value().toFloat(), 0.0f, 5.0f);
       settingWrite(NK_cvRecovDeepBandV, String(cvRecovDeepBandV, 3).c_str());
       queueConsoleMessageF("CV recovery deep band: %.2f V", cvRecovDeepBandV);
     }
-    if (request->hasParam("cvRecovDeepMult")) {  // starve-walk rate multiplier at full depth
+    if (paramOk(request, "cvRecovDeepMult")) {  // starve-walk rate multiplier at full depth
       foundParameter = true;
       cvRecovDeepMult = clamp_f(request->getParam("cvRecovDeepMult")->value().toFloat(), 1.0f, 20.0f);
       settingWrite(NK_cvRecovDeepMult, String(cvRecovDeepMult, 1).c_str());
       queueConsoleMessageF("CV recovery deep walk multiplier: %.1fx", cvRecovDeepMult);
     }
-    if (request->hasParam("cvRecovFlareBandV")) {  // arrival flare band (V per 12V block): recovery ceiling tapers within this shortfall
+    if (paramOk(request, "cvRecovFlareBandV")) {  // arrival flare band (V per 12V block): recovery ceiling tapers within this shortfall
       foundParameter = true;
       cvRecovFlareBandV = clamp_f(request->getParam("cvRecovFlareBandV")->value().toFloat(), 0.0f, 2.0f);
       settingWrite(NK_cvRecovFlareBandV, String(cvRecovFlareBandV, 3).c_str());
       queueConsoleMessageF("CV recovery arrival flare band: %.2f V", cvRecovFlareBandV);
     }
-    if (request->hasParam("cvRecovFlareFrac")) {  // flare ceiling at target, fraction of the recovery goal
+    if (paramOk(request, "cvRecovFlareFrac")) {  // flare ceiling at target, fraction of the recovery goal
       foundParameter = true;
       cvRecovFlareFrac = clamp_f(request->getParam("cvRecovFlareFrac")->value().toFloat(), 0.5f, 1.0f);
       settingWrite(NK_cvRecovFlareFrac, String(cvRecovFlareFrac, 2).c_str());
@@ -8062,13 +8146,13 @@ void setupServer() {
       queueConsoleMessageF("Manual CV test slew mode: %s",
                            cvTestSlewMode == 0 ? "Off (instant)" : cvTestSlewMode == 1 ? "Default rate" : "Custom rate");
     }
-    if (request->hasParam("vTgtRampUp")) {  // CV voltage-target ramp UP rate (V/s); 0 = instant
+    if (paramOk(request, "vTgtRampUp")) {  // CV voltage-target ramp UP rate (V/s); 0 = instant
       foundParameter = true;
       vTgtRampUp = clamp_f(request->getParam("vTgtRampUp")->value().toFloat(), 0.0f, 5.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       settingWrite(NK_vTgtRampUp, String(vTgtRampUp, 3).c_str());
       queueConsoleMessageF("CV target ramp up: %.3f V/s", vTgtRampUp);
     }
-    if (request->hasParam("vTgtRampDn")) {  // CV voltage-target ramp DOWN rate (V/s); 0 = instant
+    if (paramOk(request, "vTgtRampDn")) {  // CV voltage-target ramp DOWN rate (V/s); 0 = instant
       foundParameter = true;
       vTgtRampDn = clamp_f(request->getParam("vTgtRampDn")->value().toFloat(), 0.0f, 5.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       settingWrite(NK_vTgtRampDn, String(vTgtRampDn, 3).c_str());
@@ -8080,13 +8164,13 @@ void setupServer() {
       settingWrite(NK_cvWindDownEn, String((int)cvWindDownEnable).c_str());
       queueConsoleMessageF("CV target wind-down: %s", cvWindDownEnable ? "enabled" : "disabled");
     }
-    if (request->hasParam("cvWindDownRate")) {  // fraction of MaxTableValue shed per second
+    if (paramOk(request, "cvWindDownRate")) {  // fraction of MaxTableValue shed per second
       foundParameter = true;
       cvWindDownRate = clamp_f(request->getParam("cvWindDownRate")->value().toFloat(), 0.005f, 1.0f);
       settingWrite(NK_cvWindDownRate, String(cvWindDownRate, 3).c_str());
       queueConsoleMessageF("CV wind-down rate: %.3f of max amps/s", cvWindDownRate);
     }
-    if (request->hasParam("cvWindDownStopV")) {  // V real per-bus — stop margin above the commanded target
+    if (paramOk(request, "cvWindDownStopV")) {  // V real per-bus — stop margin above the commanded target
       foundParameter = true;
       cvWindDownStopV = clamp_f(request->getParam("cvWindDownStopV")->value().toFloat(), 0.0f, 0.3f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       settingWrite(NK_cvWindDownStopV, String(cvWindDownStopV, 3).c_str());
@@ -8094,7 +8178,7 @@ void setupServer() {
     }
     // Plant curve K(t) = Ka + Kb·√t. The fit step writes both; a bench hand-entry may send cvPlantK alone,
     // which means "flat curve" (Kb = 0) — the old single-point behaviour.
-    if (request->hasParam("cvPlantK")) {   // alias: flat curve at the given gain
+    if (paramOk(request, "cvPlantK")) {   // alias: flat curve at the given gain
       foundParameter = true;
       cvPlantKa = request->getParam("cvPlantK")->value().toFloat();
       cvPlantKb = 0.0f;
@@ -8102,7 +8186,7 @@ void setupServer() {
       settingWrite(NK_cvPlantKb, "0.00000");
       recomputeCvGains();
     }
-    if (request->hasParam("cvPlantKa")) {
+    if (paramOk(request, "cvPlantKa")) {
       foundParameter = true;
       cvPlantKa = request->getParam("cvPlantKa")->value().toFloat();
       settingWrite(NK_cvPlantKa, String(cvPlantKa, 5).c_str());
@@ -8117,7 +8201,7 @@ void setupServer() {
       }
       recomputeCvGains();
     }
-    if (request->hasParam("cvPlantKb")) {
+    if (paramOk(request, "cvPlantKb")) {
       foundParameter = true;
       cvPlantKb = fmaxf(0.0f, request->getParam("cvPlantKb")->value().toFloat());   // a falling tail is never physical
       settingWrite(NK_cvPlantKb, String(cvPlantKb, 5).c_str());
@@ -8156,33 +8240,33 @@ void setupServer() {
     }
     // The `else` is load-bearing: a batched resTest=0&resTestTargetA=N would otherwise zero the target in the
     // disarm above and then command N amps back into a field that was asked to wind down. Arm/disarm wins.
-    else if (request->hasParam("resTestTargetA")) {
+    else if (paramOk(request, "resTestTargetA")) {
       foundParameter = true;
       resTestTargetA = request->getParam("resTestTargetA")->value().toFloat();
       resTestLastCmdMs = millis();  // keepalive refresh (deadman)
     }
-    if (request->hasParam("CvKdDeadbandVps")) {
+    if (paramOk(request, "CvKdDeadbandVps")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdDeadbandVps")->value();
       CvKdDeadbandVps = inputMessage.toFloat();
       settingWrite(NK_CvKdDeadbandVps, String(CvKdDeadbandVps, 3).c_str());
       queueConsoleMessageF("CV D-term deadband base: %.3f V/s", CvKdDeadbandVps);
     }
-    if (request->hasParam("CvKdDbSlope")) {
+    if (paramOk(request, "CvKdDbSlope")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdDbSlope")->value();
       CvKdDbSlope = inputMessage.toFloat();
       settingWrite(NK_CvKdDbSlope, String(CvKdDbSlope, 5).c_str());
       queueConsoleMessageF("CV D-term deadband slope: %.5f V/s per A", CvKdDbSlope);
     }
-    if (request->hasParam("CvKdDbFloor")) {
+    if (paramOk(request, "CvKdDbFloor")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdDbFloor")->value();
       CvKdDbFloor = inputMessage.toFloat();
       settingWrite(NK_CvKdDbFloor, String(CvKdDbFloor, 3).c_str());
       queueConsoleMessageF("CV D-term deadband floor: %.3f V/s", CvKdDbFloor);
     }
-    if (request->hasParam("CvKdDbCeil")) {
+    if (paramOk(request, "CvKdDbCeil")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdDbCeil")->value();
       CvKdDbCeil = inputMessage.toFloat();
@@ -8203,7 +8287,7 @@ void setupServer() {
       settingWrite(NK_CvKdExcessMode, String((int)CvKdExcessMode).c_str());
       queueConsoleMessageF("CV D-term response: %s", CvKdExcessMode ? "GRADUAL (slope excess over tolerance line)" : "STEPPED (legacy full-slope latch)");
     }
-    if (request->hasParam("VoltageKd")) {
+    if (paramOk(request, "VoltageKd")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageKd")->value();
       VoltageKd = inputMessage.toFloat();
@@ -8211,7 +8295,7 @@ void setupServer() {
       recomputeCvGains();  // manual gain changed → refresh the active gain
       queueConsoleMessageF("CV D-term gain: %.1f A/(V/s)", VoltageKd);
     }
-    if (request->hasParam("CvKdVoltFiltTC")) {
+    if (paramOk(request, "CvKdVoltFiltTC")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdVoltFiltTC")->value();
       float kdFiltPrev = CvKdVoltFiltTC;
@@ -8229,28 +8313,28 @@ void setupServer() {
       settingWrite(NK_cvHelpersEnabled, String((int)cvHelpersEnabled).c_str());
       queueConsoleMessageF("CV tuning helpers (asymmetric unwind + D term): %s", cvHelpersEnabled ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("CvKdArmV")) {
+    if (paramOk(request, "CvKdArmV")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdArmV")->value();
       CvKdArmV = inputMessage.toFloat();
       settingWrite(NK_CvKdArmV, String(CvKdArmV, 2).c_str());
       queueConsoleMessageF("CV D-term arm window: %.2f V", CvKdArmV);
     }
-    if (request->hasParam("CvKdMaxTrimA")) {
+    if (paramOk(request, "CvKdMaxTrimA")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdMaxTrimA")->value();
       CvKdMaxTrimA = fmaxf(0.0f, inputMessage.toFloat());
       settingWrite(NK_CvKdMaxTrimA, String(CvKdMaxTrimA, 1).c_str());
       queueConsoleMessageF("CV D-term max back-off: %.1f A", CvKdMaxTrimA);
     }
-    if (request->hasParam("CvKdSlopeCeil")) {
+    if (paramOk(request, "CvKdSlopeCeil")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdSlopeCeil")->value();
       CvKdSlopeCeil = clamp_f(inputMessage.toFloat(), 1.0f*((float)SYSTEM_VOLTAGE_CLASS/12.0f), 20.0f*((float)SYSTEM_VOLTAGE_CLASS/12.0f));  // real per-bus — bounds scale with class like the input widget
       settingWrite(NK_CvKdSlopeCeil, String(CvKdSlopeCeil, 1).c_str());
       queueConsoleMessageF("CV D-term slope ceiling: %.1f V/s", CvKdSlopeCeil);
     }
-    if (request->hasParam("CvKdTd")) {  // CV D derivative time — Auto-mode Kd = Td·Kp
+    if (paramOk(request, "CvKdTd")) {  // CV D derivative time — Auto-mode Kd = Td·Kp
       foundParameter = true;
       inputMessage = request->getParam("CvKdTd")->value();
       CvKdTd = clamp_f(inputMessage.toFloat(), 0.0f, 3.0f);
@@ -8258,7 +8342,7 @@ void setupServer() {
       recomputeCvGains();  // Td feeds the auto Kd
       queueConsoleMessageF("CV D-term time Td: %.2f s (Auto Kd = Td x Kp)", CvKdTd);
     }
-    if (request->hasParam("TempPIDKp")) {
+    if (paramOk(request, "TempPIDKp")) {
       foundParameter = true;
       inputMessage = request->getParam("TempPIDKp")->value();
       settingWrite(NK_TempPIDKp, inputMessage.c_str());
@@ -8266,7 +8350,7 @@ void setupServer() {
       // Velocity form reads TempPIDKp directly each tick — no library object to retune.
       queueConsoleMessageF("Temp PID Kp updated to: %.6f", TempPIDKp);
     }
-    if (request->hasParam("TempPIDKi")) {
+    if (paramOk(request, "TempPIDKi")) {
       foundParameter = true;
       inputMessage = request->getParam("TempPIDKi")->value();
       settingWrite(NK_TempPIDKi, inputMessage.c_str());
@@ -8274,20 +8358,20 @@ void setupServer() {
       // Velocity form reads TempPIDKi directly each tick — no library object to retune.
       queueConsoleMessageF("Temp PID Ki updated to: %.6f", TempPIDKi);
     }
-    if (request->hasParam("TempPIDKiDownFrac")) {
+    if (paramOk(request, "TempPIDKiDownFrac")) {
       foundParameter = true;
       inputMessage = request->getParam("TempPIDKiDownFrac")->value();
       TempPIDKiDownFrac = constrain(inputMessage.toFloat(), 0.0f, 1.0f);  // ratio of Ki used to bleed below setpoint
       settingWrite(NK_TempPIDKiDownFrac, String(TempPIDKiDownFrac, 3).c_str());
       queueConsoleMessageF("Temp PID below-setpoint bleed ratio set to: %.2f x Ki", TempPIDKiDownFrac);
     }
-    if (request->hasParam("ThermalLookaheadSec")) {
+    if (paramOk(request, "ThermalLookaheadSec")) {
       foundParameter = true;
       inputMessage = request->getParam("ThermalLookaheadSec")->value();
       ThermalLookaheadSec = clamp_f(inputMessage.toFloat(), 0.0f, 300.0f);
       settingWrite(NK_ThermalLookaheadSec, String(ThermalLookaheadSec, 1).c_str());      queueConsoleMessageF("ThermalLookaheadSec set to: %.1f s", ThermalLookaheadSec);
     }
-    if (request->hasParam("ThermalSlopeWindowSec")) {
+    if (paramOk(request, "ThermalSlopeWindowSec")) {
       foundParameter = true;
       inputMessage = request->getParam("ThermalSlopeWindowSec")->value();
       ThermalSlopeWindowSec = clamp_f(inputMessage.toFloat(), 10.0f, 60.0f);  // slope backward-difference window
@@ -8297,16 +8381,18 @@ void setupServer() {
     if (request->hasParam("TempPIDIntervalMs")) {
       foundParameter = true;
       inputMessage = request->getParam("TempPIDIntervalMs")->value();
-      settingWrite(NK_TempPIDIntervalMs, inputMessage.c_str());
-      TempPIDIntervalMs = inputMessage.toInt();      queueConsoleMessageF("Temp PID interval updated to: %d ms", TempPIDIntervalMs);
+      long tpi = strtol(inputMessage.c_str(), nullptr, 10);   // signed: the global is uint32_t, so "-5" must clamp before assignment
+      TempPIDIntervalMs = (uint32_t)constrain(tpi, 500L, 60000L);   // 0 makes the thermal slope NaN; UI range is 500..60000
+      settingWrite(NK_TempPIDIntervalMs, String(TempPIDIntervalMs).c_str());
+      queueConsoleMessageF("Temp PID interval updated to: %d ms", TempPIDIntervalMs);
     }
-    if (request->hasParam("TempPIDFilterAlpha")) {
+    if (paramOk(request, "TempPIDFilterAlpha")) {
       foundParameter = true;
       inputMessage = request->getParam("TempPIDFilterAlpha")->value();
       settingWrite(NK_TempPIDFilterAlpha, inputMessage.c_str());
       TempPIDFilterAlpha = inputMessage.toFloat();      queueConsoleMessageF("Temp PID filter alpha updated to: %.3f", TempPIDFilterAlpha);
     }
-    if (request->hasParam("PidKi")) {
+    if (paramOk(request, "PidKi")) {
       foundParameter = true;
       inputMessage = request->getParam("PidKi")->value();
       settingWrite(NK_PidKi, inputMessage.c_str());
@@ -8317,7 +8403,7 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       queueConsoleMessageF("PID Ki updated to: %.6f", PidKi);
     }
-    if (request->hasParam("PidKd")) {
+    if (paramOk(request, "PidKd")) {
       foundParameter = true;
       inputMessage = request->getParam("PidKd")->value();
       settingWrite(NK_PidKd, inputMessage.c_str());
@@ -8355,7 +8441,7 @@ void setupServer() {
       LearningTempHysteresis = inputMessage.toInt();
     }
     // "Group 0" in UI = hardware overcurrent trip (no protection-group integration yet)
-    if (request->hasParam("MaxTableValue")) {
+    if (paramOk(request, "MaxTableValue")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxTableValue")->value();
       settingWrite(NK_MaxTableValue, inputMessage.c_str());
@@ -8363,7 +8449,7 @@ void setupServer() {
       HardOCTripAmps = MaxTableValue + 10.0f;  // always 10A above current limit
       queueConsoleMessageF("Alternator current limit set to %.1fA — OC trip threshold: %.1fA", MaxTableValue, HardOCTripAmps);
     }
-    if (request->hasParam("MaxPenaltyPercent")) {
+    if (paramOk(request, "MaxPenaltyPercent")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxPenaltyPercent")->value();
       settingWrite(NK_MaxPenaltyPercent, inputMessage.c_str());
@@ -8376,7 +8462,7 @@ void setupServer() {
       settingWrite(NK_MaxPenaltyDuration, String(temp).c_str());
       MaxPenaltyDuration = temp;
     }
-    if (request->hasParam("NeighborLearningFactor")) {
+    if (paramOk(request, "NeighborLearningFactor")) {
       foundParameter = true;
       inputMessage = request->getParam("NeighborLearningFactor")->value();
       settingWrite(NK_NeighborLearningFactor, inputMessage.c_str());
@@ -8394,7 +8480,7 @@ void setupServer() {
       settingWrite(NK_LearningMemoryDuration, inputMessage.c_str());
       LearningMemoryDuration = inputMessage.toInt();
     }
-    if (request->hasParam("DutyRampRate")) {
+    if (paramOk(request, "DutyRampRate")) {
       foundParameter = true;
       inputMessage = request->getParam("DutyRampRate")->value();
       settingWrite(NK_DutyRampRate, inputMessage.c_str());
@@ -8402,12 +8488,24 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       queueConsoleMessageF("Duty ramp rate set to: %.1f %%/sec", DutyRampRate);
     }
-    if (request->hasParam("DutySlowRampRate")) {
+    if (paramOk(request, "DutySlowRampRate")) {
       foundParameter = true;
       inputMessage = request->getParam("DutySlowRampRate")->value();
       settingWrite(NK_DutySlowRampRate, inputMessage.c_str());
       DutySlowRampRate = inputMessage.toFloat();
-      queueConsoleMessageF("Shutdown slow ramp rate set to: %.2f %%/s", DutySlowRampRate);
+      queueConsoleMessageF("Shutdown final ramp rate set to: %.2f %%/s", DutySlowRampRate);
+    }
+    if (paramOk(request, "ShutdownRampTauS")) {
+      foundParameter = true;
+      ShutdownRampTauS = clamp_f(request->getParam("ShutdownRampTauS")->value().toFloat(), 0.0f, 60.0f);
+      settingWrite(NK_ShutdownRampTauS, String(ShutdownRampTauS, 2).c_str());
+      queueConsoleMessageF("Shutdown ramp time constant set to: %.2f s", ShutdownRampTauS);
+    }
+    if (paramOk(request, "NoOutputAmps")) {
+      foundParameter = true;
+      NoOutputAmps = clamp_f(request->getParam("NoOutputAmps")->value().toFloat(), 0.1f, 50.0f);
+      settingWrite(NK_NoOutputAmps, String(NoOutputAmps, 2).c_str());
+      queueConsoleMessageF("No-output current set to: %.2f A", NoOutputAmps);
     }
     if (request->hasParam("ShutdownPhase2HoldMs")) {
       foundParameter = true;
@@ -8424,21 +8522,21 @@ void setupServer() {
       SettleTimeBeforeCut = inputMessage.toInt();
       queueConsoleMessageF("Settle time before cut set to: %d ms", SettleTimeBeforeCut);
     }
-    if (request->hasParam("TempWarnExcess")) {
+    if (paramOk(request, "TempWarnExcess")) {
       foundParameter = true;
       inputMessage = request->getParam("TempWarnExcess")->value();
       settingWrite(NK_TempWarnExcess, inputMessage.c_str());
       TempWarnExcess = inputMessage.toFloat();
       queueConsoleMessageF("Temp warning threshold set to: +%.1f%s above limit", dispTempDeltaF(TempWarnExcess), dispTempUnit());
     }
-    if (request->hasParam("TempCritExcess")) {
+    if (paramOk(request, "TempCritExcess")) {
       foundParameter = true;
       inputMessage = request->getParam("TempCritExcess")->value();
       settingWrite(NK_TempCritExcess, inputMessage.c_str());
       TempCritExcess = inputMessage.toFloat();
       queueConsoleMessageF("Temp critical threshold set to: +%.1f%s above limit", dispTempDeltaF(TempCritExcess), dispTempUnit());
     }
-    if (request->hasParam("TempSustainedTimeout")) {
+    if (paramOk(request, "TempSustainedTimeout")) {
       foundParameter = true;
       inputMessage = request->getParam("TempSustainedTimeout")->value();
       int temp = inputMessage.toInt() * 1000;  // user enters seconds
@@ -8451,8 +8549,8 @@ void setupServer() {
     // against the value being replaced would corrupt a joint move in either direction. The
     // hardware rung is the anchor; the software cut must sit strictly below it (0.05 x class/12
     // guard band) so software always gets first shot.
-    bool swRungPresent = request->hasParam("AlternatorHardShutdownV");
-    bool hwRungPresent = request->hasParam("VoltageHardwareLimit");
+    bool swRungPresent = paramOk(request, "AlternatorHardShutdownV");
+    bool hwRungPresent = paramOk(request, "VoltageHardwareLimit");
     if (swRungPresent || hwRungPresent) {
       foundParameter = true;
       float reqSw = swRungPresent ? request->getParam("AlternatorHardShutdownV")->value().toFloat()
@@ -8482,14 +8580,14 @@ void setupServer() {
       HardOCDebounceMs = (uint32_t)inputMessage.toInt();
       queueConsoleMessageF("Overcurrent trip debounce set to: %ums", HardOCDebounceMs);
     }
-    if (request->hasParam("WarmupRampRate")) {
+    if (paramOk(request, "WarmupRampRate")) {
       foundParameter = true;
       inputMessage = request->getParam("WarmupRampRate")->value();
       WarmupRampRate = max(0.0f, inputMessage.toFloat());
       settingWrite(NK_WarmupRampRate, String(WarmupRampRate, 2).c_str());
       queueConsoleMessageF("Warmup ramp rate set to: %.2f A/s", WarmupRampRate);
     }
-    if (request->hasParam("IExcessFrac")) {
+    if (paramOk(request, "IExcessFrac")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessFrac")->value();  // UI sends percent; stored as fraction
       IExcessFrac = constrain(inputMessage.toFloat() / 100.0f, 0.02f, 0.50f);
@@ -8497,14 +8595,14 @@ void setupServer() {
       queueConsoleMessageF("IExcess CV threshold set to: %.0f%% of command", IExcessFrac * 100.0f);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("IExcessFracBulk")) {
+    if (paramOk(request, "IExcessFracBulk")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessFracBulk")->value();  // UI sends percent; stored as fraction
       IExcessFracBulk = constrain(inputMessage.toFloat() / 100.0f, 0.02f, 0.60f);
       settingWrite(NK_IExcessFracBulk, String(IExcessFracBulk, 3).c_str());
       queueConsoleMessageF("IExcess bulk threshold set to: %.0f%% of ceiling", IExcessFracBulk * 100.0f);
     }
-    if (request->hasParam("IExcessFloorA")) {
+    if (paramOk(request, "IExcessFloorA")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessFloorA")->value();
       IExcessFloorA = constrain(inputMessage.toFloat(), 1.0f, 20.0f);
@@ -8512,7 +8610,7 @@ void setupServer() {
       queueConsoleMessageF("IExcess threshold floor set to: %.1fA", IExcessFloorA);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("IExcessCeilA")) {
+    if (paramOk(request, "IExcessCeilA")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessCeilA")->value();
       IExcessCeilA = constrain(inputMessage.toFloat(), 5.0f, 200.0f);
@@ -8520,7 +8618,7 @@ void setupServer() {
       queueConsoleMessageF("IExcess threshold ceiling set to: %.1fA", IExcessCeilA);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("IExcessBaseA")) {
+    if (paramOk(request, "IExcessBaseA")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessBaseA")->value();
       IExcessBaseA = constrain(inputMessage.toFloat(), 0.0f, 150.0f);
@@ -8528,7 +8626,7 @@ void setupServer() {
       queueConsoleMessageF("IExcess trip-line base set to: %.1fA", IExcessBaseA);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("IExcessCcOffsetA")) {
+    if (paramOk(request, "IExcessCcOffsetA")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessCcOffsetA")->value();
       IExcessCcOffsetA = constrain(inputMessage.toFloat(), 0.0f, 150.0f);
@@ -8538,7 +8636,7 @@ void setupServer() {
     }
     // Max battery charge current (G4). Ceiling on the alternator command = limit + measured
     // house-load offset; requires the INA228 battery shunt. 0 disables the feature.
-    if (request->hasParam("BattCurrentLimitA")) {
+    if (paramOk(request, "BattCurrentLimitA")) {
       foundParameter = true;
       inputMessage = request->getParam("BattCurrentLimitA")->value();
       BattCurrentLimitA = constrain(inputMessage.toFloat(), 0.0f, 2000.0f);  // battery-side limit, unrelated to the alternator ceiling: a large bank at 1C wants far more than 500
@@ -8546,7 +8644,7 @@ void setupServer() {
       if (BattCurrentLimitA > 0.0f) queueConsoleMessageF("Battery charge current limit set to: %.1fA", BattCurrentLimitA);
       else queueConsoleMessage("Battery charge current limit disabled");
     }
-    if (request->hasParam("IExcessTau")) {
+    if (paramOk(request, "IExcessTau")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessTau")->value();
       float iexTauPrev = IExcessTau;
@@ -8559,7 +8657,7 @@ void setupServer() {
       if (fabsf(IExcessTau - iexTauPrev) > 0.05f) ripFitForget(true, false, "IExcess averaging TC changed");
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("IExcessRelFrac")) {
+    if (paramOk(request, "IExcessRelFrac")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessRelFrac")->value();  // UI sends percent; stored as fraction
       IExcessRelFrac = constrain(inputMessage.toFloat() / 100.0f, 0.1f, 0.9f);
@@ -8567,7 +8665,7 @@ void setupServer() {
       queueConsoleMessageF("IExcess release hysteresis set to: %.0f%% of threshold", IExcessRelFrac * 100.0f);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("IExcessKBleed")) {
+    if (paramOk(request, "IExcessKBleed")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessKBleed")->value();
       IExcessKBleed = inputMessage.toFloat();
@@ -8575,14 +8673,14 @@ void setupServer() {
       queueConsoleMessageF("K_bleed set to: %.2f A/s per A", IExcessKBleed);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("IExcessArmMarginV")) {
+    if (paramOk(request, "IExcessArmMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessArmMarginV")->value();
       IExcessArmMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 5.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       settingWrite(NK_IExcessArmMarginV, String(IExcessArmMarginV, 3).c_str());
       queueConsoleMessageF("iExcess arming margin set to: %.0f mV below target", IExcessArmMarginV * 1000.0f);
     }
-    if (request->hasParam("AwBleedRate")) {
+    if (paramOk(request, "AwBleedRate")) {
       foundParameter = true;
       inputMessage = request->getParam("AwBleedRate")->value();
       AwBleedRate = inputMessage.toFloat();
@@ -8591,7 +8689,7 @@ void setupServer() {
       if (CVTuningMode) cvTuningParamChanged = true;
     }
     // No AwRecoverRate handler — hardcoded in firmware (0.1f)
-    if (request->hasParam("FastSetpointRiseRate")) {
+    if (paramOk(request, "FastSetpointRiseRate")) {
       foundParameter = true;
       inputMessage = request->getParam("FastSetpointRiseRate")->value();
       FastSetpointRiseRate = constrain(inputMessage.toFloat(), 1.0f, 50.0f);
@@ -8605,7 +8703,7 @@ void setupServer() {
       settingWrite(NK_FastSetpointRiseWindowMs, String(FastSetpointRiseWindowMs).c_str());
       queueConsoleMessageF("Fast rise window set to: %ums", FastSetpointRiseWindowMs);
     }
-    if (request->hasParam("FastSetpointRiseHeadroomV")) {
+    if (paramOk(request, "FastSetpointRiseHeadroomV")) {
       foundParameter = true;
       inputMessage = request->getParam("FastSetpointRiseHeadroomV")->value();
       FastSetpointRiseHeadroomV = constrain(inputMessage.toFloat(), 0.05f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
@@ -8620,7 +8718,7 @@ void setupServer() {
       queueConsoleMessageF("AW seed protect window set to: %u ms", (unsigned)AwSeedProtectMs);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("KHard")) {
+    if (paramOk(request, "KHard")) {
       foundParameter = true;
       inputMessage = request->getParam("KHard")->value();
       KHard = inputMessage.toFloat();
@@ -8692,42 +8790,42 @@ void setupServer() {
       settingWrite(NK_OutputPIDMA_N, String(OutputPIDMA_N).c_str());
       queueConsoleMessageF("Output PID MA window: N=%d", OutputPIDMA_N);
     }
-    if (request->hasParam("OutputPIDFilterTC")) {
+    if (paramOk(request, "OutputPIDFilterTC")) {
       foundParameter = true;
       inputMessage = request->getParam("OutputPIDFilterTC")->value();
       OutputPIDFilterTC = inputMessage.toFloat();
       settingWrite(NK_OutputPIDFilterTC, String(OutputPIDFilterTC).c_str());
       queueConsoleMessageF("Output PID EMA TC: %.1f ms", OutputPIDFilterTC);
     }
-    if (request->hasParam("VoltageFilterTC")) {
+    if (paramOk(request, "VoltageFilterTC")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageFilterTC")->value();
       VoltageFilterTC = inputMessage.toFloat();
       settingWrite(NK_VoltageFilterTC, String(VoltageFilterTC).c_str());
       queueConsoleMessageF("Voltage EMA TC: %.1f ms", VoltageFilterTC);
     }
-    if (request->hasParam("TdPred")) {
+    if (paramOk(request, "TdPred")) {
       foundParameter = true;
       inputMessage = request->getParam("TdPred")->value();
       TdPred = constrain(inputMessage.toFloat(), 0.01f, 0.30f);
       settingWrite(NK_TdPred, String(TdPred, 3).c_str());
       queueConsoleMessageF("OV prediction horizon set to: %.3f s", TdPred);
     }
-    if (request->hasParam("OvMeasMarginV")) {
+    if (paramOk(request, "OvMeasMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("OvMeasMarginV")->value();
       OvMeasMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));  // ceiling matches OvTierLoMarginV: the LOW tier rides this line, so a tighter cap here made the lead/AGM 0.50 recommendation unraisable
       settingWrite(NK_OvMeasMarginV, String(OvMeasMarginV, 3).c_str());
       queueConsoleMessageF("Group 2 measured-voltage trigger margin set to: %.0f mV", OvMeasMarginV * 1000.0f);
     }
-    if (request->hasParam("OvPredMarginV")) {
+    if (paramOk(request, "OvPredMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("OvPredMarginV")->value();
       OvPredMarginV = constrain(inputMessage.toFloat(), 0.050f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       settingWrite(NK_OvPredMarginV, String(OvPredMarginV, 3).c_str());
       queueConsoleMessageF("Group 1 prediction trigger margin set to: %.0f mV", OvPredMarginV * 1000.0f);
     }
-    if (request->hasParam("OvTierLoMarginV")) {
+    if (paramOk(request, "OvTierLoMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("OvTierLoMarginV")->value();
       OvTierLoMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
@@ -8742,7 +8840,7 @@ void setupServer() {
       if (OvTierLoDwellMs == 0) queueConsoleMessage("Timed OV cut LOW tier DISABLED (dwell 0)");
       else queueConsoleMessageF("Timed OV cut LOW-tier dwell set to: %ums", OvTierLoDwellMs);
     }
-    if (request->hasParam("OvTierMidMarginV")) {
+    if (paramOk(request, "OvTierMidMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("OvTierMidMarginV")->value();
       OvTierMidMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
@@ -8757,14 +8855,14 @@ void setupServer() {
       if (OvTierMidDwellMs == 0) queueConsoleMessage("Timed OV cut MID tier DISABLED (dwell 0)");
       else queueConsoleMessageF("Timed OV cut MID-tier dwell set to: %ums", OvTierMidDwellMs);
     }
-    if (request->hasParam("DvdtTC")) {
+    if (paramOk(request, "DvdtTC")) {
       foundParameter = true;
       inputMessage = request->getParam("DvdtTC")->value();
       DvdtTC = constrain(inputMessage.toFloat(), 5.0f, 500.0f);
       settingWrite(NK_DvdtTC, String(DvdtTC, 1).c_str());
       queueConsoleMessageF("dvdt EMA TC set to: %.1f ms (dt-aware; alpha computed per-sample)", DvdtTC);
     }
-    if (request->hasParam("ReseedFrac")) {
+    if (paramOk(request, "ReseedFrac")) {
       foundParameter = true;
       inputMessage = request->getParam("ReseedFrac")->value();
       ReseedFrac = clamp_f(inputMessage.toFloat(), 0.2f, 1.0f);  // at exactly 1.0 the first-fire de-escalation on a persistent cause is dead — UI max stays 0.95, 1.0 is deliberate-raw-URL territory
@@ -8772,7 +8870,7 @@ void setupServer() {
       queueConsoleMessageF("Recovery seed fraction set to: %.2f", ReseedFrac);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("ReseedFracNoShunt")) {
+    if (paramOk(request, "ReseedFracNoShunt")) {
       foundParameter = true;
       inputMessage = request->getParam("ReseedFracNoShunt")->value();
       ReseedFracNoShunt = clamp_f(inputMessage.toFloat(), 0.1f, 0.95f);
@@ -8780,7 +8878,7 @@ void setupServer() {
       queueConsoleMessageF("No-shunt recovery seed fraction set to: %.2f", ReseedFracNoShunt);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("CvRecovClimbRate")) {
+    if (paramOk(request, "CvRecovClimbRate")) {
       foundParameter = true;
       inputMessage = request->getParam("CvRecovClimbRate")->value();
       CvRecovClimbRate = clamp_f(inputMessage.toFloat(), 0.01f, 1.0f);
@@ -8824,7 +8922,7 @@ void setupServer() {
       cvTuningParamChanged = false;
       queueConsoleMessage("CVTuningScore: test restarted via UI");
     }
-    if (request->hasParam("cvWaveAmplitudeV")) {
+    if (paramOk(request, "cvWaveAmplitudeV")) {
       foundParameter = true;
       inputMessage = request->getParam("cvWaveAmplitudeV")->value();
       cvWaveAmplitudeV = constrain(inputMessage.toFloat(), 0.05f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
@@ -8838,7 +8936,7 @@ void setupServer() {
       settingWrite(NK_cvWavePeriodSec, String(cvWavePeriodSec).c_str());
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("cvKOvershoot")) {
+    if (paramOk(request, "cvKOvershoot")) {
       foundParameter = true;
       inputMessage = request->getParam("cvKOvershoot")->value();
       cvKOvershoot = inputMessage.toFloat();
@@ -8850,7 +8948,7 @@ void setupServer() {
       cvConsecutiveReads = (uint8_t)constrain(inputMessage.toInt(), 1, 20);
       settingWrite(NK_cvConsecutiveReads, String(cvConsecutiveReads).c_str());
     }
-    if (request->hasParam("VoltageDisagreeThreshold")) {
+    if (paramOk(request, "VoltageDisagreeThreshold")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageDisagreeThreshold")->value();
       settingWrite(NK_VoltageDisagreeThreshold, inputMessage.c_str());
@@ -9462,7 +9560,7 @@ void setupServer() {
     // whether or not settings are armed), and phone GPS/speed/time are backup sources a LAN
     // client is trusted to provide. NMEA always outranks phone data, and range checks reject garbage.
     bool acceptedGps = false, acceptedTime = false;
-    if (request->hasParam("lat") && request->hasParam("lon")) {
+    if (paramOk(request, "lat") && paramOk(request, "lon")) {
       // Use strtod + endptr (not String::toDouble — that silently returns 0.0
       // for unparseable input, so "lat=NaN&lon=42" would pass as (0.0, 42)).
       const char *latStr = request->getParam("lat")->value().c_str();
@@ -9497,7 +9595,7 @@ void setupServer() {
     // ground (degrees, coords.heading). Sent independently of lat/lon — heading
     // is null on a stationary phone, so each gets its own freshness stamp.
     bool acceptedSpd = false, acceptedHdg = false;
-    if (request->hasParam("spd")) {
+    if (paramOk(request, "spd")) {
       const char *spdStr = request->getParam("spd")->value().c_str();
       char *spdEnd = nullptr;
       double spd = strtod(spdStr, &spdEnd);
@@ -9508,7 +9606,7 @@ void setupServer() {
         acceptedSpd = true;
       }
     }
-    if (request->hasParam("hdg")) {
+    if (paramOk(request, "hdg")) {
       const char *hdgStr = request->getParam("hdg")->value().c_str();
       char *hdgEnd = nullptr;
       double hdg = strtod(hdgStr, &hdgEnd);
@@ -9911,11 +10009,12 @@ void setupServer() {
   // Charge health calibration status (commissioning stage 9 polls this). One small object — the
   // captured swing never leaves the device, only the fits do. runMs/rampMs/idleRpm/top are the
   // schedule the browser draws its chart against, so the screen and the firmware share one clock.
+  // topCapA is valid BEFORE a run: the charge-rate limit at the would-be test top, for the setup screen.
   server.on("/chc.json", HTTP_GET, [](AsyncWebServerRequest *request) {
     char buf[768];
     snprintf(buf, sizeof(buf),
              "{\"active\":%d,\"phase\":%d,\"ready\":%d,\"ok\":%d,\"pct\":%d,"
-             "\"targetA\":%.1f,\"capA\":%.0f,\"hiCol\":%d,\"duty\":%.1f,\"amps\":%.1f,"
+             "\"targetA\":%.1f,\"capA\":%.0f,\"topCapA\":%.0f,\"hiCol\":%d,\"duty\":%.1f,\"amps\":%.1f,"
              "\"vbus\":%.2f,\"rpm\":%.0f,\"idleRpm\":%.0f,\"top\":%.0f,\"maxRpm\":%d,"
              "\"rampMs\":%lu,\"runMs\":%lu,\"cyc\":%d,\"seg\":%d,\"frozen\":%d,"
              "\"minA\":%.1f,\"peakA\":%.0f,\"leadSec\":%.3f,"
@@ -9923,7 +10022,9 @@ void setupServer() {
              "\"rateMin\":%.0f,\"rateAvg\":%.0f,\"rateMax\":%.0f,"
              "\"nPts\":%d,\"abort\":\"%s\"}",
              chcActive != 0 ? 1 : 0, (int)chcPhase, chcResultsReady ? 1 : 0, chcOk ? 1 : 0, (int)chcTestPct,
-             chcTargetA, chcSizeCapA, (BatteryCapacity_Ah >= CHC_LOHI_AH) ? 1 : 0, chcHoldDuty, MeasuredAmps,
+             chcTargetA, chcSizeCapA,
+             (chcActive != 0) ? chcSizeCapA : chcPreviewCapA(),   // no flash read while a run is polling this every 700 ms
+             (BatteryCapacity_Ah >= CHC_LOHI_AH) ? 1 : 0, chcHoldDuty, MeasuredAmps,
              BatteryV, RPM, chcIdleRpm, chcTopRpm, maxWorkingRpm,
              (unsigned long)chcRampMs, (unsigned long)chcRunMs, (int)chcCycle, (int)chcSeg, chcFrozen ? 1 : 0,
              chcMinA, chcPeakA, chcLeadSec,
@@ -10401,6 +10502,9 @@ void setupServer() {
     g_voltDisagreeWarnCount = 0;
     g_voltImplausibleCount = 0;
     g_currentStaleCount = 0;
+    g_voltStaleCount = 0;
+    g_volt2StaleCount = 0;
+    g_battTempLostCount = 0;
     request->send(200, "text/plain", "OK");
   });
 
@@ -11060,6 +11164,8 @@ void SendWifiData() {
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +13 battery/extra temperature: BATT probe, EXTRA probe, active F, active src, probe count, unassigned, VE.Direct T, RV-C T, derate inert, batt wm lo/hi, extra wm lo/hi
                                "%d,"            // +1 enforced field-duty floor (x100)
                                "%d,%d,"         // +2 INA228 die temperature: live, session max (°F x10)
+                               "%d,%d,%d,"      // +3 sensor-fault field-event counters: voltage stale, voltage2 stale, battery temp lost
+                               "%d,%d,%d,%d,%d,%d,"   // +6 sensor faults: fault mask, battery-temperature state, limp tier, steady mask, required-fault count, battery-current state
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -11679,6 +11785,15 @@ void SendWifiData() {
                                SafeInt(g_fieldDutyFloor, 100),                           // CSV2_fieldDutyFloor
                                SafeInt(inaDieTempF, 10),                                 // CSV2_inaDieTempF
                                SafeInt(inaDieTempMaxF, 10),                              // CSV2_inaDieTempMaxF
+                               SafeInt(g_voltStaleCount),                                // CSV2_voltStaleCount
+                               SafeInt(g_volt2StaleCount),                               // CSV2_volt2StaleCount
+                               SafeInt(g_battTempLostCount),                             // CSV2_battTempLostCount
+                               (int)g_sensorFaultMask,                                   // CSV2_sensorFaultMask
+                               (int)g_battTempState,                                     // CSV2_battTempState
+                               (int)g_limpTier,                                          // CSV2_limpTier
+                               (int)g_sensorSteadyMask,                                  // CSV2_sensorSteadyMask
+                               (int)g_reqFaultCount,                                     // CSV2_reqFaultCount
+                               (int)g_battCurState,                                      // CSV2_battCurState
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost

@@ -317,6 +317,10 @@
     <div id="dvcc-banner" class="header-notice" style="display:none;"
       onclick="goToDvccFollow()" title="Open Setup &rarr; Integrations &rarr; Charge-Limit Follow"></div>
 
+    <!-- Sensor fault / running-without-sensors line (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §4.6-4.7).
+         Survives header collapse like the two banners above. Text and buttons set by updateSensorBanner(). -->
+    <div id="sensor-banner" class="header-notice header-notice-alert" style="display:none;"></div>
+
 
     <!-- Settings Access — the button arms the firmware's settings write window (no password; LAN
          clients are trusted, this is an acknowledgment). Armed until Lock Settings, another client's
@@ -434,7 +438,15 @@
                 <hr>
 
                 <div class="form-row">
-                  <div class="form-label">Type:</div>
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>Type:</span>
+                    <span class="tooltip">
+                      &#8505;&#65039;
+                      <span class="tooltip-box">Monohull and Catamaran mean a sailboat: the app shows the sailing
+                        polar, upwind VMG and sailing records. Trawler, Powerboat and Other are treated as motorboats
+                        and show the motoring view only. A power catamaran should choose Trawler.</span>
+                    </span>
+                  </div>
                   <div class="form-input">
                     <select name="BOAT_TYPE" required>
                       <option value="">-- Select Type --</option>
@@ -1492,7 +1504,8 @@
                         (a PWM of 0 really means zero field), no engine-speed or tachometer-plausibility cut, no
                         battery temperature or voltage checks, and no current control at all. The master On/Off
                         switch, the hardware over-voltage shutdown and the field ceiling (Max Field % and Max Field
-                        Volts, whichever is lower) still apply. Switching to Manual asks for confirmation and lists
+                        Volts, whichever is lower) still apply. If the INA228 battery monitor is not reading, Manual
+                        has no over-voltage protection at all: the hardware shutdown is that chip. Switching to Manual asks for confirmation and lists
                         the full set.</span>
                     </span>
                   </div>
@@ -1611,7 +1624,7 @@
                     <span>Min RPM For Field (RPM) (<span id="MinRPMForField_echo">?</span>):</span>
                     <span class="tooltip">
                       ℹ️
-                      <span class="tooltip-box">Field is cut immediately when RPM falls below this threshold. Set to 0 to disable — not recommended; to run without a tach use Ignore RPM under Setup → System → Emergency Overrides.</span>
+                      <span class="tooltip-box">Field is cut immediately when RPM falls below this threshold. Set to 0 to disable — not recommended; to run without a tach ignore engine speed under Setup → System → Run Without Failed Sensors.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -1822,10 +1835,11 @@
                 <hr />
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Shutdown Slow Ramp Rate (%/s) (<span id="DutySlowRampRate_echo">?</span>):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">Rate at
-                        which field duty ramps from minimum to 0% during Phase 3 shutdown. Lower = slower, gentler on
-                        LM2907 tach signal.</span></span>
+                    <span>Shutdown Final Ramp Rate (%/s) (<span id="DutySlowRampRate_echo">?</span>):</span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">The slowest
+                        the shutdown ramp is allowed to go. The ramp normally slows as the field gets smaller (see
+                        Shutdown Ramp Time); this rate takes over at the bottom so the field reaches 0%.
+                        Lower = gentler on the tachometer signal at the very end, but a longer shutdown.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -1846,6 +1860,45 @@
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
                       <input name="ShutdownPhase2HoldMs" type="number" step="1" min="0" max="10000" />
+                      <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
+                    </form>
+                  </div>
+                </div>
+
+                <hr />
+                <div class="form-row">
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>Shutdown Ramp Time (s) (<span id="ShutdownRampTauS_echo">?</span>):</span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">How quickly
+                        the field winds down after the alternator is switched off. Each second the field drops by a
+                        share of what is left, so it falls quickly from a high setting and slowly near zero. This
+                        is the time for the field to fall by about two-thirds. The tachometer input needs about
+                        2 seconds to follow a shrinking signal, so values below about 4 s risk a few seconds of
+                        false zero engine speed after switch-off. 0 = use the Final Ramp Rate for the whole
+                        ramp.</span></span>
+                  </div>
+                  <div class="form-input">
+                    <form action="/get" method="GET" target="hidden-form">
+                      <input name="ShutdownRampTauS" type="number" step="0.1" min="0" max="60" />
+                      <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
+                    </form>
+                  </div>
+                </div>
+
+                <hr />
+                <div class="form-row">
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>No-Output Current (A) (<span id="NoOutputAmps_echo">?</span>):</span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">Alternator
+                        current at or below this counts as "making nothing". Used in two places: during a shutdown
+                        ramp, current above it for 0.3 s means the alternator is still charging, so the field
+                        drops at the Duty Ramp Rate until it stops; and the tachometer plausibility check treats
+                        current below it as no output. Raise it if your alternator current sensor reads a few amps
+                        with the field off (for example without auto-zero).</span></span>
+                  </div>
+                  <div class="form-input">
+                    <form action="/get" method="GET" target="hidden-form">
+                      <input name="NoOutputAmps" type="number" step="0.1" min="0.1" max="50" />
                       <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                     </form>
                   </div>
@@ -5210,6 +5263,9 @@
                 <div class="param-subhead">Temperature compensation</div>
 
                 <hr />
+                <!-- Greyed (body.no-batt-temp) while the battery-temperature source is Not fitted -->
+                <div class="gate-batt-temp">
+                <p class="gate-note gate-note-batt-temp">Needs a battery temperature. Choose a source under Setup &rarr; Battery &rarr; Battery Temperature.</p>
                 <!-- Battery-temperature gain derate -->
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
@@ -5256,6 +5312,7 @@
                   </div>
                 </div>
                 </div> <!-- end cvDerateDetailBlock -->
+                </div><!-- end gate-batt-temp -->
 
                 <!-- ============ TARGET SHAPING & TIMING ============ -->
                 <div class="param-subhead">Target voltage ramp</div>
@@ -7204,17 +7261,17 @@
               <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Battery Temperature Source (<span id="battTempSource_echo">?</span>):</span>
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which measurement the regulator reads as battery temperature. Automatic takes the first available in this order: battery probe, NMEA 2000 battery status (PGN 127508), VE.Direct battery monitor, RV-C source. Any single source disables the fallback chain and reports no temperature while that source is missing or stale. None disables battery temperature entirely. Every option is a measurement taken at the bank; with none of them reporting, the cold and hot charge lockouts stay inactive and the voltage-loop gain derate stays at 1.00.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which measurement the regulator reads as battery temperature. Automatic takes the first available in this order: battery probe, NMEA 2000 battery status (PGN 127508), VE.Direct battery monitor, RV-C source. Any single source disables the fallback chain and reports no temperature while that source is missing or stale. Not fitted declares that this boat has no battery temperature: the lockouts and the voltage-loop gain derate stay off and nothing nags. Every other option expects a reading: if it stops arriving, charging stops until it returns or the source is set to Not fitted.</span></span>
                 </div>
                 <div class="form-input">
-                  <form action="/get" method="GET" target="hidden-form">
+                  <form action="/get" method="GET" target="hidden-form" onsubmit="return battTempSourceSubmit(this)">
                     <select name="battTempSource">
                       <option value="0">Automatic</option>
                       <option value="1">Battery probe</option>
                       <option value="2">NMEA 2000</option>
                       <option value="3">VE.Direct</option>
                       <option value="4">RV-C</option>
-                      <option value="6">None</option>
+                      <option value="6">Not fitted</option>
                     </select>
                     <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                   </form>
@@ -7225,10 +7282,14 @@
               <div class="form-row" id="battTempStatus_row">
                 <div class="form-label" style="font-size:0.9em; opacity:0.85; line-height:1.5;">
                   <span id="battTempStatus_ID">No battery temperature available</span>
+                  <button type="button" id="battTempNotFitted_btn" class="btn-secondary" style="display:none; margin-left:10px;" onclick="battTempSetNotFitted()">Set to Not fitted</button>
                 </div>
               </div>
 
               <hr />
+              <!-- The four rows below need a battery temperature: greyed (body.no-batt-temp) while the source is Not fitted. -->
+              <div class="gate-batt-temp">
+              <p class="gate-note gate-note-batt-temp">Needs a battery temperature. Choose a source under Setup &rarr; Battery &rarr; Battery Temperature.<span class="lfp-only"> Without one, charging below freezing is left to the battery's own BMS, and a BMS disconnect while charging can spike system voltage.</span></p>
               <!-- Cold-Charge Lockout (lithium protection) — master on/off -->
               <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
@@ -7306,6 +7367,7 @@
                   </form>
                 </div>
               </div>
+              </div><!-- end gate-batt-temp -->
 
             </details>
 
@@ -7762,7 +7824,7 @@
               <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Battery Voltage Source (<span id="BatteryVoltageSource_echo">?</span>):</span>
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Chooses the battery voltage used to decide bulk, absorption, float, and rebulk. The onboard INA228 always drives the control loops and protections. Choose an external source when the Regulator Ground Wire is long enough to shift the onboard reading; the regulator falls back to the onboard sensor whenever the external source is stale.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Chooses the battery voltage used to decide bulk, absorption, float, and rebulk. The onboard INA228 always drives the control loops and protections. Choose an external source if the Regulator Ground Wire is longer than 6 ft or smaller than 12 AWG; the regulator falls back to the onboard sensor whenever the external source is stale.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -8319,6 +8381,34 @@
               </div>
             </div>
 
+            <hr />
+            <div class="form-row">
+              <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                <span>Alarm on General Fault Condition (<span id="GeneralFaultAlarm_echo">0</span>):</span>
+                <span class="tooltip">
+                  ℹ️
+                  <span class="tooltip-box">Sounds the alarm for faults that have no threshold of their own: a required
+                    sensor that stops reading (alternator temperature, engine speed, alternator current, either battery
+                    voltage, battery temperature), a battery current shunt or VE.Direct feed that goes quiet, a lost
+                    ADS1115 or INA228 chip, a stalled temperature task, and the INA228 hardware over-voltage trip. Off
+                    limits the alarm to the thresholds set on this page and to the cold and hot charge lockouts. The
+                    header line names the fault either way, and Silence mutes the buzzer for the fault that is sounding.</span>
+                </span>
+              </div>
+              <div class="form-input">
+                <form action="/get" method="GET" target="hidden-form">
+                  <span class="toggle-label">Off</span>
+                  <label class="switch">
+                    <input id="GeneralFaultAlarm_checkbox" type="checkbox"
+                      onchange="if(handleUserToggle('GeneralFaultAlarm_checkbox', 'GeneralFaultAlarm', 'GeneralFaultAlarm')) { this.form.submit(); submitMessage(); }" />
+                    <span class="slider round"></span>
+                  </label>
+                  <span class="toggle-label">On</span>
+                  <input id="GeneralFaultAlarm" name="GeneralFaultAlarm" type="number" value="" style="display:none;" />
+                </form>
+              </div>
+            </div>
+
             <!-- Temperature Alarms Section -->
             <details open style="margin-top: 20px;">
               <summary
@@ -8538,6 +8628,14 @@
                     <input type="hidden" name="ResetAlarmLatch" value="1">
                     <button type="submit" id="reset-latch-btn" class="btn-secondary">Reset Latch</button>
                   </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Silence Alarm:</div>
+                <div class="form-input">
+                  <button type="button" id="silence-alarm-btn" class="btn-secondary" onclick="silenceAlarm()">Silence</button>
                 </div>
               </div>
             </details>
@@ -9875,47 +9973,43 @@
 
             </details>
 
-            <!-- Emergency Overrides Section -->
+            <!-- Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §4.6). The per-sensor
+                 controls live in the #rwfs-modal-overlay modal; this card is the status line and the way in. -->
             <details open style="margin-top: 20px;">
               <summary
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
-                Emergency Overrides</summary>
+                Run Without Failed Sensors</summary>
 
               <div class="emergency-section-content">
-                <div class="emergency-section-title">⚠️ Caution!</div>
-                <div style="font-size: 12px; opacity: 0.85; margin: 0 0 12px;">These settings are dangerous and for expert use only.</div>
+                <div style="font-size: 12px; opacity: 0.85; margin: 0 0 12px;">A required sensor that stops reading stops charging. This screen is the only way to charge without it: each sensor can be ignored on its own, and the regulator says what protection that costs.</div>
 
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Ignition Override (<span id="IgnitionOverride_echo">0</span>):</span>
+                    <span>Sensors in use (<span id="rwfs_status_echo">?</span>):</span>
                     <span class="tooltip">
-                      ℹ️
-                      <span class="tooltip-box">Auto follows the physical ignition wire (the normal setting). Force On ignores the wire and
-                        treats the ignition as always on — for bench testing or when no ignition wire is connected. It keeps WiFi up and can
-                        energize the field with the engine off, which drains the battery, so leave this on Auto in normal use.</span>
+                      &#8505;&#65039;
+                      <span class="tooltip-box">Which sensors the regulator is currently running without, if any. Open the screen to change it, to see which sensor stopped charging, or to set a failed battery-temperature source to Not fitted.</span>
                     </span>
                   </div>
                   <div class="form-input">
-                    <form action="/get" method="GET" target="hidden-form">
-                      <span class="toggle-label">Auto</span>
-                      <label class="switch">
-                        <input id="IgnitionOverride_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('IgnitionOverride_checkbox', 'IgnitionOverride', 'IgnitionOverride')) { this.form.submit(); submitMessage(); }" />
-                        <span class="slider round"></span>
-                      </label>
-                      <span class="toggle-label">Force On</span>
-                      <input id="IgnitionOverride" name="IgnitionOverride" type="number" value=""
-                        style="display:none;" />
-                    </form>
+                    <button type="button" class="btn-primary" onclick="rwfsOpen(false)">Open</button>
                   </div>
                 </div>
+              </div>
+            </details>
 
-                <hr />
+            <!-- Bench and Development -->
+            <details style="margin-top: 20px;">
+              <summary
+                style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
+                Bench and Development</summary>
+
+              <div class="emergency-section-content">
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Hardware Present? (<span id="HardwarePresent_echo">?</span>):</span>
                     <span class="tooltip">
-                      ℹ️
+                      &#8505;&#65039;
                       <span class="tooltip-box">When lacking wiring harnesses, this mode will fake data inputs to allow
                         interface testing.</span>
                     </span>
@@ -9933,79 +10027,6 @@
                     </form>
                   </div>
                 </div>
-
-                <hr />
-                <div class="form-row">
-                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Ignore Alt Temp (<span id="IgnoreTemperature_echo">0</span>):</span>
-                    <span class="tooltip">
-                      ℹ️
-                      <span class="tooltip-box">For emergency use, if temp sensor is bad</span>
-                    </span>
-                  </div>
-                  <div class="form-input">
-                    <form action="/get" method="GET" target="hidden-form">
-                      <span class="toggle-label">No</span>
-                      <label class="switch">
-                        <input id="IgnoreTemperature_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('IgnoreTemperature_checkbox', 'IgnoreTemperature', 'IgnoreTemperature')) { this.form.submit(); submitMessage(); }" />
-                        <span class="slider round"></span>
-                      </label>
-                      <span class="toggle-label">Yes</span>
-                      <input id="IgnoreTemperature" name="IgnoreTemperature" type="number" value=""
-                        style="display:none;" />
-                    </form>
-                  </div>
-                </div>
-
-                <hr />
-                <div class="form-row">
-                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Ignore RPM (<span id="IgnoreRPM_echo">0</span>):</span>
-                    <span class="tooltip">
-                      ℹ️
-                      <span class="tooltip-box">For emergency use only. Bypasses the RPM gate (Min RPM For Field, under Setup → Alternator → Output Control) — field will be enabled regardless of RPM. Use if RPM sensor is absent or malfunctioning.</span>
-                    </span>
-                  </div>
-                  <div class="form-input">
-                    <form action="/get" method="GET" target="hidden-form">
-                      <span class="toggle-label">No</span>
-                      <label class="switch">
-                        <input id="IgnoreRPM_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('IgnoreRPM_checkbox', 'IgnoreRPM', 'IgnoreRPM')) { this.form.submit(); submitMessage(); if(this.checked) warnIgnoreRpmNeedsCap(); }" />
-                        <span class="slider round"></span>
-                      </label>
-                      <span class="toggle-label">Yes</span>
-                      <input id="IgnoreRPM" name="IgnoreRPM" type="number" value=""
-                        style="display:none;" />
-                    </form>
-                  </div>
-                </div>
-
-                <hr />
-                <div class="form-row">
-                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Limp Home Mode (<span id="LimpHome_echo">?</span>):</span>
-                    <span class="tooltip">
-                      ℹ️
-                      <span class="tooltip-box">DO NOT USE CASUALLY. Will ignore all sensors and set a field of 30%,
-                        even
-                        with IGNITION OFF!  Hardware Over-voltage protection is still active.</span>
-                    </span>
-                  </div>
-                  <div class="form-input">
-                    <form action="/get" method="GET" target="hidden-form">
-                      <span class="toggle-label">Off</span>
-                      <label class="switch">
-                        <input id="LimpHome_checkbox" type="checkbox"
-                          onchange="if(this.checked) limpHomeOpenLoopWarn(); if(handleUserToggle('LimpHome_checkbox', 'LimpHome', 'LimpHome')) { this.form.submit(); submitMessage(); }" />
-                        <span class="slider round"></span>
-                      </label>
-                      <span class="toggle-label">On</span>
-                      <input id="LimpHome" name="LimpHome" type="number" value="" style="display:none;" />
-                    </form>
-                  </div>
-                </div>
               </div>
             </details>
 
@@ -10020,7 +10041,7 @@
                                 <div style="font-size: 12px; opacity: 0.85; margin: 10px 0;">Deliberately trigger a field collapse to reproduce an electrical fault in a controlled way. The normal Live Data plots, CSV, and Console capture the transient. One test runs at a time.</div>
 
                 <div class="emergency-section-title" style="font-size: 14px;">1. Manual Bench Testing</div>
-                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 8px;">For a manually-set field on the bench (Manual Field driving a power resistor). Hard-cuts the field you already set — no auto-energize. Turn Manual Field ON first; Ignore RPM is fine. In manual mode the regulator's own lockout is bypassed, so the cut duration below is what sets the off-time. Set the values, then press Fire.</div>
+                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 8px;">For a manually-set field on the bench (Manual Field driving a power resistor). Hard-cuts the field you already set — no auto-energize. Turn Manual Field ON first; running without engine speed (Setup → System → Run Without Failed Sensors) is fine. In manual mode the regulator's own lockout is bypassed, so the cut duration below is what sets the off-time. Set the values, then press Fire.</div>
 
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
@@ -10074,7 +10095,7 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Manual field hard cut:</span>
                     <span class="tooltip">ℹ️
-                      <span class="tooltip-box">Fires immediately. Drives the field-enable line open (the same hard chop as a fast over-voltage cut) against the field you set manually, holds it for the cut duration, then restores your manual field and ramps it back at Duty Ramp Rate. Requires Manual Field ON. Works with Ignore RPM on.</span>
+                      <span class="tooltip-box">Fires immediately. Drives the field-enable line open (the same hard chop as a fast over-voltage cut) against the field you set manually, holds it for the cut duration, then restores your manual field and ramps it back at Duty Ramp Rate. Requires Manual Field ON. Works while engine speed is ignored.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -10411,10 +10432,10 @@
                 </div>
               </div>
             </div>
-            <hr />
+            <hr style="display:none;" />
 
             <!-- polar symmetry (sailing only) -->
-            <div class="form-row" id="perf-sym-row">
+            <div class="form-row" id="perf-sym-row" style="display:none;">
               <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                 <span>Polar symmetry</span>
                 <span class="tooltip">ℹ️<span class="tooltip-box">Symmetric folds port and starboard together (|wind angle|) at display + scoring time — fills the polar twice as fast and assumes the boat sails the same on both tacks. Both tacks keeps them separate (for a lopsided rig or instrument offset). Raw both-sided data is always stored either way.</span></span>
@@ -10474,6 +10495,7 @@
             <details>
               <summary class="alt-summary-nested">Tuning</summary>
               <p style="font-size:12px;color:var(--text-muted);margin:6px 2px 8px;">A reading is only banked when conditions hold steady. Most inputs below come as a pair: a <b>band</b> (how much that value may drift) and a <b>steady time</b> (how long it must stay inside the band before the reading counts). Tighter bands and longer times give fewer but cleaner points.</p>
+              <div id="perf-sail-tuning" style="display:none;">
               <div class="form-row">
                 <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                   <span>Wind-speed band (kt) (<span id="perfWsTol_echo">?</span>)</span>
@@ -10506,6 +10528,7 @@
                 <div class="form-input"><form action="/get" method="GET" target="hidden-form"><input name="perfWaSec" type="number" step="0.5" /><input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" /></form></div>
               </div>
               <hr>
+              </div>
               <div class="form-row">
                 <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                   <span>Sea-state band (&deg; pitch std) (<span id="perfSeaTol_echo">?</span>)</span>
@@ -10570,7 +10593,7 @@
                 <div class="form-input"><form action="/get" method="GET" target="hidden-form"><input name="perfMinBoatSpeed" type="number" step="0.1" /><input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" /></form></div>
               </div>
               <hr>
-              <div class="form-row">
+              <div class="form-row" id="perf-minws-row">
                 <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                   <span>Min wind speed (kt) (<span id="perfMinWindSpeed_echo">?</span>)</span>
                   <span class="tooltip">ℹ️<span class="tooltip-box">Below this apparent wind speed, sailing data is ignored — too little wind to learn a meaningful polar.</span></span>
@@ -10581,7 +10604,7 @@
               <div class="form-row">
                 <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                   <span>Engine-off RPM threshold (<span id="perfRpmFloor_echo">?</span>)</span>
-                  <span class="tooltip">ℹ️<span class="tooltip-box">Below this alternator RPM = sailing; above = motoring. Splits which front a run feeds.</span></span>
+                  <span class="tooltip">ℹ️<span class="tooltip-box">Below this alternator RPM the engine counts as off: on a sailboat the run feeds the sailing polar, on a motorboat nothing is learned. Above it, runs feed the motoring map.</span></span>
                 </div>
                 <div class="form-input"><form action="/get" method="GET" target="hidden-form"><input name="perfRpmFloor" type="number" step="10" /><input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" /></form></div>
               </div>
@@ -10705,7 +10728,7 @@
           <div class="card">
             <p>Alternator Current</p>
             <p class="reading with-wm" style="font-size: 28px;">
-              <span><span id="MeasAmpsID">0</span>&nbsp;A</span>
+              <span><span id="MeasAmpsID">0</span><span class="rd-unit">&nbsp;A</span></span>
               <span class="wm-inline">
                 <span><span class="arr">↑</span><span id="MeasAmpsID_hi">—</span></span>
                 <span><span class="arr">↓</span><span id="MeasAmpsID_lo">—</span></span>
@@ -11599,13 +11622,13 @@
           <span id="perf-settle-chip" style="display:inline-flex;align-items:center;gap:6px;min-width:96px;justify-content:center;font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;"></span>
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
             <!-- Polar wind frame: apparent (native) vs true (display-layer transform). Sailing view only. -->
-            <div class="cap-mode-toggle" id="perf-wind-toggle">
+            <div class="cap-mode-toggle" id="perf-wind-toggle" style="display:none;">
               <button type="button" id="perf-wind-0" class="cap-mode-btn cap-mode-active" onclick="setPerfWindRef(0)">Apparent</button>
               <button type="button" id="perf-wind-1" class="cap-mode-btn" onclick="setPerfWindRef(1)">True</button>
             </div>
-            <div class="cap-mode-toggle">
-              <button type="button" id="perf-view-sail" class="cap-mode-btn cap-mode-active" onclick="setPerfView(0)">Sailing</button>
-              <button type="button" id="perf-view-motor" class="cap-mode-btn" onclick="setPerfView(1)">Motoring</button>
+            <div class="cap-mode-toggle" id="perf-view-toggle" style="display:none;">
+              <button type="button" id="perf-view-sail" class="cap-mode-btn" onclick="pickPerfView(0)">Sailing</button>
+              <button type="button" id="perf-view-motor" class="cap-mode-btn cap-mode-active" onclick="pickPerfView(1)">Motoring</button>
             </div>
           </div>
         </div>
@@ -11615,16 +11638,16 @@
         <div style="display:grid;grid-template-columns:minmax(64px,1fr) auto minmax(64px,1fr);grid-template-rows:auto 1fr auto;gap:4px 8px;align-items:start;">
           <!-- TL: conditions (apparent wind / engine RPM) -->
           <div style="grid-column:1;grid-row:1;text-align:left;">
-            <div id="perf-condL-label" style="font-size:12px;color:var(--text-muted);">Apparent wind</div>
+            <div id="perf-condL-label" style="font-size:12px;color:var(--text-muted);">Engine RPM</div>
             <div id="perf-condL-val" style="font-size:30px;font-weight:800;line-height:1.05;">&mdash;</div>
             <div id="perf-condL-sub" style="font-size:13px;color:var(--text-muted);"></div>
           </div>
           <!-- center: plot (one of the two is shown per view) + center-hub live speed -->
           <div style="grid-column:2;grid-row:1 / span 3;align-self:center;">
             <div style="position:relative;max-width:300px;margin:0 auto;">
-              <canvas id="perf-plot" width="360" height="360" style="width:100%;max-width:260px;aspect-ratio:1/1;display:block;margin:0 auto;"></canvas>
-              <canvas id="motor-plot" width="520" height="300" style="width:100%;max-width:300px;aspect-ratio:520/300;display:none;margin:0 auto;"></canvas>
-              <div id="perf-speed-hub" style="position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;">
+              <canvas id="perf-plot" width="360" height="360" style="width:100%;max-width:260px;aspect-ratio:1/1;display:none;margin:0 auto;"></canvas>
+              <canvas id="motor-plot" width="520" height="300" style="width:100%;max-width:300px;aspect-ratio:520/300;display:block;margin:0 auto;"></canvas>
+              <div id="perf-speed-hub" style="position:absolute;left:9%;top:11%;transform:none;text-align:left;pointer-events:none;">
                 <div id="perf-speed-num" style="font-size:40px;font-weight:800;line-height:.85;color:var(--accent);">&mdash;</div>
                 <div id="perf-speed-unit" style="font-size:10px;font-weight:700;letter-spacing:1px;color:var(--text-muted);">KNOTS</div>
               </div>
@@ -11647,7 +11670,7 @@
             <div id="perf-pts" style="font-size:20px;font-weight:700;line-height:1.05;">&mdash;</div>
             <div style="font-size:12px;color:var(--text-muted);">best surface points</div>
             <div id="perf-hours-val" style="font-size:20px;font-weight:700;line-height:1.05;margin-top:4px;">&mdash;</div>
-            <div id="perf-hours-label" style="font-size:12px;color:var(--text-muted);">sailing hours</div>
+            <div id="perf-hours-label" style="font-size:12px;color:var(--text-muted);">motoring hours</div>
           </div>
         </div>
         <details style="margin:10px auto 0;max-width:560px;font-size:13px;color:#555;">
@@ -11734,7 +11757,7 @@
           </div>
 
           <!-- VMG upwind + Leeway combined -->
-          <div class="vital-tile">
+          <div class="vital-tile" id="vt-vmg-leeway">
             <div class="vt-duo">
               <div class="vt-duo-item">
                 <div class="vt-label">VMG Upwind
@@ -11858,7 +11881,7 @@
                 <span class="tooltip">
                   ℹ️
                   <span class="tooltip-box">
-                    Enter compass heading you want to sail toward (0-359°). Set to -1 to disable.
+                    Enter compass heading you want to steer toward (0-359°). Set to -1 to disable.
                   </span>
                 </span>
               </span>
@@ -12356,7 +12379,7 @@
 
         <!-- Best Upwind VMG -->
         <hr />
-        <div class="form-row">
+        <div class="form-row" id="best-upwind-vmg-row">
           <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
             <span>Best Upwind VMG</span>
             <span class="tooltip">
@@ -14512,6 +14535,30 @@
           </span>
           <span class="metric-value telemetry-value"><span id="currentStaleCountID">?</span></span>
         </div>
+        <div class="metric-row telemetry-row">
+          <span class="metric-label telemetry-label">Battery Voltage Stale Events
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">Rising-edge count: the main battery voltage (INA228) stopped delivering valid readings and the field was cut. Check the battery voltage sense wiring and the INA228.</span>
+            </span>
+          </span>
+          <span class="metric-value telemetry-value"><span id="voltStaleCountID">?</span></span>
+        </div>
+        <div class="metric-row telemetry-row">
+          <span class="metric-label telemetry-label">Second Voltage Stale Events
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">Rising-edge count: the second battery voltage reading (ADS1115 channel 0) stopped delivering valid readings and the field was ramped off. Check the second voltage sense wiring and the ADS1115 connection.</span>
+            </span>
+          </span>
+          <span class="metric-value telemetry-value"><span id="volt2StaleCountID">?</span></span>
+        </div>
+        <div class="metric-row telemetry-row">
+          <span class="metric-label telemetry-label">Battery Temperature Lost Events
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">Rising-edge count: charging stopped because the expected battery temperature source stopped reporting. Check the battery probe or the network source, or set the source to Not fitted if the boat has none.</span>
+            </span>
+          </span>
+          <span class="metric-value telemetry-value"><span id="battTempLostCountID">?</span></span>
+        </div>
         <div style="margin-top:10px;">
           <button onclick="resetVoltageProtectionCounters()" class="btn-secondary">Reset Voltage &amp; Current Counters</button>
         </div>
@@ -15447,8 +15494,14 @@
 
                       <hr />
                       <div class="form-row">
-                        <div class="form-label"><span>Capacity reference (0=rated, 1=first reading) (<span id="capRefMode_echo">?</span>):</span></div>
-                        <div class="form-input"><form action="/get" method="GET" target="hidden-form"><input name="capRefMode" type="number" step="1" min="0" max="1" /><input type="submit" value="Set" class="btn-primary" /></form></div>
+                        <div class="form-label"><span>Capacity reference (<span id="capRefMode_echo">?</span>):</span></div>
+                        <div class="form-input"><form action="/get" method="GET" target="hidden-form">
+                          <div class="cap-mode-toggle ab-seg-select" data-seg-name="capRefMode">
+                            <button type="button" class="cap-mode-btn" data-val="0" onclick="abSegSelectClick(this)">Rated</button>
+                            <button type="button" class="cap-mode-btn" data-val="1" onclick="abSegSelectClick(this)">First reading</button>
+                          </div>
+                          <input id="capRefMode_val" name="capRefMode" type="hidden" value="0" />
+                        </form></div>
                       </div>
 
                       <hr />
@@ -15495,8 +15548,14 @@
 
                       <hr />
                       <div class="form-row">
-                        <div class="form-label"><span>Battery temperature normalization (0=off, 1=on) (<span id="capTempNorm_echo">?</span>):</span></div>
-                        <div class="form-input"><form action="/get" method="GET" target="hidden-form"><input name="capTempNorm" type="number" step="1" min="0" max="1" /><input type="submit" value="Set" class="btn-primary" /></form></div>
+                        <div class="form-label"><span>Battery temperature normalization (<span id="capTempNorm_echo">?</span>):</span></div>
+                        <div class="form-input"><form action="/get" method="GET" target="hidden-form">
+                          <div class="cap-mode-toggle ab-seg-select" data-seg-name="capTempNorm">
+                            <button type="button" class="cap-mode-btn" data-val="0" onclick="abSegSelectClick(this)">Off</button>
+                            <button type="button" class="cap-mode-btn" data-val="1" onclick="abSegSelectClick(this)">On</button>
+                          </div>
+                          <input id="capTempNorm_val" name="capTempNorm" type="hidden" value="0" />
+                        </form></div>
                       </div>
 
                       <hr />
@@ -16581,6 +16640,28 @@
     </div>
   </div><!-- END commprep-modal-overlay -->
 
+  <!-- Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §4.6). Same dark shell as the
+       prerequisites / battery-defaults modals; rows are rendered by rwfsRender() from the live CSV1/2/3 caches. -->
+  <div id="rwfs-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9150; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:720px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+      <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
+        <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Run Without Failed Sensors</span>
+        <button onclick="rwfsClose()" class="rwfs-close" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
+      </div>
+      <div style="overflow-y:auto; flex:1; min-height:0; padding:12px 16px;">
+        <p style="margin:0 0 10px; font-size:12.5px; line-height:1.5; color:#bbb;">Every sensor the regulator needs, its live status, and a choice to run without it. Ignoring a sensor removes the protections that depend on it; the box below says which. Each choice is kept until you clear it here.</p>
+        <div class="rwfs-row rwfs-head" style="padding-bottom:0;"><span>Sensor</span><span>Status</span><span>Run without it</span><span>What changes</span></div>
+        <div id="rwfs-rows"></div>
+        <div id="rwfs-summary" class="rwfs-summary"></div>
+      </div>
+      <div style="padding:12px 16px; border-top:1px solid #333; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
+        <button type="button" class="rwfs-btn" onclick="rwfsClose()">Cancel</button>
+        <button type="button" class="rwfs-btn" id="rwfs-clear-btn" onclick="rwfsStopAll()">Stop ignoring all</button>
+        <button type="button" class="rwfs-btn primary" id="rwfs-apply-btn" onclick="rwfsApply()">Apply</button>
+      </div>
+    </div>
+  </div><!-- END rwfs-modal-overlay -->
+
   <!-- Charge Rate Limits — pre-commissioning, between the Prerequisites screen and tach alignment
        (commPrepFinish → openRpmCap → rpmCapContinue → openRpmAlign). Seeds BOTH the Low and High cap
        tables at once (capBothSave); the chosen Continue button sets the charge-rate mode (HiLow).
@@ -16636,15 +16717,19 @@
         <button type="button" class="why-close" onclick="whyPanelClose()" aria-label="Close">&#x2715;</button>
       </div>
       <div class="why-body">
-        <div class="why-now">
-          <span class="why-k">Engine speed</span><span class="why-v" id="why-rpm">&mdash;</span><span class="why-u">RPM</span>
-          <span class="why-k">Alternator output</span><span class="why-v" id="why-alt">&mdash;</span><span class="why-u">A</span>
-          <span class="why-k">Asking for</span><span class="why-v" id="why-ask">&mdash;</span><span class="why-u">A</span>
-          <span class="why-k">Field drive</span><span class="why-v" id="why-duty">&mdash;</span><span class="why-u">%</span>
-        </div>
         <div class="why-verdict">
           <div class="why-line why-headline" id="why-headline">Waiting for data</div>
         </div>
+        <div class="why-flow" id="why-flow">
+          <div class="why-tile"><div class="why-tl">Alternator</div><div class="why-tv"><span id="why-alt">&mdash;</span>&nbsp;<small>A</small></div></div>
+          <div class="why-op why-batt-part">=</div>
+          <div class="why-tile why-batt-part"><div class="why-tl">Battery</div><div class="why-tv"><span id="why-batt">&mdash;</span>&nbsp;<small>A</small></div></div>
+          <div class="why-op why-batt-part" id="why-op2">+</div>
+          <div class="why-tile why-batt-part"><div class="why-tl" id="why-house-l">House</div><div class="why-tv"><span id="why-house">&mdash;</span>&nbsp;<small>A</small></div></div>
+        </div>
+        <div class="why-meta"><span>Engine <b><span id="why-rpm">&mdash;</span>&nbsp;RPM</b></span><span>Field drive <b><span id="why-duty">&mdash;</span>%</b></span></div>
+        <div class="why-sect">Alternator current limits</div>
+        <div class="why-lims" id="why-lims"></div>
         <div class="why-line why-where" id="why-where"></div>
         <div class="why-ext" id="why-ext">
           <div class="why-ext-grid">
