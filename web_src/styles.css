@@ -1241,6 +1241,7 @@ input[type="submit"]:hover {
 #commission-modal-panel .btn-primary,
 #rpmalign-modal-overlay .btn-primary,
 #commprep-modal-overlay .btn-primary,
+#fieldres-modal-overlay .btn-primary,
 #rpmcap-modal-overlay .btn-primary,
 #socseed-modal-panel .btn-primary,
 #battdef-modal-overlay .btn-primary {
@@ -1257,6 +1258,7 @@ input[type="submit"]:hover {
 #commission-modal-panel .btn-primary:hover,
 #rpmalign-modal-overlay .btn-primary:hover,
 #commprep-modal-overlay .btn-primary:hover,
+#fieldres-modal-overlay .btn-primary:hover,
 #rpmcap-modal-overlay .btn-primary:hover,
 #socseed-modal-panel .btn-primary:hover,
 #battdef-modal-overlay .btn-primary:hover {
@@ -1333,6 +1335,7 @@ a.btn-secondary {
 #test-panel .btn-secondary,
 #commission-modal-panel .btn-secondary,
 #commprep-modal-overlay .btn-secondary,
+#fieldres-modal-overlay .btn-secondary,
 #rpmcap-modal-overlay .btn-secondary,
 #rpmalign-modal-overlay .btn-secondary,
 #socseed-modal-panel .btn-secondary,
@@ -1345,6 +1348,7 @@ a.btn-secondary {
 #test-panel .btn-secondary:hover,
 #commission-modal-panel .btn-secondary:hover,
 #commprep-modal-overlay .btn-secondary:hover,
+#fieldres-modal-overlay .btn-secondary:hover,
 #rpmcap-modal-overlay .btn-secondary:hover,
 #rpmalign-modal-overlay .btn-secondary:hover,
 #socseed-modal-panel .btn-secondary:hover,
@@ -1609,6 +1613,7 @@ a.btn-secondary {
 #bhw-modal-panel .btn-danger-ghost,
 #cvs-modal-panel .btn-danger-ghost,
 #commprep-modal-overlay .btn-danger-ghost,
+#fieldres-modal-overlay .btn-danger-ghost,
 #rpmcap-modal-overlay .btn-danger-ghost,
 #rpmalign-modal-overlay .btn-danger-ghost,
 #socseed-modal-panel .btn-danger-ghost,
@@ -1623,6 +1628,7 @@ a.btn-secondary {
 #bhw-modal-panel .btn-danger-ghost:hover,
 #cvs-modal-panel .btn-danger-ghost:hover,
 #commprep-modal-overlay .btn-danger-ghost:hover,
+#fieldres-modal-overlay .btn-danger-ghost:hover,
 #rpmcap-modal-overlay .btn-danger-ghost:hover,
 #rpmalign-modal-overlay .btn-danger-ghost:hover,
 #socseed-modal-panel .btn-danger-ghost:hover,
@@ -2913,6 +2919,7 @@ h2 {
 #bhw-modal-panel h2,
 #cvs-modal-panel h2,
 #commprep-modal-overlay h2,
+#fieldres-modal-overlay h2,
 #rpmcap-modal-overlay h2,
 #rpmalign-modal-overlay h2,
 #socseed-modal-panel h2,
@@ -3508,8 +3515,9 @@ hr {
   justify-content: flex-start !important;  /* override inline space-between; keeps ℹ️ next to label text */
 }
 
-/* Which of the two field caps (Max Field %, Max Field Volts) is enforced right now. Laid out on
-   both rows always (visibility, not display) so the word moving between them never reflows. */
+/* Which of the four field caps (Max Field %, Max Field Volts, Field Current Ceiling, Field Drive Heat
+   Ceiling) is enforced right now. Laid out on every row always (visibility, not display) so the word
+   moving between them never reflows. */
 .cap-limiting {
   margin-left: 6px;
   font-size: 12px;
@@ -4948,6 +4956,7 @@ body.readings-stale .reading-value {
      (#5f6368 on a #2e2e2e track, 2.2:1), so the inactive segment needs literal ink there. */
   #commission-modal-panel .cap-mode-btn:not(.cap-mode-active),
   #commprep-modal-overlay .cap-mode-btn:not(.cap-mode-active),
+  #fieldres-modal-overlay .cap-mode-btn:not(.cap-mode-active),
   #rpmcap-modal-overlay .cap-mode-btn:not(.cap-mode-active),
   #rpmalign-modal-overlay .cap-mode-btn:not(.cap-mode-active) {
     color: #b0b0b0;

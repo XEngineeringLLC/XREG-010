@@ -72,7 +72,7 @@ String kneeLearnStateJson();
 void updateCurrentRPMTableIndex(float rpm);
 bool shouldImmediatelyCutGPIO4(FieldEventReason reason);
 bool shouldCutGPIO4AfterSettle(FieldEventReason reason, uint32_t nowMs, float appliedDuty);
-void updateFieldTelemetry(float duty, float voltage, float fieldResistance);
+void updateFieldTelemetry(float duty, float voltage);
 void reportFieldModeEvent(uint32_t nowMs, FieldControlMode mode, FieldEventReason reason,
                           const TickSnapshot &tick, bool gpio4Low, float appliedDuty);
 
@@ -95,6 +95,7 @@ bool voltageInPlausibleWindow(float v);
 void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEventReason reason,
                      float actualDtSec, bool exitingNormal);
 void runCommissionIdle(const TickSnapshot &tick, FieldEventReason reason, float actualDtSec);
+void runFieldResTestHold(const TickSnapshot &tick, FieldEventReason reason);
 
 // FIELD CONTROL MODULE - Refactored with Unified Actuator Governor
 // ====================================================================================
@@ -984,7 +985,106 @@ static float g_fieldVoltDutyCeil = 99.0f;
 static float g_fieldVoltBusFilt  = 0.0f;   // slow-filtered bus volts the ceiling is solved against; 0 = not yet seeded
 static bool  g_fieldVoltFloored  = false;  // one-shot console warn latch for the MinDuty collision below
 
-// ccDutyCeiling — the upper duty bound the CC loop is allowed to reach: the lower of the two field
+// FIELD-DERATE-LAW-BEGIN
+// Field-drive heat law and 10 A current ceiling (spec: private_refs/v9_rework/d5_thermal_model/README.md, "FIELD
+// DERATE - BUILD SPEC"). Plain C on purpose: the host test compiles this exact text against the explainer page's law.
+// Constants are the V9 rework's geometry, fitted on soaked bench rows: J2 connector minus INA228 die on N wiring
+// (pin heating + SB5H100 power), D5 case top minus die on P wiring (Wurth film on D5). V10 moves the diode: re-measure.
+// The heat law and the 10 A ceiling both run on Rc, the resistance corrected for alternator temperature (fdRcOhm; owner
+// 2026-10-10: the same 90 % credit in both). No added margins (owner rule).
+#define FD_VF_EST      0.4f      // freewheel drop in the field-current estimate, V
+#define FD_PIN_K       17.8f     // J2 pin heating at 10 A, K
+#define FD_DIODE_KW    10.0f     // J2 heating per watt in the SB5H100 soldered into its pins, K/W
+#define FD_D5_KW       21.2f     // D5 case top per watt in D5, K/W
+#define FD_CONN_LIM_C  105.0f    // J2 housing (PA66) rating
+#define FD_D5_LIM_C    120.0f    // Wurth film adhesive rating on D5's top
+#define FD_ALPHA       0.00393f  // copper resistance per degree C
+#define FD_CREDIT      0.9f      // share of the probe rise credited to the rotor (owner 2026-10-08; to be checked against a measured rotor)
+#define FD_TCAP_C      120.0f    // credited probe temperature ceiling: bounds the credit a falsely high probe can claim
+#define FD_TREF_DEF_C  30.0f     // Tref when none was recorded with the resistance
+#define FD_FIELD_MAX_A 10.0f     // board field-current rating
+#define FD_WIRING_P    1
+#define FD_WIRING_N    2
+#define FD_PART_NONE   0
+#define FD_PART_CONN   1
+#define FD_PART_D5     2
+
+static float fdIEst(float D, float V, float R) {
+  float i = (D * V - (1.0f - D) * FD_VF_EST) / R;
+  return i > 0.0f ? i : 0.0f;
+}
+static float fdGapConn(float D, float V, float R) {
+  float I = fdIEst(D, V, R);
+  return FD_PIN_K * (I / 10.0f) * (I / 10.0f) + FD_DIODE_KW * I * (1.0f - D) * (0.48f + 0.0158f * I);
+}
+static float fdGapD5(float D, float V, float R) {
+  float I = fdIEst(D, V, R);
+  return FD_D5_KW * ((0.405f + 0.0175f * (I - 8.0f)) * I * (1.0f - D) + 0.013f * V * D);
+}
+// The heat checks at grid point k (duty k / 10 %): FD_PART_NONE = pass, else the part that failed. P wiring runs the D5
+// check only, N wiring the connector check only, not set (0) both.
+#define FD_SCAN_LAST_K 990
+static int fdHeatCheckAt(int k, float T_C, float V, float R, int wiring) {
+  float D = (float)k / 1000.0f;
+  if (wiring != FD_WIRING_P && T_C + fdGapConn(D, V, R) > FD_CONN_LIM_C) return FD_PART_CONN;
+  if (wiring != FD_WIRING_N && T_C + fdGapD5(D, V, R) > FD_D5_LIM_C) return FD_PART_D5;
+  return FD_PART_NONE;
+}
+// Duty (percent) the scan reports when grid point k is the first to fail.
+static float fdHeatPctBefore(int k) {
+  return (k > 0) ? (float)(k - 1) / 10.0f : 0.0f;
+}
+// Largest duty (percent, 0.1 grid, 0..99.0) whose checks pass at EVERY duty from 0 up to it. The connector estimate is
+// not monotonic in duty (pin heat rises as diode heat falls), so the first failure ends the scan. *part = the check that
+// failed first. The firmware runs the same scan in slices (updateFieldDerateCeilings); this whole form is the host test's.
+__attribute__((unused)) static float fdHeatCeilPct(float T_C, float V, float R, int wiring, int *part) {
+  *part = FD_PART_NONE;
+  for (int k = 0; k <= FD_SCAN_LAST_K; k++) {
+    int p = fdHeatCheckAt(k, T_C, V, R, wiring);
+    if (p != FD_PART_NONE) { *part = p; return fdHeatPctBefore(k); }
+  }
+  return (float)FD_SCAN_LAST_K / 10.0f;
+}
+// Resistance the 10 A ceiling and the heat law use. A probe below Tref gets the full correction (a cold rotor draws MORE than the
+// estimate); above it, 90 % credit up to 120 C. No probe reading (NaN): no credit.
+static float fdRcOhm(float R, float Tp_C, float Tref_C) {
+  if (Tp_C != Tp_C) return R;
+  if (Tp_C < Tref_C) return R * (1.0f + FD_ALPHA * (Tp_C - Tref_C));
+  float t = (Tp_C < FD_TCAP_C) ? Tp_C : FD_TCAP_C;
+  return R * (1.0f + FD_ALPHA * FD_CREDIT * (t - Tref_C));
+}
+// Duty (percent) where (D V - (1 - D) 0.4) / Rc = 10 A.
+static float fdCurCeilPct(float Rc, float V) {
+  return 100.0f * (FD_FIELD_MAX_A * Rc + FD_VF_EST) / (V + FD_VF_EST);
+}
+// FIELD-DERATE-LAW-END
+
+static float   g_fieldHeatRawPct = 99.0f;   // last finished heat scan; 99 until the first valid die sample
+static uint8_t g_fieldHeatPart = FD_PART_NONE;
+static bool    g_fieldCurBelowMin = false;  // one-shot console latches, same pattern as g_fieldVoltFloored
+static bool    g_fieldHeatBelowMin = false;
+static bool    g_fieldResMissingSaid = false;
+
+// Heat scan in slices: FD_SCAN_SLICE grid points per control pass, inputs latched at the start, so a rescan never costs
+// one pass more than a slice (the control loop's added-work budget is 0.5 ms). A full scan spans <= 10 passes (~50 ms).
+#define FD_SCAN_SLICE     100
+#define FD_DIE_FALL_KPS   2.0f   // fastest fall the heat law accepts from the die reading, K/s: a bad low read (0 C) cannot open the ceiling
+static bool  s_fdScanActive = false;
+static int   s_fdScanK = 0, s_fdScanWiring = 0;
+static float s_fdScanT = 0.0f, s_fdScanV = 0.0f, s_fdScanR = 1.0f;
+
+// Bus volts the ceilings solve against when there is no trusted main reading (limp tier 3/4, stale main voltage, before the
+// first reading): the INA228 hardware limit or 16 V per 12 V of class, whichever is higher. Higher volts = lower duty.
+float fieldCeilAssumedBusV() {
+  return fmaxf(VoltageHardwareLimit, 16.0f * (float)SYSTEM_VOLTAGE_CLASS / 12.0f);
+}
+
+// The two board ceilings alone: they win over every duty floor (Min Field, the per-RPM onset floors).
+float boardDutyCeiling() {
+  return fminf(g_fieldCurDutyCeil, g_fieldHeatDutyCeil);
+}
+
+// ccDutyCeiling — the upper duty bound the CC loop is allowed to reach: the lowest of the four field
 // caps. MaxDuty (Max Field %) is the REAL per-bus duty cap, class-invariant (99 on every class) — the
 // user-visible Max Field box IS the cap the loop respects, no hidden ×12/Vbatt. g_fieldVoltDutyCeil is
 // Max Field Volts solved against the measured bus, which is the same limit in the units on the
@@ -992,8 +1092,16 @@ static bool  g_fieldVoltFloored  = false;  // one-shot console warn latch for th
 // full-field volts) works out above 99% on a 12V bus and to ~52/35/26% on 24/36/48V. A user wanting
 // full duty on a high-voltage bank raises Max Field Volts to the winding's rating (Max Field is
 // already 99). Everything that asks "how high may duty go" must come through here — a raw MaxDuty
-// read silently skips the volts cap. MaxDuty itself stays the persisted setting.
+// read silently skips the volts cap. MaxDuty itself stays the persisted setting. The two board ceilings
+// (g_fieldCurDutyCeil, g_fieldHeatDutyCeil) come from updateFieldDerateCeilings() and protect the
+// regulator, not the alternator.
 float ccDutyCeiling() {
+  return fminf(fminf(MaxDuty, g_fieldVoltDutyCeil), fminf(g_fieldCurDutyCeil, g_fieldHeatDutyCeil));
+}
+
+// The alternator's own ceiling, without the board derates: alt-health's high-field test reads this so a hot
+// regulator never raises an alternator alert.
+float altFieldCeiling() {
   return fminf(MaxDuty, g_fieldVoltDutyCeil);
 }
 
@@ -1036,14 +1144,504 @@ void updateFieldVoltCeiling(float busV, float dtSec) {
   }
 }
 
+// updateFieldDerateCeilings — the two board ceilings, once per control tick right after updateFieldVoltCeiling(), on
+// the same filtered bus (or fieldCeilAssumedBusV() when busUnmeasured). The current ceiling is closed form every pass. The
+// heat scan restarts when the die moved 0.25 K, the bus 0.1 V, Rc 0.1 % (~0.3 K of alternator temperature) or a setting
+// changed, at most once a second, and runs FD_SCAN_SLICE grid points per pass. A ceiling that falls is applied at once;
+// one that rises waits for the volts term's 0.5-point deadband. A die reading that is not valid holds the last heat
+// ceiling; REASON_DIE_TEMP_LOST is what ends that after 10 s. No resistance entered: the 10 A ceiling is 0 (field off).
+// Also keeps the time-at-ceiling counters.
+void updateFieldDerateCeilings(float dtSec, bool busUnmeasured) {
+  const bool dirty = g_fieldDerateDirty;   // cleared only when a scan starts, so a change made while the die is invalid still lands
+
+  const bool rKnown = isfinite(FieldResistance) && FieldResistance > 0.0f;
+  const float tpF = n2kAltTempF();
+  const float tpC = isfinite(tpF) ? (tpF - 32.0f) / 1.8f : NAN;
+  const float trefC = isfinite(FieldResTrefC) ? FieldResTrefC : FD_TREF_DEF_C;
+  g_fieldRcOhm = rKnown ? fdRcOhm(fmaxf(FieldResistance, 0.05f), tpC, trefC) : NAN;
+  const float V = (busUnmeasured || g_fieldVoltBusFilt <= 0.0f) ? fmaxf(fieldCeilAssumedBusV(), g_fieldVoltBusFilt)
+                                                                 : g_fieldVoltBusFilt;
+  float cur = rKnown ? fdCurCeilPct(g_fieldRcOhm, V) : 0.0f;
+  if (!rKnown && !g_fieldResMissingSaid) {
+    g_fieldResMissingSaid = true;
+    queueConsoleMessage("Field Resistance has not been measured: the 10 A field ceiling cannot be calculated, so the field stays off until it is (the Field Resistance test after the commissioning Prerequisites screen, or Setup > Alternator > Basic > Output Control > Measure)");
+  } else if (rKnown) {
+    g_fieldResMissingSaid = false;
+  }
+
+  // Die input to the heat law: rises pass at once, falls at most FD_DIE_FALL_KPS.
+  static float dieC = NAN;
+  const uint32_t now = millis();
+  const uint32_t dieTs = dataTimestamps[IDX_INA_DIE_TEMP];
+  const bool dieOk = (dieTs != 0) && ((int32_t)(now - dieTs) <= 10000) && isfinite(g_fdDieTempF);
+  if (dieOk) {
+    const float tC = (g_fdDieTempF - 32.0f) / 1.8f;
+    dieC = (!isfinite(dieC) || tC >= dieC) ? tC : fmaxf(tC, dieC - FD_DIE_FALL_KPS * dtSec);
+  }
+  if (dieOk && rKnown) {
+    static float lastT = NAN, lastV = 0.0f, lastRc = 0.0f;
+    static uint32_t lastStartMs = 0;
+    const bool moved = !isfinite(lastT) || fabsf(dieC - lastT) >= 0.25f || fabsf(V - lastV) >= 0.1f ||
+                       fabsf(g_fieldRcOhm - lastRc) >= 0.001f * g_fieldRcOhm;
+    if (dirty || (moved && (uint32_t)(now - lastStartMs) >= 1000UL)) {
+      g_fieldDerateDirty = false;   // before FieldWiring is latched: a write landing later sets it again for the next pass (a resistance write also moves Rc)
+      s_fdScanT = dieC;
+      s_fdScanV = V;
+      s_fdScanR = g_fieldRcOhm;
+      s_fdScanWiring = FieldWiring;
+      s_fdScanK = 0;
+      s_fdScanActive = true;
+      lastT = dieC;
+      lastV = V;
+      lastRc = g_fieldRcOhm;
+      lastStartMs = now;
+    }
+  }
+  if (s_fdScanActive) {
+    const int kEnd = min(s_fdScanK + FD_SCAN_SLICE, FD_SCAN_LAST_K + 1);
+    for (; s_fdScanK < kEnd; s_fdScanK++) {
+      const int p = fdHeatCheckAt(s_fdScanK, s_fdScanT, s_fdScanV, s_fdScanR, s_fdScanWiring);
+      if (p != FD_PART_NONE) {
+        g_fieldHeatRawPct = fdHeatPctBefore(s_fdScanK);
+        g_fieldHeatPart = (uint8_t)p;
+        s_fdScanActive = false;
+        break;
+      }
+    }
+    if (s_fdScanActive && s_fdScanK > FD_SCAN_LAST_K) {
+      g_fieldHeatRawPct = (float)FD_SCAN_LAST_K / 10.0f;
+      g_fieldHeatPart = FD_PART_NONE;
+      s_fdScanActive = false;
+    }
+  }
+
+  if (cur > 99.0f) cur = 99.0f;
+  if (cur < 0.0f) cur = 0.0f;
+  float heat = constrain(g_fieldHeatRawPct, 0.0f, 99.0f);
+
+  if (rKnown && cur < MinDuty) {
+    if (!g_fieldCurBelowMin) {
+      g_fieldCurBelowMin = true;
+      queueConsoleMessageF("Field current ceiling: 10 A at %.2f ohm and %.1f V is %.2f%% duty, below Min Field %.2f%% - the field is held below Min Field. Check Field Resistance.",
+                           g_fieldRcOhm, V, cur, MinDuty);
+    }
+  } else {
+    g_fieldCurBelowMin = false;
+  }
+  if (heat < MinDuty) {
+    if (!g_fieldHeatBelowMin) {
+      g_fieldHeatBelowMin = true;
+      const char *part = (g_fieldHeatPart == FD_PART_D5) ? "freewheel diode's heat spreader" : "field connector";
+      if (heat <= 0.0f)
+        queueConsoleMessageF("Field drive heat limit: board at %.0f%s, the %s is at its rating with no field at all - field held off until the regulator cools",
+                             dispTempF(dieC * 1.8f + 32.0f), dispTempUnit(), part);
+      else
+        queueConsoleMessageF("Field drive heat limit: board at %.0f%s, the %s allows %.1f%% duty, below Min Field %.2f%% - the field is held below Min Field until the regulator cools",
+                             dispTempF(dieC * 1.8f + 32.0f), dispTempUnit(), part, heat, MinDuty);
+    }
+  } else {
+    g_fieldHeatBelowMin = false;
+  }
+
+  bool moved = false;
+  if (cur < g_fieldCurDutyCeil - 0.01f || cur > g_fieldCurDutyCeil + 0.5f)    { g_fieldCurDutyCeil = cur;   moved = true; }
+  if (heat < g_fieldHeatDutyCeil - 0.01f || heat > g_fieldHeatDutyCeil + 0.5f) { g_fieldHeatDutyCeil = heat; moved = true; }
+  if (moved && pidInitialized) applyCcOutputLimits();
+
+  // Ties go to the term the owner can act on (strict <, settings first).
+  float ceil = MaxDuty;
+  uint8_t bind = 0;
+  if (g_fieldVoltDutyCeil < ceil) { ceil = g_fieldVoltDutyCeil; bind = 1; }
+  if (g_fieldCurDutyCeil < ceil)  { ceil = g_fieldCurDutyCeil;  bind = 2; }
+  if (g_fieldHeatDutyCeil < ceil) { ceil = g_fieldHeatDutyCeil; bind = (g_fieldHeatPart == FD_PART_D5) ? 4 : 3; }
+  g_fieldCeilBind = bind;
+
+  static uint32_t heatAccMs = 0, curAccMs = 0;
+  const bool atCeil = !gpio4IsLow && dutyCycle > 0.0f && dutyCycle >= ceil - 1.0f && frt.state != FRT_RUNNING;   // the test runs past the board ceilings by design
+  const uint32_t dms = (uint32_t)(dtSec * 1000.0f + 0.5f);
+  if (atCeil && bind >= 3) {
+    heatAccMs += dms;
+    while (heatAccMs >= 1000) { heatAccMs -= 1000; g_fieldHeatLimS++; g_fieldHeatLimSesS++; }
+  }
+  if (atCeil && bind == 2) {
+    curAccMs += dms;
+    while (curAccMs >= 1000) { curAccMs -= 1000; g_fieldCurLimS++; g_fieldCurLimSesS++; }
+  }
+}
+
 // applyCcOutputLimits — set the inner current PID's output bounds to [MinDuty, ccDutyCeiling()]. Making
 // the ceiling the PID's REAL upper limit lets its anti-windup track it: otherwise the loop would wind
 // the integrator toward MaxDuty while setDutyPercent() clamps the applied duty far lower, then lag on
 // the way down. setDutyPercent() still applies the same clamp as the catch-all for the open-loop paths
 // (manual/limp/fault) that bypass the PID. Call on AUTO entry, on a ceiling toggle, and on a voltage
 // change — SetOutputLimits also re-clamps the live output + integrator, which is the desired anti-windup.
+// A board ceiling below MinDuty lowers the bottom bound with it (the board limit wins); SetOutputLimits
+// ignores min >= max, hence the 0.01 gap.
 void applyCcOutputLimits() {
-  currentPID.SetOutputLimits((double)MinDuty, (double)ccDutyCeiling());
+  const float hi = ccDutyCeiling();
+  float lo = fminf(MinDuty, hi);
+  if (lo > hi - 0.01f) lo = hi - 0.01f;
+  currentPID.SetOutputLimits((double)lo, (double)hi);
+}
+
+// ==================== FIELD RESISTANCE TEST ====================
+// BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1. Holds are planned in field volts X (the firmware's own model, so one plan
+// suits every bus and winding): a probe at 3 V (6 V, 12 V while it reads under 0.5 A), a top aimed at 4 A, a middle at
+// 0.6 x the top measured AFTER the top (coil warming then tilts R low, the safe side), and on the shunt method the probe
+// again. R and the contact drop come from the top and middle only: a probe sits where the contact curve still bends.
+// The only thing that drives the field with no resistance stored. frtService runs first in every control pass; the hold
+// itself is applied by runFieldResTestHold once the arbiter selects MODE_FIELD_RES_TEST.
+static const float FRT_PROBE_X[3] = { 3.0f, 6.0f, 12.0f };
+
+static float frtCeilPct() {
+  return fminf(fminf(MaxDuty, g_fieldVoltDutyCeil), 99.0f);   // the alternator ceilings: they need no resistance
+}
+static float frtXAt(float dPct, float v) {
+  const float d = dPct / 100.0f;
+  return d * v - (1.0f - d) * FD_VF_EST;
+}
+static float frtDutyFor(float x, float v) {
+  if (!(v > 1.0f)) return 0.0f;
+  return constrain(100.0f * (x + FD_VF_EST) / (v + FD_VF_EST), 0.0f, frtCeilPct());
+}
+
+void frtFieldOff() {
+  digitalWrite(4, LOW);
+  gpio4IsLow = true;
+  apply_pwm_float(0.0f);
+  lastAppliedDuty = 0.0f;
+  dutyCycle = 0.0f;
+  fieldActiveStatus = 0;
+  frt.duty = 0.0f;
+}
+
+void frtFail(const char *why) {
+  if (frt.state != FRT_RUNNING) return;
+  strncpy(frt.msg, why, sizeof(frt.msg) - 1);
+  frt.msg[sizeof(frt.msg) - 1] = '\0';
+  frt.state = FRT_FAILED;
+  frt.endMs = millis();
+  frtFieldOff();
+  queueConsoleMessageF("Field resistance test: %s", frt.msg);
+}
+
+static void frtResetWindow(uint32_t now) {
+  frt.sumI = frt.sumV = 0.0;
+  frt.n = 0;
+  frt.ringN = frt.ringK = 0;
+  frt.phaseStartMs = now;
+}
+
+// Starts hold frt.hold at field volts x. carryA (shunt): the field-off phase just measured opens this hold too.
+static void frtStartHold(uint32_t now, float x, bool carryA) {
+  frt.holdX = x;
+  frt.holdDuty = frtDutyFor(x, IBV);
+  if (frt.method == FRT_SHUNT) {
+    if (carryA) {
+      frt.phI[0] = frt.phI[frt.phase - 1];   // the field-off phase just closed: 2 after a probe's first cycle, else 6
+      frt.phV[0] = frt.phV[frt.phase - 1];
+      frt.phase = 1;
+    } else {
+      frt.phase = 0;
+    }
+  } else {
+    frt.phase = FRT_MP_HOLD;
+  }
+  frtResetWindow(now);
+}
+
+void frtBegin(uint32_t now) {
+  const uint8_t method = frt.reqMethod;
+  const uint32_t endMs = frt.endMs;
+  frt = FieldResTestState();
+  frt.endMs = endMs;
+  frt.method = method;
+  frt.hold = FRT_H_PROBE;
+  frt.startMs = now;
+  frt.lastPollMs = now;
+  frt.probeC = fieldResProbeC();
+  frt.baseA = NAN;
+  frt.r = frt.vc = frt.probeOffV = frt.warmPct = NAN;
+  for (int k = 0; k < 4; k++) frt.h[k] = { NAN, NAN, NAN, NAN };
+  frtStartHold(now, FRT_PROBE_X[0], false);
+  frt.state = FRT_RUNNING;
+  queueConsoleMessageF("Field resistance test started (%s method), engine off, battery %.2f V",
+                       method == FRT_SHUNT ? "shunt" : "meter", IBV);
+}
+
+// Median step and field-on volts of the good shunt cycles of the hold just completed. false: the test has failed.
+static bool frtShuntHoldResult(float &stepA, float &vB) {
+  float steps[3];
+  float vs[3];
+  int good = 0;
+  for (int k = 0; k < 3; k++) {
+    const float a0 = frt.phI[2 * k], b = frt.phI[2 * k + 1], a1 = frt.phI[2 * k + 2];
+    const float step = 0.5f * (a0 + a1) - b;   // charging-positive amps: the field's draw lowers the reading
+    if (fabsf(a0 - a1) <= fmaxf(0.050f, 0.15f * fabsf(step))) {
+      steps[good] = step;
+      vs[good] = frt.phV[2 * k + 1];
+      good++;
+    }
+  }
+  if (good < 2) {
+    frtFail("The battery current kept changing between readings, likely a load switching on and off. Turn off cycling loads (fridge, pumps, inverter) and try again.");
+    return false;
+  }
+  if (good == 3) {
+    float lo = fminf(steps[0], fminf(steps[1], steps[2])), hi = fmaxf(steps[0], fmaxf(steps[1], steps[2]));
+    stepA = steps[0] + steps[1] + steps[2] - lo - hi;
+    vB = (vs[0] + vs[1] + vs[2]) / 3.0f;
+  } else {
+    stepA = 0.5f * (steps[0] + steps[1]);
+    vB = 0.5f * (vs[0] + vs[1]);
+  }
+  return true;
+}
+
+static void frtFinish(uint32_t now) {
+  const FrtHold &t = frt.h[FRT_H_TOP], &m = frt.h[FRT_H_MID], &p = frt.h[FRT_H_PROBE];
+  char why[240];
+  if (!(t.i >= 1.3f * m.i)) {
+    snprintf(why, sizeof(why), "The field current did not rise enough between the top and middle holds (%.2f A and %.2f A). Check Max Field %% and Max Field Volts under Setup > Alternator, then try again.", t.i, m.i);
+    frtFail(why);
+    return;
+  }
+  const float r = (t.x - m.x) / (t.i - m.i);
+  const float vc = m.x - m.i * r;
+  if (!(r >= 0.05f && r <= 100.0f)) {
+    snprintf(why, sizeof(why), "The result, %.3f ohm, is outside 0.05 to 100 ohm. Check the readings and try again.", r);
+    frtFail(why);
+    return;
+  }
+  if (!(vc >= -0.3f && vc <= 3.0f)) {
+    snprintf(why, sizeof(why), "The brush and contact drop came out at %.2f V, outside -0.3 to 3 V. Check the readings and try again.", vc);
+    frtFail(why);
+    return;
+  }
+  frt.r = r;
+  frt.vc = vc;
+  frt.probeOffV = p.x - (vc + r * p.i);
+  frt.warmPct = (frt.method == FRT_SHUNT && p.i > 0.0f) ? 100.0f * (p.i - frt.h[FRT_H_PROBE2].i) / p.i : NAN;
+  frt.state = FRT_DONE;
+  frt.endMs = now;
+  frtFieldOff();
+  snprintf(frt.msg, sizeof(frt.msg), "%.3f ohm", r);
+  const float tC = isfinite(frt.probeC) ? frt.probeC : FD_TREF_DEF_C;
+  queueConsoleMessageF("Field resistance test (%s): R %.3f ohm, contact drop %.2f V, alternator %.0f%s%s",
+                       frt.method == FRT_SHUNT ? "shunt" : "meter", r, vc, dispTempF(tC * 1.8f + 32.0f), dispTempUnit(),
+                       isfinite(frt.probeC) ? "" : " (no probe reading, 30 C assumed)");
+  const char *nm[4] = { "probe", "top", "middle", "probe again" };
+  for (int k = 0; k < 4; k++) {
+    if (!isfinite(frt.h[k].i)) continue;
+    queueConsoleMessageF("  %s: duty %.2f%%, %.2f V field, %.3f A, battery %.2f V", nm[k], frt.h[k].d, frt.h[k].x, frt.h[k].i, frt.h[k].v);
+  }
+  if (isfinite(frt.warmPct))
+    queueConsoleMessageF("  probe off the top-middle line by %.3f V; probe current fell %.2f%% over the test (coil warming)", frt.probeOffV, frt.warmPct);
+  else
+    queueConsoleMessageF("  probe off the top-middle line by %.3f V", frt.probeOffV);
+}
+
+// A hold's current is in: record it and plan the next hold, or finish.
+static void frtHoldDone(uint32_t now, float amps, float v) {
+  FrtHold &hd = frt.h[frt.hold];
+  hd.d = frt.holdDuty;
+  hd.v = v;
+  hd.x = frtXAt(frt.holdDuty, v);
+  hd.i = amps;
+  const float vNow = isfinite(IBV) ? IBV : v;
+  const float xCeil = frtXAt(frtCeilPct(), vNow);
+  char why[240];
+
+  switch (frt.hold) {
+    case FRT_H_PROBE: {
+      if (amps < FRT_PROBE_MIN_A && frt.rung < 2 && FRT_PROBE_X[frt.rung + 1] <= xCeil + 0.01f) {
+        frt.rung++;
+        frtStartHold(now, FRT_PROBE_X[frt.rung], true);
+        return;
+      }
+      if (!(amps > 0.0f)) {
+        frtFail("No field current was measured at the first holds. Check the field wiring and the field fuse.");
+        return;
+      }
+      const float r1 = hd.x / amps;
+      const float xt = fminf(fminf(FRT_TOP_AIM_A * r1, 4.0f * hd.x), xCeil);
+      frt.hold = FRT_H_TOP;
+      frtStartHold(now, xt, true);
+      return;
+    }
+    case FRT_H_TOP: {
+      const FrtHold &p = frt.h[FRT_H_PROBE];
+      if (!(amps > 1.1f * p.i)) {
+        snprintf(why, sizeof(why), "The field current did not rise between the first holds (%.2f A and %.2f A). Max Field %% or Max Field Volts under Setup > Alternator may be holding the field too low.", p.i, amps);
+        frtFail(why);
+        return;
+      }
+      const float s = (hd.x - p.x) / (amps - p.i);
+      float xm = p.x + s * (FRT_MID_FRAC * amps - p.i);
+      xm = constrain(xm, 0.2f * hd.x, 0.85f * hd.x);
+      frt.hold = FRT_H_MID;
+      frtStartHold(now, xm, true);
+      return;
+    }
+    case FRT_H_MID:
+      if (frt.method == FRT_SHUNT) {
+        frt.hold = FRT_H_PROBE2;
+        frtStartHold(now, frt.h[FRT_H_PROBE].x, true);
+        return;
+      }
+      frtFinish(now);
+      return;
+    default:
+      frtFinish(now);
+      return;
+  }
+}
+
+// INA228 sample hook (5_functions.ino, every committed read). Same loop task as frtService: no locking.
+void frtInaSample(float bcur, float v, bool shuntOk) {
+  if (frt.state != FRT_RUNNING) return;
+  const uint32_t el = millis() - frt.phaseStartMs;
+  if (frt.method == FRT_SHUNT) {
+    if (!shuntOk) return;
+    if ((frt.phase & 1) && frt.holdDuty > 0.1f && isfinite(frt.baseA)) {
+      frt.ring[frt.ringK] = bcur;
+      frt.ringK = (frt.ringK + 1) & 7;
+      if (frt.ringN < 8) frt.ringN++;
+      if (frt.ringN == 8) {
+        float s = 0.0f;
+        for (int k = 0; k < 8; k++) s += frt.ring[k];
+        frt.liveI = (frt.baseA - s / 8.0f) / (frt.holdDuty / 100.0f);
+        if (frt.liveI > FRT_MAX_A) frt.overA = true;
+      }
+    }
+    if (el >= FRT_SETTLE_MS) {
+      frt.sumI += bcur;
+      frt.sumV += v;
+      frt.n++;
+    }
+  } else if (frt.phase == FRT_MP_HOLD && el >= FRT_SETTLE_MS) {
+    frt.sumV += v;
+    frt.n++;
+  }
+}
+
+// Every control pass, ahead of buildTickSnapshot: requests, the run's own aborts, and the phase clock. Sets frt.duty.
+void frtService(uint32_t now) {
+  if (frt.reqAbort) {
+    frt.reqAbort = false;
+    frtFail("Test stopped.");
+  }
+  if (frt.reqStart) {
+    frt.reqStart = false;
+    if (frt.state != FRT_RUNNING) frtBegin(now);
+  }
+  if (frt.state != FRT_RUNNING) {
+    frt.reqAgain = false;
+    frt.reqReading = false;
+    return;
+  }
+  if ((int32_t)(now - frt.lastPollMs) > (int32_t)FRT_HB_MS) {   // signed: the web task can stamp lastPollMs after now was sampled
+    frtFail("The app stopped answering, so the test stopped and the field is off.");
+    return;
+  }
+  const uint32_t ibvTs = dataTimestamps[IDX_IBV];
+  if (ibvTs == 0 || (uint32_t)(now - ibvTs) > 2500UL || !isfinite(IBV)) {
+    frtFail("The battery voltage reading stopped, so the test stopped.");
+    return;
+  }
+
+  if (frt.method == FRT_SHUNT) {
+    if (frt.overA) {
+      char why[200];
+      snprintf(why, sizeof(why), "The field current went above %.0f A (%.1f A), more than the test plan allows. The field was switched off. Check the rotor and the field wiring, or a large load switched on during the test.", FRT_MAX_A, frt.liveI);
+      frtFail(why);
+      return;
+    }
+    const uint32_t bTs = dataTimestamps[IDX_BCUR];
+    if (bTs == 0 || (uint32_t)(now - bTs) > 2500UL) {
+      frtFail("The battery current reading stopped, so the test stopped.");
+      return;
+    }
+    if ((uint32_t)(now - frt.phaseStartMs) >= FRT_PHASE_MS) {
+      if (frt.n < 20) {
+        frtFail("Too few battery current readings arrived during a hold. Check the shunt connection and try again.");
+        return;
+      }
+      frt.phI[frt.phase] = (float)(frt.sumI / frt.n);
+      frt.phV[frt.phase] = (float)(frt.sumV / frt.n);
+      if (!(frt.phase & 1)) frt.baseA = frt.phI[frt.phase];
+      frt.phase++;
+      frtResetWindow(now);
+      if (frt.hold == FRT_H_PROBE && frt.phase == 3) {
+        // After one cycle the probe decides: step up a rung, give up on the shunt, or carry on to three cycles.
+        const float step = 0.5f * (frt.phI[0] + frt.phI[2]) - frt.phI[1];
+        const float amps = step / (frt.holdDuty / 100.0f);
+        if (frt.rung == 1 && step < FRT_NO_STEP_A) {
+          frtFail("The battery shunt is not seeing the field current. A charger may be holding the battery voltage (switch off shore power, solar and DC-DC chargers), or the regulator's power or ground is not on the shunted battery, or its wires do not land as the wiring page shows. Otherwise use a meter instead.");
+          return;
+        }
+        if (amps < FRT_PROBE_MIN_A && frt.rung < 2) {
+          frtHoldDone(now, amps, frt.phV[1]);   // steps up a rung, carrying phase 2
+          return;
+        }
+      }
+      if (frt.phase == 7) {
+        float stepA, vB;
+        if (!frtShuntHoldResult(stepA, vB)) return;
+        const float d = frt.holdDuty / 100.0f;
+        frtHoldDone(now, (d > 0.001f) ? stepA / d : NAN, vB);
+        if (frt.state != FRT_RUNNING) return;
+      }
+    }
+    frt.duty = (frt.phase & 1) ? frt.holdDuty : 0.0f;
+  } else {
+    if (frt.reqAgain) {
+      frt.reqAgain = false;
+      frt.holdDuty = frtDutyFor(frt.holdX, IBV);
+      frt.phase = FRT_MP_HOLD;
+      frtResetWindow(now);
+    }
+    if (frt.phase == FRT_MP_HOLD && (uint32_t)(now - frt.phaseStartMs) >= FRT_METER_HOLD_MS) {
+      frt.phV[0] = (frt.n > 0) ? (float)(frt.sumV / frt.n) : IBV;
+      frt.phase = FRT_MP_WAIT;
+    }
+    if (frt.reqReading) {
+      frt.reqReading = false;
+      if (frt.phase == FRT_MP_HOLD) frt.phV[0] = (frt.n > 0) ? (float)(frt.sumV / frt.n) : IBV;
+      const float amps = frt.reqAmps;
+      if (!(amps >= FRT_METER_MIN_A)) {
+        frtFail("The meter read under 0.05 A, so it is not reading the field current. Check it is on DC amps (a clamp must be a DC clamp, zeroed), around or in series with the Regulator Field wire.");
+        return;
+      }
+      frtHoldDone(now, amps, frt.phV[0]);
+      if (frt.state != FRT_RUNNING) return;
+    }
+    frt.duty = (frt.phase == FRT_MP_HOLD) ? frt.holdDuty : 0.0f;
+  }
+}
+
+// MODE_FIELD_RES_TEST: the hold duty frtService chose, with GPIO4 up for the whole run (a field-off phase is duty 0) so
+// the INA228 stays in its fast mode and both phases are read the same way. Bypasses the AUTO/stage machinery like the
+// commissioning rest; a fault never lands here (the arbiter selects the fault mode instead).
+void runFieldResTestHold(const TickSnapshot &tick, FieldEventReason reason) {
+  voltageControlActive = false;
+  lastVoltageControlActive = false;
+  cvWindDownActive = false;
+  uTargetAmps = 0;
+  setpointLimited = 0.0f;
+  ctrlLimiter = 0;
+  shutdownPhase = SHUTDOWN_PHASE_NONE;
+  digitalWrite(4, HIGH);
+  gpio4IsLow = false;
+  apply_pwm_float(frt.duty);
+  currentPID.ResetIntegratorTo(0.0);
+  pidOutput = 0.0;
+  lastAppliedDuty = frt.duty;
+  dutyCycle = frt.duty;
+  updateFieldTelemetry(dutyCycle, tick.currentBatteryVoltage);
+  fieldActiveStatus = (dutyCycle > 0.01f) ? 1 : 0;
+  chargeStageDisplay = getChargeStageDisplayCode();
+  reportFieldModeEvent(tick.nowMs, MODE_FIELD_RES_TEST, reason, tick, gpio4IsLow, dutyCycle);
 }
 
 // applyNominalVoltageChange — single entry point for a system-voltage class change (12/24/36/48 V).
@@ -1301,6 +1899,7 @@ float governor_apply(float lastAppliedDuty, float requestDutyFloat, int gmode,
     finalMin = (dynMin > hardMin) ? dynMin : hardMin;
     finalMax = (dynMax < hardMax) ? dynMax : hardMax;
   }
+  finalMin = fminf(finalMin, boardDutyCeiling());   // the board ceilings win over every floor
 
   // Sanity check
   if (finalMax < finalMin) {
@@ -1457,7 +2056,7 @@ void applyImmediateCut(const TickSnapshot &tick, FieldEventReason reason, bool r
   // it can arrive with charging already off and must still register as the fault it is.
   sysMode = (reason == REASON_CHARGING_DISABLED || reason == REASON_CHARGE_COMPLETE_IDLE || reason == REASON_BMS_DISABLED
              || reason == REASON_SOLAR_PAUSE) ? SYS_MODE_OFF : SYS_MODE_FAULT;
-  updateFieldTelemetry(0.0f, tick.currentBatteryVoltage, FieldResistance);
+  updateFieldTelemetry(0.0f, tick.currentBatteryVoltage);
   fieldActiveStatus = 0;
   currentPID.SetMode(MANUAL);
   pidOutput = 0.0;
@@ -1749,7 +2348,7 @@ void runReducedSensorControl(const TickSnapshot &tick, FieldEventReason reason, 
   pidLog_dutyRequest = request;
   pidLog_dutyApplied = applied;
 
-  updateFieldTelemetry(applied, tick.currentBatteryVoltage, FieldResistance);
+  updateFieldTelemetry(applied, tick.currentBatteryVoltage);
   fieldActiveStatus = (applied > 0.01f) ? 1 : 0;
   chargeStageDisplay = getChargeStageDisplayCode();
   reportFieldModeEvent(tick.nowMs, MODE_NORMAL_AUTO_PID, reason, tick, gpio4IsLow, dutyCycle);
@@ -1890,7 +2489,7 @@ void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEvent
     }
   }
 
-  updateFieldTelemetry(dutyCycle, tick.currentBatteryVoltage, FieldResistance);
+  updateFieldTelemetry(dutyCycle, tick.currentBatteryVoltage);
 
   if (gpio4IsLow) {
     fieldActiveStatus = 0;
@@ -1998,7 +2597,7 @@ void runCommissionIdle(const TickSnapshot &tick, FieldEventReason reason, float 
   lastAppliedDuty = dutyNewFloat;
   dutyCycle = dutyNewFloat;
 
-  updateFieldTelemetry(dutyCycle, tick.currentBatteryVoltage, FieldResistance);
+  updateFieldTelemetry(dutyCycle, tick.currentBatteryVoltage);
   fieldActiveStatus = (dutyCycle > 0.01f) ? 1 : 0;
   chargeStageDisplay = getChargeStageDisplayCode();
   reportFieldModeEvent(tick.nowMs, MODE_COMMISSION_IDLE, reason, tick, gpio4IsLow, dutyCycle);
@@ -2743,6 +3342,7 @@ void AdjustFieldLearnMode() {
   updateCurrentRPMTableIndex(RPM);
   updateRPMBucketHistory(currentMillis);
 
+  frtService(currentMillis);   // before the snapshot: a start or an end this pass is in tick.fieldResTest
   TickSnapshot tick = buildTickSnapshot(currentMillis, actualDtMs);
   // Above every early-return below (fresh-CH1 gate, limp home, immediate cuts) so lifetime OV
   // dwell accumulates in all modes. RAW voltage on purpose — filtered smears ~100ms spikes.
@@ -2835,8 +3435,9 @@ void AdjustFieldLearnMode() {
   // current-sensor freshness. Forced reason RPM_TOO_LOW so the log/telemetry name the cause.
   // Manual field mode is exempt: the arbiter puts MANUAL above the RPM gate, so this cut and
   // the manual path fought at loop rate (GPIO4 oscillation), and manual exists precisely for
-  // engine-off wiring/diagnostic tests (same doctrine as manual-beats-lockout).
-  if (tick.engineFullyStopped && !tick.manualMode && !gpio4IsLow) {
+  // engine-off wiring/diagnostic tests (same doctrine as manual-beats-lockout). The field resistance test is exempt
+  // the same way: it runs on a stopped engine, and its tach reads 0 by design (frtTachMasked).
+  if (tick.engineFullyStopped && !tick.manualMode && !tick.fieldResTest && !gpio4IsLow) {
     applyImmediateCut(tick, REASON_RPM_TOO_LOW, true);
     return;
   }
@@ -3225,6 +3826,13 @@ void AdjustFieldLearnMode() {
   FieldEventReason reason = selectFieldEventReason(tick);
   g_fieldEventReason = (uint8_t)reason;  // steady-state / commission-rest cause (immediate cuts overwrite this in applyImmediateCut)
 
+  // Anything that outranks the field resistance test ends it (a protection, the switch, the ignition, the BMS input).
+  if (frt.state == FRT_RUNNING && mode != MODE_FIELD_RES_TEST) {
+    char why[160];
+    snprintf(why, sizeof(why), "The field was switched off: %s.", (reason == REASON_CHARGING_DISABLED) ? "the ignition or Alternator Enable went off" : reasonToString(reason));
+    frtFail(why);
+  }
+
   if (immediateCutNow(reason, tick) && !gpio4IsLow) {
     applyImmediateCut(tick, reason, false);
     return;
@@ -3246,6 +3854,12 @@ void AdjustFieldLearnMode() {
       queueConsoleMessage("Charging enabled (AUTO)");
     }
     runCommissionIdle(tick, reason, passDtSec);
+    prevMode = mode;
+    return;
+  }
+
+  if (mode == MODE_FIELD_RES_TEST) {
+    runFieldResTestHold(tick, reason);
     prevMode = mode;
     return;
   }
@@ -5770,7 +6384,7 @@ void AdjustFieldLearnMode() {
           else if (zeroCmd)                                       rawCode = 12;
           else if (glideBinding)                                  rawCode = 14;
           else if (altZeroOutput)                                 rawCode = 7;
-          else if (fieldSaturated)                                rawCode = 5;
+          else if (fieldSaturated)                                rawCode = (g_fieldCeilBind >= 3) ? 16 : (g_fieldCeilBind == 2) ? 15 : 5;  // board heat / board 10 A / the alternator's own ceiling
           else if (voltageControlActive && Icv < icvCeil - 0.5f)  rawCode = dvccCvlBinding ? 9 : 3;  // held at the BMS's voltage vs our own target
           else if (dvccCclBinding)                                rawCode = 8;  // BMS charge-current limit is the active ceiling
           else if (battCeilBinding)                               rawCode = 4;
@@ -5798,6 +6412,8 @@ void AdjustFieldLearnMode() {
       setpointLimited = 0.0f;
       ctrlLimiter = 10;                  // the user's own duty IS the limit here — published so the banner
                                          // and limit panel can name manual instead of "nothing limiting"
+      if (g_fieldCeilBind >= 2 && ManualDutyTarget > ccDutyCeiling() + 0.05f)
+        ctrlLimiter = (g_fieldCeilBind >= 3) ? 16 : 15;   // a board ceiling is holding the manual duty down
       pidInput = (double)((OutputPIDSigSrc == 2) ? MeasuredAmps : (OutputPIDSigSrc == 1) ? g_pidMA_N
                                                                                          : g_pidI_filtered);
     }  // end of MANUAL mode else
@@ -6049,7 +6665,7 @@ void AdjustFieldLearnMode() {
     innerTermP = innerTermI = innerTermD = 0.0f;
   }
 
-  updateFieldTelemetry(dutyCycle, tick.currentBatteryVoltage, FieldResistance);
+  updateFieldTelemetry(dutyCycle, tick.currentBatteryVoltage);
 
   fieldActiveStatus = (!gpio4IsLow && lastAppliedDuty > 0.01f)
                         ? ((sysMode == SYS_MODE_MANUAL) ? 3 : 1)
@@ -6112,8 +6728,11 @@ void setDutyPercent(float percent) {
   // (manual/limp/fault). Both caps, on every class — the Manual-mode copy promises the field ceiling
   // still applies, and Max Field Volts is what protects a 12V winding on a higher-voltage bus. Sits
   // under the 99% bootstrap cap above. Duty-ratio proxy, not a measured amp limit.
-  if (percent > ccDutyCeiling()) {
-    percent = ccDutyCeiling();
+  // The field resistance test replaces the two board ceilings (they need the resistance it measures) with its own hold
+  // duty; the alternator ceilings stay.
+  const float ceil = (frt.state == FRT_RUNNING) ? fminf(frtCeilPct(), frt.duty) : ccDutyCeiling();
+  if (percent > ceil) {
+    percent = ceil;
   }
 
   uint32_t duty = (uint32_t)((((1UL << pwmResolution) - 1) * percent) / 100.0f);
@@ -6618,6 +7237,7 @@ const char *modeToString(FieldControlMode mode) {
     case MODE_NORMAL_MANUAL: return "NORMAL_MANUAL";
     case MODE_NORMAL_AUTO_PID: return "NORMAL_AUTO_PID";
     case MODE_COMMISSION_IDLE: return "COMMISSION_IDLE";
+    case MODE_FIELD_RES_TEST: return "FIELD_RES_TEST";
     default: return "UNKNOWN";
   }
 }
@@ -6656,6 +7276,8 @@ const char *reasonToString(FieldEventReason r) {
     case REASON_VOLTAGE2_STALE: return "VOLTAGE2_STALE";
     case REASON_BATT_TEMP_WAIT: return "Waiting for the first battery temperature reading";
     case REASON_MULTI_SENSOR_FAULT: return "MULTI_SENSOR_FAULT";
+    case REASON_DIE_TEMP_LOST: return "DIE_TEMP_LOST";
+    case REASON_FIELD_RES_TEST: return "Field resistance test";
 
     default: return "UNKNOWN";
   }
@@ -6673,6 +7295,7 @@ bool fieldReasonIsFault(FieldEventReason r) {
     case REASON_BATTERY_TOO_COLD: case REASON_TACH_IMPLAUSIBLE: case REASON_OV_TIER_LOW:
     case REASON_OV_TIER_MID: case REASON_BATTERY_TOO_HOT: case REASON_BATT_TEMP_LOST:
     case REASON_VOLTAGE_STALE: case REASON_VOLTAGE2_STALE: case REASON_MULTI_SENSOR_FAULT:
+    case REASON_DIE_TEMP_LOST:
       return true;
     default:
       return false;
@@ -6693,6 +7316,7 @@ const char *sensorFaultName(uint8_t bit) {
     case 6: return "battery temperature";
     case 7: return "ADS1115 analog input chip";
     case 8: return "INA228 battery monitor chip";
+    case 9: return "regulator drive temperature (INA228)";
     default: return "sensor";
   }
 }
@@ -6712,11 +7336,13 @@ void sensorFaultNames(uint16_t bits, char *out, size_t n) {
     bits &= ~(SF_ENGINE_SPEED | SF_ALT_CURRENT | SF_BATT_V_SECOND | (TempSource == 1 ? SF_ALT_TEMP : 0));
   }
   if (bits & SF_INA228) {
-    add("INA228 battery monitor chip (main battery voltage)");
-    bits &= ~SF_BATT_V_MAIN;
+    add((bits & SF_DRIVE_TEMP) ? "INA228 battery monitor chip (main battery voltage, regulator drive temperature)"
+                               : "INA228 battery monitor chip (main battery voltage)");
+    bits &= ~(SF_BATT_V_MAIN | SF_DRIVE_TEMP);
   }
   if (bits & (SF_BATT_V_MAIN | SF_BATT_V_SECOND)) bits &= ~SF_BATT_V_DISAGREE;   // a relationship, not a third sensor
   for (uint8_t b = 0; b < 7; b++) if (bits & (1u << b)) add(sensorFaultName(b));
+  if (bits & SF_DRIVE_TEMP) add(sensorFaultName(9));
 }
 
 // Smallest non-zero row of the active amps table: the low-speed (worst cooling) limit. Stands in for a
@@ -6741,11 +7367,11 @@ float largestRpmTableMinDuty() {
 // Mask bits whose sensor the owner has chosen to run without (§3.3: overridden sensors never alarm).
 uint16_t sensorOverriddenBits() {
   uint16_t m = 0;
-  if (LimpHome) return 0x1FF;
+  if (LimpHome) return SF_ALL_BITS;
   if (IgnoreTemperature) m |= SF_ALT_TEMP;
   if (IgnoreRPM) m |= SF_ENGINE_SPEED;
   if (IgnoreAltCurrent) m |= SF_ALT_CURRENT;
-  if (IgnoreBattVMain) m |= SF_BATT_V_MAIN | SF_INA228;
+  if (IgnoreBattVMain) m |= SF_BATT_V_MAIN | SF_INA228 | SF_DRIVE_TEMP;   // the die reading dies with the chip the owner chose to run without
   if (IgnoreBattV2) m |= SF_BATT_V_SECOND;
   if (IgnoreBattVMain || IgnoreBattV2) m |= SF_BATT_V_DISAGREE;
   // the chip bits are only "overridden" once every reading that chip feeds is ignored
@@ -6767,7 +7393,8 @@ uint16_t sensorBitsForReason(FieldEventReason r) {
     case REASON_VOLTAGE_IMPLAUSIBLE:
     case REASON_VOLTAGE_DISAGREE_CRITICAL:
     case REASON_VOLTAGE_DISAGREE_WARNING:   return SF_BATT_V_MAIN | SF_BATT_V_SECOND | SF_BATT_V_DISAGREE | SF_ADS1115 | SF_INA228;
-    case REASON_MULTI_SENSOR_FAULT:         return 0x1FF;
+    case REASON_DIE_TEMP_LOST:              return SF_DRIVE_TEMP | SF_INA228;
+    case REASON_MULTI_SENSOR_FAULT:         return SF_ALL_BITS;
     default:                                return 0;
   }
 }
@@ -6798,6 +7425,7 @@ bool reasonSuppressedByOverride(FieldEventReason r, const TickSnapshot &t) {
       return (t.ignoreBattVMain && t.ignoreBattV2) || t.limpHome;
     case REASON_VOLTAGE_STALE:
     case REASON_INA_OVERVOLTAGE:       // firmware latch only; the ALERT pin still acts in hardware
+    case REASON_DIE_TEMP_LOST:         // the die reading dies with the INA228; there is no separate override (a board sensor, not an installer item)
       return t.ignoreBattVMain || t.limpHome;
     case REASON_VOLTAGE2_STALE:
       return t.ignoreBattV2 || t.limpHome;
@@ -6866,6 +7494,20 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
   // Duty 0 with the enable line up, like the commissioning rest. Must mirror selectFieldEventReason.
   if (tick.altZeroMeasuring) {
     return MODE_COMMISSION_IDLE;
+  }
+
+  // PRIORITY 1.95: DRIVE TEMPERATURE LOST in MANUAL or the field resistance test (owner 2026-10-10). The 10 A ceiling still clamps manual duty,
+  // but without the die reading the heat ceiling is frozen, and at 48 V heat binds below 10 A. AUTO keeps its slot
+  // below (2.05 / 2.5 / 3.3 stay first). IgnoreBattVMain still suppresses it, so a chip-dead bench runs manual that way.
+  // Must mirror selectFieldEventReason.
+  if ((tick.manualMode || tick.fieldResTest) && tick.dieTempLost && !reasonSuppressedByOverride(REASON_DIE_TEMP_LOST, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
+
+  // PRIORITY 1.97: FIELD RESISTANCE TEST — engine off by its own precondition, so it sits above the RPM gate like
+  // MANUAL, under everything above. It ends itself on a stale voltage and on its own checks. Mirrors selectFieldEventReason.
+  if (tick.fieldResTest) {
+    return MODE_FIELD_RES_TEST;
   }
 
   // PRIORITY 2: MANUAL MODE (UNRESTRICTED - bypasses all safeties when user wants manual control)
@@ -6955,6 +7597,9 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
   if (tick.tempDataVeryStale && !reasonSuppressedByOverride(REASON_TEMP_STALE, tick)) {
     return MODE_CRITICAL_RAMP;
   }
+  if (tick.dieTempLost && !reasonSuppressedByOverride(REASON_DIE_TEMP_LOST, tick)) {
+    return MODE_CRITICAL_RAMP;
+  }
   if (tick.battVStale && !reasonSuppressedByOverride(REASON_VOLTAGE2_STALE, tick)) {
     return MODE_CRITICAL_RAMP;
   }
@@ -7019,6 +7664,12 @@ FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
   // Priority 1.9: Current-sensor zero hold (not a fault). Mirrors selectFieldControlMode.
   if (tick.altZeroMeasuring) return REASON_ALTZERO_MEASURE;
 
+  // Priority 1.95: drive temperature lost in MANUAL or the field resistance test — mirrors selectFieldControlMode.
+  if ((tick.manualMode || tick.fieldResTest) && tick.dieTempLost && !reasonSuppressedByOverride(REASON_DIE_TEMP_LOST, tick)) return REASON_DIE_TEMP_LOST;
+
+  // Priority 1.97: field resistance test — mirrors selectFieldControlMode.
+  if (tick.fieldResTest) return REASON_FIELD_RES_TEST;
+
   // Priority 2: Manual mode
   if (tick.manualMode) return REASON_MANUAL_MODE;
 
@@ -7059,6 +7710,7 @@ FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
 
   // Priority 4: Critical (auto mode only). VOLTAGE_STALE is at 2.05, CURRENT_STALE and TEMP_CRITICAL at 3.3.
   if (tick.tempDataVeryStale && !reasonSuppressedByOverride(REASON_TEMP_STALE, tick)) return REASON_TEMP_STALE;
+  if (tick.dieTempLost && !reasonSuppressedByOverride(REASON_DIE_TEMP_LOST, tick)) return REASON_DIE_TEMP_LOST;
   if (tick.battVStale && !reasonSuppressedByOverride(REASON_VOLTAGE2_STALE, tick)) return REASON_VOLTAGE2_STALE;
   if (!tick.voltagePlausible && !reasonSuppressedByOverride(REASON_VOLTAGE_IMPLAUSIBLE, tick)) return REASON_VOLTAGE_IMPLAUSIBLE;
   if (tick.voltageDisagreementCritical && !reasonSuppressedByOverride(REASON_VOLTAGE_DISAGREE_CRITICAL, tick)) return REASON_VOLTAGE_DISAGREE_CRITICAL;
@@ -7116,6 +7768,7 @@ void updateProtectionCounters(FieldEventReason reason) {
       case REASON_VOLTAGE_STALE: g_voltStaleCount++; break;
       case REASON_VOLTAGE2_STALE: g_volt2StaleCount++; break;
       case REASON_BATT_TEMP_LOST: g_battTempLostCount++; break;
+      case REASON_DIE_TEMP_LOST: g_dieTempLostCount++; break;
       default: break;
     }
     prevReason = reason;
@@ -7183,9 +7836,13 @@ void reportFieldModeEvent(uint32_t nowMs, FieldControlMode mode, FieldEventReaso
  * Note: When GPIO4 is LOW, PWM is electrically disconnected, but we still
  * report duty-based values for logging consistency
  */
-void updateFieldTelemetry(float duty, float voltage, float fieldResistance) {
+void updateFieldTelemetry(float duty, float voltage) {
   vvout = duty / 100.0f * voltage;
-  iiout = (fieldResistance > 0.001f) ? (vvout / fieldResistance) : 0.0f;
+  // The same estimate the 10 A ceiling acts on: freewheel drop over the off-time, alternator-temperature-corrected R.
+  const float d = duty / 100.0f;
+  // No resistance entered: NAN (the readout shows a dash, never a made-up 0).
+  const float i = (d * voltage - (1.0f - d) * FD_VF_EST) / g_fieldRcOhm;
+  iiout = !isfinite(g_fieldRcOhm) ? NAN : (g_fieldRcOhm > 0.001f && i > 0.0f) ? i : 0.0f;
   MARK_FRESH(IDX_DUTY_CYCLE);
   MARK_FRESH(IDX_FIELD_VOLTS);
   MARK_FRESH(IDX_FIELD_AMPS);
@@ -7281,6 +7938,7 @@ bool shouldCutGPIO4AfterSettle(FieldEventReason reason, uint32_t nowMs, float ap
     case REASON_BATTERY_TOO_COLD:   // cold-charge lockout: ramp to zero, then cut once settled
     case REASON_BATTERY_TOO_HOT:    // hot-charge lockout: same path
     case REASON_BATT_TEMP_LOST:     // expected battery temperature missing: same path
+    case REASON_DIE_TEMP_LOST:      // no drive temperature, no heat ceiling: same path
     case REASON_VOLTAGE_STALE:      // normally cut immediately; defensive if it ever reaches settle
     case REASON_VOLTAGE2_STALE:     // critical ramp, then cut
       return true;
@@ -7369,6 +8027,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // automatic degrade (owner ruling 2026-10-02). Everything downstream — tier, suppression,
   // voltageFeedbackOk — reads these.
   tick.manualMode = (ManualFieldToggle == 1);
+  tick.fieldResTest = (frt.state == FRT_RUNNING);
   tick.multiSensorFault = s_multiSensorFault;
   tick.ignoreTemperature = (IgnoreTemperature != 0);
   tick.ignoreRPM = (IgnoreRPM != 0);
@@ -7402,7 +8061,8 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     if (tick.limpHome)             tick.limpTier = 4;
     else if (tick.ignoreBattVMain) tick.limpTier = battV2Usable ? 3 : 4;
     else if (tick.ignoreAltCurrent) tick.limpTier = 2;
-    else if (tick.ignoreTemperature || tick.ignoreRPM || tick.ignoreBattV2 || IgnitionOverride == 1) tick.limpTier = 1;
+    // IgnitionOverride is not a tier: a boat with no ignition wire is a normal install (owner 2026-10-11).
+    else if (tick.ignoreTemperature || tick.ignoreRPM || tick.ignoreBattV2) tick.limpTier = 1;
     else                           tick.limpTier = 0;
     g_limpTier = tick.limpTier;
     // Fast OV and the timed tiers are skipped only when NO trusted fresh voltage feeds them (§1.3):
@@ -7417,22 +8077,28 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     lastTierForStage = tick.limpTier;
   }
 
-  // Tier 3 (§4.4): the second reading IS the battery voltage this tick — priority 1.5 and the volts
-  // ceiling read it natively. Tier 4 has no usable voltage: the ceiling is solved against the class
-  // nominal x 1.15 (§4.5) and the voltage reasons are suppressed by §1.3.
+  // Tier 3 (§4.4): the second reading IS the battery voltage this tick — priority 1.5 reads it natively.
+  // Tier 4 has no usable voltage and the voltage reasons are suppressed by §1.3. Neither feeds the field
+  // ceilings (below).
   tick.currentBatteryVoltage = (tick.limpTier == 3) ? BatteryV : getBatteryVoltage();
 
-  // Re-solve the Max Field Volts ceiling before any consumer of ccDutyCeiling() runs this tick. Tier 4, or a
-  // stale main voltage (manual may run then, owner ruling 2026-10-02), solves against class nominal x 1.15 so a
-  // held reading cannot steer the cap.
+  // Re-solve the field ceilings before any consumer of ccDutyCeiling() runs this tick. Tier 3/4, or a stale
+  // main voltage (manual may run then, owner ruling 2026-10-02), solves against fieldCeilAssumedBusV() (owner
+  // 2026-10-10: no pushing limits in a degraded mode), so neither a held reading nor a low guess steers a cap.
   // Own per-call dt: dt_ms is the closed-loop tick gap, which grows across every pass between ticks (and sits at
   // the 500 ms cap outside normal mode), so feeding it per pass collapsed the 2 s bus filter to tens of ms.
   static uint32_t lastCeilMs = 0;
   uint32_t ceilDtMs = (lastCeilMs == 0) ? 0 : (currentMillis - lastCeilMs);
   lastCeilMs = currentMillis;
   if (ceilDtMs > 500) ceilDtMs = 500;
-  updateFieldVoltCeiling((tick.limpTier == 4 || tick.ibvStale) ? (float)SYSTEM_VOLTAGE_CLASS * 1.15f : tick.currentBatteryVoltage,
-                         (float)ceilDtMs / 1000.0f);
+  const bool busUnmeasured = (tick.limpTier >= 3 || tick.ibvStale);
+  updateFieldVoltCeiling(busUnmeasured ? fieldCeilAssumedBusV() : tick.currentBatteryVoltage, (float)ceilDtMs / 1000.0f);
+  {
+    const uint32_t fdT0 = micros();
+    updateFieldDerateCeilings((float)ceilDtMs / 1000.0f, busUnmeasured);
+    const uint32_t fdUs = micros() - fdT0;
+    if (fdUs > g_fieldDerateWorstUs) g_fieldDerateWorstUs = fdUs;
+  }
 
   tick.batteryCurrentA = Bcur;
 
@@ -7460,13 +8126,14 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // and a manual field command is the operator overriding the stage machine on purpose. Bench 09-16:
   // a 24 V bank parked in IDLE left both the master switch and Manual dead with no explanation.
   // Tiers 3/4 are exempt: without the main voltage the stage machine does not run, so IDLE can never clear.
-  tick.idleHold = inIdleStage && chargingEnabledLocal && !tick.manualMode && tick.limpTier < 3;
+  // The field resistance test is exempt for the same reason: it is not charging.
+  tick.idleHold = inIdleStage && chargingEnabledLocal && !tick.manualMode && !tick.fieldResTest && tick.limpTier < 3;
   if (tick.idleHold) chargingEnabledLocal = false;
 
   // Weather mode: rest the alternator when the solar forecast is strong. Applied LAST so the flag
   // means "a sunny forecast is the ONLY thing holding charging off" — the banner must not blame
   // the forecast when the key, the on/off switch, the BMS, or a full battery is the real cause.
-  tick.solarForecastPause = chargingEnabledLocal && weatherModeEnabled == 1 && currentWeatherMode == 1;
+  tick.solarForecastPause = chargingEnabledLocal && weatherModeEnabled == 1 && currentWeatherMode == 1 && !tick.fieldResTest;
   if (tick.solarForecastPause) chargingEnabledLocal = false;
 
   tick.chargingEnabled = chargingEnabledLocal;
@@ -7766,6 +8433,22 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     tick.currentDataStale = curStale;
   }
 
+  // Die temperature: the field-drive heat ceiling's only input. The stamp moves only on a sample past the warm-up discard
+  // and inside the bad-read window, so out of range, stale and missing are one condition. A chip that has never
+  // produced a valid sample counts as missing from boot.
+  {
+    const uint32_t ts = dataTimestamps[IDX_INA_DIE_TEMP];
+    const bool fresh = (ts != 0) && ((int32_t)(currentMillis - ts) <= 10000);
+    tick.dieTempLost = (currentMillis > 15000UL) && !fresh;
+    static bool prevLost = false;
+    if (tick.dieTempLost != prevLost) {
+      if (tick.dieTempLost) queueConsoleMessageF("Regulator drive temperature (INA228 die) has no valid reading for 10 s (%s) - the field-drive heat limit has no input, so the field ramps off in every mode, MANUAL included, until it reads again",
+                                                 (ts == 0) ? "never read since boot" : "last valid sample too old or out of range");
+      else queueConsoleMessage("Regulator drive temperature (INA228 die) reading again - the field may run again");
+      prevLost = tick.dieTempLost;
+    }
+  }
+
   // Hard over-current: HardOCDebounceMs on a FRESH sample only — a held value from a dead sensor must not sit
   // on top of the ladder for ever. The debounce state lives here so both ladders read one flag and
   // selectFieldEventReason (called twice per tick) owns no state.
@@ -7812,7 +8495,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     // zero-output band; the min-duty table's largest row (the idle floor) stands in so the bar stays above it
     // (history check 2026-10-02).
     const float tachLieFloor = tick.ignoreRPM ? largestRpmTableMinDuty() : tick.rpmMinDuty;
-    bool tachLieNow = TachLieEnable && chargingEnabledLocal && !tick.manualMode
+    bool tachLieNow = TachLieEnable && chargingEnabledLocal && !tick.manualMode && !tick.fieldResTest
                       && !reasonSuppressedByOverride(REASON_TACH_IMPLAUSIBLE, tick)   // needs the alternator current
                       && !sweepDrivingField
                       && !tick.currentDataStale
@@ -7937,6 +8620,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     if (tick.battTempState == 2) m |= SF_BATT_TEMP;
     if (ADS1115Disconnected != 0) m |= SF_ADS1115;
     if (INADisconnected != 0) m |= SF_INA228;
+    if (tick.dieTempLost) m |= SF_DRIVE_TEMP;
     g_sensorFaultMask = m;
 
     // A DS18B20 that died mid-run holds its last value, so at rest bit 0 clears on the engine gate alone:
@@ -7945,9 +8629,9 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     const uint32_t altTs = dataTimestamps[tempFromAlt ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
     const bool altTempReadRecently = (altTs != 0) && ((uint32_t)(currentMillis - altTs) <= 90000UL);
 
-    static uint32_t clearSinceMs[9] = { 0 };
+    static uint32_t clearSinceMs[10] = { 0 };
     uint16_t steady = 0;
-    for (uint8_t b = 0; b < 9; b++) {
+    for (uint8_t b = 0; b < 10; b++) {
       bool clear = !(m & (1u << b)) && (b != 0 || altTempReadRecently);
       if (!clear) {
         clearSinceMs[b] = 0;
@@ -7969,10 +8653,11 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     if (tick.ibvStale || INADisconnected != 0) f |= SF_BATT_V_MAIN;
     if (tick.battVStale) f |= SF_BATT_V_SECOND;
     if (tick.battTempState == 2) f |= SF_BATT_TEMP;
+    if (tick.dieTempLost || INADisconnected != 0) f |= SF_DRIVE_TEMP;   // a dead chip is every reading it carried, like the ADS1115 line below
     if (ADS1115Disconnected != 0) f |= SF_ENGINE_SPEED | SF_ALT_CURRENT | SF_BATT_V_SECOND | ((TempSource == 1) ? SF_ALT_TEMP : 0);
     if ((m & SF_BATT_V_DISAGREE) && !(f & (SF_BATT_V_MAIN | SF_BATT_V_SECOND))) f |= SF_BATT_V_DISAGREE;
     f &= ~sensorOverriddenBits();
-    f &= (SF_ALT_TEMP | SF_ENGINE_SPEED | SF_ALT_CURRENT | SF_BATT_V_MAIN | SF_BATT_V_SECOND | SF_BATT_V_DISAGREE | SF_BATT_TEMP);
+    f &= (SF_ALT_TEMP | SF_ENGINE_SPEED | SF_ALT_CURRENT | SF_BATT_V_MAIN | SF_BATT_V_SECOND | SF_BATT_V_DISAGREE | SF_BATT_TEMP | SF_DRIVE_TEMP);
     g_reqFaultBits = f;
     g_reqFaultCount = (uint8_t)__builtin_popcount((unsigned)f);
 
@@ -8729,6 +9414,9 @@ void kneeLearnObserve(float rpm, float appliedDuty, float tF, float amps,
   float maxFloorEff = kneeMaxFloorPct;
   float margin = (kneeMarginPct > 0) ? kneeMarginPct : 0;
   float caseF = isnan(AlternatorTemperatureF) ? 0.0f : AlternatorTemperatureF;
+
+  // A board ceiling (10 A / drive heat) is holding the field under the floor: the amps say nothing about this floor.
+  if (g_fieldCeilBind >= 2 && appliedDuty >= ccDutyCeiling() - 0.05f) { probeBin = -1; haveZero = false; return; }
 
   if (kneeFrozen[b]) {
     // Locked: only act if the knee dropped below the floor (real current at the floor). Lower one step.

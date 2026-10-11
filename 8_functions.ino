@@ -689,6 +689,8 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "WarmupRampRate", NK_WarmupRampRate, 1 },
   { "StartupRiseRate", NK_StartupRiseRate, 1 },
   { "FieldResistance", NK_FieldResistance, 1 },
+  { "FieldResTrefC", NK_FieldResTrefC, 1 },   // written only beside FieldResistance (no /get param of its own)
+  { "FieldWiring", NK_FieldWiring, 1 },
   { "PulleyRatio", NK_PulleyRatio, 1 },
   // Tier 3, not 1: adopting another boat's tach calibration would silently rescale this device's
   // engine-RPM axis via a direct settingWrite, bypassing the /get guard that arms the wipe.
@@ -1018,7 +1020,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "InvertAltAmps", NK_InvertAltAmps, 1 },
   { "InvertBattAmps", NK_InvertBattAmps, 1 },
   { "BatteryShuntPresent", NK_BatteryShuntPresent, 1 },
-  { "ShuntGroundComp", NK_ShuntGroundComp, 1 },
+  { "ShuntLead", NK_ShuntLead, 1 },
   { "AlternatorCOffset", NK_AlternatorCOffset, 1 },
   { "BatteryCOffset", NK_BatteryCOffset, 1 },
   { "AutoAltCurrentZero", NK_AutoAltCurrentZero, 1 },
@@ -1618,10 +1620,24 @@ int applyImportConfig(const char *body) {
       }
     }
   }
+  // The field resistance and the alternator temperature recorded with it are adopted only as a pair: a resistance with no
+  // temperature (every 0.0.6 export carries the old 2-ohm seed that way) or a temperature with no resistance is skipped,
+  // so the Prerequisites screen asks for a measurement. Interim rule (owner 2026-10-10): a later cloud step that strips
+  // hardware-specific values before an import is expected to replace it.
+  bool fieldResPair;
+  {
+    String r, t;
+    const bool hasR = cfgJsonExtract(cfg, "FieldResistance", r);
+    const bool hasT = cfgJsonExtract(cfg, "FieldResTrefC", t);
+    fieldResPair = hasR && hasT;
+    if (hasR != hasT)
+      queueConsoleMessage("IMPORT: Field Resistance not imported - it travels only with the alternator temperature it was measured at; enter it on this boat");
+  }
   int applied = 0;
   for (size_t i = 0; i < CONFIG_MANIFEST_COUNT; i++) {
     if (CONFIG_MANIFEST[i].tier == 3) continue;   // export-only: this device's own history, never adopted
     if (cfgClassBad && strcmp(CONFIG_MANIFEST[i].param, "BatteryVoltage") == 0) continue;
+    if (!fieldResPair && (strcmp(CONFIG_MANIFEST[i].param, "FieldResistance") == 0 || strcmp(CONFIG_MANIFEST[i].param, "FieldResTrefC") == 0)) continue;
     String val;
     bool found = cfgJsonExtract(cfg, CONFIG_MANIFEST[i].param, val);
     if (!found) {
@@ -2024,9 +2040,14 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
         // the field circuit). Abort with the numbers now — the old silent fallback K sized a tiny step
         // and doomed the whole pulse train to flat, all-dropped edges (bench 2026-08-04).
         if (dIp < 2.0f) {
-          snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
-                   "the +%.0f A pilot pulse moved output only %.1f A — alternator at its output ceiling for this RPM, a limiter capping current, or the field circuit not carrying the step; fix and re-run",
-                   cvpfPilotA, dIp);
+          if (boardCeilHoldsField())
+            snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
+                     "the +%.0f A pilot pulse moved output only %.1f A — the field sat at %s, which no setting raises; re-run at a higher engine speed, where the same output needs less field",
+                     cvpfPilotA, dIp, fieldCeilBindName(g_fieldCeilBind));
+          else
+            snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
+                     "the +%.0f A pilot pulse moved output only %.1f A — alternator at its output ceiling for this RPM, a limiter capping current, or the field circuit not carrying the step; fix and re-run",
+                     cvpfPilotA, dIp);
           cvpfAbort(cvpfDiagBuf);
           break;
         }
@@ -2075,9 +2096,14 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
       // (settled implies in-band delivery, so this only fires on the timeout path.)
       if (settled || elapsed >= CVPF_HOLD_TIMEOUT_MS) {
         if (cvpfAmpsEma - cvpfBaseAmps < 2.0f) {
-          snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
-                   "practice step didn't raise output (%.1f -> %.1f A with +%.0f A commanded) — alternator at its output ceiling for this RPM, or the field circuit didn't carry it; re-run once output can move",
-                   cvpfBaseAmps, cvpfAmpsEma, cvpfStepA);
+          if (boardCeilHoldsField())
+            snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
+                     "practice step didn't raise output (%.1f -> %.1f A with +%.0f A commanded) — the field sat at %s, which no setting raises; re-run at a higher engine speed, where the same output needs less field",
+                     cvpfBaseAmps, cvpfAmpsEma, cvpfStepA, fieldCeilBindName(g_fieldCeilBind));
+          else
+            snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
+                     "practice step didn't raise output (%.1f -> %.1f A with +%.0f A commanded) — alternator at its output ceiling for this RPM, or the field circuit didn't carry it; re-run once output can move",
+                     cvpfBaseAmps, cvpfAmpsEma, cvpfStepA);
           cvpfAbort(cvpfDiagBuf);
           break;
         }

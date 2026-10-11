@@ -926,7 +926,7 @@ float altPruneK       = 6.0f;    // cloud prune neighbor count (echoed; applied 
 float altRidgeFrac    = 0.10f;   // LWLR ridge fraction (× slope-block trace/NAXIS) — fit stability vs slope fidelity
 float altRiskThresh   = 0.15f;   // classifier risk above which an in-radius point shows "learning" instead of a %
 // High-field-low-output alert thresholds (independent safety net — see altHealth_tick):
-float altHiFieldPct   = 80.0f;   // high-drive threshold as % of the live field ceiling (ccDutyCeiling), so it works on 24/36/48V compressed spans
+float altHiFieldPct   = 80.0f;   // high-drive threshold as % of the alternator's live field ceiling (altFieldCeiling), so it works on 24/36/48V compressed spans
 float altLowOutAmps   = 10.0f;   // output at/below this counts as low (A)
 float altHiFieldSec   = 30.0f;   // both conditions must persist this long before the alert fires (s)
 
@@ -2477,11 +2477,12 @@ void altHealth_tick(uint32_t nowMs) {
   // unlearned territory where the gauge says "learning"). Self-clears when either condition lifts.
   {
     static uint32_t hiFieldSinceMs = 0;
-    // altHiFieldPct reads as % of the live field ceiling (ccDutyCeiling: the lower of Max Field % and
-    // the Max Field Volts term), not absolute duty — absolute 80% is unreachable on 24/36/48V banks
-    // where the ceiling is ~50/33/25%, deadening the alert.
+    // altHiFieldPct reads as % of the alternator's field ceiling (altFieldCeiling: the lower of Max Field %
+    // and the Max Field Volts term), not absolute duty — absolute 80% is unreachable on 24/36/48V banks
+    // where the ceiling is ~50/33/25%, deadening the alert. Never the board-derated ccDutyCeiling(): a hot
+    // regulator holding the field down must not read as a weak alternator.
     bool cond = foldFresh && altLiveValid
-                && altLive_duty >= altHiFieldPct * (ccDutyCeiling() / 100.0f) && altLive_amps <= altLowOutAmps;
+                && altLive_duty >= altHiFieldPct * (altFieldCeiling() / 100.0f) && altLive_amps <= altLowOutAmps;
     if (!cond) {
       hiFieldSinceMs = 0; altHiFieldAlert = false;
     } else {
@@ -4070,6 +4071,49 @@ bool serveCachedAsset(AsyncWebServerRequest *request, const String &path, const 
   }
   return false;
 }
+
+// The duty setDutyPercent writes for a commissioning override's command this tick. The field ceilings are
+// re-solved in buildTickSnapshot before any override runs and the overrides bypass the floor, so this IS the clamp.
+static float dutyAfterCeiling(float cmd) {
+  return fminf(cmd, fminf(ccDutyCeiling(), 99.0f));
+}
+
+// A g_fieldCeilBind term as the owner sees it: a setting by its Setup label, or the regulator's own limit.
+static const char *fieldCeilBindName(uint8_t bind) {
+  switch (bind) {
+    case 1:  return "Max Field Volts";
+    case 2:  return "the regulator's 10 A field-current limit";
+    case 3:
+    case 4:  return "the regulator's field-drive heat limit";
+    default: return "Max Field (%)";
+  }
+}
+// Short form for chcAbortMsg's 96 bytes.
+static const char *fieldCeilBindBrief(uint8_t bind) {
+  switch (bind) {
+    case 1:  return "Max Field Volts";
+    case 2:  return "regulator's own 10 A limit";
+    case 3:
+    case 4:  return "regulator's own heat limit";
+    default: return "Max Field (%)";
+  }
+}
+static const char *fieldCeilBindRemedy(uint8_t bind) {
+  switch (bind) {
+    case 1:  return "If Max Field Volts is under the alternator's rated field voltage, raise it (Setup > Alternator > Basic > Output Control) and re-run.";
+    case 2:  return "It protects the regulator, and no setting raises it.";
+    case 3:
+    case 4:  return "It protects the regulator, no setting raises it, and it recovers as the regulator cools.";
+    default: return "Raise Max Field (%) (Setup > Alternator > Basic > Output Control) and re-run.";
+  }
+}
+
+// True while one of the regulator's own ceilings (not an owner setting) holds the field: duty within a point of
+// ccDutyCeiling(), the same "pegged" test the limiter code uses.
+static bool boardCeilHoldsField() {
+  return g_fieldCeilBind >= 2 && lastAppliedDuty >= ccDutyCeiling() - 1.0f;
+}
+
 // systemID_tick() — plant delay measurement step test. 8 phases: BASELINE + 3x (UP/DOWN), each held
 // SYSID_STEP_HOLD_MS to let the plant settle. Called on every fresh CH1 hit from AdjustFieldLearnMode;
 // the caller MUST force govMode = GOV_BYPASS_SLEW, put the PID in MANUAL with its integrator reset to
@@ -4322,6 +4366,23 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     float drive = SystemIDStepAmplitude * (1.0f + sinf(2.0f * (float)M_PI * f * tSec));
     float d = constrain(baseDuty + drive, 0.0f, 100.0f);
     dutyOut = d;
+
+    // A field ceiling under the crest clips the wave: the fundamental shrinks, K reads low and the proposed
+    // gains run hot. A clip deeper than 5% of the amplitude (under 1% gain error) ends the run unfitted.
+    const float dApplied = dutyAfterCeiling(d);
+    if (d - dApplied > fmaxf(0.05f, 0.05f * SystemIDStepAmplitude)) {
+      queueConsoleMessageF("SystemID: ABORTED at %.2f Hz: %s (%.1f%% duty) clipped the sine peak (%.1f%% commanded). A clipped wave reads as low plant gain, so nothing was fitted.",
+                           f, fieldCeilBindName(g_fieldCeilBind), dApplied, d);
+      systemIDAbortReason = 253;             // sentinel: a field ceiling clipped the sine (outside FieldEventReason enum)
+      systemIDAbortPhase  = systemIDActive;
+      commitSystemIDRecord(true);
+      systemIDActive = 0;
+      sysidEaseFromDuty = dApplied;
+      sysidEaseStartMs = nowMs;
+      phase = SYSID_EASE;
+      dutyOut = dApplied;
+      return true;
+    }
 
     // Engine-speed stats over the sine phase — advisory context for /sysidbode, never gated on.
     float rNow = (float)RPM;
@@ -5413,6 +5474,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   static float    stepDuty = 0.0f;
   static uint32_t stepStartMs = 0;
   static double   ampSum = 0.0;
+  static double   dutySum = 0.0;      // APPLIED duty over the same settled window as amps (a step past the ceiling is clamped)
   static uint32_t ampN = 0;
   static uint32_t fcEaseStartMs = 0;  // EASE phase: gentle field ramp-down on exit
   static float    fcEaseFromDuty = 0.0f;
@@ -5480,6 +5542,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     }
     stepStartMs = nowMs;
     ampSum = 0.0;
+    dutySum = 0.0;
     ampN = 0;
     rpmSum = 0.0;
     // Ease the field DOWN from the live charging duty to the sweep floor over FIELDCURVE_EASE_MS instead of
@@ -5512,7 +5575,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     // real per-bus cap and setDutyPercent clamps the APPLIED duty down to it on every class. Cap the ramp at that same ceiling so we STOP
     // there instead of marching stepDuty up into a frozen-duty region that records flat/false amps and a
     // bogus curve. If the amp target isn't reached by then, we flag fieldCurveCeilingLimited so the
-    // dashboard can tell the user to raise Max Field % and re-run for the full curve.
+    // dashboard can name the binding ceiling (fieldCeilBind) and what, if anything, raises it.
     // Taken through ccDutyCeiling() so a Max Field Volts cap stops the ramp too — it clamps applied duty
     // in setDutyPercent identically, so a raw MaxDuty read here would walk into that same frozen region.
     float effDutyCeil = FIELDCURVE_DUTY_MAX;
@@ -5522,6 +5585,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     // Accumulate amps (and RPM, for the onset knee) only over the settled second half of the dwell.
     if ((nowMs - stepStartMs) >= (FIELDCURVE_DWELL_MS / 2)) {
       ampSum += ampsRaw;
+      dutySum += dutyAfterCeiling(stepDuty);
       rpmSum += RPM;
       ampN++;
       fcRunRpmSample();
@@ -5530,8 +5594,16 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     if ((nowMs - stepStartMs) >= FIELDCURVE_DWELL_MS) {
       float avgAmps = (ampN > 0) ? (float)(ampSum / ampN) : ampsRaw;
       float avgRpm  = (ampN > 0) ? (float)(rpmSum / ampN) : RPM;
-      if (fieldCurveCount < FIELDCURVE_MAX_PTS) {
-        fieldCurveBuf[fieldCurveCount++] = { stepDuty, avgAmps };
+      // Recorded at the APPLIED duty: the last step usually lands past the ceiling, and its command would draw
+      // a false slope drop (a "knee") into the final segment.
+      float avgDuty = (ampN > 0) ? (float)(dutySum / ampN) : dutyAfterCeiling(stepDuty);
+      // A clamped point under half a step above the previous one is dropped: the slope over it is noise, and
+      // one at or below the previous duty breaks the ascending order fieldCurveInvert relies on. Saturation
+      // mode only, because the onset baseline keys off fieldCurveCount == 1.
+      bool clampedTooClose = !fieldCurveOnsetMode && fieldCurveCount > 0 && avgDuty < stepDuty - 0.01f
+                             && avgDuty < fieldCurveBuf[fieldCurveCount - 1].duty + 0.5f * FIELDCURVE_DUTY_STEP;
+      if (fieldCurveCount < FIELDCURVE_MAX_PTS && !clampedTooClose) {
+        fieldCurveBuf[fieldCurveCount++] = { avgDuty, avgAmps };
       }
       // ── Onset-stop mode (Min% knee) ─────────────────────────────────────────
       // First settled step = baseline (below the knee). Stop the instant a later step lifts
@@ -5569,9 +5641,9 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
           kneeSweepOk       = false;
           fieldCurveResultsReady = true;
           if (onsetCeilDutyCapped) {
-            fieldCurveCeilingLimited = true;
-            queueConsoleMessageF("Min%% knee: no onset below %.1f%% duty (Max Field %% limit) @ %.0f RPM — "
-                                 "raise Max Field %% and re-run if onset is higher", stepDuty, avgRpm);
+            fieldCurveCeilingLimited = true; fieldCurveCeilBind = g_fieldCeilBind;
+            queueConsoleMessageF("Min%% knee: no onset below %.1f%% duty @ %.0f RPM, capped by %s; onset may be higher. %s",
+                                 avgDuty, avgRpm, fieldCeilBindName(g_fieldCeilBind), fieldCeilBindRemedy(g_fieldCeilBind));
           } else {
             queueConsoleMessageF("Min%% knee: no onset below %.1f%% duty @ %.0f RPM (using ceiling)", stepDuty, avgRpm);
           }
@@ -5586,12 +5658,12 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 
       if (reachedLimit || reachedCeil || bufFull) {
         // Stopped at the duty-limit ceiling (not the natural 92% backstop) without hitting the amp
-        // target → the curve is truncated by the 24/36/48V field-duty limit. Flag it + tell the user.
+        // target → the curve is truncated by whichever field ceiling binds. Flag it + name it.
         if (reachedCeil && !reachedLimit && effDutyCeil < FIELDCURVE_DUTY_MAX) {
-          fieldCurveCeilingLimited = true;
-          queueConsoleMessageF("Field curve: stopped at %.0f%% duty (Max Field %% limit) before reaching %.0fA — "
-                               "raise Max Field %% and re-run for the full curve",
-                               effDutyCeil, fieldCurveTargetLimitA);
+          fieldCurveCeilingLimited = true; fieldCurveCeilBind = g_fieldCeilBind;
+          queueConsoleMessageF("Field curve: stopped at %.1f%% duty before reaching %.0fA, capped by %s, so the curve is cut short. %s",
+                               effDutyCeil, fieldCurveTargetLimitA,
+                               fieldCeilBindName(g_fieldCeilBind), fieldCeilBindRemedy(g_fieldCeilBind));
         }
         // ── Post-process: knee + proposals ──────────────────────────────────
         fieldCurveActive = 2;
@@ -5649,6 +5721,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       stepDuty += FIELDCURVE_DUTY_STEP;
       stepStartMs = nowMs;
       ampSum = 0.0;
+      dutySum = 0.0;
       ampN = 0;
       rpmSum = 0.0;
     }
@@ -5715,7 +5788,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     if (frac >= 1.0f) {
       dutyOut = stepDuty;
       stepStartMs = nowMs;
-      ampSum = 0.0; ampN = 0; rpmSum = 0.0;
+      ampSum = 0.0; dutySum = 0.0; ampN = 0; rpmSum = 0.0;
       phase = 1;
       return true;
     }
@@ -5837,8 +5910,8 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     altSweepRequested = false;
     altSweepAbortRequested = false;
 
-    // The two field caps are the ONLY ceilings: Max Field % and Max Field Volts, whichever binds first
-    // (ccDutyCeiling). Both are named on the panel and both are lookupable, which is what the earlier
+    // The field caps are the ONLY ceilings: Max Field %, Max Field Volts and the board's 10 A and drive-heat
+    // ceilings, whichever binds first (ccDutyCeiling). All are named on the panel and lookupable, which is what the earlier
     // "only MaxDuty" rule was protecting — unlike FIELDCURVE_DUTY_MAX, which the field curve stops at
     // as its own knee-search bound and which is deliberately still NOT carried here. Reaching the
     // ceiling is nothing new: governor_apply clamps every duty the regulator commands to it every tick.
@@ -5849,7 +5922,8 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     if (toDuty - fromDuty < 1.0f) {
       queueConsoleMessageF("Field sweep: refused — span %.1f%%→%.1f%% is under 1%% after clamping to the field ceiling %.1f%% (set by %s)",
                            fromDuty, toDuty, dutyCeil,
-                           (dutyCeil < MaxDuty - 0.05f) ? "Max Field Volts" : "Max Field %");
+                           (g_fieldCeilBind == 1) ? "Max Field Volts" : (g_fieldCeilBind == 2) ? "the board's 10 A field-current ceiling"
+                           : (g_fieldCeilBind >= 3) ? "the field-drive heat ceiling" : "Max Field %");
       return false;
     }
     curDuty = fromDuty;
@@ -6389,9 +6463,22 @@ static bool chcSchedule(uint32_t runMs, uint8_t &cyc, uint8_t &seg) {
   return true;
 }
 
+// Lowest and highest applied duty inside each measured cycle's window, and the ceiling term that first moved one.
+// The estimator assumes a fixed field: a ceiling stepping the frozen field mid-cycle reads as up/down hysteresis
+// and biases the lead, so that cycle is discarded. A clamp that holds steady across a whole cycle is a fixed field.
+static float   chcCycDutyLo[CHC_MEAS_CYCLES], chcCycDutyHi[CHC_MEAS_CYCLES];
+static uint8_t chcClampBind = 0;
+static bool chcCycMoved(int m) { return chcCycDutyHi[m] - chcCycDutyLo[m] > 0.05f; }
+
 // Fit one measured cycle as soon as its clock window closes, so the work is spread across the run
 // instead of landing on one control tick at the end, and the wizard can show each answer as it lands.
 static void chcFitCycle(int m) {
+  if (chcCycMoved(m)) {
+    chcLead[m] = chcGapB[m] = chcGapA[m] = -1.0f;
+    queueConsoleMessageF("Charge health calibration: cycle %d discarded, %s moved the frozen field during it",
+                         m + 2, fieldCeilBindName(chcClampBind));
+    return;
+  }
   chcLead[m] = chcFitLead(chcCycStart[m], chcCycEnd[m], &chcGapB[m], &chcGapA[m]);
   queueConsoleMessageF("Charge health calibration: cycle %d fit %s (%.3f s, gap %.1f -> %.1f A)",
                        m + 2, (chcLead[m] >= 0.0f) ? "ok" : (chcLead[m] <= -1.5f) ? "past 0.9 s" : "no answer",
@@ -6441,6 +6528,7 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     chcMinA = 0.0f; chcPeakA = 0.0f; chcCount = 0;
     chcLeadSec = -1.0f;
     for (int i = 0; i < 3; i++) { chcLead[i] = chcGapB[i] = chcGapA[i] = -1.0f; chcCycStart[i] = 0; chcCycEnd[i] = 0; }
+    for (int i = 0; i < CHC_MEAS_CYCLES; i++) { chcCycDutyLo[i] = 1000.0f; chcCycDutyHi[i] = -1000.0f; }
     chcRateMin = chcRateMax = chcRateAvg = -1.0f;
     chcResultsReady = false; chcOk = false; chcAbortMsg[0] = '\0';
     // The same range guard the setup screen applies to the entered maximum, in case Start arrived
@@ -6525,14 +6613,18 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       // something to watch rise and fall). Otherwise the sizing did not happen at the top, and a
       // field sized anywhere lower is the 09-09 failure, so the run ends instead.
       if (!settled && (seg == 3 || !onSchedule)) {
+        const bool boardHeld = boardCeilHoldsField();
         if (atTop && ampsEma >= CHC_MIN_TEST_A) {
           settled = true;
-          queueConsoleMessageF("Charge health calibration: %.1f A not reachable here — proceeding at %.1f A", chcCmdA, ampsEma);
+          queueConsoleMessageF("Charge health calibration: %.1f A not reachable here%s%s — proceeding at %.1f A", chcCmdA,
+                               boardHeld ? ", field held by " : "", boardHeld ? fieldCeilBindName(g_fieldCeilBind) : "", ampsEma);
         } else {
           chcCcActive = false;
           setpointLimited = preSetpoint;
           if (!atTop) snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the top speed was not reached — hold %.0f rpm through the marked stretch", chcTopRpm);
-          chcFinish(false, atTop ? "the field reached its ceiling before making the test current" : chcAbortMsg);
+          else if (boardHeld) snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the field reached its ceiling (%s) before making the test current",
+                                       fieldCeilBindBrief(g_fieldCeilBind));
+          chcFinish(false, (atTop && !boardHeld) ? "the field reached its ceiling before making the test current" : chcAbortMsg);
           chcActive = 0; chcPhase = 0; chcLastEndMs = millis(); phase = 0;
           return false;
         }
@@ -6585,6 +6677,20 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
         chcAbortRequested = true;
         return true;
       }
+      // A ceiling crossing the frozen field (die warming, or the bus rising under the 10 A law) steps it mid-cycle.
+      // lastCyc, not cyc: this tick's sample closes lastCyc's window on a boundary tick.
+      if (lastCyc >= 2 && lastCyc - 2 < CHC_MEAS_CYCLES) {
+        const int m = lastCyc - 2;
+        const float applied = dutyAfterCeiling(fminf(holdDuty, 99.0f));
+        const bool wasMoved = chcCycMoved(m);
+        chcCycDutyLo[m] = fminf(chcCycDutyLo[m], applied);
+        chcCycDutyHi[m] = fmaxf(chcCycDutyHi[m], applied);
+        if (!wasMoved && chcCycMoved(m)) {
+          chcClampBind = g_fieldCeilBind;
+          queueConsoleMessageF("Charge health calibration: %s moved the frozen field between %.1f%% and %.1f%% in cycle %d, so that cycle will not be fitted",
+                               fieldCeilBindName(chcClampBind), chcCycDutyLo[m], chcCycDutyHi[m], (int)lastCyc);
+        }
+      }
       // Cycle bookkeeping off the clock: a measured cycle's window is [first sample in it, first
       // sample of the next), and it is fitted the moment it closes.
       if (cyc != lastCyc || !onSchedule) {
@@ -6597,10 +6703,18 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       // Schedule over. Closest pair of the fits that produced an answer is the run's self-check;
       // the browser recomputes the same pair and stores the mean.
       chcRateStats(chcCycStart[0], chcCycEnd[CHC_MEAS_CYCLES - 1]);
-      int nGood = 0; bool pastRange = false;
-      for (int i = 0; i < CHC_MEAS_CYCLES; i++) { if (chcLead[i] >= 0.0f) nGood++; if (chcLead[i] <= -1.5f) pastRange = true; }
+      int nGood = 0, nMoved = 0; bool pastRange = false;
+      for (int i = 0; i < CHC_MEAS_CYCLES; i++) {
+        if (chcLead[i] >= 0.0f) nGood++;
+        if (chcLead[i] <= -1.5f) pastRange = true;
+        if (chcCycMoved(i)) nMoved++;
+      }
       const float span = chcTopRpm - chcIdleRpm;
-      if (nGood == 0) {
+      if (nGood < 2 && nMoved > 0) {
+        snprintf(chcAbortMsg, sizeof(chcAbortMsg), "the field ceiling (%s) moved the frozen field in %d of %d cycles",
+                 fieldCeilBindBrief(chcClampBind), nMoved, CHC_MEAS_CYCLES);
+        chcFinish(false, chcAbortMsg);
+      } else if (nGood == 0) {
         if (pastRange) chcFinish(false, "the lead is past the 0.9 s the fit can see");
         else {
           snprintf(chcAbortMsg, sizeof(chcAbortMsg), "no usable measurement — %.0f to %.0f A over %.0f rpm of range gave the fit nothing to read",

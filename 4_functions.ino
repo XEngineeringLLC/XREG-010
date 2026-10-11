@@ -1105,6 +1105,7 @@ void initIMUStructures() {
 // INA228 register configuration. Boot and every runtime recovery (a chip that lost power has lost its
 // ALERT threshold, so the OV comparator must be re-armed with the rest).
 void inaApplyConfig() {
+  g_inaDieRewarm = true;
   // setAverage() takes raw register value: 0=1, 1=4, 2=16, 3=64, 4=128, 5=256, 6=512, 7=1024 samples
   INA.setMode(15);                       // Continuous shunt, bus voltage AND die temperature
   INA.setAverage(4);                     // 128-sample averaging — 128 × 8.24ms = 1054ms register update
@@ -1211,6 +1212,7 @@ if (!BMP388Disconnected) {
   for (int i = 0; i < MAX_DATA_INDICES; i++) {
     dataTimestamps[i] = now;
   }
+  dataTimestamps[IDX_INA_DIE_TEMP] = 0;   // stamped only by a real sample past the warm-up discard: the heat ceiling's freshness
 
   // if (setupDisplay()) {
   //   Serial.println("Display ready for use");
@@ -1649,10 +1651,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     BatteryShuntPresent = settingRead(NK_BatteryShuntPresent).toInt();
   }
-  if (!settingExists(NK_ShuntGroundComp)) {
-    settingWrite(NK_ShuntGroundComp, String(ShuntGroundComp).c_str());
+  if (!settingExists(NK_ShuntLead)) {
+    settingWrite(NK_ShuntLead, String(ShuntLead).c_str());
   } else {
-    ShuntGroundComp = (settingRead(NK_ShuntGroundComp).toInt() != 0) ? 1 : 0;
+    ShuntLead = settingRead(NK_ShuntLead).toInt();
+    if (ShuntLead < 0 || ShuntLead > 2) ShuntLead = 0;
   }
   if (!settingExists(NK_LimpHome)) {
     settingWrite(NK_LimpHome, String(LimpHome).c_str());
@@ -2027,10 +2030,22 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     RPMScalingFactor = settingRead(NK_RPMScalingFactor).toInt();
   }
-  if (!settingExists(NK_FieldResistance)) {
-    settingWrite(NK_FieldResistance, String(FieldResistance).c_str());
+  // Neither key is seeded: the owner must enter the resistance (no default, owner 2026-10-10). Entered = both keys, as the
+  // /get handler writes them; a resistance without its recorded temperature (the old firmware seed) counts as never entered,
+  // like a value outside the handler's range.
+  if (settingExists(NK_FieldResistance) && settingExists(NK_FieldResTrefC)) {
+    const float r = settingRead(NK_FieldResistance).toFloat();
+    const float t = settingRead(NK_FieldResTrefC).toFloat();
+    if (r >= 0.05f && r <= 100.0f && t >= -40.0f && t <= 150.0f) {
+      FieldResistance = r;
+      FieldResTrefC = t;
+    }
+  }
+  if (!settingExists(NK_FieldWiring)) {
+    settingWrite(NK_FieldWiring, String(FieldWiring).c_str());
   } else {
-    FieldResistance = settingRead(NK_FieldResistance).toFloat();
+    FieldWiring = settingRead(NK_FieldWiring).toInt();
+    if (FieldWiring < 0 || FieldWiring > 2) FieldWiring = 0;
   }
   if (!settingExists(NK_MaximumAllowedBatteryAmps)) {
     settingWrite(NK_MaximumAllowedBatteryAmps, String(MaximumAllowedBatteryAmps).c_str());

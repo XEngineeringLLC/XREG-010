@@ -21,6 +21,76 @@
 // handler block is skipped as if the parameter were absent, a console line names it once, and every other
 // parameter in the same request is still processed. Ids, tokens and text parameters stay on plain
 // hasParam(): strtod reads a hex id like "0001e315" as infinity.
+// Alternator temperature (C) recorded with a Field Resistance write. 90 s, not n2kAltTempF's 20 s: the engine-off poll is
+// 60 s, and a cold engine is exactly when the resistance is measured. NAN = no reading to record.
+float fieldResProbeC() {
+  if (IgnoreTemperature || LimpHome) return NAN;
+  const uint32_t ts = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
+  if (ts == 0 || (uint32_t)(millis() - ts) > 90000UL) return NAN;
+  const float f = (TempSource == 0) ? (float)AlternatorTemperatureF : ((temperatureThermistor == -99) ? NAN : (float)temperatureThermistor);
+  return isfinite(f) ? (f - 32.0f) / 1.8f : NAN;
+}
+
+// The one writer of a Field Resistance: a typed entry (/get) and the field resistance test (/fieldResTest save=1). The
+// alternator temperature is recorded with it: the coil-temperature credit is relative to it. 30 C when there is none.
+void fieldResRecord(float r, float probeC) {
+  FieldResistance = r;
+  settingWrite(NK_FieldResistance, String(FieldResistance, 3).c_str());
+  FieldResTrefC = isfinite(probeC) ? probeC : 30.0f;
+  settingWrite(NK_FieldResTrefC, String(FieldResTrefC, 1).c_str());
+  g_fieldDerateDirty = true;
+  stateRevision++;
+  settingsDirty = true;
+  if (isfinite(probeC)) queueConsoleMessageF("Field Resistance %.3f ohm recorded at %.0f%s from the alternator probe", FieldResistance, dispTempF(probeC * 1.8f + 32.0f), dispTempUnit());
+  else queueConsoleMessageF("Field Resistance %.3f ohm: no alternator temperature reading, %.0f%s assumed", FieldResistance, dispTempF(86.0f), dispTempUnit());
+}
+
+// Why a field resistance test may not start now, or nullptr. Read on the web task; the control pass starts the run.
+const char *frtRefuseReason(uint8_t method) {
+  static char busyMsg[96];
+  const uint32_t now = millis();
+  if (frt.state == FRT_RUNNING || frt.reqStart) return "A field resistance test is already running.";
+  if (hardwarePresent != 1) return "The regulator is running on simulated sensor data, so there is no field to measure.";
+  const char *busy = (systemIDActive != 0) ? "The Plant Delay test"
+                     : TuningMode ? "Current tuning"
+                     : CVTuningMode ? "Voltage tuning"
+                     : cvPlantFitActive ? "Voltage Control Autotuning"
+                     : batteryHealthTestActive ? "The battery health test"
+                     : resTestActive ? "The resonance current-check"
+                     : (fieldCurveActive != 0) ? "The field curve"
+                     : (fieldCutActive != 0) ? "The field cut test"
+                     : (protTestActive != 0) ? "A protection test"
+                     : cvStressActive ? "The CV stress test"
+                     : (altSweepActive != 0 || altSweepRequested) ? "The gate-tuning field sweep"
+                     : (chcActive != 0 || chcRequested) ? "The charge health calibration" : nullptr;
+  if (busy) {
+    snprintf(busyMsg, sizeof(busyMsg), "%s is running. Wait for it to finish.", busy);
+    return busyMsg;
+  }
+  if (IgnoreTemperature || IgnoreRPM || IgnoreAltCurrent || IgnoreBattVMain || IgnoreBattV2 || LimpHome)
+    return "The test needs every sensor. Stop running without failed sensors first (Setup > System > Run Without Failed Sensors).";
+  if (ManualFieldToggle == 1) return "Manual field mode is on. Switch Field Control back to Auto first.";
+  if (Ignition != 1) return "The ignition input is off, so the regulator will not drive the field. Turn the key on, or, with no ignition wire connected, turn on Ignition Override under Setup > Engine.";
+  if (OnOff != 1) return "Alternator Enable is off. Switch it on (top right) to run the test.";
+  if (bmsLogic == 1 && !((bmsLogicLevelOff == 0) ? bmsSignalActive : !bmsSignalActive)) return "The BMS on/off input is withholding permission, so the regulator will not drive the field.";
+  if (RPM > 0.0f) return "The engine is turning. The test runs with the engine off.";
+  if (inaOvervoltageLatched) return "The hardware over-voltage latch is set. Wait for it to clear.";
+  const uint8_t cut = g_fieldEventReason;
+  if ((cut == REASON_FAST_OVERVOLTAGE || cut == REASON_OV_TIER_LOW || cut == REASON_OV_TIER_MID || cut == REASON_INA_OVERVOLTAGE || cut == REASON_HARD_OVERCURRENT)
+      && fieldCollapseTime > 0 && (now - fieldCollapseTime) < activeCollapseDelay)
+    return "An over-voltage or over-current lockout is running. Wait a few seconds and try again.";
+  const uint32_t ibvTs = dataTimestamps[IDX_IBV];
+  if (ibvTs == 0 || (uint32_t)(now - ibvTs) > 3000UL) return "The main battery voltage reading is missing.";
+  const uint32_t dieTs = dataTimestamps[IDX_INA_DIE_TEMP];
+  if (dieTs == 0 || (uint32_t)(now - dieTs) > 10000UL) return "The regulator's drive temperature reading is missing.";
+  if (method == FRT_SHUNT) {
+    if (!HAS_BATT_SHUNT || (ShuntLead != 1 && ShuntLead != 2)) return "The shunt method needs the battery shunt installed and its location set.";
+    const uint32_t bTs = dataTimestamps[IDX_BCUR];
+    if (bTs == 0 || (uint32_t)(now - bTs) > 3000UL) return "The battery shunt reading is missing.";
+  }
+  return nullptr;
+}
+
 bool paramOk(AsyncWebServerRequest *request, const char *name) {
   if (!request->hasParam(name)) return false;
   const String &v = request->getParam(name)->value();
@@ -710,7 +780,7 @@ enum Csv2Index {
   CSV2_n183ChecksumErrs,  // NMEA 0183 sentences that failed checksum — climbs on wrong polarity or a noisy line
   CSV2_ft_ReadNMEA0183_win,  // NMEA 0183 drain worst us (window) — the 0.5 ms control-loop budget check
   CSV2_ft_ReadNMEA0183_ses,  // NMEA 0183 drain worst us (session)
-  CSV2_fieldDutyCeil,     // enforced field-duty ceiling ×100 — ccDutyCeiling(), the lower of Max Field % and the Max Field Volts term. Neither setting alone tells a log which cap was binding
+  CSV2_fieldDutyCeil,     // enforced field-duty ceiling ×100 — ccDutyCeiling(), the lowest of Max Field %, the Max Field Volts term, fieldCurDutyCeil and fieldHeatDutyCeil (fieldCeilBind names the binding one). Neither setting alone tells a log which cap was binding
   CSV2_dvccAuthMfg,       // NAME manufacturer code of the node publishing the limits (358 = Victron, 2046 = open code; 0 = identity never heard)
   CSV2_dvccAuthProd,      // its 126996 product code, else its Victron VREG 0x0100 product id, else 0
   CSV2_ovTierLowCount,    // timed OV cut, LOW tier — session rising-edge counter (lifetime twin in ov_telemetry)
@@ -749,12 +819,22 @@ enum Csv2Index {
   CSV2_battTempLostCount,   // session count of REASON_BATT_TEMP_LOST field events
 
   // Sensor faults / Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §1.2, §2.6, §4.2, §4.7)
-  CSV2_sensorFaultMask,     // bit0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228 — computed regardless of overrides
+  CSV2_sensorFaultMask,     // bit0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228, 9 regulator drive temperature (INA228 die) — computed regardless of overrides
   CSV2_battTempState,       // 0 not expected (source Not fitted), 1 reading, 2 lost (charging stopped), 3 waiting for the first reading (field held off)
   CSV2_limpTier,            // 0 normal, 1 closed-loop minus dependent reasons, 2 voltage-only, 3 fixed duty + second-voltage cap, 4 fixed duty
   CSV2_sensorSteadyMask,    // same bits as sensorFaultMask; set once that fault bit has been clear continuously for 10 min (the "reading again" prompt)
   CSV2_reqFaultCount,       // §11: number of required sensors faulted (chip loss expanded to its readings; owner overrides and Not fitted excluded); >= 2 = REASON_MULTI_SENSOR_FAULT
   CSV2_battCurState,        // §11.6 battery current (declared shunt / VE.Direct): 0 not declared, 1 reading, 2 lost 10 s (alarm + header line; charging continues on voltage)
+  // Board field ceilings (6_functions.ino updateFieldDerateCeilings)
+  CSV2_fieldCurDutyCeil,    // 10 A field-current ceiling, duty % x100
+  CSV2_fieldHeatDutyCeil,   // field-drive heat ceiling, duty % x100 (99 until the first valid die sample)
+  CSV2_fieldCeilBind,       // binding ccDutyCeiling() term: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the J2 connector, 4 heat at the D5 spreader
+  CSV2_fieldRcOhm,          // FieldResistance corrected for alternator temperature, ohm x100 (the 10 A ceiling and Field Amps use it)
+  CSV2_fieldHeatLimS,       // lifetime seconds held at the heat ceiling
+  CSV2_fieldCurLimS,        // lifetime seconds held at the 10 A ceiling
+  CSV2_fieldHeatLimSesS,    // session seconds held at the heat ceiling (ResetFieldHeatLimTime)
+  CSV2_fieldCurLimSesS,     // session seconds held at the 10 A ceiling (ResetFieldCurLimTime)
+  CSV2_dieTempLostCount,    // session count of REASON_DIE_TEMP_LOST field events
 
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
@@ -782,7 +862,7 @@ enum Csv4Index {
   CSV4_VictronCurrent,          // Victron battery current (A ×100)
   CSV4_currentFuelGPH,          // live fuel flow (gal/hr ×100)
   CSV4_currentNMPG,             // live fuel economy (naut mi/gal ×100)
-  CSV4_ctrlLimiter,             // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target, 8 BMS charge-current limit, 9 BMS charge-voltage limit, 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide — rides NavStream so the banner tint updates at ~500ms
+  CSV4_ctrlLimiter,             // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target, 8 BMS charge-current limit, 9 BMS charge-voltage limit, 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide, 15 board 10 A field-current ceiling, 16 field-drive heat ceiling — rides NavStream so the banner tint updates at ~500ms
   CSV4_chargeStage,             // CHARGE_STAGE_* code — rides NavStream so the Plots-tab mode ribbon tracks stage changes at ~500ms (CSV2 still carries it for the thermal ring)
   CSV4_n183Heading,             // NMEA 0183 decoded heading (deg ×10; -10 = nothing decoded). Separate from CSV4_HeadingNMEA, which is the NMEA2000 source.
   CSV4_n183HdgRef,              // reference frame of the above: 0 none, 1 magnetic, 2 true
@@ -802,7 +882,7 @@ enum Csv4Index {
 // backslash and truncates the macro, and every expansion truncates together and consistently --
 // so the count/order gate in compress_web.sh cannot see it. The static_assert on
 // CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 442
+#define CSV3_EXPECTED_FIELDS 445
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -1240,7 +1320,7 @@ enum Csv4Index {
   X(CommissionTempSrc, "%d", SafeInt(CommissionTempSrc))                                                          /* battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown, 5 = retired board stamp) */ \
   X(maxWorkingRpm, "%d", SafeInt(maxWorkingRpm))                                                                  /* stage-9 setup screen; 0 = never entered */ \
   X(RemoteDiagnostics, "%d", SafeInt(RemoteDiagnostics))                                                          /* owner switch for the dashboard's support log-relay poll (0/1) */ \
-  X(ShuntGroundComp, "%d", SafeInt(ShuntGroundComp))                                                        /* add the INA228 shunt drop back into IBV (0/1) */ \
+  X(retired2, "%d", 0)                                                                                            /* was ShuntGroundComp — dead slot, sends 0; kept so CSV3 indices never renumber */ \
   X(BatteryVoltageSource, "%d", SafeInt(BatteryVoltageSource))                                                /* charge-decision battery volts: 0 INA228, 1 NMEA 2000, 3 Victron */ \
   X(IgnoreAltCurrent, "%d", SafeInt(IgnoreAltCurrent))                                                          /* run without alternator current (0/1) — voltage-only regulation */ \
   X(IgnoreBattVMain, "%d", SafeInt(IgnoreBattVMain))                                                            /* run without the INA228 bus voltage (0/1) — fixed duty */ \
@@ -1249,6 +1329,9 @@ enum Csv4Index {
   X(NoRpmCurrentA, "%d", SafeInt(NoRpmCurrentA, 10))                                                            /* alternator current limit while engine speed is ignored, A x10 */ \
   X(ShutdownRampTauS, "%d", SafeInt(ShutdownRampTauS, 100))                                                      /* shutdown ramp proportional decay time constant, s x100 */ \
   X(NoOutputAmps, "%d", SafeInt(NoOutputAmps, 100))                                                              /* alternator amps at or below this = no output, A x100 */ \
+  X(FieldResTrefC, "%d", SafeInt(FieldResTrefC, 10))                                                              /* alternator temperature recorded with FieldResistance, C x10; ROLL_EMPTY = never recorded (Prerequisites gate) */ \
+  X(FieldWiring, "%d", SafeInt(FieldWiring))                                                                       /* field wiring for the drive-heat limit: 0 not set, 1 P-type, 2 N-type */ \
+  X(ShuntLead, "%d", SafeInt(ShuntLead))                                                                           /* shunt location: 0 not set, 1 negative lead (IBV corrected), 2 positive lead */ \
   X(sessionId, "%u", (unsigned)g_sessionId)                                                                   /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
   X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
   /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
@@ -1310,12 +1393,13 @@ enum TsIndex {
   TS_ExtraTemp,     // EXTRA-role DS18B20 staleness (IDX_EXTRA_TEMP)
   TS_VeBattTemp,    // VE.Direct "T" battery temperature staleness (IDX_VE_BATT_TEMP)
   TS_RvcBattTemp,   // RV-C DC_SOURCE_STATUS_2 battery temperature staleness (IDX_RVC_BATT_TEMP)
+  TS_DieTemp,       // INA228 die temperature: age of the last valid sample (IDX_INA_DIE_TEMP), the field-drive heat ceiling's input
 
   TS_sessionId,     // boot identity — matches CSV1_sessionId while this cached block is from the live run
   TS_sendMs,        // millis() when this payload was built. Every other TS field is an AGE, so without this
                     // a frozen block reads as a set of plausible ages that simply stopped advancing.
 
-  TS_FIELD_COUNT  // = 41
+  TS_FIELD_COUNT  // = 42
 };
 
 
@@ -6162,12 +6246,16 @@ void setupServer() {
       settingWrite(NK_InvertBattAmps, inputMessage.c_str());
       InvertBattAmps = inputMessage.toInt();
     }
-    if (request->hasParam("ShuntGroundComp")) {
+    if (paramOk(request, "ShuntLead")) {
       foundParameter = true;
-      inputMessage = request->getParam("ShuntGroundComp")->value();
-      ShuntGroundComp = (inputMessage.toInt() != 0) ? 1 : 0;
-      settingWrite(NK_ShuntGroundComp, ShuntGroundComp ? "1" : "0");
-      queueConsoleMessageF("Shunt resistance compensation: %s", ShuntGroundComp ? "On" : "Off");
+      const int lead = request->getParam("ShuntLead")->value().toInt();
+      if (lead == 1 || lead == 2) {
+        ShuntLead = lead;
+        settingWrite(NK_ShuntLead, String(lead).c_str());
+        queueConsoleMessageF("Shunt location: %s", (lead == 1) ? "negative lead. Battery voltage is corrected for the shunt's drop." : "positive lead. No correction.");
+      } else {
+        queueConsoleMessageF("WRITE REJECTED: ShuntLead=%d - negative lead (1) or positive lead (2) only", lead);
+      }
     }
     if (request->hasParam("BatteryShuntPresent")) {
       foundParameter = true;
@@ -6698,8 +6786,25 @@ void setupServer() {
     if (paramOk(request, "FieldResistance")) {
       foundParameter = true;
       inputMessage = request->getParam("FieldResistance")->value();
-      settingWrite(NK_FieldResistance, inputMessage.c_str());
-      FieldResistance = inputMessage.toFloat();
+      const float r = inputMessage.toFloat();
+      if (!(r >= 0.05f && r <= 100.0f)) {   // a measured value or nothing: no clamping a typo into a resistance the ceilings act on
+        queueConsoleMessageF("WRITE REJECTED: FieldResistance=%s - enter the measured resistance, 0.05 to 100 ohm", inputMessage.c_str());
+      } else {
+        fieldResRecord(r, fieldResProbeC());
+      }
+    }
+    if (paramOk(request, "FieldWiring")) {
+      foundParameter = true;
+      const int w = request->getParam("FieldWiring")->value().toInt();
+      if (w == 1 || w == 2) {
+        FieldWiring = w;
+        settingWrite(NK_FieldWiring, String(w).c_str());
+        g_fieldDerateDirty = true;
+        queueConsoleMessageF("Field wiring set to %s: the drive-heat limit protects the %s", (w == 1) ? "P-type" : "N-type",
+                             (w == 1) ? "freewheel diode's heat spreader" : "field connector");
+      } else {
+        queueConsoleMessageF("WRITE REJECTED: FieldWiring=%d - P-type (1) or N-type (2) only", w);
+      }
     }
     if (paramOk(request, "AlternatorCOffset")) {
       foundParameter = true;
@@ -6937,6 +7042,18 @@ void setupServer() {
       AlternatorOnTime = 0;
       nvsPersistNow = true;
       queueConsoleMessage("Alternator On Time: Reset requested from web interface");
+    }
+    if (request->hasParam("ResetFieldHeatLimTime")) {
+      foundParameter = true;
+      g_fieldHeatLimSesS = 0;
+      nvsPersistNow = true;
+      queueConsoleMessage("Field Held by Drive Heat: session reset requested from web interface");
+    }
+    if (request->hasParam("ResetFieldCurLimTime")) {
+      foundParameter = true;
+      g_fieldCurLimSesS = 0;
+      nvsPersistNow = true;
+      queueConsoleMessage("Field Held at 10 A Limit: session reset requested from web interface");
     }
     if (request->hasParam("ResetEnergy")) {
       foundParameter = true;
@@ -9140,6 +9257,7 @@ void setupServer() {
       // AdjustField section profiler — clear the worst-full-pass latch + breakdown (/debug)
       aflWorstTotalUs = 0;
       memset(aflWorstSecUs, 0, sizeof(aflWorstSecUs));
+      g_fieldDerateWorstUs = 0;
       // Worst-loop attribution diagnostic — re-arm so the next worst pass prints to Console
       loopDiagWorstUs = 0;
       // Fault-detector overall compute time — clear so /debug tracks worst since-reset.
@@ -9495,6 +9613,7 @@ void setupServer() {
              "Net task cores (0/1=pinned, 2147483647=floating, -99=not found): async_tcp=%d lwIP=%d\n"
              "Dashboard stream: clients=%u queue=%u peak=%u/%u stalls=%lu longest=%.1fs dropped=%lu csv3=%uB peak=%uB of %uB\n"
              "AdjustField worst full pass (ms): total=%.1f | thermal=%.1f snapshot=%.1f fastov=%.1f modes=%.1f control=%.1f duty=%.1f tail=%.1f\n"
+             "Field derate worst pass: %lu us (budget 500 us; part of snapshot above)\n"
              "Time source: %s (NMEA last sync: %lus ago, Phone last: %lus ago)\n"
              "GPS source:  %s (NMEA last fix: %lus ago, Phone last: %lus ago)\n"
              "Speed source: %s (NMEA last SOG: %lus ago, Phone last: %lus ago)\n"
@@ -9516,6 +9635,7 @@ void setupServer() {
              aflWorstSecUs[0] / 1000.0f, aflWorstSecUs[1] / 1000.0f, aflWorstSecUs[2] / 1000.0f,
              aflWorstSecUs[3] / 1000.0f, aflWorstSecUs[4] / 1000.0f, aflWorstSecUs[5] / 1000.0f,
              aflWorstSecUs[6] / 1000.0f,
+             (unsigned long)g_fieldDerateWorstUs,
              timeSrcName,
              lastNmea2kSystemTimeMs ? (now - lastNmea2kSystemTimeMs) / 1000UL : 0UL,
              lastPhoneTimeMs        ? (now - lastPhoneTimeMs)        / 1000UL : 0UL,
@@ -9961,17 +10081,102 @@ void setupServer() {
     // can stay 1 indefinitely. The poller checks "aborted" so it never hangs waiting for !active.
     pos += snprintf(buf + pos, 2048 - pos,
                     "],\"active\":%d,\"ready\":%d,\"ok\":%d,\"tok\":%u,\"kneeDuty\":%.1f,\"kneeAmps\":%.2f,"
-                    "\"targetA\":%.1f,\"propStabA\":%.1f,\"propStepPct\":%.2f,\"ceilLimited\":%d,\"aborted\":%d,\"abort\":\"%s\","
+                    "\"targetA\":%.1f,\"propStabA\":%.1f,\"propStepPct\":%.2f,\"ceilLimited\":%d,\"ceilBind\":%d,\"aborted\":%d,\"abort\":\"%s\","
                     "\"abortWhy\":%d,\"abortNext\":%d,\"abortV\":%.2f,\"abortD\":%.1f,"
                     "\"rpmAvg\":%.0f,\"rpmMin\":%.0f,\"rpmMax\":%.0f}",
                     fieldCurveActive != 0 ? 1 : 0, fieldCurveResultsReady ? 1 : 0, fieldCurveOk ? 1 : 0,
                     (unsigned)fieldCurveRunTok,
                     fieldCurveKneeDuty, fieldCurveKneeAmps, fieldCurveTargetLimitA,
-                    fieldCurvePropStabA, fieldCurvePropStepPct, fieldCurveCeilingLimited ? 1 : 0,
+                    fieldCurvePropStabA, fieldCurvePropStepPct, fieldCurveCeilingLimited ? 1 : 0, (int)fieldCurveCeilBind,
                     fieldCurveAbortRequested ? 1 : 0, fieldCurveAbortMsg,
                     (int)fieldCurveAbortReason, (int)fieldCurveAbortFollowOn,
                     fieldCurveAbortVolts, fieldCurveAbortDuty,
                     fieldCurveRpmAvg, fieldCurveRpmMin, fieldCurveRpmMax);
+    request->send(200, "application/json", buf);
+  });
+
+  // Field resistance test (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1). Every request is the app's heartbeat: a run ends
+  // 3 s after the last one. start=1&method=1|2 (shunt|meter), reading=<amps>, again=1, save=1 and abort=1 act; with none
+  // it is a status read. abort works locked, like OnOff=0; the others need the settings arm. save=1 writes a finished
+  // result: the owner's Next or Save, so an explicit action may write flash here. The firmware does the math for both
+  // methods, so the formula lives once, beside the estimate it calibrates.
+  server.on("/fieldResTest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    frt.lastPollMs = millis();
+    const char *refused = nullptr;
+    if (request->hasParam("abort") && frt.state == FRT_RUNNING) {
+      frt.reqAbort = true;
+      logClientWrite(request, "FIELD RESISTANCE TEST: stop requested");
+    }
+    const bool acts = request->hasParam("start") || request->hasParam("reading") || request->hasParam("again") || request->hasParam("save");
+    if (acts && !settingsArmActive(request)) {
+      refused = "Unlock settings first.";
+    } else if (request->hasParam("save")) {
+      if (frt.state != FRT_DONE) {
+        refused = "There is no test result to save.";
+      } else if (!frt.saved) {
+        fieldResRecord(frt.r, frt.probeC);
+        frt.saved = true;
+        logClientWrite(request, "FIELD RESISTANCE TEST: result saved");
+      }
+    } else if (request->hasParam("start")) {
+      const uint8_t m = (request->hasParam("method") && request->getParam("method")->value().toInt() == FRT_SHUNT) ? FRT_SHUNT : FRT_METER;
+      refused = frtRefuseReason(m);
+      if (!refused) {
+        frt.reqMethod = m;
+        frt.state = FRT_IDLE;   // a status read between here and the control pass must not show the last run's result
+        frt.reqStart = true;
+        logClientWrite(request, (m == FRT_SHUNT) ? "FIELD RESISTANCE TEST: start (shunt method)" : "FIELD RESISTANCE TEST: start (meter method)");
+      }
+    } else if (request->hasParam("again")) {
+      if (frt.state == FRT_RUNNING && frt.method == FRT_METER) frt.reqAgain = true;
+    } else if (paramOk(request, "reading")) {
+      // A clamp or meter the wrong way round reads negative; the magnitude is the field current.
+      const float a = fabsf(request->getParam("reading")->value().toFloat());
+      if (frt.state == FRT_RUNNING && frt.method == FRT_METER) {
+        frt.reqAmps = a;
+        frt.reqReading = true;
+      }
+    }
+
+    char buf[1400];
+    int pos = 0;
+    auto num = [&](const char *key, float v, int dp) {
+      if (isfinite(v)) pos += snprintf(buf + pos, sizeof(buf) - pos, "\"%s\":%.*f,", key, dp, v);
+      else pos += snprintf(buf + pos, sizeof(buf) - pos, "\"%s\":null,", key);
+    };
+    const bool starting = frt.reqStart;
+    // sh: the shunt method is on offer (the screen picks the method from it; the start refusal has the full check).
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"st\":%u,\"m\":%u,\"h\":%u,\"rung\":%u,\"ph\":%u,\"el\":%lu,\"phMs\":%lu,\"holdMs\":%lu,\"sh\":%d,",
+                    starting ? (unsigned)FRT_RUNNING : (unsigned)frt.state, (unsigned)(starting ? frt.reqMethod : frt.method),
+                    (unsigned)frt.hold, (unsigned)frt.rung, (unsigned)frt.phase,
+                    (unsigned long)((frt.state == FRT_RUNNING) ? (millis() - frt.phaseStartMs) : 0UL),
+                    (unsigned long)FRT_PHASE_MS, (unsigned long)FRT_METER_HOLD_MS,
+                    (HAS_BATT_SHUNT && (ShuntLead == 1 || ShuntLead == 2)) ? 1 : 0);
+    num("d", frt.duty, 2);
+    num("hd", frt.holdDuty, 2);
+    num("hx", frt.holdX, 2);
+    num("li", (frt.method == FRT_SHUNT && (frt.phase & 1)) ? frt.liveI : NAN, 2);
+    num("ibv", IBV, 2);
+    num("r", frt.r, 3);
+    num("vc", frt.vc, 3);
+    num("off", frt.probeOffV, 3);
+    num("warm", frt.warmPct, 2);
+    num("tC", frt.probeC, 1);
+    num("R", FieldResistance, 3);
+    num("Tref", FieldResTrefC, 1);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\"holds\":[");
+    for (int k = 0; k < 4; k++) {
+      const FrtHold &hd = frt.h[k];
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "%s{", k ? "," : "");
+      num("x", hd.x, 2);
+      num("d", hd.d, 2);
+      num("i", hd.i, 3);
+      if (buf[pos - 1] == ',') pos--;
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "}");
+    }
+    // msg and refused are firmware-authored ASCII without quotes or backslashes.
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"saved\":%d,\"msg\":\"%s\",\"refused\":\"%s\"}",
+                    frt.saved ? 1 : 0, (frt.state == FRT_FAILED || frt.state == FRT_DONE) ? frt.msg : "", refused ? refused : "");
     request->send(200, "application/json", buf);
   });
 
@@ -10129,10 +10334,10 @@ void setupServer() {
                       i > 0 ? "," : "", kneeAnchorRPM[i], kneeAnchorDuty[i], kneeAnchorTempF[i]);
     }
     // "aborted" = protection-abort latch, reported independently of "active" (see /fieldcurve.json note).
-    // "ceilLimited" = the sweep stopped at the 24/36/48V field-duty ceiling before finding onset.
-    pos += snprintf(buf + pos, 1024 - pos, "],\"ceilLimited\":%d,\"aborted\":%d,\"abort\":\"%s\","
+    // "ceilLimited" = the sweep stopped at the field-duty ceiling before finding onset; "ceilBind" = which term.
+    pos += snprintf(buf + pos, 1024 - pos, "],\"ceilLimited\":%d,\"ceilBind\":%d,\"aborted\":%d,\"abort\":\"%s\","
                     "\"abortWhy\":%d,\"abortNext\":%d,\"abortV\":%.2f,\"abortD\":%.1f}",
-                    fieldCurveCeilingLimited ? 1 : 0, fieldCurveAbortRequested ? 1 : 0, fieldCurveAbortMsg,
+                    fieldCurveCeilingLimited ? 1 : 0, (int)fieldCurveCeilBind, fieldCurveAbortRequested ? 1 : 0, fieldCurveAbortMsg,
                     (int)fieldCurveAbortReason, (int)fieldCurveAbortFollowOn,
                     fieldCurveAbortVolts, fieldCurveAbortDuty);
     request->send(200, "application/json", buf);
@@ -10505,6 +10710,7 @@ void setupServer() {
     g_voltStaleCount = 0;
     g_volt2StaleCount = 0;
     g_battTempLostCount = 0;
+    g_dieTempLostCount = 0;
     request->send(200, "text/plain", "OK");
   });
 
@@ -11166,6 +11372,7 @@ void SendWifiData() {
                                "%d,%d,"         // +2 INA228 die temperature: live, session max (°F x10)
                                "%d,%d,%d,"      // +3 sensor-fault field-event counters: voltage stale, voltage2 stale, battery temp lost
                                "%d,%d,%d,%d,%d,%d,"   // +6 sensor faults: fault mask, battery-temperature state, limp tier, steady mask, required-fault count, battery-current state
+                               "%d,%d,%d,%d,%lu,%lu,%lu,%lu,%d,"   // +9 board field ceilings: current, heat, binding term, corrected R, lifetime/session seconds at each, die-temp-lost count
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -11794,6 +12001,15 @@ void SendWifiData() {
                                (int)g_sensorSteadyMask,                                  // CSV2_sensorSteadyMask
                                (int)g_reqFaultCount,                                     // CSV2_reqFaultCount
                                (int)g_battCurState,                                      // CSV2_battCurState
+                               SafeInt(g_fieldCurDutyCeil, 100),                         // CSV2_fieldCurDutyCeil
+                               SafeInt(g_fieldHeatDutyCeil, 100),                        // CSV2_fieldHeatDutyCeil
+                               (int)g_fieldCeilBind,                                     // CSV2_fieldCeilBind
+                               SafeInt(g_fieldRcOhm, 100),                               // CSV2_fieldRcOhm
+                               (unsigned long)g_fieldHeatLimS,                           // CSV2_fieldHeatLimS
+                               (unsigned long)g_fieldCurLimS,                            // CSV2_fieldCurLimS
+                               (unsigned long)g_fieldHeatLimSesS,                        // CSV2_fieldHeatLimSesS
+                               (unsigned long)g_fieldCurLimSesS,                         // CSV2_fieldCurLimSesS
+                               SafeInt(g_dieTempLostCount),                              // CSV2_dieTempLostCount
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost
@@ -11885,6 +12101,7 @@ void SendWifiData() {
     int timestampPayloadLen = snprintf(timestampPayload, TIMESTAMP_PAYLOAD_SIZE,
                                        "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                                        "%lu,%lu,%lu,%lu,"  // +4 battery/extra temperature: BATT probe, EXTRA probe, VE.Direct T, RV-C T
+                                       "%lu,"      // +1 INA228 die temperature
                                        "%lu,%lu",  // +2: sessionId, sendMs
                                        (unsigned long)TS_FIELD_COUNT,
                                        (dataTimestamps[IDX_HEADING_NMEA] == 0) ? 999999 : (now - dataTimestamps[IDX_HEADING_NMEA]),
@@ -11929,6 +12146,7 @@ void SendWifiData() {
                                        (dataTimestamps[IDX_EXTRA_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_EXTRA_TEMP]),
                                        (dataTimestamps[IDX_VE_BATT_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_VE_BATT_TEMP]),
                                        (dataTimestamps[IDX_RVC_BATT_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_RVC_BATT_TEMP]),
+                                       (dataTimestamps[IDX_INA_DIE_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_INA_DIE_TEMP]),
                                        (unsigned long)g_sessionId,   // TS_sessionId
                                        (unsigned long)now            // TS_sendMs (`now` is this dispatch tick's millis())
     );

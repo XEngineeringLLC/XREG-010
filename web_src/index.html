@@ -228,6 +228,8 @@
           <span id="battgt-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">BATT &gt; TARGET</span><span class="pw-short">B&gt;T</span></span>
           <span id="extlim-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">EXT LIMIT</span><span class="pw-short">EXT</span></span>
           <span id="minfield-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">MIN FIELD</span><span class="pw-short">MIN</span></span>
+          <span id="fieldcap-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">10 A FIELD</span><span class="pw-short">10 A</span></span>
+          <span id="driveheat-note" class="battgt-word why-tap" style="display:none;"><span class="pw-full">DRIVE HEAT</span><span class="pw-short">HEAT</span></span>
           <span id="charge-stage" class="charge-stage charge-stage-unknown">—</span>
         </div>
         <span id="field-off-reason" class="field-off-reason"></span>
@@ -1579,8 +1581,8 @@
                         duty the gate driver's bootstrap capacitor cannot refresh, so the high-side MOSFET may not fully
                         turn on and runs hot. This is a duty ratio, so the field current it allows rises with system
                         voltage. Max Field Volts below caps the same drive in volts, and is what protects a 12 V
-                        winding on a 24 V or 48 V bank. Whichever of the two works out lower is enforced, and that one
-                        is marked "limiting".</span></span>
+                        winding on a 24 V, 36 V, or 48 V bank. The lowest of this, Max Field Volts and the board's two field
+                        ceilings below is enforced, and that one is marked "limiting".</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -1597,12 +1599,12 @@
                     <span>Max Field Volts (V) (<span id="MaxFieldVolts_echo">?</span>, <span id="MaxFieldVolts_asDuty">?</span>% now):<span id="MaxFieldVolts_limiting" class="cap-limiting">limiting</span></span>
                     <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Caps the average voltage applied
                         to the field winding, calculated from commanded duty and the measured system voltage.
-                        Alternator makers often reuse one 12&nbsp;V field winding across their 24&nbsp;V and 48&nbsp;V
+                        Alternator makers often reuse one 12&nbsp;V field winding across their 24&nbsp;V, 36&nbsp;V, and 48&nbsp;V
                         models, so the winding inside a high-voltage alternator may still be a 12&nbsp;V part — enter
                         the field voltage from the alternator's datasheet, and a higher rating raises the ceiling.
-                        The duty this works out to at the present system voltage is shown beside its value; whichever
-                        of this and Max Field (%) is lower is what the loop enforces, in every mode, and that one is
-                        marked "limiting". Because this solves against the measured bus every control tick, it hands
+                        The duty this works out to at the present system voltage is shown beside its value; the lowest
+                        of this, Max Field (%) and the board's two field ceilings below is what the loop enforces, in
+                        every mode, and that one is marked "limiting". Because this solves against the measured bus every control tick, it hands
                         duty back as the bank sags, which a fixed duty percentage cannot. This is a heating limit, not
                         an insulation limit: field drive is switched, so the winding still sees full system voltage on
                         each pulse whatever the cap. And it is derived from duty and battery voltage rather than sensed
@@ -1614,6 +1616,32 @@
                       <input name="MaxFieldVolts" type="number" step="0.1" min="0.5" max="60" />
                       <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                     </form>
+                  </div>
+                </div>
+
+                <!-- Field Current Ceiling (read-only) -->
+                <hr />
+                <div class="form-row">
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>Field Current Ceiling, 10 A (<span id="fieldCurDutyCeil_now">?</span>% now):<span id="FieldCurCeil_limiting" class="cap-limiting">limiting</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">Not a setting. The board's field drive
+                        is rated 10 A, and this is the duty that gives 10 A of field current at the present system
+                        voltage. Field current is estimated from Field Resistance (measured by the field resistance test),
+                        corrected for alternator temperature, so this ceiling is only as good as that measurement.</span></span>
+                  </div>
+                </div>
+
+                <!-- Field Drive Heat Ceiling (read-only) -->
+                <hr />
+                <div class="form-row">
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>Field Drive Heat Ceiling (<span id="fieldHeatDutyCeil_now">?</span>% now<span id="fieldHeatCeil_part"></span>):<span id="FieldHeatCeil_limiting" class="cap-limiting">limiting</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">Not a setting. The highest duty at which
+                        the regulator's field-drive parts stay inside their temperature rating at the regulator's
+                        present temperature: the field connector on N-type wiring, the freewheel diode's heat
+                        spreader on P-type wiring, both while Field Wiring is not set. It falls as the regulator
+                        warms and recovers as it cools. It rises as the alternator warms, because a warm field coil
+                        draws less current at the same duty. A cooler location for the regulator raises it.</span></span>
                   </div>
                 </div>
 
@@ -1635,16 +1663,45 @@
                   </div>
                 </div>
 
+                <!-- Field Resistance -->
                 <hr />
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Field Resistance (Ω) (<span id="FieldResistance_echo">?</span>):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">Only
-                        affects Field Amps calc, not important.</span></span>
+                    <span>Field Resistance (Ω) (<span id="FieldResistance_echo">?</span>, <span id="FieldResTrefC_echo">?</span>):</span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">The resistance of the field circuit at working
+                        current: the rotor winding, its brushes and slip rings, the field wire, and the fuse. Measure
+                        runs the field resistance test with the engine off, and records the alternator temperature
+                        with the result. The regulator's field-current estimate, its 10 A field limit, and its
+                        drive-heat protection are all built on this number. An ohmmeter reading through the brushes
+                        reads high, and a high number lets the field run harder than those limits intend, so type
+                        only a result from the test here.</span></span>
                   </div>
                   <div class="form-input">
-                    <form action="/get" method="GET" target="hidden-form">
-                      <input name="FieldResistance" type="number" step="0.01" min="0.01" max="100" />
+                    <form action="/get" method="GET" target="hidden-form" onsubmit="return dropEmpty(this)">
+                      <input name="FieldResistance" type="number" step="0.01" min="0.05" max="100" />
+                      <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
+                      <button type="button" class="btn-secondary" onclick="fieldResOpen('setup')">Measure</button>
+                    </form>
+                  </div>
+                </div>
+
+                <!-- Field Wiring -->
+                <hr />
+                <div class="form-row">
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>Field Wiring (<span id="FieldWiring_echo">?</span>):</span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">How the field is wired at the green
+                        field connector: the 1-3 jumper is P-type, the 2-4 jumper is N-type. The drive-heat limit
+                        checks the part that wiring heats: the freewheel diode's heat spreader for P-type, the
+                        field connector for N-type. While this is not set, both are checked.</span></span>
+                  </div>
+                  <div class="form-input">
+                    <form action="/get" method="GET" target="hidden-form" onsubmit="return /^[12]$/.test(this.elements.FieldWiring.value)">
+                      <select name="FieldWiring">
+                        <option value="0" disabled hidden selected>Not set</option>
+                        <option value="1">P-type</option>
+                        <option value="2">N-type</option>
+                      </select>
                       <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                     </form>
                   </div>
@@ -3836,7 +3893,7 @@
                     <div class="metric-row telemetry-row">
                       <span class="metric-label telemetry-label">Field Curr
                         <span class="tooltip">ℹ️
-                          <span class="tooltip-box">Estimated, not measured — field voltage divided by the entered field resistance of <span id="FieldResistance_echo_fldamps2">?</span> Ω, adjustable in Settings → Alternator → Basic → Output Control → Field Resistance. Real field resistance drifts 10–20% with rotor temperature, so treat this as an estimate.</span>
+                          <span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps2">?</span> Ω, measured by the field resistance test, in Settings → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. Reads a little high because the rotor runs hotter than the probe.</span>
                         </span>
                       </span>
                       <span class="metric-value telemetry-value"><span id="FieldAmpsID2">?</span>&nbsp;A</span>
@@ -6497,7 +6554,7 @@
                 <div class="form-row">
                   <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                     <span>Sweep up to (% field):</span>
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Where the up leg stops climbing and turns around. Capped at Max Field %, and it starts there. In practice the sweep usually turns around well before it, short of whichever current or voltage limit the machine approaches first.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Where the up leg stops climbing and turns around. Capped at the field ceiling the regulator is enforcing right now (the lowest of Max Field %, Max Field Volts, and the board's two field ceilings), and it starts there. In practice the sweep usually turns around well before it, short of whichever current or voltage limit the machine approaches first.</span></span>
                   </div>
                   <div class="form-input" style="gap:8px;">
                     <input id="altsweep-to" type="number" step="1" min="1" max="99" />
@@ -6698,6 +6755,32 @@
                   <form action="/get" method="GET" target="hidden-form">
                     <input name="PulleyRatio" type="number" step="0.01" min="1.0" max="10.0" />
                     <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
+                  </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                  <span>Ignition Override (<span id="IgnitionOverride_echo">?</span>):</span>
+                  <span class="tooltip">
+                    ℹ️
+                    <span class="tooltip-box">Off: the regulator counts the ignition as on only while the key is on,
+                      and charges only then. On: it counts the ignition as on all the time, so charging no longer
+                      waits for the key; the alternator switch turns it on and off. Use On when no ignition
+                      wire is connected. With it on, the regulator also stays fully awake with the engine off, so it
+                      draws more power while the boat sits.</span>
+                  </span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="IgnitionOverride_checkbox" type="checkbox" onchange="ignitionOverrideToggle(this)" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input id="IgnitionOverride" name="IgnitionOverride" type="number" value="" style="display:none;" />
                   </form>
                 </div>
               </div>
@@ -7458,7 +7541,7 @@
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
                 Measurement Sources
               </summary>
-              <p class="gate-note gate-note-shunt">Battery Shunt Present is Off, so the three rows that calibrate the shunt &mdash; Invert Battery Amps, Battery Current Offset and Shunt Resistance &mdash; are greyed. Switch it to Yes to set them up.</p>
+              <p class="gate-note gate-note-shunt">Battery Shunt Present is Off, so the four rows that set up the shunt &mdash; Invert Battery Amps, Battery Current Offset, Shunt Resistance and Shunt Location &mdash; are greyed. Switch it to Yes to set them up.</p>
 
               <hr />
               <div class="form-row">
@@ -7466,7 +7549,7 @@
                   <span>Battery Shunt Present (<span id="BatteryShuntPresent_echo">?</span>):</span>
                   <span class="tooltip">
                     ℹ️
-                    <span class="tooltip-box">Turn off if this device has no battery shunt (battery-current sensor). Battery current, State of Charge, battery health, the battery charge-current limit, load-dump detection and float charging all become unavailable — the alternator current limit is then the only thing bounding charge current. Their settings stay on their pages, greyed, and each card says why; only the live readouts that would sit at a dash are hidden.</span></span>
+                    <span class="tooltip-box">Turn off if this device has no battery shunt (battery-current sensor). Battery current, State of Charge, battery health, the battery charge-current limit, load-dump detection and float charging all become unavailable — the alternator current limit is then the only thing bounding charge current. Their settings stay on their pages, greyed, and each card says why; only the live readouts that would sit at a dash are hidden. If your shunt is in the battery negative lead and its current reaches the regulator only over NMEA 2000 or VE.Direct, the regulator's own battery voltage reading runs high while charging, by charging current × shunt resistance (10 mV per 100 A on a 500 A / 50 mV shunt). Wiring Cable 2 pins 9 and 10 to the shunt removes it.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -7557,22 +7640,20 @@
               <hr />
               <div class="form-row gate-batt-current">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                  <span>Shunt Resistance Compensation (<span id="ShuntGroundComp_echo">?</span>):</span>
+                  <span>Shunt Location (<span id="ShuntLead_echo">?</span>):</span>
                   <span class="tooltip">
                     &#8505;&#65039;
-                    <span class="tooltip-box">On: the battery voltage reading is corrected for the shunt's own voltage drop, which is what a Regulator Ground Wire landed on the load side of a shunt in the battery negative lead adds to it. Off: for a Regulator Ground Wire landed on the battery negative post, or a shunt in the positive lead.</span>
+                    <span class="tooltip-box">Which battery cable your shunt sits in. Negative lead: the Regulator Ground Wire lands on the shunt's load side, and the regulator removes the shunt's own voltage drop from its battery voltage reading. Positive lead: the Regulator Power Wire lands on the shunt's load side, and no correction is needed.</span>
                   </span>
                 </div>
                 <div class="form-input">
-                  <form action="/get" method="GET" target="hidden-form">
-                    <span class="toggle-label">Off</span>
-                    <label class="switch">
-                      <input id="ShuntGroundComp_checkbox" type="checkbox"
-                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'ShuntGroundComp').then(ok => { if (ok && handleUserToggle('ShuntGroundComp_checkbox', 'ShuntGroundComp', 'ShuntGroundComp')) { cb.form.submit(); submitMessage(); } });" />
-                      <span class="slider round"></span>
-                    </label>
-                    <span class="toggle-label">On</span>
-                    <input id="ShuntGroundComp" name="ShuntGroundComp" type="number" value="" style="display:none;" />
+                  <form action="/get" method="GET" target="hidden-form" onsubmit="return /^[12]$/.test(this.elements.ShuntLead.value)">
+                    <select name="ShuntLead">
+                      <option value="0" disabled hidden selected>Not set</option>
+                      <option value="1">Negative lead</option>
+                      <option value="2">Positive lead</option>
+                    </select>
+                    <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                   </form>
                 </div>
               </div>
@@ -10781,7 +10862,7 @@
             <div class="metric-row">
               <span class="metric-label" style="display:flex;align-items:center;gap:4px;">
                 Field Amps (Calc'd)
-                <span class="tooltip">ℹ️<span class="tooltip-box">Not measured — calculated as Field Volts divided by the entered field resistance of <span id="FieldResistance_echo_fldamps">?</span> Ω, adjustable in Settings → Alternator → Basic → Output Control → Field Resistance. Real field resistance drifts 10–20% with rotor temperature, so treat this as an estimate.</span></span>
+                <span class="tooltip">ℹ️<span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps">?</span> Ω, measured by the field resistance test, in Settings → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. Reads a little high because the rotor runs hotter than the probe.</span></span>
               </span>
               <span class="metric-value"><span id="FieldAmpsID">0</span>&nbsp;A</span>
             </div>
@@ -10871,6 +10952,60 @@
                   <input type="hidden" name="ResetAlternatorOnTime" id="ResetAlternatorOnTime" value="0" />
                   <button type="button" class="btn-secondary" onclick="resetParameter('ResetAlternatorOnTime')"
                     id="ResetAlternatorOnTime_button">Reset</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Field Held at 10 A Limit -->
+        <hr />
+        <div class="form-row">
+          <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+            <span>Field Held at 10 A Limit</span>
+            <span class="tooltip">ℹ️<span class="tooltip-box">Time the field spent held at the board's 10 A field-current ceiling while charging.</span></span>
+          </div>
+          <div class="form-input">
+            <div class="dual-counter">
+              <div class="dual-counter-row">
+                <span class="counter-label">Lifetime</span>
+                <span class="counter-value" id="fieldCurLimS_ID">0</span><span>H:M:S</span>
+              </div>
+              <div class="dual-counter-row" style="position:relative;">
+                <span class="counter-label">Session</span>
+                <span class="counter-value" id="fieldCurLimSesS_ID">0</span><span>H:M:S</span>
+                <form action="/get" method="GET" target="hidden-form"
+                  style="position:absolute;left:100%;margin-left:8px;">
+                  <input type="hidden" name="ResetFieldCurLimTime" id="ResetFieldCurLimTime" value="0" />
+                  <button type="button" class="btn-secondary" onclick="resetParameter('ResetFieldCurLimTime')"
+                    id="ResetFieldCurLimTime_button">Reset</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Field Held by Drive Heat -->
+        <hr />
+        <div class="form-row">
+          <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+            <span>Field Held by Drive Heat</span>
+            <span class="tooltip">ℹ️<span class="tooltip-box">Time the field spent held down by the regulator's drive-heat ceiling while charging. A lot of time here means the regulator is mounted somewhere hot.</span></span>
+          </div>
+          <div class="form-input">
+            <div class="dual-counter">
+              <div class="dual-counter-row">
+                <span class="counter-label">Lifetime</span>
+                <span class="counter-value" id="fieldHeatLimS_ID">0</span><span>H:M:S</span>
+              </div>
+              <div class="dual-counter-row" style="position:relative;">
+                <span class="counter-label">Session</span>
+                <span class="counter-value" id="fieldHeatLimSesS_ID">0</span><span>H:M:S</span>
+                <form action="/get" method="GET" target="hidden-form"
+                  style="position:absolute;left:100%;margin-left:8px;">
+                  <input type="hidden" name="ResetFieldHeatLimTime" id="ResetFieldHeatLimTime" value="0" />
+                  <button type="button" class="btn-secondary" onclick="resetParameter('ResetFieldHeatLimTime')"
+                    id="ResetFieldHeatLimTime_button">Reset</button>
                 </form>
               </div>
             </div>
@@ -14559,6 +14694,14 @@
           </span>
           <span class="metric-value telemetry-value"><span id="battTempLostCountID">?</span></span>
         </div>
+        <div class="metric-row telemetry-row">
+          <span class="metric-label telemetry-label">Drive Temperature Lost Events
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">Rising-edge count: charging stopped because the regulator's own drive temperature reading (the INA228 chip's die temperature) stopped arriving or read out of range for 10 s. The field drive's heat protection needs it, so the field stays off until it reads again.</span>
+            </span>
+          </span>
+          <span class="metric-value telemetry-value"><span id="dieTempLostCountID">?</span></span>
+        </div>
         <div style="margin-top:10px;">
           <button onclick="resetVoltageProtectionCounters()" class="btn-secondary">Reset Voltage &amp; Current Counters</button>
         </div>
@@ -16625,7 +16768,7 @@
        the wizard measures them. On a first Vessel Info save it comes BEFORE the battery-defaults popup, so
        the proposal is derived from the hardware described here (the Charge Rate Limits handoff is then
        made by the save chain, after the SoC and restart-ack screens). Body rendered by commPrepRender()
-       from /exportConfig; only edited fields are written (one /get). -->
+       from /exportConfig; only edited fields are written (commPrepFinish). -->
   <div id="commprep-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16636,9 +16779,27 @@
       <div style="padding:12px 16px; border-top:1px solid #333; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
         <button onclick="commPrepFinish(false)" style="background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em;">I'll do this later</button>
         <button id="commprep-start-btn" onclick="commPrepFinish(true)" style="background:rgba(255,255,255,0.10); color:#e8e8e8; border:1px solid rgba(255,255,255,0.18); border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em;">Next →</button>
+        <div id="commprep-start-why" style="display:none; flex-basis:100%; text-align:right; font-size:12px; line-height:1.4; color:#e6a23c;"></div>
       </div>
     </div>
   </div><!-- END commprep-modal-overlay -->
+
+  <!-- Field Resistance screen: the field resistance test. Opened by the Prerequisites screen's Next and by Setup >
+       Alternator > Field Resistance > Measure; body rendered by frRender() from /fieldResTest. -->
+  <div id="fieldres-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+      <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
+        <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Field Resistance</span>
+        <button onclick="frLater()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
+      </div>
+      <div id="fieldres-body" style="padding:14px 16px; overflow-y:auto; flex:1; min-height:0;"></div>
+      <div style="padding:12px 16px; border-top:1px solid #333; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
+        <button id="fieldres-later-btn" onclick="frLater()" style="background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em;">I'll do this later</button>
+        <button id="fieldres-next-btn" onclick="frNext()" disabled style="background:rgba(255,255,255,0.10); color:#e8e8e8; border:1px solid rgba(255,255,255,0.18); border-radius:6px; padding:8px 16px; cursor:default; opacity:0.45; font-size:0.9em;">Next →</button>
+        <div id="fieldres-next-why" style="display:none; flex-basis:100%; text-align:right; font-size:12px; line-height:1.4; color:#e6a23c;"></div>
+      </div>
+    </div>
+  </div><!-- END fieldres-modal-overlay -->
 
   <!-- Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §4.6). Same dark shell as the
        prerequisites / battery-defaults modals; rows are rendered by rwfsRender() from the live CSV1/2/3 caches. -->

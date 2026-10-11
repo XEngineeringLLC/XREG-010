@@ -1274,7 +1274,8 @@ static void rvcDeratingFromLimiter(uint8_t &derating, uint8_t &reason) {
   if (ctrlLimiter == 0 || ctrlLimiter == 10 || ctrlLimiter == 11 || ctrlLimiter == 12) { derating = 0; reason = 0; return; }
   derating = 1;
   switch (ctrlLimiter) {
-    case 2: reason = 1; break;  // thermal derate -> High Internal Temperature
+    case 2:                     // thermal derate
+    case 16: reason = 1; break; // field-drive heat ceiling -> High Internal Temperature
     case 3:                     // CV voltage loop
     case 9: reason = 3; break;  // BMS charge-voltage limit -> Battery Voltage
     default: reason = 0xFF; break;
@@ -1321,6 +1322,8 @@ static bool rvcActiveFault(uint8_t &msb, uint8_t &lsb, uint8_t &fmi, bool &red) 
         msb = 2; lsb = 0; fmi = 0; return true;  // alternator temperature above normal range
       case REASON_TEMP_STALE:
         msb = 2; lsb = 0; fmi = 9; return true;  // alternator temperature not updating
+      case REASON_DIE_TEMP_LOST:
+        msb = 2; lsb = 1; fmi = 9; return true;  // board (INA228 die) temperature not updating
       case REASON_TACH_IMPLAUSIBLE:
         msb = 2; lsb = 3; fmi = 2; return true;  // engine speed erratic or invalid
       case REASON_MULTI_SENSOR_FAULT:
@@ -2634,6 +2637,16 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
     AvgVoltage_AllTime = voltageAccumulator_AllTime / totalVoltageSampleTime_AllTime;
   }
 }
+// The key is on, for the at-rest alarm gates. A forced-on ignition (IgnitionOverride) is no key at all, so the
+// engine alone says whether the boat is in use and a switch left on at anchor stays silent.
+bool keyOnForAlarms() { return Ignition == 1 && IgnitionOverride != 1; }
+// Engine stopped, for the sailing statistics. A forced-on ignition (IgnitionOverride, a boat with no ignition
+// wire) says nothing, so engine speed decides alone; with engine speed ignored as well nothing can tell
+// motoring from sailing, so none is counted.
+bool sailingEngineOff() {
+  if (IgnitionOverride == 1) return IgnoreRPM == 0 && RPM < 50;
+  return RPM < 50 && Ignition == 0;
+}
 void UpdateTravelStatistics(unsigned long elapsedMillis) {
   // ===== DISTANCE CALCULATION - Using GPS position (Haversine) =====
 
@@ -2675,7 +2688,7 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
 
           distanceAccumulator += (float)distanceDelta_nm;
           distanceAccumulator_AllTime += (float)distanceDelta_nm;
-          if (boatIsSail() && RPM < 50 && Ignition == 0) sailingDistAccumulator_AllTime += (float)distanceDelta_nm;  // under sail = sailboat + engine off (matches sailing_days gate)
+          if (boatIsSail() && sailingEngineOff()) sailingDistAccumulator_AllTime += (float)distanceDelta_nm;  // under sail = sailboat + engine off (matches sailing_days gate)
 
           if (distanceAccumulator >= 0.01f) {
             TotalDistance += distanceAccumulator;
@@ -2987,11 +3000,11 @@ double calculateHaversineDistance(double lat1, double lon1, double lat2, double 
 
 /**
  * UpdateSailingMetrics - Track sailing time and calculate ratio
- * Sailing conditions: sailboat (Vessel Info Type) AND SOG > 0.5 knots AND RPM < 50 AND Ignition == 0
+ * Sailing conditions: sailboat (Vessel Info Type) AND SOG > 0.5 knots AND sailingEngineOff()
  */
 void UpdateSailingMetrics(unsigned long elapsedMillis) {
   bool isSailing = false;
-  if (boatIsSail() && !IS_STALE(IDX_SOG_NMEA) && SOGNMEA > 0.5 && RPM < 50 && Ignition == 0) {
+  if (boatIsSail() && !IS_STALE(IDX_SOG_NMEA) && SOGNMEA > 0.5 && sailingEngineOff()) {
     isSailing = true;
   }
 
@@ -3423,7 +3436,7 @@ void CheckAlarms() {
   if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     static unsigned long lastSensorFaultMsgMs = 0;
     static char sensorAlarmText[240];
-    const bool awake = g_engineRunning || (Ignition == 1 && OnOff == 1);
+    const bool awake = g_engineRunning || (keyOnForAlarms() && OnOff == 1);
     if (g_reqFaultBits && awake) {
       char names[200];
       sensorFaultNames(g_reqFaultBits | (g_sensorFaultMask & (SF_ADS1115 | SF_INA228)), names, sizeof(names));
@@ -3470,7 +3483,7 @@ void CheckAlarms() {
   // rest like the block above. General-fault class.
   if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     static unsigned long lastBattCurLostMsgMs = 0;
-    const bool awake = g_engineRunning || (Ignition == 1 && OnOff == 1);
+    const bool awake = g_engineRunning || (keyOnForAlarms() && OnOff == 1);
     const bool inaOwnsIt = (BatteryCurrentSource != 3) && (g_reqFaultBits & SF_BATT_V_MAIN);
     if (g_battCurState == 2 && awake && !inaOwnsIt) {
       currentAlarmCondition = true;
@@ -4416,7 +4429,7 @@ void _ReadAnalogInputs_inner() {
                      // differential reading IS that drop (charging-positive once InvertBattAmps is applied), so it is
                      // subtracted. Raw shunt volts only - the current-path calibrations (BatteryCOffset,
                      // DynamicShuntGainFactor) must not leak into a voltage.
-                     if (ShuntGroundComp && HAS_BATT_SHUNT && shuntOk) {
+                     if (ShuntLead == 1 && HAS_BATT_SHUNT && shuntOk) {
                        busV -= (InvertBattAmps ? -1.0f : 1.0f) * shuntMv / 1000.0f;
                      }
 
@@ -4466,6 +4479,7 @@ void _ReadAnalogInputs_inner() {
                        } else {
                          ina228ErrorCount++;
                        }
+                       frtInaSample(Bcur, IBV, shuntOk);
 
                        // IBV EMA — used by getFiltV() and CV loop error terms
                        // dBcur/dt — positive value = load dump (loads disconnected, OV risk)
@@ -4595,10 +4609,16 @@ void _ReadAnalogInputs_inner() {
     }
     if (millis() - lastInaTempMs >= INA_DIETEMP_INTERVAL_MS) {
       lastInaTempMs = millis();
+      if (g_inaDieRewarm) {
+        g_inaDieRewarm = false;
+        inaDieWarmup = 0;
+        inaDiePrevF = NAN;
+      }
       try {
         float tC = INA.getTemperature();
+        const bool readOk = (INA.getLastError() == 0);   // a failed transfer returns 0 = 0 C, inside the window below
         if (tC > 256.0f) tC -= 512.0f;   // library reads DIETEMP unsigned; the register is 16-bit two's complement, so the upper half of its 0..511.99°C span is negative
-        inaDieTempF = (tC > -60.0f && tC < 150.0f) ? (tC * 1.8f + 32.0f) : NAN;   // outside the package's own -40..125°C rating = a bad read, not a temperature
+        inaDieTempF = (readOk && tC > -60.0f && tC < 150.0f) ? (tC * 1.8f + 32.0f) : NAN;   // outside the package's own -40..125°C rating = a bad read, not a temperature
       } catch (...) {
         inaDieTempF = NAN;
       }
@@ -4606,6 +4626,10 @@ void _ReadAnalogInputs_inner() {
       // comes back down, so a single garbage sample would pollute the fleet record forever. A value
       // counts only after the warm-up discard AND only if the previous sample sits within
       // INA_DIETEMP_STEP_F of it. Earliest a reading can reach the max is the 4th sample.
+      if (isfinite(inaDieTempF) && inaDieWarmup >= INA_DIETEMP_WARMUP_SAMPLES) {   // the field-drive heat ceiling's input: out of range ages it like a missing read
+        g_fdDieTempF = inaDieTempF;
+        MARK_FRESH(IDX_INA_DIE_TEMP);
+      }
       if (!isfinite(inaDieTempF)) {
         inaDiePrevF = NAN;               // bad read re-arms corroboration; the next sample cannot feed the max either
       } else {
@@ -4910,7 +4934,7 @@ void _ReadAnalogInputs_inner() {
                                rpmLastAccepted = rpmCand;
                              }
                            }
-                           if (rpmCand < 100) {
+                           if (rpmCand < 100 || frtTachMasked()) {
                              rpmCand = 0;
                            }
                            if (rpmCand >= 0 && rpmCand < 10000) {  // Sanity check
@@ -5360,6 +5384,11 @@ void ReadAnalogInputs_Fake() {
     if (fakeBattTempC > 30.0f) fakeBattTempC = 30.0f;
     BatteryTempProbeF = fakeBattTempC * 1.8f + 32.0f;
     MARK_FRESH(IDX_BATT_TEMP_PROBE);
+
+    // Drive temperature (INA228 die): without it REASON_DIE_TEMP_LOST stops the field 15 s after boot. Tracks the walk, 30-75 C.
+    inaDieTempF = (30.0f + 0.45f * (fakeTemp - 10.0f)) * 1.8f + 32.0f;
+    g_fdDieTempF = inaDieTempF;
+    MARK_FRESH(IDX_INA_DIE_TEMP);
 
     float tempC = fakeTemp + 10 + random(-20, 20) / 10.0;
     AlternatorTemperatureF = tempC * 9.0 / 5.0 + 32.0;
@@ -6166,6 +6195,10 @@ void saveNVSDataFull() {
   if (prev_perfMotorSeconds != (int32_t)perfMotorSeconds)                   { nvs_set_i32(h, "PerfMotorSec",   (int32_t)perfMotorSeconds);                     prev_perfMotorSeconds = (int32_t)perfMotorSeconds;                   chg = true; }
   if (prev_EngineCycles_AllTime != (int32_t)EngineCycles_AllTime)           { nvs_set_i32(h, "EngCycles_AT",   (int32_t)EngineCycles_AllTime);                 prev_EngineCycles_AllTime = (int32_t)EngineCycles_AllTime;           chg = true; }
   if (prev_AltOnTime_AllTime != (int32_t)AlternatorOnTime_AllTime)          { nvs_set_i32(h, "AltOnTime_AT",   (int32_t)AlternatorOnTime_AllTime);             prev_AltOnTime_AllTime = (int32_t)AlternatorOnTime_AllTime;          chg = true; }
+  if (prev_FieldHeatLimS != g_fieldHeatLimS)                                { nvs_set_u32(h, "FieldHeatLimS",  g_fieldHeatLimS);                               prev_FieldHeatLimS = g_fieldHeatLimS;                                chg = true; }
+  if (prev_FieldCurLimS != g_fieldCurLimS)                                  { nvs_set_u32(h, "FieldCurLimS",   g_fieldCurLimS);                                prev_FieldCurLimS = g_fieldCurLimS;                                  chg = true; }
+  if (prev_FieldHeatLimSes != g_fieldHeatLimSesS)                           { nvs_set_u32(h, "FieldHeatLimSes", g_fieldHeatLimSesS);                           prev_FieldHeatLimSes = g_fieldHeatLimSesS;                           chg = true; }
+  if (prev_FieldCurLimSes != g_fieldCurLimSesS)                             { nvs_set_u32(h, "FieldCurLimSes", g_fieldCurLimSesS);                             prev_FieldCurLimSes = g_fieldCurLimSesS;                             chg = true; }
   if (prev_ChargeCycles != (int32_t)ChargeCycles)                           { nvs_set_i32(h, "ChrgCycles",     (int32_t)ChargeCycles);                         prev_ChargeCycles = (int32_t)ChargeCycles;                           chg = true; }
   if (prev_ChargeCycles_AllTime != (int32_t)ChargeCycles_AllTime)           { nvs_set_i32(h, "ChrgCyc_AT",     (int32_t)ChargeCycles_AllTime);                 prev_ChargeCycles_AllTime = (int32_t)ChargeCycles_AllTime;           chg = true; }
   // App-usage lifetime totals (UsgTime_AT is seconds of visible app time). UsageOpenTime_AllTime is a
@@ -6517,6 +6550,10 @@ void loadNVSData() {
   if (nvs_get_i32(nvs_handle, "PerfMotorSec", &temp_int32) == ESP_OK) perfMotorSeconds = temp_int32;
   if (nvs_get_i32(nvs_handle, "EngCycles_AT", &temp_int32) == ESP_OK) EngineCycles_AllTime = temp_int32;
   if (nvs_get_i32(nvs_handle, "AltOnTime_AT", &temp_int32) == ESP_OK) AlternatorOnTime_AllTime = temp_int32;
+  if (nvs_get_u32(nvs_handle, "FieldHeatLimS", &temp_uint32) == ESP_OK) g_fieldHeatLimS = temp_uint32;
+  if (nvs_get_u32(nvs_handle, "FieldCurLimS", &temp_uint32) == ESP_OK) g_fieldCurLimS = temp_uint32;
+  if (nvs_get_u32(nvs_handle, "FieldHeatLimSes", &temp_uint32) == ESP_OK) g_fieldHeatLimSesS = temp_uint32;
+  if (nvs_get_u32(nvs_handle, "FieldCurLimSes", &temp_uint32) == ESP_OK) g_fieldCurLimSesS = temp_uint32;
 
   if (nvs_get_i32(nvs_handle, "ChrgCycles", &temp_int32) == ESP_OK) ChargeCycles = temp_int32;
 
@@ -6766,6 +6803,10 @@ void initNVSCache() {
   prev_perfMotorSeconds = (int32_t)perfMotorSeconds;
   prev_EngineCycles_AllTime = (int32_t)EngineCycles_AllTime;
   prev_AltOnTime_AllTime = (int32_t)AlternatorOnTime_AllTime;
+  prev_FieldHeatLimS = g_fieldHeatLimS;
+  prev_FieldCurLimS = g_fieldCurLimS;
+  prev_FieldHeatLimSes = g_fieldHeatLimSesS;
+  prev_FieldCurLimSes = g_fieldCurLimSesS;
   prev_ChargeCycles_AllTime = (int32_t)ChargeCycles_AllTime;
   prev_UsageOpenTime_AllTime = (int32_t)UsageOpenTime_AllTime;
   prev_UsageOpens_AllTime = (int32_t)UsageOpens_AllTime;

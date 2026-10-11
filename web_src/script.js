@@ -1042,7 +1042,7 @@ const CSV2_FIELDS = [
     "n183ChecksumErrs",        // NMEA 0183 sentences that failed checksum
     "ft_ReadNMEA0183_win",     // NMEA 0183 drain worst µs (window)
     "ft_ReadNMEA0183_ses",     // NMEA 0183 drain worst µs (session)
-    "fieldDutyCeil",           // enforced field-duty ceiling x100: lower of Max Field % and the Max Field Volts term
+    "fieldDutyCeil",           // enforced field-duty ceiling x100: lowest of Max Field %, the Max Field Volts term, the 10 A field-current ceiling and the field-drive heat ceiling (fieldCeilBind names it)
     "dvccAuthMfg",             // NAME manufacturer code of the node publishing the charge limits (358 = Victron; 0 = never heard)
     "dvccAuthProd",            // its product code (126996), else its Victron VREG product id, else 0
     "ovTierLowCount",          // timed OV cut, LOW tier — session rising-edge counter
@@ -1074,12 +1074,21 @@ const CSV2_FIELDS = [
     "voltStaleCount",          // session count of VOLTAGE_STALE field events (main battery voltage, INA228)
     "volt2StaleCount",         // session count of VOLTAGE2_STALE field events (second battery voltage, ADS1115)
     "battTempLostCount",       // session count of BATT_TEMP_LOST field events
-    "sensorFaultMask",         // bit0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228 — real status, overrides or not
+    "sensorFaultMask",         // bit0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228, 9 regulator drive temperature (INA228 die) — real status, overrides or not
     "battTempState",           // 0 not expected (Not fitted), 1 reading, 2 lost (charging stopped), 3 waiting for the first reading (field held off)
     "limpTier",                // 0 normal, 1 closed-loop minus dependent reasons, 2 voltage-only, 3 fixed duty + second-voltage cap, 4 fixed duty
     "sensorSteadyMask",        // same bits as sensorFaultMask, set once that fault has been clear for 10 min (the "reading again" prompt)
     "reqFaultCount",           // §11: required sensors faulted right now (chip loss counts its readings; owner overrides and Not fitted excluded); 2+ = charging stopped
     "battCurState",            // §11.6 battery current (declared shunt / VE.Direct): 0 not declared, 1 reading, 2 lost (alarm + header line; charging continues on voltage)
+    "fieldCurDutyCeil",        // the board's 10 A field-current ceiling as duty x100 (solved on the temperature-corrected resistance)
+    "fieldHeatDutyCeil",       // field-drive heat ceiling as duty x100 (99 = not limiting)
+    "fieldCeilBind",           // which term sets the enforced field ceiling: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the field connector, 4 heat at the D5 spreader
+    "fieldRcOhm",              // field resistance the 10 A ceiling uses, corrected for alternator temperature (ohm x100)
+    "fieldHeatLimS",           // lifetime seconds held at the heat ceiling (raw seconds)
+    "fieldCurLimS",            // lifetime seconds held at the 10 A ceiling (raw seconds)
+    "fieldHeatLimSesS",        // session seconds held at the heat ceiling (raw seconds; Reset on Live Data)
+    "fieldCurLimSesS",         // session seconds held at the 10 A ceiling (raw seconds; Reset on Live Data)
+    "dieTempLostCount",        // session count of DIE_TEMP_LOST field events (INA228 die temperature)
     "sessionId",               // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
@@ -1140,7 +1149,7 @@ const CSV4_FIELDS = [
     "VictronCurrent",             // Victron battery current (A ×100)
     "currentFuelGPH",             // live fuel flow (gal/hr ×100)
     "currentNMPG",                // live fuel economy (naut mi/gal ×100)
-    "ctrlLimiter",                // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target (zero-output stand-down), 8 external charge-current limit (DVCC CCL), 9 external charge-voltage limit (DVCC CVL), 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide
+    "ctrlLimiter",                // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target (zero-output stand-down), 8 external charge-current limit (DVCC CCL), 9 external charge-voltage limit (DVCC CVL), 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide, 15 field at the board's 10 A field-current ceiling, 16 field-drive heat limit
     "chargeStage",                // CHARGE_STAGE_* code — feeds gLastChargeStage at 2 Hz for the mode ribbon
     "n183Heading",                // NMEA 0183 decoded heading (deg ×10; negative = nothing decoded). Distinct from HeadingNMEA, which is the NMEA2000 source.
     "n183HdgRef",                 // reference frame of the above: 0 none, 1 magnetic, 2 true
@@ -1841,13 +1850,21 @@ function altCaptureRender() {
     altSweepSyncCeiling();
 }
 
-// Both sweep bounds are capped at the live Max Field %, which is the firmware's only ceiling too, and
-// "up to" starts there — so the box shows the real number instead of a note explaining what empty
-// means. Only ever fills an EMPTY box: a value the user typed is theirs.
-function altSweepSyncCeiling() {
+// Both sweep bounds are capped at the field ceiling the firmware is enforcing right now (CSV2 fieldDutyCeil: the
+// lowest of Max Field %, the Max Field Volts term and the board's 10 A and drive-heat ceilings), which holds the
+// sweep too, and "up to" starts there — so the box shows the real number instead of a note explaining what empty
+// means. Max Field % stands in until a CSV2 frame carries the ceiling. Only ever fills an EMPTY box: a value the
+// user typed is theirs.
+function altSweepCeiling() {
+    const c = (typeof g_lastCsv2 === 'object' && g_lastCsv2) ? Number(g_lastCsv2.fieldDutyCeil) / 100 : NaN;
+    if (c > 0) return Math.max(1, Math.floor(c));
     const md = parseFloat(getField('MaxDuty_echo'));
-    if (!(md > 0)) return;                      // no live value yet — leave the markup defaults alone
-    const cap = String(Math.round(md));
+    return (md > 0) ? Math.round(md) : NaN;
+}
+function altSweepSyncCeiling() {
+    const capN = altSweepCeiling();
+    if (!(capN > 0)) return;                    // no live value yet — leave the markup defaults alone
+    const cap = String(capN);
     ['altsweep-to', 'altsweep-from'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.max = cap;
@@ -1894,7 +1911,7 @@ function altSweepSetParam(id, btn) {
     }
 }
 
-// Restores before the 1 Hz frame can prefill "up to" from Max Field % — that prefill is only ever
+// Restores before the 1 Hz frame can prefill "up to" from the live field ceiling — that prefill is only ever
 // for an empty box, and userSet keeps the class-scaled volt-margin prefill off a chosen value too.
 function altSweepRestoreParams() {
     let store = null;
@@ -1973,10 +1990,10 @@ function altSweepPress() {
     const val = id => { const e = document.getElementById(id); return e ? e.value.trim() : ''; };
     const rate = val('altsweep-rate') || '1.0';
     const from = val('altsweep-from') || '5';
-    // The box is pre-filled with Max Field % and capped there, but a number input still accepts a
-    // typed-over value, so clamp on the way out. 0 is the firmware's "resolve it yourself" fallback
-    // and only reaches it if Max Field % has not arrived from the device yet.
-    const md = parseFloat(getField('MaxDuty_echo'));
+    // The box is pre-filled with the live field ceiling and capped there, but a number input still accepts
+    // a typed-over value, so clamp on the way out. 0 is the firmware's "resolve it yourself" fallback
+    // and only reaches it if neither the ceiling nor Max Field % has arrived from the device yet.
+    const md = altSweepCeiling();
     let to = parseFloat(val('altsweep-to'));
     if (!(to > 0)) to = (md > 0) ? md : 0;
     else if (md > 0 && to > md) to = md;
@@ -2333,16 +2350,25 @@ let _cfgDiffResolve=null,_cfgDiffIncoming=null;
 const _CFG_TABLE_LABELS={rpmPoints:'RPM Breakpoints',capTable:'Current Cap Table — Normal (A)',
   capPowerTable:'Power Cap Table — Normal (W)',capTableLo:'Current Cap Table — Low (A)',
   capPowerTableLo:'Power Cap Table — Low (W)',minDutyTable:'Tachometer Keep-Alive Floors (%)'};
+// Field Resistance and the alternator temperature recorded with it are one measurement: the firmware import takes
+// both or neither, so their rows tick together, and a file carrying only one of them cannot apply it.
+const _CFG_PAIR={FieldResistance:'FieldResTrefC',FieldResTrefC:'FieldResistance'};
+const _CFG_KEY_LABELS={FieldResTrefC:'Alternator temperature recorded with Field Resistance (°C)',ShuntLead:'Shunt location (1 negative lead, 2 positive lead)'};
+function cfgDiffPairToggle(cb){
+  document.querySelectorAll('#cfgdiff-body .cfgdiff-cb[data-pair]:not(:disabled)').forEach(c=>{ c.checked=cb.checked; });
+}
 function cfgDiffClose(apply){
   const inc=_cfgDiffIncoming;
   if(apply && inc){
-    const cbs=Array.from(document.querySelectorAll('#cfgdiff-body .cfgdiff-cb'));
+    const cbs=Array.from(document.querySelectorAll('#cfgdiff-body .cfgdiff-cb:not(:disabled)'));
     const picked=cbs.filter(c=>c.checked);
-    if(cbs.length && !picked.length){ xAlert('Nothing is checked — check at least one setting, or Cancel.'); return; }
+    if(!picked.length){ xAlert('Nothing is checked — check at least one setting, or Cancel.'); return; }   // also a diff of only rows that cannot apply
     const out={};
     for(const k of Object.keys(inc)) if(k!=='config'&&k!=='tables') out[k]=inc[k];
     out.config={};
     picked.filter(c=>c.dataset.kind==='config').forEach(c=>{ out.config[c.dataset.key]=inc.config[c.dataset.key]; });
+    // A partner that already matches this regulator has no row of its own, but the import still needs both.
+    for(const k of Object.keys(out.config)){ const p=_CFG_PAIR[k]; if(p && !(p in out.config) && (p in inc.config)) out.config[p]=inc.config[p]; }
     const tp=picked.filter(c=>c.dataset.kind==='tables');
     if(tp.length){ out.tables={}; tp.forEach(c=>{ out.tables[c.dataset.key]=inc.tables[c.dataset.key]; }); }
     document.getElementById('cfgdiff-modal-overlay').style.display='none';
@@ -2355,7 +2381,7 @@ function cfgDiffClose(apply){
   if(r) r(null);
 }
 function cfgDiffToggleAll(){
-  const cbs=Array.from(document.querySelectorAll('#cfgdiff-body .cfgdiff-cb'));
+  const cbs=Array.from(document.querySelectorAll('#cfgdiff-body .cfgdiff-cb:not(:disabled)'));
   if(!cbs.length) return;
   const target=!cbs.every(c=>c.checked);
   cbs.forEach(c=>{ c.checked=target; });
@@ -2428,11 +2454,17 @@ async function cfgDiffPreview(blobText, sourceLabel){
     +'<br>Only checked rows are applied.'
     +(vNow?'<br>Source system voltage: <b>'+_cfgEsc(vNow)+' V</b> — confirm this matches your bank.':'')
     +'<br><span style="color:#fca5a5;">Hardware and calibration settings (sensor/shunt/polarity/offsets) WILL be applied — uncheck them unless the hardware is identical.</span>';
-  const row=(kind,k,label,cur,nv)=>'<tr>'
-    +'<td style="padding:3px 6px 3px 0;"><input type="checkbox" class="cfgdiff-cb" data-kind="'+kind+'" data-key="'+_cfgEsc(k)+'" checked style="width:16px; height:16px; margin:0; vertical-align:middle;"></td>'
-    +'<td style="padding:3px 8px 3px 0; color:#9cc; word-break:break-all;">'+_cfgEsc(label)+'</td>'
+  const row=(kind,k,label,cur,nv)=>{
+    const pair=kind==='config'?_CFG_PAIR[k]:null;
+    const solo=!!pair && !(pair in incoming.config);   // the import refuses it alone
+    return '<tr>'
+    +'<td style="padding:3px 6px 3px 0;"><input type="checkbox" class="cfgdiff-cb" data-kind="'+kind+'" data-key="'+_cfgEsc(k)+'"'
+    +(pair?' data-pair="1" onchange="cfgDiffPairToggle(this)"':'')+(solo?' disabled':' checked')+' style="width:16px; height:16px; margin:0; vertical-align:middle;"></td>'
+    +'<td style="padding:3px 8px 3px 0; color:#9cc; word-break:break-all;">'+_cfgEsc(label)
+    +(solo?'<div style="color:#888; word-break:normal;">Not applied: the file has no '+(k==='FieldResistance'?'alternator temperature recorded with it.':'Field Resistance.')+'</div>':'')+'</td>'
     +'<td style="padding:3px 8px; color:#888; word-break:break-all;">'+_cfgEsc(cur)+'</td>'
     +'<td style="padding:3px 0; color:#fff; word-break:break-all;">'+_cfgEsc(nv)+'</td></tr>';
+  };
   // Reference-only rows: no checkbox (a checkbox would promise an apply that cannot happen), dimmed.
   const refRow=r=>'<tr>'
     +'<td></td>'
@@ -2442,8 +2474,8 @@ async function cfgDiffPreview(blobText, sourceLabel){
   let h='';
   if(nChange||nFresh){
     h='<table style="width:100%; border-collapse:collapse; font-size:0.85em;"><tr style="color:#aaa; text-align:left;"><th></th><th style="padding:3px 8px 3px 0;">Setting</th><th style="padding:3px 8px;">Now</th><th style="padding:3px 0;">New</th></tr>'
-      +changed.map(c=>row('config',c.k,c.k,c.cur,c.nv)).join('')
-      +fresh.map(f=>row('config',f.k,f.k,'(not set)',f.nv)).join('')
+      +changed.map(c=>row('config',c.k,_CFG_KEY_LABELS[c.k]||c.k,c.cur,c.nv)).join('')
+      +fresh.map(f=>row('config',f.k,_CFG_KEY_LABELS[f.k]||f.k,'(not set)',f.nv)).join('')
       +tblChanged.map(c=>row('tables',c.k,_CFG_TABLE_LABELS[c.k]||c.k,c.cur,c.nv)).join('')
       +tblFresh.map(f=>row('tables',f.k,_CFG_TABLE_LABELS[f.k]||f.k,'(not set)',f.nv)).join('')+'</table>';
   } else {
@@ -3916,7 +3948,7 @@ const CSV3_FIELDS = [
     "CommissionTempSrc",  // battTempActiveSrc when CommissionTempF was stamped (0 = legacy, 5 = retired board stamp)
     "maxWorkingRpm",
     "RemoteDiagnostics",
-    "ShuntGroundComp",
+    "retired2",
     "BatteryVoltageSource",
     "IgnoreAltCurrent",
     "IgnoreBattVMain",
@@ -3925,6 +3957,9 @@ const CSV3_FIELDS = [
     "NoRpmCurrentA",
     "ShutdownRampTauS",
     "NoOutputAmps",
+    "FieldResTrefC",
+    "FieldWiring",
+    "ShuntLead",
     "sessionId",  // device boot identity, same in every channel this boot
     "sendMs",  // device millis() when this settings echo was built; event-driven with a 60 s fallback
 ];
@@ -3968,6 +4003,7 @@ const TS_FIELDS = [
     "ts_ExtraTemp",
     "ts_VeBattTemp",
     "ts_RvcBattTemp",
+    "ts_DieTemp",     // age of the last valid INA228 die-temperature sample (999999 = never)
     "ts_sessionId",   // device boot identity, same in every channel this boot
     "ts_sendMs",      // device millis() when this payload was built — every other TS field is an age measured at that instant
 ];
@@ -4006,7 +4042,7 @@ function controlUid() {
 // /armSettings handed this client, so buildURL puts it on these and syncWriteUidInputs on the forms.
 const ARM_GATED_PATHS = ['/get', '/armSettings', '/factoryReset', '/huntclear', '/perfUploadFront', '/altUploadFront',
     '/exportConfig', '/importConfig', '/saveVesselInfo', '/checkRegistration', '/cloudOpState', '/registerProfile',
-    '/updateProfile', '/deleteAllData', '/setPassword', '/pair', '/unpair'];
+    '/updateProfile', '/deleteAllData', '/setPassword', '/pair', '/unpair', '/fieldResTest'];
 function isArmGatedPath(path) {
     return ARM_GATED_PATHS.indexOf(path.split('?')[0]) !== -1;
 }
@@ -6267,6 +6303,12 @@ function sendFakeCSVData() {
             EngineRunTime: 19800,
             temperatureThermistor: 92,   // board temp, raw °F
             MaxTemperatureThermistor: 118,
+            // Board field ceilings at rest (0 would read "0.0% now"): neither binds, Max Field % sets the 99% ceiling.
+            fieldDutyCeil: 9900,
+            fieldCurDutyCeil: 9900,
+            fieldHeatDutyCeil: 9900,
+            fieldCeilBind: 0,
+            fieldRcOhm: 242,             // ohm x100: a 2.00 ohm coil at the ~168 °F alternator temperature above
         };
         const v2 = CSV2_FIELDS.map(k => csv2[k] !== undefined ? csv2[k] : 0);
         csv2Handler({ data: v2.length + ',' + v2.join(',') });
@@ -7847,7 +7889,8 @@ function processCSVDataOptimized(data) {
         const battCurrent = Number.isFinite(battCurrentRaw) ? battCurrentRaw : null;
         const altCurrent = 'MeasuredAmps' in data ? parseFloat(data.MeasuredAmps) / 100 : 0;
         const altCurrentFilt = 'pidAltPV' in data ? parseFloat(data.pidAltPV) / 100 : 0;
-        const fieldCurrent = 'iiout' in data ? parseFloat(data.iiout) / 100 : 0;
+        const fieldCurrentRaw = 'iiout' in data ? parseFloat(data.iiout) / 100 : 0;
+        const fieldCurrent = Number.isFinite(fieldCurrentRaw) ? fieldCurrentRaw : null;   // NaN until a Field Resistance is entered: a gap, like battCurrent
         const fieldPct = 'dutyCycle' in data ? parseFloat(data.dutyCycle) / 100 : 0;
         // Latch the real telemetry the alt-health session plot wants to show per dot — these live in
         // CSV1, not in altLive, so the session push (on the alt channel) can't read them directly.
@@ -8729,9 +8772,12 @@ function updateAllEchosOptimized(data) {
         { key: 'MaxFieldVolts', id: 'MaxFieldVolts_echo', transform: v => (v / 10).toFixed(1) },
         { key: 'MinDuty', id: 'MinDuty_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'MinDuty', id: 'MinDuty_echo_gate', transform: v => (v / 100).toFixed(2) },
-        { key: 'FieldResistance', id: 'FieldResistance_echo', transform: v => (v / 100).toFixed(2) },
+        { key: 'FieldResistance', id: 'FieldResistance_echo', nan: 'not entered', transform: v => (v / 100).toFixed(2) },
         { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps',  transform: v => (v / 100).toFixed(2) },
         { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps2', transform: v => (v / 100).toFixed(2) },
+        { key: 'FieldResTrefC', id: 'FieldResTrefC_echo', nan: 'not recorded',
+          transform: v => 'recorded at ' + Math.round(toDisplayTempFromC(v / 10)) + ' ' + tempUnitLabel() },
+        { key: 'FieldWiring', id: 'FieldWiring_echo', transform: v => v == 1 ? 'P-type' : v == 2 ? 'N-type' : 'Not set' },
         { key: 'maxPoints', id: 'maxPoints_echo', transform: v => v },
         { key: 'AlternatorCOffset', id: 'AlternatorCOffset_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'BatteryCOffset', id: 'BatteryCOffset_echo', transform: v => (v / 100).toFixed(2) },
@@ -8740,6 +8786,7 @@ function updateAllEchosOptimized(data) {
         { key: 'Beta', id: 'Beta_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'T0_C', id: 'T0_C_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'TempSource', id: 'TempSource_echo', transform: v => v == 0 ? 'Digital' : 'Thermistor' },
+        { key: 'IgnitionOverride', id: 'IgnitionOverride_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'AmpSensorRange', id: 'AmpSensorRange_echo', transform: v => (['±200A', '±300A', '±500A'][v] ?? v) },
         { key: 'AlarmLatchEnabled', id: 'AlarmLatchEnabled_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'AlarmTest', id: 'AlarmTest_echo', transform: v => v == 1 ? 'Active' : '---' },
@@ -8750,7 +8797,7 @@ function updateAllEchosOptimized(data) {
         { key: 'absorptionCompleteTime', id: 'absorptionCompleteTime_echo', transform: v => Math.round(v / 1000) },
         { key: 'FLOAT_DURATION', id: 'FLOAT_DURATION_echo', transform: v => (v / 3600).toFixed(2) },
         { key: 'AutoShuntGainCorrection', id: 'AutoShuntGainCorrection_echo', transform: v => v == 1 ? 'On' : 'Off' },
-        { key: 'ShuntGroundComp', id: 'ShuntGroundComp_echo', transform: v => v == 1 ? 'On' : 'Off' },
+        { key: 'ShuntLead', id: 'ShuntLead_echo', transform: v => v == 1 ? 'Negative lead' : v == 2 ? 'Positive lead' : 'Not set' },
         { key: 'AutoAltCurrentZero', id: 'AutoAltCurrentZero_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'WindingTempOffset', id: 'WindingTempOffset_echo', transform: v => Math.round(toDisplayTempDelta(v)) },
         { key: 'PulleyRatio', id: 'PulleyRatio_echo', transform: v => (v / 100).toFixed(2) },
@@ -9019,9 +9066,10 @@ function updateAllEchosOptimized(data) {
     echoUpdates.forEach(update => {
         if (update.key in data) {
             // Most transforms end in .toFixed(), and NaN.toFixed() is the string "NaN". Print the
-            // em dash instead, so a sentinel echo reads like every other absent value on the page.
+            // em dash instead, so a sentinel echo reads like every other absent value on the page,
+            // unless the entry names its own absent text (nan:).
             const raw = data[update.key];
-            const newValue = (typeof raw === 'number' && !Number.isFinite(raw)) ? '—' : update.transform(raw);
+            const newValue = (typeof raw === 'number' && !Number.isFinite(raw)) ? (update.nan || '—') : update.transform(raw);
             if (updateEchoIfChanged(update.id, newValue)) {
                 updatesCount++;
             }
@@ -9058,6 +9106,8 @@ function updateAllEchosOptimized(data) {
         { key: 'battTempSource',        name: 'battTempSource' },
         { key: 'n2kChgrMode',           name: 'n2kChgrMode' },
         { key: 'dvccSrcType',           name: 'dvccSrcType' },
+        { key: 'FieldWiring',           name: 'FieldWiring' },
+        { key: 'ShuntLead',             name: 'ShuntLead' },
     ]);
     selectSyncs.forEach(({ key, name }) => {
         if (key in data) {
@@ -9773,7 +9823,7 @@ async function handleVesselInfoSave(event) {
                 // First install: describe the hardware BEFORE anything is recommended from it — Before You
                 // Start, then Commissioning Prerequisites (sensor roles, shunt). The battery-defaults proposal
                 // below reads battTempProbeEnable from its own /exportConfig, so it sees the Prerequisites
-                // writes (one awaited /get in commPrepFinish) with no extra plumbing. The screen's handoff to
+                // writes (awaited in commPrepFinish) with no extra plumbing. The screen's handoff to
                 // Charge Rate Limits is deferred to the tail of this chain. Guarded so a failure here never
                 // blocks the save result.
                 .then(() => { if (result.firstSave === true) return maybeShowCommPrereqs().then(go => { _goWizard = go === true; }).catch(() => { }); })
@@ -10417,8 +10467,8 @@ function vesselNextStepWait(on, copy) {
 // On a first Vessel Info save it runs FIRST, ahead of the battery-defaults popup, so the proposal is
 // derived from the hardware described here; the Charge Rate Limits handoff is then made by the save
 // chain rather than by this screen (_commPrepDeferHandoff). Presents the sensor/current settings
-// commissioning depends on, pre-filled from /exportConfig. Only user-edited fields are written, in one
-// /get (battdef pattern).
+// commissioning depends on, pre-filled from /exportConfig. Only user-edited fields are written, awaited
+// /get writes on Next (battdef pattern; see commPrepFinish for the write order).
 // Temperature inputs follow the app's display unit; every param is submitted in its native unit.
 let _commPrereqResolve = null;   // awaited by the vessel-save chain; resolved when the modal closes
 let _commPrepCfg = null;         // /exportConfig snapshot captured at open, for changed-detection
@@ -10427,11 +10477,13 @@ let _commPrepTsInit = 0;         // TempSource at open (0 = DS18B20, 1 = Thermis
 let _commPrepTempSrc = 0;        // live TempSource selection
 let _commPrepShuntInit = 1;      // BatteryShuntPresent at open (1 = INA228 fitted, 0 = none)
 let _commPrepShuntPresent = 1;   // live shunt-present selection
-let _commPrepGndCompInit = 0;    // ShuntGroundComp at open (1 = correct battery volts for the shunt drop)
-let _commPrepGndComp = 0;        // live shunt-ground-compensation selection
+let _commPrepShuntLeadInit = 0;  // ShuntLead at open (0 not set, 1 negative lead, 2 positive lead)
+let _commPrepShuntLead = 0;      // live shunt-location selection
 let _commPrepVSrcInit = 0;       // BatteryVoltageSource at open (0 = onboard, 1 = NMEA 2000, 3 = Victron)
 let _commPrepVSrc = 0;           // live charge-decision voltage source selection
 let _commPrepFloatInit = '';     // UseFloat at open (Other-only charge block); written only if the select changed
+let _commPrepWiringInit = 0;     // FieldWiring at open (0 not set, 1 P-type, 2 N-type)
+let _commPrepWiring = 0;         // live field-wiring selection
 let _commPrepRpmActive = false;  // deep-linked into the RPM editor from the wizard: suppress the live blue row highlight
 let _commPrepFirstInstall = true; // false on a re-commission: different intro copy
 // Whether Next hands off to the tach-alignment screen. Split from _commPrepFirstInstall because the two
@@ -10458,6 +10510,7 @@ function commPrepPaintCta() {
         start.disabled = false;   // a re-render clears the probe-assignment gate; commPrepOwGate re-applies it if still needed
         start.title = '';
     }
+    commPrepFieldGateApply();
 }
 
 // ----- Temperature probes on the prerequisites screen -----
@@ -10568,6 +10621,7 @@ function commPrepOwRender(j) {
     }
     commPrepOwGate(j);
     commPrepBattTempGate(j);
+    commPrepFieldGateRefresh();
 }
 // Blocking gate. Only the alternator blocks: commissioning drives the alternator hard and the
 // over-temperature protection has nothing to act on without it. A missing battery or other sensor is a
@@ -10667,6 +10721,8 @@ async function commPrepOwScan() {
     }
 }
 function commPrepFetchCfg() {
+    // The in-app demo has no device to read; the screen now fails closed on a failed read, so give it a recorded install.
+    if (DEMO_MODE) return Promise.resolve({ config: { TempSource: '0', BatteryShuntPresent: '1', ShuntLead: '1', FieldResistance: '2.000', FieldResTrefC: '22.0', FieldWiring: '1' }, tables: {} });
     return fetchWithTimeout(buildURL('/exportConfig'), {}, 10000)
         .then(r => r.ok ? r.json() : null)
         .catch(e => { diagLog('commissioning prerequisites config fetch failed:', e); return null; });
@@ -10708,28 +10764,51 @@ async function openCommPrereqs(firstInstall, deferHandoff, showAlign) {
         vesselNextStepWait(true);
         const [j] = await Promise.all([cfgP, armP]);
         vesselNextStepWait(false);
-        if (!j) {
-            // First install the save chain simply carries on. A re-commission was a deliberate button
-            // press, so dead-ending here reads as a broken control — say so and run the rest of the flow.
-            if (firstInstall) { _battDefSkipNote('Could not read the current device settings, so the commissioning prerequisites screen was skipped. Those settings are all available under Setup.'); return false; }
-            await xAlert('Could not read the current device settings, so the prerequisites screen was skipped. Check them under Setup if anything has changed since the last run.');
-            openRpmCap(openCommissionModal, null);
-            return false;
-        }
-        // Same response also carries the RPM cap tables the NEXT screen needs, so hand them over
-        // rather than making openRpmCap re-fetch. The cap tables live in the "learning" namespace and
-        // nothing this screen writes can touch them, so the snapshot cannot go stale in between.
-        _rpmCapTablesPre = j.tables || null;
-        _commPrepCfg = j.config || {};
-        commPrepRender(_commPrepCfg);
+        // A failed read used to skip the screen, and with it the field-resistance gate, on the way to the
+        // wizard. It now fails closed: the screen opens with a Retry, and ✕ / "I'll do this later" still leave.
+        if (j) commPrepShowCfg(j);
+        else commPrepShowCfgError();
         document.getElementById('commprep-modal-overlay').style.display = 'flex';
-        commPrepOwPollStart();          // installed once; renders the probe block and re-checks the Next gate every 5 s
-        commPrepOwPollNow();
         return await new Promise(res => { _commPrereqResolve = res; });   // true only from Next
     } catch (e) {
         diagLog('commissioning prerequisites failed:', e);
         return false;
     }
+}
+function commPrepShowCfg(j) {
+    // Same response also carries the RPM cap tables the NEXT screen needs, so hand them over
+    // rather than making openRpmCap re-fetch. The cap tables live in the "learning" namespace and
+    // nothing this screen writes can touch them, so the snapshot cannot go stale in between.
+    _rpmCapTablesPre = j.tables || null;
+    _commPrepCfg = j.config || {};
+    commPrepRender(_commPrepCfg);
+    commPrepOwPollStart();          // installed once; renders the probe block and re-checks the Next gate every 5 s
+    commPrepOwPollNow();
+}
+// No commprep-ow block in this body, so the probe poll never runs a gate that could re-enable the hidden Next.
+function commPrepShowCfgError() {
+    _commPrepCfg = null;            // commPrepFinish writes nothing without a snapshot
+    _rpmCapTablesPre = null;
+    const body = document.getElementById('commprep-body');
+    if (body) body.innerHTML = '<p style="font-size:13px; line-height:1.5; color:#e6a23c; margin:0 0 12px;">Could not read the current device settings, so the prerequisites cannot be checked. Check the connection, then retry.</p>'
+        + '<button type="button" id="commprep-retry-btn" onclick="commPrepRetryCfg()" class="btn-secondary" style="border-radius:5px; padding:6px 14px; cursor:pointer; font-size:0.85em;">Retry</button>'
+        + '<div id="commprep-retry-status" style="min-height:1.4em; margin-top:6px; font-size:12px; line-height:1.4; color:#888;"></div>';
+    const start = document.getElementById('commprep-start-btn');
+    if (start) { start.disabled = true; start.style.display = 'none'; }   // commPrepPaintCta's cssText brings it back
+    const why = document.getElementById('commprep-start-why');
+    if (why) why.style.display = 'none';
+}
+async function commPrepRetryCfg() {
+    const btn = document.getElementById('commprep-retry-btn');
+    if (!btn || btn.disabled) return;
+    const st = document.getElementById('commprep-retry-status');
+    btn.disabled = true;
+    if (st) st.textContent = 'Reading the device settings';
+    const [j] = await Promise.all([commPrepFetchCfg(), settingsUnlocked ? null : syncArmState()]);
+    if (document.getElementById('commprep-modal-overlay').style.display === 'none' || !document.getElementById('commprep-retry-btn')) return;   // closed or re-rendered meanwhile
+    if (j) { commPrepShowCfg(j); return; }
+    btn.disabled = false;
+    if (st) st.textContent = 'Still could not read them.';
 }
 
 // First install — the vessel-save chain awaits this one and makes the Charge Rate Limits handoff itself
@@ -10810,12 +10889,18 @@ function commPrepRender(cfg) {
     const shuntPresent = (numF('BatteryShuntPresent') === 0) ? 0 : 1;   // default fitted
     _commPrepShuntInit = shuntPresent; _commPrepShuntPresent = shuntPresent;
 
-    const gndComp = (numF('ShuntGroundComp') === 1) ? 1 : 0;
-    _commPrepGndCompInit = gndComp; _commPrepGndComp = gndComp;
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    const leadRaw = isFinite(numF('ShuntLead')) ? numF('ShuntLead') : (c3 ? Number(c3.ShuntLead) : 0);
+    const shuntLead = (leadRaw === 1 || leadRaw === 2) ? leadRaw : 0;
+    _commPrepShuntLeadInit = shuntLead; _commPrepShuntLead = shuntLead;
 
     const vsrcRaw = numF('BatteryVoltageSource');
     const vsrc = (vsrcRaw === 1 || vsrcRaw === 3) ? vsrcRaw : 0;
     _commPrepVSrcInit = vsrc; _commPrepVSrc = vsrc;
+
+    const wRaw = isFinite(numF('FieldWiring')) ? numF('FieldWiring') : (c3 ? Number(c3.FieldWiring) : 0);
+    const wiring = (wRaw === 1 || wRaw === 2) ? wRaw : 0;
+    _commPrepWiringInit = wiring; _commPrepWiring = wiring;
 
     // The charge block (Bulk/Absorption/Float/current/protection) appears ONLY for Other — every other
     // chemistry got these proposed by the battery-defaults populator, which bails for Other and leaves
@@ -10869,14 +10954,16 @@ function commPrepRender(cfg) {
         '<button type="button" id="commprep-sh-1" class="cap-mode-btn' + (shuntPresent === 1 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntPresent(1)">Installed</button>' +
         '<button type="button" id="commprep-sh-0" class="cap-mode-btn' + (shuntPresent === 0 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntPresent(0)">None</button>' +
         '</div>' +
-        '<div style="font-size:11px; color:#888; margin-top:5px; line-height:1.4;">Set this before commissioning. Without a shunt: state of charge, the battery-current limit, and zero-current float turn off, and absorption can no longer end on tapering current — it runs until its time limit instead, then float (if enabled) holds the float voltage. The alternator-current limit protects the battery (as best it can — it\'s unaware of other charging sources). This mode is NOT RECOMMENDED and for skilled use only.</div>' +
+        '<div style="font-size:11px; color:#888; margin-top:5px; line-height:1.4;">Set this before commissioning. Without a shunt: state of charge, the battery-current limit, and zero-current float turn off, and absorption can no longer end on tapering current — it runs until its time limit instead, then float (if enabled) holds the float voltage. The alternator-current limit protects the battery (as best it can — it\'s unaware of other charging sources). This mode is NOT RECOMMENDED and for skilled use only.' +
+        '<span id="commprep-sh-netnote" style="display:' + (shuntPresent === 0 ? '' : 'none') + ';"> If your shunt is in the battery negative lead and its current reaches the regulator only over NMEA 2000 or VE.Direct, the regulator\'s own battery voltage reading runs high while charging, by charging current × shunt resistance (10 mV per 100 A on a 500 A / 50 mV shunt). Wiring Cable 2 pins 9 and 10 to the shunt removes it.</span></div>' +
         '</div>';
 
-    const gndCompSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Shunt resistance compensation</label>' +
+    const shuntLeadSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Shunt location</label>' +
         '<div class="cap-mode-toggle" style="background:rgba(255,255,255,0.07); border-color:#444;">' +
-        '<button type="button" id="commprep-gc-1" class="cap-mode-btn' + (gndComp === 1 ? ' cap-mode-active' : '') + '" onclick="commPrepGndComp(1)">On</button>' +
-        '<button type="button" id="commprep-gc-0" class="cap-mode-btn' + (gndComp === 0 ? ' cap-mode-active' : '') + '" onclick="commPrepGndComp(0)">Off</button>' +
-        '</div><div style="' + capCss + '">Turn on only if the Regulator Ground Wire lands on the load side of a shunt in the battery negative lead.</div></div>';
+        '<button type="button" id="commprep-sl-1" class="cap-mode-btn' + (shuntLead === 1 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntLead(1)">Negative lead</button>' +
+        '<button type="button" id="commprep-sl-2" class="cap-mode-btn' + (shuntLead === 2 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntLead(2)">Positive lead</button>' +
+        '</div><div style="' + capCss + '">Negative lead: the Regulator Ground Wire lands on the shunt\'s load side. Positive lead: the Regulator Power Wire does.' +
+        ' <a id="commprep-sl-doc" href="' + commPrepWiringDocUrl(wiring) + '" target="_blank" rel="noopener" style="color:#2ec4b6; text-decoration:none; white-space:nowrap;">Where each wire lands ›</a></div></div>';
 
     const vSrcBtn = (val, label) => '<button type="button" id="commprep-vs-' + val + '" class="cap-mode-btn' + (vsrc === val ? ' cap-mode-active' : '') + '" onclick="commPrepVoltSrc(' + val + ')">' + label + '</button>';
     const vSrcSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery voltage for charge decisions</label>' +
@@ -10898,6 +10985,12 @@ function commPrepRender(cfg) {
         '</div>';
 
     const hr = '<hr style="border:none; border-top:1px solid #333; margin:2px 0 14px;">';
+
+    const wiringSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Field wiring</label>' +
+        '<div class="cap-mode-toggle" style="background:rgba(255,255,255,0.07); border-color:#444;">' +
+        '<button type="button" id="commprep-fw-1" class="cap-mode-btn' + (wiring === 1 ? ' cap-mode-active' : '') + '" onclick="commPrepWiring(1)">P-type</button>' +
+        '<button type="button" id="commprep-fw-2" class="cap-mode-btn' + (wiring === 2 ? ' cap-mode-active' : '') + '" onclick="commPrepWiring(2)">N-type</button>' +
+        '</div><div style="' + capCss + '">The 1-3 jumper is P-type, the 2-4 jumper is N-type. The drive-heat limit checks the part that wiring heats.</div></div>';
 
     // Shell only — commPrepOwRender fills the rows, the warnings and the Next gate from /tempSensors while
     // the screen is open, and hides the whole block on a thermistor install with a bare 1-Wire bus. Assigning
@@ -10946,7 +11039,7 @@ function commPrepRender(cfg) {
     const shRow = (a, u, m, hl) => '<tr style="text-align:right;' + (hl ? ' font-weight:700; color:#fff;' : '') + '"><td style="text-align:left;">' + a + ' A' + (hl ? ' — BMV-712' : '') + '</td><td>' + u + '</td><td>' + m + '</td></tr>';
     const shGrp = (t, rows) => '<tr><td colspan="3" style="text-align:left; padding-top:5px; color:#7fb0c0; text-transform:uppercase; letter-spacing:0.04em; font-size:10px;">' + t + '</td></tr>' + rows.map(r => shRow(r[0], r[1], r[2], r[3])).join('');
     const shuntHelp =
-        '<details style="margin:-4px 0 0; font-size:11px;">' +
+        '<details style="margin:-4px 0 14px; font-size:11px;">' +
         '<summary style="cursor:pointer; color:#7fb0c0;">Common shunt values</summary>' +
         '<div style="margin-top:6px; color:#999; line-height:1.4;">Shunts are rated by a full-scale millivolt drop at a rated current; µΩ = mV ÷ amps × 1000. Victron is the 50 mV family.</div>' +
         '<table style="width:100%; margin-top:6px; border-collapse:collapse; font-size:11px; color:#ccc; text-align:right;">' +
@@ -10960,10 +11053,11 @@ function commPrepRender(cfg) {
         intro + owBlock +
         grpHdr('Alternator') + seg + thermistor +
         fieldCap('Alternator Temperature Limit (' + tempLbl + ')', 'commprep-templimit', fToDisp(numF('TemperatureLimitF')), '1', '0', '350',
-                 'A case temperature, not a winding temperature — the case runs 40–50 °F cooler than the windings inside.') + hr +
+                 'A case temperature, not a winding temperature — the case runs 40–50 °F cooler than the windings inside.') +
+        wiringSeg + hr +
         grpHdr('Battery') + shuntSeg +
         '<div id="commprep-shunt-row" style="display:' + (shuntPresent === 1 ? '' : 'none') + ';">' +
-        field('Shunt Resistance (µΩ)', 'commprep-shunt', raw('ShuntResistanceMicroOhm'), '1', '1', '5000') + shuntHelp + gndCompSeg +
+        field('Shunt Resistance (µΩ)', 'commprep-shunt', raw('ShuntResistanceMicroOhm'), '1', '1', '5000') + shuntHelp + shuntLeadSeg +
         '</div>' + vSrcSeg + battTempSeg + hr +
         otherBlock;
     commPrepPaintCta();
@@ -11018,13 +11112,23 @@ function commPrepShuntPresent(v) {
     if (b0) b0.classList.toggle('cap-mode-active', v === 0);
     const row = document.getElementById('commprep-shunt-row');
     if (row) row.style.display = (v === 1) ? '' : 'none';
+    const note = document.getElementById('commprep-sh-netnote');
+    if (note) note.style.display = (v === 0) ? '' : 'none';
+    commPrepFieldGateRefresh();
 }
 
-function commPrepGndComp(v) {
-    _commPrepGndComp = v;
-    const b1 = document.getElementById('commprep-gc-1'), b0 = document.getElementById('commprep-gc-0');
-    if (b1) b1.classList.toggle('cap-mode-active', v === 1);
-    if (b0) b0.classList.toggle('cap-mode-active', v === 0);
+function commPrepShuntLead(v) {
+    _commPrepShuntLead = v;
+    [1, 2].forEach(k => {
+        const b = document.getElementById('commprep-sl-' + k);
+        if (b) b.classList.toggle('cap-mode-active', k === v);
+    });
+    commPrepFieldGateRefresh();
+}
+
+// Both wiring pages carry the same landing section; follow the field-wiring choice when there is one.
+function commPrepWiringDocUrl(wiring) {
+    return 'https://docs.xengineering.net/basic-use/wiring/' + (wiring === 2 ? 'n-type' : 'p-type') + '/#battery-wire-landing';
 }
 
 function commPrepVoltSrc(v) {
@@ -11033,6 +11137,50 @@ function commPrepVoltSrc(v) {
         const b = document.getElementById('commprep-vs-' + k);
         if (b) b.classList.toggle('cap-mode-active', k === v);
     });
+}
+
+function commPrepWiring(v) {
+    _commPrepWiring = v;
+    [1, 2].forEach(k => {
+        const b = document.getElementById('commprep-fw-' + k);
+        if (b) b.classList.toggle('cap-mode-active', k === v);
+    });
+    const doc = document.getElementById('commprep-sl-doc');
+    if (doc) doc.href = commPrepWiringDocUrl(v);
+    commPrepFieldGateRefresh();
+}
+
+// Field wiring gate: the drive-heat limit is built on it, so Next waits for a wiring choice; says why on one line
+// under Next. Shunt location rides the same gate: with a shunt installed, the battery-voltage correction and the
+// field resistance test's shunt method depend on it. The resistance itself is the next screen's (fieldResOpen).
+// Unlike the other Next gates it also blocks while settings are locked: Next's writes are dropped then, and the
+// first-install chain can still reach the wizard if settings unlock before its handoff. Locked, only what the
+// device already holds counts.
+function commPrepFieldGateReason() {
+    const w = settingsUnlocked ? _commPrepWiring : _commPrepWiringInit;
+    const haveW = w === 1 || w === 2;
+    const shunt = settingsUnlocked ? _commPrepShuntPresent : _commPrepShuntInit;
+    const lead = settingsUnlocked ? _commPrepShuntLead : _commPrepShuntLeadInit;
+    const haveL = shunt !== 1 || lead === 1 || lead === 2;
+    if (!haveW && !settingsUnlocked) return 'Unlock settings first: the field wiring must be saved before commissioning.';
+    if (!haveL && !settingsUnlocked) return 'Unlock settings first: the shunt location must be saved before commissioning.';
+    if (!haveW) return 'Choose the field wiring first.';
+    if (!haveL) return 'Choose which battery lead the shunt is in.';
+    return '';
+}
+function commPrepFieldGateApply() {
+    const reason = commPrepFieldGateReason();
+    const why = document.getElementById('commprep-start-why');
+    if (why) { if (why.textContent !== reason) why.textContent = reason; why.style.display = reason ? '' : 'none'; }
+    const start = document.getElementById('commprep-start-btn');
+    if (start && reason) { start.disabled = true; start.style.opacity = '0.45'; start.style.cursor = 'default'; start.title = reason; }
+    return reason;
+}
+function commPrepFieldGateRefresh() {
+    const start = document.getElementById('commprep-start-btn');
+    const wasOurs = !!start && start.disabled && /field wiring|shunt (location|is in)/.test(start.title || '');
+    if (!commPrepFieldGateApply() && wasOurs
+        && !document.getElementById('commprep-owgate') && !document.getElementById('commprep-batttemp-gate')) commPrepPaintCta();
 }
 
 // Float Voltage / Float Duration are inert unless Voltage Float (UseFloat=1) is selected — reveal only then.
@@ -11053,6 +11201,7 @@ function commPrepCollectChanges() {
         out.push({ param, value: native ? native(v) : v });
     };
     rec('TemperatureLimitF', 'commprep-templimit', toF);
+    if (_commPrepWiring !== _commPrepWiringInit && (_commPrepWiring === 1 || _commPrepWiring === 2)) out.push({ param: 'FieldWiring', value: _commPrepWiring });
     rec('ShuntResistanceMicroOhm', 'commprep-shunt', null);
     rec('BattCurrentLimitA', 'commprep-battlim', null);
     rec('R_fixed', 'commprep-rfixed', null);
@@ -11074,29 +11223,53 @@ function commPrepCollectChanges() {
     // Write shunt-present before the wizard starts so its side effects (zero-current float demoted, SoC/limit off) settle
     // ahead of commissioning, instead of being toggled mid-run.
     if (_commPrepShuntPresent !== _commPrepShuntInit) out.push({ param: 'BatteryShuntPresent', value: _commPrepShuntPresent });
-    if (_commPrepGndComp !== _commPrepGndCompInit) out.push({ param: 'ShuntGroundComp', value: _commPrepGndComp });
+    if (_commPrepShuntLead !== _commPrepShuntLeadInit && (_commPrepShuntLead === 1 || _commPrepShuntLead === 2)) out.push({ param: 'ShuntLead', value: _commPrepShuntLead });
     if (_commPrepVSrc !== _commPrepVSrcInit) out.push({ param: 'BatteryVoltageSource', value: _commPrepVSrc });
     return out;
 }
 
-// Write any edited fields (one /get) then close. start=true hands off to the commissioning wizard —
-// immediately, or (vessel-save chain) by resolving true so the chain opens Charge Rate Limits later.
+// Write any edited fields (one /get) then close. start=true opens the Field Resistance screen, whose Next
+// (commPrepContinue) hands off to the commissioning wizard — immediately, or (vessel-save chain) by resolving
+// true so the chain opens Charge Rate Limits later.
 async function commPrepFinish(start) {
-    const changes = commPrepCollectChanges();
+    const changes = _commPrepCfg ? commPrepCollectChanges() : [];   // no snapshot: the config read failed and nothing was shown to edit
     _commPrepRpmActive = false;
     document.getElementById('commprep-modal-overlay').style.display = 'none';
     if (start) vesselNextStepWait(true);   // the write below, then openRpmCap (or the chain's battery-defaults read), run against a blank page
-    if (changes.length && settingsUnlocked) {
-        const url = '/get?' + changes.map(c => c.param + '=' + encodeURIComponent(c.value)).join('&');
-        try { await fetchWithTimeout(buildURL(url), {}, 10000); } catch (e) { diagLog('prerequisites submit failed:', e); }
+    if (changes.length && settingsUnlocked && !DEMO_MODE) {
+        let saved = true;
+        try {
+            const r = await fetchWithTimeout(buildURL('/get?' + changes.map(c => c.param + '=' + encodeURIComponent(c.value)).join('&')), {}, 10000);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+        } catch (e) { saved = false; diagLog('prerequisites submit failed:', e); }
+        if (!saved && start) {
+            // Next must not reach the wizard on settings that never landed (the field wiring gate's among them).
+            vesselNextStepWait(false);
+            document.getElementById('commprep-modal-overlay').style.display = 'flex';
+            xAlert('Could not save these settings. Check the connection, then press Next again.');
+            return;
+        }
     }
+    if (!start) { commPrepEndChain(); return; }
+    // The test reads the shunt choice and the temperature source just written, so it opens only after they land.
+    fieldResOpen('chain');
+}
+
+// Next on the Field Resistance screen: a resistance is stored, so the chain goes on.
+function commPrepContinue() {
     const deferred = _commPrepDeferHandoff; _commPrepDeferHandoff = false;   // one-shot: a reopen via ← Back hands off immediately
-    if (!start) _rpmCapTablesPre = null;   // no next screen takes the handed-over tables
-    const r = _commPrereqResolve; _commPrereqResolve = null; if (r) r(!!start);
-    if (!start || deferred) return;
-    // Both paths: Low/High charge-rate limits next, ← Back reopens this screen. Tach alignment is
+    const r = _commPrereqResolve; _commPrereqResolve = null; if (r) r(true);
+    if (deferred) return;
+    // Both paths: Low/High charge-rate limits next, ← Back reopens the Prerequisites screen. Tach alignment is
     // first-install only — RPMScalingFactor/PulleyRatio persist and stay editable under Setup ▸ Engine.
     openRpmCap(_commPrepShowAlign ? openRpmAlign : openCommissionModal, commPrepReopen);
+}
+
+// "I'll do this later" on either screen: no wizard, the rest of a vessel-save chain still runs.
+function commPrepEndChain() {
+    _commPrepDeferHandoff = false;
+    _rpmCapTablesPre = null;   // no next screen takes the handed-over tables
+    const r = _commPrereqResolve; _commPrereqResolve = null; if (r) r(false);
 }
 
 // ← Back from Charge Rate Limits: the screen comes back as it was left, and its Next hands off directly.
@@ -11109,6 +11282,388 @@ function commPrepClose() {
     _commPrepDeferHandoff = false;
     _rpmCapTablesPre = null;
     const r = _commPrereqResolve; _commPrereqResolve = null; if (r) r(false);
+}
+
+// ===== Field Resistance screen (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1) =====
+// Engine off, the regulator holds the field at a few planned field voltages and reads the current from the battery
+// shunt's step (method 1) or the owner's meter (method 2); the firmware plans the holds and does the math. Opened by
+// the Prerequisites screen's Next (mode 'chain') and by Setup ▸ Alternator ▸ Field Resistance ▸ Measure ('setup').
+// Every /fieldResTest request is the run's heartbeat (the firmware ends it 3 s after the last one), so the poll runs
+// while the screen is open and every way off the screen stops a run. Only Next / Save writes the result (save=1).
+let _fr = null;
+const FR_POLL_MS = 500;
+const FR_HOLD_NAMES = ['Low hold', 'Top hold', 'Middle hold', 'Low hold again'];
+const frEsc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const frTempTxt = c => Math.round(toDisplayTempFromC(c)) + ' ' + tempUnitLabel();
+const frStored = st => !!st && Number.isFinite(st.R) && Number.isFinite(st.Tref);
+const frStoredTxt = st => st.R.toFixed(3) + ' Ω, recorded at ' + frTempTxt(st.Tref);
+
+async function frRequest(q) {
+    // The in-app demo has no device (commPrepFetchCfg gives it a recorded 2 Ω install): Keep works, a test cannot run.
+    if (DEMO_MODE) return { st: 0, sh: 1, R: 2, Tref: 22, saved: 0, holds: [], refused: q.indexOf('start=') !== -1 ? 'The demo has no regulator to measure.' : '' };
+    const r = await fetchWithTimeout(buildURL('/fieldResTest' + (q ? '?' + q : '')), {}, 4000);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+}
+function frVisible() {
+    const ov = document.getElementById('fieldres-modal-overlay');
+    return !!ov && ov.style.display !== 'none';
+}
+
+async function fieldResOpen(mode) {
+    if (_fr && _fr.pollTimer) clearTrackedTimeout(_fr.pollTimer);
+    _fr = { mode, view: 'offline', ack: false, meter: '', method: 0, st: null, runKey: '', sentKey: '', pollTimer: null, busy: false };
+    try { _fr.st = await frRequest(''); } catch (e) { diagLog('field resistance status failed:', e); }
+    vesselNextStepWait(false);
+    if (!_fr || _fr.mode !== mode) return;   // closed or reopened while the status read was in flight
+    _fr.view = frHomeView();
+    if (_fr.view === 'run') _fr.method = _fr.st.m;
+    document.getElementById('fieldres-modal-overlay').style.display = 'flex';
+    frRender();
+    frPollLoop();
+}
+async function frRetryOpen() { if (_fr) fieldResOpen(_fr.mode); }
+
+function frHomeView() {
+    const st = _fr.st;
+    if (!st) return 'offline';
+    if (st.st === 1) return 'run';
+    if (st.st === 2 && st.saved !== 1) return 'done';   // a result from an earlier visit this boot, never saved
+    if (_fr.mode === 'chain' && frStored(st)) return 'keep';
+    return st.sh === 1 ? 'shunt' : 'meterpick';
+}
+function frGo(view) { if (!_fr) return; _fr.view = view; frRender(); }
+function frPickMeter(kind) { if (!_fr) return; _fr.meter = kind; frGo('meter'); }
+function frAck(on) {
+    if (!_fr) return;
+    _fr.ack = !!on;
+    const b = document.getElementById('fr-start');
+    if (b) { b.disabled = !on; b.style.opacity = on ? '' : '0.45'; b.style.cursor = on ? 'pointer' : 'default'; }
+}
+
+function frPollLoop() {
+    if (!_fr || _fr.pollTimer) return;
+    const tick = async () => {
+        if (!_fr) return;
+        _fr.pollTimer = null;
+        if (!frVisible()) return;
+        try {
+            const j = await frRequest('');
+            if (_fr && frVisible()) { _fr.st = j; frOnStatus(); }
+        } catch (e) { diagLog('field resistance poll failed:', e); }
+        if (_fr && frVisible() && !_fr.pollTimer) _fr.pollTimer = setTrackedTimeout(tick, FR_POLL_MS);
+    };
+    _fr.pollTimer = setTrackedTimeout(tick, FR_POLL_MS);
+}
+function frOnStatus() {
+    const st = _fr.st;
+    if (_fr.view === 'run') {
+        if (st.st === 2) { frGo('done'); return; }
+        if (st.st !== 1) { frGo('fail'); return; }
+        frRunUpdate();
+    } else if (_fr.view === 'done') {
+        frPaintFooter();
+    }
+}
+
+async function frStart(m) {
+    if (!_fr || _fr.busy || !_fr.ack) return;
+    _fr.busy = true;
+    let j = null;
+    try { j = await frRequest('start=1&method=' + m); } catch (e) { diagLog('field resistance start failed:', e); }
+    if (!_fr) return;
+    _fr.busy = false;
+    if (!j) { frShowRefused('Could not reach the regulator. Check the connection and try again.'); return; }
+    _fr.st = j;
+    if (j.refused) { frShowRefused(j.refused); return; }
+    _fr.method = m;
+    _fr.runKey = '';
+    _fr.sentKey = '';   // a reading sent in the last run must not lock the new run's first hold (same hold key)
+    // The reply comes before the control pass resets the run, so its hold, phase and table are still the last run's.
+    _fr.st = Object.assign({}, j, { h: 0, rung: 0, ph: m === 1 ? 0 : 1, el: 0, hx: null, li: null, holds: [] });
+    frGo('run');
+}
+function frShowRefused(txt) {
+    const el = document.getElementById('fr-refused');
+    if (!el) { xAlert(txt, 'Field Resistance'); return; }
+    el.textContent = txt;
+    el.style.display = '';
+}
+function frTryAgain() {
+    if (!_fr) return;
+    if (_fr.method === 1) frStart(1);
+    else if (_fr.meter) frStart(2);
+    else frGo('meterpick');
+}
+async function frStop() {
+    try { const j = await frRequest('abort=1'); if (_fr) { _fr.st = j; frOnStatus(); } } catch (e) { diagLog('field resistance stop failed:', e); }
+}
+async function frAgain() {
+    try { await frRequest('again=1'); } catch (e) { diagLog('field resistance hold again failed:', e); }
+}
+async function frReading() {
+    if (!_fr) return;
+    const el = document.getElementById('fr-amps');
+    const a = el ? parseFloat(el.value) : NaN;
+    const hint = document.getElementById('fr-amps-hint');
+    if (!Number.isFinite(a)) { if (hint) { hint.textContent = 'Type the amps the meter read.'; hint.style.display = ''; } return; }
+    // The firmware plans the next hold on its next control pass, so this hold's reading must not be sent twice:
+    // the box stays locked until the next hold arrives.
+    _fr.sentKey = _fr.runKey;
+    frMeterInputLock(true);
+    try {
+        const j = await frRequest('reading=' + encodeURIComponent(a));
+        if (_fr && j.refused) { _fr.sentKey = ''; frMeterInputLock(false); frShowRefused(j.refused); }
+    } catch (e) {
+        diagLog('field resistance reading failed:', e);
+        if (_fr) { _fr.sentKey = ''; frMeterInputLock(false); }
+    }
+}
+function frMeterInputLock(on) {
+    ['fr-amps', 'fr-enter'].forEach(id => { const el = document.getElementById(id); if (el) { el.disabled = on; el.style.opacity = on ? '0.45' : ''; } });
+}
+
+async function frNext() {
+    if (!_fr) return;
+    if (_fr.view === 'keep') { frCloseOverlay(); commPrepContinue(); return; }
+    if (_fr.view !== 'done') return;
+    if (_fr.st.saved !== 1) {
+        const btn = document.getElementById('fieldres-next-btn');
+        if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
+        let j = null;
+        try { j = await frRequest('save=1'); } catch (e) { diagLog('field resistance save failed:', e); }
+        if (!_fr) return;
+        if (j) _fr.st = j;
+        if (!j || j.saved !== 1) {
+            frPaintFooter();
+            const why = document.getElementById('fieldres-next-why');
+            if (why) { why.textContent = j && j.refused ? j.refused : 'Could not reach the regulator. Check the connection and try again.'; why.style.display = ''; }
+            return;
+        }
+    }
+    const chain = _fr.mode === 'chain';
+    frCloseOverlay();
+    if (chain) commPrepContinue();
+}
+// ✕, "I'll do this later" and Close: a run stops with the screen.
+function frLater() {
+    if (!_fr) return;
+    if (_fr.st && _fr.st.st === 1) frRequest('abort=1').catch(() => { });
+    const chain = _fr.mode === 'chain';
+    frCloseOverlay();
+    if (chain) commPrepEndChain();
+}
+function frCloseOverlay() {
+    if (_fr && _fr.pollTimer) clearTrackedTimeout(_fr.pollTimer);
+    _fr = null;
+    document.getElementById('fieldres-modal-overlay').style.display = 'none';
+}
+
+function frPaintFooter() {
+    const chain = _fr.mode === 'chain';
+    const later = document.getElementById('fieldres-later-btn');
+    const next = document.getElementById('fieldres-next-btn');
+    const why = document.getElementById('fieldres-next-why');
+    if (later) later.textContent = chain ? 'I\'ll do this later' : 'Close';
+    if (why) why.style.display = 'none';
+    if (!next) return;
+    const can = (chain && _fr.view === 'keep') || (_fr.view === 'done' && !!_fr.st && _fr.st.saved !== 1);
+    next.textContent = chain ? 'Next →' : 'Save';
+    next.disabled = !can;
+    next.style.cssText = 'border-radius:6px; padding:8px 16px; font-size:0.9em; ' + (can ? 'cursor:pointer; ' + CP_BTN_GREEN
+        : 'cursor:default; opacity:0.45; background:rgba(255,255,255,0.10); color:#e8e8e8; border:1px solid rgba(255,255,255,0.18);');
+}
+
+function frRender() {
+    const body = document.getElementById('fieldres-body');
+    if (!body || !_fr) return;
+    const st = _fr.st || {};
+    const chain = _fr.mode === 'chain';
+    const p = (t, css) => '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 12px;' + (css || '') + '">' + t + '</p>';
+    const btn = (label, onclick, cls, id, extra, off) => '<button type="button"' + (id ? ' id="' + id + '"' : '') + (off ? ' disabled' : '') + ' class="' + cls + '" onclick="' + onclick + '" style="border-radius:5px; padding:7px 14px; cursor:pointer; font-size:0.9em;' + (extra || '') + '">' + label + '</button>';
+    const row = inner => '<div style="display:flex; flex-wrap:wrap; gap:10px; margin:4px 0 12px;">' + inner + '</div>';
+    const refused = '<div id="fr-refused" style="display:none; font-size:12px; line-height:1.45; color:#e6a23c; margin:0 0 12px;"></div>';
+    const storedLine = (!chain && frStored(st)) ? p('Stored now: <strong style="color:#e0e0e0;">' + frStoredTxt(st) + '</strong>.') : '';
+    const keepLink = (chain && frStored(st)) ? p('<a href="#" onclick="frGo(\'keep\'); return false;" style="color:#2ec4b6; text-decoration:none;">Keep the recorded value instead ›</a>', ' font-size:12px;') : '';
+    const checklist = items => '<div style="margin:0 0 12px; padding:10px 12px; background:#191919; border:1px solid #333; border-radius:6px;">' +
+        '<div style="font-size:11px; color:#9cc; letter-spacing:0.04em; text-transform:uppercase; margin:0 0 6px;">Before you start</div>' +
+        '<ul style="margin:0 0 10px; padding-left:18px; font-size:13px; line-height:1.5; color:#ccc;">' + items.map(t => '<li>' + t + '</li>').join('') + '</ul>' +
+        '<label style="display:flex; align-items:center; gap:8px; font-size:13px; color:#e0e0e0; cursor:pointer;">' +
+        '<input type="checkbox" id="fr-ack"' + (_fr.ack ? ' checked' : '') + ' onchange="frAck(this.checked)" style="width:18px; height:18px; margin:0;">The engine is off.</label></div>';
+    const startBtn = m => btn('Start test', 'frStart(' + m + ')', 'btn-primary', 'fr-start', _fr.ack ? '' : ' opacity:0.45; cursor:default;', !_fr.ack);
+    const ign = 'The ignition is on (or <strong>Ignition Override</strong> is on, on a boat with no ignition wire).';
+    let h = '';
+
+    switch (_fr.view) {
+        case 'offline':
+            h = p('Could not reach the regulator.') + row(btn('Retry', 'frRetryOpen()', 'btn-secondary'));
+            break;
+        case 'keep':
+            h = p('A field resistance is already recorded: <strong style="color:#e0e0e0;">' + frStoredTxt(st) + '</strong>.') +
+                p('Keep it, or measure again after replacing the alternator, its brushes, or the field wiring.') +
+                row(btn('Keep', 'frNext()', 'btn-primary') + btn('Measure again', 'frGo(\'' + (st.sh === 1 ? 'shunt' : 'meterpick') + '\')', 'btn-secondary'));
+            break;
+        case 'shunt':
+            h = storedLine +
+                p('The regulator measures the field current with the battery shunt. It switches the field on and off at four settings and reads the change in battery current at each. It takes about two minutes.') +
+                checklist([
+                    'The engine is off. ' + ign,
+                    'The battery switch is in its normal position, not on BOTH.',
+                    'Chargers are off: shore power, solar, and DC-DC.',
+                    'Loads that cycle on and off, such as a fridge, pump, or inverter, are off.'
+                ]) + refused +
+                row(startBtn(1) + btn('Use a meter instead', 'frGo(\'meterpick\')', 'btn-secondary')) + keepLink;
+            break;
+        case 'meterpick':
+            h = storedLine +
+                p('You read the field current on a meter while the regulator holds the field, and type each reading in. Which meter do you have?') +
+                row(btn('DC clamp meter', 'frPickMeter(\'clamp\')', 'btn-secondary') + btn('Multimeter in series', 'frPickMeter(\'series\')', 'btn-secondary')) +
+                (st.sh === 1 ? p('<a href="#" onclick="frGo(\'shunt\'); return false;" style="color:#2ec4b6; text-decoration:none;">Use the battery shunt instead ›</a>', ' font-size:12px;') : '') + keepLink;
+            break;
+        case 'meter':
+            h = storedLine + (_fr.meter === 'clamp'
+                ? p('<strong style="color:#e0e0e0;">DC clamp meter.</strong> It must read DC, which means a Hall-effect clamp; an AC-only clamp reads nothing here. With the jaws closed and away from any wire, zero it (the DCA zero or REL button). Then clamp it around the Regulator Field wire alone, not a bundle of wires.')
+                : p('<strong style="color:#e0e0e0;">Multimeter in series.</strong> Set it to DC amps, with the red lead in the 10 A jack (marked A on some meters) and the black lead in COM. With the field off, pull the 10 A field fuse and hold or clip the meter leads on the two contacts of the empty fuse holder. Refit the fuse when the test is done.') +
+                  '<div style="margin:0 0 12px; padding:10px 12px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.4); border-radius:6px; font-size:12px; line-height:1.5; color:#f2a7a7;"><strong>A meter set to amps is a short circuit.</strong> Never put it across the battery or across any two different wires. Its leads go only on the two contacts of the field fuse holder.</div>') +
+                p('Each hold runs the field for 10 seconds with a countdown. Read the meter while it counts, or freeze it with the meter\'s HOLD button, then type the amps and press <strong>Enter</strong>.') +
+                checklist(['The engine is off. ' + ign]) + refused +
+                row(startBtn(2) + btn('Change meter', 'frGo(\'meterpick\')', 'btn-secondary')) + keepLink;
+            break;
+        case 'run':
+            h = frRunHtml();
+            break;
+        case 'done': {
+            const tTxt = Number.isFinite(st.tC) ? 'Measured at an alternator temperature of ' + frTempTxt(st.tC) + '.'
+                : 'There was no alternator temperature reading, so ' + frTempTxt(30) + ' is recorded with it.';
+            const det = '<div style="margin:0 0 12px;">' + frHoldsTableHtml(st, -1, NaN, false) +
+                (Number.isFinite(st.warm) ? '<div style="font-size:12px; color:#999; line-height:1.5; margin-top:4px;">Low-hold current fell ' + st.warm.toFixed(1) + ' % over the test as the coil warmed.</div>' : '') +
+                '</div>';
+            h = '<div style="font-size:12px; color:#9cc; letter-spacing:0.04em; text-transform:uppercase; margin:2px 0 2px;">Field resistance</div>' +
+                '<div style="font-size:26px; color:#e8e8e8; margin:0 0 6px; font-variant-numeric:tabular-nums;">' + (Number.isFinite(st.r) ? st.r.toFixed(3) + ' Ω' : frEsc(st.msg)) + '</div>' +
+                p(tTxt) + det +
+                p(st.saved === 1 ? 'Saved.' : (chain ? 'Press <strong>Next</strong> to save it and go on.' : 'Press <strong>Save</strong> to store it.'), ' color:#2ec4b6;') +
+                row(btn('Measure again', 'frGo(\'' + (_fr.method === 2 ? 'meter' : 'shunt') + '\')', 'btn-secondary'));
+            break;
+        }
+        case 'fail':
+            h = '<div style="font-size:14px; color:#e6a23c; margin:2px 0 8px;">The test stopped, and the field is off.</div>' +
+                p(frEsc(frFailText(st.msg))) + refused +
+                row(btn('Try again', 'frTryAgain()', 'btn-primary') +
+                    (_fr.method === 1 ? btn('Use a meter instead', 'frGo(\'meterpick\')', 'btn-secondary') : btn('Change meter', 'frGo(\'meterpick\')', 'btn-secondary')));
+            break;
+    }
+    body.innerHTML = h;
+    frPaintFooter();
+    if (_fr.view === 'run') { _fr.runKey = ''; _fr.tableHtml = ''; frRunUpdate(); }
+}
+
+// A protection that ends a run arrives as the firmware's reason name ("The field was switched off: OV_TIER_LOW.").
+function frFailText(msg) {
+    const m = /^The field was switched off: (.+)\.$/.exec(msg || '');
+    const cause = m ? cxCutCauseText(CX_CUT_NAME_TO_CODE[m[1]] || 0) : '';
+    return cause ? 'The field was switched off by ' + cause + '.' : (msg || 'The test stopped.');
+}
+
+function frRunHtml() {
+    const meter = _fr.method === 2;
+    return '<div id="fr-run-title" style="font-size:15px; color:#e8e8e8; margin:2px 0 4px;"></div>' +
+        '<div id="fr-run-sub" style="font-size:13px; color:#9cc; margin:0 0 10px;"></div>' +
+        (meter
+            ? '<div id="fr-run-count" style="font-size:34px; color:#35d6c7; font-variant-numeric:tabular-nums; margin:0 0 10px;"></div>' +
+              '<div style="display:flex; gap:8px; align-items:center; margin:0 0 6px;">' +
+              '<input id="fr-amps" type="number" step="0.01" min="0" inputmode="decimal" placeholder="Amps" onkeydown="if (event.key === \'Enter\') frReading()" style="flex:1; min-width:0; background:#161616; color:#ddd; border:1px solid #444; border-radius:5px; padding:7px 10px; font-size:16px; box-sizing:border-box;">' +
+              '<button type="button" id="fr-enter" class="btn-primary" onclick="frReading()" style="border-radius:5px; padding:7px 14px; cursor:pointer; font-size:0.9em;">Enter</button></div>' +
+              '<div id="fr-amps-hint" style="display:none; font-size:12px; color:#e6a23c; margin:0 0 6px;"></div>'
+            : '<div style="height:8px; background:#2a2a2a; border-radius:4px; overflow:hidden; margin:0 0 10px;"><div id="fr-run-bar" style="height:100%; width:0; background:#35d6c7; transition:width 0.4s;"></div></div>' +
+              '<div id="fr-run-live" style="font-size:30px; color:#35d6c7; font-variant-numeric:tabular-nums; min-height:36px;"></div>' +
+              '<div id="fr-run-live-sub" style="font-size:12px; color:#999; margin:0 0 10px; font-variant-numeric:tabular-nums;"></div>') +
+        '<div id="fr-run-table" style="margin:8px 0 10px;"></div>' +
+        '<div id="fr-refused" style="display:none; font-size:12px; line-height:1.45; color:#e6a23c; margin:0 0 12px;"></div>' +
+        '<div style="display:flex; flex-wrap:wrap; gap:10px; margin:4px 0 12px;">' +
+        (meter ? '<button type="button" id="fr-again" class="btn-secondary" onclick="frAgain()" style="display:none; border-radius:5px; padding:7px 14px; cursor:pointer; font-size:0.9em;">Hold again</button>' : '') +
+        '<button type="button" class="btn-danger-ghost" onclick="frStop()" style="border-radius:5px; padding:7px 14px; cursor:pointer; font-size:0.9em;">Stop</button></div>';
+}
+function frRunUpdate() {
+    const st = _fr.st;
+    if (!st || !document.getElementById('fr-run-title')) return;
+    const set = (id, t) => { const el = document.getElementById(id); if (el && el.textContent !== t) el.textContent = t; };
+    const key = st.h + '/' + st.rung;
+    const holdTxt = (FR_HOLD_NAMES[st.h] || 'Hold') + (Number.isFinite(st.hx) ? ' (' + st.hx.toFixed(1) + ' V on the field)' : '');
+    set('fr-run-title', holdTxt);
+    if (_fr.method === 2) {
+        if (key !== _fr.runKey) {
+            _fr.runKey = key;
+            const el = document.getElementById('fr-amps');
+            if (el && _fr.sentKey) el.value = '';
+            const hint = document.getElementById('fr-amps-hint');
+            if (hint) hint.style.display = 'none';
+        }
+        frMeterInputLock(!!_fr.sentKey && _fr.sentKey === _fr.runKey);
+        const holding = st.ph === 1;
+        const left = Math.max(0, Math.ceil(((st.holdMs || 10000) - (st.el || 0)) / 1000));
+        set('fr-run-count', holding ? left + ' s' : '');
+        set('fr-run-sub', holding ? 'Field on. Read the meter now.' : 'Field off. Type the reading in amps and press Enter.');
+        const again = document.getElementById('fr-again');
+        if (again) again.style.display = holding ? 'none' : '';
+    } else {
+        // The firmware reports live amps only while the field is on; the last field-on reading stays up through the
+        // field-off phase so the number does not blink, and clears when the next hold starts.
+        if (key !== _fr.runKey) _fr.lastLi = NaN;
+        _fr.runKey = key;
+        const ph = st.ph || 0;
+        const on = (ph & 1) === 1;
+        if (on && Number.isFinite(st.li)) _fr.lastLi = st.li;
+        const a = _fr.lastLi;
+        set('fr-run-sub', (on ? 'Field on' : 'Field off') + ', cycle ' + Math.min(3, Math.floor(ph / 2) + 1) + ' of 3');
+        const frac = Math.min(1, (ph + Math.min(1, (st.el || 0) / (st.phMs || 3000))) / 7);
+        const bar = document.getElementById('fr-run-bar');
+        if (bar) bar.style.width = Math.round(100 * Math.min(1, ((st.h || 0) + frac) / 4)) + '%';
+        set('fr-run-live', Number.isFinite(a) ? a.toFixed(2) + ' A' : '');
+        set('fr-run-live-sub', (Number.isFinite(a) ? 'Field current' + (on ? '' : ', last field-on reading') + '. ' : 'Field current appears with the first field-on phase. ')
+            + (Number.isFinite(st.ibv) ? 'Battery ' + st.ibv.toFixed(2) + ' V.' : ''));
+    }
+    const tbl = document.getElementById('fr-run-table');
+    const html = frHoldsTableHtml(st, st.h, _fr.method === 1 ? _fr.lastLi : NaN, true);
+    if (tbl && _fr.tableHtml !== html) { _fr.tableHtml = html; tbl.innerHTML = html; }
+}
+
+// The holds as they complete: field volts, amps, and each hold's own volts / amps. cur is the hold in progress (its row
+// shows the planned field volts and liveA), -1 on the result screen. Once the top and middle are both in, the
+// resistance is worked through as their slope, so the owner can see why it sits below every V / A.
+function frHoldsTableHtml(st, cur, liveA, running) {
+    const n = st.m === 2 ? 3 : 4;
+    const f = (v, dp, u) => Number.isFinite(v) ? v.toFixed(dp) + u : '—';
+    const td = 'padding:4px 0 4px 10px; text-align:right; white-space:nowrap;';
+    const hold = k => (k !== cur && st.holds && st.holds[k] && Number.isFinite(st.holds[k].i)) ? st.holds[k] : null;
+    let rows = '';
+    for (let k = 0; k < n; k++) {
+        const done = hold(k);
+        if (!done && k !== cur) continue;
+        const x = done ? done.x : st.hx;
+        const a = done ? done.i : liveA;
+        const va = (Number.isFinite(x) && a > 0.05) ? x / a : NaN;
+        rows += '<tr style="border-top:1px solid #2c2c2c;' + (done ? '' : ' color:#35d6c7;') + '"><td style="padding:4px 0;">' + FR_HOLD_NAMES[k] + (done ? '' : ', now') + '</td>' +
+            '<td style="' + td + '">' + f(x, 2, ' V') + '</td><td style="' + td + '">' + f(a, 2, ' A') + '</td><td style="' + td + '">' + f(va, 2, ' Ω') + '</td></tr>';
+    }
+    if (!rows) return '';
+    const th = 'font-weight:600; padding:0 0 4px 10px; text-align:right;';
+    let out = '<table style="width:100%; border-collapse:collapse; font-size:13px; color:#ccc; font-variant-numeric:tabular-nums;">' +
+        '<tr style="color:#9cc;"><th style="font-weight:600; padding:0 0 4px; text-align:left;">Hold</th><th style="' + th + '">Field</th><th style="' + th + '">Amps</th><th style="' + th + '">V ÷ A</th></tr>' +
+        rows + '</table>';
+    const t = hold(1), m = hold(2);
+    const note = 'font-size:12px; color:#999; line-height:1.5; margin-top:6px;';
+    if (t && m && t.i > m.i) {
+        // The result quotes the firmware's figures: a slope worked from the table's rounded values can miss the
+        // headline in the third decimal.
+        const fw = !running && Number.isFinite(st.r) && Number.isFinite(st.vc);
+        const r = fw ? st.r : (t.x - m.x) / (t.i - m.i), vc = fw ? st.vc : m.x - m.i * r;
+        out += '<div style="font-size:13px; color:#e0e0e0; margin-top:8px; font-variant-numeric:tabular-nums;">' + (running ? 'Resistance so far: ' : 'Resistance: ')
+            + '(' + t.x.toFixed(2) + ' − ' + m.x.toFixed(2) + ') V ÷ (' + t.i.toFixed(2) + ' − ' + m.i.toFixed(2) + ') A = <strong>' + r.toFixed(3) + ' Ω</strong></div>'
+            + '<div style="' + note + '">That is the slope between the top and middle holds. What is left over, ' + vc.toFixed(2) + ' V, is the drop across the brushes and contacts, which each hold\'s V ÷ A counts as resistance, so V ÷ A reads higher.</div>';
+    } else {
+        out += '<div style="' + note + '">V ÷ A counts the brush and contact drop as resistance, so it reads high. The result is the slope between the top and middle holds, which separates the two.</div>';
+    }
+    return out;
 }
 
 // ===== Charge Rate Limits screen (pre-commissioning) =====
@@ -11456,7 +12011,7 @@ async function socSeedPoll() {
 async function socSeedMaybeAutoOpen() {
     // Don't auto-pop over the first-run chain's screens or the commissioning modal (the chain shows this
     // popup itself, in sequence); still reachable from the header SOC readout.
-    const overModal = ['commprep-modal-overlay', 'battdef-modal-overlay', 'nextstep-modal-overlay', 'commission-modal-overlay', 'rwfs-modal-overlay'].some(id => {
+    const overModal = ['commprep-modal-overlay', 'fieldres-modal-overlay', 'battdef-modal-overlay', 'nextstep-modal-overlay', 'commission-modal-overlay', 'rwfs-modal-overlay'].some(id => {
         const el = document.getElementById(id);
         return el && (el.style.display === 'flex' || el.style.display === 'block');
     });
@@ -12920,6 +13475,11 @@ function fieldOffReasonText(reasonCode) {
         case 29: return 'second battery voltage sensor not responding';
         case 30: return 'waiting for the first battery temperature reading';
         case 31: { const n = (typeof rwfsFaultNames === 'function') ? rwfsFaultNames() : ''; return 'two or more sensors failed' + (n ? ' (' + n + ')' : ''); }
+        case 32: // outranks MANUAL in the firmware, so a manual run stops for it too; the status word then reads FAULT, not MANUAL
+            return (typeof g_lastCsv3 === 'object' && g_lastCsv3 && Number(g_lastCsv3.ManualFieldToggle) === 1)
+                ? 'manual field stopped: no regulator drive temperature (INA228) reading; it resumes when the reading returns'
+                : 'regulator temperature sensor not responding';
+        case 33: return 'field resistance test running (engine off)';
         // 0 NONE (transient), 11 MANUAL (shown as its own status word) — no OFF annotation
         default: return '';
     }
@@ -13005,12 +13565,21 @@ function syncPanelOverrideGates(on) {
     }
 }
 
+// No Field Resistance entered (there is no default): the firmware holds its 10 A ceiling at 0, so the field stays
+// off with no off-reason of its own (ctrlLimiter reads 15). False until the first CSV3 frame says otherwise.
+function fieldResMissing() {
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    return !!c3 && c3.FieldResistance !== undefined && !Number.isFinite(Number(c3.FieldResistance));
+}
+const FIELD_RES_MISSING_TXT = 'Field Resistance not measured: the field stays off until it is (Setup ▸ Alternator ▸ Basic ▸ Field Resistance ▸ Measure)';
+const FIELD_RES_WHERE = 'Setup ▸ Alternator ▸ Basic ▸ Output Control ▸ Field Resistance ▸ Measure runs the field resistance test, with the engine off. Commissioning runs it too, right after the Prerequisites screen.';
+
 function fieldOffReasonUpdate(fieldActiveStatus, reasonCode) {
     window._lastFieldEventReason = reasonCode;   // cached fresh (CSV1) for the commissioning field-step gate
     const el = document.getElementById('field-off-reason');
     if (!el) return;
     const isOff = !(fieldActiveStatus >= 1 && fieldActiveStatus <= 4);   // 0/undefined = OFF; 1-4 have their own words
-    const txt = isOff ? fieldOffReasonText(reasonCode) : '';
+    const txt = !isOff ? '' : (fieldOffReasonText(reasonCode) || (fieldResMissing() ? FIELD_RES_MISSING_TXT : ''));
     if (txt) { el.textContent = txt; el.classList.add('show'); }
     else el.classList.remove('show');   // text kept so the opacity fade-out reads
 }
@@ -15412,13 +15981,16 @@ function applyStaleStyleByAge(elementId, ageMs, staleThreshold = STALE_THRESHOLD
 // 2 thermal, 3 CV voltage, 4 battery limit, 5 field at max duty → header duty readout,
 // 6 protection → brown duty digits (no fill) + a lone brown P left of the charge stage,
 // 7 battery above target → voltage pill + muted BATT > TARGET word in the same slot,
-// 10 manual field and 11 min-field floor → duty pill, 11 also gets a MIN FIELD word).
+// 10 manual field and 11 min-field floor → duty pill, 11 also gets a MIN FIELD word,
+// 15 board's 10 A field-current ceiling and 16 field-drive heat limit → duty pill + 10 A FIELD / DRIVE HEAT word;
+// 15 with no Field Resistance entered → NO FIELD Ω word and no pill, the field is off).
 // 10 needs no word of its own: the field-status readout already prints MANUAL.
 // Alt temp digits also go red >2°F over the limit.
 function updateHeaderLimiterColors(sa) {
     const RED = "#f44336", NORM = "var(--reading)";
     const limFresh = (performance.now() - (window._ctrlLimiterAtMs || 0)) < 5000;  // 10× CSV4 cadence
     const lim = limFresh ? window._ctrlLimiter : 0;
+    const noFieldRes = lim === 15 && fieldResMissing();
     const pill = (labelId, ageMs, thresh, on) => {
         const el = document.getElementById(labelId);
         if (!el) return;
@@ -15440,7 +16012,7 @@ function updateHeaderLimiterColors(sa) {
     pill('lbl-voltage', sa.ibv, STALE_THRESHOLD_DEFAULT_MS, lim === 3 || lim === 7 || lim === 9);
     pill('lbl-alt-current', sa.measuredAmps, STALE_THRESHOLD_DEFAULT_MS, lim === 1);
     pill('lbl-batt-current', sa.bcur, STALE_THRESHOLD_DEFAULT_MS, lim === 4 || lim === 8);
-    pill('duty-pill-wrap', sa.dutyCycle, STALE_THRESHOLD_DEFAULT_MS, lim === 5 || lim === 10 || lim === 11);
+    pill('duty-pill-wrap', sa.dutyCycle, STALE_THRESHOLD_DEFAULT_MS, lim === 5 || lim === 10 || lim === 11 || (lim === 15 && !noFieldRes) || lim === 16);
     // Code 6 (protection): brown duty digits + a brown P inline left of the stage word. Quieter
     // than every cut state on purpose — the field is still live, output is only being trimmed.
     const dw = document.getElementById('duty-pill-wrap');
@@ -15457,6 +16029,18 @@ function updateHeaderLimiterColors(sa) {
     // the one limiter that pushes output UP, and the reason a full bank keeps taking current at idle.
     const mf = document.getElementById('minfield-note');
     if (mf) { const d = (lim === 11) ? '' : 'none'; if (mf.style.display !== d) mf.style.display = d; }
+    // Code 15 with no Field Resistance entered is a missing setting holding the field off, not a field at 10 A.
+    const fc = document.getElementById('fieldcap-note');
+    if (fc) {
+        const d = (lim === 15) ? '' : 'none'; if (fc.style.display !== d) fc.style.display = d;
+        if (fc._noR !== noFieldRes) {
+            fc._noR = noFieldRes;
+            fc.innerHTML = noFieldRes ? '<span class="pw-full">NO FIELD Ω</span><span class="pw-short">NO Ω</span>'
+                               : '<span class="pw-full">10 A FIELD</span><span class="pw-short">10 A</span>';
+        }
+    }
+    const dh = document.getElementById('driveheat-note');
+    if (dh) { const d = (lim === 16) ? '' : 'none'; if (dh.style.display !== d) dh.style.display = d; }
 }
 
 function updateAllStalenessStyles() {
@@ -15531,6 +16115,8 @@ function updateAllStalenessStyles() {
     // rather than borrowing the alternator-temp one.
     applyStaleStyleByAge("baroPressureID", sa.baroPressure, STALE_THRESHOLD_BOARD_MS);
     applyStaleStyleByAge("ambientTempID", sa.ambientTemp, STALE_THRESHOLD_BOARD_MS);
+    // INA228 die temperature: 1 Hz reads, and the firmware stops trusting it (REASON_DIE_TEMP_LOST) after the same 10 s.
+    applyStaleStyleByAge("inaDieTempF_ID", sa.dieTemp, STALE_THRESHOLD_BOARD_MS);
 
     // --- Battery / extra temperature — the battery readouts grey on whichever source feeds them ---
     const battTempAge = battTempActiveAgeMs(_battTempActiveSrc);
@@ -16265,7 +16851,6 @@ function updateTogglesFromData(data) {
         updateCheckbox("InvertAltAmps_checkbox", data.InvertAltAmps, "InvertAltAmps");
         updateCheckbox("InvertBattAmps_checkbox", data.InvertBattAmps, "InvertBattAmps");
         updateCheckbox("BatteryShuntPresent_checkbox", data.BatteryShuntPresent, "BatteryShuntPresent");
-        updateCheckbox("ShuntGroundComp_checkbox", data.ShuntGroundComp, "ShuntGroundComp");
         // Single point that drives the whole no-shunt UI: body.no-batt-current greys every
         // .gate-batt-current setting and hides every .req-batt-current readout (styles.css).
         // Only touch it when the echo is actually present.
@@ -16281,6 +16866,7 @@ function updateTogglesFromData(data) {
         // Same shape for the Extra probe: its alarms live in Setup > Alarms and grey out there
         // while the probe is off, instead of only existing when it is on.
         if ('extraTempProbeEnable' in data) document.body.classList.toggle('no-extra-temp', String(data.extraTempProbeEnable) === '0');
+        updateCheckbox("IgnitionOverride_checkbox", data.IgnitionOverride, "IgnitionOverride");  // checked = 1 (always on); 0 and 2 both follow the key
         updateCheckbox("TempSource_checkbox", data.TempSource, "TempSource");
         updateCheckbox("AlarmLatchEnabled_checkbox", data.AlarmLatchEnabled, "AlarmLatchEnabled");
         updateCheckbox("MaintainMode_checkbox", data.MaintainMode, "MaintainMode");
@@ -17082,7 +17668,7 @@ function setCapMode(mode) {
 
 // Field-OFF reasons that are protective shut-downs (fault-class) rather than a normal rest —
 // mirrors the fault codes in fieldOffReasonText(). Used to colour a fault red vs a normal OFF gray.
-const FIELD_FAULT_REASONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 19, 22, 23, 24, 27, 28, 29, 31]);
+const FIELD_FAULT_REASONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 19, 22, 23, 24, 27, 28, 29, 31, 32]);
 
 // Single OFF-state classifier shared by the minimized pill AND the expanded status word so the two
 // can never disagree. reason 10 while enabled = engine-on-but-not-charging (IDLE); faults = FAULT.
@@ -17281,7 +17867,8 @@ window.addEventListener("load", function () {
         battTempProbe: 999999,
         extraTemp: 999999,
         veBattTemp: 999999,
-        rvcBattTemp: 999999
+        rvcBattTemp: 999999,
+        dieTemp: 999999
     };
 
     document.getElementById("AlarmLatchEnabled_checkbox").checked = (document.getElementById("AlarmLatchEnabled").value === "1");
@@ -18418,6 +19005,13 @@ window.addEventListener("load", function () {
                         const seconds = Math.floor(totalSeconds % 60);
                         newTextContent = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
                     }
+                    else if (["fieldCurLimS", "fieldCurLimSesS", "fieldHeatLimS", "fieldHeatLimSesS"].includes(key)) {
+                        const totalSeconds = Math.max(0, Math.floor(num));   // raw seconds, unlike the hours x100 run times above
+                        const hours = Math.floor(totalSeconds / 3600);
+                        const minutes = Math.floor((totalSeconds % 3600) / 60);
+                        const seconds = totalSeconds % 60;
+                        newTextContent = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                    }
                     else if (["innerTermP", "innerTermI", "innerTermD", "outerTermP", "outerTermI", "outerTermLookahead"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
@@ -18524,6 +19118,8 @@ window.addEventListener("load", function () {
                 ["RPMMaxID", "RPMMax"],
                 ["EngineRunTimeID", "EngineRunTime"],
                 ["AlternatorOnTimeID", "AlternatorOnTime"],
+                ["fieldCurLimSesS_ID", "fieldCurLimSesS"],
+                ["fieldHeatLimSesS_ID", "fieldHeatLimSesS"],
                 ["AlternatorFuelUsedID", "AlternatorFuelUsed"],
                 ["ChargedEnergyID", "ChargedEnergy"],
                 ["DischargedEnergyID", "DischargedEnergy"],
@@ -18590,6 +19186,8 @@ window.addEventListener("load", function () {
                 ["AvgSpeed_AllTimeID", "AvgSpeed_AllTime"],
                 ["AvgSpeedID", "AvgSpeed"],
                 ["AlternatorOnTime_AllTimeID", "AlternatorOnTime_AllTime"],
+                ["fieldCurLimS_ID", "fieldCurLimS"],
+                ["fieldHeatLimS_ID", "fieldHeatLimS"],
                 ["EngineCycles_AllTimeID", "EngineCycles_AllTime"],
                 ["MaxAlternatorTemperatureF_AllTimeID", "MaxAlternatorTemperatureF_AllTime"],
                 ["MaxTemperatureThermistor_AllTimeID", "MaxTemperatureThermistor_AllTime"],
@@ -18936,6 +19534,7 @@ window.addEventListener("load", function () {
                 ["voltStaleCountID", "voltStaleCount"],
                 ["volt2StaleCountID", "volt2StaleCount"],
                 ["battTempLostCountID", "battTempLostCount"],
+                ["dieTempLostCountID", "dieTempLostCount"],
                 // CH1 / INA timing stats
                 ["ch1_last_ms_ID", "ch1_last_ms"],
                 ["ch1_avg_10s_ID", "ch1_avg_10s"],
@@ -19065,23 +19664,40 @@ window.addEventListener("load", function () {
                 set2('n2kRxSoc_ID', (data.n2kRxSoc === undefined || soc < 0) ? '—' : soc + '\u00A0%');
             })();
 
-            // Field caps — Setup → the Max Field (%) and Max Field Volts rows. The loop enforces the
-            // lower of the two (CSV2 fieldDutyCeil), so mark the one that is limiting right now and show
-            // what the volts cap works out to against the live bus beside its value: without that the
-            // loop obeys a bound neither box shows. Compared with a tolerance because the volts term is
-            // a filtered quotient and lands a hair off an integer Max Field %. The echo span, NOT
-            // getElementById('MaxDuty') — that resolves to the legacy hidden input at the bottom of
-            // index.html, which nothing populates (always "0"). Same idiom as altSweepSyncCeiling.
+            // Field caps — Setup → the Max Field (%), Max Field Volts, Field Current Ceiling and Field
+            // Drive Heat Ceiling rows. The loop enforces the lowest of the four (CSV2 fieldDutyCeil) and
+            // the firmware names which one (fieldCeilBind), so mark that row and show what the volts cap
+            // works out to against the live bus beside its value: without that the loop obeys a bound
+            // no box shows. The echo span, NOT getElementById('MaxDuty') — that resolves to the legacy
+            // hidden input at the bottom of index.html, which nothing populates (always "0"). Same idiom
+            // as altSweepSyncCeiling.
             (function () {
                 if (data.fieldDutyCeil === undefined) return;
                 const ceil = Number(data.fieldDutyCeil) / 100;
                 if (!Number.isFinite(ceil) || ceil < 0) return;
-                const maxDuty = parseFloat(getField('MaxDuty_echo'));
-                const voltsLimiting = Number.isFinite(maxDuty) && ceil < maxDuty - 0.05;
-                const tagD = document.getElementById('MaxDuty_limiting');
-                const tagV = document.getElementById('MaxFieldVolts_limiting');
-                if (tagD) tagD.classList.toggle('on', !voltsLimiting);
-                if (tagV) tagV.classList.toggle('on', voltsLimiting);
+                const bind = Number(data.fieldCeilBind);
+                const voltsLimiting = bind === 1;
+                const tag = (id, on) => { const el = document.getElementById(id); if (el) el.classList.toggle('on', on); };
+                tag('MaxDuty_limiting', bind === 0);
+                tag('MaxFieldVolts_limiting', voltsLimiting);
+                tag('FieldCurCeil_limiting', bind === 2);
+                tag('FieldHeatCeil_limiting', bind === 3 || bind === 4);
+                const pct = v => { const n = Number(v) / 100; return (v !== undefined && Number.isFinite(n)) ? n.toFixed(1) : '?'; };
+                const curEl = document.getElementById('fieldCurDutyCeil_now');
+                if (curEl) { const s = pct(data.fieldCurDutyCeil); if (curEl.textContent !== s) curEl.textContent = s; }
+                const heatEl = document.getElementById('fieldHeatDutyCeil_now');
+                if (heatEl) { const s = pct(data.fieldHeatDutyCeil); if (heatEl.textContent !== s) heatEl.textContent = s; }
+                // Which part the heat ceiling protects: fixed by the wiring once it is set; with it unset both are
+                // checked and only a binding ceiling says which one failed.
+                const partEl = document.getElementById('fieldHeatCeil_part');
+                if (partEl) {
+                    const heat = Number(data.fieldHeatDutyCeil) / 100;
+                    const wiring = Number(g_lastCsv3 && g_lastCsv3.FieldWiring);
+                    const d5 = wiring === 1 || (wiring !== 2 && bind === 4);
+                    const known = wiring === 1 || wiring === 2 || bind === 3 || bind === 4;
+                    const s = (Number.isFinite(heat) && heat < 99 && known) ? (d5 ? ', D5 spreader' : ', connector') : '';
+                    if (partEl.textContent !== s) partEl.textContent = s;
+                }
                 const asDuty = document.getElementById('MaxFieldVolts_asDuty');
                 if (!asDuty) return;
                 // While the volts cap is limiting, the enforced ceiling IS its duty — use it exactly.
@@ -20010,7 +20626,8 @@ window.addEventListener("load", function () {
                 battTempProbe: data.ts_BattTempProbe,
                 extraTemp: data.ts_ExtraTemp,
                 veBattTemp: data.ts_VeBattTemp,
-                rvcBattTemp: data.ts_RvcBattTemp
+                rvcBattTemp: data.ts_RvcBattTemp,
+                dieTemp: data.ts_DieTemp
             };
 
             updateWeatherForecastAge(data.ts_WeatherFetch);
@@ -20103,6 +20720,7 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("InvertAltAmps_checkbox").checked = (document.getElementById("InvertAltAmps").value === "1");
     document.getElementById("InvertBattAmps_checkbox").checked = (document.getElementById("InvertBattAmps").value === "1");
     document.getElementById("BatteryShuntPresent_checkbox").checked = (document.getElementById("BatteryShuntPresent").value === "1");
+    document.getElementById("IgnitionOverride_checkbox").checked = (document.getElementById("IgnitionOverride").value === "1");
     document.getElementById("TempSource_checkbox").checked = (document.getElementById("TempSource").value === "1");
     document.getElementById("timeAxisModeChanging_checkbox").checked = (document.getElementById("timeAxisModeChanging").value === "1");
     document.getElementById("weatherModeEnabled_checkbox").checked = (document.getElementById("weatherModeEnabled").value === "1");
@@ -21515,12 +22133,15 @@ function openLoopHighVoltageNote() {
 
 // ===== Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §2.6, §4.6-§4.8, §6) =====
 // One data model for the Setup > System card, the #sensor-banner header line, the modal and the
-// commissioning Prep gate. Inputs: the CSV3 settings echo (the six override keys + the two numbers), CSV2
-// (sensorFaultMask, battTempState, limpTier, sensorSteadyMask) and CSV1 (fieldEventReason, Ignition).
-const RWFS_KEYS = ['IgnoreTemperature', 'IgnoreRPM', 'IgnitionOverride', 'IgnoreAltCurrent', 'IgnoreBattVMain', 'IgnoreBattV2', 'LimpHome'];
-const rwfsFlags = { IgnoreTemperature: 0, IgnoreRPM: 0, IgnitionOverride: 0, IgnoreAltCurrent: 0, IgnoreBattVMain: 0, IgnoreBattV2: 0, LimpHome: 0,
+// commissioning Prep gate. Inputs: the CSV3 settings echo (the six override keys + the two numbers, and
+// IgnitionOverride for the engine-speed acknowledgement), CSV2 (sensorFaultMask, battTempState, limpTier,
+// sensorSteadyMask) and CSV1 (fieldEventReason).
+// IgnitionOverride is a Setup > Engine setting, not a sensor override (owner 2026-10-11): no row here.
+const RWFS_KEYS = ['IgnoreTemperature', 'IgnoreRPM', 'IgnoreAltCurrent', 'IgnoreBattVMain', 'IgnoreBattV2', 'LimpHome'];
+const rwfsFlags = { IgnoreTemperature: 0, IgnoreRPM: 0, IgnoreAltCurrent: 0, IgnoreBattVMain: 0, IgnoreBattV2: 0, LimpHome: 0,
                     LimpDutyPct: 30, NoRpmCurrentA: 0, seen: false };
-let rwfsMask = 0, rwfsSteady = 0, rwfsTier = 0, rwfsBattState = NaN, rwfsReason = 0, rwfsFieldOff = false, rwfsIgnition = NaN;
+let rwfsMask = 0, rwfsSteady = 0, rwfsTier = 0, rwfsBattState = NaN, rwfsReason = 0, rwfsFieldOff = false;
+let rwfsIgnForced = false;   // IgnitionOverride == 1
 let rwfsReqCount = 0;   // §11: CSV2 reqFaultCount
 let rwfsBattCurState = NaN, rwfsAlarm = 0;   // §11.6 CSV2 battCurState; CSV1 Alarm_Status (the banner's Silence button)
 let rwfsOpenedFromBanner = false;
@@ -21532,8 +22153,6 @@ const RWFS_ROWS = [
       what: 'Stops every over-temperature trip, the stale-sensor cut, the thermal derate, the alternator-temperature alarms, NMEA 2000 alternator temperature, alternator health and Auto Min% learning.' },
     { key: 'IgnoreRPM', name: 'Engine speed', bit: 1,
       what: 'Stops the Min RPM gate and the engine-stopped cut. The current limit becomes the amps entered below, the keep-alive floor goes to 0, and engine hours, the RPM tables and every speed-indexed learner pause. The field-on-with-no-output cut still runs on the alternator current, so a stalled engine with the key on is still caught.' },
-    { key: 'IgnitionOverride', name: 'Ignition wire', bit: -1,
-      what: 'The ignition is treated as always on: no ignition-off standby and no ignition-off charge permission; only the alternator switch withholds charging.' },
     { key: 'IgnoreAltCurrent', name: 'Alternator current', bit: 2,
       what: 'Voltage-only regulation under a field duty cap: no current loop, no over-current trips, no current limits (RPM table, battery, external), no load-dump protection.' },
     { key: 'IgnoreBattVMain', name: 'Main battery voltage', bit: 3,
@@ -21552,26 +22171,26 @@ function rwfsSecondVUsable(d) {
 // A second reading that is not reading but not ignored still holds the field off (firmware suppresses
 // REASON_VOLTAGE2_STALE only through IgnoreBattV2), so plain fixed duty runs only once it is ignored too.
 function rwfsMainVText(d) {
-    if (rwfsSecondVUsable(d)) return 'Fixed field duty capped by the second battery voltage reading; the fast over-voltage cut keeps running on that reading. Lost: the timed over-voltage tiers, the INA228 firmware latch, voltage plausibility and disagreement checks, and the charge stages.';
+    if (rwfsSecondVUsable(d)) return 'Fixed field duty capped by the second battery voltage reading; the fast over-voltage cut keeps running on that reading. Lost: the timed over-voltage tiers, the INA228 firmware latch, voltage plausibility and disagreement checks, and the charge stages. The regulator\'s own drive-heat limit freezes at its last value.';
     const ign2 = d ? d.IgnoreBattV2 : rwfsFlags.IgnoreBattV2;
     if (!ign2) return 'Charging stays off: the second battery voltage is not reading, so there is no voltage to run on. Tick Second battery voltage as well for plain fixed field duty with no usable battery voltage, or wait for that reading to return.';
-    return 'Plain fixed field duty with no usable battery voltage (the second reading is ignored too): no fast over-voltage cut, no timed over-voltage tiers, no INA228 firmware latch, no plausibility or disagreement checks, no charge stages. Only the INA228 hardware alert remains.';
+    return 'Plain fixed field duty with no usable battery voltage (the second reading is ignored too): no fast over-voltage cut, no timed over-voltage tiers, no INA228 firmware latch, no plausibility or disagreement checks, no charge stages, and the regulator\'s own drive-heat limit freezes at its last value. Only the INA228 hardware alert remains.';
 }
 // §11 mirror of the firmware's required-fault set: the fault mask expanded to SENSORS (a dead chip is every
 // reading it carries), minus the owner's overrides and Not fitted. NAMES only; the count comes from the
 // firmware in CSV2 (reqFaultCount).
-const RWFS_BIT_NAMES = ['alternator temperature', 'engine speed', 'alternator current', 'main battery voltage', 'second battery voltage', 'battery voltage readings disagree', 'battery temperature', 'ADS1115 analog input chip', 'INA228 battery monitor chip'];
+const RWFS_BIT_NAMES = ['alternator temperature', 'engine speed', 'alternator current', 'main battery voltage', 'second battery voltage', 'battery voltage readings disagree', 'battery temperature', 'ADS1115 analog input chip', 'INA228 battery monitor chip', 'regulator drive temperature (INA228)'];
 function rwfsThermistorSelected() { return Number(g_lastCsv3 && g_lastCsv3.TempSource) === 1; }
 function rwfsCountedBits() {
     if (rwfsFlags.LimpHome) return 0;
-    let f = rwfsMask & 0x7F;
+    let f = rwfsMask & (0x7F | (1 << 9));
     if (rwfsMask & (1 << 7)) f |= (1 << 1) | (1 << 2) | (1 << 4) | (rwfsThermistorSelected() ? 1 : 0);
-    if (rwfsMask & (1 << 8)) f |= (1 << 3);
+    if (rwfsMask & (1 << 8)) f |= (1 << 3) | (1 << 9);
     if (f & ((1 << 3) | (1 << 4))) f &= ~(1 << 5);
     if (rwfsFlags.IgnoreTemperature) f &= ~1;
     if (rwfsFlags.IgnoreRPM) f &= ~(1 << 1);
     if (rwfsFlags.IgnoreAltCurrent) f &= ~(1 << 2);
-    if (rwfsFlags.IgnoreBattVMain) f &= ~((1 << 3) | (1 << 5));
+    if (rwfsFlags.IgnoreBattVMain) f &= ~((1 << 3) | (1 << 5) | (1 << 9));   // the die reading dies with the INA228 chip, so its only override is the chip's
     if (rwfsFlags.IgnoreBattV2) f &= ~((1 << 4) | (1 << 5));
     return f;
 }
@@ -21580,8 +22199,12 @@ function rwfsFaultNames(bits) {
     const out = [];
     const adsBits = (1 << 1) | (1 << 2) | (1 << 4) | (rwfsThermistorSelected() ? 1 : 0);
     if ((rwfsMask & (1 << 7)) && (b & adsBits)) { out.push('ADS1115 analog input chip (engine speed, alternator current, second battery voltage' + (rwfsThermistorSelected() ? ', thermistor' : '') + ')'); b &= ~adsBits; }
-    if ((rwfsMask & (1 << 8)) && (b & (1 << 3))) { out.push('INA228 battery monitor chip (main battery voltage)'); b &= ~(1 << 3); }
+    if ((rwfsMask & (1 << 8)) && (b & ((1 << 3) | (1 << 9)))) {
+        out.push('INA228 battery monitor chip (main battery voltage' + ((b & (1 << 9)) ? ', regulator drive temperature' : '') + ')');
+        b &= ~((1 << 3) | (1 << 9));
+    }
     for (let i = 0; i < 7; i++) if (b & (1 << i)) out.push(RWFS_BIT_NAMES[i]);
+    if (b & (1 << 9)) out.push(RWFS_BIT_NAMES[9]);
     return out.join(', ');
 }
 // Which rows a fault points at (outline + "This is what stopped charging"); pretick = tick the box when opened
@@ -21598,12 +22221,14 @@ function rwfsCauseFor(r) {
             : { rows: [1, 3], pretick: false, note: 'The field is driven hard but no alternator current is measured: a false engine-speed signal, a current sensor stuck at zero, or an open field circuit / dead alternator. Run without the one you can rule out.' };
         case 5:  return { rows: [4, 5], pretick: false, note: 'Both battery-voltage readings are outside the plausible range.' };
         case 6: case 8: return { rows: [4, 5], pretick: false, note: 'The two battery-voltage readings disagree. Run without the one you trust less.' };
+        case 32: return { rows: [4], pretick: false, note: 'The regulator\'s drive temperature (read from the INA228 chip) is lost, and the field-drive heat protection depends on it. The only way to run without it is to run without the INA228 chip, which also drops the main battery voltage.' };
         default: break;
     }
     const f = rwfsCountedBits();
     const rows = [];
     RWFS_ROWS.forEach((row, i) => { if (row.bit >= 0 && (f & (1 << row.bit))) rows.push(i); });
     if (f & (1 << 5)) { if (!rows.includes(4)) rows.push(4); if (!rows.includes(5)) rows.push(5); }
+    if ((f & (1 << 9)) && !rows.includes(4)) rows.push(4);   // drive temperature has no row; its only override is Main battery voltage (the INA228 chip)
     return { rows, pretick: rows.length === 1 && rwfsReqCount === 1 };
 }
 function rwfsBattTempState() { return (g_lastCsv2 && g_lastCsv2.battTempState !== undefined) ? Number(g_lastCsv2.battTempState) : NaN; }
@@ -21663,6 +22288,7 @@ function battTempSourceSubmit(form) {
 function rwfsOnSettingsEcho(data) {
     let changed = false;
     for (const k of RWFS_KEYS) if (data[k] !== undefined) { const v = Number(data[k]) === 1 ? 1 : 0; if (v !== rwfsFlags[k]) changed = true; rwfsFlags[k] = v; }
+    if (data.IgnitionOverride !== undefined) { const v = Number(data.IgnitionOverride) === 1; if (v !== rwfsIgnForced) changed = true; rwfsIgnForced = v; }
     if (data.LimpDutyPct !== undefined && Number.isFinite(Number(data.LimpDutyPct))) rwfsFlags.LimpDutyPct = Number(data.LimpDutyPct) / 10;
     if (data.NoRpmCurrentA !== undefined && Number.isFinite(Number(data.NoRpmCurrentA))) rwfsFlags.NoRpmCurrentA = Number(data.NoRpmCurrentA) / 10;
     if (data.IgnoreTemperature !== undefined) rwfsFlags.seen = true;
@@ -21687,7 +22313,6 @@ let _rwfsCsv1LastMs = 0;
 function rwfsOnCsv1(data) {
     rwfsReason = parseInt(data.fieldEventReason) || 0;
     rwfsFieldOff = !(Number(data.fieldActiveStatus) >= 1 && Number(data.fieldActiveStatus) <= 4);
-    if (data.Ignition !== undefined) rwfsIgnition = Number(data.Ignition);
     if (data.Alarm_Status !== undefined) rwfsAlarm = Number(data.Alarm_Status);
     const now = Date.now();
     if (now - _rwfsCsv1LastMs < 1000) return;   // CSV1 is 10 Hz; the banner and the modal only need ~1 Hz
@@ -21726,6 +22351,10 @@ function updateSensorBanner() {
         alert = true;
     } else if (rwfsFieldOff && rwfsReason === 5 && !f) {
         html = 'Charging stopped: both battery-voltage readings are implausible.' + optBtn;
+        alert = true;
+    } else if (rwfsFieldOff && rwfsReason === 32 && f && Number(g_lastCsv3 && g_lastCsv3.ManualFieldToggle) === 1) {
+        // REASON_DIE_TEMP_LOST outranks MANUAL in the firmware, so what stopped is the owner's manual field.
+        html = 'Manual field stopped: ' + names + ' not responding, so the field-drive heat limit has no input. Manual resumes when the reading returns.' + optBtn;
         alert = true;
     } else if (f) {
         let state = 'not responding';
@@ -21798,8 +22427,6 @@ function rwfsSmallestTableAmps() {
     return best;
 }
 function rwfsStatusFor(r) {
-    if (r.key === 'IgnitionOverride') return rwfsFlags.IgnitionOverride ? { t: 'Cannot be checked (forced on)', c: 'na' }
-                                                                        : { t: 'Cannot be checked (' + (rwfsIgnition === 1 ? 'ON' : rwfsIgnition === 0 ? 'OFF' : '?') + ')', c: 'na' };
     if (r.key === null) {
         if (rwfsBattState === 0) return { t: 'Not fitted', c: 'na' };
         if (rwfsBattState === 1) return { t: 'OK', c: 'ok' };
@@ -21812,6 +22439,7 @@ function rwfsStatusFor(r) {
     if (rwfsMask & (1 << r.bit)) return { t: 'Not responding', c: 'bad' };
     if (r.bit >= 0 && (rwfsMask & (1 << 7)) && (r.bit === 1 || r.bit === 2 || r.bit === 4 || (r.bit === 0 && rwfsThermistorSelected()))) return { t: 'Not responding (ADS1115 chip)', c: 'bad' };
     if (r.bit === 3 && (rwfsMask & (1 << 8))) return { t: 'Not responding (INA228 chip)', c: 'bad' };
+    if (r.bit === 3 && (rwfsMask & (1 << 9))) return { t: 'Drive temperature not responding (INA228 chip)', c: 'bad' };
     return { t: 'OK', c: 'ok' };
 }
 // The row markup is built once per structure (which rows and conditional inputs exist) and otherwise
@@ -21824,7 +22452,7 @@ function rwfsRender(fresh) {
     const cause = (rwfsFieldOff || rwfsCountedBits()) ? rwfsCauseFor(rwfsReason) : { rows: [], pretick: false };
     const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
     const limp = val('LimpHome');
-    const engAndIgn = val('IgnoreRPM') && val('IgnitionOverride');
+    const engAndIgn = val('IgnoreRPM') && rwfsIgnForced;
     const capInput = val('IgnoreAltCurrent') || val('IgnoreBattVMain') || limp;
     const structKey = [val('IgnoreRPM') ? 1 : 0, engAndIgn ? 1 : 0, limp ? 1 : 0, capInput ? 1 : 0, rwfsBattState].join('|');
     if (fresh || structKey !== _rwfsStructKey) {
@@ -21858,7 +22486,7 @@ function rwfsRender(fresh) {
         h += '<div id="rwfs-cause-note" class="rwfs-sub" style="display:none; color:#ff8a80; font-size:12.5px; padding:6px 8px;"></div>';
         if (engAndIgn) {
             h += '<div class="rwfs-row"><div class="rwfs-sub rwfs-ack"><input type="checkbox" id="rwfs-ack-eng"' + (draft.ackEng ? ' checked' : '') + ' onchange="rwfsSummary()">'
-               + '<span>Nothing will tell the regulator the engine has stopped. The field stays on and drains the battery until you switch the alternator off. I understand.</span></div></div>';
+               + '<span>Ignition Override is on (Setup → Engine), so with engine speed ignored nothing will tell the regulator the engine has stopped. With the alternator switch on it keeps powering the field and drains the battery until you switch the alternator off. I understand.</span></div></div>';
         }
         // last row, separated: fixed duty, ignore every sensor
         h += '<div class="rwfs-row" style="margin-top:10px; border-top:2px solid #444;">'
@@ -21913,7 +22541,7 @@ function rwfsSummary() {
                               : 'Charging stays off: the second battery voltage is not reading and is not ignored, so there is no voltage to run on. Tick Second battery voltage as well for fixed field duty of ' + capTxt + '%, or wait for that reading to return.';
     }
     else if (d.IgnoreAltCurrent) { tier = 2; mode = 'Voltage-only regulation: the field duty rises slowly and falls fast on the voltage error, capped at ' + capTxt + '%. Charge stages still run on the main battery voltage.'; }
-    else if (d.IgnoreTemperature || d.IgnoreRPM || d.IgnitionOverride || d.IgnoreBattV2) { tier = 1; mode = 'Normal closed-loop regulation; only the protections that depend on the ignored sensor are removed.'; }
+    else if (d.IgnoreTemperature || d.IgnoreRPM || d.IgnoreBattV2) { tier = 1; mode = 'Normal closed-loop regulation; only the protections that depend on the ignored sensor are removed.'; }
     else { tier = 0; mode = 'Normal regulation with every sensor in use.'; }
     const lost = [], kept = [];
     const add = (cond, txt) => (cond ? lost : kept).push(txt);
@@ -21922,7 +22550,6 @@ function rwfsSummary() {
     add(all || d.IgnoreTemperature, 'over-temperature trips and the thermal derate');
     add(all || d.IgnoreRPM, 'Min RPM gate and the engine-stopped cut');
     add(all || d.IgnoreAltCurrent, 'field-on-with-no-output (tach plausibility) cut');
-    add(all || d.IgnitionOverride, 'ignition-off standby and ignition-off charge permission');
     add(all || d.IgnoreAltCurrent, 'current limits, over-current trips and load-dump protection');
     add(all || d.IgnoreBattVMain || d.IgnoreBattV2, 'two-sensor voltage disagreement check');
     add(all || d.IgnoreBattVMain, 'voltage plausibility check and the charge stages');
@@ -21942,19 +22569,17 @@ function rwfsSummary() {
 function rwfsValidate(d) {
     if (d.IgnoreRPM && !(parseFloat(d.NoRpmCurrentA) > 0)) return 'Enter the alternator current limit to use without engine speed.';
     if ((d.IgnoreAltCurrent || d.IgnoreBattVMain || d.LimpHome) && !(parseFloat(d.LimpDutyPct) >= 0 && parseFloat(d.LimpDutyPct) <= 99)) return 'Enter a field duty cap between 0 and 99%.';
-    if (d.IgnoreRPM && d.IgnitionOverride && !d.ackEng) return 'Tick the acknowledgement for running without engine speed and the ignition wire.';
+    if (d.IgnoreRPM && rwfsIgnForced && !d.ackEng) return 'Tick the acknowledgement for running without engine speed while Ignition Override is on.';
     if (d.LimpHome && !d.ackLimp) return 'Tick the acknowledgement for fixed duty with every sensor ignored.';
     return '';
 }
-// The ignition override is stored as 1 = forced on, 2 = Auto (any value other than 1 reads as Auto in firmware).
-function rwfsKeyValue(k, v) { return (k === 'IgnitionOverride' && v !== 1) ? 2 : v; }
 async function rwfsApply() {
     if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
     const d = rwfsDraft(false);
     const why = rwfsValidate(d);
     if (why) { xAlert(why); return; }
     const params = [];
-    for (const k of RWFS_KEYS) if (d[k] !== rwfsFlags[k]) params.push(k + '=' + rwfsKeyValue(k, d[k]));
+    for (const k of RWFS_KEYS) if (d[k] !== rwfsFlags[k]) params.push(k + '=' + d[k]);
     if (d.IgnoreRPM && parseFloat(d.NoRpmCurrentA) !== rwfsFlags.NoRpmCurrentA) params.push('NoRpmCurrentA=' + parseFloat(d.NoRpmCurrentA));
     if ((d.IgnoreAltCurrent || d.IgnoreBattVMain || d.LimpHome) && parseFloat(d.LimpDutyPct) !== rwfsFlags.LimpDutyPct) params.push('LimpDutyPct=' + parseFloat(d.LimpDutyPct));
     if (!params.length) { rwfsClose(); return; }
@@ -21976,7 +22601,7 @@ async function rwfsStopAll() {
     const ok = await xConfirm('Stop ignoring every sensor? Each protection comes back the moment its sensor is read again; a sensor that is still failed stops charging.', { title: 'Run Without Failed Sensors', okText: 'Stop ignoring all', cancelText: 'Cancel' });
     if (!ok) return;
     try {
-        const r = await fetchWithTimeout(buildURL('/get?' + RWFS_KEYS.map(k => k + '=' + rwfsKeyValue(k, 0)).join('&')), {}, 10000);
+        const r = await fetchWithTimeout(buildURL('/get?' + RWFS_KEYS.map(k => k + '=0').join('&')), {}, 10000);
         if (!r.ok) { xAlert('The regulator refused the change (HTTP ' + r.status + ').'); return; }
         rwfsClose();
     } catch (e) { diagLog('rwfs clear failed:', e); xAlert('Could not reach the regulator. Check the connection and try again.'); }
@@ -21984,9 +22609,19 @@ async function rwfsStopAll() {
 async function rwfsStopOne(key) {
     if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
     try {
-        const r = await fetchWithTimeout(buildURL('/get?' + key + '=' + rwfsKeyValue(key, 0)), {}, 10000);
+        const r = await fetchWithTimeout(buildURL('/get?' + key + '=0'), {}, 10000);
         if (!r.ok) xAlert('The regulator refused the change (HTTP ' + r.status + ').');
     } catch (e) { diagLog('rwfs stop-one failed:', e); }
+}
+// Setup > Engine. With engine speed ignored the ignition is the only "engine running" signal, so forcing it on
+// needs the same acknowledgement the Run Without Failed Sensors screen asks for in the other order.
+async function ignitionOverrideToggle(cb) {
+    if (cb.checked && rwfsFlags.IgnoreRPM === 1) {
+        const ok = await xConfirm('Engine speed is ignored (Setup → System → Run Without Failed Sensors), so the ignition is the regulator\'s only sign that the engine is running. With Ignition Override on as well, nothing will tell it the engine has stopped: with the alternator switch on it keeps powering the field and drains the battery until you switch the alternator off.',
+            { title: 'Ignition Override', okText: 'Turn on', cancelText: 'Cancel' });
+        if (!ok) { cb.checked = false; return; }
+    }
+    if (handleUserToggle('IgnitionOverride_checkbox', 'IgnitionOverride', 'IgnitionOverride')) { cb.form.submit(); submitMessage(); }
 }
 // §6: the commissioning Prep gate. Returns '' when every sensor is in use and reading, else the reason.
 function rwfsCommissioningBlock() {
@@ -21997,8 +22632,8 @@ function rwfsCommissioningBlock() {
         .map(k => k === 'LimpHome' ? 'every sensor (fixed duty)' : (RWFS_ROWS.find(r => r.key === k) || { name: k }).name.toLowerCase());
     if (ign.length) return 'Commissioning needs every sensor. Stop running without: ' + ign.join(', ') + ' (Setup > System > Run Without Failed Sensors).';
     const names = [];
-    for (const b of [0, 2, 3, 4, 5, 7, 8]) if (rwfsMask & (1 << b)) {
-        names.push(['alternator temperature', 'engine speed', 'alternator current', 'main battery voltage', 'second battery voltage', 'battery voltage readings (disagree)', 'battery temperature', 'ADS1115 analog input chip', 'INA228 battery monitor chip'][b]);
+    for (const b of [0, 2, 3, 4, 5, 7, 8, 9]) if (rwfsMask & (1 << b)) {
+        names.push(['alternator temperature', 'engine speed', 'alternator current', 'main battery voltage', 'second battery voltage', 'battery voltage readings (disagree)', 'battery temperature', 'ADS1115 analog input chip', 'INA228 battery monitor chip', 'regulator drive temperature (INA228)'][b]);
     }
     if (names.length) return names.join(', ') + ' ' + (names.length === 1 ? 'is' : 'are') + ' not reading.';
     return '';
@@ -25822,7 +26457,11 @@ const SYSID_ABORT_REASONS = {
     28: 'main battery voltage sensor not responding',
     29: 'second battery voltage sensor not responding',
     30: 'waiting for the first battery temperature reading',
-    31: 'two or more required sensors failed'
+    31: 'two or more required sensors failed',
+    32: 'regulator temperature sensor not responding',
+    33: 'field resistance test',
+    253: 'a field ceiling clipped the test signal',
+    254: 'output could not settle at the stabilize current'
 };
 
 function sysidInitDrag() {
@@ -27440,7 +28079,7 @@ function cxBulkV() { const v = getEchoNumber('BulkVoltage_echo'); return (v > 0)
 function cxDriveOffReason() {
   const c = (typeof g_lastCsv1 === 'object' && g_lastCsv1) ? g_lastCsv1 : {};
   const ign = (c.Ignition !== undefined && c.Ignition !== '') ? Number(c.Ignition) : NaN;
-  if (ign === 0) return 'The ignition input is off, so the regulator will not drive the field. Turn the key on, or check the ignition wire.';
+  if (ign === 0) return 'The ignition input is off, so the regulator will not drive the field. Turn the key on, or check the ignition wire. With no ignition wire connected, turn on Ignition Override under Setup → Engine.';
   if (g_onOffDevice === 0) return 'Alternator Enable is OFF. Switch it on (top right) to run this test.';
   return null;
 }
@@ -27512,7 +28151,7 @@ function cxWhyTip(html) {
 // few facts that change what the user DOES on this screen; everything else goes in the doc.
 function cxFinePrint(phase) {
   switch (phase) {
-    case 0: return 'Commissioning runs some semi-automated tests on your alternator and uses the results to optimize configuration settings. Time required is ~ 15 minutes and requires some charging headroom in the battery SOC to avoid tripping overvoltage protections.' + cxDocLink('step-1-prep');
+    case 0: return 'Commissioning runs some semi-automated tests on your alternator and uses the results to optimize configuration settings. Time required is ~ 30 minutes and requires some charging headroom in the battery SOC to avoid tripping overvoltage protections.' + cxDocLink('step-1-prep');
     case 1: return 'Ramps the field across its full range with no feedback control, mapping drive to amps and finding the saturation knee — where more drive stops adding current. It also sizes the next step\'s test.' + cxDocLink('step-2-field-curve');
     case 2: return 'A small open-loop sine sweep measures the field\'s own electrical lag and proposes the current-loop gains and filters. Run it near the same engine speed you used for the Field curve.' + cxDocLink('step-3-current-control-autotuning');
     case 3: return 'Closed-loop check of the new gains: overshoot, and how fast a change the loop can actually follow. It sweeps past that speed on purpose — the response going small and ragged at the top end is the bandwidth being found, not a bad reading.' + cxDocLink('step-4-verify-current-control');
@@ -27904,7 +28543,7 @@ function cxPrepRefresh() {
     const iEl = document.getElementById('cx-prep-ign');
     if (iEl) iEl.innerHTML = ignOn
         ? '<strong style="color:#5a5;">ON</strong>'
-        : '<strong style="color:#f0a500;">OFF</strong> (turn the key on, or check the ignition wire)';
+        : '<strong style="color:#f0a500;">OFF</strong> (turn the key on, check the ignition wire, or with no ignition wire turn on Ignition Override under Setup → Engine)';
     const fEl = document.getElementById('cx-prep-field');
     if (fEl) fEl.innerHTML = fieldOn
         ? '<strong style="color:#5a5;">ON</strong>'
@@ -28222,6 +28861,13 @@ function cxCutCauseText(code) {
         case 23: return 'sustained over-voltage protection (timed cut)';
         case 24: return 'the hot-charge lockout';
         case 26: return 'the current-sensor zero measurement holding the field off';
+        case 27: return 'the battery temperature sensor not responding';
+        case 28: return 'the main battery voltage reading going stale';
+        case 29: return 'the second battery voltage reading going stale';
+        case 30: return 'the wait for a first battery temperature reading';
+        case 31: return 'two or more required sensors failing at once';
+        case 32: return 'the regulator drive temperature (INA228 die) reading being lost';
+        case 33: return 'the field resistance test';
         default: return '';
     }
 }
@@ -28234,8 +28880,34 @@ const CX_CUT_NAME_TO_CODE = {
     'HARD_OVERCURRENT': 13, 'RPM_TOO_LOW': 14, 'CURRENT_STALE': 15, 'FAST_OVERVOLTAGE': 16,
     'Battery too cold to charge': 17, 'TACH_IMPLAUSIBLE': 19, 'SOLAR_PAUSE': 20, 'BMS_OFF': 21,
     'OV_TIER_LOW': 22, 'OV_TIER_MID': 23, 'Battery too hot to charge': 24,
-    'CHARGE COMPLETE (idle - battery full)': 25, 'Measuring current sensor zero (field at 0%)': 26
+    'CHARGE COMPLETE (idle - battery full)': 25, 'Measuring current sensor zero (field at 0%)': 26,
+    'Battery temperature sensor not responding': 27, 'VOLTAGE_STALE': 28, 'VOLTAGE2_STALE': 29,
+    'Waiting for the first battery temperature reading': 30, 'MULTI_SENSOR_FAULT': 31, 'DIE_TEMP_LOST': 32,
+    'Field resistance test': 33
 };
+
+// The binding field-ceiling term (CSV2 fieldCeilBind: 0 Max Field %, 1 Max Field Volts, 2 the 10 A field-current
+// ceiling, 3/4 field-drive heat) as the owner sees it. setting = the action that raises it, '' for the regulator's
+// own limits; note = why nothing in Setup raises those. An unknown bind (no CSV2 yet) points at the "limiting" marker.
+function cxCeilBindInfo(bind) {
+    const where = '(Setup ▸ Alternator ▸ Basic ▸ Output Control)';
+    switch (bind) {
+        case 0: return { name: 'Max Field (%)', setting: 'raise Max Field (%) ' + where, note: '' };
+        case 1: return { name: 'Max Field Volts', setting: 'check Max Field Volts against the alternator\'s rated field voltage and raise it if it is lower ' + where, note: '' };
+        case 2: return { name: 'the regulator\'s 10 A field-current limit', setting: '',
+                         note: 'That is the regulator\'s own protection (Field Current Ceiling, 10 A), and no setting raises it.' };
+        case 3:
+        case 4: return { name: 'the regulator\'s field-drive heat limit', setting: '',
+                         note: 'That is the regulator\'s own protection (Field Drive Heat Ceiling), no setting raises it, and it recovers as the regulator cools.' };
+        default: return { name: 'the field ceiling', setting: '',
+                          note: 'Setup ▸ Alternator ▸ Basic ▸ Output Control marks which field limit is binding.' };
+    }
+}
+// Live CSV2 fieldCeilBind, or -1 before the first CSV2 frame.
+function cxLiveCeilBind() {
+    const b = (g_lastCsv2 && g_lastCsv2.fieldCeilBind !== undefined) ? Number(g_lastCsv2.fieldCeilBind) : NaN;
+    return Number.isFinite(b) ? b : -1;
+}
 function cxCutIsOv(code) { return code === 7 || code === 12 || code === 16 || code === 22 || code === 23; }
 
 // The saturation ramp climbs open-loop until output reaches the current limit for the held RPM in
@@ -28321,13 +28993,17 @@ function cxRenderField(b) {
     } else if (cx.fieldAbort) {
         body += cxRampAbortHtml('Ramp stopped', cx.fieldAbort, cx.fieldAbortInfo, 'Field curve', 'run', true);
     } else if (r) {
+        // ceilBind is the live CSV2 term captured when the result landed (cxFieldStart).
+        const bi = cxCeilBindInfo(r.ceilLimited ? r.ceilBind : -1);
+        const cutFix = bi.setting ? 'If the proposals look low, ' + bi.setting + ', then re-run.'
+            : bi.note + ' A higher engine speed makes more current from the same field, so a re-run there captures more of the curve.';
         body += '<div style="margin:10px 0; padding:8px 10px; background:#222; border-radius:6px;">' +
             'Captured <strong>' + r.pts.length + '</strong> points. ' +
-            (r.kneeAmps > 0 ? 'Saturation knee ~<strong>' + r.kneeAmps.toFixed(0) + ' A</strong> (' + r.kneeDuty.toFixed(0) + '% duty). Data is valid.'
-                : (r.ceilLimited ? 'No saturation reached before the Max Field % limit.'
+            (r.kneeAmps > 0 ? 'Saturation knee ~<strong>' + r.kneeAmps.toFixed(0) + ' A</strong> (' + r.kneeDuty.toFixed(0) + '% duty).' + (r.ceilLimited ? '' : ' Data is valid.')
+                : (r.ceilLimited ? 'No saturation reached before ' + bi.name + '.'
                                  : '<span style="color:#5a5;"><strong>Good</strong> — the alternator stayed in its linear range across the whole ramp (no saturation). Data is valid.</span>')) +
             '<br>Proposed <strong>Stabilize current</strong> ' + r.propStabA.toFixed(0) + ' A &nbsp;·&nbsp; <strong>Step amplitude</strong> ' + r.propStepPct.toFixed(1) + '% duty.' +
-            (r.ceilLimited ? '<br><span style="color:#f0a500;">The ramp hit the Max Field % limit before reaching the amp target, so the curve is cut short. If the proposals look low, raise “Max Field (%)” (Settings ▸ Battery) and re-run.</span>' : '') +
+            (r.ceilLimited ? '<br><span style="color:#f0a500;">The ramp reached ' + bi.name + ' before the amp target, so the curve is cut short. ' + cutFix + '</span>' : '') +
             (r.ok ? '' : '<br><span style="color:#f0a500;">Curve looks marginal — review before applying.</span>') +
             (cx.fieldApplied ? '<br><span style="color:#5a5;">Applied.</span>' : '') + '</div>';
         body += cxRpmAdvisoryHtml(r.rpmAvg || 0, r.rpmMin || 0, r.rpmMax || 0, 0, '', '');
@@ -28395,6 +29071,7 @@ function cxFieldStart() {
                     settle(); cx.fieldRunning = false; cx.fieldAbort = j.abort;
                     cx.fieldAbortInfo = cxAbortInfoFrom(j); commissionRender();
                 } else if (j.ready && !j.active) {        // completed normally
+                    if (j.ceilBind === undefined) j.ceilBind = cxLiveCeilBind();   // firmware latches the bind at the stop; older JSON lacks it
                     settle(); cx.fieldRunning = false; cx.fieldResult = j; commissionRender();
                 } else if (sawActive && !j.active) {      // ran then stopped, no result/reason (e.g. cancel)
                     settle(); cx.fieldRunning = false; commissionRender();
@@ -28490,9 +29167,12 @@ function cxRenderKnee(b) {
             // the bank up to the table limit the way the saturation ramp does.
             body += cxRampAbortHtml('Automatic current sweep stopped', cx.kneeAbort, cx.kneeAbortInfo, 'keep-alive onset', 'Record', false);
         } else if (cx.kneeNoOnset) {
+            const kb = cxCeilBindInfo(cx.kneeCeilLimited ? cx.kneeCeilBind : -1);
             body += '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' +
                 (cx.kneeCeilLimited
-                    ? 'The automatic current sweep reached the Max Field % limit before any onset — the real onset may be above it. Raise “Max Field (%)” (Settings ▸ Battery) and Record again, or hold a slightly different steady RPM.'
+                    ? 'The automatic current sweep reached ' + kb.name + ' before any onset, so the real onset may be above it. ' +
+                      (kb.setting ? kb.setting.charAt(0).toUpperCase() + kb.setting.slice(1) + ', then Record again, or hold a slightly different steady RPM.'
+                                  : kb.note + ' Hold a slightly different steady RPM, then Record again.')
                     : 'No clean onset at that speed — nothing recorded. Hold a slightly different steady RPM in the same range, then Record again.') + '</div>';
         }
         body += '<div style="margin:10px 0;padding:10px 12px;background:#1c2530;border-radius:6px;">' +
@@ -28626,7 +29306,7 @@ function cxKneeStart() {
                             if (idx < CX_KNEE_STEPS.length) cxFdStart(idx); else commissionRender();
                         }).catch(e => { cx.kneeRunning = false; xAlert('Add failed: ' + e); commissionRender(); });
                     } else {                              // no clean onset → record nothing, let them retry
-                        cx.kneeRunning = false; cx.kneeNoOnset = true; cx.kneeCeilLimited = !!j.ceilLimited; commissionRender();
+                        cx.kneeRunning = false; cx.kneeNoOnset = true; cx.kneeCeilLimited = !!j.ceilLimited; cx.kneeCeilBind = (j.ceilBind !== undefined) ? Number(j.ceilBind) : cxLiveCeilBind(); commissionRender();
                     }
                 } else if (sawActive && !j.active) {      // ran then stopped, no result/reason (e.g. cancel)
                     settle(); cx.kneeRunning = false; commissionRender();
@@ -28689,6 +29369,7 @@ function cxRenderPlant(b) {
     const fit = cx.fit;
     let body = '';
     if (cx.plantRunning) body += '<p style="color:#4a9eff;">Sine sweep running… hold RPM steady.</p>';
+    else if (cx.plantStop && !fit) body += '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' + cx.plantStop + '</div>';
     else if (fit) {
         if (!fit.ok) body += '<div style="margin:10px 0;color:#f0a500;">No −3 dB corner found in the swept range. Widening the sweep and retrying…</div>';
         else body += '<div style="margin:10px 0; padding:8px 10px; background:#222; border-radius:6px;">' +
@@ -28721,16 +29402,28 @@ function cxRenderPlant(b) {
     }
     b.innerHTML = body;
 }
+// The firmware's own stop of the plant sweep. /sysidbode carries no reason; CSV2 systemIDAbortReason does:
+// 253 = a field ceiling clipped the sine (nothing fitted), 254 = could not settle at the Stabilize current.
+function cxPlantStopText(code) {
+    if (code === 253) {
+        const bi = cxCeilBindInfo(cxLiveCeilBind());
+        const speed = 're-run the Field curve step and then this one at a higher engine speed, where the same current needs less field';
+        return '<strong>Sweep stopped: the wave\'s peak reached ' + bi.name + '.</strong> A clipped wave reads as lower plant gain and would propose gains that are too high, so nothing was fitted. ' +
+            (bi.setting ? 'Either ' + bi.setting + ', or ' + speed + '.' : bi.note + ' To fit below it, ' + speed + '.');
+    }
+    if (code === 254) return '<strong>Sweep never started:</strong> output could not settle at the Stabilize current. Hold the engine speed steady, then re-run.';
+    return '<strong>The sweep stopped without a result.</strong> <strong>Live Data ▸ Console</strong> has the firmware line. Clear the cause, then re-run.';
+}
 function cxPlantStart(wide) {
     cxShowTab('plots', 'displays');   // open-loop sine sweep → watch on Plots ▸ Short Term
-    cx.fit = null; cx.plantApplied = false; cx.plantRunning = true; commissionRender();
+    cx.fit = null; cx.plantApplied = false; cx.plantStop = null; cx.plantRunning = true; commissionRender();
     const fStart = wide ? 0.3 : 0.5, fEnd = wide ? 30 : 20;
     const tok = cxRunTok();
     cxGet('systemIDTestType=1&systemIDSineFreqStart=' + fStart + '&systemIDSineFreqEnd=' + fEnd)
         .then(() => cxGet('startSystemID=1&run=' + tok))
         .then(() => {
             cxStopPoll();
-            let waited = 0, settled = false, framesSeen = 0;
+            let waited = 0, settled = false, framesSeen = 0, sawActive = false, endedPolls = 0;
             // Run token + one-shot latch, as in cxKneeStart: a refused start (2 s cooldown, another
             // test busy, not AUTO) leaves the LAST sweep latched ready, and fitting it here would write
             // a previous run's plant tau and gains.
@@ -28746,7 +29439,17 @@ function cxPlantStart(wide) {
                     if (settled || !cx.plantRunning) return;
                     framesSeen++;
                     if (j.tok !== tok) return;
+                    if (j.active) sawActive = true;
                     if (j.aborted) { settle(); cx.plantRunning = false; xAlert('Plant sweep aborted — a protection fired during the test (see console). Re-run once charging resumes.'); commissionRender(); return; }
+                    if (!j.ready && !j.active && sawActive) {
+                        // Ended with no result and no protection latch: the firmware stopped it, and the reason
+                        // (CSV2) can trail this poll by one 5 s CSV2 frame. Never offers Apply.
+                        const why = Number(g_lastCsv2 && g_lastCsv2.systemIDAbortReason);
+                        if (why === 253 || why === 254 || ++endedPolls > 8) {
+                            settle(); cx.plantRunning = false; cx.plantStop = cxPlantStopText(why); commissionRender();
+                        }
+                        return;
+                    }
                     if (j.ready && !j.active) {
                         settle();
                         const pts = j.pts;
@@ -30749,7 +31452,14 @@ function cxRtFinish() {
     } else {
         const iLo = fa.lo, iHi = fa.hi;
         cx.rtestState = 'failed';
-        cx.rtFailMsg = 'Levels spanned only ' + (iHi - iLo > 0 ? (iHi - iLo).toFixed(0) : '0') + ' A (need ≥5 A). Retry — make sure the alternator actually reaches the higher levels at this RPM.';
+        // A regulator ceiling holding the field (CSV1 duty within a point of CSV2 fieldDutyCeil while bind >= 2)
+        // looks like a weak alternator here; name it instead.
+        const bind = cxLiveCeilBind(), c1 = g_lastCsv1 || {}, c2 = g_lastCsv2 || {};
+        const held = bind >= 2 && Number(c1.dutyCycle) / 100 >= Number(c2.fieldDutyCeil) / 100 - 1;
+        const bi = cxCeilBindInfo(bind);
+        cx.rtFailMsg = 'Levels spanned only ' + (iHi - iLo > 0 ? (iHi - iLo).toFixed(0) : '0') + ' A (need ≥5 A). ' +
+            (held ? 'The field sat at ' + bi.name + ', so the higher levels were out of reach at this speed. ' + bi.note + ' Retry, or skip to Thresholds.'
+                  : 'Retry — make sure the alternator actually reaches the higher levels at this RPM.');
     }
     commissionRender();
 }
@@ -31525,7 +32235,7 @@ function cxStressArmLive(j) {
 const CHC_PAIR_DISAGREE = 0.30;      // closest pair of cycle fits differing by more than this share of their mean is flagged
 // Firmware abort reasons a lower test current can relieve (7_functions.ino chcFinish strings). NOT the
 // "charge-rate limit at the test speed is too small" refusal — lowering the share makes that one worse.
-const CHC_CEILING_RE = /output reached the charge-rate limit|bus reached the charge target|field reached its ceiling/;
+const CHC_CEILING_RE = /output reached the charge-rate limit|bus reached the charge target|field reached its ceiling|moved the frozen field/;
 const CHC_TOP_FRAC = 0.50;           // test top as a share of maxWorkingRpm. MUST equal CHC_TOP_FRAC in Xregulator.ino
 const CHC_PACE_RPM_S = 200;          // schedule ramp pace, rpm/s (5 s per 1000 rpm). MUST equal CHC_PACE_RPM_S in Xregulator.ino
 const CHC_SETTLE_S = 10, CHC_SIZE_HOLD_S = 8, CHC_TOP_HOLD_S = 3, CHC_MIN_RAMP_S = 2, CHC_CYCLES = 4;   // MUST equal CHC_SETTLE_IDLE_MS / CHC_SIZE_HOLD_MS / CHC_TOP_HOLD_MS / CHC_MIN_RAMP_MS / 1+CHC_MEAS_CYCLES in Xregulator.ino
@@ -36054,8 +36764,10 @@ function ssBuildIndex() {
         const labEl = row.querySelector('.form-label');
         if (!labEl) return;
         const clone = labEl.cloneNode(true);
-        clone.querySelectorAll('.tooltip, [id$="_echo"]').forEach(n => n.remove());
-        const label = ssCleanLabel(clone.textContent);
+        // Field-cap rows also carry live "% now" readouts and a "limiting" tag; removing the spans leaves
+        // "(, )" or "(% now)" behind, collapsed here ("(%)" and other unit parens survive).
+        clone.querySelectorAll('.tooltip, .cap-limiting, [id$="_echo"], [id$="_now"], [id$="_asDuty"], [id$="_part"]').forEach(n => n.remove());
+        const label = ssCleanLabel(clone.textContent.replace(/\(\s*[,\s]*(?:%\s*now)?\s*\)/g, ' '));
         if (label.length < 2) return;
         const tipEl = labEl.querySelector('.tooltip-box');
         list.push({ label: label, tip: tipEl ? ssTidy(tipEl.textContent) : '', crumbs: ssCrumbs(row, names), el: row });
@@ -36990,7 +37702,10 @@ function whyPanelRender() {
         head = 'Waiting for data';
     } else if (!running) {
         const r = fs === 4 ? 'waiting for cloud' : fieldOffReasonText(Number(c1.fieldEventReason));
-        head = r ? 'Not charging — ' + r : 'Not charging';
+        if (!r && fieldResMissing()) {
+            head = 'Not charging — Field Resistance has not been measured. The field stays off until it is.';
+            where = FIELD_RES_WHERE;
+        } else head = r ? 'Not charging — ' + r : 'Not charging';
     } else {
         const tLim = Number.isFinite(window._lastAltTempLimitF) ? window._lastAltTempLimitF : parseFloat(getEchoText('TemperatureLimitF_echo', '')) ;
         const tLimF = Number.isFinite(window._lastAltTempLimitF) ? window._lastAltTempLimitF : NaN;
@@ -36998,6 +37713,9 @@ function whyPanelRender() {
         const cvl = f(c2, 'dvccRxCvl', 100), ccl = f(c2, 'dvccRxCcl', 10);
         const cvlOk = Number.isFinite(cvl) && cvl > -1000000, cclOk = Number.isFinite(ccl) && ccl > -1000000;
         const rate = (typeof currentChargeRateMode === 'string' && currentChargeRateMode === 'low') ? 'Low' : 'High';
+        // The board ceilings (15/16) also clamp a manual duty; say it is the owner's setting being held down.
+        const manSet = f(g_lastCsv3, 'ManualDutyTarget', 100);
+        const manualHeld = fs === 3 ? ' Your manual setting is ' + (Number.isFinite(manSet) ? num(manSet, 1) + '%' : 'higher') + '; the board limit holds the field below it.' : '';
         switch (lim) {
             case 0:
                 head = 'Nothing limiting charging';
@@ -37096,6 +37814,25 @@ function whyPanelRender() {
                 head = 'Easing down to the ' + rate + ' charge rate — ' + amps(alt) + ' A now, settling to ' + amps(cap) + ' A.';
                 where = 'Charge Rate, in the header. The step is spread over a couple of seconds on purpose, so the field tracks the new ceiling down instead of stepping to it.';
                 break;
+            case 15:
+                if (fieldResMissing()) {
+                    head = 'Field Resistance has not been measured. The field stays off until it is.';
+                    where = FIELD_RES_WHERE;
+                    break;
+                }
+                head = (fs === 3 ? 'Manual field mode — ' : '')
+                     + 'Field at the board\'s 10 A limit — field ' + num(f(c1, 'iiout', 100), 1) + ' A, output ' + amps(alt) + ' A at ' + rpmTxt(rpm) + ' RPM.'
+                     + manualHeld;
+                where = 'Board rating, not a setting. Field amps are estimated from Field Resistance, corrected for alternator temperature.';
+                break;
+            case 16:
+                head = (fs === 3 ? 'Manual field mode — ' : '')
+                     + 'Regulator heat limit — board ' + tempTxt(f(c2, 'inaDieTempF', 10)) + ', field held to ' + num(duty, 1) + '% ('
+                     + num(f(c1, 'iiout', 100), 1) + ' A). Output returns as the regulator cools.'
+                     + manualHeld;
+                where = (Number(c2.fieldCeilBind) === 4 ? 'Not a setting. Protects the freewheel diode\'s heat spreader.' : 'Not a setting. Protects the field connector.')
+                      + ' A cooler location for the regulator raises the limit.';
+                break;
             default:
                 head = 'Waiting for data';
         }
@@ -37103,11 +37840,12 @@ function whyPanelRender() {
         // Hi->Lo glide (14), which both push output UP; the deliberate zero-current command (12); and the
         // warm-up ramp (13), which is on its way up by itself. Red = a protection is cutting output (6).
         // Amber = a real ceiling the owner can act on, manual field mode (10) included since its
-        // protections are off. Grey stays for the no-data / not-charging states, which never reach here.
+        // protections are off, and the board's own field ceilings (15 10 A, 16 drive heat).
+        // Grey stays for the no-data / not-charging states, which never reach here.
         const TONE_OK = [0, 11, 12, 13, 14];
         tone = TONE_OK.indexOf(lim) >= 0 ? 'tone-ok'
              : (lim === 6) ? 'tone-alarm'
-             : (lim >= 1 && lim <= 10) ? 'tone-limit' : '';   // unknown code falls through to grey, like no data
+             : ((lim >= 1 && lim <= 10) || lim === 15 || lim === 16) ? 'tone-limit' : '';   // unknown code falls through to grey, like no data
     }
     _whyRenderLimits(running ? lim : NaN, { c1, c2, f, amps, rpmTxt, rpm, alt, cap, haveBatt, houseR });
     set('why-headline', head);

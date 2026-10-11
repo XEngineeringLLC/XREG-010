@@ -164,6 +164,8 @@ bool fsRemove(const char *path) {
 // Stale values may still sit in NVS on units flashed before this; nothing reads them.
 // #define NK_FieldAdjustmentInterval "FldAdjstmntIntr"
 #define NK_FieldResistance "FieldResistance"
+#define NK_FieldResTrefC "FieldResTrefC"
+#define NK_FieldWiring "FieldWiring"
 #define NK_FloatVoltage "FloatVoltage"
 #define NK_GeneralFaultAlarm "GenFaultAlarm"
 #define NK_FuelEfficiency "FuelEfficiency"
@@ -282,7 +284,8 @@ bool fsRemove(const char *path) {
 #define NK_SetpointBigStepRiseRate "SetpntBigStpRt"
 #define NK_SettleTimeBeforeCut "SettleTimeBfrCt"
 #define NK_ShuntResistanceMicroOhm "ShntRsstncMcrOh"
-#define NK_ShuntGroundComp "ShuntGroundComp"
+// #define NK_ShuntGroundComp "ShuntGroundComp"   // RETIRED 2026-10-11, replaced by ShuntLead (the correction is no longer a user choice) — key reserved, never reuse
+#define NK_ShuntLead "ShuntLead"
 #define NK_ShutdownPhase2HoldMs "ShtdwnPhs2HldMs"
 #define NK_ShutdownRampTauS "ShutdnRampTauS"
 #define NK_NoOutputAmps "NoOutputAmps"
@@ -4419,6 +4422,7 @@ static inline size_t cfgRemain(int off) {
   X(prot_volt_stale_count,      "%lu",   (unsigned long)g_voltStaleCount) \
   X(prot_volt2_stale_count,     "%lu",   (unsigned long)g_volt2StaleCount) \
   X(prot_batt_temp_lost_count,  "%lu",   (unsigned long)g_battTempLostCount) \
+  X(prot_die_temp_lost_count,   "%lu",   (unsigned long)g_dieTempLostCount) \
   X(prot_load_dump_count,       "%lu",   (unsigned long)g_loadDumpCount) \
   X(sensor_fault_mask,          "%d",    (int)g_sensorFaultMask) \
   /* Stability. Loop worsts stay in RAW MICROSECONDS (firmware-canonical, like eng_hrs seconds). */ \
@@ -4521,7 +4525,11 @@ static inline size_t cfgRemain(int off) {
      because it is NAN until the read site's warm-up + corroboration gate passes, and a literal null \
      is what the column wants there; a fabricated 0.0 would be a permanent fake in the time series. \
      idtMaxS is declared at the emit site below, the same way buildSnapshotJson declares bcMinS. */ \
-  X(ina_die_temp_max_f,         "%s",    ltJsonNum(idtMaxS, sizeof(idtMaxS), (double)inaDieTempMaxF, isfinite(inaDieTempMaxF)))
+  X(ina_die_temp_max_f,         "%s",    ltJsonNum(idtMaxS, sizeof(idtMaxS), (double)inaDieTempMaxF, isfinite(inaDieTempMaxF))) \
+  /* Lifetime seconds the field sat at each board ceiling (6_functions.ino updateFieldDerateCeilings): how \
+     often an installation runs into the drive-heat law or the 10 A rating, which nothing else records. */ \
+  X(field_heat_limited_s,       "%lu",   (unsigned long)g_fieldHeatLimS) \
+  X(field_cur_limited_s,        "%lu",   (unsigned long)g_fieldCurLimS)
 
 #define CD_FMT(key, fmt, expr) ",\"" #key "\":" fmt
 #define CD_ARG(key, fmt, expr) , expr

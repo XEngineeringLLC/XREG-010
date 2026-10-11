@@ -1247,9 +1247,10 @@ float fieldCurvePropStepPct = 0.0f;            // proposed SystemIDStepAmplitude
 // RPM advisory, never a gate). Reset at each start; valid for the last run until reboot.
 float fieldCurveRpmMin = 0.0f, fieldCurveRpmMax = 0.0f, fieldCurveRpmAvg = 0.0f;
 bool  fieldCurveOk = false;                     // true if a usable linear region + proposals were found
-bool  fieldCurveCeilingLimited = false;         // true if the ramp was capped by the Max Field % limit
-                                                // (MaxDuty, the real per-bus cap) BEFORE reaching the amp target —
-                                                // curve is truncated; dashboard tells the user to raise Max Field %
+bool  fieldCurveCeilingLimited = false;         // true if the ramp was capped by the field ceiling (ccDutyCeiling)
+                                                // BEFORE reaching the amp target — curve is truncated; the dashboard
+                                                // names the binding term (fieldCurveCeilBind)
+uint8_t fieldCurveCeilBind = 0;                 // g_fieldCeilBind latched when the ramp stopped on the ceiling (/fieldcurve.json, /kneesweep.json "ceilBind")
                                                 // and re-run. Cleared at each sweep start.
 // Abort reason for the field-curve / knee sweeps (latched at the protection cut, cleared at each start).
 // fieldCurveAbortMsg is built from reasonToString() in 6_functions.ino and read back by the dashboard
@@ -1822,7 +1823,8 @@ float ManualDutyTarget = 4.0f;  // manual-mode field duty %, 0.01 resolution (op
 int InvertAltAmps = 0;     // change sign of alternator amp reading
 int InvertBattAmps = 0;    // change sign of battery amp reading
 int BatteryShuntPresent = 1;  // 1 = INA228 battery shunt fitted (default). 0 = no battery-current sensor: Bcur meaningless, every battery-current consumer takes its safe/off branch and the UI hides those features.
-int ShuntGroundComp = 0;   // 1 = add the INA228 shunt drop back into IBV. Board ground is the Regulator Ground Wire; landed on the LOAD side of a shunt in the battery negative lead it sits I*Rshunt off the battery post, so IBV reads low while charging.
+int ShuntLead = 0;         // battery lead the shunt sits in: 0 not set, 1 negative (ground on its load side: IBV reads high by I*Rshunt, corrected at the INA228 read),
+                           // 2 positive (no correction; correcting it would read low = overcharge)
 uint32_t Freq = 0;         // ESP32 switching Frequency in case we want to report it for debugging
 
 //Variables to store measurements
@@ -1832,7 +1834,78 @@ float targetCurrent;                          // This is used in the field adjus
 float IBV;                                    // Ina 228 battery voltage
 float IBVMax = 6;                             // used to track maximum battery voltage (NVS-persisted, shown on dashboard)
 float dutyCycle;                              // Field outout %--- this is just what's transmitted over Wifi (case sensitive)
-float FieldResistance = 2;                    // Field resistance in Ohms usually between 2 and 6 Ω, changes 10-20% with temp
+float FieldResistance = NAN;                  // Field resistance in ohms, usually 2 to 6, changes 10-20% with temp. NAN = never entered: no default (owner 2026-10-10); the 10 A ceiling then holds the field off
+float FieldResTrefC = NAN;                    // alternator temperature (°C) recorded when FieldResistance was last written; NAN = never recorded (the math then assumes 30 °C)
+
+// Field resistance test (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1): engine off, the field held at a few field
+// voltages, the current at each read from the battery-current step (shunt) or the owner's meter. Here because the
+// control path (6_functions.ino), the INA228 read (5_functions.ino) and /fieldResTest (3_functions.ino) all use it.
+#define FRT_IDLE     0
+#define FRT_RUNNING  1
+#define FRT_DONE     2
+#define FRT_FAILED   3
+#define FRT_SHUNT    1
+#define FRT_METER    2
+#define FRT_H_PROBE  0   // holds, in run order
+#define FRT_H_TOP    1
+#define FRT_H_MID    2
+#define FRT_H_PROBE2 3   // shunt only: the probe repeated, for the coil-warming figure
+#define FRT_MP_HOLD  1   // meter phases: field on, counting down
+#define FRT_MP_WAIT  2   //               field off, waiting for the owner's reading
+#define FRT_PHASE_MS      3000UL   // shunt: one field-off or field-on phase
+#define FRT_SETTLE_MS     1000UL   // discarded at the start of a phase: the coil's L/R is tenths of a second
+#define FRT_METER_HOLD_MS 10000UL  // meter: field on per hold
+#define FRT_HB_MS         3000UL   // no request from the app this long ends the test
+#define FRT_MAX_A         6.0f     // shunt: implied field current that ends the test at once
+#define FRT_TOP_AIM_A     4.0f
+#define FRT_MID_FRAC      0.6f
+#define FRT_PROBE_MIN_A   0.5f     // a probe under this moves up a rung
+#define FRT_NO_STEP_A     0.020f   // shunt: a battery step under this at the 6 V probe means the shunt does not see the field
+#define FRT_METER_MIN_A   0.05f    // every real winding draws more than this at 3 V
+struct FrtHold {
+  float x;   // field volts by the firmware's model, d*V - (1-d)*FD_VF_EST, at the V measured during the hold
+  float d;   // duty %
+  float v;   // battery volts during the hold
+  float i;   // field amps measured
+};
+struct FieldResTestState {
+  volatile uint8_t state;      // FRT_IDLE / RUNNING / DONE / FAILED
+  uint8_t method;              // FRT_SHUNT / FRT_METER
+  uint8_t hold;                // FRT_H_* in progress
+  uint8_t rung;                // probe rung 0..2 (3 / 6 / 12 V)
+  uint8_t phase;               // shunt 0..6 (even field off, odd field on); meter FRT_MP_*
+  uint32_t phaseStartMs;
+  uint32_t startMs;
+  uint32_t endMs;              // last end of a run (0 = none since boot): the tach-mask tail runs from here
+  volatile uint32_t lastPollMs;   // last /fieldResTest request: the app's heartbeat
+  float duty;                  // % applied this pass (0 in a field-off phase)
+  float holdX, holdDuty;       // the hold in progress
+  double sumI, sumV;           // sample window of the phase in progress (after the settle)
+  uint32_t n;
+  float phI[7], phV[7];        // shunt phase means: battery amps (charging positive) and volts
+  float baseA;                 // last field-off phase mean: the live 6 A check's baseline
+  float ring[8];
+  uint8_t ringN, ringK;
+  bool overA;                  // the live check saw more than FRT_MAX_A
+  float liveI;                 // latest implied field amps (shunt), for the screen
+  FrtHold h[4];
+  float probeC;                // alternator temperature at the start (NAN: no reading), stored with R
+  float r, vc, probeOffV, warmPct;
+  volatile bool saved;         // written by /fieldResTest save=1, the owner's Next or Save
+  volatile bool reqStart, reqAbort, reqAgain, reqReading;
+  volatile uint8_t reqMethod;
+  volatile float reqAmps;
+  char msg[320];               // failure reason, or the result line
+};
+FieldResTestState frt = {};
+// The field PWM reaches the tach pickup through the stator, so with the engine stopped (a test precondition) anything
+// the tach reads during a test and the LM2907 re-bias tail after it is coupling, not rotation.
+inline bool frtTachMasked() {
+  return frt.state == FRT_RUNNING || (frt.endMs != 0 && (uint32_t)(millis() - frt.endMs) < FIELDCUT_RPM_GRACE_MS);
+}
+void frtInaSample(float bcur, float v, bool shuntOk);
+void fieldResRecord(float r, float probeC);
+int FieldWiring = 0;                          // field wiring the drive-heat limit checks: 0 not set (both checks), 1 P-type (D5 spreader), 2 N-type (J2 connector)
 float vvout;                                  // Calculated field volts (approximate)
 float iiout;                                  // Calculated field amps (approximate)
 volatile float AlternatorTemperatureF = NAN;
@@ -2812,6 +2885,7 @@ int32_t prev_perfSailSeconds = 0;
 int32_t prev_perfMotorSeconds = 0;
 int32_t prev_EngineCycles_AllTime = 0;
 int32_t prev_AltOnTime_AllTime = 0;
+uint32_t prev_FieldHeatLimS = 0, prev_FieldCurLimS = 0, prev_FieldHeatLimSes = 0, prev_FieldCurLimSes = 0;
 float prev_ChargeCycles_AllTime = 0;
 int32_t prev_TotalDist_AllTime = 0;
 int32_t prev_AvgSpeed_AllTime = 0;
@@ -2995,7 +3069,7 @@ float NoRpmCurrentA = 0.0f;           // alternator current limit while engine s
 // Derived every tick in buildTickSnapshot (6_functions.ino); read by CSV2, CheckAlarms, TempTask, the bus senders.
 bool g_engineRunning = false;         // §1.1 engineRunning: spinning held 15 s (the staleness consumers)
 bool g_engineSpinningNow = false;     // §1.1 instantaneous: RPM >= 200, or the effective ignition when engine speed is ignored (TempTask cadence)
-uint16_t g_sensorFaultMask = 0;       // §1.2 bits: 0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228
+uint16_t g_sensorFaultMask = 0;       // §1.2 bits: 0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228, 9 regulator drive temperature (INA228 die)
 uint16_t g_sensorSteadyMask = 0;      // §4.7: bit set once the matching fault bit has been clear continuously for 10 min
 uint16_t g_reqFaultBits = 0;          // §11: the fault mask expanded to SENSORS (a dead ADS1115 = engine speed + alt current + second V [+ thermistor]), minus owner overrides / Not fitted. Debounced conditions only
 uint8_t  g_reqFaultCount = 0;         // §11: popcount of g_reqFaultBits (a voltage disagreement counts only when neither voltage bit is set). 1 = that sensor's own reason cuts (owner ruling 2026-10-02: no automatic degrade; the owner chooses on Run Without Failed Sensors), >= 2 = REASON_MULTI_SENSOR_FAULT
@@ -3008,6 +3082,8 @@ uint8_t  g_reqFaultCount = 0;         // §11: popcount of g_reqFaultBits (a vol
 #define SF_BATT_TEMP       (1u << 6)
 #define SF_ADS1115         (1u << 7)
 #define SF_INA228          (1u << 8)
+#define SF_DRIVE_TEMP      (1u << 9)   // required: the field-drive heat ceiling reads it; overridden only by IgnoreBattVMain (the die reading dies with the chip)
+#define SF_ALL_BITS        0x3FFu
 uint8_t g_battTempState = 0;          // §2.6: 0 not expected, 1 reading, 2 lost, 3 waiting for the first reading (field held off)
 uint8_t g_battCurState = 0;           // §11.6 battery current (optional, declared by BatteryShuntPresent): 0 not declared, 1 reading, 2 lost 10 s (alarm + header line, never a cut)
 uint8_t g_limpTier = 0;               // §4.2
@@ -3536,7 +3612,17 @@ float setpointCommand = 0.0f;   // pre-slew current command (Icv in CV, uTargetA
 // in 6_functions.ino because 3_functions.ino's CSV2 builder reads it, and the .ino files concatenate
 // in filename order — a definition in 6_ is not in scope there.
 float g_fieldDutyFloor = 0.0f;
-uint8_t ctrlLimiter = 0;        // banner limiter code (→ CSV4/NavStream): 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty (machine/RPM limit), 6 protection (cap binding or post-protection recovery window), 7 battery above target (zero-output stand-down, altZeroOutput), 8 BMS charge-current limit (DVCC CCL), 9 BMS charge-voltage limit (DVCC CVL), 10 manual field mode (open loop — the user's duty IS the output), 11 min field floor holding duty UP (the only code where the limit raises output rather than lowering it), 12 zero-current command (Maintain Mode or zero-current float — the bank is held at 0 A on purpose), 13 warm-up ramp ceiling still climbing (WarmupRampRate), 14 charge-rate High->Low glide holding the old ceiling on the way down
+// Board field ceilings from updateFieldDerateCeilings() (6_functions.ino), here for the same reason as g_fieldDutyFloor.
+float g_fieldCurDutyCeil = 99.0f;   // 10 A field-current ceiling, duty %
+float g_fieldHeatDutyCeil = 99.0f;  // field-drive heat ceiling, duty %
+float g_fieldRcOhm = NAN;           // FieldResistance corrected for alternator temperature: the 10 A cap, the heat law and the Field Amps readout all use it (NAN = no resistance entered)
+uint8_t g_fieldCeilBind = 0;        // which ccDutyCeiling() term binds: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the J2 connector, 4 heat at the D5 spreader
+uint32_t g_fieldHeatLimS = 0;       // lifetime seconds held at the heat ceiling (NVS FieldHeatLimS, daily cloud field_heat_limited_s)
+uint32_t g_fieldCurLimS = 0;        // lifetime seconds held at the 10 A ceiling (NVS FieldCurLimS, daily cloud field_cur_limited_s)
+uint32_t g_fieldHeatLimSesS = 0;    // session twin of g_fieldHeatLimS, cleared by ResetFieldHeatLimTime
+uint32_t g_fieldCurLimSesS = 0;     // session twin of g_fieldCurLimS, cleared by ResetFieldCurLimTime
+volatile bool g_fieldDerateDirty = true;  // set by every writer of FieldResistance / FieldResTrefC / FieldWiring: the next tick re-runs the heat scan
+uint8_t ctrlLimiter = 0;        // banner limiter code (→ CSV4/NavStream): 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty (machine/RPM limit), 6 protection (cap binding or post-protection recovery window), 7 battery above target (zero-output stand-down, altZeroOutput), 8 BMS charge-current limit (DVCC CCL), 9 BMS charge-voltage limit (DVCC CVL), 10 manual field mode (open loop — the user's duty IS the output), 11 min field floor holding duty UP (the only code where the limit raises output rather than lowering it), 12 zero-current command (Maintain Mode or zero-current float — the bank is held at 0 A on purpose), 13 warm-up ramp ceiling still climbing (WarmupRampRate), 14 charge-rate High->Low glide holding the old ceiling on the way down, 15 field at the board's 10 A field-current ceiling, 16 field-drive heat ceiling (INA228 die temperature law)
 bool setpointInitialized = false;
 
 // ===== LEARNING MODE CONTROL PARAMETERS =====
@@ -4386,9 +4472,10 @@ enum FieldControlMode {
   MODE_DISABLED_RAMP,             // Normal shutdown: ramp to 0, cut when settled
   MODE_NORMAL_MANUAL,             // Manual control with rate limiting
   MODE_NORMAL_AUTO_PID,           // PID control with learning
-  MODE_COMMISSION_IDLE            // Commissioning "rest" between guided steps: hold field at a low
+  MODE_COMMISSION_IDLE,           // Commissioning "rest" between guided steps: hold field at a low
                                   // duty (per-RPM floor or a voltage-scaled minimum), slow ramp, no
                                   // GPIO4 cut — keeps the RPM pickup alive instead of resuming charging
+  MODE_FIELD_RES_TEST             // Field resistance test (engine off): the test's own hold duty, GPIO4 up
 };
 
 enum FieldEventReason : uint8_t {
@@ -4423,7 +4510,9 @@ enum FieldEventReason : uint8_t {
   REASON_VOLTAGE_STALE,            // 28 — no valid INA228 bus-voltage read committed within the stale limit (10 invalid reads field-on / 3 field-off) — immediate cut, critical tier
   REASON_VOLTAGE2_STALE,           // 29 — no valid ADS1115 CH0 battery-voltage read committed within 500 ms — critical ramp
   REASON_BATT_TEMP_WAIT,           // 30 — an expected battery temperature has not delivered its first reading yet (boot / source-change grace, §2.3): field held off quietly — no alarm, no fault, no lockout; becomes BATT_TEMP_LOST at 90 s
-  REASON_MULTI_SENSOR_FAULT        // 31 — two or more required sensors faulted at once (§11: g_reqFaultCount >= 2, owner overrides and Not fitted excluded) — immediate cut, 30 s lockout, clears after the count has been <= 1 for 10 s
+  REASON_MULTI_SENSOR_FAULT,       // 31 — two or more required sensors faulted at once (§11: g_reqFaultCount >= 2, owner overrides and Not fitted excluded) — immediate cut, 30 s lockout, clears after the count has been <= 1 for 10 s
+  REASON_DIE_TEMP_LOST,            // 32 — no valid INA228 die-temperature sample for 10 s past 15 s of uptime: the field-drive heat ceiling has no input — graceful ramp + settle cut, like TEMP_STALE, until it reads again
+  REASON_FIELD_RES_TEST            // 33 — the field resistance test is driving the field (engine off). Not a fault
 };
 
 
@@ -4492,6 +4581,8 @@ struct TickSnapshot {
   bool voltageFeedbackOk;     // a fresh, trusted battery voltage is feeding the OV rungs (IBV, or the second reading in tier 3); false = fast OV / OV tiers cannot act
   bool hardOverCurrent;       // HardOCTripAmps exceeded on a FRESH alternator-current sample for HardOCDebounceMs (debounce lives in buildTickSnapshot; both ladders read the flag)
   bool multiSensorFault;      // §11: two or more required sensors faulted (g_reqFaultCount >= 2), held through the 10 s clear dwell
+  bool dieTempLost;           // REASON_DIE_TEMP_LOST condition (before override suppression)
+  bool fieldResTest;          // the field resistance test is running (frt.state == FRT_RUNNING)
 };
 
 // ==================== CONFIGURABLE PARAMETERS ====================
@@ -5340,6 +5431,7 @@ uint32_t g_currentStaleCount = 0;
 uint32_t g_voltStaleCount = 0;
 uint32_t g_volt2StaleCount = 0;
 uint32_t g_battTempLostCount = 0;
+uint32_t g_dieTempLostCount = 0;
 
 // CV loop tunable parameters live in the CV LOOP PARAMETERS block above
 
@@ -5457,8 +5549,9 @@ enum DataIndex {
   IDX_EXTRA_TEMP,                // 44 - EXTRA-role DS18B20 (ExtraTempF)
   IDX_VE_BATT_TEMP,              // 45 - VE.Direct "T" battery temperature (VictronBattTempF)
   IDX_RVC_BATT_TEMP,             // 46 - RV-C DC_SOURCE_STATUS_2 battery temperature (rvcRxBattTempF)
+  IDX_INA_DIE_TEMP,              // 47 - INA228 die temperature: stamped only by a sample past the warm-up discard and inside the bad-read window
   // Keep this last and increment when new added
-  MAX_DATA_INDICES = 47
+  MAX_DATA_INDICES = 48
 };
 
 unsigned long dataTimestamps[MAX_DATA_INDICES];  // Uses the enum size automatically
@@ -5838,6 +5931,9 @@ uint32_t inaBusReadWorstUs = 0;    // worst µs spent in the two INA228 Wire rea
 uint32_t inaBusSlowCount = 0;      // INA228 bus reads > 15 ms (one Wire-timeout's worth) since reset
 uint32_t ina228ErrorCount = 0;     // INA228 reads dropped (sanity fail / exception)
 float inaDieTempF = NAN;           // INA228 internal die temperature (°F) — the only sensor AT the power stage; BMP388 board temp is bulk and lags it badly
+float g_fdDieTempF = NAN;          // the same reading as the heat law sees it: written only with a valid sample past the warm-up discard (IDX_INA_DIE_TEMP stamp)
+bool g_inaDieRewarm = false;       // set by inaApplyConfig(): a re-initialized chip reads DIETEMP 0 C until its first conversion, so the warm-up discard runs again
+uint32_t g_fieldDerateWorstUs = 0;  // worst updateFieldDerateCeilings() pass since boot / Reset Peak Values (/debug): the control-loop budget for it is 500 us
 float inaDieTempMaxF = NAN;        // session max of inaDieTempF, zeroed at boot and by Reset Peak Values. Uploads once per 24h as device_state_daily.ina_die_temp_max_f, so a bad first read here becomes a permanent fleet record — hence the warm-up + corroboration gate at the read site
 uint32_t imuFifoFetchWorstUs = 0;  // worst µs spent in Get_FIFO_Sample since reset
 uint16_t imuFifoWorstSamples = 0;  // sample count of THAT worst fetch — 42 bytes is ~1ms at 400kHz, so a
@@ -6770,7 +6866,7 @@ void loop() {
     UpdateBoardTempPressureMaximums();
     handleSocGainReset();   // do the dynamic updates
     handleAltZeroReset();   // do the dynamic udpates
-    // These three flash writers use fieldCutSettled (hardware gate) — the duty-based
+    // These flash writers use fieldCutSettled (hardware gate) — the duty-based
     // fieldOffSettled reads "off" during a live duty-0 CV hold (2026-08-13 loop-stall
     // incident class), which let small NVS/LittleFS commits land on live control passes.
     TIMED_CALL(ft_kneeLearnService, kneeLearnService(fieldCutSettled(2000)));  // Auto Min% learning: NVS flush of learned floors
@@ -7196,6 +7292,23 @@ void loop() {
           altHealthSave();
           boatPerfSave();
           fieldOffMatrixFlushDone = true;
+        }
+        // Gate 3 (engine stopped 1 h, ignition still on): the two saves that otherwise wait for a key-off
+        // (shutdown Phase 4) or the 72 h maintenance restart, for a boat whose ignition never goes off
+        // (IgnitionOverride, or a key left on). Once per stop; the blocking ring dump is Phase 4's own.
+        static uint32_t engineStoppedAtMs = 0;
+        static bool restSaveDone = false;
+        if (g_engineSpinningNow || fieldNowActive) {
+          engineStoppedAtMs = 0;
+          restSaveDone = false;
+        } else if (engineStoppedAtMs == 0) {
+          engineStoppedAtMs = millis() ? millis() : 1;
+        }
+        if (!restSaveDone && Ignition == 1 && engineStoppedAtMs != 0
+            && (uint32_t)(millis() - engineStoppedAtMs) >= 3600000UL) {
+          if (!ringIsEmpty()) dumpSensorRingToLittleFS();
+          dumpUsageAccum();
+          restSaveDone = true;
         }
       }
 
