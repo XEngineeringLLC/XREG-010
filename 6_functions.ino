@@ -987,11 +987,11 @@ static bool  g_fieldVoltFloored  = false;  // one-shot console warn latch for th
 
 // FIELD-DERATE-LAW-BEGIN
 // Field-drive heat law and 10 A current ceiling (spec: private_refs/v9_rework/d5_thermal_model/README.md, "FIELD
-// DERATE - BUILD SPEC"). Plain C on purpose: the host test compiles this exact text against the explainer page's law.
+// DERATE - SPEC"). Plain C on purpose: the host test compiles this exact text against the explainer page's law.
 // Constants are the V9 rework's geometry, fitted on soaked bench rows: J2 connector minus INA228 die on N wiring
 // (pin heating + SB5H100 power), D5 case top minus die on P wiring (Wurth film on D5). V10 moves the diode: re-measure.
 // The heat law and the 10 A ceiling both run on Rc, the resistance corrected for alternator temperature (fdRcOhm; owner
-// 2026-10-10: the same 90 % credit in both). No added margins (owner rule).
+// 2026-10-10: the same 90 % credit in both). One added margin, FD_MARGIN on Rc (owner 2026-10-12), and no other.
 #define FD_VF_EST      0.4f      // freewheel drop in the field-current estimate, V
 #define FD_PIN_K       17.8f     // J2 pin heating at 10 A, K
 #define FD_DIODE_KW    10.0f     // J2 heating per watt in the SB5H100 soldered into its pins, K/W
@@ -1001,6 +1001,7 @@ static bool  g_fieldVoltFloored  = false;  // one-shot console warn latch for th
 #define FD_ALPHA       0.00393f  // copper resistance per degree C
 #define FD_CREDIT      0.9f      // share of the probe rise credited to the rotor (owner 2026-10-08; to be checked against a measured rotor)
 #define FD_TCAP_C      120.0f    // credited probe temperature ceiling: bounds the credit a falsely high probe can claim
+#define FD_MARGIN      0.12f     // Rc / (1 + this): a parked warm-up from cold at ~100 A output read up to 9.8 % over the credited estimate (clamp, +-2.8 %), 2026-10-12
 #define FD_TREF_DEF_C  30.0f     // Tref when none was recorded with the resistance
 #define FD_FIELD_MAX_A 10.0f     // board field-current rating
 #define FD_WIRING_P    1
@@ -1045,13 +1046,15 @@ __attribute__((unused)) static float fdHeatCeilPct(float T_C, float V, float R, 
   }
   return (float)FD_SCAN_LAST_K / 10.0f;
 }
-// Resistance the 10 A ceiling and the heat law use. A probe below Tref gets the full correction (a cold rotor draws MORE than the
-// estimate); above it, 90 % credit up to 120 C. No probe reading (NaN): no credit.
+// Resistance the 10 A ceiling, the heat law and the Field Amps readout use. A probe below Tref gets the full correction (a cold
+// rotor draws MORE than the estimate); above it, 90 % credit up to 120 C. No probe reading (NaN): no credit. Every branch is
+// then divided by 1 + FD_MARGIN: the rotor warms behind the probe, and part of the gap showed before any credit applied.
 static float fdRcOhm(float R, float Tp_C, float Tref_C) {
-  if (Tp_C != Tp_C) return R;
-  if (Tp_C < Tref_C) return R * (1.0f + FD_ALPHA * (Tp_C - Tref_C));
-  float t = (Tp_C < FD_TCAP_C) ? Tp_C : FD_TCAP_C;
-  return R * (1.0f + FD_ALPHA * FD_CREDIT * (t - Tref_C));
+  float rc;
+  if (Tp_C != Tp_C) rc = R;
+  else if (Tp_C < Tref_C) rc = R * (1.0f + FD_ALPHA * (Tp_C - Tref_C));
+  else rc = R * (1.0f + FD_ALPHA * FD_CREDIT * (((Tp_C < FD_TCAP_C) ? Tp_C : FD_TCAP_C) - Tref_C));
+  return rc / (1.0f + FD_MARGIN);
 }
 // Duty (percent) where (D V - (1 - D) 0.4) / Rc = 10 A.
 static float fdCurCeilPct(float Rc, float V) {
@@ -1286,12 +1289,16 @@ void applyCcOutputLimits() {
 
 // ==================== FIELD RESISTANCE TEST ====================
 // BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1. Holds are planned in field volts X (the firmware's own model, so one plan
-// suits every bus and winding): a probe at 3 V (6 V, 12 V while it reads under 0.5 A), a top aimed at 4 A, a middle at
-// 0.6 x the top measured AFTER the top (coil warming then tilts R low, the safe side), and on the shunt method the probe
-// again. R and the contact drop come from the top and middle only: a probe sits where the contact curve still bends.
+// suits every bus and winding): a probe at 3 V (6 V, 12 V while it reads under 0.5 A), an aiming hold, a top at 4 A, a
+// middle at 0.6 x the top measured AFTER the top (coil warming then tilts R low, the safe side). R and the contact drop
+// come from the top and middle only: a probe sits where the contact curve still bends. The aiming hold is there because
+// the probe's V / A counts any contact drop as resistance, so a top planned from it alone lands high by the drop's share;
+// the slope from the probe to the aiming hold cancels it. (The bench alternator's drop measured zero: B1.12 follow-up.)
+// No repeat of the probe at the end: its cycle scatter (+-4 %) swamps the test's own warming (1-2 %), B1.12 follow-up.
 // The only thing that drives the field with no resistance stored. frtService runs first in every control pass; the hold
 // itself is applied by runFieldResTestHold once the arbiter selects MODE_FIELD_RES_TEST.
 static const float FRT_PROBE_X[3] = { 3.0f, 6.0f, 12.0f };
+static const char *const FRT_HOLD_NAME[FRT_N_HOLDS] = { "low hold", "aiming hold", "top hold", "middle hold" };
 
 static float frtCeilPct() {
   return fminf(fminf(MaxDuty, g_fieldVoltDutyCeil), 99.0f);   // the alternator ceilings: they need no resistance
@@ -1315,6 +1322,15 @@ void frtFieldOff() {
   frt.duty = 0.0f;
 }
 
+// Every hold measured so far, for the console: the result's working on success, what was in hand on a failure.
+static void frtLogHolds() {
+  for (int k = 0; k < FRT_N_HOLDS; k++) {
+    const FrtHold &hd = frt.h[k];
+    if (!isfinite(hd.i)) continue;
+    queueConsoleMessageF("  %s: duty %.2f%%, %.2f V field, %.3f A, battery %.2f V", FRT_HOLD_NAME[k], hd.d, hd.x, hd.i, hd.v);
+  }
+}
+
 void frtFail(const char *why) {
   if (frt.state != FRT_RUNNING) return;
   strncpy(frt.msg, why, sizeof(frt.msg) - 1);
@@ -1323,12 +1339,19 @@ void frtFail(const char *why) {
   frt.endMs = millis();
   frtFieldOff();
   queueConsoleMessageF("Field resistance test: %s", frt.msg);
+  frtLogHolds();
+}
+
+static void frtLiveRangeReset() {
+  frt.lvLo = frt.fsLo = INFINITY;
+  frt.lvHi = frt.fsHi = -INFINITY;
 }
 
 static void frtResetWindow(uint32_t now) {
   frt.sumI = frt.sumV = 0.0;
   frt.n = 0;
   frt.ringN = frt.ringK = 0;
+  frt.ringSum = 0.0;
   frt.phaseStartMs = now;
 }
 
@@ -1336,6 +1359,8 @@ static void frtResetWindow(uint32_t now) {
 static void frtStartHold(uint32_t now, float x, bool carryA) {
   frt.holdX = x;
   frt.holdDuty = frtDutyFor(x, IBV);
+  frt.h[frt.hold].nc = 0;
+  frtLiveRangeReset();
   if (frt.method == FRT_SHUNT) {
     if (carryA) {
       frt.phI[0] = frt.phI[frt.phase - 1];   // the field-off phase just closed: 2 after a probe's first cycle, else 6
@@ -1360,36 +1385,77 @@ void frtBegin(uint32_t now) {
   frt.startMs = now;
   frt.lastPollMs = now;
   frt.probeC = fieldResProbeC();
-  frt.baseA = NAN;
-  frt.r = frt.vc = frt.probeOffV = frt.warmPct = NAN;
-  for (int k = 0; k < 4; k++) frt.h[k] = { NAN, NAN, NAN, NAN };
+  frt.baseA = frt.gateA = NAN;
+  frt.r = frt.vc = frt.probeOffV = NAN;
+  for (int k = 0; k < FRT_N_HOLDS; k++) frt.h[k] = { NAN, NAN, NAN, NAN, NAN };
+  for (int k = 0; k < 2; k++) frt.rungX[k] = frt.rungI[k] = NAN;
   frtStartHold(now, FRT_PROBE_X[0], false);
   frt.state = FRT_RUNNING;
   queueConsoleMessageF("Field resistance test started (%s method), engine off, battery %.2f V",
                        method == FRT_SHUNT ? "shunt" : "meter", IBV);
 }
 
-// Median step and field-on volts of the good shunt cycles of the hold just completed. false: the test has failed.
+// Shunt: cycle k of the hold in progress has just closed (phases 2k, 2k+1, 2k+2). Kept with the hold, kept or dropped,
+// so the screen and the console show every cycle and not only the median.
+static void frtCycleDone(int k, float d) {
+  FrtHold &hd = frt.h[frt.hold];
+  FrtCycle &c = hd.c[k];
+  c.a0 = frt.phI[2 * k];
+  c.b = frt.phI[2 * k + 1];
+  c.a1 = frt.phI[2 * k + 2];
+  const float step = 0.5f * (c.a0 + c.a1) - c.b;   // charging-positive amps: the field's draw lowers the reading
+  c.ok = fabsf(c.a0 - c.a1) <= fmaxf(FRT_DRIFT_A, FRT_DRIFT_FRAC * fabsf(step));
+  c.f = (d > 0.001f) ? step / d : NAN;
+  hd.nc = k + 1;
+  char drop[96] = "";
+  if (!c.ok) snprintf(drop, sizeof(drop), ", dropped: the two field-off readings differ by %.3f A (the battery current moved)", fabsf(c.a0 - c.a1));
+  queueConsoleMessageF("Field resistance test, %s at %.2f V, cycle %d: battery %.3f / %.3f / %.3f A (off, on, off), step %.3f A / %.2f%% = %.3f A field%s",
+                       FRT_HOLD_NAME[frt.hold], frt.holdX, k + 1, c.a0, c.b, c.a1, step, 100.0f * d, c.f, drop);
+  // How far the live check's two means wandered around the cycle's answer: the margin under FRT_MAX_A / FRT_FAST_MAX_A.
+  if (frt.lvLo <= frt.lvHi)
+    queueConsoleMessageF("  live field amps after the settle: %.2f to %.2f A (0.3 s mean), %.2f to %.2f A (40 ms mean)", frt.lvLo, frt.lvHi, frt.fsLo, frt.fsHi);
+  frtLiveRangeReset();
+}
+
+// Takes the hold index, not an FrtHold: the Arduino prototype pass would declare it above the struct.
+static int frtGoodCycles(int hold) {
+  const FrtHold &hd = frt.h[hold];
+  int good = 0;
+  for (int k = 0; k < hd.nc; k++) good += hd.c[k].ok ? 1 : 0;
+  return good;
+}
+
+// The stop when the battery current will not hold still. A field-off reading above FRT_CHARGING_A is a charge into the
+// battery with the engine off, so the message names a charger (2026-10-12: a solar charge wandering 1.1-2.0 A).
+static void frtFailDrift(float offA) {
+  char why[260];
+  if (offA > FRT_CHARGING_A)
+    snprintf(why, sizeof(why), "The battery current kept changing between readings, and something was charging the battery at %.1f A with the engine off. Switch off solar, shore power and DC-DC chargers, then try again.", offA);
+  else
+    snprintf(why, sizeof(why), "The battery current kept changing between readings: a load switching on and off (fridge, pumps, inverter) or a charger changing its output. Switch them off and try again.");
+  frtFail(why);
+}
+
+// Median step and field-on volts of the good cycles of the hold just completed (it stops at three). false: the test has
+// failed.
 static bool frtShuntHoldResult(float &stepA, float &vB) {
+  const FrtHold &hd = frt.h[frt.hold];
   float steps[3];
   float vs[3];
   int good = 0;
-  for (int k = 0; k < 3; k++) {
-    const float a0 = frt.phI[2 * k], b = frt.phI[2 * k + 1], a1 = frt.phI[2 * k + 2];
-    const float step = 0.5f * (a0 + a1) - b;   // charging-positive amps: the field's draw lowers the reading
-    if (fabsf(a0 - a1) <= fmaxf(0.050f, 0.15f * fabsf(step))) {
-      steps[good] = step;
-      vs[good] = frt.phV[2 * k + 1];
-      good++;
-    }
+  for (int k = 0; k < hd.nc && good < 3; k++) {
+    if (!hd.c[k].ok) continue;
+    steps[good] = 0.5f * (hd.c[k].a0 + hd.c[k].a1) - hd.c[k].b;
+    vs[good] = frt.phV[2 * k + 1];
+    good++;
   }
   if (good < 2) {
-    frtFail("The battery current kept changing between readings, likely a load switching on and off. Turn off cycling loads (fridge, pumps, inverter) and try again.");
+    frtFailDrift(frt.baseA);
     return false;
   }
   if (good == 3) {
-    float lo = fminf(steps[0], fminf(steps[1], steps[2])), hi = fmaxf(steps[0], fmaxf(steps[1], steps[2]));
-    stepA = steps[0] + steps[1] + steps[2] - lo - hi;
+    // The middle step itself, bit for bit, so the hold's amps match its median cycle's on the screen.
+    stepA = fmaxf(fminf(steps[0], steps[1]), fminf(fmaxf(steps[0], steps[1]), steps[2]));
     vB = (vs[0] + vs[1] + vs[2]) / 3.0f;
   } else {
     stepA = 0.5f * (steps[0] + steps[1]);
@@ -1413,15 +1479,23 @@ static void frtFinish(uint32_t now) {
     frtFail(why);
     return;
   }
-  if (!(vc >= -0.3f && vc <= 3.0f)) {
-    snprintf(why, sizeof(why), "The brush and contact drop came out at %.2f V, outside -0.3 to 3 V. Check the readings and try again.", vc);
+  // A drop a little below zero is cycle scatter on a drop too small to measure (bench 2026-10-11: -0.20 V). The scatter
+  // scales with the holds' volts, so the floor does too: a fifth of the middle hold's volts below zero is a misread
+  // hold, or a clamp offset over a fifth of the middle hold's amps.
+  const float vcFloor = -0.2f * m.x;
+  if (vc > 3.0f) {
+    snprintf(why, sizeof(why), "The brush and contact drop came out at %.2f V, over 3 V. Check the readings and try again.", vc);
+    frtFail(why);
+    return;
+  }
+  if (!(vc >= vcFloor)) {
+    snprintf(why, sizeof(why), "The brush and contact drop came out at %.2f V. A real drop is zero or more, and scatter between readings reaches only %.2f V on these holds. Check the readings and try again.", vc, vcFloor);
     frtFail(why);
     return;
   }
   frt.r = r;
   frt.vc = vc;
   frt.probeOffV = p.x - (vc + r * p.i);
-  frt.warmPct = (frt.method == FRT_SHUNT && p.i > 0.0f) ? 100.0f * (p.i - frt.h[FRT_H_PROBE2].i) / p.i : NAN;
   frt.state = FRT_DONE;
   frt.endMs = now;
   frtFieldOff();
@@ -1430,15 +1504,9 @@ static void frtFinish(uint32_t now) {
   queueConsoleMessageF("Field resistance test (%s): R %.3f ohm, contact drop %.2f V, alternator %.0f%s%s",
                        frt.method == FRT_SHUNT ? "shunt" : "meter", r, vc, dispTempF(tC * 1.8f + 32.0f), dispTempUnit(),
                        isfinite(frt.probeC) ? "" : " (no probe reading, 30 C assumed)");
-  const char *nm[4] = { "probe", "top", "middle", "probe again" };
-  for (int k = 0; k < 4; k++) {
-    if (!isfinite(frt.h[k].i)) continue;
-    queueConsoleMessageF("  %s: duty %.2f%%, %.2f V field, %.3f A, battery %.2f V", nm[k], frt.h[k].d, frt.h[k].x, frt.h[k].i, frt.h[k].v);
-  }
-  if (isfinite(frt.warmPct))
-    queueConsoleMessageF("  probe off the top-middle line by %.3f V; probe current fell %.2f%% over the test (coil warming)", frt.probeOffV, frt.warmPct);
-  else
-    queueConsoleMessageF("  probe off the top-middle line by %.3f V", frt.probeOffV);
+  frtLogHolds();
+  queueConsoleMessageF("  low hold off the top-middle line by %.3f V", frt.probeOffV);
+  queueConsoleMessageF("  longest gap between the app's requests: %.1f s (the test stops at %.0f s)", frt.hbWorstMs / 1000.0f, FRT_HB_MS / 1000.0f);
 }
 
 // A hold's current is in: record it and plan the next hold, or finish.
@@ -1448,6 +1516,7 @@ static void frtHoldDone(uint32_t now, float amps, float v) {
   hd.v = v;
   hd.x = frtXAt(frt.holdDuty, v);
   hd.i = amps;
+  hd.tC = fieldResProbeC();
   const float vNow = isfinite(IBV) ? IBV : v;
   const float xCeil = frtXAt(frtCeilPct(), vNow);
   char why[240];
@@ -1455,6 +1524,9 @@ static void frtHoldDone(uint32_t now, float amps, float v) {
   switch (frt.hold) {
     case FRT_H_PROBE: {
       if (amps < FRT_PROBE_MIN_A && frt.rung < 2 && FRT_PROBE_X[frt.rung + 1] <= xCeil + 0.01f) {
+        frt.rungX[frt.rung] = hd.x;
+        frt.rungI[frt.rung] = amps;
+        hd.d = hd.v = hd.x = hd.i = hd.tC = NAN;   // the low hold's row is the rung in progress; the screen lists this one apart
         frt.rung++;
         frtStartHold(now, FRT_PROBE_X[frt.rung], true);
         return;
@@ -1464,33 +1536,52 @@ static void frtHoldDone(uint32_t now, float amps, float v) {
         return;
       }
       const float r1 = hd.x / amps;
-      const float xt = fminf(fminf(FRT_TOP_AIM_A * r1, 4.0f * hd.x), xCeil);
+      if (amps < FRT_AIM_SKIP_A) {
+        // Planned by V / A it lands above FRT_AIM_A by the contact drop's share, held to 2.5 x the probe; at least
+        // 1.25 x the probe so the slope to it is a real one.
+        const float xa = fmaxf(1.25f * hd.x, fminf(FRT_AIM_A * r1, 2.5f * hd.x));
+        if (xa < xCeil - 0.05f) {
+          frt.hold = FRT_H_AIM;
+          frtStartHold(now, xa, true);
+          return;
+        }
+      }
+      // A probe already near the top current, or the ceiling leaves no room for an aiming hold: the top from V / A.
       frt.hold = FRT_H_TOP;
-      frtStartHold(now, xt, true);
+      frtStartHold(now, fminf(fminf(FRT_TOP_AIM_A * r1, 4.0f * hd.x), xCeil), true);
       return;
     }
-    case FRT_H_TOP: {
+    case FRT_H_AIM: {
       const FrtHold &p = frt.h[FRT_H_PROBE];
       if (!(amps > 1.1f * p.i)) {
         snprintf(why, sizeof(why), "The field current did not rise between the first holds (%.2f A and %.2f A). Max Field %% or Max Field Volts under Setup > Alternator may be holding the field too low.", p.i, amps);
         frtFail(why);
         return;
       }
+      // The contact drop is in both holds, so their slope is the winding's and the top lands near 4 A. Held between
+      // this hold and twice it, so a misread meter cannot send the top far past the plan.
       const float s = (hd.x - p.x) / (amps - p.i);
-      float xm = p.x + s * (FRT_MID_FRAC * amps - p.i);
+      const float xt = fminf(constrain(hd.x + s * (FRT_TOP_AIM_A - amps), hd.x, 2.0f * hd.x), xCeil);
+      frt.hold = FRT_H_TOP;
+      frtStartHold(now, xt, true);
+      return;
+    }
+    case FRT_H_TOP: {
+      // The middle sits on the line from the hold below the top: the aiming hold, unless the top repeated its voltage.
+      const FrtHold &a = frt.h[FRT_H_AIM];
+      const FrtHold &b = (isfinite(a.i) && hd.x > 1.05f * a.x) ? a : frt.h[FRT_H_PROBE];
+      if (!(amps > 1.1f * b.i)) {
+        snprintf(why, sizeof(why), "The field current did not rise between the first holds (%.2f A and %.2f A). Max Field %% or Max Field Volts under Setup > Alternator may be holding the field too low.", b.i, amps);
+        frtFail(why);
+        return;
+      }
+      const float s = (hd.x - b.x) / (amps - b.i);
+      float xm = b.x + s * (FRT_MID_FRAC * amps - b.i);
       xm = constrain(xm, 0.2f * hd.x, 0.85f * hd.x);
       frt.hold = FRT_H_MID;
       frtStartHold(now, xm, true);
       return;
     }
-    case FRT_H_MID:
-      if (frt.method == FRT_SHUNT) {
-        frt.hold = FRT_H_PROBE2;
-        frtStartHold(now, frt.h[FRT_H_PROBE].x, true);
-        return;
-      }
-      frtFinish(now);
-      return;
     default:
       frtFinish(now);
       return;
@@ -1498,20 +1589,43 @@ static void frtHoldDone(uint32_t now, float amps, float v) {
 }
 
 // INA228 sample hook (5_functions.ino, every committed read). Same loop task as frtService: no locking.
+// The live current is the mean of the last FRT_RING_N reads (~0.3 s). The INA228's fast-mode windows and the 400 Hz
+// field PWM beat slowly, so an 8-read (~40 ms) mean wanders about +-6 % at the top hold and +-24 % at the 3 V probe
+// (B1.12, simulated); 64 reads hold it to about +-2 % and +-9 %. The 8-read mean is kept for a fault-sized current.
+// The first bench runs showed 5.35 A live where about 4.2 A flowed: more wander than simulated, or a load moving the
+// baseline. frtCycleDone logs both means' range per cycle to tell which.
 void frtInaSample(float bcur, float v, bool shuntOk) {
   if (frt.state != FRT_RUNNING) return;
   const uint32_t el = millis() - frt.phaseStartMs;
   if (frt.method == FRT_SHUNT) {
     if (!shuntOk) return;
     if ((frt.phase & 1) && frt.holdDuty > 0.1f && isfinite(frt.baseA)) {
+      if (frt.ringN == FRT_RING_N) frt.ringSum -= frt.ring[frt.ringK];
       frt.ring[frt.ringK] = bcur;
-      frt.ringK = (frt.ringK + 1) & 7;
-      if (frt.ringN < 8) frt.ringN++;
-      if (frt.ringN == 8) {
-        float s = 0.0f;
-        for (int k = 0; k < 8; k++) s += frt.ring[k];
-        frt.liveI = (frt.baseA - s / 8.0f) / (frt.holdDuty / 100.0f);
-        if (frt.liveI > FRT_MAX_A) frt.overA = true;
+      frt.ringSum += bcur;
+      frt.ringK = (frt.ringK + 1) % FRT_RING_N;
+      if (frt.ringN < FRT_RING_N) frt.ringN++;
+      if (frt.ringN >= 8) {
+        const float d = frt.holdDuty / 100.0f;
+        float s8 = 0.0f;
+        for (int k = 1; k <= 8; k++) s8 += frt.ring[(frt.ringK + FRT_RING_N - k) % FRT_RING_N];
+        const float fast = (frt.baseA - s8 / 8.0f) / d;
+        frt.liveI = (frt.baseA - (float)(frt.ringSum / frt.ringN)) / d;
+        if (el >= FRT_SETTLE_MS && frt.ringN == FRT_RING_N) {
+          frt.lvLo = fminf(frt.lvLo, frt.liveI);
+          frt.lvHi = fmaxf(frt.lvHi, frt.liveI);
+          frt.fsLo = fminf(frt.fsLo, fast);
+          frt.fsHi = fmaxf(frt.fsHi, fast);
+        }
+        if (!frt.overA && fast > FRT_FAST_MAX_A) {
+          frt.overA = true;
+          frt.tripA = fast;
+          frt.tripLim = FRT_FAST_MAX_A;
+        } else if (!frt.overA && frt.ringN == FRT_RING_N && frt.liveI > FRT_MAX_A) {
+          frt.overA = true;
+          frt.tripA = frt.liveI;
+          frt.tripLim = FRT_MAX_A;
+        }
       }
     }
     if (el >= FRT_SETTLE_MS) {
@@ -1541,7 +1655,9 @@ void frtService(uint32_t now) {
     return;
   }
   if ((int32_t)(now - frt.lastPollMs) > (int32_t)FRT_HB_MS) {   // signed: the web task can stamp lastPollMs after now was sampled
+    const float worst = frt.hbWorstMs / 1000.0f;
     frtFail("The app stopped answering, so the test stopped and the field is off.");
+    queueConsoleMessageF("  no request from the app for %.1f s; the longest gap before that was %.1f s", (now - frt.lastPollMs) / 1000.0f, worst);
     return;
   }
   const uint32_t ibvTs = dataTimestamps[IDX_IBV];
@@ -1552,8 +1668,8 @@ void frtService(uint32_t now) {
 
   if (frt.method == FRT_SHUNT) {
     if (frt.overA) {
-      char why[200];
-      snprintf(why, sizeof(why), "The field current went above %.0f A (%.1f A), more than the test plan allows. The field was switched off. Check the rotor and the field wiring, or a large load switched on during the test.", FRT_MAX_A, frt.liveI);
+      char why[260];
+      snprintf(why, sizeof(why), "The field current went above %.0f A (%.1f A at the %s), more than the test plan allows. The field was switched off. Check the rotor and the field wiring, or a large load switched on during the test.", frt.tripLim, frt.tripA, FRT_HOLD_NAME[frt.hold]);
       frtFail(why);
       return;
     }
@@ -1570,26 +1686,53 @@ void frtService(uint32_t now) {
       frt.phI[frt.phase] = (float)(frt.sumI / frt.n);
       frt.phV[frt.phase] = (float)(frt.sumV / frt.n);
       if (!(frt.phase & 1)) frt.baseA = frt.phI[frt.phase];
-      frt.phase++;
-      frtResetWindow(now);
-      if (frt.hold == FRT_H_PROBE && frt.phase == 3) {
-        // After one cycle the probe decides: step up a rung, give up on the shunt, or carry on to three cycles.
-        const float step = 0.5f * (frt.phI[0] + frt.phI[2]) - frt.phI[1];
-        const float amps = step / (frt.holdDuty / 100.0f);
-        if (frt.rung == 1 && step < FRT_NO_STEP_A) {
-          frtFail("The battery shunt is not seeing the field current. A charger may be holding the battery voltage (switch off shore power, solar and DC-DC chargers), or the regulator's power or ground is not on the shunted battery, or its wires do not land as the wiring page shows. Otherwise use a meter instead.");
+      // The field first comes on once two field-off readings in a row agree: a battery current that is already wandering
+      // (a charger, a cycling load) stops the test here, before the coil is driven at all.
+      if (frt.phase == 0 && !frt.calm) {
+        if (isfinite(frt.gateA) && fabsf(frt.phI[0] - frt.gateA) <= FRT_DRIFT_A) {
+          frt.calm = true;
+        } else if ((uint32_t)(now - frt.startMs) >= FRT_CALM_MS) {
+          queueConsoleMessageF("Field resistance test: the field-off battery current did not settle within %.0f mA in %.0f s (last two readings %.3f and %.3f A)",
+                               1000.0f * FRT_DRIFT_A, FRT_CALM_MS / 1000.0f, frt.gateA, frt.phI[0]);
+          frtFailDrift(frt.phI[0]);
           return;
-        }
-        if (amps < FRT_PROBE_MIN_A && frt.rung < 2) {
-          frtHoldDone(now, amps, frt.phV[1]);   // steps up a rung, carrying phase 2
+        } else {
+          queueConsoleMessageF("Field resistance test, waiting for a steady battery current: field off, battery %.3f A", frt.phI[0]);
+          frt.gateA = frt.phI[0];
+          frtResetWindow(now);
+          frt.duty = 0.0f;
           return;
         }
       }
-      if (frt.phase == 7) {
-        float stepA, vB;
-        if (!frtShuntHoldResult(stepA, vB)) return;
+      frt.phase++;
+      frtResetWindow(now);
+      if (frt.phase >= 3 && (frt.phase & 1)) {   // a field-off phase just closed cycle k
+        const uint8_t hold = frt.hold;
+        const int k = (frt.phase - 3) / 2;
         const float d = frt.holdDuty / 100.0f;
-        frtHoldDone(now, (d > 0.001f) ? stepA / d : NAN, vB);
+        frtCycleDone(k, d);
+        const FrtCycle c = frt.h[hold].c[k];
+        const float step = 0.5f * (c.a0 + c.a1) - c.b;
+        const int good = frtGoodCycles(hold);
+        const int left = FRT_MAX_CYC - (k + 1);
+        // The probe decides on its first good cycle: step up a rung, give up on the shunt, or carry on to three good
+        // cycles. A dropped cycle decides nothing (2026-10-12: one moved the low hold up a rung on a wandering current).
+        const bool firstGood = c.ok && good == 1;
+        if (hold == FRT_H_PROBE && firstGood && frt.rung == 1 && step < FRT_NO_STEP_A) {
+          frtFail("The battery shunt is not seeing the field current. A charger may be holding the battery voltage (switch off shore power, solar and DC-DC chargers), or the regulator's power or ground is not on the shunted battery, or its wires do not land as the wiring page shows. Otherwise use a meter instead.");
+          return;
+        }
+        if (hold == FRT_H_PROBE && firstGood && step / d < FRT_PROBE_MIN_A && frt.rung < 2) {
+          frtHoldDone(now, step / d, frt.phV[2 * k + 1]);   // up a rung, carrying the field-off phase just closed
+        } else if (hold == FRT_H_AIM && c.ok) {
+          frtHoldDone(now, step / d, frt.phV[2 * k + 1]);   // it only aims the top: its first good cycle is enough
+        } else if (hold != FRT_H_AIM && (good == 3 || left == 0 || good + left < 2)) {   // a dropped cycle is retaken while two good can still come
+          float stepA, vB;
+          if (!frtShuntHoldResult(stepA, vB)) return;
+          frtHoldDone(now, (d > 0.001f) ? stepA / d : NAN, vB);
+        } else if (hold == FRT_H_AIM && left == 0) {
+          frtFailDrift(frt.baseA);   // no good cycle in five
+        }
         if (frt.state != FRT_RUNNING) return;
       }
     }
@@ -1613,6 +1756,7 @@ void frtService(uint32_t now) {
         frtFail("The meter read under 0.05 A, so it is not reading the field current. Check it is on DC amps (a clamp must be a DC clamp, zeroed), around or in series with the Regulator Field wire.");
         return;
       }
+      queueConsoleMessageF("Field resistance test, %s at %.2f V: meter %.3f A", FRT_HOLD_NAME[frt.hold], frt.holdX, amps);
       frtHoldDone(now, amps, frt.phV[0]);
       if (frt.state != FRT_RUNNING) return;
     }
@@ -3347,6 +3491,7 @@ void AdjustFieldLearnMode() {
   // Above every early-return below (fresh-CH1 gate, limp home, immediate cuts) so lifetime OV
   // dwell accumulates in all modes. RAW voltage on purpose — filtered smears ~100ms spikes.
   updateOvHistogram(tick.currentBatteryVoltage, tick.nowMs);
+  fieldCheck_tick(currentMillis, tick.currentBatteryVoltage);  // TEMP-FIELDCHECK
   uint32_t aflM1 = micros();  // end of section 1: RPM tables + tick snapshot
 
   // Runs every tick in every mode (not just AUTO): an over-temp event drops to SYS_MODE_FAULT,
@@ -4841,7 +4986,7 @@ void AdjustFieldLearnMode() {
           }
         }
         bool battCeilBinding = false;  // battery charge-current ceiling won the min-select this tick (banner limiter code 4)
-        if (BattLimitEnable && BattCurrentLimitA > 0.0f && BatteryCurrentSource == 0 && ShuntResistanceMicroOhm > 0 && BatteryShuntPresent) {
+        if (BattLimitEnable && BattCurrentLimitA > 0.0f && HAS_BATT_SHUNT) {
           // Shunt quiet: the house-load offset is unknowable, so the battery limit caps alternator amps directly
           // (charge current can never exceed alternator output) until the reading returns.
           float battCeilAlt = bcurLive ? fmaxf(0.0f, BattCurrentLimitA + loadOffsetFilt) : BattCurrentLimitA;
@@ -4879,7 +5024,7 @@ void AdjustFieldLearnMode() {
         // rides the existing rate-governed ramp when the authority raises it again.
         bool dvccCclBinding = false;
         if (dvccEn == 1 && dvccState == 3 /*FOLLOWING*/ && !cxOwnsBatteryNow() && !isnan(dvccCclA)) {
-          bool shuntBasis = (BatteryCurrentSource == 0 && ShuntResistanceMicroOhm > 0 && BatteryShuntPresent && bcurLive);
+          bool shuntBasis = (HAS_BATT_SHUNT && bcurLive);
           float dvccCeil = shuntBasis ? fmaxf(0.0f, dvccCclA + loadOffsetFilt) : fmaxf(0.0f, dvccCclA);
           if (dvccCeil < uTargetAmps) {
             uTargetAmps = dvccCeil;
@@ -6762,8 +6907,9 @@ void setDutyPercent(float percent) {
 // Bcur is meaningless without a battery shunt (reads ~0) — stage logs print "n/a" instead of a
 // fabricated number. Single control-task caller, so the shared buffer is safe.
 static const char *bcurForLog() {
-  static char b[12];
+  static char b[16];
   if (HAS_BATT_SHUNT) snprintf(b, sizeof(b), "%.1fA", Bcur);
+  else if (BattMonSrc != 0 && !isnan(netMonCurrentA())) snprintf(b, sizeof(b), "%.1fA %s", netMonCurrentA(), BattMonSrc == 3 ? "VE" : "N2K");
   else strncpy(b, "n/a", sizeof(b));
   return b;
 }
@@ -6773,10 +6919,13 @@ void updateChargingStage() {
   // Stage thresholds only. Control loops, protections and every dynamic measurement stay on getFiltV().
   const float v = getChargeDecisionVoltage();
   const char *vsrc = chargeDecisionVoltageSourceName();
-  const int soc = SOC_percent / 100;  // SOC_percent is %×100; the rebulk gates compare in plain percent
-  // A held (stale) shunt reading can neither end absorption nor trigger a current rebulk (§10.6).
-  const bool bcurOk = bcurFresh();
-  const bool bcurRebulk = HAS_BATT_SHUNT && bcurOk && RebulkCurrent_A > 0.0f && Bcur < -RebulkCurrent_A;   // Bcur is still computed with no shunt declared (a -1 mV offset read -10 A and rebulked every MinFloatTime)
+  const int soc = socShownX100() / 100;  // %×100; the rebulk gates compare in plain percent
+  // A held (stale) reading can neither end absorption nor trigger a current rebulk (§10.6): NAN when not fresh. With no
+  // regulator shunt this is the network battery monitor or nothing; Bcur is never read then (a -1 mV offset read -10 A
+  // and rebulked every MinFloatTime).
+  bool stageINet = false;
+  const float stageI = stageBattCurrentA(stageINet);
+  const bool bcurRebulk = !isnan(stageI) && RebulkCurrent_A > 0.0f && stageI < -RebulkCurrent_A;
 
   // While a commissioning run is live (IN_PROGRESS and the wizard dialog heartbeat is still fresh) the
   // field is owned by the wizard — resting between steps (COMMISSION_IDLE) or driven by the running
@@ -6858,9 +7007,11 @@ void updateChargingStage() {
     // One-sided: another charge source holding the bus ABOVE target is a legitimate tail condition.
     const float ABS_V_TAIL_BAND = 0.15f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
     const bool atAbsorbV = (v >= (AbsorptionVoltage - ABS_V_TAIL_BAND));
-    // No battery shunt → Bcur is meaningless (reads ~0), which would false-trip tail on tick 1 and drop
-    // the bank out of absorption instantly. Disable the tail path; absorption then ends on AbsorptionTimeoutMs.
-    const bool tailReached = HAS_BATT_SHUNT && bcurOk && !thermallyConstrained && atAbsorbV && (Bcur <= TailCurrent_A);
+    // No current source (no shunt and no network monitor) → stageI is NAN and absorption ends on AbsorptionTimeoutMs.
+    // A network monitor is read by magnitude: at absorption voltage the bank only accepts current, so one with the
+    // opposite sign convention would otherwise read negative and end absorption on its first sample.
+    const bool tailReached = !isnan(stageI) && !thermallyConstrained && atAbsorbV
+                             && ((stageINet ? fabsf(stageI) : stageI) <= TailCurrent_A);
 
     // AbsorptionTimeoutMs counts time actually spent AT the absorption voltage, not wall clock. Entering
     // absorption only proves the bank hit the voltage once — it says nothing about who put it there, so a
@@ -6974,9 +7125,9 @@ void updateChargingStage() {
     const bool rebulkCondition = (v < RebulkVoltage) || bcurRebulk;
 
     bool allowRebulk = true;
-    // SOC_percent stops integrating when the battery current is stale or the shunt is gone; a frozen 100 %
-    // would then block every rebulk, voltage sag included (audit 2026-09-27). Voltage rebulk alone stands in.
-    if (socInfoAvailable && HAS_BATT_SHUNT && battCurrentFresh()) {
+    // A held SoC (the count stops when the shunt reading is stale or gone, a network monitor goes quiet) frozen at
+    // 100 % would block every rebulk, voltage sag included (audit 2026-09-27). Voltage rebulk alone stands in.
+    if (socInfoAvailable && socDecisionOk()) {
       if (soc >= SOC_BlockRebulk_percent) allowRebulk = false;
       if (soc <= SOC_AllowRebulk_percent) allowRebulk = true;
     }
@@ -7054,9 +7205,9 @@ void updateChargingStage() {
     bool sagConfirmed = false;
 
     bool allowRebulk = true;
-    // SOC_percent stops integrating when the battery current is stale or the shunt is gone; a frozen 100 %
-    // would then block every rebulk, voltage sag included (audit 2026-09-27). Voltage rebulk alone stands in.
-    if (socInfoAvailable && HAS_BATT_SHUNT && battCurrentFresh()) {
+    // A held SoC (the count stops when the shunt reading is stale or gone, a network monitor goes quiet) frozen at
+    // 100 % would block every rebulk, voltage sag included (audit 2026-09-27). Voltage rebulk alone stands in.
+    if (socInfoAvailable && socDecisionOk()) {
       if (soc >= SOC_BlockRebulk_percent) allowRebulk = false;
       if (soc <= SOC_AllowRebulk_percent) allowRebulk = true;
     }
@@ -8442,8 +8593,11 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     tick.dieTempLost = (currentMillis > 15000UL) && !fresh;
     static bool prevLost = false;
     if (tick.dieTempLost != prevLost) {
-      if (tick.dieTempLost) queueConsoleMessageF("Regulator drive temperature (INA228 die) has no valid reading for 10 s (%s) - the field-drive heat limit has no input, so the field ramps off in every mode, MANUAL included, until it reads again",
-                                                 (ts == 0) ? "never read since boot" : "last valid sample too old or out of range");
+      if (tick.dieTempLost) queueConsoleMessageF("Regulator drive temperature (INA228 die) has no valid reading for 10 s (%s) - %s",
+                                                 (ts == 0) ? "never read since boot" : "last valid sample too old or out of range",
+                                                 reasonSuppressedByOverride(REASON_DIE_TEMP_LOST, tick)
+                                                   ? "Run Without Failed Sensors (main battery voltage) or Limp Home is on, so the field keeps running and the field-drive heat limit holds its last value"
+                                                   : "the field-drive heat limit has no input, so the field ramps off in every mode, MANUAL included, until it reads again");
       else queueConsoleMessage("Regulator drive temperature (INA228 die) reading again - the field may run again");
       prevLost = tick.dieTempLost;
     }
@@ -8682,17 +8836,18 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   }
 
   // §11.6 battery current (owner ruling 2026-09-27): an OPTIONAL sensor the owner declared present, so its loss
-  // is never a cut and never counts toward g_reqFaultCount. Lost = the selected source (INA228 shunt or
-  // VE.Direct) has stamped since boot, or 90 s have passed, and nothing fresh for 10 s. The alarm and the header
-  // line name it; every consumer (SoC, tail current, current rebulk, battery charge limit) already waits for a
-  // fresh reading.
+  // is never a cut and never counts toward g_reqFaultCount. Lost = the source the charge stages read (the regulator
+  // shunt, or with none fitted the network battery monitor) has stamped since boot, or 90 s have passed, and nothing
+  // fresh for 10 s. The alarm and the header line name it; every consumer already waits for a fresh reading.
   {
     static uint32_t battCurStaleSinceMs = 0;
     uint8_t st = 0;
-    if (HAS_BATT_SHUNT) {
-      const uint32_t ts = dataTimestamps[(BatteryCurrentSource == 3) ? IDX_VICTRON_CURRENT : IDX_BCUR];
+    const bool netSrc = !HAS_BATT_SHUNT && BattMonSrc != 0;
+    if (HAS_BATT_SHUNT || netSrc) {
+      const uint32_t ts = dataTimestamps[!netSrc ? IDX_BCUR : (BattMonSrc == 3) ? IDX_VICTRON_CURRENT : IDX_N2K_BATT];
       const bool everSeen = (ts != 0) || (currentMillis > 90000UL);
-      if (battCurrentFresh() || !everSeen) {
+      const bool fresh = netSrc ? !isnan(netMonCurrentA()) : bcurFresh();
+      if (fresh || !everSeen) {
         battCurStaleSinceMs = 0;
         st = 1;
       } else {
@@ -8703,8 +8858,10 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
       battCurStaleSinceMs = 0;
     }
     if (st != g_battCurState) {
-      if (st == 2) queueConsoleMessageF("Battery current lost: %s has not reported for 10 s - state of charge, the tail-current absorption exit, the current rebulk and the battery charge limit wait for it; charging continues on voltage",
-                                        (BatteryCurrentSource == 3) ? "the VE.Direct feed" : "the INA228 shunt");
+      if (st == 2 && netSrc) queueConsoleMessageF("Battery current lost: the %s battery monitor has not reported for 10 s - the tail-current absorption exit and the current rebulk wait for it; charging continues on voltage",
+                                                  (BattMonSrc == 3) ? "VE.Direct" : "NMEA 2000");
+      else if (st == 2) queueConsoleMessageF("Battery current lost: the INA228 shunt has not reported for 10 s - %sthe tail-current absorption exit, the current rebulk and the battery charge limit wait for it; charging continues on voltage",
+                                             (BattMonSrc == 0) ? "state of charge, " : "");
       else if (g_battCurState == 2) queueConsoleMessage("Battery current reading again");
     }
     g_battCurState = st;
@@ -10345,6 +10502,121 @@ void pidLog_tick(uint32_t nowMs) {
   pidLogHead = (pidLogHead + 1) % PID_LOG_SIZE;
   if (pidLogCount < PID_LOG_SIZE) pidLogCount++;
 }
+
+// ===== TEMP-FIELDCHECK BEGIN: TEMPORARY field-current validation log (see the Xregulator.ino block). REMOVE after the drive. =====
+void fieldCheck_init() {
+  fc = (FcStore *)heap_caps_malloc(sizeof(FcStore), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (fc) {
+    memset(fc, 0, sizeof(FcStore));
+    fc->row.clear();
+    for (int i = 0; i < FC_SEC_N; i++) fc->sec[i].clear();
+  }
+  Serial.printf("fieldCheck: %u entries x %u bytes, %u KB PSRAM %s\n", (unsigned)FC_RING_N, (unsigned)sizeof(FcRec),
+                (unsigned)(sizeof(FcStore) / 1024), fc ? "OK" : "FAILED");
+}
+
+// busV = the voltage the Field Amps estimate is computed from (updateFieldTelemetry's argument).
+void fieldCheck_tick(uint32_t now, float busV) {
+  if (!fc) return;
+  // Lambdas, not functions: the sketch prototyper would declare FcRec functions above the struct.
+  auto fcFill = [](FcRec &r, uint8_t kind, uint32_t now, const FcAcc &a) {
+    r.ms = now;
+    r.kind = kind;
+    r.mode = (uint8_t)sysMode;
+    r.lim = ctrlLimiter;
+    r.bind = g_fieldCeilBind;
+    r.stage = getChargeStageDisplayCode();
+    r.fieldOn = gpio4IsLow ? 0 : 1;
+    r.frtRun = (frt.state == FRT_RUNNING) ? 1 : 0;
+    r.pad = 0;
+    r.meterA = NAN;
+    r.estAvg = a.est.avg();    r.estMin = a.est.lo();    r.estMax = a.est.hi();
+    r.dutyAvg = a.duty.avg();  r.dutyMin = a.duty.lo();  r.dutyMax = a.duty.hi();
+    r.vAvg = a.volts.avg();    r.vMin = a.volts.lo();    r.vMax = a.volts.hi();
+    r.rc = g_fieldRcOhm;
+    r.r = FieldResistance;
+    r.trefC = FieldResTrefC;
+    r.probeF = n2kAltTempF();
+    r.dieF = g_fdDieTempF;
+    r.rpm = a.rpm.avg();
+    r.altA = a.altA.avg();
+    r.battA = a.battA.avg();
+    r.curCeil = g_fieldCurDutyCeil;
+    r.heatCeil = g_fieldHeatDutyCeil;
+  };
+  auto fcPush = [](const FcRec &r) {
+    portENTER_CRITICAL(&fcMux);
+    fc->ring[fcHead] = r;
+    fcHead = (uint16_t)((fcHead + 1) % FC_RING_N);
+    if (fcCount < FC_RING_N) fcCount++;
+    portEXIT_CRITICAL(&fcMux);
+  };
+  FcAcc &row = fc->row;
+  FcAcc *sec = fc->sec;
+  static uint8_t secIdx = 0;
+  static uint32_t lastSampleMs = 0, rowStartMs = 0, secStartMs = 0;
+  static bool started = false;
+  if (!started) {
+    rowStartMs = secStartMs = lastSampleMs = now;
+    started = true;
+  }
+
+  if ((uint32_t)(now - lastSampleMs) >= FC_SAMPLE_MS) {
+    lastSampleMs = now;
+    if ((uint32_t)(now - secStartMs) >= 1000) {
+      secStartMs = now;
+      secIdx = (uint8_t)((secIdx + 1) % FC_SEC_N);
+      sec[secIdx].clear();
+    }
+    const float batt = getBatteryCurrent();
+    FcAcc *dst[2] = { &row, &sec[secIdx] };
+    for (FcAcc *a : dst) {
+      a->est.add(iiout);
+      a->duty.add(dutyCycle);
+      a->volts.add(busV);
+      a->rpm.add(RPM);
+      a->altA.add(MeasuredAmps);
+      a->battA.add(batt);
+    }
+  }
+
+  uint32_t seq;
+  uint8_t kind;
+  float amps;
+  portENTER_CRITICAL(&fcMux);
+  seq = fcReqSeq;
+  kind = fcReqKind;
+  amps = fcReqAmps;
+  portEXIT_CRITICAL(&fcMux);
+  if (seq != fcDoneSeq) {
+    FcAcc w;
+    w.clear();
+    for (int i = 0; i < FC_SEC_N; i++) w.merge(sec[i]);
+    FcRec r;
+    fcFill(r, kind, now, w);
+    r.meterA = (kind == FC_KIND_METER) ? amps : NAN;
+    fcPush(r);
+    portENTER_CRITICAL(&fcMux);
+    fc->last = r;
+    fcEntries++;
+    fcDoneSeq = seq;
+    portEXIT_CRITICAL(&fcMux);
+    if (kind == FC_KIND_METER)
+      queueConsoleMessageF("Field check: meter %.2f A, estimate %.2f A (%.2f to %.2f over the last 5 s), meter minus estimate %+.2f A",
+                           r.meterA, r.estAvg, r.estMin, r.estMax, r.meterA - r.estAvg);
+    else
+      queueConsoleMessageF("Field check: mark, estimate %.2f A", r.estAvg);
+  }
+
+  if ((uint32_t)(now - rowStartMs) >= FC_ROW_MS) {
+    rowStartMs = now;
+    FcRec r;
+    fcFill(r, FC_KIND_ROW, now, row);
+    fcPush(r);
+    row.clear();
+  }
+}
+// ===== TEMP-FIELDCHECK END =====
 
 void thermalLog_init() {
   Serial.printf("thermalLog_init: PSRAM found=%d\n", psramFound());

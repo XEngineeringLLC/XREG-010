@@ -998,24 +998,19 @@ unsigned long lastConsoleMessageTime = 0;
 const unsigned long CONSOLE_MESSAGE_INTERVAL = 700;  //
 // Fixed-size circular buffer:
 // 128 silently truncated 14 diagnostics mid-sentence (every INA228 over-voltage line, both SystemID failure
-// explanations) — always the tail, which is the part that says what to do. Queue is ps_malloc'd, so the extra
-// 1280 B is PSRAM. Also caps queueConsoleMessageF's vsnprintf.
+// explanations) — always the tail, which is the part that says what to do. The ring below is ps_malloc'd, so
+// the length costs PSRAM. Also caps queueConsoleMessageF's vsnprintf.
 #define CONSOLE_MSG_LEN 256
-struct ConsoleMessage {
-  char message[CONSOLE_MSG_LEN];
-  unsigned long timestamp;
-};
-#define CONSOLE_QUEUE_SIZE 10
-ConsoleMessage *consoleQueue;
-volatile int consoleHead = 0;
-volatile int consoleTail = 0;
-volatile int consoleCount = 0;
 static portMUX_TYPE consoleMux = portMUX_INITIALIZER_UNLOCKED;
-// Console history ring (~55 KB PSRAM), served at /consolehist.txt. The 10-slot queue drains to
-// whichever SSE clients happen to be connected and the browser-side buffer lives in per-browser
-// localStorage — so a fresh browser (or a dropped SSE message) loses history forever. This ring is
-// the device-side source of truth the Download Logs console file is built from.
+// Console history ring (~55 KB PSRAM), served at /consolehist.txt. The live SSE console drains from this
+// same ring (consoleSsePending) to whichever clients happen to be connected, and the browser-side buffer
+// lives in per-browser localStorage — so a fresh browser (or a dropped SSE message) loses history forever.
+// This ring is the device-side source of truth the Download Logs console file is built from.
 #define CONSOLE_HIST_SIZE 200
+// Unsent live-console lines are capped well under the ring: a radio outage stops the drain, and on
+// reconnect the browser stamps every backlog line with its arrival time. 32 clears a wizard test's
+// end-of-run burst (13 lines from one SysID pass dropped Bode 1-3 at the old 10-slot queue, 2026-10-11).
+#define CONSOLE_SSE_BACKLOG 32
 struct ConsoleHistEntry {
   uint32_t ms;      // millis() at queue time
   time_t epoch;     // soft-clock epoch at queue time (pre-2020 value = clock not yet synced)
@@ -1024,6 +1019,7 @@ struct ConsoleHistEntry {
 ConsoleHistEntry *consoleHist = nullptr;
 volatile int consoleHistHead = 0;
 volatile int consoleHistCount = 0;
+volatile int consoleSsePending = 0;   // newest ring entries not yet sent to SSE, capped at CONSOLE_SSE_BACKLOG
 
 
 // DNS Server for captive portal
@@ -1744,6 +1740,7 @@ float batteryTempF(uint8_t *srcOut);   // 6_functions.ino — callers earlier in
 float battTempActiveF = NAN;        // batteryTempF() result of the current tick (°F); NAN = no source qualifies
 uint8_t battTempActiveSrc = 0;      // 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T), 4 RV-C (DC_SOURCE_STATUS_2); 5 retired, never emitted
 float VictronBattTempF = NAN;       // VE.Direct "T" field (°F), BMV/SmartShunt with a temperature sensor
+float VictronSoc = NAN;             // VE.Direct "SOC" field (%), the battery monitor's own count; NAN while it reports "---" (unsynced)
 float rvcRxBattTempF = NAN;         // RV-C DC_SOURCE_STATUS_2 source temperature (°F) at the dvccInst instance
 bool  cvTempDerateInert = false;    // CommissionTempSrc is not a measured source (legacy 0, or the retired board stamp 5); derate returns 1.0 until the CV fit is re-run
 int ManualFieldToggle = 0;           // 0 = Auto (PID) — fresh-flash default. Set to 1 for manual field control (debugging).
@@ -1847,50 +1844,75 @@ float FieldResTrefC = NAN;                    // alternator temperature (°C) re
 #define FRT_SHUNT    1
 #define FRT_METER    2
 #define FRT_H_PROBE  0   // holds, in run order
-#define FRT_H_TOP    1
-#define FRT_H_MID    2
-#define FRT_H_PROBE2 3   // shunt only: the probe repeated, for the coil-warming figure
+#define FRT_H_AIM    1   // between the probe and the top, so the top is aimed by a slope (skipped when there is no room)
+#define FRT_H_TOP    2
+#define FRT_H_MID    3
+#define FRT_N_HOLDS  4
 #define FRT_MP_HOLD  1   // meter phases: field on, counting down
 #define FRT_MP_WAIT  2   //               field off, waiting for the owner's reading
 #define FRT_PHASE_MS      3000UL   // shunt: one field-off or field-on phase
 #define FRT_SETTLE_MS     1000UL   // discarded at the start of a phase: the coil's L/R is tenths of a second
-#define FRT_METER_HOLD_MS 10000UL  // meter: field on per hold
-#define FRT_HB_MS         3000UL   // no request from the app this long ends the test
-#define FRT_MAX_A         6.0f     // shunt: implied field current that ends the test at once
+#define FRT_METER_HOLD_MS 12000UL  // meter: field on per hold. Up from 10 s on tester feedback: more time to read the meter
+#define FRT_HB_MS         8000UL   // no request from the app this long ends the test. Not 3 s: on this link a lost reply is resent 2-2.5 s later, a second loss 5 s after that
+#define FRT_MAX_A         6.0f     // shunt: implied field current, FRT_RING_N-read mean, that ends the test at once
+#define FRT_FAST_MAX_A    9.0f     // shunt: the same on the last 8 reads (~40 ms), for a fault rather than a plan that lands high
+#define FRT_RING_N        64       // ~0.3 s of INA228 fast-mode reads
 #define FRT_TOP_AIM_A     4.0f
+#define FRT_AIM_A         2.0f     // the aiming hold, planned by the probe's V / A
+#define FRT_AIM_SKIP_A    3.0f     // a probe at or above this plans the top itself: there the contact drop moves it little
 #define FRT_MID_FRAC      0.6f
 #define FRT_PROBE_MIN_A   0.5f     // a probe under this moves up a rung
 #define FRT_NO_STEP_A     0.020f   // shunt: a battery step under this at the 6 V probe means the shunt does not see the field
 #define FRT_METER_MIN_A   0.05f    // every real winding draws more than this at 3 V
+#define FRT_MAX_CYC       5        // shunt: cycles per hold, three plus up to two retakes of a dropped cycle
+#define FRT_DRIFT_A       0.050f   // shunt: a cycle's two field-off readings may differ by this or FRT_DRIFT_FRAC of the step
+#define FRT_DRIFT_FRAC    0.03f    // 15 % until 2026-10-12: cycles drifting 0.19-0.28 A on a wandering solar charge passed at the top hold; a steady run stays under 0.04 A
+#define FRT_CALM_MS       45000UL  // shunt: two opening field-off readings must agree within FRT_DRIFT_A by this, or the test stops
+#define FRT_CHARGING_A    0.30f    // shunt: a field-off reading above this (charging, engine off) names a charger in the drift stop
+struct FrtCycle {
+  float a0, b, a1;   // shunt: battery amps (charging positive) of the field-off, field-on and field-off phases
+  bool ok;           // the two field-off readings agree, so no load switched mid-cycle
+  float f;           // field amps, step / duty: the screen shows this, so a hold and its median cycle read the same
+};
 struct FrtHold {
   float x;   // field volts by the firmware's model, d*V - (1-d)*FD_VF_EST, at the V measured during the hold
   float d;   // duty %
   float v;   // battery volts during the hold
   float i;   // field amps measured
+  float tC;  // alternator temperature (C) when the hold's amps came in, NAN with no probe reading: shown per hold
+  FrtCycle c[FRT_MAX_CYC];   // shunt: every cycle of the hold, kept or dropped
+  uint8_t nc;
 };
 struct FieldResTestState {
   volatile uint8_t state;      // FRT_IDLE / RUNNING / DONE / FAILED
   uint8_t method;              // FRT_SHUNT / FRT_METER
   uint8_t hold;                // FRT_H_* in progress
   uint8_t rung;                // probe rung 0..2 (3 / 6 / 12 V)
-  uint8_t phase;               // shunt 0..6 (even field off, odd field on); meter FRT_MP_*
+  float rungX[2], rungI[2];    // a rung the probe stepped up from: its field volts and amps
+  uint8_t phase;               // shunt 0..2 * FRT_MAX_CYC (even field off, odd field on); meter FRT_MP_*
   uint32_t phaseStartMs;
   uint32_t startMs;
   uint32_t endMs;              // last end of a run (0 = none since boot): the tach-mask tail runs from here
   volatile uint32_t lastPollMs;   // last /fieldResTest request: the app's heartbeat
+  volatile uint32_t hbWorstMs;    // longest gap between requests this run, for the console
   float duty;                  // % applied this pass (0 in a field-off phase)
   float holdX, holdDuty;       // the hold in progress
   double sumI, sumV;           // sample window of the phase in progress (after the settle)
   uint32_t n;
-  float phI[7], phV[7];        // shunt phase means: battery amps (charging positive) and volts
+  float phI[2 * FRT_MAX_CYC + 1], phV[2 * FRT_MAX_CYC + 1];   // shunt phase means: battery amps (charging positive) and volts
+  bool calm;                   // shunt: two opening field-off readings agreed, so the field may come on
+  float gateA;                 // shunt: the last opening field-off reading, for that agreement (NAN: none yet)
   float baseA;                 // last field-off phase mean: the live 6 A check's baseline
-  float ring[8];
+  float ring[FRT_RING_N];
+  double ringSum;
   uint8_t ringN, ringK;
-  bool overA;                  // the live check saw more than FRT_MAX_A
-  float liveI;                 // latest implied field amps (shunt), for the screen
-  FrtHold h[4];
+  bool overA;                  // the live check saw more than FRT_MAX_A (or FRT_FAST_MAX_A)
+  float tripA, tripLim;        // the reading that tripped it, and the limit it passed
+  float liveI;                 // latest implied field amps (shunt), FRT_RING_N-read mean, for the screen
+  float lvLo, lvHi, fsLo, fsHi;   // this on-phase's range after the settle: liveI, and the 8-read mean; logged per cycle
+  FrtHold h[FRT_N_HOLDS];
   float probeC;                // alternator temperature at the start (NAN: no reading), stored with R
-  float r, vc, probeOffV, warmPct;
+  float r, vc, probeOffV;
   volatile bool saved;         // written by /fieldResTest save=1, the owner's Next or Save
   volatile bool reqStart, reqAbort, reqAgain, reqReading;
   volatile uint8_t reqMethod;
@@ -1904,7 +1926,7 @@ inline bool frtTachMasked() {
   return frt.state == FRT_RUNNING || (frt.endMs != 0 && (uint32_t)(millis() - frt.endMs) < FIELDCUT_RPM_GRACE_MS);
 }
 void frtInaSample(float bcur, float v, bool shuntOk);
-void fieldResRecord(float r, float probeC);
+void fieldResRecord(float r, float probeC, bool typed);
 int FieldWiring = 0;                          // field wiring the drive-heat limit checks: 0 not set (both checks), 1 P-type (D5 spreader), 2 N-type (J2 connector)
 float vvout;                                  // Calculated field volts (approximate)
 float iiout;                                  // Calculated field amps (approximate)
@@ -3575,7 +3597,10 @@ unsigned long rebootRequestedAt = 0;
 uint32_t restartRemainingSec = 0;
 const unsigned long RESTART_WARNING_WINDOW_MS = 600000UL;  // 10 minutes
 
-int BatteryCurrentSource = 0;  // 0=INA228, 1=NMEA2K Batt, 2=NMEA0183 Batt, 3=Victron Batt
+// Network battery monitor (Setup > Integrations "Use as Battery Monitor"): 0 none, 1 NMEA 2000 (n2kRxBattInstance,
+// 127508 + 127506), 3 VE.Direct BMV/SmartShunt. Its own SoC is the SoC shown and used, never re-integrated here. With
+// no regulator shunt its current also drives the taper exit and current rebulk; it never feeds a fast loop.
+int BattMonSrc = 0;
 int BatteryVoltageSource = 0;  // battery volts for CHARGE DECISIONS only: 0=INA228, 1=NMEA2K Batt (127508), 3=Victron Batt. Control loops and protections always read IBV.
 int timeAxisModeChanging = 0;  // toggle the time axis on and off in Plots.  Off = less janky but less info
 
@@ -3615,7 +3640,7 @@ float g_fieldDutyFloor = 0.0f;
 // Board field ceilings from updateFieldDerateCeilings() (6_functions.ino), here for the same reason as g_fieldDutyFloor.
 float g_fieldCurDutyCeil = 99.0f;   // 10 A field-current ceiling, duty %
 float g_fieldHeatDutyCeil = 99.0f;  // field-drive heat ceiling, duty %
-float g_fieldRcOhm = NAN;           // FieldResistance corrected for alternator temperature: the 10 A cap, the heat law and the Field Amps readout all use it (NAN = no resistance entered)
+float g_fieldRcOhm = NAN;           // FieldResistance corrected for alternator temperature, less FD_MARGIN: the 10 A cap, the heat law and the Field Amps readout all use it (NAN = no resistance entered)
 uint8_t g_fieldCeilBind = 0;        // which ccDutyCeiling() term binds: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the J2 connector, 4 heat at the D5 spreader
 uint32_t g_fieldHeatLimS = 0;       // lifetime seconds held at the heat ceiling (NVS FieldHeatLimS, daily cloud field_heat_limited_s)
 uint32_t g_fieldCurLimS = 0;        // lifetime seconds held at the 10 A ceiling (NVS FieldCurLimS, daily cloud field_cur_limited_s)
@@ -3793,20 +3818,21 @@ uint32_t cvpfPhaseStartMs = 0, cvpfSampleLastMs = 0, cvpfTestStartMs = 0;
 float    cvpfBaseA = 10.0f, cvpfPilotA = 6.0f, cvpfStepA = 6.0f, cvpfTargetDV = 0.30f;
 float    cvpfPilotK = 0.02f, cvpfPilotVbase = 12.0f, cvpfCmdA = 10.0f;
 bool     cvpfFellBack = false;
+bool     cvpfBoosted = false;   // operator accepted the weak-signal stronger step: cvpfDiMaxA is that step, target-ΔV sizing skipped
 float    cvpfBaseDuty = 0.0f, cvpfStepDuty = 0.0f;  // settled duties captured from the current PID, replayed abruptly
 float    cvpfPreSetpoint = 0.0f;   // setpointLimited before the test — restored pre-override so the resume snapshot is clean
 uint32_t cvpfEdgeMs[8] = { 0 };    // tick timestamp of each abrupt duty edge (even idx = step-up, odd = step-down; pulse = idx>>1)
 uint8_t  cvpfEdgeCount = 0;
 float    cvpfEdgeK[8]   = { 0 };   // per-edge stiffness mV/A for the wizard table (0 = no reading)
 uint8_t  cvpfEdgeStat[8] = { 4, 4, 4, 4, 4, 4, 4, 4 };  // 0 used · 1 weak step · 2 wrong-way · 3 window starved · 4 not fired
-float    cvpfDiMaxA = 40.0f;       // per-run current-step ceiling (A); raised only when the operator accepts the weak-signal re-run, reset each start
+float    cvpfDiMaxA = 40.0f;       // per-run current-step ceiling (A); set to the requested step when the operator accepts the weak-signal re-run, reset each start
 float    cvpfRpmAtFit = 0.0f;      // mean RPM over the two middle pulse segments — re-run RPM advice + result-card conditions
 float    cvpfRpmMinAtFit = 0.0f, cvpfRpmMaxAtFit = 0.0f;  // RPM extremes over the same windows — result-card context only
 float    cvpfBattVAtFit = 0.0f;    // mean IBV over the two middle pulse segments — result-card "test conditions" only
 float    cvpfSocAtFit = -1.0f;     // mean SOC% over the two middle pulse segments (−1 when socInfoAvailable false) — result-card only
 double   cvpfRpmSum = 0.0, cvpfBattVSum = 0.0, cvpfSocSum = 0.0;   // accumulators, summed over the settled tail of the mid high+low segments
 uint32_t cvpfCondN = 0;            // condition samples accumulated (settled tails of segments 3 & 4 → ~1 s of stable level each)
-float    cvpfCapHeadroomA = 0.0f;  // A — alternator cap-table headroom at fit time (g_I_cap − cvpfBaseA); how much bigger a step the table allows
+float    cvpfCapHeadroomA = 0.0f;  // A — largest step the cap-table clamp in cvpfSizeStep allows at fit time (g_I_cap − cvpfBaseA − CVPF_CAP_MARGIN_A)
 float    cvpfRebaseRpm = 0.0f;     // RPM at REBASE exit — same base current as cvpfSettleRpm, so the pair reads drift with load sag cancelled
 float    cvpfDriftSetupPct = 0.0f; // signed % engine drift across setup (SETTLE exit -> REBASE exit, both at base current)
 float    cvpfDriftTrainPct = 0.0f; // signed % engine drift across the pulse train (first vs last base segment, both at base duty)
@@ -5026,6 +5052,50 @@ float thermalPenaltyAmps = 0.0f;    // temperature loop output: amps subtracted 
 //=============================================================================
 //                    END LEARNING MODE GLOBAL VARIABLES
 //=============================================================================
+// ===== TEMP-FIELDCHECK BEGIN: TEMPORARY field-current validation log. REMOVE after the owner's validation drive: delete every
+// block tagged TEMP-FIELDCHECK (grep -rn TEMP-FIELDCHECK: Xregulator.ino, 3_functions.ino, 6_functions.ino, web_src/index.html,
+// web_src/script.js). Plan: d5_thermal_model/README.md, "FIELD DERATE - SPEC", "Validation drive". A row every 10 s plus each meter
+// reading the owner types in Live Data > Alternator, so a moment the estimate (iiout) read below the meter can be found later.
+#define FC_ROW_MS     10000   // one row per 10 s
+#define FC_SAMPLE_MS  100     // averages are fed at 10 Hz
+#define FC_SEC_N      6       // 1 s buckets behind an owner entry: the last 5 whole seconds plus the current one (the meter is slow)
+#define FC_RING_N     512     // 360 rows = 1 h, plus room for entries
+#define FC_KIND_ROW   0
+#define FC_KIND_METER 1
+#define FC_KIND_MARK  2
+struct FcStat {
+  uint16_t n; float s, mn, mx;
+  void clear() { n = 0; s = 0.0f; mn = INFINITY; mx = -INFINITY; }
+  void add(float v) { if (!isfinite(v)) return; n++; s += v; if (v < mn) mn = v; if (v > mx) mx = v; }
+  void merge(const FcStat &o) { if (!o.n) return; n += o.n; s += o.s; if (o.mn < mn) mn = o.mn; if (o.mx > mx) mx = o.mx; }
+  float avg() const { return n ? s / n : NAN; }
+  float lo() const { return n ? mn : NAN; }
+  float hi() const { return n ? mx : NAN; }
+};
+struct FcAcc {
+  FcStat est, duty, volts, rpm, altA, battA;
+  void clear() { est.clear(); duty.clear(); volts.clear(); rpm.clear(); altA.clear(); battA.clear(); }
+  void merge(const FcAcc &o) { est.merge(o.est); duty.merge(o.duty); volts.merge(o.volts); rpm.merge(o.rpm); altA.merge(o.altA); battA.merge(o.battA); }
+};
+struct FcRec {
+  uint32_t ms;
+  uint8_t kind, mode, lim, bind, stage, fieldOn, frtRun, pad;
+  float meterA;
+  float estAvg, estMin, estMax, dutyAvg, dutyMin, dutyMax, vAvg, vMin, vMax;
+  float rc, r, trefC, probeF, dieF, rpm, altA, battA, curCeil, heatCeil;
+};
+struct FcStore {
+  FcRec ring[FC_RING_N];
+  FcRec last;                            // the latest entry, for the panel
+  FcAcc row, sec[FC_SEC_N];              // Core 1 only
+};
+FcStore *fc = nullptr;                   // one PSRAM block; ring, last and the fields below are guarded by fcMux (written on Core 1, read by the web task)
+uint16_t fcHead = 0, fcCount = 0, fcEntries = 0;
+portMUX_TYPE fcMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t fcReqSeq = 0, fcDoneSeq = 0;    // the web handler bumps fcReqSeq; the control tick records the entry and catches fcDoneSeq up
+uint8_t fcReqKind = FC_KIND_MARK;
+float fcReqAmps = NAN;
+// ===== TEMP-FIELDCHECK END =====
 // ===== THERMAL LOG (PSRAM circular buffer) =====
 #define THERMAL_LOG_SIZE 3600  // covers 2 hours at 0.5 Hz (halved from 7200/1Hz to reclaim ~183 KB PSRAM for cvLog)
 #define THERMAL_LOG_INTERVAL_MS 2000
@@ -5550,8 +5620,9 @@ enum DataIndex {
   IDX_VE_BATT_TEMP,              // 45 - VE.Direct "T" battery temperature (VictronBattTempF)
   IDX_RVC_BATT_TEMP,             // 46 - RV-C DC_SOURCE_STATUS_2 battery temperature (rvcRxBattTempF)
   IDX_INA_DIE_TEMP,              // 47 - INA228 die temperature: stamped only by a sample past the warm-up discard and inside the bad-read window
+  IDX_VE_SOC,                    // 48 - VE.Direct "SOC" field seen: only battery monitors send it, so it also proves the port is not an MPPT
   // Keep this last and increment when new added
-  MAX_DATA_INDICES = 48
+  MAX_DATA_INDICES = 49
 };
 
 unsigned long dataTimestamps[MAX_DATA_INDICES];  // Uses the enum size automatically
@@ -5830,7 +5901,8 @@ const unsigned long N2kTransmitMessages[] PROGMEM = { 127488UL, 127489UL, 127506
 const unsigned long N2kReceiveMessages[] PROGMEM = { 126720UL, 126992UL, 127245UL, 127250UL, 127257UL, 127506UL, 127508UL, 127513UL, 128259UL, 128267UL, 129026UL, 129029UL, 129540UL, 130306UL, 0 };
 void nmea2kTransmitTick();
 // ===== NMEA2000 received battery data (127508 + 127506 at n2kRxBattInstance) =====
-// Display/telemetry only — never an input to field control, protections, targets, or SoC.
+// Never an input to field control, protections or targets. With BattMonSrc = 1 the SoC is the one shown and used,
+// and with no regulator shunt the current drives the taper exit and current rebulk.
 int n2kRxBattInstance = 0;   // battery instance to read (a shunt/BMS "virtual shunt" bridged onto N2K)
 float n2kRxBattV = NAN;      // received battery voltage (127508)
 float n2kRxBattA = NAN;      // received battery current (127508, signed)
@@ -6185,8 +6257,6 @@ void setup() {
   if (!timestampBuffer) Serial.println("FATAL: timestampBuffer ps_malloc failed");
   messageBuffer = (char *)ps_malloc(MESSAGE_BUFFER_SIZE);
   if (!messageBuffer) Serial.println("FATAL: messageBuffer ps_malloc failed");
-  consoleQueue = (ConsoleMessage *)ps_malloc(CONSOLE_QUEUE_SIZE * sizeof(ConsoleMessage));
-  if (!consoleQueue) Serial.println("FATAL: consoleQueue ps_malloc failed");
   usageSlots = (UsageSlot *)ps_malloc(USAGE_SLOTS * sizeof(UsageSlot));
   if (!usageSlots) Serial.println("FATAL: usageSlots ps_malloc failed");
   else memset(usageSlots, 0, USAGE_SLOTS * sizeof(UsageSlot));
@@ -6214,7 +6284,6 @@ void setup() {
   anchorageRing = (AnchorageSample *)ps_malloc(ANCHORAGE_RING_SIZE * sizeof(AnchorageSample));
   if (!anchorageRing) Serial.println("FATAL: anchorageRing ps_malloc failed");
   else memset(anchorageRing, 0, ANCHORAGE_RING_SIZE * sizeof(AnchorageSample));
-  if (consoleQueue) memset(consoleQueue, 0, CONSOLE_QUEUE_SIZE * sizeof(ConsoleMessage));
   // Battery Health PSRAM buffers (sample buffer interval-gated at 15ms: 8192 covers ~120s,
   // i.e. the default 56s test plus headroom for a raised edge count or stretched dwell).
   bhSampleCap = 8192;
@@ -6632,6 +6701,7 @@ void setup() {
   pidLog_init();
   cvLog_init();
   tuningScore_init();
+  fieldCheck_init();  // TEMP-FIELDCHECK
   // Post-allocation PSRAM baseline: largest contiguous block matters as much as total —
   // cvLog's 333 KB is one heap_caps_malloc, so total-free can look fine while it can't fit.
   Serial.printf("PSRAM after setup: %u KB free / %u KB total, largest block %u KB\n",

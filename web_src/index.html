@@ -191,7 +191,7 @@
       <span class="hcs-gsep hcs-asep"></span>
       <!-- Battery group -->
       <span class="hcs-m"><span id="hcs-volt">-</span><i>V</i></span>
-      <span class="hcs-m hcs-soc req-batt-current"><span id="hcs-soc">-</span><i>%</i></span>
+      <span class="hcs-m hcs-soc req-soc-src"><span id="hcs-soc">-</span><i>%</i></span>
       <span class="hcs-m hcs-batt req-batt-current"><span id="hcs-batt">-</span><i>A</i></span>
       <span class="hcs-gsep hcs-eng"></span>
       <!-- Engine group -->
@@ -245,9 +245,9 @@
           <span class="duo-lbl why-tap" id="lbl-voltage" data-t="Batt">Batt</span>
           <span class="duo-num"><span id="header-voltage">-</span></span>
           <span class="duo-unit">V</span>
-          <span class="duo-lbl req-batt-current" data-t="SOC" onclick="socSeedOpen()" style="cursor:pointer;">SOC</span>
-          <span class="duo-num req-batt-current" onclick="socSeedOpen()" style="cursor:pointer;"><span id="header-soc">-</span></span>
-          <span class="duo-unit req-batt-current" onclick="socSeedOpen()" style="cursor:pointer;">%</span>
+          <span class="duo-lbl req-soc-src" data-t="SOC" onclick="socSeedOpen()" style="cursor:pointer;">SOC</span>
+          <span class="duo-num req-soc-src" onclick="socSeedOpen()" style="cursor:pointer;"><span id="header-soc">-</span></span>
+          <span class="duo-unit req-soc-src" onclick="socSeedOpen()" style="cursor:pointer;">%</span>
         </div>
 
         <!-- Alt + Batt currents — 3-column grid keeps A's vertically aligned -->
@@ -1674,14 +1674,19 @@
                         with the result. The regulator's field-current estimate, its 10 A field limit, and its
                         drive-heat protection are all built on this number. An ohmmeter reading through the brushes
                         reads high, and a high number lets the field run harder than those limits intend, so type
-                        only a result from the test here.</span></span>
+                        only a result from the test here, with the alternator temperature the test showed for it:
+                        the regulator corrects the resistance from that temperature.</span></span>
                   </div>
-                  <div class="form-input">
-                    <form action="/get" method="GET" target="hidden-form" onsubmit="return dropEmpty(this)">
-                      <input name="FieldResistance" type="number" step="0.01" min="0.05" max="100" />
-                      <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
+                  <div class="form-input" style="flex-wrap:wrap;">
+                    <form action="/get" method="GET" target="hidden-form" onsubmit="return fieldResTypedSubmit(this)">
+                      <input name="FieldResistance" type="number" step="0.001" min="0.05" max="100" placeholder="Ω" style="width:84px;" />
+                      <span style="white-space:nowrap;">at <input id="FieldResTempIn" type="number" step="1" placeholder="Temp" style="width:72px;" />
+                        <span class="temp-unit-label">°F</span></span>
+                      <input type="hidden" name="FieldResTrefC" />
+                      <input type="submit" value="Set" class="btn-primary" />
                       <button type="button" class="btn-secondary" onclick="fieldResOpen('setup')">Measure</button>
                     </form>
+                    <div id="FieldResTypedHint" style="display:none; flex-basis:100%; text-align:right; margin-top:6px; font-size:13px; color:#e6a23c;"></div>
                   </div>
                 </div>
 
@@ -2970,7 +2975,7 @@
                     <div class="protections-name">
                       <span class="protections-tag g4">G4</span>
                       Battery Charge Current Limit (A) (<span id="BattCurrentLimitA_echo">?</span>)
-                      <span class="tooltip">ℹ️<span class="tooltip-box">The most charging current the battery is allowed to receive, in amps — set it to the battery bank's maximum acceptance (for lithium, the C-rate limit). This is a ceiling on the command, not a trip: the alternator command is capped at this limit plus the measured house-load draw, so loads are always covered and only the battery's share is limited. Requires the INA228 battery shunt as the Battery Current Source. 0 disables the limit.<br><br>If you have other charging sources on the bus (solar, shore power, a DC-DC charger), the shunt sees everything going into the battery, so the alternator is backed off to make room for them. When those sources are putting in more than the boat is using, the alternator gets a lower ceiling — and if they can cover the whole limit on their own, the alternator is commanded down to nothing until they ease off.</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">The most charging current the battery is allowed to receive, in amps — set it to the battery bank's maximum acceptance (for lithium, the C-rate limit). This is a ceiling on the command, not a trip: the alternator command is capped at this limit plus the measured house-load draw, so loads are always covered and only the battery's share is limited. Requires the battery shunt wired to the regulator. 0 disables the limit.<br><br>If you have other charging sources on the bus (solar, shore power, a DC-DC charger), the shunt sees everything going into the battery, so the alternator is backed off to make room for them. When those sources are putting in more than the boat is using, the alternator gets a lower ceiling — and if they can cover the whole limit on their own, the alternator is commanded down to nothing until they ease off.</span></span>
                       <span class="sinfo" data-sinfo="BattCurrentLimitA"></span>
                     </div>
                     <form action="/get" method="GET" target="hidden-form">
@@ -3893,7 +3898,7 @@
                     <div class="metric-row telemetry-row">
                       <span class="metric-label telemetry-label">Field Curr
                         <span class="tooltip">ℹ️
-                          <span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps2">?</span> Ω, measured by the field resistance test, in Settings → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. Reads a little high because the rotor runs hotter than the probe.</span>
+                          <span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps2">?</span> Ω, measured by the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe.</span>
                         </span>
                       </span>
                       <span class="metric-value telemetry-value"><span id="FieldAmpsID2">?</span>&nbsp;A</span>
@@ -6900,7 +6905,8 @@
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
                 Phase Definitions
               </summary>
-              <p class="gate-note gate-note-shunt">No battery shunt is installed, so every setting that reads battery current is greyed below: Tail Current, zero-current float, Force &quot;Maintain Mode&quot; and the Rebulk Current Threshold. Absorption ends on time alone, and float (if enabled) then holds the float voltage, until a shunt is fitted under Setup &rarr; Battery &rarr; Measurement Sources.</p>
+              <p class="gate-note gate-note-shunt">No battery shunt is wired to the regulator, so zero-current float and Force &quot;Maintain Mode&quot; are greyed below. Both need the regulator&#39;s own shunt, set up under Setup &rarr; Battery &rarr; Measurement Sources.</p>
+              <p class="gate-note gate-note-soc-src">Tail Current and the Rebulk Current Threshold are greyed too, because no battery monitor is set up under Setup &rarr; Integrations either. Absorption ends on time alone, and float (if enabled) then holds the float voltage.</p>
               <div style="padding-left: 12px; border-left: 2px solid var(--border); margin-top: 10px;">
 
             <!-- Bulk Phase -->
@@ -6977,7 +6983,7 @@
               </div>
 
               <hr />
-              <div class="form-row gate-batt-current">
+              <div class="form-row gate-soc-src">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Tail Current (A) (<span id="TailCurrent_A_echo">?</span>):</span>
                   <span class="tooltip">
@@ -7195,7 +7201,7 @@
               </div>
 
               <hr />
-              <div class="form-row gate-batt-current">
+              <div class="form-row gate-soc-src">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Rebulk Current Threshold (A) (<span id="RebulkCurrent_A_echo">?</span>):</span>
                   <span class="tooltip">
@@ -7455,12 +7461,12 @@
             </details>
 
             <!-- SoC Integration Section -->
-            <details class="gate-batt-current" open style="margin-top: 20px;">
+            <details class="gate-soc-src" open style="margin-top: 20px;">
               <summary
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
                 SoC Integration
               </summary>
-              <p class="gate-note gate-note-shunt">State of charge is counted from battery current, and no battery shunt is installed &mdash; so this whole card is greyed and no state of charge is reported. Fit a shunt and turn it on under Measurement Sources below.</p>
+              <p class="gate-note gate-note-soc-src">State of charge needs a battery shunt wired to the regulator or a battery monitor set up under Setup &rarr; Integrations. Neither is present, so this card is greyed and no state of charge is reported.</p>
 
               <div style="padding: 15px 0; border-bottom: 2px solid var(--border); margin-bottom: 20px;">
                 <div class="form-row">
@@ -7869,7 +7875,6 @@
               <summary
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
                 Other Settings</summary>
-              <p class="gate-note gate-note-shunt">Battery Current Source below is greyed: no battery shunt is installed, so there is no battery-current measurement to choose a source for. Setup &rarr; Battery &rarr; Measurement Sources &rarr; Battery Shunt Present.</p>
 
               <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
@@ -7880,23 +7885,6 @@
                   <form action="/get" method="GET" target="hidden-form">
                     <input name="ManualSOCPoint" type="number" step="any" min="0" max="100" />
                     <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
-                  </form>
-                </div>
-              </div>
-
-              <hr />
-              <div class="form-row gate-batt-current">
-                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                  <span>Battery Current Source (<span id="BatteryCurrentSource_echo">?</span>):</span>
-                  <span class="tooltip">ℹ️<span class="tooltip-box"><strong>This setting only chooses the source for the battery-monitor SoC and current readouts.</strong> It does NOT change which sensor drives any safety or control loop. The onboard INA228 shunt is always required for this controller — Load Dump Protection, fast over-voltage, tail-current detection, rebulk-by-current, and MaintainMode all read the INA228 directly regardless of this setting.<br><br>INA228 Shunt = onboard high-precision sensor (most accurate, recommended; also makes the battery-monitor numbers consistent with the safety logic). Victron VE.Direct = use serial data from a Victron BMV or smart shunt for the SoC display only. Note that Victron data lags the actual current by ~1–2 s, so short transients (e.g. windlass pulls) will be smeared in the SoC readout.</span></span>
-                </div>
-                <div class="form-input">
-                  <form action="/get" method="GET" target="hidden-form">
-                    <div class="cap-mode-toggle ab-seg-select" data-seg-name="BatteryCurrentSource">
-                      <button type="button" class="cap-mode-btn" data-val="0" onclick="abSegSelectClick(this)">INA228 Shunt</button>
-                      <button type="button" class="cap-mode-btn" data-val="3" onclick="abSegSelectClick(this)">Victron</button>
-                    </div>
-                    <input id="BatteryCurrentSource_val" name="BatteryCurrentSource" type="hidden" value="0" />
                   </form>
                 </div>
               </div>
@@ -8597,7 +8585,7 @@
               <summary
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
                 Voltage &amp; Charge Alarms</summary>
-              <p class="gate-note gate-note-shunt">The Low State of Charge Alarm is greyed: state of charge needs a battery shunt and none is installed. The voltage alarms are unaffected. Setup &rarr; Battery &rarr; Measurement Sources &rarr; Battery Shunt Present.</p>
+              <p class="gate-note gate-note-soc-src">The Low State of Charge Alarm is greyed: state of charge needs a battery shunt wired to the regulator or a battery monitor set up under Setup &rarr; Integrations, and neither is present. The voltage alarms are unaffected.</p>
 
               <div class="form-row">
                 <div class="form-label">High Voltage Alarm (<span id="VoltageAlarmHigh_echo">0</span>):</div>
@@ -8621,7 +8609,7 @@
               </div>
 
               <hr />
-              <div class="form-row gate-batt-current">
+              <div class="form-row gate-soc-src">
                 <div class="form-label">Low State of Charge Alarm (%) (<span id="SocAlarmLow_echo">0</span>):
                   <span class="tooltip">ℹ️<span class="tooltip-box">Sounds the alarm when the battery's state of charge falls below this percentage. Only active when the battery monitor's state of charge information is available. 0 disables.</span></span>
                 </div>
@@ -8756,7 +8744,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Read Battery Instance (<span id="n2kRxBattInstance_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Battery instance number of a shunt, battery monitor, or BMS on the network whose voltage, current, temperature, and state of charge this device reads - including a "virtual shunt" a managed battery publishes through a gateway. Shown below and in telemetry for reference only; charge control always runs on this device's own sensors.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Battery instance number of a shunt, battery monitor, or BMS on the network whose voltage, current, temperature, and state of charge this device reads - including a "virtual shunt" a managed battery publishes through a gateway. Shown below and in telemetry. Use as Battery Monitor below decides whether its state of charge and current are used; field control and protections always run on this device&#39;s own sensors.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -8773,6 +8761,24 @@
                 </div>
                 <div class="form-input">
                   <span style="font-size: 14px;"><span id="n2kRxBattV_ID">-</span> &middot; <span id="n2kRxBattA_ID">-</span> &middot; <span id="n2kRxBattTempF_ID">-</span> &middot; SOC <span id="n2kRxSoc_ID">-</span></span>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Use as Battery Monitor (<span id="BattMonN2k_echo">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Uses the battery instance above as the regulator&#39;s battery monitor. Its own state of charge (PGN 127506) becomes the one shown and used. With no shunt wired to the regulator, its current (PGN 127508) also ends absorption on taper current and triggers the current rebulk. Same setting as Use as Battery Monitor in the VE.Direct card, so only one can be on.</span></span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="BattMonN2k_checkbox" type="checkbox" onchange="battMonToggle(this, 1)" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input name="BattMonSrc" type="number" value="" style="display:none;" />
+                  </form>
                 </div>
               </div>
 
@@ -9265,6 +9271,24 @@
                     </label>
                     <span class="toggle-label">On</span>
                     <input id="VeData" name="VeData" type="number" value="" style="display:none;" />
+                  </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Use as Battery Monitor (<span id="BattMonVe_echo">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Uses the Victron battery monitor (BMV or SmartShunt) on this port as the regulator&#39;s battery monitor. Its own state of charge becomes the one shown and used. With no shunt wired to the regulator, its current also ends absorption on taper current and triggers the current rebulk. A solar charger on this port is never used this way. Same setting as Use as Battery Monitor in the NMEA 2000 card, so only one can be on.</span></span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="BattMonVe_checkbox" type="checkbox" onchange="battMonToggle(this, 3)" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input name="BattMonSrc" type="number" value="" style="display:none;" />
                   </form>
                 </div>
               </div>
@@ -10862,7 +10886,7 @@
             <div class="metric-row">
               <span class="metric-label" style="display:flex;align-items:center;gap:4px;">
                 Field Amps (Calc'd)
-                <span class="tooltip">ℹ️<span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps">?</span> Ω, measured by the field resistance test, in Settings → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. Reads a little high because the rotor runs hotter than the probe.</span></span>
+                <span class="tooltip">ℹ️<span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps">?</span> Ω, measured by the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe.</span></span>
               </span>
               <span class="metric-value"><span id="FieldAmpsID">0</span>&nbsp;A</span>
             </div>
@@ -10874,6 +10898,21 @@
           </div>
 
         </div> <!-- closes .grid -->
+
+        <!-- TEMP-FIELDCHECK BEGIN: TEMPORARY field-current validation panel. REMOVE after the validation drive (grep -rn TEMP-FIELDCHECK). -->
+        <div class="card-group" id="fieldCheckPanel" style="margin-top:10px;">
+          <p class="card-group-title">Field Current Check (temporary)</p>
+          <p style="margin:0 0 8px; font-size:13px; opacity:0.8;">Type the meter's field amps and press Submit. Submit with the box empty marks the moment. The regulator also logs a row every 10 s and keeps about the last hour.</p>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+            <input id="fcAmps" type="number" step="0.01" min="0" inputmode="decimal" placeholder="Meter amps" style="width:130px;" onkeydown="if (event.key === 'Enter') fcSubmit()">
+            <button type="button" id="fcSubmitBtn" class="btn-primary" onclick="fcSubmit()">Submit</button>
+            <button type="button" class="btn-secondary" onclick="fcDownload()">Download CSV</button>
+          </div>
+          <div id="fcHint" style="display:none; margin-top:6px; font-size:13px; color:#e6a23c;"></div>
+          <div id="fcLast" style="margin-top:8px; font-size:14px; font-variant-numeric:tabular-nums;"></div>
+          <div id="fcStatus" style="margin-top:4px; font-size:12px; opacity:0.7;"></div>
+        </div>
+        <!-- TEMP-FIELDCHECK END -->
 
         <!-- ===== STATISTICS (health/life/charging-health items live in Live Data → Diag) ===== -->
         <div class="section-title">Statistics</div>
@@ -10963,7 +11002,7 @@
         <div class="form-row">
           <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
             <span>Field Held at 10 A Limit</span>
-            <span class="tooltip">ℹ️<span class="tooltip-box">Time the field spent held at the board's 10 A field-current ceiling while charging.</span></span>
+            <span class="tooltip">ℹ️<span class="tooltip-box">Time the field spent held at the board's 10 A field-current ceiling, in any mode.</span></span>
           </div>
           <div class="form-input">
             <div class="dual-counter">
@@ -10990,7 +11029,7 @@
         <div class="form-row">
           <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
             <span>Field Held by Drive Heat</span>
-            <span class="tooltip">ℹ️<span class="tooltip-box">Time the field spent held down by the regulator's drive-heat ceiling while charging. A lot of time here means the regulator is mounted somewhere hot.</span></span>
+            <span class="tooltip">ℹ️<span class="tooltip-box">Time the field spent held down by the regulator's drive-heat ceiling, in any mode. A lot of time here means the regulator is mounted somewhere hot.</span></span>
           </div>
           <div class="form-input">
             <div class="dual-counter">
@@ -11096,13 +11135,13 @@
     <!-- Battery Live Data Sub-tab -->
     <div id="livedata-battery" class="sub-tab-content">
       <div class="settings-card">
-        <p class="gate-note gate-note-shunt">No battery shunt is installed, so battery current,
-           state of charge, time-to-full and the coulomb count cannot be measured and are not shown.
-           The voltage readings below are unaffected. Setup &rarr; Battery &rarr; Measurement
-           Sources &rarr; Battery Shunt Present.</p>
+        <p class="gate-note gate-note-shunt">No battery shunt is wired to the regulator, so battery
+           current, time-to-full and the coulomb count are not measured or shown. State of charge
+           shows only with a battery monitor set up under Setup &rarr; Integrations. The voltage
+           readings below are unaffected.</p>
         <div class="grid">
 
-          <div class="card req-batt-current">
+          <div class="card req-soc-src">
             <p>State of Charge</p>
             <p class="reading with-wm" style="font-size: 28px;">
               <span><span id="SOC_percentID">0</span>&nbsp;%</span>
@@ -11605,6 +11644,10 @@
             <div class="metric-row">
               <span class="metric-label">Victron Battery Current</span>
               <span class="metric-value"><span id="VictronCurrentID">0</span>&nbsp;A</span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">Victron State of Charge</span>
+              <span class="metric-value"><span id="VictronSocID">&mdash;</span>&nbsp;%</span>
             </div>
           </div>
           <div class="card-group">
@@ -16216,7 +16259,6 @@
     <input id="WindingTempOffset" style="display:none;" value="50.0" />
     <input id="PulleyRatio" style="display:none;" value="2.00" />
     <input id="ManualLifePercentage" style="display:none;" value="100" />
-    <input id="BatteryCurrentSource" style="display:none;" value="0" />
     <span id="systemIDActive_ID" style="display:none;">0</span>
     <span id="systemIDResultsReady_ID" style="display:none;">0</span>
     <span id="systemIDStepAmp_0_ID" style="display:none;">0</span>
@@ -16634,8 +16676,8 @@
   <!-- Battery-defaults populator: after a Vessel Info save that sets/changes battery type, capacity,
        or system voltage, proposes chemistry-appropriate charge/protection values, Now → Proposed.
        Never applies silently; Bulk/Absorption voltages deliberately excluded (manufacturer sheet). -->
-  <div id="battdef-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9100; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+  <div id="battdef-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Recommend Initial Charging Settings</span>
         <button onclick="battDefClose(false)" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
@@ -16656,8 +16698,8 @@
        page looking finished, and a note under the Save button is nowhere anyone is looking. This
        keeps a black box on screen so the wait reads as the next step in the same sequence.
        Shown/hidden only by vesselNextStepWait(); the close X appears only on the stall escalation. -->
-  <div id="nextstep-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9250; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">
+  <div id="nextstep-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9060; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span id="nextstep-title" style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Loading the Next Step</span>
         <button id="nextstep-close-btn" onclick="vesselNextStepWait(false)" style="display:none; background:none; border:none; color:#888; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>
@@ -16677,8 +16719,8 @@
   <!-- Maintenance-restart acknowledgement: first Vessel Info save only, after the SoC popup and
        before the Charge Rate Limits handoff. Static body; maintAckClose() resolves the
        save-chain promise. -->
-  <div id="maint-ack-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:470px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+  <div id="maint-ack-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:470px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:flex-start; justify-content:space-between; gap:10px; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em; line-height:1.35;">FYI Note:<br>Automatic Maintenance Restarts</span>
         <button onclick="maintAckClose()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
@@ -16769,8 +16811,8 @@
        the proposal is derived from the hardware described here (the Charge Rate Limits handoff is then
        made by the save chain, after the SoC and restart-ack screens). Body rendered by commPrepRender()
        from /exportConfig; only edited fields are written (commPrepFinish). -->
-  <div id="commprep-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+  <div id="commprep-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Commissioning Prerequisites</span>
         <button onclick="commPrepClose()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
@@ -16786,14 +16828,15 @@
 
   <!-- Field Resistance screen: the field resistance test. Opened by the Prerequisites screen's Next and by Setup >
        Alternator > Field Resistance > Measure; body rendered by frRender() from /fieldResTest. -->
-  <div id="fieldres-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+  <div id="fieldres-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Field Resistance</span>
         <button onclick="frLater()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div id="fieldres-body" style="padding:14px 16px; overflow-y:auto; flex:1; min-height:0;"></div>
       <div style="padding:12px 16px; border-top:1px solid #333; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
+        <button id="fieldres-back-btn" onclick="frBack()" style="display:none; margin-right:auto; background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em;">← Start of this step</button>
         <button id="fieldres-later-btn" onclick="frLater()" style="background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:0.9em;">I'll do this later</button>
         <button id="fieldres-next-btn" onclick="frNext()" disabled style="background:rgba(255,255,255,0.10); color:#e8e8e8; border:1px solid rgba(255,255,255,0.18); border-radius:6px; padding:8px 16px; cursor:default; opacity:0.45; font-size:0.9em;">Next →</button>
         <div id="fieldres-next-why" style="display:none; flex-basis:100%; text-align:right; font-size:12px; line-height:1.4; color:#e6a23c;"></div>
@@ -16827,8 +16870,8 @@
        (commPrepFinish → openRpmCap → rpmCapContinue → openRpmAlign). Seeds BOTH the Low and High cap
        tables at once (capBothSave); the chosen Continue button sets the charge-rate mode (HiLow).
        Body rendered by rpmCapRender(). -->
-  <div id="rpmcap-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+  <div id="rpmcap-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Charge Rate Limits</span>
         <button onclick="rpmCapCancel()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
@@ -16848,8 +16891,8 @@
   <!-- Tachometer Calibration (engine-speed alignment) — first-install only, between the Prerequisites screen and the
        commissioning wizard (commPrepFinish → openRpmAlign → openCommissionModal). Needs the engine
        running; body rendered by rpmAlignRender(); tach settings are written live as edited. -->
-  <div id="rpmalign-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9200; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+  <div id="rpmalign-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">Tachometer Calibration</span>
         <button onclick="rpmAlignCancel()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
@@ -16905,8 +16948,8 @@
 
   <!-- First-boot SoC seed popup — auto-opens once after the boot-time voltage seed (ack persisted
        in NVS via SocSeedAck), reopens any time from the header SOC readout. Body rendered by socSeedRender(). -->
-  <div id="socseed-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9100; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
-    <div id="socseed-modal-panel" style="position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
+  <div id="socseed-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9100; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
+    <div id="socseed-modal-panel" style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0;">
         <span style="font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em;">State of Charge &mdash; Commissioning Estimate</span>
         <button onclick="socSeedClose(false)" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">&#10005;</button>

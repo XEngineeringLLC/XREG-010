@@ -5701,8 +5701,11 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
         fieldCurvePropStepPct = constrain((duty75 - duty50) * 0.5f, 1.0f, 25.0f);
         fieldCurveOk = (fieldCurveCount >= 4 && duty75 > duty50 && amps50 > 1.0f);
 
-        queueConsoleMessageF("Field curve: %d pts, knee %.1fA@%.1f%% — propose Stabilize=%.0fA Step=%.1f%% (%s)",
-                             fieldCurveCount, fieldCurveKneeAmps, fieldCurveKneeDuty,
+        char kneeTxt[40];
+        if (fieldCurveKneeAmps > 0.0f) snprintf(kneeTxt, sizeof(kneeTxt), "knee %.1fA@%.1f%%", fieldCurveKneeAmps, fieldCurveKneeDuty);
+        else                           snprintf(kneeTxt, sizeof(kneeTxt), "no knee in range");
+        queueConsoleMessageF("Field curve: %d pts, %s — propose Stabilize=%.0fA Step=%.1f%% (%s)",
+                             fieldCurveCount, kneeTxt,
                              fieldCurvePropStabA, fieldCurvePropStepPct,
                              fieldCurveOk ? "ok" : "review");
 
@@ -5861,7 +5864,7 @@ static const char *altSweepLimitNow() {
                                                                            return "external current limit";
   // Same enable gate the battery-limit ceiling uses in the min-select chain (BattLimitEnable +
   // a configured INA228 shunt), so a disabled limit cannot cut the sweep short.
-  if (BattLimitEnable && HAS_BATT_SHUNT && BatteryCurrentSource == 0 && BattCurrentLimitA > 0.5f
+  if (BattLimitEnable && HAS_BATT_SHUNT && BattCurrentLimitA > 0.5f
       && !isnan(Bcur) && Bcur >= BattCurrentLimitA - altSweepAmpMargin(BattCurrentLimitA))
                                                                            return "battery current limit";
   if (TemperatureLimitF > 0 && !isnan(TempToUse) && TempToUse >= TemperatureLimitF)

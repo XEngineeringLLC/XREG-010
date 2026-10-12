@@ -1013,7 +1013,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "capTempCoeff", NK_capTempCoeff, 1 },
   { "capTempRef", NK_capTempRef, 1 },
   { "capOcv", NK_capOcvBlob, 1 },
-  { "BatteryCurrentSource", NK_BatteryCurrentSource, 1 },
+  { "BattMonSrc", NK_BattMonSrc, 1 },
   { "BatteryVoltageSource", NK_BatteryVoltageSource, 1 },
   { "ShuntResistanceMicroOhm", NK_ShuntResistanceMicroOhm, 1 },
   { "AmpSensorRange", NK_AmpSensorRange, 1 },
@@ -1739,7 +1739,7 @@ bool bhStartTest() {
   // altSweepRequested too: a sweep start is two-stage (the HTTP press arms the request, the next
   // control tick promotes it to altSweepActive), so active alone leaves a one-tick window.
   if (TuningMode || CVTuningMode || systemIDActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || resTestActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) { bhAbortReason = "another test active"; return false; }
-  if (BatteryCurrentSource != 0 || !HAS_BATT_SHUNT){ bhAbortReason = "needs INA228 battery shunt"; return false; }
+  if (!HAS_BATT_SHUNT){ bhAbortReason = "needs INA228 battery shunt"; return false; }
   if (bhNumEdges < 3) bhNumEdges = 3;
   if (bhNumEdges > BH_MAX_TOGGLES - 3) bhNumEdges = BH_MAX_TOGGLES - 3;
   if (bhDwellMs < bhMinDwellMs()) bhDwellMs = bhMinDwellMs();   // belt-and-braces; set paths already clamp
@@ -1980,10 +1980,10 @@ static void cvpfSizeStep() {
   float headroom = fmaxf(0.05f, AlternatorHardShutdownV - cvpfPilotVbase - CVPF_V_RESERVE * cvpfVScale());
   float di = cvpfDiMaxA;
   di = fminf(di, headroom / fmaxf(1e-3f, Kupper));
-  // Target-ΔV sizing — skipped on an operator-boosted re-run (diMax raised), whose whole point is a
+  // Target-ΔV sizing — skipped on an operator-boosted re-run (cvpfBoosted), whose whole point is a
   // bigger swing for SNR; the OV-headroom and cap-table clamps still bound it, and the gassing gate
   // judges the projected peak. Never skipped after an OV fallback re-size (headroom already proved tight).
-  if (cvpfDiMaxA <= CVPF_DI_MAX_DEFAULT || cvpfFellBack)
+  if (!cvpfBoosted || cvpfFellBack)
     di = fminf(di, cvpfTargetDV / fmaxf(1e-3f, Klong));
   // Never command past what the alternator cap table allows at this RPM (the step rides on top of cvpfBaseA).
   // Skip when g_I_cap is unset/tiny (low RPM) — the delivery-short warn catches under-delivery instead.
@@ -2303,7 +2303,7 @@ void cvpfProcess() {
   cvpfRpmAtFit   = cvpfCondN ? (float)(cvpfRpmSum   / cvpfCondN) : RPM;
   cvpfBattVAtFit = cvpfCondN ? (float)(cvpfBattVSum / cvpfCondN) : IBV;
   cvpfSocAtFit   = (socInfoAvailable && cvpfCondN) ? (float)(cvpfSocSum / cvpfCondN) : -1.0f;  // −1 → SOC untrustworthy, UI blanks it
-  cvpfCapHeadroomA = fmaxf(0.0f, g_I_cap - cvpfBaseA);   // how much bigger a step the alternator table allows at this RPM
+  cvpfCapHeadroomA = fmaxf(0.0f, g_I_cap - cvpfBaseA - CVPF_CAP_MARGIN_A);   // same clamp cvpfSizeStep applies — the step a re-run can actually get
   cvpfOk = true; cvpfState = 2;
   queueConsoleMessageF("CV plant-fit: K=%.1f mV/A (median of %d/%d edges) dV=%.0f mV dI=%.2f A SNR=%.0f -> Kp %.1f Ki %.1f warn=%d drift setup %+.1f%% train %+.1f%% (%luus)",
                        cvpfKa * 1000.0f, nK, (int)cvpfEdgeCount, cvpfDV * 1000.0f, cvpfDI, cvpfSNR, cvpfKp, cvpfKi, (int)cvpfWarn,
@@ -2324,9 +2324,12 @@ bool cvpfStartTest(float diMaxReq) {
   cvpfBaseA = 10.0f; cvpfPilotA = 6.0f; cvpfStepA = 6.0f;
   cvpfTargetDV = 0.30f * cvpfVScale(); cvpfFellBack = false;  // 300 mV per 12V block — ripple-limited SNR, so per-cell (see cvpfVScale)
   cvpfCmdA = cvpfBaseA;
-  cvpfDiMaxA = (diMaxReq > CVPF_DI_MAX_DEFAULT) ? fminf(diMaxReq, CVPF_DI_MAX_CEIL) : CVPF_DI_MAX_DEFAULT;
-  if (cvpfDiMaxA > CVPF_DI_MAX_DEFAULT)
-    queueConsoleMessageF("CV plant-fit: step ceiling raised to %.0f A for a stronger signal (weak-signal re-run)", cvpfDiMaxA);
+  // Any request is a boost, including ones under the 40 A default: the default is a ceiling the 300 mV target
+  // or the cap table almost always undercuts, so gating the boost on >40 A silently re-ran the same step.
+  cvpfBoosted = (diMaxReq > 0.0f);
+  cvpfDiMaxA = cvpfBoosted ? fminf(fmaxf(diMaxReq, cvpfPilotA), CVPF_DI_MAX_CEIL) : CVPF_DI_MAX_DEFAULT;
+  if (cvpfBoosted)
+    queueConsoleMessageF("CV plant-fit: stronger step requested — up to %.0f A (weak-signal re-run)", cvpfDiMaxA);
   cvpfBaseDuty = 0.0f; cvpfStepDuty = 0.0f;
   cvpfEdgeCount = 0;
   for (int i = 0; i < 8; i++) { cvpfEdgeK[i] = 0.0f; cvpfEdgeStat[i] = 4; }   // clear the per-edge table; an early abort shows none
@@ -2410,6 +2413,7 @@ static const uint32_t CVS_WATCH_MAX_MS      = 45000;   // armed watch backstop (
 static const uint32_t CVS_POLL_DEADMAN_MS   = 20000;   // no /cvstress.json poll while active = browser gone
 static const float    CVS_SNAP_RPM_DELTA    = 300.0f;  // rpmMax over arm RPM that counts as "a snap happened"
 static const float    CVS_SLEW_SOFT_RPMPS   = 1000.0f; // no trip + slew below this = soft stimulus (snap harder)
+static const uint32_t CVS_EVENT_MERGE_MS    = 300;     // re-trip this soon after a release = same surge, not a new event; logged chatter laps are ≥1.5 s
 
 // Filtered-bus sample ring for the CVS_STAB_BAND_V / CVS_STAB_WIN_MS stationarity gate + the 2 s target average.
 static const int CVS_RING_N = 64;
@@ -2455,6 +2459,8 @@ static float    cvsSettleRefV = 0.0f;
 static uint32_t cvsSettleRefMs = 0;
 // arm baselines (raw protection counters)
 static uint32_t cvsClamp0 = 0, cvsClampPrev = 0, cvsHoc0 = 0, cvsLd0 = 0, cvsIx0 = 0;
+static bool     cvsClampWas = false;   // merged protection flag as last seen by the watcher — release detection
+static uint32_t cvsReleaseMs = 0;      // last merged-flag release (0 = none since arm)
 // watch-window trackers
 static float    cvsPeakV = 0.0f, cvsMinV = 0.0f, cvsOvershootV = 0.0f, cvsValleyV = 0.0f;
 static float    cvsRpmMax = 0.0f, cvsRpmSlewMax = 0.0f, cvsRpmPrev = 0.0f;
@@ -2678,6 +2684,7 @@ void cvStress_tick(uint32_t nowMs) {
           queueConsoleMessageF("CV stress test: bus steady but %.2f V from the %.2f V target at the deadline — arming anyway; stability graded marginal", fabsf(busAvg - cvStressTargetV), cvStressTargetV);
         }
         cvsClamp0 = cvsClampPrev = g_fastOvClampCount;
+        cvsClampWas = g_fastOvClampActive; cvsReleaseMs = 0;
         cvsHoc0 = g_hardOCCount; cvsLd0 = g_loadDumpCount; cvsIx0 = g_iExcessCount;
         cvsBattStartA = Bcur;
         cvsArmAltA = MeasuredAmps;
@@ -2712,10 +2719,21 @@ void cvStress_tick(uint32_t nowMs) {
         }
         cvsRpmPrev = RPM; cvsRpmPrevMs = nowMs;
       }
-      // OV events = every fast-OV clamp rising edge (NO clustering — chatter is the defect).
+      // OV events = merged-flag trips (G1/G2 OV, iExcess, LoadDump share one flag, so overlapping trips are
+      // already one). Chatter — release, refill, re-trip — is the defect, but a re-trip inside
+      // CVS_EVENT_MERGE_MS of the release is one surge handed between detectors (10-11: two trips ≤0.25 s
+      // apart graded MARGINAL). A merged re-trip still restarts the re-settle clock below.
+      bool clampOn = g_fastOvClampActive;
+      if (cvsClampWas && !clampOn) cvsReleaseMs = nowMs;
+      cvsClampWas = clampOn;
       uint32_t clampNow = g_fastOvClampCount;
       if (clampNow != cvsClampPrev) {
-        cvsEvents = (uint16_t)fminf(65535.0f, (float)(clampNow - cvsClamp0));
+        uint32_t gapMs = nowMs - cvsReleaseMs;
+        if (cvsEvents > 0 && cvsReleaseMs != 0 && gapMs < CVS_EVENT_MERGE_MS) {
+          queueConsoleMessageF("CV stress test: re-trip %lu ms after release counted with the previous event", (unsigned long)gapMs);
+        } else if (cvsEvents < 65535) {
+          cvsEvents++;
+        }
         cvsClampPrev = clampNow;
         if (cvsFirstEventMs == 0) cvsFirstEventMs = nowMs;
         cvsResettleSinceMs = 0;   // a fresh event restarts the re-settle clock

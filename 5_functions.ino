@@ -1434,7 +1434,8 @@ void nmea2kTransmitTick() {
       case SLOT_BATT_DC:
         if (n2kBattEnable == 1) {
           SetN2kDCStatus(N2kMsg, sidBatt, (unsigned char)n2kBattInstance, N2kDCt_Battery,
-                         (HAS_BATT_SHUNT && socInfoAvailable) ? (unsigned char)(SOC_percent / 100) : N2kUInt8NA,
+                         // never echo an NMEA 2000 monitor's own SoC back onto its bus; a VE.Direct monitor's is bridged
+                         (socInfoAvailable && socShownOk() && BattMonSrc != 1) ? (unsigned char)(socShownX100() / 100) : N2kUInt8NA,
                          N2kUInt8NA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA);
           composed = true;
         }
@@ -1760,6 +1761,15 @@ void ReadVEData() {
       if (strcmp(myve.veName[i], "H21") == 0)  { VictronMaxPowerToday_W    = atof(myve.veValue[i]);          dataReceived = true; }
       if (strcmp(myve.veName[i], "H22") == 0)  { VictronYieldYesterday_kWh = atof(myve.veValue[i]) / 100.0f; dataReceived = true; }  // 0.01 kWh units
       if (strcmp(myve.veName[i], "H23") == 0)  { VictronMaxPowerYesterday_W = atof(myve.veValue[i]);         dataReceived = true; }
+      // Sent only by a battery monitor (BMV / SmartShunt), so its presence is what lets VE.Direct current drive charge-stage
+      // decisions: an MPPT's "I" is its own output. Per mille; "---" while the monitor is unsynchronized.
+      if (strcmp(myve.veName[i], "SOC") == 0) {
+        const char *s = myve.veValue[i];
+        const float pm = (s[0] >= '0' && s[0] <= '9') ? atof(s) : -1.0f;
+        VictronSoc = (pm >= 0.0f && pm <= 1000.0f) ? pm / 10.0f : NAN;
+        MARK_FRESH(IDX_VE_SOC);
+        dataReceived = true;
+      }
       // Battery temperature (degC), present only on a BMV / SmartShunt with a temperature sensor -> batteryTempF() source 3
       if (strcmp(myve.veName[i], "T") == 0) {
         float tC = atof(myve.veValue[i]);
@@ -1998,7 +2008,7 @@ void checkAndRestart() {
   bool cloudReachable = (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered);
   // Offline there is nothing to wait for — the flush below dumps the un-uploaded ring to flash.
   bool cloudIdle = !core0Busy && (bufferedRecordCount == 0 || !cloudReachable);
-  bool socOk = (!socInfoAvailable || SOC_percent >= REBOOT_SOC_FLOOR_X100);
+  bool socOk = (!socInfoAvailable || !socShownOk() || socShownX100() >= REBOOT_SOC_FLOOR_X100);
   bool vQuietOk = (!vValid || IBV >= REBOOT_VBAT_FLOOR_V * vScale);
   bool vBrownOk = (!vValid || IBV >= REBOOT_VBAT_BROWNOUT_V * vScale);
 
@@ -2377,11 +2387,11 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
   float energyDelta_Wh = (batteryPower_W * elapsedSeconds) / 3600.0f;
   // Battery-side tracking (charge/discharge energy, coulomb/SoC, capacity tracker,
   // full-charge detection) all need a real Bcur — gate on the shunt, and on a fresh reading
-  // (§10.6: a dead INA228 or unplugged VE.Direct must not integrate its last value forever).
+  // (§10.6: a dead INA228 must not integrate its last value forever).
   // A stale interval is dropped, not back-filled: the current during a read gap is unknown, and the
   // 2.5 s window (2 x the slow-mode read) means only a real gap ever lands here. The alternator
   // stats and voltage averaging below run on every config.
-  if (HAS_BATT_SHUNT && battCurrentFresh()) {
+  if (HAS_BATT_SHUNT && bcurFresh()) {
     static float chargedEnergyAccumulator = 0.0f;
     static float dischargedEnergyAccumulator = 0.0f;
     static float chargedEnergyAccumulator_AllTime = 0.0f;
@@ -2456,7 +2466,6 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
     CoulombCount_Ah_scaled = constrain(CoulombCount_Ah_scaled, 0, capAhX100);
     float SoC_float = (float)CoulombCount_Ah_scaled / (float)capAhX100 * 100.0f;
     SOC_percent = (int)(SoC_float * 100);  // Store as percentage × 100 for 2 decimals
-    wmIgnUpdate(wmIgn_SOC, SoC_float);     // ignition-cycle watermark (float percent, 0..100)
 
     // Capacity tracker (OCV-anchored): rest detection, low-OCV anchor capture, Ah bridge.
     // Uses the FILTERED INA228 voltage (getFiltV) — rest/OCV is a slow read where filtering
@@ -2518,6 +2527,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
       FullChargeDetected = false;
     }
   }
+  if (socShownOk()) wmIgnUpdate(wmIgn_SOC, socShownX100() / 100.0f);   // ignition-cycle watermark of the SoC shown (float percent, 0..100)
 
   // =================================================================
   //     ALTERNATOR-SPECIFIC TRACKING - ONLY RUNS WHEN ALT IS ON
@@ -3060,11 +3070,47 @@ void UpdateBoardTempPressureMaximums() {
 
 
 float getBatteryCurrent() {
-  // Source variables are populated by ReadAnalogInputs() or ReadAnalogInputs_Fake()
-  switch (BatteryCurrentSource) {
-    case 3: return VictronCurrent;  // Victron VE.Direct
-    default: return Bcur;           // INA228 (case 0, and fallback)
-  }
+  return Bcur;  // the regulator's own shunt: a network monitor's current never feeds the SoC count, health or a loop
+}
+
+// Network battery monitor (BattMonSrc). Windows cover each cadence: VE.Direct is drained on a 2 s tick, 127508 arrives
+// every 1-1.5 s, and some monitors send 127506 far slower.
+static bool netStampFresh(int idx, uint32_t limMs) {
+  const uint32_t ts = dataTimestamps[idx];
+  return ts != 0 && (uint32_t)(millis() - ts) <= limMs;
+}
+bool veIsBattMonitor() { return netStampFresh(IDX_VE_SOC, 5000UL); }
+bool veSocFresh() { return veIsBattMonitor() && !isnan(VictronSoc); }
+
+// The selected monitor's own SoC (%), NAN when none is selected or it is stale / unsynced.
+float netMonSocPct() {
+  if (BattMonSrc == 3) return veSocFresh() ? VictronSoc : NAN;
+  if (BattMonSrc == 1) return (n2kRxSoc >= 0 && netStampFresh(IDX_N2K_SOC, 10000UL)) ? (float)n2kRxSoc : NAN;
+  return NAN;
+}
+
+// The selected monitor's battery current (A, + = charging), NAN when none is selected or it is stale.
+float netMonCurrentA() {
+  if (BattMonSrc == 3) return (veIsBattMonitor() && netStampFresh(IDX_VICTRON_CURRENT, 5000UL)) ? VictronCurrent : NAN;
+  if (BattMonSrc == 1) return netStampFresh(IDX_N2K_BATT, 5000UL) ? n2kRxBattA : NAN;
+  return NAN;
+}
+
+// Battery current for the minute-scale charge-stage decisions (taper exit, current rebulk), NAN when no fresh source:
+// the regulator shunt when fitted, else the network monitor. fromNet says which.
+float stageBattCurrentA(bool &fromNet) {
+  fromNet = !HAS_BATT_SHUNT;
+  if (!fromNet) return bcurFresh() ? Bcur : NAN;
+  return netMonCurrentA();
+}
+
+// The SoC shown and used: a selected network monitor's own, else the regulator's count off its shunt. The display
+// holds the count through a short shunt gap; charge decisions (socDecisionOk) need it integrating right now.
+bool socShownOk() { return BattMonSrc != 0 ? !isnan(netMonSocPct()) : (bool)HAS_BATT_SHUNT; }
+bool socDecisionOk() { return BattMonSrc != 0 ? !isnan(netMonSocPct()) : (HAS_BATT_SHUNT && bcurFresh()); }
+int socShownX100() {
+  const float s = netMonSocPct();
+  return (BattMonSrc != 0 && !isnan(s)) ? (int)lroundf(s * 100.0f) : SOC_percent;
 }
 float getBatteryVoltage() {
   // INA228 bus voltage — more accurate (20-bit, no divider drift) and faster in field-on mode.
@@ -3090,17 +3136,10 @@ bool ibvFresh() {   // INA228 slow mode reads every 1.1 s
   uint32_t ts = dataTimestamps[IDX_IBV];
   return ts != 0 && (uint32_t)(millis() - ts) <= 2500UL;
 }
-bool bcurFresh() {   // the INA228 shunt reading (Bcur) itself, whatever BatteryCurrentSource selects
+bool bcurFresh() {   // the INA228 shunt reading (Bcur) itself
   if (hardwarePresent == 0) return true;
   uint32_t ts = dataTimestamps[IDX_BCUR];
   return ts != 0 && (uint32_t)(millis() - ts) <= 2500UL;
-}
-bool battCurrentFresh() {
-  if (hardwarePresent == 0) return true;
-  int idx = (BatteryCurrentSource == 3) ? IDX_VICTRON_CURRENT : IDX_BCUR;
-  uint32_t ts = dataTimestamps[idx];
-  uint32_t lim = (BatteryCurrentSource == 3) ? 3000UL : 2500UL;   // VE.Direct ~1 s frames; INA slow mode 1.1 s
-  return ts != 0 && (uint32_t)(millis() - ts) <= lim;
 }
 float getTargetAmps() {
   return MeasuredAmps;
@@ -3350,14 +3389,14 @@ void CheckAlarms() {
     }
 
     static unsigned long lastSocLowMsgMs = 0;
-    // SOC_percent is %×100; socInfoAvailable gates this the same way as the rebulk SoC gates
-    if (HAS_BATT_SHUNT && SocAlarmLow > 0 && socInfoAvailable && SOC_percent < SocAlarmLow * 100) {
+    // socShownX100 is %×100; socInfoAvailable gates this the same way as the rebulk SoC gates
+    if (socShownOk() && SocAlarmLow > 0 && socInfoAvailable && socShownX100() < SocAlarmLow * 100) {
       currentAlarmCondition = true;
       alarmReason = "Low battery state of charge"; alarmBits |= 1UL << 10;
       if (millis() - lastSocLowMsgMs >= 30000) {
         lastSocLowMsgMs = millis();
         queueConsoleMessageF("Low battery state of charge: %.1f%% (limit: %d%%)",
-                             SOC_percent / 100.0f, SocAlarmLow);
+                             socShownX100() / 100.0f, SocAlarmLow);
       }
     } else {
       lastSocLowMsgMs = 0;
@@ -3476,22 +3515,26 @@ void CheckAlarms() {
   }
 
   // ========== BATTERY CURRENT LOST ALARM (§11.6, optional sensor declared present) ==========
-  // Owner ruling 2026-09-27: a declared shunt (INA228 or VE.Direct) that stops reporting alarms and is named in
-  // the header line; charging continues on voltage alone (state of charge, the tail-current absorption exit, the
-  // current rebulk and the battery charge-current limit all wait for a fresh reading). Never a cut. Silent while
-  // the INA228 itself is the named fault (the sensor-fault block above already covers the chip), and silent at
-  // rest like the block above. General-fault class.
+  // Owner ruling 2026-09-27: the battery-current source the charge stages read (the regulator shunt, or with none
+  // fitted the network battery monitor) that stops reporting alarms and is named in the header line; charging
+  // continues on voltage alone (the tail-current absorption exit, the current rebulk and, on the shunt, SoC and the
+  // battery charge-current limit wait for a fresh reading). Never a cut. Silent while the INA228 itself is the named
+  // fault (the sensor-fault block above already covers the chip), and silent at rest like the block above.
+  // General-fault class.
   if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     static unsigned long lastBattCurLostMsgMs = 0;
     const bool awake = g_engineRunning || (keyOnForAlarms() && OnOff == 1);
-    const bool inaOwnsIt = (BatteryCurrentSource != 3) && (g_reqFaultBits & SF_BATT_V_MAIN);
+    const bool netSrc = !HAS_BATT_SHUNT;
+    const bool inaOwnsIt = !netSrc && (g_reqFaultBits & SF_BATT_V_MAIN);
     if (g_battCurState == 2 && awake && !inaOwnsIt) {
       currentAlarmCondition = true;
       alarmReason = "Battery current sensor not responding - charging continues on voltage alone"; alarmBits |= 1UL << 16;
       if (millis() - lastBattCurLostMsgMs >= 30000) {
         lastBattCurLostMsgMs = millis();
-        queueConsoleMessageF("ALARM: %s not responding - state of charge, the tail-current absorption exit, the current rebulk and the battery charge limit are waiting for it; charging continues on voltage alone.",
-                             (BatteryCurrentSource == 3) ? "VE.Direct battery current" : "Battery shunt (INA228 current)");
+        if (netSrc) queueConsoleMessageF("ALARM: %s battery monitor not responding - the tail-current absorption exit and the current rebulk are waiting for it; charging continues on voltage alone.",
+                                         (BattMonSrc == 3) ? "VE.Direct" : "NMEA 2000");
+        else queueConsoleMessageF("ALARM: Battery shunt (INA228 current) not responding - %sthe tail-current absorption exit, the current rebulk and the battery charge limit are waiting for it; charging continues on voltage alone.",
+                                  (BattMonSrc == 0) ? "state of charge, " : "");
       }
     } else {
       lastBattCurLostMsgMs = 0;
@@ -3725,13 +3768,10 @@ void logDashboardValues() {
     // frozen NVS value (coulomb counting is HAS_BATT_SHUNT-gated). Print "n/a" rather than numbers
     // that read like measurements in a log we later analyse as ground truth.
     char socStr[8], bcurStr[12];
-    if (HAS_BATT_SHUNT) {
-      snprintf(socStr,  sizeof(socStr),  "%d%%",   SOC_percent / 100);
-      snprintf(bcurStr, sizeof(bcurStr), "%.1fA", Bcur);
-    } else {
-      strncpy(socStr,  "n/a", sizeof(socStr));
-      strncpy(bcurStr, "n/a", sizeof(bcurStr));
-    }
+    if (socShownOk()) snprintf(socStr, sizeof(socStr), "%d%%", socShownX100() / 100);
+    else strncpy(socStr, "n/a", sizeof(socStr));
+    if (HAS_BATT_SHUNT) snprintf(bcurStr, sizeof(bcurStr), "%.1fA", Bcur);
+    else strncpy(bcurStr, "n/a", sizeof(bcurStr));
     // (int)NAN prints 2147483647 on this core; absent probe / out-of-range amps sensor read "n/a".
     char altIStr[12], altTStr[12];
     unsigned long ampsTs = dataTimestamps[IDX_MEASURED_AMPS];
@@ -4461,6 +4501,7 @@ void _ReadAnalogInputs_inner() {
                          queueConsoleMessageF("INA228 back after %u dropped reads — configuration and hardware overvoltage threshold re-applied", (unsigned)inaMissRun);
                        }
                        inaMissRunHadI2c = false;
+                       float bcurUnscaled = Bcur;
                        // A shunt NACK with a good bus read must not commit a current made of BatteryCOffset alone.
                        if (shuntOk) {
                          ShuntVoltage_mV = shuntMv;
@@ -4469,6 +4510,7 @@ void _ReadAnalogInputs_inner() {
                          if (InvertBattAmps == 1) {
                            Bcur = -Bcur;
                          }
+                         bcurUnscaled = Bcur;   // the field resistance test's: a SoC-learned gain must not scale R
                          // battery current always from INA228
                          if (AutoShuntGainCorrection == 1) {
                            Bcur = Bcur * DynamicShuntGainFactor;
@@ -4479,7 +4521,7 @@ void _ReadAnalogInputs_inner() {
                        } else {
                          ina228ErrorCount++;
                        }
-                       frtInaSample(Bcur, IBV, shuntOk);
+                       frtInaSample(bcurUnscaled, IBV, shuntOk);
 
                        // IBV EMA — used by getFiltV() and CV loop error terms
                        // dBcur/dt — positive value = load dump (loads disconnected, OV risk)
@@ -6037,8 +6079,8 @@ bool settingsArmActive(AsyncWebServerRequest *request) {
   if (!pwRequired) return true;
   return armTokenValid(request);
 }
-// Mirror every queued message into the /consolehist.txt history ring (own indices, own short
-// critical section — never nested inside the queue's).
+// Every console line lands here once: the /consolehist.txt history ring, which the live SSE console
+// also drains from (consoleSsePending).
 static void consoleHistAppend(const char *msg) {
   if (!consoleHist || !msg) return;
   time_t ep = time(nullptr);
@@ -6051,6 +6093,7 @@ static void consoleHistAppend(const char *msg) {
   h.msg[CONSOLE_MSG_LEN - 1] = '\0';
   consoleHistHead = (consoleHistHead + 1) % CONSOLE_HIST_SIZE;
   if (consoleHistCount < CONSOLE_HIST_SIZE) consoleHistCount++;
+  if (consoleSsePending < CONSOLE_SSE_BACKLOG) consoleSsePending++;
   portEXIT_CRITICAL(&consoleMux);
 }
 // printf-style — avoids String heap churn
@@ -6058,7 +6101,7 @@ void queueConsoleMessageF(const char *format, ...) {
   if (otaInProgress) {
     return;  // Skip during OTA
   }
-  if (!consoleQueue || !format) return;
+  if (!consoleHist || !format) return;
   char formattedMsg[CONSOLE_MSG_LEN];
   va_list args;
   va_start(args, format);
@@ -6066,38 +6109,15 @@ void queueConsoleMessageF(const char *format, ...) {
   va_end(args);
 
   consoleHistAppend(formattedMsg);
-  portENTER_CRITICAL(&consoleMux);
-  if (consoleCount >= CONSOLE_QUEUE_SIZE) {
-    consoleTail = (consoleTail + 1) % CONSOLE_QUEUE_SIZE;
-    consoleCount = CONSOLE_QUEUE_SIZE - 1;
-  }
-  strncpy(consoleQueue[consoleHead].message, formattedMsg, CONSOLE_MSG_LEN - 1);
-  consoleQueue[consoleHead].message[CONSOLE_MSG_LEN - 1] = '\0';
-  consoleQueue[consoleHead].timestamp = millis();
-  consoleHead = (consoleHead + 1) % CONSOLE_QUEUE_SIZE;
-  consoleCount++;
-  portEXIT_CRITICAL(&consoleMux);
 }
 // Legacy c-string variant — no formatting
 void queueConsoleMessage(const char *msg) {
   if (otaInProgress) {
     return;  // Skip during OTA
   }
-  if (!consoleQueue || !msg) return;
+  if (!consoleHist || !msg) return;
 
   consoleHistAppend(msg);
-  portENTER_CRITICAL(&consoleMux);
-  if (consoleCount >= CONSOLE_QUEUE_SIZE) {
-    consoleTail = (consoleTail + 1) % CONSOLE_QUEUE_SIZE;
-    consoleCount = CONSOLE_QUEUE_SIZE - 1;
-  }
-  // Copy directly into queue slot
-  strncpy(consoleQueue[consoleHead].message, msg, CONSOLE_MSG_LEN - 1);
-  consoleQueue[consoleHead].message[CONSOLE_MSG_LEN - 1] = '\0';
-  consoleQueue[consoleHead].timestamp = millis();
-  consoleHead = (consoleHead + 1) % CONSOLE_QUEUE_SIZE;
-  consoleCount++;
-  portEXIT_CRITICAL(&consoleMux);
 }
 // Legacy String overload
 void queueConsoleMessage(const String &message) {
@@ -6106,19 +6126,19 @@ void queueConsoleMessage(const String &message) {
   }
   queueConsoleMessage(message.c_str());
 }
-// Copy the oldest queued message out under the lock (the SSE send must happen outside it). False when empty.
+// Copy the oldest unsent ring line out under the lock (the SSE send must happen outside it). False when none.
 // One message per call, one caller-side buffer: the old 5-slot variant cost 5×CONSOLE_MSG_LEN of caller stack
 // and filled a timestamp array nothing ever read (the client stamps app-received time).
 bool popConsoleMessage(char *out) {
-  if (!consoleQueue || !out) return false;
+  if (!consoleHist || !out) return false;
 
   bool got = false;
   portENTER_CRITICAL(&consoleMux);
-  if (consoleCount > 0) {
-    strncpy(out, consoleQueue[consoleTail].message, CONSOLE_MSG_LEN - 1);
+  if (consoleSsePending > 0) {
+    int idx = (consoleHistHead - consoleSsePending + CONSOLE_HIST_SIZE) % CONSOLE_HIST_SIZE;
+    strncpy(out, consoleHist[idx].msg, CONSOLE_MSG_LEN - 1);
     out[CONSOLE_MSG_LEN - 1] = '\0';
-    consoleTail = (consoleTail + 1) % CONSOLE_QUEUE_SIZE;
-    consoleCount--;
+    consoleSsePending--;
     got = true;
   }
   portEXIT_CRITICAL(&consoleMux);
@@ -6127,7 +6147,7 @@ bool popConsoleMessage(char *out) {
 }
 void trySendConsoleSSE(bool &sentSomething, unsigned long now) {
   if (sentSomething) return;
-  if (sseBacklogged()) return;   // lines wait in the console queue and go out after the link drains
+  if (sseBacklogged()) return;   // lines wait in the history ring (up to CONSOLE_SSE_BACKLOG) and go out after the link drains
   if (now - lastConsoleMessageTime < CONSOLE_MESSAGE_INTERVAL) return;
 
   char msg[CONSOLE_MSG_LEN];   // copy under the lock, send outside it — same discipline, one buffer

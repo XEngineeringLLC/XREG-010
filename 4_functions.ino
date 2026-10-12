@@ -1213,6 +1213,7 @@ if (!BMP388Disconnected) {
     dataTimestamps[i] = now;
   }
   dataTimestamps[IDX_INA_DIE_TEMP] = 0;   // stamped only by a real sample past the warm-up discard: the heat ceiling's freshness
+  dataTimestamps[IDX_VE_SOC] = 0;         // a boot stamp would pass an unseen VE.Direct port off as a battery monitor
 
   // if (setupDisplay()) {
   //   Serial.println("Display ready for use");
@@ -2315,10 +2316,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     PulleyRatio = settingRead(NK_PulleyRatio).toFloat();
   }
-  if (!settingExists(NK_BatteryCurrentSource)) {
-    settingWrite(NK_BatteryCurrentSource, String(BatteryCurrentSource).c_str());
+  if (!settingExists(NK_BattMonSrc)) {
+    settingWrite(NK_BattMonSrc, String(BattMonSrc).c_str());
   } else {
-    BatteryCurrentSource = settingRead(NK_BatteryCurrentSource).toInt();
+    BattMonSrc = settingRead(NK_BattMonSrc).toInt();
+    if (BattMonSrc != 1 && BattMonSrc != 3) BattMonSrc = 0;
   }
   if (!settingExists(NK_BatteryVoltageSource)) {
     settingWrite(NK_BatteryVoltageSource, String(BatteryVoltageSource).c_str());
@@ -4144,6 +4146,9 @@ void updateAccelMetrics() {
   // _triggered arms the 1s timer; _reported latches true after the message fires
   // and prevents re-firing while the angle stays above threshold. Both flags reset
   // only when the angle drops back below threshold (one message per event).
+  // Same rule as the slam lifetime stats: a board that failed the install check has no trustworthy
+  // heel/pitch, so its events and extremes stay out of the persisted, uploaded lifetime values.
+  const bool imuMountTrusted = (imuMountState != IMU_MOUNT_BAD);
   static bool capsize_triggered = false;
   static bool capsize_reported = false;
   static bool pitchpole_triggered = false;
@@ -4156,8 +4161,8 @@ void updateAccelMetrics() {
       capsize_triggered = true;
       capsize_start = now;
     } else if (!capsize_reported && (now - capsize_start > 1000)) {  // fires once per event
-      imu_capsize_count++;
-      queueConsoleMessageF("CAPSIZE EVENT: %.1f deg", cf_heel);
+      if (imuMountTrusted) imu_capsize_count++;
+      queueConsoleMessageF("CAPSIZE EVENT: %.1f deg%s", cf_heel, imuMountTrusted ? "" : " (IMU install check failed, not counted)");
       // Persisted by the next saveNVSDataFull() at the field-cut-settled flash pass: no flash writes from the
       // control loop, and a wet or mis-mounted IMU hovering at the threshold re-fired this every second.
       capsize_reported = true;
@@ -4172,8 +4177,8 @@ void updateAccelMetrics() {
       pitchpole_triggered = true;
       pitchpole_start = now;
     } else if (!pitchpole_reported && (now - pitchpole_start > 1000)) {  // fires once per event
-      imu_pitchpole_count++;
-      queueConsoleMessageF("PITCHPOLE EVENT: %.1f deg", cf_pitch);
+      if (imuMountTrusted) imu_pitchpole_count++;
+      queueConsoleMessageF("PITCHPOLE EVENT: %.1f deg%s", cf_pitch, imuMountTrusted ? "" : " (IMU install check failed, not counted)");
       // Persisted by the next saveNVSDataFull() at the field-cut-settled flash pass: no flash writes from the
       // control loop, and a wet or mis-mounted IMU hovering at the threshold re-fired this every second.
       pitchpole_reported = true;
@@ -4183,10 +4188,10 @@ void updateAccelMetrics() {
     pitchpole_reported = false;
   }
 
-  if (abs(cf_heel) > imu_heel_max_lifetime) {
+  if (imuMountTrusted && abs(cf_heel) > imu_heel_max_lifetime) {
     imu_heel_max_lifetime = abs(cf_heel);
   }
-  if (abs(cf_pitch) > imu_pitch_max_lifetime) {
+  if (imuMountTrusted && abs(cf_pitch) > imu_pitch_max_lifetime) {
     imu_pitch_max_lifetime = abs(cf_pitch);
   }
 

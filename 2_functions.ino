@@ -139,7 +139,8 @@ bool fsRemove(const char *path) {
 #define NK_AwSeedProtectMs "AwSeedProtectMs"
 #define NK_BatteryCOffset "BatteryCOffset"
 #define NK_BatteryCapacity_Ah "BatteryCapctyAh"
-#define NK_BatteryCurrentSource "BatteryCrrntSrc"
+// #define NK_BatteryCurrentSource "BatteryCrrntSrc"   // retired 2026-10-11, folded into BattMonSrc; name reserved
+#define NK_BattMonSrc "BattMonSrc"
 #define NK_BatteryVoltage "BatteryVoltage"   // 12/24/36/48 nominal bank class
 #define NK_BatteryVoltageSource "BatteryVoltSrc"
 #define NK_Beta "Beta"
@@ -2691,7 +2692,7 @@ void updateSensorWindow() {
   // Battery current - CONDITIONAL on the shunt (same pattern as baro/alt-temp below). No shunt ->
   // Bcur is INA input noise and SOC_percent is a frozen NVS value; leaving the window untouched
   // keeps *_valid_us at 0, which the uploader turns into JSON null instead of invented numbers.
-  // Bcur is always the INA228 shunt, so its own stamp decides freshness, not BatteryCurrentSource (§10.6).
+  // Bcur is always the INA228 shunt, so its own stamp decides freshness (§10.6).
   if (HAS_BATT_SHUNT && bcurFresh()) {
     int32_t battCurr = (int32_t)(Bcur * 100.0);
     if (battCurr < currentWindow->battCurr_min) currentWindow->battCurr_min = battCurr;
@@ -2736,8 +2737,8 @@ void updateSensorWindow() {
     }
   }
 
-  if (HAS_BATT_SHUNT) {
-    int32_t soc = SOC_percent;
+  if (socShownOk()) {
+    int32_t soc = socShownX100();
     if (soc < currentWindow->soc_min) currentWindow->soc_min = soc;
     if (soc > currentWindow->soc_max) currentWindow->soc_max = soc;
     if (shouldAccumulate) {

@@ -31,9 +31,10 @@ float fieldResProbeC() {
   return isfinite(f) ? (f - 32.0f) / 1.8f : NAN;
 }
 
-// The one writer of a Field Resistance: a typed entry (/get) and the field resistance test (/fieldResTest save=1). The
-// alternator temperature is recorded with it: the coil-temperature credit is relative to it. 30 C when there is none.
-void fieldResRecord(float r, float probeC) {
+// The one writer of a Field Resistance: a typed entry (/get, with the temperature it was measured at, typed=true) and the
+// field resistance test (/fieldResTest save=1, the probe at its start). The coil-temperature credit is relative to that
+// temperature. 30 C when there is none.
+void fieldResRecord(float r, float probeC, bool typed) {
   FieldResistance = r;
   settingWrite(NK_FieldResistance, String(FieldResistance, 3).c_str());
   FieldResTrefC = isfinite(probeC) ? probeC : 30.0f;
@@ -41,7 +42,8 @@ void fieldResRecord(float r, float probeC) {
   g_fieldDerateDirty = true;
   stateRevision++;
   settingsDirty = true;
-  if (isfinite(probeC)) queueConsoleMessageF("Field Resistance %.3f ohm recorded at %.0f%s from the alternator probe", FieldResistance, dispTempF(probeC * 1.8f + 32.0f), dispTempUnit());
+  if (isfinite(probeC)) queueConsoleMessageF("Field Resistance %.3f ohm recorded at %.0f%s %s", FieldResistance, dispTempF(probeC * 1.8f + 32.0f), dispTempUnit(),
+                                             typed ? "as entered" : "from the alternator probe");
   else queueConsoleMessageF("Field Resistance %.3f ohm: no alternator temperature reading, %.0f%s assumed", FieldResistance, dispTempF(86.0f), dispTempUnit());
 }
 
@@ -824,7 +826,7 @@ enum Csv2Index {
   CSV2_limpTier,            // 0 normal, 1 closed-loop minus dependent reasons, 2 voltage-only, 3 fixed duty + second-voltage cap, 4 fixed duty
   CSV2_sensorSteadyMask,    // same bits as sensorFaultMask; set once that fault bit has been clear continuously for 10 min (the "reading again" prompt)
   CSV2_reqFaultCount,       // §11: number of required sensors faulted (chip loss expanded to its readings; owner overrides and Not fitted excluded); >= 2 = REASON_MULTI_SENSOR_FAULT
-  CSV2_battCurState,        // §11.6 battery current (declared shunt / VE.Direct): 0 not declared, 1 reading, 2 lost 10 s (alarm + header line; charging continues on voltage)
+  CSV2_battCurState,        // §11.6 battery current (regulator shunt, or with none fitted the network battery monitor): 0 not declared, 1 reading, 2 lost 10 s (alarm + header line; charging continues on voltage)
   // Board field ceilings (6_functions.ino updateFieldDerateCeilings)
   CSV2_fieldCurDutyCeil,    // 10 A field-current ceiling, duty % x100
   CSV2_fieldHeatDutyCeil,   // field-drive heat ceiling, duty % x100 (99 until the first valid die sample)
@@ -869,9 +871,10 @@ enum Csv4Index {
   CSV4_bmsSignalActive,         // live BMS on/off opto input (GPIO42): 1 = 5-28 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice
   CSV4_panelHiRateInput,        // switch panel HIGH/LOW opto input (Cable 3 pin 5, GPIO39): 1 = wire energized = switch ON = asking for High. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
   CSV4_panelForceFloatInput,    // switch panel FORCEFLOAT opto input (Cable 3 pin 7, GPIO40): 1 = wire energized = switch ON = asking for Maintain. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
+  CSV4_VictronSoc,              // VE.Direct battery monitor's own state of charge (% ×10; ROLL_EMPTY when stale, unsynced or not a battery monitor)
   CSV4_sessionId,               // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV4_sendMs,                  // millis() when this payload was built
-  CSV4_FIELD_COUNT  // = 26
+  CSV4_FIELD_COUNT  // = 27
 };
 
 // CSV3 wire contract, declared ONCE. CSV3_LIST is expanded four ways: the Csv3Index enum, the
@@ -941,7 +944,7 @@ enum Csv4Index {
   X(IgnitionOverride, "%d", SafeInt(IgnitionOverride)) \
   X(FLOAT_DURATION, "%d", SafeInt(FLOAT_DURATION)) \
   X(PulleyRatio, "%d", SafeInt(PulleyRatio, 100)) \
-  X(BatteryCurrentSource, "%d", SafeInt(BatteryCurrentSource)) \
+  X(BattMonSrc, "%d", SafeInt(BattMonSrc)) \
   X(rpmTableRPMPoints0, "%d", SafeInt(rpmTableRPMPoints[0])) \
   X(rpmTableRPMPoints1, "%d", SafeInt(rpmTableRPMPoints[1])) \
   X(rpmTableRPMPoints2, "%d", SafeInt(rpmTableRPMPoints[2])) \
@@ -4069,6 +4072,138 @@ void setupServer() {
     response->addHeader("Cache-Control", "no-cache");
     request->send(response);
   });
+  // ===== TEMP-FIELDCHECK BEGIN: TEMPORARY field-current validation log (see the Xregulator.ino block). REMOVE after the drive. =====
+  // /fieldcheck?amps=<A> records a meter reading, ?mark=1 a mark; both answer {ok, seq} and the control tick records the entry
+  // on its next pass (fcDoneSeq catches up). No arguments: the panel's status.
+  server.on("/fieldcheck", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!fc) { request->send(200, "application/json", "{\"ok\":0,\"err\":\"no log buffer\"}"); return; }
+    char buf[512];
+    const bool isAmps = request->hasParam("amps"), isMark = request->hasParam("mark");
+    if (isAmps || isMark) {
+      float a = NAN;
+      if (isAmps) {
+        const String v = request->getParam("amps")->value();
+        char *end = nullptr;
+        a = strtof(v.c_str(), &end);
+        if (end == v.c_str() || !(a >= 0.0f && a <= 30.0f)) {
+          request->send(400, "application/json", "{\"ok\":0,\"err\":\"amps must be a number from 0 to 30\"}");
+          return;
+        }
+      }
+      uint32_t seq;
+      portENTER_CRITICAL(&fcMux);
+      fcReqKind = isAmps ? FC_KIND_METER : FC_KIND_MARK;
+      fcReqAmps = a;
+      seq = ++fcReqSeq;
+      portEXIT_CRITICAL(&fcMux);
+      snprintf(buf, sizeof(buf), "{\"ok\":1,\"seq\":%lu}", (unsigned long)seq);
+      request->send(200, "application/json", buf);
+      return;
+    }
+    FcRec last;
+    uint16_t n, ent;
+    uint32_t done, oldMs = 0, newMs = 0;
+    portENTER_CRITICAL(&fcMux);
+    last = fc->last;
+    n = fcCount;
+    ent = fcEntries;
+    done = fcDoneSeq;
+    if (n) {
+      oldMs = fc->ring[(fcHead + FC_RING_N - n) % FC_RING_N].ms;
+      newMs = fc->ring[(fcHead + FC_RING_N - 1) % FC_RING_N].ms;
+    }
+    portEXIT_CRITICAL(&fcMux);
+    auto num = [](char *p, size_t cap, const char *key, float v, int prec) -> int {
+      return isfinite(v) ? snprintf(p, cap, ",\"%s\":%.*f", key, prec, v) : snprintf(p, cap, ",\"%s\":null", key);
+    };
+    int pos = snprintf(buf, sizeof(buf), "{\"ok\":1,\"n\":%u,\"entries\":%u,\"spanS\":%lu,\"seq\":%lu,\"last\":",
+                       (unsigned)n, (unsigned)ent, (unsigned long)((newMs - oldMs) / 1000UL), (unsigned long)done);
+    if (!ent) {
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "null}");
+    } else {
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"kind\":%u,\"ageS\":%lu", (unsigned)last.kind,
+                      (unsigned long)((uint32_t)(millis() - last.ms) / 1000UL));
+      pos += num(buf + pos, sizeof(buf) - pos, "meter", last.meterA, 2);
+      pos += num(buf + pos, sizeof(buf) - pos, "est", last.estAvg, 2);
+      pos += num(buf + pos, sizeof(buf) - pos, "estMin", last.estMin, 2);
+      pos += num(buf + pos, sizeof(buf) - pos, "estMax", last.estMax, 2);
+      pos += num(buf + pos, sizeof(buf) - pos, "dutyMin", last.dutyMin, 1);
+      pos += num(buf + pos, sizeof(buf) - pos, "dutyMax", last.dutyMax, 1);
+      pos += num(buf + pos, sizeof(buf) - pos, "vMin", last.vMin, 2);
+      pos += num(buf + pos, sizeof(buf) - pos, "vMax", last.vMax, 2);
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "}}");
+    }
+    request->send(200, "application/json", buf);
+  });
+  // Oldest first. The first line is "#now_ms,<millis>" so the page can put a clock time on every row; it strips that line.
+  server.on("/fieldcheck.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
+    struct FcExp { uint16_t head, count, idx; uint8_t stage; bool done; char line[480]; int len, pos; };
+    FcExp st = {};
+    if (fc) {
+      portENTER_CRITICAL(&fcMux);
+      st.head = fcHead;
+      st.count = fcCount;
+      portEXIT_CRITICAL(&fcMux);
+    }
+    AsyncWebServerResponse *response = request->beginChunkedResponse("text/csv",
+      [st](uint8_t *buf, size_t maxLen, size_t) mutable -> size_t {
+        if (st.done) return 0;
+        size_t written = 0;
+        while (written < maxLen) {
+          if (st.pos >= st.len) {
+            if (st.stage == 0) {
+              st.len = snprintf(st.line, sizeof(st.line), "#now_ms,%lu\n", (unsigned long)millis());
+              st.stage = 1;
+            } else if (st.stage == 1) {
+              st.len = snprintf(st.line, sizeof(st.line),
+                                "kind,ms,meterA,meter_minus_estA,estA_avg,estA_min,estA_max,duty_avg,duty_min,duty_max,"
+                                "busV_avg,busV_min,busV_max,Rc_ohm,R_ohm,Tref_F,altTemp_F,boardTemp_F,rpm,altA,battA,"
+                                "ceil10A_pct,ceilHeat_pct,ceilBind,limitCode,mode,stage,fieldOn,fieldResTest\n");
+              st.stage = 2;
+            } else {
+              if (st.idx >= st.count) { st.done = true; return written; }
+              FcRec r;
+              portENTER_CRITICAL(&fcMux);
+              r = fc->ring[(st.head + FC_RING_N - st.count + st.idx) % FC_RING_N];
+              portEXIT_CRITICAL(&fcMux);
+              st.idx++;
+              // Blank cell for a value that was never read (NAN).
+              char *p = st.line;
+              size_t cap = sizeof(st.line);
+              auto cell = [&p, &cap](float v, int prec) {
+                int w = isfinite(v) ? snprintf(p, cap, ",%.*f", prec, v) : snprintf(p, cap, ",");
+                if (w > 0 && (size_t)w < cap) { p += w; cap -= w; }
+              };
+              static const char *const kinds[] = { "row", "meter", "mark" };
+              static const char *const modes[] = { "off", "manual", "auto", "fault" };
+              int w = snprintf(p, cap, "%s,%lu", r.kind < 3 ? kinds[r.kind] : "?", (unsigned long)r.ms);
+              p += w; cap -= w;
+              cell(r.meterA, 2);
+              cell(r.meterA - r.estAvg, 2);
+              cell(r.estAvg, 3); cell(r.estMin, 3); cell(r.estMax, 3);
+              cell(r.dutyAvg, 2); cell(r.dutyMin, 2); cell(r.dutyMax, 2);
+              cell(r.vAvg, 3); cell(r.vMin, 3); cell(r.vMax, 3);
+              cell(r.rc, 4); cell(r.r, 4); cell(r.trefC * 1.8f + 32.0f, 1);
+              cell(r.probeF, 1); cell(r.dieF, 1);
+              cell(r.rpm, 0); cell(r.altA, 1); cell(r.battA, 1);
+              cell(r.curCeil, 2); cell(r.heatCeil, 2);
+              w = snprintf(p, cap, ",%u,%u,%s,%u,%u,%u\n", (unsigned)r.bind, (unsigned)r.lim,
+                           r.mode < 4 ? modes[r.mode] : "?", (unsigned)r.stage, (unsigned)r.fieldOn, (unsigned)r.frtRun);
+              p += w;
+              st.len = (int)(p - st.line);
+            }
+            st.pos = 0;
+          }
+          size_t tw = min((size_t)(st.len - st.pos), maxLen - written);
+          memcpy(buf + written, st.line + st.pos, tw);
+          written += tw; st.pos += (int)tw;
+        }
+        return written;
+      });
+    response->addHeader("Cache-Control", "no-cache");
+    request->send(response);
+  });
+  // ===== TEMP-FIELDCHECK END =====
   // The held best-ever front (BEFRONT1 CSV artifact) — streamed (constant RAM at any front size).
   server.on("/altcurve.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
     altCurveCsvSend(request);
@@ -6787,10 +6922,15 @@ void setupServer() {
       foundParameter = true;
       inputMessage = request->getParam("FieldResistance")->value();
       const float r = inputMessage.toFloat();
+      // The temperature it was measured at comes with it, typed by the owner: a resistance from another day stamped with
+      // the probe now would carry the wrong reference into the coil-temperature credit.
+      const float tC = paramOk(request, "FieldResTrefC") ? request->getParam("FieldResTrefC")->value().toFloat() : NAN;
       if (!(r >= 0.05f && r <= 100.0f)) {   // a measured value or nothing: no clamping a typo into a resistance the ceilings act on
         queueConsoleMessageF("WRITE REJECTED: FieldResistance=%s - enter the measured resistance, 0.05 to 100 ohm", inputMessage.c_str());
+      } else if (!(tC >= -40.0f && tC <= 150.0f)) {   // the range boot accepts for a stored pair
+        queueConsoleMessageF("WRITE REJECTED: FieldResistance=%s - enter the alternator temperature it was measured at with it", inputMessage.c_str());
       } else {
-        fieldResRecord(r, fieldResProbeC());
+        fieldResRecord(r, tC, true);
       }
     }
     if (paramOk(request, "FieldWiring")) {
@@ -7406,12 +7546,16 @@ void setupServer() {
       settingWrite(NK_battMaxMode, battMaxMode ? "1" : "0");
       queueConsoleMessageF("Battery V/I plot sampling: %s", battMaxMode ? "Max" : "Average");
     }
-    if (request->hasParam("BatteryCurrentSource")) {
+    if (request->hasParam("BattMonSrc")) {
       foundParameter = true;
-      inputMessage = request->getParam("BatteryCurrentSource")->value();
-      settingWrite(NK_BatteryCurrentSource, inputMessage.c_str());
-      BatteryCurrentSource = inputMessage.toInt();
-      queueConsoleMessageF("Battery current source changed to: %d", BatteryCurrentSource);
+      const int src = request->getParam("BattMonSrc")->value().toInt();
+      if (src == 0 || src == 1 || src == 3) {
+        BattMonSrc = src;
+        settingWrite(NK_BattMonSrc, String(BattMonSrc).c_str());
+        queueConsoleMessageF("Battery monitor: %s", src == 3 ? "VE.Direct" : src == 1 ? "NMEA 2000" : "none");
+      } else {
+        queueConsoleMessageF("WRITE REJECTED: BattMonSrc=%d - 0 (none), 1 (NMEA 2000) or 3 (VE.Direct) only", src);
+      }
     }
     if (request->hasParam("BatteryVoltageSource")) {
       foundParameter = true;
@@ -10101,7 +10245,12 @@ void setupServer() {
   // result: the owner's Next or Save, so an explicit action may write flash here. The firmware does the math for both
   // methods, so the formula lives once, beside the estimate it calibrates.
   server.on("/fieldResTest", HTTP_GET, [](AsyncWebServerRequest *request) {
-    frt.lastPollMs = millis();
+    const uint32_t nowMs = millis();
+    if (frt.state == FRT_RUNNING) {
+      const uint32_t gap = nowMs - frt.lastPollMs;
+      if ((int32_t)gap > 0 && gap > frt.hbWorstMs) frt.hbWorstMs = gap;
+    }
+    frt.lastPollMs = nowMs;
     const char *refused = nullptr;
     if (request->hasParam("abort") && frt.state == FRT_RUNNING) {
       frt.reqAbort = true;
@@ -10114,7 +10263,7 @@ void setupServer() {
       if (frt.state != FRT_DONE) {
         refused = "There is no test result to save.";
       } else if (!frt.saved) {
-        fieldResRecord(frt.r, frt.probeC);
+        fieldResRecord(frt.r, frt.probeC, false);
         frt.saved = true;
         logClientWrite(request, "FIELD RESISTANCE TEST: result saved");
       }
@@ -10138,15 +10287,18 @@ void setupServer() {
       }
     }
 
-    char buf[1400];
+    const int cap = 3072;
+    std::shared_ptr<char> bufPtr((char *)ps_malloc(cap), [](char *p) { if (p) free(p); });
+    if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
+    char *buf = bufPtr.get();
     int pos = 0;
     auto num = [&](const char *key, float v, int dp) {
-      if (isfinite(v)) pos += snprintf(buf + pos, sizeof(buf) - pos, "\"%s\":%.*f,", key, dp, v);
-      else pos += snprintf(buf + pos, sizeof(buf) - pos, "\"%s\":null,", key);
+      if (isfinite(v)) pos += snprintf(buf + pos, cap - pos, "\"%s\":%.*f,", key, dp, v);
+      else pos += snprintf(buf + pos, cap - pos, "\"%s\":null,", key);
     };
     const bool starting = frt.reqStart;
     // sh: the shunt method is on offer (the screen picks the method from it; the start refusal has the full check).
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"st\":%u,\"m\":%u,\"h\":%u,\"rung\":%u,\"ph\":%u,\"el\":%lu,\"phMs\":%lu,\"holdMs\":%lu,\"sh\":%d,",
+    pos += snprintf(buf + pos, cap - pos, "{\"st\":%u,\"m\":%u,\"h\":%u,\"rung\":%u,\"ph\":%u,\"el\":%lu,\"phMs\":%lu,\"holdMs\":%lu,\"sh\":%d,",
                     starting ? (unsigned)FRT_RUNNING : (unsigned)frt.state, (unsigned)(starting ? frt.reqMethod : frt.method),
                     (unsigned)frt.hold, (unsigned)frt.rung, (unsigned)frt.phase,
                     (unsigned long)((frt.state == FRT_RUNNING) ? (millis() - frt.phaseStartMs) : 0UL),
@@ -10160,22 +10312,36 @@ void setupServer() {
     num("r", frt.r, 3);
     num("vc", frt.vc, 3);
     num("off", frt.probeOffV, 3);
-    num("warm", frt.warmPct, 2);
     num("tC", frt.probeC, 1);
+    num("tNowC", fieldResProbeC(), 1);   // the hold in progress shows it
+    pos += snprintf(buf + pos, cap - pos, "\"calm\":%d,", frt.calm ? 1 : 0);   // shunt: 0 while the opening field-off readings wait to agree
     num("R", FieldResistance, 3);
     num("Tref", FieldResTrefC, 1);
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\"holds\":[");
-    for (int k = 0; k < 4; k++) {
+    // rungs: probe rungs stepped up from, [x, i]. holds[k].c: the shunt cycles, [off, on, off battery amps, kept 1/0,
+    // field amps].
+    pos += snprintf(buf + pos, cap - pos, "\"rungs\":[");
+    for (int k = 0; k < 2 && k < frt.rung; k++) {
+      if (!isfinite(frt.rungX[k]) || !isfinite(frt.rungI[k])) continue;
+      pos += snprintf(buf + pos, cap - pos, "%s[%.2f,%.3f]", (buf[pos - 1] == '[') ? "" : ",", frt.rungX[k], frt.rungI[k]);
+    }
+    pos += snprintf(buf + pos, cap - pos, "],\"holds\":[");
+    for (int k = 0; k < FRT_N_HOLDS; k++) {
       const FrtHold &hd = frt.h[k];
-      pos += snprintf(buf + pos, sizeof(buf) - pos, "%s{", k ? "," : "");
+      pos += snprintf(buf + pos, cap - pos, "%s{", k ? "," : "");
       num("x", hd.x, 2);
       num("d", hd.d, 2);
       num("i", hd.i, 3);
-      if (buf[pos - 1] == ',') pos--;
-      pos += snprintf(buf + pos, sizeof(buf) - pos, "}");
+      num("tC", hd.tC, 1);
+      pos += snprintf(buf + pos, cap - pos, "\"c\":[");
+      for (int j = 0; j < hd.nc && j < FRT_MAX_CYC; j++) {
+        const FrtCycle &c = hd.c[j];
+        pos += snprintf(buf + pos, cap - pos, "%s[%.3f,%.3f,%.3f,%d,", j ? "," : "", c.a0, c.b, c.a1, c.ok ? 1 : 0);
+        pos += isfinite(c.f) ? snprintf(buf + pos, cap - pos, "%.3f]", c.f) : snprintf(buf + pos, cap - pos, "null]");
+      }
+      pos += snprintf(buf + pos, cap - pos, "]}");
     }
     // msg and refused are firmware-authored ASCII without quotes or backslashes.
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"saved\":%d,\"msg\":\"%s\",\"refused\":\"%s\"}",
+    pos += snprintf(buf + pos, cap - pos, "],\"saved\":%d,\"msg\":\"%s\",\"refused\":\"%s\"}",
                     frt.saved ? 1 : 0, (frt.state == FRT_FAILED || frt.state == FRT_DONE) ? frt.msg : "", refused ? refused : "");
     request->send(200, "application/json", buf);
   });
@@ -11240,7 +11406,7 @@ void SendWifiData() {
                                "%d,"  // CSV4_FIELD_COUNT
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,"
+                               "%d,%d,%d,"
                                "%u,%u",  // +2: sessionId, sendMs
 
                                CSV4_FIELD_COUNT,
@@ -11270,6 +11436,7 @@ void SendWifiData() {
                                (int)bmsSignalActive,                     // CSV4_bmsSignalActive
                                (int)panelHiRateInput,                    // CSV4_panelHiRateInput
                                (int)panelForceFloatInput,                // CSV4_panelForceFloatInput
+                               SafeInt(veSocFresh() ? VictronSoc : NAN, 10),  // CSV4_VictronSoc
                                (unsigned)g_sessionId,                    // CSV4_sessionId
                                (unsigned)millis()                        // CSV4_sendMs
     );
@@ -11378,7 +11545,7 @@ void SendWifiData() {
                                SafeInt(IBVMax, 100),
                                SafeInt(MeasuredAmpsMax, 100),
                                SafeInt(RPMMax),
-                               HAS_BATT_SHUNT ? SafeInt(SOC_percent) : ROLL_EMPTY,   // no shunt -> coulomb counting is off, the value is a frozen NVS leftover
+                               socShownOk() ? SafeInt(socShownX100()) : ROLL_EMPTY,   // no shunt and no network monitor -> SOC_percent is a frozen NVS leftover
                                SafeInt((double)EngineRunTime * 100.0 / 3600.0, 1),    // double: int math overflows (UB) at 5,965 engine-hours
                                SafeInt((double)AlternatorOnTime * 100.0 / 3600.0, 1),
                                SafeInt(AlternatorFuelUsed, 100),

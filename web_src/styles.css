@@ -40,11 +40,14 @@
 
    Triggers are body classes set from the echoes in script.js:
      no-batt-current   BatteryShuntPresent = 0 (mirrors firmware HAS_BATT_SHUNT)
+     no-soc-src        no-batt-current AND no network battery monitor (BattMonSrc = 0):
+                       nothing supplies SoC or the taper/rebulk current
      no-extra-temp     extraTempProbeEnable = 0
      ap-mode           currentMode = 1 (regulator IS the access point)
      cloud-off         CloudFeatures = 0
    =========================================================================== */
 body.no-batt-current .req-batt-current { display: none !important; }
+body.no-soc-src .req-soc-src { display: none !important; }
 /* Only the Alternator diag panel survives no-shunt, so drop its now-single-tab switcher. */
 body.no-batt-current #livedata-diag .diag-panel-tabs { display: none !important; }
 
@@ -52,6 +55,7 @@ body.no-batt-current #livedata-diag .diag-panel-tabs { display: none !important;
    composites its whole subtree, which would fade the .gate-note explanation along with the
    controls it is explaining. The note is a direct child and is excluded here. */
 body.no-batt-current .gate-batt-current > *:not(.gate-note),
+body.no-soc-src      .gate-soc-src      > *:not(.gate-note),
 body.no-extra-temp   .gate-extra-temp   > *:not(.gate-note),
 body.no-batt-temp    .gate-batt-temp    > *:not(.gate-note),
 body.ap-mode         .gate-ap           > *:not(.gate-note),
@@ -72,6 +76,11 @@ body.no-batt-current .gate-batt-current select,
 body.no-batt-current .gate-batt-current label.switch,
 body.no-batt-current .gate-batt-current .btn-primary,
 body.no-batt-current .gate-batt-current .btn-secondary,
+body.no-soc-src      .gate-soc-src input,
+body.no-soc-src      .gate-soc-src select,
+body.no-soc-src      .gate-soc-src label.switch,
+body.no-soc-src      .gate-soc-src .btn-primary,
+body.no-soc-src      .gate-soc-src .btn-secondary,
 body.no-extra-temp   .gate-extra-temp input,
 body.no-extra-temp   .gate-extra-temp select,
 body.no-extra-temp   .gate-extra-temp label.switch,
@@ -137,6 +146,7 @@ body.dark-mode .gate-note {
 body.ap-mode .ap-only-row { display: block; }
 
 body.no-batt-current .gate-note-shunt,
+body.no-soc-src      .gate-note-soc-src,
 body.no-extra-temp   .gate-note-extra,
 body.no-batt-temp    .gate-note-batt-temp,
 body.ap-mode         .gate-note-ap,
