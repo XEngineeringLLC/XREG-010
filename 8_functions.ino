@@ -690,6 +690,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "StartupRiseRate", NK_StartupRiseRate, 1 },
   { "FieldResistance", NK_FieldResistance, 1 },
   { "FieldResTrefC", NK_FieldResTrefC, 1 },   // written only beside FieldResistance (no /get param of its own)
+  { "FieldResDefault", NK_FieldResDefault, 1 },   // written by the test screen's skip (/fieldResTest skip=1) and cleared by any measured value
   { "FieldWiring", NK_FieldWiring, 1 },
   { "PulleyRatio", NK_PulleyRatio, 1 },
   // Tier 3, not 1: adopting another boat's tach calibration would silently rescale this device's

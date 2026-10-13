@@ -166,6 +166,7 @@ bool fsRemove(const char *path) {
 // #define NK_FieldAdjustmentInterval "FldAdjstmntIntr"
 #define NK_FieldResistance "FieldResistance"
 #define NK_FieldResTrefC "FieldResTrefC"
+#define NK_FieldResDefault "FieldResDefault"
 #define NK_FieldWiring "FieldWiring"
 #define NK_FloatVoltage "FloatVoltage"
 #define NK_GeneralFaultAlarm "GenFaultAlarm"

@@ -2354,7 +2354,7 @@ const _CFG_TABLE_LABELS={rpmPoints:'RPM Breakpoints',capTable:'Current Cap Table
 // Field Resistance and the alternator temperature recorded with it are one measurement: the firmware import takes
 // both or neither, so their rows tick together, and a file carrying only one of them cannot apply it.
 const _CFG_PAIR={FieldResistance:'FieldResTrefC',FieldResTrefC:'FieldResistance'};
-const _CFG_KEY_LABELS={FieldResTrefC:'Alternator temperature recorded with Field Resistance (°C)',ShuntLead:'Shunt location (1 negative lead, 2 positive lead)'};
+const _CFG_KEY_LABELS={FieldResTrefC:'Alternator temperature recorded with Field Resistance (°C)',FieldResDefault:'Field Resistance test skipped, 2 Ω used (1 yes, 12 V with no shunt only)',ShuntLead:'Shunt location (1 negative lead, 2 positive lead)'};
 function cfgDiffPairToggle(cb){
   document.querySelectorAll('#cfgdiff-body .cfgdiff-cb[data-pair]:not(:disabled)').forEach(c=>{ c.checked=cb.checked; });
 }
@@ -3959,6 +3959,7 @@ const CSV3_FIELDS = [
     "ShutdownRampTauS",
     "NoOutputAmps",
     "FieldResTrefC",
+    "FieldResDefault",
     "FieldWiring",
     "ShuntLead",
     "sessionId",  // device boot identity, same in every channel this boot
@@ -6086,105 +6087,105 @@ function initializeEventSource() {
 // drive with every other TEMP-FIELDCHECK block (grep -rn TEMP-FIELDCHECK). The regulator keeps the log; this page sends the
 // owner's meter readings, shows the latest comparison and saves the CSV with time-from-start and clock columns added.
 // The website demo and the screenshot rig run demo-shim.js, which swaps in MockEventSource without setting DEMO_MODE.
-function fcIsDemo() { return DEMO_MODE || !!(window.EventSource && window.EventSource.name === 'MockEventSource'); }
-function fcPanelVisible() {
-    const p = document.getElementById('fieldCheckPanel');
-    if (!p) return false;
-    if (fcIsDemo()) { p.style.display = 'none'; return false; }
-    return p.offsetParent !== null;
-}
-// Input and request problems go in their own line, so the status refresh does not wipe them.
-function fcHint(msg) {
-    const h = document.getElementById('fcHint');
-    if (h) { h.textContent = msg || ''; h.style.display = msg ? '' : 'none'; }
-}
-function fcAmpsText(v) { return Number.isFinite(v) ? v.toFixed(2) + ' A' : 'no estimate'; }
-function fcRender(j) {
-    const st = document.getElementById('fcStatus'), lastEl = document.getElementById('fcLast');
-    if (!st || !lastEl) return;
-    if (!j || !j.ok) { st.textContent = 'The log is not available on this regulator' + (j && j.err ? ' (' + j.err + ')' : '') + '.'; return; }
-    st.textContent = 'Recording: ' + Math.round(j.spanS / 60) + ' min logged, ' + j.entries + (j.entries === 1 ? ' entry' : ' entries') +
-        ' since the regulator started.';
-    const L = j.last;
-    lastEl.style.color = '';
-    if (!L) { lastEl.textContent = ''; return; }
-    const ago = L.ageS < 90 ? L.ageS + ' s ago' : Math.round(L.ageS / 60) + ' min ago';
-    if (L.kind === 2) { lastEl.textContent = 'Mark recorded ' + ago + '. Estimate ' + fcAmpsText(L.est) + '.'; return; }
-    let s = 'Last reading, ' + ago + ': meter ' + fcAmpsText(L.meter) + ', estimate ' + fcAmpsText(L.est) +
-        ' (' + fcAmpsText(L.estMin) + ' to ' + fcAmpsText(L.estMax) + ' over the 5 s before).';
-    if (Number.isFinite(L.meter) && Number.isFinite(L.est)) {
-        const d = L.meter - L.est;
-        if (d > 0) { s += ' Meter is ' + d.toFixed(2) + ' A HIGHER than the estimate.'; lastEl.style.color = '#e6a23c'; }
-        else s += ' Estimate is ' + (-d).toFixed(2) + ' A higher.';
-        // A field that moved during the window is not a steady comparison.
-        if (L.estMax - L.estMin > 0.05 * Math.max(L.est, 0.5)) s += ' The field was moving, so this reading may not count.';
-    }
-    lastEl.textContent = s;
-}
-// Every 10 s while the panel is on screen, and at once when it comes into view.
-let _fcShown = false, _fcLastFetch = 0;
-async function fcRefresh() {
-    const vis = fcPanelVisible();
-    const due = vis && (!_fcShown || Date.now() - _fcLastFetch >= 10000);
-    _fcShown = vis;
-    if (!due) return;
-    _fcLastFetch = Date.now();
-    try { fcRender(await (await fetchWithTimeout(buildURL('/fieldcheck'), {}, 4000)).json()); } catch (e) { }
-}
-async function fcSubmit() {
-    if (fcIsDemo()) return;
-    const el = document.getElementById('fcAmps'), btn = document.getElementById('fcSubmitBtn');
-    const raw = el ? el.value.trim() : '';
-    const a = raw === '' ? NaN : parseFloat(raw);
-    if (raw !== '' && !(a >= 0 && a <= 30)) {
-        fcHint('Type the amps the meter reads (0 to 30), or leave the box empty to mark the moment.');
-        return;
-    }
-    if (btn) btn.disabled = true;
-    try {
-        const j = await (await fetchWithTimeout(buildURL('/fieldcheck?' + (raw === '' ? 'mark=1' : 'amps=' + encodeURIComponent(a))), {}, 4000)).json();
-        if (!j.ok) throw new Error(j.err || 'refused');
-        fcHint('');
-        if (el) el.value = '';
-        // The control loop records the entry on its next pass.
-        for (let i = 0; i < 8; i++) {
-            await new Promise(res => setTimeout(res, 250));
-            const s = await (await fetchWithTimeout(buildURL('/fieldcheck'), {}, 4000)).json();
-            if (s.ok && s.seq >= j.seq) { fcRender(s); break; }
-        }
-    } catch (e) {
-        fcHint('Not recorded (' + e.message + '). Try again.');
-    } finally {
-        if (btn) btn.disabled = false;
-    }
-}
-async function fcDownload() {
-    if (fcIsDemo()) return;
-    try {
-        const text = await (await fetchWithTimeout(buildURL('/fieldcheck.csv'), {}, 15000)).text();
-        const tFetch = Date.now();
-        const lines = text.split('\n').filter(l => l.length);
-        if (lines.length < 2 || !lines[0].startsWith('#now_ms,')) throw new Error('unexpected reply');
-        const nowMs = parseInt(lines[0].split(',')[1], 10);
-        const head = lines[1].split(',');   // kind,ms,...: ms becomes t_s (0 = first row) and the clock time it was recorded
-        const out = ['t_s,clock,' + [head[0]].concat(head.slice(2)).join(',')];
-        let ms0 = null;
-        for (const l of lines.slice(2)) {
-            const c = l.split(',');
-            const ms = parseInt(c[1], 10);
-            if (ms0 === null) ms0 = ms;
-            const clock = new Date(tFetch - (nowMs - ms)).toLocaleTimeString([], { hour12: false });
-            out.push(((ms - ms0) / 1000).toFixed(1) + ',' + clock + ',' + [c[0]].concat(c.slice(2)).join(','));
-        }
-        const d = new Date(), p2 = n => String(n).padStart(2, '0');
-        deliverFile('field_check_' + d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + '_' + p2(d.getHours()) +
-            p2(d.getMinutes()) + '.csv', out.join('\n') + '\n', 'text/csv');
-    } catch (e) {
-        fcHint('Download failed (' + e.message + ').');
-    }
-}
-document.addEventListener('DOMContentLoaded', fcPanelVisible);
-setInterval(fcRefresh, 1000);
+// function fcIsDemo() { return DEMO_MODE || !!(window.EventSource && window.EventSource.name === 'MockEventSource'); }
+// function fcPanelVisible() {
+//     const p = document.getElementById('fieldCheckPanel');
+//     if (!p) return false;
+//     if (fcIsDemo()) { p.style.display = 'none'; return false; }
+//     return p.offsetParent !== null;
+// }
+// // Input and request problems go in their own line, so the status refresh does not wipe them.
+// function fcHint(msg) {
+//     const h = document.getElementById('fcHint');
+//     if (h) { h.textContent = msg || ''; h.style.display = msg ? '' : 'none'; }
+// }
+// function fcAmpsText(v) { return Number.isFinite(v) ? v.toFixed(2) + ' A' : 'no estimate'; }
+// function fcRender(j) {
+//     const st = document.getElementById('fcStatus'), lastEl = document.getElementById('fcLast');
+//     if (!st || !lastEl) return;
+//     if (!j || !j.ok) { st.textContent = 'The log is not available on this regulator' + (j && j.err ? ' (' + j.err + ')' : '') + '.'; return; }
+//     st.textContent = 'Recording: ' + Math.round(j.spanS / 60) + ' min logged, ' + j.entries + (j.entries === 1 ? ' entry' : ' entries') +
+//         ' since the regulator started.';
+//     const L = j.last;
+//     lastEl.style.color = '';
+//     if (!L) { lastEl.textContent = ''; return; }
+//     const ago = L.ageS < 90 ? L.ageS + ' s ago' : Math.round(L.ageS / 60) + ' min ago';
+//     if (L.kind === 2) { lastEl.textContent = 'Mark recorded ' + ago + '. Estimate ' + fcAmpsText(L.est) + '.'; return; }
+//     let s = 'Last reading, ' + ago + ': meter ' + fcAmpsText(L.meter) + ', estimate ' + fcAmpsText(L.est) +
+//         ' (' + fcAmpsText(L.estMin) + ' to ' + fcAmpsText(L.estMax) + ' over the 5 s before).';
+//     if (Number.isFinite(L.meter) && Number.isFinite(L.est)) {
+//         const d = L.meter - L.est;
+//         if (d > 0) { s += ' Meter is ' + d.toFixed(2) + ' A HIGHER than the estimate.'; lastEl.style.color = '#e6a23c'; }
+//         else s += ' Estimate is ' + (-d).toFixed(2) + ' A higher.';
+//         // A field that moved during the window is not a steady comparison.
+//         if (L.estMax - L.estMin > 0.05 * Math.max(L.est, 0.5)) s += ' The field was moving, so this reading may not count.';
+//     }
+//     lastEl.textContent = s;
+// }
+// // Every 10 s while the panel is on screen, and at once when it comes into view.
+// let _fcShown = false, _fcLastFetch = 0;
+// async function fcRefresh() {
+//     const vis = fcPanelVisible();
+//     const due = vis && (!_fcShown || Date.now() - _fcLastFetch >= 10000);
+//     _fcShown = vis;
+//     if (!due) return;
+//     _fcLastFetch = Date.now();
+//     try { fcRender(await (await fetchWithTimeout(buildURL('/fieldcheck'), {}, 4000)).json()); } catch (e) { }
+// }
+// async function fcSubmit() {
+//     if (fcIsDemo()) return;
+//     const el = document.getElementById('fcAmps'), btn = document.getElementById('fcSubmitBtn');
+//     const raw = el ? el.value.trim() : '';
+//     const a = raw === '' ? NaN : parseFloat(raw);
+//     if (raw !== '' && !(a >= 0 && a <= 30)) {
+//         fcHint('Type the amps the meter reads (0 to 30), or leave the box empty to mark the moment.');
+//         return;
+//     }
+//     if (btn) btn.disabled = true;
+//     try {
+//         const j = await (await fetchWithTimeout(buildURL('/fieldcheck?' + (raw === '' ? 'mark=1' : 'amps=' + encodeURIComponent(a))), {}, 4000)).json();
+//         if (!j.ok) throw new Error(j.err || 'refused');
+//         fcHint('');
+//         if (el) el.value = '';
+//         // The control loop records the entry on its next pass.
+//         for (let i = 0; i < 8; i++) {
+//             await new Promise(res => setTimeout(res, 250));
+//             const s = await (await fetchWithTimeout(buildURL('/fieldcheck'), {}, 4000)).json();
+//             if (s.ok && s.seq >= j.seq) { fcRender(s); break; }
+//         }
+//     } catch (e) {
+//         fcHint('Not recorded (' + e.message + '). Try again.');
+//     } finally {
+//         if (btn) btn.disabled = false;
+//     }
+// }
+// async function fcDownload() {
+//     if (fcIsDemo()) return;
+//     try {
+//         const text = await (await fetchWithTimeout(buildURL('/fieldcheck.csv'), {}, 15000)).text();
+//         const tFetch = Date.now();
+//         const lines = text.split('\n').filter(l => l.length);
+//         if (lines.length < 2 || !lines[0].startsWith('#now_ms,')) throw new Error('unexpected reply');
+//         const nowMs = parseInt(lines[0].split(',')[1], 10);
+//         const head = lines[1].split(',');   // kind,ms,...: ms becomes t_s (0 = first row) and the clock time it was recorded
+//         const out = ['t_s,clock,' + [head[0]].concat(head.slice(2)).join(',')];
+//         let ms0 = null;
+//         for (const l of lines.slice(2)) {
+//             const c = l.split(',');
+//             const ms = parseInt(c[1], 10);
+//             if (ms0 === null) ms0 = ms;
+//             const clock = new Date(tFetch - (nowMs - ms)).toLocaleTimeString([], { hour12: false });
+//             out.push(((ms - ms0) / 1000).toFixed(1) + ',' + clock + ',' + [c[0]].concat(c.slice(2)).join(','));
+//         }
+//         const d = new Date(), p2 = n => String(n).padStart(2, '0');
+//         deliverFile('field_check_' + d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + '_' + p2(d.getHours()) +
+//             p2(d.getMinutes()) + '.csv', out.join('\n') + '\n', 'text/csv');
+//     } catch (e) {
+//         fcHint('Download failed (' + e.message + ').');
+//     }
+// }
+// document.addEventListener('DOMContentLoaded', fcPanelVisible);
+// setInterval(fcRefresh, 1000);
 // ===== TEMP-FIELDCHECK END =====
 
 // ===== DEMO MODE FOR APP STORE (No ESP32 hardware required) =====
@@ -6193,7 +6194,7 @@ function enableDemoMode() {
     if (DEMO_MODE) return;
 
     DEMO_MODE = true;
-    { const p = document.getElementById('fieldCheckPanel'); if (p) p.style.display = 'none'; }  // TEMP-FIELDCHECK
+    // { const p = document.getElementById('fieldCheckPanel'); if (p) p.style.display = 'none'; }  // TEMP-FIELDCHECK
     console.log('[DEMO MODE] Enabled - Generating simulated data');
 
     // Hard-sever the device link: demo must never actuate real hardware — field
@@ -8879,10 +8880,11 @@ function updateAllEchosOptimized(data) {
         { key: 'MaxFieldVolts', id: 'MaxFieldVolts_echo', transform: v => (v / 10).toFixed(1) },
         { key: 'MinDuty', id: 'MinDuty_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'MinDuty', id: 'MinDuty_echo_gate', transform: v => (v / 100).toFixed(2) },
-        { key: 'FieldResistance', id: 'FieldResistance_echo', nan: 'not entered', transform: v => (v / 100).toFixed(2) },
-        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps',  transform: v => (v / 100).toFixed(2) },
-        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps2', transform: v => (v / 100).toFixed(2) },
-        { key: 'FieldResTrefC', id: 'FieldResTrefC_echo', nan: 'not recorded',
+        // With the 12 V skipped-test default in use (FieldResDefault 1) nothing is measured, and the regulator uses 2 ohm.
+        { key: 'FieldResistance', id: 'FieldResistance_echo', nan: d => fieldResDefaultIn(d) ? '2.00' : 'not entered', transform: v => (v / 100).toFixed(2) },
+        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps',  nan: d => fieldResDefaultIn(d) ? '2.00' : '', transform: v => (v / 100).toFixed(2) },
+        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps2', nan: d => fieldResDefaultIn(d) ? '2.00' : '', transform: v => (v / 100).toFixed(2) },
+        { key: 'FieldResTrefC', id: 'FieldResTrefC_echo', nan: d => fieldResDefaultIn(d) ? 'default, test skipped' : 'not recorded',
           transform: v => 'recorded at ' + Math.round(toDisplayTempFromC(v / 10)) + ' ' + tempUnitLabel() },
         { key: 'FieldWiring', id: 'FieldWiring_echo', transform: v => v == 1 ? 'P-type' : v == 2 ? 'N-type' : 'Not set' },
         { key: 'maxPoints', id: 'maxPoints_echo', transform: v => v },
@@ -9175,9 +9177,10 @@ function updateAllEchosOptimized(data) {
         if (update.key in data) {
             // Most transforms end in .toFixed(), and NaN.toFixed() is the string "NaN". Print the
             // em dash instead, so a sentinel echo reads like every other absent value on the page,
-            // unless the entry names its own absent text (nan:).
+            // unless the entry names its own absent text (nan:, a string or a function of the frame).
             const raw = data[update.key];
-            const newValue = (typeof raw === 'number' && !Number.isFinite(raw)) ? (update.nan || '—') : update.transform(raw);
+            const absent = typeof update.nan === 'function' ? update.nan(data) : update.nan;
+            const newValue = (typeof raw === 'number' && !Number.isFinite(raw)) ? (absent || '—') : update.transform(raw);
             if (updateEchoIfChanged(update.id, newValue)) {
                 updatesCount++;
             }
@@ -11089,7 +11092,7 @@ function commPrepRender(cfg) {
         '<button type="button" id="commprep-sh-1" class="cap-mode-btn' + (shuntPresent === 1 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntPresent(1)">Installed</button>' +
         '<button type="button" id="commprep-sh-0" class="cap-mode-btn' + (shuntPresent === 0 ? ' cap-mode-active' : '') + '" onclick="commPrepShuntPresent(0)">None</button>' +
         '</div>' +
-        '<div style="font-size:11px; color:#888; margin-top:5px; line-height:1.4;">Without a shunt wired directly to the regulator, the battery-current limit, load-dump detection, and other fast features are inactive. An NMEA 2000 or VE.Direct shunt is too slow for these features, but if set up in Setup &rarr; Integrations it still provides basic SOC and ends absorption on taper current. If a networked (not direct-wired) shunt is used, select None here, and set up later in Integrations. A shunt in the negative lead that is not wired to the regulator also makes the regulator&rsquo;s battery voltage read slightly high while charging, so you may want to choose NMEA 2000 or Victron under Battery voltage for charge decisions, below, in that case.</div>' +
+        '<div id="commprep-sh-cap" style="' + capCss + '">' + commPrepShuntCap(shuntPresent) + '</div>' +
         '</div>';
 
     const shuntLeadSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Shunt location</label>' +
@@ -11100,10 +11103,10 @@ function commPrepRender(cfg) {
         '<a id="commprep-sl-doc" href="' + commPrepWiringDocUrl(wiring) + '" target="_blank" rel="noopener" style="color:#2ec4b6; text-decoration:none; white-space:nowrap;">Where each wire lands ›</a></div></div>';
 
     const vSrcBtn = (val, label) => '<button type="button" id="commprep-vs-' + val + '" class="cap-mode-btn' + (vsrc === val ? ' cap-mode-active' : '') + '" onclick="commPrepVoltSrc(' + val + ')">' + label + '</button>';
-    const vSrcSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery voltage for charge decisions</label>' +
+    const vSrcSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery voltage for charge stage changes</label>' +
         '<div class="cap-mode-toggle" style="flex-wrap:wrap; background:rgba(255,255,255,0.07); border-color:#444;">' +
         vSrcBtn(0, 'Onboard') + vSrcBtn(1, 'NMEA 2000') + vSrcBtn(3, 'Victron') +
-        '</div><div style="' + capCss + '">The onboard sensor drives all control loops regardless. Choose an external source if the Regulator Ground Wire is longer than 6 ft or smaller than 12 AWG.</div></div>';
+        '</div><div style="' + capCss + '">Decides when charging moves from bulk to absorption to float, and back to bulk. The onboard sensor drives all control loops regardless. Choose an external source if the Regulator Ground Wire is longer than 6 ft, smaller than 12 AWG, or if there&rsquo;s a shunt in the negative lead not connected to the regulator via Cable 2 pins 9 and 10.</div></div>';
 
     // Which measured battery-temperature source is live right now. Painted from the last CSV2 frame here
     // and kept current by renderBattTempReadouts while the screen is open. The "none found" choice (Not
@@ -11238,12 +11241,20 @@ function commPrepTempSrc(v) {
     if (_commPrepOwLast) commPrepOwRender(_commPrepOwLast);   // Thermistor drops the Alternator-role requirement
 }
 
+// Battery shunt caption: only what the current choice means.
+function commPrepShuntCap(v) {
+    if (v === 1) return 'Wired to the regulator on Cable 2 pins 9 and 10. A shunt that reports only over NMEA 2000 or VE.Direct counts as None.';
+    return 'With no shunt wired to the regulator, the battery-current limit, load-dump detection, and other fast features are off. A shunt on NMEA 2000 or VE.Direct is too slow for them, but set up later under Setup &rarr; Integrations it still allows the absorption phase to end on a taper current. If that shunt is in the battery negative lead, the regulator&rsquo;s battery voltage reads slightly high while charging, so you may want to choose NMEA 2000 or Victron under &ldquo;Battery voltage for charge stage changes&rdquo;, below.';
+}
+
 // Shunt Resistance is inert without a battery shunt — reveal it only when one is installed.
 function commPrepShuntPresent(v) {
     _commPrepShuntPresent = v;
     const b1 = document.getElementById('commprep-sh-1'), b0 = document.getElementById('commprep-sh-0');
     if (b1) b1.classList.toggle('cap-mode-active', v === 1);
     if (b0) b0.classList.toggle('cap-mode-active', v === 0);
+    const cap = document.getElementById('commprep-sh-cap');
+    if (cap) cap.innerHTML = commPrepShuntCap(v);
     const row = document.getElementById('commprep-shunt-row');
     if (row) row.style.display = (v === 1) ? '' : 'none';
     commPrepFieldGateRefresh();
@@ -11430,8 +11441,10 @@ const FR_POLL_TIMEOUT_MS = 2000;
 const FR_HOLD_NAMES = ['Low hold', 'Aiming hold', 'Top hold', 'Middle hold'];
 const frEsc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const frTempTxt = c => Math.round(toDisplayTempFromC(c)) + ' ' + tempUnitLabel();
-const frStored = st => !!st && Number.isFinite(st.R) && Number.isFinite(st.Tref);
-const frStoredTxt = st => st.R.toFixed(3) + ' Ω, recorded at ' + frTempTxt(st.Tref);
+// def: the 12 V skipped-test default stands in for a measured value (B1.14).
+const frStored = st => !!st && ((Number.isFinite(st.R) && Number.isFinite(st.Tref)) || st.def === 1);
+const frDefR = st => Number.isFinite(st.defR) ? st.defR : 2;
+const frStoredTxt = st => st.def === 1 ? frDefR(st) + '\u00a0Ω, the default (test skipped)' : st.R.toFixed(3) + ' Ω, recorded at ' + frTempTxt(st.Tref);
 
 async function frRequest(q, timeoutMs) {
     // The in-app demo has no device (commPrepFetchCfg gives it a recorded 2 Ω install): Keep works, a test cannot run.
@@ -11473,14 +11486,19 @@ function frHomeView() {
     if (!st) return 'offline';
     if (st.st === 1) return 'run';
     if (st.st === 2 && st.saved !== 1) return 'done';   // a result from an earlier visit this boot, never saved
-    if (_fr.mode === 'chain' && frStored(st)) return 'keep';
-    return st.sh === 1 ? 'shunt' : 'meterpick';
+    // A skipped-test default on a boat that has since gained a shunt is measured instead: the test now runs by itself.
+    if (_fr.mode === 'chain' && frStored(st) && !(st.def === 1 && st.sh === 1)) return 'keep';
+    return frStartView();
 }
 function frGo(view) { if (!_fr) return; _fr.view = view; frRender(); }
 // Where the owner picks shunt or meter: the footer's "Start of this step" returns here from every later screen.
-function frStartView() { return (_fr && _fr.st && _fr.st.sh === 1) ? 'shunt' : 'meterpick'; }
+// 'optional' (12 V, no shunt, nothing stored) puts Skip first; once a value or the default is stored, skipping is moot.
+function frStartView() {
+    const st = _fr && _fr.st;
+    if (st && st.sh === 1) return 'shunt';
+    return (st && st.sk === 1 && !frStored(st)) ? 'optional' : 'meter';
+}
 function frBack() { frGo(frStartView()); }
-function frPickMeter(kind) { if (!_fr) return; _fr.meter = kind; frGo('meter'); }
 function frAck(on) {
     if (!_fr) return;
     _fr.ack = !!on;
@@ -11542,8 +11560,28 @@ function frShowRefused(txt) {
 function frTryAgain() {
     if (!_fr) return;
     if (_fr.method === 1) frStart(1);
-    else if (_fr.meter) frStart(2);
-    else frGo('meterpick');
+    else if (_fr.ack) frStart(2);
+    else frGo('meter');
+}
+// "Skip the test" on the optional screen: the firmware refuses it unless the system is 12 V with no battery shunt.
+async function frSkip() {
+    if (!_fr || _fr.busy) return;
+    _fr.busy = true;
+    const b = document.getElementById('fr-skip-btn');
+    if (b) b.disabled = true;
+    let j = null;
+    try { j = await frAct('skip=1'); } catch (e) { diagLog('field resistance skip failed:', e); }
+    if (!_fr) return;
+    _fr.busy = false;
+    if (j) _fr.st = j;
+    if (!j || j.refused || j.def !== 1) {
+        frShowRefused(j && j.refused ? j.refused : 'Could not reach the regulator. Check the connection and try again.');
+        if (b) b.disabled = false;
+        return;
+    }
+    const chain = _fr.mode === 'chain';
+    frCloseOverlay();
+    if (chain) commPrepContinue();
 }
 async function frStop() {
     if (!_fr) return;
@@ -11618,7 +11656,7 @@ function frPaintFooter() {
     const next = document.getElementById('fieldres-next-btn');
     const why = document.getElementById('fieldres-next-why');
     // Not during a run: Stop ends it and lands on a screen that has this button.
-    if (back) back.style.display = (['meterpick', 'meter', 'done', 'fail'].includes(_fr.view) && _fr.view !== frStartView()) ? '' : 'none';
+    if (back) back.style.display = (['meter', 'done', 'fail'].includes(_fr.view) && _fr.view !== frStartView()) ? '' : 'none';
     if (later) later.textContent = chain ? 'I\'ll do this later' : 'Close';
     if (why) why.style.display = 'none';
     if (!next) return;
@@ -11627,6 +11665,37 @@ function frPaintFooter() {
     next.disabled = !can;
     next.style.cssText = 'border-radius:6px; padding:8px 16px; font-size:0.9em; ' + (can ? 'cursor:pointer; ' + CP_BTN_GREEN
         : 'cursor:default; opacity:0.45; background:rgba(255,255,255,0.10); color:#e8e8e8; border:1px solid rgba(255,255,255,0.18);');
+}
+
+// The two ways to read field current, drawn rather than explained: a DC clamp around the field wire, and a multimeter on
+// its 10 A range bridging the empty field fuse holder.
+function frMeterDiagramsHtml() {
+    const box = (x, t) => '<rect x="' + x + '" y="20" width="66" height="34" rx="5" fill="#262626" stroke="#555"/>' +
+        '<text x="' + (x + 33) + '" y="41" text-anchor="middle" font-size="11" fill="#ccc">' + t + '</text>';
+    const ends = box(4, 'Regulator') + box(190, 'Alternator');
+    const meter = (y, h, txt) => '<rect x="108" y="' + y + '" width="44" height="' + h + '" rx="6" fill="#2b2b2b" stroke="#e6a23c" stroke-width="2"/>' +
+        '<rect x="115" y="' + (y + 7) + '" width="30" height="15" rx="2" fill="#111" stroke="#555"/>' +
+        '<text x="130" y="' + (y + 18) + '" text-anchor="middle" font-size="10" fill="#2ec4b6">' + txt + '</text>';
+    const svg = inner => '<svg viewBox="0 0 260 150" width="100%" style="display:block; max-width:260px;" role="img">' + inner + '</svg>';
+    const clamp = svg(ends +
+        '<line x1="70" y1="37" x2="190" y2="37" stroke="#d0d0d0" stroke-width="3"/>' +
+        '<text x="96" y="30" text-anchor="middle" font-size="10" fill="#999">Field</text>' +
+        '<ellipse cx="130" cy="37" rx="13" ry="17" fill="none" stroke="#e6a23c" stroke-width="5"/>' +
+        meter(56, 64, 'DC A'));
+    const series = svg(ends +
+        '<line x1="70" y1="37" x2="113" y2="37" stroke="#d0d0d0" stroke-width="3"/>' +
+        '<line x1="147" y1="37" x2="190" y2="37" stroke="#d0d0d0" stroke-width="3"/>' +
+        '<rect x="110" y="28" width="40" height="18" rx="3" fill="none" stroke="#777" stroke-dasharray="3 2"/>' +
+        '<rect x="112" y="32" width="6" height="10" fill="#bbb"/><rect x="142" y="32" width="6" height="10" fill="#bbb"/>' +
+        '<text x="130" y="22" text-anchor="middle" font-size="10" fill="#999">Fuse pulled</text>' +
+        '<path d="M115 42 C115 62, 120 70, 121 90" fill="none" stroke="#e05252" stroke-width="2.5"/>' +
+        '<path d="M145 42 C145 62, 140 70, 139 90" fill="none" stroke="#8a8a8a" stroke-width="2.5"/>' +
+        meter(90, 54, '10 A'));
+    const fig = (art, cap) => '<figure style="margin:0; flex:1 1 200px; max-width:280px; padding:8px 10px 10px; background:#191919; border:1px solid #333; border-radius:6px;">' +
+        art + '<figcaption style="font-size:12px; line-height:1.4; color:#bbb; margin-top:4px;">' + cap + '</figcaption></figure>';
+    return '<div style="display:flex; flex-wrap:wrap; gap:10px; margin:0 0 12px;">' +
+        fig(clamp, 'DC clamp meter around the field wire') +
+        fig(series, 'Multimeter on its 10\u00a0A DC range in place of the field fuse. Solid connections on both leads are essential, and a second person to help is preferred.') + '</div>';
 }
 
 function frRender() {
@@ -11639,7 +11708,7 @@ function frRender() {
     const row = inner => '<div style="display:flex; flex-wrap:wrap; gap:10px; margin:4px 0 12px;">' + inner + '</div>';
     const refused = '<div id="fr-refused" style="display:none; font-size:12px; line-height:1.45; color:#e6a23c; margin:0 0 12px;"></div>';
     const storedLine = (!chain && frStored(st)) ? p('Stored now: <strong style="color:#e0e0e0;">' + frStoredTxt(st) + '</strong>.') : '';
-    const keepLink = (chain && frStored(st)) ? p('<a href="#" onclick="frGo(\'keep\'); return false;" style="color:#2ec4b6; text-decoration:none;">Keep the recorded value instead ›</a>', ' font-size:12px;') : '';
+    const keepLink = (chain && frStored(st)) ? p('<a href="#" onclick="frGo(\'keep\'); return false;" style="color:#2ec4b6; text-decoration:none;">' + (st.def === 1 ? 'Keep the ' + frDefR(st) + '\u00a0Ω default instead ›' : 'Keep the recorded value instead ›') + '</a>', ' font-size:12px;') : '';
     const checklist = items => '<div style="margin:0 0 12px; padding:10px 12px; background:#191919; border:1px solid #333; border-radius:6px;">' +
         '<div style="font-size:11px; color:#9cc; letter-spacing:0.04em; text-transform:uppercase; margin:0 0 6px;">Before you start</div>' +
         '<ul style="margin:0 0 10px; padding-left:18px; font-size:13px; line-height:1.5; color:#ccc;">' + items.map(t => '<li>' + t + '</li>').join('') + '</ul>' +
@@ -11647,8 +11716,6 @@ function frRender() {
         '<input type="checkbox" id="fr-ack"' + (_fr.ack ? ' checked' : '') + ' onchange="frAck(this.checked)" style="width:18px; height:18px; margin:0;">The engine is off.</label></div>';
     const startBtn = m => btn('Start test', 'frStart(' + m + ')', 'btn-primary', 'fr-start', _fr.ack ? '' : ' opacity:0.45; cursor:default;', !_fr.ack);
     const ign = 'The ignition is on (or <strong>Ignition Override</strong> is on, on a boat with no ignition wire).';
-    // With no shunt the meter choice is the start of the step, which the footer button already returns to.
-    const changeMeter = frStartView() === 'meterpick' ? '' : btn('Change meter', 'frGo(\'meterpick\')', 'btn-secondary');
     let h = '';
 
     switch (_fr.view) {
@@ -11656,9 +11723,12 @@ function frRender() {
             h = p('Could not reach the regulator.') + row(btn('Retry', 'frRetryOpen()', 'btn-secondary'));
             break;
         case 'keep':
-            h = p('A field resistance is already recorded: <strong style="color:#e0e0e0;">' + frStoredTxt(st) + '</strong>.') +
-                p('Keep it, or measure again after replacing the alternator, its brushes, or the field wiring.') +
-                row(btn('Keep', 'frNext()', 'btn-primary') + btn('Measure again', 'frGo(\'' + (st.sh === 1 ? 'shunt' : 'meterpick') + '\')', 'btn-secondary'));
+            h = (st.def === 1
+                ? p('The test was skipped, and the regulator uses the <strong style="color:#e0e0e0;">' + frDefR(st) + '\u00a0Ω</strong> default.') +
+                  p('Keep it, or measure the real value now.')
+                : p('A field resistance is already recorded: <strong style="color:#e0e0e0;">' + frStoredTxt(st) + '</strong>.') +
+                  p('Keep it, or measure again after replacing the alternator, its brushes, or the field wiring.')) +
+                row(btn('Keep', 'frNext()', 'btn-primary') + btn(st.def === 1 ? 'Measure' : 'Measure again', 'frGo(\'' + (st.sh === 1 ? 'shunt' : 'meter') + '\')', 'btn-secondary'));
             break;
         case 'shunt':
             h = storedLine +
@@ -11669,21 +11739,18 @@ function frRender() {
                     'Chargers are off: shore power, solar, and DC-DC.',
                     'Loads that cycle on and off, such as a fridge, pump, or inverter, are off.'
                 ]) + refused +
-                row(startBtn(1) + btn('Use a meter instead', 'frGo(\'meterpick\')', 'btn-secondary')) + keepLink;
+                row(startBtn(1) + btn('Use a meter instead', 'frGo(\'meter\')', 'btn-secondary')) + keepLink;
             break;
-        case 'meterpick':
-            h = storedLine +
-                p('You read the field current on a meter while the regulator holds the field, and type each reading in. Which meter do you have?') +
-                row(btn('DC clamp meter', 'frPickMeter(\'clamp\')', 'btn-secondary') + btn('Multimeter in series', 'frPickMeter(\'series\')', 'btn-secondary')) + keepLink;
+        case 'optional':
+            h = p('This test is <strong style="color:#e0e0e0;">optional</strong> on a 12 V system with no battery shunt: it only makes the Field Amps reading more accurate. Skipping it uses a typical ' + frDefR(st) + '\u00a0Ω.') +
+                refused + row(btn('Skip the test', 'frSkip()', 'btn-primary', 'fr-skip-btn') + btn('Test anyway', 'frGo(\'meter\')', 'btn-secondary'));
             break;
         case 'meter':
-            h = storedLine + (_fr.meter === 'clamp'
-                ? p('<strong style="color:#e0e0e0;">DC clamp meter.</strong> It must read DC, which means a Hall-effect clamp; an AC-only clamp reads nothing here. With the jaws closed and away from any wire, zero it (the DCA zero or REL button). Then clamp it around the Regulator Field wire alone, not a bundle of wires.')
-                : p('<strong style="color:#e0e0e0;">Multimeter in series.</strong> Set it to DC amps, with the red lead in the 10 A jack (marked A on some meters) and the black lead in COM. With the field off, pull the 10 A field fuse and hold or clip the meter leads on the two contacts of the empty fuse holder. Refit the fuse when the test is done.') +
-                  '<div style="margin:0 0 12px; padding:10px 12px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.4); border-radius:6px; font-size:12px; line-height:1.5; color:#f2a7a7;"><strong>A meter set to amps is a short circuit.</strong> Never put it across the battery or across any two different wires. Its leads go only on the two contacts of the field fuse holder.</div>') +
-                p('Each hold runs the field for ' + Math.round((st.holdMs || 12000) / 1000) + ' seconds with a countdown. Read the meter while it counts, or freeze it with the meter\'s HOLD button, then type the amps and press <strong>Enter</strong>.') +
+            h = storedLine +
+                p('The regulator holds the field for ' + Math.round((st.holdMs || 12000) / 1000) + ' seconds at a time, with a countdown. Read the field current on a DC clamp meter or a multimeter in series during each hold, type the amps, and press <strong>Record</strong>.') +
+                frMeterDiagramsHtml() +
                 checklist(['The engine is off. ' + ign]) + refused +
-                row(startBtn(2) + changeMeter) + keepLink;
+                row(startBtn(2)) + keepLink;
             break;
         case 'run':
             h = frRunHtml();
@@ -11705,7 +11772,7 @@ function frRender() {
                 p(frEsc(frFailText(st.msg))) + refused +
                 (got ? '<div style="font-size:12px; color:#9cc; letter-spacing:0.04em; text-transform:uppercase; margin:4px 0 4px;">Measured before it stopped</div><div style="margin:0 0 12px;">' + got + '</div>' : '') +
                 row(btn('Try again', 'frTryAgain()', 'btn-primary') +
-                    (_fr.method === 1 ? btn('Use a meter instead', 'frGo(\'meterpick\')', 'btn-secondary') : changeMeter));
+                    (_fr.method === 1 ? btn('Use a meter instead', 'frGo(\'meter\')', 'btn-secondary') : ''));
             break;
         }
     }
@@ -11729,7 +11796,7 @@ function frRunHtml() {
             ? '<div id="fr-run-count" style="font-size:34px; color:#35d6c7; font-variant-numeric:tabular-nums; margin:0 0 10px;"></div>' +
               '<div style="display:flex; gap:8px; align-items:center; margin:0 0 6px;">' +
               '<input id="fr-amps" type="number" step="0.01" min="0" inputmode="decimal" placeholder="Amps" onkeydown="if (event.key === \'Enter\') frReading()" style="flex:1; min-width:0; background:#161616; color:#ddd; border:1px solid #444; border-radius:5px; padding:7px 10px; font-size:16px; box-sizing:border-box;">' +
-              '<button type="button" id="fr-enter" class="btn-primary" onclick="frReading()" style="border-radius:5px; padding:7px 14px; cursor:pointer; font-size:0.9em;">Enter</button></div>' +
+              '<button type="button" id="fr-enter" class="btn-primary" onclick="frReading()" style="border-radius:5px; padding:7px 14px; cursor:pointer; font-size:0.9em;">Record</button></div>' +
               '<div id="fr-amps-hint" style="display:none; font-size:12px; color:#e6a23c; margin:0 0 6px;"></div>'
             : '<div style="height:8px; background:#2a2a2a; border-radius:4px; overflow:hidden; margin:0 0 10px;"><div id="fr-run-bar" style="height:100%; width:0; background:#35d6c7; transition:width 0.4s;"></div></div>' +
               '<div id="fr-run-live" style="font-size:30px; color:#35d6c7; font-variant-numeric:tabular-nums; min-height:36px;"></div>' +
@@ -11759,7 +11826,7 @@ function frRunUpdate() {
         const holding = st.ph === 1;
         const left = Math.max(0, Math.ceil(((st.holdMs || 12000) - (st.el || 0)) / 1000));
         set('fr-run-count', holding ? left + ' s' : '');
-        set('fr-run-sub', holding ? 'Field on. Read the meter now.' : 'Field off. Type the reading in amps and press Enter.');
+        set('fr-run-sub', holding ? 'Field on. Read the meter now.' : 'Field off. Type the reading in amps and press Record.');
         const again = document.getElementById('fr-again');
         if (again) again.style.display = holding ? 'none' : '';
     } else {
@@ -13765,14 +13832,16 @@ function syncPanelOverrideGates(on) {
     }
 }
 
-// No Field Resistance entered (there is no default): the firmware holds its 10 A ceiling at 0, so the field stays
-// off with no off-reason of its own (ctrlLimiter reads 15). False until the first CSV3 frame says otherwise.
+// The firmware's CSV3 FieldResDefault: 1 while the skipped-test 2 ohm default stands in (12 V, nothing measured).
+function fieldResDefaultIn(c3) { return !!c3 && Number(c3.FieldResDefault) === 1; }
+// No Field Resistance measured and no 12 V skipped-test default: the firmware holds its 10 A ceiling at 0, so the field
+// stays off with no off-reason of its own (ctrlLimiter reads 15). False until the first CSV3 frame says otherwise.
 function fieldResMissing() {
     const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
-    return !!c3 && c3.FieldResistance !== undefined && !Number.isFinite(Number(c3.FieldResistance));
+    return !!c3 && c3.FieldResistance !== undefined && !Number.isFinite(Number(c3.FieldResistance)) && !fieldResDefaultIn(c3);
 }
 const FIELD_RES_MISSING_TXT = 'Field Resistance not measured: the field stays off until it is (Setup ▸ Alternator ▸ Basic ▸ Output Control ▸ Field Resistance ▸ Measure)';
-const FIELD_RES_WHERE = 'Setup ▸ Alternator ▸ Basic ▸ Output Control ▸ Field Resistance ▸ Measure runs the field resistance test, with the engine off. Commissioning runs it too, right after the Prerequisites screen.';
+const FIELD_RES_WHERE = 'Setup ▸ Alternator ▸ Basic ▸ Output Control ▸ Field Resistance ▸ Measure runs the field resistance test, with the engine off. Commissioning runs it too, right after the Prerequisites screen. A 12 V system with no battery shunt can skip the test there and use 2\u00a0Ω.';
 
 function fieldOffReasonUpdate(fieldActiveStatus, reasonCode) {
     window._lastFieldEventReason = reasonCode;   // cached fresh (CSV1) for the commissioning field-step gate

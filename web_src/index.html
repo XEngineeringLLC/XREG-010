@@ -1627,7 +1627,8 @@
                     <span class="tooltip">ℹ️<span class="tooltip-box">Not a setting. The board's field drive
                         is rated 10 A, and this is the duty that gives 10 A of field current at the present system
                         voltage. Field current is estimated from Field Resistance (measured by the field resistance test),
-                        corrected for alternator temperature, so this ceiling is only as good as that measurement.</span></span>
+                        corrected for alternator temperature, so this ceiling is only as good as that measurement. With
+                        the 2&nbsp;Ω default on a 12 V system that skipped the test, it never comes into play.</span></span>
                   </div>
                 </div>
 
@@ -1675,7 +1676,9 @@
                         drive-heat protection are all built on this number. An ohmmeter reading through the brushes
                         reads high, and a high number lets the field run harder than those limits intend, so type
                         only a result from the test here, with the alternator temperature the test showed for it:
-                        the regulator corrects the resistance from that temperature.</span></span>
+                        the regulator corrects the resistance from that temperature. A 12 V system with no battery
+                        shunt can skip the test from Measure: the regulator then uses 2&nbsp;Ω, which changes nothing but the
+                        accuracy of the Field Amps reading.</span></span>
                   </div>
                   <div class="form-input" style="flex-wrap:wrap;">
                     <form action="/get" method="GET" target="hidden-form" onsubmit="return fieldResTypedSubmit(this)">
@@ -3898,7 +3901,7 @@
                     <div class="metric-row telemetry-row">
                       <span class="metric-label telemetry-label">Field Curr
                         <span class="tooltip">ℹ️
-                          <span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps2">?</span> Ω, measured by the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe.</span>
+                          <span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps2">?</span> Ω, from the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe. On a 12 V system that skipped the test it uses 2&nbsp;Ω, so it is only approximate.</span>
                         </span>
                       </span>
                       <span class="metric-value telemetry-value"><span id="FieldAmpsID2">?</span>&nbsp;A</span>
@@ -7893,7 +7896,7 @@
               <div class="form-row">
                 <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                   <span>Battery Voltage Source (<span id="BatteryVoltageSource_echo">?</span>):</span>
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Chooses the battery voltage used to decide bulk, absorption, float, and rebulk. The onboard INA228 always drives the control loops and protections. Choose an external source if the Regulator Ground Wire is longer than 6 ft or smaller than 12 AWG; the regulator falls back to the onboard sensor whenever the external source is stale.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Chooses the battery voltage used to decide bulk, absorption, float, and rebulk. The onboard INA228 always drives the control loops and protections. Choose an external source if the Regulator Ground Wire is longer than 6 ft, smaller than 12 AWG, or if there&rsquo;s a shunt in the negative lead not connected to the regulator via Cable 2 pins 9 and 10; the regulator falls back to the onboard sensor whenever the external source is stale.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -10886,7 +10889,7 @@
             <div class="metric-row">
               <span class="metric-label" style="display:flex;align-items:center;gap:4px;">
                 Field Amps (Calc'd)
-                <span class="tooltip">ℹ️<span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps">?</span> Ω, measured by the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe.</span></span>
+                <span class="tooltip">ℹ️<span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps">?</span> Ω, from the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe. On a 12 V system that skipped the test it uses 2&nbsp;Ω, so it is only approximate.</span></span>
               </span>
               <span class="metric-value"><span id="FieldAmpsID">0</span>&nbsp;A</span>
             </div>
@@ -10900,6 +10903,7 @@
         </div> <!-- closes .grid -->
 
         <!-- TEMP-FIELDCHECK BEGIN: TEMPORARY field-current validation panel. REMOVE after the validation drive (grep -rn TEMP-FIELDCHECK). -->
+        <!--
         <div class="card-group" id="fieldCheckPanel" style="margin-top:10px;">
           <p class="card-group-title">Field Current Check (temporary)</p>
           <p style="margin:0 0 8px; font-size:13px; opacity:0.8;">Type the meter's field amps and press Submit. Submit with the box empty marks the moment. The regulator also logs a row every 10 s and keeps about the last hour.</p>
@@ -10912,6 +10916,7 @@
           <div id="fcLast" style="margin-top:8px; font-size:14px; font-variant-numeric:tabular-nums;"></div>
           <div id="fcStatus" style="margin-top:4px; font-size:12px; opacity:0.7;"></div>
         </div>
+        -->
         <!-- TEMP-FIELDCHECK END -->
 
         <!-- ===== STATISTICS (health/life/charging-health items live in Live Data → Diag) ===== -->

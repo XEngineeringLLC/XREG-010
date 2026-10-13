@@ -1152,22 +1152,24 @@ void updateFieldVoltCeiling(float busV, float dtSec) {
 // heat scan restarts when the die moved 0.25 K, the bus 0.1 V, Rc 0.1 % (~0.3 K of alternator temperature) or a setting
 // changed, at most once a second, and runs FD_SCAN_SLICE grid points per pass. A ceiling that falls is applied at once;
 // one that rises waits for the volts term's 0.5-point deadband. A die reading that is not valid holds the last heat
-// ceiling; REASON_DIE_TEMP_LOST is what ends that after 10 s. No resistance entered: the 10 A ceiling is 0 (field off).
-// Also keeps the time-at-ceiling counters.
+// ceiling; REASON_DIE_TEMP_LOST is what ends that after 10 s. No resistance measured and no 12 V skipped-test default
+// (fieldResDefaultInUse): the 10 A ceiling is 0 (field off). Also keeps the time-at-ceiling counters.
 void updateFieldDerateCeilings(float dtSec, bool busUnmeasured) {
   const bool dirty = g_fieldDerateDirty;   // cleared only when a scan starts, so a change made while the die is invalid still lands
 
-  const bool rKnown = isfinite(FieldResistance) && FieldResistance > 0.0f;
+  const bool rMeasured = isfinite(FieldResistance) && FieldResistance > 0.0f;
+  const bool rDefault = !rMeasured && fieldResDefaultInUse();
+  const bool rKnown = rMeasured || rDefault;
   const float tpF = n2kAltTempF();
   const float tpC = isfinite(tpF) ? (tpF - 32.0f) / 1.8f : NAN;
   const float trefC = isfinite(FieldResTrefC) ? FieldResTrefC : FD_TREF_DEF_C;
-  g_fieldRcOhm = rKnown ? fdRcOhm(fmaxf(FieldResistance, 0.05f), tpC, trefC) : NAN;
+  g_fieldRcOhm = rMeasured ? fdRcOhm(fmaxf(FieldResistance, 0.05f), tpC, trefC) : rDefault ? FD_SKIP_R_OHM : NAN;
   const float V = (busUnmeasured || g_fieldVoltBusFilt <= 0.0f) ? fmaxf(fieldCeilAssumedBusV(), g_fieldVoltBusFilt)
                                                                  : g_fieldVoltBusFilt;
   float cur = rKnown ? fdCurCeilPct(g_fieldRcOhm, V) : 0.0f;
   if (!rKnown && !g_fieldResMissingSaid) {
     g_fieldResMissingSaid = true;
-    queueConsoleMessage("Field Resistance has not been measured: the 10 A field ceiling cannot be calculated, so the field stays off until it is (the Field Resistance test after the commissioning Prerequisites screen, or Setup > Alternator > Basic > Output Control > Measure)");
+    queueConsoleMessage("Field Resistance has not been measured: the 10 A field ceiling cannot be calculated, so the field stays off until it is (the Field Resistance test after the commissioning Prerequisites screen, or Setup > Alternator > Basic > Output Control > Measure; a 12 V system with no battery shunt can skip the test there)");
   } else if (rKnown) {
     g_fieldResMissingSaid = false;
   }
@@ -3491,7 +3493,7 @@ void AdjustFieldLearnMode() {
   // Above every early-return below (fresh-CH1 gate, limp home, immediate cuts) so lifetime OV
   // dwell accumulates in all modes. RAW voltage on purpose — filtered smears ~100ms spikes.
   updateOvHistogram(tick.currentBatteryVoltage, tick.nowMs);
-  fieldCheck_tick(currentMillis, tick.currentBatteryVoltage);  // TEMP-FIELDCHECK
+  // fieldCheck_tick(currentMillis, tick.currentBatteryVoltage);  // TEMP-FIELDCHECK
   uint32_t aflM1 = micros();  // end of section 1: RPM tables + tick snapshot
 
   // Runs every tick in every mode (not just AUTO): an over-temp event drops to SYS_MODE_FAULT,
@@ -10504,118 +10506,118 @@ void pidLog_tick(uint32_t nowMs) {
 }
 
 // ===== TEMP-FIELDCHECK BEGIN: TEMPORARY field-current validation log (see the Xregulator.ino block). REMOVE after the drive. =====
-void fieldCheck_init() {
-  fc = (FcStore *)heap_caps_malloc(sizeof(FcStore), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (fc) {
-    memset(fc, 0, sizeof(FcStore));
-    fc->row.clear();
-    for (int i = 0; i < FC_SEC_N; i++) fc->sec[i].clear();
-  }
-  Serial.printf("fieldCheck: %u entries x %u bytes, %u KB PSRAM %s\n", (unsigned)FC_RING_N, (unsigned)sizeof(FcRec),
-                (unsigned)(sizeof(FcStore) / 1024), fc ? "OK" : "FAILED");
-}
+// void fieldCheck_init() {
+//   fc = (FcStore *)heap_caps_malloc(sizeof(FcStore), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+//   if (fc) {
+//     memset(fc, 0, sizeof(FcStore));
+//     fc->row.clear();
+//     for (int i = 0; i < FC_SEC_N; i++) fc->sec[i].clear();
+//   }
+//   Serial.printf("fieldCheck: %u entries x %u bytes, %u KB PSRAM %s\n", (unsigned)FC_RING_N, (unsigned)sizeof(FcRec),
+//                 (unsigned)(sizeof(FcStore) / 1024), fc ? "OK" : "FAILED");
+// }
 
-// busV = the voltage the Field Amps estimate is computed from (updateFieldTelemetry's argument).
-void fieldCheck_tick(uint32_t now, float busV) {
-  if (!fc) return;
-  // Lambdas, not functions: the sketch prototyper would declare FcRec functions above the struct.
-  auto fcFill = [](FcRec &r, uint8_t kind, uint32_t now, const FcAcc &a) {
-    r.ms = now;
-    r.kind = kind;
-    r.mode = (uint8_t)sysMode;
-    r.lim = ctrlLimiter;
-    r.bind = g_fieldCeilBind;
-    r.stage = getChargeStageDisplayCode();
-    r.fieldOn = gpio4IsLow ? 0 : 1;
-    r.frtRun = (frt.state == FRT_RUNNING) ? 1 : 0;
-    r.pad = 0;
-    r.meterA = NAN;
-    r.estAvg = a.est.avg();    r.estMin = a.est.lo();    r.estMax = a.est.hi();
-    r.dutyAvg = a.duty.avg();  r.dutyMin = a.duty.lo();  r.dutyMax = a.duty.hi();
-    r.vAvg = a.volts.avg();    r.vMin = a.volts.lo();    r.vMax = a.volts.hi();
-    r.rc = g_fieldRcOhm;
-    r.r = FieldResistance;
-    r.trefC = FieldResTrefC;
-    r.probeF = n2kAltTempF();
-    r.dieF = g_fdDieTempF;
-    r.rpm = a.rpm.avg();
-    r.altA = a.altA.avg();
-    r.battA = a.battA.avg();
-    r.curCeil = g_fieldCurDutyCeil;
-    r.heatCeil = g_fieldHeatDutyCeil;
-  };
-  auto fcPush = [](const FcRec &r) {
-    portENTER_CRITICAL(&fcMux);
-    fc->ring[fcHead] = r;
-    fcHead = (uint16_t)((fcHead + 1) % FC_RING_N);
-    if (fcCount < FC_RING_N) fcCount++;
-    portEXIT_CRITICAL(&fcMux);
-  };
-  FcAcc &row = fc->row;
-  FcAcc *sec = fc->sec;
-  static uint8_t secIdx = 0;
-  static uint32_t lastSampleMs = 0, rowStartMs = 0, secStartMs = 0;
-  static bool started = false;
-  if (!started) {
-    rowStartMs = secStartMs = lastSampleMs = now;
-    started = true;
-  }
+// // busV = the voltage the Field Amps estimate is computed from (updateFieldTelemetry's argument).
+// void fieldCheck_tick(uint32_t now, float busV) {
+//   if (!fc) return;
+//   // Lambdas, not functions: the sketch prototyper would declare FcRec functions above the struct.
+//   auto fcFill = [](FcRec &r, uint8_t kind, uint32_t now, const FcAcc &a) {
+//     r.ms = now;
+//     r.kind = kind;
+//     r.mode = (uint8_t)sysMode;
+//     r.lim = ctrlLimiter;
+//     r.bind = g_fieldCeilBind;
+//     r.stage = getChargeStageDisplayCode();
+//     r.fieldOn = gpio4IsLow ? 0 : 1;
+//     r.frtRun = (frt.state == FRT_RUNNING) ? 1 : 0;
+//     r.pad = 0;
+//     r.meterA = NAN;
+//     r.estAvg = a.est.avg();    r.estMin = a.est.lo();    r.estMax = a.est.hi();
+//     r.dutyAvg = a.duty.avg();  r.dutyMin = a.duty.lo();  r.dutyMax = a.duty.hi();
+//     r.vAvg = a.volts.avg();    r.vMin = a.volts.lo();    r.vMax = a.volts.hi();
+//     r.rc = g_fieldRcOhm;
+//     r.r = FieldResistance;
+//     r.trefC = FieldResTrefC;
+//     r.probeF = n2kAltTempF();
+//     r.dieF = g_fdDieTempF;
+//     r.rpm = a.rpm.avg();
+//     r.altA = a.altA.avg();
+//     r.battA = a.battA.avg();
+//     r.curCeil = g_fieldCurDutyCeil;
+//     r.heatCeil = g_fieldHeatDutyCeil;
+//   };
+//   auto fcPush = [](const FcRec &r) {
+//     portENTER_CRITICAL(&fcMux);
+//     fc->ring[fcHead] = r;
+//     fcHead = (uint16_t)((fcHead + 1) % FC_RING_N);
+//     if (fcCount < FC_RING_N) fcCount++;
+//     portEXIT_CRITICAL(&fcMux);
+//   };
+//   FcAcc &row = fc->row;
+//   FcAcc *sec = fc->sec;
+//   static uint8_t secIdx = 0;
+//   static uint32_t lastSampleMs = 0, rowStartMs = 0, secStartMs = 0;
+//   static bool started = false;
+//   if (!started) {
+//     rowStartMs = secStartMs = lastSampleMs = now;
+//     started = true;
+//   }
 
-  if ((uint32_t)(now - lastSampleMs) >= FC_SAMPLE_MS) {
-    lastSampleMs = now;
-    if ((uint32_t)(now - secStartMs) >= 1000) {
-      secStartMs = now;
-      secIdx = (uint8_t)((secIdx + 1) % FC_SEC_N);
-      sec[secIdx].clear();
-    }
-    const float batt = getBatteryCurrent();
-    FcAcc *dst[2] = { &row, &sec[secIdx] };
-    for (FcAcc *a : dst) {
-      a->est.add(iiout);
-      a->duty.add(dutyCycle);
-      a->volts.add(busV);
-      a->rpm.add(RPM);
-      a->altA.add(MeasuredAmps);
-      a->battA.add(batt);
-    }
-  }
+//   if ((uint32_t)(now - lastSampleMs) >= FC_SAMPLE_MS) {
+//     lastSampleMs = now;
+//     if ((uint32_t)(now - secStartMs) >= 1000) {
+//       secStartMs = now;
+//       secIdx = (uint8_t)((secIdx + 1) % FC_SEC_N);
+//       sec[secIdx].clear();
+//     }
+//     const float batt = getBatteryCurrent();
+//     FcAcc *dst[2] = { &row, &sec[secIdx] };
+//     for (FcAcc *a : dst) {
+//       a->est.add(iiout);
+//       a->duty.add(dutyCycle);
+//       a->volts.add(busV);
+//       a->rpm.add(RPM);
+//       a->altA.add(MeasuredAmps);
+//       a->battA.add(batt);
+//     }
+//   }
 
-  uint32_t seq;
-  uint8_t kind;
-  float amps;
-  portENTER_CRITICAL(&fcMux);
-  seq = fcReqSeq;
-  kind = fcReqKind;
-  amps = fcReqAmps;
-  portEXIT_CRITICAL(&fcMux);
-  if (seq != fcDoneSeq) {
-    FcAcc w;
-    w.clear();
-    for (int i = 0; i < FC_SEC_N; i++) w.merge(sec[i]);
-    FcRec r;
-    fcFill(r, kind, now, w);
-    r.meterA = (kind == FC_KIND_METER) ? amps : NAN;
-    fcPush(r);
-    portENTER_CRITICAL(&fcMux);
-    fc->last = r;
-    fcEntries++;
-    fcDoneSeq = seq;
-    portEXIT_CRITICAL(&fcMux);
-    if (kind == FC_KIND_METER)
-      queueConsoleMessageF("Field check: meter %.2f A, estimate %.2f A (%.2f to %.2f over the last 5 s), meter minus estimate %+.2f A",
-                           r.meterA, r.estAvg, r.estMin, r.estMax, r.meterA - r.estAvg);
-    else
-      queueConsoleMessageF("Field check: mark, estimate %.2f A", r.estAvg);
-  }
+//   uint32_t seq;
+//   uint8_t kind;
+//   float amps;
+//   portENTER_CRITICAL(&fcMux);
+//   seq = fcReqSeq;
+//   kind = fcReqKind;
+//   amps = fcReqAmps;
+//   portEXIT_CRITICAL(&fcMux);
+//   if (seq != fcDoneSeq) {
+//     FcAcc w;
+//     w.clear();
+//     for (int i = 0; i < FC_SEC_N; i++) w.merge(sec[i]);
+//     FcRec r;
+//     fcFill(r, kind, now, w);
+//     r.meterA = (kind == FC_KIND_METER) ? amps : NAN;
+//     fcPush(r);
+//     portENTER_CRITICAL(&fcMux);
+//     fc->last = r;
+//     fcEntries++;
+//     fcDoneSeq = seq;
+//     portEXIT_CRITICAL(&fcMux);
+//     if (kind == FC_KIND_METER)
+//       queueConsoleMessageF("Field check: meter %.2f A, estimate %.2f A (%.2f to %.2f over the last 5 s), meter minus estimate %+.2f A",
+//                            r.meterA, r.estAvg, r.estMin, r.estMax, r.meterA - r.estAvg);
+//     else
+//       queueConsoleMessageF("Field check: mark, estimate %.2f A", r.estAvg);
+//   }
 
-  if ((uint32_t)(now - rowStartMs) >= FC_ROW_MS) {
-    rowStartMs = now;
-    FcRec r;
-    fcFill(r, FC_KIND_ROW, now, row);
-    fcPush(r);
-    row.clear();
-  }
-}
+//   if ((uint32_t)(now - rowStartMs) >= FC_ROW_MS) {
+//     rowStartMs = now;
+//     FcRec r;
+//     fcFill(r, FC_KIND_ROW, now, row);
+//     fcPush(r);
+//     row.clear();
+//   }
+// }
 // ===== TEMP-FIELDCHECK END =====
 
 void thermalLog_init() {

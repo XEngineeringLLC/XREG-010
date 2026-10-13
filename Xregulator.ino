@@ -1831,8 +1831,12 @@ float targetCurrent;                          // This is used in the field adjus
 float IBV;                                    // Ina 228 battery voltage
 float IBVMax = 6;                             // used to track maximum battery voltage (NVS-persisted, shown on dashboard)
 float dutyCycle;                              // Field outout %--- this is just what's transmitted over Wifi (case sensitive)
-float FieldResistance = NAN;                  // Field resistance in ohms, usually 2 to 6, changes 10-20% with temp. NAN = never entered: no default (owner 2026-10-10); the 10 A ceiling then holds the field off
+float FieldResistance = NAN;                  // Field resistance in ohms, usually 2 to 6, changes 10-20% with temp. NAN = never measured: the 10 A ceiling then holds the field off, unless FieldResDefault applies
 float FieldResTrefC = NAN;                    // alternator temperature (°C) recorded when FieldResistance was last written; NAN = never recorded (the math then assumes 30 °C)
+bool FieldResDefault = false;                 // the owner skipped the test for FD_SKIP_R_OHM (12 V with no battery shunt only, owner 2026-10-13); counts only while nothing is measured and the class is 12 V (fieldResDefaultInUse)
+// Field resistance a 12 V owner with no battery shunt may take instead of the test. Used flat, with no temperature credit and no
+// FD_MARGIN: then the 10 A ceiling stays above 124 % duty up to 16 V and the heat law trims only above a 90 C INA228 die.
+#define FD_SKIP_R_OHM 2.0f
 
 // Field resistance test (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1): engine off, the field held at a few field
 // voltages, the current at each read from the battery-current step (shunt) or the owner's meter. Here because the
@@ -5056,45 +5060,46 @@ float thermalPenaltyAmps = 0.0f;    // temperature loop output: amps subtracted 
 // block tagged TEMP-FIELDCHECK (grep -rn TEMP-FIELDCHECK: Xregulator.ino, 3_functions.ino, 6_functions.ino, web_src/index.html,
 // web_src/script.js). Plan: d5_thermal_model/README.md, "FIELD DERATE - SPEC", "Validation drive". A row every 10 s plus each meter
 // reading the owner types in Live Data > Alternator, so a moment the estimate (iiout) read below the meter can be found later.
-#define FC_ROW_MS     10000   // one row per 10 s
-#define FC_SAMPLE_MS  100     // averages are fed at 10 Hz
-#define FC_SEC_N      6       // 1 s buckets behind an owner entry: the last 5 whole seconds plus the current one (the meter is slow)
-#define FC_RING_N     512     // 360 rows = 1 h, plus room for entries
-#define FC_KIND_ROW   0
-#define FC_KIND_METER 1
-#define FC_KIND_MARK  2
-struct FcStat {
-  uint16_t n; float s, mn, mx;
-  void clear() { n = 0; s = 0.0f; mn = INFINITY; mx = -INFINITY; }
-  void add(float v) { if (!isfinite(v)) return; n++; s += v; if (v < mn) mn = v; if (v > mx) mx = v; }
-  void merge(const FcStat &o) { if (!o.n) return; n += o.n; s += o.s; if (o.mn < mn) mn = o.mn; if (o.mx > mx) mx = o.mx; }
-  float avg() const { return n ? s / n : NAN; }
-  float lo() const { return n ? mn : NAN; }
-  float hi() const { return n ? mx : NAN; }
-};
-struct FcAcc {
-  FcStat est, duty, volts, rpm, altA, battA;
-  void clear() { est.clear(); duty.clear(); volts.clear(); rpm.clear(); altA.clear(); battA.clear(); }
-  void merge(const FcAcc &o) { est.merge(o.est); duty.merge(o.duty); volts.merge(o.volts); rpm.merge(o.rpm); altA.merge(o.altA); battA.merge(o.battA); }
-};
-struct FcRec {
-  uint32_t ms;
-  uint8_t kind, mode, lim, bind, stage, fieldOn, frtRun, pad;
-  float meterA;
-  float estAvg, estMin, estMax, dutyAvg, dutyMin, dutyMax, vAvg, vMin, vMax;
-  float rc, r, trefC, probeF, dieF, rpm, altA, battA, curCeil, heatCeil;
-};
-struct FcStore {
-  FcRec ring[FC_RING_N];
-  FcRec last;                            // the latest entry, for the panel
-  FcAcc row, sec[FC_SEC_N];              // Core 1 only
-};
-FcStore *fc = nullptr;                   // one PSRAM block; ring, last and the fields below are guarded by fcMux (written on Core 1, read by the web task)
-uint16_t fcHead = 0, fcCount = 0, fcEntries = 0;
-portMUX_TYPE fcMux = portMUX_INITIALIZER_UNLOCKED;
-uint32_t fcReqSeq = 0, fcDoneSeq = 0;    // the web handler bumps fcReqSeq; the control tick records the entry and catches fcDoneSeq up
-uint8_t fcReqKind = FC_KIND_MARK;
-float fcReqAmps = NAN;
+// Disabled 2026-10-13 by commenting out every TEMP-FIELDCHECK block, not deleting them; uncomment all of them together to restore.
+// #define FC_ROW_MS     10000   // one row per 10 s
+// #define FC_SAMPLE_MS  100     // averages are fed at 10 Hz
+// #define FC_SEC_N      6       // 1 s buckets behind an owner entry: the last 5 whole seconds plus the current one (the meter is slow)
+// #define FC_RING_N     512     // 360 rows = 1 h, plus room for entries
+// #define FC_KIND_ROW   0
+// #define FC_KIND_METER 1
+// #define FC_KIND_MARK  2
+// struct FcStat {
+//   uint16_t n; float s, mn, mx;
+//   void clear() { n = 0; s = 0.0f; mn = INFINITY; mx = -INFINITY; }
+//   void add(float v) { if (!isfinite(v)) return; n++; s += v; if (v < mn) mn = v; if (v > mx) mx = v; }
+//   void merge(const FcStat &o) { if (!o.n) return; n += o.n; s += o.s; if (o.mn < mn) mn = o.mn; if (o.mx > mx) mx = o.mx; }
+//   float avg() const { return n ? s / n : NAN; }
+//   float lo() const { return n ? mn : NAN; }
+//   float hi() const { return n ? mx : NAN; }
+// };
+// struct FcAcc {
+//   FcStat est, duty, volts, rpm, altA, battA;
+//   void clear() { est.clear(); duty.clear(); volts.clear(); rpm.clear(); altA.clear(); battA.clear(); }
+//   void merge(const FcAcc &o) { est.merge(o.est); duty.merge(o.duty); volts.merge(o.volts); rpm.merge(o.rpm); altA.merge(o.altA); battA.merge(o.battA); }
+// };
+// struct FcRec {
+//   uint32_t ms;
+//   uint8_t kind, mode, lim, bind, stage, fieldOn, frtRun, pad;
+//   float meterA;
+//   float estAvg, estMin, estMax, dutyAvg, dutyMin, dutyMax, vAvg, vMin, vMax;
+//   float rc, r, trefC, probeF, dieF, rpm, altA, battA, curCeil, heatCeil;
+// };
+// struct FcStore {
+//   FcRec ring[FC_RING_N];
+//   FcRec last;                            // the latest entry, for the panel
+//   FcAcc row, sec[FC_SEC_N];              // Core 1 only
+// };
+// FcStore *fc = nullptr;                   // one PSRAM block; ring, last and the fields below are guarded by fcMux (written on Core 1, read by the web task)
+// uint16_t fcHead = 0, fcCount = 0, fcEntries = 0;
+// portMUX_TYPE fcMux = portMUX_INITIALIZER_UNLOCKED;
+// uint32_t fcReqSeq = 0, fcDoneSeq = 0;    // the web handler bumps fcReqSeq; the control tick records the entry and catches fcDoneSeq up
+// uint8_t fcReqKind = FC_KIND_MARK;
+// float fcReqAmps = NAN;
 // ===== TEMP-FIELDCHECK END =====
 // ===== THERMAL LOG (PSRAM circular buffer) =====
 #define THERMAL_LOG_SIZE 3600  // covers 2 hours at 0.5 Hz (halved from 7200/1Hz to reclaim ~183 KB PSRAM for cvLog)
@@ -6701,7 +6706,7 @@ void setup() {
   pidLog_init();
   cvLog_init();
   tuningScore_init();
-  fieldCheck_init();  // TEMP-FIELDCHECK
+  // fieldCheck_init();  // TEMP-FIELDCHECK
   // Post-allocation PSRAM baseline: largest contiguous block matters as much as total —
   // cvLog's 333 KB is one heap_caps_malloc, so total-free can look fine while it can't fit.
   Serial.printf("PSRAM after setup: %u KB free / %u KB total, largest block %u KB\n",

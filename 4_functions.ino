@@ -2031,9 +2031,10 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     RPMScalingFactor = settingRead(NK_RPMScalingFactor).toInt();
   }
-  // Neither key is seeded: the owner must enter the resistance (no default, owner 2026-10-10). Entered = both keys, as the
-  // /get handler writes them; a resistance without its recorded temperature (the old firmware seed) counts as never entered,
-  // like a value outside the handler's range.
+  // Neither key is seeded: the owner measures the resistance, or on a 12 V system with no battery shunt may skip the test
+  // for the 2 ohm default (FieldResDefault, owner 2026-10-13). Entered = both keys, as the /get handler writes them; a
+  // resistance without its recorded temperature (the old firmware seed) counts as never entered, like a value outside the
+  // handler's range.
   if (settingExists(NK_FieldResistance) && settingExists(NK_FieldResTrefC)) {
     const float r = settingRead(NK_FieldResistance).toFloat();
     const float t = settingRead(NK_FieldResTrefC).toFloat();
@@ -2042,6 +2043,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
       FieldResTrefC = t;
     }
   }
+  FieldResDefault = settingExists(NK_FieldResDefault) && settingRead(NK_FieldResDefault).toInt() == 1;
   if (!settingExists(NK_FieldWiring)) {
     settingWrite(NK_FieldWiring, String(FieldWiring).c_str());
   } else {

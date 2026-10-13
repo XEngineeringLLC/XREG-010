@@ -33,18 +33,49 @@ float fieldResProbeC() {
 
 // The one writer of a Field Resistance: a typed entry (/get, with the temperature it was measured at, typed=true) and the
 // field resistance test (/fieldResTest save=1, the probe at its start). The coil-temperature credit is relative to that
-// temperature. 30 C when there is none.
+// temperature. 30 C when there is none. A measured value ends the skipped-test default.
 void fieldResRecord(float r, float probeC, bool typed) {
   FieldResistance = r;
   settingWrite(NK_FieldResistance, String(FieldResistance, 3).c_str());
   FieldResTrefC = isfinite(probeC) ? probeC : 30.0f;
   settingWrite(NK_FieldResTrefC, String(FieldResTrefC, 1).c_str());
+  if (FieldResDefault) {
+    FieldResDefault = false;
+    settingWrite(NK_FieldResDefault, "0");
+  }
   g_fieldDerateDirty = true;
   stateRevision++;
   settingsDirty = true;
   if (isfinite(probeC)) queueConsoleMessageF("Field Resistance %.3f ohm recorded at %.0f%s %s", FieldResistance, dispTempF(probeC * 1.8f + 32.0f), dispTempUnit(),
                                              typed ? "as entered" : "from the alternator probe");
   else queueConsoleMessageF("Field Resistance %.3f ohm: no alternator temperature reading, %.0f%s assumed", FieldResistance, dispTempF(86.0f), dispTempUnit());
+}
+
+// The test may be skipped for the FD_SKIP_R_OHM default only on a 12 V system with no battery shunt (owner 2026-10-13):
+// there the default cannot bring either field ceiling into play, and without a shunt the test needs a meter.
+bool fieldResSkipAllowed() {
+  return SYSTEM_VOLTAGE_CLASS == 12 && !HAS_BATT_SHUNT;
+}
+
+// The default stands in only while nothing is measured, and only on a 12 V class: a class change strands it, so the field
+// waits for a measurement as it does with nothing recorded.
+bool fieldResDefaultInUse() {
+  return FieldResDefault && SYSTEM_VOLTAGE_CLASS == 12 && !(isfinite(FieldResistance) && FieldResistance > 0.0f);
+}
+
+// /fieldResTest skip=1: the owner's explicit choice on the test screen, so it may write flash. The measured pair is removed,
+// so one value is in force.
+void fieldResUseDefault() {
+  FieldResistance = NAN;
+  FieldResTrefC = NAN;
+  settingRemove(NK_FieldResistance);
+  settingRemove(NK_FieldResTrefC);
+  FieldResDefault = true;
+  settingWrite(NK_FieldResDefault, "1");
+  g_fieldDerateDirty = true;
+  stateRevision++;
+  settingsDirty = true;
+  queueConsoleMessageF("Field Resistance test skipped: the regulator uses %.0f ohm (12 V system, no battery shunt). Charging and protection are unchanged; only the Field Amps reading is approximate", FD_SKIP_R_OHM);
 }
 
 // Why a field resistance test may not start now, or nullptr. Read on the web task; the control pass starts the run.
@@ -885,7 +916,7 @@ enum Csv4Index {
 // backslash and truncates the macro, and every expansion truncates together and consistently --
 // so the count/order gate in compress_web.sh cannot see it. The static_assert on
 // CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 445
+#define CSV3_EXPECTED_FIELDS 446
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -1333,6 +1364,7 @@ enum Csv4Index {
   X(ShutdownRampTauS, "%d", SafeInt(ShutdownRampTauS, 100))                                                      /* shutdown ramp proportional decay time constant, s x100 */ \
   X(NoOutputAmps, "%d", SafeInt(NoOutputAmps, 100))                                                              /* alternator amps at or below this = no output, A x100 */ \
   X(FieldResTrefC, "%d", SafeInt(FieldResTrefC, 10))                                                              /* alternator temperature recorded with FieldResistance, C x10; ROLL_EMPTY = never recorded (Prerequisites gate) */ \
+  X(FieldResDefault, "%d", fieldResDefaultInUse() ? 1 : 0)                                                         /* 1 = the skipped-test 2 ohm default is in use (12 V, nothing measured); the stored flag is NK_FieldResDefault */ \
   X(FieldWiring, "%d", SafeInt(FieldWiring))                                                                       /* field wiring for the drive-heat limit: 0 not set, 1 P-type, 2 N-type */ \
   X(ShuntLead, "%d", SafeInt(ShuntLead))                                                                           /* shunt location: 0 not set, 1 negative lead (IBV corrected), 2 positive lead */ \
   X(sessionId, "%u", (unsigned)g_sessionId)                                                                   /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
@@ -4075,134 +4107,134 @@ void setupServer() {
   // ===== TEMP-FIELDCHECK BEGIN: TEMPORARY field-current validation log (see the Xregulator.ino block). REMOVE after the drive. =====
   // /fieldcheck?amps=<A> records a meter reading, ?mark=1 a mark; both answer {ok, seq} and the control tick records the entry
   // on its next pass (fcDoneSeq catches up). No arguments: the panel's status.
-  server.on("/fieldcheck", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!fc) { request->send(200, "application/json", "{\"ok\":0,\"err\":\"no log buffer\"}"); return; }
-    char buf[512];
-    const bool isAmps = request->hasParam("amps"), isMark = request->hasParam("mark");
-    if (isAmps || isMark) {
-      float a = NAN;
-      if (isAmps) {
-        const String v = request->getParam("amps")->value();
-        char *end = nullptr;
-        a = strtof(v.c_str(), &end);
-        if (end == v.c_str() || !(a >= 0.0f && a <= 30.0f)) {
-          request->send(400, "application/json", "{\"ok\":0,\"err\":\"amps must be a number from 0 to 30\"}");
-          return;
-        }
-      }
-      uint32_t seq;
-      portENTER_CRITICAL(&fcMux);
-      fcReqKind = isAmps ? FC_KIND_METER : FC_KIND_MARK;
-      fcReqAmps = a;
-      seq = ++fcReqSeq;
-      portEXIT_CRITICAL(&fcMux);
-      snprintf(buf, sizeof(buf), "{\"ok\":1,\"seq\":%lu}", (unsigned long)seq);
-      request->send(200, "application/json", buf);
-      return;
-    }
-    FcRec last;
-    uint16_t n, ent;
-    uint32_t done, oldMs = 0, newMs = 0;
-    portENTER_CRITICAL(&fcMux);
-    last = fc->last;
-    n = fcCount;
-    ent = fcEntries;
-    done = fcDoneSeq;
-    if (n) {
-      oldMs = fc->ring[(fcHead + FC_RING_N - n) % FC_RING_N].ms;
-      newMs = fc->ring[(fcHead + FC_RING_N - 1) % FC_RING_N].ms;
-    }
-    portEXIT_CRITICAL(&fcMux);
-    auto num = [](char *p, size_t cap, const char *key, float v, int prec) -> int {
-      return isfinite(v) ? snprintf(p, cap, ",\"%s\":%.*f", key, prec, v) : snprintf(p, cap, ",\"%s\":null", key);
-    };
-    int pos = snprintf(buf, sizeof(buf), "{\"ok\":1,\"n\":%u,\"entries\":%u,\"spanS\":%lu,\"seq\":%lu,\"last\":",
-                       (unsigned)n, (unsigned)ent, (unsigned long)((newMs - oldMs) / 1000UL), (unsigned long)done);
-    if (!ent) {
-      pos += snprintf(buf + pos, sizeof(buf) - pos, "null}");
-    } else {
-      pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"kind\":%u,\"ageS\":%lu", (unsigned)last.kind,
-                      (unsigned long)((uint32_t)(millis() - last.ms) / 1000UL));
-      pos += num(buf + pos, sizeof(buf) - pos, "meter", last.meterA, 2);
-      pos += num(buf + pos, sizeof(buf) - pos, "est", last.estAvg, 2);
-      pos += num(buf + pos, sizeof(buf) - pos, "estMin", last.estMin, 2);
-      pos += num(buf + pos, sizeof(buf) - pos, "estMax", last.estMax, 2);
-      pos += num(buf + pos, sizeof(buf) - pos, "dutyMin", last.dutyMin, 1);
-      pos += num(buf + pos, sizeof(buf) - pos, "dutyMax", last.dutyMax, 1);
-      pos += num(buf + pos, sizeof(buf) - pos, "vMin", last.vMin, 2);
-      pos += num(buf + pos, sizeof(buf) - pos, "vMax", last.vMax, 2);
-      pos += snprintf(buf + pos, sizeof(buf) - pos, "}}");
-    }
-    request->send(200, "application/json", buf);
-  });
-  // Oldest first. The first line is "#now_ms,<millis>" so the page can put a clock time on every row; it strips that line.
-  server.on("/fieldcheck.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
-    struct FcExp { uint16_t head, count, idx; uint8_t stage; bool done; char line[480]; int len, pos; };
-    FcExp st = {};
-    if (fc) {
-      portENTER_CRITICAL(&fcMux);
-      st.head = fcHead;
-      st.count = fcCount;
-      portEXIT_CRITICAL(&fcMux);
-    }
-    AsyncWebServerResponse *response = request->beginChunkedResponse("text/csv",
-      [st](uint8_t *buf, size_t maxLen, size_t) mutable -> size_t {
-        if (st.done) return 0;
-        size_t written = 0;
-        while (written < maxLen) {
-          if (st.pos >= st.len) {
-            if (st.stage == 0) {
-              st.len = snprintf(st.line, sizeof(st.line), "#now_ms,%lu\n", (unsigned long)millis());
-              st.stage = 1;
-            } else if (st.stage == 1) {
-              st.len = snprintf(st.line, sizeof(st.line),
-                                "kind,ms,meterA,meter_minus_estA,estA_avg,estA_min,estA_max,duty_avg,duty_min,duty_max,"
-                                "busV_avg,busV_min,busV_max,Rc_ohm,R_ohm,Tref_F,altTemp_F,boardTemp_F,rpm,altA,battA,"
-                                "ceil10A_pct,ceilHeat_pct,ceilBind,limitCode,mode,stage,fieldOn,fieldResTest\n");
-              st.stage = 2;
-            } else {
-              if (st.idx >= st.count) { st.done = true; return written; }
-              FcRec r;
-              portENTER_CRITICAL(&fcMux);
-              r = fc->ring[(st.head + FC_RING_N - st.count + st.idx) % FC_RING_N];
-              portEXIT_CRITICAL(&fcMux);
-              st.idx++;
-              // Blank cell for a value that was never read (NAN).
-              char *p = st.line;
-              size_t cap = sizeof(st.line);
-              auto cell = [&p, &cap](float v, int prec) {
-                int w = isfinite(v) ? snprintf(p, cap, ",%.*f", prec, v) : snprintf(p, cap, ",");
-                if (w > 0 && (size_t)w < cap) { p += w; cap -= w; }
-              };
-              static const char *const kinds[] = { "row", "meter", "mark" };
-              static const char *const modes[] = { "off", "manual", "auto", "fault" };
-              int w = snprintf(p, cap, "%s,%lu", r.kind < 3 ? kinds[r.kind] : "?", (unsigned long)r.ms);
-              p += w; cap -= w;
-              cell(r.meterA, 2);
-              cell(r.meterA - r.estAvg, 2);
-              cell(r.estAvg, 3); cell(r.estMin, 3); cell(r.estMax, 3);
-              cell(r.dutyAvg, 2); cell(r.dutyMin, 2); cell(r.dutyMax, 2);
-              cell(r.vAvg, 3); cell(r.vMin, 3); cell(r.vMax, 3);
-              cell(r.rc, 4); cell(r.r, 4); cell(r.trefC * 1.8f + 32.0f, 1);
-              cell(r.probeF, 1); cell(r.dieF, 1);
-              cell(r.rpm, 0); cell(r.altA, 1); cell(r.battA, 1);
-              cell(r.curCeil, 2); cell(r.heatCeil, 2);
-              w = snprintf(p, cap, ",%u,%u,%s,%u,%u,%u\n", (unsigned)r.bind, (unsigned)r.lim,
-                           r.mode < 4 ? modes[r.mode] : "?", (unsigned)r.stage, (unsigned)r.fieldOn, (unsigned)r.frtRun);
-              p += w;
-              st.len = (int)(p - st.line);
-            }
-            st.pos = 0;
-          }
-          size_t tw = min((size_t)(st.len - st.pos), maxLen - written);
-          memcpy(buf + written, st.line + st.pos, tw);
-          written += tw; st.pos += (int)tw;
-        }
-        return written;
-      });
-    response->addHeader("Cache-Control", "no-cache");
-    request->send(response);
-  });
+  // server.on("/fieldcheck", HTTP_GET, [](AsyncWebServerRequest *request) {
+  //   if (!fc) { request->send(200, "application/json", "{\"ok\":0,\"err\":\"no log buffer\"}"); return; }
+  //   char buf[512];
+  //   const bool isAmps = request->hasParam("amps"), isMark = request->hasParam("mark");
+  //   if (isAmps || isMark) {
+  //     float a = NAN;
+  //     if (isAmps) {
+  //       const String v = request->getParam("amps")->value();
+  //       char *end = nullptr;
+  //       a = strtof(v.c_str(), &end);
+  //       if (end == v.c_str() || !(a >= 0.0f && a <= 30.0f)) {
+  //         request->send(400, "application/json", "{\"ok\":0,\"err\":\"amps must be a number from 0 to 30\"}");
+  //         return;
+  //       }
+  //     }
+  //     uint32_t seq;
+  //     portENTER_CRITICAL(&fcMux);
+  //     fcReqKind = isAmps ? FC_KIND_METER : FC_KIND_MARK;
+  //     fcReqAmps = a;
+  //     seq = ++fcReqSeq;
+  //     portEXIT_CRITICAL(&fcMux);
+  //     snprintf(buf, sizeof(buf), "{\"ok\":1,\"seq\":%lu}", (unsigned long)seq);
+  //     request->send(200, "application/json", buf);
+  //     return;
+  //   }
+  //   FcRec last;
+  //   uint16_t n, ent;
+  //   uint32_t done, oldMs = 0, newMs = 0;
+  //   portENTER_CRITICAL(&fcMux);
+  //   last = fc->last;
+  //   n = fcCount;
+  //   ent = fcEntries;
+  //   done = fcDoneSeq;
+  //   if (n) {
+  //     oldMs = fc->ring[(fcHead + FC_RING_N - n) % FC_RING_N].ms;
+  //     newMs = fc->ring[(fcHead + FC_RING_N - 1) % FC_RING_N].ms;
+  //   }
+  //   portEXIT_CRITICAL(&fcMux);
+  //   auto num = [](char *p, size_t cap, const char *key, float v, int prec) -> int {
+  //     return isfinite(v) ? snprintf(p, cap, ",\"%s\":%.*f", key, prec, v) : snprintf(p, cap, ",\"%s\":null", key);
+  //   };
+  //   int pos = snprintf(buf, sizeof(buf), "{\"ok\":1,\"n\":%u,\"entries\":%u,\"spanS\":%lu,\"seq\":%lu,\"last\":",
+  //                      (unsigned)n, (unsigned)ent, (unsigned long)((newMs - oldMs) / 1000UL), (unsigned long)done);
+  //   if (!ent) {
+  //     pos += snprintf(buf + pos, sizeof(buf) - pos, "null}");
+  //   } else {
+  //     pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"kind\":%u,\"ageS\":%lu", (unsigned)last.kind,
+  //                     (unsigned long)((uint32_t)(millis() - last.ms) / 1000UL));
+  //     pos += num(buf + pos, sizeof(buf) - pos, "meter", last.meterA, 2);
+  //     pos += num(buf + pos, sizeof(buf) - pos, "est", last.estAvg, 2);
+  //     pos += num(buf + pos, sizeof(buf) - pos, "estMin", last.estMin, 2);
+  //     pos += num(buf + pos, sizeof(buf) - pos, "estMax", last.estMax, 2);
+  //     pos += num(buf + pos, sizeof(buf) - pos, "dutyMin", last.dutyMin, 1);
+  //     pos += num(buf + pos, sizeof(buf) - pos, "dutyMax", last.dutyMax, 1);
+  //     pos += num(buf + pos, sizeof(buf) - pos, "vMin", last.vMin, 2);
+  //     pos += num(buf + pos, sizeof(buf) - pos, "vMax", last.vMax, 2);
+  //     pos += snprintf(buf + pos, sizeof(buf) - pos, "}}");
+  //   }
+  //   request->send(200, "application/json", buf);
+  // });
+  // // Oldest first. The first line is "#now_ms,<millis>" so the page can put a clock time on every row; it strips that line.
+  // server.on("/fieldcheck.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
+  //   struct FcExp { uint16_t head, count, idx; uint8_t stage; bool done; char line[480]; int len, pos; };
+  //   FcExp st = {};
+  //   if (fc) {
+  //     portENTER_CRITICAL(&fcMux);
+  //     st.head = fcHead;
+  //     st.count = fcCount;
+  //     portEXIT_CRITICAL(&fcMux);
+  //   }
+  //   AsyncWebServerResponse *response = request->beginChunkedResponse("text/csv",
+  //     [st](uint8_t *buf, size_t maxLen, size_t) mutable -> size_t {
+  //       if (st.done) return 0;
+  //       size_t written = 0;
+  //       while (written < maxLen) {
+  //         if (st.pos >= st.len) {
+  //           if (st.stage == 0) {
+  //             st.len = snprintf(st.line, sizeof(st.line), "#now_ms,%lu\n", (unsigned long)millis());
+  //             st.stage = 1;
+  //           } else if (st.stage == 1) {
+  //             st.len = snprintf(st.line, sizeof(st.line),
+  //                               "kind,ms,meterA,meter_minus_estA,estA_avg,estA_min,estA_max,duty_avg,duty_min,duty_max,"
+  //                               "busV_avg,busV_min,busV_max,Rc_ohm,R_ohm,Tref_F,altTemp_F,boardTemp_F,rpm,altA,battA,"
+  //                               "ceil10A_pct,ceilHeat_pct,ceilBind,limitCode,mode,stage,fieldOn,fieldResTest\n");
+  //             st.stage = 2;
+  //           } else {
+  //             if (st.idx >= st.count) { st.done = true; return written; }
+  //             FcRec r;
+  //             portENTER_CRITICAL(&fcMux);
+  //             r = fc->ring[(st.head + FC_RING_N - st.count + st.idx) % FC_RING_N];
+  //             portEXIT_CRITICAL(&fcMux);
+  //             st.idx++;
+  //             // Blank cell for a value that was never read (NAN).
+  //             char *p = st.line;
+  //             size_t cap = sizeof(st.line);
+  //             auto cell = [&p, &cap](float v, int prec) {
+  //               int w = isfinite(v) ? snprintf(p, cap, ",%.*f", prec, v) : snprintf(p, cap, ",");
+  //               if (w > 0 && (size_t)w < cap) { p += w; cap -= w; }
+  //             };
+  //             static const char *const kinds[] = { "row", "meter", "mark" };
+  //             static const char *const modes[] = { "off", "manual", "auto", "fault" };
+  //             int w = snprintf(p, cap, "%s,%lu", r.kind < 3 ? kinds[r.kind] : "?", (unsigned long)r.ms);
+  //             p += w; cap -= w;
+  //             cell(r.meterA, 2);
+  //             cell(r.meterA - r.estAvg, 2);
+  //             cell(r.estAvg, 3); cell(r.estMin, 3); cell(r.estMax, 3);
+  //             cell(r.dutyAvg, 2); cell(r.dutyMin, 2); cell(r.dutyMax, 2);
+  //             cell(r.vAvg, 3); cell(r.vMin, 3); cell(r.vMax, 3);
+  //             cell(r.rc, 4); cell(r.r, 4); cell(r.trefC * 1.8f + 32.0f, 1);
+  //             cell(r.probeF, 1); cell(r.dieF, 1);
+  //             cell(r.rpm, 0); cell(r.altA, 1); cell(r.battA, 1);
+  //             cell(r.curCeil, 2); cell(r.heatCeil, 2);
+  //             w = snprintf(p, cap, ",%u,%u,%s,%u,%u,%u\n", (unsigned)r.bind, (unsigned)r.lim,
+  //                          r.mode < 4 ? modes[r.mode] : "?", (unsigned)r.stage, (unsigned)r.fieldOn, (unsigned)r.frtRun);
+  //             p += w;
+  //             st.len = (int)(p - st.line);
+  //           }
+  //           st.pos = 0;
+  //         }
+  //         size_t tw = min((size_t)(st.len - st.pos), maxLen - written);
+  //         memcpy(buf + written, st.line + st.pos, tw);
+  //         written += tw; st.pos += (int)tw;
+  //       }
+  //       return written;
+  //     });
+  //   response->addHeader("Cache-Control", "no-cache");
+  //   request->send(response);
+  // });
   // ===== TEMP-FIELDCHECK END =====
   // The held best-ever front (BEFRONT1 CSV artifact) — streamed (constant RAM at any front size).
   server.on("/altcurve.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -10240,10 +10272,10 @@ void setupServer() {
   });
 
   // Field resistance test (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1). Every request is the app's heartbeat: a run ends
-  // 3 s after the last one. start=1&method=1|2 (shunt|meter), reading=<amps>, again=1, save=1 and abort=1 act; with none
-  // it is a status read. abort works locked, like OnOff=0; the others need the settings arm. save=1 writes a finished
-  // result: the owner's Next or Save, so an explicit action may write flash here. The firmware does the math for both
-  // methods, so the formula lives once, beside the estimate it calibrates.
+  // 3 s after the last one. start=1&method=1|2 (shunt|meter), reading=<amps>, again=1, save=1, skip=1 and abort=1 act; with
+  // none it is a status read. abort works locked, like OnOff=0; the others need the settings arm. save=1 writes a finished
+  // result and skip=1 the 12 V no-shunt default (B1.14): the owner's Next, Save or Use 2 ohm, so an explicit action may write
+  // flash here. The firmware does the math for both methods, so the formula lives once, beside the estimate it calibrates.
   server.on("/fieldResTest", HTTP_GET, [](AsyncWebServerRequest *request) {
     const uint32_t nowMs = millis();
     if (frt.state == FRT_RUNNING) {
@@ -10256,9 +10288,19 @@ void setupServer() {
       frt.reqAbort = true;
       logClientWrite(request, "FIELD RESISTANCE TEST: stop requested");
     }
-    const bool acts = request->hasParam("start") || request->hasParam("reading") || request->hasParam("again") || request->hasParam("save");
+    const bool acts = request->hasParam("start") || request->hasParam("reading") || request->hasParam("again") || request->hasParam("save")
+                      || request->hasParam("skip");
     if (acts && !settingsArmActive(request)) {
       refused = "Unlock settings first.";
+    } else if (request->hasParam("skip")) {
+      if (frt.state == FRT_RUNNING || frt.reqStart) {
+        refused = "Stop the test first.";
+      } else if (!fieldResSkipAllowed()) {
+        refused = "Only a 12 V system with no battery shunt can skip the test.";
+      } else {
+        fieldResUseDefault();
+        logClientWrite(request, "FIELD RESISTANCE TEST: skipped, 2 ohm default");
+      }
     } else if (request->hasParam("save")) {
       if (frt.state != FRT_DONE) {
         refused = "There is no test result to save.";
@@ -10317,6 +10359,9 @@ void setupServer() {
     pos += snprintf(buf + pos, cap - pos, "\"calm\":%d,", frt.calm ? 1 : 0);   // shunt: 0 while the opening field-off readings wait to agree
     num("R", FieldResistance, 3);
     num("Tref", FieldResTrefC, 1);
+    // sk: the skip is on offer (12 V, no battery shunt); def: the skipped-test default is what the regulator uses now.
+    pos += snprintf(buf + pos, cap - pos, "\"sk\":%d,\"def\":%d,\"defR\":%.1f,", fieldResSkipAllowed() ? 1 : 0, fieldResDefaultInUse() ? 1 : 0,
+                    (double)FD_SKIP_R_OHM);
     // rungs: probe rungs stepped up from, [x, i]. holds[k].c: the shunt cycles, [off, on, off battery amps, kept 1/0,
     // field amps].
     pos += snprintf(buf + pos, cap - pos, "\"rungs\":[");
