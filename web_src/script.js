@@ -1083,7 +1083,7 @@ const CSV2_FIELDS = [
     "fieldCurDutyCeil",        // the board's 10 A field-current ceiling as duty x100 (solved on the temperature-corrected resistance)
     "fieldHeatDutyCeil",       // field-drive heat ceiling as duty x100 (99 = not limiting)
     "fieldCeilBind",           // which term sets the enforced field ceiling: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the field connector, 4 heat at the D5 spreader
-    "fieldRcOhm",              // field resistance the 10 A ceiling uses, corrected for alternator temperature, less the 12 % margin (ohm x100)
+    "fieldRcOhm",              // field resistance both board ceilings and Field Amps use, corrected for alternator temperature, less the 12 % margin (ohm x100)
     "fieldHeatLimS",           // lifetime seconds held at the heat ceiling (raw seconds)
     "fieldCurLimS",            // lifetime seconds held at the 10 A ceiling (raw seconds)
     "fieldHeatLimSesS",        // session seconds held at the heat ceiling (raw seconds; Reset on Live Data)
@@ -1149,11 +1149,11 @@ const CSV4_FIELDS = [
     "VictronCurrent",             // Victron battery current (A ×100)
     "currentFuelGPH",             // live fuel flow (gal/hr ×100)
     "currentNMPG",                // live fuel economy (naut mi/gal ×100)
-    "ctrlLimiter",                // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target (zero-output stand-down), 8 external charge-current limit (DVCC CCL), 9 external charge-voltage limit (DVCC CVL), 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide, 15 field at the board's 10 A field-current ceiling, 16 field-drive heat limit
+    "ctrlLimiter",                // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target (zero-output stand-down), 8 external charge-current limit (DVCC CCL), 9 external charge-voltage limit (DVCC CVL), 10 Manual mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide, 15 field at the board's 10 A field-current ceiling, 16 field-drive heat limit
     "chargeStage",                // CHARGE_STAGE_* code — feeds gLastChargeStage at 2 Hz for the mode ribbon
     "n183Heading",                // NMEA 0183 decoded heading (deg ×10; negative = nothing decoded). Distinct from HeadingNMEA, which is the NMEA2000 source.
     "n183HdgRef",                 // reference frame of the above: 0 none, 1 magnetic, 2 true
-    "bmsSignalActive",            // live BMS on/off opto input: 1 = 5-28 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice
+    "bmsSignalActive",            // live BMS on/off opto input: 1 = 5-62 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice
     "panelHiRateInput",           // switch panel HIGH/LOW opto input (Cable 3 pin 5): 1 = wire energized = switch on = asking for High. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything
     "panelForceFloatInput",       // switch panel FORCEFLOAT opto input (Cable 3 pin 7): 1 = wire energized = switch on = asking for Maintain. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything
     "VictronSoc",                 // VE.Direct battery monitor's own state of charge (% ×10; NaN when stale, unsynced or not a battery monitor)
@@ -2354,7 +2354,23 @@ const _CFG_TABLE_LABELS={rpmPoints:'RPM Breakpoints',capTable:'Current Cap Table
 // Field Resistance and the alternator temperature recorded with it are one measurement: the firmware import takes
 // both or neither, so their rows tick together, and a file carrying only one of them cannot apply it.
 const _CFG_PAIR={FieldResistance:'FieldResTrefC',FieldResTrefC:'FieldResistance'};
-const _CFG_KEY_LABELS={FieldResTrefC:'Alternator temperature recorded with Field Resistance (°C)',FieldResDefault:'Field Resistance test skipped, 2 Ω used (1 yes, 12 V with no shunt only)',ShuntLead:'Shunt location (1 negative lead, 2 positive lead)'};
+// The field-side values fieldWindApplied describes (firmware FIELD_SIDE_KNOBS, plus the current-loop gains a winding
+// rescale can hold). When the file's fieldWindApplied differs from this regulator's, the file's values are on another
+// winding's scale: fieldWindApplied goes with any of them, the ones that already match here go too, and the firmware
+// converts the ones left out (fieldSideConvertUnwritten), so a partial pick still lands on one scale.
+const _CFG_FIELD_SIDE=new Set(['MinDuty','DutyRampRate','DutySlowRampRate','LimpDutyPct','HuntTrigPct','kneeMarginPct','kneeStepPct',
+  'kneeMaxFloorPct','kneeDutyTolPct','altDutyLineRms','altDutySlewMax','altMinDuty','SystemIDStepAmplitude','PidKp','PidKi','PidKd']);
+let _cfgDiffFieldScale=false;   // this preview's file has fieldWindApplied on another winding than this regulator
+function cfgDiffFieldSideToggle(cb){
+  if(!cb.checked) return;
+  const f=document.querySelector('#cfgdiff-body .cfgdiff-cb[data-fwa]');
+  if(f) f.checked=true;
+}
+function cfgDiffFwaToggle(cb){
+  if(cb.checked) return;
+  document.querySelectorAll('#cfgdiff-body .cfgdiff-cb[data-fside]').forEach(c=>{ c.checked=false; });
+}
+const _CFG_KEY_LABELS={fieldWindApplied:'Field winding the field-duty settings are scaled for (V)',FieldResTrefC:'Alternator temperature recorded with Field Resistance (°C)',FieldResDefault:'Field Resistance test skipped, 2 Ω used (1 yes, 12 V with no shunt only)',ShuntLead:'Shunt location (1 negative lead, 2 positive lead)'};
 function cfgDiffPairToggle(cb){
   document.querySelectorAll('#cfgdiff-body .cfgdiff-cb[data-pair]:not(:disabled)').forEach(c=>{ c.checked=cb.checked; });
 }
@@ -2370,6 +2386,13 @@ function cfgDiffClose(apply){
     picked.filter(c=>c.dataset.kind==='config').forEach(c=>{ out.config[c.dataset.key]=inc.config[c.dataset.key]; });
     // A partner that already matches this regulator has no row of its own, but the import still needs both.
     for(const k of Object.keys(out.config)){ const p=_CFG_PAIR[k]; if(p && !(p in out.config) && (p in inc.config)) out.config[p]=inc.config[p]; }
+    if(_cfgDiffFieldScale){
+      if(!('fieldWindApplied' in out.config) && Object.keys(out.config).some(k=>_CFG_FIELD_SIDE.has(k))) out.config.fieldWindApplied=inc.config.fieldWindApplied;
+      if('fieldWindApplied' in out.config){
+        const rowed=new Set(cbs.filter(c=>c.dataset.kind==='config').map(c=>c.dataset.key));
+        for(const k of _CFG_FIELD_SIDE) if(!(k in out.config) && !rowed.has(k) && (k in inc.config)) out.config[k]=inc.config[k];
+      }
+    }
     const tp=picked.filter(c=>c.dataset.kind==='tables');
     if(tp.length){ out.tables={}; tp.forEach(c=>{ out.tables[c.dataset.key]=inc.tables[c.dataset.key]; }); }
     document.getElementById('cfgdiff-modal-overlay').style.display='none';
@@ -2449,20 +2472,32 @@ async function cfgDiffPreview(blobText, sourceLabel){
   // payload_v 3 blobs carry the voltage as the BatteryVoltage manifest key; older exported
   // files still have the vessel{} TOC header.
   const vNow=(incoming.config&&incoming.config.BatteryVoltage)||(incoming.vessel&&incoming.vessel.battery_voltage);
+  const wIn=incoming.config?incoming.config.FieldWindingV:undefined, wCur=curFull.FieldWindingV;
+  const wDiff=wIn!==undefined&&wCur!==undefined&&String(wIn)!==String(wCur);
+  const aIn=incoming.config?incoming.config.fieldWindApplied:undefined, aCur=curFull.fieldWindApplied;
+  _cfgDiffFieldScale=aIn!==undefined&&aCur!==undefined&&String(aIn)!==String(aCur)&&!exportOnly.has('fieldWindApplied');
   sum.innerHTML='Loading <b>'+_cfgEsc(sourceLabel)+'</b>'+(incoming.fw_version?' (saved on firmware '+_cfgEsc(incoming.fw_version)+')':'')+'.<br>'
     +'<b>'+nChange+'</b> settings change, <b>'+nFresh+'</b> are new here, <b>'+unchanged+'</b> already match.'
     +(refRows.length?'<br><b>'+refRows.length+'</b> device-state values differ — listed at the bottom for reference; this regulator never adopts them.':'')
     +'<br>Only checked rows are applied.'
     +(vNow?'<br>Source system voltage: <b>'+_cfgEsc(vNow)+' V</b> — confirm this matches your bank.':'')
+    +(wDiff?'<br><span style="color:#fca5a5;">Source field winding voltage: <b>'+_cfgEsc(wIn)+' V</b>; this regulator: <b>'+_cfgEsc(wCur)+' V</b>. '
+      +'Applying it puts the field-duty settings and Max Field Volts on a '+_cfgEsc(wIn)+' V winding\'s scale and erases this regulator\'s alternator health history. '
+      +'Confirm it matches this alternator\'s field winding, or uncheck FieldWindingV.</span>':'')
     +'<br><span style="color:#fca5a5;">Hardware and calibration settings (sensor/shunt/polarity/offsets) WILL be applied — uncheck them unless the hardware is identical.</span>';
   const row=(kind,k,label,cur,nv)=>{
     const pair=kind==='config'?_CFG_PAIR[k]:null;
     const solo=!!pair && !(pair in incoming.config);   // the import refuses it alone
+    const fwa=kind==='config'&&_cfgDiffFieldScale&&k==='fieldWindApplied';
+    const fside=kind==='config'&&_cfgDiffFieldScale&&_CFG_FIELD_SIDE.has(k);
     return '<tr>'
     +'<td style="padding:3px 6px 3px 0;"><input type="checkbox" class="cfgdiff-cb" data-kind="'+kind+'" data-key="'+_cfgEsc(k)+'"'
-    +(pair?' data-pair="1" onchange="cfgDiffPairToggle(this)"':'')+(solo?' disabled':' checked')+' style="width:16px; height:16px; margin:0; vertical-align:middle;"></td>'
+    +(pair?' data-pair="1" onchange="cfgDiffPairToggle(this)"':'')
+    +(fwa?' data-fwa="1" onchange="cfgDiffFwaToggle(this)"':'')+(fside?' data-fside="1" onchange="cfgDiffFieldSideToggle(this)"':'')
+    +(solo?' disabled':' checked')+' style="width:16px; height:16px; margin:0; vertical-align:middle;"></td>'
     +'<td style="padding:3px 8px 3px 0; color:#9cc; word-break:break-all;">'+_cfgEsc(label)
-    +(solo?'<div style="color:#888; word-break:normal;">Not applied: the file has no '+(k==='FieldResistance'?'alternator temperature recorded with it.':'Field Resistance.')+'</div>':'')+'</td>'
+    +(solo?'<div style="color:#888; word-break:normal;">Not applied: the file has no '+(k==='FieldResistance'?'alternator temperature recorded with it.':'Field Resistance.')+'</div>':'')
+    +(fwa?'<div style="color:#888; word-break:normal;">Applied with any field-duty or current-loop gain row. This regulator converts the ones you leave unchecked onto the same scale.</div>':'')+'</td>'
     +'<td style="padding:3px 8px; color:#888; word-break:break-all;">'+_cfgEsc(cur)+'</td>'
     +'<td style="padding:3px 0; color:#fff; word-break:break-all;">'+_cfgEsc(nv)+'</td></tr>';
   };
@@ -3234,9 +3269,9 @@ function perfSettleChip(steady, settleSec){
 // Unified gauge/conditions updater — reads the active view's live object.
 function renderPerf(){
   const L = perfView ? motorLive : perfLive;
-  // Center-hub live speed — the dominant readable number on the plot (SOG sailing / STW motoring)
+  // Center-hub live speed — the dominant readable number on the plot (both views: STW or SOG per perfSpeedSrc)
   setTxt('perf-speed-num', (L.valid && typeof L.spd === 'number') ? L.spd.toFixed(1) : '—');
-  setTxt('perf-speed-unit', perfView ? 'KT · STW' : 'KT · SOG');
+  setTxt('perf-speed-unit', (perfSettings.perfSpeedSrc >= 1.5) ? 'KT · SOG' : 'KT · STW');
   // % vs best-ever (NO clamp) — shown only in the graded confidence states (MEASURED/ESTIMATED);
   // LEARNING/NO-REFERENCE deliberately show no number, just the state label. Same engine + labels
   // as the charging-system panel (ALT_STATE_LABEL/ALT_STATE_COLOR).
@@ -3802,10 +3837,10 @@ const CSV3_FIELDS = [
     "cvHelpersEnabled",  // master switch: asymmetric KiDown unwind + CV D term (1=on)
     "MinChargeTempF",  // cold-charge lockout floor on the active battery temperature (°F)
     "coldChargeLockoutEnable",  // cold-charge lockout master on/off (1=on)
-    "cvGainMode",  // CV gain mode: 0=Manual, 1=Auto (α/K anchored)
+    "cvGainMode",  // CV Gain Source: 0=Manual, 1=Measured (α/K anchored)
     "cvPlantK",  // measured plant gain K (V/A); ×10000
-    "cvComputedKp",  // Auto-computed Kp (12V-equiv); ×100
-    "cvComputedKi",  // Auto-computed Ki (12V-equiv); ×100
+    "cvComputedKp",  // Plant-fit Kp, run under CV Gain Source = Measured (12V-equiv); ×100
+    "cvComputedKi",  // Plant-fit Ki, run under CV Gain Source = Measured (12V-equiv); ×100
     "cvCrossover",  // CV crossover ω_c (rad/s); ×100
     "cvPiZero",  // CV PI integral zero ρ (rad/s); ×100
     "vTgtRampUp",  // CV voltage-target ramp UP rate (V/s); ×1000
@@ -3839,7 +3874,7 @@ const CSV3_FIELDS = [
     "CvKdMaxTrimA",  // CV D-term back-off ceiling (A ×10)
     "cvAlpha",  // CV auto-gain aggressiveness α (fraction of deadbeat-ohmic gain); ×1000
     "CvKdSlopeCeil",  // CV D-term slope ceiling (V/s real per-bus ×10)
-    "cvComputedKd",  // Auto-computed D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100
+    "cvComputedKd",  // Plant-fit D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100
     "CvKdDbSlope",  // CV D-term deadband line slope (V/s per A ×10000)
     "CvKdDbFloor",  // CV D-term deadband line floor (V/s ×100)
     "CvKdDbCeil",  // CV D-term deadband line ceiling (V/s ×100)
@@ -3909,7 +3944,7 @@ const CSV3_FIELDS = [
     "HuntCooldownMin",  // damper retest cooldown after a failed test (min)
     "HuntSteadyPct",  // damper engine-speed steadiness tolerance (%)
     "HuntQualifyScans",  // damper wobble-confirm scan count (1.6 s each)
-    "HuntTrigPct",  // damper detection bar: peak-bin duty swing % (x100)
+    "HuntTrigPct",  // damper detection bar: peak-bin duty swing % (x1000)
     "NMEA0183Baud",  // NMEA 0183 serial baud (4800 / 9600 / 19200 / 38400)
     "NMEA0183Invert",  // NMEA 0183 polarity: 0 RS-232-level talker, 1 TTL-level talker
     "displayVolUnit",  // fuel volume display preference: 0 US gallons, 1 litres
@@ -3962,6 +3997,8 @@ const CSV3_FIELDS = [
     "FieldResDefault",
     "FieldWiring",
     "ShuntLead",
+    "FieldWindingV",
+    "fieldWindApplied",
     "sessionId",  // device boot identity, same in every channel this boot
     "sendMs",  // device millis() when this settings echo was built; event-driven with a 60 s fallback
 ];
@@ -6416,7 +6453,7 @@ function sendFakeCSVData() {
             fieldCurDutyCeil: 9900,
             fieldHeatDutyCeil: 9900,
             fieldCeilBind: 0,
-            fieldRcOhm: 216,             // ohm x100: a 2.00 ohm coil at the ~168 °F alternator temperature above, less the 12 % margin
+            fieldRcOhm: 212,             // ohm x100: the demo's 2.00 ohm coil recorded at 22 °C, at the ~168 °F alternator temperature above with 90 % credit, less the 12 % margin
         };
         const v2 = CSV2_FIELDS.map(k => csv2[k] !== undefined ? csv2[k] : 0);
         csv2Handler({ data: v2.length + ',' + v2.join(',') });
@@ -7091,7 +7128,7 @@ function displayAvailableVersions() {
 }
 
 function confirmUpdate(form, version) {
-    xConfirm(`ALTERNATOR WILL BE AUTOMATICALLY DISABLED FOR SAFETY\n\nUpdate process takes 2-3 minutes. Do not interfere with auto-reboots. When finished, the web interface will be accessible in the usual way, but you must HARD-REFRESH your browser (Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows/Linux) to load the new web files — otherwise your browser will keep showing the old cached UI. The Software Update sub-tab in Cloud Features will then confirm the new version.\n\nIf process fails, you may try again with better internet. If the whole thing bricks, you may always start fresh with the factory golden image (connect FactoryReset wire, pin 9 in RJ3, Orange/White to GND), which will never force updates.\n\nAlternator will remain OFF after update - you must manually re-enable it.`).then(confirmed => {
+    xConfirm(`ALTERNATOR WILL BE AUTOMATICALLY DISABLED FOR SAFETY\n\nUpdate process takes 2-3 minutes. Do not interfere with auto-reboots. When finished, the web interface will be accessible in the usual way, but you must HARD-REFRESH your browser (Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows/Linux) to load the new web files — otherwise your browser will keep showing the old cached UI. The Software Update sub-tab in Cloud Features will then confirm the new version.\n\nIf process fails, you may try again with better internet. If the whole thing bricks, you may always start fresh with the factory golden image (connect FactoryReset wire, pin 9 in RJ3, Orange/White to GND), which will never force updates.\n\nWhether the update completes or fails, Alternator Enable returns to the setting it had before the update.`).then(confirmed => {
         if (!confirmed) return;
         // UpdateToVersion is arm-gated in firmware (a stale/replayed update URL must never
         // reboot the device); the OK click above is the acknowledgment, so arm just-in-time.
@@ -8512,11 +8549,11 @@ function drawModeStrip() {
         if (i === n || modeStripData[i] !== segMode) {
             const meta = MODE_STRIP_META[segMode];
             if (meta) {
-                present.add(segMode);
                 // Right edge of the newest segment pins to the plot edge, not the last sample —
                 // the interp loop keeps the last x slightly left of 0 while it eases in.
                 const a = px(segStart);
                 const b = (i === n) ? (offL + oRect.width) : px(i);
+                if (b > x0 && a < x1) present.add(segMode);
                 ctx.globalAlpha = 0.88;
                 ctx.fillStyle = THERMAL_MODE_COLORS[meta.key];
                 ctx.fillRect(a, 0, Math.max(1, b - a), cssH);
@@ -8755,9 +8792,9 @@ function updateWeatherAlerts() {
     gpsAlert.style.display = gpsMissing ? 'block' : 'none';
     gpsStaleAlert.style.display = gpsStale ? 'block' : 'none';
 
-    // In AP mode the fetch is impossible and "Update Weather Now" is hidden with the rest of the
-    // forecast block, so this alert would point at a control that isn't there — the offline note
-    // in that slot says it instead.
+    // In AP mode the fetch is impossible and "Update Weather Now" is dimmed and inert with the rest
+    // of the forecast block (.gate-ap), so this alert would point at a control that can't be used;
+    // the offline note in that slot says it instead.
     const apMode = (window._lastKnownMode === 1);   // 1 = MODE_AP
     if (weatherValid === 0 && !gpsMissing && !gpsStale && !apMode) {
         weatherAlert.style.display = 'block';
@@ -8801,7 +8838,7 @@ function updateAllEchosOptimized(data) {
         { key: 'ManualDutyTarget', id: 'ManualDutyTarget_echo_gate', transform: v => (v / 100).toFixed(2) },
         { key: 'PhysicalPanelOverride', id: 'PhysicalPanelOverride_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'OnOff', id: 'OnOff_echo', transform: v => v == 1 ? 'On' : 'Off' },
-        { key: 'ManualFieldToggle', id: 'ManualFieldToggle_echo', transform: v => v == 1 ? 'Manual' : 'PID' },
+        { key: 'ManualFieldToggle', id: 'ManualFieldToggle_echo', transform: v => v == 1 ? 'Manual' : 'Auto' },
         { key: 'VeData', id: 'VeData_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'NMEA0183Data', id: 'NMEA0183Data_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'NMEA2KData', id: 'NMEA2KData_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
@@ -8881,9 +8918,9 @@ function updateAllEchosOptimized(data) {
         { key: 'MinDuty', id: 'MinDuty_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'MinDuty', id: 'MinDuty_echo_gate', transform: v => (v / 100).toFixed(2) },
         // With the 12 V skipped-test default in use (FieldResDefault 1) nothing is measured, and the regulator uses 2 ohm.
-        { key: 'FieldResistance', id: 'FieldResistance_echo', nan: d => fieldResDefaultIn(d) ? '2.00' : 'not entered', transform: v => (v / 100).toFixed(2) },
-        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps',  nan: d => fieldResDefaultIn(d) ? '2.00' : '', transform: v => (v / 100).toFixed(2) },
-        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps2', nan: d => fieldResDefaultIn(d) ? '2.00' : '', transform: v => (v / 100).toFixed(2) },
+        { key: 'FieldResistance', id: 'FieldResistance_echo', nan: d => fieldResDefaultIn(d) ? '2.000' : 'not entered', transform: v => (v / 1000).toFixed(3) },
+        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps',  nan: d => fieldResDefaultIn(d) ? '2.000' : '', transform: v => (v / 1000).toFixed(3) },
+        { key: 'FieldResistance', id: 'FieldResistance_echo_fldamps2', nan: d => fieldResDefaultIn(d) ? '2.000' : '', transform: v => (v / 1000).toFixed(3) },
         { key: 'FieldResTrefC', id: 'FieldResTrefC_echo', nan: d => fieldResDefaultIn(d) ? 'default, test skipped' : 'not recorded',
           transform: v => 'recorded at ' + Math.round(toDisplayTempFromC(v / 10)) + ' ' + tempUnitLabel() },
         { key: 'FieldWiring', id: 'FieldWiring_echo', transform: v => v == 1 ? 'P-type' : v == 2 ? 'N-type' : 'Not set' },
@@ -9042,7 +9079,7 @@ function updateAllEchosOptimized(data) {
         { key: 'cvTestSlewMode',    id: 'cvTestSlewMode_echo',    transform: v => v == 0 ? 'Off' : v == 1 ? 'Default' : 'Custom' },
         { key: 'battTempDerateEnable', id: 'battTempDerateEnable_echo', transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'battTempCoeff',     id: 'battTempCoeff_echo',     transform: v => (v / 10000).toFixed(3) + ' /°C (' + (v / 10000 * 100).toFixed(1) + ' %/°C)' },
-        { key: 'cvGainMode',        id: 'cvGainMode_echo',        transform: v => v == 1 ? 'Auto' : 'Manual' },
+        { key: 'cvGainMode',        id: 'cvGainMode_echo',        transform: v => v == 1 ? 'Measured' : 'Manual' },
         { key: 'OvGroup1Enable',    id: 'OvGroup1Enable_echo',    transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'OvGroup2Enable',    id: 'OvGroup2Enable_echo',    transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'HardOCEnable',      id: 'HardOCEnable_echo',      transform: v => v == 1 ? 'ON' : 'OFF' },
@@ -9065,7 +9102,7 @@ function updateAllEchosOptimized(data) {
         { key: 'HuntCooldownMin',   id: 'HuntCooldownMin_echo',   transform: v => v },
         { key: 'HuntSteadyPct',     id: 'HuntSteadyPct_echo',     transform: v => v },
         { key: 'HuntQualifyScans',  id: 'HuntQualifyScans_echo',  transform: v => v },
-        { key: 'HuntTrigPct',       id: 'HuntTrigPct_echo',       transform: v => (v / 100).toFixed(2) },
+        { key: 'HuntTrigPct',       id: 'HuntTrigPct_echo',       transform: v => (v / 1000).toFixed(3) },
         { key: 'cvHelpersEnabled',  id: 'cvHelpersEnabled_echo',  transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'coldChargeLockoutEnable', id: 'coldChargeLockoutEnable_echo', transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'MinChargeTempF',    id: 'MinChargeTempF_echo',    transform: v => Math.round(toDisplayTemp(v)) },
@@ -9187,14 +9224,16 @@ function updateAllEchosOptimized(data) {
         }
     });
 
-    // Load-dump derived "time to act" labels: N consecutive samples x the ~5 ms INA fast-mode
-    // cadence (INA_FAST_INTERVAL_MS). Driven by the CSV3 echo so the label tracks the firmware value.
+    // Load-dump derived "time to act" labels: the tier counters step once per INA228 reading (loadDumpStep,
+    // measured ~6 ms apart, worst ~18 ms), then the duty cut waits for the next control tick (~13 ms apart,
+    // worst ~30 ms). Range = N readings + 0..one tick; worst = N worst readings + one worst tick.
+    // Driven by the CSV3 echo so the label tracks the firmware value.
     [['LoadDumpN1', 'LoadDumpN1_tta'], ['LoadDumpN2', 'LoadDumpN2_tta'], ['LoadDumpN3', 'LoadDumpN3_tta']].forEach(([key, id]) => {
         if (key in data) {
             const el = document.getElementById(id);
             const n = Math.round(Number(data[key]));
             if (el && isFinite(n) && n > 0) {
-                const txt = 'time to act: ' + n + ' × 5 ms = ' + (n * 5) + ' ms';
+                const txt = 'time to act: about ' + (n * 6) + '–' + (n * 6 + 13) + ' ms (up to ~' + (n * 18 + 30) + ' ms worst case)';
                 if (el.textContent !== txt) el.textContent = txt;
             }
         }
@@ -9778,6 +9817,11 @@ async function fetchAndPopulateVesselInfo() {
         form.ENGINE_HP.value = data.engine_hp || '';
         form.BATTERY_VOLTAGE.value = data.battery_voltage || 12;
         window._nominalStored = data.battery_voltage || 12;  // baseline class for the save-rescale warning + open-loop warnings
+        if (form.FIELD_WINDING_V) {
+            window._windingStored = Number(data.field_winding_v) || 12;
+            form.FIELD_WINDING_V.value = String(window._windingStored);
+            fieldWindingSyncOptions();
+        }
         applyClassScaledInputAttrs();
         form.BATTERY_CAPACITY_AH.value = data.battery_capacity_ah || '';
         form.BATTERY_TYPE.value = data.battery_type || '';
@@ -9860,6 +9904,7 @@ async function handleVesselInfoSave(event) {
         engine_make: form.ENGINE_MAKE.value,
         engine_hp: parseInt(form.ENGINE_HP.value),
         battery_voltage: parseInt(form.BATTERY_VOLTAGE.value),
+        field_winding_v: form.FIELD_WINDING_V ? parseInt(form.FIELD_WINDING_V.value, 10) : undefined,
         battery_capacity_ah: parseInt(form.BATTERY_CAPACITY_AH.value),
         battery_type: form.BATTERY_TYPE.value,
         battery_make_model: form.BATTERY_MAKE_MODEL.value,
@@ -9876,9 +9921,12 @@ async function handleVesselInfoSave(event) {
     const _oldV = parseInt(window._nominalStored, 10);
     const _newV = vesselData.battery_voltage;
     const _classOk = v => v === 12 || v === 24 || v === 36 || v === 48;
-    if (_classOk(_newV) && _classOk(_oldV)
-        && _newV !== _oldV && !(await confirmVoltageRescale(_oldV, _newV))) {
-        return;  // user cancelled — leave the form unsaved
+    // Field winding first (class clamp, resistance check), so one dialog can list everything the save moves.
+    const _plan = await fieldWindingSavePlan(vesselData, _classOk(_oldV) ? _oldV : null, _classOk(_newV) ? _newV : null);
+    if (_classOk(_newV) && _classOk(_oldV) && _newV !== _oldV) {
+        if (!(await confirmVoltageRescale(_oldV, _newV, _plan))) return;  // user cancelled — leave the form unsaved
+    } else if (Math.abs(_plan.fr - 1) > 1e-9) {
+        if (!(await confirmWindingRescale(_plan))) return;
     }
 
     messageDiv.style.display = 'block';
@@ -9914,6 +9962,7 @@ async function handleVesselInfoSave(event) {
             // back to the unit's own XREG-<id>, which only the device can tell us.
             probeIdentify(API_BASE_URL || '', 4000).then(h => { if (h) applyConnectedIdentity(h); });
             window._nominalStored = vesselData.battery_voltage;  // new baseline for the next change/warning
+            if (vesselData.field_winding_v) window._windingStored = vesselData.field_winding_v;
             applyClassScaledInputAttrs();
             updateBattHealthChemNote();  // chemistry may have just changed
             vesselInfoComplete = true;
@@ -12110,12 +12159,13 @@ function _xDlgShow(msg, opts) {
         inp.value = '';
         let settled = false;
         const done = v => { if (settled) return; settled = true; ov.style.display = 'none'; resolve(v); };
+        let exB = null, cancel = null;
         // Optional third action, e.g. "Go to the setting". Gets its own full-width row above
         // Cancel/OK (btns wraps) so a descriptive label still fits at phone width. Resolves like
         // Cancel — the caller's action replaces the submit, it never proceeds as well.
         btns.style.flexWrap = 'wrap';
         if (o.extra && o.extra.text) {
-            const exB = document.createElement('button');
+            exB = document.createElement('button');
             exB.type = 'button';
             exB.textContent = o.extra.text;
             exB.style.cssText = 'flex:1 1 100%; background:transparent; border:1px solid #35d6c7; color:#35d6c7; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;';
@@ -12123,7 +12173,7 @@ function _xDlgShow(msg, opts) {
             btns.appendChild(exB);
         }
         if (o.confirm) {
-            const cancel = document.createElement('button');
+            cancel = document.createElement('button');
             cancel.textContent = o.cancelText || 'Cancel';
             cancel.style.cssText = 'flex:1; background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;';
             cancel.onclick = () => done(o.prompt ? null : false);
@@ -12136,7 +12186,12 @@ function _xDlgShow(msg, opts) {
         inp.onkeydown = e => { if (e.key === 'Enter') okB.click(); };
         btns.appendChild(okB);
         ov.style.display = 'flex';
-        if (o.prompt) inp.focus(); else okB.focus();
+        // focus: 'extra' or 'cancel' puts the keyboard default on a non-committing button, for a question that opens
+        // without the user asking, where a stray Enter or Space must not answer it.
+        if (o.prompt) inp.focus();
+        else if (o.focus === 'extra' && exB) exB.focus();
+        else if (o.focus === 'cancel' && cancel) cancel.focus();
+        else okB.focus();
     });
 }
 // Dark panel wrapper for the firmware-update overlay states (forced + manual paths).
@@ -12359,7 +12414,8 @@ function socSeedRender(s) {
             const rBase = s.lith ? 6 : 12;
             const rEff = rBase * s.rs * (100 / s.cap) * (s.sysV / 12);
             calc += eq('Effective resistance for this bank',
-                'R = ' + rBase + ' m&Omega; &times; ' + Number(s.rs).toFixed(2) + ' &times; (100 / ' + s.cap + ' Ah) = ' + rEff.toFixed(1) + ' m&Omega;');
+                'R = ' + rBase + ' m&Omega; &times; ' + Number(s.rs).toFixed(2) + ' &times; (100 / ' + s.cap + ' Ah)'
+                + (Number(s.sysV) !== 12 ? ' &times; (' + s.sysV + ' V / 12 V)' : '') + ' = ' + rEff.toFixed(1) + ' m&Omega;');
             calc += eq('Resting voltage (open-circuit voltage, OCV)',
                 'V rest = ' + Number(s.v).toFixed(2) + ' &minus; (' + Number(s.i).toFixed(1) + ' A &times; ' + rEff.toFixed(1) + ' m&Omega;) = ' + Number(s.vocv).toFixed(3) + ' V');
         } else {
@@ -12491,7 +12547,7 @@ async function handleDeleteAllData() {
         return;
     }
 
-    if (!await xConfirm('WARNING: This permanently deletes your cloud account and ALL associated cloud data including history, profile, and statistics. This CANNOT be undone.\n\nYour hardware device will continue working locally, but all cloud features are reset.\n\nType DELETE in the next prompt to confirm.')) {
+    if (!await xConfirm('WARNING: This permanently deletes your cloud account and ALL associated cloud data including history, profile, and statistics. This CANNOT be undone. A record of which firmware versions this regulator has installed, and when, is kept under its serial number for safety recalls and support.\n\nYour hardware device will continue working locally, but all cloud features are reset.\n\nType DELETE in the next prompt to confirm.')) {
         return;
     }
 
@@ -12849,7 +12905,7 @@ function resetOvTelemetryLifetime() {
 const HG_VERDICT = {
     'damped': 'Wobble stopped',
     'damped-partial': 'Wobble halved — reduced gain kept',
-    'external-suspected': 'Not the regulator — full gain restored',
+    'external-suspected': 'Not the regulator — wobble persisted at reduced gain',
     'aborted': 'Not concluded — gain test interrupted, conditions changed',
     'recovered': 'Settled on its own',
     'damped-dterm': 'Wobble stopped — voltage damper switched off here',
@@ -12867,8 +12923,10 @@ function hgStateWord(state, pct, enabled) {
         case 1: return 'Testing — gain cut applied, measuring whether the wobble responds';
         case 4: return 'Testing — voltage damper paused, measuring whether the wobble responds';
         case 3: return 'Cooling down — the last wobble did not respond to the gain cut';
-        default: return pct >= 100 ? 'Watching — no trouble spot at this speed, full gain'
-                                   : 'In a mapped trouble spot — running reduced gain';
+        default:
+            if (pct < 100) return 'In a mapped trouble spot — running reduced gain';
+            if (hgKdScaleLast < 99) return 'In a mapped trouble spot — voltage damper ' + (hgKdScaleLast <= 1 ? 'off' : 'reduced') + ' at this speed';
+            return 'Watching — no trouble spot at this speed, full gain';
     }
 }
 
@@ -12923,10 +12981,13 @@ function huntGovLiveOnCsv1(data) {
 
 // Voltage-damper (D-term) lever readout — CSV2 cadence is plenty (it moves on pocket entry/exit
 // and test open/close). Old firmware without the field leaves the row at its placeholder.
+let hgKdScaleLast = 100;   // last CSV2 huntKdScale, read by hgStateWord on the faster CSV1 cadence
 function huntGovLiveOnCsv2(data) {
-    const el = document.getElementById('hgKdState');
-    if (!el || data.huntKdScale === undefined) return;
+    if (data.huntKdScale === undefined) return;
     const pct = Number(data.huntKdScale);
+    if (Number.isFinite(pct)) hgKdScaleLast = pct;
+    const el = document.getElementById('hgKdState');
+    if (!el) return;
     el.textContent = pct >= 99 ? 'Running' : pct <= 1 ? 'Off at this speed' : 'Reduced (pocket edge)';
 }
 
@@ -15438,6 +15499,7 @@ function initCurrentTempPlot() {
         width: plotFitWidth(plotEl, 600, 800),  // fallback 600 (viewport-clamped): never born 0-wide if built hidden
         height: 300,
         title: "Current History",
+        cursor: { drag: { x: false, y: false } },
         series: [
             { label: null, points: { show: false }, stroke: "transparent", width: 0 },
             {
@@ -15626,6 +15688,7 @@ function initVoltagePlot() {
         width: plotFitWidth(plotEl, 600, 800),  // fallback 600 (viewport-clamped): never born 0-wide if built hidden
         height: 300,
         title: "Battery Voltage History",
+        cursor: { drag: { x: false, y: false } },
         series: [
             { label: null, points: { show: false }, stroke: "transparent", width: 0 },
             {
@@ -15791,6 +15854,7 @@ function initRPMPlot() {
         width: plotFitWidth(plotEl, 600, 800),  // fallback 600 (viewport-clamped): never born 0-wide if built hidden
         height: 300,
         title: "RPM History",
+        cursor: { drag: { x: false, y: false } },
         series: [
             { label: null, points: { show: false }, stroke: "transparent", width: 0 },
             {
@@ -15950,6 +16014,7 @@ function initTemperaturePlot() {
         width: plotFitWidth(plotEl, 600, 800),  // fallback 600 (viewport-clamped): never born 0-wide if built hidden
         height: 300,
         title: "Alternator Temperature History",
+        cursor: { drag: { x: false, y: false } },
         series: [
             { label: null, points: { show: false }, stroke: "transparent", width: 0 },
             {
@@ -16717,7 +16782,7 @@ async function passwordSet() {
         pwRemember(a);
         renderAccessCard();
         xAlert(changing ? 'The settings password was changed. Other phones and browsers will ask for the new one at their next unlock.'
-            : 'The settings password is on. Unlock Settings now asks for it. If it is ever lost, ground pin 11 at boot: that clears it together with the WiFi credentials.', 'Settings password');
+            : 'The settings password is on. Unlock Settings now asks for it. If it is ever lost, ground pin 11 at boot: that clears it and opens the WiFi setup page on the regulator\'s own hotspot, under the hotspot\'s default name and password.', 'Settings password');
     } else if (j && j.err === 'password') {
         pwForget();
         xAlert('The current password was not accepted. Nothing was changed.', 'Settings password');
@@ -17331,7 +17396,7 @@ function gotoRpmTableHighlightFirstAmps() {
     }, 80);
 }
 
-// ── CV gain-mode UI (Auto ω-based vs Manual) — see Working Markdown Docs/CV_AUTOTUNE_PLAN.md ──
+// ── CV Gain Source UI (Measured ω-based vs Manual) — see Working Markdown Docs/CV_AUTOTUNE_PLAN.md ──
 function updateCvGainModeUI(data) {
     if (data.cvGainMode === undefined) return;
     if (data.cvPiZero !== undefined) CV_PI_ZERO = (parseFloat(data.cvPiZero) || 50) / 100;
@@ -17341,7 +17406,7 @@ function updateCvGainModeUI(data) {
     const manBlk  = document.getElementById('cvManualBlock');
     if (autoBlk) autoBlk.style.display = auto ? '' : 'none';
     if (manBlk)  manBlk.style.display  = auto ? 'none' : '';
-    // Kd gain follows the same gate: auto-derived (Kd = Td·Kp) in Auto, typed in Manual.
+    // Kd gain follows the same gate: derived (Kd = Td·Kp) under Measured, typed under Manual.
     const kdAutoBlk = document.getElementById('cvKdAutoBlock');
     const kdManBlk  = document.getElementById('cvKdManualBlock');
     if (kdAutoBlk) kdAutoBlk.style.display = auto ? '' : 'none';
@@ -17359,7 +17424,7 @@ function updateCvGainModeUI(data) {
         const tScale = (c2.cvTempDerateScale !== undefined && c2.cvTempDerateScale !== '') ? parseFloat(c2.cvTempDerateScale) / 1000 : 1;
         const scaleTxt = (isFinite(tScale) && Math.abs(tScale - 1) > 0.005) ? ` &middot; temp &times;${Math.round(tScale * 100)}%` : '';
         activeEl.innerHTML = (isFinite(cKp) && isFinite(cKi))
-            ? `<strong>Active gains:</strong> Kp ${(cKp * tScale).toFixed(1)} / Ki ${(cKi * tScale).toFixed(1)}${isFinite(cKd) ? ` / Kd ${(cKd * tScale).toFixed(1)}` : ''} (12 V-equiv)${scaleTxt} &middot; ${auto ? 'Auto' : 'Manual'}`
+            ? `<strong>Active gains:</strong> Kp ${(cKp * tScale).toFixed(1)} / Ki ${(cKi * tScale).toFixed(1)}${isFinite(cKd) ? ` / Kd ${(cKd * tScale).toFixed(1)}` : ''} (12 V-equiv)${scaleTxt} &middot; ${auto ? 'Measured' : 'Manual'}`
             : '<strong>Active gains:</strong> &mdash;';
     }
     // measured ohmic stiffness + computed gains (ohmic-anchor rule): Kp = α/K, Ki = ρ·Kp (12V-equiv space).
@@ -17373,7 +17438,7 @@ function updateCvGainModeUI(data) {
     const status = document.getElementById('cvFitStatus');
     if (status) status.innerHTML = valid
         ? `<strong>From commissioning:</strong> battery stiffness ${(K * 1000).toFixed(1)} mV/A (~0.6 s response) &rarr; Kp ${Kp.toFixed(1)} / Ki ${Ki.toFixed(1)} (12 V-equiv)`
-        : 'No fit yet — run the Voltage Control Autotuning step in commissioning. Auto uses safe defaults until then.';
+        : 'No fit yet — run the Voltage Control Autotuning step in commissioning. Until then the voltage loop runs safe default gains.';
     previewCvAlpha();
     renderBattTempDerate();
     syncCvDependentVis();
@@ -17797,20 +17862,22 @@ function submitSimpleParam(paramName, val, extra) {
 // old→new preview (read from the live echo values) and returns false if the user cancels, so the
 // save can be aborted.
 // oldV/newV are 12/24/36/48; window._nominalStored holds the last-loaded class (set from the vessel fetch).
-async function confirmVoltageRescale(oldV, newV) {
+// plan (fieldWindingSavePlan) carries the field-side ratio: oldV/newV while the winding is unchanged, otherwise
+// whatever the winding move and the class clamp on it make it.
+async function confirmVoltageRescale(oldV, newV, plan) {
     const ratio = newV / oldV;
+    const fr = (plan && Number.isFinite(plan.fr)) ? plan.fr : oldV / newV;
     const fmt = n => Number.isFinite(n) ? n.toFixed(2) : '?';
     const line = (label, echoId) => {
         const o = getEchoNumber(echoId);
         return '  ' + label + ': ' + fmt(o) + ' → ' + fmt(o * ratio) + ' V';
     };
-    // Field-duty knobs scale by the INVERSE ratio (oldV/newV) so the field CURRENT they govern stays
-    // constant across banks; unit is %/s (or %), not volts.
-    // src is an echo element id, or a number for a knob with no echo span (the Run Without Failed Sensors cache).
-    const dline = (label, src, unit) => {
-        const o = (typeof src === 'number') ? src : getEchoNumber(src);
-        return '  ' + label + ': ' + fmt(o) + ' → ' + fmt(o / ratio) + ' ' + unit;
-    };
+    const fieldTxt = (Math.abs(fr - 1) < 1e-9)
+        ? 'The field-duty settings stay as they are: the field winding moves with the system voltage, so each keeps '
+          + 'the same share of the winding\'s rated field.\n'
+        : 'These field-duty settings rescale ×' + fieldRatioText(fr) + ' so each keeps the same share of the field '
+          + 'winding\'s rated field (Field Winding Voltage, Vessel Info):\n' + fieldKnobLines(fr) + '\n';
+    const windTxt = plan ? fieldWindingPlanText(plan) : '';
     const msg = 'Changing system voltage from ' + oldV + 'V to ' + newV + 'V (×'
         + (ratio % 1 === 0 ? ratio : ratio.toFixed(2)) + ') will rescale your charge profile and '
         + 'write it to the device:\n\n'
@@ -17826,26 +17893,273 @@ async function confirmVoltageRescale(oldV, newV) {
         + line('Hardware shutdown (INA228)', 'VoltageHardwareLimit_echo') + '\n'
         + line('Timed OV cut LOW margin', 'OvTierLoMarginV_echo') + '\n'
         + line('Timed OV cut MID margin', 'OvTierMidMarginV_echo') + '\n\n'
-        + 'These field-duty settings also rescale (inversely) so field current stays constant:\n'
-        + dline('Min Field', 'MinDuty_echo', '%') + '\n'
-        + dline('Duty ramp rate', 'DutyRampRate_echo', '%/s') + '\n'
-        + dline('Shutdown final ramp rate', 'DutySlowRampRate_echo', '%/s') + '\n'
-        + dline('Run Without Failed Sensors field duty cap', rwfsFlags.seen ? rwfsFlags.LimpDutyPct : NaN, '%') + '\n\n'
-        + 'Max Field % and Max Field Volts are left alone: they describe the alternator, not the bank, '
-        + 'and the field ceiling re-derives from Max Field Volts against the new system voltage.\n\n'
+        + fieldTxt
+        + (windTxt ? windTxt + '\n' : '\n')
+        + 'Max Field % is left alone, and so is Max Field Volts unless the field winding changes: they describe the '
+        + 'alternator, not the bank, and the field ceiling re-derives from Max Field Volts against the new system voltage.\n\n'
         + 'IT ALSO ERASES THESE, and they cannot be recovered:\n'
         + '  - Your commissioned tachometer keep-alive floor table, and the learning behind it. It goes back '
-        + 'to the flat 1% default and the Keep-Alive Floor step has to be run again.\n'
-        + '  - Learned oscillation-damper engine-speed ranges.\n\n'
+        + 'to the flat 0.25% default and the Keep-Alive Floor step has to be run again.\n'
+        + '  - Learned oscillation-damper engine-speed ranges.\n'
+        + altHealthEraseLine(plan) + '\n'
         + 'Protection margins and tuning-helper thresholds (overvoltage trip margins, sensor '
         + 'disagreement threshold, target ramp rates, voltage-damper arm and deadband thresholds, '
-        + 'CV test wave amplitude, and similar voltage-referenced bands) rescale with the new voltage, '
-        + 'and field-duty bands (keep-alive onset margin and probe step, alternator-health steadiness bands and duty '
-        + 'floor) rescale inversely. Voltage-loop gains are unaffected: the stored battery stiffness '
+        + 'CV test wave amplitude, and similar voltage-referenced bands) rescale with the new voltage. '
+        + 'Voltage-loop gains are unaffected: the stored battery stiffness '
         + 'is rescaled with the bank precisely so the loop behaves the same per cell.\n\n'
         + 'It rescales from the CURRENT values, so if you already entered real ' + newV
         + 'V setpoints by hand, press Cancel.\n\nContinue and save?';
     return await xConfirm(msg);
+}
+
+// ===== Field winding voltage (Vessel Info FIELD_WINDING_V, firmware FieldWindingV / fieldWindApplied) =====
+const FIELD_WIND_MAX_A = 10;   // the board's field-current rating (FD_FIELD_MAX_A): the resistance check's bar
+let _fieldWindLastSig = '';    // last FieldWindingV/fieldWindApplied pair seen on CSV3
+let _fieldWindAskedKey = '';   // "W:R" already asked this page load
+
+// What the device reports: w = the owner's winding, eff = the winding the field-side knobs are scaled for (below w
+// while the resistance check waits on the owner). Falls back to the Vessel Info fetch before the first CSV3 frame.
+function fieldWindingDevice() {
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    const ok = v => v === 12 || v === 24 || v === 36 || v === 48;
+    const w = c3 && ok(Number(c3.FieldWindingV)) ? Number(c3.FieldWindingV) : (ok(Number(window._windingStored)) ? Number(window._windingStored) : 12);
+    const eff = c3 && ok(Number(c3.fieldWindApplied)) ? Number(c3.fieldWindApplied) : w;
+    return { w, eff };
+}
+
+// fieldScale() as the firmware applies it: effective winding / class. unknownAsOne: a caller that must never
+// over-gain (the plant-fit gain store) takes 1 when the device has not said, which can only under-gain.
+function webFieldScale(unknownAsOne) {
+    const cls = parseInt(window._nominalStored, 10) || 12;
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    const eff = c3 ? Number(c3.fieldWindApplied) : NaN;
+    if (eff === 12 || eff === 24 || eff === 36 || eff === 48) return eff / cls;
+    return unknownAsOne ? 1 : 12 / cls;
+}
+
+function fieldResOhms() {
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    const r = c3 ? Number(c3.FieldResistance) / 1000 : NaN;
+    return (Number.isFinite(r) && r > 0) ? r : NaN;
+}
+
+// The firmware's resistance check (fieldWindingImplausible), in the same whole milliohms, so the two agree right at
+// 2.4/3.6/4.8 ohm: a winding rated w drawing more than the board's 10 A at its own rating.
+function fieldWindImplausible(w, R) {
+    return w > 12 && R > 0 && Math.round(R * 1000) * FIELD_WIND_MAX_A < w * 1000;
+}
+
+// The "W:R" pairing a resistance-check answer is for; the firmware refuses an answer whose pairing has moved on.
+function fieldWindAskedKey(w, R) {
+    return w + ':' + R.toFixed(3);
+}
+
+// Commissioning stage 2 (Plant fit) done: the current-loop gains were measured on this alternator, so the firmware keeps
+// the gain applied to the field across a winding change instead of scaling it.
+function ccGainCommissioned() {
+    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
+    return !!c3 && ((parseInt(c3.commissionDoneMask, 10) || 0) & 4) !== 0;
+}
+
+// Vessel Info: a field winding is never rated above the bus, so options above the chosen system voltage are disabled.
+function fieldWindingSyncOptions() {
+    const form = document.getElementById('vessel-info-form');
+    if (!form || !form.FIELD_WINDING_V || !form.BATTERY_VOLTAGE) return;
+    const cls = parseInt(form.BATTERY_VOLTAGE.value, 10) || 12;
+    const sel = form.FIELD_WINDING_V;
+    Array.from(sel.options).forEach(o => { o.disabled = parseInt(o.value, 10) > cls; });
+    if ((parseInt(sel.value, 10) || 12) > cls) sel.value = String(cls);
+}
+
+// The resistance-check question. Resolves 'keep', 'twelve' or 'later'.
+async function fieldWindingQuestion(w, R, answerNote) {
+    let later = false;
+    const msg = 'Field Resistance is ' + R.toFixed(3) + ' ohm. A ' + w + ' V field winding with that resistance would draw '
+        + (w / R).toFixed(1) + ' A at ' + w + ' V, above this regulator\'s ' + FIELD_WIND_MAX_A + ' A field limit. '
+        + 'A 12 V winding with that resistance draws ' + (12 / R).toFixed(1) + ' A at 12 V.\n\n'
+        + 'Field settings are held at 12 V winding values until you choose. Decide later keeps them there and asks again '
+        + 'the next time the app is opened.'
+        + (answerNote ? '\n\n' + answerNote : '');
+    const ok = await xConfirm(msg, {
+        title: 'Check Field Winding Voltage', okText: 'Keep ' + w + ' V winding', cancelText: 'Use 12 V winding',
+        extra: { text: 'Decide later', onSelect: () => { later = true; } }, focus: 'extra'
+    });
+    _fieldWindAskedKey = fieldWindAskedKey(w, R);   // one ask per pairing per page load, whatever the answer
+    return ok ? 'keep' : (later ? 'later' : 'twelve');
+}
+
+// Asked from the CSV3 hook while the device holds a bus-rated winding on 12 V values (a new Field Resistance, an import),
+// or from the Answer now button (force). The answer goes straight to the device.
+async function fieldWindingAsk(force) {
+    if (DEMO_MODE) return;
+    const d = fieldWindingDevice();
+    const R = fieldResOhms();
+    if (!(d.eff < d.w) || !(R > 0)) return;
+    const asked = fieldWindAskedKey(d.w, R);
+    if (!force && _fieldWindAskedKey === asked) return;
+    _fieldWindAskedKey = asked;
+    const gainTxt = ccGainCommissioned()
+        ? 'the field-duty settings by ' + fieldRatioText(d.w / d.eff) + ' (the current-loop gain applied to the field stays '
+          + 'as it was measured in commissioning)'
+        : 'the field-duty settings and the current-loop gain applied to the field by ' + fieldRatioText(d.w / d.eff);
+    const ans = await fieldWindingQuestion(d.w, R, 'Keep ' + d.w + ' V winding multiplies ' + gainTxt + ' and sets Max Field Volts to '
+        + (1.25 * d.w).toFixed(1) + ' V. It also erases the tachometer keep-alive floor table (the Keep-Alive Floor step '
+        + 'has to be run again), the learned oscillation-damper engine-speed ranges, and your alternator health history '
+        + 'on the regulator and in the cloud. None of these can be recovered.\n\n'
+        + 'Use 12 V winding sets Field Winding Voltage to 12 V and changes nothing else.');
+    if (ans === 'later') return;
+    if (!(await ensureArmed('Answering the field winding question changes this unit\'s settings.'))) return;
+    try {
+        const q = ans === 'keep' ? 'FieldWindingAck=' + encodeURIComponent(asked)
+                                 : 'FieldWindingV=12&FieldWindingAsked=' + encodeURIComponent(asked);
+        const r = await fetchWithTimeout(buildURL('/get?' + q), { cache: 'no-store' }, 4000);
+        if (r.status === 409) { xAlert(await r.text(), 'Field Winding Voltage'); return; }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (ans === 'twelve') {   // the next CSV3 frame would confirm it; a Vessel Info save before then must not put the old winding back
+            window._windingStored = 12;
+            const sel = document.querySelector('#vessel-info-form select[name="FIELD_WINDING_V"]');
+            if (sel) sel.value = '12';
+        }
+    } catch (e) {
+        _fieldWindAskedKey = '';
+        xAlert('The regulator did not take the answer. Check the connection and press Answer now in Vessel Info.\n\n' + e);
+    }
+}
+
+// CSV3 hook: keeps the Vessel Info winding row, its hold note and the field-scaled input attributes in step with the
+// device, and raises the resistance-check question once per page load while the device holds the 12 V values.
+function fieldWindingOnCsv3(d) {
+    const w = Number(d.FieldWindingV), eff = Number(d.fieldWindApplied);
+    if (!(w === 12 || w === 24 || w === 36 || w === 48)) return;
+    const sig = w + '/' + eff;
+    if (sig !== _fieldWindLastSig) {
+        const first = _fieldWindLastSig === '';
+        _fieldWindLastSig = sig;
+        window._windingStored = w;
+        const sel = document.querySelector('#vessel-info-form select[name="FIELD_WINDING_V"]');
+        if (sel && !first && document.activeElement !== sel) sel.value = String(w);   // a dialog answer or another client moved it
+        applyClassScaledInputAttrs();
+    }
+    const held = eff < w;
+    const hold = document.getElementById('fieldWindHold');
+    if (hold) {
+        hold.style.display = held ? '' : 'none';
+        const R = fieldResOhms();
+        const t = document.getElementById('fieldWindHoldTxt');
+        if (held && t) t.textContent = 'Field settings are held at 12 V winding values: Field Resistance '
+            + (R > 0 ? R.toFixed(3) + ' ohm would draw ' + (w / R).toFixed(1) + ' A' : 'would draw more than ' + FIELD_WIND_MAX_A + ' A')
+            + ' at ' + w + ' V, above the regulator\'s ' + FIELD_WIND_MAX_A + ' A field limit.';
+    }
+    if (held) fieldWindingAsk(false);
+}
+
+// What a Vessel Info save does to the field side: the winding after the class clamp, the owner's answer to the
+// resistance check, and the field-knob ratio (effective winding / class, new over old). Writes the answer into
+// vesselData (field_winding_v, field_winding_ack); the firmware repeats every step, this only previews it.
+async function fieldWindingSavePlan(vesselData, oldV, newV) {
+    const dev = fieldWindingDevice();
+    const cls = newV || oldV || 12;
+    let w = parseInt(vesselData.field_winding_v, 10);
+    if (!(w === 12 || w === 24 || w === 36 || w === 48)) w = dev.w;
+    if (w > cls) w = cls;
+    vesselData.field_winding_v = w;
+    let effNew = w;
+    const R = fieldResOhms();
+    if (fieldWindImplausible(w, R) && !(w === dev.w && dev.eff === dev.w)) {
+        if (w === dev.w && _fieldWindAskedKey === fieldWindAskedKey(w, R)) {
+            effNew = dev.eff;   // already asked this page load and deferred: a save of other fields does not ask again
+        } else {
+            const ans = await fieldWindingQuestion(w, R);
+            if (ans === 'twelve') { w = 12; vesselData.field_winding_v = 12; effNew = 12; }
+            else if (ans === 'keep') vesselData.field_winding_ack = fieldWindAskedKey(w, R);
+            else effNew = 12;
+        }
+    }
+    const oldCls = oldV || cls;
+    const fr = (effNew / cls) / (dev.eff / oldCls);
+    // The class converter runs first with the present winding (clamped to the new class, its confirmation cleared if the
+    // clamp moves it) and scales the gain; the winding step after it keeps the applied gain when the current loop is
+    // commissioned. effCls is the winding the field settings are on between the two.
+    const wCls = Math.min(dev.w, cls);
+    const effCls = (wCls === dev.w) ? Math.min(dev.eff, cls) : (fieldWindImplausible(wCls, R) ? 12 : wCls);
+    const gainHeld = ccGainCommissioned() && effNew !== effCls;
+    const gr = gainHeld ? (effCls / cls) / (dev.eff / oldCls) : fr;
+    return { wOld: dev.w, wNew: w, effOld: dev.eff, effNew, fr, gr, gainHeld, kRatio: gainHeld ? effCls / effNew : 1,
+             mfvNew: effNew !== dev.eff ? 1.25 * effNew : NaN };
+}
+
+function fieldRatioText(fr) {
+    return (Math.abs(fr - Math.round(fr)) < 1e-6) ? String(Math.round(fr)) : fr.toFixed(2);
+}
+
+// One line per field-side duty knob, old → new at ratio fr (the firmware's scaleFieldSideKnobs list).
+function fieldKnobLines(fr) {
+    const fmt = (n, d) => Number.isFinite(n) ? n.toFixed(d) : '?';
+    const L = (label, src, unit, d) => {
+        const o = (typeof src === 'number') ? src : getEchoNumber(src);
+        return '  ' + label + ': ' + fmt(o, d) + ' → ' + fmt(o * fr, d) + ' ' + unit;
+    };
+    return [
+        L('Min Field', 'MinDuty_echo', '%', 2),
+        L('Duty ramp rate', 'DutyRampRate_echo', '%/s', 2),
+        L('Shutdown final ramp rate', 'DutySlowRampRate_echo', '%/s', 3),
+        L('Oscillation damper Detection Amplitude', 'HuntTrigPct_echo', '%', 3),
+        L('Run Without Failed Sensors field duty cap', rwfsFlags.seen ? rwfsFlags.LimpDutyPct : NaN, '%', 1),
+        L('Keep-Alive Margin Below Onset', 'kneeMarginPct_echo', '%', 2),
+        L('Keep-Alive Probe Step', 'kneeStepPct_echo', '%', 3),
+        L('Keep-Alive Maximum Floor', 'kneeMaxFloorPct_echo', '%', 2),
+        L('Keep-Alive Steady Band, field', 'kneeDutyTolPct_echo', '%', 2),
+        L('Alternator Health field-duty wobble limit', 'altDutyLineRms_echo', '%', 3),
+        L('Alternator Health field-duty rate limit', 'altDutySlewMax_echo', '%/s', 3),
+        L('Alternator Health admission min duty', 'altMinDuty_echo', '%', 2),
+        L('Manual Field PWM', 'ManualDutyTarget_echo', '%', 2),
+        L('Plant Delay test Wave Amplitude', 'SystemIDStepAmplitude_echo', '% duty', 1),
+    ].join('\n');
+}
+
+// The field-winding lines a save adds to either dialog: the winding itself, Max Field Volts and the loop gain.
+function fieldWindingPlanText(plan) {
+    let t = '';
+    if (plan.wNew !== plan.wOld) t += '  Field Winding Voltage: ' + plan.wOld + ' V → ' + plan.wNew + ' V\n';
+    if (Number.isFinite(plan.mfvNew)) {
+        const o = getEchoNumber('MaxFieldVolts_echo');
+        t += '  Max Field Volts: ' + (Number.isFinite(o) ? o.toFixed(1) : '?') + ' → ' + plan.mfvNew.toFixed(1) + ' V\n';
+    }
+    const gr = Number.isFinite(plan.gr) ? plan.gr : plan.fr;
+    if (plan.gainHeld) {
+        t += '  Current-loop gain applied to the field: ' + (Math.abs(gr - 1) < 1e-9 ? 'unchanged' : '×' + fieldRatioText(gr) + ' from the system voltage change')
+            + '. It was measured on this alternator in commissioning, so the winding change does not move it; the PID Kp, Ki, and Kd '
+            + 'values shown change ×' + fieldRatioText(plan.kRatio) + ' to keep it.\n';
+    } else if (Math.abs(gr - 1) > 1e-9) {
+        t += '  Current-loop gain applied to the field: ×' + fieldRatioText(gr) + ' (the PID Kp, Ki and Kd values shown are kept)\n';
+    }
+    if (plan.effNew < plan.wNew) t += '  Field settings are held at 12 V winding values until the resistance question is answered.\n';
+    return t;
+}
+
+// Vessel Info save that moves the winding the field knobs are scaled for, with the class unchanged. Returns false on Cancel.
+async function confirmWindingRescale(plan) {
+    const msg = 'Field settings move from a ' + plan.effOld + ' V to a ' + plan.effNew + ' V field winding (×'
+        + fieldRatioText(plan.fr) + ') and are written to the device:\n\n'
+        + fieldKnobLines(plan.fr) + '\n'
+        + fieldWindingPlanText(plan) + '\n'
+        + 'IT ALSO ERASES THESE, and they cannot be recovered:\n'
+        + '  - Your commissioned tachometer keep-alive floor table, and the learning behind it. It goes back '
+        + 'to the flat 0.25% default and the Keep-Alive Floor step has to be run again.\n'
+        + '  - Learned oscillation-damper engine-speed ranges.\n'
+        + altHealthEraseLine(plan) + '\n'
+        + 'It rescales from the CURRENT values, so if you already set these for the new winding by hand, press Cancel.'
+        + '\n\nContinue and save?';
+    return await xConfirm(msg, { title: 'Field Winding Voltage' });
+}
+
+// The firmware clears the alt-health record whenever the winding the field settings run on (fieldWindApplied) moves
+// (altHealthWindingCheck); a change of the setting alone, held at 12 V values or released back to them, keeps it.
+function altHealthEraseLine(plan) {
+    return (plan && plan.effNew !== plan.effOld)
+        ? '  - Your alternator health history: My History, the % vs Engine-Hours trend and the session stats, '
+          + 'on the regulator and in the cloud. It starts again on the new winding\'s scale.\n'
+        : '';
 }
 
 // Level offsets row (Zero Now): the offsets are averaged over ~2s on the device before they echo back, so show a
@@ -19334,8 +19648,12 @@ window.addEventListener("load", function () {
                     else if (key === "overheatingPenaltyTimer") {
                         newTextContent = (value).toFixed(0);
                     }
+                    // Field Resistance is sent x1000 (3 decimals, what the firmware stores)
+                    else if (key === "FieldResistance") {
+                        newTextContent = (value / 1000).toFixed(3);
+                    }
                     // Values scaled by 100 on server (pid and learning fields)
-                    else if (["pidSetpoint", "FieldResistance", "TailCurrent_A", "RebulkVoltage", "SOC_BlockRebulk_percent", "SOC_AllowRebulk_percent", "DutySlowRampRate", "VoltageKi", "VoltageKp"].includes(key)) {
+                    else if (["pidSetpoint", "TailCurrent_A", "RebulkVoltage", "SOC_BlockRebulk_percent", "SOC_AllowRebulk_percent", "DutySlowRampRate", "VoltageKi", "VoltageKp"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
                     // safeHours: stored as seconds — display as hours
@@ -20468,6 +20786,7 @@ window.addEventListener("load", function () {
                     renderImuZeroLabel(data);
                 }
             } catch (e) { }
+            try { fieldWindingOnCsv3(data); } catch (e) { }
 
             //CSVData3
             /*             ## 🎯 **Summary**
@@ -20607,8 +20926,12 @@ window.addEventListener("load", function () {
                     else if (["LearningSettlingPeriod", "rebulkDebounceTime", "MinFloatTime"].includes(key)) {
                         newTextContent = (value / 1000).toFixed(0);
                     }
+                    // Field Resistance is sent x1000 (3 decimals, what the firmware stores)
+                    else if (key === "FieldResistance") {
+                        newTextContent = (value / 1000).toFixed(3);
+                    }
                     // Values scaled by 100 
-                    else if (["pidSetpoint", "FieldResistance", "TailCurrent_A", "RebulkVoltage", "SOC_BlockRebulk_percent", "SOC_AllowRebulk_percent", "DutySlowRampRate", "VoltageKi", "VoltageKp"].includes(key)) {
+                    else if (["pidSetpoint", "TailCurrent_A", "RebulkVoltage", "SOC_BlockRebulk_percent", "SOC_AllowRebulk_percent", "DutySlowRampRate", "VoltageKi", "VoltageKp"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
 
@@ -22412,14 +22735,16 @@ function updateLifeIndicators(data) {
 
 
 // Open-loop field modes (manual / limp-home) command duty directly, bypassing the current-limiting
-// loop. On a 24/36/48V bank each duty-percent drives ~2×/3×/4× the field current of 12V, so a duty that's
-// safe at 12V can over-current the field. window._nominalStored is the system voltage from the Vessel
-// Info fetch/save. Returns a paragraph to append to the mode's own warning, or '' on a 12V bank.
+// loop. Each duty-percent drives the field class / winding times as hard as on a 12V system (4× for a 12 V
+// winding at 48V, 1× for a bus-rated one), so a duty that's safe at 12V can over-current a 12 V winding on a
+// higher bank. Returns a paragraph to append to the mode's own warning, or '' when the ratio is 1.
 function openLoopHighVoltageNote() {
     const nsv = parseInt(window._nominalStored, 10) || 12;
-    if (nsv <= 12) return '';
-    return '\n\nThis is a ' + nsv + 'V system. Each duty-percent drives about ' + (nsv / 12)
-        + '× the field current of a 12V system, so a duty that is safe at 12V can over-current the '
+    const k = 1 / webFieldScale(false);
+    if (!(k > 1.01)) return '';
+    const w = Math.round(nsv / k);
+    return '\n\nThis is a ' + nsv + 'V system with a ' + w + 'V field winding. Each duty-percent drives the field about '
+        + fieldRatioText(k) + '× as hard as on a 12V system, so a duty that is safe at 12V can over-current the '
         + 'field here. Keep the commanded duty low and raise it gradually while watching field and '
         + 'output current.';
 }
@@ -22859,7 +23184,7 @@ function rwfsSummary() {
     if (lost.length) html += '<div style="margin-top:6px;"><span class="lost"><b>Lost:</b> ' + lost.join('; ') + '.</span></div>';
     if (kept.length) html += '<div style="margin-top:4px;"><span class="kept"><b>Still active:</b> ' + kept.join('; ') + '.</span></div>';
     if (d.IgnoreBattVMain || d.LimpHome) html += '<div style="margin-top:6px; color:#ff8a80;">Over-voltage protection then depends on the INA228\'s hardware alert, which only works while that chip is powered. If the INA228 is the part that failed, there is no over-voltage protection.</div>';
-    if (nsv > 12 && tier >= 2) html += '<div style="margin-top:6px;">' + String(openLoopHighVoltageNote()).replace(/^\n+/, '') + '</div>';
+    if (nsv > 12 && tier >= 2 && openLoopHighVoltageNote()) html += '<div style="margin-top:6px;">' + String(openLoopHighVoltageNote()).replace(/^\n+/, '') + '</div>';
     if (s.innerHTML !== html) s.innerHTML = html;
     // Apply is live only when every required input is present.
     const btn = document.getElementById('rwfs-apply-btn');
@@ -22964,21 +23289,21 @@ function manualFieldBypassText() {
 }
 
 // Entering manual is the only switch in the app that REMOVES protections, so it asks first and puts
-// the switch back if the answer is no. Leaving manual (back to PID) always goes straight through.
+// the switch back if the answer is no. Leaving manual (back to Auto) always goes straight through.
 // The confirm has to run before handleUserToggle, or a cancel would leave a pending desired value
 // behind that the next settings echo would fight.
 function manualFieldToggleChanged(cb) {
     if (!cb) return;
-    const wantManual = !cb.checked;                           // checked = PID; the position just chosen
-    if (!wantManual) { manualFieldToggleApply(cb, false); return; }   // → PID, nothing to warn about
+    const wantManual = !cb.checked;                           // checked = Auto; the position just chosen
+    if (!wantManual) { manualFieldToggleApply(cb, false); return; }   // → Auto, nothing to warn about
     xConfirm(manualFieldBypassText(), {
-        title: 'Manual field mode — protections off',
+        title: 'Manual mode — protections off',
         okText: 'Switch to Manual',
-        cancelText: 'Stay on PID'
+        cancelText: 'Stay on Auto'
     }).then(ok => {
         if (ok) { manualFieldToggleApply(cb, true); return; }
-        cb.checked = true;                             // back to PID; nothing was ever sent
-        syncSegmented('ManualFieldToggle_checkbox');   // abSegClick already painted Manual; repaint PID
+        cb.checked = true;                             // back to Auto; nothing was ever sent
+        syncSegmented('ManualFieldToggle_checkbox');   // abSegClick already painted Manual; repaint Auto
     });
 }
 
@@ -22998,7 +23323,7 @@ function manualFieldToggleApply(cb, manual) {
     const v = manual ? 1 : 0;
     const repaint = () => {
         pendingToggles.delete('ManualFieldToggle');
-        const last = toggleStates['ManualFieldToggle'];          // last CSV3 echo, inverted domain (1 = PID)
+        const last = toggleStates['ManualFieldToggle'];          // last CSV3 echo, inverted domain (1 = Auto)
         if (last !== undefined) { cb.checked = (last === 1); syncSegmented('ManualFieldToggle_checkbox'); }
     };
     const url = buildURL('/get?ManualFieldToggle=' + v + clientWriteTag());
@@ -23030,15 +23355,15 @@ function handleManualFieldToggle(checkboxId) {
     const cb = document.getElementById(checkboxId);
     if (!cb) return false;
 
-    // ESP32 convention is inverted: 0 = PID, 1 = Manual
-    // So when checkbox is checked (PID), we send 0; unchecked (Manual), we send 1
+    // ESP32 convention is inverted: 0 = Auto, 1 = Manual
+    // So when checkbox is checked (Auto), we send 0; unchecked (Manual), we send 1
     const invertedVal = cb.checked ? '0' : '1';
 
     const result = handleUserToggle(checkboxId, 'ManualFieldToggle', 'ManualFieldToggle');
 
     const pending = pendingToggles.get('ManualFieldToggle');
     if (pending) {
-        pending.desiredValue = cb.checked ? 1 : 0;  // checked=PID=invertedManual=1
+        pending.desiredValue = cb.checked ? 1 : 0;  // checked=Auto=invertedManual=1
     }
 
     const hiddenInput = document.getElementById('ManualFieldToggle');
@@ -23147,11 +23472,11 @@ function svTempSensor() {
 }
 
 // shared source descriptions
-const S_ADS_ALT = 'alternator output current — Hall-effect clamp, read by the external 16-bit ADC (ADS1115 ch&nbsp;1, shared round-robin), fresh within ~30&nbsp;ms';
-const S_INA_I = 'battery current — INA228 shunt monitor, new sample every ~5&nbsp;ms while charging';
-const S_INA_V = 'battery voltage — INA228 bus-voltage register, new sample every ~5&nbsp;ms';
+const S_ADS_ALT = 'alternator output current — Hall-effect clamp, read by the external 16-bit ADC (ADS1115 ch&nbsp;1, shared round-robin), new sample about every 13&nbsp;ms (up to ~30&nbsp;ms worst case)';
+const S_INA_I = 'battery current — INA228 shunt monitor, new sample about every 6&nbsp;ms while charging (up to ~18&nbsp;ms worst case)';
+const S_INA_V = 'battery voltage — INA228 bus-voltage register, new sample about every 6&nbsp;ms while charging (up to ~18&nbsp;ms worst case), about once a second with the field off';
 const S_FAST = 'the same alternator Hall clamp, tapped to the ESP32’s own on-chip ADC (GPIO3) at 20,000 samples/s — separate from the ADS1115 slow path';
-const S_RPM_ADS = 'engine speed — tach conditioner voltage on ADS1115 ch&nbsp;2 × RPM scaling factor';
+const S_RPM_ADS = 'engine speed — tach conditioner voltage on ADS1115 ch&nbsp;2 × RPM scaling factor, new reading about every 40&nbsp;ms (up to ~80&nbsp;ms worst case)';
 const S_DUTY = 'field drive strength (duty cycle) — the regulator’s own PWM command, no sensor involved';
 
 function sIETau() { return 'smoothed with a moving-average low-pass (EMA), time constant ' + svv('IExcessTau_echo', 'ms') + ' — adjustable: the "Averaging Time Constant" field in this Detection section'; }
@@ -23162,7 +23487,7 @@ const SINFO = {
     huntGov: () => [
         ['Signal', S_DUTY + ' — the applied duty actually written to the field, sampled at a fixed 20&nbsp;samples/s so the analysis band never moves when the control loop cadence changes'],
         ['Detects', 'a sustained tone in one of six fixed frequency slots from 0.31 to 2.34&nbsp;Hz, measured over a 6.4&nbsp;s window (Goertzel, Hann-weighted). It must beat ' + svv('HuntTrigPct_echo', '%') + ' duty swing AND stand 3× above the other slots, on ' + svv('HuntQualifyScans_echo', '') + ' scans in a row with engine speed steady (within ' + svv('HuntSteadyPct_echo', '%') + ' of where it started), before a test opens. A wobble that keeps the voltage damper (D-term) rhythmically reversing qualifies at a lower duty bar — its rhythm is the evidence'],
-        ['Ignored while', 'open loop, a protection or recovery is acting, any tuning/commissioning routine is running, manual field is on, the current target has just moved, or engine speed is drifting — none of those are the plant hunting'],
+        ['Ignored while', 'open loop, a protection or recovery is acting, any tuning/commissioning routine is running, Manual mode is on, the current target has just moved, or engine speed is drifting — none of those are the plant hunting'],
         ['Acts on', 'one lever per test. Usually the current loop\'s integral gain (PID Ki): one cut to ' + svv('HuntCutPct_echo', '%') + ' of your setting, then a re-measure. When the D-term is the part swinging, it is paused instead — and switched off entirely across a verified trouble spot, never reduced partway. Verified fixes are mapped by engine speed and applied proactively at that speed from then on, tapering to full gain over ' + svv('HuntWingPct_echo', '%') + ' of speed beyond the trouble spot'],
         ['Kept only if', 'the wobble shrinks at least ' + svv('HuntVerifyPct_echo', '%') + ', averaged scans before vs after. A failed D-term test rolls straight into the Ki test; only when every lever fails is full strength restored, with no new test for ' + svv('HuntCooldownMin_echo', ' min') + '. The map survives restarts; Clear System erases it'],
         ['Set', 'the Oscillation Damper switch and its seven settings on Setup ▸ Alternator ▸ Tuning ▸ Current ▸ Controller Parameters, next to the PID Ki it acts on'],
@@ -23186,7 +23511,7 @@ const SINFO = {
     ],
     DvdtTC: () => [
         ['Signal', 'the voltage rate-of-rise feeding Group 1’s prediction'],
-        ['Source', 'successive INA228 bus-voltage samples ~5&nbsp;ms apart'],
+        ['Source', 'successive INA228 bus-voltage samples about 6&nbsp;ms apart (up to ~18&nbsp;ms)'],
         ['Filter', 'this field IS the filter — moving-average low-pass (EMA) time constant'],    ],
     ovG2: () => [
         ['Signal', 'filtered battery voltage vs ' + svv('OvMeasMarginV_echo', 'V') + ' above target'],
@@ -23297,7 +23622,7 @@ const SINFO = {
         ['Signal', 'rate-of-change of battery current, computed on every new sample'],
         ['Source', S_INA_I],
         ['Filter', 'none — raw per-sample derivative (a filtered edge would be missed)'],
-        ['Trips', 'when a tier’s set number of consecutive samples all exceed its threshold — time to act = samples × the ~5 ms sampling interval; a single sample below resets that tier’s run'],
+        ['Trips', 'when a tier’s set number of consecutive samples all exceed its threshold — a sample is one battery-current reading, about every 6 ms (up to ~18 ms worst case); the output is cut at the next control update, about 13 ms apart (up to ~30 ms worst case); a single sample below resets that tier’s run'],
         ['Armed', 'whenever charging with fast battery reads — even when test protections are disabled; only the Group 5 Enable toggle disarms it'],    ],
     // ── Protections: Response ──
     KHard: () => [
@@ -23374,16 +23699,16 @@ const SINFO = {
         ['Filter', sAltEma()],    ],
     altFit: () => [
         ['Acts on', 'the best-ever reference surface and its locally-weighted fit (LWLR)'],
-        ['Fit inputs', 'smoothed RPM, excitation (derived from field duty / voltage / temperature), vs the recorded points'],
+        ['Fit inputs', 'smoothed RPM, excitation (derived from field duty / voltage / temperature, expressed for a 12&nbsp;V field winding so every Field Winding Voltage reads on one scale), vs the recorded points'],
         ['Prune k', 'stored on the device but applied cloud-side by the prune job'],
     ],
     altHiField: () => [
-        ['Signals', 'smoothed field duty (PWM command) at or above ' + svv('altHiFieldPct_echo', '%') + ' of the Max Field % ceiling AND smoothed alternator amps (ADS1115) at or below ' + svv('altLowOutAmps_echo', 'A') + ' for ' + svv('altHiFieldSec_echo', 's')],
+        ['Signals', 'smoothed field duty (PWM command) at or above ' + svv('altHiFieldPct_echo', '%') + ' of the alternator\'s field ceiling (the lower of Max Field % and the duty Max Field Volts works out to) AND smoothed alternator amps (ADS1115) at or below ' + svv('altLowOutAmps_echo', 'A') + ' for ' + svv('altHiFieldSec_echo', 's')],
         ['Filter', sAltEma()],
         ['Role', 'advisory readout only — no audible alarm, no field action'],    ],
     // ── Setup ▸ Diag: C4 measured-ripple capture ──
     ripWinMs: () => [
-        ['Signals', 'battery current (INA228 shunt, ~5&nbsp;ms samples while charging) + alternator current (ADS1115 Hall clamp, fresh within ~30&nbsp;ms) + engine speed (ADS1115 ch&nbsp;2)'],
+        ['Signals', 'battery current (INA228 shunt, a sample about every 6&nbsp;ms while charging, up to ~18&nbsp;ms) + alternator current (ADS1115 Hall clamp, about every 13&nbsp;ms, up to ~30&nbsp;ms) + engine speed (ADS1115 ch&nbsp;2, about every 40&nbsp;ms, up to ~80&nbsp;ms)'],
         ['Filter', 'the same EMA the over-current detectors use — τ = ' + svv('IExcessTau_echo', 'ms') + ', set as "Averaging Time Constant" on Setup ▸ Alternator ▸ Protections'],
         ['Recorded value', 'the smaller of the two half-window peak-to-peaks'],
         ['Consumed by', 'Commissioning ▸ Step 5 current check and the RPM-table game'],
@@ -26172,7 +26497,7 @@ async function downloadCvLog(ts = getLogTimestamp(), sfx = getLogNameSuffix()) {
     if (buf == null) return fail(`download failed after retry (${fetchErr})`);
 
     if (buf.byteLength < CV_LOG_HEADER_SIZE + CV_LOG_MIN_ENTRY_SIZE) {
-        return fail('device returned an empty log — run in AUTO with voltage control active first, or the log buffer failed to allocate at boot (check serial for "cvLog: PSRAM malloc failed")');
+        return fail('device returned an empty log — run in Auto mode with voltage control active first, or the log buffer failed to allocate at boot (check serial for "cvLog: PSRAM malloc failed")');
     }
 
     const d = parseCvBin(buf);
@@ -26532,9 +26857,9 @@ function updateTestPanelParams(testName) {
     }
 }
 
-// Class-scaled input attributes: Min Field steps inversely with the bank class (1 / 0.5 / 0.33 / 0.25 %
-// at 12/24/36/48V — the usable duty span compresses), and the CV wave amplitude limits scale
-// per-cell. Static HTML carries the 12V values; this refines them once the class is known.
+// Class-scaled input attributes: Min Field steps with fieldScale() (1 / 0.5 / 0.33 / 0.25 % at 12/24/36/48V
+// on a 12 V winding, 1 % on a bus-rated one), and the CV wave amplitude limits scale per-cell. Static HTML
+// carries the 12V values; this refines them once the class and winding are known.
 function applyClassScaledInputAttrs() {
     const k = (parseInt(window._nominalStored, 10) || 12) / 12;
     // 36V is the first class where k (=3) isn't a power of two: raw products pick up float dust
@@ -26542,8 +26867,9 @@ function applyClassScaledInputAttrs() {
     const r = x => String(Math.round(x * 1e6) / 1e6);
     // querySelectorAll, not querySelector: Min Field % is duplicated into the Gate Tuning Capture
     // panel, and a box left on the 12V step blocks its own Set with a stepMismatch.
-    const mdStep = (k === 3) ? 'any' : r(1 / k);
-    // At 36V, 1/k = 1/3 never terminates, so ANY finite step makes typed round values (e.g. 1)
+    const fsv = webFieldScale(false);
+    const mdStep = (Math.abs(fsv - 1 / 3) < 1e-6 || Math.abs(fsv - 2 / 3) < 1e-6) ? 'any' : r(fsv);
+    // At 1/3 or 2/3 (12 or 24 V winding at 36V) the step never terminates, so ANY finite step makes typed round values (e.g. 1)
     // a stepMismatch and the native form submit blocks the Set — step-free is the only correct attr.
     document.querySelectorAll('input[name="MinDuty"]').forEach(md => { md.step = mdStep; });
     const cw = document.querySelector('input[name="cvWaveAmplitudeV"]');
@@ -26556,6 +26882,16 @@ function applyClassScaledInputAttrs() {
         smv.max = r(2 * k);
         if (k !== 1 && smv.value === '0.20' && !smv.dataset.userSet && document.activeElement !== smv) smv.value = r(0.20 * k);
     }
+    // Sweep rate and floor are 12V field-duty values: prefilled × fieldScale() while a box still holds its markup
+    // default or the last prefill, never over a typed value. This re-runs when the winding changes.
+    [['altsweep-rate', 1.0], ['altsweep-from', 5]].forEach(([id, base]) => {
+        const el = document.getElementById(id);
+        if (!el || el.dataset.userSet || document.activeElement === el) return;
+        if (el.value !== el.defaultValue && el.value !== el.dataset.autoFill) return;
+        el.step = 'any';
+        el.value = (Math.abs(fsv - 1) < 1e-9) ? el.defaultValue : r(base * fsv);
+        el.dataset.autoFill = el.value;
+    });
     // D-term deadband + slope ceiling (V/s), arm window (V), target ramp rates (V/s) and the
     // wind-down stop margin (V) are WYSIWYG per-bus (scale ×class), so their input bounds must
     // too, else a 24/36/48 V user is capped at the 12 V ceiling. Kd/cap are NOT here — Kd is
@@ -26736,7 +27072,7 @@ const SYSID_ABORT_REASONS = {
     8:  'voltage sensor disagreement (warning)',
     9:  'lockout active',
     10: 'charging disabled',
-    11: 'switched to manual mode',
+    11: 'switched to Manual mode',
     12: 'hard overvoltage shutdown (INA228)',
     13: 'hard overcurrent shutdown',
     14: 'RPM dropped below minimum',
@@ -27227,7 +27563,7 @@ function sysidUpdatePreflight() {
     const modeMsg = modeOK
         ? '✅ Mode: ' + stageLabel + ' — OK to run (no limits enforced during test)'
         : (stage === CS_MANUAL
-            ? '❌ Mode: Manual — not available in manual mode (duty is fixed; test cannot drive the field)'
+            ? '❌ Mode: Manual — not available in Manual mode (duty is fixed; test cannot drive the field)'
             : (stageLabel
                 ? '❌ Mode: ' + stageLabel + ' — charging must be active (not idle or maintain)'
                 : '❌ Mode: Charging not active'));
@@ -27759,13 +28095,14 @@ function sysidFitFOPDT(pts, g0, fsHz) {
     out.lambdaMs = lambdaSec * 1000;
     const Kp = tauSec / (g0 * (lambdaSec + thetaSec));
     if (isFinite(Kp) && Kp > 0) {
-        // g0 is A per %duty measured at the CURRENT bus voltage, so Kp/Ki land in that bus's duty-space.
-        // Stored PidKp/PidKi are 12V-equivalent (recomputeCcGains re-applies ×12/Vbatt at use), so convert
-        // the seed here by ×(Vbatt/12): 12V → ×1 no-op; 24/36/48V cancels the recompute back to the measured
-        // gain instead of leaving the loop under-gained. Unknown class defaults to 12 → can only under-, never over-gain.
-        const vClass = (parseInt(window._nominalStored, 10) || 12) / 12;
-        out.Kp = Kp * vClass;
-        out.Ki = (Kp / tauSec) * vClass;
+        // g0 is A per %duty measured on this alternator and bus, so Kp/Ki land in its duty-space. Stored
+        // PidKp/PidKi are referenced to a 12 V winding on a 12 V bus (recomputeCcGains re-applies × fieldScale(),
+        // winding volts / class, at use), so store the seed / fieldScale(): 12/12 → no-op, and the firmware's
+        // multiply lands back on the measured gain. A device that has not reported its winding counts as
+        // fieldScale() = 1, which can only under-, never over-gain.
+        const fScale = webFieldScale(true);
+        out.Kp = Kp / fScale;
+        out.Ki = (Kp / tauSec) / fScale;
         out.ok = true;
     }
     return out;
@@ -28020,7 +28357,7 @@ const CX_MANUAL_LOC = [
     'Verification only — nothing is stored. The current-loop gains from the previous step stand.',
     'Alternator ripple map. Not measured when skipped — check the ripple plot under Protections; the over-current trip lines will use your existing/default ripple.',
     'Over-current trip floor and ceiling. Set them under Protections ▸ Over-current.',
-    'Voltage-loop gains (CV Kp/Ki). Leave CV gain mode on Auto (safe defaults) or set them under Tuning ▸ Voltage Control.',
+    'Voltage-loop gains (CV Kp/Ki). Leave CV Gain Source on Measured (safe defaults) or set them under Tuning ▸ Voltage Control.',
     'Per-RPM tachometer keep-alive floor and the field drain time. Set the floor in the RPM table\'s Keep-Alive (%) column (Setup ▸ Alternator) and the drain time under Protections ▸ Field Drain Time, or re-run this step.',
     'Diagnostic verdict only — no settings are written and it does not block COMMISSIONED. Run it any time from Setup ▸ Alternator ▸ Tuning ▸ Stress Test.',
     'Alternator output lead for the charge-health tracker — the 0.4 s default stands. Set it in the Steady-State Detection group under Tuning as "Output lead (s)", or re-run this step.',
@@ -28938,8 +29275,9 @@ function cxStart() {
 // Fires once on first install, after the Prerequisites screen and before the commissioning wizard
 // opens (commPrepFinish → openRpmAlign → openCommissionModal). NOT a wizard stage: it only writes the
 // two tach settings (RPMScalingFactor / PulleyRatio), which persist and stay editable under Setup ▸
-// Engine, so re-commissioning skips it. Needs the engine running to show a live RPM (no field is
-// driven). Two-way linked to the Setup ▸ Engine RPM fields via the CSV3 echo (getEchoNumber) + the same
+// Engine, so re-commissioning skips it. Needs the engine running to show a live RPM. Nothing here holds
+// the field off, and /get RPMScalingFactor 409s while it is driven, so the copy asks for Alternator
+// Enable off first. Two-way linked to the Setup ▸ Engine RPM fields via the CSV3 echo (getEchoNumber) + the same
 // /get params, so both share one source of truth. The scaling-factor slider pins to 200–3000 but the
 // numeric box carries the true value (any positive integer), so an out-of-range stored value is shown,
 // never silently clamped. Reuses the cx-rpma-* controls and their handlers below.
@@ -28973,7 +29311,7 @@ function rpmAlignRender() {
     const prVal = isFinite(pr) ? pr : 2.0;
     const sliderVal = Math.min(3000, Math.max(200, sfVal));
     document.getElementById('rpmalign-body').innerHTML =
-        '<p style="font-size:15px;line-height:1.5;"><strong>Start the engine</strong> — it needs to be running so a live engine-speed reading shows below. Idle is fine; no field is driven here.</p>' +
+        '<p style="font-size:15px;line-height:1.5;"><strong>Switch Alternator Enable off</strong> (top right), then <strong>start the engine</strong> — it needs to be running so a live engine-speed reading shows below. Idle is fine. With Alternator Enable on, the regulator can start charging once the engine runs, and the scaling factor cannot be changed while it is charging. The commissioning wizard asks you to switch it back on.</p>' +
         '<p style="font-size:15px;line-height:1.5;">Make the regulator\'s engine-speed reading match your boat\'s tachometer (or a handheld tachometer). Extreme precision is not needed here.</p>' +
         // On a restart the two values below are the ones already in use — say so, or the screen reads as
         // if it wants fresh numbers and invites an unnecessary rescale (which erases the RPM-indexed learning).
@@ -29034,10 +29372,10 @@ const RPM_SCALE_WIPE_MSG =
     + '• Tachometer keep-alive floor table and its learning\n'
     + '• Overheat history\n'
     + '• Resonance and ripple maps, and the reference waveforms\n'
-    + '• Alternator health record book and its engine-hour trend\n'
+    + '• Alternator health matrix and its engine-hour trend\n'
     + '• Motoring speed curve (your sailing data is kept)\n'
     + '• Step-test log\n'
-    + '• Every commissioning step\n\n'
+    + '• Commissioning steps 2 to 8 (Field curve through Keep-Alive Floor & Field Decay), which have to be run again\n\n'
     + 'The same data is deleted from the cloud, including your all-time alternator records. This cannot be undone.\n\n'
     + 'Your fuel curve, current-limit tables, and alternator wear hours are kept. The alternator must be off.';
 
@@ -29146,7 +29484,7 @@ function cxCutCauseText(code) {
         case 7:  return 'a voltage spike';
         case 9:  return 'a protection lockout still being active';
         case 10: return 'charging being switched off';
-        case 11: return 'manual field mode';
+        case 11: return 'Manual mode';
         case 12: return 'over-voltage protection (hardware cutoff)';
         case 13: return 'over-current protection';
         case 14: return 'engine speed below the field minimum';
@@ -29192,7 +29530,7 @@ function cxCeilBindInfo(bind) {
     const where = '(Setup ▸ Alternator ▸ Basic ▸ Output Control)';
     switch (bind) {
         case 0: return { name: 'Max Field (%)', setting: 'raise Max Field (%) ' + where, note: '' };
-        case 1: return { name: 'Max Field Volts', setting: 'check Max Field Volts against the alternator\'s rated field voltage and raise it if it is lower ' + where, note: '' };
+        case 1: return { name: 'Max Field Volts', setting: 'check Field Winding Voltage in Vessel Info against the alternator\'s datasheet, then raise Max Field Volts if it is below the rated field voltage ' + where, note: '' };
         case 2: return { name: 'the regulator\'s 10 A field-current limit', setting: '',
                          note: 'That is the regulator\'s own protection (Field Current Ceiling, 10 A), and no setting raises it.' };
         case 3:
@@ -29326,9 +29664,9 @@ function cxFieldRunBlockReason() {
     if (drive) return drive;
     const r = window._lastFieldEventReason;
     if (r === undefined || r === 0 || r === 18) return null;   // NONE / commissioning-rest → runnable
-    if (r === 11) return 'Manual field mode is on. Switch back to AUTO to run this test.';
+    if (r === 11) return 'Manual mode is on. Switch Field Control back to Auto to run this test.';
     if (r === 10 || r === 20 || r === 25)
-        return 'The regulator is not charging right now (' + fieldOffReasonText(r) + '). This test can only run while the alternator is actively charging in AUTO — a resting battery has nothing to measure. It will be available again once a charge cycle is underway.';
+        return 'The regulator is not charging right now (' + fieldOffReasonText(r) + '). This test can only run while the alternator is actively charging in Auto mode — a resting battery has nothing to measure. It will be available again once a charge cycle is underway.';
     return 'The regulator is holding the field off (' + (fieldOffReasonText(r) || 'reason ' + r) + '). Clear that, then run again.';
 }
 
@@ -29350,7 +29688,7 @@ function cxFieldStart() {
             waited += 1.5;
             if (!settled && !sawActive && framesSeen >= 3 && waited > 12) {
                 settle(); cx.fieldRunning = false;
-                cx.fieldAbort = "The sweep never ran. Confirm you are in AUTO mode with the engine turning, check Live Data \u25b8 Console, then run again.";
+                cx.fieldAbort = "The sweep never ran. Confirm you are in Auto mode with the engine turning, check Live Data \u25b8 Console, then run again.";
                 commissionRender(); return;
             }
             if (!settled && waited > 300) {
@@ -29575,7 +29913,7 @@ function cxKneeStart() {
             // late still carry a sweep that ran, and throwing that away loses a good point.
             if (!settled && !sawActive && framesSeen >= 3 && waited > 12) {
                 settle(); cx.kneeRunning = false;
-                cx.kneeAbort = "The sweep never ran. Confirm you are in AUTO mode with the engine turning, check Live Data \u25b8 Console, then Record again.";
+                cx.kneeAbort = "The sweep never ran. Confirm you are in Auto mode with the engine turning, check Live Data \u25b8 Console, then Record again.";
                 commissionRender(); return;
             }
             // Dead-link backstop, not a sweep deadline: a legitimate onset sweep runs up to ~80 s
@@ -29731,7 +30069,7 @@ function cxPlantStart(wide) {
                 waited += 1.5;
                 if (!settled && framesSeen >= 3 && waited > 240) {
                     settle(); cx.plantRunning = false;
-                    xAlert('The plant sweep never ran. Confirm you are in AUTO mode with the engine turning; open Live Data → Console to see whether the regulator rejected the request, then run again.');
+                    xAlert('The plant sweep never ran. Confirm you are in Auto mode with the engine turning; open Live Data → Console to see whether the regulator rejected the request, then run again.');
                     commissionRender(); return;
                 }
                 fetch(buildURL('/sysidbode')).then(r => r.json()).then(j => {
@@ -30114,7 +30452,7 @@ function cxVerifyDone() {
 // ── Stage 6 · CV plant fit — current square wave → battery-voltage fit → plant K for the α/K auto gains ──
 // Reuses the proven current-tuning square wave (TuningMode, tuningWaveform=0) to COMMAND current; the
 // browser records the live CSV1 (IBV, MeasuredAmps) stream and fits K/τ/L locally (no internet),
-// then writes them via the cvPlantKa/cvPlantKb handlers and switches CV gains to Auto. No new firmware control
+// then writes them via the cvPlantKa/cvPlantKb handlers and switches the CV gain source to Measured. No new firmware control
 // code — TuningMode already gates G1/G2 (fast-OV stays live) and restores bumplessly on exit.
 let cvFitCapture = null;   // {active, samples:[{t,v,iB,iA}], t0} while a fit run is recording
 
@@ -30406,7 +30744,7 @@ function cxCVEdgeTable(edges) {
 function cxCVPlantApply() {
     const f = cx.cvFit; if (!f || !f.ok) return;
     // Store the measured stiffness as cvPlantKa (Kb rides along as 0); recomputeCvGains() applies
-    // Kp = α/K, Ki = ρ·Kp and the gain source switches to Auto.
+    // Kp = α/K, Ki = ρ·Kp and the gain source switches to Measured.
     cxGet('cvPlantKa=' + f.Ka.toFixed(5) + '&cvPlantKb=' + f.Kb.toFixed(5))
         .then(() => cxGet('cvGainMode=1'))
         .then(() => { cx.cvApplied = true; commissionRender(); })
@@ -32421,7 +32759,7 @@ function cvsResultsHtml(j) {
         h += row('Recovery time', ((!j.recovered && j.gRecov === 2) ? 'never re-settled' : (j.recovMs / 1000).toFixed(1) + ' s'), j.gRecov);
         h += row('Post-recovery stability', stabTxt, j.gStab);
     }
-    h += row('Hard current cut (INA228)', j.hardCuts > 0 ? j.hardCuts + ' — over-current' : 'none', j.gHardCut);
+    h += row('Hard current cut', j.hardCuts > 0 ? j.hardCuts + ' — over-current or load dump' : 'none', j.gHardCut);
     const swingTile = j.gStab === 2 ? '—'
                     : swingV > 0 ? swingV.toFixed(2) + ' V <span style="font-size:11px;font-weight:400;color:#8a8a8a;">/ ' + stabBand + '</span>'
                     : 'under ' + stabBand + ' V';
@@ -32445,7 +32783,7 @@ function cvsResultsHtml(j) {
 // its own re-run button directly under the card, so the card carries none.
 let _cvsFixCtx = null;   // j of the last render — the card re-renders in place after each write so every from → to stays current
 // One fix as the exact write it makes from the live tune values; null when the setting is already at its limit.
-// Auto mode derives Kd = Td·Kp, so Soften raises Td by the inverse of the α cut: the D term is the surge brake,
+// The Measured gain source derives Kd = Td·Kp, so Soften raises Td by the inverse of the α cut: the D term is the surge brake,
 // and cutting P and I must not take it down with them.
 function cvsFixPlan(kind, t) {
     const f2 = v => v.toFixed(2), f3 = v => v.toFixed(3);
@@ -33024,7 +33362,7 @@ function cxChcApply() {
     const j = cx.chc.done;
     if (!j || !j.ok) return;
     const pr = cxChcPair(j.lead);
-    if (pr.n < 2) return;
+    if (pr.n < 2 || pr.rel > CHC_PAIR_DISAGREE) return;
     const q = Math.max(0, Math.min(1.0, Math.round(pr.mean / 0.1) * 0.1));
     cxGet('altLeadSec=' + q.toFixed(2))
         .then(() => cxAdvance(true))
@@ -33149,6 +33487,7 @@ function cxRenderChc(b) {
 
     // 4 · result: three independent answers, the closest two averaged, the third marked as not used
     const pr = cxChcPair(d.lead);
+    const ok = pr.n >= 2 && pr.rel <= CHC_PAIR_DISAGREE;
     const q = Math.max(0, Math.min(1.0, Math.round(pr.mean / 0.1) * 0.1));
     if (pr.n < 2) {
         body += warnBox('<strong>Only one cycle gave an answer</strong> — there is nothing to check it against, so nothing is stored. Run it again.');
@@ -33181,11 +33520,11 @@ function cxRenderChc(b) {
     if (d.rateAvg >= 0)
         body += kv('Throttle pace', 'min ' + d.rateMin.toFixed(0) + ' · avg ' + d.rateAvg.toFixed(0) +
                    ' · max ' + d.rateMax.toFixed(0) + ' rpm/s');
-    if (pr.n >= 2) body += kv('Stored value', q.toFixed(2) + ' s');
+    if (ok) body += kv('Stored value', q.toFixed(2) + ' s');
     body += '<hr style="border:none;border-top:1px solid #333;margin:9px 0;">';
-    if (pr.n >= 2) body += '<div style="margin-top:12px;"><button onclick="cxChcApply()" class="btn-primary" style="width:100%;padding:9px;">Approve and finish</button></div>';
-    body += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;"><button onclick="cxChcRestart()" class="' + (pr.n >= 2 ? 'btn-secondary' : 'btn-primary') + ' btn-sm">Run it again</button>' +
-        (pr.n < 2 ? cxNextBtn(false, false) : '') + '</div>';
+    if (ok) body += '<div style="margin-top:12px;"><button onclick="cxChcApply()" class="btn-primary" style="width:100%;padding:9px;">Approve and finish</button></div>';
+    body += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;"><button onclick="cxChcRestart()" class="' + (ok ? 'btn-secondary' : 'btn-primary') + ' btn-sm">Run it again</button>' +
+        (!ok ? cxNextBtn(false, false) : '') + '</div>';
     b.innerHTML = body;
 }
 function cxRpmStr(v) { return (v > 0) ? Math.round(v).toLocaleString() : '—'; }
@@ -33547,7 +33886,7 @@ const CX_CLOUD_PITCH_HTML =
     '<p style="font-size:13px; line-height:1.6; margin:16px 0 0; color:#ddd;">' +
     'Registering shows your username, boat type, and length publicly on the leaderboards.<br>' +
     'Contact info and location are never shared.<br>' +
-    'The <strong>Delete My Account</strong> button removes all stored Cloud data, and the regulator keeps working locally either way.</p>';
+    'The <strong>Delete My Account</strong> button removes all stored Cloud data, and the regulator keeps working locally either way. A record of which firmware versions this regulator has installed, and when, is kept under its serial number for safety recalls and support.</p>';
 
 // Terminal page, same shell as Helpful Hints. OK is the only exit — it lands on the Registration
 // form rather than committing anything, so there is nothing here to decline.
@@ -35147,7 +35486,7 @@ window.addEventListener('load', function () {
     const t = ltData.t, st = ltData.stage, ig = ltData.isGap || [], N = ltData.n;
     const interval = ltData.interval || 600;
     const W = x1 - x0, pxN = Math.max(1, Math.round(W));
-    const acc = new Float32Array(pxN * 8);   // [pixel*8 + stageCode] → accumulated width (∝ time)
+    const acc = new Float32Array(pxN * 9);   // [pixel*9 + stageCode] → accumulated width (∝ time)
     let i = 0;
     while (i < N) {
       if (ig[i] || st[i] == null) { i++; continue; }
@@ -35156,20 +35495,20 @@ window.addEventListener('load', function () {
       while (j + 1 < N && !ig[j + 1] && st[j + 1] === s) j++;
       let segStart = t[i], segEnd = (j + 1 < N) ? t[j + 1] : t[j] + interval;
       i = j + 1;
-      if (s < 0 || s > 7 || segEnd <= fromSec || segStart >= toSec) continue;
+      if (s < 0 || s > 8 || segEnd <= fromSec || segStart >= toSec) continue;
       if (segStart < fromSec) segStart = fromSec;
       if (segEnd > toSec) segEnd = toSec;
       const pa = (segStart - fromSec) / span * W, pb = (segEnd - fromSec) / span * W;
       const p0 = Math.max(0, Math.floor(pa)), p1 = Math.min(pxN - 1, Math.ceil(pb) - 1);
       for (let p = p0; p <= p1; p++) {
         const lo = Math.max(pa, p), hi = Math.min(pb, p + 1);
-        if (hi > lo) acc[p * 8 + s] += (hi - lo);
+        if (hi > lo) acc[p * 9 + s] += (hi - lo);
       }
     }
     const dom = new Uint8Array(pxN);   // dominant stage per column (0 = off/no-data → track)
     for (let p = 0; p < pxN; p++) {
       let best = 0, bestV = 0;
-      for (let sc = 0; sc <= 7; sc++) { const v = acc[p * 8 + sc]; if (v > bestV) { bestV = v; best = sc; } }
+      for (let sc = 0; sc <= 8; sc++) { const v = acc[p * 9 + sc]; if (v > bestV) { bestV = v; best = sc; } }
       dom[p] = bestV > 0 ? best : 0;
     }
     let p = 0;   // merge adjacent same-stage columns into one rect (no internal seams)
@@ -36522,8 +36861,8 @@ function bhwPrePrecheck() {
   const engineOk = !isNaN(v.rpm) && v.rpm > 100;
   rpmEl.innerHTML = isNaN(v.rpm) ? '<span style="color:#f0a500;">no RPM — start the engine</span>'
     : '<strong style="color:' + (engineOk ? '#5a5' : '#f0a500') + ';">' + Math.round(v.rpm) + ' RPM</strong>' + (engineOk ? '' : ' (start the engine)');
-  if (modeEl) modeEl.innerHTML = v.auto ? '<strong style="color:#5a5;">AUTO</strong>'
-    : '<span style="color:#f0a500;">not in AUTO — switch the system to Auto</span>';
+  if (modeEl) modeEl.innerHTML = v.auto ? '<strong style="color:#5a5;">Auto, charging</strong>'
+    : '<span style="color:#f0a500;">not charging in Auto mode — set Field Control to Auto and turn the alternator on</span>';
   if (shEl) shEl.innerHTML = v.shuntOk ? '<strong style="color:#5a5;">INA228 shunt OK</strong>'
     : '<span style="color:#f0a500;">no INA228 battery shunt — the test needs the battery-current shunt</span>';
   if (failEl) failEl.innerHTML = (j.state === 0 && j.reason) ?
@@ -38081,10 +38420,24 @@ function whyPanelRender() {
                 head = 'Battery charge current limit — ' + amps(battLim) + ' A, battery ' + amps(bcur) + ' A';
                 where = 'Battery Charge Current Limit, under Setup ▸ Alternator ▸ Protections.';
                 break;
-            case 5:
-                head = 'Field at maximum — ' + amps(alt) + ' A at ' + rpmTxt(rpm) + ' RPM. More engine speed would give more output.';
-                where = 'Not a setting — the alternator is at full field.';
+            case 5: {
+                // Code 5 means one of the alternator's two field caps binds (fieldCeilBind 0 Max Field %, 1 Max Field Volts).
+                // Max Field % at 99 is full field; anything lower, or the volts cap, is a setting the owner can move.
+                const bind = c2 ? Number(c2.fieldCeilBind) : NaN;
+                const mdSet = parseFloat(getEchoText('MaxDuty_echo', ''));
+                const mfvSet = parseFloat(getEchoText('MaxFieldVolts_echo', ''));
+                if (bind === 1) {
+                    head = 'Field held at Max Field Volts (' + (Number.isFinite(mfvSet) ? num(mfvSet, 1) + ' V' : NA) + '): ' + amps(alt) + ' A at ' + rpmTxt(rpm) + ' RPM.';
+                    where = 'A setting: check Field Winding Voltage in Vessel Info against the alternator\'s datasheet, then raise Max Field Volts under Setup ▸ Alternator ▸ Basic ▸ Output Control if it is below the rated field voltage.';
+                } else if (bind === 0 && Number.isFinite(mdSet) && mdSet < 99) {
+                    head = 'Field held at Max Field (' + num(mdSet, 0) + '%): ' + amps(alt) + ' A at ' + rpmTxt(rpm) + ' RPM.';
+                    where = 'A setting: raise Max Field (%) under Setup ▸ Alternator ▸ Basic ▸ Output Control.';
+                } else {
+                    head = 'Field at maximum — ' + amps(alt) + ' A at ' + rpmTxt(rpm) + ' RPM. More engine speed would give more output.';
+                    where = 'Not a setting — the alternator is at full field.';
+                }
                 break;
+            }
             case 6:
                 head = 'Protection active — charging reduced. Output returns on its own.';
                 where = 'Protections, under Setup ▸ Alternator.';
@@ -38102,9 +38455,9 @@ function whyPanelRender() {
                 where = _whyLimitAuthority(c2);
                 break;
             case 10:
-                head = 'Manual field mode — field held at ' + num(duty, 1) + '%, output ' + amps(alt) + ' A. '
+                head = 'Manual mode — field held at ' + num(duty, 1) + '%, output ' + amps(alt) + ' A. '
                      + 'Nothing is limiting charging: the protections are off and your PWM setting is the output.';
-                where = 'Field Control, under Setup ▸ Alternator ▸ Output Control. Switch it back to PID to '
+                where = 'Field Control, under Setup ▸ Alternator ▸ Output Control. Switch it back to Auto to '
                       + 'restore temperature, engine-speed, battery and current protection.';
                 break;
             case 11: {
@@ -38165,13 +38518,13 @@ function whyPanelRender() {
                     where = FIELD_RES_WHERE;
                     break;
                 }
-                head = (fs === 3 ? 'Manual field mode — ' : '')
+                head = (fs === 3 ? 'Manual mode — ' : '')
                      + 'Field at the board\'s 10 A limit — field ' + num(f(c1, 'iiout', 100), 1) + ' A, output ' + amps(alt) + ' A at ' + rpmTxt(rpm) + ' RPM.'
                      + manualHeld;
                 where = 'Board rating, not a setting. Field amps are estimated from Field Resistance, corrected for alternator temperature.';
                 break;
             case 16:
-                head = (fs === 3 ? 'Manual field mode — ' : '')
+                head = (fs === 3 ? 'Manual mode — ' : '')
                      + 'Regulator heat limit — board ' + tempTxt(f(c2, 'inaDieTempF', 10)) + ', field held to ' + num(duty, 1) + '% ('
                      + num(f(c1, 'iiout', 100), 1) + ' A). Output returns as the regulator cools.'
                      + manualHeld;
@@ -38184,7 +38537,7 @@ function whyPanelRender() {
         // Severity tone. Teal = nothing to fix: nothing limiting (0), the min-field floor (11) and the
         // Hi->Lo glide (14), which both push output UP; the deliberate zero-current command (12); and the
         // warm-up ramp (13), which is on its way up by itself. Red = a protection is cutting output (6).
-        // Amber = a real ceiling the owner can act on, manual field mode (10) included since its
+        // Amber = a real ceiling the owner can act on, Manual mode (10) included since its
         // protections are off, and the board's own field ceilings (15 10 A, 16 drive heat).
         // Grey stays for the no-data / not-charging states, which never reach here.
         const TONE_OK = [0, 11, 12, 13, 14];

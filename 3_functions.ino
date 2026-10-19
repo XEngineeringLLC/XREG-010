@@ -31,11 +31,16 @@ float fieldResProbeC() {
   return isfinite(f) ? (f - 32.0f) / 1.8f : NAN;
 }
 
+// 409 body for a resistance-check answer that no longer matches the unit (fieldWindingAnswerOpen); the dashboard shows it.
+static const char FIELD_WIND_ANSWER_STALE[] = "Not changed: this field winding question was already answered, or the winding or Field Resistance changed after it was asked.";
+
 // The one writer of a Field Resistance: a typed entry (/get, with the temperature it was measured at, typed=true) and the
 // field resistance test (/fieldResTest save=1, the probe at its start). The coil-temperature credit is relative to that
 // temperature. 30 C when there is none. A measured value ends the skipped-test default.
 void fieldResRecord(float r, float probeC, bool typed) {
-  FieldResistance = r;
+  // Held at the 3 decimals NVS stores: the winding confirmation key is built from this RAM value, and a finer one would
+  // stop matching the reloaded value after a reboot and drop a confirmed 24/36/48 V winding back to 12 V values.
+  FieldResistance = roundf(r * 1000.0f) / 1000.0f;
   settingWrite(NK_FieldResistance, String(FieldResistance, 3).c_str());
   FieldResTrefC = isfinite(probeC) ? probeC : 30.0f;
   settingWrite(NK_FieldResTrefC, String(FieldResTrefC, 1).c_str());
@@ -49,6 +54,7 @@ void fieldResRecord(float r, float probeC, bool typed) {
   if (isfinite(probeC)) queueConsoleMessageF("Field Resistance %.3f ohm recorded at %.0f%s %s", FieldResistance, dispTempF(probeC * 1.8f + 32.0f), dispTempUnit(),
                                              typed ? "as entered" : "from the alternator probe");
   else queueConsoleMessageF("Field Resistance %.3f ohm: no alternator temperature reading, %.0f%s assumed", FieldResistance, dispTempF(86.0f), dispTempUnit());
+  fieldWindingReconcile("Field Resistance changed");   // a new R re-runs the resistance check on a bus-rated winding
 }
 
 // The test may be skipped for the FD_SKIP_R_OHM default only on a 12 V system with no battery shunt (owner 2026-10-13):
@@ -102,7 +108,7 @@ const char *frtRefuseReason(uint8_t method) {
   }
   if (IgnoreTemperature || IgnoreRPM || IgnoreAltCurrent || IgnoreBattVMain || IgnoreBattV2 || LimpHome)
     return "The test needs every sensor. Stop running without failed sensors first (Setup > System > Run Without Failed Sensors).";
-  if (ManualFieldToggle == 1) return "Manual field mode is on. Switch Field Control back to Auto first.";
+  if (ManualFieldToggle == 1) return "Manual mode is on. Switch Field Control back to Auto first.";
   if (Ignition != 1) return "The ignition input is off, so the regulator will not drive the field. Turn the key on, or, with no ignition wire connected, turn on Ignition Override under Setup > Engine.";
   if (OnOff != 1) return "Alternator Enable is off. Switch it on (top right) to run the test.";
   if (bmsLogic == 1 && !((bmsLogicLevelOff == 0) ? bmsSignalActive : !bmsSignalActive)) return "The BMS on/off input is withholding permission, so the regulator will not drive the field.";
@@ -733,8 +739,8 @@ enum Csv2Index {
   CSV2_cpuFreqMhz,   // live CPU clock (80 or 240 MHz) — 80 = engine-off low-power throttle, 240 = full speed
 
   // ADS slow-channel inter-sample gap meters (ms). last = most recent gap between valid
-  // readings, worst = max since Reset Peak Values. Validate the continuous-mode excursion
-  // scheme keeps CH0/CH2 under their <30ms targets. Dashboard: Live Data → ESP32.
+  // readings, worst = max since Reset Peak Values. Single-shot round-robin: CH0/CH2 each get one
+  // slot in six, ~40 ms apart (~80 ms worst field-on). Dashboard: Live Data → ESP32.
   CSV2_ch0GapLast,   // CH0 battery-voltage read gap, most recent (ms)
   CSV2_ch0GapWorst,  // CH0 battery-voltage read gap, worst since reset (ms)
   CSV2_ch2GapLast,   // CH2 RPM read gap, most recent (ms)
@@ -862,7 +868,7 @@ enum Csv2Index {
   CSV2_fieldCurDutyCeil,    // 10 A field-current ceiling, duty % x100
   CSV2_fieldHeatDutyCeil,   // field-drive heat ceiling, duty % x100 (99 until the first valid die sample)
   CSV2_fieldCeilBind,       // binding ccDutyCeiling() term: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the J2 connector, 4 heat at the D5 spreader
-  CSV2_fieldRcOhm,          // FieldResistance corrected for alternator temperature, ohm x100 (the 10 A ceiling and Field Amps use it)
+  CSV2_fieldRcOhm,          // FieldResistance corrected for alternator temperature, less FD_MARGIN, ohm x100 (both board ceilings and Field Amps use it)
   CSV2_fieldHeatLimS,       // lifetime seconds held at the heat ceiling
   CSV2_fieldCurLimS,        // lifetime seconds held at the 10 A ceiling
   CSV2_fieldHeatLimSesS,    // session seconds held at the heat ceiling (ResetFieldHeatLimTime)
@@ -895,11 +901,11 @@ enum Csv4Index {
   CSV4_VictronCurrent,          // Victron battery current (A ×100)
   CSV4_currentFuelGPH,          // live fuel flow (gal/hr ×100)
   CSV4_currentNMPG,             // live fuel economy (naut mi/gal ×100)
-  CSV4_ctrlLimiter,             // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target, 8 BMS charge-current limit, 9 BMS charge-voltage limit, 10 manual field mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide, 15 board 10 A field-current ceiling, 16 field-drive heat ceiling — rides NavStream so the banner tint updates at ~500ms
+  CSV4_ctrlLimiter,             // banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target, 8 BMS charge-current limit, 9 BMS charge-voltage limit, 10 Manual mode, 11 min field floor holding duty up, 12 zero-current command (Maintain / zero-current float), 13 warm-up ramp ceiling, 14 charge-rate Hi->Lo glide, 15 board 10 A field-current ceiling, 16 field-drive heat ceiling — rides NavStream so the banner tint updates at ~500ms
   CSV4_chargeStage,             // CHARGE_STAGE_* code — rides NavStream so the Plots-tab mode ribbon tracks stage changes at ~500ms (CSV2 still carries it for the thermal ring)
   CSV4_n183Heading,             // NMEA 0183 decoded heading (deg ×10; -10 = nothing decoded). Separate from CSV4_HeadingNMEA, which is the NMEA2000 source.
   CSV4_n183HdgRef,              // reference frame of the above: 0 none, 1 magnetic, 2 true
-  CSV4_bmsSignalActive,         // live BMS on/off opto input (GPIO42): 1 = 5-28 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice
+  CSV4_bmsSignalActive,         // live BMS on/off opto input (GPIO42): 1 = 5-62 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice
   CSV4_panelHiRateInput,        // switch panel HIGH/LOW opto input (Cable 3 pin 5, GPIO39): 1 = wire energized = switch ON = asking for High. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
   CSV4_panelForceFloatInput,    // switch panel FORCEFLOAT opto input (Cable 3 pin 7, GPIO40): 1 = wire energized = switch ON = asking for Maintain. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
   CSV4_VictronSoc,              // VE.Direct battery monitor's own state of charge (% ×10; ROLL_EMPTY when stale, unsynced or not a battery monitor)
@@ -916,7 +922,7 @@ enum Csv4Index {
 // backslash and truncates the macro, and every expansion truncates together and consistently --
 // so the count/order gate in compress_web.sh cannot see it. The static_assert on
 // CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 446
+#define CSV3_EXPECTED_FIELDS 448
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -962,7 +968,7 @@ enum Csv4Index {
   X(InvertBattAmps, "%d", SafeInt(InvertBattAmps)) \
   X(MaxDuty, "%d", SafeInt(MaxDuty)) \
   X(MinDuty, "%d", SafeInt(MinDuty, 100)) \
-  X(FieldResistance, "%d", SafeInt(FieldResistance, 100)) \
+  X(FieldResistance, "%d", SafeInt(FieldResistance, 1000)) \
   X(maxPoints, "%d", SafeInt(maxPoints)) \
   X(AlternatorCOffset, "%d", SafeInt(AlternatorCOffset, 100)) \
   X(BatteryCOffset, "%d", SafeInt(BatteryCOffset, 100)) \
@@ -1205,10 +1211,10 @@ enum Csv4Index {
   X(cvHelpersEnabled, "%d", (int)cvHelpersEnabled)                                                                /* master switch: asymmetric KiDown unwind + CV D term (1=on) */ \
   X(MinChargeTempF, "%d", SafeInt(MinChargeTempF))                                                                /* cold-charge lockout board-temp floor (°F) */ \
   X(coldChargeLockoutEnable, "%d", (int)coldChargeLockoutEnable)                                                  /* cold-charge lockout master on/off (1=on) */ \
-  X(cvGainMode, "%d", (int)cvGainMode)                                                                            /* CV gain mode: 0=Manual, 1=Auto (α/K anchored) */ \
+  X(cvGainMode, "%d", (int)cvGainMode)                                                                            /* CV Gain Source: 0=Manual, 1=Measured (α/K anchored) */ \
   X(cvPlantK, "%d", SafeInt(cvPlantK, 10000))                                                                     /* measured plant gain K (V/A); ×10000 */ \
-  X(cvComputedKp, "%d", SafeInt(cvComputedKp, 100))                                                               /* Auto-computed Kp (12V-equiv); ×100 */ \
-  X(cvComputedKi, "%d", SafeInt(cvComputedKi, 100))                                                               /* Auto-computed Ki (12V-equiv); ×100 */ \
+  X(cvComputedKp, "%d", SafeInt(cvComputedKp, 100))                                                               /* Plant-fit Kp, run under CV Gain Source = Measured (12V-equiv); ×100 */ \
+  X(cvComputedKi, "%d", SafeInt(cvComputedKi, 100))                                                               /* Plant-fit Ki, run under CV Gain Source = Measured (12V-equiv); ×100 */ \
   X(cvCrossover, "%d", SafeInt(cvCrossover, 100))                                                                 /* CV crossover ω_c (rad/s); ×100 */ \
   X(cvPiZero, "%d", SafeInt(cvPiZero, 100))                                                                       /* CV PI integral zero ρ (rad/s); ×100 */ \
   X(vTgtRampUp, "%d", SafeInt(vTgtRampUp, 1000))                                                                  /* CV voltage-target ramp UP rate (V/s); ×1000 */ \
@@ -1243,7 +1249,7 @@ enum Csv4Index {
   X(CvKdMaxTrimA, "%d", SafeInt(CvKdMaxTrimA, 10))                                                                /* CV D-term back-off ceiling (A ×10); caps kdTrim so a fast rise saturates instead of flooring the field */ \
   X(cvAlpha, "%d", SafeInt(cvAlpha, 1000))                                                                        /* CV auto-gain aggressiveness α (fraction of the deadbeat-ohmic gain); ×1000 */ \
   X(CvKdSlopeCeil, "%d", SafeInt(CvKdSlopeCeil, 10))                                                              /* CV D-term slope ceiling (V/s real per-bus ×10) — max slope the D acts on */ \
-  X(cvComputedKd, "%d", SafeInt(cvComputedKd, 100))                                                               /* Auto-computed D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100 */ \
+  X(cvComputedKd, "%d", SafeInt(cvComputedKd, 100))                                                               /* Plant-fit D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100 */ \
   X(CvKdDbSlope, "%d", SafeInt(CvKdDbSlope, 10000))                                                               /* CV D-term deadband line slope (V/s per A ×10000) */ \
   X(CvKdDbFloor, "%d", SafeInt(CvKdDbFloor, 100))                                                                 /* CV D-term deadband line floor (V/s ×100) */ \
   X(CvKdDbCeil, "%d", SafeInt(CvKdDbCeil, 100))                                                                   /* CV D-term deadband line ceiling (V/s ×100) */ \
@@ -1313,7 +1319,7 @@ enum Csv4Index {
   X(HuntCooldownMin, "%d", (int)HuntCooldownMin)                                                                  /* damper retest cooldown after a failed test (min) */ \
   X(HuntSteadyPct, "%d", (int)HuntSteadyPct)                                                                      /* damper engine-speed steadiness tolerance (%) */ \
   X(HuntQualifyScans, "%d", (int)HuntQualifyScans)                                                                /* damper wobble-confirm scan count (1.6 s each) */ \
-  X(HuntTrigPct, "%d", SafeInt(HuntTrigPct, 100))                                                                 /* damper detection bar: peak-bin duty swing % (x100) */ \
+  X(HuntTrigPct, "%d", SafeInt(HuntTrigPct, 1000))                                                                 /* damper detection bar: peak-bin duty swing % (x1000) */ \
   X(NMEA0183Baud, "%d", (int)NMEA0183Baud)                                                                        /* NMEA 0183 serial baud (4800 / 9600 / 19200 / 38400) */ \
   X(NMEA0183Invert, "%d", (int)NMEA0183Invert)                                                                    /* NMEA 0183 UART polarity: 0 RS-232-level talker, 1 TTL-level talker */ \
   X(displayVolUnit, "%d", SafeInt(displayVolUnit))                                                                /* fuel volume display preference: 0 US gallons, 1 litres */ \
@@ -1324,7 +1330,7 @@ enum Csv4Index {
   X(OvTierMidMarginV, "%.3f", OvTierMidMarginV)                                                                   /* timed OV cut MID-tier margin above target (V, %.3f) */ \
   X(OvTierMidDwellMs, "%d", SafeInt(OvTierMidDwellMs))                                                            /* timed OV cut MID-tier continuous dwell (ms; 0 = tier off) */ \
   X(VoltageHardwareLimit, "%d", SafeInt(VoltageHardwareLimit, 100))                                               /* INA228 hardware shutdown voltage (x100) — top OV-ladder rung, user setting */ \
-  X(LoadDumpN1, "%d", SafeInt(LoadDumpN1))                                                                        /* load-dump tier 1 consecutive-sample count (time to act = N x ~5 ms) */ \
+  X(LoadDumpN1, "%d", SafeInt(LoadDumpN1))                                                                        /* load-dump tier 1 consecutive-reading count (time to act = N INA228 readings ~6 ms each + next control tick ~13 ms) */ \
   X(LoadDumpN2, "%d", SafeInt(LoadDumpN2))                                                                        /* load-dump tier 2 consecutive-sample count */ \
   X(LoadDumpN3, "%d", SafeInt(LoadDumpN3))                                                                        /* load-dump tier 3 consecutive-sample count */ \
   X(solarLearnEnable, "%d", SafeInt(solarLearnEnable))                                                            /* 0/1 — learn performanceRatio from each complete day's actual/forecast harvest */ \
@@ -1367,6 +1373,8 @@ enum Csv4Index {
   X(FieldResDefault, "%d", fieldResDefaultInUse() ? 1 : 0)                                                         /* 1 = the skipped-test 2 ohm default is in use (12 V, nothing measured); the stored flag is NK_FieldResDefault */ \
   X(FieldWiring, "%d", SafeInt(FieldWiring))                                                                       /* field wiring for the drive-heat limit: 0 not set, 1 P-type, 2 N-type */ \
   X(ShuntLead, "%d", SafeInt(ShuntLead))                                                                           /* shunt location: 0 not set, 1 negative lead (IBV corrected), 2 positive lead */ \
+  X(FieldWindingV, "%d", (int)FieldWindingV)                                                                       /* field winding rated voltage from Vessel Info, V */ \
+  X(fieldWindApplied, "%d", (int)fieldWindApplied)                                                                 /* winding the field-side knobs are scaled for; below FieldWindingV = held on 12 V values until the owner confirms */ \
   X(sessionId, "%u", (unsigned)g_sessionId)                                                                   /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
   X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
   /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
@@ -4459,6 +4467,7 @@ void setupServer() {
       importConfigBuf = "";
       if (!bodyc) { request->send(500, "text/plain", "Out of memory"); return; }
       String preClassV = settingRead(NK_BatteryVoltage);
+      String preWindV = settingRead(NK_FieldWindingV) + "/" + settingRead(NK_fieldWindApplied);
       // Recorded BEFORE the write burst, because the burst itself is what may stall the loop and the
       // console line is the only trace afterwards. The UI warns pre-Apply; this covers every other
       // caller (bench noReboot, curl) and leaves the stutter explained in the log.
@@ -4470,7 +4479,8 @@ void setupServer() {
       // noReboot is a bench affordance (no UI path uses it) and it leaves RAM stale against the NVS the
       // manifest loop just wrote. Harmless for ordinary keys; NOT harmless for a class change, where the
       // conversion mutates RAM while the loop's overwrites land only in NVS. Force the reboot there.
-      bool classMoved = (settingRead(NK_BatteryVoltage) != preClassV);
+      bool classMoved = (settingRead(NK_BatteryVoltage) != preClassV)
+                        || (settingRead(NK_FieldWindingV) + "/" + settingRead(NK_fieldWindApplied) != preWindV);   // a winding move converts the same way
       bool reboot = classMoved || !request->hasParam("noReboot") || request->getParam("noReboot")->value().toInt() == 0;
       if (reboot) { rebootRequested = true; rebootRequestedAt = millis(); }
       String resp = "{\"applied\":";
@@ -4495,12 +4505,12 @@ void setupServer() {
 
     uint32_t cnt = (uint32_t)cvLogCount;
     uint32_t entrySize = (uint32_t)sizeof(CvLogEntry);
-    float kp = (float)VoltageKp_active;  // gains ACTUALLY in effect (Manual or Auto α/K, 12V-block normalized) — not the raw manual VoltageKp, which the loop ignores in Auto mode / on 24-48V
+    float kp = (float)VoltageKp_active;  // gains ACTUALLY in effect (Manual or Measured α/K, 12V-block normalized) — not the raw manual VoltageKp, which the loop ignores under Measured / on 24-48V
     float ki = (float)VoltageKi_active;
     uint32_t interval = (uint32_t)VoltageLoopInterval;
 
     float kdDeadband = CvKdDeadbandVps;
-    float kdActiveGain = VoltageKd_active;  // the gain the trim law multiplies (Auto Td·Kp or Manual, ×vNorm×derate) — the typed VoltageKd here once mislabeled every Auto-mode log
+    float kdActiveGain = VoltageKd_active;  // the gain the trim law multiplies (Measured Td·Kp or Manual, ×vNorm×derate) — the typed VoltageKd here once mislabeled every Measured-source log
     float kdArmV     = CvKdArmV;
     float kdOneSided = (float)(CvKdOneSided ? 1 : 0);
     float kdVoltFiltTC = CvKdVoltFiltTC;
@@ -4822,6 +4832,10 @@ void setupServer() {
     strncpy(oldBatteryType, BATTERY_TYPE, sizeof(oldBatteryType));
     SYSTEM_VOLTAGE_CLASS = (uint8_t)newBatteryVoltage;
     applyNominalVoltageChange(oldBatteryVoltage, newBatteryVoltage);
+    // Field winding after the class, so the new class bounds it. field_winding_ack is the owner's "keep" answer to the
+    // resistance check the dashboard asks before saving, as the "W:R" pairing it was asked about; an absent key keeps
+    // the present winding.
+    fieldWindingSet((int)(doc["field_winding_v"] | (int)FieldWindingV), doc["field_winding_ack"] | (const char *)nullptr);
     // An absent/invalid key yields 0, which zeroes the full-charge tail-current threshold
     // (TailCurrent * BatteryCapacity_Ah) and the displayed capacity. Keep the current value instead.
     BatteryCapacity_Ah = constrain((int)(doc["battery_capacity_ah"] | BatteryCapacity_Ah), 1, 100000);
@@ -4933,6 +4947,15 @@ void setupServer() {
       strncpy(selectedVersion, selectedVersionStr.c_str(), 31);
       selectedVersion[31] = '\0';
 
+      // RAM only, so the reboot after a completed install brings Enable back from NVS. Every path below that ends
+      // without a reboot puts it back here instead.
+      const int onOffBeforeOta = OnOff;
+      auto otaRestoreEnable = [onOffBeforeOta]() {
+        if (OnOff != 0 || onOffBeforeOta == 0) return;
+        OnOff = onOffBeforeOta;
+        settingsDirty = true;
+        queueConsoleMessage("OTA UPDATE: not installed - Alternator Enable back to its setting before the update");
+      };
       OnOff = 0;
       Serial.println("OTA UPDATE: Alternator disabled for safety");
       queueConsoleMessage("OTA UPDATE: Alternator disabled for safety");
@@ -4951,7 +4974,8 @@ void setupServer() {
 
       if (running_partition == factory_partition) {
         Serial.printf("Direct update to version %s from factory partition\n", selectedVersion);
-        performOTAUpdateToVersion(selectedVersion);
+        performOTAUpdateToVersion(selectedVersion);   // a completed install reboots inside, so returning means it failed
+        otaRestoreEnable();
         inputMessage = "Update initiated from factory partition";
 
       } else {
@@ -4961,6 +4985,7 @@ void setupServer() {
         esp_err_t err = nvs_open("update_req", NVS_READWRITE, &nvs_handle);
         if (err != ESP_OK) {
           Serial.printf("UPDATE DEBUG: Failed to open NVS namespace 'update_req': %s\n", esp_err_to_name(err));
+          otaRestoreEnable();
           request->send(500, "text/plain", "NVS open failed");
           return;
         }
@@ -4972,6 +4997,7 @@ void setupServer() {
         if (err != ESP_OK) {
           Serial.printf("UPDATE DEBUG: Failed to set target_ver: %s\n", esp_err_to_name(err));
           nvs_close(nvs_handle);
+          otaRestoreEnable();
           request->send(500, "text/plain", "NVS write failed");
           return;
         }
@@ -4981,6 +5007,7 @@ void setupServer() {
         if (err != ESP_OK) {
           Serial.printf("UPDATE DEBUG: Failed to set update_flag: %s\n", esp_err_to_name(err));
           nvs_close(nvs_handle);
+          otaRestoreEnable();
           request->send(500, "text/plain", "NVS write failed");
           return;
         }
@@ -5129,9 +5156,9 @@ void setupServer() {
                                  : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode == SYS_MODE_MANUAL) {
-        queueConsoleMessage("SystemID: start blocked — not allowed in manual mode (duty is fixed; test cannot drive the field)");
+        queueConsoleMessage("SystemID: start blocked — not allowed in Manual mode (duty is fixed; test cannot drive the field)");
       } else if (!sysidModeOK) {
-        queueConsoleMessage("SystemID: start blocked — only allowed in AUTO mode (bulk, absorption, float, or target voltage)");
+        queueConsoleMessage("SystemID: start blocked — only allowed while charging in Auto mode (bulk, absorption, float, or target voltage)");
       } else if (activeTuning != nullptr) {
         queueConsoleMessageF("SystemID: start blocked — %s is active. Turn it off before running the Plant Delay Test.", activeTuning);
       } else if (systemIDActive == 0 && (millis() - systemIDLastEndMs) > 2000UL) {
@@ -5205,7 +5232,7 @@ void setupServer() {
                          : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
-        queueConsoleMessage("Field curve: start blocked — only allowed in AUTO mode");
+        queueConsoleMessage("Field curve: start blocked — only allowed while charging in Auto mode");
       } else if (busy != nullptr) {
         queueConsoleMessageF("Field curve: start blocked — %s is active", busy);
       } else if ((millis() - fieldCurveLastEndMs) > 2000UL) {
@@ -5243,7 +5270,7 @@ void setupServer() {
                          : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
-        queueConsoleMessage("Field cut: start blocked — only allowed in AUTO mode");
+        queueConsoleMessage("Field cut: start blocked — only allowed while charging in Auto mode");
       } else if (busy != nullptr) {
         queueConsoleMessageF("Field cut: start blocked — %s is active", busy);
       } else if ((millis() - fieldCutLastEndMs) > 2000UL) {
@@ -5290,10 +5317,10 @@ void setupServer() {
       // timeout waiting for a run that was never armed. Not when chc itself is the blocker — that
       // would abort the run in progress from the wizard's point of view.
       if (sysMode != SYS_MODE_AUTO) {
-        queueConsoleMessage("Charge health calibration: start blocked — only allowed in AUTO mode");
+        queueConsoleMessage("Charge health calibration: start blocked — only allowed while charging in Auto mode");
         if (chcActive == 0) {
           chcOk = false; chcResultsReady = true;
-          snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — only allowed in AUTO mode");
+          snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — only allowed while charging in Auto mode");
         }
       } else if (chcRequested) {
         queueConsoleMessage("Charge health calibration: start ignored (already requested)");
@@ -5398,7 +5425,7 @@ void setupServer() {
                                protTestCutMs, protTestReps, protTestGapMs);
         }
       } else if (sysMode != SYS_MODE_AUTO) {
-        queueConsoleMessage("Protection test: start blocked — engine-running tests need AUTO mode (use Manual Bench Testing instead)");
+        queueConsoleMessage("Protection test: start blocked — engine-running tests need charging in Auto mode (in Manual mode, use Bench Testing instead)");
       } else if (!chargingEnabled) {
         queueConsoleMessage("Protection test: start blocked — charging must be enabled (engine running, On/Off on)");
       } else if (RPM < (float)MinRPMForField) {
@@ -5440,7 +5467,7 @@ void setupServer() {
                          : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
-        queueConsoleMessage("Keep-alive onset: start blocked — only allowed in AUTO mode");
+        queueConsoleMessage("Keep-alive onset: start blocked — only allowed while charging in Auto mode");
       } else if (busy != nullptr) {
         queueConsoleMessageF("Keep-alive onset: start blocked — %s is active", busy);
       } else if ((millis() - fieldCurveLastEndMs) > 2000UL) {
@@ -5513,7 +5540,7 @@ void setupServer() {
         // Same rule as the field curve: the duty override lives in the AUTO control path, and the
         // bumpless resume restores AUTO state. In MANUAL the user's fixed duty owns the field —
         // which is the throttle-sweep condition anyway, and needs no sweeper.
-        queueConsoleMessage("Field sweep: start blocked — only allowed in AUTO mode");
+        queueConsoleMessage("Field sweep: start blocked — only allowed while charging in Auto mode");
       } else if (altSweepRequested) {
         queueConsoleMessage("Field sweep: start ignored (already requested)");
       } else if (busy != nullptr) {
@@ -6294,7 +6321,7 @@ void setupServer() {
         // it left no trace at all — the 2026-09-15 bench cut (RPM_TOO_LOW in what the user knew as
         // Manual mode) could only be attributed to "some client".
         logClientWrite(request, (ManualFieldToggle == 1) ? "FIELD CONTROL: MANUAL (protections bypassed)"
-                                                         : "FIELD CONTROL: PID");
+                                                         : "FIELD CONTROL: AUTO");
       }
     }
     if (request->hasParam("capLimitMode")) {
@@ -6457,13 +6484,36 @@ void setupServer() {
     if (paramOk(request, "MaxFieldVolts")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxFieldVolts")->value();
-      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as the boot-time sanity check in InitSystemSettings, which rewrites anything outside it to the compile default
+      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as the boot-time sanity check in InitSystemSettings, which rewrites anything outside it to 1.25 x the winding rating; 60 V covers a 48 V winding
       settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
       // Force an immediate re-solve rather than waiting for the tick filter to drift the derived
       // ceiling past its 0.5-point deadband: a large dtSec collapses the bus filter onto the present
       // reading, so the new cap is enforced on the next duty write, not up to 2s later.
       updateFieldVoltCeiling(getBatteryVoltage(), 999.0f);
       queueConsoleMessageF("Max Field Volts updated to: %.1fV (field ceiling now %.1f%%)", MaxFieldVolts, ccDutyCeiling());
+    }
+    // Field winding rating outside a Vessel Info save: the dashboard's answer "use a 12 V winding" to the resistance check.
+    // FieldWindingAsked is the "W:R" pairing the question was asked about; the answer is refused once that has moved on.
+    if (paramOk(request, "FieldWindingV")) {
+      foundParameter = true;
+      if (request->hasParam("FieldWindingAsked")
+          && !fieldWindingAnswerOpen(request->getParam("FieldWindingAsked")->value().c_str())) {
+        request->send(409, "text/plain", FIELD_WIND_ANSWER_STALE);
+        return;
+      }
+      fieldWindingSet(request->getParam("FieldWindingV")->value().toInt(), nullptr);
+      updateFieldVoltCeiling(getBatteryVoltage(), 999.0f);
+    }
+    // The owner's "keep this winding" answer to the resistance check, carrying the "W:R" pairing it was asked about.
+    if (request->hasParam("FieldWindingAck")) {
+      foundParameter = true;
+      if (!fieldWindingAnswerOpen(request->getParam("FieldWindingAck")->value().c_str())) {
+        request->send(409, "text/plain", FIELD_WIND_ANSWER_STALE);
+        return;
+      }
+      fieldWindingConfirm();
+      fieldWindingReconcile("owner confirmed the winding");
+      updateFieldVoltCeiling(getBatteryVoltage(), 999.0f);
     }
     if (paramOk(request, "MinDuty")) {
       foundParameter = true;
@@ -6869,8 +6919,9 @@ void setupServer() {
     if (request->hasParam("MinRPMForField")) {
       foundParameter = true;
       inputMessage = request->getParam("MinRPMForField")->value();
-      settingWrite(NK_MinRPMForField, inputMessage.c_str());
       MinRPMForField = inputMessage.toInt();
+      if (MinRPMForField < 0) MinRPMForField = 0;
+      settingWrite(NK_MinRPMForField, String(MinRPMForField).c_str());
     }
     if (request->hasParam("bmsLogic")) {
       foundParameter = true;
@@ -7063,7 +7114,7 @@ void setupServer() {
     if (request->hasParam("ResetAlarmLatch")) {
       foundParameter = true;
       ResetAlarmLatch = 1;  // Set the flag - don't save to file as it's momentary
-      queueConsoleMessage("ALARM LATCH: Reset requested from web interface NO FUNCTION!");
+      queueConsoleMessage("ALARM LATCH: Reset requested from web interface");
       inputMessage = "1";
     }
     if (request->hasParam("ZeroIMU")) {
@@ -7191,7 +7242,7 @@ void setupServer() {
     if (request->hasParam("ResetTemp")) {
       foundParameter = true;
       MaxAlternatorTemperatureF = 0;
-      queueConsoleMessage("Max Alterantor Temp: Reset requested from web interface");
+      queueConsoleMessage("Max Alternator Temp: Reset requested from web interface");
     }
     if (request->hasParam("ResetVoltage")) {
       foundParameter = true;
@@ -7703,8 +7754,8 @@ void setupServer() {
       foundParameter = true;
       // Every rejection path must give user feedback — a silent fall-through (e.g. no GPS) reads as
       // "nothing happened". Check each precondition separately so the message names the actual reason.
-      // Deliberately NOT gated on field state: the scheduled fetch waits for fieldOffSettled, but a
-      // user pressing the button has asked for it now and owns the consequences.
+      // Deliberately NOT gated on field state: the scheduled fetch waits for fieldCutSettled (field
+      // gate cut 75 s), but a user pressing the button has asked for it now and owns the consequences.
       if (LatitudeNMEA == 0.0 && LongitudeNMEA == 0.0) {
         queueConsoleMessage("Weather update failed: no GPS position yet — wait for a fix or set a manual lat/lon");
         inputMessage = "no_gps";
@@ -8221,21 +8272,21 @@ void setupServer() {
         cvGainMode = (uint8_t)(inputMessage == "1" ? 1 : 0);
         settingWrite(NK_cvGainMode, String((int)cvGainMode).c_str());
         recomputeCvGains();
-        queueConsoleMessageF("CV gain mode: %s (set by %s)", cvGainMode ? "AUTO (lambda-based)" : "MANUAL",
+        queueConsoleMessageF("CV Gain Source: %s (set by %s)", cvGainMode ? "Measured (lambda-based)" : "Manual",
                              request->client()->remoteIP().toString().c_str());
       } else {
-        queueConsoleMessageF("CV gain mode: malformed value '%s' from %s IGNORED - gain source unchanged",
+        queueConsoleMessageF("CV Gain Source: malformed value '%s' from %s IGNORED - gain source unchanged",
                              inputMessage.c_str(), request->client()->remoteIP().toString().c_str());
       }
     }
-    if (paramOk(request, "cvAlpha")) {  // CV auto-gain aggressiveness α — Kp = α / measured stiffness K
+    if (paramOk(request, "cvAlpha")) {  // CV aggressiveness α (Measured gain source) — Kp = α / measured stiffness K
       foundParameter = true;
       cvAlpha = clamp_f(request->getParam("cvAlpha")->value().toFloat(), 0.02f, 0.50f);
       settingWrite(NK_cvAlpha, String(cvAlpha, 3).c_str());
       recomputeCvGains();
       queueConsoleMessageF("CV aggressiveness alpha: %.2f", cvAlpha);
     }
-    // Legacy — inert in AUTO under the ohmic-anchor rule; kept so a bench curl / stale page can't 404.
+    // Legacy — inert under the Measured gain source (ohmic-anchor rule); kept so a bench curl / stale page can't 404.
     if (paramOk(request, "cvCrossover")) {  // CV crossover ω_c (rad/s)
       foundParameter = true;
       cvCrossover = clamp_f(request->getParam("cvCrossover")->value().toFloat(), 0.05f, 0.80f);  // 0.80 ≈ 5 s, fast end of the seconds control
@@ -8344,7 +8395,7 @@ void setupServer() {
     if (paramOk(request, "HuntTrigPct")) {
       foundParameter = true;
       HuntTrigPct = fmaxf(request->getParam("HuntTrigPct")->value().toFloat(), HUNT_TRIG_PCT_MIN);
-      settingWrite(NK_HuntTrigPct, String(HuntTrigPct, 2).c_str());
+      settingWrite(NK_HuntTrigPct, String(HuntTrigPct, 3).c_str());
     }
     if (request->hasParam("HuntSteadyPct")) {
       foundParameter = true;
@@ -8627,13 +8678,13 @@ void setupServer() {
       settingWrite(NK_CvKdSlopeCeil, String(CvKdSlopeCeil, 1).c_str());
       queueConsoleMessageF("CV D-term slope ceiling: %.1f V/s", CvKdSlopeCeil);
     }
-    if (paramOk(request, "CvKdTd")) {  // CV D derivative time — Auto-mode Kd = Td·Kp
+    if (paramOk(request, "CvKdTd")) {  // CV D derivative time — Measured-source Kd = Td·Kp
       foundParameter = true;
       inputMessage = request->getParam("CvKdTd")->value();
       CvKdTd = clamp_f(inputMessage.toFloat(), 0.0f, 3.0f);
       settingWrite(NK_CvKdTd, String(CvKdTd, 2).c_str());
       recomputeCvGains();  // Td feeds the auto Kd
-      queueConsoleMessageF("CV D-term time Td: %.2f s (Auto Kd = Td x Kp)", CvKdTd);
+      queueConsoleMessageF("CV D-term time Td: %.2f s (Measured Kd = Td x Kp)", CvKdTd);
     }
     if (paramOk(request, "TempPIDKp")) {
       foundParameter = true;
@@ -9468,7 +9519,7 @@ void setupServer() {
 
     if (request->hasParam("forceCloudFlush")) {
       foundParameter = true;
-      // "Upload Cloud Now" button — bypasses fieldOffSettled and the 13-sec
+      // "Upload Cloud Now" button — bypasses fieldCutSettled and the 13-sec
       // interval throttle. The cloud-feature block in loop() reads this flag,
       // drains the PSRAM ring through the HTTPS queue, and clears the flag
       // once the ring is empty.
@@ -10238,24 +10289,26 @@ void setupServer() {
   // Auto-commissioning field-% curve: the duty→amps points + the saturation knee + the
   // proposed open-loop-sine settings. Dashboard shows these and lets the user Apply.
   server.on("/fieldcurve.json", HTTP_GET, [](AsyncWebServerRequest *request) {
-    std::shared_ptr<char> bufPtr((char *)ps_malloc(2048), [](char *p) { if (p) free(p); });
+    // Sized for FIELDCURVE_MAX_PTS points at ~24 characters each, plus the ~500-character tail.
+    static const int FCJ_BUF = FIELDCURVE_MAX_PTS * 26 + 768;
+    std::shared_ptr<char> bufPtr((char *)ps_malloc(FCJ_BUF), [](char *p) { if (p) free(p); });
     if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
     char *buf = bufPtr.get();
     int pos = 0;
-    pos += snprintf(buf + pos, 2048 - pos, "{\"pts\":[");
+    pos += snprintf(buf + pos, FCJ_BUF - pos, "{\"pts\":[");
     // Points are display-only and the poller reads them once, off the FINISHED run. Shipping them on
     // the in-run polls put ~1.7 kB on the wire every 1.5 s for the whole ramp, contending with the
     // 10 Hz SSE telemetry on the same TCP stack, for bytes the client discards.
     const bool fcvDone = (fieldCurveActive == 0) && fieldCurveResultsReady;
-    for (int i = 0; fcvDone && i < fieldCurveCount && pos < 1700; i++) {
-      pos += snprintf(buf + pos, 2048 - pos, "%s{\"d\":%.1f,\"a\":%.2f}",
+    for (int i = 0; fcvDone && i < fieldCurveCount && pos < FCJ_BUF - 640; i++) {
+      pos += snprintf(buf + pos, FCJ_BUF - pos, "%s{\"d\":%.1f,\"a\":%.2f}",
                       i > 0 ? "," : "", fieldCurveBuf[i].duty, fieldCurveBuf[i].amps);
     }
     // "aborted" is the protection-abort latch (fieldCurveAbortRequested). It is reported INDEPENDENTLY
     // of "active" because a protection cut latches the abort but leaves fieldCurveActive set until
     // fieldCurve_tick next runs — and that tick is gated out during the fault lockout, so "active"
     // can stay 1 indefinitely. The poller checks "aborted" so it never hangs waiting for !active.
-    pos += snprintf(buf + pos, 2048 - pos,
+    pos += snprintf(buf + pos, FCJ_BUF - pos,
                     "],\"active\":%d,\"ready\":%d,\"ok\":%d,\"tok\":%u,\"kneeDuty\":%.1f,\"kneeAmps\":%.2f,"
                     "\"targetA\":%.1f,\"propStabA\":%.1f,\"propStepPct\":%.2f,\"ceilLimited\":%d,\"ceilBind\":%d,\"aborted\":%d,\"abort\":\"%s\","
                     "\"abortWhy\":%d,\"abortNext\":%d,\"abortV\":%.2f,\"abortD\":%.1f,"
@@ -11061,11 +11114,11 @@ void dnsHandleRequest() {  // process dns request for captive portals
 // router. Nap costs only ~1mA over full-off (measured), so there is no idle timeout. While napping
 // the CPU bumps to 240MHz whenever a dashboard is connected (snappy UI) and drops to 80MHz when
 // idle. The temp task is NO LONGER suspended here — the DS18B20/OneWire path reads fine at 80MHz
-// (all its timing is wall-clock, not CPU-cycle, based), and the task self-throttles to a 10-min
-// cadence while the engine is off (see TempTask), which keeps alt temperature fresh for the
-// zero-drift log at negligible standby power. Modem-sleep stays on, so there's still ~100-300ms
-// beacon latency on the first packet, which is fine. Ordering matters: do the WiFi op, then set the
-// clock.
+// (all its timing is wall-clock, not CPU-cycle, based), and the task self-throttles while the
+// engine is off (60 s unwatched, 5 s with a dashboard connected; see TempTask), which keeps alt
+// temperature fresh for the zero-drift log at negligible standby power. Modem-sleep stays on, so
+// there's still ~100-300ms beacon latency on the first packet, which is fine. Ordering matters: do
+// the WiFi op, then set the clock.
 void enterLowPowerStandby() {
   if (wifiNapEnabled && currentMode == MODE_CLIENT) {
     if (!wifiNapActive) {
@@ -11081,7 +11134,7 @@ void enterLowPowerStandby() {
     WiFi.mode(WIFI_OFF);             // THIS MUST BE DONE FIRST
     wifiNapActive = false;           // napping disabled (or AP mode) — clear stale nap state
   }
-  // Temp task intentionally NOT suspended (reads fine at 80MHz; self-throttles to 10 min engine-off).
+  // Temp task intentionally NOT suspended (reads fine at 80MHz; self-throttles engine-off: 60 s unwatched, 5 s watched).
   // While napping, run 240MHz when a dashboard is actually connected (snappy UI), else 80MHz.
   // WiFi-off standby always stays 80MHz. Guarded so the PLL isn't reconfigured every loop pass.
   uint32_t targetMhz = (wifiNapActive && events.count() > 0) ? 240 : 80;

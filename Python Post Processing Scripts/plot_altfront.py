@@ -102,7 +102,19 @@ def load_front(path):
             source = -1
 
     cols = ["rpm", "exc", "vbus", "tempF", "amps", "nSamp", "tEmit"]
-    df = pd.read_csv(path, skiprows=1, header=None, names=cols)
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        fh.readline()
+        for line in fh:
+            p = line.strip().split(",")
+            if not p[0]:
+                continue
+            try:
+                float(p[0])
+            except ValueError:
+                break  # end of the BEFRONT1 block; the export appends /altdebug.csv, DEVSESS, SESSPT after it
+            rows.append((p + [None] * 7)[:7])
+    df = pd.DataFrame(rows, columns=cols).apply(pd.to_numeric, errors="coerce")
     # Older/cloud-pruned files may omit tEmit; fill so downstream code is uniform.
     if df["tEmit"].isna().all():
         df["tEmit"] = 0

@@ -28,11 +28,12 @@ derived image asset is likewise made available under CC BY-SA 3.0.
 
 ### PID controller — `PID_v1_xeng`
 
-- **Origin:** Arduino PID Library v1.2.2 by Brett Beauregard
+- **Origin:** Arduino PID Library v1.2.1 by Brett Beauregard
 - **Source:** <https://github.com/br3ttb/Arduino-PID-Library>
 - **License:** MIT — notice kept in the library source.
-- **Modifications:** actuator-aware tracking anti-windup methods (described in the
-  library source).
+- **Modifications:** tracking anti-windup and integral up-restraint methods added;
+  `Compute()` reworked to run on every call and scale its integral and derivative gains to
+  the measured interval (described in the library source).
 
 ### NMEA2000 ESP32-S3 CAN driver — `NMEA2000_esp32_xeng`
 

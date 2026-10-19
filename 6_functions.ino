@@ -113,6 +113,29 @@ float clamp_f(float x, float lo, float hi) {
   return x;
 }
 
+// Two-reading rule shared by the RPM cuts (low-RPM gate, engine-stopped zero cut, spin-down) and the tach-lie
+// count: true once `low` has held minMs AND `readStamp` moved (a newer CH2 reading) while it held, or maxMs
+// regardless. dataTimestamps[IDX_RPM] moves on every committed CH2 read whatever its value; rpmUnheldReadMs
+// skips a read the lone-jump rejection held back. Failed reads, a dead or stale converter and loop stalls
+// move neither, which is what maxMs bounds.
+struct RpmLowConfirm {
+  uint32_t sinceMs = 0;   // millis() when `low` started (0 = not low)
+  uint32_t readMs = 0;    // readStamp (stampA) at that moment
+  uint32_t readMsB = 0;   // stampB at that moment
+  bool update(bool low, uint32_t nowMs, uint32_t minMs, uint32_t maxMs, uint32_t readStamp) {
+    return update(low, nowMs, minMs, maxMs, readStamp, readStamp, false);
+  }
+  // Both stamps are recorded at the start and each is compared only with its own start value, so a caller
+  // switching useB mid-dwell can neither invent a newer reading nor lose one.
+  bool update(bool low, uint32_t nowMs, uint32_t minMs, uint32_t maxMs, uint32_t stampA, uint32_t stampB, bool useB) {
+    if (!low) { sinceMs = 0; return false; }
+    if (sinceMs == 0) { sinceMs = nowMs; readMs = stampA; readMsB = stampB; }
+    const uint32_t heldMs = (uint32_t)(nowMs - sinceMs);
+    const bool newerRead = useB ? (stampB != readMsB) : (stampA != readMs);
+    return (heldMs >= minMs && newerRead) || heldMs >= maxMs;
+  }
+};
+
 // CV AUTO-tune design constants — see Working Markdown Docs/CV_AUTOTUNE_PLAN.md §E.
 // The old λ/SIMC fit (cvPlantTau, cvPlantL, cvLambdaMult) is RETIRED: a real step test showed the
 // loop is stability-robust (86–95° phase margin even at the "disaster" gains), so neither phase
@@ -228,7 +251,7 @@ void recomputeCvGains() {
   bool plantValid = (cvPlantK > 1e-6f);
   float kpNorm, kiNorm, kdNorm;                     // 12V-equivalent gains (what the user sees)
   if (cvGainMode == 1 && plantValid) {
-    // AUTO: Kp = α/K anchored to the ~0.6 s stiffness — the timescale the loop reacts on
+    // Measured: Kp = α/K anchored to the ~0.6 s stiffness — the timescale the loop reacts on
     float Knorm = cvPlantK * vNorm;                 // V per 12V-equivalent, per A
     kpNorm = cvAlpha / Knorm;
     kiNorm = cvPiZero * kpNorm;                     // Ki = ρ · Kp (from the UN-clamped Kp, then clamp both)
@@ -239,7 +262,7 @@ void recomputeCvGains() {
     // plant anchor and auto-scales per-install. Ceiling guards a pathological fit (soft plant → huge Kp).
     kdNorm = clamp_f(CvKdTd * kpNorm, 0.0f, 40.0f);
   } else {
-    // MANUAL, or AUTO with no valid fit yet → use the typed / conservative gains.
+    // Manual, or Measured with no valid fit yet → use the typed / conservative gains.
     kpNorm = VoltageKp;
     kiNorm = VoltageKi;
     kdNorm = VoltageKd;                             // Manual keeps the typed Kd (bench override)
@@ -251,22 +274,23 @@ void recomputeCvGains() {
   VoltageKp_active = kpNorm * vNorm * cvTempDerateScale;   // pack-space gains the loop uses with raw pack-volt error
   VoltageKi_active = kiNorm * vNorm * cvTempDerateScale;
   // D gain normalizes identically to P/I (×vNorm×derate), so one number works on 12/24/36/48 V and tracks the
-  // battery-temp derate. In Auto it is the plant-anchored Td·Kp; in Manual it is the typed VoltageKd.
+  // battery-temp derate. Under Measured it is the plant-anchored Td·Kp; under Manual it is the typed VoltageKd.
   VoltageKd_active = kdNorm * vNorm * cvTempDerateScale;
 }
 
-// recomputeCcGains — CC (output-current) analog of recomputeCvGains. PidKp/Ki/Kd are 12V-equivalent;
-// ×(12/SYSTEM_VOLTAGE_CLASS) bakes them into the duty-space gains the inner current PID actually applies,
-// so one set of tunings behaves identically on 12/24/36/48 V (field current per duty-% scales with bus
-// voltage). Call after any PidK* change and after a SYSTEM_VOLTAGE_CLASS change. currentPID is a global
+// recomputeCcGains — CC (output-current) analog of recomputeCvGains. PidKp/Ki/Kd are referenced to a 12 V winding
+// on a 12 V bus; × fieldScale() (winding volts / class) bakes them into the duty-space gains the inner current PID
+// applies, so one set of tunings asks for the same share of rated field per amp of error on any class and winding.
+// Output amps per unit of field still differ between alternators, which is why commissioning measures the gain.
+// Call after any PidK* change and after a class or winding change. currentPID is a global
 // object (constructed before setup), so SetTunings is safe to call unconditionally. The hunt
 // governor's Ki derate applies here — the single SetTunings choke point — so every recompute path
 // (setting change, class change, governor step) preserves it.
 void recomputeCcGains() {
-  float vNorm = 12.0f / (float)SYSTEM_VOLTAGE_CLASS;     // 1, 0.5, 0.33, 0.25 for 12/24/36/48 V
-  PidKp_active = PidKp * vNorm;
-  PidKi_active = PidKi * vNorm;
-  PidKd_active = PidKd * vNorm;
+  const float fs = fieldScale();     // 1 at 12/12, 0.25 for a 12 V winding at 48 V, 1 for a 48 V winding at 48 V
+  PidKp_active = PidKp * fs;
+  PidKi_active = PidKi * fs;
+  PidKd_active = PidKd * fs;
   currentPID.SetTunings(PidKp_active, PidKi_active * g_huntDerate, PidKd_active);
 }
 
@@ -281,12 +305,12 @@ void recomputeCcGains() {
 #define HG_RING_N 128            // 6.4 s at 50 ms — two periods of the lowest bin (hard floor for 0.31 Hz selectivity)
 #define HG_EVAL_EVERY 32         // evaluate every 1.6 s (window/4)
 #define HG_NBINS 6
-// Detection amplitude bar is the HuntTrigPct setting (default 0.5% duty). It has no upper clamp:
-// the duty swing a given wobble produces scales with 12/SYSTEM_VOLTAGE_CLASS, so a 48 V install
-// needs a lower bar for the same physical hunt. Bench measurement 08-21 (pidlog_20260821_212919):
+// Detection amplitude bar is the HuntTrigPct setting (0.5% duty at 12 V). It has no upper clamp.
+// The duty swing a given wobble produces scales with fieldScale() (winding volts / class), so the bar is seeded
+// and rescaled with the other field-duty knobs (scaleFieldSideKnobs). Bench measurement 08-21 (pidlog_20260821_212919):
 // a real 0.70 Hz idle hunt read 0.39–0.62% peak-bin duty against the old fixed 0.5, so only 2 of 6
 // scans qualified and HuntQualifyScans in a row never happened — the miss this setting exists for.
-// KNOWN GAP (2026-08-22, unstudied): this bar is NOT class-scaled x12/V like every other duty-domain knob, so on a 24/36/48V install the same physical wobble may never reach it and the damper never fires at all — needs study before trusting v2 above 12V. See HUNT_GOVERNOR_V2_SPEC.md "Higher-voltage installs".
+// Untested above 12 V: with a 12 V winding at 48 V the D-attributed bar (x HG_TRIG_D_FRAC) sits near 1.5 PWM LSB, so the kdTrim alternation gate carries D detection there. See HUNT_GOVERNOR_V2_SPEC.md "Higher-voltage installs".
 #define HG_TRIG_RATIO 3.0f       // peak vs median of other bins — rejected a 2.22% broadband load transient amplitude alone would have flagged
 #define HG_TRIG_D_FRAC 0.3f      // relaxed duty bar for a D-attributed scan, as a FRACTION of HuntTrigPct (0.3 x 0.5 = the 0.15 the D lever was built against): the D-driven mode lives in VOLTS and its duty amplitude can sit below the quiet-log floor (08-21: 0.27% duty, 0.33 V p-p). Safe below the 0.4 quiet median ONLY because the kdTrim alternation requirement is the real gate — a quiet log has no alternations. Proportional, not fixed: a fixed 0.15 would become STRICTER than the standard bar the moment HuntTrigPct is set below it
 // Qualify-scan count is the HuntQualifyScans setting (default 3): consecutive hunt+steady scans to
@@ -999,7 +1023,7 @@ static bool  g_fieldVoltFloored  = false;  // one-shot console warn latch for th
 #define FD_CONN_LIM_C  105.0f    // J2 housing (PA66) rating
 #define FD_D5_LIM_C    120.0f    // Wurth film adhesive rating on D5's top
 #define FD_ALPHA       0.00393f  // copper resistance per degree C
-#define FD_CREDIT      0.9f      // share of the probe rise credited to the rotor (owner 2026-10-08; to be checked against a measured rotor)
+#define FD_CREDIT      0.9f      // share of the probe rise credited to the rotor (owner 2026-10-08); a measured rotor rose 0.56-0.95 x the probe 3-11 min into a cold start, 1.15-1.21 x from 16 min (2026-10-13)
 #define FD_TCAP_C      120.0f    // credited probe temperature ceiling: bounds the credit a falsely high probe can claim
 #define FD_MARGIN      0.12f     // Rc / (1 + this): a parked warm-up from cold at ~100 A output read up to 9.8 % over the credited estimate (clamp, +-2.8 %), 2026-10-12
 #define FD_TREF_DEF_C  30.0f     // Tref when none was recorded with the resistance
@@ -1091,10 +1115,9 @@ float boardDutyCeiling() {
 // caps. MaxDuty (Max Field %) is the REAL per-bus duty cap, class-invariant (99 on every class) — the
 // user-visible Max Field box IS the cap the loop respects, no hidden ×12/Vbatt. g_fieldVoltDutyCeil is
 // Max Field Volts solved against the measured bus, which is the same limit in the units on the
-// alternator datasheet; it carries the per-class protection, because its default (a 12V winding's
-// full-field volts) works out above 99% on a 12V bus and to ~52/35/26% on 24/36/48V. A user wanting
-// full duty on a high-voltage bank raises Max Field Volts to the winding's rating (Max Field is
-// already 99). Everything that asks "how high may duty go" must come through here — a raw MaxDuty
+// alternator datasheet; it carries the per-class protection, because its default (1.25 x fieldWindApplied, the winding the
+// field settings run on: 15 V for a 12 V winding) works out above 99% on a 12V bus and to ~52/35/26% on 24/36/48V, and to 99%
+// for a bus-rated winding (Max Field is already 99). Everything that asks "how high may duty go" must come through here — a raw MaxDuty
 // read silently skips the volts cap. MaxDuty itself stays the persisted setting. The two board ceilings
 // (g_fieldCurDutyCeil, g_fieldHeatDutyCeil) come from updateFieldDerateCeilings() and protect the
 // regulator, not the alternator.
@@ -1790,6 +1813,275 @@ void runFieldResTestHold(const TickSnapshot &tick, FieldEventReason reason) {
   reportFieldModeEvent(tick.nowMs, MODE_FIELD_RES_TEST, reason, tick, gpio4IsLow, dutyCycle);
 }
 
+// Settings rescale write-ahead journal: every NVS write of one rescale (a system-voltage class change, a field-winding
+// move) is staged as "key=value;" into one string, saved under NK_rescaleJournal before the individual writes and
+// removed after them. A reboot between those writes leaves the journal behind, and rescaleJournalReplay() finishes the
+// set at boot. Without it a class change cut short left the new class over the old class's trip voltages (48 -> 12 V:
+// ~58 V overvoltage trips on a 12 V bank), and the boot reconcile applied a winding factor twice (x16 instead of x4).
+static void rescaleStage(String &jr, const char *key, const String &value) {
+  jr += key; jr += '='; jr += value; jr += ';';
+}
+
+static void rescaleWritePairs(const char *jr) {
+  char key[16], val[24];
+  const char *p = jr;
+  while (*p) {
+    const char *eq = strchr(p, '=');
+    const char *end = eq ? strchr(eq, ';') : nullptr;
+    if (!eq || !end || eq - p >= (int)sizeof(key) || end - eq - 1 >= (int)sizeof(val)) return;   // malformed: stop rather than write a guess
+    memcpy(key, p, eq - p); key[eq - p] = '\0';
+    memcpy(val, eq + 1, end - eq - 1); val[end - eq - 1] = '\0';
+    settingWrite(key, val);
+    p = end + 1;
+  }
+}
+
+// The stored field-side duty knobs, with the clamp the scaled value is held to. One list for the rescale
+// (scaleFieldSideKnobs) and the import's conversion of what it did not write (fieldSideConvertUnwritten). The alt-health
+// registry knobs persist under their registry names (NVS key = name).
+struct FieldSideKnob { const char *key; float *v; float lo; float hi; };
+static const FieldSideKnob FIELD_SIDE_KNOBS[] = {
+  { NK_kneeMarginPct,         &kneeMarginPct,         -INFINITY, INFINITY },
+  { NK_kneeStepPct,           &kneeStepPct,           -INFINITY, INFINITY },
+  { NK_kneeMaxFloorPct,       &kneeMaxFloorPct,       -INFINITY, INFINITY },
+  { NK_kneeDutyTolPct,        &kneeDutyTolPct,        -INFINITY, INFINITY },   // field-duty steadiness band
+  { NK_DutyRampRate,          &DutyRampRate,          -INFINITY, INFINITY },
+  { NK_DutySlowRampRate,      &DutySlowRampRate,      -INFINITY, INFINITY },
+  { NK_MinDuty,               &MinDuty,               -INFINITY, INFINITY },   // field floor: float, keeps sub-1% resolution
+  { NK_LimpDutyPct,           &LimpDutyPct,           0.0f,      99.0f    },   // reduced-sensor tier duty cap / fixed duty
+  { NK_HuntTrigPct,           &HuntTrigPct,           HUNT_TRIG_PCT_MIN, INFINITY },   // oscillation-damper detection bar
+  { NK_ManualDutyTarget,      &ManualDutyTarget,      0.0f,      100.0f   },   // Manual mode field duty
+  { NK_SystemIDStepAmplitude, &SystemIDStepAmplitude, -INFINITY, INFINITY },   // plant-test wave amplitude
+  { "altDutyLineRms",         &altDutyLineRms,        -INFINITY, INFINITY },   // alt-health field-duty straightness limit (% points)
+  { "altDutySlewMax",         &altDutySlewMax,        -INFINITY, INFINITY },   // …and its slew cap (% points per second)
+  { "altMinDuty",             &altMinDuty,            -INFINITY, INFINITY },   // alt-health admission duty floor
+};
+
+// Field-side duty knobs, scaled in place by r and staged into the rescale journal. applyFieldWindingRescale() is the one
+// caller: r = the class factor (oldV/newV, what fieldScale() moves by while the winding is unchanged) times the winding
+// factor (newW/oldW), so a clamp cannot bite between the two. They are stored in REAL duty-% for the bus, so the
+// dashboard box shows the value in use and nothing multiplies them at use.
+static void scaleFieldSideKnobs(float r, String &jr) {
+  // 4 decimals: a 12 -> 48 -> 12 round trip must land back on the 12 V values, which 2 decimals do not (0.125 -> 0.13)
+  for (const FieldSideKnob &k : FIELD_SIDE_KNOBS) {
+    *k.v = constrain(*k.v * r, k.lo, k.hi);
+    rescaleStage(jr, k.key, String(*k.v, 4));
+  }
+  altSweepRatePctS *= r;   // RAM-only sweep ramp and floor (the panel posts its own with each start)
+  altSweepFromPct  *= r;
+}
+
+// True for an NVS key fieldSideConvertUnwritten converts: a FIELD_SIDE_KNOBS entry or a current-loop gain.
+bool fieldSideKey(const char *key) {
+  for (const FieldSideKnob &k : FIELD_SIDE_KNOBS)
+    if (strcmp(k.key, key) == 0) return true;
+  return strcmp(key, NK_PidKp) == 0 || strcmp(key, NK_PidKi) == 0 || strcmp(key, NK_PidKd) == 0;
+}
+
+// An import that moves the stored fieldWindApplied (fromW -> toW) relabels every stored field-side value as being on toW's
+// scale. What it wrote came from the file and is; this converts in NVS what it did not write (a tier-3 knob such as Manual
+// Field PWM, a row unchecked in the preview, a key the file lacks) by toW/fromW, so the boot reconcile moves every value
+// alike. writtenKeys is ";key;key;...;" (the field-side keys the import wrote). With the current loop commissioned the boot rescale holds the applied gain, so
+// this unit's own PidK* convert by fromW/toW to come out of it unchanged.
+void fieldSideConvertUnwritten(int fromW, int toW, const String &writtenKeys) {
+  auto norm = [](int w) { return (w == 24 || w == 36 || w == 48) ? w : 12; };   // the boot loader's reading of the key
+  fromW = norm(fromW);
+  toW = norm(toW);
+  if (fromW == toW) return;
+  const float r = (float)toW / (float)fromW;
+  auto written = [&](const char *key) {
+    String t = ";";
+    t += key;
+    t += ';';
+    return writtenKeys.indexOf(t) >= 0;
+  };
+  for (const FieldSideKnob &k : FIELD_SIDE_KNOBS) {
+    if (written(k.key) || !settingExists(k.key)) continue;
+    settingWrite(k.key, String(constrain(settingRead(k.key).toFloat() * r, k.lo, k.hi), 4).c_str());
+  }
+  if (commissionDoneMask & (1u << 2)) {
+    const char *gainKeys[] = { NK_PidKp, NK_PidKi, NK_PidKd };
+    for (const char *key : gainKeys) {
+      if (written(key) || !settingExists(key)) continue;
+      settingWrite(key, String(settingRead(key).toFloat() / r, 6).c_str());
+    }
+  }
+}
+
+// Per-RPM Min% floors back to the flat KNEE_BASELINE_PCT baseline (behaves as MinDuty alone) with the knee tracker
+// unlearned; bin 0 keeps its permanent 0% lock while the learner owns the table, matching the boot rebuild in kneeLearnInit.
+static void kneeTableResetToBaseline() {
+  for (int i = 0; i < RPM_TABLE_SIZE; i++) {
+    kneeKnee[i] = 0; kneeFrozen[i] = false; kneeLearnTempF[i] = 0; kneeLastMs[i] = 0;
+    kneeFloor[i] = (i == 0) ? 0.0f : defaultMinDutyValues[i];
+    rpmMinDutyTable[i] = kneeLearnEnable ? kneeFloor[i] : defaultMinDutyValues[i];
+  }
+  kneeFitA = 0.0f; kneeFitC = 0.0f;   // no commissioning fit any more -> live correction reverts to whole-knee
+  kneeFitResidPct = -1.0f; kneeFitWorstIdx = -1;   // -1/-1 = "no fit", same sentinel the wizard's clear path writes
+  saveKneeLearnState();
+  {
+    nvs_handle_t nvs_h;
+    if (nvs_open("learning", NVS_READWRITE, &nvs_h) == ESP_OK) {
+      nvs_set_blob(nvs_h, "minDutyTable", rpmMinDutyTable, sizeof(rpmMinDutyTable));
+      nvs_commit(nvs_h);
+      nvs_close(nvs_h);
+    }
+  }
+}
+
+// Resistance check on a bus-rated winding choice: FieldWindingV / R is what the winding would draw at its own rating.
+// No winding this regulator can drive at rated field draws more than the board's 10 A (FD_FIELD_MAX_A) there, so a
+// pairing above it is a 12 V winding entered as 24/36/48 V (below 2.4/3.6/4.8 ohm). That mistake runs every field
+// setting W/12 too strong (the board's own limits do not depend on it), so it waits on the owner's confirmation;
+// under 10 A, R cannot tell the two windings apart.
+// Compared in whole milliohms (W / R > 10 A as mohm x 10 < W x 1000), the dashboard's preview does the same, so the
+// two cannot round a resistance right at 2.4/3.6/4.8 ohm to different answers.
+bool fieldWindingImplausible() {
+  return FieldWindingV > 12 && isfinite(FieldResistance) && FieldResistance > 0.0f
+         && (float)lroundf(FieldResistance * 1000.0f) * FD_FIELD_MAX_A < (float)FieldWindingV * 1000.0f;
+}
+
+static void fieldWindAckKeyFor(char *buf, size_t n) {
+  snprintf(buf, n, "%u:%.4f", (unsigned)FieldWindingV, FieldResistance);
+}
+
+// The winding the field-side knobs should be scaled for now: the owner's choice, or 12 while the resistance check
+// doubts it and the owner has not confirmed this exact winding and resistance.
+uint8_t fieldWindingEffective() {
+  if (!fieldWindingImplausible()) return FieldWindingV;
+  char k[sizeof(fieldWindAck)];
+  fieldWindAckKeyFor(k, sizeof(k));
+  return (strcmp(k, fieldWindAck) == 0) ? FieldWindingV : 12;
+}
+
+// The dashboard's answer to the resistance-check question names the pairing it was asked about ("W:R", R in ohm to 3
+// decimals). It stands only while that pairing is still on the unit and still waiting on the owner, so a question left
+// open in a second window cannot land on a state that changed after it was asked.
+bool fieldWindingAnswerOpen(const char *asked) {
+  unsigned w = 0;
+  float r = NAN;
+  if (!asked || sscanf(asked, "%u:%f", &w, &r) != 2) return false;
+  return w == FieldWindingV && isfinite(FieldResistance) && fabsf(r - FieldResistance) < 0.0005f
+         && fieldWindingEffective() != FieldWindingV;
+}
+
+// Moves the stored field-side knobs by classRatio (oldV/newV on a class change, 1 otherwise) and from the oldW to the
+// newW winding scale in one multiply. A winding move also sets Max Field Volts to 1.25 x newW. classJr is the class
+// change's journal: the writes are staged into it for applyNominalVoltageChange to commit with its own, and the
+// knee-floor reset, damper-map clear, console line and re-commission notice are left to it and its callers. Without
+// it this commits its own journal.
+static void applyFieldWindingRescale(float classRatio, uint8_t oldW, uint8_t newW, const char *why, String *classJr) {
+  if (oldW == 0 || newW == 0) return;
+  const bool windMoved = (oldW != newW);
+  const float r = classRatio * (float)newW / (float)oldW;
+  if (!windMoved && r == 1.0f) return;
+  // A commissioned current-loop gain (stage 2, Plant fit) was measured on this alternator, which a winding correction does
+  // not change, so the stored PidK* move by oldW/newW and recomputeCcGains() applies the same duty-space gain as before.
+  // Default gains are 12 V referenced and follow the winding. A class change scales them as it always has.
+  const bool holdGain = windMoved && !classJr && (commissionDoneMask & (1u << 2));
+  String own;
+  String &jr = classJr ? *classJr : own;
+  if (!classJr) own.reserve(768);
+  scaleFieldSideKnobs(r, jr);
+  if (windMoved) {
+    MaxFieldVolts = constrain(1.25f * (float)newW, 0.5f, 60.0f);
+    rescaleStage(jr, NK_MaxFieldVolts, String(MaxFieldVolts, 1));
+    if (holdGain) {
+      const float g = (float)oldW / (float)newW;
+      PidKp *= g; PidKi *= g; PidKd *= g;
+      rescaleStage(jr, NK_PidKp, String(PidKp, 6));
+      rescaleStage(jr, NK_PidKi, String(PidKi, 6));
+      rescaleStage(jr, NK_PidKd, String(PidKd, 6));
+    }
+    fieldWindApplied = newW;
+    rescaleStage(jr, NK_fieldWindApplied, String((int)newW));
+  }
+  if (classJr) return;
+  settingWrite(NK_rescaleJournal, jr.c_str());
+  rescaleWritePairs(jr.c_str());
+  kneeTableResetToBaseline();   // floors learned against the old ceiling and clamps; same reasoning as a class change
+  huntMapClearAll("field winding scale changed");
+  char gainTxt[96];
+  if (holdGain) snprintf(gainTxt, sizeof(gainTxt), "current-loop gain kept as measured in commissioning (PID Kp/Ki/Kd x%.2f)", (float)oldW / (float)newW);
+  else          snprintf(gainTxt, sizeof(gainTxt), "current-loop gain applied to the field x%.2f", r);
+  queueConsoleMessageF("Field settings moved from a %uV to a %uV field winding (%s): field-duty settings x%.2f, %s, Max Field Volts %.1fV, tachometer keep-alive floors reset to the %.2f%% default. Re-run the Keep-Alive Floor step.",
+                       (unsigned)oldW, (unsigned)newW, why, r, gainTxt, MaxFieldVolts, KNEE_BASELINE_PCT);
+  if (CommissionEpoch > 0) raiseRecommissionNag();
+  settingRemove(NK_rescaleJournal);
+  recomputeCcGains();
+  if (pidInitialized) applyCcOutputLimits();
+  stateRevision++;
+  settingsDirty = true;
+}
+
+// Boot, before any settings loader reads a rescaled key: writes out a rescale journal a reboot left behind. Its values
+// are absolute, so writing them again is harmless. rescaleJournalFinish() does the rest once the subsystems it
+// touches have loaded, and only then removes the journal, so a second reboot in between replays it again.
+static bool rescaleReplayed = false;
+void rescaleJournalReplay() {
+  const String jr = settingRead(NK_rescaleJournal);
+  if (!jr.length()) return;
+  rescaleWritePairs(jr.c_str());
+  rescaleReplayed = true;
+}
+
+// End of setup(), before the boot reconcile. Repeats the knee-floor reset, damper-map clear and re-commission notice the
+// interrupted rescale may not have reached; where it had, running them again changes nothing. The INA228 comparator
+// needs nothing here: its boot setup programs it from the replayed VoltageHardwareLimit.
+void rescaleJournalFinish() {
+  if (!rescaleReplayed) return;
+  rescaleReplayed = false;
+  kneeTableResetToBaseline();
+  huntMapClearAll("settings rescale finished at boot");
+  if (CommissionEpoch > 0) raiseRecommissionNag();
+  settingRemove(NK_rescaleJournal);
+  queueConsoleMessageF("A system voltage or field winding change was cut short by a reboot and was finished at boot: tachometer keep-alive floors reset to the %.2f%% default, learned oscillation-damper ranges cleared. Re-run the Keep-Alive Floor step.",
+                       KNEE_BASELINE_PCT);
+}
+
+// Brings the stored knobs onto the scale fieldWindingEffective() asks for. Called at the end of setup() (an import
+// writes NVS raw), after a change of the winding setting, the field resistance or the owner's confirmation. A move of a
+// commissioned tune raises the re-commission notice inside the rescale.
+bool fieldWindingReconcile(const char *why) {
+  const uint8_t eff = fieldWindingEffective();
+  if (eff == fieldWindApplied) return false;
+  if (eff == 12 && fieldWindingImplausible())
+    queueConsoleMessageF("Field winding set to %uV, but Field Resistance %.3f ohm would draw %.1fA at that rating, above the regulator's 10 A field limit. Field settings held at 12 V winding values until this is confirmed in the app.",
+                         (unsigned)FieldWindingV, FieldResistance, (float)FieldWindingV / FieldResistance);
+  applyFieldWindingRescale(1.0f, fieldWindApplied, eff, why, nullptr);
+  return true;
+}
+
+// The owner's confirmation of a winding the resistance check doubted, recorded for this exact pairing.
+void fieldWindingConfirm() {
+  if (FieldWindingV <= 12 || !(isfinite(FieldResistance) && FieldResistance > 0.0f)) return;
+  fieldWindAckKeyFor(fieldWindAck, sizeof(fieldWindAck));
+  settingWrite(NK_fieldWindAck, fieldWindAck);
+  settingsDirty = true;
+  queueConsoleMessageF("Field winding %uV confirmed by the owner for Field Resistance %.3f ohm", (unsigned)FieldWindingV, FieldResistance);
+}
+
+// The owner's winding choice (Vessel Info save, /get FieldWindingV), clamped to the class. Any change clears the
+// resistance-check confirmation. confirmAsked is the dashboard's "keep" answer ("W:R", asked before saving), recorded
+// only if fieldWindingAnswerOpen() still holds for it after the set. Returns true when the knobs moved.
+bool fieldWindingSet(int w, const char *confirmAsked) {
+  if (w != 12 && w != 24 && w != 36 && w != 48) w = FieldWindingV;
+  if (w > (int)SYSTEM_VOLTAGE_CLASS) w = SYSTEM_VOLTAGE_CLASS;
+  if (w != (int)FieldWindingV) {
+    FieldWindingV = (uint8_t)w;
+    settingWrite(NK_FieldWindingV, String(w).c_str());
+    fieldWindAck[0] = '\0';
+    settingWrite(NK_fieldWindAck, "");
+    stateRevision++;
+    settingsDirty = true;
+  }
+  if (confirmAsked && *confirmAsked) {
+    if (fieldWindingAnswerOpen(confirmAsked)) fieldWindingConfirm();
+    else queueConsoleMessageF("Field winding answer for %s not recorded: the winding or Field Resistance changed after the question was asked, or it was already answered", confirmAsked);
+  }
+  return fieldWindingReconcile("winding setting changed");
+}
+
 // applyNominalVoltageChange — single entry point for a system-voltage class change (12/24/36/48 V).
 // Two callers: the Vessel Info save, and applyImportConfig when an imported/pushed payload carries a
 // different class (SYSTEM_VOLTAGE_CLASS is the sole source of truth). On the import path it runs BEFORE
@@ -1800,25 +2092,26 @@ void runFieldResTestHold(const TickSnapshot &tick, FieldEventReason reason) {
 // volt-domain protection/helper margins and V/s rates (OV margins incl. the timed-tier trip lines,
 // disagreement threshold, iExcess arm margin, fast-rise headroom, CV D-term arm/deadband thresholds, target ramps,
 // rest-settle gate, CV wave amplitude, alt-health Vbus band), rescales both absolute OV rungs
-// (AlternatorHardShutdownV, VoltageHardwareLimit) x ratio and reprograms the INA228 comparator. Writing the
-// class and the rescaled profile to NVS in the SAME call (synchronously) keeps them atomic — a reboot
-// mid-change can never strand the overvoltage trips at the wrong voltage. It always re-derives
-// both control loops' normalized gains. It also rescales the field-duty knobs (knee margin/step/
-// maxfloor + DutyRampRate + DutySlowRampRate + MinDuty + alt-health duty
-// band/floor) and the amp-per-volt gain KHard
-// (bank resistance rises with class, so the same per-cell excess needs the same amp response) in place
-// by oldV/newV and persists them, so they stay WYSIWYG in real per-bus units
-// (the live paths do not multiply by 12/Vbatt at use; nothing reads SYSTEM_VOLTAGE_CLASS at duty-clamp
-// time). Currents/times/normalized gains are voltage-independent. VoltageKd is NOT here — it is
+// (AlternatorHardShutdownV, VoltageHardwareLimit) x ratio and reprograms the INA228 comparator. The
+// class and every rescaled value go to NVS as one journaled set (NK_rescaleJournal), so a reboot
+// mid-change is finished at boot and cannot strand the overvoltage trips at the old class's voltages. It always re-derives
+// both control loops' normalized gains. It also rescales the field-side duty knobs (scaleFieldSideKnobs) by
+// oldV/newV, which is what fieldScale() moves by while the winding is unchanged, times any winding move the class clamp
+// makes (one multiply, applyFieldWindingRescale, staged into the same journal), and separately the battery-side
+// amp-per-volt gain KHard by the same oldV/newV (bank resistance rises with class, so the same per-cell excess
+// needs the same amp response), in place, persisting them so they stay WYSIWYG in real per-bus units (the stored
+// knobs are never multiplied at use). A field winding rated above the new class is clamped to it. Currents/times/normalized gains are voltage-independent. VoltageKd is NOT here — it is
 // runtime-normalized like VoltageKp/Ki (recomputeCvGains below re-derives VoltageKd_active for the new
 // class). CvKdMaxTrimA is NOT here either — a flat amp cap, voltage-independent by design. Neither
-// field cap is here: MaxDuty and MaxFieldVolts describe the alternator, not the bank, and the enforced
-// ceiling re-derives itself from MaxFieldVolts against the new bus (updateFieldVoltCeiling).
+// field cap is class-scaled: MaxDuty and MaxFieldVolts describe the alternator, not the bank (MaxFieldVolts moves
+// only with a winding change), and the enforced ceiling re-derives itself against the new bus (updateFieldVoltCeiling).
 // The per-RPM Min% floor table is the one commissioned artifact this RESETS rather than rescales
-// (to the 1% default, knee tracker unlearned) — see the block at the end of the function.
+// (to the flat KNEE_BASELINE_PCT 0.25% default, knee tracker unlearned) — see the block at the end of the function.
 void applyNominalVoltageChange(int oldV, int newV) {
   if (newV != oldV && oldV > 0 && (newV == 12 || newV == 24 || newV == 36 || newV == 48)) {
-    settingWrite(NK_BatteryVoltage, String(newV).c_str());  // persist class FIRST, same transaction as the profile below
+    String jr;   // every NVS write of the change, committed as one journal below
+    jr.reserve(2048);
+    rescaleStage(jr, NK_BatteryVoltage, String(newV));
     float ratio = (float)newV / (float)oldV;
     BulkVoltage           *= ratio;
     FloatVoltage          *= ratio;
@@ -1859,75 +2152,61 @@ void applyNominalVoltageChange(int oldV, int newV) {
     altVbusTol                *= ratio;  // alt-health bus-voltage steadiness band
     Ymin2                     *= ratio;  // voltage-plot axis window follows the bus
     Ymax2                     *= ratio;
-    cvPlantKa                 *= ratio;  // Auto-gain V/A anchor is per-bus stiffness; recomputeCvGains below re-derives from it (unscaled it leaves Auto Kp/Ki newV/oldV too hot)
-    // Knee duty-domain knobs are stored in REAL duty-% for the bus, so rescale them by the INVERSE
-    // ratio (oldV/newV): a 5% margin at 12V becomes 1.25% at 48V. Persist so the dashboard box shows
-    // the new value — the math is visible, never hidden behind a runtime multiply.
-    float dutyRatio = (float)oldV / (float)newV;
-    kneeMarginPct   *= dutyRatio;
-    kneeStepPct     *= dutyRatio;
-    kneeMaxFloorPct *= dutyRatio;
-    kneeDutyTolPct  *= dutyRatio;   // field-duty steadiness band — inverse-scale like altDutyLineRms
-    DutyRampRate    *= dutyRatio;
-    DutySlowRampRate *= dutyRatio;
-    MinDuty         *= dutyRatio;  // field floor: float, keeps sub-1% resolution on higher banks
-    KHard           *= dutyRatio;  // A per V of OV excess
-    altDutyLineRms  *= dutyRatio;  // alt-health field-duty straightness limit (% points)
-    altDutySlewMax  *= dutyRatio;  // …and its slew cap (% points per second) — same duty domain
-    altMinDuty      *= dutyRatio;  // alt-health admission duty floor
-    LimpDutyPct     = constrain(LimpDutyPct * dutyRatio, 0.0f, 99.0f);  // reduced-sensor tier duty cap / fixed duty
-    settingWrite(NK_kneeMarginPct,   String(kneeMarginPct, 2).c_str());
-    settingWrite(NK_kneeStepPct,     String(kneeStepPct, 2).c_str());
-    settingWrite(NK_kneeMaxFloorPct, String(kneeMaxFloorPct, 2).c_str());
-    settingWrite(NK_kneeDutyTolPct,  String(kneeDutyTolPct, 2).c_str());
-    settingWrite(NK_DutyRampRate,    String(DutyRampRate, 1).c_str());
-    settingWrite(NK_DutySlowRampRate, String(DutySlowRampRate, 2).c_str());
-    settingWrite(NK_MinDuty,         String(MinDuty, 2).c_str());
-    settingWrite(NK_KHard,           String(KHard, 1).c_str());
-    settingWrite(NK_LimpDutyPct,     String(LimpDutyPct, 1).c_str());
-    // Alt-health registry knobs persist under their registry names (NVS key = name), and the
+    cvPlantKa                 *= ratio;  // Measured-gain V/A anchor is per-bus stiffness; recomputeCvGains below re-derives from it (unscaled it leaves Measured Kp/Ki newV/oldV too hot)
+    KHard *= (float)oldV / (float)newV;   // A per V of OV excess: battery-side, follows the class whatever the winding
+    rescaleStage(jr, NK_KHard, String(KHard, 1));
+    // The alt-health Vbus band persists under its registry name (NVS key = name), and the
     // CV wave amplitude under its 15-char NK_ key.
-    settingWrite("altVbusTol",    String(altVbusTol, 4).c_str());
-    settingWrite("altDutyLineRms", String(altDutyLineRms, 4).c_str());
-    settingWrite("altDutySlewMax", String(altDutySlewMax, 4).c_str());
-    settingWrite("altMinDuty",    String(altMinDuty, 4).c_str());
-    settingWrite(NK_cvWaveAmplitudeV, String(cvWaveAmplitudeV, 2).c_str());
-    settingWrite(NK_BulkVoltage, String(BulkVoltage, 2).c_str());
-    settingWrite(NK_FloatVoltage, String(FloatVoltage, 2).c_str());
-    settingWrite(NK_AbsorptionVoltage, String(AbsorptionVoltage, 2).c_str());
-    settingWrite(NK_RebulkVoltage, String(RebulkVoltage, 2).c_str());
-    settingWrite(NK_TargetVoltageSetpoint, String(TargetVoltageSetpoint, 2).c_str());
-    settingWrite(NK_ChargedVoltage, String(ChargedVoltage_Scaled).c_str());
-    settingWrite(NK_VoltageAlarmHigh, String(VoltageAlarmHigh, 2).c_str());
-    settingWrite(NK_VoltageAlarmLow, String(VoltageAlarmLow, 2).c_str());
-    settingWrite(NK_AlternatorHardShutdownV, String(AlternatorHardShutdownV, 2).c_str());
-    settingWrite(NK_VoltageHardwareLimit, String(VoltageHardwareLimit, 2).c_str());
-    settingWrite(NK_OvMeasMarginV, String(OvMeasMarginV, 3).c_str());
-    settingWrite(NK_OvPredMarginV, String(OvPredMarginV, 3).c_str());
-    settingWrite(NK_OvTierLoMarginV, String(OvTierLoMarginV, 3).c_str());
-    settingWrite(NK_OvTierMidMarginV, String(OvTierMidMarginV, 3).c_str());
-    settingWrite(NK_dvccCvlMin, String(dvccCvlMin, 2).c_str());
-    settingWrite(NK_dvccCvlMax, String(dvccCvlMax, 2).c_str());
-    settingWrite(NK_VoltageDisagreeThreshold, String(VoltageDisagreeThreshold, 2).c_str());
-    settingWrite(NK_IExcessArmMarginV, String(IExcessArmMarginV, 3).c_str());
-    settingWrite(NK_FastSetpointRiseHeadroomV, String(FastSetpointRiseHeadroomV, 2).c_str());
-    settingWrite(NK_CvKdArmV, String(CvKdArmV, 2).c_str());
-    settingWrite(NK_CvKdDeadbandVps, String(CvKdDeadbandVps, 3).c_str());
-    settingWrite(NK_CvKdDbSlope, String(CvKdDbSlope, 5).c_str());
-    settingWrite(NK_CvKdDbFloor, String(CvKdDbFloor, 3).c_str());
-    settingWrite(NK_CvKdDbCeil, String(CvKdDbCeil, 3).c_str());
-    settingWrite(NK_CvKdSlopeCeil, String(CvKdSlopeCeil, 1).c_str());
-    settingWrite(NK_vTgtRampUp, String(vTgtRampUp, 3).c_str());
-    settingWrite(NK_vTgtRampDn, String(vTgtRampDn, 3).c_str());
-    settingWrite(NK_cvWindDownStopV, String(cvWindDownStopV, 3).c_str());
-    settingWrite(NK_capSettleRate, String(capSettleRateMv10, 2).c_str());
-    settingWrite(NK_Ymin2, String(Ymin2).c_str());
-    settingWrite(NK_Ymax2, String(Ymax2).c_str());
-    settingWrite(NK_cvPlantKa, String(cvPlantKa, 5).c_str());
-    // Min% floor table: RESET, never rescaled. The duty-knee is class-invariant by design (see
+    rescaleStage(jr, "altVbusTol", String(altVbusTol, 4));
+    rescaleStage(jr, NK_cvWaveAmplitudeV, String(cvWaveAmplitudeV, 2));
+    rescaleStage(jr, NK_BulkVoltage, String(BulkVoltage, 2));
+    rescaleStage(jr, NK_FloatVoltage, String(FloatVoltage, 2));
+    rescaleStage(jr, NK_AbsorptionVoltage, String(AbsorptionVoltage, 2));
+    rescaleStage(jr, NK_RebulkVoltage, String(RebulkVoltage, 2));
+    rescaleStage(jr, NK_TargetVoltageSetpoint, String(TargetVoltageSetpoint, 2));
+    rescaleStage(jr, NK_ChargedVoltage, String(ChargedVoltage_Scaled));
+    rescaleStage(jr, NK_VoltageAlarmHigh, String(VoltageAlarmHigh, 2));
+    rescaleStage(jr, NK_VoltageAlarmLow, String(VoltageAlarmLow, 2));
+    rescaleStage(jr, NK_AlternatorHardShutdownV, String(AlternatorHardShutdownV, 2));
+    rescaleStage(jr, NK_VoltageHardwareLimit, String(VoltageHardwareLimit, 2));
+    rescaleStage(jr, NK_OvMeasMarginV, String(OvMeasMarginV, 3));
+    rescaleStage(jr, NK_OvPredMarginV, String(OvPredMarginV, 3));
+    rescaleStage(jr, NK_OvTierLoMarginV, String(OvTierLoMarginV, 3));
+    rescaleStage(jr, NK_OvTierMidMarginV, String(OvTierMidMarginV, 3));
+    rescaleStage(jr, NK_dvccCvlMin, String(dvccCvlMin, 2));
+    rescaleStage(jr, NK_dvccCvlMax, String(dvccCvlMax, 2));
+    rescaleStage(jr, NK_VoltageDisagreeThreshold, String(VoltageDisagreeThreshold, 2));
+    rescaleStage(jr, NK_IExcessArmMarginV, String(IExcessArmMarginV, 3));
+    rescaleStage(jr, NK_FastSetpointRiseHeadroomV, String(FastSetpointRiseHeadroomV, 2));
+    rescaleStage(jr, NK_CvKdArmV, String(CvKdArmV, 2));
+    rescaleStage(jr, NK_CvKdDeadbandVps, String(CvKdDeadbandVps, 3));
+    rescaleStage(jr, NK_CvKdDbSlope, String(CvKdDbSlope, 5));
+    rescaleStage(jr, NK_CvKdDbFloor, String(CvKdDbFloor, 3));
+    rescaleStage(jr, NK_CvKdDbCeil, String(CvKdDbCeil, 3));
+    rescaleStage(jr, NK_CvKdSlopeCeil, String(CvKdSlopeCeil, 1));
+    rescaleStage(jr, NK_vTgtRampUp, String(vTgtRampUp, 3));
+    rescaleStage(jr, NK_vTgtRampDn, String(vTgtRampDn, 3));
+    rescaleStage(jr, NK_cvWindDownStopV, String(cvWindDownStopV, 3));
+    rescaleStage(jr, NK_capSettleRate, String(capSettleRateMv10, 2));
+    rescaleStage(jr, NK_Ymin2, String(Ymin2));
+    rescaleStage(jr, NK_Ymax2, String(Ymax2));
+    rescaleStage(jr, NK_cvPlantKa, String(cvPlantKa, 5));
+    if (FieldWindingV > newV) {   // a winding is never rated above the bus it sits on
+      FieldWindingV = (uint8_t)newV;
+      rescaleStage(jr, NK_FieldWindingV, String(newV));
+      fieldWindAck[0] = '\0';
+      rescaleStage(jr, NK_fieldWindAck, String());
+    }
+    // Field-side duty knobs follow fieldScale(), which moves by oldV/newV while the winding is unchanged (a 5%
+    // margin at 12V becomes 1.25% at 48V on a 12 V winding), and by the winding move the clamp above makes. One
+    // multiply for both, so the 99% Limp cap cannot clamp between them (48 -> 12 V with a 48 V winding is x1).
+    applyFieldWindingRescale((float)oldV / (float)newV, fieldWindApplied, fieldWindingEffective(), "system voltage changed", &jr);
+    settingWrite(NK_rescaleJournal, jr.c_str());   // from here a reboot finishes the whole set at boot
+    rescaleWritePairs(jr.c_str());
+    // Min% floor table: RESET, never rescaled. The duty-knee is independent of one install's own bus swing (see
     // rpmMinDutyTable in Xregulator.ino — the field-strength and rectifier-threshold effects
     // cancel), but the enforced field ceiling moves with the class: MaxFieldVolts is class-invariant,
-    // so against the new bus it works out to a different duty (~52% at 24V, ~26% at 48V, 99% at 12V)
+    // so against the new bus it works out to a different duty (~52% at 24V, ~26% at 48V, 99% at 12V on a 12 V winding)
     // and floors learned on the old class can now sit at or above it. Two things break there: the
     // floor outranks the cap in the duty path, and the tach-lie arm bar
     // (rpmMinDuty + frac x (ccDutyCeiling() - rpmMinDuty)) collapses to an unsatisfiable value, silently
@@ -1936,26 +2215,14 @@ void applyNominalVoltageChange(int oldV, int newV) {
     // alternator, which invalidates the learned knee anyway. Back to the flat baseline (behaves
     // as MinDuty alone) with the knee tracker unlearned; bin 0 keeps its permanent 0% lock while
     // the learner owns the table, matching what the boot rebuild in kneeLearnInit produces.
-    for (int i = 0; i < RPM_TABLE_SIZE; i++) {
-      kneeKnee[i] = 0; kneeFrozen[i] = false; kneeLearnTempF[i] = 0; kneeLastMs[i] = 0;
-      kneeFloor[i] = (i == 0) ? 0.0f : defaultMinDutyValues[i];
-      rpmMinDutyTable[i] = kneeLearnEnable ? kneeFloor[i] : defaultMinDutyValues[i];
-    }
-    kneeFitA = 0.0f; kneeFitC = 0.0f;   // no commissioning fit any more -> live correction reverts to whole-knee
-    kneeFitResidPct = -1.0f; kneeFitWorstIdx = -1;   // -1/-1 = "no fit", same sentinel the wizard's clear path writes
-    saveKneeLearnState();
-    {
-      nvs_handle_t nvs_h;
-      if (nvs_open("learning", NVS_READWRITE, &nvs_h) == ESP_OK) {
-        nvs_set_blob(nvs_h, "minDutyTable", rpmMinDutyTable, sizeof(rpmMinDutyTable));
-        nvs_commit(nvs_h);
-        nvs_close(nvs_h);
-      }
-    }
+    kneeTableResetToBaseline();
     queueConsoleMessageF("System voltage %dV -> %dV: tachometer keep-alive floors reset to the %.2f%% default and their learning cleared (old floors were %dV-referenced and can exceed the field ceiling Max Field Volts works out to on a %dV bus). Re-run the Keep-Alive Floor step.",
                          oldV, newV, KNEE_BASELINE_PCT, oldV, newV);
     huntMapClearAll("system voltage class changed");  // pockets learned on the old class describe a different alternator
+    settingRemove(NK_rescaleJournal);
     updateINA228OvervoltageThreshold();
+    stateRevision++;
+    settingsDirty = true;
   }
   recomputeCvGains();  // always re-derive the normalized active gains for the (possibly) new class
   recomputeCcGains();
@@ -2070,7 +2337,7 @@ float governor_apply(float lastAppliedDuty, float requestDutyFloat, int gmode,
     case GOV_NORMAL_SLEW:
     default:
       // Slew from last applied duty. DutyRampRate is stored in REAL %/s for this bus (its default was
-      // scaled by 12/Vbatt at first boot and it's rescaled in place on a voltage change), so it's used
+      // scaled x fieldScale() at first boot and it's rescaled in place on a class or winding change), so it's used
       // as-is here — WYSIWYG with the dashboard box, no hidden runtime multiply.
       if (!dutySlewEnable && !g_autoTestActive) {
         // Duty slew limiter disabled (Test Limiters, both tabs) → duty steps instantly. For A/B study;
@@ -2367,8 +2634,9 @@ void enter_sys_auto() {
 // so nothing here fights a protection. Replaces handleLimpHome, which re-raised GPIO4 every 100 ms
 // against whatever cut reason was still true.
 //   tier 2  voltage-only regulation on the 12 V-equivalent error to (target - OvTierLoMarginV/2): duty rate =
-//           clamp(4 x e, 0, +2) %/s under that point, clamp(20 x e, -30, 0) %/s over it, x (12/class) (identity
-//           at 12 V; a duty point moves class/12 times the field current on a higher bus). Builds slowly, sheds
+//           clamp(4 x e, 0, +2) %/s under that point, clamp(20 x e, -30, 0) %/s over it, x fieldScale() (identity
+//           at 12 V and on a bus-rated winding; on a 12 V winding a duty point moves class/12 times the field current
+//           of a 12 V system). Builds slowly, sheds
 //           fast, and settles half a low-tier margin under the target so the timed OV tiers are the backstop,
 //           not the regulator. Duty capped at min(LimpDutyPct, field ceiling). The charge-stage machine
 //           keeps running on IBV; voltageControlActive stays true so the timed OV tiers stay armed.
@@ -2462,8 +2730,9 @@ void runReducedSensorControl(const TickSnapshot &tick, FieldEventReason reason, 
     // low tier line (ChargingVoltageTarget + OvTierLoMarginV, which reads the unshifted target), and shed
     // five times faster than the build: a stiff bank otherwise walks straight into the tier cut.
     float e = (voltageTargetSlewed - 0.5f * OvTierLoMarginV - tick.currentBatteryVoltage) * 12.0f / fmaxf(1.0f, (float)SYSTEM_VOLTAGE_CLASS);
-    // Duty-%/s drives class/12 times the field current on a higher bus, so the law scales by 12/class.
-    const float dScale = 12.0f / fmaxf(1.0f, (float)SYSTEM_VOLTAGE_CLASS);
+    // The error above is battery-side (12/class); the duty-rate side moves the field by bus volts over winding
+    // volts per duty-%, so the rate law scales by fieldScale().
+    const float dScale = fieldScale();
     float rate = (e >= 0.0f) ? clamp_f(4.0f * dScale * e, 0.0f, 2.0f * dScale)
                              : clamp_f(20.0f * dScale * e, -30.0f * dScale, 0.0f);
     tierDuty = clamp_f(tierDuty + rate * actualDtSec, 0.0f, fminf(LimpDutyPct, ccDutyCeiling()));
@@ -2497,7 +2766,7 @@ void runReducedSensorControl(const TickSnapshot &tick, FieldEventReason reason, 
   updateFieldTelemetry(applied, tick.currentBatteryVoltage);
   fieldActiveStatus = (applied > 0.01f) ? 1 : 0;
   chargeStageDisplay = getChargeStageDisplayCode();
-  reportFieldModeEvent(tick.nowMs, MODE_NORMAL_AUTO_PID, reason, tick, gpio4IsLow, dutyCycle);
+  reportFieldModeEvent(tick.nowMs, MODE_NORMAL_AUTO, reason, tick, gpio4IsLow, dutyCycle);
 
   if ((uint32_t)(tick.nowMs - lastReportMs) >= 30000UL) {
     lastReportMs = tick.nowMs;
@@ -2697,9 +2966,9 @@ void runShutdownPath(const TickSnapshot &tick, FieldControlMode mode, FieldEvent
   reportFieldModeEvent(tick.nowMs, mode, reason, tick, gpio4IsLow, dutyCycle);
 }
 
-// runCommissionIdle — "rest" hold between commissioning steps. Holds the field at a flat voltage-scaled
-// minimum (COMMISSION_REST_FLOOR_PCT × 12/Vbatt), eased in at a slow dedicated rate
-// (COMMISSION_REST_RAMP_PCT × 12/Vbatt). Deliberately does NOT max() in the per-RPM onset floor
+// runCommissionIdle — "rest" hold between commissioning steps. Holds the field at a flat winding-scaled
+// minimum (COMMISSION_REST_FLOOR_PCT × fieldScale()), eased in at a slow dedicated rate
+// (COMMISSION_REST_RAMP_PCT × fieldScale()). Deliberately does NOT max() in the per-RPM onset floor
 // (rpmMinDuty): that floor lives in rpmMinDutyTable, the very table commissioning is (re)learning, so
 // resting on it means leaning on a possibly stale/half-written table; it also lets a held high-RPM-low
 // onset duty briefly exceed the (lower) onset after RPM rises, producing a real output blip until the
@@ -2720,10 +2989,10 @@ void runCommissionIdle(const TickSnapshot &tick, FieldEventReason reason, float 
   ctrlLimiter = 0;
   shutdownPhase = SHUTDOWN_PHASE_NONE;   // so a later real shutdown starts its ramp fresh from here
 
-  const float vNorm = 12.0f / fmaxf(1.0f, (float)SYSTEM_VOLTAGE_CLASS);
-  const float restFloor = COMMISSION_REST_FLOOR_PCT * vNorm;   // 4 / 2 / 1.33 / 1 % @ 12 / 24 / 36 / 48 V
+  const float fScale = fieldScale();
+  const float restFloor = COMMISSION_REST_FLOOR_PCT * fScale;   // 4 / 2 / 1.33 / 1 % @ 12 / 24 / 36 / 48 V on a 12 V winding
   const bool  zeroHold   = (reason == REASON_ALTZERO_MEASURE);
-  const float restRamp   = (zeroHold ? ALTZERO_RAMP_PCT : COMMISSION_REST_RAMP_PCT) * vNorm;   // rest: 5 / 2.5 / 1.67 / 1.25 %/s
+  const float restRamp   = (zeroHold ? ALTZERO_RAMP_PCT : COMMISSION_REST_RAMP_PCT) * fScale;   // rest: 5 / 2.5 / 1.67 / 1.25 %/s on a 12 V winding
   const float restTarget = zeroHold ? 0.0f : restFloor;
 
   // Re-assert the field enable unconditionally: the mode arbiter guarantees no fault or lockout is
@@ -2935,7 +3204,7 @@ void commitCVTuningRecord() {
   rec.iExcessFires = cvTuningScore.iExcessFires;
   rec.loadDumpFires = cvTuningScore.loadDumpFires;
   rec.hardOcFires = cvTuningScore.hardOcFires;
-  rec.voltageKp = VoltageKp_active;  // gain actually in effect (Manual or Auto α/K, normalized)
+  rec.voltageKp = VoltageKp_active;  // gain actually in effect (Manual or Measured α/K, normalized)
   rec.voltageKi = VoltageKi_active;
   rec.setpointRiseRate = SetpointRiseRate;
   rec.setpointFallRate = SetpointFallRate;
@@ -3350,7 +3619,7 @@ void commitTuningSweepRecord() {
                        rec.runNumber, rec.bandwidthHz, rec.peakGain, rec.worstPhaseDeg);
 }
 
-// Called from tempPID_tick() on every tick (16 Hz). Feeds the thermal Control
+// Called from tempPID_tick() on every tick (~75 Hz). Feeds the thermal Control
 // Accuracy containment score (v4: binding seconds + in-band seconds), authority-gated.
 void thermalAccuracyScore_tick(uint32_t nowMs, float dtSec) {
   // ===== Thermal Control Accuracy — containment while binding =====
@@ -3467,6 +3736,15 @@ void AdjustFieldLearnMode() {
 
   static uint32_t passCount = 0;
   passCount++;
+  // Disarm load-dump counting for any pass that leaves before the detector block; the fresh-CH1 wait
+  // returns restore it (the block keeps arming between its ticks), and the block itself re-arms.
+  // vlHasPrev follows the same rule with the CV branch as its restorer, so the CV-interval meter
+  // re-baselines after any stretch the voltage loop did not run (cut, Manual, tests, limp tiers).
+  const bool ldArmedIn = g_ldArmed;
+  g_ldArmed = false;
+  if (!ldArmedIn) loadDumpReset();  // the last pass left the gate closed: drop counts before anything can re-arm
+  const bool vlHasPrevIn = vlHasPrev;
+  vlHasPrev = false;
   uint32_t actualDtMs = (lastControlTickMs == 0) ? 62 : (currentMillis - lastControlTickMs);
   if (actualDtMs > 500) actualDtMs = 500;
   if (actualDtMs == 0) actualDtMs = 1;  // floor prevents 0-div in slew calcs when tick runs twice in same ms
@@ -3574,13 +3852,13 @@ void AdjustFieldLearnMode() {
     return;
   }
 
-  // Engine confirmed stopped (RPM held at 0 for >= RPM_ZERO_CUT_MS): cut the field
+  // Engine confirmed stopped (tick.engineFullyStopped: two zero readings over RPM_ZERO_CUT_MS): cut the field
   // immediately, overriding any graceful shutdown ramp. CHARGING_DISABLED (priority 1a)
   // outranks the RPM gate, so on a normal key-off + engine-stop the field would otherwise
   // slow-ramp for ~30s while still energized — coupling PWM noise into the LM2907 RPM sense
   // (phantom RPM spikes). Placed pre-CH1-gate so it fires at full loop rate regardless of
   // current-sensor freshness. Forced reason RPM_TOO_LOW so the log/telemetry name the cause.
-  // Manual field mode is exempt: the arbiter puts MANUAL above the RPM gate, so this cut and
+  // Manual mode is exempt: the arbiter puts MANUAL above the RPM gate, so this cut and
   // the manual path fought at loop rate (GPIO4 oscillation), and manual exists precisely for
   // engine-off wiring/diagnostic tests (same doctrine as manual-beats-lockout). The field resistance test is exempt
   // the same way: it runs on a stopped engine, and its tach reads 0 by design (frtTachMasked).
@@ -3591,27 +3869,25 @@ void AdjustFieldLearnMode() {
 
   // Shutdown spin-down: charging already disabled AND RPM below the field minimum — the graceful
   // CHARGING_DISABLED ramp has nothing left to soften (no alternator output below MinRPMForField)
-  // and an energized field only fakes tach readings, so finish the cut. The RPM_BELOWMIN_CUT_MS
-  // dwell (≥ two ADS CH2 samples) keeps a lone glitched low read from cutting mid-ramp at real
-  // duty — that abrupt amplitude step is the LM2907 coupling-cap slam the ramp exists to avoid.
-  // Still ~3x faster than the zero-cut's RPM_ZERO_CUT_MS on a real spin-down. Engine running
-  // above minimum keeps the full graceful ramp.
+  // and an energized field only fakes tach readings, so finish the cut. It fires on the second consecutive
+  // low CH2 reading (RpmLowConfirm, no minimum time), so a lone glitched low read cannot cut mid-ramp at
+  // real duty — that abrupt amplitude step is the LM2907 coupling-cap slam the ramp exists to avoid. A
+  // value held by the lone-jump rejection carries a fresh stamp and counts as that second low reading, so
+  // a phantom spike after a low read is itself the reading that cuts. RPM_BELOWMIN_MAX_WAIT_MS cuts when no
+  // second reading comes. Engine running above minimum keeps the full graceful ramp.
   {
-    static uint32_t rpmBelowMinSinceMs = 0;
-    if (!tick.chargingEnabled && tick.rpmBelowMinimum) {
-      if (rpmBelowMinSinceMs == 0) rpmBelowMinSinceMs = tick.nowMs;
-      if ((uint32_t)(tick.nowMs - rpmBelowMinSinceMs) >= RPM_BELOWMIN_CUT_MS && !gpio4IsLow) {
-        // Cut with the arbiter's OWN reason, not a hard-coded RPM_TOO_LOW. The low RPM is only the
-        // permission to finish early; the CAUSE is whatever disabled charging, and preReason already
-        // holds it (priority 1a outranks the RPM gate). Hard-coding it made every master-switch OFF
-        // on a stopped engine report "Field cut immediately: RPM_TOO_LOW" and left the banner's
-        // OFF-reason (g_fieldEventReason) blaming engine speed for the user's own switch — bench,
-        // 2026-09-15. Falls back only if the arbiter somehow had nothing to say.
-        applyImmediateCut(tick, (preReason == REASON_NONE) ? REASON_RPM_TOO_LOW : preReason, true);
-        return;
-      }
-    } else {
-      rpmBelowMinSinceMs = 0;
+    static RpmLowConfirm spinDownConfirm;
+    if (spinDownConfirm.update(!tick.chargingEnabled && tick.rpmBelowMinimum, tick.nowMs,
+                               0, RPM_BELOWMIN_MAX_WAIT_MS, (uint32_t)dataTimestamps[IDX_RPM])
+        && !gpio4IsLow) {
+      // Cut with the arbiter's OWN reason, not a hard-coded RPM_TOO_LOW. The low RPM is only the
+      // permission to finish early; the CAUSE is whatever disabled charging, and preReason already
+      // holds it (priority 1a outranks the RPM gate). Hard-coding it made every master-switch OFF
+      // on a stopped engine report "Field cut immediately: RPM_TOO_LOW" and left the banner's
+      // OFF-reason (g_fieldEventReason) blaming engine speed for the user's own switch — bench,
+      // 2026-09-15. Falls back only if the arbiter somehow had nothing to say.
+      applyImmediateCut(tick, (preReason == REASON_NONE) ? REASON_RPM_TOO_LOW : preReason, true);
+      return;
     }
   }
 
@@ -4062,7 +4338,7 @@ void AdjustFieldLearnMode() {
     lastDebugReason = reason;
   }
 
-  if ((mode != MODE_NORMAL_AUTO_PID && mode != MODE_NORMAL_MANUAL) && reason == REASON_NONE) {
+  if ((mode != MODE_NORMAL_AUTO && mode != MODE_NORMAL_MANUAL) && reason == REASON_NONE) {
     static uint32_t lastNoReasonWarnMs = 0;
     if ((uint32_t)(currentMillis - lastNoReasonWarnMs) >= 5000) {
       lastNoReasonWarnMs = currentMillis;
@@ -4115,13 +4391,6 @@ void AdjustFieldLearnMode() {
     govMode = GOV_BYPASS_SLEW;
   }
 
-  // Major overvoltage: bypass slew for fast field collapse.
-  // Triggers when battery is 0.5V (per-cell-scaled by class) above the hard-shutdown threshold —
-  // by this point the fault path is already ramping; this just removes the slew limit so the
-  // ramp is instant.
-  if (tick.currentBatteryVoltage > (tick.alternatorHardShutdownV + 0.5f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f))) {
-    govMode = GOV_BYPASS_SLEW;
-  }
   // Voltage sensor failure: bypass slew. An owner-overridden disagreement is not a failure: with a reading ignored
   // the other one stays dead or far off for the whole run, and this would drop the duty ramp limit throughout.
   if ((!tick.voltagePlausible && !reasonSuppressedByOverride(REASON_VOLTAGE_IMPLAUSIBLE, tick))
@@ -4151,8 +4420,8 @@ void AdjustFieldLearnMode() {
   }
 
   // ========== MODE TRANSITION HANDLING ==========
-  bool isNormalMode = (mode == MODE_NORMAL_AUTO_PID || mode == MODE_NORMAL_MANUAL) && !immediateCutNow(reason, tick);
-  bool wasNormalMode = (prevMode == MODE_NORMAL_AUTO_PID || prevMode == MODE_NORMAL_MANUAL);
+  bool isNormalMode = (mode == MODE_NORMAL_AUTO || mode == MODE_NORMAL_MANUAL) && !immediateCutNow(reason, tick);
+  bool wasNormalMode = (prevMode == MODE_NORMAL_AUTO || prevMode == MODE_NORMAL_MANUAL);
   bool enteringNormal = !wasNormalMode && isNormalMode;
   bool exitingNormal = wasNormalMode && !isNormalMode;
 
@@ -4160,7 +4429,7 @@ void AdjustFieldLearnMode() {
   if (!tick.chargingEnabled) newSysMode = SYS_MODE_OFF;
   else if (immediateCutNow(reason, tick)) newSysMode = SYS_MODE_FAULT;
   else if (mode == MODE_NORMAL_MANUAL) newSysMode = SYS_MODE_MANUAL;
-  else if (mode == MODE_NORMAL_AUTO_PID) newSysMode = SYS_MODE_AUTO;
+  else if (mode == MODE_NORMAL_AUTO) newSysMode = SYS_MODE_AUTO;
   else newSysMode = SYS_MODE_FAULT;
 
   if (newSysMode != sysMode) {
@@ -4272,7 +4541,7 @@ void AdjustFieldLearnMode() {
     if (!chcResultsReady) {
       chcOk = false;
       chcResultsReady = true;
-      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "ended — the field left normal AUTO (%s)", reasonToString(reason));
+      snprintf(chcAbortMsg, sizeof(chcAbortMsg), "ended — the field left normal Auto-mode charging (%s)", reasonToString(reason));
     }
   }
 
@@ -4299,7 +4568,7 @@ void AdjustFieldLearnMode() {
   lastNormalPass = passCount;
 
   // ========== GATE ON FRESH CH1 DATA ==========
-  // PidSampleDivisor=1: PID runs every CH1 sample (fresh CH1 measured 5–25ms apart, assume ~30ms)
+  // PidSampleDivisor=1: PID runs every CH1 sample (fresh CH1 ~13 ms apart, up to ~30 ms)
   // PidSampleDivisor=2: every other sample, etc. Only the closed-loop body below needs a current sample;
   // every shutdown, cut and rest path has already run above this line, and the published reason is current.
   static uint8_t ch1SampleCount = 0;
@@ -4307,12 +4576,16 @@ void AdjustFieldLearnMode() {
     // Manual mode does not need current sensor data — let it through. Neither do the reduced-sensor
     // tiers (2-4), whose whole point is a dead or ignored CH1.
     if (!tick.manualMode && tick.limpTier < 2) {
+      g_ldArmed = ldArmedIn;
+      vlHasPrev = vlHasPrevIn;
       return;
     }
   } else {
     ch1SampleCount++;
     if (ch1SampleCount < PidSampleDivisor) {
       ch1FreshFlag = false;
+      g_ldArmed = ldArmedIn;
+      vlHasPrev = vlHasPrevIn;
       return;
     }
     ch1FreshFlag = false;
@@ -4496,7 +4769,7 @@ void AdjustFieldLearnMode() {
   //      changed during the test. Current applied duty is the actual operating point.
   //   4. Let the normal control path compute the next command immediately.
   if (sysIDJustCompleted && g_sysIDResume.valid) {
-    bool legalToResume = (mode == MODE_NORMAL_AUTO_PID || mode == MODE_NORMAL_MANUAL);
+    bool legalToResume = (mode == MODE_NORMAL_AUTO || mode == MODE_NORMAL_MANUAL);
 
     if (!legalToResume) {
       // A fault or disable arrived during the test. Do not force old state back;
@@ -5292,41 +5565,30 @@ void AdjustFieldLearnMode() {
         }
 
         // ── Load dump detection — dBcur/dt positive spike in CV mode ─────────────────
-        // Three-tier cascade: LoadDumpN1 consecutive samples above LoadDumpDtThresh1, LoadDumpN2 above
-        // LoadDumpDtThresh, LoadDumpN3 above LoadDumpDtThresh3 (counts are user settings; time to act =
-        // N x the ~5 ms INA fast-mode cadence). INA228 noise is alternating-sign (high/low/high/low) —
-        // two consecutive same-direction crossings cannot be measurement noise. Tier 1 catches
-        // hard-switched FET disconnects; tiers 2/3 catch relay-contact events spread over multiple samples.
+        // Three-tier cascade: LoadDumpN1 consecutive INA228 readings above LoadDumpDtThresh1, LoadDumpN2 above
+        // LoadDumpDtThresh, LoadDumpN3 above LoadDumpDtThresh3 (counts are user settings). The counters step
+        // once per reading in loadDumpStep() (INA read path, ~6 ms, up to ~18 ms); this block consumes any
+        // trip since the last tick, so time to act = N readings + the wait for this tick (~13 ms, up to
+        // ~30 ms). Logged per-reading slope peaked ~3.5 kA/s on one reading and ~1.2 kA/s on the lower of
+        // an adjacent pair, so tier 1 (7 kA/s) and tiers 2/3 (5 kA/s on adjacent readings) sit well clear
+        // of measurement noise. Tier 1 catches hard-switched FET disconnects; tiers 2/3 catch relay-contact
+        // events spread over multiple readings.
         // Gate: LoadDumpEnable (Group 5 toggle — the only disarm; global protections toggle does not apply),
-        // voltageControlActive (= !inIdleStage; bulk/absorption/float/TVMode/MaintainMode) and fast INA228 reads active (5ms cadence).
+        // voltageControlActive (= !inIdleStage; bulk/absorption/float/TVMode/MaintainMode) and fast INA228 reads active.
         // On detection: snaps cv_I = 0 on rising edge and collapses setpointLimited + fastOvCurrentCap to 0.
         // Recovery: AW bleed drives recovery naturally — same path as fastOV.
         {
-          // Statics live at this scope so the gate-closed else can clear them.
-          // Otherwise, a load dump active at the moment CV exits leaves
-          // ldWasActive=true; on CV re-entry the rising-edge cv_I=0 snap and
+          // At this scope so the gate-closed else can clear it. Otherwise, a load dump active at the
+          // moment CV exits leaves ldWasActive=true; on CV re-entry the rising-edge cv_I=0 snap and
           // g_loadDumpCount increment are skipped for the next event.
           static bool ldWasActive = false;
-          static int ldCount1 = 0;  // consecutive samples above LoadDumpDtThresh1
-          static int ldCount2 = 0;  // consecutive samples above LoadDumpDtThresh
-          static int ldCount3 = 0;  // consecutive samples above LoadDumpDtThresh3
           if (LoadDumpEnable && voltageControlActive && inaFastModeActive && HAS_BATT_SHUNT) {  // no shunt → dBcur/dt is noise; fast-OV dV/dt is the load-dump backstop
-            if (g_dBcur_dt > LoadDumpDtThresh1) {
-              ldCount1++;
-            } else {
-              ldCount1 = 0;
-            }
-            if (g_dBcur_dt > LoadDumpDtThresh) {
-              ldCount2++;
-            } else {
-              ldCount2 = 0;
-            }
-            if (g_dBcur_dt > LoadDumpDtThresh3) {
-              ldCount3++;
-            } else {
-              ldCount3 = 0;
-            }
-            bool ldNow = (ldCount1 >= LoadDumpN1) || (ldCount2 >= LoadDumpN2) || (ldCount3 >= LoadDumpN3);
+            g_ldArmed = true;
+            // Latch: a reading tripped since the last tick, even if a later one cleared. Now: the latest
+            // reading still trips — holds the clamp across a tick that saw no new reading.
+            bool ldNow = g_ldTripLatch || g_ldTripNow;
+            float ldDbdt = g_ldTripDbdt;
+            g_ldTripLatch = false;
             if (ldNow) {
               fastOvCurrentCap = 0.0f;
               capReasonTick = CAP_REASON_LOADDUMP;  // hard cutoff — always the binding cap
@@ -5341,7 +5603,7 @@ void AdjustFieldLearnMode() {
                 currentPID.ResetIntegratorTo(0.0);
                 g_loadDumpCount++;
                 queueConsoleMessageF("Load dump #%lu detected — output cut, inner PID integrator reset (dBcur/dt=%.0f A/s)",
-                                     (unsigned long)g_loadDumpCount, g_dBcur_dt);
+                                     (unsigned long)g_loadDumpCount, ldDbdt);
               }
             }
             // Falling-edge cv_I reseed handled by the unified reseed in the bumpless
@@ -5349,10 +5611,9 @@ void AdjustFieldLearnMode() {
             g_loadDumpActive = ldNow;
             ldWasActive = ldNow;
           } else {
-            // Gate closed — clean state so next gate-open starts fresh.
-            ldCount1 = 0;
-            ldCount2 = 0;
-            ldCount3 = 0;
+            // Gate closed — clean state so next gate-open starts fresh. g_ldArmed stays false (cleared at
+            // the top of this pass); counters, latch and trip are zeroed now, not at the next reading.
+            loadDumpReset();
             ldWasActive = false;
             g_loadDumpActive = false;
           }
@@ -5846,7 +6107,7 @@ void AdjustFieldLearnMode() {
           } else {
             cv_I_track = cv_I;
             // Per-tick cv_I bleed during active fastOV: voltage PI fires at 100ms but
-            // the integrator needs to reduce every 5ms tick to counteract bulk-phase wind-up.
+            // the integrator needs to reduce every control tick (~13 ms) to counteract bulk-phase wind-up.
             // Suppressed during seed-protection window to preserve the seeded cv_I value.
             if (fastOvClampActive && !seedProtected) {
               cv_I = fmaxf(0.0f, cv_I - awBleedAmpS * actualDtSec);
@@ -5858,6 +6119,7 @@ void AdjustFieldLearnMode() {
 
         if (voltageControlActive) {
           bool cvLoopFired = enteringCV || ((currentMillis - lastVoltageLoopMs) >= VoltageLoopInterval);
+          vlHasPrev = vlHasPrevIn;
 
           // ===== CV D term — sliding-window derivative, recomputed every output tick =====
           // kdTrim is a POSITION (VoltageKd_active × slope EXCESS over the deadband line — or × full slope,
@@ -5976,8 +6238,10 @@ void AdjustFieldLearnMode() {
             } else {
               g_voltLoopActualIntervalMs = 0;
             }
+            g_voltLoopLogIntervalMs = vlHasPrev ? g_voltLoopActualIntervalMs : 0;  // before voltLoop_record sets vlHasPrev
             voltLoop_record(currentMillis);  // feed the CV-interval ladder (vl_*); vlHasPrev re-baselines on CV exit
             pidLog_voltageLoopRanThisTick = 1;
+            g_cvLogVoltLoopFired = true;
             pidLog_enteringCV = enteringCV ? 1 : 0;
 
             float e = voltageTargetSlewed - IBV;  // raw INA228 — no filter lag on PI error (governor output)
@@ -6254,8 +6518,8 @@ void AdjustFieldLearnMode() {
         // Per-tick Icv recompute — proportional path responds every output current loop tick; cv_I still
         // updates only on VoltageLoopInterval cadence. The D-term back-off (g_cvKdTrimLive) is recomputed
         // every tick in the D block above and subtracted here too, so the fast P path never overwrites the
-        // trim (an earlier build subtracted it only in the 100ms path, and this recompute wiped it ~5ms
-        // later — the D term then had authority for ~5% of ticks and was effectively negated). It is a
+        // trim (an earlier build subtracted it only in the 100ms path, and this recompute wiped it one
+        // tick (~13 ms) later — the D term then had authority for ~1 tick in 8 and was effectively negated). It is a
         // position, not an integral: zeroed on CV entry, recomputed from the present slope each tick.
         {
           float e_now = voltageTargetSlewed - IBV;  // raw INA228 — no filter lag on per-tick proportional (governor output)
@@ -6539,7 +6803,7 @@ void AdjustFieldLearnMode() {
           else if (minFloorBinding)                               rawCode = 11;  // no ceiling binds: over-delivery really is the keep-alive floor
           else if (warmupBinding)                                 rawCode = 13;  // last real ceiling before the catch-all
           else                                                    rawCode = 1;
-          // Publish a change only after 5 consecutive identical ticks (~150 ms): edge-hover
+          // Publish a change only after 5 consecutive identical ticks (~65 ms; ~150 ms worst case): edge-hover
           // between two codes (Icv at icvCeil, thermal penalty at 0.5 A) parks the published
           // value instead of hopping at whatever instant the 500 ms CSV4 sampler catches.
           static uint8_t limCand = 0, limCandTicks = 0;
@@ -6829,7 +7093,7 @@ void AdjustFieldLearnMode() {
   // (past digitalWrite(4,HIGH)). loop() clears pfHasPrev while the field is off so the
   // first firing after a field-off stretch re-baselines instead of logging the off-gap.
   pidFire_record(currentMillis);
-  // Best-Ever Front: fold one alternator-health sample per control tick (~200 Hz). Live only —
+  // Best-Ever Front: fold one alternator-health sample per control tick (~75 Hz). Live only —
   // bench-sim folds at 1 Hz from altHealth_tick instead. Off/fault/shutdown early-return above this.
   if (altSimMode < 0.5f) TIMED_CALL(ft_altFold, altFold_tick(currentMillis));
   // Section profiler latch — full passes only; early returns above never reach here.
@@ -7388,7 +7652,7 @@ const char *modeToString(FieldControlMode mode) {
     case MODE_LOCKOUT_RAMP: return "LOCKOUT_RAMP";
     case MODE_DISABLED_RAMP: return "DISABLED_RAMP";
     case MODE_NORMAL_MANUAL: return "NORMAL_MANUAL";
-    case MODE_NORMAL_AUTO_PID: return "NORMAL_AUTO_PID";
+    case MODE_NORMAL_AUTO: return "NORMAL_AUTO";
     case MODE_COMMISSION_IDLE: return "COMMISSION_IDLE";
     case MODE_FIELD_RES_TEST: return "FIELD_RES_TEST";
     default: return "UNKNOWN";
@@ -7691,9 +7955,9 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
     return MODE_CRITICAL_RAMP;
   }
 
-  // PRIORITY 3: RPM GATE (field must be cut when engine is not running). rpmBelowMinimum already
-  // carries the §1.3 test (buildTickSnapshot).
-  if (tick.rpmBelowMinimum) {
+  // PRIORITY 3: RPM GATE (field must be cut when engine is not running). rpmGateActive already
+  // carries the §1.3 test and the two-reading rule for an energized field (buildTickSnapshot).
+  if (tick.rpmGateActive) {
     return MODE_CRITICAL_RAMP;
   }
 
@@ -7787,7 +8051,7 @@ FieldControlMode selectFieldControlMode(const TickSnapshot &tick) {
   }
 
   // PRIORITY 8: NORMAL AUTO
-  return MODE_NORMAL_AUTO_PID;
+  return MODE_NORMAL_AUTO;
 }
 
 /**
@@ -7837,8 +8101,8 @@ FieldEventReason selectFieldEventReason(const TickSnapshot &tick) {
   // Priority 2.5: two or more required sensors faulted (§11) — mirrors selectFieldControlMode.
   if (tick.multiSensorFault) return REASON_MULTI_SENSOR_FAULT;
 
-  // Priority 3: RPM gate (rpmBelowMinimum already carries the §1.3 test)
-  if (tick.rpmBelowMinimum) return REASON_RPM_TOO_LOW;
+  // Priority 3: RPM gate (rpmGateActive already carries the §1.3 test and the two-reading rule)
+  if (tick.rpmGateActive) return REASON_RPM_TOO_LOW;
 
   // Priority 3.2: Tach-lie plausibility — mirrors selectFieldControlMode.
   if (tick.tachImplausible) return REASON_TACH_IMPLAUSIBLE;
@@ -8261,7 +8525,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   bool chargingEnabledLocal = (Ignition == 1 && OnOff == 1);
 
   // GPIO42 = BMSLogic opto (U16); inverted — the phototransistor pulls the pin low when the
-  // external 5-28 V signal is present. Read every tick even with bmsLogic off: the Integrations
+  // external 5-62 V signal is present. Read every tick even with bmsLogic off: the Integrations
   // status row is how an installer verifies the wiring BEFORE handing the wire any authority.
   bmsSignalActive = !digitalRead(42);
   bool bmsPermits = true;
@@ -8294,8 +8558,8 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // Protection-event grace: a clamp runs the field near MinDuty (tach floor dropped), which can
   // starve the LM2907 pickup — an EXACTLY-zero reading inside the window is signal dropout, not a
   // stopped engine. Only literal 0 is masked (a real post-blip idle droop reads nonzero and gates
-  // normally); a genuine stall cuts the moment the window expires because rpmZeroSinceMs keeps
-  // counting below. Only while charging is enabled: a shutdown (toggle/key-off/BMS/weather) has
+  // normally); a genuine stall cuts the moment the window expires because the zero hold
+  // (rpmZeroConfirm) keeps counting below. Only while charging is enabled: a shutdown (toggle/key-off/BMS/weather) has
   // nothing to recover, and deferring the cuts just keeps the field energized where its PWM fakes
   // tach readings (phantom RPM in datalogs).
   // Field-cut test (commissioning stage 7) deliberately drops the field to MinDuty to time the
@@ -8341,20 +8605,19 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
                              && ((uint32_t)(currentMillis - g_lastProtClampMs) < PROT_RPM_GRACE_MS)
                              && chargingEnabledLocal
                              && (RPM <= 0.0f));
-  // Engine confirmed stopped: RPM held at exactly 0 for >= RPM_ZERO_CUT_MS. RPM is already
-  // floored to 0 below 100 in ReadAnalogInputs, so RPM <= 0 means a true zero. Skipped when
-  // the owner runs without engine speed (§1.3). Drives the immediate-cut override below.
+  // Engine confirmed stopped: RPM held at exactly 0 for >= RPM_ZERO_CUT_MS with a second zero reading
+  // in that time, or RPM_ZERO_MAX_WAIT_MS with none. RPM is already floored to 0 below 100 in
+  // ReadAnalogInputs, so RPM <= 0 means a true zero. Skipped when the owner runs without engine speed
+  // (§1.3). The hold counts through rpmDropoutGrace. Drives the immediate-cut override below.
   const bool rpmReasonSuppressed = reasonSuppressedByOverride(REASON_RPM_TOO_LOW, tick);
-  if (!rpmReasonSuppressed && RPM <= 0.0f) {
-    if (rpmZeroSinceMs == 0) rpmZeroSinceMs = currentMillis;
-  } else {
-    rpmZeroSinceMs = 0;
-  }
+  static RpmLowConfirm rpmZeroConfirm;
+  const bool rpmZeroHeld = rpmZeroConfirm.update(!rpmReasonSuppressed && RPM <= 0.0f, currentMillis,
+                                                 RPM_ZERO_CUT_MS, RPM_ZERO_MAX_WAIT_MS, (uint32_t)dataTimestamps[IDX_RPM]);
   g_rpmTachMasked = rpmDropoutGrace;
-  tick.engineFullyStopped = (!rpmDropoutGrace && rpmZeroSinceMs != 0 && (currentMillis - rpmZeroSinceMs) >= RPM_ZERO_CUT_MS);
+  tick.engineFullyStopped = !rpmDropoutGrace && rpmZeroHeld;
 
   // Engine-restart confirmation: a confirmed stop arms rpmRestartPending; RPM must then hold
-  // >= MinRPMForField for RPM_RESTART_CONFIRM_MS before the RPM gate releases, so a lone noise
+  // >= MinRPMForField, and above 0, for RPM_RESTART_CONFIRM_MS before the RPM gate releases, so a lone noise
   // blip (or a phantom's first seconds) can't re-energize the field. Grace-masked dropouts never
   // arm it — only a true zero-hold stop does. Real starts pass through the dwell unnoticed
   // beyond the ~2 s charging delay.
@@ -8366,7 +8629,7 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     if (prevRpmIgnored && !tick.ignoreRPM) rpmRestartPending = true;
     prevRpmIgnored = tick.ignoreRPM;
   }
-  if (!rpmReasonSuppressed && RPM >= (float)MinRPMForField) {
+  if (!rpmReasonSuppressed && RPM >= (float)MinRPMForField && RPM > 0.0f) {
     if (rpmAboveMinSinceMs == 0) rpmAboveMinSinceMs = currentMillis;
     if (rpmRestartPending && (uint32_t)(currentMillis - rpmAboveMinSinceMs) >= RPM_RESTART_CONFIRM_MS) {
       rpmRestartPending = false;
@@ -8634,6 +8897,8 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // setpointLimited holds its pre-test value, so an active or pending sweep stays exempt; the knee
   // sweep is also mid-rewrite of the very floor table the arm bar reads (07-22 bench: idle knee
   // sweep aborted TACH_IMPLAUSIBLE at 743 RPM / 30% field).
+  // Armed = every term but the evidence (tach claims running, zero output). The low-RPM gate reads it.
+  bool tachLieArmed;
   {
     bool sweepDrivingField = (fieldCurveActive != 0) || (systemIDActive != 0) || (fieldCutActive != 0)
                              || fieldCurveRequested || systemIDRequested || fieldCutRequested
@@ -8651,13 +8916,21 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
     // zero-output band; the min-duty table's largest row (the idle floor) stands in so the bar stays above it
     // (history check 2026-10-02).
     const float tachLieFloor = tick.ignoreRPM ? largestRpmTableMinDuty() : tick.rpmMinDuty;
-    bool tachLieNow = TachLieEnable && chargingEnabledLocal && !tick.manualMode && !tick.fieldResTest
-                      && !reasonSuppressedByOverride(REASON_TACH_IMPLAUSIBLE, tick)   // needs the alternator current
-                      && !sweepDrivingField
-                      && !tick.currentDataStale
-                      && (tick.ignoreRPM || RPM >= (float)MinRPMForField)
-                      && setpointLimited > NoOutputAmps
-                      && dutyCycle >= tachLieFloor + TACH_LIE_HEADROOM_FRAC * fmaxf(0.0f, ccDutyCeiling() - tachLieFloor)
+    // One reading under MinRPMForField must not restart the count, or a phantom that dips now and then is never
+    // cut (each dip reset it, each reading back above reset the gate). Same rule, timing and stamp as the
+    // low-RPM gate uses while this detector is armed (the only time the count runs), so outside an RPM mask the
+    // count restarts only on the tick the gate takes the field itself.
+    static RpmLowConfirm tachLieRpmLow;
+    const bool tachLieRpmLowConfirmed = tachLieRpmLow.update(RPM < (float)MinRPMForField, currentMillis,
+                                                             0, RPM_BELOWMIN_MAX_WAIT_ARMED_MS, rpmUnheldReadMs);
+    tachLieArmed = TachLieEnable && chargingEnabledLocal && !tick.manualMode && !tick.fieldResTest
+                   && !reasonSuppressedByOverride(REASON_TACH_IMPLAUSIBLE, tick)   // needs the alternator current
+                   && !sweepDrivingField
+                   && !tick.currentDataStale
+                   && setpointLimited > NoOutputAmps
+                   && dutyCycle >= tachLieFloor + TACH_LIE_HEADROOM_FRAC * fmaxf(0.0f, ccDutyCeiling() - tachLieFloor);
+    bool tachLieNow = tachLieArmed
+                      && (tick.ignoreRPM || !tachLieRpmLowConfirmed)
                       && fabsf(MeasuredAmps) < NoOutputAmps;
     if (tachLieNow) {
       if (tachLieSinceMs == 0) tachLieSinceMs = currentMillis;
@@ -8665,6 +8938,23 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
       tachLieSinceMs = 0;
     }
     tick.tachImplausible = (tachLieSinceMs != 0 && (uint32_t)(currentMillis - tachLieSinceMs) >= TACH_LIE_DWELL_MS);
+  }
+
+  // The arbiter's RPM gate holds a field that is already off at once, but cutting an energized one takes
+  // two low reads, so one glitched low read cannot drop a charging field from full duty (the LM2907
+  // coupling-cap slam, then a ~4.6 s false zero and the restart confirmation). A glitch under 100 at cruise
+  // makes the lone-jump rejection repeat it in place of the next real reading. While tach-lie is armed that
+  // held read does not count (rpmUnheldReadMs) and the hard bound is RPM_BELOWMIN_MAX_WAIT_ARMED_MS. On a stopped engine a phantom at or above the minimum that
+  // follows it then resets this gate, and only tach-lie can cut it: that needs the loop commanding more than
+  // NoOutputAmps and duty above the arm bar at the phantom's speed, and short of that the field stays on.
+  // Unarmed, the held read counts (plain stamp). Placed after the tach-lie block so both see this pass's arm
+  // state. Confirmation restarts when a mask ends.
+  {
+    static RpmLowConfirm rpmGateConfirm;
+    const bool confirmed = rpmGateConfirm.update(tick.rpmBelowMinimum, currentMillis,
+                                                 0, tachLieArmed ? RPM_BELOWMIN_MAX_WAIT_ARMED_MS : RPM_BELOWMIN_MAX_WAIT_MS,
+                                                 (uint32_t)dataTimestamps[IDX_RPM], rpmUnheldReadMs, tachLieArmed);
+    tick.rpmGateActive = confirmed || (tick.rpmBelowMinimum && gpio4IsLow);
   }
 
   tick.voltagePlausible = isVoltageSensorPlausible();
@@ -9565,9 +9855,9 @@ void kneeLearnObserve(float rpm, float appliedDuty, float tF, float amps,
   // The duty-domain knobs — kneeStepPct (staircase), kneeMarginPct (park margin / step-down),
   // kneeMaxFloorPct (ceiling) — are stored in REAL duty-% for THIS bus, so they're used as-is here
   // (no runtime normalization — WYSIWYG with the dashboard box). Their defaults are scaled by
-  // ×(12/SYSTEM_VOLTAGE_CLASS) at first boot (kneeLearnInit) and rescaled in place on a system-voltage
-  // change (applyNominalVoltageChange) so a 5% 12V margin shows/uses as 1.25% on a 48V bank — keeping
-  // the field-CURRENT margin constant without hiding the math. Amps-domain knobs (kneeOnsetA,
+  // × fieldScale() at first boot (kneeLearnInit) and rescaled in place on a class or winding change
+  // (scaleFieldSideKnobs) so a 5% 12V margin shows/uses as 1.25% on a 48V bank with a 12 V winding — keeping
+  // the margin a constant share of rated field without hiding the math. Amps-domain knobs (kneeOnsetA,
   // kneeReArmA) and the learned floors are voltage-independent (the probe observes real onset).
   float stepEff = kneeStepPct;
   float maxFloorEff = kneeMaxFloorPct;
@@ -9918,8 +10208,7 @@ void kneeLearnService(bool fieldOff) {
 // scalar too — so the user's Min Field % setting does nothing at any engine speed and nothing says so.
 // The baseline is written back into kneeFloor, not just the column, or the learner's next probe
 // restart (rpmMinDutyTable[b] = kneeFloor[b]) knocks it straight back to zero.
-// Bin 0 keeps its permanent zero: it sits at 100 RPM, below MinRPMForField, so the field is cut
-// there regardless and the learner never probes it.
+// Bin 0 keeps its permanent zero: at 100 RPM there is no usable knee, so the learner never probes it.
 void kneeRebuildOwnedTable() {
   for (int i = 0; i < RPM_TABLE_SIZE; i++) {
     if (i != 0 && !kneeFrozen[i] && kneeFloor[i] <= 0.0f) kneeFloor[i] = KNEE_BASELINE_PCT;
@@ -9949,9 +10238,9 @@ void kneeLearnInit() {
   else kneeTempComp = (settingRead(NK_kneeTempComp).toInt() != 0);
 #define KNEE_LD_F(key, var) do { if (!settingExists(key)) settingWrite(key, String(var).c_str()); else var = settingRead(key).toFloat(); } while (0)
   // Duty-domain knobs are stored in REAL duty-% for this bus. Their hardcoded globals are 12V values,
-  // so on FIRST creation scale the default by ×(12/SYSTEM_VOLTAGE_CLASS) (5%→1.25% at 48V) before persisting.
+  // so on FIRST creation scale the default × fieldScale() (5%→1.25% at 48V on a 12 V winding) before persisting.
   // Once a key exists the stored value wins verbatim (no scaling) — that's the WYSIWYG dashboard value.
-#define KNEE_LD_DUTY(key, var) do { if (!settingExists(key)) { var = var * 12.0f / (float)SYSTEM_VOLTAGE_CLASS; settingWrite(key, String(var).c_str()); } else var = settingRead(key).toFloat(); } while (0)
+#define KNEE_LD_DUTY(key, var) do { if (!settingExists(key)) { var = var * fieldScale(); settingWrite(key, String(var, 4).c_str()); } else var = settingRead(key).toFloat(); } while (0)
   KNEE_LD_DUTY(NK_kneeMarginPct,   kneeMarginPct);
   KNEE_LD_F(NK_kneeOnsetA,      kneeOnsetA);
   KNEE_LD_F(NK_kneeReArmA,      kneeReArmA);
@@ -9961,7 +10250,7 @@ void kneeLearnInit() {
   KNEE_LD_DUTY(NK_kneeMaxFloorPct, kneeMaxFloorPct);
   KNEE_LD_F(NK_kneeRpmTolPct,   kneeRpmTolPct);
   KNEE_LD_F(NK_kneeTempTolF,    kneeTempTolF);
-  KNEE_LD_DUTY(NK_kneeDutyTolPct,  kneeDutyTolPct);   // duty-domain steadiness band — inverse-scale ×12/V like altDutyLineRms
+  KNEE_LD_DUTY(NK_kneeDutyTolPct,  kneeDutyTolPct);   // duty-domain steadiness band, × fieldScale() like altDutyLineRms
 #undef KNEE_LD_F
 #undef KNEE_LD_DUTY
 
@@ -10481,21 +10770,21 @@ void pidLog_tick(uint32_t nowMs) {
   // ── Context ───────────────────────────────────────────────────────────────
   e.rpm = RPM;
   e.measAmps = MeasuredAmps;
-  // Inner output-current PID — the gains ACTUALLY handed to currentPID (setting × voltage-class norm,
+  // Inner output-current PID — the gains ACTUALLY handed to currentPID (setting × fieldScale(),
   // Ki × the oscillation damper's live derate), same convention as voltageKp/Ki below. The configured
   // PidKp/Ki/Kd ride the CSV3 settings echo in the snapshot JSON saved beside every log, so the derate
-  // is recoverable as innerKi ÷ (PidKi × 12/SYSTEM_VOLTAGE_CLASS).
+  // is recoverable as innerKi ÷ (PidKi × fieldWindApplied/SYSTEM_VOLTAGE_CLASS).
   e.innerKp = PidKp_active;
   e.innerKi = PidKi_active * g_huntDerate;
   e.innerKd = PidKd_active;
-  e.voltageKp = (float)VoltageKp_active;  // outer voltage loop — gain actually in effect (Manual or Auto α/K)
+  e.voltageKp = (float)VoltageKp_active;  // outer voltage loop — gain actually in effect (Manual or Measured α/K)
   e.voltageKi = (float)VoltageKi_active;
 
   e.battV_filt = IBV_filtered;
   e.dBcur_dt = g_dBcur_dt;
   e.battI = getBatteryCurrent();
   e.ch1IntervalMs = (int16_t)g_ch1LastIntervalMs;
-  e.voltLoopIntervalMs = pidLog_voltageLoopRanThisTick ? (int16_t)g_voltLoopActualIntervalMs : 0;
+  e.voltLoopIntervalMs = pidLog_voltageLoopRanThisTick ? (int16_t)g_voltLoopLogIntervalMs : 0;
   e.inaIntervalMs = (int16_t)ina_last_ms;
   e.pad2 = 0;
   e.mExcessEma = g_mExcessEma;             // iExcess detector traces — averaged excess vs its

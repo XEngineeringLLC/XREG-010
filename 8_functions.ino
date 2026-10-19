@@ -692,6 +692,12 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "FieldResTrefC", NK_FieldResTrefC, 1 },   // written only beside FieldResistance (no /get param of its own)
   { "FieldResDefault", NK_FieldResDefault, 1 },   // written by the test screen's skip (/fieldResTest skip=1) and cleared by any measured value
   { "FieldWiring", NK_FieldWiring, 1 },
+  { "FieldWindingV", NK_FieldWindingV, 1 },
+  // Travels with the knobs it describes: a full export's field-duty values sit on this winding's scale, and the boot
+  // reconcile (fieldWindingReconcile) converts them to the destination's own effective winding.
+  { "fieldWindApplied", NK_fieldWindApplied, 1 },
+  // Tier 3: the owner's answer for THIS rotor's resistance; the owner of a destination boat answers for theirs.
+  { "fieldWindAck", NK_fieldWindAck, 3 },
   { "PulleyRatio", NK_PulleyRatio, 1 },
   // Tier 3, not 1: adopting another boat's tach calibration would silently rescale this device's
   // engine-RPM axis via a direct settingWrite, bypassing the /get guard that arms the wipe.
@@ -1114,6 +1120,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "faCalOffA", NK_faCalOffA, 3 },
   { "altbaseSec", NK_altbaseSec, 3 },
   { "altRefSrc", NK_altRefSrc, 3 },
+  { "altWindV", NK_altWindV, 3 },   // winding this device's alt-health record is on; imported, it would hide a winding change
   // Address this node claimed on the NMEA 2000 bus and persisted (5_functions.ino), reloaded as the
   // preferred address at boot. Tier 3: importing it would aim two regulators at the same address.
   { "n2kSrcAddr", NK_n2kSrcAddr, 3 },
@@ -1215,9 +1222,9 @@ String manifestConfigObject() {
   CFG_EMIT_REGISTRY(PERF_SETTINGS, PERF_SETTING_COUNT)
   #undef CFG_EMIT_REGISTRY
   // Derived read-only: the base 12V-equiv CV gains the voltage loop is ACTUALLY running
-  // (recomputeCvGains sets these from the plant fit in Auto, or = the manual VoltageKp/Ki in
+  // (recomputeCvGains sets these from the plant fit under Measured, or = the manual VoltageKp/Ki under
   // Manual). Emitted so the blob is self-describing — the manual VoltageKp/Ki above are the
-  // dormant fallback whenever cvGainMode=Auto. NOT in CONFIG_MANIFEST, so applyImportConfig
+  // dormant fallback whenever cvGainMode=1 (Measured). NOT in CONFIG_MANIFEST, so applyImportConfig
   // ignores them on the destination (it recomputes its own from its own plant fit).
   if (!first) j += ',';
   first = false;
@@ -1361,7 +1368,7 @@ String exportTablesObject() {
 // Derived view of the Vessel Info NVS record, served at /vessel_info.json. Built from the live
 // globals rather than re-reading NVS so it always matches what the loops are running. Numbers stay
 // JSON numbers — the dashboard form tests `!== undefined` and radio-selects on a numeric compare,
-// so a quoted "0" orientation would fail to select. The same 20 fields are also in the manifest
+// so a quoted "0" orientation would fail to select. The same fields are also in the manifest
 // half of /exportConfig; this is the ungated, form-shaped view of them.
 String vesselInfoJson() {
   String j;
@@ -1376,6 +1383,7 @@ String vesselInfoJson() {
   j += ",\"engine_make\":";             cfgAppendJsonStr(j, ENGINE_MAKE);
   j += ",\"engine_hp\":";               j += String((unsigned)ENGINE_HP);
   j += ",\"battery_voltage\":";         j += String((unsigned)SYSTEM_VOLTAGE_CLASS);
+  j += ",\"field_winding_v\":";         j += String((unsigned)FieldWindingV);
   j += ",\"battery_capacity_ah\":";     j += String(BatteryCapacity_Ah);
   j += ",\"battery_type\":";            cfgAppendJsonStr(j, BATTERY_TYPE);
   j += ",\"battery_make_model\":";      cfgAppendJsonStr(j, BATTERY_MAKE_MODEL);
@@ -1595,6 +1603,7 @@ int applyImportConfig(const char *body) {
   String preClass = settingRead(NK_BatteryVoltage);
   String preCap   = settingRead(NK_BatteryCapacity_Ah);
   String preChem  = settingRead(NK_batteryType);
+  String preWinding = settingRead(NK_FieldWindingV);
   // System voltage class is not an ordinary setting — it is the MEANING of every other volt- and
   // duty-domain value, so it is handled BEFORE the manifest loop rather than inside it. A payload that
   // carries only the class (a one-key admin push) brings nothing to reinterpret the rest of NVS with, so
@@ -1621,6 +1630,27 @@ int applyImportConfig(const char *body) {
       }
     }
   }
+  // The field winding is the other half of what every field-duty value means, so it converts here too, after the
+  // class (which bounds it). A full export also carries fieldWindApplied and its own knobs, which the loop below
+  // writes over this; whatever field-side value it leaves is converted onto the file's scale after it
+  // (fieldSideConvertUnwritten), and the boot reconcile then moves them all onto this device's effective winding.
+  bool cfgWindBad = false;
+  {
+    String wv;
+    if (cfgJsonExtract(cfg, "FieldWindingV", wv)) {
+      int w = wv.toInt();
+      if (w != 12 && w != 24 && w != 36 && w != 48) {
+        cfgWindBad = true;
+        queueConsoleMessageF("IMPORT WARNING: ignoring invalid field winding voltage \"%s\" in the imported config", wv.c_str());
+      } else if (w != (int)FieldWindingV) {
+        fieldWindingSet(w, nullptr);
+      }
+    }
+  }
+  // The scale the stored field-side values are on once the winding step above has run, and the field-side NVS keys the
+  // loops below write (";key;key;"), for fieldSideConvertUnwritten after them.
+  const int preWindApplied = settingRead(NK_fieldWindApplied).toInt();
+  String cfgWritten = ";";
   // The field resistance and the alternator temperature recorded with it are adopted only as a pair: a resistance with no
   // temperature (every 0.0.6 export carries the old 2-ohm seed that way) or a temperature with no resistance is skipped,
   // so the Prerequisites screen asks for a measurement. Interim rule (owner 2026-10-10): a later cloud step that strips
@@ -1638,6 +1668,7 @@ int applyImportConfig(const char *body) {
   for (size_t i = 0; i < CONFIG_MANIFEST_COUNT; i++) {
     if (CONFIG_MANIFEST[i].tier == 3) continue;   // export-only: this device's own history, never adopted
     if (cfgClassBad && strcmp(CONFIG_MANIFEST[i].param, "BatteryVoltage") == 0) continue;
+    if (cfgWindBad && strcmp(CONFIG_MANIFEST[i].param, "FieldWindingV") == 0) continue;
     if (!fieldResPair && (strcmp(CONFIG_MANIFEST[i].param, "FieldResistance") == 0 || strcmp(CONFIG_MANIFEST[i].param, "FieldResTrefC") == 0)) continue;
     String val;
     bool found = cfgJsonExtract(cfg, CONFIG_MANIFEST[i].param, val);
@@ -1652,9 +1683,11 @@ int applyImportConfig(const char *body) {
         queueConsoleMessageF("IMPORT WARNING: ignoring non-finite value \"%s\" for %s", val.c_str(), CONFIG_MANIFEST[i].param);
         continue;
       }
+      if (strcmp(CONFIG_MANIFEST[i].param, "MinRPMForField") == 0 && val.toInt() < 0) val = "0";
       if (settingWrite(CONFIG_MANIFEST[i].nvsKey, val.c_str())) {
         applied++;
         cfgImportNoteChanged(CONFIG_MANIFEST[i].param);
+        if (fieldSideKey(CONFIG_MANIFEST[i].nvsKey)) { cfgWritten += CONFIG_MANIFEST[i].nvsKey; cfgWritten += ';'; }
       }
     }
   }
@@ -1672,9 +1705,12 @@ int applyImportConfig(const char *body) {
     // stage clear is left to do here; applyImportTables still runs last, so an imported table wins.
     if (classChanged) {
       commissionClearStage(7);
-      queueConsoleMessage("IMPORT WARNING: battery voltage class changed - charge profile, protection trips and field-duty limits converted to the new class; learned tachometer keep-alive floors reset and learned oscillation speed ranges cleared; recommissioning recommended");
+      queueConsoleMessage("IMPORT WARNING: battery voltage class changed - charge profile, protection trips and field-duty limits converted to the new class for the field winding set in Vessel Info; learned tachometer keep-alive floors reset and learned oscillation speed ranges cleared; recommissioning recommended");
     }
   }
+  if (settingRead(NK_FieldWindingV) != preWinding)
+    queueConsoleMessageF("IMPORT WARNING: field winding voltage changed to %sV - field-duty settings and Max Field Volts move onto the new winding's scale, and the alternator-health history is cleared. Confirm the rating on the alternator's datasheet.",
+                         settingRead(NK_FieldWindingV).c_str());
   // Registry knobs — generic import mirroring the export side.
   // Macro for the same auto-prototype reason as the emit.
   #define CFG_IMPORT_REGISTRY(REG, COUNT) \
@@ -1685,12 +1721,13 @@ int applyImportConfig(const char *body) {
         char key[16]; \
         snprintf(key, sizeof(key), "%s", REG[i].name); \
         if (!floatTokenValid(val.c_str())) { queueConsoleMessageF("IMPORT WARNING: ignoring non-finite value \"%s\" for %s", val.c_str(), REG[i].name); continue; } \
-        if (settingWrite(key, val.c_str())) { applied++; cfgImportNoteChanged(REG[i].name); } \
+        if (settingWrite(key, val.c_str())) { applied++; cfgImportNoteChanged(REG[i].name); if (fieldSideKey(key)) { cfgWritten += key; cfgWritten += ';'; } } \
       } \
     }
   CFG_IMPORT_REGISTRY(ALT_SETTINGS, ALT_SETTING_COUNT)
   CFG_IMPORT_REGISTRY(PERF_SETTINGS, PERF_SETTING_COUNT)
   #undef CFG_IMPORT_REGISTRY
+  fieldSideConvertUnwritten(preWindApplied, settingRead(NK_fieldWindApplied).toInt(), cfgWritten);
   applied += applyImportTables(body);
   return applied;
 }
@@ -1736,7 +1773,7 @@ bool bhStartTest() {
   if (bhTestState == 1)        { bhAbortReason = "already running";          return false; }
   if (!bhSamples || !bhResults){ bhAbortReason = "buffers unallocated";      return false; }
   if (RPM < 100)               { bhAbortReason = "engine not running";       return false; }
-  if (sysMode != SYS_MODE_AUTO){ bhAbortReason = "must be in AUTO mode";     return false; }   // generator only runs in the AUTO control path
+  if (sysMode != SYS_MODE_AUTO){ bhAbortReason = "must be charging in Auto mode";     return false; }   // generator only runs in the AUTO control path
   // altSweepRequested too: a sweep start is two-stage (the HTTP press arms the request, the next
   // control tick promotes it to altSweepActive), so active alone leaves a one-tick window.
   if (TuningMode || CVTuningMode || systemIDActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || resTestActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) { bhAbortReason = "another test active"; return false; }
@@ -1867,7 +1904,7 @@ void bhServiceCompletion() {
   // Watchdog: if the engine stops mid-test the health branch stops toggling and the
   // test would hang RUNNING forever.
   uint32_t budget = (uint32_t)(bhNumEdges + 4) * bhDwellMs + 5000;
-  if (millis() - bhTestStartMs > budget) bhAbort("timed out (engine stopped or left AUTO?)");
+  if (millis() - bhTestStartMs > budget) bhAbort("timed out (engine stopped or left Auto mode?)");
 }
 
 // ════════════════════════ CV PLANT FIT (firmware voltage-loop identification) ════════════════════════
@@ -2254,7 +2291,7 @@ void cvpfProcess() {
     // setup phases were pinned (floor/ceiling/limiter); duty stepped but current didn't = ceiling
     // or field circuit; current stepped but edges still dropped = disturbed/starved voltage windows.
     float dStepPct = cvpfStepDuty - cvpfBaseDuty;
-    if (dStepPct < 1.5f) {
+    if (dStepPct < 1.5f * fieldScale()) {   // 1.5 % is the 12 V-winding-on-12 V gap
       snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
                "pulse edges unusable — the two field levels came out nearly identical (%.1f%% / %.1f%%) even though they were learned back to back: output was pinned at a floor, a ceiling, or a limiter. Re-run where the alternator has room to move",
                cvpfBaseDuty, cvpfStepDuty);
@@ -2315,7 +2352,7 @@ bool cvpfStartTest(float diMaxReq) {
   if (cvpfState == 1)           { cvpfAbortMsg = "already running";        return false; }
   if (!cvpfBuf)                 { cvpfAbortMsg = "buffer unallocated";     return false; }
   if (RPM < 100)                { cvpfAbortMsg = "engine not running";     return false; }
-  if (sysMode != SYS_MODE_AUTO) { cvpfAbortMsg = "must be in AUTO mode";   return false; }
+  if (sysMode != SYS_MODE_AUTO) { cvpfAbortMsg = "must be charging in Auto mode";   return false; }
   if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) {
     cvpfAbortMsg = "another test active"; return false;
   }
@@ -2370,7 +2407,7 @@ void cvpfServiceCompletion() {
   uint32_t budget = CVPF_SETTLE_TIMEOUT_MS + CVPF_T_PILOT_MS + 2 * CVPF_HOLD_TIMEOUT_MS
                     + CVPF_REBASE_SETTLE_MS + (uint32_t)(1000.0f * CVPF_DI_MAX_CEIL / TEST_ENTRY_RATE_A)
                     + 9 * CVPF_PULSE_SEG_MS + 8000;
-  if (millis() - cvpfTestStartMs > budget) cvpfAbort("timed out (engine stopped or left AUTO?)");
+  if (millis() - cvpfTestStartMs > budget) cvpfAbort("timed out (engine stopped or left Auto mode?)");
 }
 
 // ═══════════════ CV STRESS TEST (commissioning stage 8 / standalone Tuning ▸ Stress Test) ═══════════════
@@ -2481,7 +2518,7 @@ static bool     cvsReady = false, cvsOk = false, cvsAborted = false;
 bool cvStressStartTest() {
   if (cvStressActive)           { cvStressAbortMsg = "already running";      return false; }
   if (RPM < 100)                { cvStressAbortMsg = "engine not running";   return false; }
-  if (sysMode != SYS_MODE_AUTO) { cvStressAbortMsg = "must be in AUTO mode"; return false; }
+  if (sysMode != SYS_MODE_AUTO) { cvStressAbortMsg = "must be charging in Auto mode"; return false; }
   if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) {
     cvStressAbortMsg = "another test active"; return false;
   }
@@ -2561,7 +2598,7 @@ static void cvStressPersistResult() {
 // Grade a run that reached ARMED (armed → snapped). Overshoot/valley are reported, never gated.
 static void cvStressGrade() {
   cvsGEvents  = (cvsEvents <= 1) ? 0 : (cvsEvents == 2) ? 1 : 2;   // 1 ideal, 2 marginal, 3+ fail
-  cvsGHardCut = (cvsHardCuts > 0) ? 2 : 0;                          // any INA228 current cut = fail
+  cvsGHardCut = (cvsHardCuts > 0) ? 2 : 0;                          // any hard current cut (hard over-current or load dump) = fail
   if (cvsFirstEventMs == 0) {
     cvsOutcome = 1;                                                 // rode it out — no protection event
     cvsGRecovery = 3;                                               // n/a
@@ -2606,7 +2643,7 @@ void cvStress_tick(uint32_t nowMs) {
   uint32_t elapsed = nowMs - cvsPhaseStartMs;
 
   if (cvStressAbortRequested) { cvStressAbortRequested = false; cvStressAbort("cancelled by user"); return; }
-  if (sysMode != SYS_MODE_AUTO) { cvStressAbort("left AUTO mode"); return; }
+  if (sysMode != SYS_MODE_AUTO) { cvStressAbort("left Auto mode"); return; }
   // Signed compare: a poll can land between this pass's nowMs capture and this check, stamping
   // cvsLastPollMs a hair AHEAD of nowMs — unsigned subtraction would wrap to ~4.3e9 and abort.
   if (cvsLastPollMs != 0 && (int32_t)(nowMs - cvsLastPollMs) > (int32_t)CVS_POLL_DEADMAN_MS) {
@@ -2739,7 +2776,7 @@ void cvStress_tick(uint32_t nowMs) {
         if (cvsFirstEventMs == 0) cvsFirstEventMs = nowMs;
         cvsResettleSinceMs = 0;   // a fresh event restarts the re-settle clock
       }
-      // Hard current cut = INA228-driven field cut (hard over-current OR load dump), NOT the OV clamp.
+      // Hard current cut = hard over-current (alternator current sensor) OR load dump (INA228 battery current), NOT the OV clamp.
       cvsHardCuts = (uint16_t)((g_hardOCCount - cvsHoc0) + (g_loadDumpCount - cvsLd0));
       cvsIxTrips  = (uint16_t)(g_iExcessCount - cvsIx0);
       if (fieldCollapseTime != 0 && activeCollapseDelay > cvsMaxLockoutMs) cvsMaxLockoutMs = activeCollapseDelay;

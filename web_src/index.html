@@ -522,7 +522,7 @@
                 <div class="form-row">
                   <div class="form-label">Nominal Battery Voltage:</div>
                   <div class="form-input">
-                    <select name="BATTERY_VOLTAGE" required>
+                    <select name="BATTERY_VOLTAGE" class="vi-volt-select" required onchange="fieldWindingSyncOptions()">
                       <option value="">-- Select Voltage --</option>
                       <option value="12" selected>12V</option>
                       <option value="24">24V</option>
@@ -530,6 +530,36 @@
                       <option value="48">48V</option>
                     </select>
                   </div>
+                </div>
+
+                <hr>
+
+                <div class="form-row">
+                  <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                    <span>Field Winding Voltage:</span>
+                    <span class="tooltip">
+                      &#8505;&#65039;
+                      <span class="tooltip-box">The voltage the alternator's field (rotor) winding is rated for. Many
+                        24&nbsp;V, 36&nbsp;V, and 48&nbsp;V alternators use a 12&nbsp;V field winding, and 12&nbsp;V is the
+                        right setting for them. Take the rating from the alternator's datasheet, or from the field
+                        or rotor rating; if neither lists one, ask the alternator's maker. It cannot be higher than the
+                        Nominal Battery Voltage. The field-duty settings, Max Field Volts, and the default current-loop gains are
+                        sized from it, so changing it rescales them, and Save lists each change first. A current-loop gain
+                        measured in commissioning stays as measured.</span>
+                    </span>
+                  </div>
+                  <div class="form-input">
+                    <select name="FIELD_WINDING_V" class="vi-volt-select" required>
+                      <option value="12" selected>12V</option>
+                      <option value="24">24V</option>
+                      <option value="36">36V</option>
+                      <option value="48">48V</option>
+                    </select>
+                  </div>
+                </div>
+                <div id="fieldWindHold" style="display:none; margin-top:6px; font-size:12px; color:#c77d1a;">
+                  <span id="fieldWindHoldTxt"></span>
+                  <button type="button" class="btn-secondary" style="margin-top:6px;" onclick="fieldWindingAsk(true)">Answer now</button>
                 </div>
 
                 <hr>
@@ -926,9 +956,10 @@
                             <th>Keep-Alive<br>(%) <span class="tooltip">ℹ️<span
                                   class="tooltip-box">Tachometer keep-alive floor: the lowest field duty cycle (%) the
                                   regulator will hold at this engine speed, even when the controls otherwise want less.
-                                  Holding a little field keeps the alternator's stator lightly energized, which keeps
-                                  the RPM signal alive. Edit these cells by hand only while Automatic Learning (card
-                                  below) is off.</span></span>
+                                  The RPM signal reads normally with the field off; only a rapid field drop blinds it.
+                                  This floor sits a small margin below where output current begins, to keep the field
+                                  from dropping fast from a working level to zero. Edit these cells by hand only while
+                                  Automatic Learning (card below) is off.</span></span>
                               <span id="minduty-managed-hint" class="learning-info-label"
                                     style="display:none; font-weight:400;">auto</span></th>
                           </tr>
@@ -1229,7 +1260,8 @@
                           <span>Margin Below Onset (%) (<span id="kneeMarginPct_echo">?</span>):
                             <span class="tooltip">ℹ️<span class="tooltip-box">How
                                   far below the current-onset point to park the floor. Larger = safer (never forces
-                                  unwanted current), smaller = field stays more primed. 5 is a good start.</span></span>
+                                  unwanted current), smaller = field stays more primed. The value it starts at is already
+                                  scaled for the Nominal Battery Voltage and Field Winding Voltage in Vessel Info.</span></span>
                           </span>
                         </div>
                         <div class="form-input">
@@ -1468,7 +1500,7 @@
                       <span class="tooltip">ℹ️<span
                           class="tooltip-box">Whether
                           the output current PID has been initialized for the current operating point. Briefly false on
-                          startup or after mode transitions; the PID performs a bumpless transfer before resuming AUTO
+                          startup or after mode transitions; the PID performs a bumpless transfer before it resumes closed-loop
                           control.</span></span>
                     </span>
                     <span class="learning-info-value"><span id="pidInitialized_display">No</span></span>
@@ -1500,7 +1532,7 @@
                     <span>Field Control (<span id="ManualFieldToggle_echo">?</span>):</span>
                     <span class="tooltip">
                       ℹ️
-                      <span class="tooltip-box">PID runs the charge stages and every protection. Manual drives the field
+                      <span class="tooltip-box">Auto runs the charge stages and every protection. Manual drives the field
                         straight from the Manual Field PWM box below and turns the protections off: no temperature
                         cut-back or over-temperature shutdown, no Min Field or per-speed tachometer keep-alive floor
                         (a PWM of 0 really means zero field), no engine-speed or tachometer-plausibility cut, no
@@ -1515,7 +1547,7 @@
                     <form action="/get" method="GET" target="hidden-form">
                       <div class="cap-mode-toggle ab-seg" data-seg-for="ManualFieldToggle_checkbox">
                         <button type="button" class="cap-mode-btn" data-checked="0" onclick="abSegClick(this)">Manual</button>
-                        <button type="button" class="cap-mode-btn" data-checked="1" onclick="abSegClick(this)">PID</button>
+                        <button type="button" class="cap-mode-btn" data-checked="1" onclick="abSegClick(this)">Auto</button>
                       </div>
                       <input id="ManualFieldToggle_checkbox" type="checkbox" style="display:none;"
                         onchange="manualFieldToggleChanged(this)" />
@@ -1534,7 +1566,7 @@
                         PWM duty cycle applied to the field winding when Manual mode is active, 0–100% in steps of
                         0.01, delivered as typed — Min Field and the per-speed keep-alive floor do not raise it, so 0
                         is a genuinely dead field. Only the field ceiling, Max Field % or Max Field Volts, whichever
-                        is lower, still caps it. Has no effect in PID mode. Use with caution — Manual mode bypasses the thermal, engine-speed, battery and current
+                        is lower, still caps it. Has no effect in Auto mode. Use with caution — Manual mode bypasses the thermal, engine-speed, battery and current
                         protections.</span></span>
                   </div>
                   <div class="form-input">
@@ -1559,7 +1591,7 @@
                         table's Keep-Alive (%) column and leaving this at or near zero. It raises that column, never
                         lowers it, and it has no effect at an engine speed whose Keep-Alive cell is 0 — commissioning
                         sets 0 above the highest speed it measured, where the field must be able to shut fully off.
-                        Manual field mode ignores both floors, as do shutdown ramps and an active protection clamp.
+                        Manual mode ignores both floors, as do shutdown ramps and an active protection clamp.
                         When the floor is what is setting output — the loop wanting less than the floor delivers — the
                         banner reads MIN FIELD.</span></span>
                   </div>
@@ -1600,8 +1632,9 @@
                     <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Caps the average voltage applied
                         to the field winding, calculated from commanded duty and the measured system voltage.
                         Alternator makers often reuse one 12&nbsp;V field winding across their 24&nbsp;V, 36&nbsp;V, and 48&nbsp;V
-                        models, so the winding inside a high-voltage alternator may still be a 12&nbsp;V part — enter
-                        the field voltage from the alternator's datasheet, and a higher rating raises the ceiling.
+                        models, so the winding inside a high-voltage alternator may still be a 12&nbsp;V part. Field Winding
+                        Voltage in Vessel Info records which it is, and changing it there sets this to suit that winding;
+                        change it here only to match a different field voltage on the alternator's datasheet.
                         The duty this works out to at the present system voltage is shown beside its value; the lowest
                         of this, Max Field (%) and the board's two field ceilings below is what the loop enforces, in
                         every mode, and that one is marked "limiting". Because this solves against the measured bus every control tick, it hands
@@ -1625,9 +1658,9 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Field Current Ceiling, 10 A (<span id="fieldCurDutyCeil_now">?</span>% now):<span id="FieldCurCeil_limiting" class="cap-limiting">limiting</span></span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Not a setting. The board's field drive
-                        is rated 10 A, and this is the duty that gives 10 A of field current at the present system
-                        voltage. Field current is estimated from Field Resistance (measured by the field resistance test),
-                        corrected for alternator temperature, so this ceiling is only as good as that measurement. With
+                        is rated 10 A, and this is the duty at which the estimated field current reaches 10 A at the
+                        present system voltage. The estimate comes from Field Resistance (measured by the field resistance
+                        test), corrected for alternator temperature, so this ceiling is only as good as that measurement. With
                         the 2&nbsp;Ω default on a 12 V system that skipped the test, it never comes into play.</span></span>
                   </div>
                 </div>
@@ -1653,7 +1686,7 @@
                     <span>Min RPM For Field (RPM) (<span id="MinRPMForField_echo">?</span>):</span>
                     <span class="tooltip">
                       ℹ️
-                      <span class="tooltip-box">Field is cut immediately when RPM falls below this threshold. Set to 0 to disable — not recommended; to run without a tach ignore engine speed under Setup → System → Run Without Failed Sensors.</span>
+                      <span class="tooltip-box">In Auto mode the field is cut on the second consecutive tach reading below this threshold, about 40 ms after the first low reading (up to about 80 ms with the field on, 160 ms at most if no reading arrives). A field that is already off stays off from the first low reading. A lone jump from near zero to above 1000 RPM is held at the previous reading until the next one confirms it. While the Tach Plausibility Cut is on and the control loop is commanding current with the field driven well above its zero-output floor, that held reading does not count as the second low one, which keeps a single tach glitch at cruising speed from cutting a charging field. A false reading that follows it on a stopped engine is then left to the Tach Plausibility Cut. At other times the held reading counts as the second low one, and the field is cut when it arrives. Setting 0 removes this cut but not the stopped-engine cut: a tach reading of zero still turns the field off after 0.2 s (0.3 s at most), and it stays off until the tach reads above zero for 2 s. To charge without a working tach, ignore engine speed under Setup → System → Run Without Failed Sensors.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -1759,7 +1792,7 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Setpoint Rise Rate (A/s) (<span id="SetpointRiseRate_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Maximum
-                        rate the current target can increase during AUTO operation. Does not apply during on/off
+                        rate the current target can increase in Auto mode. Does not apply during on/off
                         transitions — only Duty Ramp Rate applies then. Use a slower rate (e.g. 5 A/s) to prevent sudden
                         demand spikes.</span></span>
                   </div>
@@ -1834,7 +1867,7 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Setpoint Fall Rate (A/s) (<span id="SetpointFallRate_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Maximum
-                        rate the current target can decrease during AUTO operation. No effect during on/off transitions
+                        rate the current target can decrease in Auto mode. No effect during on/off transitions
                         — only Duty Ramp Rate applies then.</span></span>
                   </div>
                   <div class="form-input">
@@ -1868,7 +1901,7 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Startup Rise Rate (A/s) (<span id="StartupRiseRate_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Setpoint
-                        slew rate applied only when the field is first turned on (OFF to AUTO). A slow value (e.g. 3
+                        slew rate applied only when charging first starts in Auto mode. A slow value (e.g. 3
                         A/s) lets the alternator build field current gradually, preventing integrator windup and the
                         FastOV crash-to-zero that can follow. Has no effect on tuning steps, CV load-connect recovery,
                         or RPM step-ups — those use Setpoint Rise Rate.</span></span>
@@ -2338,7 +2371,7 @@
 
 
               <div style="background:var(--card-light);padding:14px 16px;border-radius:var(--radius);border-left:4px solid var(--accent);margin:0 0 14px 0;font-size:13px;line-height:1.55;">
-                <strong>CV Mode</strong> holds the alternator output to a fixed user-specified voltage target, bypassing the normal Bulk / Absorption / Float charge algorithm. The voltage loop adjusts the current setpoint every 100 ms (set by Voltage Loop Interval) using Voltage Loop Kp and Ki to eliminate steady-state voltage error. All current limits remain fully active — RPM Cap Table, thermal penalty, Fast OV, Load Dump, the Group 3 iExcess detectors, the Group 4 battery charge limit, and any user overrides — so the only thing this mode changes is the voltage target. Use this tab to tune voltage loop parameters or simulate a fixed-voltage regulator. <strong>⚠️ Not intended for lithium batteries.</strong>
+                <strong>CV Mode</strong> holds the alternator output to a fixed user-specified voltage target, bypassing the normal Bulk / Absorption / Float charge algorithm. The voltage loop adjusts the current setpoint on every output-current control update (about every 13 ms, up to ~30 ms worst case) through Voltage Loop Kp; its integral term (Voltage Loop Ki), which eliminates steady-state voltage error, steps once per Voltage Loop Interval (about every 105 ms at the default 100 ms, up to ~125 ms). All current limits remain fully active — RPM Cap Table, thermal penalty, Fast OV, Load Dump, the Group 3 iExcess detectors, the Group 4 battery charge limit, and any user overrides — so the only thing this mode changes is the voltage target. Use this tab to tune voltage loop parameters or simulate a fixed-voltage regulator. <strong>⚠️ Not intended for lithium batteries.</strong>
               </div>
 
               <div class="form-row" style="margin-bottom:8px;">
@@ -2551,7 +2584,7 @@
                     <div class="protections-name">
                       <span class="protections-tag g5">G5</span>
                       Group 5 Enable (<span id="LoadDumpEnable_echo">?</span>)
-                      <span class="tooltip">ℹ️<span class="tooltip-box">Master switch for the Load Dump rate-of-change trip (Group 5). Load Dump stays armed even when the global Protections toggle is off — this switch is the only thing that disarms it. A load dump (battery disconnect under charge) is the most violent overvoltage event there is: leave this on unless bench work requires otherwise.</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">Master switch for the Load Dump rate-of-change trip (Group 5). Load Dump stays armed even when the global Protections toggle is off — this switch is the only thing that disarms it. It catches a large load dropping off the bus while the alternator is charging, when the current that load drew surges into the battery. A battery disconnecting under charge drives battery current toward zero instead, and the over-voltage protections (Groups 1–2 and the Over-Voltage Ladder) catch that event as the bus voltage climbs. Leave this on unless bench work requires otherwise.</span></span>
                     </div>
                     <form action="/get" method="GET" target="hidden-form">
                       <div class="protections-edit-row">
@@ -2571,7 +2604,7 @@
                     <div class="protections-name">
                       <span class="protections-tag">RPM</span>
                       Tach Plausibility Cut (<span id="TachLieEnable_echo">?</span>)
-                      <span class="tooltip">ℹ️<span class="tooltip-box">Cuts the field when the tach claims the engine is turning, the control loop is commanding current, the field is driven well above the learned zero-output floor, and the alternator still delivers nothing for several seconds. That combination means a false RPM reading (field switching noise on the tach line), a dead alternator, or an open field circuit — a false reading left running energizes the field indefinitely and drains the battery through it with the engine stopped. This cut stays armed even when the global Protections toggle is off; this switch is the only thing that disarms it. Leave it on unless bench work with a simulated tach signal requires otherwise.</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">Cuts the field when the tach claims the engine is turning, the control loop is commanding current, the field is driven well above the learned zero-output floor, and the alternator still delivers nothing for several seconds. A lone tach reading below Min RPM For Field does not restart that count. That combination means a false RPM reading (field switching noise on the tach line), a dead alternator, or an open field circuit — a false reading left running energizes the field indefinitely and drains the battery through it with the engine stopped. While this cut is on and the control loop is commanding current with the field driven well above its zero-output floor, Min RPM For Field leaves to it a stopped engine whose tach jumps from a low reading to a false one at or above that minimum. At other times Min RPM For Field cuts that case on the held reading, about 40 ms after the low one, and a single tach glitch at cruising speed can then cut a charging field. This cut stays armed even when the global Protections toggle is off; this switch is the only thing that disarms it. Leave it on unless bench work with a simulated tach signal requires otherwise.</span></span>
                     </div>
                     <form action="/get" method="GET" target="hidden-form">
                       <div class="protections-edit-row">
@@ -2600,7 +2633,7 @@
                   <p data-intro="g2">Engages when measured battery voltage exceeds the active charge target by more than the <strong>Group 2 Trigger Margin</strong>. <strong>Group 2 Enable</strong> (in the Enable section above) turns the whole layer off. Above this proportional shed sits the <strong>Over-Voltage Ladder</strong> card: two timed cut tiers that fire only when the filtered voltage stays over their trip lines continuously for their set time to act, then the absolute software and hardware instant cuts.</p>
                   <p data-intro="g3">Watches <strong>alternator</strong> output current. Two regimes, split at the <strong>Strict Over-Current Band</strong> below the active voltage target. <strong>Near the target — the voltage-limited (CV) phase</strong>: engages when the time-averaged current rises above the moving current <strong>setpoint</strong> by more than the <strong>Detection Threshold</strong> — the sloped trip line set by <strong>Slope</strong> and <strong>CV base</strong> below. <strong>Below the band — the current-limited (bulk / CC) phase</strong>: the looser <strong>Detection Threshold (Bulk)</strong> takes over — the same line raised by <strong>CC offset</strong> and judged against the commanded <strong>ceiling</strong> instead of the moving setpoint, so normal speed-up ramps toward the ceiling don't false-trip. Both thresholds are bounded by the <strong>Threshold Floor / Ceiling</strong> (amps); <strong>Averaging Time Constant</strong> sets how heavily the current is smoothed before each comparison, and <strong>Release Hysteresis</strong> sets the re-arm point.</p>
                   <p data-intro="g4"><strong>Battery Charge Current Limit</strong> is a ceiling, not a trip: the commanded alternator current is capped at the limit plus the measured house-load draw, so the battery never sees more than the set amps no matter what the loads are doing. It needs the INA228 battery shunt and is off when set to 0.</p>
-                  <p data-intro="g5"><strong>Load Dump</strong> catches a battery disconnect under charge (a load dump) — FET-disconnect or load-drop events: three tiered thresholds on the <em>rate-of-change</em> of battery current, each firing when its set number of <strong>consecutive samples</strong> all exceed its threshold. Fewer samples act faster on a single spike; more samples reject noise but wait longer — each tier's effective time to act (samples × the ~5 ms battery-current sampling interval) is shown under its sample count. Unlike the over-current detectors, Load Dump stays armed even when test protections are disabled — only the <strong>Group 5 Enable</strong> toggle in the Enable section disarms it.</p>
+                  <p data-intro="g5"><strong>Load Dump</strong> catches a large load dropping off the bus while the alternator is charging: the current that load drew surges into the battery as a rising spike in battery current, sharp when a FET switches the load off and spread over a few readings when relay contacts open. Three tiered thresholds sit on the <em>rate-of-change</em> of battery current, each firing when its set number of <strong>consecutive samples</strong> all exceed its threshold. A battery disconnecting under charge drives battery current toward zero instead; the over-voltage protections (Groups 1–2 and the Over-Voltage Ladder) catch that event. Fewer samples act faster on a single spike; more samples reject noise but wait longer. A sample is one battery-current reading, taken about every 6 ms (up to ~18 ms worst case), and the output is cut at the next control update, about 13 ms apart (up to ~30 ms worst case) — each tier's resulting time to act is shown under its sample count. Unlike the over-current detectors, Load Dump stays armed even when test protections are disabled — only the <strong>Group 5 Enable</strong> toggle in the Enable section disarms it.</p>
                 </div>
 
                 <div class="protections-cards">
@@ -3594,7 +3627,7 @@
             <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
               <span>Sweep End (Hz) (<span id="systemIDSineFreqEnd_echo">?</span>):</span>
               <span class="tooltip">ℹ️
-                <span class="tooltip-box">Highest frequency in the sine sweep. Keep below about half your current-sample rate (~50 Hz) or the result aliases. 20 Hz is a good default for finding the plant's roll-off.</span>
+                <span class="tooltip-box">Highest frequency in the sine sweep. Keep below about a third of the alternator-current sample rate (about 75 samples a second, so about 25 Hz); the firmware measures the real rate and trims a higher setting down to that limit. 20 Hz is a good default for finding the plant's roll-off.</span>
               </span>
             </div>
             <div class="form-input">
@@ -3763,7 +3796,7 @@
           <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
             <span>Output current PID feedback filter (ms) (<span id="OutputPIDFilterTC_echo">?</span>):</span>
             <span class="tooltip">ℹ️
-              <span class="tooltip-box">EMA time constant for the alternator current signal fed back into the output current PID. Set All Filters writes <strong>plant/3</strong> here. The plant (field coil L/R) is already a first-order low-pass inside the loop; setting the sensor filter equal to it stacks two equal lags in series, which costs ~45° of phase margin at crossover and forces lower Kp than you'd otherwise get away with. A filter at roughly <code>plant/3</code> lets the controller see current dynamics in close to real time without feeding raw sensor noise into Kp/Kd. Separate from the alternator current display filter and from the iExcess detector's own averaging (Group 3). <strong>Mostly inert when the Output PID signal source is MA(N) or Raw, but the same EMA is also used unconditionally to seed the CV integrator on the AUTO→CV handoff.</strong> Echoed read-only in Current tab → Output Current Controller.</span>
+              <span class="tooltip-box">EMA time constant for the alternator current signal fed back into the output current PID. Set All Filters writes <strong>plant/3</strong> here. The plant (field coil L/R) is already a first-order low-pass inside the loop; setting the sensor filter equal to it stacks two equal lags in series, which costs ~45° of phase margin at crossover and forces lower Kp than you'd otherwise get away with. A filter at roughly <code>plant/3</code> lets the controller see current dynamics in close to real time without feeding raw sensor noise into Kp/Kd. Separate from the alternator current display filter and from the iExcess detector's own averaging (Group 3). <strong>Mostly inert when the Output PID signal source is MA(N) or Raw, but the same EMA is also used unconditionally to seed the CV integrator on the handoff to voltage control.</strong> Echoed read-only in Current tab → Output Current Controller.</span>
             </span>
           </div>
           <div class="form-input">
@@ -3819,7 +3852,7 @@
                       <span class="metric-label telemetry-label">PID Input
                         <span class="tooltip">ℹ️
                           <span class="tooltip-box">Measured alternator current (A) from the selected amp source. This
-                            is the process variable fed to the output current PID on every fresh current sample (~200 Hz, ~5 ms).</span>
+                            is the process variable fed to the output current PID on every fresh current sample (about every 13 ms, up to ~30 ms worst case; about 75 times a second).</span>
                         </span>
                       </span>
                       <span class="metric-value telemetry-value"><span id="pidInput_display">?</span>&nbsp;A</span>
@@ -3901,7 +3934,7 @@
                     <div class="metric-row telemetry-row">
                       <span class="metric-label telemetry-label">Field Curr
                         <span class="tooltip">ℹ️
-                          <span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps2">?</span> Ω, from the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe. On a 12 V system that skipped the test it uses 2&nbsp;Ω, so it is only approximate.</span>
+                          <span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps2">?</span> Ω, from the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe. On a 12 V system that skipped the test it uses 2&nbsp;Ω, so it is only approximate.</span>
                         </span>
                       </span>
                       <span class="metric-value telemetry-value"><span id="FieldAmpsID2">?</span>&nbsp;A</span>
@@ -4085,7 +4118,7 @@
                   <div class="form-row">
                     <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                       <span>Sweep End (Hz) (<span id="tuningSweepEnd_echo">?</span>):</span>
-                      <span class="tooltip">ℹ️<span class="tooltip-box">Highest frequency in the sweep. Keep below about half the current-loop rate (~50 Hz).</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">Highest frequency in the sweep. Keep below about a third of the alternator-current sample rate (about 75 samples a second, so about 25 Hz); the firmware measures the real rate and trims a higher setting down to that limit.</span></span>
                     </div>
                     <div class="form-input">
                       <form action="/get" method="GET" target="hidden-form">
@@ -4335,9 +4368,11 @@
                     <span>PID Kp (Proportional) (<span id="PidKp_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span
                         class="tooltip-box">Immediate response to current error. Higher = faster correction but more
-                        overshoot. Start with 0.3, increase if too slow, decrease if oscillating. <strong>Voltage-normalized:</strong>
-                        the value you enter produces the same field-current response on a 12, 24, 36, or 48 V system, so you never
-                        re-tune it when you change system voltage (it is scaled to the bus behind the scenes).</span></span>
+                        overshoot. Start with 0.3, increase if too slow, decrease if oscillating. <strong>Field-normalized:</strong>
+                        the regulator multiplies the value you enter by Field Winding Voltage divided by Nominal Battery Voltage (both
+                        in Vessel Info), so one number asks for the same share of the winding's rated field per amp of error on
+                        every system. How many amps that field makes depends on the alternator, so commissioning measures this
+                        gain for the alternator it is wired to.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -4353,9 +4388,11 @@
                     <span>PID Ki (Integral) (<span id="PidKi_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span
                         class="tooltip-box">Eliminates steady-state error over time. Higher = faster elimination of
-                        offset but may cause instability. Start with 0.5, increase slowly if needed. <strong>Voltage-normalized:</strong>
-                        the value you enter produces the same field-current response on a 12, 24, 36, or 48 V system, so you never
-                        re-tune it when you change system voltage (it is scaled to the bus behind the scenes).</span></span>
+                        offset but may cause instability. Start with 0.5, increase slowly if needed. <strong>Field-normalized:</strong>
+                        the regulator multiplies the value you enter by Field Winding Voltage divided by Nominal Battery Voltage (both
+                        in Vessel Info), so one number asks for the same share of the winding's rated field per amp of error on
+                        every system. How many amps that field makes depends on the alternator, so commissioning measures this
+                        gain for the alternator it is wired to.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -4370,9 +4407,11 @@
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>PID Kd (Derivative) (<span id="PidKd_echo">?</span>):</span>
                     <span class="tooltip">ℹ️<span class="tooltip-box">Dampens
-                        rapid changes to reduce overshoot. Usually kept at or near zero (default 0.01). <strong>Voltage-normalized:</strong>
-                        the value you enter produces the same field-current response on a 12, 24, 36, or 48 V system, so you never
-                        re-tune it when you change system voltage (it is scaled to the bus behind the scenes).</span></span>
+                        rapid changes to reduce overshoot. Usually kept at or near zero. <strong>Field-normalized:</strong>
+                        the regulator multiplies the value you enter by Field Winding Voltage divided by Nominal Battery Voltage (both
+                        in Vessel Info), so one number asks for the same share of the winding's rated field per amp of error on
+                        every system. How many amps that field makes depends on the alternator, so commissioning measures this
+                        gain for the alternator it is wired to.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -4494,11 +4533,11 @@
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Detection Amplitude (<span id="HuntTrigPct_echo">?</span>%):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">How big the rhythmic swing in field drive must be before a scan counts it as a wobble, as the percent of field duty moving at the wobble's own frequency. Lower it if the regulator is visibly surging but the damper never reacts; raise it if tests keep opening on disturbances that are not hunting. The same physical wobble moves roughly a quarter as much duty on a 48&nbsp;V bank as on a 12&nbsp;V one, so the useful value belongs to the installation.</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">How big the rhythmic swing in field drive must be before a scan counts it as a wobble, as the percent of field duty moving at the wobble's own frequency. Lower it if the regulator is visibly surging but the damper never reacts; raise it if tests keep opening on disturbances that are not hunting. With a 12&nbsp;V field winding on a 48&nbsp;V bank, the same physical wobble moves about a quarter as much duty as on a 12&nbsp;V system, so this setting rescales with Nominal Battery Voltage and Field Winding Voltage like the other field-duty settings.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
-                      <input name="HuntTrigPct" type="number" step="0.01" min="0.01" />
+                      <input name="HuntTrigPct" type="number" step="0.001" min="0.01" />
                       <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                     </form>
                   </div>
@@ -4508,8 +4547,8 @@
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>PID Sample Divisor (<span id="PidSampleDivisor_echo">?</span>):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">The output current PID normally updates on every fresh current sample (~200 Hz). A 2
-                        makes it update every other sample (~100 Hz), etc. Don't adjust.</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">The output current PID normally updates on every fresh current sample (about every 13 ms, up to ~30 ms worst case; about 75 times a second). A 2
+                        makes it update every other sample (about every 26 ms, up to ~50 ms), etc. Don't adjust.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -4558,7 +4597,7 @@
                   <div class="form-row">
                     <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                       <span>MA Window — N samples (<span id="OutputPIDMA_N_echo">?</span>):</span>
-                      <span class="tooltip">ℹ️<span class="tooltip-box">Number of alternator current samples to average for the MA(N) signal fed into the Output Current PID. Samples arrive about every 5 ms, so N=2 ≈ a 10 ms window. Applies only to this PID — the iExcess over-current detector (Group 3) does its own averaging separately.</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">Number of alternator current samples to average for the MA(N) signal fed into the Output Current PID. Samples arrive about every 13 ms (~30 ms worst case), so N=2 ≈ a 26 ms window. Applies only to this PID — the iExcess over-current detector (Group 3) does its own averaging separately.</span></span>
                     </div>
                     <div class="form-input">
                       <form action="/get" method="GET" target="hidden-form">
@@ -4641,7 +4680,7 @@
                     <div class="metric-row telemetry-row">
                       <span class="metric-label telemetry-label">Voltage Ctrl Active
                         <span class="tooltip">ℹ️
-                          <span class="tooltip-box">Whether the CV loop is running this tick. True in bulk, absorption, float, Target Voltage mode, and Maintain Mode. False in idle (UseFloat=0 post-absorption rest) and in Manual field mode.</span>
+                          <span class="tooltip-box">Whether the CV loop is running this tick. True in bulk, absorption, float, Target Voltage mode, and Maintain Mode. False in idle (UseFloat=0 post-absorption rest) and in Manual mode.</span>
                         </span>
                       </span>
                       <span class="metric-value telemetry-value"><span id="voltageCtrlActive_display">?</span></span>
@@ -4826,7 +4865,7 @@
                   <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                     <span>Settling Consecutive Reads (<span id="cvConsecutiveReads_echo">?</span>):</span>
                     <span class="tooltip">ℹ️
-                      <span class="tooltip-box">How many readings in a row the battery voltage must stay within ±0.10V of the test target before the system calls it "settled" and stops the settling-time timer. Each reading happens about every 100ms (the voltage loop rate), so 10 readings ≈ 1 second of being on-target. Higher = stricter, more honest settling-time numbers, but tests take longer. Lower = looser, could be fooled by a brief lucky moment. 8–12 is a reasonable starting range.</span>
+                      <span class="tooltip-box">How many readings in a row the battery voltage must stay within ±0.10V of the test target before the system calls it "settled" and stops the settling-time timer. Each reading is one output-current control update (about every 13 ms, up to ~30 ms worst case), so 10 readings ≈ 0.13 seconds of being on-target (up to ~0.22 seconds when the loop runs slow). Higher = stricter, more honest settling-time numbers, but tests take longer. Lower = looser, could be fooled by a brief lucky moment. 8–12 is a reasonable starting range.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -4981,11 +5020,11 @@
                 <div class="param-subhead">Gain selection</div>
 
                 <hr />
-                <!-- CV gain source: Auto (ω-based) vs Manual -->
+                <!-- CV gain source: Measured (ω-based) vs Manual -->
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>CV Gain Source (<span id="cvGainMode_echo">?</span>):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">How Voltage Loop Kp/Ki are set. <strong>Auto</strong> computes them from the battery stiffness measured by the Voltage Control Autotuning step — the ~0.6 s voltage-per-amp response, measured at the timescale the voltage loop actually reacts on — via <strong>Kp = α ÷ stiffness</strong>, <strong>Ki = ρ × Kp</strong>, where α (Aggressiveness) and ρ (Ki/Kp ratio) are the two knobs below. <strong>Manual</strong> uses the Kp/Ki you type below. The two paths are independent: switching does not change the other's stored values. Both are normalized to 12V-equivalent, so the same numbers work on 12 / 24 / 36 / 48 V systems.</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">How Voltage Loop Kp/Ki are set. <strong>Measured</strong> computes them from the battery stiffness measured by the Voltage Control Autotuning step — the ~0.6 s voltage-per-amp response, measured at the timescale the voltage loop actually reacts on — via <strong>Kp = α ÷ stiffness</strong>, <strong>Ki = ρ × Kp</strong>, where α (Aggressiveness) and ρ (Ki/Kp ratio) are the two knobs below. <strong>Manual</strong> uses the Kp/Ki you type below. The two paths are independent: switching does not change the other's stored values. Both are normalized to 12V-equivalent, so the same numbers work on 12 / 24 / 36 / 48 V systems.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -4995,7 +5034,7 @@
                           onchange="if(handleUserToggle('cvGainMode_checkbox', 'cvGainMode', 'cvGainMode')) { this.form.submit(); submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
-                      <span class="toggle-label">Auto</span>
+                      <span class="toggle-label">Measured</span>
                       <input id="cvGainMode" name="cvGainMode" type="number" value="" style="display:none;" />
                     </form>
                   </div>
@@ -5006,17 +5045,17 @@
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between; font-size:0.92em; opacity:0.95; line-height:1.5;">
                     <span id="cvActiveGains">Active gains: &mdash;</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">The Kp/Ki the voltage loop is running <strong>right now</strong>, in 12V-equivalent units. It is the commissioning gain <strong>after the battery-temperature correction</strong> (Temperature compensation, below), so it drifts with battery temperature even though you never re-tune. In <strong>Auto</strong> the base comes from Voltage Control Autotuning; in <strong>Manual</strong> it is your typed Kp/Ki — either way, temperature-corrected. This is the number that actually shapes the response.</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">The Kp/Ki the voltage loop is running <strong>right now</strong>, in 12V-equivalent units. It is the commissioning gain <strong>after the battery-temperature correction</strong> (Temperature compensation, below), so it drifts with battery temperature even though you never re-tune. In <strong>Measured</strong> the base comes from Voltage Control Autotuning; in <strong>Manual</strong> it is your typed Kp/Ki — either way, temperature-corrected. This is the number that actually shapes the response.</span></span>
                   </div>
                 </div>
 
-                <!-- Auto (ω-based) controls — shown only in Auto mode -->
+                <!-- Measured (ω-based) controls — shown only when CV Gain Source = Measured -->
                 <div id="cvAutoBlock">
                   <hr />
                   <div class="form-row">
                     <div class="form-label" style="display: flex; align-items: center; justify-content: space-between; font-size:0.9em; opacity:0.85; line-height:1.5;">
-                      <span id="cvFitStatus">No fit yet — run the Voltage Control Autotuning step in commissioning. Auto uses safe defaults until then.</span>
-                      <span class="tooltip">ℹ️<span class="tooltip-box">What the Voltage Control Autotuning step measured at commissioning: the battery's ~0.6 s voltage-per-amp stiffness, from which Auto derives Kp = α ÷ stiffness, Ki = ρ × Kp. These are the <strong>base design gains at the commissioning temperature</strong> — before any temperature correction. Auto runs these (temperature-corrected) as the <strong>Active gains</strong> above. Re-run the Voltage Control Autotuning step to update the stiffness.</span></span>
+                      <span id="cvFitStatus">No fit yet — run the Voltage Control Autotuning step in commissioning. Until then the voltage loop runs safe default gains.</span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">What the Voltage Control Autotuning step measured at commissioning: the battery's ~0.6 s voltage-per-amp stiffness, from which Measured derives Kp = α ÷ stiffness, Ki = ρ × Kp. These are the <strong>base design gains at the commissioning temperature</strong> — before any temperature correction. Measured runs these (temperature-corrected) as the <strong>Active gains</strong> above. Re-run the Voltage Control Autotuning step to update the stiffness.</span></span>
                     </div>
                   </div>
 
@@ -5024,7 +5063,7 @@
                   <div class="form-row">
                     <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                       <span>CV Aggressiveness (α) (<span id="cvAlpha_echo">?</span>):<span id="cvAlphaPreview" style="display:block; font-size:0.85em; opacity:0.7; font-weight:normal; margin-top:2px;">&nbsp;</span></span>
-                      <span class="tooltip">ℹ️<span class="tooltip-box">With CV Gain Source = Auto, how strongly the voltage loop corrects, as a fraction of the theoretical one-shot ("deadbeat") correction: <strong>Kp = α ÷ measured battery stiffness</strong>, with the stiffness measured at the loop's own (~0.6 s) reaction timescale by Voltage Control Autotuning. Measuring at that timescale keeps the loop's stability margin battery-independent, so the same α gives every bank the same character — lower is gentler and more damped, higher corrects harder at the cost of overshoot risk. Response time is an outcome of this setting (typically a few seconds), not a separate input. Calculated from the stored measurement, so no re-commission is needed after adjustment.</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">With CV Gain Source = Measured, how strongly the voltage loop corrects, as a fraction of the theoretical one-shot ("deadbeat") correction: <strong>Kp = α ÷ measured battery stiffness</strong>, with the stiffness measured at the loop's own (~0.6 s) reaction timescale by Voltage Control Autotuning. Measuring at that timescale keeps the loop's stability margin battery-independent, so the same α gives every bank the same character — lower is gentler and more damped, higher corrects harder at the cost of overshoot risk. Response time is an outcome of this setting (typically a few seconds), not a separate input. Calculated from the stored measurement, so no re-commission is needed after adjustment.</span></span>
                     </div>
                     <div class="form-input">
                       <form action="/get" method="GET" target="hidden-form">
@@ -5038,7 +5077,7 @@
                   <div class="form-row">
                     <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                       <span>CV auto-tune Ki/Kp ratio ρ (<span id="cvPiZero_echo">?</span>):</span>
-                      <span class="tooltip">ℹ️<span class="tooltip-box">With CV Gain Source = Auto, the integral gain is tied to the proportional gain by this ratio: <strong>Ki = ρ × Kp</strong>. Sets where the integrator's corner sits — the point at which it takes over from proportional action to pull out steady-state error — relative to the proportional strength, which the <strong>Aggressiveness (α)</strong> knob above sets separately. Lower ρ = lazier integral: gentler and more damped. Higher ρ = more aggressive integral, at the cost of more overshoot. Calculated from the stored measurement, so no re-commission is needed after adjustment.</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">With CV Gain Source = Measured, the integral gain is tied to the proportional gain by this ratio: <strong>Ki = ρ × Kp</strong>. Sets where the integrator's corner sits — the point at which it takes over from proportional action to pull out steady-state error — relative to the proportional strength, which the <strong>Aggressiveness (α)</strong> knob above sets separately. Lower ρ = lazier integral: gentler and more damped. Higher ρ = more aggressive integral, at the cost of more overshoot. Calculated from the stored measurement, so no re-commission is needed after adjustment.</span></span>
                     </div>
                     <div class="form-input">
                       <form action="/get" method="GET" target="hidden-form">
@@ -5049,7 +5088,7 @@
                   </div>
                 </div> <!-- end cvAutoBlock -->
 
-                <!-- Manual gains — shown only in Manual mode; ignored (but preserved) when Auto ω is active -->
+                <!-- Manual gains — shown only when CV Gain Source = Manual; ignored (but preserved) under Measured -->
                 <div id="cvManualBlock">
                   <hr />
                   <div class="form-row">
@@ -5084,15 +5123,15 @@
                 <!-- ============ VOLTAGE D TERM (helper #2) ============ -->
                 <div class="param-subhead">Voltage D term (rate-of-rise damping)</div>
 
-                <!-- Kd gain mirrors Kp/Ki: auto-derived (Kd = Td x Kp off the commissioned Kp) in Auto,
+                <!-- Kd gain mirrors Kp/Ki: derived (Kd = Td x Kp off the commissioned Kp) in Measured,
                      typed only in Manual — same cvGainMode gate as cvAutoBlock/cvManualBlock. ONLY the
                      gain follows the mode; the shaping params below (deadband/arm/one-sided/max back-off/
-                     slope ceiling/filter) are not auto-derived and stay visible in both modes. -->
+                     slope ceiling/filter) are not derived and stay visible under both gain sources. -->
                 <div id="cvKdAutoBlock" style="display:none;">
                   <div class="form-row">
                     <div class="form-label" style="display: flex; align-items: center; justify-content: space-between; font-size:0.9em; opacity:0.85; line-height:1.5;">
                       <span>Damping strength (Kd) is set automatically from the voltage loop's proportional gain (Kp) &mdash; Kd = Td &times; Kp &mdash; so it scales with the same battery measurement that sets Kp. Switch <strong>CV Gain Source</strong> to Manual to set it yourself. The value in use is on the <strong>Active gains</strong> line above.</span>
-                      <span class="tooltip">ℹ️<span class="tooltip-box">With CV Gain Source = Auto, the voltage loop's derivative gain (Kd) is tied to its proportional gain (Kp) by a fixed derivative time (Td): <strong>Kd = Td × Kp</strong>. Because Kp is derived from the battery stiffness measured at commissioning, Kd inherits the same plant anchor and scales per install with no separate tuning. Set CV Gain Source to Manual to enter Kd directly.</span></span>
+                      <span class="tooltip">ℹ️<span class="tooltip-box">With CV Gain Source = Measured, the voltage loop's derivative gain (Kd) is tied to its proportional gain (Kp) by a fixed derivative time (Td): <strong>Kd = Td × Kp</strong>. Because Kp is derived from the battery stiffness measured at commissioning, Kd inherits the same plant anchor and scales per install with no separate tuning. Set CV Gain Source to Manual to enter Kd directly.</span></span>
                     </div>
                   </div>
                 </div>
@@ -5545,7 +5584,7 @@
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Voltage Loop Interval (ms) (<span id="VoltageLoopInterval_echo">?</span>):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">How often the voltage loop's <strong>integrator</strong> (the slow-correction term) updates. Active in bulk, absorption, float, Target Voltage mode, and Maintain Mode. The <strong>proportional response</strong> (the fast-correction term — Voltage Loop Kp × voltage error) runs every output PID tick (~5ms) regardless of this setting, so the loop reacts to voltage changes immediately; only the integral build-up cadence is controlled here. Shorter values make the integrator more responsive but can amplify noise; longer values make it smoother but slower to correct steady-state error.</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">How often the voltage loop's <strong>integrator</strong> (the slow-correction term) updates. Active in bulk, absorption, float, Target Voltage mode, and Maintain Mode. The integrator steps on the first control update after this interval has passed, so the real spacing runs a little longer: at 100 ms it measures about 105 ms, up to ~125 ms worst case. The <strong>proportional response</strong> (the fast-correction term — Voltage Loop Kp × voltage error) runs on every output-current control update (about every 13 ms, up to ~30 ms worst case) regardless of this setting, so the loop reacts to voltage changes immediately; only the integral build-up cadence is controlled here. Shorter values make the integrator more responsive but can amplify noise; longer values make it smoother but slower to correct steady-state error.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -5602,8 +5641,8 @@
                     <div class="metric-row telemetry-row">
                       <span class="metric-label telemetry-label">Temperature PID Active
                         <span class="tooltip">ℹ️
-                          <span class="tooltip-box">Whether the temperature PID is currently running in AUTO. Goes
-                            MANUAL when temp data is stale; resumes with bumpless transfer on recovery.</span>
+                          <span class="tooltip-box">Whether the temperature loop is running closed-loop. It holds
+                            its output when temperature data is stale and resumes with a bumpless transfer on recovery.</span>
                         </span>
                       </span>
                       <span class="metric-value telemetry-value"><span id="tempPIDActive_display">?</span></span>
@@ -5889,13 +5928,17 @@
               <div
                 style="background: var(--card-light); padding: 15px; border-radius: var(--radius); border-left: 4px solid var(--accent); margin: 10px 0;">
                 <p style="margin: 0 0 15px 0; line-height: 1.5; color: var(--text-dark);">
-                  <strong>Three-Loop Cascaded Control:</strong> Three independent controllers run at different rates
-                  and stack on top of each other. The <em>output current loop</em> runs 10 times per second and drives
-                  the alternator field duty cycle to chase a current target. The <em>voltage loop</em> also runs 10
-                  times per second during the voltage-hold phases (Absorption and Float) — it computes the current
+                  <strong>Three-Loop Cascaded Control:</strong> Three independent controllers react at different rates
+                  and stack on top of each other. The <em>output current loop</em> runs on every fresh alternator-current
+                  sample (about 75 times a second: every 13 ms or so, up to ~30 ms worst case) and drives
+                  the alternator field duty cycle to chase a current target. The <em>voltage loop</em> recomputes its
+                  proportional and damping terms on that same update and steps its integral about 10 times a second
+                  (about every 105 ms at the default Voltage Loop Interval, up to ~125 ms) during the voltage-hold
+                  phases (Absorption and Float) — it computes the current
                   target that holds the battery at the configured voltage. In the current-limited phase (Bulk) the
-                  voltage loop stands aside and the system charges at the ceiling. The <em>temperature loop</em> runs
-                  once every 5 seconds, and outputs a single thermal penalty in amps that gets subtracted from the RPM
+                  voltage loop stands aside and the system charges at the ceiling. The <em>temperature loop</em> also
+                  runs on every control update, but its alternator temperature reading refreshes only about every
+                  5 seconds (default OneWire probe); it outputs a single thermal penalty in amps that gets subtracted from the RPM
                   Cap Table ceiling before the inner loops see it. The cascade is strict: temperature constrains what
                   current the voltage loop is allowed to ask for; the voltage loop constrains what the output current
                   loop is allowed to chase; the output current loop is the only thing that touches the field. Each
@@ -6055,10 +6098,10 @@
                 <p style="margin: 0 0 15px 0; line-height: 1.5; color: var(--text-dark);">
                   <strong>Manual tuning (optional).</strong> The output current loop and the voltage loop each also
                   have their own live tuning mode you can drive by hand — Tuning Mode for the inner current loop
-                  (Current tab), and the Auto-or-Manual gain selector on the Voltage tab for the voltage
+                  (Current tab), and the CV Gain Source selector (Measured or Manual) on the Voltage tab for the voltage
                   loop. Tune them in that order — inner loop first, then voltage — because each layer depends on the
                   one beneath it being stable. The rest of this section covers hand-tuning the inner current loop; the
-                  voltage loop has its own dedicated tab with a built-in step test, an Auto mode that reuses the
+                  voltage loop has its own dedicated tab with a built-in step test, a Measured gain source that reuses the
                   commissioned fit, and live scoring. The temperature loop is tuned offline from logged data (no
                   live step test) — its tab shows the live control plot and the controller parameters.
                 </p>
@@ -6490,7 +6533,7 @@
                 <summary class="tuning-section-title">High-Field Alert</summary>
                 <form action="/get" method="GET" target="hidden-form" onsubmit="return dropEmpty(this)">
                 <div class="form-row">
-                  <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;"><span>Alert: field drive at least (% of Max Field) (<span id="altHiFieldPct_echo">?</span>):</span><span class="tooltip">&#8505;&#65039;<span class="tooltip-box">An independent safety net: it flags low output despite high field drive even where the health gauge is still learning and has no % to show.</span></span><span class="sinfo" data-sinfo="altHiField"></span></div>
+                  <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;"><span>Alert: field drive at least (% of field ceiling) (<span id="altHiFieldPct_echo">?</span>):</span><span class="tooltip">&#8505;&#65039;<span class="tooltip-box">An independent safety net: it flags low output despite high field drive even where the health gauge is still learning and has no % to show. The field ceiling is the lower of Max Field (%) and the duty Max Field Volts works out to at the present battery voltage.</span></span><span class="sinfo" data-sinfo="altHiField"></span></div>
                   <div class="form-input"><input name="altHiFieldPct" type="number" step="5" min="0" max="100" /></div>
                 </div>
                 <hr>
@@ -6525,7 +6568,7 @@
                 <hr>
                 <div class="form-row">
                   <div class="form-label">Field sweeper (<span id="altsweep-state">idle</span>):
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Takes the field away from the regulator and drives it directly: ramps up and back down at a fixed rate, holding nothing else, so field moves independently of engine speed. Up and back down is what cancels the field's lag and separates the two things that drift one way through a sweep &mdash; engine speed sagging under load, and the case warming &mdash; from the field itself. It stands on its own: run it whenever you want to see what the machine does against field, with or without a recording running. AUTO mode only.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Takes the field away from the regulator and drives it directly: ramps up and back down at a fixed rate, holding nothing else, so field moves independently of engine speed. Up and back down is what cancels the field's lag and separates the two things that drift one way through a sweep &mdash; engine speed sagging under load, and the case warming &mdash; from the field itself. It stands on its own: run it whenever you want to see what the machine does against field, with or without a recording running. Auto mode only.</span></span>
                     <span style="display:flex;gap:14px;flex-wrap:wrap;font-size:0.85em;font-weight:normal;opacity:0.85;margin-top:3px;">
                       <span style="display:inline-flex;align-items:center;white-space:nowrap;">What&rsquo;s Active<span class="tooltip">&#8505;&#65039;<span class="tooltip-box"><strong>Still active while a sweep runs:</strong> hardware over-voltage &mdash; the INA228 alert pin cuts the field in hardware, with no software in the path; Alternator Hard Shutdown Voltage, and the lockout that follows; the timed over-voltage cut tiers &mdash; a hold over a tier's trip line for its time to act still cuts the field and ends the sweep; Group 0, the hardware overcurrent trip; critical alternator temperature; engine speed; current sensor freshness; Max Field %; the On/Off switch.<br><br><strong>Switched off while a sweep runs:</strong> the Group 1 and Group 2 over-voltage current clamps; current-overshoot trim and load-dump detection; the temperature loop; every current and voltage limit &mdash; they only say when to turn around, nothing holds output to them; Min Field % and the learned tachometer keep-alive floors; the field slew-rate limiter; the charge-stage machine.</span></span></span>
                       <span style="display:inline-flex;align-items:center;white-space:nowrap;">Ways to stop it<span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Stop sweep ends the run and eases the field back out. Reverse now sends the up leg back down immediately, at the same rate. The On/Off switch, or anything that turns charging off, ends the run too.</span></span></span>
@@ -6608,7 +6651,7 @@
                 <div class="form-row">
                   <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
                     <span>Manual Field PWM (%) (<span id="ManualDutyTarget_echo_gate">?</span>):</span>
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">A duplicate of Manual Field PWM (%) in Setup &rarr; Alternator &rarr; Field Control &mdash; one setting, reachable from both places, because a capture session spends its time parking the field by hand. It is the duty applied straight to the field winding while Manual mode is on, delivered as typed (Min Field does not raise it), and has no effect while it is off. Manual mode bypasses the thermal, engine-speed, battery and current protections, and the sweeper needs AUTO &mdash; a sweep and a held manual field are alternatives, never both at once.</span></span>
+                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">A duplicate of Manual Field PWM (%) in Setup &rarr; Alternator &rarr; Field Control &mdash; one setting, reachable from both places, because a capture session spends its time parking the field by hand. It is the duty applied straight to the field winding while Manual mode is on, delivered as typed (Min Field does not raise it), and has no effect while it is off. Manual mode bypasses the thermal, engine-speed, battery and current protections, and the sweeper needs Auto mode &mdash; a sweep and a held manual field are alternatives, never both at once.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -6878,7 +6921,7 @@
 
               <p style="margin-top: 12px; font-size: 12px; color: var(--text-muted); text-align: center; line-height: 1.5;">
                 Used to estimate fuel burned from engine RPM. Totals appear in
-                <strong>Cloud Features &rarr; Statistics</strong>.
+                <strong>Live Data &rarr; Boat &rarr; Lifetime Statistics</strong>.
               </p>
             </form>
 
@@ -6895,12 +6938,12 @@
           <div id="battery-panel-charge" class="diag-panel active">
           <div class="settings-card">
 
-            <!-- System voltage (12/24/36/48 V) is set in Vessel Info; changing it there rescales the
-                 whole charge profile AND the field-duty knobs (Duty Ramp Rate, knee margins) so field
-                 current stays safe on higher-voltage banks. The two field caps (Max Field %, Max Field
-                 Volts) are class-invariant: they describe the alternator, and the enforced ceiling
-                 re-derives from Max Field Volts against the live bus. Max Field % IS the real per-bus
-                 duty cap; 99 = full duty. -->
+            <!-- System voltage (12/24/36/48 V) and Field Winding Voltage are set in Vessel Info. Changing
+                 either rescales the field-duty knobs (Duty Ramp Rate, knee margins) by winding volts / system
+                 volts, and a system-voltage change also rescales the whole charge profile. The two field caps
+                 (Max Field %, Max Field Volts) are never class-scaled: they describe the alternator. Max Field
+                 Volts follows the winding rating, and the enforced ceiling re-derives from it against the live
+                 bus. Max Field % IS the real per-bus duty cap; 99 = full duty. -->
 
             <!-- Phase Definitions — one parent dropdown over the four charge-stage sections; each phase is a nested secondary dropdown -->
             <details style="margin-top: 20px;">
@@ -7068,7 +7111,7 @@
                   <span>Float Mode (<span id="UseFloat_echo">?</span>):</span>
                   <span class="tooltip">
                     ℹ️
-                    <span class="tooltip-box"><strong>No Float (idle)</strong> — after Absorption the field turns off. The battery carries the house loads, and charging restarts when the rebulk criteria (next section) are met.<br><br><strong>Voltage Float</strong> — the classic third stage: holds the battery at Float Voltage indefinitely to maintain near-full charge.<br><br><strong>Zero-Current Float</strong> — the alternator carries exactly the house loads and the battery rests at 0 A, at whatever voltage it naturally sits. The battery is neither charged nor discharged while the engine runs. Needs the INA228 battery shunt. The rebulk criteria stay armed — unlike the manual Force Maintain Mode override below, which suspends the charge-stage machine entirely.</span>
+                    <span class="tooltip-box"><strong>No Float (idle)</strong> — after Absorption the field turns off. The battery carries the house loads, and charging restarts when the rebulk criteria (next section) are met.<br><br><strong>Voltage Float</strong> — the classic third stage: holds the battery at Float Voltage to maintain near-full charge, and returns to Bulk when the rebulk criteria are met or Float Duration runs out.<br><br><strong>Zero-Current Float</strong> — the alternator carries exactly the house loads and the battery rests at 0 A, at whatever voltage it naturally sits. The battery is neither charged nor discharged while the engine runs. Needs the INA228 battery shunt. The rebulk criteria stay armed — unlike the manual Force Maintain Mode override below, which suspends the charge-stage machine entirely.</span>
                   </span>
                 </div>
                 <div class="form-input">
@@ -9437,7 +9480,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Fault Messages (<span id="rvcFaultEnable_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The RV-C diagnostic message: a red or yellow fault flag plus a code naming what failed and how. It reports the protection cuts &mdash; over voltage, over current, alternator over temperature, a sensor that stopped updating or disagrees with its partner, an implausible tachometer reading, a bank too cold to charge &mdash; and repeats every five seconds when nothing is wrong so a display can tell a healthy regulator from a missing one. Deliberate states are never faults: switched off, manual mode, engine below the minimum speed, a solar rest, or a BMS withholding permission.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The RV-C diagnostic message: a red or yellow fault flag plus a code naming what failed and how. It reports the protection cuts &mdash; over voltage, over current, alternator over temperature, a sensor that stopped updating or disagrees with its partner, an implausible tachometer reading, a bank too cold to charge &mdash; and repeats every five seconds when nothing is wrong so a display can tell a healthy regulator from a missing one. Deliberate states are never faults: switched off, Manual mode, engine below the minimum speed, a solar rest, or a BMS withholding permission.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9641,7 +9684,7 @@
             <details class="integ-section">
               <summary class="integ-section-title">Minimal BMS On/Off Control</summary>
 
-              <p class="integ-copy">One wire from a battery management system (BMS) that says charge, or don't &mdash; any BMS with a spare relay or a charge-enable output can drive it. The BMS applies 5 to 28 V to the BMS on/off wire (Cable 1, pin 16) and the regulator takes that as permission to charge.</p>
+              <p class="integ-copy">One wire from a battery management system (BMS) that says charge, or don't &mdash; any BMS with a spare relay or a charge-enable output can drive it. The BMS applies 5 to 62 V to the BMS on/off wire (Cable 2, pin 16) and the regulator takes that as permission to charge.</p>
 
               <p class="integ-copy">If your BMS or Victron GX also publishes charge limits on the CAN backbone, use Battery Charge Limits over CAN above as well: those limits taper the charge, this wire is a full stop. Both can be connected at once, and the stop wins.</p>
 
@@ -9664,7 +9707,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Charge When Signal Is (<span id="bmsLogicLevelOff_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Present charges while your BMS applies 5 to 28 V and stops when the wire goes dead, so a cut or unplugged wire reads as stop. Absent inverts it, for a BMS whose output energizes to signal a fault.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Present charges while your BMS applies 5 to 62 V and stops when the wire goes dead, so a cut or unplugged wire reads as stop. Absent inverts it, for a BMS whose output energizes to signal a fault.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9897,8 +9940,8 @@
                       anything, which is fine on a boat's own WiFi. On: Unlock Settings asks for this password first,
                       and the unlock belongs to the phone or browser that typed it. Live readings stay visible either
                       way, and turning the alternator off never needs a password. Each device remembers the password
-                      after its first unlock. If it is lost, ground pin 11 at boot: that clears it along with the WiFi
-                      credentials.</span>
+                      after its first unlock. If it is lost, ground pin 11 at boot: that clears it and opens the WiFi
+                      setup page on the regulator's own hotspot, under the hotspot's default name and password.</span>
                   </span>
                 </div>
                 <div class="form-input" style="display: flex; gap: 8px; flex-wrap: wrap;">
@@ -10015,7 +10058,7 @@
                   <span>Fuel Volume Units:</span>
                   <span class="tooltip">
                     ℹ️
-                    <span class="tooltip-box">Choose US gallons or litres for the fuel table, the live burn and economy readouts, and the fuel-used totals. Setting is saved on the device. The regulator stores fuel in its own units either way, so switching never changes a stored value.</span>
+                    <span class="tooltip-box">Choose US gallons or liters for the fuel table, the live burn and economy readouts, and the fuel-used totals. Setting is saved on the device. The regulator stores fuel in its own units either way, so switching never changes a stored value.</span>
                   </span>
                 </div>
                 <div class="form-input">
@@ -10148,14 +10191,14 @@
                 <div class="emergency-section-title">⚠️ Fires a real field collapse</div>
                                 <div style="font-size: 12px; opacity: 0.85; margin: 10px 0;">Deliberately trigger a field collapse to reproduce an electrical fault in a controlled way. The normal Live Data plots, CSV, and Console capture the transient. One test runs at a time.</div>
 
-                <div class="emergency-section-title" style="font-size: 14px;">1. Manual Bench Testing</div>
-                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 8px;">For a manually-set field on the bench (Manual Field driving a power resistor). Hard-cuts the field you already set — no auto-energize. Turn Manual Field ON first; running without engine speed (Setup → System → Run Without Failed Sensors) is fine. In manual mode the regulator's own lockout is bypassed, so the cut duration below is what sets the off-time. Set the values, then press Fire.</div>
+                <div class="emergency-section-title" style="font-size: 14px;">1. Bench Testing (Manual mode)</div>
+                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 8px;">For a manually-set field on the bench (Manual Field driving a power resistor). Hard-cuts the field you already set — no auto-energize. Set Field Control to Manual first; running without engine speed (Setup → System → Run Without Failed Sensors) is fine. In Manual mode the regulator's own lockout is bypassed, so the cut duration below is what sets the off-time. Set the values, then press Fire.</div>
 
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Cut duration (ms) (<span id="protTestCutMs_echo">?</span>):</span>
                     <span class="tooltip">ℹ️
-                      <span class="tooltip-box">How long the field-enable line is held open (a true hard cut) before your manual field is restored. In manual mode the regulator's adaptive lockout ladder is bypassed, so this fixed hold gives a clean, repeatable off-time. On release the field ramps back up at Duty Ramp Rate.</span>
+                      <span class="tooltip-box">How long the field-enable line is held open (a true hard cut) before your manual field is restored. In Manual mode the regulator's adaptive lockout ladder is bypassed, so this fixed hold gives a clean, repeatable off-time. On release the field ramps back up at Duty Ramp Rate.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -10215,8 +10258,8 @@
                 </div>
 
                 <hr />
-                <div class="emergency-section-title" style="font-size: 14px;">2. Engine Running (auto mode)</div>
-                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 8px;">For a running engine in AUTO mode. Each Fire button first ramps the field up to the test current through the real current loop, holds until it settles, then triggers the protection. Refuses to start unless in AUTO with charging enabled and RPM above Min RPM For Field, so it can never chop into a dead field.</div>
+                <div class="emergency-section-title" style="font-size: 14px;">2. Engine Running (Auto mode)</div>
+                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 8px;">For a running engine in Auto mode. Each Fire button first ramps the field up to the test current through the real current loop, holds until it settles, then triggers the protection. Refuses to start unless in Auto mode with charging enabled and RPM above Min RPM For Field, so it can never chop into a dead field.</div>
 
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
@@ -10343,7 +10386,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Charge Rate Wire (<span id="panelHiRateWord_ID">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Live state of the Charge Rate switch wire (data Cable 3 pin 5). Energized means 5 to 28 V is present at the wire, which is the panel switch turned on, asking for the High charge rate. Read at all times, so you can prove the wiring before the switch is given any authority.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Live state of the Charge Rate switch wire (data Cable 3 pin 5). Energized means 5 to 62 V is present at the wire, which is the panel switch turned on, asking for the High charge rate. Read at all times, so you can prove the wiring before the switch is given any authority.</span></span>
                 </div>
                 <div class="form-input">
                   <span style="font-size: 14px;" id="panelHiRateEffect_ID">-</span>
@@ -10353,7 +10396,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Force Float Wire (<span id="panelForceFloatWord_ID">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Live state of the Force Float switch wire (data Cable 3 pin 7). Energized means 5 to 28 V is present at the wire, which is the panel switch turned on, asking for Force &quot;Maintain Mode&quot;. Read at all times, so you can prove the wiring before the switch is given any authority. Force &quot;Maintain Mode&quot; needs the battery shunt and yields to Target Voltage mode.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Live state of the Force Float switch wire (data Cable 3 pin 7). Energized means 5 to 62 V is present at the wire, which is the panel switch turned on, asking for Force &quot;Maintain Mode&quot;. Read at all times, so you can prove the wiring before the switch is given any authority. Force &quot;Maintain Mode&quot; needs the battery shunt and yields to Target Voltage mode.</span></span>
                 </div>
                 <div class="form-input">
                   <span style="font-size: 14px;" id="panelForceFloatEffect_ID">-</span>
@@ -10523,7 +10566,7 @@
 
           <div class="settings-card">
             <p class="card-group-title"><span>Performance Learning</span>
-              <span class="tooltip">ℹ️<span class="tooltip-box">Settings for the best-ever boat-speed learning system. The live polar / motoring display is under Live Data &rarr; GPS/Travel/Wind.</span></span>
+              <span class="tooltip">ℹ️<span class="tooltip-box">Settings for the best-ever boat-speed learning system. The live polar / motoring display is under Live Data &rarr; Boat.</span></span>
             </p>
             <hr />
 
@@ -10889,7 +10932,7 @@
             <div class="metric-row">
               <span class="metric-label" style="display:flex;align-items:center;gap:4px;">
                 Field Amps (Calc'd)
-                <span class="tooltip">ℹ️<span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps">?</span> Ω, from the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads up to about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe. On a 12 V system that skipped the test it uses 2&nbsp;Ω, so it is only approximate.</span></span>
+                <span class="tooltip">ℹ️<span class="tooltip-box">Estimated, not measured: from Field Resistance (<span id="FieldResistance_echo_fldamps">?</span> Ω, from the field resistance test, in Setup → Alternator → Basic → Output Control), corrected for alternator temperature, less the freewheel diode's share of each cycle. It reads about 12 % high on purpose: the rotor can warm more slowly than the alternator temperature probe. On a 12 V system that skipped the test it uses 2&nbsp;Ω, so it is only approximate.</span></span>
               </span>
               <span class="metric-value"><span id="FieldAmpsID">0</span>&nbsp;A</span>
             </div>
@@ -11772,7 +11815,7 @@
           <div class="card-group">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
               <p class="card-group-title" style="border:0;margin:0;padding:0;">Predicted vs Actual, by Day
-                <span class="tooltip">ℹ️<span class="tooltip-box">Bars are what happened; the line with points is what was predicted the evening before. Days the regulator was awake under 20 hours are drawn but do not feed the learned ratio or the consumption prediction. A missing bar means that quantity was not measurable that day (no VE.Direct link, no battery shunt); a missing point means there was no forecast or no history to predict from.</span></span>
+                <span class="tooltip">ℹ️<span class="tooltip-box">Bars are what happened; the line with points is what was predicted the evening before. The learned ratio is built hour by hour, only from hours when the regulator was awake and the solar charger was freely tracking the panels (not held back by a full battery) for the whole hour. Days the regulator was awake under 20 hours are drawn but do not feed the consumption prediction. A missing bar means that quantity was not measurable that day (no VE.Direct link, no battery shunt); a missing point means there was no forecast or no history to predict from.</span></span>
               </p>
               <div class="seg-field">
                 <span class="seg-label">Window</span>
@@ -13979,7 +14022,7 @@
               <div style="grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; border-bottom: 1px solid var(--border);">
                 <div style="padding: 6px 8px; font-size: 12px; color: #666;">Alternator Health
                   <span class="tooltip">ℹ️
-                    <span class="tooltip-box">Updates the alternator best-ever health record book. Fires only when
+                    <span class="tooltip-box">Updates the alternator best-ever health matrix. Fires only when
                       readings are steady — 0ms is normal between qualifying samples.</span>
                   </span>
                 </div>
@@ -13991,12 +14034,12 @@
                 </div>
               </div>
 
-              <!-- Alt Health Fold (200 Hz IDW eval) -->
+              <!-- Alt Health Fold (per-control-tick IDW eval) -->
               <div style="grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; border-bottom: 1px solid var(--border);">
-                <div style="padding: 6px 8px; font-size: 12px; color: #666;">Alt Health Fold (200 Hz)
+                <div style="padding: 6px 8px; font-size: 12px; color: #666;">Alt Health Fold (per control tick)
                   <span class="tooltip">ℹ️
                     <span class="tooltip-box">Best-ever front IDW evaluation, folded once per control tick
-                      (~200 Hz). Cost scales with the number of front support points; near-zero until a
+                      (about every 13 ms in Auto mode, up to ~30 ms worst case; every main-loop pass in Manual mode). Cost scales with the number of front support points; near-zero until a
                       front exists. This is the hot-path cost that bounds how large the front cap can grow.</span>
                   </span>
                 </div>
@@ -14235,8 +14278,8 @@
             <p class="card-group-title"><span>Inner Current Loop Timing — two separate clocks: how often the current sensor is READ vs how often the control loop FIRES</span></p>
             <div class="interval-row interval-head">
               <span class="interval-label"></span>
-              <span class="interval-colhead">Current Sensor Read (always) <span class="tooltip">ℹ️<span class="tooltip-box">How often the alternator-current sensor channel (CH1 on the ADS1115 ADC) is READ. Tracked continuously, field on or off. This ADC is shared — it rotates through four measurements and alternator current gets 3 of every 6 conversion slots — so even on a perfect run, samples arrive only about every 10 ms. This column and the Current PID Firing column next to it measure DIFFERENT events at different natural rates — do not compare them directly: this read cadence (~10 ms) normally reads HIGHER than the firing column without anything being wrong. Judge each column against its own Avg / Over-2× rows. A real freeze stops the whole loop and stretches BOTH columns at once — that pairing is the stall signature.</span></span></span>
-              <span class="interval-colhead">Current PID Firing (field-on) <span class="tooltip">ℹ️<span class="tooltip-box">How often the fast inner current-control loop actually FIRES (sets field duty from CH1) — a DIFFERENT event from the Current Sensor Read column, not the same number gated by field. Gated to ticks where the field is driven, and re-baselines when the field turns off, so it never counts idle gaps. IMPORTANT: in MANUAL field mode the control tick runs every loop pass, so this reads the loop rate (~1–2 ms), NOT a true control cadence — it only reflects real control timing in AUTO field-on (where it rises to ~10 ms like the read column). A worst value well above this column's own Avg rows means a tick was starved during active control. Do not compare this column's worst against the Sensor Read column's — that one tracks the shared ADC's slower ~10 ms spacing and normally reads higher even when nothing is wrong.</span></span></span>
+              <span class="interval-colhead">Current Sensor Read (always) <span class="tooltip">ℹ️<span class="tooltip-box">How often the alternator-current sensor channel (CH1 on the ADS1115 ADC) is READ. Tracked continuously, field on or off. This ADC is shared — it rotates through four measurements and alternator current gets 3 of every 6 conversion slots — so even on a perfect run, samples arrive only about every 13 ms (~30 ms worst case). This column and the Current PID Firing column next to it measure DIFFERENT events — do not compare them directly: in Auto mode with the field on the PID fires once per read, so the two averages match, but in Manual mode the firing column tracks the much faster main loop, and this read cadence (~13 ms, up to ~30 ms) reads HIGHER without anything being wrong. Judge each column against its own Avg / Over-2× rows. A real freeze stops the whole loop and stretches BOTH columns at once — that pairing is the stall signature.</span></span></span>
+              <span class="interval-colhead">Current PID Firing (field-on) <span class="tooltip">ℹ️<span class="tooltip-box">How often the fast inner current-control loop actually FIRES (sets field duty from CH1) — a DIFFERENT event from the Current Sensor Read column, not the same number gated by field. Gated to ticks where the field is driven, and re-baselines when the field turns off, so it never counts idle gaps. IMPORTANT: in Manual mode the control tick runs every loop pass, so this reads the main-loop rate (~2–4 ms), NOT a true control cadence — it only reflects real control timing in Auto mode with the field on (where it rises to ~13 ms, up to ~30 ms worst case, matching the read column). A worst value well above this column's own Avg rows means a tick was starved during active control. Do not compare this column's worst against the Sensor Read column's — that one also counts field-off passes (flash writes and other background work) and normally reads higher even when nothing is wrong.</span></span></span>
             </div>
             <div class="interval-row interval-row-headline">
               <span class="interval-label">Worst All-Time (ms)
@@ -14321,8 +14364,8 @@
             <p class="card-group-title"><span>Voltage Loop Timing — two separate clocks: how often the voltage sensor is READ vs how often the CV loop FIRES</span></p>
             <div class="interval-row interval-head">
               <span class="interval-label"></span>
-              <span class="interval-colhead">Voltage Sensor Read (field-on) <span class="tooltip">ℹ️<span class="tooltip-box">How often the battery voltage/current sensor (INA228) is READ. These stats only count while the field is on. Field on, the sensor runs in fast mode (~5 ms cycle) and these update live; field off, it drops to a slow ~1 s cycle and freezes at the last field-on reading — so a dash or 0 means the field has not been on yet this session. This is the sensor-read clock; the CV Loop Firing column next to it is a DIFFERENT event (how often the voltage control loop runs), so do not compare the two columns directly. A large gap here means the loop was starved while actively controlling. Each interval is wall-clock across several loop iterations, so it normally reads higher than the worst single Loop Time without anything being blocked; cross-check the worst Loop Time to tell a single freeze from accumulated jitter.</span></span></span>
-              <span class="interval-colhead">CV Loop Firing (CV mode) <span class="tooltip">ℹ️<span class="tooltip-box">How often the constant-voltage (CV) loop's slow integral-correction term FIRES — a DIFFERENT event from the Voltage Sensor Read column. Only updates while the field is on AND the regulator is actively holding a voltage target (bulk, absorption, float, Target Voltage mode, or Maintain Mode); frozen otherwise, and reads a dash until CV has fired at least twice. Target spacing is set by Voltage Loop Interval (default 100 ms) — a value well above that means a loop tick was starved during active voltage control, the case that risks overvoltage. Each value is wall-clock across several loop iterations, so it can exceed the worst single Loop Time without any one loop being blocked. Re-baselines whenever CV turns off, so an off-then-on gap is never counted.</span></span></span>
+              <span class="interval-colhead">Voltage Sensor Read (field-on) <span class="tooltip">ℹ️<span class="tooltip-box">How often the battery voltage/current sensor (INA228) is READ. These stats only count while the field is on. Field on, the sensor runs in fast mode and is read about every 6 ms (up to ~18 ms worst case), and these update live; field off, it drops to a slow ~1 s cycle and freezes at the last field-on reading — so a dash or 0 means the field has not been on yet this session. This is the sensor-read clock; the CV Loop Firing column next to it is a DIFFERENT event (how often the voltage control loop runs), so do not compare the two columns directly. A large gap here means the loop was starved while actively controlling. Each interval is wall-clock across several loop iterations, so it normally reads higher than the worst single Loop Time without anything being blocked; cross-check the worst Loop Time to tell a single freeze from accumulated jitter.</span></span></span>
+              <span class="interval-colhead">CV Loop Firing (CV mode) <span class="tooltip">ℹ️<span class="tooltip-box">How often the constant-voltage (CV) loop's slow integral-correction term FIRES — a DIFFERENT event from the Voltage Sensor Read column. Only updates while the field is on AND the regulator is actively holding a voltage target (bulk, absorption, float, Target Voltage mode, or Maintain Mode); frozen otherwise, and reads a dash until CV has fired at least twice. Target spacing is set by Voltage Loop Interval (default 100 ms); the loop fires on the first control update past that mark, so at 100 ms about 105 ms is normal and up to ~125 ms is still healthy — a value well above that means a loop tick was starved during active voltage control, the case that risks overvoltage. Each value is wall-clock across several loop iterations, so it can exceed the worst single Loop Time without any one loop being blocked. Re-baselines whenever CV turns off, so an off-then-on gap is never counted.</span></span></span>
             </div>
             <div class="interval-row interval-row-headline">
               <span class="interval-label">Worst All-Time (ms)
@@ -14401,7 +14444,7 @@
             <div class="metric-row">
               <span class="metric-label">RPM Read Gap — Last (ms)
                 <span class="tooltip">ℹ
-                  <span class="tooltip-box">Milliseconds since the previous valid RPM (ADS channel 2) reading. RPM is a time-shared channel: with the continuous-mode sampler it is read on a brief mux excursion off the parked current channel. Target is under 30 ms so RPM stays smooth for the control logic that uses it. Glitch/out-of-range reads do not count.</span>
+                  <span class="tooltip-box">Milliseconds since the previous valid RPM (ADS channel 2) reading. RPM shares the ADS1115 converter with three other inputs: the converter reads them one at a time in a fixed six-slot rotation (single-shot round-robin) that gives alternator current three slots and RPM one, so a new RPM reading arrives about every 40 ms (up to ~80 ms worst case with the field on). Glitch/out-of-range reads do not count.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="ch2GapLast_ID">0</span></span>
@@ -14409,7 +14452,7 @@
             <div class="metric-row">
               <span class="metric-label">RPM Read Gap — Worst (ms)
                 <span class="tooltip">ℹ
-                  <span class="tooltip-box">Largest gap between valid RPM readings since the last Reset Peak Values. Confirms the excursion scheduler is not starving RPM. Should stay under ~30 ms; a spike means a heavy loop pass stretched the excursion. Resets with Reset Peak Values.</span>
+                  <span class="tooltip-box">Largest gap between valid RPM readings since the last Reset Peak Values. Confirms the round-robin is not starving RPM. Up to about 80 ms is normal with the field on; field-off background passes (flash flushes) can stretch this field-blind figure to a few hundred ms harmlessly, so judge it against the Field-On row below. Resets with Reset Peak Values.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="ch2GapWorst_ID">0</span></span>
@@ -14417,7 +14460,7 @@
             <div class="metric-row">
               <span class="metric-label">RPM Read Gap — Worst Field-On (ms)
                 <span class="tooltip">ℹ
-                  <span class="tooltip-box">Same gap meter, counting only gaps that ended while the field gate was open — the control-relevant figure. The field-blind worst above includes field-off background passes (flash flushes) that stretch the loop harmlessly. Resets with Reset Peak Values.</span>
+                  <span class="tooltip-box">Same gap meter, counting only gaps that ended while the field gate was open — the control-relevant figure. Up to about 80 ms is normal. The field-blind worst above includes field-off background passes (flash flushes) that stretch the loop harmlessly. Resets with Reset Peak Values.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="ch2GapFieldOnWorst_ID">0</span></span>
@@ -14425,7 +14468,7 @@
             <div class="metric-row">
               <span class="metric-label">Voltage Read Gap — Last (ms)
                 <span class="tooltip">ℹ
-                  <span class="tooltip-box">Milliseconds since the previous valid ADS battery-voltage (channel 0) reading. This is the secondary voltage used only as a sanity cross-check against the INA228; like RPM it is read on a brief mux excursion. Target is under 30 ms. Out-of-range reads do not count.</span>
+                  <span class="tooltip-box">Milliseconds since the previous valid ADS battery-voltage (channel 0) reading. This is the secondary voltage used only as a sanity cross-check against the INA228; like RPM it gets one slot in the ADS1115's six-slot rotation (single-shot round-robin), so a new reading arrives about every 40 ms (up to ~80 ms worst case with the field on). Out-of-range reads do not count.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="ch0GapLast_ID">0</span></span>
@@ -14433,7 +14476,7 @@
             <div class="metric-row">
               <span class="metric-label">Voltage Read Gap — Worst (ms)
                 <span class="tooltip">ℹ
-                  <span class="tooltip-box">Largest gap between valid ADS battery-voltage readings since the last Reset Peak Values. Confirms the cross-check voltage channel is not starved by the excursion scheduler. Resets with Reset Peak Values.</span>
+                  <span class="tooltip-box">Largest gap between valid ADS battery-voltage readings since the last Reset Peak Values. Confirms the cross-check voltage channel is not starved by the round-robin. Up to about 80 ms is normal with the field on; field-off background passes (flash flushes) can stretch this field-blind figure to a few hundred ms harmlessly, so judge it against the Field-On row below. Resets with Reset Peak Values.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="ch0GapWorst_ID">0</span></span>
@@ -14441,7 +14484,7 @@
             <div class="metric-row">
               <span class="metric-label">Voltage Read Gap — Worst Field-On (ms)
                 <span class="tooltip">ℹ
-                  <span class="tooltip-box">Same gap meter, counting only gaps that ended while the field gate was open — the control-relevant figure. The field-blind worst above includes field-off background passes (flash flushes) that stretch the loop harmlessly. Resets with Reset Peak Values.</span>
+                  <span class="tooltip-box">Same gap meter, counting only gaps that ended while the field gate was open — the control-relevant figure. Up to about 80 ms is normal. The field-blind worst above includes field-off background passes (flash flushes) that stretch the loop harmlessly. Resets with Reset Peak Values.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="ch0GapFieldOnWorst_ID">0</span></span>
@@ -14814,7 +14857,7 @@
         <!-- Charging-system health summary (v2) — sits directly above the plots -->
         <div style="display:flex;align-items:center;gap:18px;margin:4px 0 10px;flex-wrap:wrap;">
           <div style="min-width:96px;text-align:center;flex-shrink:0;">
-            <div style="font-size:11px;color:var(--text-muted);">Charging System Health <span class="tooltip">ℹ️<span class="tooltip-box">Output amps as a percentage of the best the charging system has done in the past under these same conditions. Both sides of the comparison are the same statistic — a sustained multi-second average, the same window the record book stores — so a momentary dip can't read as lost health. MEASURED means a recorded best exists at this operating point (within a small matching window); ESTIMATED means it's interpolated.</span></span></div>
+            <div style="font-size:11px;color:var(--text-muted);">Charging System Health <span class="tooltip">ℹ️<span class="tooltip-box">Output amps as a percentage of the best the charging system has done in the past under these same conditions. Both sides of the comparison are the same statistic — a sustained multi-second average, the same window the health matrix stores — so a momentary dip can't read as lost health. MEASURED means a recorded best exists at this operating point (within a small matching window); ESTIMATED means it's interpolated.</span></span></div>
             <div id="alt-health-pct" style="font-size:30px;font-weight:800;line-height:1.1;">—</div>
             <div id="alt-health-status" style="font-size:12px;color:#888;">Learning</div>
             <div id="alt-hifield-alert" style="display:none;font-size:11px;font-weight:700;color:#d9534f;">Low output despite high field drive</div>
@@ -15060,7 +15103,7 @@
             <div style="background:rgba(0,161,154,0.06);padding:12px;border-radius:var(--radius);border-left:4px solid var(--accent);margin:8px 0;line-height:1.5;color:var(--text-muted);font-size:0.85em;">
               <p style="margin:0;">
                 Some engine, alternator and belt combinations develop a slow wobble, somewhere
-                between 0.3 and 2 Hz, in field drive, engine speed and voltage together. This damper
+                between about 0.3 and 2.5 Hz, in field drive, engine speed and voltage together. This damper
                 watches field drive for it while speed is steady, makes a single test cut in the
                 current loop's integral gain, and retains the cut (at that speed) only if the wobble
                 significantly shrinks.
@@ -15495,7 +15538,7 @@
               during ordinary steady running. A new install shows gaps and "learning" labels until
               the engine has spent time at more speeds and loads.</p>
             <p><b>Replaced the alternator, regulator, or belt?</b> Reset the learned baselines so
-              old data doesn't grade the new hardware: Start Over (health record book, in Setup →
+              old data doesn't grade the new hardware: Start Over (health matrix, in Setup →
               Alternator → Diag), Re-baseline (reference pages), and Clear Map (ripple map).</p>
           </div>
         </div>
@@ -15838,9 +15881,10 @@
           <span class="tooltip log-info">
             ℹ️
             <span class="tooltip-box">Downloads three diagnostic logs as CSV files to the Downloads folder (pc)
-              or Files (mobile device): a temperature log (up to the last ~2 hours at 1-second resolution), a
-              control-loop log (the last ~11 seconds at the full control-loop rate, ~200 Hz), and a
-              voltage-tuning log (the last ~28 seconds, also ~200 Hz). Logs are automatically cleared after
+              or Files (mobile device): a temperature log (up to the last ~2 hours at 2-second resolution), a
+              control-loop log (about 75 rows per second, covering roughly the last 30 seconds; in Manual
+              mode about 300 rows per second, covering only the last ~8 seconds), and a voltage-tuning log
+              (about 75 rows per second, covering roughly the last 80 seconds). Logs are automatically cleared after
               download. Pause Logs freezes the log buffers so their contents stay fixed; Resume Logs continues
               recording — the dot on the button shows the state (pulsing green = recording, amber = paused).
               Start Fresh Log clears the buffers and begins a new log.</span>
@@ -15858,13 +15902,13 @@
       </div>
       <!-- X-axis time window — buttons set plotTimeWindow (seconds) for all four live plots.
            The current setting is shown by highlighting its button (driven from the CSV3 echo
-           in updateAllEchosOptimized), not by a text echo. Y axis is set by dragging on a plot
-           (double-click resets). -->
+           in updateAllEchosOptimized), not by a text echo. Y axis is set by clicking its top or
+           bottom number (attachYAxisEdit). -->
       <div class="settings-card">
         <div class="form-row form-row-wide">
           <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
             <span style="white-space: nowrap;">Time Window:</span>
-            <span class="tooltip">ℹ️<span class="tooltip-box">Sets how many seconds of live data all four short-term plots show on the X axis. The highlighted button is the current setting. To zoom the Y axis, drag a box directly on a plot; double-click a plot to reset its zoom.</span></span>
+            <span class="tooltip">ℹ️<span class="tooltip-box">Sets how many seconds of live data all four short-term plots show on the X axis. The highlighted button is the current setting. To set the Y axis range, click the top or bottom number on that axis.</span></span>
           </div>
           <div class="form-input time-window-input">
             <form action="/get" method="GET" target="hidden-form">
@@ -16079,7 +16123,9 @@
             <strong style="color: #555;">What's public:</strong> Registering shows your username, boat type, and
             boat length on the public leaderboards, visible to anyone. Your email and location are never shared.
             You can leave at any time with <strong style="color: #555;">Delete My Account</strong> — this permanently
-            deletes your cloud account and associated cloud data. Your hardware device will continue working locally
+            deletes your cloud account and associated cloud data. A record of which firmware versions this regulator
+            has installed, and when, is kept under its serial number for safety recalls and support. Your hardware
+            device will continue working locally
             without cloud features.
           </p>
 
@@ -16089,7 +16135,7 @@
                Delete is type=button + onclick so it never submits the profile form; its own JS confirm
                (warning + type-DELETE prompt) carries the irreversibility warning. -->
           <div style="display: flex; justify-content: flex-end; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <button type="button" onclick="handleDeleteAllData()" class="btn-danger-ghost" title="Permanently deletes your cloud account and all associated cloud data. Cannot be undone — your hardware device keeps working locally without cloud features.">Delete My Account</button>
+            <button type="button" onclick="handleDeleteAllData()" class="btn-danger-ghost" title="Permanently deletes your cloud account and all associated cloud data. Cannot be undone — your hardware device keeps working locally without cloud features. A record of which firmware versions this regulator has installed, and when, is kept under its serial number for safety recalls and support.">Delete My Account</button>
             <input type="submit" value="Save Profile Changes" class="btn-primary" />
           </div>
 
@@ -16895,7 +16941,8 @@
 
   <!-- Tachometer Calibration (engine-speed alignment) — first-install only, between the Prerequisites screen and the
        commissioning wizard (commPrepFinish → openRpmAlign → openCommissionModal). Needs the engine
-       running; body rendered by rpmAlignRender(); tach settings are written live as edited. -->
+       running with Alternator Enable off (nothing here holds the field off, and a scaling-factor change is
+       refused while it is driven); body rendered by rpmAlignRender(); tach settings are written live as edited. -->
   <div id="rpmalign-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">

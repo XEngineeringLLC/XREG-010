@@ -520,23 +520,25 @@ void WaterDepth(const tN2kMsg &N2kMsg) {
         MARK_FRESH(IDX_WATER_DEPTH);
       }
     }
-    if (N2kIsNA(Offset) || Offset == 0) {
-      PrintLabelValWithConversionCheckUnDef("Depth below transducer", DepthBelowTransducer);
-      if (N2kIsNA(Offset)) {
-        OutputStream->println(", offset not available");
+    if (NMEA2KVerbose == 1) {
+      if (N2kIsNA(Offset) || Offset == 0) {
+        PrintLabelValWithConversionCheckUnDef("Depth below transducer", DepthBelowTransducer);
+        if (N2kIsNA(Offset)) {
+          OutputStream->println(", offset not available");
+        } else {
+          OutputStream->println(", offset=0");
+        }
       } else {
-        OutputStream->println(", offset=0");
-      }
-    } else {
-      if (Offset > 0) {
-        OutputStream->print("Water depth:");
-      } else {
-        OutputStream->print("Depth below keel:");
-      }
-      if (!N2kIsNA(DepthBelowTransducer)) {
-        OutputStream->println(DepthBelowTransducer + Offset);
-      } else {
-        OutputStream->println(" not available");
+        if (Offset > 0) {
+          OutputStream->print("Water depth:");
+        } else {
+          OutputStream->print("Depth below keel:");
+        }
+        if (!N2kIsNA(DepthBelowTransducer)) {
+          OutputStream->println(DepthBelowTransducer + Offset);
+        } else {
+          OutputStream->println(" not available");
+        }
       }
     }
   }
@@ -903,7 +905,8 @@ static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uin
     uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
     if (!dvccVicAcceptSender(src)) return true;
     // 0xFFFF = not available. It is a WITHDRAWAL, not a value: the GX publishes this register only
-    // while DVCC is on with a smart battery or a manual CVL override, so the limit really can go
+    // while DVCC is on and a managed battery (or an ESS Multi) supplies a charge voltage; the DVCC
+    // Maximum Charge Voltage only clamps it, never originates it, so the limit really can go
     // away while frames keep flowing. Clearing re-ingests NAN and dvccTick drops to WAITING within
     // 1 s; treating it as an unrecognized frame instead held the last clamp until the silence timeout.
     dvccVicCvl = (raw == 0xFFFF) ? NAN : raw * 0.01f;
@@ -3547,7 +3550,7 @@ void CheckAlarms() {
   // suppressed until the condition is confirmed cleared, plus the messaging around it.
   // SLOW_ALERT is SET, so the comparison uses the averaged ADC value rather than instantaneous
   // reads — a single noise spike cannot assert ALERT. The averaging window follows the chip mode:
-  // ~4.3 ms (4-sample) in fast charging mode, ~1054 ms (128-sample) with the field off — so while
+  // ~4.5 ms (4-sample) in fast charging mode, ~1061 ms (128-sample) with the field off — so while
   // charging the pin is a near-instant electrical cut. A transparent-mode pin blip that clears
   // before the 250 ms BUSOL status poll still cuts the field but is never logged here.
   // New-event detection is throttled to 5 s (I2C cost); the 3 s / 10 s latch checks run every 250 ms.
@@ -3660,7 +3663,7 @@ void CheckAlarms() {
           queueConsoleMessageF(
             "INA228 HARDWARE ALERT PIN FIRED: busV(avg)=%.3fV limit=%.3fV | "
             "GPIO4 was cut electrically by ALERT pin before this message. "
-            "SLOW_ALERT active: trigger used the chip's averaged value (~4.3ms in fast charging mode). "
+            "SLOW_ALERT active: trigger used the chip's averaged value (~4.5ms in fast charging mode). "
             "SW latch engaged. Disagreement check suppressed for %ds.",
             busV, VoltageHardwareLimit,
             INA_OV_DISAGREE_SUPPRESS_MS / 1000);
@@ -4278,7 +4281,7 @@ void updateINA228OvervoltageThreshold() {
   // charge-disconnect voltage, one rung ABOVE the software instant cut (AlternatorHardShutdownV),
   // so software gets first shot at every rung and the pin is purely the electrical MCU-hang /
   // software-failed-to-protect backstop (~0 trips normally). The compare uses the chip's averaged
-  // value (SLOWALERT); while the field is on the chip runs fast mode (4-sample avg, ~4.3 ms), so
+  // value (SLOWALERT); while the field is on the chip runs fast mode (4-sample avg, ~4.5 ms), so
   // the pin is a near-instant electrical cut, not a slow layer. It can never be the timed layer:
   // AVG applies to ALL active inputs, so slowing the bus average would drag CURRENT register
   // updates to the same cadence and kill the 5 ms load-dump/CV sampling (TI SLYS021 — the alert
@@ -4315,7 +4318,7 @@ void updateINA228OvervoltageThreshold() {
   }
 
   if (!g_inaQuietConfig) queueConsoleMessageF(
-    "INA228: Overvoltage threshold=%.2fV | SLOW_ALERT ON (averaged compare; ~4.3ms in fast charging mode)",
+    "INA228: Overvoltage threshold=%.2fV | SLOW_ALERT ON (averaged compare; ~4.5ms in fast charging mode)",
     VoltageHardwareLimit);
 }
 
@@ -4398,13 +4401,42 @@ uint16_t inaExpectedBovlLsb() {
   return (uint16_t)(VoltageHardwareLimit / 0.003125 + 0.5);   // 3.125 mV/LSB, same rounding as updateINA228OvervoltageThreshold
 }
 
+// Load-dump tier counters: one step per INA228 read, so "consecutive" means adjacent readings. Duty is
+// written only by the control tick (governor_apply), which consumes g_ldTripLatch/g_ldTripNow. fresh =
+// this read produced a new g_dBcur_dt; a dropped read neither extends nor breaks a run.
+static uint8_t ldC1 = 0, ldC2 = 0, ldC3 = 0;
+
+// Also called by the control tick in its gate-closed branch and on the pass after one that left the gate
+// closed, so a close-and-reopen between two INA228 reads cannot carry counts or a trip across it.
+void loadDumpReset() {
+  ldC1 = ldC2 = ldC3 = 0;
+  g_ldTripNow = false;
+  g_ldTripLatch = false;
+}
+
+static void loadDumpStep(bool fresh, float dIdt) {
+  if (!g_ldArmed || !LoadDumpEnable || !inaFastModeActive || !HAS_BATT_SHUNT) {
+    loadDumpReset();
+    return;
+  }
+  if (!fresh) return;
+  ldC1 = (dIdt > LoadDumpDtThresh1) ? (uint8_t)(ldC1 < 255 ? ldC1 + 1 : 255) : 0;
+  ldC2 = (dIdt > LoadDumpDtThresh)  ? (uint8_t)(ldC2 < 255 ? ldC2 + 1 : 255) : 0;
+  ldC3 = (dIdt > LoadDumpDtThresh3) ? (uint8_t)(ldC3 < 255 ? ldC3 + 1 : 255) : 0;
+  g_ldTripNow = (ldC1 >= LoadDumpN1) || (ldC2 >= LoadDumpN2) || (ldC3 >= LoadDumpN3);
+  if (g_ldTripNow) {
+    g_ldTripDbdt = g_ldTripLatch ? fmaxf(g_ldTripDbdt, dIdt) : dIdt;
+    g_ldTripLatch = true;
+  }
+}
+
 void _ReadAnalogInputs_inner() {
 
   // ── INA228 Battery Monitor ────────────────────────────────────────────────
   static unsigned long lastINARead_local = 0;
 
-  // Speed mode switch — fast (4.3ms) when field gate is open, slow (1054ms) when off.
-  // Writes two I2C registers only on transition; no cost on steady state.
+  // Speed mode switch — fast (~4.5ms) when field gate is open, slow (~1061ms) when off.
+  // Four read-modify-writes of ADC_CONFIG, only on transition; no cost on steady state.
   if (INADisconnected == 0) {
     bool fieldGateOpen = !gpio4IsLow;
     if (fieldGateOpen && !inaFastModeActive) {
@@ -4437,9 +4469,9 @@ void _ReadAnalogInputs_inner() {
       && (INADisconnected == 0 || millis() - lastINARead_local >= INA_SLOW_INTERVAL_MS)) {
     {
       lastINARead_local = millis();
-      // Track intervals only while INA228 is in fast mode (~5ms cadence).
+      // Track intervals only while INA228 is in fast mode (~6 ms cadence).
       // Gating on inaFastModeActive (not fieldActiveStatus) avoids logging a
-      // slow-mode ~1054ms read as a false outlier during gate transitions.
+      // slow-mode ~1061ms read as a false outlier during gate transitions.
       // Reset windowed stats on each fast-mode rising edge.
       static bool lastFastMode = false;
       bool nowFastMode = inaFastModeActive;
@@ -4450,6 +4482,7 @@ void _ReadAnalogInputs_inner() {
       // ft_rai_ina228 / AnalogReadTime aliases: worstWindow + lastCall updated by macro
       TIMED_CALL(ft_rai_ina228, ([&]() {
                    bool busOk = false;
+                   bool ldFresh = false;   // this read produced a new g_dBcur_dt (loadDumpStep)
                    try {
                      uint32_t inaBusT0 = micros();
                      // Read into locals; the globals are committed only when the read is valid (§10.1).
@@ -4555,6 +4588,7 @@ void _ReadAnalogInputs_inner() {
                              uint32_t dtBcur = nowIna - bcurPrevMs;
                              if (dtBcur >= 3 && dtBcur < 2000) {
                                g_dBcur_dt = (Bcur - bcurPrev) / ((float)dtBcur * 0.001f);
+                               ldFresh = true;
                                rollUpdate(ROLL_LDSLEW, g_dBcur_dt);   // load-dump slew gate-tuning readout
                              }
                            }
@@ -4591,6 +4625,7 @@ void _ReadAnalogInputs_inner() {
                        lastINAFailureWarning = millis();
                      }
                    }
+                   loadDumpStep(ldFresh, g_dBcur_dt);
                    if (busOk) inaMissRun = 0;
                    else {
                      if (inaMissRun == 0) inaMissRunFieldOn = !gpio4IsLow;
@@ -4694,11 +4729,11 @@ void _ReadAnalogInputs_inner() {
   }
 
   // ── ADS1115 non-blocking state machine ───────────────────────────────────
-  // Sequence {1,0,1,2,1,3} → CH1 = 3/6 samples (fresh CH1 measured 5–25ms apart, assume ~30ms)
+  // Sequence {1,0,1,2,1,3} → CH1 = 3/6 samples (fresh CH1 ~13 ms apart, up to ~30 ms)
   // ADS_WAIT uses time-based 3ms delay — no isConversionDone() I²C poll.
   // Back-to-back trigger fires next conversion at end of ADS_READ_RESULT,
   // saving one loop() call per step. Falls back to ADS_IDLE if <2ms elapsed.
-  // Full 6-step cycle ≈ 14ms; CH0/CH2/CH3 each update every ~14ms.
+  // Full 6-step cycle ≈ 40ms on the bench (CH1 ~13ms apart, ~75 Hz); CH0/CH2/CH3 each update once per cycle.
   //
   // ft_rai_ads_state measures cost per state step (not a full logical read cycle),
   // which is the correct unit for a non-blocking state machine.
@@ -4959,18 +4994,23 @@ void _ReadAnalogInputs_inner() {
                              }
                              prevRPMdbg = rpmCand;
                            }
-                           // Lone-sample glitch rejection: a real start ramps across >=2 samples (~30ms
+                           // Lone-sample glitch rejection: a real start ramps across >=2 samples (~40ms
                            // apart via the ADS round-robin); a single <100 -> >1000 jump is field-PWM
                            // pickup during shutdown or an ADS mux-carryover artifact, never a real engine.
                            // Hold the last accepted value for one sample and accept on the second
                            // consecutive high reading — keeps phantoms out of RPM, RPMMax, watermarks,
-                           // aggregates, and CSVs, and stops a lone spike resetting rpmZeroSinceMs.
+                           // aggregates, and CSVs, and stops a lone spike resetting the zero hold.
+                           // The held value is stamped fresh, so the spin-down and zero cuts, and the low-RPM gate
+                           // while tach-lie is not armed, count it as a low read; it leaves rpmUnheldReadMs alone,
+                           // so the tach-lie count, and the gate while tach-lie is armed, do not.
+                           bool rpmHeld = false;
                            {
                              static float rpmLastAccepted = 0.0f;
                              static bool rpmJumpPending = false;
                              if (rpmLastAccepted < 100.0f && rpmCand > 1000.0f && !rpmJumpPending) {
                                rpmJumpPending = true;
                                rpmCand = rpmLastAccepted;
+                               rpmHeld = true;
                              } else {
                                rpmJumpPending = false;
                                rpmLastAccepted = rpmCand;
@@ -4987,6 +5027,7 @@ void _ReadAnalogInputs_inner() {
                                if (RPM > RPMMax_AllTime) { RPMMax_AllTime = RPM; }
                              }
                              MARK_FRESH(IDX_RPM);
+                             if (!rpmHeld) rpmUnheldReadMs = (uint32_t)dataTimestamps[IDX_RPM];
                              wmIgnUpdate(wmIgn_RPM, RPM);  // ignition-cycle watermark
                              adsGapUpdate(2, now);  // CH2 RPM inter-sample gap meter
                              aggRpm.add(RPM);
@@ -5401,6 +5442,7 @@ void ReadAnalogInputs_Fake() {
     fakeRPM = 1000;
     RPM = fakeRPM;
     MARK_FRESH(IDX_RPM);
+    rpmUnheldReadMs = (uint32_t)dataTimestamps[IDX_RPM];
 
     if (RPM > RPMMax)         { RPMMax         = RPM; }
     if (RPM > RPMMax_AllTime) { RPMMax_AllTime = RPM; }

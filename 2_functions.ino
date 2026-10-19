@@ -168,6 +168,10 @@ bool fsRemove(const char *path) {
 #define NK_FieldResTrefC "FieldResTrefC"
 #define NK_FieldResDefault "FieldResDefault"
 #define NK_FieldWiring "FieldWiring"
+#define NK_FieldWindingV "FieldWindingV"      // field winding rated voltage 12/24/36/48 (Vessel Info)
+#define NK_fieldWindApplied "fldWindApplied"  // winding rating the stored field-side knobs are scaled for
+#define NK_fieldWindAck "fldWindAck"          // "W:R" pair the owner confirmed past the resistance check
+#define NK_rescaleJournal "rescaleJournal"  // "key=value;" writes of a class change or winding rescale in progress, replayed at boot
 #define NK_FloatVoltage "FloatVoltage"
 #define NK_GeneralFaultAlarm "GenFaultAlarm"
 #define NK_FuelEfficiency "FuelEfficiency"
@@ -343,7 +347,7 @@ bool fsRemove(const char *path) {
 #define HUNT_STEADY_PCT_MAX    10
 #define HUNT_QUALIFY_SCANS_MIN  2
 #define HUNT_QUALIFY_SCANS_MAX  6
-// No upper bound: a 48 V install sees a quarter the duty swing for the same wobble, so the useful
+// No upper bound: a 12 V winding on a 48 V bus sees a quarter the duty swing for the same wobble, so the useful
 // bar is a property of the install, not a range we can pick. The floor only keeps 0 (= every scan
 // detects) out of the detector.
 #define HUNT_TRIG_PCT_MIN   0.01f
@@ -472,6 +476,7 @@ bool fsRemove(const char *path) {
 #define NK_altbaseSec "altbaseSec"
 #define NK_altRefSrc "altRefSrc"
 #define NK_AltWipePend "AltWipePend"
+#define NK_altWindV "altWindV"   // field winding the alt-health record was built on
 #define NK_bmsLogic "bmsLogic"
 #define NK_bmsLogicLevelOff "bmsLogicLevlOff"
 #define NK_bulkVoltageHoldMs "bulkVoltagHldMs"
@@ -913,7 +918,7 @@ bool commissionRestoreScalars(const char* key) {
   // Affine trip-line intercept + CC offset (13th/14th fields, always written as a pair).
   IExcessBaseA = v[12];     settingWrite(NK_IExcessBaseA, String(IExcessBaseA, 1).c_str());
   IExcessCcOffsetA = v[13]; settingWrite(NK_IExcessCcOffsetA, String(IExcessCcOffsetA, 1).c_str());
-  recomputeCcGains();  // re-apply CC gains live (normalized to SYSTEM_VOLTAGE_CLASS)
+  recomputeCcGains();  // re-apply CC gains live (normalized by fieldScale())
   // Fields 15-26: the same clamps as their /get handlers, so a snapshot can never re-introduce a value
   // the handler would have refused.
   systemIDPlantTauMs = (uint16_t)lroundf(v[14]);           settingWrite(NK_sysidPlantTau, String(systemIDPlantTauMs).c_str());
@@ -3166,7 +3171,7 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     "\"vmg_min\":%s,\"vmg_max\":%s,\"vmg_avg\":%s,"
     "\"leeway_min\":%s,\"leeway_max\":%s,\"leeway_avg\":%s,"
     // Wind/heading angles + alt-zero + charge stage (long-term-plot stitch fields).
-    // awa/twa envelope; cog/heading/alt_zero avg-only; charge_stage categorical (0-7).
+    // awa/twa envelope; cog/heading/alt_zero avg-only; charge_stage categorical (0-8).
     "\"awa_min\":%s,\"awa_max\":%s,\"awa_avg\":%s,"
     "\"twa_min\":%s,\"twa_max\":%s,\"twa_avg\":%s,"
     "\"cog_avg\":%s,\"heading_avg\":%s,\"alt_zero_avg\":%s,"
@@ -4108,7 +4113,7 @@ void zeroLogService() {
   if (!zeroLogRing || !ZeroLogEnable) return;
   uint32_t now = millis();
 
-  // SAMPLE — own short field-off timer. fieldOffSettled() has a 60 s floor (it gates flash writes,
+  // SAMPLE — own short field-off timer. fieldCutSettled() has a 20 s floor (it gates flash writes,
   // a different job), so we track field-off start here for the 5 s sampling threshold.
   static uint32_t lastFieldOnMs = 0;
   if (fieldActiveStatus > 0) lastFieldOnMs = now;
@@ -5864,7 +5869,7 @@ static volatile bool faPendingMatrixClear = false;  // set by /get handler (Core
 // drift-removed AC pk-pk: that high-pass kept the fast belt content the IExcessTau low-pass is meant to
 // attenuate, so it read far too large. Qualifying windows fold into the game-scoped ripTab below
 // (RPM_RIPPLE_TABLE_SPEC) — used only to PICK the current-check RPM and to draw the Protections
-// reference plot. It NEVER moves the over-current floor. Called every INA fast-read (~4.3 ms,
+// reference plot. It NEVER moves the over-current floor. Called every INA fast-read (5 ms poll,
 // field-active) from 5_functions.ino.
 // ADMISSION (spec §10): a window folds only if it was genuinely steady — the IExcessTau low-pass passes
 // slow current ramps straight through, so a ramping window would record the RAMP size (10–20 A) as
@@ -6159,7 +6164,7 @@ void faFiltRippleUpdate(float bcur, float macur, float rpm) {
     // movement is allowed. This is what lets a "dirty speed" in while still rejecting ramps: the old
     // amplitude drift gate rejected hunting idle every window, which starved the map at the exact RPM
     // that trips the bulk over-current supervisor.
-    uint32_t minN = (uint32_t)(ripWinMs * 0.1f);            // ~50% of expected samples at the ~5 ms INA cadence
+    uint32_t minN = (uint32_t)(ripWinMs * 0.1f);            // ~60% of expected samples at the ~6 ms INA cadence
     bool halvesOk = (filtRippleH1N >= minN / 4) && (filtRippleH2N >= minN / 4);  // both half-means must be real averages, not a few stray samples
     float altShift = 1e9f, battShift = 1e9f, rpmShift = 1e9f, rpmMean = 0.0f;
     if (halvesOk) {

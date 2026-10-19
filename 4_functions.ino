@@ -1108,7 +1108,7 @@ void inaApplyConfig() {
   g_inaDieRewarm = true;
   // setAverage() takes raw register value: 0=1, 1=4, 2=16, 3=64, 4=128, 5=256, 6=512, 7=1024 samples
   INA.setMode(15);                       // Continuous shunt, bus voltage AND die temperature
-  INA.setAverage(4);                     // 128-sample averaging — 128 × 8.24ms = 1054ms register update
+  INA.setAverage(4);                     // 128-sample averaging — 128 × 8.29ms ≈ 1061ms register update
   INA.setBusVoltageConversionTime(7);    // 4120 µs conversion time
   INA.setShuntVoltageConversionTime(7);  // 4120 µs conversion time
   INA.setTemperatureConversionTime(0);   // 50 µs — MUST stay at the minimum. ADC_CONFIG resets VTCT to 1052 µs, which drags the fast-mode cycle to 8.5 ms, past the 5 ms poll, and halves the CV loop's voltage update rate
@@ -1364,11 +1364,6 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     TemperatureLimitF = settingRead(NK_TemperatureLimitF).toInt();
   }
-  if (!settingExists(NK_ManualDutyTarget)) {
-    settingWrite(NK_ManualDutyTarget, String(ManualDutyTarget, 2).c_str());
-  } else {
-    ManualDutyTarget = settingRead(NK_ManualDutyTarget).toFloat();
-  }
   if (!settingExists(NK_capLimitMode)) {
     settingWrite(NK_capLimitMode, String(capLimitMode).c_str());
   } else {
@@ -1384,17 +1379,42 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     if (v != 12 && v != 24 && v != 36 && v != 48) v = 12;  // reject corrupt NVS value (guards vNorm = 12/SYSTEM_VOLTAGE_CLASS div-by-zero/NaN)
     SYSTEM_VOLTAGE_CLASS = (uint8_t)v;
   }
-  // First-creation class scaling. Every hardcoded default below is a 12V value; volt-domain seeds
-  // scale ×(V/12), duty-domain seeds ×(12/V) — the same two domains applyNominalVoltageChange
-  // rescales on a live class change. Existing keys always load verbatim, so this only fires when a
-  // key is first created on a device already provisioned 24/36/48V (fresh NVS with the class known, or
-  // a firmware update introducing a new setting).
+  // Field winding rating, never above the class. fieldWindApplied is NOT clamped: it describes the knobs as
+  // stored, and fieldWindingReconcile() at the end of setup() converts them to the effective winding.
+  if (settingExists(NK_FieldWindingV)) {
+    int w = settingRead(NK_FieldWindingV).toInt();
+    FieldWindingV = (w == 24 || w == 36 || w == 48) ? (uint8_t)w : 12;
+  }
+  if (FieldWindingV > SYSTEM_VOLTAGE_CLASS) FieldWindingV = SYSTEM_VOLTAGE_CLASS;
+  settingWrite(NK_FieldWindingV, String((int)FieldWindingV).c_str());   // compare-first: creates the key, heals a bad import
+  if (settingExists(NK_fieldWindApplied)) {
+    int a = settingRead(NK_fieldWindApplied).toInt();
+    fieldWindApplied = (a == 24 || a == 36 || a == 48) ? (uint8_t)a : 12;
+  }
+  settingWrite(NK_fieldWindApplied, String((int)fieldWindApplied).c_str());
+  if (settingExists(NK_fieldWindAck)) {
+    strncpy(fieldWindAck, settingRead(NK_fieldWindAck).c_str(), sizeof(fieldWindAck) - 1);
+    fieldWindAck[sizeof(fieldWindAck) - 1] = '\0';
+  }
+  // First-creation scaling. Every hardcoded default below is a 12V value referenced to a 12 V field winding;
+  // volt-domain seeds scale ×(V/12), field-duty seeds × fieldScale() (the winding the stored knobs are scaled
+  // for, over the class) — the same two domains applyNominalVoltageChange and the winding rescale convert.
+  // Existing keys always load verbatim, so this only fires when a key is first created on a device already
+  // provisioned 24/36/48V (fresh NVS with the class known, or a firmware update introducing a new setting).
   const float seedVScale = (float)SYSTEM_VOLTAGE_CLASS / 12.0f;
-  const float seedDScale = 12.0f / (float)SYSTEM_VOLTAGE_CLASS;
+  const float seedDScale = fieldScale();
   // RAM-only volt-domain knob (posted with each sweep start, never NVS): its hardcoded default is a
   // 12V value like every seed below, and 0.15 V at 48 V is a quarter of the per-cell margin while the
   // sweep bypasses every soft protection layer — so scale it once here (runs once, at boot).
   altSweepMarginV *= seedVScale;
+  altSweepRatePctS *= seedDScale;   // its field-duty siblings, RAM-only the same way
+  altSweepFromPct  *= seedDScale;
+  if (!settingExists(NK_ManualDutyTarget)) {
+    ManualDutyTarget *= seedDScale;
+    settingWrite(NK_ManualDutyTarget, String(ManualDutyTarget, 2).c_str());
+  } else {
+    ManualDutyTarget = settingRead(NK_ManualDutyTarget).toFloat();
+  }
   if (!settingExists(NK_BulkVoltage)) {
     BulkVoltage *= seedVScale;
     settingWrite(NK_BulkVoltage, String(BulkVoltage).c_str());
@@ -1470,7 +1490,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   }
 
   if (!settingExists(NK_SystemIDStepAmplitude)) {
-      settingWrite(NK_SystemIDStepAmplitude, String(SystemIDStepAmplitude).c_str());
+      SystemIDStepAmplitude *= seedDScale;
+      settingWrite(NK_SystemIDStepAmplitude, String(SystemIDStepAmplitude, 3).c_str());
     } else {
       SystemIDStepAmplitude = settingRead(NK_SystemIDStepAmplitude).toFloat();
     }
@@ -1978,6 +1999,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     settingWrite(NK_MinRPMForField, String(MinRPMForField).c_str());
   } else {
     MinRPMForField = settingRead(NK_MinRPMForField).toInt();
+    if (MinRPMForField < 0) { MinRPMForField = 0; settingWrite(NK_MinRPMForField, "0"); }
   }
   if (!settingExists(NK_bmsLogic)) {
     settingWrite(NK_bmsLogic, String(bmsLogic).c_str());
@@ -2183,10 +2205,10 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     MaxDuty = settingRead(NK_MaxDuty).toInt();
   }
   if (!settingExists(NK_MaxFieldVolts)) {
-    // Deliberately NOT class-scaled: the default is a 12V winding's full-field volts, and the winding
-    // rating belongs to the alternator, not the bank. Against a 12V bus it works out above 99% (inert);
-    // against 24/36/48V it is the binding ceiling (~52/35/26% at absorption) until the installer enters
-    // the winding's rated voltage from the alternator datasheet.
+    // Deliberately NOT class-scaled: the default is 1.25 x the winding rating (15 V for a 12 V winding), and
+    // the rating belongs to the alternator, not the bank. For a 12 V winding against a 12V bus it works out
+    // above 99% (inert); against 24/36/48V it is the binding ceiling (~52/35/26% at absorption).
+    MaxFieldVolts = 1.25f * (float)fieldWindApplied;
     settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
   } else {
     // A garbage NVS string (hand-edited export imported raw, or a bad admin push) parses to 0.0,
@@ -2195,14 +2217,14 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     // the window edge — a 0.5 V ceiling is still a dead field.
     MaxFieldVolts = settingRead(NK_MaxFieldVolts).toFloat();
     if (!(MaxFieldVolts >= 0.5f && MaxFieldVolts <= 60.0f)) {
-      MaxFieldVolts = 15.0f;
+      MaxFieldVolts = 1.25f * (float)fieldWindApplied;
       settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
     }
   }
   if (!settingExists(NK_MinDuty)) {
-    // Float field floor, first-creation scaled ×(12/SYSTEM_VOLTAGE_CLASS) like MaxDuty so the same
-    // field current floor applies on any bank (0.25% @48V ≡ 1% @12V).
-    MinDuty = MinDuty * 12.0f / (float)SYSTEM_VOLTAGE_CLASS;
+    // Float field floor, first-creation scaled × fieldScale() so it is the same share of the winding's rated
+    // field on any bank (0.25% @48V with a 12 V winding ≡ 1% @12V; 1% with a 48 V winding).
+    MinDuty = MinDuty * seedDScale;
     settingWrite(NK_MinDuty, String(MinDuty, 2).c_str());
   } else {
     MinDuty = settingRead(NK_MinDuty).toFloat();
@@ -2535,7 +2557,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     CvStressFailBandV = settingRead(NK_CvStressFailBandV).toFloat();
   }
   if (!settingExists(NK_CvKdTd)) {
-    settingWrite(NK_CvKdTd, String(CvKdTd, 2).c_str());  // s — derivative time; Auto Kd = Td·Kp
+    settingWrite(NK_CvKdTd, String(CvKdTd, 2).c_str());  // s — derivative time; Measured Kd = Td·Kp
   } else {
     CvKdTd = settingRead(NK_CvKdTd).toFloat();
   }
@@ -2545,7 +2567,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     cvHelpersEnabled = settingRead(NK_cvHelpersEnabled).toInt() != 0;
   }
-  // ── CV gain-mode system (Auto α/K plant-anchored vs Manual) + measured plant ──
+  // ── CV Gain Source system (Measured α/K plant-anchored vs Manual) + measured plant ──
   if (!settingExists(NK_cvGainMode)) {
     settingWrite(NK_cvGainMode, String((int)cvGainMode).c_str());
   } else {
@@ -2682,7 +2704,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
                                                    HUNT_QUALIFY_SCANS_MIN, HUNT_QUALIFY_SCANS_MAX);
   }
   if (!settingExists(NK_HuntTrigPct)) {
-    settingWrite(NK_HuntTrigPct, String(HuntTrigPct, 2).c_str());
+    HuntTrigPct *= seedDScale;
+    settingWrite(NK_HuntTrigPct, String(HuntTrigPct, 3).c_str());
   } else {
     // Floor only, no ceiling — see HUNT_TRIG_PCT_MIN. A garbage NVS string parses to 0.0, which would
     // make aPk > bar true on every scan, so the floor is the one thing the load path must enforce.
@@ -3033,9 +3056,9 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   }
   if (!settingExists(NK_DutyRampRate)) {
     // Duty-domain knob stored in REAL %/s for THIS bus. The hardcoded default is a 12V value, so on
-    // first creation scale it by ×(12/SYSTEM_VOLTAGE_CLASS) (40%/s → 10%/s @48V) before persisting — the
-    // field-current slew stays constant across banks, and the dashboard box shows what's actually used.
-    DutyRampRate = DutyRampRate * 12.0f / (float)SYSTEM_VOLTAGE_CLASS;
+    // first creation scale it × fieldScale() (40%/s → 10%/s @48V with a 12 V winding) before persisting — the
+    // slew in share-of-rated-field per second stays constant, and the dashboard box shows what's actually used.
+    DutyRampRate = DutyRampRate * seedDScale;
     settingWrite(NK_DutyRampRate, String(DutyRampRate, 1).c_str());
   } else {
     DutyRampRate = settingRead(NK_DutyRampRate).toFloat();
@@ -3236,7 +3259,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     FastSetpointRiseHeadroomV = settingRead(NK_FastSetpointRiseHeadroomV).toFloat();
   }
   if (!settingExists(NK_KHard)) {
-    KHard *= seedDScale;
+    KHard *= 12.0f / (float)SYSTEM_VOLTAGE_CLASS;   // amps per pack volt: battery-side, scales with the class, never the winding
     settingWrite(NK_KHard, String(KHard, 1).c_str());
   } else {
     KHard = settingRead(NK_KHard).toFloat();

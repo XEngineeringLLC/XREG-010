@@ -3556,6 +3556,12 @@ hr {
   flex-shrink: 0;
 }
 
+/* Vessel Info: Nominal Battery Voltage and Field Winding Voltage sit one above the other; content-sized, the
+   winding select came out a third as wide. */
+.form-input select.vi-volt-select {
+  width: 10em;
+}
+
 /* Let this one card go full width */
 .wide-card {
   max-width: 100% !important;
