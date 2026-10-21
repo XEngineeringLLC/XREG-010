@@ -861,7 +861,7 @@ const uint8_t WIFI_FULL_SWEEP_EVERY = 5;           // every Nth scan sweeps all 
 // True while the LM2907 tach is known to be lying (field-cut test, hard-cut tail). Set every tick by
 // buildTickSnapshot; read by the engine start/stop console lines so they do not report a phantom.
 bool g_rpmTachMasked = false;
-// No timer: armed stays armed until the Lock Settings button, another client's lock, or a reboot.
+// No timer: armed stays armed until the Lock Controls button, another client's lock, or a reboot.
 // The 30-minute auto-lock was removed 2026-09-16 — an unattended relock stranded a user mid-session
 // and silently refused the next write.
 bool settingsArmed = false;

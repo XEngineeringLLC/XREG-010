@@ -4932,7 +4932,7 @@ void setupServer() {
 
     if (!settingsArmActive(request)) {
       // Console line so a rejected write is visible — a stale/replayed URL lands here silently.
-      queueConsoleMessage("Settings write REJECTED: not armed (press Unlock Settings first)");
+      queueConsoleMessage("Settings write REJECTED: not armed (press Unlock Controls first)");
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -9619,7 +9619,7 @@ void setupServer() {
                 pwLockUntilMs = now + 60000UL;
                 pwFailCount = 0;
               }
-              queueConsoleMessageF("Unlock Settings REFUSED: wrong password from %s", request->client()->remoteIP().toString().c_str());
+              queueConsoleMessageF("Unlock Controls REFUSED: wrong password from %s", request->client()->remoteIP().toString().c_str());
             }
           }
         }
@@ -9680,7 +9680,7 @@ void setupServer() {
       request->send(500, "application/json", "{\"ok\":0,\"err\":\"store\"}");
       return;
     }
-    queueConsoleMessage("Settings password set: Unlock Settings now asks for it");
+    queueConsoleMessage("Settings password set: Unlock Controls now asks for it");
     String out = "{\"ok\":1,\"pw\":1,\"tok\":\"";
     out += armTokenIssue();   // pwStore retired every token; this client stays unlocked
     out += "\"}";
@@ -10030,7 +10030,7 @@ void setupServer() {
   // The discovery floor, and the only thing that can tell two regulators apart before a client
   // commits to one: uid is what the app pins to, name is what it shows the user, host is the
   // per-unit mDNS name, ap is this unit's access-point SSID (per-unit now, so the app's Join
-  // button cannot offer a name that belongs to another board). pwreq says whether Unlock Settings
+  // button cannot offer a name that belongs to another board). pwreq says whether Unlock Controls
   // will ask for a password, paired is this boat's other regulators, peers is every other regulator
   // this unit currently hears on the network — the dashboard's picker is built from those two.
   server.on("/identify", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -10344,7 +10344,7 @@ void setupServer() {
     const bool acts = request->hasParam("start") || request->hasParam("reading") || request->hasParam("again") || request->hasParam("save")
                       || request->hasParam("skip");
     if (acts && !settingsArmActive(request)) {
-      refused = "Unlock settings first.";
+      refused = "Unlock controls first.";
     } else if (request->hasParam("skip")) {
       if (frt.state == FRT_RUNNING || frt.reqStart) {
         refused = "Stop the test first.";

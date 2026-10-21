@@ -180,10 +180,10 @@
       <!-- Connection dot: teal = live stream, red = disconnected, orange = offline mode.
            Leads the reading order — everything to its right is only live if this is teal. -->
       <span class="conn-dot" title="Regulator connection"></span>
-      <!-- Only path back to the Unlock Settings button while collapsed: the whole settings-access tier
+      <!-- Only path back to the Unlock Controls button while collapsed: the whole settings-access tier
            is display:none under .header-collapsed, so a locked+minimized session is otherwise a dead end.
            Shown by syncHeaderStrip only while settingsUnlocked is false. -->
-      <span id="hcs-unlock" class="hcs-unlock" style="display:none;" title="Expand the header and unlock settings" onclick="stripExpandToUnlock(event)"><svg class="lock-glyph" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 9V7a5 5 0 0 0-10 0v2H5v13h14V9h-2zm-8-2a3 3 0 0 1 6 0v2H9V7zm4 9.7V19h-2v-2.3a2 2 0 1 1 2 0z"/></svg><span class="u-long">Tap to unlock</span></span>
+      <span id="hcs-unlock" class="hcs-unlock" style="display:none;" title="Expand the header and unlock controls" onclick="stripExpandToUnlock(event)"><svg class="lock-glyph" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 9V7a5 5 0 0 0-10 0v2H5v13h14V9h-2zm-8-2a3 3 0 0 1 6 0v2H9V7zm4 9.7V19h-2v-2.3a2 2 0 1 1 2 0z"/></svg><span class="u-long">Tap to unlock</span></span>
       <!-- Alternator group -->
       <span class="hcs-m hcs-alt"><span id="hcs-alt">-</span><i>A</i></span>
       <span class="hcs-m hcs-temp"><span id="hcs-temp">-</span><i class="temp-unit-label">°F</i></span>
@@ -325,7 +325,7 @@
 
 
     <!-- Settings Access — the button arms the firmware's settings write window (no password; LAN
-         clients are trusted, this is an acknowledgment). Armed until Lock Settings, another client's
+         clients are trusted, this is an acknowledgment). Armed until Lock Controls, another client's
          lock, or a reboot — nothing relocks on a timer. The button's padlock styling is the ONLY
          locked-state indicator; the whole tier hides once armed. -->
     <div id="settings-access-section" class="settings-access-tier">
@@ -333,7 +333,7 @@
         <form onsubmit="return armSettings();">
           <div class="password-form">
             <div class="password-input-group">
-              <button type="submit" id="settings_arm_btn"><svg class="lock-glyph" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 9V7a5 5 0 0 0-10 0v2H5v13h14V9h-2zm-8-2a3 3 0 0 1 6 0v2H9V7zm4 9.7V19h-2v-2.3a2 2 0 1 1 2 0z"/></svg>Unlock Settings</button>
+              <button type="submit" id="settings_arm_btn"><svg class="lock-glyph" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 9V7a5 5 0 0 0-10 0v2H5v13h14V9h-2zm-8-2a3 3 0 0 1 6 0v2H9V7zm4 9.7V19h-2v-2.3a2 2 0 1 1 2 0z"/></svg>Unlock Controls</button>
             </div>
           </div>
           <div id="unlock-warning" style="font-size:11px;color:#b87b00;margin-top:4px;">⚠ Avoid parameter changes during rapid RPM or load swings — controls may briefly lag.</div>
@@ -6679,7 +6679,7 @@
                 </div>
                 <div class="form-input">
                   <input type="button" value="Reset / Start Over" class="btn-danger"
-                    onclick="if(!settingsUnlocked){xAlert('Please unlock settings first');return;} xConfirm('Clear My History, the whole % vs Engine-Hours trend (including the current partial hour) and the session stats, restart the engine-hour axis at 0, and revert the source to My History? Tuning settings are kept. Do this after replacing the alternator, regulator, or belt. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetAlternatorHealth=1'),{},5000).then(()=>{altTrend=[];drawAltTrend();}).catch(()=>{});}})" />
+                    onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Clear My History, the whole % vs Engine-Hours trend (including the current partial hour) and the session stats, restart the engine-hour axis at 0, and revert the source to My History? Tuning settings are kept. Do this after replacing the alternator, regulator, or belt. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetAlternatorHealth=1'),{},5000).then(()=>{altTrend=[];drawAltTrend();}).catch(()=>{});}})" />
                 </div>
               </div>
             </div>
@@ -9936,8 +9936,8 @@
                   <span>Password for Changes (<span id="pwStateOut">?</span>):</span>
                   <span class="tooltip">
                     &#8505;&#65039;
-                    <span class="tooltip-box">Off: anyone on the same network can press Unlock Settings and change
-                      anything, which is fine on a boat's own WiFi. On: Unlock Settings asks for this password first,
+                    <span class="tooltip-box">Off: anyone on the same network can press Unlock Controls and change
+                      anything, which is fine on a boat's own WiFi. On: Unlock Controls asks for this password first,
                       and the unlock belongs to the phone or browser that typed it. Live readings stay visible either
                       way, and turning the alternator off never needs a password. Each device remembers the password
                       after its first unlock. If it is lost, ground pin 11 at boot: that clears it and opens the WiFi
@@ -10405,9 +10405,9 @@
 
               <hr />
               <div class="form-row">
-                <div class="form-label">Lock Settings:</div>
+                <div class="form-label">Lock Controls:</div>
                 <div class="form-input">
-                  <button type="button" onclick="lockSettingsManually()" class="btn-secondary">Lock Settings</button>
+                  <button type="button" onclick="lockSettingsManually()" class="btn-secondary">Lock Controls</button>
                 </div>
               </div>
 
@@ -10637,7 +10637,7 @@
                 <span class="tooltip">ℹ️<span class="tooltip-box">Clear All erases every learned point in both the sailing and motoring maps and zeroes the best surface points and hours counters. Use after a major rig, sail, or propeller change. Cannot be undone.</span></span>
               </div>
               <div class="form-input">
-                <input type="button" value="Clear All" class="btn-danger-ghost" onclick="if(!settingsUnlocked){xAlert('Please unlock settings first');return;} xConfirm('Wipe ALL learned boat-performance data? This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetBoatPerformance=1'),{},5000).then(()=>{perfCells=[];motorCells=[];drawPerfPlot();drawMotorPlot();}).catch(()=>{});}})" />
+                <input type="button" value="Clear All" class="btn-danger-ghost" onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Wipe ALL learned boat-performance data? This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetBoatPerformance=1'),{},5000).then(()=>{perfCells=[];motorCells=[];drawPerfPlot();drawMotorPlot();}).catch(()=>{});}})" />
               </div>
             </div>
             <hr />
@@ -14918,10 +14918,10 @@
             title="Load a reference surface from a health dataset file (another unit or a backup) into the Uploaded reference surface — resident alongside My History, which is kept. Only the reference surface is read from the file; the trend, session and parameter rows are ignored. It switches grading to the uploaded surface; you'll choose Pause learning (just compare) or Continue learning My History while graded against it." />
           <input type="button" value="Health Settings &amp; Reset" class="btn-secondary"
             onclick="goToDiagSettings('c3')"
-            title="Jump to Setup &rarr; Alternator &rarr; Diag with the Charging System Health card showing: steady-state gates, curve-fit knobs, reference source, Pause / Continue learning, and Reset / Start Over. Reset needs settings unlocked." />
+            title="Jump to Setup &rarr; Alternator &rarr; Diag with the Charging System Health card showing: steady-state gates, curve-fit knobs, reference source, Pause / Continue learning, and Reset / Start Over. Reset needs controls unlocked." />
           <input type="button" value="Gate Tuning Capture" class="btn-secondary"
             onclick="goToGateTuningCapture()"
-            title="Jump to Setup &rarr; Alternator &rarr; Diag with the Gate Tuning Capture panel open: the recorder, the field sweeper and its turnaround margins, Min and Manual Field %, and the CSV transfer. Running a sweep needs settings unlocked." />
+            title="Jump to Setup &rarr; Alternator &rarr; Diag with the Gate Tuning Capture panel open: the recorder, the field sweeper and its turnaround margins, Min and Manual Field %, and the CSV transfer. Running a sweep needs controls unlocked." />
           <input type="file" id="alt-load-file" accept=".csv,text/csv,text/plain" style="display:none;" onchange="altUploadCsvFile(this)" />
         </span>
         </div>
@@ -14990,7 +14990,7 @@
         <div class="form-row form-row-wide" style="align-items:center; gap:8px; flex-wrap:wrap; margin-top:8px;">
           <span style="font-size:13px; font-weight:600;">Reference pages</span>
           <button type="button" class="btn-danger-ghost btn-sm" style="margin-left:auto;"
-            onclick="if(!settingsUnlocked){xAlert('Please unlock settings first');return;} xConfirm('Re-baseline the reference pages? The frozen reference waveforms are wiped and re-captured on the next steady runs (do this after replacing the alternator or belt). Anomaly captures are kept. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?FastAltRebaseline=1'),{},5000).then(()=>{setTimeout(fetchFastFlip,3000);}).catch(()=>{});}})">Re-baseline</button>
+            onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Re-baseline the reference pages? The frozen reference waveforms are wiped and re-captured on the next steady runs (do this after replacing the alternator or belt). Anomaly captures are kept. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?FastAltRebaseline=1'),{},5000).then(()=>{setTimeout(fetchFastFlip,3000);}).catch(()=>{});}})">Re-baseline</button>
         </div>
         <div id="fastflip-bands" class="form-row form-row-wide" style="align-items:center; gap:6px; flex-wrap:wrap; margin-top:4px;"></div>
 
@@ -15017,7 +15017,7 @@
           <span style="margin-left:auto;font-size:12px;color:var(--text-muted);white-space:nowrap;"><span id="faCellsUsed_ID" style="font-weight:600;">?</span> cells learned</span>
           <button type="button" class="btn-secondary btn-sm" onclick="downloadRippleBundle()">Download CSV</button>
           <button type="button" class="btn-danger-ghost btn-sm"
-            onclick="if(!settingsUnlocked){xAlert('Please unlock settings first');return;} xConfirm('Clear the entire Resonance & Ripple Map? Every learned RPM/current cell is wiped and re-learned from scratch on the next steady runs. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?FastAltClearMatrix=1'),{},5000).then(()=>{rippleMapClearVisual();}).catch(()=>{xAlert('Could not reach the regulator — the ripple map was NOT cleared.');});}})">Clear Map</button>
+            onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Clear the entire Resonance & Ripple Map? Every learned RPM/current cell is wiped and re-learned from scratch on the next steady runs. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?FastAltClearMatrix=1'),{},5000).then(()=>{rippleMapClearVisual();}).catch(()=>{xAlert('Could not reach the regulator — the ripple map was NOT cleared.');});}})">Clear Map</button>
         </div>
       </div>
 

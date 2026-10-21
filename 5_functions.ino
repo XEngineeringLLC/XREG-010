@@ -6113,7 +6113,7 @@ void ensurePreferredBootPartition() {
   }
 }
 // The settings arm gate — every mutating endpoint calls this. Nothing expires it: only an explicit
-// lock (Lock Settings, or any client's /armSettings?arm=0) or a reboot clears settingsArmed.
+// lock (Lock Controls, or any client's /armSettings?arm=0) or a reboot clears settingsArmed.
 // With the settings password on, the arm belongs to the clients holding a token from /armSettings,
 // so the request itself is what is checked.
 bool settingsArmActive(AsyncWebServerRequest *request) {

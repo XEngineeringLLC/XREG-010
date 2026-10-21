@@ -2597,7 +2597,7 @@ a.btn-secondary {
   cursor: pointer;
 }
 
-/* Unlock Settings — the only locked-state indicator now that the red "Settings are Locked"
+/* Unlock Controls — the only locked-state indicator now that the red "Settings are Locked"
    line is gone, so it is deliberately heavier than a stock .btn-primary. Must stay visually
    identical to #hcs-unlock (the collapsed strip's "Tap to unlock"). */
 #settings_arm_btn {

@@ -1481,7 +1481,7 @@ function fetchKneeLearnState(){
     }).catch(()=>{});
 }
 async function resetKneeLearn(){
-    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
     if (!await xConfirm("Reset all learned tachometer keep-alive floors to factory defaults?")) return;
     const params = new URLSearchParams({ ResetKneeLearn: '1' });
     fetchWithTimeout(buildURL('/get?' + params.toString()), {}, 8000)
@@ -1514,7 +1514,7 @@ function fetchZeroLogState(){
     }).catch(()=>{});
 }
 async function resetZeroLog(){
-    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
     if (!await xConfirm("Erase the zero-drift log and start a fresh session?")) return;
     const params = new URLSearchParams({ ResetZeroLog: '1' });
     fetchWithTimeout(buildURL('/get?' + params.toString()), {}, 8000)
@@ -1586,13 +1586,13 @@ function altZeroPaint(j) {
         : 'Not measured on this installation';
 }
 function altZeroNow() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
     fetchWithTimeout(buildURL('/get?AltZeroCaptureNow=1'), {}, 8000)
         .then(()=>{ setTimeout(fetchZeroFitState, 400); })
         .catch(()=>{});
 }
 function altZeroApplyNow() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
     fetchWithTimeout(buildURL('/get?altZeroApply=1'), {}, 8000)
         .then(()=>{ setTimeout(fetchZeroFitState, 400); })
         .catch(()=>{});
@@ -1716,7 +1716,7 @@ function echoSettingWrite(query, what){
 }
 // Simulator Off(0)/On(1) — segmented toggle in Setup, parallels Vessel Performance's perfSimMode.
 function altSetSim(v){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   optimisticEchoWrite('altSimMode', v?1:0, 'altSimMode='+(v?1:0), 'the simulator',
                       i=>setSeg(['alt-sim-off','alt-sim-on'],i), updateAltHealth);
 }
@@ -1724,13 +1724,13 @@ function altSetSim(v){
 // defaults Pause = ON firmware-side (spec §4.3); the user can flip Continue afterward. Only the
 // source pill paints optimistically — the paused knock-on moves on the echo alone.
 function altSetSource(src){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   optimisticEchoWrite('altSource', src?1:0, 'altSource='+(src?1:0), 'the reference source',
                       i=>setSeg(['alt-src-hist','alt-src-file'],i), updateAltHealth);
 }
 // Pause / Continue Learning — independent of Reference Source (spec §4.1). Learning always writes My History.
 function altSetPaused(p){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   optimisticEchoWrite('altPaused', p?1:0, 'altPaused='+(p?1:0), 'learning',
                       i=>setSeg(['alt-learn-on','alt-learn-off'],i), updateAltHealth);
 }
@@ -1796,7 +1796,7 @@ const altLogMMSS = s => `${String(Math.floor(Math.max(0, s) / 60)).padStart(2, '
 
 // One gate for every device write here: unlocked, and a real regulator on the other end.
 function altCapPost(query) {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return false; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return false; }
     if (DEMO_MODE) { xAlert('Demo mode — no regulator is connected, so the capture cannot be controlled.'); return false; }
     fetchWithTimeout(buildURL('/get?' + query), {}, 5000).catch(() => {});
     return true;
@@ -1931,7 +1931,7 @@ function altLogRecordPress() {
     const st = altLive.logState | 0;
     if (st === 1) { altCapPost('altLogStop=1'); return; }
     if (st === 2 || st === 3) {
-        if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+        if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
         xConfirm(`Recording will discard the ${altLive.logRows | 0} rows already captured — they have not been transferred. Continue?`)
             .then(ok => { if (ok) altCapPost('altLogRecord=1'); });
         return;
@@ -1940,7 +1940,7 @@ function altLogRecordPress() {
 }
 
 function altLogDiscardPress() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     if ((altLive.logState | 0) === 1) { xAlert('Press Stop first — the recording is still running.'); return; }
     if ((altLive.logState | 0) === 0) { xAlert('Nothing to discard.'); return; }
     xConfirm(`Discard ${altLive.logRows | 0} recorded rows without saving them?`)
@@ -1978,7 +1978,7 @@ async function altLogDumpPress() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
     } catch (err) {
         xAlert('CSV saved, but the device buffer was NOT cleared (' + err + ' — settings are ' +
-               'likely locked). Unlock settings and press Discard to free it.');
+               'likely locked). Unlock controls and press Discard to free it.');
     }
 }
 
@@ -2332,7 +2332,7 @@ function downloadRippleBundle(){
 // Every path carries the FULL config, hardware/calibration keys included; the import
 // diff checkboxes are the only place anything gets held back.
 function exportConfigDownload(){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   fetchWithTimeout(buildURL('/exportConfig'),{},10000)
     .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
     .then(txt=>{
@@ -2549,7 +2549,7 @@ function _cfgPostImport(bodyText){
     .catch(e=>xAlert('Import failed: '+(e&&e.message?e.message:e)));
 }
 function importConfigFromFile(){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   const inp=document.getElementById('importConfigFile');
   if(!inp || !inp.files || !inp.files.length){ xAlert('Choose a configuration file first.'); return; }
   const reader=new FileReader();
@@ -2562,7 +2562,7 @@ function importConfigFromFile(){
   reader.readAsText(inp.files[0]);
 }
 async function shareConfigToLibrary(){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   const nameEl=document.getElementById('shareConfigName');
   const name=nameEl?nameEl.value.trim():'';
   try{
@@ -2583,7 +2583,7 @@ async function shareConfigToLibrary(){
 // Import a health curve from a file in Downloads (BEFRONT1). Opens the native picker;
 // altUploadCsvFile() reads it and POSTs the raw text to /altUploadFront. Mirrors perfLoadCsv.
 function altLoadCsv(){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   const inp=document.getElementById('alt-load-file'); if(inp){ inp.value=''; inp.click(); }   // freeze/learn is asked after the file is chosen
 }
 async function altUploadCsvFile(inp){
@@ -3187,7 +3187,7 @@ function perfSet(key, val){
   const cfg = PERF_OPTIMISTIC[key];
   // repaint on the locked path too: the learn switch is a native checkbox, so the browser has
   // already flipped it visually — undo that from device state.
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); if(cfg) cfg.repaint(); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); if(cfg) cfg.repaint(); return; }
   const what = PERF_SET_LABEL[key] || 'that setting';
   if(cfg) optimisticEchoWrite(key, cfg.idx(val), key+'='+val, what, cfg.paint, cfg.repaint);
   else    echoSettingWrite(key+'='+val, what);
@@ -3328,17 +3328,17 @@ function updatePerfControls(){
 }
 // Switching STW↔SOG invalidates every learned point → the firmware does a Clear-All. Warn first.
 async function perfSetSpeedSrc(v){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   if((perfSettings.perfSpeedSrc|0) === v) return;
   if(!await xConfirm('Switching speed source (STW ↔ SOG) clears ALL learned boat-performance data — same as Clear All. Continue?')) return;
   perfSet('perfSpeedSrc', v);
 }
 // LEARNED↔FIXED reference toggle.
-function perfSetSource(src){ if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; } perfSet('perfSource', src?1:0); }
+function perfSetSource(src){ if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; } perfSet('perfSource', src?1:0); }
 // Import a boat polar from a file (a shared BEFRONT1 CSV, or a Download-CSV backup). Opens the
 // native file picker; perfUploadCsvFile() reads it and POSTs the raw text to /perfUploadFront.
 function perfLoadCsv(){
-  if(!settingsUnlocked){ xAlert('Please unlock settings first'); return; }
+  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   const inp=document.getElementById('perf-load-file'); if(inp){ inp.value=''; inp.click(); }   // freeze/learn is asked after the file is chosen
 }
 async function perfUploadCsvFile(inp){
@@ -9544,7 +9544,7 @@ function alternatorSet(want) {
                 // means the device is locked — another client locked it, or it rebooted. Re-sync now.
                 syncArmState();
                 // xAlert("Settings must be unlocked to turn alternator ON");   // i find this intrusive
-                xAlert('The regulator refused this — its settings are locked. Press Unlock Settings, then press ON again.',
+                xAlert('The regulator refused this — its controls are locked. Press Unlock Controls, then press ON again.',
                        'Alternator NOT enabled');
             } else if (r.status === 409) {
                 xAlert('That command reached a different regulator than the one shown here, and it refused it. The alternator was NOT changed. Open this regulator at its own address (Setup \u25b8 System \u25b8 This Regulator) and try again.',
@@ -10373,7 +10373,7 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
 
         // Current values from the device (raw NVS strings)
         const r = await fetchWithTimeout(buildURL('/exportConfig'), {}, 10000);
-        if (!r.ok) { _battDefSkipNote('Could not read the current device settings (HTTP ' + r.status + '), so no initial charging settings could be recommended.' + (r.status === 403 ? ' Settings are locked — unlock them and try again.' : ''), manual); return; }
+        if (!r.ok) { _battDefSkipNote('Could not read the current device settings (HTTP ' + r.status + '), so no initial charging settings could be recommended.' + (r.status === 403 ? ' Controls are locked — unlock them and try again.' : ''), manual); return; }
         const cfg = (await r.json()).config || {};
         const battMon = ('BattMonSrc' in cfg) ? parseInt(cfg.BattMonSrc, 10) : 0;  // network battery monitor, 0 = none
         const battProbe = ('battTempProbeEnable' in cfg) ? parseInt(cfg.battTempProbeEnable, 10) : 0;   // 1 = BATT-role DS18B20 in use
@@ -10528,7 +10528,7 @@ const BATTDEF_CX_OWNED = new Set(['IExcessCeilA', 'CvKdDeadbandVps']);
 async function launchBatteryRecommender() {
     if (_battDefResolve) { xAlert('The recommendation list is already open.', 'Recommend Initial Charging Settings'); return; }
     if (cxSetupBusy()) { fileToast(CX_SETUP_BUSY_TXT); return; }
-    if (!settingsUnlocked) { xAlert('Please unlock settings first', 'Recommend Initial Charging Settings'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first', 'Recommend Initial Charging Settings'); return; }
     let vessel = null;
     try {
         const r = await fetchWithTimeout(buildURL('/vessel_info.json'), {}, 5000);
@@ -10837,7 +10837,7 @@ function commPrepOwGate(j) {
     }
     const html = '<strong>Say which sensor is on the alternator.</strong> '
         + n + ' sensor' + (n === 1 ? ' is' : 's are') + ' on the bus and none of them is set to Alternator. '
-        + (!settingsUnlocked ? 'Unlock settings to set it.' : 'Set it in the table below.');
+        + (!settingsUnlocked ? 'Unlock controls to set it.' : 'Set it in the table below.');
     if (box.innerHTML !== html) box.innerHTML = html;
     // Locked settings refuse the assignment, so blocking Next would dead-end the screen — say it, don't
     // block it. Re-run on every poll, so a lock that lands while the gate is up (arm window expired,
@@ -10855,7 +10855,7 @@ async function commPrepOwAssign(sel) {
         ? _commPrepOwLast.probes.find(p => String(p.id || '').toLowerCase() === id) : null;
     const oldRole = cur ? Number(cur.role) : -1;
     const revert = () => { sel.value = String(oldRole); };
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); revert(); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); revert(); return; }
     if (!/^[0-9a-f]{16}$/.test(id) || !Number.isFinite(newRole)) { revert(); return; }
     sel.disabled = true;
     let enabledEarly = null;   // enable turned on ahead of the bind, undone if the bind is refused
@@ -10889,7 +10889,7 @@ async function commPrepOwSetEnable(param, on) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
 }
 async function commPrepOwScan() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const btn = document.getElementById('commprep-ow-scan');
     if (btn) btn.disabled = true;
     try {
@@ -11050,7 +11050,7 @@ function commPrepBattTempGate(j) {
     }
 }
 async function commPrepBattTempNotFitted() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     try {
         const r = await fetchWithTimeout(buildURL('/get?battTempSource=6'), {}, 8000);
         if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -11259,7 +11259,7 @@ function commPrepRender(cfg) {
 // staged with the number fields: it must hold even if this screen is dismissed with ✕, and a
 // failure has to be visible before the run starts rather than silently skipped.
 async function commPrepDvccOff() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const btn = document.getElementById('commprep-dvcc-btn');
     const copy = document.getElementById('commprep-dvcc-copy');
     const box = document.getElementById('commprep-dvcc');
@@ -11354,8 +11354,8 @@ function commPrepFieldGateReason() {
     const shunt = settingsUnlocked ? _commPrepShuntPresent : _commPrepShuntInit;
     const lead = settingsUnlocked ? _commPrepShuntLead : _commPrepShuntLeadInit;
     const haveL = shunt !== 1 || lead === 1 || lead === 2;
-    if (!haveW && !settingsUnlocked) return 'Unlock settings first: the field wiring must be saved before commissioning.';
-    if (!haveL && !settingsUnlocked) return 'Unlock settings first: the shunt location must be saved before commissioning.';
+    if (!haveW && !settingsUnlocked) return 'Unlock controls first: the field wiring must be saved before commissioning.';
+    if (!haveL && !settingsUnlocked) return 'Unlock controls first: the shunt location must be saved before commissioning.';
     if (!haveW) return 'Choose the field wiring first.';
     if (!haveL) return 'Choose which battery lead the shunt is in.';
     return '';
@@ -12451,7 +12451,7 @@ function socSeedRender(s) {
         + ' style="background:#2a2a2a; color:#bbb; font-weight:600; font-size:13px; border:1px solid #444; border-radius:5px; padding:8px 16px; cursor:pointer;' + (unlocked ? '' : ' opacity:0.45; cursor:default;') + '">Set SOC</button></div>'
         + '<div id="socseed-override-msg" style="font-size:11px; color:#777; margin-top:6px;">'
         + (unlocked ? 'If you know the true state of charge, set it here &mdash; the charge counter (coulomb counter) restarts from this value.'
-            : 'Unlock settings to set a value.') + '</div></div>';
+            : 'Unlock controls to set a value.') + '</div></div>';
 
     const foot = '<div style="margin-top:14px; padding-top:10px; border-top:1px solid #333; font-size:11px; color:#777;">This is a one-time starting estimate. From here SOC tracks measured amp-hours in and out, and it self-corrects over time: every detected full charge re-anchors SOC to 100&nbsp;%, and deep discharges followed by a rest let the regulator measure the bank\'s true usable capacity.</div>';
 
@@ -12478,7 +12478,7 @@ function handleProfileUpdate(event) {
     event.preventDefault();
 
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
 
@@ -12543,7 +12543,7 @@ function handleProfileUpdate(event) {
 
 async function handleDeleteAllData() {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
 
@@ -14788,7 +14788,7 @@ async function loadConfigSharingInIframe() {
 function _configShareHandleMessage(e) {
     if (e.origin !== 'https://supabase-nine-ashy.vercel.app') return;
     if (!e.data || e.data.type !== 'LOAD_CONFIG_TO_DEVICE' || !e.data.config) return;
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const label = e.data.name ? ('"' + e.data.name + '"') : 'this shared configuration';
     const txt = JSON.stringify(e.data.config);
     cfgDiffPreview(txt, label)
@@ -14966,7 +14966,7 @@ function endStallNotice() {
 
 function resetParameter(parameterName) {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
 
@@ -14991,7 +14991,7 @@ function resetParameter(parameterName) {
 // no shunt) — call that out in the warning so the button isn't mistaken for that fix.
 async function restartChargeCycle() {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
     if (!await xConfirm(
@@ -16656,9 +16656,9 @@ function applySettingsUnlockUI() {
     hideSettingsAccess();
 }
 
-// The Unlock Settings button — arms the device's settings write window (the arm state lives in
+// The Unlock Controls button — arms the device's settings write window (the arm state lives in
 // firmware, so stale/replayed URLs from other tabs stay rejected while locked). It stays armed
-// until Lock Settings, another client's lock, or a reboot — nothing relocks on a timer.
+// until Lock Controls, another client's lock, or a reboot — nothing relocks on a timer.
 function armSettings() {
     const button = document.getElementById('settings_arm_btn');
     const msg = document.getElementById('settings_arm_msg');
@@ -16764,7 +16764,7 @@ async function passwordSet() {
         if (!cur) return;
     }
     let a = await xPrompt(changing ? 'Enter the new settings password (4 to 32 characters).'
-        : 'Choose a settings password (4 to 32 characters). Unlock Settings will ask for it once on each phone or browser, then remember it there. Live readings stay visible without it, and turning the alternator off never needs it.',
+        : 'Choose a settings password (4 to 32 characters). Unlock Controls will ask for it once on each phone or browser, then remember it there. Live readings stay visible without it, and turning the alternator off never needs it.',
         { title: 'Settings password', okText: 'Continue', password: true });
     if (a === null) return;
     a = a.trim();   // the firmware trims before hashing: what is remembered must be what it stored
@@ -16782,12 +16782,12 @@ async function passwordSet() {
         pwRemember(a);
         renderAccessCard();
         xAlert(changing ? 'The settings password was changed. Other phones and browsers will ask for the new one at their next unlock.'
-            : 'The settings password is on. Unlock Settings now asks for it. If it is ever lost, ground pin 11 at boot: that clears it and opens the WiFi setup page on the regulator\'s own hotspot, under the hotspot\'s default name and password.', 'Settings password');
+            : 'The settings password is on. Unlock Controls now asks for it. If it is ever lost, ground pin 11 at boot: that clears it and opens the WiFi setup page on the regulator\'s own hotspot, under the hotspot\'s default name and password.', 'Settings password');
     } else if (j && j.err === 'password') {
         pwForget();
         xAlert('The current password was not accepted. Nothing was changed.', 'Settings password');
     } else if (j && j.err === 'armed') {
-        xAlert('Settings are locked. Press Unlock Settings and try again.', 'Settings password');
+        xAlert('Controls are locked. Press Unlock Controls and try again.', 'Settings password');
     } else {
         xAlert('The regulator did not accept the password' + (r ? ' (HTTP ' + r.status + ')' : ': no answer') + '.', 'Settings password');
     }
@@ -16797,7 +16797,7 @@ async function passwordOff() {
     if (!(await ensureArmed())) return;
     const cur = (pwRemembered() || await xPrompt('Enter the current settings password.', { title: 'Settings password', okText: 'Continue', password: true }) || '').trim();
     if (!cur) return;
-    const ok = await xConfirm('Turn the settings password off? Anyone on this network will again be able to press Unlock Settings and change anything.', { title: 'Settings password', okText: 'Turn Off', cancelText: 'Keep It' });
+    const ok = await xConfirm('Turn the settings password off? Anyone on this network will again be able to press Unlock Controls and change anything.', { title: 'Settings password', okText: 'Turn Off', cancelText: 'Keep It' });
     if (!ok) return;
     let r = null;
     try { r = await fetchWithTimeout(buildURL('/setPassword'), { method: 'POST', body: new URLSearchParams({ off: '1', cur: cur }) }, 8000); } catch (e) { }
@@ -16943,7 +16943,7 @@ async function remotePairWrite(other, me, add) {
         if (!tok) return { ok: false, why: 'The password for ' + label + ' was not accepted.' };
     } else if (!before.armed) {
         const j = await armJson('', { arm: '1' });
-        if (!j || !j.armed) return { ok: false, why: label + ' would not unlock its settings.' };
+        if (!j || !j.armed) return { ok: false, why: label + ' would not unlock its controls.' };
         relock = true;
     }
     const q = add ? '/pair?uid=' + encodeURIComponent(me.uid) + '&name=' + encodeURIComponent(me.name || '')
@@ -17003,7 +17003,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function triggerWeatherUpdate() {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
     const formData = new FormData();
@@ -17335,13 +17335,13 @@ function updateTogglesFromData(data) {
 // timestamp holds the telemetry echo from clobbering the just-clicked pill for a few seconds.
 let _testSlewModePendMs = 0;
 function setTestSlewMode(v) {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     _testSlewModePendMs = Date.now() + 3000;
     fetchWithTimeout(buildURL('/get?testSlewMode=' + encodeURIComponent(v)), {}, 5000).catch(() => {});
 }
 let _cvTestSlewModePendMs = 0;
 function setCvTestSlewMode(v) {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     _cvTestSlewModePendMs = Date.now() + 3000;
     fetchWithTimeout(buildURL('/get?cvTestSlewMode=' + encodeURIComponent(v)), {}, 5000).catch(() => {});
 }
@@ -17724,7 +17724,7 @@ async function owAssignRole(sel) {
     const cur = (_owLast && Array.isArray(_owLast.probes)) ? _owLast.probes.find(p => String(p.id || '').toLowerCase() === id) : null;
     const oldRole = cur ? Number(cur.role) : -1;
     const revert = () => { sel.value = String(oldRole); };
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); revert(); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); revert(); return; }
     if (!/^[0-9a-f]{16}$/.test(id) || !Number.isFinite(newRole)) { revert(); return; }
     if (oldRole === newRole) return;
     sel.disabled = true;
@@ -17742,7 +17742,7 @@ async function owAssignRole(sel) {
     }
 }
 async function owScanRequest() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const btn = document.getElementById('owScanBtn');
     if (btn) btn.disabled = true;
     try {
@@ -21409,7 +21409,7 @@ function resetDisplayValuesAndCaches(ids) {
 
 function handleResetPerfCounters() {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
 
@@ -21450,7 +21450,7 @@ function handleResetPerfCounters() {
 }
 
 function handleResetAccelSession() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
     const params = new URLSearchParams({ ResetAccelSession: '1' });
     fetchWithTimeout(buildURL('/get?' + params.toString()), {}, 8000)
         .then(() => {
@@ -21466,7 +21466,7 @@ function handleResetAccelSession() {
 }
 
 async function handleResetAccelLifetime() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first"); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
     if (!await xConfirm("Reset ALL lifetime motion stats? This clears max heel/pitch, slam records, and capsize/pitchpole counts from the device's saved memory. Cannot be undone.")) return;
     const params = new URLSearchParams({ ResetAccelLifetime: '1' });
     fetchWithTimeout(buildURL('/get?' + params.toString()), {}, 8000)
@@ -21572,7 +21572,7 @@ function resizeLivePlotsOnShow() {
 
 function showMainTab(tabName) {
     if (tabName === 'cloudfeatures' && !settingsUnlocked) {
-        xAlert('Please unlock settings first to access Cloud Features');
+        xAlert('Please unlock controls first to access Cloud Features');
         return;
     }
 
@@ -22443,7 +22443,7 @@ function setupInputValidation() {
 //Dynamic adjustment factors
 function resetDynamicShuntGain() {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
 
@@ -22459,7 +22459,7 @@ function resetDynamicShuntGain() {
 
 function resetDynamicAltZero() {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first");
+        xAlert("Please unlock controls first");
         return;
     }
 
@@ -22879,7 +22879,7 @@ function rwfsChemLfp() {
     return !!(v && String(v.battery_type || '').toLowerCase() === 'lifepo4');
 }
 async function battTempSetNotFitted() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const ok = await xConfirm('Set the battery temperature source to Not fitted? The cold and hot charge lockouts and the voltage-loop temperature correction then stay off until a source is chosen again.'
         + (rwfsChemLfp() ? '\n\nThis is a LiFePO4 bank: without a battery temperature, charging below freezing is left to the battery\'s own BMS, and a BMS disconnect while charging can spike system voltage.' : ''),
         { title: 'Battery temperature: Not fitted', okText: 'Set to Not fitted', cancelText: 'Keep the source' });
@@ -23198,7 +23198,7 @@ function rwfsValidate(d) {
     return '';
 }
 async function rwfsApply() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const d = rwfsDraft(false);
     const why = rwfsValidate(d);
     if (why) { xAlert(why); return; }
@@ -23216,12 +23216,12 @@ async function rwfsApply() {
     }
     try {
         const r = await fetchWithTimeout(buildURL('/get?' + params.join('&')), {}, 10000);
-        if (!r.ok) { xAlert(r.status === 403 ? 'The regulator refused this — its settings window has closed. Press Unlock Settings and try again.' : 'The regulator refused the change (HTTP ' + r.status + ').'); return; }
+        if (!r.ok) { xAlert(r.status === 403 ? 'The regulator refused this — its controls are locked. Press Unlock Controls and try again.' : 'The regulator refused the change (HTTP ' + r.status + ').'); return; }
         rwfsClose();
     } catch (e) { diagLog('rwfs apply failed:', e); xAlert('Could not reach the regulator. Check the connection and try again.'); }
 }
 async function rwfsStopAll() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const ok = await xConfirm('Stop ignoring every sensor? Each protection comes back the moment its sensor is read again; a sensor that is still failed stops charging.', { title: 'Run Without Failed Sensors', okText: 'Stop ignoring all', cancelText: 'Cancel' });
     if (!ok) return;
     try {
@@ -23231,7 +23231,7 @@ async function rwfsStopAll() {
     } catch (e) { diagLog('rwfs clear failed:', e); xAlert('Could not reach the regulator. Check the connection and try again.'); }
 }
 async function rwfsStopOne(key) {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     try {
         const r = await fetchWithTimeout(buildURL('/get?' + key + '=0'), {}, 10000);
         if (!r.ok) xAlert('The regulator refused the change (HTTP ' + r.status + ').');
@@ -23336,7 +23336,7 @@ function manualFieldToggleApply(cb, manual) {
             repaint();
             if (r.status === 403) {
                 syncArmState();
-                xAlert('The regulator refused this — its settings window has closed. Press Unlock Settings, then choose the mode again.',
+                xAlert('The regulator refused this — its controls are locked. Press Unlock Controls, then choose the mode again.',
                        'Field control NOT changed');
             } else {
                 xAlert('The regulator rejected the request (HTTP ' + r.status + '). Field control was NOT changed.',
@@ -26968,7 +26968,7 @@ function turnOffActiveTest() {
     const test = _testPanelCurrentTest;
     if (!test) return;
     if (test === 'sysid') { abortSystemIDTest(); return; }
-    if (!settingsUnlocked) { xAlert('Unlock settings first.'); return; }
+    if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     const paramMap = { curr: 'TuningMode', cv: 'CVTuningMode' };
     const param = paramMap[test];
     if (!param) return;
@@ -27228,7 +27228,7 @@ function _setTestBtnRunning(running) {
 // arm the generator and run continuously until Stop; 2 sine sweep arms then fires the closed-loop
 // frequency sweep. Pressing again while running (Stop Test) disarms.
 function tuningToggleTest() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first."); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
     // Already running → this press is a Stop.
     if (parseInt(getField("TuningMode") ?? 0) === 1) { tuningStopTest(); return; }
 
@@ -27394,7 +27394,7 @@ function renderTuningBode(data) {
 
 function openSystemIDModal() {
     if (!settingsUnlocked) {
-        xAlert("Please unlock settings first.");
+        xAlert("Please unlock controls first.");
         return;
     }
     // Reset panel position to default top-right on each open
@@ -28506,7 +28506,7 @@ function commissionPrimaryAction() {
 // at the end, or the network dropped between the last step and Finish). Sends commissionDone=1 to
 // persist the new tune and flip the badge to COMMISSIONED — without reopening the wizard or reverting.
 function commissionCommitUncommitted() {
-    if (!settingsUnlocked) { xAlert('Unlock settings first.'); return; }
+    if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     cxGet('commissionDone=1&cmEpoch=' + Math.floor(Date.now() / 1000)).then(() => {
         cx = null; cxPlanUserSet = false;   // run over — the plan re-defaults from the now-complete mask
         cxLastState = 2;
@@ -28891,7 +28891,7 @@ function cxShowTab(main, sub) {
 function cxGet(params) {
     return fetch(buildURL('/get?' + params)).then(r => {
         if (r.ok) return r;
-        const why = r.status === 403 ? 'settings are locked'
+        const why = r.status === 403 ? 'controls are locked'
                   : r.status === 409 ? 'a different regulator answered'
                   : 'the regulator refused it (HTTP ' + r.status + ')';
         const e = new Error(why); e.toString = () => why;
@@ -28910,7 +28910,7 @@ async function cxSendEach(list) {
 function cxReportStopFailure(what, failed) {
     if (!failed || !failed.length) return;
     xAlert(what + ' was not confirmed by the regulator:\n\n' + failed.join('\n') +
-        '\n\nUnlock settings if they are locked and try again. Switching the alternator off from the header always works.',
+        '\n\nUnlock controls if they are locked and try again. Switching the alternator off from the header always works.',
         'Stop not confirmed');
 }
 
@@ -28971,7 +28971,7 @@ document.addEventListener('click', () => {
 }, true);
 
 function openCommissionModal() {
-    if (!settingsUnlocked) { xAlert('Unlock settings first.'); return; }
+    if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     wakeLockWant(true);
     // Every entry from the Commissioning tab opens at Prep with a FRESH session object: the other-sources
     // acknowledgement and the restore point happen on every pass, and no result from an earlier pass can
@@ -33584,7 +33584,7 @@ function cvsGet(params) {
     return fetch(buildURL('/get?' + params));
 }
 function cvsOpen() {
-    if (!settingsUnlocked) { xAlert('Unlock settings first.'); return; }
+    if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     wakeLockWant(true);
     if (!cvsD) cvsD = { pane: 'pre', renderedPane: null, j: null, poll: null };
     cvsD.renderedPane = null;
@@ -34090,7 +34090,7 @@ function renderCommissionStatus(state, phase, mask, manual) {
 // is pinned to every step, as user-set: the default plan would re-derive to "pending only" from the
 // first CSV3 frame during the pre-flight and the restart would run just the two optional steps.
 async function commissionClearAndRestart() {
-    if (!settingsUnlocked) { xAlert('Unlock settings first.'); return; }
+    if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     const committed = (cxLastState === 2);
     const msg = committed
         ? 'Run the whole setup wizard again from the beginning?\n\nEvery step is re-measured, using your current settings as the starting point. Nothing is permanently changed until you finish — use "Abort and revert all" at any point to put today\'s settings back. Closing the wizard with the X just pauses it and keeps your progress so you can resume later.'
@@ -34120,7 +34120,7 @@ async function commissionClearAndRestart() {
 }
 
 function applySysidBodeFilters() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first."); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
     if (sysidFitTauMs <= 0) { xAlert("No plant fit available — re-run the sweep."); return; }
     const tcFast = encodeURIComponent(Math.max(1, Math.round(sysidFitTauMs / 3)));
     const tcSlow = encodeURIComponent(Math.max(1, Math.round(sysidFitTauMs)));
@@ -34133,7 +34133,7 @@ function applySysidBodeFilters() {
 // "Apply PID seed" — write the IMC starting Kp/Ki to the current loop. A starting point;
 // the user refines with the square-wave tuner. Kd left untouched (PI seed).
 function applySysidPidSeed() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first."); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
     if (!(sysidFitKp > 0)) { xAlert("No PID seed available — re-run the sweep."); return; }
     const kp = encodeURIComponent(sysidFitKp.toFixed(4));
     const ki = encodeURIComponent(sysidFitKi.toFixed(4));
@@ -34144,7 +34144,7 @@ function applySysidPidSeed() {
 }
 
 function applySystemIDResults() {
-    if (!settingsUnlocked) { xAlert("Please unlock settings first."); return; }
+    if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
     // PID feedback gets plant/3 to preserve phase margin inside the control loop.
     // Voltage smoothing gets the full plant delay because its consumers run on
     // slower (seconds) timescales; the CV D term's dV/dt has its own separate filter.
@@ -36356,7 +36356,7 @@ function faUpdatePauseBtn(value) {
     }
 }
 function faAnomPauseToggle() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const next = _faAnomPause ? 0 : 1;
     pendingToggles.set('faAnomPause', { desiredValue: next, baseRev: lastSeenRev });
     faUpdatePauseBtn(next);
@@ -38201,7 +38201,7 @@ function solarLedgerRender() {
     setTxt('sled-summary', parts.join(' '));
 }
 function solarLedgerClearConfirm() {
-    if (!settingsUnlocked) { xAlert('Please unlock settings first'); return; }
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     xConfirm('Clear the solar ledger? Every day on record is erased and the consumption prediction starts over. The learned performance ratio is kept.').then(ok => {
         if (!ok) return;
         fetchWithTimeout(buildURL('/get?ResetSolarLedger=1'), {}, 8000)
