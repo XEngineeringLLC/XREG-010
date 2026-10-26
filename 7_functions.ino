@@ -14,55 +14,30 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// BEST-EVER FRONT — shared engine (Phase A). Generic over an axis count NAXIS so one C++
-// instance serves each system: alternator (4-D), sail (3-D), motor (3-D). Templates can't be
-// auto-prototyped, so this block must stay ABOVE the alt/boat front code below that instantiates
-// it (this project keeps no .h files; the FRONT_* state #defines stay in Xregulator.ino because
-// globals there use them). Design contract: BEST_EVER_FRONT_SPEC.md §2/§5 + IMPLEMENTATION_PLAN.md §2.
-// 1. Episode<NAXIS>    — sliding-window steady-state detector (per-axis monotonic-deque min/max).
-// 2. FrontStore<NAXIS> — sparse best-ever support points (never a grid) + IDW eval + device keep-gate.
+// BEST-EVER FRONT shared engine, generic over NAXIS (alt 4-D, sail 3-D, motor 3-D). Templates can't be
+// auto-prototyped: this block must stay ABOVE the alt/boat front code that instantiates it. FRONT_* #defines
+// stay in Xregulator.ino (globals there use them). Spec: BEST_EVER_FRONT_SPEC.md §2/§5, IMPLEMENTATION_PLAN.md §2.
 
 // Per-axis steadiness knobs (live-tunable): deviation bound + how long it must hold.
 struct EpAxisCfg { float tol; float steadySec; };
 
-// One raw sample fed to the detector. x[] are the steadiness axes (band-checked AND averaged);
-// ex[] are extra raw "passenger" inputs that are AVERAGED over the run but NOT band-checked — kept
-// so the cloud retains the spec's diagnostic/forensic inputs (alt raw duty; motor raw AWS/AWA) for
-// recomputing a derived axis or diagnosing a bad point. out is the measured output, averaged.
+// x[] = steadiness axes (band-checked and averaged); ex[] = passenger inputs averaged but NOT band-checked,
+// kept for cloud forensics (alt raw duty; motor raw AWS/AWA); out = measured output, averaged.
 template <int NAXIS>
 struct RawSample { float x[NAXIS]; float ex[2]; float out; uint32_t tMs; };
 
-// One emitted episode point == one front support point. x[] are the SURFACE coordinates (which may
-// be DERIVED from the steadiness axes, e.g. excitation from duty); ex[] are the retained raw extras
-// (run-averaged, uploaded to the cloud's raw history, not used by the front eval); y is the output.
+// One episode point == one front support point. x[] are SURFACE coords (may be derived from the steadiness
+// axes, e.g. excitation from duty); ex[] are run-averaged raw extras for the cloud, unused by eval; y = output.
 template <int NAXIS>
 struct FrontPoint { float x[NAXIS]; float ex[2]; float y; uint32_t nSamp; uint32_t tEmit; };
 
-// Steadiness detector — sliding-window form. An axis is "steady NOW" iff the max−min of that axis
-// over the trailing steadySec window is ≤ tol. That's the textbook sliding-window-min/max problem,
-// solved per axis with a pair of monotonic deques (O(1) amortized; no per-tick rescan, no O(N)
-// spike). A brief excursion only widens the window range while it sits
-// inside the window, then ages out — it never zeroes accumulated dwell, so a disqualifying sample
-// does NOT discard the prior in-band history. A point emits, at most once per EP_EMIT_PERIOD_MS,
-// while EVERY axis (and the optional output band) is steady AND data has spanned its dwell since the
-// last hard barrier (eligible=false) AND the trailing boxcar (width avgWinMs, per instance) is
-// itself clean: it spans a full window and each axis's TRIMMED range over its samples fits that
-// axis's band (see trimmedRange). Steadiness + averaging are fed at a decimated EP_FEED_DT_MS
-// cadence (the fold may run far faster — ~75 Hz on alt). Shared by alt-health (4 axes + amps band,
-// avgWinMs = ALT_EMIT_AVG_MS) and vessel-performance (sail/motor, 3 axes, output band disabled,
-// default window).
-//
-// The paragraph above describes gateMode EP_BAND, which is still what every vessel-performance axis
-// uses. Alt-health moved its rpm, field and output axes to EP_STRAIGHT (rms departure from a fitted
-// line, so a steady acceleration qualifies) and its temperature axis to EP_EXTERNAL (a trailing
-// window that must survive the eligibility barrier); see altEpisodeSyncCfg. Everything else in this
-// struct — dwell from the run start, boxcar, emit rate limit, trimmed-range emit test — is unchanged
-// and applies to every mode.
+// Steadiness detector: an axis is steady when max-min over its trailing steadySec window <= tol (EP_BAND,
+// monotonic deques), so a brief excursion ages out instead of zeroing dwell. Alt-health uses
+// EP_STRAIGHT/EP_EXTERNAL axes (altEpisodeSyncCfg); vessel-performance stays EP_BAND.
 
 #define EP_FEED_DT_MS      100    // steadiness/average update cadence (10 Hz), decimated from the fold
 #define EP_AVG_WIN_MS     2000    // default trailing boxcar width for the emitted average (per-instance avgWinMs overrides)
-#define EP_EMIT_PERIOD_MS 1000    // max emit rate while steady (≤ the ~2/s consumer drain; the front's
-                                  // max-per-cell dedup collapses repeats in a long hold, so over-emitting is harmless)
+#define EP_EMIT_PERIOD_MS 1000    // max emit rate while steady; keep <= the ~2/s consumer drain (max-per-cell dedup absorbs repeats)
 
 // Sliding-window extremum over a trailing time window (monotonic / "ascending-minima" deque).
 // keepMax=true → front() is the window max; false → the window min. Ring storage is bound in init.
@@ -83,25 +58,16 @@ struct MonoDeque {
   }
 };
 
-// How one axis decides it is steady. BAND is the original rule above. STRAIGHT asks whether the
-// signal moved along a straight LINE rather than whether it held still — a boat accelerating out of
-// a harbour is smooth but never still, and its output tracks that ramp faithfully, so the band form
-// threw the whole moving half of the operating range away. EXTERNAL hands the verdict to the caller,
-// for a test that must survive the eligibility barrier (alt-health's trailing temperature window).
+// BAND: max-min within tol. STRAIGHT: rms departure from a fitted line, so a smooth ramp (boat accelerating)
+// qualifies. EXTERNAL: caller supplies the verdict, for a test that must survive the eligibility barrier.
 enum EpGateMode : uint8_t { EP_BAND = 0, EP_STRAIGHT = 1, EP_EXTERNAL = 2 };
 
-#define EP_FIT_N     64    // straightness ring depth (samples) = 6.4 s at EP_FEED_DT_MS. Power of two so the
-                           // index arithmetic is a mask, not a runtime divide. A fit window longer than the
-                           // ring holds is clamped, exactly as a band window is clamped to its deque.
+#define EP_FIT_N     64    // straightness ring depth = 6.4 s at EP_FEED_DT_MS; power of two so indexing is a mask
 #define EP_LEAD_MAX  11    // lead-pairing delay depth (samples) — 0..10 × EP_FEED_DT_MS, i.e. up to 1.0 s
 
-// Least-squares straightness over a trailing time window: rms departure from the best-fit line, plus
-// the line's own slope. Storage is a fixed INTERNAL-RAM ring (~512 B per axis) because this runs
-// inside the control tick and a PSRAM sweep of 30 elements ten times a second would cost more than
-// the arithmetic. The fit is recomputed from the ring each tick instead of being carried in running
-// sums — 2 × 30 single-precision iterations, and it cannot drift. Values are centred on the window's
-// first sample and time is window-relative, so float32 keeps its headroom at rpm ≈ 2000; `double` is
-// software-emulated on the S3 and is never used here.
+// Least-squares straightness over a trailing window: rms departure from the best-fit line, plus its slope.
+// Internal-RAM ring (runs in the control tick; PSRAM would cost more than the math); refit each tick so it
+// cannot drift. Values centred on the window's first sample for float32 headroom; double is software-emulated on S3.
 struct LineFit {
   float    v[EP_FIT_N];
   uint32_t t[EP_FIT_N];
@@ -151,11 +117,8 @@ struct LineFit {
   }
 };
 
-// Lead pairing. The alternator's output answers where the engine is GOING, not where it has been, so
-// a speeding-up engine looks like it is producing more than it really can at the speed shown. Delay
-// the responding channels by a fixed number of feed ticks before any window sees them. Fed only from
-// Episode::feed, i.e. behind the EP_FEED_DT_MS decimation — never in the ~75 Hz fold path,
-// where the same 4 samples would be 20-36 ms instead of 400 ms.
+// Lead pairing: alternator output answers where the engine is GOING, so delay the responding channels by a
+// fixed number of feed ticks. Fed only behind the EP_FEED_DT_MS decimation, never the ~75 Hz fold path.
 struct LeadLine {
   float v[EP_LEAD_MAX];
   int   head, n, delay;
@@ -181,10 +144,8 @@ struct Episode {
   EpAxisCfg outCfg;                 // optional output-steadiness band (outCfg.tol <= 0 → disabled)
   uint32_t  minRunMs;               // emit floor: eligible data must span this long since the last hard barrier (0 = off)
 
-  // Per-axis qualification, index [NAXIS] = the output channel. All default to the original BAND
-  // rule, so an instance that sets none of them (sail/motor) behaves exactly as before and pays
-  // nothing. gateMode[] and fit[] must be set BEFORE init() — deque storage is allocated only for
-  // the axes that are still judged by a band.
+  // Per-axis qualification, index [NAXIS] = output. Defaults are EP_BAND (sail/motor set none). Set
+  // gateMode[] and fit[] BEFORE init(): deques are allocated only for band axes.
   uint8_t   gateMode[NAXIS + 1] = {};      // EpGateMode
   LineFit  *fit[NAXIS + 1] = {};           // EP_STRAIGHT axes: caller-owned fit state (internal RAM)
   LeadLine *lead[NAXIS + 1] = {};          // optional per-axis feed delay (lead pairing)
@@ -198,8 +159,7 @@ struct Episode {
   int       dqCap[NAXIS + 1];       // each deque ring's capacity (samples), sized from maxDwellSec in init
   uint32_t  dataStartMs;            // time of the first eligible sample after the last hard barrier
   bool      haveData, ready;
-  bool      axisSteady[NAXIS + 1];  // per-axis (+ output band) "steady now" — ADDITIVE: lets a caller build a
-                                    // lighter gate from a subset of axes (alt-health session gate uses all but temp).
+  bool      axisSteady[NAXIS + 1];  // per-axis (+ output band) "steady now"; alt-health session gate uses all but temp
 
   RawSample<NAXIS> *avgRing; int avgCap;          // trailing boxcar buffer (the caller's PSRAM ring)
   int       ringHead, ringCount;    // boxcar head/count (named ringHead/ringCount for caller compatibility)
@@ -212,18 +172,13 @@ struct Episode {
   // axUnqual/axExcur × EP_FEED_DT_MS. Dumped in /altdebug.csv.
   uint32_t  axUnqual[NAXIS + 1] = {}, axExcur[NAXIS + 1] = {}, feedTicks = 0;
   bool      axWasUnq[NAXIS + 1] = {};
-  // Gate-blame attribution (boot-cumulative). soleBlock = ticks where exactly ONE
-  // axis was out-of-band with its dwell filled while every other axis was steady — during real
-  // transients several axes fail together, so the sole blocker is the gate that alone cost a run.
-  // emitDirty = candidate emits vetoed by that axis's trimmed boxcar range; emitSpanShort =
-  // vetoed because the boxcar hadn't yet spanned avgWinMs. All dumped in /altdebug.csv.
+  // Gate-blame (boot-cumulative, in /altdebug.csv): soleBlock = ticks where only this axis was out-of-band
+  // with dwell filled; emitDirty = emits vetoed by its trimmed range; emitSpanShort = boxcar not yet avgWinMs.
   uint32_t  blameTicks = 0, soleBlock[NAXIS + 1] = {};
   uint32_t  emitDirty[NAXIS + 1] = {}, emitSpanShort = 0;
 
-  // ringBuf/ringCap = the caller's PSRAM boxcar ring; maxDwellSec[NAXIS+1] sizes each axis's (and the
-  // output band's) deque to its longest expected steady time. Deque storage is ps_malloc'd here, and
-  // ONLY for EP_BAND axes — a straightness or external axis never touches a deque, so set gateMode[]
-  // before calling this or you will pay for rings nothing reads.
+  // maxDwellSec[NAXIS+1] sizes each band axis's deque (ps_malloc'd here, EP_BAND axes only, so set
+  // gateMode[] first). ringBuf is the caller's PSRAM boxcar ring.
   void init(RawSample<NAXIS> *ringBuf, int ringCap, const float *maxDwellSec) {
     avgRing = ringBuf; avgCap = ringCap;
     outCfg = { 0, 0 }; minRunMs = 0;
@@ -246,8 +201,7 @@ struct Episode {
     clearRun();
   }
 
-  // Reset all detector state (sliding-window history, boxcar, dwell origin). Called on a hard barrier
-  // and by the caller's "Start Over". Safe even if init's alloc failed (clear() only zeroes indices).
+  // Reset all detector state. Safe even if init's alloc failed (clear() only zeroes indices).
   void clearRun() {
     for (int a = 0; a < NAXIS + 1; a++) {
       if (gateMode[a] == EP_BAND) { maxDQ[a].clear(); minDQ[a].clear(); }
@@ -269,17 +223,13 @@ struct Episode {
 
     // Decimate the steadiness/averaging update to EP_FEED_DT_MS (the fold may run much faster).
     if (haveData && (uint32_t)(s.tMs - lastFeedMs) < EP_FEED_DT_MS) return false;
-    // A feed gap is a hard barrier too: several caller paths stop feeding WITHOUT clearRun
-    // (stale NMEA, pause, IgnoreTemperature toggle). After a gap the window deques evict to a
-    // single sample (trivially in-band) while dwell still measures from the pre-gap dataStartMs,
-    // so one instantaneous post-gap reading would emit as a full steady run.
+    // A feed gap is a hard barrier: some callers stop feeding without clearRun (stale NMEA, pause,
+    // IgnoreTemperature), and post-gap deques hold one trivially in-band sample against pre-gap dwell.
     if (haveData && (uint32_t)(s.tMs - lastFeedMs) > 5u * EP_FEED_DT_MS) clearRun();
     lastFeedMs = s.tMs;
     if (!haveData) { dataStartMs = s.tMs; haveData = true; }
 
-    // Lead pairing, applied here and nowhere else: this is the one place running at exactly the
-    // decimated cadence the delay is counted in. Everything downstream — windows, boxcar, emitted
-    // average — sees the delayed value on the delayed channels.
+    // Lead pairing only here: the delay is counted in decimated ticks; everything downstream sees delayed channels.
     RawSample<NAXIS> ls = s;
     for (int a = 0; a < NAXIS; a++) if (lead[a]) ls.x[a] = lead[a]->push(s.x[a]);
     if (lead[NAXIS]) ls.out = lead[NAXIS]->push(s.out);
@@ -384,22 +334,9 @@ struct Episode {
     }
     count = qualified ? (uint32_t)ringCount : 0;            // caller reads count>0 as "steady now"
 
-    // Emit a steady point, rate-limited. Beyond instant steadiness (qualified), the BOXCAR itself
-    // must be clean: full avgWinMs span, and each axis's trimmed range over its samples within that
-    // axis's band. This replaced the 2026-08-14 "steady continuously for a full avgWinMs" clock:
-    // one 100 ms blip poisons the 3 s instant windows for 3 s, so with blips every few seconds the
-    // clock never reached 8 s and the record book starved (bench 2026-08-20: 12 min steady run,
-    // ONE record, live % unmoored). Trimming lets isolated blips ride in the average (unbiased,
-    // band-bounded smear) instead of vetoing the emit; a sustained shift still fails the range.
-    // An axis in emitTrimSkip is exempt: a max-minus-min test on an axis that is now judged by
-    // straightness would re-impose stillness at emit time and undo the whole change. The axes that
-    // DO stay in the test are compared against emitTrimTol(), which adds the travel the axis's own
-    // slope cap permits across the boxcar — otherwise the field axis would be allowed to slew at
-    // 1 %/s and then vetoed for having moved 2 % in the 2 s boxcar, which is the same contradiction
-    // in a different place (measured on the 2026-09-08 THEDRIVE capture: 58 emits with the flat
-    // tolerance, 202 with this one, against 206 for the offline reference).
-    // minRunMs is a floor on the ELIGIBLE span (since dataStartMs), not on continuous qualification —
-    // a continuous clock is the starvation trap described above. Below every axis window it is moot.
+    // Emit needs a clean BOXCAR: full avgWinMs span and each axis's trimmed range within emitTrimTol, so
+    // isolated blips ride in the average instead of vetoing (a continuous-steady clock starved emits).
+    // emitTrimSkip exempts straightness axes. minRunMs floors the ELIGIBLE span, not continuous qualification.
     if (qualified && (uint32_t)(ls.tMs - lastEmitMs) >= EP_EMIT_PERIOD_MS && ringCount > 2
         && (minRunMs == 0 || (uint32_t)(ls.tMs - dataStartMs) >= minRunMs)) {
       int tail = (ringHead - ringCount + avgCap) % avgCap;
@@ -424,19 +361,14 @@ struct Episode {
     return false;
   }
 
-  // What the boxcar's trimmed range is allowed to be for one axis: its own tolerance, plus the
-  // travel its slope cap permits across the boxcar window. A band axis has no slope cap, so this is
-  // exactly its band — unchanged. A straightness axis gets the room its own rules already grant it.
+  // Allowed boxcar trimmed range: the axis's tolerance plus the travel its slope cap permits over avgWinMs.
   float emitTrimTol(int axis, float baseTol) const {
     if (slopeMax[axis] <= 0.0f) return baseTol;
     return baseTol + slopeMax[axis] * ((float)avgWinMs * 0.001f);
   }
 
-  // Trimmed max−min over the boxcar ring for one axis (axis == NAXIS → the output). Drops the
-  // ~5% most extreme samples per tail (ringCount/20, min 1, cap 8) before ranging, so a few
-  // isolated 100 ms blips can't veto an emit whose core is genuinely steady — the blips stay IN
-  // the emitted average. A sustained excursion (> the trim count) still fails. O(n·trim) once
-  // per candidate emit; also read (unlocked, diagnostic) by altDebugCsvSend.
+  // Trimmed max-min over the boxcar for one axis (NAXIS = output): drops the ~5% most extreme samples per tail
+  // (n/20, 1..8) so isolated blips can't veto an emit. Also read unlocked (diagnostic) by altDebugCsvSend.
   float trimmedRange(int axis) const {
     int n = ringCount;
     if (n < 3) return 0.0f;
@@ -456,9 +388,8 @@ struct Episode {
     return hi[k] - lo[k];
   }
 
-  // Dwell seconds still needed before this episode can go steady: the largest per-axis shortfall of
-  // in-band data since dataStartMs. 0 once every axis has spanned its window (steadiness is then purely
-  // the in-band test); -1 with no eligible data. Only meaningful during the initial fill of a fresh run.
+  // Dwell seconds still needed before steady: largest per-axis shortfall since dataStartMs; 0 once every
+  // window has spanned, -1 with no eligible data.
   float settleRemainSec(uint32_t nowMs) {
     if (!haveData) return -1.0f;
     float rem = 0.0f;
@@ -474,11 +405,9 @@ struct Episode {
   }
 };
 
-// Sparse support points (never a grid). Memory scales with the data, not the input volume —
-// what makes the 4-D alternator affordable. axisScale[] normalizes each dimension's distance
-// for IDW (≈ that axis's tol or characteristic span).
-// Hard cap on neighbors entering an LWLR solve — bounds the software-double accumulation cost in
-// dense neighborhoods (~48 pts ≈ 1–2 ms worst case) independent of front size. See evalLWLR.
+// Sparse support points (never a grid), so memory scales with the data; axisScale[] normalizes each axis's
+// IDW distance (~ that axis's tol or span).
+// Cap on LWLR solve neighbors: bounds software-double cost in dense neighborhoods (~48 pts = 1-2 ms worst).
 #define FRONT_LWLR_KMAX 48
 template <int NAXIS>
 struct FrontStore {
@@ -490,12 +419,9 @@ struct FrontStore {
     pts = buf; cap = c; count = 0; source = 0;
     for (int a = 0; a < NAXIS; a++) axisScale[a] = 1.0f;
   }
-  // Max-per-cell insert: keep the store a true upper ENVELOPE, not a point cloud. If an incoming run
-  // lands in the same operating cell as an existing point (within half an axisScale on EVERY axis),
-  // keep only the higher-y one — so eval() interpolates between bests instead of averaging a best with
-  // also-rans. Returns true ONLY on a meaningful improvement (new cell, or beating the cell's record
-  // by ≥0.5% — a bare float compare re-admitted every +0.01A creep at steady state, churning the cloud
-  // upload queue; rationale in BEST_EVER_FRONT_SPEC.md §5b); callers use that to gate cloud upload.
+  // Max-per-cell insert (cell = within half an axisScale on EVERY axis) keeps a true upper envelope.
+  // Returns true only for a new cell or a >=0.5% record beat (bare compare churned the cloud upload queue;
+  // BEST_EVER_FRONT_SPEC.md §5b); callers gate cloud upload on it.
   bool add(const FrontPoint<NAXIS> &p) {
     for (int i = 0; i < count; i++) {
       bool sameCell = true;
@@ -511,12 +437,8 @@ struct FrontStore {
     if (count >= cap) return false;
     pts[count++] = p; return true;
   }
-  // IDW surface evaluation, O(count) — the spec's front_eval(). Float + precomputed reciprocal axis
-  // scales (4 mults/point, not 4 divides). Reached only via classify()/pushesHybrid() at 1 Hz
-  // (altHealth_tick, behind gHeavyRanThisPass) — never from the ~75 Hz altFold_tick, so front size
-  // has no control-loop cost.
-  // A convex blend of the support points → the result is ALWAYS within their y-range: never extrapolates.
-  // d_i = sqrt(Σ_a ((x[a]-pts.x[a])*invSc[a])^2); exact hit → that point's y; else Σ w_i y_i / Σ w_i.
+  // IDW evaluation, O(count). Reached only at 1 Hz via classify()/pushesHybrid(), never from the ~75 Hz
+  // altFold_tick. A convex blend, so the result never leaves the support points' y-range.
   float eval(const float x[NAXIS], float idwPower) const {
     if (count <= 0) return 0.0f;                     // bootstrap: no surface yet
     float invSc[NAXIS];
@@ -536,16 +458,12 @@ struct FrontStore {
     }
     return (wsum > 0) ? (num / wsum) : 0.0f;
   }
-  // Device keep-gate, IDW-bar-only form — SUPERSEDED by pushesHybrid at every call site; kept as
-  // the simple reference (unused template methods cost no flash). Only apply either gate when
-  // hasLocalSupport() is true.
+  // IDW-bar-only keep-gate, superseded by pushesHybrid everywhere; kept as reference. Apply only when hasLocalSupport().
   bool pushes(const float x[NAXIS], float y, float safetyMargin, float idwPower) const {
     if (count <= 0) return true;
     return y > eval(x, idwPower) - safetyMargin;
   }
-  // Any support point within the same cell (the half-axisScale box add() dedupes in)? A run landing
-  // in an unvisited cell is admitted unconditionally — it opens that region at its true value, and
-  // add()'s max-per-cell keeps later, better runs.
+  // Any support point in the same half-axisScale cell? A run in an unvisited cell is admitted unconditionally.
   bool hasLocalSupport(const float x[NAXIS]) const {
     for (int i = 0; i < count; i++) {
       bool sameCell = true;
@@ -557,9 +475,8 @@ struct FrontStore {
     }
     return false;
   }
-  // Normalized (axis-scaled) distance to the nearest support point — the "is the reference
-  // trustworthy here" test. Beyond the caller's radius the live % and trend report no reference
-  // instead of a ratio against a blend of faraway points. Empty front → huge distance.
+  // Normalized distance to the nearest support point; beyond the caller's radius live % and trend report no
+  // reference.
   float nearestNormDist(const float x[NAXIS]) const {
     if (count <= 0) return 1e9f;
     float invSc[NAXIS];
@@ -575,13 +492,9 @@ struct FrontStore {
     }
     return sqrtf(best);
   }
-  // Locally weighted linear regression (LWLR) — the display/trend evaluator. Fits the local slope
-  // y ≈ b0 + Σ slope_a·dx_a (normalized dx, same 1/(d²+1e-9) weights as eval); prediction = b0,
-  // which CAN sit below the lowest neighbor — removes IDW's edge bias. Ridge on the slope diagonal
-  // only; prediction clamped to [0.1, 1.25 × max stored y]; slopesOut feeds the slope-gap risk
-  // test. Returns false on an empty front or degenerate solve. Solve runs over only the nearest
-  // ≤ FRONT_LWLR_KMAX points — a hard radius cut was tried and REJECTED. Full rationale, validation
-  // numbers, and cost model: ALT_HEALTH_LWLR_ENGINE_SPEC.md.
+  // LWLR display/trend evaluator: local linear fit with eval's weights; prediction b0 can sit below the
+  // lowest neighbor (removes IDW edge bias). Nearest <= FRONT_LWLR_KMAX points only (a hard radius cut was
+  // REJECTED). Rationale and validation: ALT_HEALTH_LWLR_ENGINE_SPEC.md.
   bool evalLWLR(const float x[NAXIS], float ridgeFrac, float *predOut, float *slopesOut) const {
     if (count <= 0) return false;
     float invSc[NAXIS];
@@ -655,9 +568,9 @@ struct FrontStore {
       sol[r] = s / A[r][r];
     }
     float pred = (float)sol[0];
-    float hi = 1.25f * maxY;                                  // clamp: NO neighbor-range clamp (that
-    if (pred < 0.1f) pred = 0.1f;                             // reintroduces the edge bias) — just a
-    if (pred > hi) pred = hi;                                 // sanity ceiling over the record book
+    float hi = 1.25f * maxY;                                  // sanity ceiling only; a neighbor-range clamp reintroduces edge bias
+    if (pred < 0.1f) pred = 0.1f;
+    if (pred > hi) pred = hi;
     if (predOut) *predOut = pred;
     if (slopesOut)
       for (int a = 0; a < NAXIS; a++) slopesOut[a] = (float)sol[a + 1];
@@ -691,12 +604,9 @@ struct FrontStore {
     }
     return sum;
   }
-  // Confidence-state classifier + display prediction (the 1 Hz evaluator). Test order: MEASURED
-  // (same-cell record) → NO_REFERENCE (beyond refRadius) → risk gate (slope-gap / curvature) →
-  // LEARNING_EDGE or ESTIMATED. KEY INVARIANT: OUTPUT-BLIND — measured output never enters the
-  // state decision, so degradation can't relabel itself "learning". predOut = LWLR (IDW fallback
-  // for MEASURED on a degenerate solve; 0 = show no number). barOut = min(IDW, LWLR) admission bar
-  // from the same solve. Full design: ALT_HEALTH_LWLR_ENGINE_SPEC.md.
+  // Confidence state + display prediction (1 Hz). Order: MEASURED -> NO_REFERENCE -> risk gate ->
+  // LEARNING_EDGE or ESTIMATED. OUTPUT-BLIND: measured output never enters the state decision, so
+  // degradation can't relabel itself "learning". barOut = min(IDW, LWLR). See ALT_HEALTH_LWLR_ENGINE_SPEC.md.
   int classify(const float x[NAXIS], float refRadius, float idwPower, float ridgeFrac,
                float riskThresh, float *predOut, float *barOut = nullptr) const {
     if (predOut) *predOut = 0;
@@ -730,21 +640,18 @@ struct FrontStore {
   }
 };
 
-// ALTERNATOR HEALTH — Best-Ever Front (device side). Folds one sample per control tick (~75 Hz,
-// via the pidLog hook) into the Episode detector; an emitted steady-run average pushes the sparse
-// best-ever output-amps front (FrontStore). The cloud prunes dominated points + retains raw
-// history. Surface axes {RPM, excitation, Vbus, temp}; excitation derived from run-average
-// duty/Vbus/temp. Generic engine + globals: Xregulator.ino. Design:
-// BEST_EVER_FRONT_SPEC.md / BEST_EVER_IMPLEMENTATION_PLAN.md.
+// ALTERNATOR HEALTH, Best-Ever Front (device side). Folds one sample per control tick (~75 Hz, pidLog hook)
+// into Episode; emitted steady-run averages push the output-amps front; the cloud prunes and keeps raw history.
+// Generic engine: top of this file; globals: Xregulator.ino. Spec: BEST_EVER_FRONT_SPEC.md / BEST_EVER_IMPLEMENTATION_PLAN.md.
 
 #define ALT_VER          4u
 #define ALT_FRONT_MAGIC  0x414C4652u  // 'ALFR' — best-ever front point blob
 #define ALT_TREND_MAGIC  0x414C5452u  // 'ALTR' (legacy whole-blob trend; superseded by the append log)
 #define ALT_TRENDLOG_MAGIC 0x414C544Cu // 'ALTL' — append-only engine-hour trend log
+#define ALT_PEND_MAGIC   0x414C5044u  // 'ALPD' — unsynced cloud-pending points
 
-// Temp-normalized field drive ("excitation proxy"): (dutyFrac × Vbus) / (1 + α(Tc − Tref)), in 12 V-winding
-// equivalent volts (× 12 / fieldWindApplied, which is 12 while the resistance check holds the field on 12 V winding
-// values) so the cloud reference and the fleet view compare windings on one axis.
+// Temp-normalized field drive (excitation proxy) in 12 V-winding equivalent volts so windings compare on one
+// axis; fieldWindApplied is 12 while the resistance check holds 12 V winding values.
 static inline float altExcitation(float duty, float vbus, float tF) {
   float tc = (tF - 32.0f) / 1.8f;
   float denom = 1.0f + ALT_ALPHA_PER_C * (tc - ALT_TREF_C);
@@ -752,29 +659,16 @@ static inline float altExcitation(float duty, float vbus, float tF) {
   return (duty / 100.0f) * vbus / denom * (12.0f / (float)fieldWindApplied);
 }
 
-// ---- Best-Ever Front engine instance (alternator 4-D) ----
-// Steadiness/averaging axes: {RPM, field-duty %, Vbus, tempF}. Defined here (before every function
-// that references them) so the rest of the module can use the front. Generic engine: Xregulator.ino.
+// ---- Best-Ever Front engine instance (alternator 4-D): axes {RPM, field-duty %, Vbus, tempF}. Generic engine: top of this file ----
 #define ALT_NAXIS        4
-#define ALT_EMIT_AVG_MS  2000     // record/grade averaging window. Sized from the emit-window sizing probe
-                                  // on a real idle hour (2026-08-21): luckiest-2s-window inflation 0.25% vs
-                                  // 0.13% at 8 s, but 8 s passed only 11 of 53 ≥2 s steady runs — the old 8 s
-                                  // guess starved harvest (and all transient capture) for ~0.1% inflation.
-                                  // That probe was removed 2026-09-09 once it had answered this question
+#define ALT_EMIT_AVG_MS  2000     // record/grade averaging window; 8 s starved harvest (11 of 53 steady runs) for ~0.1% less inflation
 #define ALT_FRONT_CAP    4096     // sparse support points (PSRAM); sized to be unreachable even AP-mode/no-prune — cost scales with count, not cap (see ALT_HEALTH_LWLR_ENGINE_SPEC.md)
-#define ALT_EP_RING_CAP  1024     // Episode trailing-boxcar buffer (PSRAM). Only ~ALT_EMIT_AVG_MS of
-                                  // decimated samples are ever live in it (~80 at 10 Hz); generously
-                                  // sized. The steadiness windows live in the per-axis monotonic
-                                  // deques (allocated in Episode::init), NOT here.
+#define ALT_EP_RING_CAP  1024     // Episode boxcar buffer (PSRAM); only ~80 samples live at 10 Hz, generously sized
 #define ALT_PENDING_CAP  4096     // = front cap: holds every unsynced point through weeks offline (PSRAM)
 
 static Episode<ALT_NAXIS>     altEpisode;
-// Straightness + lead-pairing state for the three axes that use them. INTERNAL RAM on purpose
-// (~1.7 KB total): they are read and written inside the control tick at 10 Hz, and a PSRAM sweep of
-// 30 elements ten times a second would cost more than the arithmetic. In exchange the RPM, field and
-// output axes stop allocating monotonic deques entirely (52 KB of PSRAM, and the integer-divide-heavy
-// pushes that went with them); net of the new full-dwell temperature gate below and the retired
-// emit-window probe, PSRAM use drops about 16 KB.
+// Straightness + lead-pairing state: INTERNAL RAM on purpose (~1.7 KB), read and written in the 10 Hz
+// control tick where a PSRAM sweep would cost more than the arithmetic.
 static LineFit  altFitRpm, altFitDuty, altFitAmps;
 static LeadLine altLeadVbus, altLeadAmps;
 static FrontStore<ALT_NAXIS>  altFront2;                // "My History" — the LEARNED surface (always the learn target)
@@ -785,19 +679,42 @@ static FrontPoint<ALT_NAXIS> *altFrontUpBuf = nullptr;  // backing store for the
 static bool altHaveUpload     = false;                  // true once a file has been uploaded (Uploaded surface populated)
 static FrontPoint<ALT_NAXIS> *altPending  = nullptr;   // accepted-since-last-upload (raw points out)
 static int altPendingCount   = 0;
+static int altSentCount      = 0;          // pending prefix the last built upload carried (Core 1 only)
+static volatile bool altSentSeeded = false;   // that upload was the seeded batch, import or reregister (read by Core 0 on success)
+
+// Front-sync result from httpsTask (Core 0) to the learning tick (Core 1), which alone writes the pending queues
+// and fronts (else in-flight points drop and FrontStore::add races). body = pruned BEFRONT1 CSV when ingest: the
+// upload's own PSRAM block, which the reply was read into, owned by the hand-off from make() on (no second copy).
+// make() is a member because Arduino's auto-prototype generator breaks on sketch types in free-function signatures.
+struct FrontSyncHandoff {
+  bool ingest;
+  char *body;
+  static FrontSyncHandoff *make(bool ingest, char *body) {
+    if (!ingest) { free(body); body = nullptr; }
+    FrontSyncHandoff *h = (FrontSyncHandoff *)ps_malloc(sizeof(FrontSyncHandoff));
+    if (!h) { free(body); return nullptr; }
+    h->ingest = ingest && body;
+    h->body = body;
+    return h;
+  }
+  static void drop(FrontSyncHandoff *h) {
+    if (!h) return;
+    free(h->body);
+    free(h);
+  }
+};
+static FrontSyncHandoff *altSyncHandoff = nullptr, *perfSyncHandoff = nullptr;
+// Either reply still waiting for Core 1 holds its block; the uploads take turns on that too (see the producers in loop()).
+bool frontSyncHandoffPending() {
+  return __atomic_load_n(&altSyncHandoff, __ATOMIC_ACQUIRE) || __atomic_load_n(&perfSyncHandoff, __ATOMIC_ACQUIRE);
+}
 
 // ---- session-plot series (PSRAM ring, RAM-only) ----------------------------------------------
-// The session % plot used to exist ONLY in the browser tab: a page opened mid-session drew an empty
-// chart, and a WiFi drop left a permanent hole (the live stream never backfills). The device now
-// keeps the same 5 s series itself and serves it at /altsess.csv, so any page — fresh, reloaded, or
-// reconnecting — recovers the whole run. Deliberately never persisted: a session ends at field-off,
-// and writing it would put flash in the control path.
+// Device-side copy of the dashboard's 5 s series, served at /altsess.csv so a fresh or reconnecting page
+// recovers the whole run. Never persisted: a session ends at field-off, and writing it puts flash in the control path.
 #define ALT_SESS_DT_MS    5000u   // MUST match the dashboard's dot cadence (altSessionPush in script.js)
-#define ALT_SESS_RING_N   1440    // 2 h at ALT_SESS_DT_MS, ~32 KB PSRAM. Oldest rolls off. This only
-                                  // has to cover "how long was I away / disconnected" — an open page
-                                  // keeps ~40 h of its own. Uniform cadence on purpose: the plot's
-                                  // information IS dot density, so decimating old data would read as
-                                  // a change in the machine rather than a change in sampling.
+#define ALT_SESS_RING_N   1440    // 2 h at ALT_SESS_DT_MS, ~30 KB PSRAM; only covers "how long was I away"
+                                  // (an open page keeps ~40 h). Never decimate: the plot's information IS dot density.
 struct __attribute__((packed)) AltSessPt {   // 21 B — packed + fixed-point; 2 h = 30 KB, not 200 KB
   uint32_t tMs;                   // device millis() at capture — client maps to wall clock via the header's nowMs
   uint16_t gAmps;                 // graded (boxcar) output A ×100 — the % numerator
@@ -834,17 +751,9 @@ static inline FrontStore<ALT_NAXIS> &altGradeFront() {
 }
 
 // ---- trailing case-temperature gates (full dwell + the lighter half dwell for the Session plot) ----
-// Same monotonic-deque sliding-window min/max as Episode, fed the same decimated tF. Two instances:
-// the FULL dwell (altThermSec) supplies the detector's temperature verdict, and the HALF dwell lets
-// the Session plot show a dot before the record-book dwell is reached. PSRAM-backed (cap sized in
-// init for ample headroom past any dwell).
-//
-// Deliberately NOT reset by the detector's eligibility barrier: this is a physical
-// thermal-equilibrium test, and clearing it whenever output dipped below the admission floor would
-// turn "4 °F over the last 40 s" back into "40 unbroken seconds above the floors" — which offline
-// replay of three 2026-09-08 captures identifies as the single largest cause of the old gate banking
-// 12 points on a 13-minute drive. Only a feed gap (field off, boot) clears it: without folds there
-// is no thermal history to trail.
+// Same deque sliding-window min/max as Episode, fed the same decimated tF; PSRAM-backed.
+// NOT reset by the detector's eligibility barrier: it is a physical thermal-equilibrium test, and clearing it
+// on every output dip was the largest cause of a starved record book. Only a feed gap clears it.
 struct AltTempGate {
   MonoDeque maxDQ, minDQ;
   uint32_t  startMs, lastFeedMs; bool have, steady; int cap;
@@ -872,7 +781,7 @@ struct AltTempGate {
 };
 static AltTempGate altThermGate;      // FULL dwell (altThermSec) — the detector's temperature axis
 static AltTempGate altSessTempGate;   // HALF dwell — the Session plot's lighter tier
-static String altPendingSeededFrom = "";   // non-empty → this pending batch is an adopted import (provenance tag)
+static String altPendingSeededFrom = "";   // non-empty → this pending batch is a seeded curve: "import" or "reregister" (provenance tag)
 static int altFrontEmitCount = 0;        // episode points emitted (whether or not they pushed the front)
 
 // Per-axis steady-time knobs + front/eval knobs (registry-wired below; per-axis tol + floors are in
@@ -882,15 +791,8 @@ float altDutySec      = 3.0f;    // field-duty % steady time (s)
 float altVbusSec      = 3.0f;    // bus-voltage steady time (s)
 float altThermDegF    = 4.0f;    // temperature deviation bound (°F) — record only at thermal equilibrium. 0.105 A/°F at cruise; also gates the altThermSec dwell, so it is the biggest yield knob
 float altThermSec     = 20.0f;   // STEADY_TEMP_SEC — FULL-steady temp dwell (s). Feeds the surface + trend + orange ring.
-                                 // 80→40 2026-08-20: at 80 the normal warm-up ramp (~1.5-2 °F/min) ate half the 4 °F band
-                                 // and starved records for whole sessions. NVS-held — bench device needs a live set too.
-                                 // 40→20 2026-09-19: at 40 it was the second-largest sole-blocker (490 of 7,587 eligible ticks
-                                 // on the 09-18 drive) and buying nothing measurable — 40 vs 20 vs 10 moved p90 smear by under
-                                 // 0.15 points on all three captures while 40 cost 16-28% of the records. The dwell was the
-                                 // brake, not the 4 °F band: at 20 s a 5 °F/min warm-up spans 1.7 °F and the band never binds.
-                                 // What still protects a warming machine is tempF being a book axis and tSlope riding every record.
-// SESSION-steady temp dwell is DERIVED as half of altThermSec (see altSessTempDwell()) — no separate
-// knob, so the session gate auto-tracks whenever the full dwell above is changed.
+                                 // Longer dwell costs records without reducing smear; at 20 s a 5 °F/min warm-up spans 1.7 °F.
+                                 // A warming machine is still protected by tempF being a book axis and tSlope on every record.
 static inline float altSessTempDwell() { return altThermSec * 0.5f; }
 // ---- engine-hours trend knobs (spec §5) ----
 float altTrendBucketSec = 3600.0f;  // TREND_BUCKET_SEC — engine-seconds per trend bucket (production 3600 = 1 h; testing 600)
@@ -898,31 +800,22 @@ float altTrendFeedSec   = 10.0f;    // TREND_FEED_SEC — min spacing between gr
 float altTrendMinSamp   = 2.0f;     // MIN_SAMPLES — a bucket needs ≥ this many graded steady-run samples before it commits
 // Output straightness (5th criterion: the measured amps must themselves lie on a straight line —
 // directly guards what gets recorded, letting the input limits stay tight) + signal conditioning.
-// The output is allowed ANY slope: while the machine ramps smoothly up a straight speed line, its
+// The output may slope (up to the slope cap below): while the machine ramps smoothly up a straight speed line, its
 // output rides a straight line of its own, and that pair is exactly the measurement worth banking.
 float altAmpsLinePct  = 0.5f;    // output-amps rms departure from its own line, % of the window mean
-float altAmpsLineFloorA = 0.4f;  // …with this absolute floor (A), which governs below ~80 A. Registry name is
-                                 // altAmpsLineFlrA — the NVS key caps at 15 characters
-// Output SLOPE cap (2026-09-19). Smear from a moving operating point is (output ramp rate) × (residual
-// lead error), so bounding the ramp bounds the smear at its source; the speed and field straightness
-// bands only ever proxied for it. Offline replay of three 10 Hz captures (09-18 drive, 09-09 night,
-// 09-14 evening): with this in place altRpmLineRms could go 12 → 48 and the gate still banked 20/16/38%
-// MORE records while p95 smear fell 3.4→2.9 / 3.8→2.1 / 4.5→2.9 percent. Relative like the wobble limit
-// above, and for the same reason — an absolute A/s cap sized at a 20 A float would strangle a 90 A bulk.
+float altAmpsLineFloorA = 0.4f;  // …with this absolute floor (A), which governs below ~80 A; registry name altAmpsLineFlrA (15-char NVS key cap)
+// Output SLOPE cap: smear from a moving operating point is (output ramp rate) x (residual lead error), so
+// bounding the ramp bounds smear at its source. Relative with a floor: an absolute A/s cap sized at a 20 A
+// float would strangle a 90 A bulk.
 float altAmpsSlewPct  = 1.0f;    // output-line slope cap, % of the window mean per second
-float altAmpsSlewFloorA = 0.15f; // …with this absolute floor (A/s), which governs below 15 A. Registry name is
-                                 // altAmpsSlewFlrA — the NVS key caps at 15 characters
+float altAmpsSlewFloorA = 0.15f; // …with this absolute floor (A/s), which governs below 15 A; registry name altAmpsSlewFlrA (15-char NVS key cap)
 float altAmpsSec      = 3.0f;    // output-amps straightness window (s)
 float altEmaSec       = 0.5f;    // EMA time constant (s) on detector inputs RPM/duty/Vbus/amps (0 = off)
-float altLeadSec      = 0.40f;   // output lead: amps and bus volts are delayed this long relative to RPM, field
-                                 // and temperature before the window statistics. Validated on the 2026-09-08
-                                 // held-field sweeps: uncorrected, an accelerating pass reads 2-4 A high against
-                                 // a decelerating pass at the same indicated speed, and per-sample scatter about
-                                 // the truth curve is ~2.4 A; corrected, the two agree to 0.1-0.6 A at ~0.4 A
-                                 // scatter. Quantized to whole EP_FEED_DT_MS ticks, clamped to 0..10
+float altLeadSec      = 0.40f;   // output lead: amps and bus volts delayed this long relative to RPM, field and temp before
+                                 // window stats (0.4 s aligns accel/decel passes to 0.1-0.6 A). Quantized to EP_FEED_DT_MS ticks, 0..10
 float altMinRunSec    = 2.0f;    // minimum steady-run length to emit a point (s)
 float altRefRadius    = 2.0f;    // normalized nearest-support distance beyond which live % + trend report no reference
-float altSafetyMargin = 0.0f;    // amps — gate keeps only runs that strictly beat the front (no keep-bias: the cloud only prunes, so sub-front samples were pure pollution of the local eval surface)
+float altSafetyMargin = 0.0f;    // amps; 0 = keep only runs that strictly beat the front (the cloud only prunes, so sub-front samples pollute the local surface)
 float altIdwPower     = 2.0f;    // IDW power for the admission-bar/curvature IDW (display prediction is LWLR)
 float altPruneK       = 6.0f;    // cloud prune neighbor count (echoed; applied cloud-side)
 float altRidgeFrac    = 0.10f;   // LWLR ridge fraction (× slope-block trace/NAXIS) — fit stability vs slope fidelity
@@ -959,16 +852,9 @@ static AltSetting ALT_SETTINGS[] = {
 static const size_t ALT_SETTING_COUNT = sizeof(ALT_SETTINGS) / sizeof(ALT_SETTINGS[0]);
 
 // ---- performance-vs-engine-hours trend (engine-hour buckets: average + P10 output-%) ----
-// Source = FULL-steady runs only, graded against the active surface, throttled to one per
-// altTrendFeedSec (fed from altProcessEmits). A bucket spans altTrendBucketSec of engine-time
-// (production 3600 = 1 h; testing 600) and stores its samples' average + low-decile (P10) output-%
-// (from a 2%-bin histogram — the raw min made one unlucky sample define the hour's lower line; real
-// degradation drags a tenth of the hour down and the P10 with it). It
-// commits when the engine-time bucket index advances AND it holds ≥ altTrendMinSamp samples; a bucket
-// short of that many qualifying steady samples shows a gap, by design (spec §2/§5). The in-progress
-// bucket (sum/count/hist/index) PERSISTS across reboot, so a 50-min partial hour commits after only
-// 10 more minutes of the next session — the commit fires on the real engine-time rollover regardless
-// of how many reboots happen inside the bucket. NO clamp — % may exceed 100 vs a stale reference.
+// Source: FULL-steady runs graded against the active surface, one per altTrendFeedSec. P10 from a 2%-bin
+// histogram (raw min let one unlucky sample define the hour). Commits on engine-time rollover with >=
+// altTrendMinSamp samples, else a gap; partial bucket persists across reboot. NO clamp: % may exceed 100.
 static float altEngineHoursSinceBaseline() {        // engine-HOURS since Start Over (live display)
   double s = EngineRunTime_AllTime - altTrendBaselineSec;
   if (s < 0) s = 0;
@@ -1027,15 +913,11 @@ static void altTrendAdd(float perfFrac) {
   if (altBucketHist[bin] < 65535) altBucketHist[bin]++;
   altOverallPctLive = (float)(altBucket_sum / altBucket_n) * 100.0f;
   altWorstPctLive   = altBucketP10();
-  // NOTE: the partial bucket is NOT written here. It is persisted only at the ignition-off shutdown
-  // flush (altHealthSave → altPersistTrendBucket, Phase 2 after the field cuts) and on Reset. Every
-  // shutdown goes through field-off while the device is still powered, so that one write always lands —
-  // no per-tick NVS churn needed.
+  // Partial bucket is persisted only at the ignition-off flush (altHealthSave -> altPersistTrendBucket, after the
+  // field cuts) and on Reset; every shutdown passes through field-off while powered, so no per-tick NVS write.
   // (deliberately no healthy/drifting verdict here — trends are read from the plots)
 }
-// Persist the in-progress bucket to NVS (4 scalars + the P10 histogram as sparse "bin:count" pairs).
-// The committed buckets live in /alttrend.bin; this covers ONLY the partial current bucket so a
-// reboot mid-bucket keeps its accumulated samples.
+// Persist only the partial current bucket to NVS (committed buckets live in /alttrend.bin); histogram as "bin:count" pairs.
 static void altPersistTrendBucket() {
   settingWrite("altBkSum", String(altBucket_sum, 4).c_str());
   settingWrite("altBkN",   String(altBucket_n, 0).c_str());
@@ -1096,7 +978,7 @@ static void altSimTick(uint32_t nowMs) {
   float vbus = 13.6f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
   float a = 1.4f * exc * (1.0f - expf(-rpm / 1200.0f));   // rises with rpm knee + excitation
   a *= 1.0f - 0.0008f * (tF - 77.0f);                     // derate with temp
-  if (altSimLoops >= 2) altSimDeg -= 0.0006f;             // after 2 full sweeps, degrade
+  if (altSimLoops >= 2) altSimDeg -= 0.0006f * (EP_FEED_DT_MS / 1000.0f);   // after 2 full sweeps, degrade 0.0006/s (called every EP_FEED_DT_MS)
   if (altSimDeg < 0.80f) altSimDeg = 0.80f;
   a *= altSimDeg;
   a *= 1.0f + (float)random(-20, 21) / 1000.0f;          // ±2% noise
@@ -1105,15 +987,9 @@ static void altSimTick(uint32_t nowMs) {
   altSimDuty = exc * 100.0f / vbus;             // invert excitation → duty so the duty axis tracks exc
 }
 
-// Per-axis limits from the knobs, window length from the *Sec knobs. Resynced every fold so live
-// knob edits take effect immediately. The axis MODES themselves are structural and are set once in
-// altFrontInit, before Episode::init decides which axes need deque storage.
-//
-// The tolerance carried in cfg[a].tol does double duty: it is the axis's own limit (rms departure
-// for a straightness axis, max−min for a band axis) AND the tolerance the emit-time trimmed boxcar
-// range is checked against, for the axes still subject to that test (field, Vbus, temperature).
-// The output amps limit is relative with an absolute floor, so one pair works at 5 A float and
-// 150 A bulk; ampsFilt is no longer needed for it — the fit knows its own window mean.
+// Per-axis limits from the knobs, resynced every fold so live edits apply immediately. Axis MODES are set once
+// in altFrontInit, before Episode::init decides which axes need deques. cfg[a].tol is both the axis limit and
+// the emit-time trimmed-range tolerance (field, Vbus, temp).
 static void altEpisodeSyncCfg(float ampsFilt) {
   (void)ampsFilt;                                                   // the relative amps limit now scales off the fit's window mean
   altEpisode.cfg[0] = { altRpmLineRms,  altRpmSec  };   // RPM (filtered) — straightness
@@ -1145,77 +1021,47 @@ static bool altCapWarned = false;   // once per boot OR per Start Over (cleared 
 // ---- per-control-tick fold (THE canonical cadence) ----
 // ══ GATE-TUNING CAPTURE ═══════════════════════════════════════════════════════════════════════
 // Manual session logger (this block) + field sweeper (altSweep_tick, next to fieldCurve_tick).
-// Spec: Working Markdown Docs/ALT_GATE_TUNING_CAPTURE_SPEC.md. Replaces the gate-replay ring
-// (/altraw.csv + /altemits.csv), removed 2026-08-23.
-//
-// WHY IT EXISTS: the record book's admission gate keeps only runs that beat the local surface
-// estimate, so any upward bias in that surface reads as a healthy machine grading below 100%. Sizing
-// the gates needs per-axis output sensitivities, and the closed-loop operating data cannot give them:
-// the regulator holds a target by trading field against engine speed, so those two never move
-// independently and a fit on ordinary running reports "field barely matters" when the truth is "the
-// regulator was cancelling it". This logs a hand-run experiment where they DO move independently.
-//
-// 10 Hz, and 10 Hz is not a compromise: EP_FEED_DT_MS = 100, so the Episode detector already
-// decimates the ~75 Hz fold to 10 Hz before any steadiness decision — an offline replay is
-// sample-for-sample aligned with what the live gate would have done. It also clears the fixed
-// 1.5006 Hz bus disturbance (5 Hz Nyquist), which a 2 Hz log would fold straight into the band the
-// smear measurement lives in.
+// Spec: Working Markdown Docs/ALT_GATE_TUNING_CAPTURE_SPEC.md.
+// Why: closed-loop data can't give per-axis output sensitivities (the regulator trades field against speed, so
+// they never move independently); this logs a hand-run experiment where they do.
+// 10 Hz matches EP_FEED_DT_MS, so an offline replay aligns sample-for-sample with the live gate, and clears the
+// fixed 1.5006 Hz bus disturbance that a 2 Hz log would alias into the smear band.
 #define ALTLOG_DT_MS       100u    // 10 Hz — the cadence the gate itself evaluates at (EP_FEED_DT_MS)
-// 3 blocks, fixed, and deliberately not more: 192 KB is a footprint this device is known to carry, and
-// a longer window is not worth spending PSRAM nobody has measured headroom for. A capture that runs out
-// just ends — Transfer it and press Record again. Many short files cost nothing: each one carries the
-// settings that shaped it, and session id + start epoch keep a campaign in order.
+// 3 blocks, deliberately: 192 KB is a known-safe PSRAM footprint. A full capture just ends; Transfer and Record again.
 #define ALTLOG_BLOCKS      3
-#define ALTLOG_BLOCK_ROWS  3640    // rows per 64 KB block at 18 B/row (65,520 B — the 16 B remainder
-                                   // is left unused rather than splitting a row across two blocks)
+#define ALTLOG_BLOCK_ROWS  3640    // rows per 64 KB block at 18 B/row; a row never splits across blocks
 #define ALTLOG_CAP_ROWS    ((uint32_t)ALTLOG_BLOCKS * ALTLOG_BLOCK_ROWS)   // 10920 rows = 18.2 min
-                                   // (19.3 min before the per-axis gate byte widened a row 17 B → 18 B)
 #define ALTLOG_STALE_MS    300u    // fold older than this → field is off / control path not running
 
 // 18 B/row. Every axis is stored 20-100x finer than the band it gates, so quantization can never be
 // mistaken for movement. Saturating stores (altQI16/altQU16): amps clip at ±327.67 A (a 500 A
 // install running above that logs a flat line, which is visible; it does not wrap), bus volts at
-// 65.535 V (above any 48 V-class cut), temp at ±3276.7 °F. A NaN case temp stores 0 — implausible on
-// a running alternator, so the analysis treats 0 °F as "no reading" rather than as data.
+// 65.535 V (above any 48 V-class cut), temp at ±3276.7 °F. A NaN case temp stores -32768, which the
+// parser reads as "no reading" (blank) rather than as data.
 struct __attribute__((packed)) AltLogRow {
   uint16_t dtMs;      // ms since the previous row (uint16 caps an in-row gap at 65 s; longer ends the segment)
   int16_t  rpm;
   uint16_t duty;      // field % ×100
   uint16_t vbus;      // mV
   int16_t  tempF;     // °F ×10 — RAW: the health tool never filters temp (slow, quantized, noise-free)
-  int16_t  tSlope;    // case-temp rate of change, °F/min ×100 — the device's own altTempSlopeFMin
-                      // (fast-minus-slow EMA pair in the fold), NOT recomputed offline: it needs
-                      // filter history from before Record was pressed, and it is the same number the
-                      // record book stamps on every point (ex[1]), so a replay must see the same one.
-                      // Full resolution on purpose — near-zero versus a couple of °F/min is the whole
-                      // settled-vs-warming discriminator, and warm-up sessions grade ~10% low
+  int16_t  tSlope;    // case-temp rate, °F/min ×100 — the device's own altTempSlopeFMin, NOT recomputable offline
+                      // (needs pre-Record filter history; replay must see the number stamped in ex[1]). Full
+                      // resolution: near-zero vs a few °F/min is the settled-vs-warming discriminator.
   int16_t  amps;      // A ×100, EMA-filtered (altEmaSec) — the signal the detector acts on
   int16_t  ampsRaw;   // A ×100, MEAN of the fresh CH1 conversions since the previous row (see below)
   uint8_t  flags;     // b0 field on, b1 manual mode, b2 sweeper active, b3 sweep direction (1=down),
                       // b4 protection binding, b5 detector eligible, b6 detector full-steady,
                       // b7 this sweep reversed early — a control limit or Reverse now, not its ceiling
-  uint8_t  gate;      // the detector's own PER-AXIS verdict for this sample: b0 speed, b1 field, b2 bus
-                      // volts, b3 temperature, b4 output amps, b5 = a record was emitted since the last
-                      // row, b6 = the stage-9 charge-health calibration is driving the field (held-duty
-                      // speed passes — the ONE thing in a capture that can re-measure the output lead,
-                      // and nothing else in the flags byte marks it).
-                      // flags b6 is only the AND of b0..b4, so without this byte an offline replay
-                      // has to re-derive which axis blocked and can only be checked in aggregate —
-                      // 2026-09-19 that left 3.1% of rows unexplained and the blame table a reconstruction.
-                      // Zero while the fold is stale (field off): the axes hold pre-shutdown values there
-  // No segment index. A recording is deliberately FLUID — one press of Record, then whatever the
-  // operator does: a sweep, throttle movements, ordinary driving, in any order. Nothing on the device
-  // knows where one "run" ends and the next begins, and nothing needs to: these flag bits already mark
-  // every transition the analysis can split on (sweeper on/off, up leg vs down, manual vs auto, field
-  // on vs off), and dtMs marks any real gap. A counter on top of that was a second, weaker copy.
+  uint8_t  gate;      // detector's PER-AXIS verdict: b0 speed, b1 field, b2 bus volts, b3 temp, b4 output amps,
+                      // b5 record emitted since last row, b6 stage-9 charge-health calibration driving the field
+                      // (the only capture marker for output-lead re-measurement; flags b6 is just the AND of b0..b4).
+                      // b0..b4 zero while the fold is stale (field off): the axes hold pre-shutdown values there
+  // No segment index, by design: the flag bits mark every transition the analysis splits on, and dtMs marks gaps.
 };
 static_assert(sizeof(AltLogRow) == 18, "AltLogRow lost its packing — ALTLOG_BLOCK_ROWS assumes 18 B");
 
-// 192 KB as 3 × 64 KB blocks, NOT one allocation. Free PSRAM measured 848 KB (2026-08-23) and a
-// single contiguous request that size is not safe at that level: cvLog's 334 KB is one
-// heap_caps_malloc and it silently lost its boot allocation once already, serving empty files for
-// days, at a HIGHER free figure than this. Chunking removes the contiguity question entirely.
-// Allocated on Record, freed on dump-and-clear — steady-state cost is zero.
+// 192 KB as 3 x 64 KB blocks, NOT one allocation: a single contiguous PSRAM request this size is unsafe (cvLog's
+// one 334 KB malloc has silently failed at boot). Allocated on Record, freed on dump-and-clear.
 static AltLogRow *altLogBlk[ALTLOG_BLOCKS] = { nullptr, nullptr, nullptr };
 static uint32_t altLogSessionId = 0;      // millis() at Record — files from one campaign sort by it
 static uint32_t altLogStartMs = 0, altLogLastRowMs = 0;
@@ -1228,19 +1074,13 @@ static uint32_t altLogRawN = 0;
 static uint32_t altLogCh1Seen = 0;        // last ch1AtCount consumed — edge-detects a fresh conversion
 static int      altLogEmitSeen = 0;       // last altFrontEmitCount consumed — edge-detects a banked record
 static bool     altEligibleNow = false;   // detector eligibility, exported from altFold_tick for flags b5
-// Every button press is a REQUEST consumed on the control loop, never an action taken on the web
-// task: allocation, freeing and the state machine all run on the one task that also writes rows, so
-// a Discard can never free the buffer out from under a row write. Same reason the field curve is
-// request-driven. The dump lambda reads the blocks from the web task, so a release also waits for
-// any transfer in flight (with a staleness escape, since an abandoned connection may never
-// disconnect cleanly).
-// (the request flags themselves live in Xregulator.ino — the /get handlers are compiled before this file)
-static volatile bool altLogDlBusy = false;
-static volatile uint32_t altLogDlStartMs = 0;   // refreshed on every chunk the TCP stack pulls, so the
-                                                // 30 s escape fires only when the transfer truly stalls —
-                                                // a slow-but-live link must keep holding Discard back
+// Every button press is a REQUEST consumed on the control loop (the task that writes rows), so a Discard can
+// never free the buffer under a row write. Release also waits for a dump in flight (web task reads the blocks),
+// with a staleness escape for abandoned connections. Request flags live in Xregulator.ino (/get compiles first).
+static volatile int altLogDlCount = 0;          // streams holding the blocks; changed only on the web task
+static volatile uint32_t altLogDlStartMs = 0;   // refreshed per chunk, so the 30 s escape fires only on a true stall
 static inline bool altLogDlActive() {
-  return altLogDlBusy && ((uint32_t)(millis() - altLogDlStartMs) < 30000u);
+  return altLogDlCount > 0 && ((uint32_t)(millis() - altLogDlStartMs) < 30000u);
 }
 
 // A macro, not an inline function: Arduino hoists every function prototype to the top of the merged
@@ -1280,6 +1120,10 @@ static bool altLogStartRec() {
   if (altLogState == 1) { queueConsoleMessage("Gate capture: already recording"); return false; }
   if (IgnoreTemperature) {   // temp is one of the four axes AND the gate that disables the whole fold
     queueConsoleMessage("Gate capture: blocked — Ignore Temperature is on, so there is no case-temp axis to log");
+    return false;
+  }
+  if (const char *rr = rpmTestRefuseReason()) {   // engine speed is another axis, and an ignored tach stops the fold too
+    queueConsoleMessageF("Gate capture: blocked — %s", rr);
     return false;
   }
   if (altLogState != 0) {    // STOPPED or FULL, never dumped — the browser confirms before we get here
@@ -1323,17 +1167,13 @@ static void altLogService() {
   if (altLogStartReq) { altLogStartReq = false; altLogStartRec(); }
 }
 
-// Called from loop() every pass. Accumulates raw CH1 amps continuously and writes one row per
-// ALTLOG_DT_MS. Idle cost is a single compare.
+// Accumulates raw CH1 amps every loop() pass; writes one row per ALTLOG_DT_MS.
 void altLog_tick(uint32_t nowMs) {
   altLogService();
   if (altLogState != 1) return;
 
-  // ampsRaw MUST be a mean, not a point sample. CH1 delivers fresh amps roughly every 13 ms, so at
-  // 10 Hz a point sample would take one conversion in eight and alias current ripple into the one
-  // column intended for re-deriving the EMA offline — which defeats its purpose. ch1AtCount ticks
-  // once per confirmed CH1 read, so this edge-detects every fresh conversion and averages them.
-  // The other columns are the fold's EMA-filtered values, so point samples are correct for them.
+  // ampsRaw MUST be a mean of every fresh CH1 conversion (~13 ms apart, edge-detected via ch1AtCount); a 10 Hz
+  // point sample would alias current ripple. Other columns are already EMA-filtered, so point samples suit them.
   if (ch1AtCount != altLogCh1Seen) {
     altLogCh1Seen = ch1AtCount;
     if (!isnan(MeasuredAmps)) { altLogRawSum += MeasuredAmps; altLogRawN++; }
@@ -1347,10 +1187,8 @@ void altLog_tick(uint32_t nowMs) {
   uint32_t dt = nowMs - altLogLastRowMs;
   altLogLastRowMs = nowMs;
 
-  // The fold exports the EMA-filtered detector inputs at ~75 Hz but only on a normal field-on
-  // control tick. A stale fold means the field is off (or a fault path is running): log the raw
-  // live values with the field-on bit clear, so an off stretch reads as an off stretch instead of
-  // as a hole in the record.
+  // Stale fold = field off or fault path: log raw live values with the field-on bit clear, so an off stretch
+  // reads as off instead of as a hole.
   bool foldFresh = (altLastFoldMs != 0) && ((uint32_t)(nowMs - altLastFoldMs) < ALTLOG_STALE_MS);
   float rpm, duty, vbus, amps;
   if (foldFresh) {
@@ -1363,10 +1201,8 @@ void altLog_tick(uint32_t nowMs) {
   float rawAmps = (altLogRawN > 0) ? (float)(altLogRawSum / (double)altLogRawN) : amps;
   altLogRawSum = 0.0; altLogRawN = 0;
 
-  // Per-axis verdict, straight off the detector. Only meaningful while the fold is fresh — with the
-  // field off the Episode holds its pre-shutdown axis flags, and a stale verdict on an off stretch is
-  // worse than none. The emit bit edge-detects altFrontEmitCount, so it marks the row a record landed
-  // on (emits are ≥ 1 s apart and rows are 100 ms, so it can never merge two).
+  // Per-axis verdict only while the fold is fresh (field off leaves pre-shutdown flags). Emits are >= 1 s apart
+  // and rows 100 ms, so the emit bit never merges two.
   uint8_t gt = 0;
   if (foldFresh) {
     if (altEpisode.axisSteady[0])         gt |= 0x01;
@@ -1388,9 +1224,7 @@ void altLog_tick(uint32_t nowMs) {
   if (altEligibleNow)              fl |= 0x20;
   if (altSteady)                   fl |= 0x40;
   if (altSweepActive != 0 && altSweepLimitRev)
-                                   fl |= 0x80;   // this sweep turned around early — a control limit or the
-                                                 // Reverse now button, not its commanded ceiling. Gated on the
-                                                 // sweep being live so the bit describes a run, not a leftover.
+                                   fl |= 0x80;   // sweep turned around early (control limit or Reverse now), gated on a live sweep
 
 
   AltLogRow *r = ALTLOG_AT(altLogRows);
@@ -1414,9 +1248,7 @@ void altLog_tick(uint32_t nowMs) {
 }
 
 // ---- dump header (128+ B, little-endian, mirrored by parseAltLogBin() in script.js) ----
-// Dump-and-restart produces many small files instead of one large one, so each file has to carry the
-// settings that shaped it: a mid-campaign gate change would otherwise make two files silently
-// incomparable. Session id + start epoch keep them in order.
+// Each dump file carries the settings that shaped it, so a mid-campaign gate change can't make files silently incomparable.
 struct __attribute__((packed)) AltLogHdr {
   uint32_t magic;        // 'ALGL'
   uint16_t ver;
@@ -1431,12 +1263,10 @@ struct __attribute__((packed)) AltLogHdr {
   uint8_t  voltClass;
   uint8_t  endReason;    // 0 still recording, 1 Stop, 2 FULL
   uint8_t  chargeStage;
-  uint8_t  pad0[3];      // keeps the floats below 4-byte aligned (one byte was the retired segment index)
+  uint8_t  pad0[3];      // keeps the floats below 4-byte aligned
   float    startTempF, startVbus;
   float    emaSec;
-  // ver 1 only: the four max−min band widths of the stillness gate. The straightness gate replaced
-  // them, so ver 2 writes 0 here and carries its own limits in the ver-2 block below. The slots stay
-  // where they are so one parser can read both versions off fixed offsets.
+  // ver 1 only: max-min band widths, written 0 since ver 2. Slots stay so one parser reads all versions at fixed offsets.
   float    v1RpmTol, v1DutyTolPct;
   float    vbusTol, thermDegF, thermSec;
   float    v1AmpsTolPct, v1AmpsFloorA;
@@ -1454,19 +1284,17 @@ static_assert(sizeof(AltLogHdr) == 172, "AltLogHdr size changed — parseAltLogB
 // /altlog.bin — header then rows, streamed. Refused while recording: a growing row count under a
 // chunked reader would hand out a file whose header disagrees with its body.
 void altLogBinSend(AsyncWebServerRequest *request) {
-  // Claim the transfer interlock BEFORE reading any of the state it protects: altLogService only
-  // holds a Discard back while altLogDlActive(), so a guard that ran first could pass on a live
-  // buffer and then have the control loop free it under the streaming lambda. Every early return
-  // below releases it by hand — onDisconnect is not registered yet at that point.
-  altLogDlStartMs = millis();   // before the flag: altLogDlActive() reads both, and only when busy
-  altLogDlBusy = true;
+  // Claim the transfer interlock BEFORE reading the state it protects, or the control loop could free the
+  // buffer under the streaming lambda. Early returns release it by hand (onDisconnect isn't registered yet).
+  altLogDlStartMs = millis();   // before the count: altLogDlActive() reads both, and only when busy
+  altLogDlCount++;
   if (altLogState == 1) {
-    altLogDlBusy = false;
+    altLogDlCount--;
     request->send(409, "text/plain", "recording — press Stop first\n");
     return;
   }
   if (altLogState == 0 || altLogRows == 0 || !altLogBlk[0]) {
-    altLogDlBusy = false;
+    altLogDlCount--;
     request->send(200, "application/octet-stream", "");
     return;
   }
@@ -1483,7 +1311,10 @@ void altLogBinSend(AsyncWebServerRequest *request) {
   memset(&st, 0, sizeof(st));
   st.total = altLogRows;
 
-  request->onDisconnect([]() { altLogDlBusy = false; });   // Safari tears connections down abruptly
+  // Each stream releases its own hold exactly once (done or disconnect); a shared flag lets overlapping downloads release each other's.
+  auto held = std::make_shared<bool>(true);
+  auto release = [held]() { if (*held) { *held = false; if (altLogDlCount > 0) altLogDlCount--; } };
+  request->onDisconnect([release]() { release(); });   // Safari tears connections down abruptly
 
   AltLogHdr h;
   memset(&h, 0, sizeof(h));
@@ -1520,12 +1351,12 @@ void altLogBinSend(AsyncWebServerRequest *request) {
 
   AsyncWebServerResponse *response = request->beginChunkedResponse(
     "application/octet-stream",
-    [st](uint8_t *buf, size_t maxLen, size_t) mutable -> size_t {
+    [st, release](uint8_t *buf, size_t maxLen, size_t) mutable -> size_t {
       if (st.done) return 0;
       altLogDlStartMs = millis();   // progress = alive; see altLogDlActive()
       // If the 30 s escape did lapse during a stall and a Clear freed the blocks, end the stream
       // instead of reading a null block (all three are freed together).
-      if (!altLogBlk[0]) { st.done = true; altLogDlBusy = false; return 0; }
+      if (!altLogBlk[0]) { st.done = true; release(); return 0; }
       size_t written = 0;
       while (written < maxLen) {
         if (st.hdrPos < (int)sizeof(AltLogHdr)) {
@@ -1536,7 +1367,7 @@ void altLogBinSend(AsyncWebServerRequest *request) {
           continue;
         }
         if (st.rowPos >= st.rowLen) {
-          if (st.row >= st.total) { st.done = true; altLogDlBusy = false; return written; }
+          if (st.row >= st.total) { st.done = true; release(); return written; }
           memcpy(st.rowBuf, ALTLOG_AT(st.row), sizeof(AltLogRow));
           st.rowLen = (int)sizeof(AltLogRow);
           st.rowPos = 0;
@@ -1553,18 +1384,13 @@ void altLogBinSend(AsyncWebServerRequest *request) {
   request->send(response);
 }
 
-// Live: called from the pidLog hook (~75 Hz). Bench-sim: called at 1 Hz from altHealth_tick.
-// Reads the final control state, EMA-filters the detector inputs, feeds the Episode detector, and on a
-// steady-run emit builds the surface point and STASHES it into altEmitQ — the O(count) work (front
-// gate, push-if-best, trend feed) all happens at 1 Hz in altProcessEmits/altHealth_tick, never in this
-// ~75 Hz tick. The off/fault/shutdown paths early-return before the live pidLog hook, so field-off
-// cases exclude themselves with no mode check.
+// Live: called from the pidLog hook (~75 Hz); bench-sim: at EP_FEED_DT_MS from altHealth_tick. EMA-filters
+// the detector inputs, feeds Episode, and only STASHES emits into altEmitQ; O(count) work runs at 1 Hz in
+// altProcessEmits. Off/fault/shutdown paths return before the pidLog hook, so no mode check is needed.
 void altFold_tick(uint32_t nowMs) {
   if (!altFrontBuf || !altEpRing) return;
 
-  // IgnoreTemperature → the ENTIRE alt-health system is disabled: no live, no points, no trend.
-  // (altStatusCode is owned by the 1 Hz altHealth_tick, which reports this as 3.) IgnoreRPM the same:
-  // engine speed is one of the surface axes (§4.8).
+  // IgnoreTemperature or IgnoreRPM disables ALL of alt-health (both are surface axes, §4.8); altHealth_tick reports status 3.
   if (IgnoreTemperature || IgnoreRPM) { altLiveValid = false; altSteady = false; altSessSteady = false; return; }
 
   float rpm, tF, vbus, amps, duty;
@@ -1576,11 +1402,9 @@ void altFold_tick(uint32_t nowMs) {
     tF = TempToUse; duty = dutyCycle; rpm = RPM;
   }
 
-  // Detector-input EMA (altEmaSec): strips inner-loop duty dither, RPM jitter, and current ripple
-  // so the steadiness bands can be sized purely for real operating-point movement (= transient
-  // rejection). Temp (DS18B20) is DELIBERATELY raw — slow, quantized, noise-free (user, 2026-08-20),
-  // so filtering it adds only lag. The control loops never see these. A long gap between folds
-  // (field off, boot) reseeds the filters from raw so stale state can't bridge it.
+  // Detector-input EMA (altEmaSec) strips duty dither, RPM jitter and current ripple so bands size for real
+  // operating-point movement; control loops never see it. Temp stays raw (DS18B20: slow, quantized, noise-free).
+  // A long fold gap (field off, boot) reseeds from raw.
   static float fRpm = 0, fDuty = 0, fVbus = 0, fAmps = 0;
   static uint32_t lastFoldMs = 0;
   static bool fInit = false;
@@ -1597,15 +1421,12 @@ void altFold_tick(uint32_t nowMs) {
   // Bench-sim injects its own consistent excitation; live derives it from the filtered drive.
   float exc = (altSimMode >= 0.5f) ? altSimExc : altExcitation(fDuty, fVbus, tF);
 
-  // Export the filtered live point for the 1 Hz evaluator (altHealth_tick); the fold itself keeps
-  // only the EMA filters + the episode detector feed.
+  // Exported for the 1 Hz evaluator (altHealth_tick).
   altLive_rpm = fRpm; altLive_exc = exc; altLive_amps = fAmps;
   altLive_vbus = fVbus; altLive_tF = tF; altLive_duty = fDuty;
 
-  // Case-temp slope (F/min), fast-minus-slow EMA pair: for a ramp input emaFast-emaSlow settles at
-  // rate*(tauSlow-tauFast). Thermal-transient tag for the 2026-08-21 lag finding (case sensor lags
-  // windings; warm-up sessions grade ~10% low, and phase offsets at like tags track thermal state):
-  // rides the AltLive SSE (session dots latch it) and every emitted record's ex[1].
+  // Case-temp slope (°F/min) from a fast-minus-slow EMA pair (settles at rate*(tauSlow-tauFast)). The case sensor
+  // lags the windings, so this tags thermal transients: rides AltLive SSE and every record's ex[1].
   {
     static float tsF = 0, tsS = 0; static uint32_t tsLast = 0;
     if (!isnan(tF)) {
@@ -1634,15 +1455,11 @@ void altFold_tick(uint32_t nowMs) {
     return;
   }
 
-  // Feed the Episode detector (steadiness/averaging axes {RPM, duty %, Vbus, tempF} + the
-  // output-amps band) — all filtered, including the admission floors, so a single noise dip
-  // can't act as a barrier that wipes the look-back ring mid-run.
+  // Everything fed filtered, including the admission floors, so one noise dip can't act as a barrier mid-run.
   altEpisodeSyncCfg(fAmps);
   bool eligible = (!isnan(fVbus) && fVbus >= ALT_MIN_BATT_V * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f) && fAmps >= altMinAmps && fDuty >= altMinDuty && fRpm >= 0);
   altEligibleNow = eligible;                                                    // exported for the gate-capture log's flags byte
-  // Both temperature gates are fed on every fold, eligible or not: they are trailing thermal
-  // windows, not run timers (see AltTempGate). The full-dwell verdict is the detector's temperature
-  // axis; the half-dwell one is the Session plot's lighter tier.
+  // Both temp gates are fed every fold, eligible or not: trailing thermal windows, not run timers (see AltTempGate).
   altThermGate.feed(tF, nowMs, altThermDegF, altThermSec);
   altSessTempGate.feed(tF, nowMs, altThermDegF, altSessTempDwell());
   altEpisode.extOk[3] = altThermGate.steady;
@@ -1653,19 +1470,14 @@ void altFold_tick(uint32_t nowMs) {
   FrontPoint<ALT_NAXIS> ep;
   bool emitted = altEpisode.feed(eligible, s, &ep);
   altSteady = (altEpisode.count > 0);                              // FULL steady (temp held altThermSec) → ring + surface + trend
-  // SESSION steady = all axes EXCEPT temperature qualifying on their ~3 s windows (Episode per-axis flags for
-  // {RPM,duty,Vbus} + the output amps axis) AND temperature steady for the HALF dwell (altSessTempGate). Lets a
-  // Session-plot dot appear before the full record-book dwell is reached. Those per-axis flags now carry the
-  // straightness verdicts, so the plot and the record book judge motion by the same rule.
+  // SESSION steady = all non-temp axes qualifying plus temp steady for HALF the dwell, so a Session-plot dot can
+  // appear before the record-book dwell; it uses the same per-axis verdicts as the record book.
   altSessSteady = eligible
                   && altEpisode.axisSteady[0] && altEpisode.axisSteady[1] && altEpisode.axisSteady[2]
                   && altEpisode.axisSteady[ALT_NAXIS] && altSessTempGate.steady;
   if (!emitted) return;
 
-  // Full steady run completed → build the surface point (excitation derived from run averages) and STASH
-  // it UNCONDITIONALLY (even when paused) so the trend still sees it; altProcessEmits grades it against the
-  // active surface (→ trend) and admits it into My History only when learning is active. Solves run there
-  // at 1 Hz, never in this ~75 Hz control tick.
+  // Stash UNCONDITIONALLY (even paused) so the trend still sees it; altProcessEmits grades and admits at 1 Hz.
   altFrontEmitCount++;
   FrontPoint<ALT_NAXIS> sp;
   sp.x[0] = ep.x[0];                                    // RPM
@@ -1678,19 +1490,14 @@ void altFold_tick(uint32_t nowMs) {
   if (altEmitQCount < ALT_EMIT_QUEUE) altEmitQ[altEmitQCount++].sp = sp;
 }
 
-// Learning is armed only on a COMMISSIONED device whose Charge Health Calibration (commissioning stage 9)
-// is done. That stage measures altLeadSec, the admission gate's one commissioning-derived input, and the
-// wizard's own runs (held-field sweeps, usually on a cold machine) must never set best-ever records —
-// a record only ratchets up, so an early high point caps its cell until Start Over. A re-commission
-// drops commissionState to 1, so learning pauses for the run and resumes on Done with history kept.
-// "Mark done manually" on stage 9 arms it with the default lead: the operator's call.
+// Learning arms only when COMMISSIONED with stage 9 (Charge Health Calibration) done: that stage measures
+// altLeadSec, and wizard runs must never set records (records only ratchet up). Re-commission pauses learning
+// with history kept; "Mark done manually" on stage 9 arms it with the default lead.
 #define ALT_STATUS_WAIT_CX  4   // altStatusCode: not commissioned
 #define ALT_STATUS_WAIT_CHC 5   // altStatusCode: commissioned, stage 9 (Charge Health Calibration) not done
 static bool altLearnArmed() { return commissionState == 2 && (commissionDoneMask & (1u << 9)) != 0; }
 
-// Drain the emit queue (1 Hz, from altHealth_tick; same task as the fold — no lock). At most 2
-// emits per tick so a single loop() pass never blocks more than a couple ms; emits arrive at least
-// one steady-run apart, so the queue drains faster than it fills.
+// Drain the emit queue (1 Hz, same task as the fold, no lock); at most 2 per tick to bound the loop() pass.
 static void altProcessEmits() {
   if (!altLearnArmed()) { altEmitQCount = 0; return; }   // not armed: no record, no trend sample, no upload
   int n = (altEmitQCount < 2) ? altEmitQCount : 2;
@@ -1698,11 +1505,8 @@ static void altProcessEmits() {
   for (int k = 0; k < n; k++) {
     FrontPoint<ALT_NAXIS> &sp = altEmitQ[k].sp;
 
-    // (1) TREND FEED — every FULL-steady run is graded against the ACTIVE surface (My History or Uploaded)
-    // and fed to the engine-hours trend, throttled to one sample per altTrendFeedSec. This is the trend's
-    // ONLY source: the spec wants the trend built purely from
-    // full steady runs. MEASURED runs only (session plot: green dot + orange ring) — Estimated grades
-    // lean on interpolation and would blur the trend; No-reference/risky-fit runs feed nothing.
+    // (1) TREND FEED: the trend's ONLY source. FULL-steady MEASURED runs graded against the ACTIVE surface, one per
+    // altTrendFeedSec; Estimated grades lean on interpolation and would blur it.
     {
       static uint32_t lastTrendFeedMs = 0;
       float pred = 0;
@@ -1715,8 +1519,7 @@ static void altProcessEmits() {
       }
     }
 
-    // (2) SURFACE ADMISSION — into My History only, and only while learning is active. The Uploaded surface
-    // is never modified by learning. Admission grades against My History (the learn target), not the active
+    // (2) SURFACE ADMISSION into My History only, while learning. Grades against My History, not the active
     // surface, so a borrowed reference can't gate what you record.
     if (!learn) continue;
     float yref = 0, bar = 0;
@@ -1731,8 +1534,7 @@ static void altProcessEmits() {
       }
       continue;
     }
-    // No console message on accept — the dashboard front-point counters show growth; logging every
-    // accept spammed the console with same-cell improvements at steady state.
+    // No console message on accept: it spams on same-cell improvements at steady state.
     if (altFront2.add(sp)) {                                              // optimistic local front (cloud re-prunes)
       // Sim-folded points stay local (My History) — never queued, so synthetic data can't reach the cloud front
       if (altSimMode < 0.5f && altPending && altPendingCount < ALT_PENDING_CAP) altPending[altPendingCount++] = sp;
@@ -1780,10 +1582,8 @@ static float alf_hiField()   { return altHiFieldAlert ? 1.0f : 0.0f; }    // hig
 static float alf_sim()       { return (altSimMode >= 0.5f) ? 1.0f : 0.0f; }
 static float alf_gAmps()     { return altLive_gAmps; }                    // graded boxcar-average amps (the % numerator)
 static float alf_tSlope()    { return altTempSlopeFMin; }                 // case-temp slope (F/min) — thermal-transient tag
-// Gate-tuning capture state. It rides AltLive rather than a CSV channel: AltLive is the alt-health
-// module's own 1 Hz frame, the recorder UI lives on the same page, and the frame is schema-zipped
-// (/altschema) so appending a field cannot desynchronize a stale-open dashboard the way a CSV
-// index map can. A 1 Hz countdown is also all a seconds-remaining readout needs.
+// Gate-capture state rides AltLive, not a CSV channel: the frame is schema-zipped (/altschema), so appending a
+// field can't desync a stale-open dashboard the way a CSV index map can.
 static float alf_logState()  { return (float)altLogState; }               // 0 idle, 1 recording, 2 stopped, 3 full
 static float alf_logRows()   { return (float)altLogRows; }
 static float alf_logSecLeft(){ return altLogSecLeft; }                    // capacity remaining at the fixed 10 Hz rate
@@ -1830,16 +1630,67 @@ float altWorstPct()    { return altWorstPctLive; }
 int   altStatus()      { return (int)altStatusCode; }
 int   altHaveFront()   { return (altFront2.count > 0) ? 1 : 0; }   // CSV2: have a usable best-ever front
 int   altFrontCount()  { return altFront2.count; }                 // CSV2: front support-point count
-void  altClearPending() { altPendingCount = 0; altPendingSeededFrom = ""; }   // cloud accepted the batch → drop pending + tag
+// Curves owed to this unit's own cloud record (NK_recSeedOwed): an import (bits 1/2) or a new record after re-registration
+// (4/8). The cloud rebuilds each curve from this unit's rows each sync, so until it holds the curve, each boot re-queues
+// the whole curve as one seeded batch labeled "import" or "reregister".
+void recSeedOwedSet(uint8_t bits, bool on) {
+  uint8_t cur = settingExists(NK_recSeedOwed) ? (uint8_t)strtoul(settingRead(NK_recSeedOwed).c_str(), nullptr, 16) : 0;
+  uint8_t nv = on ? (cur | bits) : (cur & ~bits);
+  if (nv == cur && (nv || !settingExists(NK_recSeedOwed))) return;
+  if (!nv) { settingRemove(NK_recSeedOwed); return; }
+  char b[4];
+  snprintf(b, sizeof(b), "%x", (unsigned)nv);
+  settingWrite(NK_recSeedOwed, b);
+}
+static bool recSeedOwed(uint8_t bit) {
+  return settingExists(NK_recSeedOwed) && ((uint8_t)strtoul(settingRead(NK_recSeedOwed).c_str(), nullptr, 16) & bit);
+}
+// A new cloud record (re-registration after the old one was deleted) holds none of this unit's points, so its first
+// sync reply would collapse the local curves. Core 0 owes both curves to it (bits 4/8 survive a reboot) and asks
+// Core 1 to seed the pending queues now; the boot path seeds from the same bits.
+static volatile uint8_t regSeedRequest = 0;
+void recSeedAfterNewRegistration() {
+  recSeedOwedSet(4 | 8, true);
+  __atomic_fetch_or(&regSeedRequest, (uint8_t)(4 | 8), __ATOMIC_ACQ_REL);
+}
+// Core 0, on a successful alt-health upload; takes body (freed here unless the hand-off keeps it). False without
+// PSRAM for the hand-off: the batch then stays pending and is re-sent, which the cloud absorbs (resent points are no-ops there).
+bool altHandSync(bool ingest, char *body) {
+  if (altSentSeeded) recSeedOwedSet(1 | 4, false);   // the seeded curve reached the cloud
+  FrontSyncHandoff *h = FrontSyncHandoff::make(ingest, body);
+  if (!h) return false;
+  FrontSyncHandoff *old = __atomic_exchange_n(&altSyncHandoff, h, __ATOMIC_ACQ_REL);
+  FrontSyncHandoff::drop(old);
+  return true;
+}
+// Core 1: drop only the points that batch carried (pending kept growing while it was in flight), replace My
+// History with the cloud's pruned front, then re-add the still-unsent points, which the cloud has not seen.
+static void altApplySync() {
+  FrontSyncHandoff *h = __atomic_exchange_n(&altSyncHandoff, (FrontSyncHandoff *)nullptr, __ATOMIC_ACQ_REL);
+  if (!h) return;
+  int d = (altSentCount < altPendingCount) ? altSentCount : altPendingCount;
+  if (d > 0) {
+    memmove(altPending, altPending + d, (size_t)(altPendingCount - d) * sizeof(FrontPoint<ALT_NAXIS>));
+    altPendingCount -= d;
+    altPendingSeededFrom = "";   // a batch built before a seed carried none of it: the label stays for the seeded batch
+  }
+  altSentCount = 0;
+  if (h->ingest && !rpmAxisWipePending && !altCloudWipePending) {
+    if (altIngestFrontCsv(h->body)) {
+      for (int i = 0; i < altPendingCount; i++) altFront2.add(altPending[i]);
+      queueConsoleMessage("Alternator health: front updated from cloud");
+    } else {
+      queueConsoleMessage("Alternator health uploaded (no front in response)");
+    }
+  }
+  FrontSyncHandoff::drop(h);
+  altHealthSave();   // caller runs this only with the field physically cut (a LittleFS write stalls the flash cache)
+}
 
 // ---- front CSV (the artifact): BEFRONT1,<sys>,<naxis>,<source>,<units…> then x0..xN,y,nSamp,tEmit ----
-// Serves /altcurve.csv (dashboard), the cloud sync-back, and Save/Load to file (spec §2.2/§8).
-// Streamed row-by-row (beginChunkedResponse, same idiom as /alttrend.csv) so a front grown to its
-// 4096-point cap can no longer build a single ~150 KB std::String on the internal heap — that
-// fragmented the heap TLS needs ~32–40 KB contiguous from, a genuine fill-driven failure mode.
-// Only one row (line[]) is ever materialized; CONSTANT internal RAM at any count. total/source are
-// snapshotted so a concurrent Core-1 front edit can't run past the snapshot — an in-place same-cell
-// improvement just shows a fresher value for one row (harmless for a diagnostic CSV).
+// Serves /altcurve.csv, the cloud sync-back, and Save/Load (spec §2.2/§8). Streamed row-by-row: a ~150 KB
+// String at the 4096-point cap fragments the internal heap TLS needs 32-40 KB contiguous from. total/source are
+// snapshotted; a concurrent Core-1 same-cell edit just shows a fresher value for one row.
 void altCurveCsvSend(AsyncWebServerRequest *request) {
   struct St { int total, source, idx; bool done; char line[96]; int len, pos; };
   St st; st.total = altFrontBuf ? altFront2.count : 0; st.source = altFront2.source;
@@ -1904,10 +1755,8 @@ void altFrontRecordsCsvSend(AsyncWebServerRequest *request) {
   response->addHeader("Cache-Control", "no-cache");
   request->send(response);
 }
-// Session series for the dashboard's session-% plot (/altsess.csv). Streamed oldest-first, constant
-// RAM. The header carries the device's current millis so the client can map tMs onto its own wall
-// clock. A push can land mid-stream and overwrite the oldest slot we have not reached yet, so tMs is
-// self-describing and the client drops any row whose tMs goes backwards.
+// /altsess.csv, streamed oldest-first. Header carries device millis so the client maps tMs to wall clock; a push
+// can overwrite the oldest unread slot mid-stream, so the client drops any row whose tMs goes backwards.
 void altSessCsvSend(AsyncWebServerRequest *request) {
   struct St { uint32_t total, base, idx, nowMs; bool done; char line[144]; int len, pos; };
   St st;
@@ -1953,10 +1802,8 @@ void altSessCsvSend(AsyncWebServerRequest *request) {
   response->addHeader("Cache-Control", "no-cache");
   request->send(response);
 }
-// Full alt-health state dump for offline / AI debugging (spec §4.5 "Download Debug CSV"). Streamed
-// row-by-row (constant internal RAM at any front size). Self-describing "section,key,v0…" rows, in
-// phases: PARAM (every registry knob), LIVE/GATE/BUCKET/SESSION scalars, then MYHIST + UPLOAD front
-// points and the committed TREND buckets. Served at /altdebug.csv.
+// Full alt-health state dump (/altdebug.csv, spec §4.5), streamed. Self-describing "section,key,v0…" rows:
+// PARAM, LIVE/GATE/BUCKET/SESSION scalars, MYHIST + UPLOAD points, TREND buckets.
 void altDebugCsvSend(AsyncWebServerRequest *request) {
   struct St { int phase, idx, myN, upN, trN; bool done; char line[176]; int len, pos; };
   St st; st.phase = 0; st.idx = 0; st.done = false; st.len = 0; st.pos = 0;
@@ -2088,10 +1935,9 @@ void altDebugCsvSend(AsyncWebServerRequest *request) {
   request->send(response);
 }
 
-// Parse a BEFRONT1 CSV (the cloud's pruned front, or a saved/uploaded file) into a TARGET surface +
-// its backing buffer, replacing it. toUploaded=false → My History (cloud sync-back); true → Uploaded
-// surface (browser Load CSV). Uses a bool (not a FrontStore<> reference) so Arduino's auto-prototype
-// generator — which can't parse template types in signatures — leaves it alone.
+// Parse a BEFRONT1 CSV into a TARGET surface, replacing it: false -> My History (cloud sync-back), true ->
+// Uploaded (browser Load CSV). A bool, not a FrontStore<> reference, because Arduino's auto-prototype
+// generator can't parse template types in signatures.
 static bool altIngestFrontCsvInto(char *body, bool toUploaded) {
   FrontStore<ALT_NAXIS> &fs  = toUploaded ? altFrontUp : altFront2;
   FrontPoint<ALT_NAXIS> *buf = toUploaded ? altFrontUpBuf : altFrontBuf;
@@ -2124,13 +1970,14 @@ static bool altIngestFrontCsvInto(char *body, bool toUploaded) {
     char *eol = strchr(line, '\n');
     if (eol) *eol = '\0';
     float x0, x1, x2, x3, y; unsigned ns = 0, te = 0;
-    if (*line && sscanf(line, "%f,%f,%f,%f,%f,%u,%u", &x0, &x1, &x2, &x3, &y, &ns, &te) >= 5) {
-      FrontPoint<ALT_NAXIS> q;
-      q.x[0] = x0; q.x[1] = x1; q.x[2] = x2; q.x[3] = x3; q.y = y;
-      q.ex[0] = 0; q.ex[1] = 0;   // raw extras live in the cloud table, not the front CSV
-      q.nSamp = (uint32_t)ns; q.tEmit = (uint32_t)te;
-      buf[newCount++] = q;
-    }
+    // The block ends at the first line that is not a row, so a later bare-numeric section is never read as points
+    // (same rule as altFrontBlockOnly in script.js).
+    if (sscanf(line, "%f,%f,%f,%f,%f,%u,%u", &x0, &x1, &x2, &x3, &y, &ns, &te) < 5) break;
+    FrontPoint<ALT_NAXIS> q;
+    q.x[0] = x0; q.x[1] = x1; q.x[2] = x2; q.x[3] = x3; q.y = y;
+    q.ex[0] = 0; q.ex[1] = 0;   // raw extras live in the cloud table, not the front CSV
+    q.nSamp = (uint32_t)ns; q.tEmit = (uint32_t)te;
+    buf[newCount++] = q;
     if (!eol) break;
     line = eol + 1;
   }
@@ -2198,9 +2045,12 @@ static void altTrendLoad() {
 // ---- persistence (field-off-gated by caller) — front + trend survive reboot (cloud authoritative) ----
 void altHealthSave() {
   if (dbgRingsSynthetic) return;   // fillmax/clearmax: RAM rings are synthetic/empty — keep the real flash blobs
+  if (importRebootPending) return; // a records import just wrote this record's keys; the reboot loads them
   if (!altFrontBuf || hardwarePresent != 1) return;
   uint32_t uw = ((uint32_t)altFront2.source << 8) | (uint32_t)ALT_NAXIS;   // stash source + naxis
   writePsramBlob("/altfront.bin", ALT_FRONT_MAGIC, ALT_VER, uw, altFrontBuf, sizeof(FrontPoint<ALT_NAXIS>), ALT_FRONT_CAP, 0, altFront2.count);
+  // Unsynced points too: else a reboot loses them and the next sync-back erases them from My History.
+  if (altPending) writePsramBlob("/altpend.bin", ALT_PEND_MAGIC, ALT_VER, 0, altPending, sizeof(FrontPoint<ALT_NAXIS>), ALT_PENDING_CAP, 0, altPendingCount);
   if (altHaveUpload && altFrontUpBuf)                                       // Uploaded surface (separate file)
     writePsramBlob("/altfrontup.bin", ALT_FRONT_MAGIC, ALT_VER, (uint32_t)ALT_NAXIS, altFrontUpBuf, sizeof(FrontPoint<ALT_NAXIS>), ALT_FRONT_CAP, 0, altFrontUp.count);
   altTrendPersist();                                                       // append-only committed-bucket log
@@ -2214,6 +2064,8 @@ static void altLoad() {
     altFront2.count = (int)readPsramBlob("/altfront.bin", ALT_FRONT_MAGIC, ALT_VER, altFrontBuf, sizeof(FrontPoint<ALT_NAXIS>), ALT_FRONT_CAP, &uw, false);
     altFront2.source = (uint8_t)((uw >> 8) & 0xFF);
   }
+  if (altPending && fsExists("/altpend.bin"))
+    altPendingCount = (int)readPsramBlob("/altpend.bin", ALT_PEND_MAGIC, ALT_VER, altPending, sizeof(FrontPoint<ALT_NAXIS>), ALT_PENDING_CAP, nullptr, false);
   if (altFrontUpBuf && fsExists("/altfrontup.bin")) {                       // restore the Uploaded surface if present
     uint32_t uw2 = 0;
     altFrontUp.count = (int)readPsramBlob("/altfrontup.bin", ALT_FRONT_MAGIC, ALT_VER, altFrontUpBuf, sizeof(FrontPoint<ALT_NAXIS>), ALT_FRONT_CAP, &uw2, false);
@@ -2227,11 +2079,9 @@ static void altLoad() {
   if (altRefSource == 1 && !altHaveUpload) altRefSource = 0;               // no uploaded surface → fall back to My History
 }
 
-// Ingest a BEFRONT1 front UPLOADED from the browser (Load CSV) into the UPLOADED surface — resident
-// ALONGSIDE My History, never overwriting it (spec §4). Switches the active Reference Source to Uploaded
-// and defaults Pause per the user's choice: fixed=true → Pause ON (just grade against the borrowed curve);
-// fixed=false → keep learning My History while graded against Uploaded. My History (and its cloud upload
-// pending) is untouched. Persists immediately so the upload survives reboot. Mutates the body buffer.
+// Load CSV from the browser into the UPLOADED surface, alongside My History (never overwriting it, spec §4).
+// Switches Reference Source to Uploaded; fixed=true -> Pause ON, false -> keep learning My History. Persists
+// immediately. Mutates body.
 bool altUploadFrontCsv(char *body, bool fixed) {
   if (!altFrontUpBuf || !body) return false;
   bool ok = altIngestFrontCsvInto(body, true);
@@ -2245,29 +2095,30 @@ bool altUploadFrontCsv(char *body, bool fixed) {
   settingWrite(NK_altRefSrc, "1");
   queueConsoleMessageF("AltFront: UPLOADED %d pts to Uploaded surface (%s); My History kept",
                        altFrontUp.count, fixed ? "Pause ON" : "still learning My History");
-  // Immediate persist even field-on: user-initiated import, the brief flash-write control
-  // stall is accepted for user actions (owner decision 2026-08-14).
+  // Persist even field-on: the brief flash-write control stall is accepted for user actions.
   altHealthSave();
   return true;
 }
 
 // ---- cloud upload: batch of accepted episode points since the last upload (raw out; pruned front in) ----
 // Schema: {device_uid,token,ts,sys,pruneK,idwPower, pts:[[rpm,exc,vbus,tF,amps,nSamp], ...]}.
-// Pending cleared on a successful response (executeUploadAltHealth → altIngestFrontCsv).
+// The batch's prefix leaves pending on a successful response (executeUploadAltHealth → altHandSync → altApplySync on Core 1).
 bool buildAltHealthPayload(char *buf, size_t size) {
   if (!altPending || altPendingCount == 0 || authToken.isEmpty()) return false;
+  if (altSyncHandoff) return false;   // last sync not applied yet: its sent prefix is still in the queue
   time_t now_ts = time(NULL);
   int off = snprintf(buf, size,
     "{\"device_uid\":\"%s\",\"token\":\"%s\",\"ts\":\"%s\",\"sys\":\"ALT\",\"pruneK\":%d,\"idwPower\":%.2f,\"sysV\":%u,",
     device_id_hex, authToken.c_str(), formatTimestamp(now_ts), (int)altPruneK, altIdwPower, (unsigned)SYSTEM_VOLTAGE_CLASS);
   if (off < 0 || (size_t)off >= size) return false;
-  if (altPendingSeededFrom.length()) {   // adopted import: tag the whole batch as borrowed provenance
+  if (altPendingSeededFrom.length()) {   // seeded curve: tag the whole batch with its provenance label
     off += snprintf(buf + off, size - off, "\"seededFrom\":\"%s\",", altPendingSeededFrom.c_str());
     if (off < 0 || (size_t)off >= size) return false;
   }
   off += snprintf(buf + off, size - off, "\"pts\":[");
   bool first = true;
-  for (int k = 0; k < altPendingCount; k++) {
+  int k = 0;
+  for (; k < altPendingCount; k++) {
     if (size - (size_t)off < 80) break;   // margin for the closer
     FrontPoint<ALT_NAXIS> &p = altPending[k];
     off += snprintf(buf + off, size - off, "%s[%.0f,%.3f,%.2f,%.1f,%.2f,%u,%.1f]",
@@ -2276,7 +2127,22 @@ bool buildAltHealthPayload(char *buf, size_t size) {
   }
   off += snprintf(buf + off, size - off, "]}");
   if (off < 0 || (size_t)off >= size - 1) return false;
+  altSentCount = k;
+  altSentSeeded = (altPendingSeededFrom.length() > 0);
   return true;
+}
+// The upload block carries this batch out and the cloud's front back (executeUploadAltHealth reads the reply into it), so
+// it is sized for the larger: the JSON at the builder's 80 B per-point margin, or the reply at its widest row. The reply is
+// the cloud's pruned front, close to My History plus this batch; a bigger one grows the block up to ALT_UPLOAD_BUF_SIZE.
+// 0 = nothing to send (no allocation).
+#define ALT_CSV_ROW_MAX 56   // widest update-alt-health front row: rpm, exc 3dp, V 2dp, F 1dp, amps 2dp, nSamp, 0
+size_t altSyncBufBytes() {
+  if (!altPending || altPendingCount == 0 || authToken.isEmpty()) return 0;
+  size_t out = 512 + authToken.length() + altPendingSeededFrom.length() + ((size_t)altPendingCount + 2) * 80;
+  size_t rows = (size_t)altFront2.count + (size_t)altPendingCount;
+  size_t back = 128 + (rows + rows / 8 + 32) * ALT_CSV_ROW_MAX;
+  size_t n = (out > back) ? out : back;
+  return (n < (size_t)ALT_UPLOAD_BUF_SIZE) ? n : (size_t)ALT_UPLOAD_BUF_SIZE;
 }
 
 // ---- lifecycle ----
@@ -2287,13 +2153,21 @@ void initAlternatorHealth() {
   altTrendCount = 0; altCurEngHour = -1;
   altFrontInit();          // ps_malloc front + episode ring + pending; init the engine instance
   altLoad();               // restore front + trend + baseline (after the buffers exist)
+  if (recSeedOwed(1 | 4)) {    // an imported (1) or pre-registration (4) My History the cloud does not hold yet
+    if (altPending && altFront2.count > 0) {
+      altPendingCount = 0;
+      for (int i = 0; i < altFront2.count && altPendingCount < ALT_PENDING_CAP; i++) altPending[altPendingCount++] = altFrontBuf[i];
+      altPendingSeededFrom = recSeedOwed(1) ? "import" : "reregister";
+    } else if (altPending) {
+      recSeedOwedSet(1 | 4, false);
+    }
+  }
   queueConsoleMessageF("AltHealth init: My History %d pts, Uploaded %d pts, source=%s, %d trend pts",
                        altFront2.count, altFrontUp.count, altRefSource ? "Uploaded" : "MyHistory", altTrendCount);
 }
 void resetAlternatorHealth() {
-  // The Start Over confirm says "after replacing the alternator, regulator, or belt" — exactly the
-  // events that invalidate learned hunt pockets, so the damper map goes with the health record.
-  // Called here, before this function takes the fs lock itself (huntMapClearAll takes it too).
+  // Start Over follows alternator/regulator/belt replacement, which also invalidates learned hunt pockets.
+  // Runs before the fs lock is taken below (huntMapClearAll takes it too).
   huntMapClearAll("alternator replaced / health record reset");
   altHealthRecordClear("Reset / Start Over");
 }
@@ -2301,7 +2175,7 @@ void resetAlternatorHealth() {
 void altHealthRecordClear(const char *why) {
   if (!altFrontBuf) return;
   altFront2.count = 0; altFront2.source = 0;
-  altPendingCount = 0; altFrontEmitCount = 0; altEmitQCount = 0; altCapWarned = false;
+  altPendingCount = 0; altSentCount = 0; altFrontEmitCount = 0; altEmitQCount = 0; altCapWarned = false;
   altEpisode.clearRun(); altEpisode.ringHead = 0; altEpisode.ringCount = 0;
   altTrendCount = 0; altTrendFlushed = 0; altTrendRewrite = true;   // /alttrend.bin removed below → fresh log
   altBucket_sum = 0; altBucket_n = 0; altBucket_worst = 0; altCurEngHour = -1;
@@ -2317,19 +2191,19 @@ void altHealthRecordClear(const char *why) {
   fsTakeLock();
   LittleFS.remove("/altfront.bin");
   LittleFS.remove("/alttrend.bin");
+  LittleFS.remove("/altpend.bin");
   fsReleaseLock();
   settingWrite(NK_altbaseSec, String(altTrendBaselineSec, 1).c_str());
   settingWrite(NK_altRefSrc, "0");
-  // Cloud half: the cloud keeps every raw point and rebuilds the front from all of them, so without this
-  // the next sync-back would hand the cleared record book straight back. Persisted so a reset while
-  // offline still lands; executeResetAltHealthCloud retries until 200 and clears it.
+  // Cloud half: the cloud rebuilds the front from every raw point, so without this the next sync-back restores
+  // the cleared record. Persisted so an offline reset still lands; executeResetAltHealthCloud retries until 200.
   altCloudWipePending = true;
   settingWrite(NK_AltWipePend, "1");
   queueConsoleMessageF("AltHealth: full reset (%s) — My History + trend + session cleared, baseline restarted", why);
 }
 
 // Excitation is divided by fieldWindApplied, so points recorded under another winding sit on another scale.
-// altHealthWindV is the winding the record was built on; seeded after InitSystemSettings, never imported.
+// altHealthWindV is the winding the record was built on; seeded after InitSystemSettings, imported only with the record.
 void altHealthWindingInit() {
   const int w = settingExists(NK_altWindV) ? settingRead(NK_altWindV).toInt() : 0;
   altHealthWindV = (w == 12 || w == 24 || w == 36 || w == 48) ? (uint8_t)w : fieldWindApplied;
@@ -2339,6 +2213,7 @@ void altHealthWindingInit() {
 // resistance check, the class clamp, and an import (at the next boot).
 void altHealthWindingCheck() {
   if (altHealthWindV == 0 || altHealthWindV == fieldWindApplied) return;
+  if (importRebootPending) return;   // a records import just wrote the record's keys; the boot after it judges the winding
   char why[48];
   snprintf(why, sizeof(why), "field winding values %uV -> %uV", (unsigned)altHealthWindV, (unsigned)fieldWindApplied);
   altHealthWindV = fieldWindApplied;
@@ -2352,7 +2227,7 @@ void altFrontInit() {
   altFrontBuf   = (FrontPoint<ALT_NAXIS> *)ps_malloc((size_t)ALT_FRONT_CAP   * sizeof(FrontPoint<ALT_NAXIS>));
   altFrontUpBuf = (FrontPoint<ALT_NAXIS> *)ps_malloc((size_t)ALT_FRONT_CAP   * sizeof(FrontPoint<ALT_NAXIS>));
   altPending  = (FrontPoint<ALT_NAXIS> *)ps_malloc((size_t)ALT_PENDING_CAP * sizeof(FrontPoint<ALT_NAXIS>));
-  altSessRing = (AltSessPt *)ps_malloc((size_t)ALT_SESS_RING_N * sizeof(AltSessPt));   // session series (~32 KB)
+  altSessRing = (AltSessPt *)ps_malloc((size_t)ALT_SESS_RING_N * sizeof(AltSessPt));   // session series (~30 KB)
   if (altSessRing) memset(altSessRing, 0, (size_t)ALT_SESS_RING_N * sizeof(AltSessPt));
   else queueConsoleMessage("AltHealth: session-series ps_malloc failed — /altsess.csv empty, plots stay browser-only");
   if (!altEpRing || !altFrontBuf || !altFrontUpBuf || !altPending) { queueConsoleMessage("ERROR: AltFront ps_malloc failed"); return; }
@@ -2361,12 +2236,9 @@ void altFrontInit() {
   memset(altFrontUpBuf, 0, (size_t)ALT_FRONT_CAP   * sizeof(FrontPoint<ALT_NAXIS>));
   memset(altPending,  0, (size_t)ALT_PENDING_CAP * sizeof(FrontPoint<ALT_NAXIS>));
   altPendingCount = 0;
-  // Axis modes are structural, so they are set BEFORE init(): it allocates deque storage only for
-  // the axes still judged by a band. RPM / field / output amps ask for straightness; temperature's
-  // verdict comes from altThermGate, whose window has to outlive the eligibility barrier. RPM and
-  // output amps are also exempt from the emit-time trimmed-range re-test — a max−min test there
-  // would re-impose stillness on exactly the two axes this gate stopped demanding it from (offline
-  // replay of THEDRIVE, 2026-09-08: 26 points with those clauses in place, 209 without).
+  // Axis modes are structural: set BEFORE init(), which allocates deques only for band axes. Temperature's
+  // verdict comes from altThermGate (its window must outlive the eligibility barrier). RPM and output amps
+  // skip the emit-time trimmed-range test, which would re-impose stillness (26 vs 209 points on THEDRIVE replay).
   altEpisode.gateMode[0] = EP_STRAIGHT;  altEpisode.fit[0] = &altFitRpm;
   altEpisode.gateMode[1] = EP_STRAIGHT;  altEpisode.fit[1] = &altFitDuty;
   altEpisode.gateMode[2] = EP_BAND;      altEpisode.lead[2] = &altLeadVbus;
@@ -2386,19 +2258,14 @@ void altFrontInit() {
   altSessTempGate.init(2600);   // session-temp (half-dwell) gate, same headroom
   altFront2.init(altFrontBuf, ALT_FRONT_CAP);
   altFrontUp.init(altFrontUpBuf, ALT_FRONT_CAP);
-  // axisScale ≈ the span of each axis that moves output a comparable amount (rationale + rebalance
-  // history: ALT_HEALTH_LWLR_ENGINE_SPEC.md). MUST match AXIS_SCALE in the update-alt-health edge fn
-  // — the Vbus scale is class-aware there via the payload's sysV field (excitation needs no scaling:
-  // altExcitation() reports 12 V-winding-equivalent field volts, so its range is the same on any bank
-  // and winding).
+  // axisScale ~ the span of each axis that moves output a comparable amount (ALT_HEALTH_LWLR_ENGINE_SPEC.md).
+  // MUST match AXIS_SCALE in the update-alt-health edge fn (Vbus class-aware there via payload sysV;
+  // excitation is 12 V-winding-equivalent so it needs no scaling).
   altFront2.axisScale[0] = 25.0f;   // RPM
-  altFront2.axisScale[1] = 0.10f;   // excitation (temp-normalized field volts). 2026-08-21 sensitivity study:
-                                    // the old 0.2 cell spanned ~2.3% field ≈ ~5% output at measured g≈2 —
-                                    // coarser than the 2.5% amps steadiness band — so records within one cell
-                                    // differed by commanded field alone. Halved.
+  altFront2.axisScale[1] = 0.10f;   // excitation (temp-normalized field volts); 0.2 cells were coarser than the amps
+                                    // band, so in-cell records differed by commanded field alone
   altFront2.axisScale[2] = 0.1f;    // Vbus at 12V — class-corrected by altApplyClassScales() once SYSTEM_VOLTAGE_CLASS is loaded
-  altFront2.axisScale[3] = 10.0f;   // tempF. Same study: ≤0.32%/F apparent slope → a 5F cell stays ≤1.6% output,
-                                    // inside the amps band; opened from 5.0 for 2x faster coverage per temp span.
+  altFront2.axisScale[3] = 10.0f;   // tempF; <=0.32%/F apparent slope keeps 5F (half a cell) <=1.6% output, inside the amps band
   for (int a = 0; a < ALT_NAXIS; a++) altFrontUp.axisScale[a] = altFront2.axisScale[a];   // same metric for the borrowed surface
   queueConsoleMessageF("AltFront init: cap %d pts, ring %d, %.1fKB PSRAM",
     ALT_FRONT_CAP, ALT_EP_RING_CAP,
@@ -2406,19 +2273,17 @@ void altFrontInit() {
             (size_t)(ALT_FRONT_CAP + ALT_PENDING_CAP) * sizeof(FrontPoint<ALT_NAXIS>)) / 1024.0f);
 }
 
-// Vbus cell size per-cell-equivalent across bank classes (0.4V @48V ≡ 0.1V @12V). Separate from
-// altFrontInit because that runs BEFORE InitSystemSettings loads SYSTEM_VOLTAGE_CLASS; also re-run on a
-// live class change (applyNominalVoltageChange). Scales are interpretation-only — stored points keep
-// raw coordinates. The update-alt-health edge fn mirrors this via the upload payload's sysV field.
+// Vbus cell size per-cell-equivalent across classes (0.4V @48V = 0.1V @12V). Separate from altFrontInit, which
+// runs BEFORE InitSystemSettings loads SYSTEM_VOLTAGE_CLASS; also re-run on a live class change. Interpretation
+// only (stored points keep raw coords); the update-alt-health edge fn mirrors it via payload sysV.
 void altApplyClassScales() {
   altFront2.axisScale[2] = 0.1f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
   altFrontUp.axisScale[2] = altFront2.axisScale[2];
 }
 
-// One entry per ALT_SESS_DT_MS while the alternator is live, graded or not — an ungraded entry
-// (state 2) is the dashboard's grey gap. Nothing is pushed while the field is down, so an overnight
-// stop is a time jump in the series rather than thousands of gap rows evicting the real data.
-// Cost: one 28-byte PSRAM store every 5 s inside the existing 1 Hz evaluator — never in the fold.
+// One entry per ALT_SESS_DT_MS while the alternator is live, graded or not (state 2 = the dashboard's grey gap).
+// Nothing is pushed while the field is down, so an overnight stop is a time jump, not gap rows evicting real data.
+// Cost: one 21-byte PSRAM store every 5 s inside the existing 1 Hz evaluator — never in the fold.
 static void altSessSeriesPush(uint32_t nowMs, bool graded) {
   if (!altSessRing) return;
   if (altSessRingLastMs && (uint32_t)(nowMs - altSessRingLastMs) < ALT_SESS_DT_MS) return;
@@ -2439,30 +2304,52 @@ static void altSessSeriesPush(uint32_t nowMs, bool graded) {
   if (altSessRingCount < ALT_SESS_RING_N) altSessRingCount++;
 }
 
-// ---- 1 Hz tick (NOT the fold) — THE evaluator/classifier cadence, plus live telemetry + settings
-//      echo. In bench-sim it also advances the simulator and folds at 1 Hz; live, the fold runs in
-//      the ~75 Hz pidLog hook (altFold_tick is called from there). ----
+// ---- 1 Hz tick (NOT the fold): evaluator/classifier, live telemetry, settings echo. In bench-sim it also
+//      advances the simulator and folds at EP_FEED_DT_MS; live, the fold runs in the ~75 Hz pidLog hook. ----
 void altHealth_tick(uint32_t nowMs) {
   static uint32_t lastMs = 0;
   if (!altFrontBuf) return;
+  // A finished cloud sync (heavy: front parse + re-adds + flash write) — one heavy op per pass, and only with
+  // the field physically cut (gpio4, not the duty-derived fieldActiveStatus, which reads off in a duty-0 CV hold).
+  if (altSyncHandoff && !gHeavyRanThisPass && fieldCutSettled()) {
+    gHeavyRanThisPass = true;
+    altApplySync();
+    return;
+  }
+  if ((regSeedRequest & 4) && !gHeavyRanThisPass && fieldCutSettled()) {
+    gHeavyRanThisPass = true;
+    __atomic_fetch_and(&regSeedRequest, (uint8_t)~4, __ATOMIC_ACQ_REL);
+    if (altPending && altFront2.count > 0) {
+      altPendingCount = 0;
+      for (int i = 0; i < altFront2.count && altPendingCount < ALT_PENDING_CAP; i++) altPending[altPendingCount++] = altFrontBuf[i];
+      altSentCount = 0;   // a batch already in flight carried none of these
+      altPendingSeededFrom = "reregister";
+    } else {
+      recSeedOwedSet(4, false);
+    }
+    return;
+  }
+  // Bench simulator: advance + fold at the Episode feed cadence (at 1 Hz every feed would trip the 5x feed-gap barrier).
+  if (altSimMode >= 0.5f) {
+    static uint32_t lastSimMs = 0;
+    if (nowMs - lastSimMs >= EP_FEED_DT_MS) {
+      lastSimMs = nowMs;
+      altSimTick(nowMs);
+      altFold_tick(nowMs);
+    }
+  }
   if (nowMs - lastMs < 1000) return;
   if (gHeavyRanThisPass) return;      // one-heavy-per-pass gate; defer (lastMs unchanged → still due next pass)
   gHeavyRanThisPass = true;
   lastMs = nowMs;
-  if (altSimMode >= 0.5f) {           // bench simulator: advance synthetic point + fold at 1 Hz
-    altSimTick(nowMs);
-    altFold_tick(nowMs);
-  }
   altProcessEmits();                  // grade + admit queued steady runs FIRST (front fresh for the live classify)
   altStatusCode = (IgnoreTemperature || IgnoreRPM) ? 3 : altLearnArmed() ? 0 : (commissionState == 2 ? ALT_STATUS_WAIT_CHC : ALT_STATUS_WAIT_CX);
   // 1 Hz evaluator + OUTPUT-BLIND state classifier. A stale fold (field off) → nothing to grade.
   bool foldFresh = (altLastFoldMs != 0) && ((uint32_t)(nowMs - altLastFoldMs) < 3000u);
   if (!foldFresh) altLiveValid = false;
   if (foldFresh && altLiveValid) {
-    // Grade the SAME statistic the records store: the episode's trailing-boxcar averages (coords AND
-    // amps). A half-second snapshot divided by a best-ever boxcar reads ~95% on a healthy machine
-    // (middle-of-wiggle ÷ top-of-wiggle); boxcar-vs-boxcar reads ~100. Ring empty (just became
-    // eligible / output below the admission floor) → fall back to the fast EMA point.
+    // Grade the SAME statistic the records store (trailing-boxcar averages): a fast snapshot vs a best-ever boxcar
+    // reads ~95% on a healthy machine. Empty ring -> fall back to the fast EMA point.
     float surf[ALT_NAXIS] = { altLive_rpm, altLive_exc, altLive_vbus, altLive_tF };
     altLive_gAmps = altLive_amps;
     if (altEpisode.ringCount > 0) {
@@ -2501,10 +2388,9 @@ void altHealth_tick(uint32_t nowMs) {
   // unlearned territory where the gauge says "learning"). Self-clears when either condition lifts.
   {
     static uint32_t hiFieldSinceMs = 0;
-    // altHiFieldPct reads as % of the alternator's field ceiling (altFieldCeiling: the lower of Max Field %
-    // and the Max Field Volts term), not absolute duty — absolute 80% is unreachable on 24/36/48V banks with a
-    // 12 V winding, where the ceiling is ~50/33/25%, deadening the alert. Never the board-derated ccDutyCeiling(): a hot
-    // regulator holding the field down must not read as a weak alternator.
+    // altHiFieldPct is % of altFieldCeiling (lower of Max Field % and the Max Field Volts term), not absolute duty:
+    // 80% absolute is unreachable on 24/36/48V banks with a 12 V winding. Never ccDutyCeiling(): a hot regulator
+    // holding the field down must not read as a weak alternator.
     bool cond = foldFresh && altLiveValid
                 && altLive_duty >= altHiFieldPct * (altFieldCeiling() / 100.0f) && altLive_amps <= altLowOutAmps;
     if (!cond) {
@@ -2524,15 +2410,13 @@ void altHealth_tick(uint32_t nowMs) {
 }
 
 
-// ALTERNATOR HEALTH — GUI-adjustable settings (registry-driven)
-// One float registry → one /get handler loop + one boot-load loop +
-// one "AltSettings" SSE echo. (ALT_SETTINGS[] is defined up with the param
-// declarations so altDebugCsvSend can iterate it.) Avoids fragile CSV3 plumbing.
+// ALTERNATOR HEALTH — GUI-adjustable settings (registry-driven): one /get handler loop, one boot-load loop,
+// one "AltSettings" SSE echo. ALT_SETTINGS[] is defined with the params so altDebugCsvSend can iterate it.
 void altSettingsLoad() {
-  // Three knobs are class-dependent 12V-value defaults, and this loader runs BEFORE InitSystemSettings
+  // Four knobs are class-dependent 12V-value defaults, and this loader runs BEFORE InitSystemSettings
   // resolves SYSTEM_VOLTAGE_CLASS (NVS else vessel-JSON mirror). Their first creation is DEFERRED to
   // altSeedClassKnobs() right after it; existing keys still load verbatim here. The knobs have no
-  // consumer until the runtime fold (altEpisodeSyncCfg), so the gap is safe.
+  // consumer until the runtime fold (altFold_tick, altEpisodeSyncCfg), so the gap is safe.
   for (size_t i = 0; i < ALT_SETTING_COUNT; i++) {
     char key[16];
     snprintf(key, sizeof(key), "%s", ALT_SETTINGS[i].name);  // NVS key = registry name (15-char cap)
@@ -2565,10 +2449,8 @@ bool altSettingsHandle(AsyncWebServerRequest *request) {
       handled = true;
     }
   }
-  // Action (not a float knob): Reference Source selector — My History (0) | Uploaded File (1).
-  // INDEPENDENT of Pause (altPaused is its own registry knob, handled above). Per spec §4.3, selecting
-  // Uploaded defaults Pause = ON (the user may then flip Continue); switching back to My History leaves
-  // Pause untouched. Selecting Uploaded with no uploaded surface present is ignored.
+  // Reference Source selector: My History (0) | Uploaded File (1), independent of Pause. Switching INTO Uploaded
+  // defaults Pause ON (spec §4.3); back to My History leaves Pause; Uploaded with none resident is ignored.
   if (request->hasParam("altSource")) {
     int src = request->getParam("altSource")->value().toInt();
     uint8_t prevRefSource = altRefSource;
@@ -2613,19 +2495,19 @@ String altSchemaJson() {
 
 
 
-// BOAT PERFORMANCE — Best-Ever Front engine instances (sail 3-D + motor 3-D). Mirrors the
-// alternator module. Folds on a fast internal tick (~10 Hz, from boatPerf_tick). Sail axes
-// {AWS, AWA, sea-state}; motor axes {RPM, headwind = AWS·cosAWA, sea-state}. Best-ever output =
-// the user-selected STW or SOG. Generic engine (Episode/FrontStore): top of Xregulator.ino.
+// BOAT PERFORMANCE — Best-Ever Front instances (sail 3-D + motor 3-D), mirroring the alternator module; folds at
+// ~10 Hz from boatPerf_tick. Sail axes {AWS, AWA, sea-state}; motor {RPM, headwind = AWS·cosAWA, sea-state};
+// output = user-selected STW or SOG. Generic engine (Episode/FrontStore): top of this file.
 #define PERF_VER         3u
 #define PERF_SAILF_MAGIC 0x50534652u  // 'PSFR' sail front blob
 #define PERF_MOTF_MAGIC  0x504D4652u  // 'PMFR' motor front blob
+#define PERF_PEND_MAGIC  0x5050444Eu  // 'PPDN' unsynced cloud-pending points (sail / motor files)
+#define PERF_PENDA_MAGIC 0x50504441u  // 'PPDA' their admitted flags, same count
 #define PERF_NAXIS       3
 #define PERF_FRONT_CAP   4096     // sparse support points (PSRAM); sized to be unreachable even for fast hulls AP-mode/no-prune (see ALT_HEALTH_LWLR_ENGINE_SPEC.md)
 #define PERF_EP_RING_CAP 2048    // Episode trailing-boxcar buffer (PSRAM); only ~EP_AVG_WIN_MS of decimated samples are live (steadiness windows are in the per-axis deques)
-#define PERF_PENDING_CAP 4096     // = front cap (PSRAM). Covers weeks offline because non-admitted raw
-                                  // points are per-cell throttled at queue time (PerfPendingQ::push);
-                                  // admitted best-ever points always get a slot.
+#define PERF_PENDING_CAP 4096     // = front cap (PSRAM); covers weeks offline because non-admitted raw points are
+                                  // per-cell throttled (PerfPendingQ::push) and admitted ones always get a slot
 
 static Episode<PERF_NAXIS>    sailEpisode,  motorEpisode;
 static FrontStore<PERF_NAXIS> sailFront,    motorFront;
@@ -2635,7 +2517,10 @@ static FrontPoint<PERF_NAXIS> *sailPending = nullptr,  *motorPending = nullptr;
 static int sailPendingCount = 0, motorPendingCount = 0;
 static uint8_t *sailPendingAdm = nullptr, *motorPendingAdm = nullptr;   // 1 = admitted into the local front (never evicted/dropped)
 static bool perfPendingOverflowWarned = false;   // one-shot until the next successful cloud sync
-static String perfPendingSeededFrom = "";   // non-empty → this pending batch is an adopted import (provenance tag)
+static int perfSentSail = 0, perfSentMotor = 0;   // pending prefixes the last built upload carried (Core 1 only)
+static volatile bool perfSentSeeded = false;      // that upload was the seeded batch, import or reregister (read by Core 0)
+static uint32_t perfLearnSerial = 0;              // bumps on every emitted episode; the periodic save watches it
+static String perfPendingSeededFrom = "";   // non-empty → this pending batch is a seeded curve: "import" or "reregister" (provenance tag)
 static bool sailCapWarned = false, motorCapWarned = false;   // once per boot OR per Clear All (cleared in resetBoatPerformance)
 
 // Steady-time + sea-state-window + headwind + front/eval + cloud-prune knobs (registry-wired below;
@@ -2648,7 +2533,7 @@ float perfSeaWinSec = 20.0f; // rolling window the pitch-std NUMBER is computed 
 float perfRpmSec = 3.0f;     // motoring RPM steady time (s)
 float perfHwTol  = 2.0f;     // headwind deviation band (kt)
 float perfHwSec  = 3.0f;     // headwind steady time (s)
-float perfSafetyMargin = 0.0f;  // kt — gate keeps only runs that strictly beat the front (no keep-bias: cloud gets raw episodes regardless, so sub-front samples only dragged down the local eval surface)
+float perfSafetyMargin = 0.0f;  // kt; 0 = keep only runs that strictly beat the front (sub-front samples only drag down the local surface)
 float perfIdwPower     = 2.0f;  // IDW power for the admission-bar/curvature IDW (display prediction is LWLR)
 float perfPruneK       = 6.0f;  // cloud prune neighbor count (echoed; applied cloud-side)
 // Evaluator/classifier knobs (mirror the alternator's altRefRadius/altRidgeFrac/altRiskThresh):
@@ -2661,21 +2546,33 @@ float perfCoveragePct()      { return sailFrontBuf  ? (100.0f * (float)sailFront
 float perfMotorCoveragePct() { return motorFrontBuf ? (100.0f * (float)motorFront.count / (float)PERF_FRONT_CAP) : 0.0f; }
 int   perfSailCount()  { return sailFront.count; }
 int   perfMotorCount() { return motorFront.count; }
-void  perfClearPending() { sailPendingCount = 0; motorPendingCount = 0; perfPendingSeededFrom = ""; perfPendingOverflowWarned = false; }   // cloud accepted the batch + tag
+// Core 0, on a successful boat-perf upload; same contract as altHandSync.
+bool perfHandSync(bool ingest, char *body) {
+  if (perfSentSeeded) recSeedOwedSet(2 | 8, false);   // the seeded curve reached the cloud
+  FrontSyncHandoff *h = FrontSyncHandoff::make(ingest, body);
+  if (!h) return false;
+  FrontSyncHandoff *old = __atomic_exchange_n(&perfSyncHandoff, h, __ATOMIC_ACQ_REL);
+  FrontSyncHandoff::drop(old);
+  return true;
+}
+// Both fronts as one pending batch, every point admitted, labeled "import" (re-registration relabels it "reregister");
+// the cloud stores them as this unit's own rows with that provenance.
+static void perfSeedPendingFromFronts() {
+  sailPendingCount = motorPendingCount = 0;
+  for (int i = 0; i < sailFront.count  && sailPendingCount  < PERF_PENDING_CAP; i++) { if (sailPendingAdm)  sailPendingAdm[sailPendingCount]   = 1; sailPending[sailPendingCount++]   = sailFrontBuf[i]; }
+  for (int i = 0; i < motorFront.count && motorPendingCount < PERF_PENDING_CAP; i++) { if (motorPendingAdm) motorPendingAdm[motorPendingCount] = 1; motorPending[motorPendingCount++] = motorFrontBuf[i]; }
+  perfPendingSeededFrom = "import";
+}
 
-// Pending-queue admission (policy 2026-08-14). ADMITTED points (FrontStore::add returned true — they
-// opened or beat a local best-ever cell) always queue: on overflow they evict the oldest non-admitted
-// raw point, so the "front is built locally, cloud only prunes" invariant survives any offline
-// stretch. Non-admitted raw points are per-cell rate limited (same half-axisScale cell as
-// FrontStore::add dedupes in) so PERF_PENDING_CAP genuinely covers weeks, and drop with a one-shot
-// warning when the queue is full. Template so Arduino's auto-prototype generator (which can't parse
-// template types in signatures) leaves it alone.
+// Pending-queue admission. ADMITTED points (opened or beat a local cell) always queue, evicting the oldest
+// non-admitted raw point on overflow, so "front built locally, cloud only prunes" survives any offline stretch.
+// Non-admitted raw points are per-cell rate limited and drop with a one-shot warning when full.
 #define PERF_RAW_CELL_THROTTLE_MS 600000u   // one non-admitted raw push per conditions-cell per 10 min
 // Struct wrapper (not a free function): Arduino's auto-prototype generator emits a broken prototype
 // for any free function with a template type in its signature; struct members are left alone.
 struct PerfPendingQ {
   template <int N>
-  static void push(FrontPoint<N> *q, uint8_t *adm, int &n, const FrontPoint<N> &p,
+  static void push(FrontPoint<N> *q, uint8_t *adm, int &n, int &sent, const FrontPoint<N> &p,
                    bool admitted, const float axisScale[N], uint32_t nowMs) {
     if (!q || !adm) return;
   if (!admitted) {
@@ -2700,6 +2597,7 @@ struct PerfPendingQ {
   }
   for (int i = 0; i < PERF_PENDING_CAP; i++) {
     if (!adm[i]) {   // evict the oldest non-admitted raw point
+      if (i < sent) sent--;   // it was in the in-flight batch: that batch's prefix is one shorter now
       memmove(&q[i], &q[i + 1], (size_t)(PERF_PENDING_CAP - 1 - i) * sizeof(FrontPoint<N>));
       memmove(&adm[i], &adm[i + 1], (size_t)(PERF_PENDING_CAP - 1 - i));
       q[PERF_PENDING_CAP - 1] = p; adm[PERF_PENDING_CAP - 1] = 1;
@@ -2741,20 +2639,10 @@ static float perfSeaState(uint32_t nowMs) {
   return (var > 0) ? (float)sqrt(var) : 0.0f;
 }
 
-// FIXME (sail/motor steady-state — dedicated rework needed): the timescales
-// here are TOTALLY INADEQUATE for boat-speed/polar work and must be redone in a focused session.
-//  - Dwells (AWS/AWA/RPM/headwind 3 s, sea 5 s) are far too short: a displacement hull takes tens of
-//    seconds to minutes to settle to its polar speed after conditions change, so a 3 s "steady" window
-//    records the boat mid-acceleration, not an equilibrium point. These need to be MINUTES.
-//  - Averaging is wrong: this detector emits a short ~2 s boxcar (EP_AVG_WIN_MS, shared with alt where
-//    it's correct). Boat speed is surgy (waves), so a polar point needs a MINUTES-scale average over
-//    several wave cycles to capture sustained speed, not a single surf peak. Make avgWin per-instance.
-//  - Acceptance model is too brittle: a steady interval should be ACCEPTED on its average behaviour,
-//    not excluded outright because of a brief excursion. The sliding-window engine helps (an excursion
-//    ages out instead of zeroing the dwell), but the accept/emit policy still needs to be rethought
-//    around long-window averages rather than instantaneous in-band/out-of-band gating.
-//  - Cascade when fixed: minutes-scale dwells also need PERF_MAXDWELL (the deque caps) raised to match.
-// Alt-health is correct as-is (fast, well-filtered, short windows); this note is sail/motor ONLY.
+// FIXME (sail/motor steady-state, needs a dedicated rework; alt-health is correct as-is): dwells (3-5 s) must be
+// MINUTES (a displacement hull takes that long to settle); the ~2 s boxcar must be minutes over several wave
+// cycles (set sail/motor avgWinMs); accept on long-window averages, not instantaneous in/out-of-band gating;
+// then raise PERF_MAXDWELL (deque caps) to match.
 // Per-axis tol from the deviation-bound knobs, steady time from the *Sec knobs. Resynced each fold.
 static void perfEpisodeSyncCfg() {
   sailEpisode.cfg[0]  = { perfWsTol,  perfWsSec  };   // AWS
@@ -2766,11 +2654,9 @@ static void perfEpisodeSyncCfg() {
 }
 
 // ---- per-tick fold (fast internal cadence, ~10 Hz from boatPerf_tick) ----
-// Snapshots the latest axis values, updates the live %, feeds the SAIL or MOTOR Episode (the other
-// is fed an ineligible break so a run can't span a sail↔motor transition), and on a steady-run emit
-// derives the surface point, gates against the front, pushes if best-ever, and queues it for upload.
-// Wind axes are APPARENT; AWA is stored RAW (both-sided) to the front/pending — folded to |AWA| only
-// for eval + the device front when perfFoldSymmetric. Speed = STW or SOG per perfSpeedSrc.
+// Feeds the SAIL or MOTOR Episode (the other gets an ineligible break so a run can't span a sail<->motor change).
+// Wind axes are APPARENT; AWA is stored RAW (both-sided) to pending/cloud, folded to |AWA| only for eval + the
+// device front when perfFoldSymmetric.
 // Bench simulator state (perfSim* — written ONLY by perfSimTick, never the real NMEA/IMU globals).
 static float perfSimTws = 0, perfSimTwa = 0, perfSimStw = 0, perfSimSog = 0;
 static float perfSimHdg = 90, perfSimPitch = 0, perfSimRpm = 0;
@@ -2851,7 +2737,7 @@ void perfFold_tick(uint32_t nowMs) {
       } else sailAdmitted = sailFront.add(sp);   // no console message on accept (counter on the dashboard)
     }
     // Queue AFTER the admit gate so admitted points carry their never-drop flag (sim never uploads).
-    if (perfSimMode < 0.5f) PerfPendingQ::push(sailPending, sailPendingAdm, sailPendingCount, raw, sailAdmitted, sailFront.axisScale, nowMs);
+    if (perfSimMode < 0.5f) { PerfPendingQ::push(sailPending, sailPendingAdm, sailPendingCount, perfSentSail, raw, sailAdmitted, sailFront.axisScale, nowMs); perfLearnSerial++; }
   }
 
   bool motorLearn = (motorFront.source != 1);
@@ -2872,7 +2758,7 @@ void perfFold_tick(uint32_t nowMs) {
       } else motorAdmitted = motorFront.add(ep);   // no console message on accept (counter on the dashboard)
     }
     // Queue AFTER the admit gate so admitted points carry their never-drop flag (sim never uploads).
-    if (perfSimMode < 0.5f) PerfPendingQ::push(motorPending, motorPendingAdm, motorPendingCount, ep, motorAdmitted, motorFront.axisScale, nowMs);
+    if (perfSimMode < 0.5f) { PerfPendingQ::push(motorPending, motorPendingAdm, motorPendingCount, perfSentMotor, ep, motorAdmitted, motorFront.axisScale, nowMs); perfLearnSerial++; }
   }
 
   // steady-run indicator: the active mode's Episode is currently accumulating eligible samples
@@ -2885,13 +2771,8 @@ void perfFold_tick(uint32_t nowMs) {
   }
 }
 // ---- NMEA SIMULATOR (bench testing, no boat) ----
-// Writes ONLY to dedicated perfSim* vars (never the real NMEA/RPM/IMU globals) so it can't
-// touch the control loop or other subsystems. Models a realistic sailboat: each "leg" picks a
-// random operating point (weighted toward how a boat actually sails), holds it steady within the
-// episode bands long enough to bank ONE record, then jumps to a new one — so the best-ever front
-// fills ORGANICALLY over time (sparse → dense → converged) instead of re-tracing a fixed grid.
-// Speed = hull × wind-response(TWS) × polar-shape(TWA) × sea derate × slow fouling × noise.
-// (perfSim* vars declared above the fold.)
+// Writes ONLY perfSim* vars (declared above the fold), never the real NMEA/RPM/IMU globals. Each leg draws a
+// weighted random operating point and holds it long enough to bank one record, so the front fills organically.
 #define PERF_SIM_HOLD_MS 14000u    // hold each leg > max steady time so one run forms + emits
 
 // Normalized best-speed fraction vs TWA (0..180, 10° steps): zero in the no-go zone, peak on the
@@ -2955,10 +2836,8 @@ static void perfSimTick(uint32_t nowMs) {
   perfSimStw = v; perfSimSog = v;                            // no current; SOG == STW
 }
 
-// ---- live telemetry registry (PILOT: single source of truth for payload + schema) ----
-// One {name, getter} table builds BOTH the PerfLive payload AND the /perfschema field list,
-// so the firmware↔dashboard field contract cannot desync (no hand-kept parallel JS array,
-// no format-string/count drift). Adding a field = add ONE row. All values sent as floats.
+// ---- live telemetry registry (single source for the PerfLive payload + /perfschema) ----
+// Adding a field = add ONE row; the dashboard zips names from the schema, so they can't desync. All floats.
 struct PerfLiveField { const char *name; float (*get)(); };
 static float plf_valid()    { return (float)perfLiveValid; }
 static float plf_ws()       { return perfLive_ws; }
@@ -3041,7 +2920,7 @@ static void perfSendMotorLive() {
   sseSend(buf, "MotorLive");
 }
 
-// ---- persistence (Phase-0 scaffold; field-off-gated by caller) ----
+// ---- persistence (field-off-gated by caller) ----
 void boatPerfSave() {
   if (dbgRingsSynthetic) return;   // fillmax/clearmax: RAM rings are synthetic/empty — keep the real flash blobs
   if (!sailFrontBuf || hardwarePresent != 1) return;
@@ -3049,20 +2928,32 @@ void boatPerfSave() {
   uint32_t muw = ((uint32_t)motorFront.source << 8) | (uint32_t)PERF_NAXIS;
   writePsramBlob("/sailfront.bin",  PERF_SAILF_MAGIC, PERF_VER, suw, sailFrontBuf,  sizeof(FrontPoint<PERF_NAXIS>), PERF_FRONT_CAP, 0, sailFront.count);
   writePsramBlob("/motorfront.bin", PERF_MOTF_MAGIC,  PERF_VER, muw, motorFrontBuf, sizeof(FrontPoint<PERF_NAXIS>), PERF_FRONT_CAP, 0, motorFront.count);
+  // Unsynced points too: else a reboot loses them and the next sync-back erases them from the fronts.
+  if (sailPending && sailPendingAdm && motorPending && motorPendingAdm) {
+    writePsramBlob("/perfpends.bin",  PERF_PEND_MAGIC,  PERF_VER, 0, sailPending,     sizeof(FrontPoint<PERF_NAXIS>), PERF_PENDING_CAP, 0, sailPendingCount);
+    writePsramBlob("/perfpendsa.bin", PERF_PENDA_MAGIC, PERF_VER, 0, sailPendingAdm,  1,                              PERF_PENDING_CAP, 0, sailPendingCount);
+    writePsramBlob("/perfpendm.bin",  PERF_PEND_MAGIC,  PERF_VER, 0, motorPending,    sizeof(FrontPoint<PERF_NAXIS>), PERF_PENDING_CAP, 0, motorPendingCount);
+    writePsramBlob("/perfpendma.bin", PERF_PENDA_MAGIC, PERF_VER, 0, motorPendingAdm, 1,                              PERF_PENDING_CAP, 0, motorPendingCount);
+  }
 }
 static void boatPerfLoad() {
   uint32_t uw = 0;
   if (sailFrontBuf)  { sailFront.count  = (int)readPsramBlob("/sailfront.bin",  PERF_SAILF_MAGIC, PERF_VER, sailFrontBuf,  sizeof(FrontPoint<PERF_NAXIS>), PERF_FRONT_CAP, &uw, false); sailFront.source  = (uint8_t)((uw >> 8) & 0xFF); }
   if (motorFrontBuf) { motorFront.count = (int)readPsramBlob("/motorfront.bin", PERF_MOTF_MAGIC,  PERF_VER, motorFrontBuf, sizeof(FrontPoint<PERF_NAXIS>), PERF_FRONT_CAP, &uw, false); motorFront.source = (uint8_t)((uw >> 8) & 0xFF); }
+  if (sailPending && sailPendingAdm && motorPending && motorPendingAdm && fsExists("/perfpends.bin")) {
+    // Points and flags were written together; a count mismatch (torn save) keeps only the common prefix.
+    int sp = (int)readPsramBlob("/perfpends.bin",  PERF_PEND_MAGIC,  PERF_VER, sailPending,     sizeof(FrontPoint<PERF_NAXIS>), PERF_PENDING_CAP, nullptr, false);
+    int sa = (int)readPsramBlob("/perfpendsa.bin", PERF_PENDA_MAGIC, PERF_VER, sailPendingAdm,  1,                              PERF_PENDING_CAP, nullptr, false);
+    int mp = (int)readPsramBlob("/perfpendm.bin",  PERF_PEND_MAGIC,  PERF_VER, motorPending,    sizeof(FrontPoint<PERF_NAXIS>), PERF_PENDING_CAP, nullptr, false);
+    int ma = (int)readPsramBlob("/perfpendma.bin", PERF_PENDA_MAGIC, PERF_VER, motorPendingAdm, 1,                              PERF_PENDING_CAP, nullptr, false);
+    sailPendingCount  = (sp < sa) ? sp : sa;
+    motorPendingCount = (mp < ma) ? mp : ma;
+  }
 }
 
-// ---- front CSV (the artifact). A boat "curve" = the PAIR of sail + motor BEFRONT1 blocks, mode-
-//      tagged. target: 0 = sail, 1 = motor. (int target, not a template-typed param — keeps
-//      Arduino's auto-prototype pass from referencing FrontStore<3> before PERF_NAXIS is defined.) ----
-// /perfcurve.csv — held best-ever fronts as the BEFRONT1 artifact pair (SAIL block then MOTOR block).
-// Streamed row-by-row: logical lines are SAIL header, sail rows, MOTOR header, motor rows — so two
-// 4096-cap fronts never concatenate into one huge heap String. Same constant-RAM chunker as the alt
-// senders. Sail x0 is 2dp, motor x0 is 0dp.
+// ---- front CSV (the artifact): a boat "curve" = the PAIR of sail + motor BEFRONT1 blocks. target 0 = sail,
+//      1 = motor: an int, not FrontStore<3>&, so auto-prototypes don't reference it before PERF_NAXIS exists. ----
+// /perfcurve.csv, streamed row-by-row so two 4096-cap fronts never build one huge heap String.
 void perfCurveCsvSend(AsyncWebServerRequest *request) {
   struct St { int sc, mc, ssrc, msrc, idx; bool done; char line[96]; int len, pos; };
   St st; st.sc = sailFrontBuf ? sailFront.count : 0; st.mc = motorFrontBuf ? motorFront.count : 0;
@@ -3178,47 +3069,60 @@ bool perfIngestFrontCsv(char *body) {
 // Schema: {device_uid,token,ts,sys:"BOAT",speedSrc,foldSym,pruneK,idwPower,
 //          sail:[[aws,awa,sea,spd,nSamp]...], motor:[[rpm,hw,sea,spd,nSamp,aws,awa]...]}. AWA raw both-sided;
 //          motor also carries raw AWS/AWA (headwind is derived from them) for cloud diagnosis.
-// Pending cleared on a successful response (executeUploadBoatPerf → perfIngestFrontCsv → perfClearPending).
+// The batch's prefix leaves pending on a successful response (executeUploadBoatPerf → perfHandSync → perfApplySync on Core 1).
 bool buildBoatPerfPayload(char *buf, size_t size) {
   if ((sailPendingCount == 0 && motorPendingCount == 0) || authToken.isEmpty()) return false;
+  if (perfSyncHandoff) return false;   // last sync not applied yet: its sent prefixes are still in the queues
   time_t now_ts = time(NULL);
   int off = snprintf(buf, size,
     "{\"device_uid\":\"%s\",\"token\":\"%s\",\"ts\":\"%s\",\"sys\":\"BOAT\",\"speedSrc\":%d,\"foldSym\":%d,\"pruneK\":%d,\"idwPower\":%.2f,",
     device_id_hex, authToken.c_str(), formatTimestamp(now_ts),
     (int)perfSpeedSrc, (perfFoldSymmetric >= 0.5f) ? 1 : 0, (int)perfPruneK, perfIdwPower);
   if (off < 0 || (size_t)off >= size) return false;
-  if (perfPendingSeededFrom.length()) {   // adopted import: tag the whole batch as borrowed provenance
+  if (perfPendingSeededFrom.length()) {   // seeded curve: tag the whole batch with its provenance label
     off += snprintf(buf + off, size - off, "\"seededFrom\":\"%s\",", perfPendingSeededFrom.c_str());
     if (off < 0 || (size_t)off >= size) return false;
   }
   off += snprintf(buf + off, size - off, "\"sail\":[");
   bool first = true;
-  for (int k = 0; k < sailPendingCount; k++) {
+  int ks = 0, km = 0;
+  for (; ks < sailPendingCount; ks++) {
     if (size - (size_t)off < 64) break;
-    FrontPoint<PERF_NAXIS> &p = sailPending[k];
+    FrontPoint<PERF_NAXIS> &p = sailPending[ks];
     off += snprintf(buf + off, size - off, "%s[%.2f,%.1f,%.3f,%.2f,%u]", first ? "" : ",", p.x[0], p.x[1], p.x[2], p.y, p.nSamp);
     first = false;
   }
   off += snprintf(buf + off, size - off, "],\"motor\":[");
   first = true;
-  for (int k = 0; k < motorPendingCount; k++) {
+  for (; km < motorPendingCount; km++) {
     if (size - (size_t)off < 64) break;
-    FrontPoint<PERF_NAXIS> &p = motorPending[k];
+    FrontPoint<PERF_NAXIS> &p = motorPending[km];
     off += snprintf(buf + off, size - off, "%s[%.0f,%.1f,%.3f,%.2f,%u,%.2f,%.1f]",
                     first ? "" : ",", p.x[0], p.x[1], p.x[2], p.y, p.nSamp, p.ex[0], p.ex[1]);  // ex=raw AWS,AWA
     first = false;
   }
   off += snprintf(buf + off, size - off, "]}");
   if (off < 0 || (size_t)off >= size - 1) return false;
+  perfSentSail = ks; perfSentMotor = km;
+  perfSentSeeded = (perfPendingSeededFrom.length() > 0);
   return true;
 }
+// Same contract as altSyncBufBytes: the larger of this batch's JSON (64 B per-point margin) and the SAIL + MOTOR reply,
+// growing up to PERF_UPLOAD_BUF_SIZE when the cloud's fronts outrun the local ones.
+#define PERF_CSV_ROW_MAX 48  // widest update-boat-performance front row: x0, x1 1dp, x2 3dp, spd 2dp, nSamp, 0
+size_t perfSyncBufBytes() {
+  size_t pend = (size_t)sailPendingCount + (size_t)motorPendingCount;
+  if (pend == 0 || authToken.isEmpty()) return 0;
+  size_t out = 512 + authToken.length() + perfPendingSeededFrom.length() + (pend + 2) * 64;
+  size_t rows = (size_t)sailFront.count + (size_t)motorFront.count + pend;
+  size_t back = 256 + (rows + rows / 8 + 64) * PERF_CSV_ROW_MAX;
+  size_t n = (out > back) ? out : back;
+  return (n < (size_t)PERF_UPLOAD_BUF_SIZE) ? n : (size_t)PERF_UPLOAD_BUF_SIZE;
+}
 
-// Ingest a BEFRONT1 pair UPLOADED from the browser (Load CSV) — replace both fronts, then set the
-// mode the user chose at import: fixed=true → FIXED + paused (hold the borrowed polar exactly as-is);
-// fixed=false → LEARNED + resumed (use it as a starting point, keep refining from your own sailing).
-// Persists immediately so the import survives reboot (the file isn't on the device to re-load).
-// Non-static so the /perfUploadFront handler in 3_functions.ino can call it (sailFront/motorFront are
-// file-static here). Mutates the body buffer.
+// Load CSV pair from the browser: replace both fronts, then fixed=true -> FIXED + paused (hold the borrowed polar
+// as-is), false -> LEARNED + resumed (refine from your own sailing). Persists immediately (the file isn't on the
+// device to re-load). Non-static for the /perfUploadFront handler in 3_functions.ino. Mutates body.
 bool perfUploadFrontCsv(char *body, bool fixed) {
   if (!sailFrontBuf || !body) return false;
   bool ok = perfIngestFrontCsv(body);
@@ -3228,12 +3132,15 @@ bool perfUploadFrontCsv(char *body, bool fixed) {
   perfPaused = fixed ? 1.0f : 0.0f;
   settingWrite(NK_perfPaused, fixed ? "1.0000" : "0.0000");
   if (fixed) {                                  // FREEZE — local only, never uploaded
-    sailPendingCount = motorPendingCount = 0; perfPendingSeededFrom = "";
+    sailPendingCount = motorPendingCount = 0; perfSentSail = perfSentMotor = 0; perfPendingSeededFrom = "";
   } else {                                      // LEARN — adopt to cloud: stage both fronts (tagged), keep refining
-    sailPendingCount = motorPendingCount = 0;   // replace pending with the imported set (pure seeded batch)
-    for (int i = 0; i < sailFront.count  && sailPendingCount  < PERF_PENDING_CAP; i++) { if (sailPendingAdm)  sailPendingAdm[sailPendingCount]   = 1; sailPending[sailPendingCount++]   = sailFrontBuf[i]; }
-    for (int i = 0; i < motorFront.count && motorPendingCount < PERF_PENDING_CAP; i++) { if (motorPendingAdm) motorPendingAdm[motorPendingCount] = 1; motorPending[motorPendingCount++] = motorFrontBuf[i]; }
-    perfPendingSeededFrom = "import";
+    perfSeedPendingFromFronts();                // replace pending with the imported set (pure seeded batch)
+    perfSentSail = perfSentMotor = 0;
+    // The loaded curve replaces this unit's, as a records import does: the cloud rebuilds the fronts from every row
+    // it holds, so its old rows go first, and the seeded upload waits for the wipe (and survives a reboot).
+    recSeedOwedSet(2, true);
+    perfCloudWipePending = true;
+    settingWrite(NK_PerfWipePend, "1");
   }
   // Immediate persist even field-on: user-initiated import — see altUploadFrontCsv.
   boatPerfSave();
@@ -3258,9 +3165,8 @@ void initBoatPerformance() {
   }
   memset(sailFrontBuf,  0, (size_t)PERF_FRONT_CAP * sizeof(FrontPoint<PERF_NAXIS>));
   memset(motorFrontBuf, 0, (size_t)PERF_FRONT_CAP * sizeof(FrontPoint<PERF_NAXIS>));
-  // Per-axis deque window caps. Sail axes {AWS, AWA, sea}, motor axes {RPM, headwind, sea};
-  // longest dwell is sea-state (~5 s default), 60 s headroom. Index 3 = output band (unused; perf
-  // leaves outCfg disabled), small.
+  // Deque window caps {AWS|RPM, AWA|headwind, sea, output}: sea-state has the longest dwell (60 s headroom);
+  // index 3 is the unused output band (perf leaves outCfg disabled).
   static const float PERF_MAXDWELL[PERF_NAXIS + 1] = { 30.0f, 30.0f, 60.0f, 30.0f };
   sailEpisode.init(sailRing, PERF_EP_RING_CAP, PERF_MAXDWELL);
   motorEpisode.init(motorRing, PERF_EP_RING_CAP, PERF_MAXDWELL);
@@ -3273,6 +3179,14 @@ void initBoatPerformance() {
   motorFront.axisScale[0] = 100.0f; motorFront.axisScale[1] = 4.0f;  motorFront.axisScale[2] = 1.0f;  // RPM, headwind, sea
   sailPendingCount = motorPendingCount = 0;
   boatPerfLoad();
+  if (recSeedOwed(2 | 8)) {    // imported (2) or pre-registration (8) fronts the cloud does not hold yet; a FIXED (borrowed, paused) pair is never uploaded
+    if (sailFront.source == 0 && motorFront.source == 0 && (sailFront.count > 0 || motorFront.count > 0)) {
+      const bool imported = recSeedOwed(2);
+      perfSeedPendingFromFronts();
+      if (!imported) perfPendingSeededFrom = "reregister";
+    }
+    else recSeedOwedSet(2 | 8, false);
+  }
   queueConsoleMessageF("BoatPerf init: sail %d pts (%s), motor %d pts (%s)",
                        sailFront.count, sailFront.source ? "FIXED" : "LEARNED",
                        motorFront.count, motorFront.source ? "FIXED" : "LEARNED");
@@ -3280,7 +3194,7 @@ void initBoatPerformance() {
 void resetBoatPerformance() {
   if (!sailFrontBuf) return;
   sailFront.count = 0; sailFront.source = 0; motorFront.count = 0; motorFront.source = 0;
-  sailPendingCount = motorPendingCount = 0; sailCapWarned = motorCapWarned = false;
+  sailPendingCount = motorPendingCount = 0; perfSentSail = perfSentMotor = 0; sailCapWarned = motorCapWarned = false;
   sailEpisode.clearRun();  sailEpisode.ringHead = 0;  sailEpisode.ringCount = 0;
   motorEpisode.clearRun(); motorEpisode.ringHead = 0; motorEpisode.ringCount = 0;
   perfPitchHead = 0; perfPitchCount = 0;
@@ -3289,7 +3203,13 @@ void resetBoatPerformance() {
   fsTakeLock();
   LittleFS.remove("/sailfront.bin");
   LittleFS.remove("/motorfront.bin");
+  LittleFS.remove("/perfpends.bin");  LittleFS.remove("/perfpendsa.bin");
+  LittleFS.remove("/perfpendm.bin");  LittleFS.remove("/perfpendma.bin");
   fsReleaseLock();
+  // Cloud half, as resetAlternatorHealth: the cloud rebuilds both fronts from every raw point it holds, so without this
+  // the next sync-back would hand the cleared fronts straight back. executeResetBoatPerfCloud retries until 200.
+  perfCloudWipePending = true;
+  settingWrite(NK_PerfWipePend, "1");
   queueConsoleMessage("BoatPerf: full reset (Clear All)");
 }
 
@@ -3298,26 +3218,93 @@ void resetBoatPerformance() {
 void resetMotorFrontOnly() {
   if (!sailFrontBuf) return;  // shared PSRAM arena backs both fronts
   motorFront.count = 0; motorFront.source = 0;
-  motorPendingCount = 0; motorCapWarned = false;
+  motorPendingCount = 0; perfSentMotor = 0; motorCapWarned = false;
   motorEpisode.clearRun(); motorEpisode.ringHead = 0; motorEpisode.ringCount = 0;
   perfMotorSeconds = 0.0;
   motorLiveValid = false; motorLive_pct = 0;
   fsTakeLock();
   LittleFS.remove("/motorfront.bin");
+  LittleFS.remove("/perfpendm.bin");  LittleFS.remove("/perfpendma.bin");
   fsReleaseLock();
   queueConsoleMessage("BoatPerf: motoring front cleared (engine-RPM axis rescaled); sail front kept");
 }
 
 // ---- tick (call from loop()): fold at ~10 Hz, send live telemetry + settings echo at ~1 Hz ----
+// Core 1: drop only the points the synced batch carried (the queues kept growing while it was in flight), replace
+// both fronts with the cloud's pruned ones, then re-add the still-unsent admitted points, which the cloud has not
+// seen. Pending holds raw AWA; the sail front works in folded coordinates.
+static void perfApplySync() {
+  FrontSyncHandoff *h = __atomic_exchange_n(&perfSyncHandoff, (FrontSyncHandoff *)nullptr, __ATOMIC_ACQ_REL);
+  if (!h) return;
+  int ds = (perfSentSail  < sailPendingCount)  ? perfSentSail  : sailPendingCount;
+  int dm = (perfSentMotor < motorPendingCount) ? perfSentMotor : motorPendingCount;
+  if (ds > 0) {
+    memmove(sailPending, sailPending + ds, (size_t)(sailPendingCount - ds) * sizeof(FrontPoint<PERF_NAXIS>));
+    memmove(sailPendingAdm, sailPendingAdm + ds, (size_t)(sailPendingCount - ds));
+    sailPendingCount -= ds;
+  }
+  if (dm > 0) {
+    memmove(motorPending, motorPending + dm, (size_t)(motorPendingCount - dm) * sizeof(FrontPoint<PERF_NAXIS>));
+    memmove(motorPendingAdm, motorPendingAdm + dm, (size_t)(motorPendingCount - dm));
+    motorPendingCount -= dm;
+  }
+  if (ds > 0 || dm > 0) perfPendingSeededFrom = "";   // a batch built before a seed carried none of it: the label stays
+  perfSentSail = perfSentMotor = 0; perfPendingOverflowWarned = false;
+  // A Frozen (source 1) reference is held as loaded; the cloud's rebuild would replace it and flip it to Learning.
+  if (h->ingest && !rpmAxisWipePending && !perfCloudWipePending && sailFront.source != 1 && motorFront.source != 1) {
+    if (perfIngestFrontCsv(h->body)) {
+      for (int i = 0; i < sailPendingCount; i++) {
+        if (!sailPendingAdm[i]) continue;
+        FrontPoint<PERF_NAXIS> p = sailPending[i];
+        p.x[1] = perfFoldAwa(p.x[1]);
+        sailFront.add(p);
+      }
+      for (int i = 0; i < motorPendingCount; i++) if (motorPendingAdm[i]) motorFront.add(motorPending[i]);
+      queueConsoleMessage("Boat performance: fronts updated from cloud");
+    } else {
+      queueConsoleMessage("Boat performance uploaded (no front in response)");
+    }
+  }
+  FrontSyncHandoff::drop(h);
+  boatPerfSave();   // caller runs this only with the field physically cut (a LittleFS write stalls the flash cache)
+}
+
 void boatPerf_tick(uint32_t nowMs) {
   static uint32_t lastFold = 0, lastSse = 0;
   static uint8_t  perfSseStep = 0;   // 0 = idle; 1..4 = the 1 Hz SSE burst, SPREAD one step per loop pass
   static uint8_t  sc = 0;            // sendPerfSettings cadence: every 5th SSE cycle
+  static uint32_t lastPeriodicSave = 0, savedLearnSerial = 0;
   if (!sailFrontBuf) return;
-  // One-heavy-per-pass gate: defer the whole tick if any sub-op is due (or we're mid-SSE-spread) but
-  // another heavy ran this pass (lastFold/lastSse/perfSseStep unchanged → still due next pass).
-  // The 1 Hz SSE burst (classify + 2-3 SSE pushes, ~7 ms if stacked) is split one step per pass so it
-  // never lands as a single fat tick — it was the tallest loop pole and bounded CH1/Vbus worst spacing.
+  // Heavy one-offs, one per pass and only with the field physically cut (gpio4, not duty-derived fieldActiveStatus):
+  // a finished cloud sync, and a 15 min save of new learning (sailing engine-off has no field-off edge to persist on).
+  if (!gHeavyRanThisPass && fieldCutSettled()) {
+    if (perfSyncHandoff) {
+      gHeavyRanThisPass = true;
+      perfApplySync();
+      return;
+    }
+    if (regSeedRequest & 8) {   // a FIXED (borrowed, paused) pair stays local-only, as at boot
+      gHeavyRanThisPass = true;
+      __atomic_fetch_and(&regSeedRequest, (uint8_t)~8, __ATOMIC_ACQ_REL);
+      if (sailFront.source == 0 && motorFront.source == 0 && (sailFront.count > 0 || motorFront.count > 0)) {
+        perfSeedPendingFromFronts();
+        perfSentSail = perfSentMotor = 0;   // a batch already in flight carried none of these
+        perfPendingSeededFrom = "reregister";
+      } else {
+        recSeedOwedSet(8, false);
+      }
+      return;
+    }
+    if (perfLearnSerial != savedLearnSerial && (uint32_t)(nowMs - lastPeriodicSave) >= 900000u) {
+      gHeavyRanThisPass = true;
+      lastPeriodicSave = nowMs;
+      savedLearnSerial = perfLearnSerial;
+      boatPerfSave();
+      return;
+    }
+  }
+  // One-heavy-per-pass gate: defer if any sub-op is due but another heavy ran (timers unchanged -> due next pass).
+  // The 1 Hz SSE burst (~7 ms stacked) is split one step per pass so it never becomes the tallest loop pole.
   bool foldDue  = ((uint32_t)(nowMs - lastFold) >= 100);
   bool sseStart = ((uint32_t)(nowMs - lastSse) >= 1000);
   if (foldDue || sseStart || perfSseStep) {
@@ -3401,12 +3388,21 @@ bool perfSettingsHandle(AsyncWebServerRequest *request) {
   // Changing the speed source (STW↔SOG) invalidates every learned point → Clear-All (spec §1/§4;
   // the dashboard warns first). Both fronts + raw history reset.
   if (request->hasParam("perfSpeedSrc") && perfSpeedSrc != oldSpeedSrc) {
-    resetBoatPerformance();
+    pendingResetBoatPerformance = true;   // core 1, like the Clear All button: perfFold_tick adds to the fronts there
     queueConsoleMessage("BoatPerf: speed source changed → Clear All (front reset)");
   }
   // Action (not a float knob): LEARNED↔FIXED source toggle.
   if (request->hasParam("perfSource")) {   // 1 = FIXED (freeze + pause), 0 = LEARNED (resume)
     int src = request->getParam("perfSource")->value().toInt();
+    // Frozen -> Learning: a frozen curve was never uploaded, so the first sync-back (rebuilt from this unit's
+    // cloud rows) would erase it; stage it like an import. Staged while still FIXED so Core 1's fold isn't
+    // pushing into the queues being rewritten.
+    bool wasFixed = (sailFront.source == 1 || motorFront.source == 1);
+    if (wasFixed && !src && (sailFront.count > 0 || motorFront.count > 0)) {
+      perfSeedPendingFromFronts();
+      perfSentSail = perfSentMotor = 0;
+      recSeedOwedSet(2, true);
+    }
     sailFront.source = motorFront.source = (uint8_t)(src ? 1 : 0);
     perfPaused = src ? 1.0f : 0.0f;
     settingWrite(NK_perfPaused, String(perfPaused, 4).c_str());
@@ -3425,9 +3421,8 @@ void sendPerfSettings() {
   sseSend(buf, "PerfSettings");
 }
 
-// Self-describing schema (served at /perfschema). The dashboard fetches this ONCE on load
-// and zips these names against the PerfLive / PerfSettings payload values — so it never keeps
-// its own field array and can't fall out of sync with the firmware tables above.
+// Self-describing schema (/perfschema): the dashboard fetches it ONCE and zips these names against the
+// PerfLive / PerfSettings values, so it keeps no field array of its own.
 String perfSchemaJson() {
   String s = "{\"live\":[";
   for (size_t i = 0; i < PERF_LIVE_COUNT; i++) {
@@ -3529,12 +3524,12 @@ void cvLog_tick(uint32_t nowMs) {
   e.rpm = (int16_t)constrain((int)RPM, -32768, 32767);
   e.battV_filt_x100 = (int16_t)clamp_f(IBV_filtered * 100.0f, -32767.0f, 32767.0f);
   e.cvDSlope_x10000 = (int16_t)clamp_f(cvDSlope * 10000.0f, -32767.0f, 32767.0f);
-  e.ch1IntervalMs = (int16_t)g_ch1LastIntervalMs;
+  e.ch1IntervalMs = (int16_t)min((int)g_ch1LastIntervalMs, 32767);   // uint16 sources: clamp, or a >32.7 s gap logs negative
   e.battI_x10 = (int16_t)clamp_f(getBatteryCurrent() * 10.0f, -32767.0f, 32767.0f);
   e.dBcur_dt_Aps = (int16_t)clamp_f(g_dBcur_dt, -32767.0f, 32767.0f);
-  e.voltLoopIntervalMs = g_cvLogVoltLoopFired ? (int16_t)g_voltLoopLogIntervalMs : 0;
+  e.voltLoopIntervalMs = g_cvLogVoltLoopFired ? (int16_t)min((int)g_voltLoopLogIntervalMs, 32767) : 0;
   g_cvLogVoltLoopFired = false;
-  e.inaIntervalMs = (int16_t)ina_last_ms;
+  e.inaIntervalMs = (int16_t)min((int)ina_last_ms, 32767);
   e.kdTrim_x1000 = (int16_t)clamp_f(g_kdTrimThisTick * 1000.0f, -32767.0f, 32767.0f);  // signed: <0 only in symmetric mode
   g_kdTrimThisTick = 0.0f;  // clear after logging so a no-trim interval logs 0
 
@@ -3678,9 +3673,8 @@ void ch1_compute_stats() {
   ch1_over2x_at = ch1AtOver2x;
 }
 
-// Effective alternator-current sample rate (Hz). Every swept-sine measurement is capped by this,
-// not by how fast the control tick or the sine generator runs — CH1 is where new information
-// enters. 0 before the first read.
+// Effective alternator-current sample rate (Hz): CH1 is where new information enters, so it caps every
+// swept-sine measurement. 0 before the first read.
 float ch1SampleHz() {
   float avgMs = (ch1_avg_2m > 0.5f) ? ch1_avg_2m : ch1_avg_at;
   return (avgMs > 0.5f) ? (1000.0f / avgMs) : 0.0f;
@@ -3914,9 +3908,8 @@ static uint32_t  ina2mStart = 0;
 
 static uint64_t  inaAtSum   = 0;
 static uint32_t  inaAtCount = 0;
-// Deliberately no inaAtWorst intermediate — worst writes directly to the public ina_worst_at.
-// An intermediate once produced ina_worst_at=0 alongside nonzero over2x/avg (cause never found),
-// so the published variable is the single source of truth. Same for ina_worst_2m.
+// Deliberately no inaAtWorst intermediate: one once yielded ina_worst_at=0 beside nonzero over2x/avg (cause
+// never found), so worst writes directly to ina_worst_at. Same for ina_worst_2m.
 static uint32_t  inaAtOver2x = 0;
 static uint32_t  inaPrevRead = 0;
 
@@ -3934,10 +3927,7 @@ void resetINA228IntervalWindows() {
   ina_avg_2m  = 0.0f; ina_worst_2m  = 0; ina_over2x_2m  = 0;
 }
 
-// Full reset including all-time accumulators — called by the web-side
-// Reset Peaks button. resetINA228IntervalWindows() above only clears the
-// 10s/2m windows; this also wipes ina_worst_at / ina_avg_at / ina_over2x_at
-// and the static counters that feed them.
+// Full reset incl. all-time accumulators (web Reset Peaks); resetINA228IntervalWindows() clears only 10s/2m.
 void resetINA228AllStats() {
   resetINA228IntervalWindows();
   inaAtSum     = 0;
@@ -3948,11 +3938,8 @@ void resetINA228AllStats() {
   ina_over2x_at = 0;
 }
 
-// Drop the previous-read timestamp from outside this file. loop() calls this every
-// pass the field gate is low — the INA equivalent of the pf tracker's per-field-off-pass
-// pfHasPrev reset. Without it, a field-off flash write that stalls the whole loop (so
-// _ReadAnalogInputs_inner never runs to flip inaFastModeActive to slow mode) gets logged
-// as a fast-mode (field-on) read interval the next time a read fires, inflating ina_worst_at.
+// loop() calls this every field-gate-low pass (INA twin of the pf tracker's pfHasPrev reset): a field-off flash
+// write can stall the loop before inaFastModeActive flips to slow, and that gap would log as a fast-mode interval.
 void inaResetIntervalBaseline() { inaPrevRead = 0; }
 
 void recordINA228Interval(uint32_t now) {
@@ -3968,10 +3955,8 @@ void recordINA228Interval(uint32_t now) {
   inaAtCount++;
   inaAtSum += iv;
   if (iv > ina_worst_at) ina_worst_at = iv;
-  // The "2m" worst is also written directly, so ina_worst_2m means
-  // "max iv since last fast-mode rising edge" rather than a strict
-  // 2m rolling window. The bucket-based avg + over2x for 2m
-  // remain rolling. Tooltips should say "since fast-mode start" for these.
+  // ina_worst_2m is also written directly, so it means "max since last fast-mode rising edge", not a rolling
+  // 2m window (avg + over2x stay rolling). Tooltips should say "since fast-mode start".
   if (iv > ina_worst_2m) ina_worst_2m = iv;
   bool isOver2x = false;
   if (inaAtCount > 1) {
@@ -4028,9 +4013,7 @@ void recordINA228Interval(uint32_t now) {
   ina_avg_10s    = (n10 > 0) ? (float)sum10 / (float)n10 : 0.0f;
   ina_over2x_10s = (o10 > 65535u) ? 65535u : (uint16_t)o10;  // per-sample count over the 10s window
 
-  // Publish 2m stats. ina_worst_2m is updated DIRECTLY on every sample
-  // (above), so this block does NOT touch it — only avg + over2x come from
-  // the bucket ring.
+  // Publish 2m avg + over2x only; ina_worst_2m is updated directly above.
   uint32_t n2m = 0;
   uint64_t sum2m = 0;
   ina_over2x_2m  = 0;
@@ -4042,8 +4025,7 @@ void recordINA228Interval(uint32_t now) {
   }
   ina_avg_2m = (n2m > 0) ? (float)sum2m / (float)n2m : 0.0f;
 
-  // Publish all-time stats. ina_worst_at is also updated directly above,
-  // so the publish only handles avg + over2x.
+  // Publish all-time avg + over2x (ina_worst_at is updated directly above).
   ina_avg_at    = (inaAtCount > 0) ? (float)((double)inaAtSum / inaAtCount) : 0.0f;
   ina_over2x_at = inaAtOver2x;
 }
@@ -4067,14 +4049,9 @@ bool serveCachedAsset(AsyncWebServerRequest *request, const String &path, const 
   else if (path == "/uPlot.iife.min.js") cf = &cachedUplotJs;
 
   if (cf && cf->data && cf->size > 0) {
-    // index.html must revalidate on every load. Cached without a network round trip it renders a
-    // complete, live-looking dashboard off a device that is unreachable (wrong network, still in
-    // AP/config mode) — every reading dashed out and vesselInfoComplete stuck false.
-    // The rest of the bundle revalidates too (was max-age=3600): the five assets are a MATCHED SET,
-    // and a browser holding an hour-old styles.css against a just-updated index.html renders new
-    // markup with no rules for it — a viewBox-only <svg> with no matching CSS inflates to its
-    // container. loadFileToRAM always mints an ETag alongside the data, so every one of these is a
-    // 304 with no body, not a re-download.
+    // Every asset revalidates (no-cache): a cached index.html renders a live-looking dashboard off an unreachable
+    // device, and the five assets are a MATCHED SET (stale CSS against new markup breaks layout). loadFileToRAM
+    // always mints an ETag, so revalidation is a bodyless 304.
     const char *cacheHdr = "no-cache";
 
     if (cf->etag[0] && request->header("If-None-Match").indexOf(cf->etag) >= 0) {
@@ -4120,7 +4097,7 @@ static const char *fieldCeilBindName(uint8_t bind) {
     default: return "Max Field (%)";
   }
 }
-// Short form for chcAbortMsg's 96 bytes.
+// Short form for chcAbortMsg's 128 bytes.
 static const char *fieldCeilBindBrief(uint8_t bind) {
   switch (bind) {
     case 1:  return "Max Field Volts";
@@ -4146,13 +4123,9 @@ static bool boardCeilHoldsField() {
   return g_fieldCeilBind >= 2 && lastAppliedDuty >= ccDutyCeiling() - 1.0f;
 }
 
-// systemID_tick() — plant delay measurement step test. 8 phases: BASELINE + 3x (UP/DOWN), each held
-// SYSID_STEP_HOLD_MS to let the plant settle. Called on every fresh CH1 hit from AdjustFieldLearnMode;
-// the caller MUST force govMode = GOV_BYPASS_SLEW, put the PID in MANUAL with its integrator reset to
-// dutyOut, and drive duty from dutyOut. PSRAM buffer allocated once on first run, never freed.
-// The fall threshold is step-RELATIVE, not a fixed percentage: stepAmp = upMin - quietMax, fall at
-// upMin - 0.3*stepAmp (rise at quietMax * 1.2). The scan is bounded by t_down_end so it cannot bleed
-// into later phases. A reported delay of -1 ms means the crossing was never found in the buffer.
+// Plant delay step test: BASELINE + 3x (UP/DOWN), each held SYSID_STEP_HOLD_MS; PSRAM buffer allocated at test start,
+// freed back at IDLE. Called per fresh CH1 hit from AdjustFieldLearnMode; caller MUST force govMode = GOV_BYPASS_SLEW and the PID
+// to MANUAL with its integrator reset to dutyOut. Fall threshold is step-relative; a -1 ms delay = no crossing found.
 
 bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   // Phase enum. Values 1–9 map to phaseStartMs indices 0–8 via (phase – 1).
@@ -4208,9 +4181,8 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   }
   lastReqState = systemIDRequested;
 
-  // ── EASE-OUT: after a run completes, ramp the field down to baseDuty over ~1.5 s before handing
-  // back to normal control. The override (and thus the protection gate) stays held until the field
-  // has settled, so the fast current collapse doesn't trip a protection. ──
+  // ── EASE-OUT: ramp to baseDuty over ~1.5 s, holding the override (and protection gate) until settled so the
+  // fast current collapse doesn't trip a protection. ──
   if (phase == SYSID_EASE) {
     float frac = (float)(nowMs - sysidEaseStartMs) / 1500.0f;
     if (frac >= 1.0f) {
@@ -4246,6 +4218,11 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   // ── IDLE: wait for trigger ───────────────────────────────────────────────
   if (phase == SYSID_IDLE) {
     if (!systemIDRequested) {
+      if (sysIDBuffer) {   // results live in the record rings and systemIDBode; nothing reads raw samples after the run
+        free(sysIDBuffer);
+        sysIDBuffer = nullptr;
+        sysIDSampleCount = 0;
+      }
       dutyOut = lastAppliedDuty;
       return false;
     }
@@ -4314,9 +4291,7 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     systemIDActive = (uint8_t)SYSID_STABILIZE;
   }
 
-  // ── STABILIZE phase: P-control to SystemIDStabilizeAmps before baseline ──
-  // Adjust duty once per second. Once the 5-second rolling average is within
-  // ±3A of the target, advance. Abort if timeout exceeded.
+  // ── STABILIZE phase: 1 Hz P-control to SystemIDStabilizeAmps until the 5 s rolling average is within band ──
   if (phase == SYSID_STABILIZE) {
     if (nowMs - stabilizeLastAdjMs >= 1000) {
       float err = SystemIDStabilizeAmps - ampsRaw;
@@ -4382,11 +4357,9 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     return true;
   }
 
-  // ── SINE SWEEP phase (open-loop plant Bode): swept sine on duty, PID off ──
-  // dutyOut = baseDuty + amp·(1+sin(2π f t)) — baseDuty is the trough, so the swing is entirely
-  // upward and the current can't clip at the bottom. Record (ts,duty,amps) each tick; advance to
-  // the next log-spaced frequency after (1 settle + N analysed) cycles. Lock-in DFT in PROCESSING
-  // extracts per-frequency gain and phase (AC amplitude still SystemIDStepAmplitude).
+  // ── SINE SWEEP phase (open-loop plant Bode), PID off ──
+  // baseDuty is the TROUGH of amp·(1+sin), so the swing is entirely upward and current can't clip at the bottom.
+  // Each tone runs 1 settle + N analysed cycles; the PROCESSING lock-in DFT extracts gain and phase.
   if (phase == SYSID_SINE) {
     if (!sineSegStarted) {
       sineSegStartMs[sineIdx] = nowMs;
@@ -4394,7 +4367,6 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     }
     float f = sineFreq[sineIdx];
     float tSec = (float)(nowMs - sineSegStartMs[sineIdx]) / 1000.0f;
-    // (1+sin) offset: baseDuty is the wave TROUGH, not the midpoint (no-clip rationale in block header).
     float drive = SystemIDStepAmplitude * (1.0f + sinf(2.0f * (float)M_PI * f * tSec));
     float d = constrain(baseDuty + drive, 0.0f, 100.0f);
     dutyOut = d;
@@ -4426,16 +4398,12 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     sidRpmSum += rNow; sidRpmN++;
     systemIDRpmAvg = (float)(sidRpmSum / sidRpmN);
 
-    // Frequency-adaptive decimation: record ~24 samples per cycle of the current tone.
-    // At high frequencies this is essentially every CH1 sample (interval below the ~13 ms
-    // sample period); at low frequencies it throttles hard so a multi-minute, low-start
-    // sweep can't exhaust the 15000-sample buffer and starve the later (high-freq) points.
-    // 24/cycle is far above Nyquist, so the per-frequency lock-in stays clean. The DFT uses
-    // each sample's real timestamp, so the non-uniform rate across segments is harmless.
+    // Frequency-adaptive decimation, ~24 samples per cycle, so a long low-frequency start can't exhaust the
+    // 15000-sample buffer and starve the high tones. The DFT uses real timestamps, so a non-uniform rate is harmless.
     uint32_t sineSampleIntervalMs = (uint32_t)(1000.0f / (f * 24.0f));  // period/24
     if ((uint32_t)(nowMs - lastSineSampleMs) >= sineSampleIntervalMs) {
       lastSineSampleMs = nowMs;
-      if (sysIDSampleCount < SYSID_BUF_SIZE) {
+      if (sysIDBuffer && sysIDSampleCount < SYSID_BUF_SIZE) {
         sysIDBuffer[sysIDSampleCount++] = { nowMs, d, ampsRaw };
       }
     }
@@ -4458,7 +4426,6 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   }
 
   // ── Determine commanded duty for current phase ───────────────────────────
-  // UP phases command baseDuty + amplitude; all others hold baseDuty.
   bool isUpPhase = (phase == SYSID_UP_1 || phase == SYSID_UP_2 || phase == SYSID_UP_3);
   float phaseDuty = isUpPhase
                       ? constrain(baseDuty + SystemIDStepAmplitude, 0.0f, 100.0f)
@@ -4466,9 +4433,9 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   dutyOut = phaseDuty;
 
   // ── Record sample ────────────────────────────────────────────────────────
-  if (sysIDSampleCount < SYSID_BUF_SIZE) {
+  if (sysIDBuffer && sysIDSampleCount < SYSID_BUF_SIZE) {
     sysIDBuffer[sysIDSampleCount++] = { nowMs, phaseDuty, ampsRaw };
-  } else {
+  } else if (sysIDBuffer) {
     if (!bufFullWarned) {
       bufFullWarned = true;
       queueConsoleMessageF("SystemID: WARNING — sample buffer full at %d samples. "
@@ -4546,22 +4513,12 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   }
 
   // ── Post-processing (runs immediately when PROCESSING is entered) ────────
-  // phaseStartMs layout (with STABILIZE prefix):
-  //   [0] STABILIZE start  [1] BASELINE start  [2] UP_1 start   [3] DOWN_1 start
-  //   [4] UP_2 start       [5] DOWN_2 start    [6] UP_3 start   [7] DOWN_3 start
-  //   [8] test end (DOWN_3 end)
-  //
-  // Preceding quiet phase for each rise: BASELINE[1], DOWN_1[3], DOWN_2[5]
-  // UP phase starts:                     UP_1[2],     UP_2[4],   UP_3[6]
-  // UP phase ends (= next phase start):  DOWN_1[3],   DOWN_2[5], DOWN_3[7]
-  //
-  // Preceding UP phase for each fall:    UP_1[2],  UP_2[4],  UP_3[6]
-  // DOWN phase starts:                   DOWN_1[3],DOWN_2[5],DOWN_3[7]
+  // Rise i: quiet phase = BASELINE[1]/DOWN_1[3]/DOWN_2[5], UP start = [2]/[4]/[6], UP end = [3]/[5]/[7].
+  // Fall i: preceding UP = [2]/[4]/[6], DOWN start = [3]/[5]/[7]; [8] = test end.
 
   // ── Sine-sweep post-process (lock-in DFT per frequency) ──────────────────
-  // For each swept frequency, correlate (amps − mean) against sin/cos at that exact
-  // frequency over its analysis window. Rejects all other tones (incl. belt ripple)
-  // to ~0. gain = output A per %duty; phase = output lag in degrees.
+  // Correlating (amps - mean) against sin/cos at each exact frequency rejects other tones (incl. belt ripple).
+  // gain = output A per %duty; phase = output lag in degrees.
   if (phase == SYSID_PROCESSING && curTestType == 1) {
     systemIDBodeCount = 0;
     float prevLagDeg = 0.0f;   // anchors the ±180° unwrap; lag only grows across a sweep
@@ -4570,9 +4527,8 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       uint32_t segStart = sineSegStartMs[p];
       uint32_t segEnd   = (p + 1 < SYSID_SINE_NPOINTS) ? sineSegStartMs[p + 1] : sineSweepEndMs;
       uint32_t anaStart = segStart + (uint32_t)(1000.0f / f);  // skip 1 settle cycle
-      // Integer-cycle window: truncate the analysis span to a WHOLE number of drive periods
-      // so the lock-in's negative-frequency leakage term cancels exactly — the window edge
-      // lands on a cycle boundary instead of wherever the next segment happened to start.
+      // Truncate the analysis span to a WHOLE number of drive periods so the lock-in's negative-frequency
+      // leakage term cancels exactly.
       float periodMs = 1000.0f / f;
       uint32_t availMs = (segEnd > anaStart) ? (segEnd - anaStart) : 0;
       int nCyc = (int)floorf((float)availMs / periodMs);
@@ -4636,11 +4592,8 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 
     const uint32_t REF_WINDOW_MS = 2000;  // last 2 seconds of each phase used as reference
 
-    // Reference statistics saved between rise and fall loops.
-    // Mean anchors the threshold to a stable baseline; max/min measures the local noise
-    // half-amplitude. Threshold = mean ± 2× noise_half_amplitude, so the detection point
-    // stays just above the noise floor — close to the true transport delay — while a single
-    // spike can no longer move the threshold the way raw max/min could.
+    // Threshold = reference mean ± 2x noise half-amplitude (max/min vs mean): just outside the noise floor,
+    // close to the true transport delay, and a single spike can't move it the way raw max/min could.
     float quietMeanArr[3] = { 0.0f, 0.0f, 0.0f };
     float quietMaxArr[3]  = { 0.0f, 0.0f, 0.0f };
     float upMeanArr[3]    = { 0.0f, 0.0f, 0.0f };
@@ -4652,8 +4605,6 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       uint32_t t_up_start    = phaseStartMs[upIdx[i]];
       uint32_t t_up_end      = phaseStartMs[upEndIdx[i]];
 
-      // Mean + max of the last 2 seconds of the quiet phase.
-      // Mean = stable baseline; max - mean = noise half-amplitude.
       uint32_t quietRefStart = (t_up_start > REF_WINDOW_MS)
                                  ? (t_up_start - REF_WINDOW_MS)
                                  : t_quiet_start;
@@ -4680,8 +4631,6 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       quietMeanArr[i] = quietMean;
       quietMaxArr[i]  = quietMax;
 
-      // Mean + min of the last 2 seconds of the UP phase.
-      // Mean = stable settled high level; mean - min = noise half-amplitude (downward).
       uint32_t upRefStart = (t_up_end > REF_WINDOW_MS)
                               ? (t_up_end - REF_WINDOW_MS)
                               : t_up_start;
@@ -4704,9 +4653,7 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       systemIDStepAmp_A[i] = fmaxf(0.0f, upMean - quietMean);
       systemIDQuietPP_A[i] = (quietSamples > 0) ? fmaxf(0.0f, quietMax - quietMin) : 0.0f;
 
-      // Rise threshold: quiet mean + 2× noise half-amplitude (floored at 0.5A).
-      // This sits just above the noise ceiling while the mean anchor keeps it stable
-      // across trials — matching the earliest reliable detection of field response.
+      // Rise threshold: quiet mean + 2x noise half-amplitude (noise floored at 0.5 A).
       float quietNoise = fmaxf(quietMax - quietMean, 0.5f);
       float riseThresh = quietMean + 2.0f * quietNoise;
 
@@ -4743,8 +4690,7 @@ bool systemID_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       float upMean = upMeanArr[i];
       float upMin  = upMinArr[i];
 
-      // Fall threshold: UP mean − 2× noise half-amplitude (floored at 0.5A).
-      // Symmetric to the rise: sits just below the noise floor of the settled high level.
+      // Fall threshold: UP mean - 2x noise half-amplitude (floored at 0.5 A), symmetric to the rise.
       float upNoise  = fmaxf(upMean - upMin, 0.5f);
       float fallThresh = upMean - 2.0f * upNoise;
 
@@ -4848,25 +4794,11 @@ static float fieldCurveInvert(float targetA) {
 }
 
 // fieldCut_tick() — commissioning stage 7: field de-energize τ
-//
-// Sequence: (1) RAMP — the normal AUTO path drives the REAL current PID to SystemIDStabilizeAmps
-// (the level commissioned by the field-curve step) through the fieldCutCcActive branch: manually
-// slewed setpoint at TEST_ENTRY_RATE_A, duty slew bypassed, protections live. This phase returns
-// false — duty belongs to the real loop. (2) HOLD — duty FROZEN at the settled value for
-// FIELDCUT_HOLD_MS; baseline + fast-channel high calibration point averaged over the tail of the
-// hold. From here on the tick returns true (SystemID duty-override path). (3) CUT — duty steps to
-// MinDuty, the exact floor a real OV clamp drives to, and stays there FIELDCUT_MEAS_MS. The decay
-// lives in the 20 kSPS fast alt-current ring — grabbed FIELDCUT_SNAP_MS after the cut; ADS samples
-// are recorded as a fallback, and the tail of the window gives the residual floor + low calibration
-// point. (4) PROCESS — two-point calibrate the fast channel against the ADS, boxcar+zero-phase-EMA
-// filter, log-linear fit of ln(I − floor) for τ, direct 90→10% fall time. Results publish HERE, so
-// a late abort can't discard a finished measurement. (5) EASE back to the pre-test duty.
-// One run per trigger; the wizard fires one run per Min%-floor speed (max/mid/idle) because the
-// drain time IS RPM-dependent (bench 07-20), and fits drain-vs-RPM as a line across the runs.
-// fieldCutRpm (this run's x-value) averages over the hold tail, BEFORE the cut — the cut corrupts
-// the LM2907 tach signal (spike/false-zero/garbage ramp for ~4.6 s), so BOTH RPM gates are masked
-// for the whole test + FIELDCUT_RPM_GRACE_MS tail (fieldCutRpmGrace in the tick builder).
-// Field-at-MinDuty is the SAFE direction.
+// RAMP (real current PID, returns false) -> HOLD (frozen duty, high cal point) -> CUT to MinDuty, the floor a
+// real OV clamp drives to (decay from the 20 kSPS ring, ADS fallback) -> PROCESS (results publish HERE so a late
+// abort can't discard them) -> EASE. Drain time IS RPM-dependent, so the wizard runs one per Min%-floor speed.
+// fieldCutRpm averages the hold tail: the cut corrupts the LM2907 tach ~4.6 s, so both RPM gates are masked
+// through FIELDCUT_RPM_GRACE_MS. Field-at-MinDuty is the SAFE direction.
 
 static float fcMeanMv(const int16_t *b, int n) {
   if (!b || n <= 0) return NAN;
@@ -4899,10 +4831,9 @@ static void fcCalibrateFast(float faHighMv, float faLowMv) {
                        g, o, fieldCutBaseA, fieldCutFloorA);
 }
 
-// Shared τ fit + fall-time on a filtered, floor-referenced decay trace (t in ms, amps). tCmd = the cut
-// command instant in THIS trace's time base (NaN → unknown). Band: 85% down to 10% of (base − floor),
-// starting at the first 85% crossing. Also fills the wizard plot arrays (t re-zeroed to tCmd — the cut
-// command — so the plot origin matches the drain number). Returns true on a clean fit.
+// Shared τ fit + fall-time on a filtered, floor-referenced decay trace (t ms, amps). tCmd = cut command instant in
+// THIS trace's time base (NaN = unknown). Fit band 85% -> 10% of (base - floor). Also fills the plot arrays, t
+// re-zeroed to tCmd so the plot origin matches the drain number.
 static bool fcFitDecay(const float *tMs, const float *amps, int n, int minFitPts, float tCmd) {
   float base = fieldCutBaseA, floorA = fieldCutFloorA;
   float dA = base - floorA;
@@ -4912,10 +4843,8 @@ static bool fcFitDecay(const float *tMs, const float *amps, int n, int minFitPts
   }
   const float lv95 = floorA + 0.95f * dA, lv90 = floorA + 0.90f * dA,
               lv85 = floorA + 0.85f * dA, lv50 = floorA + 0.50f * dA, lv10 = floorA + 0.10f * dA;
-  // All crossings anchor around the 50% level: plateau rectifier ripple (±20% seen on the bench)
-  // can dip through 85/90/95% and fake an early edge, but it can never reach 50%. The 85/90/95
-  // crossings are the LAST ones before the 50% point (walk backward), the 10% crossing the first
-  // one after it.
+  // Crossings anchor on the 50% level: plateau rectifier ripple (±20% on the bench) can fake an early 85/90/95%
+  // edge but never reaches 50%. So 85/90/95 are the LAST crossings before i50, 10% the first after.
   int i50 = -1;
   for (int i = 0; i < n; i++) { if (amps[i] < lv50) { i50 = i; break; } }
   if (i50 <= 0) {
@@ -4972,11 +4901,9 @@ static bool fcFitDecay(const float *tMs, const float *amps, int n, int minFitPts
   fieldCutResidPct = nr ? (float)((exp(sqrt(ss / nr)) - 1.0) * 100.0) : -1.0f;
   fieldCutTauMs = (float)tauMs;
   fieldCutFallMs = (!isnan(t90)) ? (t10 - t90) : -1.0f;
-  // Drain + plot zero anchor to the cut COMMAND (tCmd): the OV release waits from when IT commands the
-  // cut, so the command→response dead time belongs inside the number. Fall back to the 95% crossing
-  // (then the 85% index) when tCmd is missing or out of range. Drain = anchor → 10%-of-baseline, read
-  // directly off the trace — the model-free "field no longer makes meaningful current" number the OV
-  // release needs. For a clean coil drain ≈ dead-time + 2.3τ, so the fit still cross-checks it.
+  // Drain + plot zero anchor to the cut COMMAND (tCmd): the OV release waits from its own cut command, so dead time
+  // belongs in the number (fallback: 95% crossing, then i85). Drain = anchor -> 10% read off the trace, model-free;
+  // for a clean coil drain ~ dead-time + 2.3τ, which cross-checks the fit.
   float t0 = !isnan(t95) ? t95 : tMs[i85];
   if (!isnan(tCmd) && tCmd >= tMs[0] && tCmd < t10) t0 = tCmd;
   fieldCutDrainMs = t10 - t0;
@@ -5004,10 +4931,8 @@ static void fieldCutProcess(float faHighMv, float faLowMv) {
   fcPlotN = 0;
   fcCalibrateFast(faHighMv, faLowMv);
 
-  // ── Fast path: 20 kSPS ring copy → boxcar-16 decimate (0.8 ms) → zero-phase EMA (τ≈4 ms,
-  //   forward+backward so the smoothing adds no lag bias to the fitted slope). The heavy filter
-  //   kills the HF hash; the ~tens-of-Hz rectifier ripple stays and averages out across the
-  //   hundreds of fit points (it is multiplicative → a zero-mean sinusoid in log space). ──
+  // ── Fast path: 20 kSPS ring -> boxcar-16 decimate (0.8 ms) -> zero-phase EMA (τ≈4 ms, fwd+back so no lag bias
+  //   in the fitted slope). Residual rectifier ripple is multiplicative, so it averages out in log space. ──
   if (fcFastCount >= 4000 && fcPlotMs && fcPlotA) {
     int nD = fcFastCount / 16;
     static float *dT = nullptr, *dA = nullptr;   // decimated workspace, PSRAM, allocated once
@@ -5069,10 +4994,8 @@ bool fieldCut_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   static double   adsHoldSum = 0.0;  static uint32_t adsHoldN = 0;   // hold-tail baseline (high cal ref)
   static double   rpmHoldSum = 0.0;  static uint32_t rpmHoldN = 0;   // hold-tail RPM (pre-cut — the cut corrupts the tach)
   static double   adsTailSum = 0.0;  static uint32_t adsTailN = 0;   // cut-tail floor (low cal ref)
-  // Calibration points are averaged over MATCHED multi-second windows on both sensors — four
-  // spaced 500 ms ring grabs (~2 s of 20 kSPS data) against the ADS mean over the same span, all
-  // in steady conditions (frozen duty / settled floor) — so ripple, noise, and any fixed pipeline
-  // delay average out instead of landing in the calibration.
+  // Cal points average MATCHED multi-second windows on both sensors (four spaced 500 ms ring grabs vs the ADS mean
+  // over the same span, steady conditions) so ripple, noise and fixed pipeline delay average out.
   static double   faHiSum = 0.0, faLoSum = 0.0;
   static uint8_t  faHiN = 0, faLoN = 0, holdGrabs = 0, tailGrabs = 0;
   static bool     snapped = false;
@@ -5127,10 +5050,8 @@ bool fieldCut_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     return false;   // ramp phase does NOT own duty — the real PID does
   }
 
-  // ── RAMP/SETTLE: the fieldCutCcActive branch slews the setpoint to fieldCutCmdA at
-  //   TEST_ENTRY_RATE_A and the real PID drives duty (slew bypassed, protections live). Here we only
-  //   WATCH: once the slewed setpoint has arrived and the measured current has sat inside the band
-  //   for FIELDCUT_SETTLE_MS, capture the applied duty and freeze it. ──
+  // ── RAMP/SETTLE: the fieldCutCcActive branch and real PID own duty; here we only WATCH until the setpoint has
+  //   arrived and current has sat in band for FIELDCUT_SETTLE_MS, then freeze the applied duty. ──
   if (phase == 1) {
     fieldCutPhase = 0;
     ampsEma += 0.05f * (ampsRaw - ampsEma);
@@ -5163,9 +5084,8 @@ bool fieldCut_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     if (settled) {
       freezeDuty = lastAppliedDuty;
       fieldCutCcActive = false;
-      // Restore the pre-test setpoint BEFORE returning true: the SystemID resume snapshot fires on
-      // this tick's rising edge (after this call) and must capture the pre-test value, not the 30 A
-      // test target — otherwise test end would re-assert the test current.
+      // Restore the pre-test setpoint BEFORE returning true: the SystemID resume snapshot fires on this tick's
+      // rising edge and must not capture the test target, or test end would re-assert the test current.
       setpointLimited = fcPreSetpoint;
       queueConsoleMessageF("Field-cut: settled at %.1f A — freezing duty %.1f%%", ampsEma, freezeDuty);
       phase = 2; phaseStartMs = nowMs;
@@ -5176,9 +5096,8 @@ bool fieldCut_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     return false;
   }
 
-  // ── HOLD: duty FROZEN at freezeDuty for FIELDCUT_HOLD_MS — a constant, settled operating point.
-  //   Baseline = ADS average over the last 2.5 s; high calibration point = four spaced 500 ms ring
-  //   grabs across the SAME 2.5 s (windows [2.0-2.5] [2.8-3.3] [3.6-4.1] [4.4-4.9] s). ──
+  // ── HOLD: duty FROZEN at freezeDuty for FIELDCUT_HOLD_MS. Baseline = ADS mean over the last 2.5 s; high cal
+  //   point = four spaced 500 ms ring grabs across the same span. ──
   if (phase == 2) {
     dutyOut = freezeDuty; fieldCutPhase = 1;
     uint32_t el = nowMs - phaseStartMs;
@@ -5199,10 +5118,8 @@ bool fieldCut_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     return true;
   }
 
-  // ── CUT + TAIL: duty steps to MinDuty (the real OV-clamp floor) and stays FIELDCUT_MEAS_MS.
-  //   Decay: fast ring grabbed FIELDCUT_SNAP_MS after the cut; ADS samples recorded for fallback.
-  //   Tail: residual floor (ADS) + low calibration point (four spaced ring grabs) over the
-  //   final 2.5 s — starts ~1.3 s after the drain has fully settled, pure floor. ──
+  // ── CUT + TAIL: duty at MinDuty (the real OV-clamp floor) for FIELDCUT_MEAS_MS. Fast ring grabbed FIELDCUT_SNAP_MS
+  //   after the cut (ADS recorded as fallback); floor + low cal point from the final 2.5 s, well after the drain. ──
   if (phase == 3) {
     dutyOut = MinDuty; fieldCutPhase = 2;
     uint32_t el = nowMs - phaseStartMs;
@@ -5251,17 +5168,12 @@ bool fieldCut_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 }
 
 // protTest_tick() — manual protection-trigger test (Settings → Emergency & Troubleshooting)
-//
-// Reproduces each field-collapse waveform on demand to hunt an electrical fault (a suspected field
-// cut). Same mutex family + duty-override contract as fieldCut_tick: returns TRUE only while it OWNS
-// duty (via dutyOut); returns FALSE during the energize ramp (the protTestCcActive branch in
-// AdjustField drives the real current PID to protTestCmdA) and during the mode-1/4 pre-gate cut +
-// ladder recovery. NO capture — the normal CSV / cvlog / console telemetry records the transient.
-// mode 1 instant cut : arms protTestCutPending → the pre-gate fires applyImmediateCut(fast-OV)
-// mode 2 load-dump    : owns duty at MinDuty + dumps the inner PID integrator (fastest commanded collapse)
-// mode 3 graceful     : owns duty, ramps down at DutyRampRate (the clean control case)
-// mode 4 ladder walk  : the mode-1 cut repeated protTestReps× — each climbs the fast-OV lockout ladder
-// Guards (AUTO / RPM / charging / no other test) live in the /protTestStart handler, not here.
+// Reproduces each field-collapse waveform on demand to hunt an electrical fault. Same duty-override contract as
+// fieldCut_tick: TRUE only while it OWNS duty; FALSE during the energize ramp (protTestCcActive branch drives the
+// real PID) and the mode-1/4 pre-gate cut + ladder recovery. NO capture: normal telemetry records the transient.
+// Modes: 1 instant cut (pre-gate applyImmediateCut, fast-OV), 2 load-dump (MinDuty + inner integrator dump),
+// 3 graceful ramp at DutyRampRate, 4 ladder walk (mode-1 cut x protTestReps up the lockout ladder).
+// Guards (AUTO / RPM / charging / no other test) live in the /protTestStart handler.
 bool protTest_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   static uint8_t  phase = 0;          // 0=idle 1=ramp/settle 2=fire-active 3=ease-out 5=ladder recovery wait
   static uint32_t phaseStartMs = 0;
@@ -5408,11 +5320,8 @@ bool protTest_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   }
 
   // ── LADDER RECOVERY WAIT (mode 4): wait out the armed cut + its lockout, then re-energize ──
-  // Only normal-path ticks reach this function: from the cut landing until the ladder lockout
-  // expires, AdjustField takes the shutdown path (MODE_LOCKOUT_RAMP) and never calls protTest_tick,
-  // so gpio4IsLow / fieldCollapseTime are NEVER observably true here. Detect the fire by the
-  // pre-gate having CONSUMED protTestCutPending — the first tick that runs after that consumption
-  // is by definition post-recovery.
+  // During the cut + lockout AdjustField takes the shutdown path and never calls this, so gpio4IsLow /
+  // fieldCollapseTime are never observably true here; the fire is detected by the pre-gate CONSUMING protTestCutPending.
   if (phase == 5) {
     if (nowMs - phaseStartMs >= PROT_RECOVER_TIMEOUT_MS) {
       queueConsoleMessage("Protection test: aborted — ladder recovery timed out");
@@ -5434,9 +5343,8 @@ bool protTest_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     return false;
   }
 
-  // ── MANUAL HARD-CUT HOLD (mode 5, phase 6): hold the field-enable line open for protTestCutMs
-  //   against the field the user already set. protTestManualCutActive gates the enable HIGH in
-  //   AdjustField; here we also command PWM 0 and own duty (return true). ──
+  // ── MANUAL HARD-CUT HOLD (mode 5, phase 6): field-enable held open for protTestCutMs against the user's field;
+  //   protTestManualCutActive gates the enable in AdjustField, and here we own duty at PWM 0. ──
   if (phase == 6) {
     if (!protTestManualCutActive) {
       protTestManualCutActive = true;
@@ -5478,16 +5386,11 @@ bool protTest_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 
 // fieldCurve_tick() — auto-commissioning Phase 1a field-% sweep
 //
-// Quasi-static duty→amps ramp. Like systemID_tick it returns true while active and
-// the caller must force GOV_BYPASS_SLEW + MANUAL PID and use dutyOut as the command.
-// Ramps duty FIELDCURVE_DUTY_START → (table limit reached | FIELDCURVE_DUTY_MAX),
-// dwelling FIELDCURVE_DWELL_MS per step and averaging amps over the settled (2nd) half
-// of each dwell so the field L/R lag doesn't bias the curve. Post-ramp it locates the
-// saturation knee and proposes SystemIDStabilizeAmps / SystemIDStepAmplitude placed in
-// the linear region below the knee. Results are read by the dashboard via /fieldcurve.csv;
-// the user clicks Apply (show-before-write) — the firmware does NOT auto-write the settings.
-// Whole-run engine-speed stats for the last ramp (fed at the same settled samples as amps,
-// so they describe the data actually captured). Advisory only — served, never gated on.
+// Quasi-static duty->amps ramp; like systemID_tick, returns true while active and the caller must force
+// GOV_BYPASS_SLEW + MANUAL PID with dutyOut as the command. Amps are averaged over the settled 2nd half of each
+// dwell so field L/R lag doesn't bias the curve. Proposals (SystemIDStabilizeAmps / StepAmplitude below the knee)
+// are show-before-write: the dashboard reads /fieldcurve.csv and the user clicks Apply.
+// Whole-run RPM stats over the same settled samples; advisory only, never gated on.
 static double   fcRunRpmSum = 0.0;
 static uint32_t fcRunRpmN   = 0;
 static void fcRunRpmSample() {
@@ -5562,12 +5465,9 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     onsetBaseline = 0.0f;
     if (fieldCurveOnsetMode) { kneeSweepKneeDuty = -1.0f; kneeSweepOk = false; }
     stepDuty = FIELDCURVE_DUTY_START;
-    // Warm-start (Min% onset only): commissioning sweeps run in DESCENDING RPM order, so each point's
-    // onset duty is strictly HIGHER than the previous (lower RPM needs more field — the 1/RPM law).
-    // Start the ramp one step below the most recent committed anchor's duty instead of from 5%, which
-    // skips re-walking duties we already know are below onset. Safe by construction: the previous
-    // (higher-RPM) onset is always below this point's onset, so we never start past the knee; the
-    // one-step backoff keeps a pre-onset baseline so the detector still sees current "begin".
+    // Warm-start (Min% onset only): commissioning sweeps run in DESCENDING RPM order, so each onset duty is higher
+    // than the previous (1/RPM law). Start one step below the last anchor's duty; the backoff keeps a pre-onset
+    // baseline so the detector still sees current "begin".
     if (fieldCurveOnsetMode && kneeAnchorN > 0) {
       float warm = kneeAnchorDuty[kneeAnchorN - 1] - FIELDCURVE_DUTY_STEP;
       if (warm > stepDuty) stepDuty = warm;
@@ -5577,9 +5477,8 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     dutySum = 0.0;
     ampN = 0;
     rpmSum = 0.0;
-    // Ease the field DOWN from the live charging duty to the sweep floor over FIELDCURVE_EASE_MS instead of
-    // snapping (the ramp runs under GOV_BYPASS_SLEW, so an un-eased entry is an instant drop). Only when
-    // coming down — a start at/below the floor (already rested) enters the sweep directly.
+    // Ease DOWN from the live duty to the sweep floor over FIELDCURVE_EASE_MS (the ramp runs under GOV_BYPASS_SLEW,
+    // so an un-eased entry is an instant drop). A start at/below the floor enters the sweep directly.
     if (lastAppliedDuty > stepDuty) {
       fcEaseInFromDuty = lastAppliedDuty;
       fcEaseInStartMs = nowMs;
@@ -5598,18 +5497,10 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 
   // ── RAMP ──────────────────────────────────────────────────────────────────
   if (phase == 1) {
-    // Over-voltage during the ramp is handled by the canonical fast-OV layer on the main
-    // control path (REASON_FAST_OVERVOLTAGE: live bus > AlternatorHardShutdownV → immediate
-    // field cut, fires before this override runs). That cut also flags fieldCurveAbortRequested,
-    // so the ramp tears down cleanly. No bespoke per-target headroom abort is needed here.
-    //
-    // Effective ramp ceiling: the field ceiling (Max Field % / Max Field Volts, whichever is lower) is the
-    // real per-bus cap and setDutyPercent clamps the APPLIED duty down to it on every class. Cap the ramp at that same ceiling so we STOP
-    // there instead of marching stepDuty up into a frozen-duty region that records flat/false amps and a
-    // bogus curve. If the amp target isn't reached by then, we flag fieldCurveCeilingLimited so the
-    // dashboard can name the binding ceiling (fieldCeilBind) and what, if anything, raises it.
-    // Taken through ccDutyCeiling() so a Max Field Volts cap stops the ramp too — it clamps applied duty
-    // in setDutyPercent identically, so a raw MaxDuty read here would walk into that same frozen region.
+    // OV during the ramp is handled by the fast-OV layer on the main path (fires before this override and flags
+    // fieldCurveAbortRequested), so no bespoke headroom abort here.
+    // Cap the ramp at ccDutyCeiling() (Max Field % / Max Field Volts, which setDutyPercent clamps APPLIED duty to)
+    // so it stops there instead of recording a frozen-duty region as a bogus curve; fieldCurveCeilingLimited names it.
     float effDutyCeil = FIELDCURVE_DUTY_MAX;
     if (ccDutyCeiling() < effDutyCeil) effDutyCeil = ccDutyCeiling();
     dutyOut = stepDuty;
@@ -5638,9 +5529,8 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
         fieldCurveBuf[fieldCurveCount++] = { avgDuty, avgAmps };
       }
       // ── Onset-stop mode (Min% knee) ─────────────────────────────────────────
-      // First settled step = baseline (below the knee). Stop the instant a later step lifts
-      // kneeOnsetA above it — that duty is the onset knee, and we've forced almost no current.
-      // No onset by kneeMaxFloorPct+margin → record the ceiling, flag "no clean knee".
+      // First settled step = baseline; stop when a later step lifts kneeOnsetA above it. No onset by
+      // kneeMaxFloorPct+margin -> record the ceiling, flag "no clean knee".
       if (fieldCurveOnsetMode) {
         if (fieldCurveCount == 1) {
           onsetBaseline = avgAmps;
@@ -5649,9 +5539,8 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
           // steps until amps fall back below onset — the lowest duty still above onset is the knee.
           queueConsoleMessageF("Min%% knee: coarse onset %.2fA at %.1f%% duty @ %.0f RPM, refining down...",
                                avgAmps - onsetBaseline, stepDuty, avgRpm);
-          // Pair the knee with the RPM/temp measured AT this step (co-temporal), not a late read —
-          // the engine drifts hundreds of RPM across a sweep. The fine-down phase overwrites these
-          // with each lower step that still shows onset, so the final pair is the knee-defining step.
+          // Pair the knee with RPM/temp measured AT this step (the engine drifts hundreds of RPM across a sweep);
+          // fine-down overwrites them per lower step still showing onset.
           onsetLastAbove = stepDuty;
           onsetLastAboveRPM = avgRpm;
           onsetLastAboveTempF = isnan(AlternatorTemperatureF) ? kneeTempRefF : AlternatorTemperatureF;
@@ -5745,9 +5634,8 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
                              fieldCurveOk ? "ok" : "review");
 
         fieldCurveResultsReady = true;
-        // Ease the field down over ~1.5 s instead of snapping from the ramp peak to the start duty —
-        // a one-tick collapse trips a protection when the override releases. Keep fieldCurveActive
-        // non-zero so the dashboard poll waits for the ease to finish.
+        // Ease down over ~1.5 s: a one-tick collapse trips a protection when the override releases. fieldCurveActive
+        // stays non-zero so the dashboard poll waits for the ease.
         fcEaseFromDuty = stepDuty;
         fcEaseStartMs = nowMs;
         phase = 2;
@@ -5767,10 +5655,8 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   }
 
   // ── ONSET FINE-DOWN (refine the coarse knee, onset mode only) ───────────────
-  // Back down in FIELDCURVE_ONSET_FINE_STEP steps from the coarse onset. Each settled step still
-  // >= kneeOnsetA over baseline becomes the new lowest-above; the first step that falls below means
-  // we've passed under the knee, so the lowest-above duty is the refined knee (rounded conservatively
-  // high = field stays primed). Bounded: at most one coarse step's worth of fine steps.
+  // Back down in FIELDCURVE_ONSET_FINE_STEP steps; each settled step still >= kneeOnsetA over baseline becomes the
+  // new lowest-above, and the first below ends it (knee rounded conservatively high = field stays primed).
   if (phase == 3) {
     dutyOut = stepDuty;
     if ((nowMs - stepStartMs) >= (FIELDCURVE_DWELL_MS / 2)) { ampSum += ampsRaw; rpmSum += RPM; ampN++; fcRunRpmSample(); }
@@ -5780,8 +5666,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       bool stillAbove = ((avgAmps - onsetBaseline) >= kneeOnsetA);
       bool atFloor = (stepDuty <= FIELDCURVE_DUTY_START + 0.001f);
       if (stillAbove) {
-        // This step still produces onset current → it defines the knee so far. Capture its duty
-        // AND the RPM/temp measured during this same dwell, so the pair is co-temporal at the knee.
+        // Still onset current: this step defines the knee so far, with its co-temporal RPM/temp.
         onsetLastAbove = stepDuty;
         onsetLastAboveRPM = avgRpm;
         onsetLastAboveTempF = isnan(AlternatorTemperatureF) ? kneeTempRefF : AlternatorTemperatureF;
@@ -5818,9 +5703,7 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   }
 
   // ── EASE-IN ────────────────────────────────────────────────────────────────
-  // Gentle ramp from the live operating duty down to the sweep floor before the first dwell begins.
-  // The dwell clock (stepStartMs) is (re)started only when the ease finishes, so no settle window
-  // opens until the field has arrived.
+  // Live duty -> sweep floor; the dwell clock starts only when the ease finishes, so no settle window opens early.
   if (phase == 4) {
     float frac = (float)(nowMs - fcEaseInStartMs) / FIELDCURVE_EASE_MS;
     if (frac >= 1.0f) {
@@ -5840,59 +5723,34 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 
 // altSweep_tick() — gate-tuning field sweeper (ALT_GATE_TUNING_CAPTURE_SPEC.md §8)
 //
-// A continuous duty ramp, up and back down, for the held-speed half of the sensitivity experiment.
-// Same contract as fieldCurve_tick: returns true while active, and the caller must force
-// GOV_BYPASS_SLEW + MANUAL PID and use dutyOut as the command.
-//
-// Modelled on fieldCurve_tick because that already solves the hard parts — easing in from the live
-// operating duty instead of snapping, easing out so a fast current collapse does not trip a
-// protection, and tearing down cleanly when the canonical fast-OV layer cuts the field. What differs:
-//   - a continuous ramp, not step-and-dwell (default 1 %/s);
-//   - up THEN down in one run. At 1 %/s against a field time constant near 0.7 s the output lags
-//     duty by roughly 0.7% of duty, and averaging the two directions cancels a symmetric lag
-//     exactly. The reversal also decorrelates the two monotone confounders — speed sag under rising
-//     field load, case temperature rising through the sweep — from the field axis;
-//   - no knee detection and no proposed settings. It is a stimulus generator; the analysis is offline.
-// Bounded by MaxDuty, the real per-bus field ceiling, exactly as the field curve is: ramping past it
-// records flat, false amps. Over-voltage is not handled here — the fast-OV layer on the control path
-// fires before this override runs and latches altSweepAbortRequested (6_functions.ino).
-// Turn around SHORT of the current and voltage limits, never on them. The soft layers that normally
-// keep the machine off its limits — Group 1/2 over-voltage, iExcess, load dump, the thermal derate, the whole min-select
-// ceiling chain — are all inside the !sysIDRunning body and therefore bypassed for the entire sweep.
-// Only the hard-cut layer is left, so arriving exactly at a limit with 1 %/s of field still building
-// and a ~0.7 s field lag behind it is how a sweep ends in a protection cut, and a cut throws away the
-// down leg the lag cancellation depends on. These margins buy back the overshoot the missing soft
-// layers would have absorbed.
-// Both margins are panel controls (altSweepMarginA / altSweepMarginV, defaults 10 A and 0.20 V),
-// posted with the start request exactly like rate/from/to.
-// No temperature margin, on the user's call. Case temperature moves on a thermal time constant, not
-// a field one: it cannot overshoot the way current and bus volts do behind the ramp's ~0.7 s field
-// lag, so there is nothing for a margin to buy back, and taking one would end sweeps early.
-// A 10 A margin would swallow a small cap whole (25 A at idle leaves 15 A of usable span, and a 12 A
-// cap would refuse to sweep at all), so the current margin also never takes more than a quarter of
-// the limit it guards — which is a clamp on the user's number too, not just on the default.
+// Continuous duty ramp up THEN down (same contract as fieldCurve_tick): averaging both legs cancels the symmetric
+// ~0.7 s field lag. Stimulus only. Bounded by ccDutyCeiling(), the enforced field ceiling, as the field curve is.
+// Fast-OV fires before this override and latches altSweepAbortRequested (6_functions.ino).
+// Turn around SHORT of current/voltage limits: every soft layer (Group 1/2 OV, iExcess, load dump, thermal derate,
+// min-select ceilings) is bypassed inside !sysIDRunning, so arriving at a limit ends in a hard cut and loses the
+// down leg. No temperature margin (case temp can't overshoot behind the field lag). The amps margin never exceeds a
+// quarter of the limit it guards, so a small cap still sweeps.
 static inline float altSweepAmpMargin(float limitA) { return fminf(altSweepMarginA, 0.25f * limitA); }
 
-// Which control limit, if any, the machine is approaching right now — evaluated from live
-// measurements against the CONFIGURED limits, deliberately not from ctrlLimiter: the sweep owns duty
-// through the same override the field curve uses, so the normal min-select chain that publishes
-// ctrlLimiter is bypassed for the whole run (and is forced to 0 while it runs). Each test therefore
-// has to repeat the enable gates the min-select chain applies, or the sweep turns around on a limit
-// the regulator itself would not have honoured.
+// Which control limit the machine is approaching, from live measurements vs CONFIGURED limits, not ctrlLimiter
+// (the min-select chain is bypassed and ctrlLimiter forced 0 during the sweep). Each test repeats that chain's
+// enable gates, or the sweep would turn around on a limit the regulator itself would not honour.
 static const char *altSweepLimitNow() {
   float v = getBatteryVoltage();
   if (ChargingVoltageTarget > 0.5f && v >= ChargingVoltageTarget - altSweepMarginV)
                                                                            return "charge-voltage target";
-  // DVCC limits count only while actually following an external authority — dvccCvlV/dvccCclA hold
-  // their last decoded values when the link drops or the feature is off, and a stale one would end
-  // every sweep. "external" not "BMS": the publisher is as often a gateway (Cerbo GX) as a battery.
+  // DVCC limits count only while following an external authority: dvccCvlV/dvccCclA hold stale values when the link
+  // drops or the feature is off. "external", not "BMS": the publisher is often a gateway (Cerbo GX).
   bool dvccFollowing = (dvccEn == 1 && dvccState == 3);
   if (dvccFollowing && !isnan(dvccCvlV) && v >= dvccCvlV - altSweepMarginV)
                                                                            return "external voltage limit";
   float amps = isnan(MeasuredAmps) ? 0.0f : MeasuredAmps;
-  // capLimitMode 1 = the cap table is watts, not amps (the min-select chain divides it by bus volts).
-  float capA = (capLimitMode == 1 && v > 0.5f) ? (interpolateRPMTable(RPM, rpmCapPowerTable) / v)
-                                               : interpolateRPMTable(RPM, rpmCapCurrentTable);
+  // capLimitMode 1 = the cap table is watts, not amps (the min-select chain divides it by bus volts). While engine speed
+  // is ignored the chain uses the owner's one limit instead (rpmCapAmpsNow), so the sweep does too.
+  float capA;
+  if (IgnoreRPM) capA = (NoRpmCurrentA > 0.0f) ? NoRpmCurrentA : smallestRpmTableAmps();
+  else           capA = (capLimitMode == 1 && v > 0.5f) ? (interpolateRPMTable(RPM, rpmCapPowerTable) / v)
+                                                        : interpolateRPMTable(RPM, rpmCapCurrentTable);
   capA = fminf(capA, (float)MaxTableValue);
   if (capA > 0.5f && amps >= capA - altSweepAmpMargin(capA))               return "current limit at this engine speed";
   if (dvccFollowing && !isnan(dvccCclA) && dvccCclA > 0.5f && amps >= dvccCclA - altSweepAmpMargin(dvccCclA))
@@ -5902,17 +5760,13 @@ static const char *altSweepLimitNow() {
   if (BattLimitEnable && HAS_BATT_SHUNT && BattCurrentLimitA > 0.5f
       && !isnan(Bcur) && Bcur >= BattCurrentLimitA - altSweepAmpMargin(BattCurrentLimitA))
                                                                            return "battery current limit";
-  if (TemperatureLimitF > 0 && !isnan(TempToUse) && TempToUse >= TemperatureLimitF)
+  if (!IgnoreTemperature && TemperatureLimitF > 0 && !isnan(TempToUse) && TempToUse >= TemperatureLimitF)   // the thermal loop parks while ignored
                                                                            return "alternator temperature limit";
   return nullptr;
 }
-#define ALTSWEEP_LIMIT_CONFIRM_MS 0u     // reverse on the FIRST sample at a limit. Was 250 ms (ripple
-                                         // debounce), but the failure costs are asymmetric: a ripple-early
-                                         // reversal just shortens the sweep (bit 7 marks it), while a late
-                                         // one at a steep battery acceptance knee ends in a hard OV cut and
-                                         // loses the down leg — measured 2026-08-27, both float-stage sweeps
-                                         // cut ~1.5 s after turnaround with the bus running >=1.2 V/s, where
-                                         // 250 ms alone cost 0.3 V of the 0.15 V margin
+#define ALTSWEEP_LIMIT_CONFIRM_MS 0u     // reverse on the FIRST sample at a limit: an early ripple reversal only
+                                         // shortens the sweep (bit 7 marks it), a late one at a steep acceptance knee
+                                         // ends in a hard OV cut (a 250 ms debounce cost 0.3 V of a 0.15 V margin)
 
 bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   static uint8_t  phase = 0;        // 0 idle, 1 ease-in, 2 ramp, 3 ease-out
@@ -5923,9 +5777,8 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 
   if (phase != 0 && altSweepAbortRequested) {
     altSweepAbortRequested = false;
-    // A teardown outside this function (protection cut, or the field leaving normal AUTO — both in
-    // 6_functions.ino) has already cleared altSweepActive and said why on the console. Only the plain
-    // Stop-sweep press arrives here with the run still marked live, so only that one announces.
+    // External teardowns (protection cut, leaving normal AUTO; 6_functions.ino) already cleared altSweepActive and
+    // announced; only a plain Stop press arrives here still live.
     if (altSweepActive != 0) queueConsoleMessage("Field sweep: aborted");
     altSweepActive = 0;
     altSweepMeasuredLeg = false;
@@ -5948,11 +5801,8 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     altSweepRequested = false;
     altSweepAbortRequested = false;
 
-    // The field caps are the ONLY ceilings: Max Field %, Max Field Volts and the board's 10 A and drive-heat
-    // ceilings, whichever binds first (ccDutyCeiling). All are named on the panel and lookupable, which is what the earlier
-    // "only MaxDuty" rule was protecting — unlike FIELDCURVE_DUTY_MAX, which the field curve stops at
-    // as its own knee-search bound and which is deliberately still NOT carried here. Reaching the
-    // ceiling is nothing new: governor_apply clamps every duty the regulator commands to it every tick.
+    // The field caps (ccDutyCeiling: Max Field %, Max Field Volts, the board's 10 A and drive-heat ceilings) are the
+    // ONLY ceilings; FIELDCURVE_DUTY_MAX (the field curve's own knee-search bound) is deliberately NOT carried here.
     float dutyCeil = ccDutyCeiling();
     fromDuty = constrain(altSweepFromPct, 0.0f, dutyCeil);
     toDuty   = (altSweepToPct <= 0.0f) ? dutyCeil : constrain(altSweepToPct, 0.0f, dutyCeil);
@@ -6002,12 +5852,9 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     lastRampMs = nowMs;
     if (dt > 0.5f) dt = 0.5f;                 // a loop stall must not teleport the command
     curDuty += (goingDown ? -1.0f : 1.0f) * ratePctS * dt;
-    // Turn around at the first control limit the machine reaches — voltage target, current cap at
-    // this speed, battery or BMS limit, temperature — instead of driving into it. Past a limit the
-    // rows stop measuring what the sweep is for (output as a function of field) and start measuring
-    // whatever is holding the machine back, and at a high state of charge driving on ends in a
-    // protection cut, which throws away the down leg the lag cancellation needs. The down leg runs
-    // at the SAME rate, so the pair stays symmetric and still averages the field lag out.
+    // Turn around at the first control limit instead of driving into it: past a limit the rows measure whatever holds
+    // the machine back, not output vs field, and at high SOC it ends in a protection cut. The down leg runs at the
+    // SAME rate so the pair still averages the field lag out.
     const char *lim = goingDown ? nullptr : altSweepLimitNow();
     if (lim) { if (limSinceMs == 0) limSinceMs = nowMs; } else limSinceMs = 0;
     bool limReached = (limSinceMs != 0) && ((uint32_t)(nowMs - limSinceMs) >= ALTSWEEP_LIMIT_CONFIRM_MS);
@@ -6065,11 +5912,8 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 
 // tuningSineStep() — Tuning→Current closed-loop sine generator (Stage 2)
 //
-// Emits a sine setpoint reference into *out (centred on baseA, amplitude ampA). For
-// waveform==2 (auto-sweep) it also runs an online single-bin lock-in of the MEASURED
-// current against the reference, per log-spaced frequency, filling tuningBode[]. The
-// phase accumulator is owned by the caller (passed by ref) so it persists across ticks.
-// Called every control tick from the TuningMode block while a sine waveform is selected.
+// Sine setpoint into *out (baseA ± ampA). waveform==2 (auto-sweep) also runs an online single-bin lock-in of the
+// MEASURED current per log-spaced frequency into tuningBode[]. phase is caller-owned so it persists across ticks.
 void tuningSineStep(uint32_t nowMs, float dt, float &phase, float baseA, float ampA,
                     float measAmps, float &out) {
   static uint8_t  segIdx = 0;
@@ -6118,9 +5962,8 @@ void tuningSineStep(uint32_t nowMs, float dt, float &phase, float baseA, float a
     }
     if (!tuningSweepActive) {
       if (tuningEaseActive) {
-        // Post-sweep: ease the setpoint all the way down to a low rest current over ~2 s (easing only to
-        // the wave floor left the floor→release drop abrupt). A still-high current when TuningMode releases
-        // reads as an over-current once protections re-arm. tuningSweepDone stays false until the ease ends.
+        // Post-sweep: ease the setpoint down to a low rest current over ~2 s; a still-high current when TuningMode
+        // releases reads as over-current once protections re-arm. tuningSweepDone stays false until the ease ends.
         float frac = (float)(nowMs - tuningEaseStartMs) / 2000.0f;
         if (frac >= 1.0f) { tuningEaseActive = false; tuningSweepDone = true; out = TUNING_EASE_REST_A; }
         else out = tuningEaseFromA + (TUNING_EASE_REST_A - tuningEaseFromA) * frac;
@@ -6165,10 +6008,8 @@ void tuningSineStep(uint32_t nowMs, float dt, float &phase, float baseA, float a
     // High rail is the live ceiling (Max Field Volts works out to ~52%@24V / ~26%@48V at its default) — a fixed 99.5 could never
     // fire there and a clipped sweep would be accepted as a valid plant fit.
     if (dutyCycle <= MinDuty + 0.5f || dutyCycle >= ccDutyCeiling() - 0.5f) tuningSweepDutyRailed = true;
-    // Integer-cycle window: settle 1 cycle, then accumulate over a WHOLE number of drive
-    // periods so the lock-in's negative-frequency leakage term cancels exactly (and the
-    // reference sin/cos sums go to ~0, keeping the DC correction clean). The raw hold
-    // (segMs, floored at 1.5 s for fast tones) is truncated down to whole cycles.
+    // Integer-cycle window: settle 1 cycle, then accumulate over a WHOLE number of periods so the lock-in's
+    // negative-frequency leakage cancels and the reference sin/cos sums go to ~0 (clean DC correction).
     float periodMs = 1000.0f / f;
     float segMs = (1.0f + (float)tuningSweepCycles) * periodMs;
     if (segMs < 1500.0f) segMs = 1500.0f;
@@ -6211,10 +6052,8 @@ void tuningSineStep(uint32_t nowMs, float dt, float &phase, float baseA, float a
           if (coh < 0.0f) coh = 0.0f;
         }
         if (gain > gMaxSeen) gMaxSeen = gain;
-        // Only in-band points (within 6 dB of the strongest response) feed worst-coherence.
-        // Past roll-off the current barely moves while the drive keeps swinging, so a low
-        // coherence there is dead signal, not a bad run — and that is exactly where slow
-        // alternators sit, so folding those points in would false-fail otherwise-clean sweeps.
+        // Only in-band points (within 6 dB of the strongest) feed worst-coherence: past roll-off low coherence is
+        // dead signal, exactly where slow alternators sit, and would false-fail clean sweeps.
         if (gMaxSeen > 0.01f && gain >= 0.5f * gMaxSeen && coh < tuningSweepWorstCoh)
           tuningSweepWorstCoh = coh;
       }
@@ -6251,8 +6090,15 @@ CachedAsset loadFileToRAM(const char *path) {
   // heap would destroy the contiguous block TLS handshakes need. On failure
   // serveCachedAsset() returns false and the file is served from flash instead.
   result.data = (uint8_t *)ps_malloc(result.size);
+  if (result.data && f.read(result.data, result.size) != result.size) {
+    Serial.printf("preload short read: %s - serving from flash\n", path);
+    free(result.data);
+    result.data = nullptr;
+    result.size = 0;
+    f.close();
+    return result;
+  }
   if (result.data) {
-    f.read(result.data, result.size);
     // FNV-1a over the loaded bytes — recomputed on every cacheWebAssets(), so a web-bundle
     // update mints a new ETag and browsers can never revalidate onto the old bundle.
     uint32_t h = 2166136261u;
@@ -6293,8 +6139,7 @@ inline void wmIgnUpdate(IgnWatermark &w, float v) {
   if (isnan(w.lo) || v < w.lo) w.lo = v;
   if (isnan(w.hi) || v > w.hi) w.hi = v;
 }
-// CSV emitter for a watermark. A sensor absent for the whole ignition cycle leaves the pair NAN;
-// a 0 there was rendered as a measured low/high (0 F, 0 kt, 0 deg heel). ROLL_EMPTY -> "—".
+// CSV emitter for a watermark: a sensor absent all ignition cycle stays NAN -> ROLL_EMPTY ("—"), never a fake 0 low/high.
 inline int wmIgnCsv(float v, int scale) {
   if (!isfinite(v)) return ROLL_EMPTY;
   float x = v * (float)scale;   // lroundf on a non-finite or out-of-range float is undefined
@@ -6303,44 +6148,16 @@ inline int wmIgnCsv(float v, int scale) {
   return (int)lroundf(x);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Charge health system calibration (commissioning stage 9) — the alternator's speed lead
-//
-// With the field pinned at a fixed level, output answers where the engine is GOING rather than
-// where it is: the rotor holds its flux for a few tenths of a second against the stator's
-// push-back, so a falling pass reads high against a rising one at the same indicated speed. The
-// health tracker grades recorded output against a steady-state surface, so it has to pair each
-// output sample with the engine speed of that moment — altLeadSec — or every window taken while
-// the boat is accelerating is smeared. Measured on the 09-08 held-field sweeps at 0.40 s here,
-// the same at every speed and field level, which is what the rotor explanation predicts.
-//
-// One run on one clock (chcRunMs), four throttle cycles the browser draws as a speed schedule:
-// idle → climb at CHC_PACE_RPM_S → hold at the top → ease back to idle. The top is CHC_TOP_FRAC of
-// the entered maximum working RPM, so it is known before Start. Cycle 1 opens with
-// CHC_SETTLE_IDLE_MS at idle and SIZES the field: on the climb the real current loop follows
-// chcTestPct of the charge-rate column at the present speed (bounded at every speed on the way up,
-// instead of chasing the top's target while the engine is slow), and inside the CHC_SIZE_HOLD_MS
-// top hold the duty it settled on is frozen. Cycles 2-4 run at that frozen duty and are each fitted
-// on their own — one climb and one descent is exactly what the estimator needs. Sizing at the top
-// is the whole point: it is the fastest the machine turns all run, so no later moment can exceed
-// what the sizing step already proved safe. (Sizing at idle, which this replaces, bounded the top
-// of the swing by nothing — output at fixed field is steeply nonlinear in speed just above the
-// knee.) The cycles chain on the clock with no button press between them, deliberately: a button
-// between cycles pins the frozen field while nobody is driving, which is where the 09-09 run
-// aborted.
-//
-// Duty-override contract is the fieldCut_tick family: returns TRUE only while it OWNS duty. The
-// sizing cycle does NOT own duty until the freeze — it returns false and drives the real current
-// PID through the chcCcActive branch in AdjustField, exactly like the field-decay ramp.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// ───── Charge health system calibration (commissioning stage 9): the alternator's speed lead ─────
+// At fixed field, output answers where the engine is GOING (rotor flux lag), so the health tracker pairs output
+// with speed via altLeadSec. Four throttle cycles on one clock (idle -> climb -> top hold -> idle). Cycle 1 SIZES
+// the field AT THE TOP, the fastest the machine turns all run, so nothing later exceeds what sizing proved safe;
+// cycles 2-4 run at that frozen duty, each fitted alone, chained with no button press (a button would pin the
+// frozen field while nobody drives). Duty-override contract as fieldCut_tick; sizing drives the real PID via chcCcActive.
 
-// The estimator, over one contiguous span of the capture [lo,hi). amps[i] is paired with rpm[i+k]
-// (k in CHC_SAMP_MS samples, so k IS the delay in feed ticks) and the count-weighted mean
-// |rising − falling| gap over speed bins is scored. Still samples belong to neither direction and
-// are dropped. Parabolic refine on the three points around the minimum gives a sub-sample answer;
-// the caller rounds it to whole ticks, which is all the delay line can hold. Returns the lead in
-// seconds (0.0 is a real answer — no lead), -1 if no candidate scored enough bins, or -2 if the
-// minimum sits at the top of the searched range, where the real lead is past what CHC_KMAX sees.
+// Estimator over one capture span [lo,hi): pair amps[i] with rpm[i+k] (k = delay in CHC_SAMP_MS ticks) and score the
+// count-weighted mean |rising - falling| gap over speed bins (still samples dropped); parabolic refine around the min.
+// Returns lead s (0.0 is real), -1 if too few bins scored, -2 if the min sits at CHC_KMAX (lead out of range).
 static float chcFitLead(int lo, int hi, float *gapBefore, float *gapAfter) {
   const int n = hi - lo;
   if (gapBefore) *gapBefore = -1.0f;
@@ -6395,9 +6212,7 @@ static float chcFitLead(int lo, int hi, float *gapBefore, float *gapAfter) {
   return ((float)bi + d) * (CHC_SAMP_MS / 1000.0f);
 }
 
-// The throttle pace the operator actually delivered, over the samples the fit could use (|rate| at
-// or above CHC_RATE_MIN — the turnarounds are not part of any pass's pace). Reported at the end
-// for reference; nothing consumes it.
+// Delivered throttle pace over the samples the fit could use (|rate| >= CHC_RATE_MIN); reported only, nothing consumes it.
 static void chcRateStats(int lo, int hi) {
   chcRateMin = chcRateMax = chcRateAvg = -1.0f;
   const int n = hi - lo;
@@ -6418,17 +6233,13 @@ static void chcRateStats(int lo, int hi) {
   if (k > 0) chcRateAvg = (float)(sum / (double)k);
 }
 
-// Read one saved charge-rate column straight out of NVS. Which one the test is SIZED from depends
-// on bank size (CHC_LOHI_AH); the HIGH column is always the guard, because it is the real ceiling.
-// Called from the chcStart web handler, never from chc_tick: the control path does not touch flash.
-// capLimitMode 1 = the charge-rate columns are WATTS (capPowerTable / capPowerTableLo) and the control
-// path divides them by bus volts at use time; chcCapAmpsAt does the same. Both kW defaults are all
-// zero, so a kW-mode unit with no stored column sizes to nothing and Start fails on CHC_MIN_TEST_A,
-// instead of on a 100 A amps default the regulator is not using.
+// Read one saved charge-rate column from NVS: the test is SIZED from one chosen by bank size (CHC_LOHI_AH), the HIGH
+// column is always the guard. Web handler only: the control path never touches flash. capLimitMode 1 = columns are
+// WATTS (divided by bus volts at use, as chcCapAmpsAt does); a missing column falls back to loadCapTablesForMode's default.
 void chcLoadCapColumn(bool high, float *out) {
   const bool kw = (capLimitMode == 1);
   for (int i = 0; i < RPM_TABLE_SIZE; i++)
-    out[i] = kw ? (high ? defaultCapPowerValues[i] : 0.0f)
+    out[i] = kw ? defaultCapPowerW(i, high)
                 : (high ? defaultCapCurrentValues[i] : defaultCapCurrentValues[i] * LOW_MODE_CAP_FRACTION);
   nvs_handle_t h;
   if (nvs_open("learning", NVS_READONLY, &h) != ESP_OK) return;
@@ -6440,15 +6251,13 @@ void chcLoadCapColumn(bool high, float *out) {
   nvs_close(h);
 }
 
-// One column's ceiling in AMPS at one speed, read the way the control path reads it: watts over bus
-// volts in kW mode, and never above the alternator rating (MaxTableValue), which every normal command
-// path also applies.
-// The bus for the charge-test backstops: the second reading, else the main one, else NAN. With the second reading
-// ignored or stale the run used to lose its "bus reached the charge target" abort entirely.
+// One column's ceiling in AMPS at one speed, read as the control path does (W / bus V in kW mode, <= MaxTableValue).
+// The bus for the charge-test backstops: the alarms' source (main reading, else the second one, each only if fresh
+// and not ignored by the owner; none in Limp Home), else NAN, so the "bus reached the charge target" abort never
+// silently drops out.
 static float chcBusV() {
-  if (battVFresh()) return BatteryV;
-  if (ibvFresh() && !IgnoreBattVMain) return IBV;
-  return NAN;
+  float v;
+  return alarmBatteryVoltage(v) ? v : NAN;
 }
 
 static float chcCapAmpsAt(float rpm, const float *table) {
@@ -6615,11 +6424,9 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       return false;
     }
 
-    // ── SIZE (cycle 1 climb + top hold): the chcCcActive branch slews the setpoint to chcCmdA at
-    //   TEST_ENTRY_RATE_A and the real PID drives duty. chcCmdA is chcTestPct of the cap column at
-    //   the PRESENT speed, never above the top's, so the command is bounded on the way up. Here we
-    //   only WATCH: once the speed is at the top, the command has arrived and the measured current
-    //   has sat inside the band for CHC_SETTLE_MS, capture the applied duty and freeze it. ──
+    // ── SIZE (cycle 1 climb + top hold): the chcCcActive branch and real PID own duty; chcCmdA is chcTestPct of the
+    //   cap column at the PRESENT speed (never above the top's), so the command is bounded on the way up. Freeze the
+    //   applied duty once at the top, arrived, and in band for CHC_SETTLE_MS. ──
     if (phase == 2) {
       chcPhase = (seg >= 2) ? 3 : 2;
       const float *col = (BatteryCapacity_Ah >= CHC_LOHI_AH) ? chcHiTable : chcLoTable;
@@ -6646,10 +6453,8 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
       } else {
         inBandSinceMs = 0;
       }
-      // The hold window has closed on the clock without a settle. At the top with real output:
-      // proceed on what there is (the field railed before the level — the cycles only need
-      // something to watch rise and fall). Otherwise the sizing did not happen at the top, and a
-      // field sized anywhere lower is the 09-09 failure, so the run ends instead.
+      // Hold window closed without a settle: at the top with real output, proceed (the field railed first; the cycles
+      // only need something to rise and fall). Off the top the run ends: a field sized lower leaves the top unbounded.
       if (!settled && (seg == 3 || !onSchedule)) {
         const bool boardHeld = boardCeilHoldsField();
         if (atTop && ampsEma >= CHC_MIN_TEST_A) {
@@ -6671,9 +6476,8 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
         holdDuty = (lastAppliedDuty > 0.0f) ? lastAppliedDuty : MinDuty;
         chcHoldDuty = holdDuty;
         chcCcActive = false;
-        // Restore the pre-test setpoint BEFORE returning true: the SystemID resume snapshot fires on
-        // this tick's rising edge (after this call) and must capture the pre-test value, not the test
-        // target — otherwise test end would re-assert the test current.
+        // Restore the pre-test setpoint BEFORE returning true: the SystemID resume snapshot fires on this tick's
+        // rising edge and must not capture the test target, or test end would re-assert the test current.
         setpointLimited = preSetpoint;
         chcMinA = ampsRaw; chcPeakA = ampsRaw;
         chcCount = 0; lastSampMs = 0;

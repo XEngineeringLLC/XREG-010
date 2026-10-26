@@ -10,14 +10,15 @@ Diagnostic plotter for CVlog data from the ESP32 alternator regulator.
   Plot 5 — Voltage loop firing health (stall diagnostic)
   Plot 6 — Voltage D term: voltage domain + current domain + gate domain (rise rate vs live gate & arm window)
 
-State strip (below each plot):
+State strip (below each plot), top to bottom:
   - binding-cap track (capReason): which layer actually set the current ceiling each tick
-    (purple=KHard, teal=iExcess, orange=loadDump; blank=unclamped) — answers "is KHard
-    doing anything?". Console also prints the per-reason sample share at load time.
+    (blue=G1 KHard, orange=G2 KHard, purple=iExcess, red=loadDump, teal=iExcessBulk;
+    blank=unclamped) — answers "is KHard doing anything?". Console also prints the
+    per-reason sample share at load time.
   - mode bar (brown=COMMISSIONING stage, green=CV active, grey=CV off)
-  - fastOvActive overlay (red when FastOV or iExcess active; load dump has its own track)
-  - Tick marks: voltLoopFired (pink), hardClamp (purple),
-                iExcess (teal), loadDumpActive (orange)
+  - Tick marks: voltLoopFired (grey)
+  - Duration bars: recovActive (blue), fastOvActive (cyan; FastOV or iExcess, load dump
+    separate), hardClamp (brown), iExcess (purple), loadDumpActive (red)
 
 File picker searches ~/Downloads for *.csv, newest first.
 PNGs saved to Downloads alongside source CSV.
@@ -53,13 +54,7 @@ plt.rcParams.update({
     "legend.handleheight": 1.5,
 })
 
-# ---------------------------------------------------------------------------
-# 1. File selector
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 2. Load and parse
-# ---------------------------------------------------------------------------
+# ===== Load and parse =====
 path = pick_file(prefix="cvlog_", title="Select CV Log")
 if not path:
     raise SystemExit("No file selected.")
@@ -67,10 +62,7 @@ if not path:
 basename = os.path.splitext(os.path.basename(path))[0]
 print(f"Loading: {path}")
 
-# Robust header search — accepts both old format (t_s, comma-sep) and new (ts_ms, tab-sep).
-# Some firmware builds write the last comment and the header on the same line (missing newline),
-# e.g. "# cv_I: ... PI ints_ms,chargeStageDisplay,...". Detect by presence of both "battV"
-# and "ts_ms"/"t_s", then repair the garbled first column after splitting.
+# Header = first line holding battV and a time column (ts_ms tab-separated, or legacy t_s comma-separated).
 with open(path, encoding="utf-8", errors="replace") as _f:
     _lines = _f.readlines()
 
@@ -88,13 +80,10 @@ if _header_idx is None:
         "Check that the CVlog header was written correctly by the firmware."
     )
 
-# Auto-detect delimiter
 _sep = "\t" if "\t" in _header_line else ","
 _col_names = [c.strip() for c in _header_line.split(_sep)]
 
-# Repair garbled first column: firmware sometimes omits the newline between the last
-# comment line and the header, so "...PI int" + "s_ms,col1,..." becomes "...PI ints_ms,col1,...".
-# The first field ends up as e.g. "# cv_I: CV position-form PI ints_ms" instead of "ts_ms".
+# Some firmware omits the newline before the header, so the first field arrives as "# cv_I: ... ints_ms".
 if _col_names:
     if _col_names[0] != "ts_ms" and "ts_ms" in _col_names[0]:
         _col_names[0] = "ts_ms"
@@ -108,39 +97,28 @@ from io import StringIO
 _data_text = "".join(_lines[_header_idx + 1:])
 df = pd.read_csv(StringIO(_data_text), names=_col_names, sep=_sep, on_bad_lines="skip")
 
-# ---------------------------------------------------------------------------
-# Normalise new log format → names the rest of the script expects.
-# New format is tab-separated with different column names and packed bitfields.
-# ---------------------------------------------------------------------------
+# ===== Rename log columns to the names used below =====
 _rename_map = {
-    # time
     "ts_ms":                   "ts_ms_raw",
-    # voltage
     "ChargingVoltageTarget":   "targV",
     "vError":                  "vError_V",
-    # current
     "Icv":                     "Icv_A",
     "cv_I":                    "cv_I_A",
     "tableThermalLimit":       "uTarget_A",
     "setpointCmd":             "spLimited_A",
     "measAmps":                "iMeas_A",
-    # duty
     "dutyApplied":             "duty_pct",
-    # loop event
     "voltageLoopRanThisTick":  "voltLoopFired",
-    # misc
     "dBcur_dt":                "dBcur_dt_Aps",
     "battI":                   "battI_A",
 }
 df.rename(columns={k: v for k, v in _rename_map.items() if k in df.columns}, inplace=True)
 
-# Derive t_s (seconds) from ts_ms_raw if present; old format already has t_s
 if "ts_ms_raw" in df.columns:
     df["t_s"] = pd.to_numeric(df["ts_ms_raw"], errors="coerce") / 1000.0
 elif "t_s" not in df.columns:
     raise SystemExit(f"ERROR: no time column found in parsed columns: {list(df.columns)}")
 
-# Unpack ovFlags bitmask → individual flag columns (new format)
 if "ovFlags" in df.columns:
     _ov = pd.to_numeric(df["ovFlags"], errors="coerce").fillna(0).astype("int64")
     df["fastOvActive"]   = (_ov & 1)
@@ -149,15 +127,12 @@ if "ovFlags" in df.columns:
     df["iExcess"]        = ((_ov & 8) > 0).astype("int64")
     df["loadDumpActive"] = ((_ov & 16) > 0).astype("int64")
 
-# Unpack flags bitmask → cvActive (bit1 = voltCtrl = CV loop running) + cvBattActive (bit5, §G:
-# inner loop regulating BATTERY current battI_A instead of alternator current iMeas_A)
+# flags: 0x02 = CV loop running; 0x20 = inner loop regulating battery current battI_A instead of iMeas_A (§G)
 if "flags" in df.columns:
     _fl = pd.to_numeric(df["flags"], errors="coerce").fillna(0).astype("int64")
     if "cvActive" not in df.columns:
         df["cvActive"] = ((_fl & 2) > 0).astype("int64")
     df["cvBattActive"] = ((_fl & 32) > 0).astype("int64")
-
-# ---------------------------------------------------------------------------
 
 if "t_s" not in df.columns:
     raise SystemExit(f"ERROR: 't_s' not in parsed columns: {list(df.columns)}")
@@ -192,7 +167,6 @@ for col in numeric_cols:
 df.dropna(subset=["t_s"], inplace=True)
 df.reset_index(drop=True, inplace=True)
 
-# t_s is already in seconds
 df["t_s"] = df["t_s"] - df["t_s"].iloc[0]   # zero-reference
 
 total_time_s = df["t_s"].iloc[-1]
@@ -207,7 +181,6 @@ else:
     df["t_plot"] = df["t_s"]
     time_label = "Time (seconds)"
 
-# Integer / flag columns
 def _to_int(col):
     if col not in df.columns:
         return pd.Series(0, index=df.index)
@@ -224,8 +197,7 @@ df["recovActive"]    = _to_int("recovActive")   # post-protection recovery windo
 df["capReason"]      = _to_int("capReason")   # 0=none 1=KHard_G1 2=KHard_G2 3=iExcess 4=loadDump 5=iExcessBulk (binding cap; older logs lack it → all 0)
 df["chargeStageDisplay"] = _to_int("chargeStageDisplay")   # 8 = COMMISSIONING (older logs lack it → all 0, band never drawn)
 
-# capReason: which protection layer was the BINDING current cap each tick. This answers
-# "does KHard actually do anything?" — KHard only matters when capReason is 1 or 2.
+# capReason = the protection layer that was the binding current cap each tick (1/2 = KHard).
 CAP_REASON_LABELS = {0: "none", 1: "KHard_G1", 2: "KHard_G2", 3: "iExcess", 4: "loadDump", 5: "iExcessBulk"}
 CAP_REASON_COLORS = {0: "#cccccc", 1: "#1f77b4", 2: "#ff7f0e", 3: "#9467bd", 4: "#d62728", 5: "#26a69a"}  # G1 blue / G2 orange / iExc purple / LD red / iExcBulk teal
 CAP_REASON_SHORT  = {1: "G1", 2: "G2", 3: "iExc", 4: "LD", 5: "iExcB"}  # compact on-plot event tags
@@ -242,22 +214,18 @@ if _have_capreason:
 else:
     print("Binding cap reason: column 'capReason' not in this log (older firmware) — skipping.")
 
-# Extract voltage loop Kp/Ki. VoltageKd is not a per-row column — the D gain is emitted in the
-# header comment and parsed separately below; only Kp/Ki come from here.
-# New log format: per-row voltageKp/Ki columns hold the actual outer voltage loop gains.
-# Old log format: only gainKp/Ki/Kd existed — those are INNER current-loop gains (PidKp/Ki/Kd),
-#   NOT the voltage loop gains. Do not use them as voltage loop gains.
+# Voltage loop Kp/Ki from the per-row voltageKp/Ki columns (Kd comes from the header, below). Old logs'
+# gainKp/Ki/Kd are the INNER current-loop gains: never use them as voltage loop gains.
 import re
 _kp = float("nan")
 _ki = float("nan")
-# Primary: new per-row voltage loop columns
 if "voltageKp" in df.columns:
     _v = pd.to_numeric(df["voltageKp"], errors="coerce").dropna()
     if len(_v): _kp = float(_v.iloc[0])
 if "voltageKi" in df.columns:
     _v = pd.to_numeric(df["voltageKi"], errors="coerce").dropna()
     if len(_v): _ki = float(_v.iloc[0])
-# Legacy: header comment with VoltageKp= (never produced by firmware, kept for future use)
+# Header VoltageKp= fallback; no firmware has emitted it
 if np.isnan(_kp):
     for _raw in _lines[:_header_idx]:
         if "VoltageKp" in _raw:
@@ -266,7 +234,6 @@ if np.isnan(_kp):
             m = re.search(r"VoltageKi=([\d.]+)", _raw)
             if m: _ki = float(m.group(1))
             break
-# Old-format log warning: gainKp/Ki/Kd = inner current-loop gains, not voltage loop gains
 if np.isnan(_kp) and ("gainKp" in df.columns or "innerKp" in df.columns):
     print("WARNING: old log format — voltage loop gains unavailable. "
           "gainKp/Ki/Kd (if present) are inner current-loop gains, not VoltageKp/Ki/Kd.")
@@ -274,13 +241,8 @@ if np.isnan(_kp) and ("gainKp" in df.columns or "innerKp" in df.columns):
 outer_label = f"VoltageKp={_kp:.4g}  VoltageKi={_ki:.4g}"
 print(f"Voltage loop gains: {outer_label}")
 
-# Extract CV D-term constants from the header comment line emitted by cvBinToCsv.
-# 2026-07-21 onward the header carries the FULL trim equation:
-#   "# VoltageD: VoltageKdActive=2.38A/(V/s) CvKdDeadbandVps=0.500V/s CvKdDbSlope=0.00400V/s/A
-#    CvKdDbFloor=0.100V/s CvKdDbCeil=3.500V/s CvKdSlopeCeil=10.00V/s CvKdMaxTrimA=500A
-#    CvKdArmV=0.500V CvKdOneSided=0 CvKdExcessMode=1 CvKdVoltFiltTC=40ms CvBrakeFallRate=200A/s"
-# Older logs have only "VoltageKd=" (the TYPED knob — in Auto mode NOT the gain the loop ran,
-# which is why VoltageKdActive is preferred when present). Match on the KEY, not a line tag.
+# CV D-term constants from the cvBinToCsv header line, matched by KEY. Old logs carry only "VoltageKd=",
+# the TYPED knob (in Auto mode not the gain that ran), so VoltageKdActive wins when present.
 _brk_thresh    = float("nan")   # V/s — deadband line BASE (b of clamp(floor, b + m·I, ceil))
 _brk_k         = float("nan")   # A/(V/s) — D gain; ACTIVE gain on new logs, typed knob on old ones
 _brk_k_typed   = False          # True when _brk_k came from the old typed-knob key (Auto logs: distrust it)
@@ -290,7 +252,7 @@ _brk_voltfilt  = float("nan")   # ms — CvKdVoltFiltTC, the dedicated voltage E
 _brk_dbslope   = float("nan")   # V/s per A — deadband line slope m, evaluated at spLimited_A
 _brk_dbfloor   = float("nan")   # V/s — deadband line clamp floor
 _brk_dbceil    = float("nan")   # V/s — deadband line clamp ceiling
-_brk_slopeceil = float("nan")   # V/s — slope ceiling, real per-bus (2026-07-21 on; older logs stored it ×V/12-effective, same value); cvDSlope clamps to ±this
+_brk_slopeceil = float("nan")   # V/s — slope ceiling; cvDSlope clamps to ±this
 _brk_maxtrim   = float("nan")   # A — flat trim cap
 _brk_excess    = float("nan")   # 1 = trim = Kd×(slope − band) continuous; 0 = legacy Kd×slope latch
 _brk_fallrate  = float("nan")   # A/s — CvBrakeFallRate: brake-tier setpoint fall rate while D-term removes current
@@ -344,9 +306,8 @@ _brk_label = (
 )
 print(f"CV D-term params: {_brk_label}")
 
-# Trim-law self-check — the header now carries the full equation, so verify the logged trims
-# against it: expected = Kd × (slope − band) in excess mode, Kd × slope in legacy mode. Uses only
-# rows where a trim landed (kdTrim_A ≠ 0); the ratio flags a header/firmware mismatch (≈1 = healthy).
+# Trim-law self-check on rows where a trim landed: expected = Kd×(slope − band) in excess mode, Kd×slope
+# in legacy mode. Ratio ≈1 = healthy; otherwise the header params differ from what ran.
 def _kd_law_check(_df):
     if _brk_k_typed or np.isnan(_brk_k) or np.isnan(_brk_thresh): return
     need = ("kdTrim_A", "cvDSlope_Vps", "kdDeadband_Vps")
@@ -384,14 +345,9 @@ if _helpers_en is not None:
     print(f"Toggles: cvHelpersEnabled={_helpers_en} cvRiseGovEnable={_risegov_en}"
           + ("   *** HELPERS OFF — CV D term did not run ***" if _helpers_en == 0 else ""))
 
-# CV D-term activity — GROUND TRUTH, not a reconstruction of the gate.
-# kdTrim_A != 0 ⟺ the D term acted on that voltage-loop tick — already logged. Do NOT re-derive it from
-# the gate formula: cvHelpersEnabled / fitProbeActive / voltageTargetSlewed / CvKdArmV drive that gate and
-# a log can be captured with any of them against you.
-# kdTrim_A lands on the single row of the VL tick that trimmed, so hold it across the interval that trim
-# governs Icv for — the gate is only EVALUATED at 10 Hz while this log samples ~100 Hz, so a per-row test
-# would both stipple the band and overstate its tail by up to one VL interval.
-# cvBinToCsv exports this as kdActive; derive it identically for CSVs predating that column.
+# kdTrim_A != 0 is ground truth that the D term acted; do NOT re-derive it from the gate formula (its inputs
+# can be against you in any log). Hold it until the next VL tick: the gate runs at 10 Hz, the log at ~100 Hz.
+# Same derivation as cvBinToCsv's kdActive, for CSVs predating that column.
 if "kdActive" not in df.columns:
     if all(c in df.columns for c in ("kdTrim_A", "voltLoopFired")):
         _held, _vals = 0, []
@@ -417,9 +373,7 @@ elif not np.isnan(_brk_armv) and _brk_armv > 0:
 _targ_pi = "targSlewed_V" if ("targSlewed_V" in df.columns and df["targSlewed_V"].notna().any()) else "targV"
 _targ_pi_exact = (_targ_pi == "targSlewed_V")
 
-# ---------------------------------------------------------------------------
-# 3. Shared drawing helpers
-# ---------------------------------------------------------------------------
+# ===== Shared drawing helpers =====
 GRID_KW    = dict(alpha=0.4, linewidth=0.7)
 DUTY_COLOR = "#78909c"   # field duty % line — neutral grey-blue on all plots
 
@@ -465,7 +419,6 @@ def draw_state_strip(ax, df):
 
     span = df["t_plot"].iloc[-1] - df["t_plot"].iloc[0]
 
-    # cvActive background bar — fills almost the full strip height
     prev_t   = df["t_plot"].iloc[0]
     prev_val = df["cvActive"].iloc[0]
     for i in range(1, len(df)):
@@ -483,11 +436,9 @@ def draw_state_strip(ax, df):
             prev_t  = t
             prev_val = val
 
-    # voltLoopFired ticks — span full bar height
     for t in df.loc[df["voltLoopFired"] == 1, "t_plot"]:
         ax.axvline(x=t, ymin=0.09, ymax=0.91, color=EV_COLOR_VLOOP, linewidth=1.0, alpha=0.9)
 
-    # Legend
     ax.text(df["t_plot"].iloc[0] + span * 0.005, 0.88, "cvActive", fontsize=7, color="#1b5e20", va="center")
     ax.text(df["t_plot"].iloc[0] + span * 0.005, 0.12, "VLoop▲",   fontsize=7, color=EV_COLOR_VLOOP, va="center")
 
@@ -574,7 +525,7 @@ COMMISSIONING_COLOR = "#795548"   # brown — matches plot_pidlog / plot_thermal
 
 
 def add_voltloop_vlines(ax, df):
-    """Faint pink vlines where voltage loop fired."""
+    """Faint grey vlines where voltage loop fired."""
     for t in df.loc[df["voltLoopFired"] == 1, "t_plot"]:
         ax.axvline(x=t, color=EV_COLOR_VLOOP, linewidth=0.6, alpha=0.35)
 
@@ -614,9 +565,7 @@ def draw_flag_bars(ax, df):
 
     span = df["t_plot"].iloc[-1] - df["t_plot"].iloc[0]
 
-    # --- Row 6 (top): capReason — which layer was the BINDING cap (colored segments) ---
-    # Only non-"none" segments are drawn, so any color here = a protection actually set
-    # the current ceiling. Colours are max-distinct: G1 blue, G2 orange, iExcess purple, loadDump red.
+    # --- Row 7 (top): capReason — which layer was the BINDING cap (colored segments) ---
     cr_offset = 7 * spacing
     if "capReason" in df.columns:
         cr_vals = df["capReason"].values
@@ -642,7 +591,6 @@ def draw_flag_bars(ax, df):
                         episodes.append([t_arr[seg_start], [code], seg_end])
                 if not last:
                     seg_start = i
-        # Inline tag above each episode so a protection event is self-explanatory on every plot.
         for ep_t, codes, ep_end in episodes:
             tag    = ">".join(CAP_REASON_SHORT.get(c, str(c)) for c in codes)
             ep_mid = 0.5 * (ep_t + ep_end)
@@ -653,9 +601,8 @@ def draw_flag_bars(ax, df):
                     va="bottom", ha="center", fontsize=7, fontweight="bold",
                     color=tcol, clip_on=False)
 
-    # --- Row 5: mode bar — brown=COMMISSIONING (stage 8), green=CV active, grey=CV off ---
-    # COMMISSIONING is a charge-stage mode, not a protection event, so it lives in this
-    # mode row (overriding cv on/off) the same way it does in plot_pidlog / plot_thermallog.
+    # --- Row 6: mode bar — brown=COMMISSIONING (stage 8), green=CV active, grey=CV off ---
+    # COMMISSIONING overrides CV on/off in this row, as in plot_pidlog / plot_thermallog.
     cv_offset = 6 * spacing
     _cv  = df["cvActive"].values
     _stg = (df["chargeStageDisplay"].values if "chargeStageDisplay" in df.columns
@@ -775,9 +722,7 @@ def draw_flag_bars(ax, df):
     ax.grid(**GRID_KW)
 
 
-# ---------------------------------------------------------------------------
-# PLOT 1 — Voltage
-# ---------------------------------------------------------------------------
+# ===== PLOT 1 — Voltage =====
 fig1 = plt.figure(figsize=(18, 8), num="Plot 1 — Voltage")
 gs1  = gridspec.GridSpec(2, 1, height_ratios=[5, 0.9], hspace=0.08)
 ax1  = fig1.add_subplot(gs1[0])
@@ -823,9 +768,7 @@ draw_flag_bars(ax1s, df)
 # save_fig(fig1, "plot1_voltage")
 
 
-# ---------------------------------------------------------------------------
-# PLOT 2 — Current command chain (top) + protection layers (bottom)
-# ---------------------------------------------------------------------------
+# ===== PLOT 2 — Current command chain (top) + protection layers (bottom) =====
 fig2 = plt.figure(figsize=(18, 12), num="Plot 2 — Command Chain & Protections")
 gs2  = gridspec.GridSpec(2, 1, height_ratios=[4, 0.9], hspace=0.12)
 ax2a = fig2.add_subplot(gs2[0])
@@ -875,7 +818,6 @@ add_ov_shading(ax2a, df)
 add_cvbatt_shading(ax2a, df)   # §G: amber band = CV regulating battery current (track spLimited vs battI)
 add_voltloop_vlines(ax2a, df)
 
-# Variable key table — maps legend nicknames to internal variable names; drag anywhere to reposition
 _p2_key = (
     "  Current ceiling/all caps =  uTarget_A      (A)\n"
     "  CV setpoint              =  Icv_A          (A)\n"
@@ -932,15 +874,12 @@ fig2.canvas.mpl_connect("button_release_event", _krelease)
 # --- 2b: mode + protection events panel ---
 draw_flag_bars(ax2b, df)
 
-# Checkbox panel for ax2a lines only (battI_A now lives there)
 _cb2 = _make_checkbox_panel(fig2, _h2a + _h2a_duty)
 
 # save_fig(fig2, "plot2_command_chain_protections")
 
 
-# ---------------------------------------------------------------------------
-# PLOT 3 — Engine & scheduling context
-# ---------------------------------------------------------------------------
+# ===== PLOT 3 — Engine & scheduling context =====
 fig3 = plt.figure(figsize=(18, 9), num="Plot 3 — RPM & Context")
 gs3  = gridspec.GridSpec(3, 1, height_ratios=[2, 1.5, 0.9], hspace=0.10)
 ax3  = fig3.add_subplot(gs3[0])
@@ -1000,22 +939,15 @@ _h3b = [l for l in ax3b.get_lines() if not l.get_label().startswith("_")]
 _leg3b = ax3b.legend(loc="upper right", fontsize=10)
 _leg3b.set_draggable(True)
 
-# One checkbox panel for both ax3 and ax3b lines
 _cb3 = _make_checkbox_panel(fig3, _h3 + _h3_duty + _h3b)
 
 draw_flag_bars(ax3s, df)
 # save_fig(fig3, "plot3_rpm_context")
 
 
-# ---------------------------------------------------------------------------
-# PLOT 4 — CV PID term decomposition
-#
-# Ground-truth split of the CV current setpoint into its three terms, straight from the
-# logged columns: Icv_A = pTerm_A + cv_I_A − kdTrim_A (before the [0, ceiling] clamp).
-# −kdTrim_A is the D contribution: negative while it REMOVES current on a rise into target, and
-# (two-sided mode) positive while it ADDS current on a fall below target. Older logs predating pTerm_A/kdTrim_A
-# fall back to the Kp×error reconstruction of P (I from cv_I_A, no D available).
-# ---------------------------------------------------------------------------
+# ===== PLOT 4 — CV PID term decomposition =====
+# Icv_A = pTerm_A + cv_I_A − kdTrim_A before the [0, ceiling] clamp. Logs without pTerm_A/kdTrim_A fall
+# back to a Kp×error P (no D).
 fig4 = plt.figure(figsize=(18, 9), num="Plot 4 — PID Term Decomposition")
 gs4  = gridspec.GridSpec(3, 1, height_ratios=[4, 1.5, 0.9], hspace=0.10)
 ax4  = fig4.add_subplot(gs4[0])
@@ -1031,9 +963,8 @@ add_subtitle(fig4,
     f"CV D term: {_brk_label}")
 fig4.subplots_adjust(top=0.90, right=0.80)
 
-# P term: prefer the logged ground truth (pTerm_A). Reconstruct from Kp×error only on older logs that
-# predate the column — and then off targSlewed (the governor output the PI tracks), not the raw target,
-# so a reconstruction is wrong wherever the rise governor clamped.
+# The Kp×error fallback uses targSlewed (what the PI tracks); off the raw target it is wrong wherever the
+# rise governor clamped.
 _have_pterm = "pTerm_A" in df.columns and df["pTerm_A"].notna().any()
 if _have_pterm:
     df["pid_P"] = df["pTerm_A"]
@@ -1072,9 +1003,7 @@ add_kd_shading(ax4, df)
 add_ov_shading(ax4, df)
 add_voltloop_vlines(ax4, df)
 
-# vError context panel. vError_V is logged as (targV − battV) — NOT the error the PI runs on, which is
-# (targSlewed − battV) and is plotted separately when the log carries it. The filtered error is
-# reference only (display EMA, VoltageFilterTC).
+# vError_V is logged as targV − battV, not the PI's error (targSlewed − battV, plotted when available).
 df["filt_error_V"] = df[_targ_pi] - df["battV_filt_V"]
 ax4b.plot(df["t_plot"], df["vError_V"],
           color="#212121", lw=1.8, alpha=0.90, label="vError_V  (logged: targV − battV)")
@@ -1093,20 +1022,14 @@ _h4b = [l for l in ax4b.get_lines() if not l.get_label().startswith("_")]
 _leg4b = ax4b.legend(_h4b, [l.get_label() for l in _h4b], loc="upper left", fontsize=10)
 _leg4b.set_draggable(True)
 
-# One checkbox panel for ax4 + ax4b lines
 _cb4 = _make_checkbox_panel(fig4, _h4 + _h4_duty + _h4b)
 
 draw_flag_bars(ax4s, df)
 # save_fig(fig4, "plot4_pid_decomposition")
 
 
-# ---------------------------------------------------------------------------
-# PLOT 5 — Voltage Loop Firing Health (diagnostic for stalls)
-# Shows "ms since previous voltage loop fire" as a sawtooth. Long flat ramps
-# = the 100ms CV PI loop did NOT fire when it should have, leaving setpoint
-# and integrator stale. Most protections sit downstream of this loop, so any
-# stall here is a stall of every overvoltage protection too.
-# ---------------------------------------------------------------------------
+# ===== PLOT 5 — Voltage loop firing health (stall diagnostic) =====
+# Most OV protections sit downstream of the 100 ms CV loop, so a stall here stalls them too.
 fig5 = plt.figure(figsize=(18, 8), num="Plot 5 — Voltage Loop Health")
 gs5  = gridspec.GridSpec(2, 1, height_ratios=[3, 1.6], hspace=0.12)
 ax5  = fig5.add_subplot(gs5[0])
@@ -1120,8 +1043,6 @@ add_subtitle(fig5,
     "Bottom: battV during the same window. Stall + rising RPM = uncontrolled overshoot.")
 fig5.subplots_adjust(top=0.90, right=0.80)
 
-# Compute "ms since last voltage loop fire" for every row.
-# Resets to 0 on each fire; grows linearly between fires.
 _last_fire_t = None
 _t_since = []
 for _i, _row in df.iterrows():
@@ -1133,7 +1054,6 @@ for _i, _row in df.iterrows():
         _t_since.append((_row["t_plot"] - _last_fire_t) * 1000.0)
 df["t_since_vloop_ms"] = _t_since
 
-# Trailing silence: from last fire to end of file (no further fire = silent)
 _fires = df.loc[df["voltLoopFired"] == 1]
 _last_fire_t_global = _fires["t_plot"].iloc[-1] if len(_fires) > 0 else None
 _file_end_t = df["t_plot"].iloc[-1]
@@ -1141,14 +1061,12 @@ _file_end_t = df["t_plot"].iloc[-1]
 ax5.plot(df["t_plot"], df["t_since_vloop_ms"],
          color="#1565c0", lw=1.6, label="ms since previous voltage loop fire")
 
-# Markers at each actual fire (interval value from log column)
 if len(_fires) > 0 and "voltLoopInterval_ms" in df.columns:
     _intervals = _fires["voltLoopInterval_ms"].astype(float)
     ax5.scatter(_fires["t_plot"], _intervals,
                 s=30, color="#0d47a1", zorder=5, marker="o",
                 label="Fire events (interval since previous fire)")
 
-# Threshold reference lines
 ax5.axhline(y=100, color="#2e7d32", linestyle="--", lw=1.0, alpha=0.65,
             label="Expected (100 ms)")
 ax5.axhline(y=200, color="#f57c00", linestyle=":",  lw=1.0, alpha=0.65,
@@ -1156,7 +1074,6 @@ ax5.axhline(y=200, color="#f57c00", linestyle=":",  lw=1.0, alpha=0.65,
 ax5.axhline(y=300, color="#c62828", linestyle=":",  lw=1.0, alpha=0.65,
             label="3× expected (300 ms)")
 
-# Highlight "silent" trailing region (last fire to file end, if > 200 ms)
 if _last_fire_t_global is not None:
     _silence_ms = (_file_end_t - _last_fire_t_global) * 1000.0
     if _silence_ms > 200:
@@ -1169,7 +1086,6 @@ ax5.grid(**GRID_KW)
 _leg5 = ax5.legend(loc="upper left", fontsize=10)
 _leg5.set_draggable(True)
 
-# Bottom panel — battV in same window for visual correlation
 ax5b.plot(df["t_plot"], df["battV"],
           color="#1565c0", lw=2.0, label="battV (measured)")
 ax5b.plot(df["t_plot"], df["targV"],
@@ -1180,7 +1096,6 @@ ax5b.grid(**GRID_KW)
 ax5b.legend(loc="upper left", fontsize=10)
 add_ov_shading(ax5b, df)
 
-# Print summary to console
 if len(_fires) > 1 and "voltLoopInterval_ms" in df.columns:
     _ivals = _fires["voltLoopInterval_ms"].astype(float)
     _worst = _ivals.max()
@@ -1195,13 +1110,8 @@ if len(_fires) > 1 and "voltLoopInterval_ms" in df.columns:
                   f"no further fires for {_silence_ms:.0f} ms before end of file")
 
 
-# ---------------------------------------------------------------------------
-# PLOT 6 — Voltage D Term
-# Everything the D term touches, on one time base: the voltage domain it watches
-# (top), the current domain it trims (bottom), and the armed window across both.
-# ---------------------------------------------------------------------------
-# Row 1 is split left/right: amps and V/s are unrelated scales and sharing one frame with a twin axis
-# made both unreadable. Both still sharex with the voltage panel, so the linked zoom drives all three.
+# ===== PLOT 6 — Voltage D term =====
+# Row 1 is split left/right because amps and V/s are unrelated scales; both sharex the voltage panel.
 fig6 = plt.figure(figsize=(18, 10), num="Plot 6 — Voltage D Term")
 gs6  = gridspec.GridSpec(3, 2, height_ratios=[3.2, 2.6, 0.9], hspace=0.13, wspace=0.16)
 ax6  = fig6.add_subplot(gs6[0, :])
@@ -1230,18 +1140,15 @@ if "cvKdFiltV_V" in df.columns and df["cvKdFiltV_V"].notna().any():
 if "ovFilt_V" in df.columns and df["ovFilt_V"].notna().any():
     ax6.plot(df["t_plot"], df["ovFilt_V"],
              color="#6a1b9a", lw=1.8, alpha=0.90, label="ovFilt_V (G2 comparator input)")
-# The governor output — the setpoint the PI tracks. Only diverges from targV on a RISING target, which
-# is exactly when overshoot is studied, so it is drawn whenever the log carries it. Drawn UNDER targV
-# (thicker, solid) so that when the two coincide the dashed targV still reads on top of it, rather than
-# one silently hiding the other.
+# targSlewed (the setpoint the PI tracks) diverges from targV only on a rising target. Drawn thick and
+# UNDER the dashed targV so neither hides the other where they coincide.
 if _targ_pi_exact:
     ax6.plot(df["t_plot"], df["targSlewed_V"],
              color="#ff8f00", lw=3.0, alpha=0.90,
              label="targSlewed_V (governor output — what the PI tracks)")
 ax6.plot(df["t_plot"], df["targV"],
          color="#e91e63", lw=1.8, linestyle="--", label="targV (raw setpoint)")
-# Arm floor: at/above this line the D term is close enough to target to act. Tracks a moving setpoint.
-# Absent entirely when CvKdArmV=0 (always-armed).
+# Arm floor: at/above it the D term is close enough to target to act (absent when CvKdArmV=0).
 if "armFloor_V" in df.columns and df["armFloor_V"].notna().any():
     _af_ref = "targSlewed" if _targ_pi_exact else "targV"
     ax6.plot(df["t_plot"], df["armFloor_V"],
@@ -1269,11 +1176,8 @@ if "spLimited_A" in df.columns:
 if "Icv_A" in df.columns:
     ax6b.plot(df["t_plot"], df["Icv_A"],
               color="#e91e63", lw=1.8, linestyle="--", alpha=0.85, label="CV setpoint  (Icv_A — what the D term trims)")
-# Ground truth: trim actually applied at the output. Recomputed every output tick since the
-# sliding-window rework, so every nonzero row is a real trim — no voltLoopFired gate (that filter
-# belonged to the VL-tick era and would hide ~95% of per-tick trims). No scatter = D term never
-# acted, whatever the reconstructed band says. kdTrim is SIGNED — negative points (two-sided mode
-# adding current below target) so a removal-only log is unambiguous.
+# kdTrim_A is recomputed every output tick, so every nonzero row is a real trim: do not filter by
+# voltLoopFired (hides ~95% of trims). No scatter = D never acted. Signed: <0 = added (two-sided mode).
 if "kdTrim_A" in df.columns:
     _kt6 = df[df["kdTrim_A"] != 0]
     if not _kt6.empty:
@@ -1292,17 +1196,14 @@ _leg6b = ax6b.legend(_h6b + _sc6, [a.get_label() for a in _h6b + _sc6], loc="low
 _leg6b.set_draggable(True)
 
 # --- 6c: the gate signal vs the LIVE gate + arm window (V/s never shares a frame with amps) ---
-# cvDSlope_Vps IS the gated signal — a sliding-window (~100 ms) backward diff of cvKdFiltV_V, refreshed
-# every output tick, that the firmware compares directly to the live deadband. No slope-EMA layer: dropping
-# the old 250 ms average is the whole point of the D-term rework (its lag released past the crest).
+# cvDSlope_Vps IS the gated signal: a ~100 ms sliding-window backward diff of cvKdFiltV_V compared directly
+# to the live deadband. No slope EMA (its lag released the brake past the crest).
 if "cvDSlope_Vps" in df.columns:
     ax6c.plot(df["t_plot"], df["cvDSlope_Vps"],
               color="#00838f", lw=1.8, alpha=0.95,
               label="Rise rate — the gated signal (cvDSlope_Vps)")
-# The ACTUAL per-row gate the firmware compared against: clamp(floor, base + CvKdDbSlope·I, ceil). Drawing
-# the header base alone read as a bug — the rise rate crossed it with no trim because the live gate rides
-# higher with current. Plot the logged live value so a crossing lines up with a 6b trim point. Non-positive
-# is a not-evaluated sentinel, masked out.
+# Logged live gate clamp(floor, base + CvKdDbSlope·I, ceil), not the header base, which rides below it as
+# current rises. Non-positive = not-evaluated sentinel, masked out.
 if "kdDeadband_Vps" in df.columns and (df["kdDeadband_Vps"] > 0).any():
     _gate6c = df["kdDeadband_Vps"].where(df["kdDeadband_Vps"] > 0)
     ax6c.plot(df["t_plot"], _gate6c, color="#f57c00", lw=1.4, linestyle="--",
@@ -1346,8 +1247,7 @@ if "kdActive" in df.columns and df["kdActive"].any():
     _eps6 = [g for _, g in df[df["kdActive"] == 1].groupby(_bg)]
     print(f"CV D term: {len(_eps6)} engagement(s)")
     for _i6, _g6 in enumerate(_eps6, 1):
-        # kdTrim lands on EVERY output tick now (not just VL ticks), so measure over all rows — a
-        # voltLoopFired filter would sample ~10% of the trims, and a summed "net A" is not physical.
+        # kdTrim lands on every output tick: measure over all rows, not voltLoopFired rows; a summed "net A" is not physical.
         _nz = _g6.loc[_g6["kdTrim_A"] != 0, "kdTrim_A"].abs()
         _peak = _nz.max()  if len(_nz) else 0.0
         _mean = _nz.mean() if len(_nz) else 0.0
@@ -1361,9 +1261,8 @@ if "kdActive" in df.columns and df["kdActive"].any():
 elif _helpers_en == 0:
     print("CV D term: never engaged — cvHelpersEnabled=0, the D term was switched OFF")
 else:
-    # Nearest miss: how close the rise rate got to the gate. Answers "why didn't it fire?" without a re-run.
-    # Test against the LIVE per-row gate (kdDeadband_Vps), not the header base — the base alone would call a
-    # sub-gate slope a "crossing" and wrongly blame the arm gate.
+    # Nearest miss vs the LIVE per-row gate (kdDeadband_Vps): the header base alone would call a sub-gate
+    # slope a "crossing" and wrongly blame the arm gate.
     _msg = "CV D term: never engaged in this log"
     if "cvDSlope_Vps" in df.columns and "kdDeadband_Vps" in df.columns and (df["kdDeadband_Vps"] > 0).any():
         _pk = df["cvDSlope_Vps"].max()
@@ -1378,13 +1277,9 @@ else:
     print(_msg)
 
 
-# ===========================================================================
-# PLOT 7 — Oscillation Damper (hunt governor)
-# ===========================================================================
-# The damper scales the INNER current-loop Ki, which no gain setting in the header reflects. A CV
-# transient that looks sluggish for no reason on Plots 1/4 is explained here: read the derate trace
-# at the same instant. Column absent on logs predating the damper — the whole figure is then skipped
-# rather than drawn empty, so a missing window means "this log has no damper data", not "no wobble".
+# ===== PLOT 7 — Oscillation Damper (hunt governor) =====
+# The damper scales the INNER current-loop Ki, which no header gain reflects. Skipped (not drawn empty)
+# on logs without huntDerate.
 _have_hunt = "huntDerate" in df.columns and df["huntDerate"].notna().any()
 
 if _have_hunt:
@@ -1417,10 +1312,7 @@ if _have_hunt:
     ax7.set_title("Field duty is the detector's own input — the wobble it reacts to is visible on the right axis",
                   fontsize=10, color="#444444", style="italic", pad=4)
     ax7_d = add_duty_axis(ax7)
-    # add_duty_axis pins 0–115% so duty reads as an absolute across the other plots. Here the whole
-    # point is a wobble the detector fires on at 0.5% peak, which is invisible on a 115% span — so
-    # this one panel scales the duty axis to the data. Deliberate: read duty here as a SHAPE, and on
-    # any other plot for its absolute level.
+    # Duty axis zoomed to the data here (not 0-115%): the detector fires on a ~0.5% peak wobble.
     if "duty_pct" in df.columns and df["duty_pct"].notna().any():
         _dlo, _dhi = df["duty_pct"].min(), df["duty_pct"].max()
         _pad = max(0.5, (_dhi - _dlo) * 0.35)
@@ -1483,9 +1375,7 @@ if _have_hunt:
             _g7 = df[_m7]
             _f7 = _g7.loc[_g7["huntFreq_Hz"] > 0, "huntFreq_Hz"]
             _lo = _hd_pct[_m7].min()          # deepest cut — matches the ledger's derateExit
-            # Recovery ceiling: the highest the creep got back to before the NEXT episode opened (or
-            # the end of the log). This is the number that explains a loop still running soft an hour
-            # later, and it is not in the ledger at all.
+            # Recovery ceiling: highest the creep got back to before the next episode (or log end); not in the ledger.
             _nxt = next((a for a, _ in _ep_spans if a > _b7), None)
             _tail = _hd_pct[(df["t_plot"] > _b7) & ((df["t_plot"] < _nxt) if _nxt is not None else True)]
             _ceil = _tail.max() if len(_tail) else _lo
@@ -1507,9 +1397,7 @@ else:
     print("Oscillation damper: no huntDerate column — log predates the damper telemetry")
 
 
-# ---------------------------------------------------------------------------
-# Linked x-axis zoom — syncs all plot windows when any one is zoomed/panned.
-# ---------------------------------------------------------------------------
+# ===== Linked x-axis zoom across all plot windows =====
 _all_primary_axes = [ax1, ax2a, ax3, ax4, ax5, ax6]
 _all_figs         = [fig1, fig2, fig3, fig4, fig5, fig6]
 if _have_hunt:
@@ -1539,9 +1427,7 @@ for _ax in _all_primary_axes:
 for _fig in _all_figs:
     enable_pan(_fig)
 
-# ---------------------------------------------------------------------------
-# File Trimmer
-# ---------------------------------------------------------------------------
+# ===== File Trimmer =====
 _trim_total_s = df["t_s"].iloc[-1]
 
 def _fmt_trim_t(t):
@@ -1609,7 +1495,6 @@ _trim_status_lbl = fig1.text(
 fig1.text(0.03, 0.043, "Trim file:", fontsize=10, color="#1a1a1a",
           fontweight="bold", verticalalignment="center")
 
-# ---------------------------------------------------------------------------
 print("Tip: use the checkboxes on the right of each plot to show/hide series.")
 tile_figures()
 plt.show()

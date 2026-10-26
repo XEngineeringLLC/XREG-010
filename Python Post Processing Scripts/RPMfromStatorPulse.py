@@ -10,9 +10,7 @@ import matplotlib.pyplot as plt
 from collections import Counter
 
 
-# =========================
-# User-tunable assumptions
-# =========================
+# ===== User-tunable assumptions =====
 ALT_POLE_PAIRS = 6          # bog-standard 12-pole automotive alternator
 PLOT_SAMPLES = 5000         # first N raw samples to show in sanity-check plot
 FLAT_KEEP_FRACTION = 0.90   # use middle 90% of each flat
@@ -24,9 +22,7 @@ MAX_PULSE_SAMPLES = None    # None = no upper bound
 SHOW_DEBUG_PRINTS = True
 
 
-# =========================
-# File selection (macOS)
-# =========================
+# ===== File selection (macOS) =====
 def pick_csv_file() -> str:
     script = """
     set theFile to choose file with prompt "Select CSV file"
@@ -42,9 +38,7 @@ def pick_csv_file() -> str:
     return result.stdout.strip()
 
 
-# =========================
-# Helpers
-# =========================
+# ===== Helpers =====
 def robust_mode(values: np.ndarray) -> float:
     """
     Return the most common exact sample value.
@@ -86,9 +80,7 @@ def interp_crossing_time(t1: float, v1: float, t2: float, v2: float, threshold: 
     return t1 + (threshold - v1) * (t2 - t1) / (v2 - v1)
 
 
-# =========================
-# Pulse segmentation
-# =========================
+# ===== Pulse segmentation =====
 def segment_signal_into_states(time_s: np.ndarray, volts: np.ndarray):
     """
     Segment waveform into alternating low/high flats using Schmitt-style hysteresis.
@@ -131,9 +123,7 @@ def segment_signal_into_states(time_s: np.ndarray, volts: np.ndarray):
     return segments, coarse_low, coarse_high, coarse_mid, low_thresh, high_thresh
 
 
-# =========================
-# Pulse extraction
-# =========================
+# ===== Pulse extraction =====
 def extract_rising_pulses(time_s: np.ndarray, volts: np.ndarray, segments: list[dict]):
     """
     Use low/high/low triplets.
@@ -239,9 +229,7 @@ def extract_rising_pulses(time_s: np.ndarray, volts: np.ndarray, segments: list[
     return pulses
 
 
-# =========================
-# RPM conversion
-# =========================
+# ===== RPM conversion =====
 def pulses_to_rpm(pulses: list[dict], pole_pairs: int) -> pd.DataFrame:
     """
     For a single stator tap on a typical alternator phase:
@@ -269,9 +257,7 @@ def pulses_to_rpm(pulses: list[dict], pole_pairs: int) -> pd.DataFrame:
     })
 
 
-# =========================
-# Plotting
-# =========================
+# ===== Plotting =====
 def plot_sanity_check(time_s: np.ndarray, volts: np.ndarray,
                       pulses: list[dict], plot_samples: int):
     n           = min(plot_samples, len(time_s))
@@ -368,7 +354,6 @@ def plot_rpm_fft(rpm_df: pd.DataFrame):
     t   = rpm_df["time_s"].to_numpy(dtype=float)
     rpm = rpm_df["alt_rpm"].to_numpy(dtype=float)
 
-    # Drop NaNs before doing anything
     mask = np.isfinite(t) & np.isfinite(rpm)
     t    = t[mask]
     rpm  = rpm[mask]
@@ -425,9 +410,7 @@ def plot_rpm_fft(rpm_df: pd.DataFrame):
     return fig
 
 
-# =========================
-# Main
-# =========================
+# ===== Main =====
 def main():
     csv_path = pick_csv_file()
     if not csv_path:

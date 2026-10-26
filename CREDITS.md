@@ -45,7 +45,12 @@ derived image asset is likewise made available under CC BY-SA 3.0.
   per fast-packet frame when the TWAI queue was full, e.g. with no bus attached); failed
   frames fall through to the core library's send-frame retry ring. A raw-RX tap hook
   (`SetRawRxHook`) surfaces every received frame to the sketch for the RV-C / proprietary
-  decodes the core library's dispatch cannot deliver.
+  decodes the core library's dispatch cannot deliver, and a raw-TX hook (`SetRawTxHook`) does
+  the same for every frame we queue. The driver publishes a bus-health snapshot (`BusStats`:
+  the TWAI status fields once a second, lifetime error counters, frame counts, bus-off count).
+  Bus-off is recovered with the IDF's documented `twai_initiate_recovery` path instead of the
+  stock driver reinstall, which freed the driver object while the receive path could still be
+  using it.
 
 ### LSM6DSOX IMU driver — `LSM6DSOX_xeng`
 

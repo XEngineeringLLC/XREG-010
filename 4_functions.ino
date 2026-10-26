@@ -16,63 +16,40 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 /*
- * KNOWN HEAP EFFICIENCY ISSUE (LOW PRIORITY): the OTA / forced-update HTTPS handlers
- * (checkForSpecificOTAUpdate, executeUpdateFirmwareVersion, executeCheckForcedUpdate)
- * build URLs / headers / JSON with String concatenation, which fragments the heap.
- * Accepted as-is: these run rarely and never in a tight loop. If OTA stability ever
- * suffers, convert them to snprintf into char buffers (see executeFetchWeatherData /
- * buildConfigPayload for the pattern).
+ * KNOWN HEAP ISSUE (low priority): checkForSpecificOTAUpdate, executeUpdateFirmwareVersion and
+ * executeCheckForcedUpdate build strings by String concatenation (fragments the heap). Accepted:
+ * they run rarely. If OTA stability suffers, convert to snprintf (see executeFetchWeatherData).
  */
 
+// Per-core busy % = 100 - that core's idle-task run time (esp_timer µs) over wall time. ulTaskGetIdleRunTimeCounterForCore holds
+// the kernel lock for one load; uxTaskGetSystemState held it, interrupts masked, for a ~4 ms scan and froze Core 1 meanwhile.
 void updateCpuLoad() {
-  if (!taskArray) return;  // allocated in setup()
+  static uint32_t lastIdle0 = 0, lastIdle1 = 0;
+  static int64_t lastUs = 0;
 
-  UBaseType_t taskCount = uxTaskGetSystemState(taskArray, MAX_TASKS, NULL);
-  if (taskCount == 0) return;
+  uint32_t idle0 = (uint32_t)ulTaskGetIdleRunTimeCounterForCore(0);
+  uint32_t idle1 = (uint32_t)ulTaskGetIdleRunTimeCounterForCore(1);
+  int64_t nowUs = esp_timer_get_time();
 
-  static uint64_t lastIdle0 = 0, lastIdle1 = 0;
-  static uint64_t lastTotal = 0;
-  static bool initialized = false;
-
-  uint64_t idle0 = 0, idle1 = 0;
-  uint64_t total = 0;
-
-  for (UBaseType_t i = 0; i < taskCount; i++) {
-    uint64_t t = (uint64_t)taskArray[i].ulRunTimeCounter;
-    total += t;
-    if (strcmp(taskArray[i].pcTaskName, "IDLE0") == 0) {
-      idle0 = t;
-    } else if (strcmp(taskArray[i].pcTaskName, "IDLE1") == 0) {
-      idle1 = t;
-    }
-  }
-
-  if (!initialized) {
+  if (lastUs == 0) {
     lastIdle0 = idle0;
     lastIdle1 = idle1;
-    lastTotal = total;
-    initialized = true;
+    lastUs = nowUs;
     return;
   }
 
-  // ulRunTimeCounter is 32-bit µs and wraps ~every 71 min; the uint64 cast happens before
-  // differencing, so a wrapped sample makes deltaTotal enormous and both cores read 100%.
-  // Discard the sample and re-baseline instead of latching a phantom max into telemetry.
-  if (total < lastTotal || idle0 < lastIdle0 || idle1 < lastIdle1) {
-    lastIdle0 = idle0;
-    lastIdle1 = idle1;
-    lastTotal = total;
-    return;
-  }
+  // The counters are 32-bit µs and wrap after ~71.6 min of idle time; the 32-bit difference spans a wrap.
+  uint64_t deltaIdle0 = (uint32_t)(idle0 - lastIdle0);
+  uint64_t deltaIdle1 = (uint32_t)(idle1 - lastIdle1);
+  uint64_t deltaUs = (uint64_t)(nowUs - lastUs);
+  lastIdle0 = idle0;
+  lastIdle1 = idle1;
+  lastUs = nowUs;
 
-  uint64_t deltaIdle0 = idle0 - lastIdle0;
-  uint64_t deltaIdle1 = idle1 - lastIdle1;
-  uint64_t deltaTotal = total - lastTotal;
+  if (deltaUs == 0) return;
 
-  if (deltaTotal == 0) return;
-
-  uint32_t idlePct0 = (uint32_t)((deltaIdle0 * 200ULL) / deltaTotal);
-  uint32_t idlePct1 = (uint32_t)((deltaIdle1 * 200ULL) / deltaTotal);
+  uint32_t idlePct0 = (uint32_t)((deltaIdle0 * 100ULL) / deltaUs);
+  uint32_t idlePct1 = (uint32_t)((deltaIdle1 * 100ULL) / deltaUs);
 
   if (idlePct0 > 100U) idlePct0 = 100U;
   if (idlePct1 > 100U) idlePct1 = 100U;
@@ -80,73 +57,118 @@ void updateCpuLoad() {
   cpuLoadCore0 = 100 - (int)idlePct0;
   cpuLoadCore1 = 100 - (int)idlePct1;
 
-  if (cpuLoadCore0 < 0) cpuLoadCore0 = 0;
-  if (cpuLoadCore0 > 100) cpuLoadCore0 = 100;
-  if (cpuLoadCore1 < 0) cpuLoadCore1 = 0;
-  if (cpuLoadCore1 > 100) cpuLoadCore1 = 100;
-
   if (cpuLoadCore0 > cpuLoadCore0Max) cpuLoadCore0Max = cpuLoadCore0;
   if (cpuLoadCore1 > cpuLoadCore1Max) cpuLoadCore1Max = cpuLoadCore1;
-
-  lastIdle0 = idle0;
-  lastIdle1 = idle1;
-  lastTotal = total;
 }
 
-// Core-0 sampler for updateCpuLoad() — the uxTaskGetSystemState scan (~4ms) is too heavy for the
-// Core-1 control loop. Runs at priority 0, so it only takes Core 0 when no network/upload task
-// needs it. Writes cpuLoadCore0/1(+Max), read by the CSV2 sender on Core 1.
+// Gate for every cpuLoadTask job that holds a lock Core 1 also takes: field cut and settled (Core 1's copy) and still cut now.
+static inline bool heapWalkOk() {
+  return !otaInProgress && heapWalkAllowed && gpio4IsLow;
+}
+
+// Largest-block walks hold each internal heap's spinlock for the whole pool walk, and Core 1 allocates internal RAM on almost
+// every pass (Strings, dashboard frames): only setup() (before loop runs) and cpuLoadTask via runIfFieldCut() call this.
+void walkInternalHeap() {
+  uint32_t freeKb = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+  uint32_t bigKb = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024;
+  LargestInternalBlock = bigKb;
+  Heapfrag = (freeKb == 0) ? 100 : (bigKb >= freeKb) ? 0 : 100 - (int)(bigKb * 100 / freeKb);
+  __sync_synchronize();  // value before stamp: checkAndRestart() reads the stamp first and judges each walk once
+  largestInternalAtMs = millis();
+}
+
+// Largest-block walks every PSRAM block holding that heap's spinlock, so a Core-1 PSRAM alloc/free would wait it out
+// (0.1-0.7 ms): field cut and settled only. The layout only moves when something allocates, so 20 s is enough.
+static void walkPsramHeap() {
+  LargestPSRAMBlock = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024;
+  largestPsramAtMs = millis();
+}
+
+// uxTaskGetSystemState holds the kernel lock, interrupts masked, while it scans every task's stack for its high-water mark
+// (~4 ms); Core 1's tick ISR spins on that lock, so loop() stops for the scan. cpuLoadTask via runIfFieldCut() only.
+static void taskCensusTake() {
+  if (!taskArray || !taskCensus) return;
+  int64_t atUs = esp_timer_get_time();
+  UBaseType_t n = uxTaskGetSystemState(taskArray, MAX_TASKS, NULL);  // 0 when more than MAX_TASKS tasks exist
+  uint8_t slot = taskCensusPub ^ 1;
+  TaskCensus &c = taskCensus[slot];
+  c.n = 0;
+  for (UBaseType_t i = 0; i < n; i++) {
+    TaskCensusRow &r = c.row[c.n++];
+    const char *nm = taskArray[i].pcTaskName;  // points into the TCB: copied now, it dangles once the task is deleted
+    size_t k = 0;
+    while (nm && k < sizeof(r.name) - 1 && nm[k]) {
+      r.name[k] = nm[k];
+      k++;
+    }
+    r.name[k] = '\0';
+    r.prio = (uint8_t)taskArray[i].uxCurrentPriority;
+    r.core = (int32_t)taskArray[i].xCoreID;
+    r.hwm = (uint32_t)taskArray[i].usStackHighWaterMark;
+    r.handle = taskArray[i].xHandle;
+    r.runUs = (uint32_t)taskArray[i].ulRunTimeCounter;
+  }
+  c.atUs = atUs;
+  c.atMs = millis();
+  __sync_synchronize();
+  taskCensusPub = slot;
+  taskCensusAtMs = c.atMs;
+  taskCensusWanted = false;
+}
+
+// Gate check and job run with Core 0's scheduler suspended: at priority 0 this task can be preempted for seconds by an upload,
+// and a preemption between the check and the lock would land the job on a field that has since turned on.
+static void runIfFieldCut(void (*job)()) {
+  vTaskSuspendAll();
+  if (heapWalkOk()) job();
+  xTaskResumeAll();
+}
+
+// Core-0 sampler, priority 0, so it only takes Core 0 when no network/upload task needs it.
 void cpuLoadTask(void *param) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(2000));
     updateCpuLoad();
+    if (millis() - largestInternalAtMs >= 20000UL) runIfFieldCut(walkInternalHeap);
+    if (millis() - largestPsramAtMs >= 20000UL) runIfFieldCut(walkPsramHeap);
+    if (taskCensusAtMs == 0 || (taskCensusWanted && millis() - taskCensusAtMs >= 20000UL)) runIfFieldCut(taskCensusTake);
   }
 }
 
 void updateSystemHealthStats() {
   if (otaInProgress) return;
+  heapWalkAllowed = fieldCutSettled(0);
 
-  // Only the 4s heap walk; CPU-load sampling runs in cpuLoadTask on Core 0.
+  // Lock-free counters only; CPU load, both largest-block walks and Heapfrag come from cpuLoadTask on Core 0.
   static unsigned long lastHeapSample = 0;
 
   unsigned long now = millis();
 
   if (now - lastHeapSample < 4000) return;
-  if (gHeavyRanThisPass) return;  // another heavy ran this pass — defer (timer unchanged → still due)
-  gHeavyRanThisPass = true;
   lastHeapSample = now;
 
-  {
-    FreeHeap = esp_get_free_heap_size() / 1024;
-    MinFreeHeap = esp_get_minimum_free_heap_size() / 1024;
-    FreeInternalRam = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
-    TotalInternalRam = heap_caps_get_total_size(MALLOC_CAP_INTERNAL) / 1024;
-    LargestInternalBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024;
-    FreePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
-    TotalPSRAM = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024;
-    Heapfrag = (FreeInternalRam > 0)
-                 ? 100 - (LargestInternalBlock * 100 / FreeInternalRam)
-                 : 100;
+  FreeHeap = esp_get_free_heap_size() / 1024;
+  MinFreeHeap = esp_get_minimum_free_heap_size() / 1024;
+  FreeInternalRam = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+  TotalInternalRam = heap_caps_get_total_size(MALLOC_CAP_INTERNAL) / 1024;
+  FreePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
+  TotalPSRAM = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024;
 
-    // Deliberately no low-contiguous-RAM console warning: every HTTPS handshake briefly
-    // dips largest-block under 34 KB and recovers, so it would re-fire constantly.
-    // The heap figures above surface it live in the ESP32 Stats panel.
+  // Deliberately no low-contiguous-RAM console warning: every HTTPS handshake briefly dips
+  // largest-block under 34 KB, so it would re-fire constantly.
 
-    // LittleFS free space — event-driven, not polled: the value can only change when this
-    // firmware writes a file, so writers set fsFreeDirty and the refresh runs here at the next
-    // heap walk with the field gate physically cut (fieldCutSettled — the duty-based
-    // fieldOffSettled reads "off" during a live duty-0 CV hold and let this ~96ms usedBytes()
-    // traversal stall live control passes, 2026-08-13). The countdown is only a ~10 min
-    // catch-all for any writer missing the fsFreeDirty hook; boot seeds the first value.
-    static uint8_t fsFreeCountdown = 150;
-    if (fsFreeCountdown > 0) fsFreeCountdown--;
-    if ((fsFreeDirty || fsFreeCountdown == 0) && fieldCutSettled(0)) {
-      size_t fsTotal = 0, fsUsed = 0;
-      if (fsStatsTry(fsTotal, fsUsed) && fsTotal >= fsUsed) {
-        LittleFsFreeKb = (int)((fsTotal - fsUsed) / 1024);
-        fsFreeDirty = false;
-        fsFreeCountdown = 150;  // 150 heap walks × ~4s
-      }
+  // LittleFS free space is event-driven: writers set fsFreeDirty. Refresh only with the field gate
+  // physically cut (fieldCutSettled, never duty-based fieldOffSettled): usedBytes() takes ~96 ms and
+  // stalls live control. The countdown (~10 min) catches any writer missing the fsFreeDirty hook.
+  static uint8_t fsFreeCountdown = 150;
+  if (fsFreeCountdown > 0) fsFreeCountdown--;
+  if ((fsFreeDirty || fsFreeCountdown == 0) && fieldCutSettled(0) && !gHeavyRanThisPass) {  // a heavy already ran: next sample
+    gHeavyRanThisPass = true;
+    size_t fsTotal = 0, fsUsed = 0;
+    if (fsStatsTry(fsTotal, fsUsed) && fsTotal >= fsUsed) {
+      LittleFsFreeKb = (int)((fsTotal - fsUsed) / 1024);
+      fsFreeDirty = false;
+      fsFreeCountdown = 150;  // 150 samples × 4 s
     }
   }
 }
@@ -179,52 +201,92 @@ bool executeFetchWeatherData() {
     weatherDataValid = 0;
     return false;
   }
+  // Not HTTPClient: GET() can't feed the 16 s task WDT, and getString() has no deadline or size cap.
+  static const char *WX_HOST = "api.open-meteo.com";
+  static const int WX_REPLY_MAX = 16384;  // real reply ~2 KB
   WiFiClientSecure client;
   client.setInsecure();
+  client.setHandshakeTimeout(HANDSHAKE_TIMEOUT / 1000);  // this API takes seconds
 
-  HTTPClient http;
-
-  char url[320];
+  char path[300];
   // daily sum = the pause decision's forecast; hourly = the ledger's per-hour learning basis (three local
   // days, unix stamps so the ledger maps slots onto its own local-day rule rather than the API's zone).
-  snprintf(url, sizeof(url),
-           "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f&daily=shortwave_radiation_sum"
+  snprintf(path, sizeof(path),
+           "/v1/forecast?latitude=%.6f&longitude=%.6f&daily=shortwave_radiation_sum"
            "&hourly=shortwave_radiation&forecast_days=3&timeformat=unixtime&timezone=auto",
            LatitudeNMEA, LongitudeNMEA);
 
-  Serial.print("Open-Meteo URL: ");
-  Serial.println(url);
+  Serial.printf("Open-Meteo URL: https://%s%s\n", WX_HOST, path);
 
-  http.begin(client, url);
-  http.setTimeout(WeatherTimeoutMs);
+  esp_task_wdt_reset();
+  IPAddress wxIP;
+  if (WiFi.hostByName(WX_HOST, wxIP) != 1) {  // a slow lookup inside connect() would run unfed
+    snprintf(weatherLastError, sizeof(weatherLastError), "DNS lookup failed");
+    weatherDataValid = 0;
+    return false;
+  }
+  esp_task_wdt_reset();
+  if (!client.connect(WX_HOST, 443, CONNECT_TIMEOUT)) {
+    snprintf(weatherLastError, sizeof(weatherLastError), "Connect failed");
+    weatherDataValid = 0;
+    client.stop();
+    return false;
+  }
+  esp_task_wdt_reset();
+  // 1.0: Open-Meteo sends a 1.1 reply chunked
+  client.printf("GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, WX_HOST);
 
-  int httpResponseCode = http.GET();
-  weatherHttpResponseCode = httpResponseCode;
+  char *reply = (char *)ps_malloc(WX_REPLY_MAX + 1);
+  int got = 0;
+  bool overflow = false, stalled = false;
+  if (reply) {
+    uint32_t readStart = millis(), lastData = readStart;
+    for (;;) {
+      int avail = client.available();
+      if (avail > 0) {
+        if (got >= WX_REPLY_MAX) { overflow = true; break; }
+        int n = client.read((uint8_t *)reply + got, min(avail, WX_REPLY_MAX - got));
+        if (n > 0) { got += n; lastData = millis(); }
+      } else if (!client.connected()) {
+        break;
+      } else if (millis() - lastData > (uint32_t)WeatherTimeoutMs || millis() - readStart > GLOBAL_TIMEOUT) {
+        stalled = true;
+        break;
+      } else {
+        delay(10);
+      }
+      esp_task_wdt_reset();
+    }
+    reply[got] = '\0';
+  }
+  client.stop();
 
-  if (httpResponseCode > 0) {
-    String payload = http.getString();
+  int httpResponseCode = 0;
+  if (reply) sscanf(reply, "HTTP/%*d.%*d %d", &httpResponseCode);
+  const char *payload = reply ? strstr(reply, "\r\n\r\n") : nullptr;
+
+  if (httpResponseCode == 200 && payload && !overflow && !stalled) {
+    payload += 4;
     queueConsoleMessageF("GPS: %.6f,%.6f", LatitudeNMEA, LongitudeNMEA);
     Serial.printf("Response Code: %d\n", httpResponseCode);
 
-    // The filter admits only the arrays read below; the rest of the reply never enters the document.
     JsonDocument filter;
     filter["daily"]["shortwave_radiation_sum"] = true;
     filter["hourly"]["time"] = true;
     filter["hourly"]["shortwave_radiation"] = true;
     JsonDocument doc(&psramJsonAllocator);
     DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    free(reply);  // ArduinoJson 7 copies what it keeps
     if (error) {
       snprintf(weatherLastError, sizeof(weatherLastError), "JSON parse error: %s", error.c_str());
       weatherDataValid = 0;
       Serial.printf("JSON error: %s\n", error.c_str());
-      http.end();
       return false;
     }
     JsonArray radiation = doc["daily"]["shortwave_radiation_sum"];
     if (radiation.size() < 3) {
       snprintf(weatherLastError, sizeof(weatherLastError), "Insufficient forecast data");
       weatherDataValid = 0;
-      http.end();
       return false;
     }
     float mjToday = radiation[0];
@@ -255,26 +317,27 @@ bool executeFetchWeatherData() {
       wxHourN = 0;
     }
     portEXIT_CRITICAL(&wxHourMux);
-    // Order is load-bearing: stamp the fetch age BEFORE publishing validity. analyzeWeatherMode()
-    // runs on the other core and voids any forecast whose stamp is stale or 0, so a valid-but-
-    // unstamped instant is enough to throw this forecast away for the whole next interval.
-    weatherLastUpdate = millis();   // was never written — the freshness gate measured uptime, not fetch age
+    // Stamp the fetch age BEFORE publishing validity: analyzeWeatherMode() on the other core voids
+    // any forecast whose stamp is stale or 0.
+    weatherLastUpdate = millis();
     weatherFetchEpoch = time(NULL);  // the ledger maps this fetch's "tomorrow"/"day 2" onto calendar days by the local day it was made
     weatherDataValid = 1;
     weatherLastError[0] = '\0';
-    nextWeatherUpdate = millis() + WeatherUpdateInterval;   // honor the user's interval (hardcoded 1 h ignored it)
+    nextWeatherUpdate = millis() + WeatherUpdateInterval;
     Serial.printf("Solar forecast: Today=%.1f, Tomorrow=%.1f, Day2=%.1f kWh\n",
                   pKwHrToday, pKwHrTomorrow, pKwHr2days);
     queueConsoleMessageF("Weather updated: %.1f kWh today", pKwHrToday);
 
 
-    http.end();
     return true;
   } else {
-    snprintf(weatherLastError, sizeof(weatherLastError), "HTTP error: %d", httpResponseCode);
+    if (!reply) snprintf(weatherLastError, sizeof(weatherLastError), "No memory for the reply");
+    else if (overflow) snprintf(weatherLastError, sizeof(weatherLastError), "Reply over %d bytes", WX_REPLY_MAX);
+    else if (stalled) snprintf(weatherLastError, sizeof(weatherLastError), "Reply stalled after %d bytes", got);
+    else snprintf(weatherLastError, sizeof(weatherLastError), "HTTP error: %d", httpResponseCode);
+    free(reply);
     weatherDataValid = 0;
-    Serial.printf("HTTP error: %d\n", httpResponseCode);
-    http.end();
+    Serial.printf("Weather: %s\n", weatherLastError);
     return false;
   }
 }
@@ -283,19 +346,17 @@ void analyzeWeatherMode() {
   if (otaInProgress) {
     return;
   }
-  // A forecast the device can no longer refresh must not keep the alternator off. currentWeatherMode
-  // is only written here, so without this release it latches at 1 through AP mode, WiFi loss, or a
-  // run of failed fetches — the field stays down with nothing left to re-evaluate it. Fail toward
-  // charging. weatherLastUpdate == 0 means nothing was fetched this boot (pKwHr* are not persisted).
+  // A forecast that can no longer refresh must not keep the alternator off: currentWeatherMode would
+  // latch at 1 through AP mode, WiFi loss or failed fetches. Fail toward charging.
+  // weatherLastUpdate == 0 means nothing was fetched this boot (pKwHr* are not persisted).
   if (weatherDataValid
       && (weatherLastUpdate == 0
           || (millis() - weatherLastUpdate) >= (unsigned long)WeatherUpdateInterval + WeatherStaleGraceMs)) {
     weatherDataValid = 0;
     queueConsoleMessageF("Weather: forecast too old - solar pause released");
   }
-  // The bar a day must clear: the owner's High Solar Threshold, or — with the toggle on and consumption
-  // history in the ledger — predicted consumption plus margin, so "enough sun" means enough for THIS boat.
-  // Computed before the validity gate so the settings page can always show which bar is in force.
+  // Bar a day must clear: High Solar Threshold, or (toggle on + ledger history) predicted consumption
+  // plus margin. Computed before the validity gate so the settings page always shows the bar in force.
   float need = UVThresholdHigh;
   sledNeedSource = 0;
   if (solarUseConsEnable == 1 && !isnan(sledLive.predConsKwh)) {
@@ -364,7 +425,12 @@ void updateWeatherMode() {
 
 // Forecast kWh at performance ratio 1.0 for a day's irradiance (kWh/m²): array watts / STC 1000 W/m².
 static inline float solarIrrToKwh(float uvKwhM2) { return uvKwhM2 * (float)SolarWatts / STC_IRRADIANCE; }
-static inline uint32_t sledLocalDay(time_t ep) { return (uint32_t)((ep + usageTzOffsetS) / 86400); }
+// The ledger's own UTC offset. usageTzOffsetS follows every client's /track POST; this copy takes it only while
+// no day is open (boot, the midnight close, Reset), so a client in another zone or a mid-day DST change can't
+// close or reopen a day. RAM only: a day restored at boot resumes on the usageTzOffsetS persisted in /usage.bin.
+static int32_t sledTzOffsetS = 0;
+static bool sledTzSeeded = false;
+static inline uint32_t sledLocalDay(time_t ep) { return (uint32_t)((ep + sledTzOffsetS) / 86400); }
 static inline bool sledClockValid(time_t ep) { return ep > 1700000000LL; }
 
 // Re-derive the three displayed predictions from the held irradiance — needed whenever the ratio or
@@ -453,19 +519,16 @@ float sledLiveActConsKwh() {
 int sledTele(float kwh) { return isnan(kwh) ? -1 : (int)lroundf(kwh * 100.0f); }   // CSV2 encoding: -1 = unknown
 
 // ── Per-hour learning basis ─────────────────────────────────────────────────────────────────────
-// A whole-day actual/forecast ratio is only honest when the sun set the harvest all day. The moment
-// the battery is the limit (absorb, float, an external charge-current limit) the MPPT throttles and
-// the day reads as "bad panels". So the day is judged hour by hour: only hours where the MPPT was
-// freely tracking the whole time, the device watched the whole time, and a forecast exists are summed
-// into the ratio. Hourly forecast = Open-Meteo shortwave_radiation, the W/m² mean of the hour ENDING
-// at each slot's time; local hour h spans [h:00, h+1:00), so its slot is the one ending at h+1:00.
+// A whole-day ratio reads a battery-limited day (MPPT throttled in absorb/float/current limit) as
+// "bad panels", so only hours freely tracking, watched, and forecast throughout are summed.
+// Open-Meteo slot = W/m² mean of the hour ENDING at its time; local hour h uses the slot ending h+1:00.
 static bool sledCaptureHourly(SolarLedgerLive &L, uint32_t today) {
   if (!wxHourWm2) return false;
   L.hourFcMask = 0;
   portENTER_CRITICAL(&wxHourMux);   // the fetch task refills the table in one critical section; read it whole
   if (wxHourT0 == 0 || wxHourN == 0) { portEXIT_CRITICAL(&wxHourMux); return false; }
   for (int h = 0; h < 24; h++) {
-    time_t tEnd = (time_t)today * 86400 + (time_t)(h + 1) * 3600 - (time_t)usageTzOffsetS;
+    time_t tEnd = (time_t)today * 86400 + (time_t)(h + 1) * 3600 - (time_t)sledTzOffsetS;
     long k = lround((double)(tEnd - wxHourT0) / 3600.0);   // nearest slot: a half-hour zone lands 30 min off, close enough
     L.hourFcWh[h] = 0;
     if (k < 0 || k >= (long)wxHourN) continue;
@@ -483,6 +546,7 @@ static bool sledCaptureHourly(SolarLedgerLive &L, uint32_t today) {
 static void sledHourClose(SolarLedgerLive &L) {
   double wh = SolarChargedEnergy_AllTime - L.hourBaseWh;
   if (wh < 0) wh = 0;
+  wh += L.hourActWh[L.curHour];   // an hour re-entered (clock stepped back) keeps the slice it already closed
   if (wh > 65535.0) wh = 65535.0;
   L.hourActWh[L.curHour] = (uint16_t)lround(wh);
 }
@@ -491,7 +555,7 @@ static void sledHourClose(SolarLedgerLive &L) {
 static void sledHourService(time_t ep, uint32_t now, bool minuteTick) {
   SolarLedgerLive &L = sledLive;
   if (L.dayIdx == 0) return;
-  int hour = (int)(((ep + usageTzOffsetS) % 86400) / 3600);
+  int hour = (int)(((ep + sledTzOffsetS) % 86400) / 3600);
   if (hour < 0 || hour > 23) return;
   if (hour != L.curHour) {
     if (L.curHour >= 0 && L.curHour < 24) sledHourClose(L);
@@ -567,10 +631,8 @@ static void solarLedgerCloseDay() {
   r.ratioAfter  = NAN;
   if (L.curHour >= 0 && L.curHour < 24) sledHourClose(L);   // the hour in progress at midnight finalises here
   sledQualify(L, &r.qualHours, &r.qualPredKwh, &r.qualActKwh);
-  // Learn: actual/forecast over the QUALIFYING hours only (sledHourService), blended slowly into
-  // performanceRatio. A whole-day ratio learnt "the panels are bad" from "the battery was full by noon";
-  // discarding the battery-limited hours is what removes that. A day with no qualifying hour, or too
-  // small a promise across them, teaches nothing.
+  // Learn actual/forecast over the QUALIFYING hours only, blended slowly into performanceRatio, so a
+  // battery full by noon doesn't read as bad panels.
   if (solarLearnEnable == 1 && r.qualHours != 0 && r.qualPredKwh >= SLED_MIN_QUAL_WH / 1000.0f) {
     float dayRatio = r.qualActKwh / r.qualPredKwh;
     if (dayRatio < SLED_RATIO_MIN) dayRatio = SLED_RATIO_MIN;
@@ -617,6 +679,17 @@ void solarLedgerFlushNow() {   // shutdown / maintenance-restart paths only
   sledWrite(sledDirty);
 }
 
+// Days are held until the clock is real: the cold-boot estimate is the last field-off time, so it would keep a days-old
+// day open (or open one on the wrong date) and book there what arrives meanwhile. Totals at the hold's start.
+static struct { bool on; uint32_t ms; double solarWh, altWh, chgWh, disWh; } sledHold = {};
+static void sledHoldSnap() {
+  sledHold.ms = millis();
+  sledHold.solarWh = SolarChargedEnergy_AllTime;
+  sledHold.altWh   = AlternatorChargedEnergy_AllTime;
+  sledHold.chgWh   = ChargedEnergy_AllTime;
+  sledHold.disWh   = DischargedEnergy_AllTime;
+}
+
 // 1 Hz. Rolls the local day (a handful of float ops at midnight), ticks coverage once a minute, and
 // flushes to flash only with the field gate physically cut (fieldCutSettled — never the duty-based
 // fieldOffSettled, which reads "off" during a live duty-0 CV hold). Every other pass is one compare.
@@ -627,13 +700,42 @@ void solarLedgerService() {
   lastTickMs = now;
   if (!sledRing) return;
   time_t ep = time(NULL);
+  bool released = false;
+  if (!clockIsReal()) {
+    if (!sledHold.on) { sledHold.on = true; sledHoldSnap(); }
+    ep = 0;
+  } else if (sledHold.on) {
+    sledHold.on = false;
+    released = true;
+  }
   if (sledClockValid(ep)) {
+    if (!sledTzSeeded) { sledTzOffsetS = usageTzOffsetS; sledTzSeeded = true; }
     uint32_t today = sledLocalDay(ep);
+    // The hold's energy goes to today only if the hold began today; a restored older day ended at the power-off, so
+    // its baselines move up by everything since the hold began and it closes on what it had then.
+    const bool holdToday = released && sledLocalDay(ep - (time_t)((now - sledHold.ms) / 1000)) == today;
+    if (released && sledLive.dayIdx != 0 && sledLive.dayIdx != today) {
+      sledLive.baseSolarWh  += SolarChargedEnergy_AllTime - sledHold.solarWh;
+      sledLive.baseAltWh    += AlternatorChargedEnergy_AllTime - sledHold.altWh;
+      sledLive.baseChgWh    += ChargedEnergy_AllTime - sledHold.chgWh;
+      sledLive.baseDischgWh += DischargedEnergy_AllTime - sledHold.disWh;
+    }
     if (sledLive.dayIdx != 0 && sledLive.dayIdx != today) solarLedgerCloseDay();
     bool minuteTick = false;
     if (sledLive.dayIdx == 0) {
-      solarLedgerOpenDay(today);
-      lastMinuteMs = now;
+      sledTzOffsetS = usageTzOffsetS;   // no day open: the only point a changed client offset is adopted
+      today = sledLocalDay(ep);
+      // A westward change lands back on the day just closed; wait for its midnight under the new offset, never reopen it.
+      if (sledCount == 0 || sledRing[(sledHead + SLED_SIZE - 1) % SLED_SIZE].dayIdx != today) {
+        solarLedgerOpenDay(today);
+        if (holdToday) {
+          sledLive.baseSolarWh  = sledHold.solarWh;
+          sledLive.baseAltWh    = sledHold.altWh;
+          sledLive.baseChgWh    = sledHold.chgWh;
+          sledLive.baseDischgWh = sledHold.disWh;
+        }
+        lastMinuteMs = now;
+      }
     } else if (now - lastMinuteMs >= 60000) {
       lastMinuteMs = now;
       minuteTick = true;
@@ -665,6 +767,7 @@ void solarLedgerClear() {
   sledCount = 0;
   sledHead = 0;
   sledLive.dayIdx = 0;
+  if (sledHold.on) sledHoldSnap();   // the reopened day starts from the reset, not from the hold's start
   sledDirty = true;
   sledLiveDirty = true;
 }
@@ -690,7 +793,7 @@ void solarLedgerCsvSend(AsyncWebServerRequest *request) {
           if (st.idx == 0) {
             time_t ep = time(NULL);
             st.len = snprintf(st.line, sizeof(st.line), "# sledger v2 today=%lu tz=%ld n=%lu ratio=%.3f need=%.2f needSrc=%d learn=%d useCons=%d\n",
-                              (unsigned long)(sledClockValid(ep) ? sledLocalDay(ep) : 0), (long)usageTzOffsetS,
+                              (unsigned long)(sledClockValid(ep) ? sledLocalDay(ep) : 0), (long)sledTzOffsetS,
                               (unsigned long)st.total, performanceRatio, sledNeedKwh, sledNeedSource,
                               solarLearnEnable, solarUseConsEnable);
           } else if (st.idx == 1) {
@@ -882,7 +985,7 @@ void checkTempTaskHealth() {
   lastTempHealthCheck = now;
 
   if (now - lastTempTaskHeartbeat > TEMP_TASK_TIMEOUT) {
-    if (tempTaskHealthy) {  // First time detecting the problem
+    if (tempTaskHealthy) {
       tempTaskHealthy = false;
       tempTaskAlarm = true;
       queueConsoleMessageF("CRITICAL: TempTask hung up - task not responding for %lu seconds", (now - lastTempTaskHeartbeat) / 1000);
@@ -891,7 +994,7 @@ void checkTempTaskHealth() {
       // MARK_FRESH call, which produces REASON_TEMP_STALE → MODE_CRITICAL_RAMP → GPIO4 cut.
     }
   } else {
-    if (!tempTaskHealthy) {  // Was unhealthy, now recovered
+    if (!tempTaskHealthy) {
       tempTaskHealthy = true;
       tempTaskAlarm = false;
       queueConsoleMessage("TempTask: Recovered and responding normally");
@@ -976,11 +1079,8 @@ void imuInit() {
     return;
   }
 
-  // Set ODRs.
-  // Accel at 104 Hz is plenty for slam peak capture (~9.6 ms sample spacing vs 20–50 ms
-  // typical slam pulse), pitch/heel max, wave-period decimation (10 Hz output), and MSI
-  // frequency-weighted Z (peaks 0.5–5 Hz). Engine-vibration diagnostics are out of scope
-  // (board is not engine-mounted). ACCEL_INTERVAL_US in drainIMUFifo() must match: 9615 µs.
+  // Accel 104 Hz covers slam peaks (20-50 ms pulses), pitch/heel, wave period and MSI (0.5-5 Hz).
+  // ACCEL_INTERVAL_US in drainIMUFifo() must match: 9615 µs.
   if (imu.Set_X_ODR(104.0f) != LSM6DSOX_OK) {
     Serial.println("ERROR: Failed to set accel ODR");
     queueConsoleMessageF("IMU: failed to set accel ODR");
@@ -1084,7 +1184,6 @@ void imuInit() {
 void initIMUStructures() {
   memset(imuWindow, 0, sizeof(ImuWindow));
 
-  // Initialize min/max to sentinel values (will be overwritten by first real data)
   imuWindow->accel_x_min = imuWindow->accel_y_min = imuWindow->accel_z_min = INT32_MAX;
   imuWindow->accel_x_max = imuWindow->accel_y_max = imuWindow->accel_z_max = INT32_MIN;
   imuWindow->total_accel_min = imuWindow->vertical_accel_min = INT32_MAX;
@@ -1106,12 +1205,10 @@ void initIMUStructures() {
 // ALERT threshold, so the OV comparator must be re-armed with the rest).
 void inaApplyConfig() {
   g_inaDieRewarm = true;
-  // setAverage() takes raw register value: 0=1, 1=4, 2=16, 3=64, 4=128, 5=256, 6=512, 7=1024 samples
-  INA.setMode(15);                       // Continuous shunt, bus voltage AND die temperature
-  INA.setAverage(4);                     // 128-sample averaging — 128 × 8.29ms ≈ 1061ms register update
-  INA.setBusVoltageConversionTime(7);    // 4120 µs conversion time
-  INA.setShuntVoltageConversionTime(7);  // 4120 µs conversion time
-  INA.setTemperatureConversionTime(0);   // 50 µs — MUST stay at the minimum. ADC_CONFIG resets VTCT to 1052 µs, which drags the fast-mode cycle to 8.5 ms, past the 5 ms poll, and halves the CV loop's voltage update rate
+  // VTCT 50 µs MUST stay at the minimum. ADC_CONFIG resets VTCT to 1052 µs, which drags the fast-mode cycle to 8.5 ms, past the 5 ms poll, and halves the CV loop's voltage update rate
+  bool adcCfgOk = false;
+  for (int attempt = 0; attempt < 3 && !adcCfgOk; attempt++) adcCfgOk = inaWriteAdcConfig(INA_ADC_CFG_SLOW);
+  if (!adcCfgOk) queueConsoleMessage("INA228: ADC configuration did not read back after 3 writes - the fast/slow switch writes it again when the field next turns on");
   updateINA228OvervoltageThreshold();
   inaFastModeActive = false;             // the read path re-selects fast mode on its next pass while the field gate is open
   inaReadInterval = INA_SLOW_INTERVAL_MS;
@@ -1162,32 +1259,39 @@ if (!BMP388Disconnected) {
   // DVCC follow: raw-RX tap (RV-C single-frame DGNs + 0xEF00 VREG carrier + §8a capture ring).
   // Registered unconditionally — the tap self-gates on NMEA2KData/dvccEn and costs a few compares.
   tNMEA2000_esp32::SetRawRxHook(dvccRawFrameTap);
+  tNMEA2000_esp32::SetRawTxHook(n2kRawTxTap);  // our own frames, for the raw bus capture (§16.3)
   initDvccCapture();
   //  NMEA2000.SetN2kCANMsgBufSize(2);
-  // Transmit (producer) mode — spec: Working Markdown Docs/NMEA2K_TRANSMIT_SPEC.md. Applied at boot
-  // only; the /get handler tells the user a toggle change needs a reboot. n2kTxEnable off keeps the
-  // library's listen-only default: zero bus presence, no address claim, exactly the pre-TX behavior.
-  // InitSystemSettings() has already run (setup order), so the n2k* globals hold NVS values here.
-  if (n2kTxEnable == 1 || rvcTxEnable == 1) {  // RV-C rides the same node: one address claim, one mode
-    NMEA2000.SetN2kCANSendFrameBufSize(80);  // software retry ring for frames the non-blocking _xeng driver refuses (TWAI queue full / no bus)
+  // Transmit mode (spec: Working Markdown Docs/NMEA2K_TRANSMIT_SPEC.md). Identity and the retry ring are set up in every
+  // mode: the ring can only be sized before Open(), and transmit can be switched on live later. Off keeps the library's
+  // listen-only default: no bus presence, no address claim. Relies on InitSystemSettings() running first.
+  NMEA2000.SetN2kCANSendFrameBufSize(80);  // software retry ring for frames the non-blocking _xeng driver refuses (TWAI queue full / no bus)
+  // TWAI RX queue 128 (driver default 40): a peer nobody acknowledged (us off the bus or unpowered) releases its whole
+  // transmit backlog back-to-back the moment we ACK again, and a Victron GX holds up to 100 (its txqlen). ~1.8 KB internal.
+  NMEA2000.SetCANBufferSize(128, 40);
+  {
     uint64_t mac = ESP.getEfuseMac();
-    static char n2kSerial[9];
-    snprintf(n2kSerial, sizeof(n2kSerial), "%08lX", (unsigned long)(mac & 0xFFFFFFFFUL));
-    NMEA2000.SetProductInformation(n2kSerial, 100, "XREG-010", FIRMWARE_VERSION, "V10",
+    static char n2kSerial[17];
+    // The full 16-hex device ID, same format as device_id_hex (what the app, cloud and labels show).
+    snprintf(n2kSerial, sizeof(n2kSerial), "%08lX%08lX", (unsigned long)(mac >> 32), (unsigned long)(mac & 0xFFFFFFFFUL));
+    NMEA2000.SetProductInformation(n2kSerial, 100, "XREG-010", FIRMWARE_VERSION, "V9",  // model version = board revision (a GX shows it as HardwareVersion); hardcoded, no board detection
                                    2);  // LEN 2 = 100 mA: isolated CAN side is backbone-powered (ISO1050 + MPM3610)
+    // 126998. Unset, the library answers with its own "NMEA2000 library, https://github.com/..." text.
+    NMEA2000.SetConfigurationInformation("X Engineering, xengineering.net", "XREG-010");
+    // A GX or display renames us by writing installation description 1 / 2 (126208): its last write survives a reboot.
+    if (settingExists(NK_n2kInstDesc1)) NMEA2000.SetInstallationDescription1(settingRead(NK_n2kInstDesc1).c_str());
+    if (settingExists(NK_n2kInstDesc2)) NMEA2000.SetInstallationDescription2(settingRead(NK_n2kInstDesc2).c_str());
+    NMEA2000.ReadResetInstallationDescriptionChanged();
     NMEA2000.SetDeviceInformation((unsigned long)(mac & 0x1FFFFFUL),  // 21-bit unique number for address claim
                                   141,    // device function: DC Generator/Alternator
                                   35,     // device class: Electrical Generation
                                   2046);  // open manufacturer code (no NMEA membership)
-    NMEA2000.SetDeviceInformationInstances((unsigned char)(n2kDeviceInstance & 0x07),
-                                           (unsigned char)((n2kDeviceInstance >> 3) & 0x1F));
     int savedAddr = settingExists(NK_n2kSrcAddr) ? settingRead(NK_n2kSrcAddr).toInt() : 22;
     if (savedAddr < 0 || savedAddr > 251) savedAddr = 22;
-    NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, (uint8_t)savedAddr);
-    if (n2kTxEnable == 1) NMEA2000.ExtendTransmitMessages(N2kTransmitMessages);  // never advertise N2K PGNs an RV-C-only node will not send
-    NMEA2000.ExtendReceiveMessages(N2kReceiveMessages);
-    n2kSrcAddrLive = savedAddr;
+    n2kPreferredAddr = (uint8_t)savedAddr;
   }
+  NMEA2000.ExtendReceiveMessages(N2kReceiveMessages);
+  n2kApplyNodeConfig(false);  // before Open(), which runs the address claim itself
   NMEA2000.Open();
   Serial.println("NMEA2K Running...");
 
@@ -1195,7 +1299,7 @@ if (!BMP388Disconnected) {
   //Victron VeDirect and NMEA0183
   Serial1.setRxBufferSize(2048);               // must precede begin(); default 256 B overflows in the 2 s ReadVEData gap (BMV emits ~900 B/s)
   Serial1.begin(19200, SERIAL_8N1, 7, -1, 1);  // Victron VEDirect
-  applyNMEA0183Serial();  // Serial2 / GPIO6 at the user's baud + polarity. InitSystemSettings() has already run, so NVS values are live here.
+  applyNMEA0183Serial();  // Serial2 / GPIO6 at the user's baud + polarity (NVS already loaded)
 
   // INA228 Battery Voltage/Current Sensor (chip config lives in inaApplyConfig so a runtime recovery re-applies it)
   if (!INA.begin()) {
@@ -1214,6 +1318,7 @@ if (!BMP388Disconnected) {
   }
   dataTimestamps[IDX_INA_DIE_TEMP] = 0;   // stamped only by a real sample past the warm-up discard: the heat ceiling's freshness
   dataTimestamps[IDX_VE_SOC] = 0;         // a boot stamp would pass an unseen VE.Direct port off as a battery monitor
+  dataTimestamps[IDX_VICTRON_SOLAR] = 0;  // and as an MPPT (the solar ledger would log a measured 0 harvest)
 
   // if (setupDisplay()) {
   //   Serial.println("Display ready for use");
@@ -1251,10 +1356,7 @@ if (!BMP388Disconnected) {
     uint8_t mode = (configReg >> 8) & 0x01;
 
     queueConsoleMessage("ADS1115 MUX: " + String(mux) + ", PGA: " + String(pga) + ", Mode: " + String(mode));
-    // Expected values:
-    // MUX should be 4 (single-ended A0) when you read channel 0
-    // PGA should be 0 (±6.144V range)
-    // Mode should be 0 (continuous) or 1 (single-shot)
+    // Expected: MUX 4 (single-ended A0) on channel 0, PGA 0 (±6.144V), Mode 0 continuous / 1 single-shot
   } else {
     queueConsoleMessage("ADS1115 Config readback failed - I2C error");
   }
@@ -1273,9 +1375,8 @@ if (!BMP388Disconnected) {
 void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, create them and populate with the hardcoded values
   // (the one-time LittleFS-to-NVS import sweep runs earlier, in setup(), before the alt/perf registry loaders)
 
-  // Vessel Info lives in NVS (CONFIG_MANIFEST) so it survives a LittleFS formatOnFail and
-  // exports/imports like every other setting. This must run before the NK_BatteryVoltage
-  // block below, which reads the class the migration seeds.
+  // Vessel Info lives in NVS so it survives a LittleFS formatOnFail and exports like any setting.
+  // Must run before the NK_BatteryVoltage block, which reads the class the migration seeds.
   migrateVesselInfoFile();
   if (settingExists(NK_vesselSaved)) {
     BOAT_LENGTH_FT         = settingRead(NK_boatLenFt).toFloat();
@@ -1309,9 +1410,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     vesselSetText(REGULATOR_NAME, sizeof(REGULATOR_NAME), settingRead(NK_regName).c_str());
   }
 
-  // Load IMU zero/level calibration (separate from vessel_info so a profile
-  // re-save from the cloud never clobbers physical-mount calibration).
-  // Stored as one JSON-string NVS value.
+  // IMU zero/level calibration is kept apart from vessel_info so a cloud profile re-save never
+  // clobbers physical-mount calibration. One JSON-string NVS value.
   if (settingExists(NK_imu_zero)) {
     DynamicJsonDocument zdoc(256);
     if (!deserializeJson(zdoc, settingRead(NK_imu_zero))) {
@@ -1342,11 +1442,9 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   settingWrite(NK_BatteryCapacity_Ah, String(BatteryCapacity_Ah).c_str());   // compare-first: heals a bad import
   PeukertRatedCurrent_A = BatteryCapacity_Ah / 20.0f;  // derived; recomputed every run regardless of branch
   if (!settingExists(NK_ChargeEfficiency)) {
-    // Save user-readable form (e.g. "99.0"), NOT the scaled integer, so the load path always
-    // sees a value ≤ 100 and can safely apply × 10 to reconstruct the scaled integer.
+    // Stored as the user-readable "99.0", not the scaled int: the load path multiplies by 10.
     settingWrite(NK_ChargeEfficiency, String(ChargeEfficiency_scaled / 10.0f, 1).c_str());
   } else {
-    // Key stores the user-readable percentage string (e.g. "99.0"). Multiply by 10 to get scaled int.
     ChargeEfficiency_scaled = (int)round(settingRead(NK_ChargeEfficiency).toFloat() * 10);
   }
   if (!settingExists(NK_TailCurrent)) {
@@ -1396,16 +1494,12 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     strncpy(fieldWindAck, settingRead(NK_fieldWindAck).c_str(), sizeof(fieldWindAck) - 1);
     fieldWindAck[sizeof(fieldWindAck) - 1] = '\0';
   }
-  // First-creation scaling. Every hardcoded default below is a 12V value referenced to a 12 V field winding;
-  // volt-domain seeds scale ×(V/12), field-duty seeds × fieldScale() (the winding the stored knobs are scaled
-  // for, over the class) — the same two domains applyNominalVoltageChange and the winding rescale convert.
-  // Existing keys always load verbatim, so this only fires when a key is first created on a device already
-  // provisioned 24/36/48V (fresh NVS with the class known, or a firmware update introducing a new setting).
+  // First-creation scaling: hardcoded defaults are 12V values for a 12 V winding. Volt-domain seeds scale
+  // ×(V/12), field-duty seeds ×fieldScale(), matching applyNominalVoltageChange. Existing keys load verbatim.
   const float seedVScale = (float)SYSTEM_VOLTAGE_CLASS / 12.0f;
   const float seedDScale = fieldScale();
-  // RAM-only volt-domain knob (posted with each sweep start, never NVS): its hardcoded default is a
-  // 12V value like every seed below, and 0.15 V at 48 V is a quarter of the per-cell margin while the
-  // sweep bypasses every soft protection layer — so scale it once here (runs once, at boot).
+  // RAM-only sweep knobs (never NVS) scale once here: 0.15 V at 48 V is a quarter of the per-cell margin,
+  // and the sweep bypasses every soft protection layer.
   altSweepMarginV *= seedVScale;
   altSweepRatePctS *= seedDScale;   // its field-duty siblings, RAM-only the same way
   altSweepFromPct  *= seedDScale;
@@ -1555,6 +1649,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     // sync until the cloud wipe lands, or the cloud ships the old-scaled front straight back.
     rpmAxisWipePending = (settingExists(NK_RpmAxisWipePend) && settingRead(NK_RpmAxisWipePend) == "1");
     altCloudWipePending = (settingExists(NK_AltWipePend) && settingRead(NK_AltWipePend) == "1");   // same reason, for the alt-health Start Over
+    perfCloudWipePending = (settingExists(NK_PerfWipePend) && settingRead(NK_PerfWipePend) == "1");   // and for a boat-performance Clear All / records import
     // Reboot interrupted the local wipe → re-run it whole (every clear it drives is idempotent)
     if (settingExists(NK_RpmAxisWipeLoc) && settingRead(NK_RpmAxisWipeLoc) == "1") pendingRpmAxisWipe = true;
     if (!settingExists(NK_systemIDSineCycles)) {
@@ -1610,10 +1705,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     timeSourceMode = (uint8_t)settingRead(NK_timeSourceMode).toInt();
     if (timeSourceMode > TSRC_NTP) timeSourceMode = TSRC_AUTO;  // sanity
   }
-  // Position source split out of the combined key on 2026-08-24. A device upgrading
-  // from a build that only had the combined setting has no NK_gpsPositionSource yet:
-  // derive it from what the owner had chosen, so a forced NMEA/phone choice survives.
-  // The old NTP value was time-only and left position on the auto chain.
+  // No NK_gpsPositionSource yet: derive it from the combined timeSourceMode so a forced NMEA/phone
+  // choice survives (NTP was time-only, so it maps to auto).
   if (!settingExists(NK_gpsPositionSource)) {
     switch (timeSourceMode) {
       case TSRC_NMEA:  gpsPositionSource = GPS_SRC_NMEA;  break;
@@ -1814,6 +1907,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     n2kEngBitsEnable = settingRead(NK_n2kEngBitsEn).toInt();
   }
+  if (!settingExists(NK_n2kConvStatEn)) {
+    settingWrite(NK_n2kConvStatEn, String(n2kConvStatEnable).c_str());
+  } else {
+    n2kConvStatEnable = settingRead(NK_n2kConvStatEn).toInt();
+  }
   if (!settingExists(NK_rvcTxEn)) {
     settingWrite(NK_rvcTxEn, String(rvcTxEnable).c_str());
   } else {
@@ -1879,6 +1977,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     dvccSettleS = settingRead(NK_dvccSettleS).toInt();
   }
+  if (!settingExists(NK_dvccVicCutHold)) {
+    settingWrite(NK_dvccVicCutHold, String(dvccVicCutHold).c_str());
+  } else {
+    dvccVicCutHold = settingRead(NK_dvccVicCutHold).toInt();
+  }
   // Captured before either load overwrites the globals, so the recovery pair below is the compile-time
   // default scaled exactly like the seed path — never a hardcoded 12 V number.
   const float dvccCvlMinSeed = dvccCvlMin * seedVScale;
@@ -1896,9 +1999,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     dvccCvlMax = settingRead(NK_dvccCvlMax).toFloat();
   }
   {
-    // Same bounds and same low < high rule the /settings handlers enforce, applied here because config
-    // import and the cloud config push write these keys raw and reach the globals only through a boot.
-    // A NaN survives the clamp untouched and fails the ordering test, which is the intent.
+    // Same bounds and low < high rule as the /settings handlers: config import and cloud push write these
+    // keys raw. A NaN survives the clamp and fails the ordering test, which is the intent.
     float cvlLo = constrain(dvccCvlMin, DVCC_CVL_ABS_MIN, DVCC_CVL_ABS_MAX);
     float cvlHi = constrain(dvccCvlMax, DVCC_CVL_ABS_MIN, DVCC_CVL_ABS_MAX);
     if (!(cvlLo < cvlHi)) { cvlLo = dvccCvlMinSeed; cvlHi = dvccCvlMaxSeed; }
@@ -2053,10 +2155,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     RPMScalingFactor = settingRead(NK_RPMScalingFactor).toInt();
   }
-  // Neither key is seeded: the owner measures the resistance, or on a 12 V system with no battery shunt may skip the test
-  // for the 2 ohm default (FieldResDefault, owner 2026-10-13). Entered = both keys, as the /get handler writes them; a
-  // resistance without its recorded temperature (the old firmware seed) counts as never entered, like a value outside the
-  // handler's range.
+  // Neither key is seeded: the owner measures the resistance (or, at 12 V with no shunt, accepts the 2 ohm
+  // FieldResDefault). Entered = both keys; a resistance without its temperature counts as never entered.
   if (settingExists(NK_FieldResistance) && settingExists(NK_FieldResTrefC)) {
     const float r = settingRead(NK_FieldResistance).toFloat();
     const float t = settingRead(NK_FieldResTrefC).toFloat();
@@ -2197,24 +2297,20 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     Ymax4 = settingRead(NK_Ymax4).toInt();
   }
   if (!settingExists(NK_MaxDuty)) {
-    // Max Field % is the REAL per-bus field-duty cap and is class-invariant (99 on every class): the
-    // per-class field-current protection is MaxFieldVolts below, solved against the live bus. WYSIWYG:
-    // the dashboard box shows the actual cap; user-adjustable.
+    // Max Field % is the real field-duty cap and is class-invariant (99 on every class); per-class
+    // field-current protection is MaxFieldVolts below, solved against the live bus.
     settingWrite(NK_MaxDuty, String(MaxDuty).c_str());
   } else {
     MaxDuty = settingRead(NK_MaxDuty).toInt();
   }
   if (!settingExists(NK_MaxFieldVolts)) {
-    // Deliberately NOT class-scaled: the default is 1.25 x the winding rating (15 V for a 12 V winding), and
-    // the rating belongs to the alternator, not the bank. For a 12 V winding against a 12V bus it works out
-    // above 99% (inert); against 24/36/48V it is the binding ceiling (~52/35/26% at absorption).
+    // Deliberately NOT class-scaled: 1.25 x the winding rating, which belongs to the alternator, not the bank.
+    // At 12 V it sits above 99% (inert); at 24/36/48V it is the binding ceiling (~52/35/26% at absorption).
     MaxFieldVolts = 1.25f * (float)fieldWindApplied;
     settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
   } else {
-    // A garbage NVS string (hand-edited export imported raw, or a bad admin push) parses to 0.0,
-    // which pins the field ceiling at MinDuty and effectively kills charging. Enforce the web
-    // handler's [0.5, 60] window here too, and fall back to the compile default rather than
-    // the window edge — a 0.5 V ceiling is still a dead field.
+    // A garbage string parses to 0.0, pinning the field at MinDuty (dead charging). Enforce the handler's
+    // [0.5, 60] window and fall back to the compile default, not the window edge (0.5 V is still dead).
     MaxFieldVolts = settingRead(NK_MaxFieldVolts).toFloat();
     if (!(MaxFieldVolts >= 0.5f && MaxFieldVolts <= 60.0f)) {
       MaxFieldVolts = 1.25f * (float)fieldWindApplied;
@@ -2290,13 +2386,9 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     UseFloat = settingRead(NK_UseFloat).toInt();
   }
-  // Shunt declared absent → the two battery-CURRENT control laws (zero-current float, MaintainMode) can never
-  // run: demote UseFloat 2 to voltage float and clear MaintainMode at boot (runs after shunt-present, UseFloat
-  // and MaintainMode are all read) so a config import pairing no-shunt with either can't leave the stage
-  // machine acting on a meaningless Bcur. /get does the same on a live toggle. Voltage float is NOT gated:
-  // absorption ends on AbsorptionTimeoutMs and CV holds FloatVoltage, no current needed. A present-but-unset
-  // resistance is deliberately NOT reconciled — it is a recoverable calibration gap, and the destroyed
-  // setting could not be restored by fixing the resistance.
+  // No shunt: the battery-current control laws (zero-current float, MaintainMode) cannot run, so demote
+  // UseFloat 2 to voltage float and clear MaintainMode (a config import can pair them; /get does the same live).
+  // A present-but-unset resistance is NOT reconciled: it is a recoverable calibration gap.
   if (!BatteryShuntPresent) {
     if (UseFloat == 2)     { UseFloat = 1;     settingWrite(NK_UseFloat, "1"); }
     if (MaintainMode != 0) { MaintainMode = 0; MaintainModeUserSel = 0; settingWrite(NK_MaintainMode, "0"); }
@@ -2309,11 +2401,6 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     settingWrite(NK_VMGTargetBearing, String(VMGTargetBearing).c_str());
   } else {
     VMGTargetBearing = settingRead(NK_VMGTargetBearing).toFloat();
-  }
-  if (!settingExists(NK_AutoShuntGainCorrection)) {  // BOOLEAN
-    settingWrite(NK_AutoShuntGainCorrection, String(AutoShuntGainCorrection).c_str());
-  } else {
-    AutoShuntGainCorrection = settingRead(NK_AutoShuntGainCorrection).toInt();
   }
   if (!settingExists(NK_AutoAltCurrentZero)) {  // BOOLEAN
     settingWrite(NK_AutoAltCurrentZero, String(AutoAltCurrentZero).c_str());
@@ -2536,7 +2623,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     CvKdOneSided = (bool)settingRead(NK_CvKdOneSided).toInt();
   }
   if (!settingExists(NK_CvKdMaxTrimA)) {
-    settingWrite(NK_CvKdMaxTrimA, String(CvKdMaxTrimA, 1).c_str());  // A — flat, voltage-independent (like every amp setting); a per-cell-equivalent back-off is the same amps on every bank, so a flat cap keeps the knee per-cell-equal
+    settingWrite(NK_CvKdMaxTrimA, String(CvKdMaxTrimA, 1).c_str());  // A — flat, not class-scaled: the same amps keeps the knee per-cell-equal on every bank
   } else {
     CvKdMaxTrimA = settingRead(NK_CvKdMaxTrimA).toFloat();
   }
@@ -2573,9 +2660,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     cvGainMode = (uint8_t)settingRead(NK_cvGainMode).toInt();
   }
-  // CV crossover ω_c (retired/inert — auto gain is now α/K) — NVS key renamed cvOmega → cvCrossover (§F.3). Mint-new-key + migrate: adopt the old
-  // value if present, folding in the misnamed-0.286 → 0.20 default fix (else ~24 % hot under the exact
-  // magnitude formula), write the new key, and remove the orphaned old one. Dev-units-only window.
+  // cvCrossover ω_c (inert; auto gain is α/K). Migrates legacy key cvOmega, mapping its old 0.286
+  // default to 0.20 (0.286 runs ~24 % hot under the exact magnitude formula).
   if (settingExists(NK_cvCrossover)) {
     cvCrossover = settingRead(NK_cvCrossover).toFloat();
   } else if (settingExists("cvOmega")) {
@@ -2586,7 +2672,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     settingWrite(NK_cvCrossover, String(cvCrossover, 3).c_str());
   }
-  // CV PI zero ρ — NVS key renamed cvKiRatio → cvPiZero. Same mint-new-key + migrate (value unchanged).
+  // cvPiZero ρ: migrates legacy key cvKiRatio (value unchanged).
   if (settingExists(NK_cvPiZero)) {
     cvPiZero = settingRead(NK_cvPiZero).toFloat();
   } else if (settingExists("cvKiRatio")) {
@@ -2821,14 +2907,13 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   }
   if (settingExists(NK_cmAgeAck))     commissionAgeAck     = settingRead(NK_cmAgeAck).toInt() != 0;
   if (settingExists(NK_cmChangeFlag)) commissionChangeFlag = settingRead(NK_cmChangeFlag).toInt() != 0;
-  // Receipt from an admin config push that applied on the PREVIOUS boot ("<n>|<key,key,...>").
-  // Survives here until the dashboard acks it, so an owner who was not watching at the moment
-  // of the push still learns their settings were changed remotely.
+  // Receipt of an admin config push applied on the PREVIOUS boot ("<n>|<key,key,...>"); kept until the
+  // dashboard acks it so an owner who was not watching still learns settings were changed remotely.
   if (settingExists(NK_cfgPushNotify)) {
     String rec = settingRead(NK_cfgPushNotify);
     int bar = rec.indexOf('|');
     if (bar > 0) {
-      cfgPushAppliedCount = (uint8_t)rec.substring(0, bar).toInt();
+      cfgPushAppliedCount = (uint16_t)constrain(rec.substring(0, bar).toInt(), 0L, 65535L);
       cfgPushAppliedKeys  = rec.substring(bar + 1);
     }
   }
@@ -2842,13 +2927,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     battTempCoeff = settingRead(NK_battTempCoeff).toFloat();
   }
-  // coldChargeLockoutEnable — master on/off for the board-temp cold-charge lockout (lithium protection)
   if (!settingExists(NK_coldChargeLockoutEnable)) {
     settingWrite(NK_coldChargeLockoutEnable, String((int)coldChargeLockoutEnable).c_str());
   } else {
     coldChargeLockoutEnable = settingRead(NK_coldChargeLockoutEnable).toInt() != 0;
   }
-  // MinChargeTempF — board-temp floor below which charging is locked out (°F)
   if (!settingExists(NK_MinChargeTempF)) {
     settingWrite(NK_MinChargeTempF, String(MinChargeTempF).c_str());
   } else {
@@ -2870,14 +2953,14 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     settingWrite(NK_battTempSource, String(battTempSource).c_str());
   } else {
     battTempSource = clampLoadedSetting("battTempSource", NK_battTempSource, settingRead(NK_battTempSource).toInt(), 0, 6);
-    if (battTempSource == 5) battTempSource = 0;   // 5 (board) retired 2026-09-18 — a stored 5 reads as Auto
+    if (battTempSource == 5) battTempSource = 0;   // 5 (board) is retired; a stored 5 reads as Auto
   }
   if (!settingExists(NK_hotChargeLockoutEnable)) {
     settingWrite(NK_hotChargeLockoutEnable, String(hotChargeLockoutEnable).c_str());
   } else {
     hotChargeLockoutEnable = settingRead(NK_hotChargeLockoutEnable).toInt() != 0 ? 1 : 0;
   }
-  // MaxChargeTempF — battery-temperature ceiling above which charging is locked out (°F, measured sources only)
+  // Hot-charge lockout ceiling; measured sources only
   if (!settingExists(NK_MaxChargeTempF)) {
     settingWrite(NK_MaxChargeTempF, String(MaxChargeTempF).c_str());
   } else {
@@ -2986,7 +3069,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     DutySlowRampRate *= seedDScale;
     settingWrite(NK_DutySlowRampRate, String(DutySlowRampRate, 2).c_str());
   } else {
-    DutySlowRampRate = settingRead(NK_DutySlowRampRate).toFloat();
+    DutySlowRampRate = fmaxf(settingRead(NK_DutySlowRampRate).toFloat(), DUTY_RAMP_MIN_12V * seedDScale);   // config import stores whatever it is handed
   }
   if (!settingExists(NK_ShutdownRampTauS)) {
     settingWrite(NK_ShutdownRampTauS, String(ShutdownRampTauS, 2).c_str());
@@ -3055,13 +3138,12 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     LearningMemoryDuration = settingRead(NK_LearningMemoryDuration).toInt();
   }
   if (!settingExists(NK_DutyRampRate)) {
-    // Duty-domain knob stored in REAL %/s for THIS bus. The hardcoded default is a 12V value, so on
-    // first creation scale it × fieldScale() (40%/s → 10%/s @48V with a 12 V winding) before persisting — the
-    // slew in share-of-rated-field per second stays constant, and the dashboard box shows what's actually used.
+    // Stored in REAL %/s for this bus; the 12V default scales ×fieldScale() on first creation so the
+    // slew per share of rated field stays constant (40%/s → 10%/s @48V with a 12 V winding).
     DutyRampRate = DutyRampRate * seedDScale;
     settingWrite(NK_DutyRampRate, String(DutyRampRate, 1).c_str());
   } else {
-    DutyRampRate = settingRead(NK_DutyRampRate).toFloat();
+    DutyRampRate = fmaxf(settingRead(NK_DutyRampRate).toFloat(), DUTY_RAMP_MIN_12V * seedDScale);   // config import stores whatever it is handed
   }
   if (!settingExists(NK_SettleTimeBeforeCut)) {
     settingWrite(NK_SettleTimeBeforeCut, String(SettleTimeBeforeCut).c_str());
@@ -3083,44 +3165,25 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     TempSustainedTimeout = settingRead(NK_TempSustainedTimeout).toInt();
   }
-  // Over-voltage ladder absolute rungs. Both are persisted user settings; the two instant cuts
-  // chain top-down from the battery's BMS charge-disconnect voltage (guidance: hardware limit
-  // 0.2 V x class/12 below the BMS floor, software cut 0.1 x class/12 below the hardware limit) so
-  // software always gets first shot and the INA228 pin is purely the electrical backstop.
-  // VoltageHardwareLimit — INA228 ALERT comparator threshold (instant, electrical).
-  // The ternary below reads as chemistry-aware but the 16.0f branch is DEAD CODE, permanently.
-  // BATTERY_TYPE is only loaded from NVS inside `if (settingExists(NK_vesselSaved))` earlier in this
-  // function, and this seed runs only on the boot where the key is absent — before any vessel info
-  // exists — so BATTERY_TYPE is still its compile default "lifepo4". It never gets a second chance:
-  // once written, settingExists() is true for the life of the device, and the only path back is
-  // performDeepFactoryReset(), which erases ALL NVS including vesselSaved, so the next boot is
-  // lithium again. Lithium is the DELIBERATE choice here (tightest rung, most units are lithium).
-  // The ternary is kept only as a marker for the day this seed moves after the first vessel save.
-  // Chemistry reaches this rung through Recommend Initial Charging Settings; the Setup > Protections
-  // field edits it directly like any setting; applyNominalVoltageChange rescales it on a class change.
-  // Seeded BEFORE AlternatorHardShutdownV so the software-cut fallback can chain from it.
+  // OV ladder rungs chain top-down from the BMS disconnect (hardware INA228 ALERT limit 0.2 V x class/12 below it,
+  // software cut 0.1 below that) so software fires first. Seeded BEFORE AlternatorHardShutdownV, which chains from it.
+  // The 16.0f branch is dead: BATTERY_TYPE is still the "lifepo4" default at first seed. Lithium is deliberate.
   if (!settingExists(NK_VoltageHardwareLimit)) {
     VoltageHardwareLimit = (batteryIsLithium() ? 14.3f : 16.0f) * seedVScale;
     settingWrite(NK_VoltageHardwareLimit, String(VoltageHardwareLimit, 2).c_str());
   } else {
     VoltageHardwareLimit = settingRead(NK_VoltageHardwareLimit).toFloat();
   }
-  // AlternatorHardShutdownV — software instant cut (absolute, all modes, raw per-tick).
-  // First-boot fallback rides one rung under the hardware limit. Once written, the value is
-  // treated as user-set; a later system-class change rescales both rungs x ratio in
-  // applyNominalVoltageChange (chain-preserving).
+  // AlternatorHardShutdownV: software instant cut (absolute, all modes, raw per-tick). First-boot seed sits
+  // one rung under the hardware limit; applyNominalVoltageChange rescales both rungs on a class change.
   if (!settingExists(NK_AlternatorHardShutdownV)) {
     AlternatorHardShutdownV = VoltageHardwareLimit - 0.1f * seedVScale;
     settingWrite(NK_AlternatorHardShutdownV, String(AlternatorHardShutdownV, 2).c_str());
   } else {
     AlternatorHardShutdownV = settingRead(NK_AlternatorHardShutdownV).toFloat();
   }
-  // Ladder-order coherence at boot. The /get handler enforces sw < hw on every write, but a
-  // device upgrading from the pre-ladder firmware boots with its old NVS software cut (lithium
-  // Bulk + 0.5 = 14.4) ABOVE the freshly seeded hardware rung (14.3) — a silently inverted
-  // ladder where the INA228 pin fires first. Same rule as the handler: the hardware rung is the
-  // anchor; the software cut is clamped 0.05 x class/12 under it and persisted. Also repairs an
-  // inverted pair arriving through the config-import path (applyImportConfig writes NVS raw).
+  // Ladder order at boot: same rule as /get (hardware rung is the anchor, software cut clamped 0.05 x class/12
+  // under it). Repairs an inverted pair from old NVS or the config-import path (writes NVS raw).
   {
     float swMax = VoltageHardwareLimit - 0.05f * seedVScale;
     if (AlternatorHardShutdownV > swMax) {
@@ -3198,9 +3261,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (settingExists(NK_commissionPhase)) {
     commissionPhase = (uint8_t)settingRead(NK_commissionPhase).toInt();
   }
-  // Per-stage completion bitmask (default 0 = nothing done). Loaded BEFORE the in-progress
-  // revert below so that revert can also clear it. This is the source of truth for the
-  // per-step ✓ marks; commissionState is derived from it.
+  // Per-stage completion bitmask: source of truth for the per-step ✓ marks (commissionState derives from it).
+  // Loaded BEFORE the in-progress revert below so that revert can also clear it.
   if (settingExists(NK_commissionDoneMask)) {
     commissionDoneMask = (uint16_t)settingRead(NK_commissionDoneMask).toInt();
   }
@@ -3208,16 +3270,9 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (settingExists(NK_commissionManualMask)) {
     commissionManualMask = (uint16_t)settingRead(NK_commissionManualMask).toInt();
   }
-  // A reboot mid-wizard must KEEP already-finished steps — only the step that was running when power
-  // was lost is un-trustworthy. The in-flight step snapshot (NK_commissionStepSnap, re-taken on each
-  // step entry) holds the scalar tune as of that step's start, so restoring it undoes exactly that one
-  // step while every finished step stays intact. The done/manual masks and IN_PROGRESS state are left
-  // as-is so the badge invites "Continue commissioning" rather than starting over. The Phase-0 origin
-  // snapshot (NK_commissionSnap) is deliberately NOT touched here — it stays so a later explicit Abort
-  // can still fully revert to the pre-commissioning tune.
-  // NOTE: a COMMITTED-but-partial device (e.g. commissioned, then binned stages invalidated by a
-  // tach rescale) is also state==1 but has NEITHER snapshot — it persists untouched and keeps
-  // nagging, which is correct.
+  // A reboot mid-wizard keeps finished steps: restoring the in-flight step snapshot (taken at each step entry)
+  // undoes only the interrupted step; masks and IN_PROGRESS stay so the badge offers "Continue". The Phase-0
+  // snapshot (NK_commissionSnap) is NOT touched, so a later Abort can still fully revert.
   if (commissionState == 1 && settingExists(NK_commissionStepSnap)) {
     commissionRestoreScalars(NK_commissionStepSnap);  // undo just the interrupted step's scalar applies
     settingRemove(NK_commissionStepSnap);
@@ -3410,8 +3465,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     FIELD_COLLAPSE_DELAY = settingRead(NK_FIELD_COLLAPSE_DELAY).toInt();
   }
-  // IMU safety thresholds — user-set via form, persisted (Pattern B).
-  // imuMountOrientation rides on the Vessel Info record, written as one batch (separate path).
+  // IMU safety thresholds (imuMountOrientation loads with Vessel Info instead)
   if (!settingExists(NK_CAPSIZE_THRESHOLD_DEG)) {
     settingWrite(NK_CAPSIZE_THRESHOLD_DEG, String(CAPSIZE_THRESHOLD_DEG, 1).c_str());
   } else {
@@ -3428,9 +3482,8 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     SLAM_THRESHOLD_G = settingRead(NK_SLAM_THRESHOLD_G).toFloat();
   }
 
-  // Fast alt-current diagnostic knobs (Pattern B). Defaults = the #define values, so a fresh
-  // device behaves exactly as before the knobs existed. faInit() also reads NK_faEnabled
-  // directly (it runs before this), but writing the default here creates the key on day one.
+  // Fast alt-current diagnostic knobs; defaults = the #define values. faInit() reads NK_faEnabled directly
+  // (it runs before this); writing the default here creates the key.
   if (!settingExists(NK_faEnabled)) {
     settingWrite(NK_faEnabled, faEnabled ? "1" : "0");
   } else {
@@ -3471,7 +3524,7 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (!settingExists(NK_ripWinMs)) {
     settingWrite(NK_ripWinMs, String(ripWinMs, 0).c_str());
   } else {
-    // §11 halves need ≥1 disturbance cycle each — floor pre-§11 stored values (250–500 ms era) up to the new minimum
+    // §11 halves need ≥1 disturbance cycle each: 500 ms floor
     ripWinMs = fmaxf(500.0f, settingRead(NK_ripWinMs).toFloat());
   }
   if (!settingExists(NK_ripDriftFloorA)) {
@@ -3506,7 +3559,6 @@ inline void pushAccelSample(int16_t x, int16_t y, int16_t z, uint32_t timestamp_
   uint16_t next_head = (imuRingBuffer->accel_head + 1) % ACCEL_RING_SIZE;
 
   if (next_head == imuRingBuffer->accel_tail) {
-    // Ring buffer full - drop oldest sample (move tail forward)
     imuRingBuffer->accel_tail = (imuRingBuffer->accel_tail + 1) % ACCEL_RING_SIZE;
     imuRingBuffer->accel_dropped++;
   }
@@ -3524,7 +3576,6 @@ inline void pushGyroSample(int16_t x, int16_t y, int16_t z, uint32_t timestamp_u
   uint16_t next_head = (imuRingBuffer->gyro_head + 1) % GYRO_RING_SIZE;
 
   if (next_head == imuRingBuffer->gyro_tail) {
-    // Ring buffer full - drop oldest sample (move tail forward)
     imuRingBuffer->gyro_tail = (imuRingBuffer->gyro_tail + 1) % GYRO_RING_SIZE;
     imuRingBuffer->gyro_dropped++;
   }
@@ -3538,21 +3589,14 @@ inline void pushGyroSample(int16_t x, int16_t y, int16_t z, uint32_t timestamp_u
   imu_total_samples_gyro++;
 }
 
-// ============================================================================
-// IMU CONVERSION CONSTANTS
-// ============================================================================
-// LSM6DSOX sensitivity values (from datasheet)
-// Accel: ±2g range → 0.061 mg/LSB → 0.000061 g/LSB
-// Gyro: ±2000 dps range → 70 mdps/LSB → 0.070 dps/LSB
+// ===== IMU conversion constants =====
+// LSM6DSOX datasheet sensitivity: accel ±2g → 0.061 mg/LSB; gyro ±2000 dps → 70 mdps/LSB
 constexpr float ACCEL_SCALE = 0.000061f;  // g per LSB
 constexpr float GYRO_SCALE = 0.070f;      // dps per LSB
 
-// Axis remapping: maps sensor axes to vessel axes for each mounting orientation.
-// src[i] = which sensor axis (0=X, 1=Y, 2=Z) feeds vessel axis i
-// sign[i] = +1 or -1
-// Index order: [0]=accel_fwd, [1]=accel_stbd, [2]=accel_up,
-//              [3]=gyro_pitch, [4]=gyro_heel,  [5]=gyro_yaw
-// All four orientations VERIFIED from physical tilt tests.
+// Sensor-to-vessel axis remap per mounting orientation (all four verified by physical tilt tests).
+// src[i] = sensor axis (0=X, 1=Y, 2=Z) feeding vessel axis i; sign[i] = ±1.
+// Index order: [0]=accel_fwd, [1]=accel_stbd, [2]=accel_up, [3]=gyro_pitch, [4]=gyro_heel, [5]=gyro_yaw
 struct AxisRemap {
   uint8_t src[6];
   int8_t sign[6];
@@ -3592,7 +3636,6 @@ struct RollingWindow120 {
 
 // ===== IMU METRIC PROCESSING FUNCTIONS =====
 void resetAccelStats() {
-  // Reset all period statistics (called after uploading to Supabase)
   imu_accel_x_min = 999.0;
   imu_accel_x_max = -999.0;
   imu_accel_x_sum = 0;
@@ -3651,11 +3694,8 @@ void complementaryFilter(float ax, float ay, float az, float gx, float gy, float
   float accel_heel = atan2(ay, sqrt(ax * ax + az * az)) * 180.0f / PI - imuHeelOffsetDeg;
   float accel_pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI - imuPitchOffsetDeg;
 
-  // First sample after boot seeds the filter from accel directly. Starting from
-  // 0 made the estimate slew to the true attitude over several seconds, and the
-  // long-term ring recorded that sweep as a 0-to-actual min/max wedge in the
-  // first bucket. (IMU-zero capture still snaps to 0 by design — that's a new
-  // level reference, not a restart.)
+  // First sample seeds the filter from accel: starting at 0 slewed for seconds and the long-term ring
+  // recorded the sweep as a min/max wedge. (IMU-zero capture still snaps to 0: a new level reference.)
   static bool cf_seeded = false;
   if (!cf_seeded) {
     cf_seeded = true;
@@ -3671,11 +3711,9 @@ void complementaryFilter(float ax, float ay, float az, float gx, float gy, float
   cf_heel = CF_ALPHA * cf_heel + (1.0f - CF_ALPHA) * accel_heel;
   cf_pitch = CF_ALPHA * cf_pitch + (1.0f - CF_ALPHA) * accel_pitch;
 }
-// Finalize IMU zero: normally once both windows hit the target (~2s @104Hz). The timeout
-// margin guarantees the capture always resolves — if samples arrive slowly it finalizes on
-// whatever it gathered (provided the IMU_ZERO_MIN floor), otherwise it aborts cleanly. Either
-// way settingsDirty fires so the CSV3 echo refreshes the dashboard "calculating" label at once.
-// Shared by the normal metrics path and the pre-vessel-info path (metrics gated, calibration live).
+// Finalize IMU zero once both windows hit the target, or at the timeout on whatever was gathered (above
+// IMU_ZERO_MIN, else abort). settingsDirty fires either way so CSV3 clears the "calculating" label at once.
+// Shared by the normal metrics path and the pre-vessel-info path.
 void imuZeroFinalizeIfDue() {
   if (!imuZeroInProgress) return;
   bool targetMet = (imuZeroAccelN >= IMU_ZERO_TARGET && imuZeroGyroN >= IMU_ZERO_TARGET);
@@ -3736,17 +3774,14 @@ void imuZeroFinalizeIfDue() {
 }
 
 void updateAccelMetrics() {
-  // Called from main loop every iteration (~300 Hz at 3ms loop time, NOT 1 Hz).
-  // Most calls find 0 new samples (arrival rate is 104 Hz post-ODR-drop) and exit quickly;
-  // accel_cap=50 limits per-call work when a backlog exists. Timer reports sub-ms worst,
-  // which integer-divides to 0 on the dashboard — function IS running (Ring Usage stays 0%).
+  // Runs every main-loop pass (NOT 1 Hz); most calls find no new samples (104 Hz arrival). Its timer
+  // shows 0 on the dashboard because sub-ms integer-divides to 0; it IS running.
 
   if (!imuEnabled) return;
   if (!imuRingBuffer || !imuWindow) { imuEnabled = false; return; }
   if (!vesselInfoSaved) {
-    // Metrics are gated until the first Vessel Info save — anything recorded before the mount
-    // orientation is known would put garbage heel/slam/sea-state into the NVS lifetime stats.
-    // The level-calibration capture must still see samples, so accumulate its sums while draining.
+    // Metrics are gated until the first Vessel Info save (unknown mount orientation would put garbage into
+    // the NVS lifetime stats); the level-calibration capture still accumulates while draining.
     const AxisRemap &rg = axisRemap[imuMountOrientation];
     while (imuRingBuffer->accel_tail != imuRingBuffer->accel_head) {
       IMUSample *s = &imuRingBuffer->accel[imuRingBuffer->accel_tail];
@@ -3791,13 +3826,11 @@ void updateAccelMetrics() {
     accel_cap++;
     IMUSample *s = &imuRingBuffer->accel[imuRingBuffer->accel_tail];
 
-    // Calculate time delta for area accumulation
     uint64_t now_us = s->timestamp_us;
     uint64_t dt_us = (imuWindow->lastUpdateTime_us > 0)
                        ? (now_us - imuWindow->lastUpdateTime_us)
                        : 0;
 
-    // Convert to engineering units with full axis permutation + sign remapping
     const AxisRemap &r = axisRemap[imuMountOrientation];
     float raw_a[3] = { (float)s->x, (float)s->y, (float)s->z };
     float ax = raw_a[r.src[0]] * ACCEL_SCALE * r.sign[0];  // vessel forward
@@ -3839,9 +3872,8 @@ void updateAccelMetrics() {
       imuWindow->total_accel_area_v_us += (int64_t)total_accel_scaled * dt_us;
       imuWindow->total_accel_valid_us += dt_us;
 
-      // Vertical acceleration (Z-axis in vessel frame)
       float vert_accel = az;
-      int32_t vert_accel_scaled = az_scaled;  // Already scaled above
+      int32_t vert_accel_scaled = az_scaled;
       if (vert_accel_scaled < imuWindow->vertical_accel_min) imuWindow->vertical_accel_min = vert_accel_scaled;
       if (vert_accel_scaled > imuWindow->vertical_accel_max) imuWindow->vertical_accel_max = vert_accel_scaled;
       imuWindow->vertical_accel_area_v_us += (int64_t)vert_accel_scaled * dt_us;
@@ -3875,8 +3907,6 @@ void updateAccelMetrics() {
     imu_total_accel_g = sqrt(ax * ax + ay * ay + az * az);
     wmIgnUpdate(wmIgn_vacc, imu_vertical_accel_g);  // ignition-cycle watermark
 
-    // Wave period decimation and processing is handled inline below (10 Hz decimation, zero-crossing)
-
     imuWindow->lastUpdateTime_us = now_us;
     imuRingBuffer->accel_tail = (imuRingBuffer->accel_tail + 1) % ACCEL_RING_SIZE;
     samples_processed++;
@@ -3895,7 +3925,6 @@ void updateAccelMetrics() {
       rolling120s.count = 0;
       imu_heading_swing_120s = -1.0f;
     }
-    // (Anchored → underway: msi_rms2_ewma already reset above; scores will read 0.0 until EWMA builds)
     gps_was_moving = gps_is_moving;
   }
 
@@ -3955,7 +3984,6 @@ void updateAccelMetrics() {
 
     if (crossing) {
       if (wave_last_crossing_time > 0) {
-        // Each crossing is a half-period; full period = 2 × half-period
         float half_period_s = (now - wave_last_crossing_time) / 1000.0f;
         float period_s = half_period_s * 2.0f;
         if (period_s >= 2.0f && period_s <= 20.0f) {
@@ -3984,13 +4012,11 @@ void updateAccelMetrics() {
     gyro_cap++;
     IMUSample *s = &imuRingBuffer->gyro[imuRingBuffer->gyro_tail];
 
-    // Calculate time delta (uses separate gyro tracker, not shared with accel)
     uint64_t now_us = s->timestamp_us;
     uint64_t dt_us = (imuWindow->lastGyroUpdateTime_us > 0)
                        ? (now_us - imuWindow->lastGyroUpdateTime_us)
                        : 0;
 
-    // Convert to engineering units with full axis permutation + sign remapping
     const AxisRemap &r = axisRemap[imuMountOrientation];
     float raw_g[3] = { (float)s->x, (float)s->y, (float)s->z };
     float gx = raw_g[r.src[3]] * GYRO_SCALE * r.sign[3];  // vessel pitch rate
@@ -4002,7 +4028,6 @@ void updateAccelMetrics() {
       imuZeroGxSum += gx; imuZeroGySum += gy; imuZeroGzSum += gz;
       imuZeroGyroN++;
     }
-    // Apply stored rest bias to live gyro
     gx -= imuGxBias; gy -= imuGyBias; gz -= imuGzBias;
 
     // Scale to integers (12.34 dps → 1234)
@@ -4010,7 +4035,6 @@ void updateAccelMetrics() {
     int32_t gy_scaled = (int32_t)(gy * 100.0f);
     int32_t gz_scaled = (int32_t)(gz * 100.0f);
 
-    // Update window statistics
     if (dt_us > 0 && dt_us < 100000) {  // Sanity check
       if (gx_scaled < imuWindow->gyro_x_min) imuWindow->gyro_x_min = gx_scaled;
       if (gx_scaled > imuWindow->gyro_x_max) imuWindow->gyro_x_max = gx_scaled;
@@ -4028,7 +4052,6 @@ void updateAccelMetrics() {
       imuWindow->gyro_z_valid_us += dt_us;
     }
 
-    // Store current raw values
     imu_gyro_x_raw = gx;
     imu_gyro_y_raw = gy;
     imu_gyro_z_raw = gz;
@@ -4067,7 +4090,7 @@ void updateAccelMetrics() {
   wmIgnUpdate(wmIgn_heel,  imu_heel_deg);   // ignition-cycle watermarks
   wmIgnUpdate(wmIgn_pitch, imu_pitch_deg);
 
-  // Update 60s rolling window (called at ~1Hz from main loop)
+  // 60s rolling window, 1 Hz tick
   static unsigned long last60sUpdate = 0;
   if (now - last60sUpdate >= 1000) {
     last60sUpdate = now;
@@ -4167,12 +4190,9 @@ void updateAccelMetrics() {
     }
   }
 
-  // Capsize/pitchpole detection
-  // _triggered arms the 1s timer; _reported latches true after the message fires
-  // and prevents re-firing while the angle stays above threshold. Both flags reset
-  // only when the angle drops back below threshold (one message per event).
-  // Same rule as the slam lifetime stats: a board that failed the install check has no trustworthy
-  // heel/pitch, so its events and extremes stay out of the persisted, uploaded lifetime values.
+  // Capsize/pitchpole: _triggered arms the 1s timer, _reported latches one message per event; both reset
+  // when the angle drops below threshold. A board that failed the install check keeps its events and
+  // extremes out of the persisted, uploaded lifetime values.
   const bool imuMountTrusted = (imuMountState != IMU_MOUNT_BAD);
   static bool capsize_triggered = false;
   static bool capsize_reported = false;
@@ -4188,8 +4208,7 @@ void updateAccelMetrics() {
     } else if (!capsize_reported && (now - capsize_start > 1000)) {  // fires once per event
       if (imuMountTrusted) imu_capsize_count++;
       queueConsoleMessageF("CAPSIZE EVENT: %.1f deg%s", cf_heel, imuMountTrusted ? "" : " (IMU install check failed, not counted)");
-      // Persisted by the next saveNVSDataFull() at the field-cut-settled flash pass: no flash writes from the
-      // control loop, and a wet or mis-mounted IMU hovering at the threshold re-fired this every second.
+      // Persisted by the next saveNVSDataFull() field-cut flash pass: never write flash from the control loop.
       capsize_reported = true;
     }
   } else {
@@ -4204,8 +4223,7 @@ void updateAccelMetrics() {
     } else if (!pitchpole_reported && (now - pitchpole_start > 1000)) {  // fires once per event
       if (imuMountTrusted) imu_pitchpole_count++;
       queueConsoleMessageF("PITCHPOLE EVENT: %.1f deg%s", cf_pitch, imuMountTrusted ? "" : " (IMU install check failed, not counted)");
-      // Persisted by the next saveNVSDataFull() at the field-cut-settled flash pass: no flash writes from the
-      // control loop, and a wet or mis-mounted IMU hovering at the threshold re-fired this every second.
+      // Persisted by the next saveNVSDataFull() field-cut flash pass: never write flash from the control loop.
       pitchpole_reported = true;
     }
   } else {
@@ -4220,9 +4238,7 @@ void updateAccelMetrics() {
     imu_pitch_max_lifetime = abs(cf_pitch);
   }
 
-  // Sea state minute bucketing — tick every 60s
-  // Bucket by MSI score: gentle<10, moderate<30, rough<70, extreme>=70
-  // Moving vs stationary by SOGNMEA (knots): moving if >= 1.5 kts
+  // Sea-state minute buckets by MSI score and moving/stationary (SOG knots)
   static unsigned long seaStateTick_ms = 0;
   if (now - seaStateTick_ms >= 60000) {
     seaStateTick_ms = now;
@@ -4238,8 +4254,7 @@ void updateAccelMetrics() {
     }
   }
 
-  // Anchorage comfort — always computed so JS can show a grayed value underway; contextually meaningful only at anchor
-  // Roll and pitch only — at anchor there are no underway-style slams; rocking and hobby-horsing are the discomfort drivers
+  // Anchorage comfort (roll + pitch only: no slams at anchor); always computed so JS can show it grayed underway
   {
     float roll_penalty  = min(imu_heel_deviation_60s  / 12.0f, 1.0f) * 65.0f;  // 12 deg heel dev -> full penalty
     float pitch_penalty = min(imu_pitch_deviation_60s /  8.0f, 1.0f) * 35.0f;  //  8 deg pitch dev -> full penalty
@@ -4256,10 +4271,8 @@ void initializeDeviceId() {
   deviceIdLower = (uint32_t)(chipid & 0xFFFFFFFF);
 
   // STEP 2: TESTING OVERRIDE - uncomment to fake device ID
-  // Device UID spoofing conflicts with OTA updates if the hardcoded override values have changed since
-  // factory partition was programmed. During OTA, the device temporarily boots to factory partition with the old UID,
-  // triggering token clearance. Workarounds exist but aren't worth the complexity—just re-register after OTA if you've
-  // changed the spoofed UID since initially programming the factory partition.
+  // Spoofed UIDs conflict with OTA if changed since the factory partition was programmed (the factory boot
+  // sees the old UID and clears the token): re-register after OTA in that case.
   //deviceIdUpper = 0xBBBBBBBB;
   //deviceIdLower = 0xAAAAAAAA;
 
@@ -4433,6 +4446,7 @@ bool parseTarHeader(StreamingExtractor *extractor) {
       Serial.printf("❌ esp_ota_begin failed: %s\n", esp_err_to_name(beginErr));
       return false;
     }
+    detachOta0ForInstall();
     extractor->otaStarted = true;
     extractor->isCurrentFileFirmware = true;
   } else if (extractor->currentFileName.indexOf('.') > 0) {
@@ -4442,6 +4456,7 @@ bool parseTarHeader(StreamingExtractor *extractor) {
       if (webFS.begin(true, "/web", 10, "prod_fs")) {
         extractor->prodFSMounted = true;
         Serial.println("OTA: Mounted prod_fs for web file updates");
+        detachOta0ForInstall();
         purgeProdFs();
       } else {
         Serial.println("OTA: Failed to mount prod_fs");
@@ -4568,46 +4583,33 @@ bool processDataChunk(StreamingExtractor *extractor, uint8_t *data, size_t dataS
 
   return true;
 }
-// Link-quality floor for every OTA path (download, version report, forced-update check).
-// Deliberately set to "only refuse when the link is effectively dead" — an ESP32 rarely holds an
-// association past about -90, so on any usable link this never fires. That is the intent: RSSI is
-// a proxy for throughput and a bad one here (a crowded marina at -60 can carry less than a quiet
-// anchorage at -82 — SNR decides, not signal strength). The download is outcome-protected instead:
-// no-data abort, total-time cap, esp_ota_abort() + RSA verify before any commit. A 2.7 MB package
-// inside the cap needs only ~12 kbps, so slow is fine and only dead is fatal. Never tune this
-// hoping to fix a download problem; the timeouts below are the real limits.
+// Link-quality floor for every OTA path: refuse only when the link is effectively dead. RSSI is a poor
+// throughput proxy (SNR decides); the download is outcome-protected instead (no-data abort, time cap, RSA
+// verify before commit). Never tune this to fix a download problem; the timeouts below are the real limits.
 static const int OTA_MIN_RSSI_DBM = -90;
 
-// The 16 s task WDT (panic) cannot span an OTA attempt: one HTTPS GET below may legally block
-// for TCP connect (60 s) + TLS handshake (120 s) + header wait (60 s) with no way to feed
-// mid-call. performOTAUpdateToVersion() widens the panic window to this for the attempt and
-// restores WDT_TIMEOUT_MS on every exit — a true lwip wedge still panic-reboots the (field-off)
-// device within 5 min instead of never.
+// The 16 s task WDT cannot span an OTA attempt: one HTTPS GET may block for connect (60 s) + TLS (120 s)
+// + headers (60 s) with no way to feed. performOTAUpdateToVersion() widens the window for the attempt and
+// restores WDT_TIMEOUT_MS on every exit, so a true lwip wedge still panic-reboots within 5 min.
 static const uint32_t OTA_WDT_WINDOW_MS = 300000;
 static void otaSetWdtWindow(uint32_t ms) {
   esp_task_wdt_config_t cfg = { .timeout_ms = ms, .idle_core_mask = 0, .trigger_panic = true };
   esp_task_wdt_reconfigure(&cfg);
-  esp_task_wdt_reset();  // start the new window fresh; harmless error on the non-subscribed web-handler task
+  esp_task_wdt_reset();  // start the new window fresh for the caller (loop or async_tcp, both subscribed)
 }
 
-// Signature fetch budget: 12 s per phase, what every other small cloud fetch uses (executeUpdateFirmwareVersion
-// and friends). Connect, handshake, read, and body-stall are deliberately the SAME value: the connect timeout
-// is also the socket poll period the core runs inside the TLS handshake, so a handshake cap only binds when
-// it is no larger than the connect cap. Left unset, the handshake inherited the core's 120 s default, which
-// with the old 60 s connect let a server that accepts TCP but never answers TLS hold the update path for
-// 3 min — on the factory path that is the web-handler task, i.e. the whole dashboard. testInternetSpeed()
-// has just proved the link; the patient client is the 2.7 MB download that follows, not this sub-1 KB fetch.
+// Signature fetch budget: 12 s per phase, like every small cloud fetch. Connect, handshake, read and stall are
+// the SAME value on purpose: the connect timeout is the socket poll period inside the TLS handshake, so a
+// handshake cap binds only when it is no larger. The patient client is the 2.7 MB download, not this fetch.
 static const uint32_t OTA_SIG_TIMEOUT_MS = 12000;
 static const int OTA_SIG_MAX_LEN = 1024;  // RSA-4096 sig is 512 B = 684 chars base64; anything bigger is not a signature
 
 // How long prepareForOTA() waits for TempTask and httpsTask to retire themselves. The longest single cloud op
-// is three 12 s phases plus the 3 s post-failure delay; TempTask's longest sleep is 5 s.
+// is a raw-TLS call capped by GLOBAL_TIMEOUT (45 s) plus the 3 s post-failure delay; TempTask's longest sleep is 5 s.
 static const uint32_t OTA_TASK_EXIT_WAIT_MS = 60000;
 
-// otaInProgress cannot legitimately stay up past this: every call on the update path is bounded (task exit
-// wait 60 s, signature fetch a few 12 s phases, download 60 s connect + 120 s handshake + 60 s header + the
-// 30 min OTA_MAX_DOWNLOAD_MS cap with its 120 s stall guard). Past it the path is wedged in something with
-// no timeout, and checkOtaWedge() retires the flag.
+// otaInProgress cannot legitimately stay up past this (every update-path call is bounded, incl. the 30 min
+// download cap); past it the path is wedged and checkOtaWedge() retires the flag.
 static const uint32_t OTA_WEDGE_LIMIT_MS = 2400000;  // 40 min
 
 // Retire both Core 0 tasks for the attempt. Returns false — caller aborts the update — if httpsTask is still
@@ -4714,9 +4716,8 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
 
   // DECLARE ALL VARIABLES AT TOP (before any goto statements)
   bool success = true;
-  // Post-download rejection (signature/finalize). The reboot-into-current-
-  // firmware these paths take is the right recovery — but without this flag
-  // the cleanup branch reported it as a successful update.
+  // Post-download rejection (signature/finalize): the reboot into current firmware is the right recovery,
+  // but without this flag the cleanup branch would report a successful update.
   bool verifyFailed = false;
   StreamingExtractor extractor = {};
   HTTPClient http;
@@ -4725,14 +4726,11 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
   int contentLength = 0;
   WiFiClient *stream = nullptr;
   const size_t CHUNK_SIZE = 1024;
-  // no-data idle limit — a half-open socket never trips !connected(). 120 s not 60 s: a deep fade or
-  // an AP roam can stall TCP well past a minute and still recover, and we would rather wait than
-  // throw away a part-done download. This is also the freeze window from the wedged-socket incident,
-  // so it stays bounded — the point is to be patient with a bad link, not to hang forever.
+  // No-data idle limit (a half-open socket never trips !connected()). 120 s: a deep fade or AP roam can
+  // stall TCP past a minute and still recover; still bounded so a wedged socket cannot hang forever.
   const unsigned long OTA_STALL_TIMEOUT_MS = 120000;
-  // absolute cap on the whole download. 30 min carries the 2.7 MB package at ~12 kbps, i.e. any link
-  // still passing traffic at all. Cost of the generosity: TempTask is deleted for this whole window,
-  // so alternator temperature is unmonitored until ensureCore0Tasks() rebuilds it after otaRestoreNormalOperation().
+  // Absolute download cap: 30 min carries the 2.7 MB package at ~12 kbps. TempTask is deleted for this whole
+  // window, so alternator temperature is unmonitored until ensureCore0Tasks() rebuilds it.
   const unsigned long OTA_MAX_DOWNLOAD_MS = 1800000;
   uint8_t inputBuffer[CHUNK_SIZE];
   int totalDownloaded = 0;
@@ -4786,12 +4784,8 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
     goto cleanup;
   }
 
-  // No RSSI gate here on purpose. By this point prepareForOTA() has already deleted TempTask and
-  // closed EventSource, the signature has already downloaded over this same link (proof it carries
-  // HTTPS), and on the ota_0 path we have already rebooted into factory. Refusing here pays every
-  // cost and saves nothing, and it would overrule a successful transfer with a guess. The
-  // OTA_MIN_RSSI_DBM pre-flight in performOTAUpdateToVersion runs before any teardown; that is the
-  // only place the check earns its keep.
+  // No RSSI gate here on purpose: teardown is done and the signature already downloaded over this link.
+  // The OTA_MIN_RSSI_DBM pre-flight in performOTAUpdateToVersion runs before any teardown.
   rssi = WiFi.RSSI();
   Serial.printf("WiFi status: %d, Signal: %d dBm\n", WiFi.status(), rssi);
 
@@ -4804,22 +4798,18 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
 
   otaHeapMark("AFTER WiFiClientSecure");
 
-  // setInsecure() not setCACert(): downloads go through the ota.xengineering.net
-  // proxy, whose cert chain we don't pin (and it may change when re-homed). Transport
-  // auth is irrelevant here — the downloaded package is RSA-signature-verified below
-  // (mbedtls_pk_verify / OTA_PUBLIC_KEY), which is the real integrity guarantee.
+  // setInsecure(): the ota.xengineering.net proxy's cert chain is not pinned (it may change when re-homed);
+  // the package's RSA signature (mbedtls_pk_verify / OTA_PUBLIC_KEY) is the real integrity guarantee.
   Serial.println("7. Setting TLS (insecure transport; payload is signature-verified)...");
   client.setInsecure();
   otaHeapMark("AFTER setInsecure");
 
   // CRITICAL: Set matching timeouts BEFORE connection attempt
-  // Note client.setTimeout here is largely advisory: HTTPClient::connect() overwrites it with its own
-  // _tcpTimeout right after connecting, so the http.setTimeout below is what actually governs reads.
-  // Kept at the same value so the two agree either way.
+  // Largely advisory: HTTPClient::connect() overwrites it with _tcpTimeout, so http.setTimeout below governs
+  // reads. Kept equal so the two agree.
   client.setTimeout(60000);
-  // SECONDS (core multiplies by 1000). 120 s is the core's own default — the previous 30 was
-  // TIGHTENING it, which is backwards for a weak link. A handshake is several round trips of large
-  // records and is the step most likely to time out on a link that would still finish the download.
+  // SECONDS (core multiplies by 1000). 120 s = the core default; do not tighten: the handshake is the step
+  // most likely to time out on a weak link that would still finish the download.
   client.setHandshakeTimeout(120);
 
   Serial.println("8. Pre-flight memory check...");
@@ -4844,8 +4834,8 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
   }
 
   Serial.println("10. Attempting http.begin() with SSL...");
-  // No M17-style heap pre-check here: tried in 0.0.38, broke OTA. prepareForOTA() above
-  // already frees memory for TLS; let http.begin() / mbedTLS surface failures themselves.
+  // Do not add a heap pre-check here (it broke OTA): prepareForOTA() already frees memory for TLS, and
+  // http.begin() / mbedTLS surface failures themselves.
   beginSuccess = http.begin(client, updateInfo.firmwareUrl);
   otaHeapMark("AFTER http.begin");
 
@@ -4860,12 +4850,10 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
   // Now safe to add headers
   http.addHeader("Device-ID", getDeviceId());
   http.addHeader("Current-Version", FIRMWARE_VERSION);
-  // setTimeout takes uint16_t — anything over 65535 silently wraps, so 60000 is the practical max
-  // and asking for 120000 would truncate to 54464 and be SHORTER than what we asked for.
+  // setTimeout takes uint16_t: over 65535 silently wraps (120000 → 54464), so 60000 is the practical max
   http.setTimeout(60000);
-  // The real bottleneck on a bad link: HTTPClient uses its own _connectTimeout (5 s default, NOT
-  // the client.setTimeout above) for the TCP connect + TLS handshake, so on a slow or lossy link the
-  // transfer died before a byte moved. int32_t here, so it takes a large value honestly.
+  // The real bottleneck on a bad link: HTTPClient's own _connectTimeout (5 s default, NOT client.setTimeout)
+  // governs TCP connect + TLS handshake. int32_t, so a large value is honest.
   http.setConnectTimeout(60000);
 
   httpCode = http.GET();
@@ -4931,9 +4919,8 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
         }
       }
     } else {
-      // Half-open cellular socket: connected() stays true and available() stays 0 forever,
-      // so without this guard the loop spins feeding the WDT — device frozen with the
-      // alternator disabled until a manual power cycle.
+      // Half-open cellular socket: connected() stays true and available() 0 forever; without this guard the
+      // loop feeds the WDT indefinitely with the alternator disabled.
       if (millis() - lastDataTime > OTA_STALL_TIMEOUT_MS) {
         Serial.printf("ABORT: OTA download stalled - no data for %lu s\n", OTA_STALL_TIMEOUT_MS / 1000);
         queueConsoleMessage("OTA FAILED: download stalled, connection dead - aborting");
@@ -5030,10 +5017,6 @@ void performStreamingOTAUpdate(const UpdateInfo &updateInfo, const String &signa
   Serial.println("=== STREAMING OTA UPDATE SUCCESSFUL ===");
   Serial.printf("Updated from %s to %s\n", FIRMWARE_VERSION, updateInfo.version.c_str());
 
-  // Clear forced update flags in Supabase after successful update
-  if (hasForcedUpdate) {
-    executeClearForcedUpdate();
-  }
   Serial.println("Restarting in 3 seconds...");
 
 cleanup:
@@ -5113,9 +5096,8 @@ void performOTAUpdate(const UpdateInfo &updateInfo) {
     otaRestoreNormalOperation(false);
     return;
   }
-  // Bounded read instead of http.getString(): HTTPClient::writeToStreamDataBlock() loops on connected() with
-  // no data deadline, and a half-open socket keeps connected() true until TCP keepalive gives up (~2 h). The
-  // tar loop below has a stall guard for exactly this; the signature body needs the same one.
+  // Bounded read, not http.getString(): writeToStreamDataBlock() loops on connected() with no data deadline,
+  // and a half-open socket stays connected() until TCP keepalive gives up (~2 h).
   String signatureBase64;
   signatureBase64.reserve(sigLen);
   {
@@ -5216,11 +5198,8 @@ void clearPendingUpdateNVS() {
   }
 }
 // ---- prod_fs clean slate + ota_0 verified-install record ------------------------------------------
-// Delete every file on prod_fs before the first web asset is written. A renamed asset can no longer
-// leave its predecessor behind, and the write path stops depending on how the library reclaims a
-// truncated file's blocks (bench 2026-09-03, esp_littlefs 1.20.4: open(...,"w") frees them at the open
-// call, so the old in-place rewrite of script.js.gz never needed old+new space — a library detail,
-// not a contract).
+// Delete every file on prod_fs before the first web asset is written, so a renamed asset leaves no
+// predecessor and writes don't depend on how the library reclaims a truncated file's blocks.
 void purgeProdFs() {
   int removed = 0, failed = 0, count;
   do {
@@ -5242,18 +5221,14 @@ void purgeProdFs() {
   Serial.printf("OTA: prod_fs purge - %d removed, %d failed, %u bytes used\n", removed, failed, (unsigned)webFS.usedBytes());
 }
 
-// ota_0 is promoted at a factory boot only when it holds exactly the image a completed, RSA-verified
-// install recorded here. Identity = the SHA-256 esp_image_verify computes over the whole image (the
-// digest appended at build time), never an app-descriptor field: a descriptor can be copied into a
-// forged image, the image digest cannot. Lives in the "update_req" namespace beside the staged-update
-// flags; a deep factory reset wipes it and the next ota_0 boot re-records itself
-// (ensurePreferredBootPartition).
+// ota_0 is promoted at a factory boot only when it holds exactly the image a completed, RSA-verified install
+// recorded here. Identity = the image's appended SHA-256 (esp_image_verify), never an app-descriptor field,
+// which can be copied into a forged image. A deep factory reset wipes it; ensurePreferredBootPartition re-records.
 static const char *OTA0_RECORD_KEY = "ota0_sha";
 
-// Appended SHA-256 of the image in `part`, read by walking the segment headers (a few small flash
-// reads, no full-image hash, no mmap of the running app). Trusted only where the content has already
-// been validated: the bootloader validated the running image, esp_ota_set_boot_partition validated a
-// fresh install. The factory gate uses ota0ImageDigest (esp_image_verify, full content check) instead.
+// Appended SHA-256 of the image in `part`, by walking segment headers (no full-image hash). Trusted only
+// where content was already validated (bootloader for the running image, esp_ota_set_boot_partition for a
+// fresh install); the factory gate uses ota0ImageDigest (full esp_image_verify) instead.
 bool appImageAppendedDigest(const esp_partition_t *part, uint8_t *digest32) {
   if (!part) return false;
   esp_image_header_t hdr;
@@ -5320,10 +5295,8 @@ bool ota0MatchesRecord() {
   if (!ota0ImageDigest(d)) return false;
   return memcmp(rec, d, 32) == 0;
 }
-// A failed install must leave nothing promotable behind: wipe the image header so the slot can neither
-// boot nor pass a descriptor check, and drop the record (the previous ota_0 image is gone anyway —
-// esp_ota_begin erased it). Bench 2026-09-03: without this a fully-streamed image that then failed
-// signature verification was promoted by the next factory boot.
+// A failed install must leave nothing promotable: wipe the image header so the slot can neither boot nor
+// pass a descriptor check, and drop the record (esp_ota_begin already erased the previous image).
 void discardOta0Image(const esp_partition_t *ota0) {
   if (ota0) esp_partition_erase_range(ota0, 0, 0x1000);
   clearOta0Record();
@@ -5335,6 +5308,12 @@ void discardOta0Install(StreamingExtractor *ex) {
   } else if (ex->prodFSMounted) {
     clearOta0Record();  // web bundle already disturbed against an untouched slot: not a matched pair any more
   }
+}
+// ensurePreferredBootPartition may have pointed the next boot at ota_0, which would then serve unverified prod_fs.
+void detachOta0ForInstall() {
+  const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+  clearOta0Record();
+  if (factory && esp_ota_get_boot_partition() != factory) esp_ota_set_boot_partition(factory);
 }
 void performOTAUpdateToVersion(const char *targetVersion) {
   //This performs an OTA update to specific version
@@ -5352,8 +5331,7 @@ void performOTAUpdateToVersion(const char *targetVersion) {
   }
 
   //Delting this- an OTA update takes priority, and we will bulldoze thru
-  // Priority still holds, but bulldozing no longer means vTaskDelete() on a mid-op cloud task:
-  // prepareForOTA() raises otaInProgress and waits for httpsTask to leave between ops.
+  // Not a vTaskDelete(): prepareForOTA() raises otaInProgress and waits for httpsTask to leave between ops.
   core0Busy = true;
 
   Serial.println("HEAP BEFORE version check:");
@@ -5381,10 +5359,9 @@ void performOTAUpdateToVersion(const char *targetVersion) {
     return;
   }
 
-  // Every network call from here on may block past the 16 s WDT window (testInternetSpeed's
-  // 10 s connect + 15 s read, then the 60/120 s OTA fetches), so widen for the whole attempt.
-  // Every return below this line must restore WDT_TIMEOUT_MS. Runs WDT-subscribed on the loop
-  // task (staged-update path) or unsubscribed on the web-handler task (factory path) — both safe.
+  // Every network call from here may block past the 16 s WDT (testInternetSpeed, then the 60/120 s OTA fetches),
+  // so widen for the whole attempt; every return below must restore WDT_TIMEOUT_MS. The factory-path caller is
+  // the WDT-subscribed async_tcp task, so this must come before its first long call.
   otaSetWdtWindow(OTA_WDT_WINDOW_MS);
 
   if (!testInternetSpeed()) {
@@ -5407,11 +5384,8 @@ void performOTAUpdateToVersion(const char *targetVersion) {
 
   esp_task_wdt_reset();
 
-  // No middleman: the target version is already known (forced-update from the
-  // cloud, or a user pick in the dashboard), so we build the artifact URLs directly
-  // from our stable OTA_BASE_URL (ota.xengineering.net proxy -> Supabase) instead of
-  // asking check.php to resolve them. A version that doesn't exist surfaces as an
-  // HTTP 404 inside performOTAUpdate(), which aborts safely (alternator stays off).
+  // The target version is already known, so build artifact URLs directly from OTA_BASE_URL. A missing
+  // version surfaces as an HTTP 404 inside performOTAUpdate(), which aborts safely (alternator stays off).
   String otaBase = String(OTA_BASE_URL);
   UpdateInfo updateInfo;
   updateInfo.hasUpdate = true;
@@ -5461,50 +5435,20 @@ void executeUpdateFirmwareVersion() {
 
   Serial.printf("FW_UPDATE: Reporting version %d\n", firmwareVersionInt);
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  // Deliberately NOT client.setTimeout(): that call was dead here. HTTPClient::connect() uses its own
-  // _connectTimeout for the connect, then overwrites the client's timeout with _tcpTimeout right
-  // after — so the old client.setTimeout(8) never applied, which is lucky, because 8 ms would have
-  // failed every connect. setConnectTimeout here plus the setTimeout after begin() are the two that
-  // actually govern; the connect one was sitting at HTTPClient's 5 s default.
-  //
-  // 12 s per phase, no more: this runs on httpsTask, which is subscribed to the 16 s panic WDT
-  // and cannot feed mid-call — the TCP connect is a single select() for the full value. The WDT
-  // must stay armed here (it is the only recovery from a wedged op leaving core0Busy stuck with
-  // the field held off), so the timeouts fit inside its window instead of widening it. The
-  // handshake cap is SECONDS and bounds the mid-handshake stall loop, which otherwise retries
-  // 12 s recvs up to the core's 120 s default.
-  client.setHandshakeTimeout(12);
-  HTTPClient http;
-  http.setConnectTimeout(12000);
-  String url = String(SUPABASE_URL) + "/functions/v1/update-firmware-version";
-
-  if (!http.begin(client, url)) {
-    Serial.println("FW_UPDATE: HTTP begin failed");
-    return;
-  }
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-  http.setTimeout(12000);  // read timeout. Set AFTER begin() deliberately — this is the one that
-                           // governs; the setConnectTimeout above governs the connect. 12 s max:
-                           // must fit httpsTask's 16 s panic WDT (see connect note above).
-
+  // Raw-TLS doCloudPOST (fed DNS pre-resolve, 7+7 s connect, fed idle reads): an unfed HTTPClient POST can
+  // outlast httpsTask's 16 s panic WDT on a link that goes silent mid-call.
   String payload = "{\"token\":\"" + authToken + "\",\"firmware_version_int\":" + String(firmwareVersionInt) + "}";
-
-  int httpCode = http.POST(payload);
+  char response[256];
+  int httpCode = doCloudPOST("/functions/v1/update-firmware-version", payload.c_str(), response, sizeof(response));
 
   if (httpCode == 200) {
     Serial.println("FW_UPDATE: Success");
     queueConsoleMessage("FW_UPDATE: Version reported");
   } else if (httpCode < 0) {
-    Serial.printf("FW_UPDATE: Failed: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("FW_UPDATE: Failed: %s\n", cloudFailReason(httpCode));
   } else {
     Serial.printf("FW_UPDATE: HTTP %d\n", httpCode);
   }
-
-  http.end();
 }
 void executeCheckForcedUpdate() {
   // Called by HTTPS task on Core 0
@@ -5533,45 +5477,29 @@ void executeCheckForcedUpdate() {
 
   Serial.println("FORCED_UPDATE: Checking...");
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  // client.setTimeout() would be dead here — see the note in executeUpdateFirmwareVersion.
-  // 12 s phases + handshake cap: must fit httpsTask's 16 s panic WDT — same note.
-  client.setHandshakeTimeout(12);
-  HTTPClient http;
-  http.setConnectTimeout(12000);
-  String url = String(SUPABASE_URL) + "/functions/v1/check-forced-update";
-
-  if (!http.begin(client, url)) {
-    Serial.println("FORCED_UPDATE: HTTP begin failed");
+  // Raw-TLS doCloudPOST: an unfed HTTPClient POST can outlast httpsTask's 16 s panic WDT. The reply
+  // scratch lives in PSRAM, not on httpsTask's stack.
+  const size_t CAP = 4096;
+  char *response = (char *)ps_malloc(CAP);
+  if (!response) {
+    Serial.println("FORCED_UPDATE: ps_malloc failed");
     return;
   }
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-  http.setTimeout(12000);  // read timeout. Set AFTER begin() deliberately — this is the one that
-                           // governs; the setConnectTimeout above governs the connect. 12 s max:
-                           // must fit httpsTask's 16 s panic WDT (see connect note above).
-
   String payload = "{\"token\":\"" + authToken + "\"}";
-  int httpCode = http.POST(payload);
+  int httpCode = doCloudPOST("/functions/v1/check-forced-update", payload.c_str(), response, CAP);
 
   if (httpCode == 200) {
-    String response = http.getString();
-    Serial.println("FORCED_UPDATE: Response: " + response);
+    Serial.printf("FORCED_UPDATE: Response: %s\n", response);
 
     DynamicJsonDocument doc(1536);
-    DeserializationError error = deserializeJson(doc, response.c_str(), response.length());
+    DeserializationError error = deserializeJson(doc, response);
     if (!error) {
-      // Admin config push notice. Parsed BEFORE the forced-update branch on purpose — that
-      // branch has an early return (already-on-forced-version) that would otherwise leave the
-      // pending-config notice frozen at whatever the last poll saw. Notice only: the config is
-      // neither fetched nor applied here, so a cancelled push clears on the next 6 h poll.
+      // Admin config push notice, parsed BEFORE the forced-update branch: its early return would freeze the
+      // notice. Notice only (nothing fetched or applied), so a cancelled push clears on the next 6 h poll.
       int pendCount = doc["pending_config_count"] | 0;
       cfgPushPendingCount = (pendCount > 255) ? 255 : (uint8_t)pendCount;
-      // Admin-authored free text. Sanitized on arrival (not at emit) so /configPush can hand it
-      // out raw: drop anything that would break the JSON string, cap the length. Built locally,
-      // then one memcpy to the global — the webserver task reads it lock-free.
+      // Admin free text, sanitized on arrival so /configPush can emit it raw. Built locally then one memcpy:
+      // the webserver task reads it lock-free.
       const char *pendNote = doc["pending_config_note"];
       char noteBuf[sizeof(cfgPushPendingNote)];
       size_t noteLen = 0;
@@ -5601,12 +5529,9 @@ void executeCheckForcedUpdate() {
           forcedFwVersionInt = major * 10000 + minor * 100 + patch;
         }
 
-        // Already at or past the forced version — the post-install clear POST must have
-        // failed (network blip before reboot), or the flag names an older build than the
-        // one running. Drop the flag locally so no stale "Update Now" modal shows, and
-        // queue a clear to self-heal the DB row. ">=" is the cloud's own clear rule in
-        // update-firmware-version; downgrades are refused anyway. Best-effort: a dropped
-        // clear retries next boot.
+        // Already at or past the forced version (the post-install clear failed, or the flag names an older
+        // build): drop it locally so no stale "Update Now" modal shows, and queue a clear to self-heal the DB
+        // row. ">=" matches the cloud's clear rule in update-firmware-version.
         if (forcedFwVersionInt > 0 && forcedFwVersionInt <= firmwareVersionInt) {
           Serial.println("FORCED_UPDATE: Already at or past forced version — clearing stale flag");
           hasForcedUpdate = false;
@@ -5614,7 +5539,7 @@ void executeCheckForcedUpdate() {
           forcedUpdateDeadline = 0;
           HttpsRequest clearReq = { .type = HTTPS_CLEAR_FORCED_UPDATE };
           xQueueSend(httpsQueue, &clearReq, 0);
-          http.end();
+          free(response);
           return;
         }
 
@@ -5653,11 +5578,11 @@ void executeCheckForcedUpdate() {
       }
     }
   } else if (httpCode < 0) {
-    Serial.printf("FORCED_UPDATE: Failed: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("FORCED_UPDATE: Failed: %s\n", cloudFailReason(httpCode));
   } else {
     Serial.printf("FORCED_UPDATE: HTTP %d\n", httpCode);
   }
-  http.end();
+  free(response);
 }
 void executeClearForcedUpdate() {
   // Called by HTTPS task on Core 0
@@ -5676,28 +5601,10 @@ void executeClearForcedUpdate() {
 
   Serial.println("CLEAR_FORCED_UPDATE: Clearing flag");
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  // client.setTimeout() would be dead here — see the note in executeUpdateFirmwareVersion.
-  // 12 s phases + handshake cap: must fit httpsTask's 16 s panic WDT — same note.
-  client.setHandshakeTimeout(12);
-  HTTPClient http;
-  http.setConnectTimeout(12000);
-  String url = String(SUPABASE_URL) + "/functions/v1/clear-forced-update";
-
-  if (!http.begin(client, url)) {
-    Serial.println("CLEAR_FORCED_UPDATE: HTTP begin failed");
-    return;
-  }
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-  http.setTimeout(12000);  // read timeout. Set AFTER begin() deliberately — this is the one that
-                           // governs; the setConnectTimeout above governs the connect. 12 s max:
-                           // must fit httpsTask's 16 s panic WDT (see connect note above).
-
+  // Raw-TLS doCloudPOST: an unfed HTTPClient POST can outlast httpsTask's 16 s panic WDT.
   String payload = "{\"token\":\"" + authToken + "\"}";
-  int httpCode = http.POST(payload);
+  char response[256];
+  int httpCode = doCloudPOST("/functions/v1/clear-forced-update", payload.c_str(), response, sizeof(response));
 
   if (httpCode == 200) {
     Serial.println("CLEAR_FORCED_UPDATE: Success");
@@ -5707,14 +5614,11 @@ void executeClearForcedUpdate() {
   } else {
     Serial.printf("CLEAR_FORCED_UPDATE: HTTP %d\n", httpCode);
   }
-
-  http.end();
 }
 
-// Cloud half of the tach-rescale wipe: deletes this device's RPM-indexed cloud data (alt_points,
-// the motoring boat_points, the RPM watermarks, the sensor_history RPM columns). The local half
-// already ran; front sync stays suppressed until this confirms, otherwise the cloud would ship the
-// old-scaled front straight back. Retried every boot/reconnect until it returns 200.
+// Cloud half of the tach-rescale wipe (alt_points, motoring boat_points, RPM watermarks, sensor_history RPM
+// columns). Front sync stays suppressed until this confirms, or the cloud ships the old-scaled front straight
+// back. Retried every boot/reconnect until it returns 200.
 void executeResetRpmAxis() {
   // Called by HTTPS task on Core 0
   if (!rpmAxisWipePending) return;
@@ -5724,45 +5628,25 @@ void executeResetRpmAxis() {
 
   Serial.println("RESET_RPM_AXIS: Requesting cloud wipe");
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  // client.setTimeout() would be dead here — see the note in executeUpdateFirmwareVersion.
-  // 12 s phases + handshake cap: must fit httpsTask's 16 s panic WDT — same note.
-  client.setHandshakeTimeout(12);
-  HTTPClient http;
-  http.setConnectTimeout(12000);
-  String url = String(SUPABASE_URL) + "/functions/v1/reset-rpm-axis";
-
-  if (!http.begin(client, url)) {
-    Serial.println("RESET_RPM_AXIS: HTTP begin failed");
-    return;
-  }
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-  http.setTimeout(12000);  // read timeout. Set AFTER begin() deliberately — this is the one that
-                           // governs; the setConnectTimeout above governs the connect. 12 s max:
-                           // must fit httpsTask's 16 s panic WDT (see connect note above).
-
+  // Raw-TLS doCloudPOST (an unfed HTTPClient POST can outlast the 16 s WDT). Clear the flag only on the edge
+  // function's own ack: a captive portal's 200 login page would clear it with the cloud rows still there.
   String payload = "{\"token\":\"" + authToken + "\"}";
-  int httpCode = http.POST(payload);
+  char response[256];
+  int httpCode = doCloudPOST("/functions/v1/reset-rpm-axis", payload.c_str(), response, sizeof(response));
 
-  if (httpCode == 200) {
+  if (httpCode == 200 && strstr(response, "\"success\":true")) {
     Serial.println("RESET_RPM_AXIS: Success - cloud RPM data wiped, front sync re-enabled");
     rpmAxisWipePending = false;
     settingWrite(NK_RpmAxisWipePend, "0");
     queueConsoleMessage("Cloud RPM-indexed data wiped; alternator record book starts over");
   } else {
-    Serial.printf("RESET_RPM_AXIS: HTTP %d - will retry\n", httpCode);
+    Serial.printf("RESET_RPM_AXIS: HTTP %d%s - will retry\n", httpCode, (httpCode == 200) ? " (no ack in body)" : "");
   }
-
-  http.end();
 }
 
-// Cloud half of the alt-health Start Over: deletes this device's alt_points + alt_health rows. The
-// local half (resetAlternatorHealth) already ran; alt-health upload and sync-back stay suppressed
-// until this confirms, because update-alt-health rebuilds the front from EVERY raw row it holds and
-// its reply replaces the local front wholesale. Retried every minute until it returns 200.
+// Cloud half of the alt-health Start Over (alt_points + alt_health rows). Upload and sync-back stay
+// suppressed until this confirms: update-alt-health rebuilds the front from EVERY raw row it holds and its
+// reply replaces the local front wholesale. Retried every minute until it returns 200.
 void executeResetAltHealthCloud() {
   if (!altCloudWipePending) return;
   if (!isRegistered || authToken.length() == 0) return;
@@ -5771,40 +5655,51 @@ void executeResetAltHealthCloud() {
 
   Serial.println("RESET_ALT_HEALTH: Requesting cloud wipe");
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(12);   // 12 s phases: must fit httpsTask's 16 s panic WDT (see executeResetRpmAxis)
-  HTTPClient http;
-  http.setConnectTimeout(12000);
-  String url = String(SUPABASE_URL) + "/functions/v1/reset-alt-health";
-
-  if (!http.begin(client, url)) {
-    Serial.println("RESET_ALT_HEALTH: HTTP begin failed");
-    return;
-  }
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-  http.setTimeout(12000);
-
+  // Raw-TLS doCloudPOST (an unfed HTTPClient POST can outlast the 16 s WDT). Clear the flag only on the edge
+  // function's own ack: a captive portal's 200 login page would clear it with the cloud rows still there.
   String payload = "{\"token\":\"" + authToken + "\"}";
-  int httpCode = http.POST(payload);
+  char response[256];
+  int httpCode = doCloudPOST("/functions/v1/reset-alt-health", payload.c_str(), response, sizeof(response));
 
-  if (httpCode == 200) {
+  if (httpCode == 200 && strstr(response, "\"success\":true")) {
     Serial.println("RESET_ALT_HEALTH: Success - cloud alt-health history wiped, upload re-enabled");
     altCloudWipePending = false;
     settingWrite(NK_AltWipePend, "0");
-    queueConsoleMessage("Cloud alternator-health history wiped; record book starts clean");
+    queueConsoleMessage("Cloud alternator-health history wiped; uploads resume");
   } else {
-    Serial.printf("RESET_ALT_HEALTH: HTTP %d - will retry\n", httpCode);
+    Serial.printf("RESET_ALT_HEALTH: HTTP %d%s - will retry\n", httpCode, (httpCode == 200) ? " (no ack in body)" : "");
   }
-
-  http.end();
 }
 
-// Extract a flat top-level "field":"value" string from a JSON body (returns "" for
-// missing or null). Used for the short id fields in the pending-config response; the
-// big config blob itself is handled by applyImportConfig's string scan, not ArduinoJson.
+// Cloud half of a boat-performance Clear All or records import: deletes this device's boat_points + boat_performance
+// rows, for the reason executeResetAltHealthCloud gives. Boat-perf upload and sync-back stay suppressed until it
+// returns 200, so the cloud rebuilds only from what this unit holds now (after an import, the fronts seeded at boot).
+void executeResetBoatPerfCloud() {
+  if (!perfCloudWipePending) return;
+  if (!isRegistered || authToken.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (currentMode != MODE_CLIENT) return;
+
+  Serial.println("RESET_BOAT_PERF: Requesting cloud wipe");
+
+  // Raw-TLS doCloudPOST (an unfed HTTPClient POST can outlast the 16 s WDT). Clear the flag only on the edge
+  // function's own ack: a captive portal's 200 login page would clear it with the cloud rows still there.
+  String payload = "{\"token\":\"" + authToken + "\"}";
+  char response[256];
+  int httpCode = doCloudPOST("/functions/v1/reset-boat-performance", payload.c_str(), response, sizeof(response));
+
+  if (httpCode == 200 && strstr(response, "\"success\":true")) {
+    Serial.println("RESET_BOAT_PERF: Success - cloud boat-performance history wiped, upload re-enabled");
+    perfCloudWipePending = false;
+    settingWrite(NK_PerfWipePend, "0");
+    queueConsoleMessage("Cloud boat-performance history wiped; uploads resume");
+  } else {
+    Serial.printf("RESET_BOAT_PERF: HTTP %d%s - will retry\n", httpCode, (httpCode == 200) ? " (no ack in body)" : "");
+  }
+}
+
+// Flat top-level "field":"value" string from a JSON body ("" for missing or null). For the short id
+// fields of the pending-config reply; the config blob goes through applyImportConfig's string scan.
 static String jsonStringField(const char *body, const char *field) {
   String needle = "\"";
   needle += field;
@@ -5846,22 +5741,18 @@ static bool cfgBodyComplete(const char *s) {
   return depth == 0 && !inStr && lastSig == '}';
 }
 
-// Admin config push (boot-only): ask the cloud whether a config is queued for this device.
-// If a new one is present (id != the last applied id stored in NVS), apply tier-1 settings,
-// record the id, clear the server flag, and reboot so InitSystemSettings re-reads cleanly.
-// The NVS id guard makes this idempotent — a stale/un-cleared flag never re-applies or loops.
+// Admin config push (boot-only): if a config with a new id (vs NVS) is queued, apply tier-1 settings,
+// record the id, clear the server flag and reboot so InitSystemSettings re-reads cleanly. The NVS id guard
+// makes this idempotent: a stale flag never re-applies or loops.
 void executeGetPendingConfig() {
   if (!isRegistered || authToken.length() == 0) return;
   if (WiFi.status() != WL_CONNECTED) return;
   if (currentMode != MODE_CLIENT) return;
   if (WiFi.RSSI() < -80) return;
 
-  // Lean raw-TLS path (doCloudPOST) instead of HTTPClient over WiFiClientSecure: the combined
-  // http.begin(client,url) pattern uses far more internal RAM (CLAUDE.md) and getString() can hang,
-  // which made this call return -1 when contiguous RAM was tight (e.g. right after the registration
-  // handshake). doCloudPOST adds the anon-key Bearer + Content-Type itself. Response holds the full
-  // config blob (a full export is ~14 KB and grows with every setting), so stage it in a 64 KB PSRAM
-  // scratch buffer and parse straight from it: no String copy into internal heap.
+  // Raw-TLS doCloudPOST, not HTTPClient over WiFiClientSecure (far more internal RAM; returned -1 when
+  // contiguous RAM was tight). The reply holds the full config blob (~14 KB and growing), so it lands in a
+  // 64 KB PSRAM scratch and is parsed in place, never copied into internal heap.
   const size_t CAP = 65536;
   char *scratch = (char *)ps_malloc(CAP);
   if (!scratch) {
@@ -5902,15 +5793,13 @@ void executeGetPendingConfig() {
     return;
   }
 
-  // A remote push writes every importable key, hardware/calibration included — sensor range,
-  // shunt resistance, current zero offsets. applyImportConfig scans the response for the
-  // embedded "config" object, so no big JSON parse is needed.
-  // Collect the names it actually changes so the dashboard can show the owner what a remote
-  // push touched. Written to NVS below and read back next boot — this boot reboots immediately,
-  // so there is no live client to tell.
+  // A remote push writes every importable key, hardware/calibration included. applyImportConfig scans for the
+  // embedded "config" object (no big JSON parse). Changed names go to NVS for the dashboard to show next boot,
+  // since this boot reboots immediately.
   String changed = "";
+  cfgImportChangedCount = 0;
   cfgImportChangedNames = &changed;
-  int n = applyImportConfig(scratch);
+  int n = applyImportConfig(scratch, true);
   cfgImportChangedNames = nullptr;
   free(scratch);
   if (n < 0) {
@@ -5918,16 +5807,16 @@ void executeGetPendingConfig() {
     return;
   }
   settingWrite(NK_lastAppldCfgId, pid.c_str());
-  if (n > 0) {
-    settingWrite(NK_cfgPushNotify, (String(n) + "|" + changed).c_str());
+  if (cfgImportChangedCount > 0) {
+    settingWrite(NK_cfgPushNotify, (String(cfgImportChangedCount) + "|" + changed).c_str());
   }
   Serial.printf("PENDING_CONFIG: applied %d settings from config %s; rebooting\n", n, pid.c_str());
   queueConsoleMessage("Config push: applied " + String(n) + " settings, rebooting to load");
 
   pendingConfigClearId = pid;
   executeClearPendingConfig();   // synchronous (same task) so it completes before the reboot
-  rebootRequested = true;
   rebootRequestedAt = millis();
+  rebootRequested = true;
 }
 
 // Clear the queued config server-side after applying it. Mirrors executeClearForcedUpdate;
@@ -5937,8 +5826,7 @@ void executeClearPendingConfig() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (currentMode != MODE_CLIENT) return;
 
-  // Lean raw-TLS path (doCloudPOST), same reasons as executeGetPendingConfig. Response is a tiny
-  // success ack, so a small stack buffer is plenty.
+  // Raw-TLS doCloudPOST, as in executeGetPendingConfig; the ack is tiny, so a stack buffer suffices.
   String payload = "{\"token\":\"" + authToken + "\",\"config_id\":\"" + pendingConfigClearId + "\"}";
   char response[256];
   int httpCode = doCloudPOST("/functions/v1/clear-pending-config", payload.c_str(), response, sizeof(response));
@@ -5979,7 +5867,7 @@ void printPartitionInfo() {
   checkExpectedPartition("factory_fs", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_LITTLEFS, 0x100000);
   checkExpectedPartition("prod_fs", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_LITTLEFS, 0x100000);
   checkExpectedPartition("nvs", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, 0x20000);
-  checkExpectedPartition("userdata", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_LITTLEFS, 0x8C0000);  // matches partitions.csv (0x8E0000 predated the nvs relocation and false-alarmed every boot)
+  checkExpectedPartition("userdata", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_LITTLEFS, 0x8C0000);  // must match partitions.csv
 
   Serial.println("\n🔄 OTA PARTITION STATUS:");
   const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
@@ -6002,8 +5890,7 @@ void printPartitionInfo() {
   Serial.println("=== END PARTITION SUMMARY ===\n");
 }
 bool testInternetSpeed() {
-  // No core0Busy skip here: the only caller is the OTA pre-flight, which sets core0Busy
-  // BEFORE calling — the old skip made this entire reachability gate dead code.
+  // No core0Busy skip: the OTA pre-flight caller sets core0Busy first, so a skip would make this gate dead.
   Serial.println("========================================");
   Serial.println(">>> testInternetSpeed() ENTERED");
   Serial.println("========================================");
@@ -6028,9 +5915,8 @@ bool testInternetSpeed() {
 
   WiFiClient client;
 
-  // 10 s, up from 3: this is a reachability test, not a latency test, and a 3 s budget failed links
-  // that could have completed an OTA fine. It gates performOTAUpdateToVersion, so a false negative
-  // here blocks the update outright.
+  // 10 s: a reachability test, not latency. It gates performOTAUpdateToVersion, so a false negative blocks
+  // the update outright.
   Serial.println(">>> Test 1: Attempting to connect to 1.1.1.1:80 (10s timeout)");
   Serial.flush();
   unsigned long connectStart = millis();
@@ -6051,12 +5937,11 @@ bool testInternetSpeed() {
   HTTPClient http;
   // Use a reliable small file (Cloudflare's trace - about 200-300 bytes)
   http.begin(client, "http://cloudflare.com/cdn-cgi/trace");
-  http.setTimeout(15000);  // 15 s, up from 5: a 300-byte fetch timing out says nothing about a 2.7 MB one
+  http.setTimeout(15000);  // 15 s: a 300-byte fetch timing out says nothing about a 2.7 MB one
   unsigned long downloadStart = millis();
   int httpCode = http.GET();
   Serial.printf(">>> http.GET() returned code %d after %lu ms\n", httpCode, millis() - downloadStart);
   Serial.flush();
-  weatherHttpResponseCode = httpCode;
   esp_task_wdt_reset();
   Serial.println(">>> Watchdog reset #3");
   Serial.flush();
@@ -6099,11 +5984,8 @@ bool testInternetSpeed() {
   Serial.printf(">>> Speed test result: %.2f Kbps (%d bytes in %lu ms)\n", kbps, bytesReceived, downloadTime);
   Serial.flush();
 
-  // Reachability only — deliberately no throughput floor. The old "kbps < 5.0" test was invalid at
-  // this sample size: 300 bytes at 5 kbps means the whole GET (DNS + TCP + HTTP round trips to
-  // cloudflare.com) had to finish inside 480 ms, so it measured latency, not bandwidth, and refused
-  // any high-RTT link that would have carried the 2.7 MB package fine. Bytes arriving at all is the
-  // only thing this test can honestly assert. kbps is still logged as a rough field diagnostic.
+  // Reachability only; deliberately no throughput floor: at 300 bytes a kbps threshold measures latency, not
+  // bandwidth, and refuses high-RTT links that carry the 2.7 MB package fine. kbps is logged only.
   if (bytesReceived == 0) {
     Serial.println(">>> Speed test FAILED: connected but received no data");
     Serial.flush();
@@ -6126,22 +6008,17 @@ void otaRestoreNormalOperation(bool success) {
   Serial.printf("OTA restore: success=%d, restoring system state...\n", success ? 1 : 0);
 
   core0Busy = false;
-  // TempTask was dead for the whole attempt. Restart its 20 s window BEFORE releasing otaInProgress: on the
-  // factory path this runs on the web-handler task, and checkTempTaskHealth() (loop) could otherwise see the
-  // gap and raise the hung-task alarm before ensureCore0Tasks() has re-created the task.
+  // Restart TempTask's 20 s window BEFORE releasing otaInProgress: on the factory path this runs on the web-handler
+  // task, and checkTempTaskHealth() could raise the hung-task alarm before ensureCore0Tasks() re-creates the task.
   lastTempTaskHeartbeat = millis();
   otaInProgress = false;
   lastHttpsOperationTime = millis();
-  // TempTask / httpsTask come back through ensureCore0Tasks() on the next loop pass — the one creator outside
-  // setup(), where a failed create is retried and alarmed instead of being a Serial line here.
+  // TempTask / httpsTask come back through ensureCore0Tasks() on the next loop pass.
 }
 
-// Core 0 task supervisor — the only place outside setup() that creates TempTask / httpsTask. An OTA attempt
-// retires both (prepareForOTA) and a failed attempt only clears the flags (otaRestoreNormalOperation), so
-// they return here. A create can fail when internal RAM is too fragmented for the stack; that used to be one
-// Serial line and a device that stayed blind — no TempTask means the 20 s temperature-stale gate cuts the
-// field — until a power cycle. Now: retry every 2 s, console after three misses, and request the maintenance
-// reboot that rebuilds everything. Params must match the xTaskCreatePinnedToCore calls in setup().
+// Core 0 task supervisor: the only creator of TempTask / httpsTask outside setup() (an OTA attempt retires both).
+// A create can fail on fragmented internal RAM, and no TempTask means the temperature-stale gate cuts the field:
+// retry every 2 s, console after three misses, then request the maintenance reboot. Params must match setup().
 void ensureCore0Tasks() {
   if (otaInProgress) return;
   static uint32_t lastAttemptMs = 0;
@@ -6181,22 +6058,22 @@ void ensureCore0Tasks() {
   }
   if (!failed) return;
 
-  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  uint32_t walkAt = largestInternalAtMs;   // cpuLoadTask's cached walk: this runs on the Core-1 loop
+  unsigned largestKb = (unsigned)LargestInternalBlock;
   if (failStreak < 255) failStreak++;
-  Serial.printf("TASKS: create failed (streak %u), internal largest=%u\n", failStreak, (unsigned)largest);
+  Serial.printf("TASKS: create failed (streak %u), internal largest=%u KB (walked %lus ago)\n", failStreak, largestKb,
+                (unsigned long)(((int32_t)(now - walkAt) > 0) ? (now - walkAt) / 1000UL : 0UL));
   if (failStreak >= 3 && !alarmed) {
     alarmed = true;
-    queueConsoleMessageF("CRITICAL: %s task cannot restart (largest free RAM %u B) - maintenance reboot at next quiet window",
-                         (tempTaskHandle == NULL) ? "temperature" : "cloud", (unsigned)largest);
+    queueConsoleMessageF("CRITICAL: %s task cannot restart (largest free RAM %u KB) - maintenance reboot at next quiet window",
+                         (tempTaskHandle == NULL) ? "temperature" : "cloud", largestKb);
     maintRebootHealthReq = true;
   }
 }
 
-// Expiry for otaInProgress. Every call on the update path is bounded (see OTA_WEDGE_LIMIT_MS), so a flag older
-// than that means the path is wedged in something with no timeout — and the flag was silencing every recovery
-// at once: the console, the TempTask health alarm, and the maintenance reboot ladder. Runs on the Core 1 loop,
-// which covers the factory-partition path where the update runs on the web-handler task (not WDT-subscribed);
-// the staged path runs on loop() itself and is covered by the 300 s WDT window instead.
+// Expiry for otaInProgress: past OTA_WEDGE_LIMIT_MS the update path is wedged in something with no timeout,
+// and the flag silences every recovery (console, TempTask health alarm, maintenance reboot). Runs on the Core 1
+// loop to cover the factory path (web-handler task, not WDT-subscribed); the staged path has the 300 s WDT.
 void checkOtaWedge() {
   if (!otaInProgress) return;
   if (millis() - otaInProgressSinceMs < OTA_WEDGE_LIMIT_MS) return;
@@ -6214,13 +6091,8 @@ static void otaHeapMark(const char *tag) {
                 ESP.getFreeHeap());
 }
 // TIME MANAGEMENT FUNCTIONS
-// Time sync is deliberately RAM-only. NVS persistence (save/loadTimeSyncState)
-// was deleted: the loader was never wired into setup(), so the per-message
-// commits only wore the tiny 20KB nvs partition without ever being read back.
-// After a reboot the device stays unsynced until a live source (NMEA / phone /
-// NTP) reports. Don't re-add persistence casually — restoring a prior boot's
-// timeBaseMillis breaks getCurrentTimestamp(): millis() restarts at 0, so the
-// unsigned subtraction wraps ~49.7 days into the future.
+// Only the epoch crosses a reboot (restoreSoftClock(), TIME_ESTIMATED). Never restore a prior boot's timeBaseMillis:
+// millis() restarts at 0, so getCurrentTimestamp()'s unsigned subtraction would wrap ~49.7 days into the future.
 
 time_t getCurrentTimestamp() {
   if (timeIsSynced && timeBase > 0) {
@@ -6231,24 +6103,10 @@ time_t getCurrentTimestamp() {
 }
 
 // ── Soft clock recovery ─────────────────────────────────────────────────────
-// Fixes the phantom multi-hour gaps in the Long Term history plots on a device
-// with NO live time source (AP mode, no NTP/phone/GPS). Without a clock the
-// long-term records are stamped 0, and the dashboard back-projects those
-// zero-stamped records onto the wrong part of the time axis — good data renders
-// as a giant gap. Re-establish a usable timebase at boot from two free sources,
-// lowest-risk first:
-//   1. RTC retention — the ESP32 system clock keeps running across a SOFTWARE
-//      reset (OTA install, scheduled restart, crash/WDT). If a prior boot ran
-//      settimeofday() (every real source does), time(nullptr) is still valid AND
-//      already includes the brief reboot downtime → accurate, no estimate.
-//   2. NVS-persisted epoch ("SoftClockEp", written at each field-off save) —
-//      survives a cold power-up. Downtime is unknown, so this is an ESTIMATE
-//      (assumes ~0 off-time); it snaps to truth the moment a real source reports.
-// Either way the source is labeled TIME_ESTIMATED (low confidence) until a real
-// source overwrites timeBase. CRITICAL: timeBaseMillis is anchored to the CURRENT
-// millis() (it restarts at 0 each boot). Restoring a PRIOR boot's timeBaseMillis
-// would wrap getCurrentTimestamp() ~49.7 days forward — exactly the hazard the old
-// RAM-only design avoided. We never persist millis, only the epoch, so we're safe.
+// With no live time source (AP mode), long-term records stamp 0 and plot as phantom gaps. At boot, adopt the
+// RTC epoch retained across a SOFTWARE reset (accurate when clockRealTag says it was real), else the NVS
+// "SoftClockEp" saved at each field-off (an estimate, cold boot). Labeled TIME_ESTIMATED until a real source wins.
+// Persist only the epoch, never millis.
 void restoreSoftClock() {
   if (timeIsSynced) return;   // a live source already won during early boot — leave it
 
@@ -6258,9 +6116,10 @@ void restoreSoftClock() {
     timeBaseMillis = millis();
     timeIsSynced = true;
     currentTimeSource = TIME_ESTIMATED;
-    Serial.printf("Soft clock: adopted retained RTC epoch=%ld\n", (long)rtc);
+    Serial.printf("Soft clock: adopted retained RTC epoch=%ld (%s)\n", (long)rtc, clockIsReal() ? "real" : "estimate");
     return;
   }
+  clockRealTag = 0;
 
   // Cold boot — seed from the epoch we persisted at the previous field-off edge.
   nvs_handle_t h;
@@ -6288,9 +6147,9 @@ void syncTimeFromGPS(uint16_t daysSince1970, double secondsSinceMidnight) {
     timeBaseMillis = millis();
     timeIsSynced = true;
     currentTimeSource = TIME_GPS;
+    clockRealTag = CLOCK_REAL_TAG;
     lastTimeSyncAttempt = millis();
-    // Set the libc clock too, so time(NULL) is valid in NMEA/AP mode — not just after NTP.
-    // Without this every time(NULL) timestamp (captures, sync badges) reads ~1970 off-grid.
+    // Set the libc clock too, or every time(NULL) stamp (captures, sync badges) reads ~1970 off-grid.
     struct timeval tv = { (time_t)gpsTime, 0 };
     settimeofday(&tv, nullptr);
 
@@ -6304,13 +6163,10 @@ void syncTimeFromGPS(uint16_t daysSince1970, double secondsSinceMidnight) {
 // hasn't forced a non-phone source. Called from /set_phone_data handler.
 void syncTimeFromPhone(time_t phoneEpochSec) {
   if (phoneEpochSec <= 1577836800) return;  // sanity (pre-2020)
-  // Skew sanity: reject phone times more than 24h off a timebase we ALREADY trust
-  // (guards against phones with manually-set clocks or sim boots). But a low-confidence
-  // soft-clock ESTIMATE (RTC/NVS restore) must NOT trigger this — it's exactly what a real
-  // phone time is meant to correct. A bench unit that sat unplugged for days restores a stale
-  // estimate; in AP mode the phone/browser POST is the ONLY clock source, so a >24h skew guard
-  // here would permanently lock the device to the wrong day. First sync (TIME_NONE) also skips.
-  if (timeIsSynced && timeBase > 0 && currentTimeSource != TIME_ESTIMATED) {
+  // Skew guard: reject phone times > 24h off a timebase we ALREADY trust (manually-set phone clocks), which includes a
+  // real clock a soft reset kept. The cold-boot ESTIMATE must NOT trigger it: in AP mode the phone is the ONLY clock,
+  // so a stale estimate would lock the device to the wrong day. First sync (TIME_NONE) also skips.
+  if (clockIsReal()) {
     time_t now = getCurrentTimestamp();
     long long diff = (long long)phoneEpochSec - (long long)now;
     if (diff < 0) diff = -diff;
@@ -6328,17 +6184,15 @@ void syncTimeFromPhone(time_t phoneEpochSec) {
   timeBaseMillis = millis();
   timeIsSynced = true;
   currentTimeSource = TIME_PHONE;
+  clockRealTag = CLOCK_REAL_TAG;
   lastTimeSyncAttempt = millis();
-  // Set the libc clock too, so time(NULL) is valid in AP/phone mode — not just after NTP.
-  // Without this every time(NULL) timestamp (captures, sync badges) reads ~1970 off-grid.
+  // Set the libc clock too, or every time(NULL) stamp (captures, sync badges) reads ~1970 off-grid.
   struct timeval tv = { (time_t)phoneEpochSec, 0 };
   settimeofday(&tv, nullptr);
 }
 
-// Promote phone GPS into the effective Latitude/Longitude globals. Respects
-// gpsPositionSource: AUTO defers to fresh NMEA; PHONE-forced always proceeds;
-// NMEA-forced never proceeds. MARK_FRESH on each index so IS_STALE-gated
-// consumers (distance, smoothing, sensor hist) actually see the phone fix.
+// Promote phone GPS into the effective Latitude/Longitude globals per gpsPositionSource (AUTO defers to fresh
+// NMEA). MARK_FRESH so IS_STALE-gated consumers (distance, smoothing, sensor hist) see the phone fix.
 void consumePhoneGps() {
   if (gpsManualActive) return;  // sticky manual override beats phone
   if (gpsPositionSource == GPS_SRC_NMEA) return;
@@ -6358,12 +6212,9 @@ void consumePhoneGps() {
   currentGpsSource = GPS_PHONE;
 }
 
-// Phone speed/course — selectable source, never an automatic fallback (user decision
-// 2026-08-21): acts only when speedSourceMode == SPD_SRC_PHONE. Called from the
-// /set_phone_data handler on each accepted sample (client posts ~2 s in phone mode), so
-// the record chain gets real samples at NMEA-like cadence. No per-tick re-assert: if the
-// app stops posting, IS_STALE greys the value ~10 s later — the honest display. Not gated
-// on gpsManualActive (typed coordinates carry no speed).
+// Phone speed/course: selectable source, never an automatic fallback (owner decision). Called from
+// /set_phone_data on each accepted sample (~2 s). No per-tick re-assert: if the app stops posting, IS_STALE
+// greys the value ~10 s later. Not gated on gpsManualActive (typed coordinates carry no speed).
 void applyPhoneSpeed(bool newSpd, bool newHdg) {
   if (speedSourceMode != SPD_SRC_PHONE) return;
   if (newSpd) {
@@ -6378,26 +6229,9 @@ void applyPhoneSpeed(bool newSpd, bool newHdg) {
   }
 }
 
-// Resolve current position + time source labels every loop tick. Position and
-// time are INDEPENDENT settings; each resolves on its own chain.
-//
-// gpsPositionSource (latitude/longitude):
-//   GPS_SRC_AUTO  — freshness-arbitrated: NMEA when fresh, else phone. Promotes
-//                   phone GPS to the effective globals when NMEA is stale.
-//   GPS_SRC_NMEA  — force NMEA. Don't touch the GNSS handler's writes. Label NMEA
-//                   always (even when stale — the dashboard's IS_STALE greying
-//                   alerts the user).
-//   GPS_SRC_PHONE — force phone. Overwrite LatitudeNMEA/LongitudeNMEA from phone
-//                   values. MARK_FRESH only if phone is actually fresh, so stale
-//                   forced data doesn't poison distance/smoothing.
-//
-// timeSourceMode (the clock):
-//   TSRC_AUTO  — NMEA SystemTime → phone → NTP, by freshness.
-//   TSRC_NMEA  — force NMEA time.
-//   TSRC_PHONE — force phone time. Works in AP mode, where nothing else does.
-//   TSRC_NTP   — force NTP. Carries no position, so it says nothing about the
-//                position chain above.
-// Cheap (a few unsigned compares); safe to call every tick.
+// Resolve position and time source labels every loop tick; the two settings resolve independently. Forced
+// NMEA position keeps its label even when stale (IS_STALE greys it); forced phone MARK_FRESHes only when the
+// phone is fresh, so stale data doesn't poison distance/smoothing. Time AUTO: NMEA SystemTime → phone → NTP.
 void resolveSources() {
   unsigned long now = millis();
   bool nmeaGpsFresh   = (lastNmea2kGnssMs > 0)       && (now - lastNmea2kGnssMs       < NMEA_GPS_FRESH_MS);
@@ -6406,9 +6240,8 @@ void resolveSources() {
   bool phoneTimeFresh = (lastPhoneTimeMs > 0)        && (now - lastPhoneTimeMs        < PHONE_FRESH_MS);
 
   // ── GPS source ─────────────────────────────────────────────────────────
-  // Sticky manual override sits ABOVE the source-mode chain: when the user has
-  // typed coordinates in Weather Mode, they win over boat NMEA and phone GPS
-  // (and even the forced modes) and are reasserted every tick until cleared.
+  // Sticky manual override (Weather Mode coordinates) beats NMEA, phone and the forced modes; reasserted every
+  // tick until cleared.
   if (gpsManualActive) {
     LatitudeNMEA  = LatitudeManual;
     LongitudeNMEA = LongitudeManual;
@@ -6470,11 +6303,8 @@ void checkTimeSync() {
     return;
   }
 
-  // AUTO: NTP fires only when BOTH NMEA SystemTime AND phone time are stale
-  // (phone is fresher and wins). NTP-forced: always fire — syncTimeFromNTP
-  // itself early-returns if the mode disallows it. NMEA/Phone-forced: never
-  // touch NTP (the syncTimeFromNTP early-return handles this too, but skip
-  // the call to avoid the WiFi check + log noise).
+  // AUTO: NTP only when BOTH NMEA SystemTime and phone time are stale. NMEA/Phone-forced skip the call
+  // (syncTimeFromNTP would early-return anyway) to avoid the WiFi check + log noise.
   if (timeSourceMode == TSRC_AUTO) {
     bool nmeaTimeFresh  = (lastNmea2kSystemTimeMs > 0) &&
                           (currentMillis - lastNmea2kSystemTimeMs < NMEA_TIME_FRESH_MS);
@@ -6484,7 +6314,6 @@ void checkTimeSync() {
   } else if (timeSourceMode == TSRC_NTP) {
     syncTimeFromNTP();
   }
-  // TSRC_NMEA / TSRC_PHONE → never NTP.
 }
 // Format timestamp into static buffer - returns pointer to timestampBuffer
 const char *formatTimestamp(time_t timestamp) {
@@ -6500,9 +6329,9 @@ const char *formatTimestamp(time_t timestamp) {
   return timestampBuffer;
 }
 // Compute collection time for current window
-// Returns: valid epoch if time synced, negative millis if not
+// Returns: valid epoch on a real clock, negative millis if not (unsynced or the cold-boot estimate)
 time_t computeCollectionTime() {
-  if (timeIsSynced && timeBase > 0) {
+  if (clockIsReal()) {
     long long deltaMs = (long long)currentWindow->windowStartTime - (long long)timeBaseMillis;
     long long deltaSec = deltaMs / 1000;
     time_t epoch = timeBase + deltaSec;
@@ -6520,7 +6349,6 @@ time_t computeCollectionTime() {
 // Handles negative millis markers and reboot scenarios
 time_t reconstructTimestamp(time_t collectionTime) {
   if (collectionTime > 1577836800) {
-    // Already a valid epoch
     return collectionTime;
   }
 
@@ -6530,19 +6358,17 @@ time_t reconstructTimestamp(time_t collectionTime) {
 
     // Check if reboot happened (millis wrapped or is now less than captured)
     if (millis() < capturedMillis) {
-      // Reboot detected: can't reliably reconstruct
-      // Use current time as best effort
+      // Previous boot's record: can't reconstruct, use current time as best effort
       Serial.println("Warning: Buffered record from previous boot, using current time");
       return getCurrentTimestamp();
     }
 
     // Same boot session: reconstruct using time base
-    if (timeIsSynced && timeBase > 0) {
+    if (clockIsReal()) {
       long long deltaMs = (long long)capturedMillis - (long long)timeBaseMillis;
       long long deltaSec = deltaMs / 1000;
       time_t reconstructed = timeBase + deltaSec;
 
-      // Sanity check
       if (reconstructed > 1704067200 && reconstructed < 2000000000) {
         return reconstructed;
       }
@@ -6554,20 +6380,10 @@ time_t reconstructTimestamp(time_t collectionTime) {
 }
 
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Improv Serial responder (improv-wifi.com/serial) on the USB port
-// ══════════════════════════════════════════════════════════════════════════════
-// Lets the browser installer (docs.xengineering.net/software/firmware-reset/, ESP Web Tools)
-// read the running firmware name / version / serial BEFORE it flashes, and recognise the board
-// as the same firmware, so a reinstall is offered as "Update" instead of a "new installation"
-// with an erase prompt. IMPROV_FW_NAME must equal the manifest "name" written by
-// publish_webflash.sh or the installer will not treat it as the same firmware. The serial rides
-// in the device-name string so the installer page can identify a board it only looked at.
-// Wi-Fi settings sent from the installer take the same path as the /wifi setup page
-// (NK_ssid / NK_pass, restart) — a user click, so the flash write is allowed.
-// Packet: "IMPROV" ver=1 type len data checksum(sum of every prior byte & 0xFF) [\n].
-// Only loop() reads Serial; each reply is one Serial.write so prints from other tasks cannot
-// interleave inside a packet.
+// ===== Improv Serial responder (improv-wifi.com/serial) on the USB port =====
+// Lets the browser installer (ESP Web Tools) read firmware name / version / serial before flashing, so a reinstall
+// is offered as "Update", not an erase. IMPROV_FW_NAME must equal the manifest "name" written by publish_webflash.sh.
+// Installer Wi-Fi is a user click, so its flash write is allowed. Each reply is one Serial.write (no interleaving).
 static const char IMPROV_FW_NAME[] = "Alternator Regulator Firmware";
 enum : uint8_t { IMPROV_T_STATE = 1, IMPROV_T_ERROR = 2, IMPROV_T_RPC = 3, IMPROV_T_RESULT = 4 };
 enum : uint8_t { IMPROV_CMD_WIFI = 1, IMPROV_CMD_STATE = 2, IMPROV_CMD_INFO = 3, IMPROV_CMD_SCAN = 4 };
@@ -6631,10 +6447,9 @@ static void improvHandleRpc(const uint8_t *d, uint8_t dlen) {
       break;
     }
     case IMPROV_CMD_INFO: {
-      // Version carries the compile stamp: several builds share one FIRMWARE_VERSION string
-      // (FIRMWARE_0.0.4_PROVENANCE.md), so this is what tells them apart in the installer and
-      // in webflash_attempts.fw_version_before. It also never equals the manifest version, which
-      // keeps ESP Web Tools on its "Update" button instead of the erase-only same-version dashboard.
+      // Version carries the compile stamp: several builds share one FIRMWARE_VERSION (this tells them apart, incl.
+      // webflash_attempts.fw_version_before), and it never equals the manifest version, which keeps ESP Web Tools
+      // on "Update" instead of the erase-only same-version dashboard.
       String ver = String(FIRMWARE_VERSION) + " (" __DATE__ " " __TIME__ ")";
       String name = String("XREG-010 ") + device_id_hex;
       const char *s[4] = { IMPROV_FW_NAME, ver.c_str(), "ESP32-S3", name.c_str() };
@@ -6666,8 +6481,8 @@ static void improvHandleRpc(const uint8_t *d, uint8_t dlen) {
       const char *s[1] = { "http://alternator.local" };  // the mDNS name client mode registers; the DHCP address is unknown until after the restart
       improvSendResult(IMPROV_CMD_WIFI, s, 1);
       Serial.printf("=== IMPROV: ship WiFi '%s' saved, restarting ===\n", ssid);
-      rebootRequested = true;  // loop() restarts 2 s later, after these packets have left
       rebootRequestedAt = millis();
+      rebootRequested = true;  // loop() restarts 2 s later, after these packets have left
       break;
     }
     default:

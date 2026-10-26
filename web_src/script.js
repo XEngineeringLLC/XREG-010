@@ -42,11 +42,8 @@ matching JS CSV*_FIELDS array — the runtime schema mismatch warning will fire 
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 
-// Canvas-drawn axis colors (tick text, axis titles, tick marks, grid) — CSS can't reach
-// these, so they're injected as FUNCTIONS into every plot's axes by the uPlot wrapper
-// below; uPlot re-resolves function-valued strokes on every redraw, so a dark-mode
-// toggle only needs refreshAllPlotThemes(). Light values mirror uPlot's own defaults
-// so light mode renders unchanged.
+// Canvas axis colors CSS can't reach; the uPlot wrapper below injects them as functions, which uPlot
+// re-resolves every redraw, so a theme toggle only needs refreshAllPlotThemes().
 function plotAxisTextColor() { return document.body.classList.contains('dark-mode') ? '#d0d0d0' : 'black'; }
 function plotGridColor() { return document.body.classList.contains('dark-mode') ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.07)'; }
 function plotTickColor() { return document.body.classList.contains('dark-mode') ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.07)'; }
@@ -63,8 +60,7 @@ function plotTickColor() { return document.body.classList.contains('dark-mode') 
         const GAP     = 10;
         const LABELPX = hasLabel ? 30 : 0;  // uPlot labelSize default
         return (u, values) => {
-            // uPlot calls size() with values=null on its first sizing pass (before ticks
-            // exist); guard so we don't deref null and throw, which would halt page init.
+            // uPlot's first sizing pass passes values=null; throwing here would halt page init.
             if (!values || !values.length) return Math.ceil((GAP + LABELPX + 4) / QUANTUM) * QUANTUM;
             if (_fontFamily === null) {
                 try { _fontFamily = getComputedStyle(u.root).fontFamily || 'sans-serif'; }
@@ -83,16 +79,12 @@ function plotTickColor() { return document.body.classList.contains('dark-mode') 
 
     const Wrapped = function (opts, data, el) {
         if (opts && Array.isArray(opts.axes)) {
-            // Phones: a rotated Y-axis title costs 30px of plot width per side (60px on
-            // dual-axis plots) — drop the titles below 600px; units already live in the
-            // legends. Only explicit side 1/3 axes: the side-undefined labeled Y axes
-            // (bode, field-decay) have no legend and already run tuned 22-24px labels.
-            // Decided per-plot at build time; a later rotation only setSize()s.
+            // Phones (<=600px): drop rotated Y titles (30px each; units live in the legends). Only side 1/3
+            // axes: side-undefined labeled axes (bode, field-decay) have no legend. Decided at build time.
             const compact = document.documentElement.clientWidth <= 600;
             opts.axes.forEach(ax => {
                 if (!ax) return;
-                // Theme injection — only fills in what the plot didn't specify, so the
-                // scope/bode plots that hardcode their own axis colors keep them.
+                // Fill only unspecified strokes; scope/bode plots hardcode their own axis colors.
                 if (ax.stroke === undefined) ax.stroke = plotAxisTextColor;
                 ax.grid = ax.grid || {};
                 if (ax.grid.stroke === undefined) ax.grid.stroke = plotGridColor;
@@ -114,26 +106,16 @@ function plotTickColor() { return document.body.classList.contains('dark-mode') 
 })();
 
 
-// STALENESS DISPLAY THRESHOLDS
-// These control when sensor readings gray out in the UI only.
-// They have zero effect on the regulator or field control logic —
-// that staleness is governed by the hardcoded 20s temp-stale threshold
-// and the hardcoded 30s in buildTickSnapshot() on the ESP32.
-//
-// The timestamp payload sends every 3s, so any threshold below
-// ~6s will cause false stale flashes even with healthy sensors.
+// UI gray-out only; firmware staleness is separate (20s temp, 30s in buildTickSnapshot()).
+// TS payload sends every 3s, so anything below ~6s false-flashes on healthy sensors.
 const STALE_THRESHOLD_DEFAULT_MS = 6000;   // All sensors except temperature
 const STALE_THRESHOLD_TEMP_MS = 12000;  // Alternator/thermistor temp read every 5s — allows one failed read
-// BMP388 board temp + barometric pressure run a 4s forced-conversion cycle. Set to the ESP32's
-// DATA_TIMEOUT so the gray appears exactly when firmware stops trusting the value (drops the
-// battery-temp gain derate, skips the cold-charge lockout) — not on some unrelated UI number.
-// 4s cycle means one missed read (8s) still reads fresh; two (12s) gray, same as firmware.
+// BMP388 4s forced-conversion cycle; equals firmware DATA_TIMEOUT so the gray appears exactly when
+// firmware stops trusting the value (one missed read stays fresh, two gray).
 const STALE_THRESHOLD_BOARD_MS = 10000;
 
-// Numerical-gauge render throttle. CSV1 LiveStream arrives every webgaugesinterval (~100ms)
-// for smooth plots, but rendering noisy gauges that fast makes the last digit unreadable.
-// Plots, setting echoes, alignment indicators, and field-status banner are NOT affected —
-// only the criticalFields DOM writes (battery V/A, alt amps, RPM, dutyCycle, PID, IMU live).
+// CSV1 arrives ~100ms; gauges that fast make the last digit unreadable. Throttles only the
+// criticalFields DOM writes, not plots, echoes, alignment indicators or the field-status banner.
 const GAUGE_RENDER_INTERVAL_MS = 500;
 
 
@@ -194,10 +176,8 @@ function updateAllTempUnitLabels() {
     const lbl = tempUnitLabel();
     document.querySelectorAll('.temp-unit-label').forEach(el => { el.textContent = lbl; });
     document.querySelectorAll('.temp-rate-label').forEach(el => { el.textContent = lbl + '/s'; });
-    // Retarget HTML min/max validation to the display unit — the browser validates the
-    // display-unit value BEFORE onsubmit converts it, so °F-authored bounds mis-gate °C
-    // entries (e.g. min="0" blocked every sub-zero °C low-alarm). Bounds are authored in
-    // °F via data-tmin-f/data-tmax-f (data-tdelta="1" for spans: scale only, no -32 shift).
+    // The browser validates the display-unit value before onsubmit converts it, so retarget min/max from
+    // the °F-authored data-tmin-f/data-tmax-f (data-tdelta="1" = span: scale only, no -32 shift).
     document.querySelectorAll('input[data-tmin-f], input[data-tmax-f]').forEach(inp => {
         const conv = inp.dataset.tdelta === '1' ? toDisplayTempDelta : toDisplayTemp;
         if (inp.dataset.tminF !== undefined) inp.min = Math.floor(conv(parseFloat(inp.dataset.tminF)));
@@ -308,8 +288,7 @@ function refreshFuelTableDisplayValues() {
     if (typeof drawFuelCurve === 'function') drawFuelCurve();
 }
 
-// Convert a form input value from display unit back to °F before GET submission.
-// Temporarily rewrites the input value, lets the form submit, then restores the display value.
+// Rewrites the input to °F for the GET submit, then restores the display value.
 function convertTempFormIfNeeded(form, inputName, isDelta, zeroMeansOff) {
     if (displayTempUnit !== 1) return true;
     const input = form.querySelector(`[name="${inputName}"]`);
@@ -320,7 +299,7 @@ function convertTempFormIfNeeded(form, inputName, isDelta, zeroMeansOff) {
     const nativeVal = isDelta
         ? (displayVal * 9 / 5)           // delta: °C span → °F span
         : (displayVal * 9 / 5 + 32);     // absolute: °C → °F
-    input.value = Math.round(nativeVal * 10) / 10;  // round to 1 decimal
+    input.value = Math.round(nativeVal * 10) / 10;
     // Restore on the next tick — the browser serializes the form synchronously right after this
     // handler returns; a longer window let a second Set re-convert the visible °F value as °C.
     const originalDisplay = String(displayVal);
@@ -345,9 +324,7 @@ function convertTempFormCNative(form, inputName) {
     return true;
 }
 
-// Tracks if device is registered for Cloud Features. Hydrated from sessionStorage so a
-// page reload mid-session doesn't drop the flag and re-prompt for registration. Cleared
-// when the app/tab fully closes → a fresh session re-validates against the cloud.
+// Hydrated from sessionStorage so a mid-session reload doesn't re-prompt registration.
 let isDeviceRegistered = (() => { try { return sessionStorage.getItem('deviceRegistered') === '1'; } catch (e) { return false; } })();
 //let isDeviceRegistered = true; // TEMP: bypass for local testing
 
@@ -375,19 +352,15 @@ let isOfflineMode = false; // True after user clicks "Continue Offline"; cleared
 
 let activeTimers = []; // Track all active timers
 
-let g_lastCsv3 = null; // Last received CSV3 data object — used by cvBinToCsv for header constants
-let g_lastCsv1 = null; // Last received CSV1 (live numbers) — for the diagnostics snapshot in log exports
-let g_lastCsv2 = null; // Last received CSV2 (diagnostics/timing/health) — for the diagnostics snapshot
-let g_lastTs = null;   // Last received TS (staleness ages) — for the diagnostics snapshot
-let g_lastCsv4 = null; // Last received CSV4 / NavStream — for the diagnostics snapshot
+let g_lastCsv3 = null; // used by cvBinToCsv for header constants
+let g_lastCsv1 = null; // the rest feed the diagnostics snapshot in log exports
+let g_lastCsv2 = null;
+let g_lastTs = null;
+let g_lastCsv4 = null;
 
-// Per-stream receive bookkeeping, the client half of the freshness stamps the device puts in every
-// payload. The device stamps sessionId + sendMs, which catches one channel falling behind the rest.
-// It cannot catch ALL channels freezing together — a cached script.js whose field arrays predate an
-// OTA fails the schema gate below on every channel at once, and the caches then serve pre-flash
-// values with pre-flash stamps that agree with each other perfectly. rxWallMs (this browser's clock)
-// and the reject counters are the only evidence of that case, so both ride the snapshot.
-// Budgets are the channel cadence with slack: CSV1 ~100ms, CSV4 500ms, CSV2 5s, CSV3 60s, TS 3s.
+// Client half of the per-payload freshness stamps. Device stamps (sessionId/sendMs) can't catch ALL
+// channels freezing together (a stale cached script.js fails the schema gate everywhere), so rxWallMs
+// and reject counters ride the snapshot. Budgets = cadence + slack: CSV1 ~100ms, CSV4 500ms, CSV2 5s, CSV3 60s, TS 3s.
 const STREAM_BUDGET_MS = { csv1: 2000, csv2: 20000, csv3: 130000, csv4: 3000, ts: 12000 };
 const g_streamMeta = {
     csv1: { rxWallMs: 0, rejects: 0, lastReject: null },
@@ -400,8 +373,7 @@ function noteStreamRx(name) {
     const m = g_streamMeta[name];
     if (m) m.rxWallMs = Date.now();
 }
-// Called from a schema/length mismatch branch, where the payload is dropped and the cache goes stale
-// with no other trace. `declared` is the device's field count, `expected` this build's array length.
+// declared = device's field count, expected = this build's array length.
 function noteStreamReject(name, declared, expected) {
     const m = g_streamMeta[name];
     if (!m) return;
@@ -459,16 +431,13 @@ const CSV1_FIELDS = [
     "cvKdFiltV",         // IBV smoothed by CvKdVoltFiltTC (V ×100) — "Voltage for D term" trace
     "huntDerate",        // hunt-governor live Ki derate (×100; 100 = full gain)
     "huntFreqHz",        // hunt-governor last confirmed wobble frequency (Hz ×100; 0 = none this session)
-    "huntState",         // 0 watching, 1 testing a Ki cut, 3 cooldown, 4 testing with the D term paused (2 unused since v2)
+    "huntState",         // 0 watching, 1 testing a Ki cut, 3 cooldown, 4 testing with the D term paused (2 unused)
     "rpmCeilingAmps",    // RPM-table current ceiling this tick (A ×100) — header Limit panel
     "sessionId",         // device boot identity, same in every channel this boot
     "sendMs",            // device millis() when this payload was built — the reference clock the other channels are aged against
 ];
 
-// Format elapsed seconds since "Reset Peak Values" press into a short window descriptor.
-// Used to populate every .session-window-label span on the diagnostics page so labels
-// like "Worst — last 12 min (ms)" / "Worst — last 1.4 hr (ms)" stay in sync with the
-// firmware's perfCountersResetMs timestamp.
+// Text for every .session-window-label span (window since "Reset Peak Values").
 function formatSessionWindow(elapsedS) {
     const s = Math.max(0, Math.floor(Number(elapsedS) || 0));
     if (s < 3600) {
@@ -511,7 +480,6 @@ const CSV2_FIELDS = [
     "weatherDataValid",
     "AlarmLatchState",
     "ResetAlarmLatch",
-    "DynamicShuntGainFactor",
     "DynamicAltCurrentZero",
     "InsulationLifePercent",
     "GreaseLifePercent",
@@ -885,7 +853,7 @@ const CSV2_FIELDS = [
     "altHealthStatus",     // 0 learn,1 healthy,2 drift-hi,3 drift-lo,4 low-coverage
     "altCoveragePct",      // frozen/with-data % ×10
     "altObsCount",         // scored observations since freeze
-    // Victron VE.Direct solar/MPPT live block (7 fields — PPV/VPV/derived-current moved to CSV4/NavStream)
+    // Victron VE.Direct solar/MPPT live block (PPV/VPV/current ride CSV4/NavStream)
     "VictronChargeState",         // CS code (×1)
     "VictronMPPTMode",            // MPPT tracker code (×1)
     "VictronError",               // ERR code (×1)
@@ -893,7 +861,6 @@ const CSV2_FIELDS = [
     "VictronMaxPowerToday_W",     // H21 max power today (W ×1)
     "VictronYieldYesterday_kWh",  // H22 yield yesterday (kWh ×100)
     "VictronMaxPowerYesterday_W", // H23 max power yesterday (W ×1)
-    // (currentFuelGPH/currentNMPG moved to CSV4/NavStream)
     // session fuel-economy curve: mpg per RPM bin (18 bins spanning 0..fuelCurveTopRPM), naut mi/gal ×100, 0 = empty
     "fuelCurveNMPG_0", "fuelCurveNMPG_1", "fuelCurveNMPG_2", "fuelCurveNMPG_3", "fuelCurveNMPG_4", "fuelCurveNMPG_5",
     "fuelCurveNMPG_6", "fuelCurveNMPG_7", "fuelCurveNMPG_8", "fuelCurveNMPG_9", "fuelCurveNMPG_10", "fuelCurveNMPG_11",
@@ -907,9 +874,9 @@ const CSV2_FIELDS = [
     // field-ON loop instrumentation (2 fields) — worst pass while actually regulating
     "loopFieldOnWin_ms",          // worst field-ON loop pass, rolling 5s (ms)
     "loopFieldOnSes_ms",          // worst field-ON loop pass since Reset Peak Values (ms)
-    // thermal tuning plot live-stream fields (replaces the old /thermallog.bin pull)
+    // thermal tuning plot live-stream fields
     "tempFiltered",               // IIR-filtered alt temp (°F ×100); distinct from raw AlternatorTemperatureF
-    "outerImpliedPenalty",        // voltage cap as downstream amps penalty (A ×100); still streamed but no longer plotted (voltage-loop info, dropped from the thermal subtab)
+    "outerImpliedPenalty",        // voltage cap as downstream amps penalty (A ×100); streamed, not plotted
     "thermalFlags",               // state-strip bitfield: bit0 tempPIDActive, bit4 AUTO, bit5 shutdown
     "outerAntiWindupFired",       // 1 = CV-bleed anti-windup fired since last frame (red ticks)
     // +10: Inner Current PID firing interval (field-on-gated), CH1-style stats (avg ÷100)
@@ -1089,13 +1056,19 @@ const CSV2_FIELDS = [
     "fieldHeatLimSesS",        // session seconds held at the heat ceiling (raw seconds; Reset on Live Data)
     "fieldCurLimSesS",         // session seconds held at the 10 A ceiling (raw seconds; Reset on Live Data)
     "dieTempLostCount",        // session count of DIE_TEMP_LOST field events (INA228 die temperature)
+    "n2kBusVerdict",           // CAN bus health, by severity: 0 off, 1 OK, 2 nothing heard, 3 receive errors, 4 nobody answering, 5 bus-off
+    "n2kTec",                  // TWAI transmit error counter (128+ = error-passive)
+    "n2kRec",                  // TWAI receive error counter
+    "n2kRxFrames",             // CAN frames received since boot
+    "n2kBusOffCount",          // bus-off recoveries since boot
+    "n2kRxLost",               // frames our receive queue / FIFO lost since boot (load on us, never wiring; diagnostics only)
+    "n2kNodesHeard",           // other nodes heard in the last 60 s
+    "LargestPSRAMBlock",       // largest contiguous free PSRAM block, KB (sampled every 20 s with the field cut, held while charging)
     "sessionId",               // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
 
-// Order MUST match ftBlameReg[] in Xregulator.ino — the blame indices in CSV2 point here.
-// tN2kTempSource display names (index = wire code) — the standard set has no Alternator source,
-// hence the user-selectable source + instance on the Integrations tab (NMEA 2000 card).
+// tN2kTempSource display names (index = wire code); the standard set has no Alternator source.
 const N2K_TEMP_SOURCE_NAMES = ["Sea", "Outside", "Inside", "Engine Room", "Main Cabin", "Live Well",
     "Bait Well", "Refrigeration", "Heating System", "Dew Point", "Apparent Wind Chill",
     "Theoretical Wind Chill", "Heat Index", "Freezer", "Exhaust Gas", "Shaft Seal"];
@@ -1103,6 +1076,7 @@ const N2K_TEMP_SOURCE_NAMES = ["Sea", "Outside", "Inside", "Engine Room", "Main 
 // tN2kChargerMode display names (index = wire code) — carried by both charger PGNs, label only.
 const N2K_CHARGER_MODE_NAMES = ["Standalone", "Primary", "Secondary"];
 
+// Order MUST match ftBlameReg[] in Xregulator.ino — the blame indices in CSV2 point here.
 const FT_BLAME_NAMES = [
     "Analog Inputs", "VE Direct", "Alt Control", "Derived Metrics",
     "Alarms", "Battery SOC", "Log Dashboard", "System Health",
@@ -1162,25 +1136,14 @@ const CSV4_FIELDS = [
 ];
 
 // ── Gate-tuning live readouts ───────────────────────────────────────────────
-// Several thresholds gate on a live/windowed quantity the user can't otherwise see (RPM edge
-// margin, current-drift spread, spectral tone peak, current slew, voltage slope). The firmware
-// streams a 10s rolling extreme of each on CSV2 (ROLL_EMPTY = no sample in the window); the iExcess
-// peak-over-command rides CSV1 at 10Hz so its 10s peak is computed here. Each readout shows the number to
-// set the threshold relative to. Spans live next to each threshold input in index.html.
+// Firmware streams a 10s rolling extreme of each gated quantity on CSV2 (ROLL_EMPTY = no sample); the iExcess
+// peak rides CSV1 at 10Hz so its 10s peak is computed here. Spans sit next to each threshold input.
 const ROLL_EMPTY_SENTINEL = -1999999999;   // firmware sends -2000000000 when a 10s window had no sample
 
 // ── Absent sensor or absent shunt: "not available" ─────────────────────────
-// With no battery shunt the INA current input still reads something, and an absent alternator probe,
-// wind instrument or paddlewheel used to ride SafeInt's -1 and render as a real measurement (-0.0 F,
-// -0.0 kt, -1 deg, a flat line in the live plot). The firmware sends the ROLL_EMPTY sentinel in those
-// slots instead. Rewrite it to NaN at parse time, once, so every downstream consumer inherits "no
-// reading": readouts print "—", plots leave a gap, and the analysis fits (autotune, diag) see NaN
-// instead of a plausible-looking number. Since SafeInt itself returns ROLL_EMPTY for NaN/Inf, EVERY
-// field on CSV1/2/3/4 can carry the sentinel — the battery slots (Bcur, SOC_percent, dBcur_dt), the
-// sensor slots, and any ignition-cycle watermark whose sensor was absent for the whole cycle — so the
-// sweep runs over the whole parsed object rather than a key list. Nothing legitimate reads below
-// -1999999999, so a whole-object sweep cannot swallow a real value. TS carries no SafeInt field and is
-// not swept.
+// Firmware sends ROLL_EMPTY in slots with no reading, and SafeInt returns it for NaN/Inf, so ANY CSV1/2/3/4
+// field can carry it. Rewrite to NaN once at parse: readouts print "—", plots gap, fits see NaN.
+// Nothing legitimate reads below -1999999999. TS carries no SafeInt field and is not swept.
 function battNaToNaN(data, keys = Object.keys(data)) {
     for (const k of keys) {
         if (!(k in data)) continue;
@@ -1201,9 +1164,7 @@ const GATE_READOUTS_CSV2 = [
     { spans: ['ripBattGate_live'],                                                           f: 'ripBattExc10sMax', s: 100,   lbl: 'batt mean-shift beyond limit (larger of Floor / ¼ window swing), 10s worst, ≤0 passes', u: 'A', d: 2 },
     { spans: ['ripRpmGate_live'],                                                            f: 'ripRpmShift10sMax', s: 10,   lbl: 'RPM mean-shift beyond limit (larger of 10 RPM / ¼ window swing), 10s worst, ≤0 passes', u: 'RPM', d: 1 },
 ];
-// Pass/fail styling for the anomaly steady-state gate readouts: green+bold when the last-10s extreme
-// currently satisfies the gate, red+bold when it doesn't, neutral (muted gray) when the window had no
-// sample. Colors match the local convention (#5cb85c pass, #ef4444 fail used elsewhere in this file).
+// Gate readout styling: pass green, fail red, null (no sample in the window) muted.
 const GATE_PASS_COLOR = '#5cb85c';
 const GATE_FAIL_COLOR = '#ef4444';
 function gateColor(id, pass) {
@@ -1228,20 +1189,17 @@ function gateReadoutOnCsv2(data) {
     const rpmRaw = Number(data.faRpmEdge10sMin);
     if (!isFinite(rpmRaw) || rpmRaw <= ROLL_EMPTY_SENTINEL) gateColor('faRpmEdgeMargin_live', null);
     else { const set = gateEchoNum('faRpmEdgeMargin_echo'); gateColor('faRpmEdgeMargin_live', isFinite(set) ? (rpmRaw / 10) >= set : null); }
-    // Drift: the firmware streams the EMA spread minus its own effective limit (max of floor / pct-of-mean),
-    // computed from the exact filtered window mean — no client recompute. <=0 means the drift gate passed.
-    // Both rows reflect the one gate. (faAmpsDriftExc10sMax is the 10s peak, i.e. the worst window.)
+    // Firmware streams the EMA spread minus its effective limit (max of floor / pct-of-mean); <=0 = pass.
+    // Both rows reflect the one gate.
     const drExc = Number(data.faAmpsDriftExc10sMax);
     const drPass = (!isFinite(drExc) || drExc <= ROLL_EMPTY_SENTINEL) ? null : (drExc / 100) <= 0;
     gateColor('faAmpsDriftFloorA_live', drPass);
     gateColor('faAmpsDriftPct_live', drPass);
-    // Ripple-capture gates: same excess convention (<=0 = that gate passed every window in the last 10s).
-    // RPM row included — the firmware streams shift − limit directly.
+    // Ripple-capture gates: same excess convention (<=0 = passed every window in the last 10s).
     for (const [f, id, s] of [['ripCmdExc10sMax', 'ripCmdGate_live', 100], ['ripAltExc10sMax', 'ripAltGate_live', 100], ['ripBattExc10sMax', 'ripBattGate_live', 100], ['ripRpmShift10sMax', 'ripRpmGate_live', 10]]) {
         const v = Number(data[f]);
         gateColor(id, (!isFinite(v) || v <= ROLL_EMPTY_SENTINEL) ? null : (v / s) <= 0);
     }
-    // (ripAltAdmitCount/ripBattAdmitCount still ride CSV2 but have no UI row.)
 }
 // iExcessLive: G3 (alternator) detector strip. Firmware ships one peak/threshold pair;
 // threshMin ≤ 0 = disarmed.
@@ -1305,10 +1263,8 @@ function drawIExcessSpark(c, S) {
     if (!S.armed) { g.fillStyle = '#888'; g.font = '10px sans-serif'; g.fillText('disarmed', 6, 12); }
 }
 
-// Commissioning RPM sparkline: permanent strip in the commissioning modal so the user can
-// hold engine speed steady without leaving the dialog. Fixed-count ring (150 samples ≈ 15 s at
-// the ~10 Hz CSV1 cadence, same fixed-ring convention as the iExcess strip). No-ops when the
-// modal is closed (canvas has zero width).
+// Commissioning RPM sparkline so the user can hold engine speed steady without leaving the dialog.
+// 150 samples ≈ 15 s at ~10 Hz CSV1. No-ops when the modal is closed (canvas has zero width).
 const _cxRpmSpark = { rpm: new Array(150).fill(NaN), N: 150 };
 let cxFpOpen = false;   // wizard "Details" disclosure — one setting for the whole session, all steps
 function cxFpSet(v) { cxFpOpen = !!v; }
@@ -1327,9 +1283,8 @@ function cxRpmSparkOnCsv1(data) {
     }
     const S = _cxRpmSpark;
     S.rpm.push(isFinite(rpm) ? rpm : NaN); S.rpm.shift();
-    // One shared ring feeds two strips: the commissioning modal and the standalone Diag
-    // stress-test modal. Draw only where laid out (modal open, not hidden by the sweep game) —
-    // but the ring above must keep feeding regardless: the game reads the same ring for its trace.
+    // One ring feeds two strips (commissioning modal, Diag stress-test modal); draw only where laid out,
+    // but always feed the ring: the sweep game reads it for its trace.
     for (const [cid, vid] of [['cxRpmSpark', 'cx-rpm-spark-val'], ['cvsRpmSpark', 'cvs-rpm-spark-val']]) {
         const canvas = document.getElementById(cid);
         if (!canvas) continue;
@@ -1341,9 +1296,7 @@ function cxRpmSparkOnCsv1(data) {
     if (hint) hint.style.display = cxRpmUnsettled() ? '' : 'none';
     if (cx) cxDriveGateRefresh();
 }
-// Throttle-settle check for the Run-button hint: unsettled = RPM spanned more than 5% of its mean
-// (min 30 RPM) over the last ~3 s of the ring. False with no data or engine effectively stopped —
-// the wizard's engine-running gates own that case.
+// False with too little data or engine stopped: the wizard's engine-running gates own that case.
 function cxRpmUnsettled() {
     const S = _cxRpmSpark, n = 30;
     let mn = Infinity, mx = -Infinity, sum = 0, k = 0;
@@ -1384,8 +1337,8 @@ function drawCxRpmSpark(c) {
     const last = S.rpm[N - 1];
     if (isFinite(last)) { g.fillStyle = '#2ec4b6'; g.beginPath(); g.arc(X(N - 1), Y(last), 2.6, 0, 7); g.fill(); }
 }
-// ── Charging-system health (v2): schema-driven live + settings, perf-vs-engine-hours trend ──
-// Schema-driven (fetch /altschema ONCE, zip names against AltLive/AltSettings) — no hardcoded array.
+// ── Charging-system health: schema-driven live + settings, perf-vs-engine-hours trend ──
+// Field names come from /altschema (fetched once) zipped against AltLive/AltSettings.
 let altSchema = null;
 let altSettings = {};
 let altLive = { valid:false, rpm:0, exc:0, amps:0, pred:0, pct:0, worstPct:0, overallPct:0,
@@ -1404,12 +1357,10 @@ try { altTrendYManual = JSON.parse(localStorage.getItem('altTrendY') || 'null');
 function fetchAltSchema(){ return fetch(buildURL('/altschema')).then(r=>r.json()).then(j=>{ altSchema=j; }).catch(()=>{}); }
 
 // ===== Tachometer Keep-Alive — Automatic Learning (firmware "knee tracker", knee*/kneeLearn* keys) =====
-// Polls /kneeLearnState and fills the echo labels, knob input placeholders, and the per-RPM
-// status table. State flows through this endpoint, not CSV, so there is no CSV plumbing.
+// State comes from /kneeLearnState, not CSV.
 function _kneeSetEcho(id, txt){ const e = document.getElementById(id); if (e) e.textContent = txt; }
 function _kneeSetInput(id, val){
-    // Intentionally a no-op for the value boxes: like every other setting on the site, the
-    // input stays blank and the current value is shown only in the _echo span in the label.
+    // Intentional no-op: like every setting, the input stays blank; the value shows only in the _echo span.
 }
 function fetchKneeLearnState(){
     return fetch(buildURL('/kneeLearnState')).then(r=>r.json()).then(j=>{
@@ -1418,8 +1369,7 @@ function fetchKneeLearnState(){
         _kneeSetEcho('kneeLearnEnable_echo', on ? 'On' : 'Off');
         const cb = document.getElementById('kneeLearnEnable_checkbox');
         if (cb) cb.checked = on;
-        // While learning owns the Keep-Alive column, lock the 10 cells so manual edits can't be silently
-        // stomped; release them (and the hint) otherwise.
+        // Lock the 10 cells while learning owns the Keep-Alive column so manual edits can't be silently stomped.
         const owns = on;
         for (let i = 0; i < 10; i++) {
             const mi = document.getElementById('rpmMinDutyTable' + i + '_input');
@@ -1490,7 +1440,6 @@ async function resetKneeLearn(){
 }
 
 // ===== Zero-drift characterization log (diagnostic) =====
-// Polls /zerologstate for the enable echo + fill/span status. CSV-free (own endpoint).
 let zeroLogToggledAt = 0; // ms timestamp of last user flip — guards the switch from poll snap-back
 function fetchZeroLogState(){
     return fetch(buildURL('/zerologstate')).then(r=>r.json()).then(j=>{
@@ -1542,18 +1491,27 @@ function fetchZeroFitState(){
     }).catch(()=>{});
 }
 
-// ===== Measured zero (engine running, field at 0%) =====
-// Rides the same /zerofitstate poll as the fit above. Zero Now asks the device for one measurement;
-// the device brings the field to 0% by itself, averages, and holds the result. This paints the
-// phase while it runs, then what is held, and arms Apply. Indexed by the firmware's ALTZERO_RJ_* /
-// ALTZERO_PH_* codes (Xregulator.ino) — keep the slots aligned.
+// ===== Measured zero (field at 0%, engine running or stopped) =====
+// Rides the /zerofitstate poll. The device itself drives the field to 0%, averages and holds the result.
+// Indexed by firmware ALTZERO_RJ_* / ALTZERO_PH_* codes (Xregulator.ino) — keep the slots aligned.
 const ALTZERO_REJ_TEXT = ['', 'too noisy to be a zero', 'reading too large, check which cable the sensor is on',
                           'engine speed moved mid-measurement', 'the field came back on before it finished',
                           'the engine is not running (it needs 400 RPM)',
                           'a test is running on the alternator, finish it first',
                           'the field could not be brought to 0%'];
-const ALTZERO_PHASE_TEXT = ['', 'Checking that the engine is running', 'Turning the field off',
+const ALTZERO_PHASE_TEXT = ['', 'Checking whether the engine is running', 'Turning the field off',
                             'Waiting for the rotor to drain', 'Averaging the reading'];
+// capEngOff describes the request in flight only from phase 2 on (phase 1 is still deciding).
+function altZeroPhaseText(j) {
+    const ph = Number(j.capPhase) || 0;
+    if (ph === 3 && Number(j.capEngOff) === 1) return 'Letting the reading settle';
+    return ALTZERO_PHASE_TEXT[ph] || '';
+}
+function altZeroWhere(j) {
+    const t = (j.capAltF === null || j.capAltF === undefined) ? j.capBoardF : j.capAltF;
+    return (Number(j.capEngOff) === 1 ? 'engine off' : Math.round(Number(j.capRpm)) + ' RPM')
+        + ((t === null || t === undefined) ? '' : ', ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel());
+}
 function altZeroPaint(j) {
     const st = document.getElementById('altzero-status');
     const btn = document.getElementById('altzero-apply-btn');
@@ -1565,16 +1523,12 @@ function altZeroPaint(j) {
         btn.style.cursor = held ? '' : 'not-allowed';
     }
     if (Number(j.capBusy) === 1) {
-        st.textContent = 'Measuring: ' + (ALTZERO_PHASE_TEXT[Number(j.capPhase)] || 'working')
-            + '. The field is held at 0%; keep the engine running.';
+        st.textContent = 'Measuring: ' + (altZeroPhaseText(j) || 'working') + '.';
         return;
     }
     if (held) {
-        const t = (j.capAltF === null || j.capAltF === undefined) ? j.capBoardF : j.capAltF;
-        st.textContent = 'Measured ' + (Number(j.capA) >= 0 ? '+' : '') + Number(j.capA).toFixed(2) + ' A at '
-            + Math.round(Number(j.capRpm)) + ' RPM'
-            + ((t === null || t === undefined) ? '' : ', ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel())
-            + '. Press Apply to fold it into the offset.';
+        st.textContent = 'Measured ' + (Number(j.capA) >= 0 ? '+' : '') + Number(j.capA).toFixed(2) + ' A ('
+            + altZeroWhere(j) + '). Press Apply to fold it into the offset.';
         return;
     }
     const rej = Number(j.capRej) || 0;
@@ -1642,11 +1596,8 @@ function updateAltHealth() {
   // High-field-low-output alert (independent safety net \u2014 fires regardless of the record book)
   const hfEl = document.getElementById('alt-hifield-alert');
   if (hfEl) hfEl.style.display = altLive.hiFieldAlert>=1 ? '' : 'none';
-  // Graded-point counter, then the statistics over those same points (mean + 10th-percentile weak tail):
-  // the graded, session-steady samples, which are also the points the This Session plot dots. The count
-  // stands on its own line because it is the only useful number in the first minutes, before mean and
-  // percentile have the 10 samples that make them meaningful. A real ~5% decline shows in the statistics
-  // before the trend buckets can.
+  // Graded-point count gets its own line: it's the only useful number before mean/p10 have 10 samples.
+  // These are the session-steady points the This Session plot dots.
   const gradedN = Math.max(0, Math.round(Number(altLive.sessionN) || 0));
   const gradEl = document.getElementById('alt-session-graded');
   if (gradEl) gradEl.innerHTML = gradedN > 0
@@ -1662,8 +1613,7 @@ function updateAltHealth() {
       ? (Math.round(altLive.ptCount)+' best surface points \u00b7 '+Math.round(altLive.engHours)+' engine-hr')
       : 'no best surface points yet';
   }
-  // Default reference (own history) is not labelled — it's the uninteresting common case. Only the
-  // genuinely distinct states are surfaced: an actively uploaded reference, and learning paused.
+  // The default reference (own history) is not labelled; only Uploaded reference and learning paused are.
   const modeLbl = document.getElementById('alt-mode-label');
   if (modeLbl) modeLbl.textContent = [altLive.source>=1 ? 'Uploaded reference' : '',
                                       altLive.paused>=1 ? 'learning paused' : '']
@@ -1675,12 +1625,9 @@ function updateAltHealth() {
   setSegEcho('altSimMode', ['alt-sim-off','alt-sim-on'], altLive.sim>=1?1:0);   // simulator segmented toggle in Setup (mirrors Vessel Performance)
 }
 
-// Write path for the echo-only controls on the two learning pages (Charging System Health +
-// Vessel Performance). The device echo over SSE stays the committed truth, but a click now
-// paints immediately (optimistic); the pendingToggles entry shields that paint from stale
-// echoes during the round-trip — same reconciliation as updateSegToggle, 2.5s grace from the
-// first stale echo — and a write that never lands reverts the paint and reports the failure.
-// `paint` draws the desired value; `repaint` restores the device's state after a failure.
+// Write path for echo-only controls on Charging System Health + Vessel Performance: paint optimistically;
+// pendingToggles shields it from stale echoes (updateSegToggle's 2.5s grace from the first stale echo);
+// a failed write reverts via `repaint` and reports. `paint` draws the desired value.
 function optimisticEchoWrite(key, desired, query, what, paint, repaint){
   if(DEMO_MODE){ repaint(); xAlert('Demo mode — no regulator is connected, so ' + what + ' cannot be changed.'); return; }
   pendingToggles.set(key, { desiredValue: desired, baseRev: lastSeenRev });
@@ -1734,12 +1681,9 @@ function altSetPaused(p){
   optimisticEchoWrite('altPaused', p?1:0, 'altPaused='+(p?1:0), 'learning',
                       i=>setSeg(['alt-learn-on','alt-learn-off'],i), updateAltHealth);
 }
-// One-button health export: everything behind BOTH Charging System Health plots plus the yardstick,
-// in one file. Concatenates the reference surface (/altcurve.csv — a BEFRONT1 block, kept FIRST so the
-// file still re-imports), the firmware debug dump (/altdebug.csv: params, live/gate, trend buckets,
-// session histogram), and the browser's This Session dots with their conditions (firmware keeps only
-// the histogram, so these live client-side). Import New Reference Surface reads ONLY the leading
-// BEFRONT1 block — every other line is label-prefixed, so its bare-float row parser skips them.
+// One-button health export: /altcurve.csv (BEFRONT1 block, kept FIRST so the file re-imports), /altdebug.csv,
+// the device session ring, and the browser's This Session dots. Import reads ONLY the leading BEFRONT1 block;
+// every other line is label-prefixed, so the first one after the curve ends the block (altFrontBlockOnly).
 function altExportHealthDataset(){
   const get = u => fetchWithTimeout(buildURL(u),{},10000).then(r=>r.text()).catch(()=>'');
   Promise.all([get('/altcurve.csv'), get('/altdebug.csv'), get('/altsess.csv')]).then(([ref, dbg, sess])=>{
@@ -1748,10 +1692,8 @@ function altExportHealthDataset(){
     const parts = [];
     if(ref) parts.push(ref);
     if(dbg) parts.push(dbg);
-    // The device's OWN session ring, label-prefixed. The SESSPT block below is the browser's copy and
-    // holds only what this page was connected for — on 2026-09-18 that was 54 of 265 graded points, and
-    // the missing ones were the whole first half of the drive. The ring is 1440 points deep and survives
-    // a page reload, so an export taken after the fact still carries the run.
+    // The device's own session ring (1440 points, survives reloads); the SESSPT block below holds only what
+    // this page was connected for, which can miss most of a run.
     if(sess) parts.push(sess.split('\n').map(l => l.startsWith('#') ? '# DEVSESS ' + l.replace(/^#\s*/,'')
                                                                     : 'DEVSESS,' + l).join('\n'));
     parts.push(altSessSectionCsv());
@@ -1779,8 +1721,7 @@ function altSessSectionCsv(){
   return rows.join('\n');
 }
 // ── Gate-tuning capture: session logger + field sweeper ──────────────────────
-// Spec: Working Markdown Docs/ALT_GATE_TUNING_CAPTURE_SPEC.md. State arrives on the AltLive frame
-// (1 Hz, schema-zipped) as logState / logRows / logSecLeft / logCap / sweepState / sweepRev.
+// Spec: Working Markdown Docs/ALT_GATE_TUNING_CAPTURE_SPEC.md. State rides the 1 Hz AltLive frame.
 // Buttons, not URL parameters: this is operated by hand while also managing a throttle.
 const ALTLOG_HDR_BYTES = 172;    // must match AltLogHdr in 7_functions.ino (ver 3)
 const ALTLOG_HDR_BYTES_V2 = 164; // ver 2 header, before the output slope cap — still readable
@@ -1817,9 +1758,7 @@ function altCaptureRender() {
     if (stEl) stEl.textContent = ALTLOG_STATE_LABEL[st] || '?';
     const cd = document.getElementById('altlog-countdown');
     if (cd) {
-        // Time only, m:ss, always the same shape. The row count was a number nobody acts on, and it
-        // grew a digit mid-recording — which re-wrapped this line and shifted the whole row. The
-        // span is tabular-nums in the markup so the digits themselves are fixed-width too.
+        // Fixed-shape m:ss only (span is tabular-nums): a changing length re-wraps and shifts the whole row.
         const rows = altLive.logRows | 0, cap = (altLive.logCap | 0) || ALTLOG_CAP_ROWS;
         if (recording) {
             const left = Math.max(0, altLive.logSecLeft | 0);
@@ -1851,11 +1790,8 @@ function altCaptureRender() {
     altSweepSyncCeiling();
 }
 
-// Both sweep bounds are capped at the field ceiling the firmware is enforcing right now (CSV2 fieldDutyCeil: the
-// lowest of Max Field %, the Max Field Volts term and the board's 10 A and drive-heat ceilings), which holds the
-// sweep too, and "up to" starts there — so the box shows the real number instead of a note explaining what empty
-// means. Max Field % stands in until a CSV2 frame carries the ceiling. Only ever fills an EMPTY box: a value the
-// user typed is theirs.
+// Sweep bounds cap at the live enforced field ceiling (CSV2 fieldDutyCeil), which holds the sweep too; Max Field %
+// stands in until CSV2 carries it. Only ever fills an EMPTY box: a typed value is the user's.
 function altSweepCeiling() {
     const c = (typeof g_lastCsv2 === 'object' && g_lastCsv2) ? Number(g_lastCsv2.fieldDutyCeil) / 100 : NaN;
     if (c > 0) return Math.max(1, Math.floor(c));
@@ -1886,10 +1822,8 @@ function altSweepMargins() {
     return { a: num('altsweep-margin-a', 10), v: num('altsweep-margin-v', 0.20 * k) };
 }
 
-// The sweep parameters live in the browser, not in NVS: altSweepPress reads the boxes when Start
-// sweep is pressed. Set is here because every other value box in Setup has one — it clamps to the
-// box's own range, remembers the value across reloads, and refreshes the two places that quote the
-// margins. Typing without pressing Set still runs; the sweeper reads the live box either way.
+// Sweep params live in the browser (localStorage), not NVS; altSweepPress reads the live boxes at Start,
+// so Set (clamp + remember) is optional.
 const ALTSWEEP_LS_KEY = 'altSweepParams';
 
 function altSweepSetParam(id, btn) {
@@ -2004,18 +1938,13 @@ function altSweepPress() {
                `&marginA=${encodeURIComponent(m.a)}&marginV=${encodeURIComponent(m.v)}`);
 }
 
-// Header (172 B in ver 3, 164 B in ver 2, 136 B in ver 1) + rows of 18 B (ver 3) or 17 B, little-
-// endian. Mirrors AltLogHdr / AltLogRow in 7_functions.ino — change one and you must change the
-// other. All three versions are read: ver 1 files were recorded by the max-minus-min band gate,
-// ver 2 by the straightness gate, ver 3 by that plus the output slope cap, and each version only
-// APPENDS, so every earlier offset is unchanged and one parser covers all three off fixed offsets.
+// Little-endian; mirrors AltLogHdr / AltLogRow in 7_functions.ino — change both together. Each version only
+// APPENDS fields, so one parser reads ver 1-3 off fixed offsets.
 function parseAltLogBin(buf) {
     if (!buf || buf.byteLength < ALTLOG_HDR_BYTES_V1 + ALTLOG_ROW_BYTES_V2) return null;
     const dv = new DataView(buf);
     if (dv.getUint32(0, true) !== 0x414C474C) return null;   // 'ALGL'
     const ver = dv.getUint16(4, true);
-    // Each version's header and row are FIXED sizes, and older files stay readable: the offsets of
-    // everything ver 1 and 2 wrote are unchanged, and each later version only appends.
     const hdrBytes = (ver >= 3) ? ALTLOG_HDR_BYTES : (ver >= 2) ? ALTLOG_HDR_BYTES_V2 : ALTLOG_HDR_BYTES_V1;
     const rowBytes = (ver >= 3) ? ALTLOG_ROW_BYTES : ALTLOG_ROW_BYTES_V2;
     if (buf.byteLength < hdrBytes + rowBytes) return null;
@@ -2087,8 +2016,7 @@ function altLogToCsv(d) {
            ` deviceMs=${h.startMs} durMs=${h.durMs}`);
     L.push(`# fw=${h.fw} voltClass=${h.voltClass}V startTempF=${h.startTempF.toFixed(1)}` +
            ` startVbus=${h.startVbus.toFixed(2)} chargeStage=${h.chargeStage}`);
-    // ver 2 recorded the straightness gate, ver 1 the max-minus-min band gate it replaced. Print the
-    // one that actually shaped the file: a header must never claim a gate that did not.
+    // Print the gate that actually shaped the file (ver 1 = band gate, ver 2+ = straightness).
     if (h.ver >= 2) {
         L.push(`# gates: straightness emaSec=${h.emaSec} leadSec=${h.leadSec}` +
                ` rpmLineRms=${h.rpmLineRms} rpmRateMax=${h.rpmRateMax}` +
@@ -2145,28 +2073,25 @@ function altLogToCsv(d) {
 }
 
 // ── Generated-file delivery with feedback ────────────────────────────────────
-// Every file this page generates (CSV/JSON exports, Download Logs, config backup)
-// goes through deliverFile(). Capacitor app (iOS and Android alike): the bytes are
-// written to the app cache with @capacitor/filesystem and handed to the system share
-// sheet (Save to Files / Drive / Mail); an anchor click saves NOTHING in either app
-// WebView — WKWebView has no download handler, and a blob-URL anchor never reaches
-// Android's DownloadListener. Desktop/Android browsers: per-file anchor download plus
-// a confirmation toast. iOS Safari, and app binaries too old to carry the plugins:
-// files queue into a bottom "ready" bar and one tap opens the share sheet, because
-// Safari silently drops programmatic clicks once the button tap's user activation
-// expires — every export here fetches for seconds first. The share promise resolving
-// is the only real "it saved" signal either share path gives.
+// Every generated file goes through deliverFile(). Capacitor (iOS + Android): write to the app cache and open the
+// share sheet; an anchor click saves NOTHING in either WebView. iOS Safari / old app binaries: queue into the
+// ready bar, since Safari drops programmatic clicks once the tap's user activation expires. Else: anchor + toast.
 
-function fileToast(msg) {
+function fileToast(msg, ms = 4000) {
     let t = document.getElementById('file-toast');
     if (!t) { t = document.createElement('div'); t.id = 'file-toast'; document.body.appendChild(t); }
     t.textContent = msg;
     t.classList.add('show');
     clearTimeout(fileToast._timer);
-    fileToast._timer = setTimeout(() => t.classList.remove('show'), 4000);
+    fileToast._timer = setTimeout(() => t.classList.remove('show'), ms);
 }
 
 const _readyFiles = [];
+const _readyFileDone = new Map();   // File -> deliverFile's resolve, settled when the file is shared or dismissed
+function settleReadyFile(f, saved) {
+    const done = _readyFileDone.get(f);
+    if (done) { _readyFileDone.delete(f); done(saved); }
+}
 
 // Both plugins ship together (iOS build 21+ and every Android build); an older binary has
 // neither, so absence — not the platform — is what selects the Web Share fallback below.
@@ -2195,29 +2120,28 @@ function endFileBatch() {
     if (!_fileBatchDepth) shareCapFiles();
 }
 
-// One sheet per batch. Resolve = delivered; a rejection naming cancel is the user backing
-// out (silent); anything else is a real failure and says so — never an anchor fallback,
-// which would save nothing inside the app. The sheet has copied the bytes by the time it
-// settles, so the cache copies go either way.
+// One sheet per batch. A cancel rejection is silent; any other failure reports, never an anchor fallback
+// (saves nothing in-app). The sheet has copied the bytes once settled, so the cache copies go either way.
 async function shareCapFiles() {
     const P = capFilePlugins();
     if (_capSharing || !P || !_capQueue.length) return;
     _capSharing = true;
     const batch = _capQueue.splice(0, _capQueue.length);
     const written = [];
-    let err = null;
+    let err = null, shared = false;
     try {
         for (const f of batch) {
             const path = 'xreg_exports/' + f.name;
             const res = await P.Filesystem.writeFile({ path: path, data: await blobToBase64(f.blob),
                                                        directory: 'CACHE', recursive: true });
-            if (res && res.uri) written.push({ path: path, uri: res.uri, name: f.name });
+            if (res && res.uri) written.push({ path: path, uri: res.uri, name: f.name, entry: f });
         }
     } catch (e) { err = e; }
     if (written.length) {
         try {
             await P.Share.share({ files: written.map(w => w.uri),
                                   title: written.length === 1 ? written[0].name : written.length + ' files' });
+            shared = true;
             fileToast(written.length === 1 ? 'Saved: ' + written[0].name : 'Saved ' + written.length + ' files');
         } catch (e) {
             const m = String((e && (e.message || e.errorMessage)) || e);
@@ -2229,16 +2153,20 @@ async function shareCapFiles() {
     } else {
         fileToast('Save failed: ' + ((err && err.message) || err || 'nothing written'));
     }
+    for (const f of batch) f.done(shared && written.some(w => w.entry === f));
     _capSharing = false;
     if (!_fileBatchDepth && _capQueue.length) shareCapFiles();
 }
 
+// Resolves true once the file is saved, false on a cancelled or failed share sheet or a dismissed ready bar. An anchor
+// download reports nothing back, so that path resolves true at the click.
 function deliverFile(name, data, mime) {
     const blob = (data instanceof Blob) ? data : new Blob([data], { type: mime || 'application/octet-stream' });
     if (capFilePlugins()) {
-        _capQueue.push({ name: name.replace(/[\\/:*?"<>|]/g, '-'), blob: blob });   // the name becomes a real cache path
-        if (!_fileBatchDepth) shareCapFiles();
-        return;
+        return new Promise(resolve => {
+            _capQueue.push({ name: name.replace(/[\\/:*?"<>|]/g, '-'), blob: blob, done: resolve });   // the name becomes a real cache path
+            if (!_fileBatchDepth) shareCapFiles();
+        });
     }
     // iOS Safari, or an app binary predating the plugins — the ready bar is the only path
     // that saves anything there. Desktop Safari on a Mac is deliberately not sniffed for:
@@ -2247,7 +2175,10 @@ function deliverFile(name, data, mime) {
         navigator.canShare && typeof File === 'function') {
         try {
             const f = new File([blob], name, { type: blob.type || 'application/octet-stream' });
-            if (navigator.canShare({ files: [f] })) { _readyFiles.push(f); renderFileReadyBar(); return; }
+            if (navigator.canShare({ files: [f] })) {
+                _readyFiles.push(f); renderFileReadyBar();
+                return new Promise(resolve => _readyFileDone.set(f, resolve));
+            }
         } catch (e) { /* fall through to anchor */ }
     }
     const a = document.createElement('a');
@@ -2257,6 +2188,7 @@ function deliverFile(name, data, mime) {
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
     fileToast('Saved to Downloads: ' + name);
+    return Promise.resolve(true);
 }
 
 function renderFileReadyBar() {
@@ -2275,6 +2207,7 @@ function renderFileReadyBar() {
     bar.style.display = 'flex';
 }
 function dismissReadyFiles() {
+    for (const f of _readyFiles) settleReadyFile(f, false);
     _readyFiles.length = 0;
     const bar = document.getElementById('file-ready-bar');
     if (bar) bar.style.display = 'none';
@@ -2286,7 +2219,7 @@ async function shareReadyFiles() {
         await navigator.share({ files: files });
         // Resolves only after the user completes the sheet — the real confirmation.
         // Remove just what was shared: a batch (Download Logs) may still be adding files.
-        for (const f of files) { const i = _readyFiles.indexOf(f); if (i >= 0) _readyFiles.splice(i, 1); }
+        for (const f of files) { const i = _readyFiles.indexOf(f); if (i >= 0) _readyFiles.splice(i, 1); settleReadyFile(f, true); }
         if (_readyFiles.length) renderFileReadyBar(); else dismissReadyFiles();
         fileToast(files.length === 1 ? 'Saved: ' + files[0].name : 'Saved ' + files.length + ' files');
     } catch (e) {
@@ -2295,10 +2228,7 @@ async function shareReadyFiles() {
     }
 }
 
-// Fetch a CSV endpoint and save it as a dated, human-named file
-// (e.g. "Alternator Health Data 2026-06-05 12-47-00.csv") rather than rendering it inline. The
-// saved file round-trips straight back through the matching Load CSV button. Shared by both the
-// alternator-health and boat-performance download buttons.
+// Saves as a dated, human-named file that round-trips back through the matching Load CSV button.
 function downloadCsv(url, baseName){
   return fetchWithTimeout(buildURL(url),{},10000).then(r=>r.text()).then(txt=>{
     if(!txt || txt.trim().length < 8){ xAlert('No '+baseName+' to download yet.'); return; }
@@ -2308,10 +2238,8 @@ function downloadCsv(url, baseName){
   }).catch(e=>xAlert('Download failed: '+(e&&e.message?e.message:e)));
 }
 
-// The Resonance & Ripple Map button pulls THREE distinct datasets, not one: the fast ESP32 tone/broadband
-// map (famatrix), the filtered INA228+ADS1115 pk-pk per RPM bin that the commissioning ripple check reads
-// (filtripple), and the commit-forensics ring (ripforensic). filtripple/ripforensic are supplementary —
-// download them silently and skip (no alert) if empty, so an un-swept device still gets the main map.
+// Three datasets: famatrix (main map), filtripple (INA228+ADS1115 pk-pk per RPM bin, read by the commissioning
+// ripple check) and ripforensic. The last two are skipped silently when empty.
 function downloadRippleBundle(){
   beginFileBatch();   // three independent fetches, one share sheet
   const jobs=[downloadCsv('/famatrix.csv','Resonance and Ripple Map')];
@@ -2327,37 +2255,77 @@ function downloadRippleBundle(){
 }
 
 // ── Configuration Backup & Sharing ──────────────────────────────────────────
-// Export the whole config (/exportConfig), load one back (/importConfig, reboots),
-// and submit the current config to the cloud library for review (submit-config).
-// Every path carries the FULL config, hardware/calibration keys included; the import
-// diff checkboxes are the only place anything gets held back.
+// Export (/exportConfig), import (/importConfig, reboots), submit to the cloud library (submit-config).
+// Every path carries the FULL config; the import diff checkboxes are the only place anything is held back.
 function exportConfigDownload(){
   if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   fetchWithTimeout(buildURL('/exportConfig'),{},10000)
     .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
-    .then(txt=>{
+    .then(async txt=>{
+      // The equipment records (firmware /exportRecords) ride in the same file as a "records" section.
+      let out=txt, recErr='';
+      try{
+        const rr=await fetchWithTimeout(buildURL('/exportRecords'),{},60000);
+        if(!rr.ok) throw new Error('HTTP '+rr.status);
+        const rec=await rr.json();
+        const cfg=JSON.parse(txt);
+        if(rec&&rec.records) cfg.records=rec.records;
+        out=JSON.stringify(cfg);
+      }catch(e){ recErr=(e&&e.message)?e.message:String(e); }
       const d=new Date(), p=n=>String(n).padStart(2,'0');
       const stamp=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+'-'+p(d.getMinutes())+'-'+p(d.getSeconds());
-      deliverFile('regulator-config '+stamp+'.json', txt, 'application/json');
+      deliverFile('regulator-config '+stamp+'.json', out, 'application/json');
+      if(recErr) xAlert('The settings were saved, but the equipment records (alternator and battery history, performance curves, lifetime totals) could not be read ('+recErr+'), so the file does not include them.','Records not saved');
     }).catch(e=>xAlert('Export failed: '+(e&&e.message?e.message:e)));
 }
-// Pre-apply diff preview. Fetches this regulator's current config and shows current → new
-// for every key the incoming blob would change, each with a checkbox (all checked by
-// default). Apply POSTs a REBUILT blob holding only the checked keys — unchecked rows and
-// already-matching keys are left out entirely. Resolves with the filtered body text to
-// POST, or null on cancel. Nothing is written until the user approves. Hardware and
-// calibration keys are ordinary rows here — uncheck them to keep this device's own.
-let _cfgDiffResolve=null,_cfgDiffIncoming=null;
+// Pre-apply diff preview: one checkbox row per key the file would change. Resolves with a REBUILT blob of only
+// the checked keys, or null on cancel. Nothing is written until the user approves.
+let _cfgDiffResolve=null,_cfgDiffIncoming=null,_cfgDiffCur={},_cfgBasisKeys=[],_cfgDiffRecordsBody=null;
+// Equipment records (firmware REC_GROUPS): one row each, carried byte for byte.
+const _CFG_REC_LABELS={altHealth:'Alternator health record',boatPerf:'Boat performance curves',
+  battHealth:'Battery health history (internal resistance and capacity)',solarLedger:'Solar ledger',
+  zeroFitHistory:'Current-sensor zero-drift history',resonanceMap:'Resonance map',
+  damperRecord:'Oscillation damper episode record',lifetime:'Lifetime totals and records'};
+function _cfgRecSummary(g){
+  const b=g?Number(g.bytes)||0:0, n=g?Number(g.items)||0:0;
+  if(!b&&!n) return '(none)';
+  return b>0?(Math.max(1,Math.round(b/1024))+' KB'):(n+' values');
+}
 const _CFG_TABLE_LABELS={rpmPoints:'RPM Breakpoints',capTable:'Current Cap Table — Normal (A)',
   capPowerTable:'Power Cap Table — Normal (W)',capTableLo:'Current Cap Table — Low (A)',
-  capPowerTableLo:'Power Cap Table — Low (W)',minDutyTable:'Tachometer Keep-Alive Floors (%)'};
+  capPowerTableLo:'Power Cap Table — Low (W)',minDutyTable:'Tachometer Keep-Alive Floors (%)',
+  overheatCount:'Overheat history per engine speed',ripTab:'Ripple map per engine speed (Disturbances step)',
+  huntPockets:'Learned oscillation speed ranges',zeroFit:'Current-sensor zero-drift fit',
+  fuelRPM:'Fuel curve engine speeds (RPM)',fuelGPH:'Fuel curve burn rates (gal/h)'};
+// Applied with the row they belong to and never shown as rows: the Keep-Alive column goes with the learner's
+// state behind it (the firmware installs it as the source regulator holds it), the overheat counts with their times.
+const _CFG_TABLE_RIDERS={minDutyTable:['kneeKnee','kneeFitA','kneeFloor','kneeFrozen'],
+  overheatCount:['lastOverheat','cumulativeTime','totalEvents','totalOverheats','totalSafeMs']};
+const _CFG_TABLE_RIDER_KEYS=new Set(Object.values(_CFG_TABLE_RIDERS).flat());
+const _CFG_CONFIG_RIDERS={imu_zero:['imu_mnt_state'],imu_mount_orientation:['imu_mnt_state']};   // the install verdict judged on that capture in that orientation
+const _CFG_CONFIG_RIDER_KEYS=new Set(Object.values(_CFG_CONFIG_RIDERS).flat());
+// The commissioning status is one row: these keys plus the Keep-Alive backups of a wizard run in flight. The
+// firmware then decides each step from what is in force after the import (applyImportCommissioning).
+const _CFG_CX_KEYS=['commissionState','commissionPhase','commissionDoneMask','commissionManualMask','CommissionEpoch',
+  'commissionAgeAck','commissionChangeAck','commissionSnap','commissionStepSnap','commissionPreRun','cvStressLast'];
+const _CFG_CX_TABLES=['bk_minDuty','bk_kneeFlr','bk_kneeKn','bk_kneeFrz','bk_kneeFitA'];
+const _CFG_CX_SET=new Set(_CFG_CX_KEYS),_CFG_CX_TSET=new Set(_CFG_CX_TABLES);
+// A library submission leaves these out: a library entry is public, and they hold the boat's position.
+const _CFG_GPS_KEYS=['gpsManualActive','LatitudeManual','LongitudeManual','gpsLastFixLat','gpsLastFixLon'];
+function _cfgCxSummary(c){
+  if(!c||c.commissionDoneMask===undefined) return '(not set)';
+  const st=parseInt(c.commissionState,10)||0, m=parseInt(c.commissionDoneMask,10)||0, h=parseInt(c.commissionManualMask,10)||0;
+  let n=0,nh=0; for(let i=0;i<10;i++){ if(m&(1<<i)){ n++; if(h&(1<<i)) nh++; } }
+  return (st===2?'Commissioned':st===1?'In progress':'Not commissioned')+', '+n+' of 10 steps done'+(nh?' ('+nh+' marked by hand)':'');
+}
 // Field Resistance and the alternator temperature recorded with it are one measurement: the firmware import takes
 // both or neither, so their rows tick together, and a file carrying only one of them cannot apply it.
 const _CFG_PAIR={FieldResistance:'FieldResTrefC',FieldResTrefC:'FieldResistance'};
-// The field-side values fieldWindApplied describes (firmware FIELD_SIDE_KNOBS, plus the current-loop gains a winding
-// rescale can hold). When the file's fieldWindApplied differs from this regulator's, the file's values are on another
-// winding's scale: fieldWindApplied goes with any of them, the ones that already match here go too, and the firmware
-// converts the ones left out (fieldSideConvertUnwritten), so a partial pick still lands on one scale.
+// The fuel curve's two columns are one curve: the firmware writes both or neither.
+const _CFG_TABLE_PAIR={fuelRPM:'fuelGPH',fuelGPH:'fuelRPM'};
+// Field-side values fieldWindApplied describes (firmware FIELD_SIDE_KNOBS + current-loop gains). When the file's
+// fieldWindApplied differs from this regulator's, it goes with any of them, matching ones go too, and the firmware
+// converts the rest (fieldSideConvertUnwritten), so a partial pick lands on one scale.
 const _CFG_FIELD_SIDE=new Set(['MinDuty','DutyRampRate','DutySlowRampRate','LimpDutyPct','HuntTrigPct','kneeMarginPct','kneeStepPct',
   'kneeMaxFloorPct','kneeDutyTolPct','altDutyLineRms','altDutySlewMax','altMinDuty','SystemIDStepAmplitude','PidKp','PidKi','PidKd']);
 let _cfgDiffFieldScale=false;   // this preview's file has fieldWindApplied on another winding than this regulator
@@ -2370,9 +2338,20 @@ function cfgDiffFwaToggle(cb){
   if(cb.checked) return;
   document.querySelectorAll('#cfgdiff-body .cfgdiff-cb[data-fside]').forEach(c=>{ c.checked=false; });
 }
-const _CFG_KEY_LABELS={fieldWindApplied:'Field winding the field-duty settings are scaled for (V)',FieldResTrefC:'Alternator temperature recorded with Field Resistance (°C)',FieldResDefault:'Field Resistance test skipped, 2 Ω used (1 yes, 12 V with no shunt only)',ShuntLead:'Shunt location (1 negative lead, 2 positive lead)'};
+const _CFG_KEY_LABELS={fieldWindApplied:'Field winding the field-duty settings are scaled for (V)',FieldResTrefC:'Alternator temperature recorded with Field Resistance (°C)',FieldResDefault:'Field Resistance test skipped, 2 Ω used (1 yes, 12 V with no shunt only)',ShuntLead:'Shunt location (1 negative lead, 2 positive lead)',
+  owAddrAlt:'Alternator temperature probe ID (matches only the same physical probe)',owAddrBatt:'Battery temperature probe ID (matches only the same physical probe)',
+  owAddrExtra:'Extra temperature probe ID (matches only the same physical probe)',pairList:'Regulators paired on this boat (this regulator\'s own entry is left out)',
+  vesselSaved:'Vessel Info form completed (1 = yes)'};
+// Display only: the pair list separates records with control characters, the long tables are cut short, and an
+// empty value (a map with nothing learned) reads (none).
+function _cfgShow(k,v){
+  let t=String(v);
+  if(t==='') return '(none)';
+  if(k==='pairList') t=t.replace(/\x1e/g,' · ').replace(/\x1f/g,' ');
+  return t.length>120?t.slice(0,117)+'…':t;
+}
 function cfgDiffPairToggle(cb){
-  document.querySelectorAll('#cfgdiff-body .cfgdiff-cb[data-pair]:not(:disabled)').forEach(c=>{ c.checked=cb.checked; });
+  document.querySelectorAll('#cfgdiff-body .cfgdiff-cb[data-pair]:not(:disabled)').forEach(c=>{ if(c.dataset.pair===cb.dataset.pair) c.checked=cb.checked; });
 }
 function cfgDiffClose(apply){
   const inc=_cfgDiffIncoming;
@@ -2381,9 +2360,34 @@ function cfgDiffClose(apply){
     const picked=cbs.filter(c=>c.checked);
     if(!picked.length){ xAlert('Nothing is checked — check at least one setting, or Cancel.'); return; }   // also a diff of only rows that cannot apply
     const out={};
-    for(const k of Object.keys(inc)) if(k!=='config'&&k!=='tables') out[k]=inc[k];
+    for(const k of Object.keys(inc)) if(k!=='config'&&k!=='tables'&&k!=='records') out[k]=inc[k];   // records post on their own (/importRecords)
     out.config={};
-    picked.filter(c=>c.dataset.kind==='config').forEach(c=>{ out.config[c.dataset.key]=inc.config[c.dataset.key]; });
+    picked.filter(c=>c.dataset.kind==='config').forEach(c=>{
+      const k=c.dataset.key; out.config[k]=inc.config[k];
+      (_CFG_CONFIG_RIDERS[k]||[]).forEach(r=>{ if(r in inc.config) out.config[r]=inc.config[r]; });
+    });
+    // A rider shared by several rows describes all of them, so it goes only when each of them ends up at the file's value.
+    for(const r of _CFG_CONFIG_RIDER_KEYS){
+      if(!(r in out.config)) continue;
+      const parents=Object.keys(_CFG_CONFIG_RIDERS).filter(p=>_CFG_CONFIG_RIDERS[p].includes(r));
+      if(parents.some(p=>(p in inc.config)&&!(p in out.config)&&String(inc.config[p])!==String(_cfgDiffCur[p]))) delete out.config[r];
+    }
+    const cxPicked=picked.some(c=>c.dataset.kind==='cx');
+    const rp=picked.filter(c=>c.dataset.kind==='rec');
+    _cfgDiffRecordsBody=null;
+    if(rp.length&&inc.records){
+      const rec={records:{}};
+      rp.forEach(c=>{ rec.records[c.dataset.key]=inc.records[c.dataset.key]; });
+      _cfgDiffRecordsBody=JSON.stringify(rec);
+    }
+    if(cxPicked) _CFG_CX_KEYS.forEach(k=>{ if(k in inc.config) out.config[k]=inc.config[k]; });
+    // The file's value of every step value, ticked or not, so the firmware can tell which steps the import left
+    // matching the file (and which speed-indexed tables an engine-speed rescale must wipe).
+    out.cx_basis={};
+    for(const k of _cfgBasisKeys){
+      if(k in inc.config) out.cx_basis[k]=inc.config[k];
+      else if(inc.tables&&(k in inc.tables)) out.cx_basis[k]=inc.tables[k];
+    }
     // A partner that already matches this regulator has no row of its own, but the import still needs both.
     for(const k of Object.keys(out.config)){ const p=_CFG_PAIR[k]; if(p && !(p in out.config) && (p in inc.config)) out.config[p]=inc.config[p]; }
     if(_cfgDiffFieldScale){
@@ -2394,7 +2398,12 @@ function cfgDiffClose(apply){
       }
     }
     const tp=picked.filter(c=>c.dataset.kind==='tables');
-    if(tp.length){ out.tables={}; tp.forEach(c=>{ out.tables[c.dataset.key]=inc.tables[c.dataset.key]; }); }
+    if(tp.length){ out.tables={}; tp.forEach(c=>{
+      const k=c.dataset.key; out.tables[k]=inc.tables[k];
+      (_CFG_TABLE_RIDERS[k]||[]).forEach(r=>{ if(r in inc.tables) out.tables[r]=inc.tables[r]; });
+    }); }
+    if(cxPicked&&inc.tables){ _CFG_CX_TABLES.forEach(k=>{ if(k in inc.tables){ out.tables=out.tables||{}; out.tables[k]=inc.tables[k]; } }); }
+    if(out.tables) for(const k of Object.keys(out.tables)){ const p=_CFG_TABLE_PAIR[k]; if(p && !(p in out.tables) && (p in inc.tables)) out.tables[p]=inc.tables[p]; }
     document.getElementById('cfgdiff-modal-overlay').style.display='none';
     const r=_cfgDiffResolve; _cfgDiffResolve=null; _cfgDiffIncoming=null;
     if(r) r(JSON.stringify(out));
@@ -2412,11 +2421,9 @@ function cfgDiffToggleAll(){
   const b=document.getElementById('cfgdiff-toggle-btn');
   if(b) b.textContent=target?'Uncheck All':'Check All';
 }
-function _cfgEsc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-// True only on POSITIVE, FRESH evidence that the field is driving. An import writes one NVS commit
-// per changed key and a commit blocks BOTH cores during sector erase (see the deleted phased-save
-// note in 5_functions.ino), so a big import while charging can stall the control loop. A stale or
-// absent CSV1 frame is not evidence — stay silent rather than cry wolf on a page that just loaded.
+function _cfgEsc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }   // quotes too: file keys land in attributes
+// True only on POSITIVE, FRESH evidence the field is driving: each changed key is one NVS commit, which blocks
+// BOTH cores during sector erase and can stall the control loop. A stale/absent CSV1 frame is not evidence.
 function _cfgFieldIsLive(){
   const m=(typeof g_streamMeta==='object'&&g_streamMeta)?g_streamMeta.csv1:null;
   if(!m||!m.rxWallMs||Date.now()-m.rxWallMs>STREAM_BUDGET_MS.csv1) return false;
@@ -2436,22 +2443,23 @@ async function cfgDiffPreview(blobText, sourceLabel){
   let unchanged=0;
   // Read-only diagnostics/results the firmware exports but never applies on import — hide them
   // from the diff so they can't show as spurious "[object Object]" rows or no-op checkable rows.
-  // vesselSaved is the "form completed" sentinel, not a value — it is tier 3 anyway, so a row would never apply.
-  const CFG_NONSETTING=new Set(['learned_state','commissioning_results','cvComputedKp','cvComputedKi','cvComputedKd','vesselSaved']);
-  // THIS regulator's export-only key list (tier-3 manifest rows + registry skip), served inside
-  // /exportConfig so the firmware manifest stays the single source of truth. Import ignores these
-  // keys, so their diffs render in a separate reference-only section with no checkbox.
+  const CFG_NONSETTING=new Set(['learned_state','commissioning_results','cvComputedKp','cvComputedKi','cvComputedKd']);
+  // This regulator's export-only keys (firmware manifest tier 3, served in /exportConfig). Import ignores
+  // them, so their diffs render reference-only with no checkbox.
   const exportOnly=new Set(Array.isArray(fullJ.export_only)?fullJ.export_only:[]);
+  _cfgBasisKeys=Array.isArray(fullJ.cx_basis_keys)?fullJ.cx_basis_keys:[];
   for(const k of Object.keys(incoming.config).sort()){
-    if(CFG_NONSETTING.has(k)) continue;
+    if(CFG_NONSETTING.has(k)||_CFG_CONFIG_RIDER_KEYS.has(k)) continue;
     const nv=String(incoming.config[k]);
     if(exportOnly.has(k)){
       const cur=(k in curFull)?String(curFull[k]):'(not set)';
       if(cur!==nv) refRows.push({k,cur,nv});
       continue;
     }
+    if(_CFG_CX_SET.has(k)) continue;   // the status row below
+    const ridersDiffer=(_CFG_CONFIG_RIDERS[k]||[]).some(r=>(r in incoming.config)&&String(incoming.config[r])!==String(curFull[r]));
     if(k in curFull){
-      if(String(curFull[k])===nv) unchanged++;
+      if(String(curFull[k])===nv&&!ridersDiffer) unchanged++;
       else changed.push({k,cur:String(curFull[k]),nv});
     } else fresh.push({k,nv});
   }
@@ -2459,14 +2467,38 @@ async function cfgDiffPreview(blobText, sourceLabel){
   const tblChanged=[],tblFresh=[];
   if(incoming.tables && typeof incoming.tables==='object'){
     for(const k of Object.keys(incoming.tables).sort()){
+      if(_CFG_TABLE_RIDER_KEYS.has(k)||_CFG_CX_TSET.has(k)) continue;
       const nv=String(incoming.tables[k]);
+      // A row whose own value matches still differs when anything riding with it does.
+      const ridersDiffer=(_CFG_TABLE_RIDERS[k]||[]).some(r=>(r in incoming.tables)&&String(incoming.tables[r])!==String(curTables[r]));
       if(k in curTables){
-        if(String(curTables[k])===nv) unchanged++;
+        if(String(curTables[k])===nv&&!ridersDiffer) unchanged++;
         else tblChanged.push({k,cur:String(curTables[k]),nv});
       } else tblFresh.push({k,nv});
     }
   }
-  const nChange=changed.length+tblChanged.length, nFresh=fresh.length+tblFresh.length;
+  // Equipment records: compared by content hash against this regulator's own summary.
+  const recRows=[];
+  if(incoming.records&&typeof incoming.records==='object'&&Object.keys(incoming.records).length){
+    let curRec=null;
+    try{
+      const rs=await fetchWithTimeout(buildURL('/exportRecords?summary=1'),{},30000);
+      if(rs.ok) curRec=((await rs.json()).records)||{};
+    }catch(e){ }
+    for(const g of Object.keys(incoming.records)){
+      if(!(g in _CFG_REC_LABELS)) continue;   // a group this firmware does not know
+      const ng=incoming.records[g];
+      if(!curRec){ recRows.push({k:g,cur:'(could not be read)',nv:_cfgRecSummary(ng),off:true}); continue; }   // left unticked: it may hold history
+      const cg=curRec[g];
+      if(cg&&String(cg.hash)===String(ng.hash)) { unchanged++; continue; }
+      recRows.push({k:g,cur:_cfgRecSummary(cg),nv:_cfgRecSummary(ng)});
+    }
+  }
+  // Commissioning status: one row when any part of it differs.
+  const cxIn=incoming.config, cxDiff=cxIn.commissionDoneMask!==undefined&&(
+    _CFG_CX_KEYS.some(k=>(k in cxIn)!==(k in curFull)||((k in cxIn)&&String(cxIn[k])!==String(curFull[k])))
+    ||_CFG_CX_TABLES.some(k=>incoming.tables&&(k in incoming.tables)&&String(incoming.tables[k])!==String(curTables[k])));
+  const nChange=changed.length+tblChanged.length+(cxDiff?1:0)+recRows.length, nFresh=fresh.length+tblFresh.length;
   const sum=document.getElementById('cfgdiff-summary');
   const body=document.getElementById('cfgdiff-body');
   // payload_v 3 blobs carry the voltage as the BatteryVoltage manifest key; older exported
@@ -2486,21 +2518,28 @@ async function cfgDiffPreview(blobText, sourceLabel){
       +'Confirm it matches this alternator\'s field winding, or uncheck FieldWindingV.</span>':'')
     +'<br><span style="color:#fca5a5;">Hardware and calibration settings (sensor/shunt/polarity/offsets) WILL be applied — uncheck them unless the hardware is identical.</span>';
   const row=(kind,k,label,cur,nv)=>{
-    const pair=kind==='config'?_CFG_PAIR[k]:null;
-    const solo=!!pair && !(pair in incoming.config);   // the import refuses it alone
+    const pair=kind==='config'?_CFG_PAIR[k]:kind==='tables'?_CFG_TABLE_PAIR[k]:null;
+    const solo=!!pair && !(pair in (kind==='tables'?(incoming.tables||{}):incoming.config));   // the import refuses it alone
+    const pairGroup=pair?[k,pair].sort()[0]:'';
     const fwa=kind==='config'&&_cfgDiffFieldScale&&k==='fieldWindApplied';
     const fside=kind==='config'&&_cfgDiffFieldScale&&_CFG_FIELD_SIDE.has(k);
     return '<tr>'
     +'<td style="padding:3px 6px 3px 0;"><input type="checkbox" class="cfgdiff-cb" data-kind="'+kind+'" data-key="'+_cfgEsc(k)+'"'
-    +(pair?' data-pair="1" onchange="cfgDiffPairToggle(this)"':'')
+    +(pair?' data-pair="'+_cfgEsc(pairGroup)+'" onchange="cfgDiffPairToggle(this)"':'')
     +(fwa?' data-fwa="1" onchange="cfgDiffFwaToggle(this)"':'')+(fside?' data-fside="1" onchange="cfgDiffFieldSideToggle(this)"':'')
     +(solo?' disabled':' checked')+' style="width:16px; height:16px; margin:0; vertical-align:middle;"></td>'
     +'<td style="padding:3px 8px 3px 0; color:#9cc; word-break:break-all;">'+_cfgEsc(label)
-    +(solo?'<div style="color:#888; word-break:normal;">Not applied: the file has no '+(k==='FieldResistance'?'alternator temperature recorded with it.':'Field Resistance.')+'</div>':'')
+    +(solo?'<div style="color:#888; word-break:normal;">Not applied: the file has no '+(k==='FieldResistance'?'alternator temperature recorded with it.':k==='FieldResTrefC'?'Field Resistance.':'other half of this curve.')+'</div>':'')
     +(fwa?'<div style="color:#888; word-break:normal;">Applied with any field-duty or current-loop gain row. This regulator converts the ones you leave unchecked onto the same scale.</div>':'')+'</td>'
-    +'<td style="padding:3px 8px; color:#888; word-break:break-all;">'+_cfgEsc(cur)+'</td>'
-    +'<td style="padding:3px 0; color:#fff; word-break:break-all;">'+_cfgEsc(nv)+'</td></tr>';
+    +'<td style="padding:3px 8px; color:#888; word-break:break-all;">'+_cfgEsc(_cfgShow(k,cur))+'</td>'
+    +'<td style="padding:3px 0; color:#fff; word-break:break-all;">'+_cfgEsc(_cfgShow(k,nv))+'</td></tr>';
   };
+  const cxRow=()=>'<tr>'
+    +'<td style="padding:3px 6px 3px 0;"><input type="checkbox" class="cfgdiff-cb" data-kind="cx" data-key="commissioning" checked style="width:16px; height:16px; margin:0; vertical-align:middle;"></td>'
+    +'<td style="padding:3px 8px 3px 0; color:#9cc;">Commissioning status'
+    +'<div style="color:#888;">Each step keeps the file\'s status only where its values come from the file too.</div></td>'
+    +'<td style="padding:3px 8px; color:#888;">'+_cfgEsc(_cfgCxSummary(curFull))+'</td>'
+    +'<td style="padding:3px 0; color:#fff;">'+_cfgEsc(_cfgCxSummary(cxIn))+'</td></tr>';
   // Reference-only rows: no checkbox (a checkbox would promise an apply that cannot happen), dimmed.
   const refRow=r=>'<tr>'
     +'<td></td>'
@@ -2513,7 +2552,13 @@ async function cfgDiffPreview(blobText, sourceLabel){
       +changed.map(c=>row('config',c.k,_CFG_KEY_LABELS[c.k]||c.k,c.cur,c.nv)).join('')
       +fresh.map(f=>row('config',f.k,_CFG_KEY_LABELS[f.k]||f.k,'(not set)',f.nv)).join('')
       +tblChanged.map(c=>row('tables',c.k,_CFG_TABLE_LABELS[c.k]||c.k,c.cur,c.nv)).join('')
-      +tblFresh.map(f=>row('tables',f.k,_CFG_TABLE_LABELS[f.k]||f.k,'(not set)',f.nv)).join('')+'</table>';
+      +tblFresh.map(f=>row('tables',f.k,_CFG_TABLE_LABELS[f.k]||f.k,'(not set)',f.nv)).join('')
+      +(cxDiff?cxRow():'')
+      +recRows.map(r=>'<tr>'
+        +'<td style="padding:3px 6px 3px 0;"><input type="checkbox" class="cfgdiff-cb" data-kind="rec" data-key="'+_cfgEsc(r.k)+'"'+(r.off?'':' checked')+' style="width:16px; height:16px; margin:0; vertical-align:middle;"></td>'
+        +'<td style="padding:3px 8px 3px 0; color:#9cc;">'+_cfgEsc(_CFG_REC_LABELS[r.k])+'</td>'
+        +'<td style="padding:3px 8px; color:#888;">'+_cfgEsc(r.cur)+'</td>'
+        +'<td style="padding:3px 0; color:#fff;">'+_cfgEsc(r.nv)+'</td></tr>').join('')+'</table>';
   } else {
     h='<div style="color:#888; font-size:0.9em; padding:8px 0;">No settings would change — this regulator already matches the file.</div>';
   }
@@ -2524,9 +2569,7 @@ async function cfgDiffPreview(blobText, sourceLabel){
       +refRows.map(refRow).join('')+'</table>';
   }
   const hasRows=!!(nChange||nFresh);
-  // Field-on advisory. Above the table so it is read before the Apply button, and advisory only —
-  // the import is legitimate at any time, it just costs the control loop a stutter it does not have
-  // to pay. Suppressed when nothing would be written.
+  // Advisory only (an import is legitimate any time); above the table so it's read before Apply.
   if(hasRows&&_cfgFieldIsLive()){
     h='<div style="color:#f0a500; border:1px solid #6a4a00; background:#241c05; border-radius:4px; padding:8px 10px; margin-bottom:12px; font-size:0.9em; line-height:1.45;">'
       +'Charging is running right now. Applying saves '+(nChange+nFresh)+' setting'+((nChange+nFresh)===1?'':'s')
@@ -2537,16 +2580,32 @@ async function cfgDiffPreview(blobText, sourceLabel){
   document.getElementById('cfgdiff-apply-btn').style.display=hasRows?'':'none';
   const tb=document.getElementById('cfgdiff-toggle-btn');
   if(tb){ tb.style.display=hasRows?'':'none'; tb.textContent='Uncheck All'; }
-  _cfgDiffIncoming=incoming;
+  _cfgDiffIncoming=incoming; _cfgDiffCur=curFull;
   document.getElementById('cfgdiff-modal-overlay').style.display='flex';
   return new Promise(res=>{ _cfgDiffResolve=res; });
 }
-function _cfgPostImport(bodyText){
-  fetchWithTimeout(buildURL('/importConfig'),
-    {method:'POST',body:bodyText},12000)
-    .then(r=>{ if(!r.ok){ return r.text().then(t=>{ throw new Error(t||('HTTP '+r.status)); }); } return r.json(); })
-    .then(res=>xAlert('Applied '+res.applied+' settings. '+(res.reboot?'The regulator is rebooting — reconnect in ~30 s.':'')))
-    .catch(e=>xAlert('Import failed: '+(e&&e.message?e.message:e)));
+// Records first (staged for the next boot; the regulator reboots within 30 s even if nothing follows), then the
+// config import, whose reboot loads both.
+async function _cfgPostImport(bodyText){
+  const recBody=_cfgDiffRecordsBody; _cfgDiffRecordsBody=null;
+  let recDone=false;
+  try{
+    let nRec=0;
+    if(recBody){
+      const rr=await fetchWithTimeout(buildURL('/importRecords?then=config'),{method:'POST',body:recBody},60000);
+      if(!rr.ok){ const t=await rr.text(); throw new Error('equipment records: '+(t||('HTTP '+rr.status))); }
+      nRec=Number((await rr.json()).applied)||0;
+      recDone=true;
+    }
+    const r=await fetchWithTimeout(buildURL('/importConfig'),{method:'POST',body:bodyText},12000);
+    if(!r.ok){ const t=await r.text(); throw new Error(t||('HTTP '+r.status)); }
+    const res=await r.json();
+    xAlert('Applied '+res.applied+' settings'+(recBody?' and '+nRec+' record items':'')+'. '+(res.reboot?'The regulator is rebooting — reconnect in ~30 s.':''));
+  }catch(e){
+    const why=e&&e.message?e.message:e;
+    if(recDone) xAlert('The equipment records were imported, but the settings were not ('+why+'). The regulator restarts within 30 s to load the records. Once it reconnects, import the file again with the record rows unchecked to bring in the settings.','Settings not imported');
+    else xAlert('Import failed: '+why);
+  }
 }
 function importConfigFromFile(){
   if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
@@ -2571,17 +2630,18 @@ async function shareConfigToLibrary(){
     const r=await fetchWithTimeout(buildURL('/exportConfig'),{},10000);
     if(!r.ok) throw new Error('export HTTP '+r.status);
     const config=await r.json();
+    if(config.config){ _CFG_GPS_KEYS.forEach(k=>{ delete config.config[k]; }); delete config.config.pairList; delete config.config.home_port; }   // the pair list names this boat's regulators; home port stays private
+    delete config.source_uid;   // which regulator saved it: means nothing to another boat
     const resp=await fetch(`${SUPABASE_URL}/functions/v1/submit-config`,{
       method:'POST', headers:cloudHeaders(), body:JSON.stringify({token, display_name:name, config})
     });
     const data=await resp.json();
-    if(resp.ok) xAlert('Submitted to the library for review (id '+data.id+'). It appears once approved.');
+    if(resp.ok) xAlert('Shared to the library as id '+data.id+'. It is listed for everyone now, marked pending review.');
     else xAlert('Submit failed: '+(data.error||('HTTP '+resp.status)));
   }catch(e){ xAlert('Submit failed: '+(e&&e.message?e.message:e)); }
 }
 
-// Import a health curve from a file in Downloads (BEFRONT1). Opens the native picker;
-// altUploadCsvFile() reads it and POSTs the raw text to /altUploadFront. Mirrors perfLoadCsv.
+// Import a BEFRONT1 health curve file. Mirrors perfLoadCsv.
 function altLoadCsv(){
   if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   const inp=document.getElementById('alt-load-file'); if(inp){ inp.value=''; inp.click(); }   // freeze/learn is asked after the file is chosen
@@ -2595,7 +2655,8 @@ async function altUploadCsvFile(inp){
   rd.onload=function(){
     const txt=String(rd.result||'');
     if(txt.indexOf('BEFRONT1')<0){ xAlert('That file is not an alternator health (BEFRONT1) CSV.'); inp.value=''; return; }
-    fetchWithTimeout(buildURL('/altUploadFront?fixed='+(freeze?1:0)),{method:'POST',body:txt},10000)
+    // 30 s: upload, parse and the flash save of a large curve all finish inside this one request.
+    fetchWithTimeout(buildURL('/altUploadFront?fixed='+(freeze?1:0)),{method:'POST',body:altFrontBlockOnly(txt)},30000)
       .then(r=>{ if(r.ok){ xAlert('Uploaded reference loaded — '+(freeze?'learning paused':'still learning My History')+'.'); if(typeof fetchAltTrend==='function') fetchAltTrend(); }
                  else { r.text().then(t=>xAlert('Import failed: '+(t||('HTTP '+r.status)))).catch(()=>xAlert('Import failed: HTTP '+r.status)); } })
       .catch(e=>xAlert('Import failed: '+(e&&e.message?e.message:e)));
@@ -2604,10 +2665,20 @@ async function altUploadCsvFile(inp){
   rd.onerror=function(){ xAlert('Could not read that file.'); inp.value=''; };
   rd.readAsText(f);
 }
+// The first BEFRONT1 header plus the rows after it, up to the first line that is not a row (at least five numbers,
+// the firmware's sscanf test in altIngestFrontCsvInto). The import reads nothing else, and the rest of a Health
+// Dataset (debug dump, session rings) would push the post past the regulator's body limit.
+function altFrontBlockOnly(txt){
+  const num = '(?:[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?|[-+]?(?:nan|inf(?:inity)?))';
+  const row = new RegExp('^\\s*' + num + '(?:,\\s*' + num + '){4}', 'i');
+  const lines = txt.slice(txt.indexOf('BEFRONT1')).split(/\r?\n/);
+  let n = 1;
+  while(n < lines.length && row.test(lines[n])) n++;
+  return lines.slice(0, n).join('\n') + '\n';
+}
 
 function fetchAltTrend() {
-  // The firmware decimates WITHIN the requested window (?hours=N), so the short shortcuts keep
-  // full resolution instead of being starved by a single global 200-point stride. All = no param.
+  // Firmware decimates WITHIN ?hours=N, so short windows keep full resolution. All = no param.
   const win = +altTrendWindow;
   const url = '/alttrend.csv' + (win > 0 ? ('?hours=' + win) : '');
   fetch(buildURL(url)).then(r=>r.text()).then(txt=>{
@@ -2620,19 +2691,20 @@ function fetchAltTrend() {
 
 function queueAltTrendUpdate() {
   const now = Date.now();
-  if (now - _altTrendLastFetch > 15000) { _altTrendLastFetch = now; fetchAltTrend(); }
+  // Same on-screen rule as perfFetchIfShown: hidden zeroes the stamp, so showing it fetches at once.
+  if (!panelOnScreen('alt-trend')) _altTrendLastFetch = 0;
+  else if (now - _altTrendLastFetch > 15000) { _altTrendLastFetch = now; fetchAltTrend(); }
   if (_altTrendPending) return;
   _altTrendPending = true;
   requestAnimationFrame(()=>{ _altTrendPending = false; drawAltTrend(); });
 }
 
-// Engine-hours X window shortcut (10 h / 100 h / All). Each window re-fetches with ?hours=N so the
-// firmware decimates inside the requested span; persisted so the choice survives a reload.
+// Engine-hours X window (10 h / 100 h / All), persisted across reloads.
 function setAltTrendWindow(w) {
   altTrendWindow = String(w);
   try { localStorage.setItem('altTrendWin', altTrendWindow); } catch(e){}
   updateAltTrendWinButtons();
-  _altTrendLastFetch = Date.now(); fetchAltTrend();   // immediate refetch with the new window
+  _altTrendLastFetch = Date.now(); fetchAltTrend();
 }
 function updateAltTrendWinButtons() {
   document.querySelectorAll('#altTrendWinButtons button').forEach(b => {
@@ -2640,9 +2712,7 @@ function updateAltTrendWinButtons() {
   });
 }
 
-// Hi-DPI canvas: size the backing store to the on-screen CSS box × devicePixelRatio, then
-// map a fixed logical coordinate space (W×H) onto it. Kills the blurry/greyed "retina" look
-// while letting every draw fn keep its existing W/H-based layout math unchanged.
+// Hi-DPI canvas: backing store = CSS box × dpr, mapped onto a fixed logical W×H so draw code keeps its W/H math.
 function hidpiCtx(cv, W, H) {
   const dpr = window.devicePixelRatio || 1;
   const dispW = cv.clientWidth || W, dispH = cv.clientHeight || H;
@@ -2653,16 +2723,11 @@ function hidpiCtx(cv, W, H) {
   return ctx;
 }
 
-// Performance-%-vs-engine-hours trend — uPlot, same family as the session plot above and the Plots
-// tab (so it inherits the click-to-edit Y limits, the "auto" checkbox, and pixel-correct rendering).
-// Bold line = worst operating region (early warning); faint line = overall average. HISTORICAL ONLY —
-// no live "now" dot (the "this session" plot above owns live %). Under 3 committed points → synthetic
-// demo curve under a red diagonal demo watermark (the trend is built on-device from engine-hours — NOT
-// from the cloud; don't reintroduce a cloud message).
+// Performance-%-vs-engine-hours trend. Bold = worst operating region, faint = overall average; historical only
+// (the session plot owns live %). Built on-device from engine-hours, NOT the cloud; don't reintroduce a cloud message.
 
-// X domain follows the active window: a window shows the last N engine-hours (full width even before it
-// fills); "All" floors the span at 4 h so the first points sit on a stable axis instead of rescaling
-// every time a new hourly point commits.
+// A window shows the last N engine-hours at full width; "All" floors the span at 4 h so early points sit on a
+// stable axis instead of rescaling at every hourly commit.
 function altTrendXRange() {
   let maxE = 0; altTrend.forEach(p=>{ if(p.eng>maxE)maxE=p.eng; });
   const win = +altTrendWindow;
@@ -2683,12 +2748,9 @@ function altTrendYRange() {
   return [lo, hi];
 }
 
-// Build the uPlot data triple [xs, overall, worst] from the committed points. uPlot breaks a line only
-// at null y, so a REAL engine-hour gap (engine on, alternator off) is rendered by inserting a synthetic
-// null sample between the two points straddling the gap — markers skip nulls too, so no phantom dot.
-// Gap threshold = 3x the median point spacing (floor 3 h) so normal decimated spacing isn't broken.
-// Synthetic curve shown until 3 hourly points have committed, so a fresh device sees a populated chart
-// (labelled with the red diagonal demo watermark in the draw hook) instead of a one-dot frame.
+// uPlot breaks a line only at null y, so a REAL engine-hour gap (engine on, alternator off) gets a synthetic null
+// sample between its two points. Gap = 3x median spacing (floor 3 h) so normal decimation isn't broken.
+// ALT_TREND_DEMO shows (watermarked) until 3 hourly points commit, instead of a one-dot frame.
 const ALT_TREND_DEMO = [
   {eng:0,overall:95,worst:85},{eng:0.5,overall:94,worst:83},{eng:1,overall:96,worst:87},
   {eng:1.5,overall:93,worst:82},{eng:2,overall:95,worst:86},{eng:2.5,overall:94,worst:84},
@@ -2763,8 +2825,7 @@ function buildAltTrendPlot() {
     if (altTrendPlot) altTrendPlot.setSize({ width: plotFitWidth(el, 320), height: 240 });
   }).observe(el);
 
-  // "auto" checkbox (top-right) — same convention as the session plot. Checked = auto-fit; unchecked
-  // pins to whatever is currently shown.
+  // "auto" checkbox (top-right): checked = auto-fit; unchecked pins to what is currently shown.
   const exAs = el.querySelector('.autoscale-ctrl'); if (exAs) exAs.remove();
   const asDiv = document.createElement('div');
   asDiv.className = 'autoscale-ctrl';
@@ -2790,18 +2851,15 @@ function drawAltTrend() {
   altTrendPlot.setData(altTrendData());   // setData re-runs the range fns (window + Y auto/manual)
 }
 
-// ── Charging-system health session plot: a point every 5 s while the session steady gate holds,
-//    since this dashboard session began, uPlot-styled like the Plots tab. Marked by confidence state:
-//    MEASURED = filled green dot, ESTIMATED = filled blue dot; a point that is also a FULL steady run
-//    gets an orange ring overlay. Below the gate / LEARNING / NO-REFERENCE periods carry NO value —
-//    they render as gaps with a light background tint (the suppressed number is never plotted). ──
+// ── Charging-system health session plot: a point every 5 s while the session steady gate holds. MEASURED = green
+//    dot, ESTIMATED = blue; a FULL steady run adds an orange ring. Below-gate / LEARNING / NO-REFERENCE periods
+//    carry NO value: gaps with a light tint (the suppressed number is never plotted). ──
 let altSessPlot = null;
 const ALT_SESS_MAX = 28800;   // dots are 5 s-cadenced (altSessionPush), so ~40 h before the oldest roll off
 const ALT_SESS_DT_S = 5;      // must match ALT_SESS_DT_MS in 7_functions.ino
 const ALT_SESS_WINDOW_S = 1800;  // X axis shows a fixed last-30-minutes window, labelled "minutes ago"
 let altSessT = [], altSessMeas = [], altSessEst = [], altSessGap = [], altSessRing = [];
-// Per-dot condition snapshot, parallel to the arrays above, so a click can show the operating
-// point behind a dot. Only the fields already arriving in altLive each tick — no firmware change.
+// Per-dot condition snapshot (parallel to the arrays above) so a click can show the operating point.
 let altSessInfo = [];
 let altSessHoverIdx = -1;   // dot index under the cursor (highlight ring), -1 = none
 // Repeated-click cycling so overlapping dots in a cluster are all reachable: a click near the same
@@ -2866,9 +2924,7 @@ function buildAltSessPlot(){
           runStart = null;
         }
       }
-      // Measured = filled green dot; Estimated = filled blue dot (spec §3). A point that was also a
-      // FULL steady run (altSessRing[i]) gets an orange ring drawn around it — an overlay that does not
-      // change the dot color. Loop once: fill the right-colored dot, then ring full-steady points.
+      // Measured = green dot, Estimated = blue (spec §3); a FULL steady run (altSessRing) adds an orange ring.
       for (let i = 0; i < altSessT.length; i++) {
         const meas = altSessMeas[i], est = altSessEst[i];
         if (meas == null && est == null) continue;
@@ -2900,11 +2956,8 @@ function buildAltSessPlot(){
     if (altSessPlot) altSessPlot.setSize({ width: plotFitWidth(el, 320), height: 200 });
   }).observe(el);
 
-  // Click-to-inspect: find plotted dots near the pointer (same valToPos mapping the draw hook uses)
-  // and render the operating point behind one into the panel below the plot. valToPos(...,false) is
-  // CSS px relative to the `over` element (zero offset — NOT the whole canvas), so it compares
-  // directly against the cursor position in over-element px; no bbox-inset correction.
-  // Returns dot indices within `radius`, nearest first, plus the cursor position in over-element px.
+  // Click-to-inspect. valToPos(...,false) is CSS px relative to the `over` element (NOT the whole canvas), so it
+  // compares directly against the cursor in over-element px; no bbox-inset correction. Nearest first.
   const altSessPick = (e, radius) => {
     const r = altSessPlot.over.getBoundingClientRect();
     const cx = e.clientX - r.left, cy = e.clientY - r.top;
@@ -2944,10 +2997,7 @@ function buildAltSessPlot(){
     renderAltSessPoint(list[altSessCycle.idx]);
   });
 
-  // Auto checkbox (top-right) — same convention as the other plots. No lock button:
-  // this is a slow point-per-update plot, so unchecking (which pins to what's shown)
-  // already covers the "stop it moving" case. Checked = auto-fit (null manual range);
-  // unchecked = pin to whatever is currently shown.
+  // No lock button: this plot is slow, so unchecking auto (pins to what's shown) covers "stop it moving".
   el.style.position = 'relative';
 
   // On-plot legend (top-left, inside the plot area — mirrors the auto checkbox top-right).
@@ -3010,8 +3060,7 @@ function altSessionPush(){
   altSessGap.push(graded ? 0 : 1);
   altSessRing.push(graded && altLive.steady>=1 ? 1 : 0);   // full steady run → orange ring overlay
   altSessInfo.push(graded ? {
-    // amps = the graded boxcar average when the firmware provides it (gAmps, the % numerator) so
-    // dot amps ÷ pred reproduces pct; older firmware falls back to the fast live amps.
+    // gAmps = graded boxcar average (the % numerator) so dot amps ÷ pred reproduces pct; else fast live amps.
     rpm: altLive.rpm, amps: (altLive.gAmps > 0 ? altLive.gAmps : altLive.amps), pred: altLive.pred, pct: altLive.pct,
     tempF: window._lastAltTempF, fieldPct: window._lastFieldPct, measAmps: window._lastMeasAmps,
     vbus: window._lastBatteryV,
@@ -3024,10 +3073,8 @@ function altSessionPush(){
 }
 
 // ── Session-series recovery ────────────────────────────────────────────────────────────────────
-// The dots above are collected live, so a page opened mid-session starts blank and a WiFi drop
-// leaves a hole the stream never backfills. The device keeps the same 5 s series in PSRAM and
-// serves it at /altsess.csv; pull it on first connect and after any feed gap, then keep appending
-// live on top. Firmware without the route returns 404 -> the old browser-only behaviour.
+// Live dots start blank mid-session and a WiFi drop leaves holes; the device keeps the same 5 s series in
+// PSRAM at /altsess.csv. Pull it on first connect and after any feed gap. 404 = firmware without the route.
 let altSessHistState = 0;      // 0 = never fetched (or retrying), 1 = in flight, 2 = have it / gave up
 let altSessHistTries = 0;      // failed attempts — a transient error right at page open must not be terminal
 let altSessHistNextTryMs = 0;  // backoff gate for state-0 retries
@@ -3037,16 +3084,15 @@ function altSessMaybeRecover(){
     if (Date.now() >= altSessHistNextTryMs) altSessFetchHistory();
     return;
   }
-  // Refetch whenever OUR newest dot is stale. Dots are pushed every ALT_SESS_DT_S for as long as
-  // events arrive, so this measures the actual hole in the series rather than guessing from event
-  // timing — any interruption that cost us a dot trips it, and filling the hole clears it.
+  // Refetch whenever OUR newest dot is stale: dots push every ALT_SESS_DT_S while events arrive, so this
+  // measures the actual hole rather than guessing from event timing.
   const newest = altSessT.length ? altSessT[altSessT.length - 1] * 1000 : 0;
   if (newest && (Date.now() - newest) > ALT_SESS_DT_S * 2500) altSessFetchHistory();
 }
 function altSessFetchHistory(){
   altSessHistState = 1;
   fetch(buildURL('/altsess.csv')).then(r => {
-    if (r.status === 404) { altSessHistState = 2; return null; }   // firmware without the route — old behaviour, never retry
+    if (r.status === 404) { altSessHistState = 2; return null; }   // firmware without the route: never retry
     if (!r.ok) throw new Error('http ' + r.status);
     return r.text();
   }).then(txt => {
@@ -3066,10 +3112,8 @@ function altSessFetchHistory(){
     altSessHistState = 2;
     altSessHistTries = 0;
   }).catch(() => {
-    // Transient failure (device busy, hiccup right at page open): back to state 0 with a growing
-    // backoff so the next AltLive events retry — a single terminal failure here would lose the
-    // pre-open history for the whole session, since live pushes keep the newest dot fresh and the
-    // state-2 staleness trigger then never fires.
+    // Retry with growing backoff: one terminal failure would lose the pre-open history for the session, since
+    // live pushes keep the newest dot fresh and the staleness trigger never fires.
     altSessHistTries++;
     altSessHistState = (altSessHistTries < 5) ? 0 : 2;
     altSessHistNextTryMs = Date.now() + 5000 * altSessHistTries;
@@ -3157,10 +3201,8 @@ function renderAltSessPoint(i){
     + '</span>';
 }
 
-// ── Boat performance (Phase 3): schema-driven live + settings, sailing polar plot ──
-// PILOT of the self-describing telemetry pattern: fetch /perfschema ONCE and zip the
-// returned field names against the PerfLive / PerfSettings payloads — no hardcoded array,
-// so this can't fall out of sync with the firmware tables.
+// ── Boat performance: schema-driven live + settings, sailing polar plot ──
+// Field names come from /perfschema (fetched once) zipped against PerfLive / PerfSettings.
 let perfSchema = null;
 let perfLive = { valid:false, pct:0, spd:0, wa:0, ws:0, best:0, pitchStd:0, src:0,
                  coverage:0, ptCount:0, source:0, paused:0, sim:0, steady:0, settleSec:-1, state:3 };
@@ -3272,9 +3314,8 @@ function renderPerf(){
   // Center-hub live speed — the dominant readable number on the plot (both views: STW or SOG per perfSpeedSrc)
   setTxt('perf-speed-num', (L.valid && typeof L.spd === 'number') ? L.spd.toFixed(1) : '—');
   setTxt('perf-speed-unit', (perfSettings.perfSpeedSrc >= 1.5) ? 'KT · SOG' : 'KT · STW');
-  // % vs best-ever (NO clamp) — shown only in the graded confidence states (MEASURED/ESTIMATED);
-  // LEARNING/NO-REFERENCE deliberately show no number, just the state label. Same engine + labels
-  // as the charging-system panel (ALT_STATE_LABEL/ALT_STATE_COLOR).
+  // % vs best-ever (NO clamp), only in graded states (MEASURED/ESTIMATED); LEARNING/NO-REFERENCE show just the
+  // state label. Same engine + labels as the charging-system panel.
   const pst = (L.state==null) ? 3 : L.state|0;
   const pGraded = L.valid && (pst===0 || pst===1) && L.pct>0;
   setTxt('perf-pct', pGraded ? Math.round(L.pct)+'%' : '—');
@@ -3302,9 +3343,8 @@ function renderPerf(){
   const sea=L.pitchStd||0;
   setTxt('perf-sea-val', sea.toFixed(1)+'°'); setTxt('perf-sea-sub', seaWord(sea));
   // steady-state is shown by the "now" dot color (green = banking, orange = settling) + the header chip — see drawPerfPlot/drawMotorPlot
-  // Learning switch (Live Data) + simulator/reference segmented toggles (Setup → Vessel Performance).
-  // All driven by perfLive, which always carries paused+sim+source; each gated through the
-  // pending-toggle reconciler so an in-flight optimistic click isn't reverted by a stale echo.
+  // Learning switch + simulator/reference toggles, each through the pending-toggle reconciler so an
+  // in-flight optimistic click isn't reverted by a stale echo.
   const pv = echoReconcile('perfPaused', perfLive.paused===1?1:0);
   if (pv !== null) paintPerfLearnSwitch(pv);
   setSegEcho('perfSimMode', ['perf-sim-off','perf-sim-on'], perfLive.sim===1?1:0);
@@ -3335,8 +3375,7 @@ async function perfSetSpeedSrc(v){
 }
 // LEARNED↔FIXED reference toggle.
 function perfSetSource(src){ if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; } perfSet('perfSource', src?1:0); }
-// Import a boat polar from a file (a shared BEFRONT1 CSV, or a Download-CSV backup). Opens the
-// native file picker; perfUploadCsvFile() reads it and POSTs the raw text to /perfUploadFront.
+// Import a boat polar (shared BEFRONT1 CSV or a Download-CSV backup).
 function perfLoadCsv(){
   if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   const inp=document.getElementById('perf-load-file'); if(inp){ inp.value=''; inp.click(); }   // freeze/learn is asked after the file is chosen
@@ -3349,7 +3388,8 @@ async function perfUploadCsvFile(inp){
   rd.onload=function(){
     const txt=String(rd.result||'');
     if(txt.indexOf('BEFRONT1')<0){ xAlert('That file is not a boat polar (BEFRONT1) CSV.'); inp.value=''; return; }
-    fetchWithTimeout(buildURL('/perfUploadFront?fixed='+(freeze?1:0)),{method:'POST',body:txt},10000)
+    // 30 s: upload, parse and the flash save of a large polar all finish inside this one request.
+    fetchWithTimeout(buildURL('/perfUploadFront?fixed='+(freeze?1:0)),{method:'POST',body:txt},30000)
       .then(r=>{ if(r.ok){ xAlert('Polar imported — '+(freeze?'FIXED (learning paused)':'LEARNED (still refining from your sailing)')+'. The plot will refresh.'); fetchPerfCurve(); }
                  else { r.text().then(t=>xAlert('Import failed: '+(t||('HTTP '+r.status)))).catch(()=>xAlert('Import failed: HTTP '+r.status)); } })
       .catch(e=>xAlert('Import failed: '+(e&&e.message?e.message:e)));
@@ -3359,15 +3399,11 @@ async function perfUploadCsvFile(inp){
   rd.readAsText(f);
 }
 
-// ── v2 curve-driven render: the polar is the cloud-fitted curve sliced at the CURRENT wind speed +
-//    sea state, with faint record dots over it. (Bin scatter retired.) ──
-// ── Boat-performance plots fed by the raw best-ever FRONT (BEFRONT1) the
-// firmware serves at /perfcurve.csv. We render directly from the front using
-// the SAME inverse-distance eval the firmware uses for the live "% of best"
-// (FrontStore::eval), so the plotted line always agrees with the gauge.
+// ── Plots render the raw best-ever FRONT (BEFRONT1, /perfcurve.csv) with the SAME IDW eval the firmware
+// uses for live "% of best" (FrontStore::eval), so the line agrees with the gauge.
 // Each point: {x:[axis0, axis1, sea], y:speed, n:nSamp}.
-let sailFrontPts = [], motorFrontPts = [], perfRecs = [];
-let _perfCurveLastFetch = 0, _perfRecLastFetch = 0;
+let sailFrontPts = [], motorFrontPts = [];
+let _perfCurveLastFetch = 0;
 // Per-axis distance normalization — MUST match the firmware axisScale[] (7_functions.ino).
 const SAIL_SCALE = [2.0, 12.0, 1.0];     // AWS, AWA, sea
 const MOTOR_SCALE = [100.0, 2.0, 1.0];   // RPM, headwind, sea
@@ -3425,11 +3461,15 @@ function parseFrontCsv(txt){
   sailFrontPts=sail; motorFrontPts=motor;
 }
 function fetchPerfCurve(){ fetch(buildURL('/perfcurve.csv')).then(r=>r.text()).then(txt=>{ parseFrontCsv(txt); drawPerfPlot(); drawMotorPlot(); }).catch(()=>{}); }
-function fetchPerfRecords(){ fetch(buildURL('/perfrecords.csv')).then(r=>r.text()).then(txt=>{ const ln=txt.trim().split('\n'); perfRecs=[]; for(let i=1;i<ln.length;i++){ const c=ln[i].split(','); if(c.length<8)continue; perfRecs.push({mode:+c[0],tws:+c[1],twa:+c[2],chop:+c[3],rpm:+c[4],hw:+c[5],stw:+c[6],sog:+c[7]}); } }).catch(()=>{}); }
-function queuePerfPlotUpdate(){
+// Both views share one curve, refetched only while the card is on screen. A hidden card zeroes the
+// stamp so the first live frame after it comes back fetches at once.
+function perfFetchIfShown(){
+  if(!panelOnScreen('perf-plot') && !panelOnScreen('motor-plot')){ _perfCurveLastFetch=0; return; }
   const now=Date.now();
   if(now-_perfCurveLastFetch>8000){ _perfCurveLastFetch=now; fetchPerfCurve(); }
-  if(now-_perfRecLastFetch>15000){ _perfRecLastFetch=now; fetchPerfRecords(); }
+}
+function queuePerfPlotUpdate(){
+  perfFetchIfShown();
   if(_perfPlotPending) return;
   _perfPlotPending=true;
   requestAnimationFrame(()=>{ _perfPlotPending=false; drawPerfPlot(); });
@@ -3443,9 +3483,7 @@ function drawPerfPlot(){
   const trueWind = (perfWindRef===1);
   const haveData = sailFrontPts.length >= 2;
 
-  // Build the best-ever line: sweep the apparent-wind-angle range we've actually
-  // sailed, eval the front at the CURRENT wind speed + sea, and (optionally) map
-  // each point to true-wind coordinates for display. Points: [plotAngle, speed].
+  // Best-ever line: sweep the sailed AWA range, eval at the CURRENT wind speed + sea, optionally map to true wind.
   let curve=[], maxS=4;
   if(haveData){
     let lo=999, hi=-999; sailFrontPts.forEach(p=>{ if(p.x[1]<lo)lo=p.x[1]; if(p.x[1]>hi)hi=p.x[1]; });
@@ -3491,18 +3529,15 @@ function drawPerfPlot(){
   }
 }
 
-// ── Motoring map (Phase 3): speed-vs-RPM, schema-driven (MotorLive) ──
+// ── Motoring map: speed-vs-RPM, schema-driven (MotorLive) ──
 let motorLive = { valid:false, rpm:0, headwind:0, spd:0, best:0, pct:0, src:0,
                   coverage:0, ptCount:0, source:0, paused:0, pitchStd:0, steady:0, settleSec:-1, state:3 };
 let motorCells = [];
 let _motorPlotPending = false, _motorModelLastFetch = 0;
 
-// updateMotor() is defined above as a thin wrapper → renderPerf() (unified card).
 function fetchMotorModel(){ fetchPerfCurve(); }   // one curve covers both views
 function queueMotorPlotUpdate(){
-  const now=Date.now();
-  if(now-_perfCurveLastFetch>8000){ _perfCurveLastFetch=now; fetchPerfCurve(); }
-  if(now-_perfRecLastFetch>15000){ _perfRecLastFetch=now; fetchPerfRecords(); }
+  perfFetchIfShown();
   if(_motorPlotPending) return;
   _motorPlotPending=true;
   requestAnimationFrame(()=>{ _motorPlotPending=false; drawMotorPlot(); });
@@ -3757,7 +3792,6 @@ const CSV3_FIELDS = [
     "IgnoreLearningDuringPenalty",
     "LogAllLearningEvents",
     "CloudFeatures",
-    "AutoShuntGainCorrection",
     "AutoAltCurrentZero",
     "WindingTempOffset",
     "ManualLifePercentage",
@@ -3794,18 +3828,18 @@ const CSV3_FIELDS = [
     "Ymin4",
     "Ymax4",
     "LoadDumpDtThresh3",
-    "hardwarePresent",  // moved from CSV2
+    "hardwarePresent",
     "testProtectionsEnabled",  // runtime flag — not persisted, resets true (enabled) on boot
     "IExcessArmMarginV",  // raw float (%.3f) — iExcess voltage gate margin
     "FastSetpointRiseRate",  // ×100, 1 decimal — multiplier on setpoint rise slew during post-protection recovery
     "FastSetpointRiseWindowMs",  // raw ms — hard upper bound on fast-rise window
     "FastSetpointRiseHeadroomV",  // ×100, 2 decimal — V below target at which fast-rise gate stays open
-    "SolarWatts",  // moved from CSV2
-    "performanceRatio",  // moved from CSV2 (÷100 for display)
-    "VeData",  // moved from CSV2 (0/1)
-    "NMEA0183Data",  // moved from CSV2 (0/1)
-    "NMEA2KData",  // moved from CSV2 (0/1)
-    "timeAxisModeChanging",  // moved from CSV2 (0/1)
+    "SolarWatts",
+    "performanceRatio",  // ÷100 for display
+    "VeData",  // 0/1
+    "NMEA0183Data",  // 0/1
+    "NMEA2KData",  // 0/1
+    "timeAxisModeChanging",  // 0/1
     "timeSourceMode",  // 0=auto, 1=NMEA, 2=Phone, 3=NTP — the CLOCK only; position is gpsPositionSource
     "speedSourceMode",  // 0=NMEA 2000, 1=phone GPS (speed/course owner — selectable, never auto)
     "faEnabled",  // 0/1 — global ON/OFF
@@ -3818,7 +3852,7 @@ const CSV3_FIELDS = [
     "faAttenDownAmps",  // A ×10
     "faPeakMinA",  // A ×100
     "wifiNapEnabled",  // 0/1 — WiFi Napping standby toggle (Client only)
-    "imuHeelOffset",  // captured rest heel offset (deg ×100) — moved from CSV2
+    "imuHeelOffset",  // captured rest heel offset (deg ×100)
     "imuPitchOffset",  // captured rest pitch offset (deg ×100)
     "systemIDTestType",  // 0=step, 1=sine sweep (Plant Delay test type)
     "systemIDSineFreqStart",  // Hz ×10
@@ -3930,6 +3964,7 @@ const CSV3_FIELDS = [
     "n2kEngInstance",
     "n2kEngDynEnable",
     "n2kEngBitsEnable",
+    "n2kConvStatEnable",
     "n2kRxBattInstance",  // battery instance to ingest (127508/127506 receive)
     "dvccEn",  // DVCC follow master (0/1)
     "dvccSrcType",  // authority dialect: 0 Victron VE.Can (VREG), 1 RV-C
@@ -3938,6 +3973,7 @@ const CSV3_FIELDS = [
     "dvccSettleS",  // settling time (s)
     "dvccCvlMin",  // plausible-CVL window low (V ×100)
     "dvccCvlMax",  // plausible-CVL window high (V ×100)
+    "dvccVicCutHold",
     "HuntCutPct",  // damper test/pocket gain, % of user Ki
     "HuntVerifyPct",  // damper verify bar, % ripple reduction required
     "HuntWingPct",  // damper pocket taper width, % of speed per side
@@ -3962,7 +3998,7 @@ const CSV3_FIELDS = [
     "solarUseConsEnable",  // 0/1 size the solar-pause bar from predicted consumption
     "solarConsMarginPct",  // x100 (%)
     "solarLearnRatePct",  // x100 (%)
-    "rvcTxEnable",  // 0/1 RV-C transmit master (bus mode applied at boot)
+    "rvcTxEnable",  // 0/1 RV-C transmit master
     "rvcChgrEnable",  // 0/1 RV-C charger DGNs
     "rvcDcEnable",  // 0/1 RV-C DC source DGNs at the alternator instance
     "rvcFaultEnable",  // 0/1 RV-C DM_RV diagnostic message
@@ -4049,15 +4085,12 @@ const TS_FIELDS = [
 
 // Detect if running in Capacitor (iOS/Android) vs web browser
 const IS_CAPACITOR = !!window.Capacitor;
-// Browser: '' = same-origin (this page was served by the regulator itself, nothing to find).
-// Capacitor: seeded with the last base that worked; discoverAndConnect() re-resolves it at
-// launch and after connection loss — mDNS is flaky across an iPhone hotspot, and the
-// regulator's IP changes when the hotspot bounces.
+// Browser: '' = same-origin. Capacitor: last base that worked; discoverAndConnect() re-resolves it at launch and
+// after connection loss (mDNS is flaky across an iPhone hotspot, and the IP changes when the hotspot bounces).
 let API_BASE_URL = IS_CAPACITOR ? (localStorage.getItem('xregDeviceBase') || 'http://alternator.local') : '';
 
-// Supabase project — used by the silent log-relay (pollLogRequest) to fulfil an
-// admin "pull" window. Public anon key (same one already shipped in firmware + Vercel).
-// Device-LAN calls use buildURL(); these cloud calls use the absolute URL on all platforms.
+// Supabase project for the silent log-relay (pollLogRequest). Public anon key (also shipped in firmware + Vercel).
+// Cloud calls use this absolute URL on all platforms; device-LAN calls use buildURL().
 const SUPABASE_URL = 'https://qnbekuaoweuteylitzvo.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFuYmVrdWFvd2V1dGV5bGl0enZvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE5NzY1MzUsImV4cCI6MjA2NzU1MjUzNX0.k2S_kzkdAyN1Azs_7enxLun9LouB1bA_q7Sw8x1Cp0o';
 
@@ -4066,12 +4099,9 @@ if (typeof window.gpsManualOverride === 'undefined') {
 }
 
 // ── Which unit a write is meant for ─────────────────────────────────────────────────
-// The stream is one long-lived socket and every write is its own request, so on an address two
-// units answer to (alternator.local, twin regulators) a page can show board A while its presses
-// land on board B - proven on the bench 2026-09-15. The stream says which board is on screen, so
-// its uid is what every write carries (buildURL for fetches, a hidden input for forms) and the
-// firmware refuses a write that names another unit (409). Until the first frame, the identity the
-// page connected under stands in.
+// On an address two units answer to (alternator.local, twin regulators) a page can show board A while its writes
+// land on board B. Every write carries the stream's uid (buildURL for fetches, a hidden input for forms) and the
+// firmware refuses one naming another unit (409). Until the first frame, the identity the page connected under stands in.
 let g_streamUid = null;
 function controlUid() {
     return g_streamUid || (IS_CAPACITOR ? rememberedUid() : ((window.xregUnit && window.xregUnit.uid) || null));
@@ -4080,7 +4110,7 @@ function controlUid() {
 // Endpoints behind the settings arm gate. With the settings password on they also need the token
 // /armSettings handed this client, so buildURL puts it on these and syncWriteUidInputs on the forms.
 const ARM_GATED_PATHS = ['/get', '/armSettings', '/factoryReset', '/huntclear', '/perfUploadFront', '/altUploadFront',
-    '/exportConfig', '/importConfig', '/saveVesselInfo', '/checkRegistration', '/cloudOpState', '/registerProfile',
+    '/exportConfig', '/importConfig', '/exportRecords', '/importRecords', '/saveVesselInfo', '/checkRegistration', '/cloudOpState', '/registerProfile',
     '/updateProfile', '/deleteAllData', '/setPassword', '/pair', '/unpair', '/fieldResTest'];
 function isArmGatedPath(path) {
     return ARM_GATED_PATHS.indexOf(path.split('?')[0]) !== -1;
@@ -4097,7 +4127,8 @@ function buildURL(path) {
     if (!path.startsWith('/')) {
         path = '/' + path;
     }
-    if (path === '/get' || path.startsWith('/get?')) {
+    // /pair and /unpair use uid= for the peer's id
+    if (!/^\/(un)?pair(\?|$)/.test(path)) {
         const uid = controlUid();
         if (uid) path += (path.indexOf('?') === -1 ? '?' : '&') + 'uid=' + uid;
     }
@@ -4132,12 +4163,9 @@ function syncWriteUidInputs(form) {
 document.addEventListener('DOMContentLoaded', () => syncWriteUidInputs());
 document.addEventListener('submit', e => { if (e.target && e.target.tagName === 'FORM') syncWriteUidInputs(e.target); }, true);
 
-// Capacitor serves the page from the app's own localhost origin, so a form's relative
-// action (/get) submits to the app bundle server — the write never reaches the regulator,
-// and the SPA fallback answers with index.html, booting a second app copy inside the
-// hidden form-target iframe (stray SSE stream + duplicate location prompt). Point every
-// device-bound form at the regulator's absolute base; re-run whenever discovery moves
-// API_BASE_URL. Browsers are same-origin with the regulator and never need this.
+// Capacitor serves the page from the app's localhost, so a relative form action (/get) hits the app bundle server:
+// the write never lands and the SPA fallback boots a second app copy in the hidden form-target iframe. Point every
+// device-bound form at the regulator's absolute base; re-run whenever discovery moves API_BASE_URL.
 function syncFormActionsToDevice() {
     if (!IS_CAPACITOR) return;
     document.querySelectorAll('form').forEach(f => {
@@ -4151,16 +4179,9 @@ function syncFormActionsToDevice() {
 }
 document.addEventListener('DOMContentLoaded', syncFormActionsToDevice);
 
-// =====================================================================
-// Device discovery (mDNS name → subnet probe)
-// =====================================================================
-// The regulator answers GET /identify passwordless with
-// {"device":"xreg-010",...} — built for this probe, and it answers with
-// Access-Control-Allow-Origin: *, so a browser probes other addresses
-// cross-origin exactly the way the app does. The dashboard is served over
-// plain http, so nothing is blocked as mixed content either. The difference
-// is only what happens on a hit: the app re-points API_BASE_URL, a browser
-// navigates the tab, because every endpoint except /identify is same-origin.
+// ===== Device discovery (mDNS name → subnet probe) =====
+// GET /identify is passwordless and sends Access-Control-Allow-Origin: *, so a browser probes other addresses
+// cross-origin like the app does. On a hit the app re-points API_BASE_URL; a browser navigates the tab.
 
 let discoveryInProgress = false;
 const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
@@ -4186,9 +4207,7 @@ async function probeIdentify(base, timeoutMs) {
         const info = await resp.json();
         if (!info || info.device !== 'xreg-010') return null;
         const str = v => (typeof v === 'string' && v) ? v : null;
-        // uid is the identity everything downstream pins to. Firmware older than the two-unit
-        // work answers without uid/name/host; those fields stay null and the app degrades to
-        // its old address-only behaviour rather than refusing to connect.
+        // Firmware without uid/name/host leaves those null: degrade to address-only rather than refuse to connect.
         return {
             base: base,
             fw: str(info.fw),
@@ -4208,11 +4227,8 @@ async function probeIdentify(base, timeoutMs) {
     }
 }
 
-// Probe a list in parallel and resolve with EVERY regulator that identified, not just the
-// first. First-hit-wins is what let a second unit on the same LAN take the connection over
-// silently: the winner was decided by a few ms of RTT and nothing downstream ever checked
-// which board it was. wantUid short-circuits the wait — a pinned unit answering is never
-// ambiguous, so the common single-regulator launch is as fast as it ever was.
+// Resolve with EVERY regulator that identified: first-hit-wins let a second unit on the LAN silently take over.
+// wantUid short-circuits the wait, so a single-regulator launch stays fast.
 const DISCOVERY_STRAGGLER_MS = 450;   // after the first answer, how long to keep listening for a second unit
 const isIpBase = b => /^https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(b || '');
 
@@ -4272,22 +4288,16 @@ async function ownSubnetIPv4() {
 }
 
 // ── Android network helpers (XEngNet native plugin) ─────────────────────────
-// Android-only; absent on iOS and in browsers, where both calls are no-ops.
-// bindWifi(): Android keeps routing app traffic to cellular when the joined WiFi has no
-// internet (the regulator's AP never does), while still showing WiFi connected — every
-// request then leaves the phone and fails. This pins this app's sockets to the WiFi net.
+// Android-only; no-ops elsewhere. bindWifi(): Android routes app traffic to cellular when the joined WiFi has
+// no internet (the regulator's AP never does); this pins this app's sockets to the WiFi net.
 async function bindWifiNetwork() {
     const P = IS_CAPACITOR && window.Capacitor.Plugins && window.Capacitor.Plugins.XEngNet;
     if (!P || !P.bindWifi) return false;
     try { const r = await P.bindWifi(); return !!(r && r.bound); } catch (e) { return false; }
 }
 
-// Android's resolver generally will not answer .local, so the native side does the mDNS
-// query and hands back an address to probe instead. Rejection = fall through unchanged.
-// Android only, and only in an app built since the two-regulator work: one mDNS browse returns
-// every regulator by its own per-unit name. Beats asking for a shared name that either unit can
-// answer to. Absent plugin or older APK → empty list, and discovery falls through to the probes
-// exactly as it did before.
+// Android's resolver generally won't answer .local; resolveLocalHost() has the native side do the mDNS query.
+// browseRegulators returns every regulator by its own per-unit name; absent plugin / older APK → empty list.
 async function browseRegulatorHosts() {
     const P = IS_CAPACITOR && window.Capacitor.Plugins && window.Capacitor.Plugins.XEngNet;
     if (!P || !P.browseRegulators) return [];
@@ -4310,15 +4320,9 @@ async function resolveLocalHost(host) {
 // past a batch that only found its neighbour.
 async function discoverDeviceBase(wantUid, exhaustive) {
     await bindWifiNetwork();   // every discovery path lands here — bind before the first probe
-    // Round 1: mDNS name, the regulator's own access-point gateway, and the last
-    // address that worked, all probed in parallel — extra candidates cost no time.
-    // 192.168.4.1 is fixed by the firmware's softAP, so an AP-mode phone lands on
-    // the device in round 1 instead of falling through to the /24 sweep. In WiFi
-    // CONFIG mode that address serves the setup portal, which has no /identify, so
-    // the probe misses and the hotspot hint banner still wins that case.
-    // A pinned unit's own mDNS name is tried FIRST and resolves past the alternator.local
-    // race entirely: two regulators both answer to alternator.local, only one answers to
-    // xreg-<uid6>.local.
+    // Round 1, in parallel: pinned unit's own name, every browsed unit, alternator.local, the softAP gateway (192.168.4.1,
+    // fixed by firmware; in WiFi CONFIG mode it serves the setup portal with no /identify) and the last base. A pinned
+    // unit's xreg-<uid6>.local goes FIRST: two regulators both answer to alternator.local, only one to its own name.
     const first = [];
     const wantHost = rememberedHost();
     if (wantUid && wantHost) {
@@ -4344,9 +4348,8 @@ async function discoverDeviceBase(wantUid, exhaustive) {
         if (dup) { if (isIpBase(h.base) && !isIpBase(dup.base)) dup.base = h.base; }
         else found.push(h);
     });
-    // exhaustive (Switch Regulator): every round runs to its end and no probe stops on the pinned
-    // unit — the point is the list, not the first answer. Otherwise a pinned unit ends the search the
-    // moment it answers, and an unpinned launch takes the first unit that does.
+    // exhaustive (Switch Regulator): every round runs to its end; the point is the list. Otherwise a pinned unit
+    // ends the search when it answers, and an unpinned launch takes the first unit.
     const probeUid = exhaustive ? null : wantUid;
     const settled = () => !exhaustive && (wantUid ? found.some(h => h.uid === wantUid) : found.length > 0);
     merge(await probeRound(first, 2500, probeUid));
@@ -4354,10 +4357,8 @@ async function discoverDeviceBase(wantUid, exhaustive) {
 
     setSplashText('Searching for regulator');
 
-    // Round 2: iPhone-hotspot subnet — DHCP hands clients 172.20.10.2–.14.
-    // Deliberately NOT gated on the phone's own IP: the wifi plugin reads en0
-    // only, which carries no IPv4 while this phone is HOSTING the hotspot
-    // (the hotspot side lives on ap1/bridge interfaces).
+    // Round 2: iPhone-hotspot subnet (DHCP 172.20.10.2–.14). NOT gated on the phone's own IP: en0 carries no IPv4
+    // while this phone HOSTS the hotspot.
     const hotspot = [];
     for (let h = 2; h <= 14; h++) hotspot.push('http://172.20.10.' + h);
     merge(await probeRound(hotspot, 1500, probeUid));
@@ -4384,13 +4385,10 @@ async function discoverDeviceBase(wantUid, exhaustive) {
 
 
 // ── Which regulator are we talking to? ──────────────────────────────────────────────
-// The address is not the identity: DHCP moves it, and alternator.local can resolve to a
-// different board between one launch and the next. The uid from /identify is the identity,
-// and it is what gets remembered.
+// The address is not the identity (DHCP moves it, alternator.local can resolve to another board); the uid is.
 
-// A browser's localStorage is keyed by ORIGIN, so everything remembered at the old address is
-// invisible the moment the regulator moves. The identity /identify handed this page is what
-// survives inside the loaded tab, and that tab is where the recovery path runs.
+// localStorage is keyed by ORIGIN, so a moved regulator hides everything remembered; the identity /identify
+// handed this page survives inside the loaded tab, where the recovery path runs.
 function rememberedUid() {
     return localStorage.getItem('xregDeviceUid') || (window.xregUnit && window.xregUnit.uid) || null;
 }
@@ -4415,8 +4413,7 @@ function applyConnectedIdentity(hit) {
     if (!hit) return;
     window.xregUnit = hit;
     if (hit.name) localStorage.setItem('xregDeviceName', hit.name);
-    // The AP SSID is per-unit now, so the Join button has to learn it from the device it is
-    // actually connected to. A name the user typed themselves still wins (xregApSsid).
+    // The AP SSID is per-unit, so learn it from the connected device. A user-typed name still wins (xregApSsid).
     if (hit.ap) localStorage.setItem('xregApSsidDev', hit.ap);
     const where = unitWhere(hit), label = unitLabel(hit);
     document.querySelectorAll('.conn-dot').forEach(d => {
@@ -4475,8 +4472,7 @@ async function resolveRegulatorChoice(hits, wantUid) {
         const mine = hits.find(h => h.uid === wantUid);
         if (mine) return mine;
     }
-    // Pre-identity firmware answers with no uid at all; there is nothing to disambiguate with,
-    // so keep the old behaviour rather than trapping the user behind an unanswerable dialog.
+    // Pre-identity firmware sends no uid: nothing to disambiguate with, so don't trap the user in an unanswerable dialog.
     if (hits.length === 1 && (!wantUid || !hits[0].uid)) return hits[0];
     return await chooseRegulator(hits, wantUid, false, { mineUid: wantUid });
 }
@@ -4600,10 +4596,8 @@ function chooseRegulator(hits, wantUid, forced, opts) {
     });
 }
 
-// Explicit "I want the other one". Always asks, even when the remembered unit answered. The app
-// re-points itself; a browser moves the tab, because every endpoint but /identify is same-origin.
-// The connected unit already hears its neighbours over mDNS, so the list is instant; the full
-// subnet sweep only runs when it hears nothing, or on request from the picker.
+// Explicit "I want the other one": always asks. The connected unit's mDNS peer list makes it instant; the full
+// subnet sweep runs only when it hears nothing, or on request from the picker.
 async function switchRegulator() {
     if (discoveryInProgress) return;
     const btn = document.querySelector('button[onclick="switchRegulator()"]');
@@ -4661,10 +4655,8 @@ async function moveTabToRegulator(hit) {
 }
 
 // ── Stream identity guard ────────────────────────────────────────────────────────────
-// A stream uid that differs from the identity this page connected under means the address is
-// ambiguous. The app re-finds its pinned unit by identity; a browser is offered a move to the unit
-// it is showing. Writes were already safe either way: they carry the stream uid (controlUid) and
-// the other board refuses them.
+// A stream uid differing from the connected identity means the address is ambiguous: the app re-finds its pinned
+// unit; a browser is offered a move. Writes are already safe: they carry controlUid() and the other board refuses them.
 let g_streamMismatchUid = null;   // the mismatch already handled, so one bad address raises one dialog
 function resetStreamIdentity() {
     g_streamUid = null;
@@ -4708,19 +4700,10 @@ async function onStreamUnitMismatch(streamUid, wantUid) {
     xAlert('The regulator shown did not answer a scan. Open it directly at http://' + ownName + '/', 'Switch Regulator');
 }
 
-// The address bar picked the unit, so ask it who it is: the UI can name it, the AP fields are
-// right for THIS board, and the recovery path has a uid to pin when the address moves.
-// Then move the tab onto the unit's own mDNS name. An address is a DHCP lease — a phone hotspot
-// hands out a different one every time it bounces, and a bookmark or a refresh on the stale one
-// reaches nothing, with no page left running to recover from. The name follows the regulator
-// across every address it will ever have, and it is the only name that reaches ONE unit:
-// alternator.local is answered by every regulator on the network. Runs on a page opened by
-// address or by that shared name, never on one already at the unit's own name, so it cannot
-// loop; silent when the name does not answer (most Android browsers, some locked-down Windows
-// networks) — those clients go on using the address exactly as before.
-// A browser's pick at the shared name, kept at that origin: alternator.local is served by whichever
-// unit won the resolver race, but localStorage there belongs to the name, so the choice survives
-// no matter which board served the page.
+// Ask the unit who it is (UI naming, AP fields, a uid to pin), then move the tab onto its own mDNS name: an address
+// is a DHCP lease a bounced hotspot invalidates, and alternator.local is answered by every regulator. Never runs on a
+// page already at the unit's own name (no loop); silent when the name doesn't answer (most Android browsers).
+// A pick made at the shared name lives in that origin's localStorage, so it survives whichever board served the page.
 function sharedChoiceGet() { try { return localStorage.getItem('xregChosenUid') || null; } catch (e) { return null; } }
 function sharedChoiceSet(uid) { try { if (uid) localStorage.setItem('xregChosenUid', uid.toUpperCase()); } catch (e) { } }
 
@@ -4785,13 +4768,9 @@ async function discoverAndConnect() {
     initializeEventSource();
 }
 
-// SSE exhausted its retries: expected after a hotspot bounce (new IP), so
-// re-scan once before surrendering to the Connection Lost dialog. The
-// _rediscoveryTried latch (cleared on SSE open / foreground / manual retry)
-// bounds this to one scan per loss so a half-dead link can't loop forever.
-// quiet=true suppresses the Connection Lost dialog on failure — used by the
-// network-change watcher, which fires before the app has ever had a packet (an
-// App Review phone changing networks must still reach demo mode, not a dialog).
+// SSE exhausted its retries (expected after a hotspot bounce): re-scan once before the Connection Lost dialog.
+// _rediscoveryTried (cleared on SSE open / foreground / manual retry) bounds this to one scan per loss. quiet=true
+// suppresses the dialog: the network-change watcher fires before any packet, and App Review must reach demo mode.
 async function rediscoverAfterLoss(quiet) {
     if (discoveryInProgress || DEMO_MODE) return;
     discoveryInProgress = true;
@@ -4804,10 +4783,8 @@ async function rediscoverAfterLoss(quiet) {
     if (DEMO_MODE) return;
     const hit = await resolveRegulatorChoice(hits, rememberedUid());
     if (hit) {
-        // A browser cannot simply re-point API_BASE_URL: /events and every write form are
-        // same-origin, and only /identify carries CORS headers. Moving the tab to the address
-        // that answered IS the reconnect — and it leaves the browser sitting on a live address,
-        // so the next refresh works too.
+        // A browser can't re-point API_BASE_URL (/events and write forms are same-origin; only /identify has CORS):
+        // moving the tab to the address that answered IS the reconnect.
         if (!IS_CAPACITOR) {
             // Carry the route across: the tab may be sitting on a deep link, and the address is
             // the only part of it that went stale.
@@ -4832,14 +4809,9 @@ async function rediscoverAfterLoss(quiet) {
     return null;
 }
 
-// =====================================================================
-// Join the regulator's own hotspot from inside the app — Capacitor only
-// =====================================================================
-// NEHotspotConfiguration (via @capgo/capacitor-wifi) asks iOS to join a named
-// network; iOS shows its own one-time Join/Cancel alert and the join persists.
-// Without it an access-point user has to leave the app for Settings > Wi-Fi.
-// The AP name and password live only in the regulator's NVS and are never in the
-// telemetry echo, so the app keeps its own copy: firmware defaults until edited.
+// ===== Join the regulator's own hotspot from inside the app — Capacitor only =====
+// NEHotspotConfiguration (@capgo/capacitor-wifi): iOS shows its own one-time Join/Cancel alert and the join persists.
+// The AP name/password live only in the regulator's NVS (never in telemetry), so the app keeps its own copy.
 const AP_SSID_DEFAULT = 'ALTERNATOR_WIFI';
 const AP_PASS_DEFAULT = 'alternator123';
 
@@ -4849,9 +4821,7 @@ function wifiJoinPlugin() {
 }
 
 function getRegulatorApCreds() {
-    // Priority: what the user typed, then what THIS unit reported over /identify, then the
-    // compile-time name. The firmware default is per-unit (ALTERNATOR_WIFI-<id>), so the bare
-    // constant is a last resort that only fits a pre-identity build.
+    // Firmware default SSID is per-unit (ALTERNATOR_WIFI-<id>); the bare constant only fits a pre-identity build.
     return {
         ssid: (localStorage.getItem('xregApSsid') || localStorage.getItem('xregApSsidDev') || AP_SSID_DEFAULT).trim(),
         password: (localStorage.getItem('xregApPass') || AP_PASS_DEFAULT)
@@ -4897,21 +4867,16 @@ async function joinRegulatorHotspot(statusElId) {
             return;
         }
     }
-    // Demo mode is a deliberate hard latch — API_BASE_URL is severed to
-    // demo.invalid and rediscoverAfterLoss() refuses to run — so it cannot be
-    // unwound in place. Tapping this button IS an explicit "take me to the real
-    // regulator", and a user who was never on its network is exactly who demo
-    // mode catches, so reload: the fresh page life finds 192.168.4.1 in round 1.
+    // Demo mode is a hard latch (API_BASE_URL severed to demo.invalid, rediscoverAfterLoss() refuses), so reload:
+    // the fresh page finds 192.168.4.1 in round 1.
     if (DEMO_MODE) {
         setApJoinStatus(statusElId, 'Joined ' + creds.ssid + '. Reloading to leave demo mode…');
         setTrackedTimeout(() => location.reload(), 2000);
         return;
     }
     setApJoinStatus(statusElId, 'Joined ' + creds.ssid + '. Looking for the regulator…');
-    // The association needs a moment before the interface will route. If the
-    // network-change watcher already started a scan, let it finish first —
-    // rediscoverAfterLoss() no-ops while one is in flight and would report a
-    // false miss.
+    // Let the association route, and let any scan the network-change watcher started finish first:
+    // rediscoverAfterLoss() no-ops while one is in flight and would report a false miss.
     await new Promise(r => setTrackedTimeout(r, 1500));
     for (let i = 0; i < 30 && discoveryInProgress; i++) {
         await new Promise(r => setTrackedTimeout(r, 500));
@@ -4950,13 +4915,8 @@ function initRegulatorApUi() {
 }
 document.addEventListener('DOMContentLoaded', initRegulatorApUi);
 
-// =====================================================================
-// Network-change watch — Capacitor only (@capacitor/network)
-// =====================================================================
-// Without it the app learns a WiFi switch only after SSE burns its retry budget:
-// ~20 s of dead stream before rediscovery fires. The plugin reports the change
-// immediately, so joining the regulator's hotspot (or walking off the boat's
-// network onto cellular) is acted on at once instead of waited out.
+// ===== Network-change watch — Capacitor only (@capacitor/network) =====
+// Otherwise a WiFi switch is noticed only after SSE burns its retry budget (~20 s of dead stream).
 let lastNetStatus = null;
 
 async function bindNetworkStatusWatch() {
@@ -4995,15 +4955,9 @@ function phoneIsOffline() {
     return !!(lastNetStatus && lastNetStatus.connected === false);
 }
 
-// Match-on-connect: make the app's stored interface identical to the one the connected
-// regulator serves. The regulator is the source of truth — it holds the byte-exact bundle for
-// its own firmware and serves it over the link the app is already on, so this works in AP mode
-// and offshore with no internet. The signed OTA zip (web_<fw>.zip) is only the fallback when the
-// device pull fails. Content is compared by hash on the native side, so a re-flashed device
-// carrying the same version number with different files still syncs. A staged bundle is applied
-// in place (applyDownloaded re-points the WebView, then location.reload() — nothing here relies
-// on a cold relaunch). Keyed per firmware string, not once per launch, so a firmware update taken
-// mid-session syncs on reconnect too.
+// Match-on-connect: make the app's stored interface identical to the connected regulator's. The regulator serves the
+// byte-exact bundle for its firmware (works in AP mode, offshore); the signed OTA zip is only the fallback. Compared by
+// hash natively, so a re-flash with the same version syncs. Keyed per fw string so a mid-session update syncs on reconnect.
 let webBundleMatchedFw = null;      // fw string already reconciled (or given up on) this page load
 let webBundleSyncRunning = false;
 let lastDiscoveredFw = null;
@@ -5018,7 +4972,7 @@ async function matchAppBundleToDevice(fw, base) {
     const plugin = window.Capacitor.Plugins && window.Capacitor.Plugins.LiveUpdate;
     if (!plugin || !plugin.getCurrentVersion) return;
     if (!base) base = lastDiscoveredBase || API_BASE_URL;
-    localStorage.removeItem('xregPendingWebVersion');   // pre-08-28 key, no longer consulted
+    localStorage.removeItem('xregPendingWebVersion');   // legacy key, no longer consulted
     webBundleSyncRunning = true;
     let outcome = null;   // 'ready' = pending bundle waiting, 'unchanged', 'failed'
     try {
@@ -5106,11 +5060,8 @@ function showWebMatchBanner(fw) {
     document.body.style.paddingTop = 'calc(72px + env(safe-area-inset-top))';
 }
 
-// Interface/firmware skew notice. Every positional CSV channel hard-drops frames whose field
-// count differs from this build's array, so a version gap shows as blank gauges and dead settings
-// echoes under a green connection — this dialog is the only thing that says why. Once per page
-// load. In the app it holds until the bundle sync settles, because the sync normally closes the
-// gap by reloading before anyone would see it.
+// Interface/firmware skew notice: a field-count mismatch hard-drops frames, so a version gap otherwise shows as blank
+// gauges under a green connection. Once per page load; in the app it waits for the bundle sync, which usually fixes it.
 let schemaMismatchInfo = null;
 let schemaMismatchShown = false;
 
@@ -5144,24 +5095,15 @@ function showSchemaMismatchDialog() {
     }
 }
 
-// =====================================================================
-// Phone GPS + time backup poster
-// =====================================================================
-// When the boat's NMEA2K GPS is unavailable (transducer fault, bus issue,
-// or just not installed), the device falls back to phone-provided location
-// and time (POST every 60s; firmware ignores it while NMEA is fresh). Speed
-// and course are different: never a fallback — they come from the phone only
-// when the user selects it (speedSourceMode), which switches this client to a
-// continuous GNSS watch posting every ~2 s. See /set_phone_data handler in
-// 3_functions.ino and consumePhoneGps() / applyPhoneSpeed() /
-// syncTimeFromPhone().
+// ===== Phone GPS + time backup poster =====
+// Without NMEA2K GPS the device falls back to phone location + time (POST every 60s; ignored while NMEA is fresh).
+// Speed/course are never a fallback: only when selected (speedSourceMode), via a continuous ~2 s GNSS watch.
+// See /set_phone_data in 3_functions.ino.
 
 const PHONE_DATA_POST_INTERVAL_MS = 60000;  // every 60 sec when foregrounded
 let phoneDataPosterTimer = null;
 
 async function getPhoneLocation() {
-    // Returns { latitude, longitude } or null. Works in both browser
-    // (navigator.geolocation) and Capacitor (Geolocation plugin).
     if (IS_CAPACITOR) {
         if (window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation) {
             try {
@@ -5185,10 +5127,7 @@ async function getPhoneLocation() {
         return null;
     }
     if (typeof navigator !== 'undefined' && navigator.geolocation) {
-        // Browser geolocation requires a secure context (HTTPS / localhost). The
-        // ESP32 serves over plain HTTP on the LAN, so a desktop browser will always
-        // be refused — skip the call (and the guaranteed console error) outright.
-        // Capacitor uses the native plugin branch above and isn't affected.
+        // Browser geolocation needs a secure context; the ESP32 serves plain HTTP, so it is always refused.
         if (typeof window !== 'undefined' && window.isSecureContext === false) {
             diagLog('[PhoneGPS] insecure origin — skipping browser geolocation');
             return null;
@@ -5222,7 +5161,7 @@ async function postPhoneFix(loc) {
         if (Number.isFinite(hdg) && hdg >= 0 && hdg <= 360) params.set('hdg', hdg.toFixed(1));
     }
     try {
-        await fetch(buildURL('/set_phone_data') + '?' + params.toString(), { method: 'GET' });
+        await fetch(buildURL('/set_phone_data?' + params.toString()), { method: 'GET' });
     } catch (e) {
         // Device unreachable — fine, we'll try again on the next tick.
     }
@@ -5237,10 +5176,8 @@ function boatPositionAlreadyKnown() {
     return src === 1 || src === 3;
 }
 
-// True when this phone's position is actually of use to the regulator right now. Backup is
-// the DEFAULT (opted in), so this is normally true on a boat with no GPS of its own and
-// false on a boat that has one — the phone is never read when the bus already answers the
-// question. Selecting "NMEA 2000 only" is the opt-out and makes this false always.
+// Backup is the DEFAULT, so this is normally true on a boat with no GPS of its own and false on one with it;
+// "NMEA 2000 only" is the opt-out.
 function phonePositionWanted() {
     if (Number(window.speedSourceMode) === 1) return true;   // phone owns speed/course outright
     const src = Number(window.gpsPositionSource);
@@ -5249,12 +5186,9 @@ function phonePositionWanted() {
     return false;                                            // NMEA 2000 only — owner opted out
 }
 
-// Ask for location, in context, at the moment the owner switches on a feature that needs
-// it. Apple's HIG wants an explainer to carry ONE button that leads to the system alert —
-// the decline belongs to iOS, not to us — so this is xAlert, not a confirm. Returns true
-// only if authorization ended up granted. Keep the explainer SHORT: a purpose string long
-// enough to overflow the system alert collapses it to a single "Allow Once" button
-// (measured 2026-08-24: 517 chars fine, 556 collapses), and the same restraint applies here.
+// Ask for location in context, when the owner switches on a feature that needs it. Apple's HIG wants ONE button leading
+// to the system alert (the decline belongs to iOS), so xAlert, not a confirm. Keep explainers SHORT: an overlong purpose
+// string collapses the system alert to a single "Allow Once" button (517 chars fine, 556 collapses).
 async function requestPhoneLocationPermission(whyLine) {
     if (!IS_CAPACITOR || !window.Capacitor.Plugins || !window.Capacitor.Plugins.Geolocation) return false;
     if (await phoneLocationGranted()) return true;
@@ -5277,9 +5211,8 @@ async function requestPhoneLocationPermission(whyLine) {
     }
 }
 
-// Defer to Solar reads the forecast for the boat's coordinates, so switching it on is the
-// third and last thing that can need this phone's location — and only when the boat has no
-// NMEA GPS of its own to supply them. Called from the toggle's onchange after it submits.
+// Defer to Solar needs the boat's coordinates, so it can need this phone's location when the boat has no NMEA GPS.
+// Called from the toggle's onchange after it submits.
 async function weatherModeToggled(isOn) {
     if (!isOn) return;
     if (boatPositionAlreadyKnown()) return;   // boat's own GPS (or typed coordinates) already answers this
@@ -5296,12 +5229,8 @@ async function weatherModeToggled(isOn) {
         'phone when the boat has no GPS of its own. It goes only to your regulator.');
 }
 
-// Backup position is on by default, so the app has to ask for authorization at some point.
-// It asks HERE — the first time this phone actually reaches a regulator — and never at
-// launch: at launch nothing has explained why, and a reviewer running the app with no
-// hardware would meet an unexplained prompt before seeing the product. On this path a
-// reviewer in demo mode never connects, so no prompt is ever raised for them.
-// Fires once per install; the flag survives app restarts but not a delete.
+// Ask the first time this phone reaches a regulator, never at launch: nothing has explained why yet, and a reviewer
+// with no hardware (demo mode, never connects) must not meet an unexplained prompt. Once per install.
 async function maybeAskLocationOnFirstConnect() {
     if (!IS_CAPACITOR || DEMO_MODE) return;
     try { if (localStorage.getItem('locPermAsked') === '1') return; } catch (e) { return; }
@@ -5314,13 +5243,9 @@ async function maybeAskLocationOnFirstConnect() {
         'Setup > Boat > Position Source.');
 }
 
-// Position source selector. Both modes that can read this phone ask for authorization if it
-// isn't already held; "NMEA 2000 only" is the opt-out and asks nothing. A refusal at the
-// system alert reverts the dropdown rather than leaving a setting that cannot work.
-// Capacitor only: the setting is DEVICE-global while the permission is THIS-client, so a plain
-// browser (where requestPhoneLocationPermission returns false unconditionally) must still submit —
-// otherwise a laptop can never select Backup or Phone, including switching back after an opt-out;
-// the phone app aboard raises its own prompt when it actually starts posting.
+// Both modes that read this phone ask for authorization; a refusal reverts the dropdown. Capacitor only: the setting is
+// DEVICE-global but the permission is THIS-client, so a browser must still submit (else a laptop could never select
+// Backup or Phone); the phone app raises its own prompt when it starts posting.
 async function gpsPositionSourceChanged(sel) {
     const v = Number(sel.value);
     if ((v === 0 || v === 2) && IS_CAPACITOR) {
@@ -5351,10 +5276,8 @@ async function phoneLocationGranted() {
 }
 
 async function postPhoneDataToDevice() {
-    // Time goes on every tick and needs no permission — in AP mode the phone is the only
-    // clock the device has. Position rides along ONLY when the owner turned on a feature
-    // that uses it AND authorization already exists; postPhoneFix(null) sends time alone.
-    // Never call getPhoneLocation() before that check: it prompts.
+    // Time goes every tick, no permission needed (in AP mode the phone is the device's only clock). Position only
+    // when wanted AND already authorized: getPhoneLocation() prompts.
     let loc = null;
     if (phonePositionWanted() && await phoneLocationGranted()) {
         loc = await getPhoneLocation();
@@ -5363,12 +5286,9 @@ async function postPhoneDataToDevice() {
 }
 
 // ── Fast speed path ──
-// When the user selects the phone as the speed/course source (speedSourceMode = 1, echoed
-// on CSV3), a continuous GNSS watch replaces the 60 s poll for cadence: fixes stream in at
-// ~1 Hz and post every PHONE_SPEED_POST_INTERVAL_MS, giving the device's record chain
-// NMEA-like sample density (its sustained-speed window rejects gaps > 8 s). The 60 s
-// poller keeps running for time/position backup; its extra posts are harmless. The watch
-// stops the moment the mode leaves phone.
+// speedSourceMode = 1 (CSV3): a continuous GNSS watch posts every PHONE_SPEED_POST_INTERVAL_MS for NMEA-like density
+// (the device's sustained-speed window rejects gaps > 8 s). The 60 s poller keeps running for time/position; its
+// extra posts are harmless.
 const PHONE_SPEED_POST_INTERVAL_MS = 2000;
 let phoneSpeedWatchId = null;      // Capacitor CallbackID string or browser watch number; 'pending' while starting
 let phoneSpeedWatchIsCap = false;
@@ -5383,9 +5303,8 @@ function phoneSpeedWatchFix(pos) {
                    speed: pos.coords.speed, heading: pos.coords.heading });
 }
 
-// True when the app binary carries the BackgroundSpeed native plugin (build 17+):
-// CLLocationManager + native posting that keeps speed flowing with the app backgrounded
-// or the screen locked. Older binaries and browsers fall back to the JS foreground watch.
+// BackgroundSpeed native plugin (build 17+): CLLocationManager + native posting that survives backgrounding / screen
+// lock. Older binaries and browsers fall back to the JS foreground watch.
 function phoneSpeedNativePlugin() {
     return (typeof IS_CAPACITOR !== 'undefined' && IS_CAPACITOR &&
             window.Capacitor.Plugins && window.Capacitor.Plugins.BackgroundSpeed) || null;
@@ -5408,11 +5327,8 @@ function stopPhoneSpeedJsWatch() {
     }
 }
 
-// Text for the phone-speed dialog, shared by the selector and by the disclosure gate below
-// so both say exactly the same thing. The first bullet reflects what THIS client can
-// actually do: with the native BackgroundSpeed plugin the stream survives backgrounding;
-// without it (older app binary, or a browser) it is foreground-only. The background
-// sentence is fixed word-for-word by Google Play's prominent-disclosure rule — do not reword.
+// Shared by the selector and the disclosure gate so both say exactly the same thing. The background sentence is fixed
+// word-for-word by Google Play's prominent-disclosure rule — do not reword.
 function phoneSpeedModeDialogText() {
     const runLine = phoneSpeedNativePlugin()
         ? '- XREG-010 collects location data to enable speed and course logging even when the app is closed or not in use. ' +
@@ -5434,10 +5350,8 @@ let bgSpeedDisclosurePending = null;    // in-flight dialog — the CSV3 echo re
 let bgSpeedDisclosureDeclined = false;  // session-only, so a decline is not re-asked on every echo
 function markPhoneSpeedDisclosed() { try { localStorage.setItem(BG_SPEED_DISCLOSED_KEY, '1'); } catch (e) { } }
 
-// The disclosure must be shown before the first call that can start background location, and
-// the speed source is a DEVICE setting: a laptop browser can turn it on for a phone that has
-// never seen the dialog, so this phone shows it here before its own first native start.
-// Declining leaves the foreground-only JS watch, which needs no such disclosure.
+// The disclosure must precede the first native start, and the speed source is a DEVICE setting another client can turn
+// on, so this phone shows it before its own first start. Declining leaves the JS watch (needs no disclosure).
 async function phoneSpeedBgDisclosed() {
     let seen = false;
     try { seen = localStorage.getItem(BG_SPEED_DISCLOSED_KEY) === '1'; } catch (e) { }
@@ -5455,11 +5369,8 @@ async function phoneSpeedBgDisclosed() {
     return bgSpeedDisclosurePending;
 }
 
-// Android 13+ posts nothing for a foreground service unless POST_NOTIFICATIONS is held: the
-// speed stream still runs and GNSS still reads, but the shade stays empty, so the owner cannot
-// see that their location is in use or stop it from there. Asked at the first native start
-// rather than at launch, for the same reason the location prompt is. iOS has no equivalent
-// permission and its plugin does not implement this method, so the call rejects and is swallowed.
+// Android 13+ shows no foreground-service notification without POST_NOTIFICATIONS, so the owner can't see or stop the
+// location use. Asked at first native start, not launch. iOS's plugin lacks the method; the rejection is swallowed.
 async function ensureSpeedNotificationPermission() {
     if (speedNotifPermTried) return false;
     speedNotifPermTried = true;
@@ -5527,21 +5438,16 @@ async function updatePhoneSpeedPoster(mode) {
 }
 window.updatePhoneSpeedPoster = updatePhoneSpeedPoster;
 
-// Selection-time warning: switching to phone speed has real tradeoffs, so the select
-// submits only after an explicit acknowledgment. Cancel reverts the dropdown to NMEA
-// (binary setting, so a change to phone always came from NMEA; the CSV3 echo re-syncs
-// it regardless on the next frame).
+// Phone speed has real tradeoffs, so the select submits only after an explicit acknowledgment. Cancel reverts to NMEA
+// (binary setting; the CSV3 echo re-syncs it anyway).
 async function speedSourceModeChanged(sel) {
     if (Number(sel.value) === 1) {
         const ok = await xConfirm(phoneSpeedModeDialogText(),
             { title: 'Use phone GPS for speed?', okText: 'Use Phone GPS' });
         if (!ok) { sel.value = '0'; return; }
         markPhoneSpeedDisclosed();   // this dialog IS the disclosure — the poster must not raise a second copy
-        // Ask for authorization here rather than at launch: this is the moment the feature
-        // is switched on, which is what guideline 5.1.1(ii) and the HIG both want.
-        // Capacitor only — the setting is device-global while the permission is this-client's,
-        // so a browser must still submit (its own geolocation prompt fires when posting starts,
-        // and the foreground-only bullet above already told the user the browser tradeoff).
+        // Ask when the feature is switched on (guideline 5.1.1(ii), HIG). Capacitor only: device-global setting, this-client
+        // permission, so a browser must still submit (its own geolocation prompt fires when posting starts).
         if (IS_CAPACITOR) {
             const granted = await requestPhoneLocationPermission(
                 'XREG-010 needs this phone\'s location to use it as the vessel speed source. ' +
@@ -5579,48 +5485,27 @@ function manualReconnect() {
 // ===== DIAGNOSTIC LOGGING SYSTEM =====
 let SHOW_DIAGNOSTIC_MESSAGES = false; // Initial value (gets overridden below)
 
-/**
- * Enable or disable diagnostic logging globally
- * @param {boolean} enabled - True to show diagnostic messages
- */
 function setDiagnosticMode(enabled) {
     SHOW_DIAGNOSTIC_MESSAGES = enabled;
     console.log(`[DIAGNOSTIC MODE] ${enabled ? 'ENABLED' : 'DISABLED'}`);
 }
 
-/**
- * Check if diagnostic mode is currently enabled
- * @returns {boolean} Current diagnostic mode state
- */
 function isDiagnosticMode() {
     return SHOW_DIAGNOSTIC_MESSAGES;
 }
 
-/**
- * Replacement for console.log - only logs if diagnostic mode enabled
- * @param {...any} args - Arguments to log
- */
 function diagLog(...args) {
     if (SHOW_DIAGNOSTIC_MESSAGES) {
         console.log('[DIAG]', ...args);
     }
 }
 
-/**
- * Replacement for console.warn - only logs if diagnostic mode enabled
- * @param {...any} args - Arguments to log
- */
 function diagWarn(...args) {
     if (SHOW_DIAGNOSTIC_MESSAGES) {
         console.warn('[DIAG WARN]', ...args);
     }
 }
 
-/**
- * Replacement for console.error - ALWAYS logs errors
- * In diagnostic mode, adds [DIAG ERROR] prefix
- * @param {...any} args - Arguments to log
- */
 function diagError(...args) {
     if (SHOW_DIAGNOSTIC_MESSAGES) {
         console.error('[DIAG ERROR]', ...args);
@@ -5629,11 +5514,7 @@ function diagError(...args) {
     }
 }
 
-/**
- * Development logging - ALWAYS logs regardless of diagnostic mode
- * Use sparingly - only for critical debugging
- * @param {...any} args - Arguments to log
- */
+// Always logs; use sparingly.
 function devLog(...args) {
     console.log('[DEV]', ...args);
 }
@@ -5649,11 +5530,8 @@ setDiagnosticMode(false); // ← CHANGE THIS LINE: true=ON, false=OFF
 // ===== END DIAGNOSTIC LOGGING SYSTEM =====
 
 
-// 1. Fetch with timeout - prevents infinite hangs. On timeout the fetch is ABORTED so its socket
-// returns to the ESP32 (it has very few); callers still see the legacy Error('Request timeout'),
-// never an AbortError — Promise.race already settled with the timeout rejection by the time the
-// aborted fetch rejects, and race subscribes to both so nothing is unhandled. On settle the timer
-// is cleared (a won race used to leave a dead timer running to its full timeout).
+// 1. Fetch with timeout - prevents infinite hangs. On timeout the fetch is ABORTED so its socket returns to the
+// ESP32 (it has very few); callers still see Error('Request timeout'), never an AbortError.
 function fetchWithTimeout(url, options = {}, timeout = 8000) {
     const ctrl = new AbortController();
     let timerId = null;
@@ -5669,11 +5547,8 @@ function fetchWithTimeout(url, options = {}, timeout = 8000) {
     ]).finally(() => { if (timerId !== null) clearTrackedTimeout(timerId); });
 }
 
-// The 4 registration/profile endpoints stage an async cloud op on the firmware (the old synchronous
-// handlers blocked every other endpoint for up to ~45 s on a dead uplink) and answer
-// 202 {"state":"pending","op":N}. Poll /cloudOpState until that op is done, then synthesize the
-// legacy response (its code + JSON body) so callers keep their old parse logic untouched. Non-202
-// replies (403 not armed, sync short-circuits like {"registered":false}) pass through as-is.
+// The registration/profile endpoints stage an async cloud op and answer 202 {"state":"pending","op":N}. Poll
+// /cloudOpState until done, then synthesize the legacy response so callers' parse logic is unchanged. Non-202 passes through.
 async function cloudOpPost(url, options, timeout) {
     const staged = await fetchWithTimeout(url, options, timeout || 8000);
     if (staged.status !== 202) return staged;
@@ -5714,8 +5589,7 @@ function setTrackedInterval(callback, delay) {
 }
 
 function setTrackedTimeout(callback, delay) {
-    // Self-pruning: fired entries were never removed, so the array grew for the life of the
-    // page (every fetchWithTimeout, debounce keystroke, and button pulse pushed one forever).
+    // Self-pruning, or the array grows for the life of the page (every fetchWithTimeout pushes one).
     const id = setTimeout(() => {
         const i = activeTimers.findIndex(t => t.type === 'timeout' && t.id === id);
         if (i !== -1) activeTimers.splice(i, 1);
@@ -5795,9 +5669,8 @@ function cleanupResources() {
     if (typeof rpmData !== 'undefined') rpmData.length = 0;
     if (typeof temperatureData !== 'undefined') temperatureData.length = 0;
 }
-// Dark-mode toggle repaint: axis/grid/tick colors are theme-resolving functions injected
-// at construction (see stabilizeUPlotAxisSizes), so a bare redraw() recolors every plot.
-// Plots whose root left the DOM (rebuilt/replaced) are pruned here.
+// Dark-mode repaint: axis colors are theme-resolving functions (see stabilizeUPlotAxisSizes), so redraw() recolors.
+// Plots whose root left the DOM are pruned.
 function refreshAllPlotThemes() {
     if (!window._allUPlots) return;
     window._allUPlots.forEach(u => {
@@ -5806,13 +5679,14 @@ function refreshAllPlotThemes() {
     });
 }
 
-// 3. Cleanup on page unload
-window.addEventListener('beforeunload', cleanupResources);
+// 3. Cleanup on page unload. pagehide, not beforeunload: beforeunload also fires when the unsaved-table
+// prompt is about to let the user choose "Stay on page", which left a frozen dashboard behind a green dot.
+window.addEventListener('pagehide', cleanupResources);
+// A back/forward-cache restore comes back with every timer and plot torn down above; start clean instead.
+window.addEventListener('pageshow', (e) => { if (e.persisted) location.reload(); });
 
-// Foregrounding fires BOTH @capacitor/app's appStateChange and visibilitychange, and one
-// reconnect is all that is wanted: a second would close the EventSource the first just
-// opened. Single entry point, one reconnect per 3 s. A stream can read OPEN while dead
-// (backgrounded sockets), so an event drought counts as dead too.
+// Foregrounding fires BOTH appStateChange and visibilitychange; a second reconnect would close the EventSource the
+// first just opened, so one per 3 s. A stream can read OPEN while dead, so an event drought counts as dead too.
 let lastForegroundReconnectMs = 0;
 function foregroundReconnect() {
     isAppInBackground = false;
@@ -5858,10 +5732,10 @@ if (IS_CAPACITOR && window.Capacitor.Plugins && window.Capacitor.Plugins.App) {
 // must not kill the SSE session and the page state behind it.
 function handleAndroidBack() {
     const vis = el => !!(el && el.getClientRects().length);   // these overlays are position:fixed, so offsetParent is always null
-    // The themed alert/confirm's first button is Cancel on a confirm and OK on an alert:
-    // clicking it settles the promise the caller is awaiting. Hiding the overlay would not.
+    // The themed alert/confirm: Back is Cancel on a confirm and OK on an alert (never the optional
+    // extra action): clicking it settles the promise the caller is awaiting. Hiding the overlay would not.
     const dlg = document.getElementById('xdlg-overlay');
-    if (vis(dlg)) { const b = dlg.querySelector('#xdlg-btns button'); if (b) b.click(); return; }
+    if (vis(dlg)) { const b = document.getElementById('xdlg-cancel') || document.getElementById('xdlg-ok'); if (b) b.click(); return; }
     if (document.getElementById('recoveryDialog')) { closeRecovery(); return; }
     if (document.querySelector('.ss-backdrop.ss-open')) { ssClose(); return; }
 
@@ -5893,10 +5767,8 @@ function handleAndroidBack() {
     if (App && App.minimizeApp) App.minimizeApp();
 }
 
-// Foreground reconnect that needs no plugin: app builds without @capacitor/app never bind
-// the appStateChange listener above, but every WebView still fires visibilitychange on
-// background/foreground. Both routes share foregroundReconnect(), which collapses the two
-// into one reconnect when the plugin IS present.
+// Plugin-free foreground reconnect: builds without @capacitor/app never bind appStateChange, but every WebView fires
+// visibilitychange. foregroundReconnect() collapses the two into one when both fire.
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
     foregroundReconnect();
@@ -5913,10 +5785,8 @@ function initializeEventSource() {
         return;
     }
     if (sseReconnectAttempts >= MAX_SSE_RECONNECTS) {
-        // A hotspot bounce hands the regulator a new IP, so retries against the old one
-        // exhausting is the EXPECTED signal — re-scan the network once (rediscoverAfterLoss
-        // shows the dialog itself on failure). Browsers scan too; the app re-points itself,
-        // a browser navigates to whatever answered.
+        // After a hotspot bounce (new IP) retries exhausting is EXPECTED: re-scan once (rediscoverAfterLoss shows the
+        // dialog on failure). The app re-points itself; a browser navigates to whatever answered.
         if (!DEMO_MODE && CAN_DISCOVER && !window._rediscoveryTried) {
             window._rediscoveryTried = true;
             console.log('[DISCOVERY] SSE retries exhausted — re-scanning for the regulator');
@@ -5925,9 +5795,7 @@ function initializeEventSource() {
         }
         diagLog("Max SSE reconnection attempts reached (10 attempts over 20 seconds). Manual reconnect required.");
 
-        // Show the Connection Lost dialog (gives user the choice of full-reload retry
-        // or "Continue Offline" which disables inputs). Hide the in-page reconnect-button
-        // while the dialog is up to avoid two competing recovery affordances on screen.
+        // Hide the in-page reconnect-button while the dialog is up: no two competing recovery affordances.
         showRecoveryOptions();
         const reconnectBtn = document.getElementById('reconnect-button');
         if (reconnectBtn) {
@@ -5998,9 +5866,7 @@ function initializeEventSource() {
                     : (Math.round(v[i] * 1000) / 1000);
                 const el = document.getElementById(k + '_echo');
                 if (el) el.textContent = txt;
-                // Band-matrix cells carry the value IN the box — a table has no room for the
-                // "(30)" parenthetical — so the echo drives the input as well, except while the
-                // user is typing in that box.
+                // Band-matrix cells show the value IN the box, so the echo drives the input too (not while the user types).
                 const inp = document.querySelector('input[data-echo="' + k + '"]');
                 if (inp && document.activeElement !== inp && inp.dataset.dirty !== '1') inp.value = txt;
             });
@@ -6037,12 +5903,9 @@ function initializeEventSource() {
         }, false);
         fetchPerfSchema();
         fetchAltSchema();
-        // These poll the ESP32, and AsyncTCP preempts the control loop, so only poll while the panel is
-        // actually rendered. The cursor resets on hide, so re-opening a tab fetches at once rather than
-        // waiting out one period — fresher on arrival than the old always-on timers.
-        // fetchKneeLearnState also disables the Keep-Alive cells when learning is on, so it must run once at
-        // connect, not on the first visible tick — otherwise the cells look editable, and Chrome silently
-        // drops the rest of your keystrokes when the disable lands on the input you are typing into.
+        // These poll the ESP32 and AsyncTCP preempts the control loop, so poll only while the panel is rendered; the cursor
+        // resets on hide so re-opening fetches at once. fetchKneeLearnState runs once at connect too: it disables the
+        // Keep-Alive cells, and Chrome drops keystrokes when the disable lands on the input being typed into.
         if (!window._kneeTimer)    { fetchKneeLearnState(); window._kneeTimer = pollWhenVisible(fetchKneeLearnState, 'kneeLearnEnable_checkbox', 4000); }
         if (!window._zeroLogTimer) window._zeroLogTimer = pollWhenVisible(fetchZeroLogState,   'ZeroLogEnable_echo',       5000);
         if (!window._zeroFitTimer) window._zeroFitTimer = pollWhenVisible(fetchZeroFitState,   'zerofit-status',           5000);
@@ -6064,10 +5927,8 @@ function initializeEventSource() {
             updateInlineStatus(false);  // Flip indicator red on any SSE error
 
             if (state === EventSource.CONNECTING) {
-                // Native auto-retry heals a device that comes back at the SAME
-                // address; after a hotspot bounce it retries a dead IP forever.
-                // Enough consecutive failures with no 'open' between them → stop
-                // and re-scan, in the app and in a browser alike.
+                // Native auto-retry heals a device back at the SAME address but retries a dead IP forever after a hotspot
+                // bounce; enough consecutive failures with no 'open' → stop and re-scan.
                 sseConnectingErrors++;
                 if (!DEMO_MODE && CAN_DISCOVER && sseConnectingErrors >= MAX_SSE_CONNECTING_ERRORS && !discoveryInProgress) {
                     this.close();
@@ -6105,12 +5966,8 @@ function initializeEventSource() {
             }
         }, false);
 
-        // Re-bind stream listeners (CSVData/CSVData2/CSVData3/TimestampData/console)
-        // on every reconnect. Without this, only the open/AltLive/AltSettings/error
-        // listeners survive a reconnect and the main telemetry streams go silent.
-        // window.attachStreamListeners is defined inside the window 'load' callback,
-        // so it is undefined on the very first call to initializeEventSource() — the
-        // initial attach is performed by the load callback itself once.
+        // Re-bind the telemetry stream listeners on every reconnect, or they go silent. attachStreamListeners is defined
+        // inside the window 'load' callback, so it is undefined on the first call; the load callback does the initial attach.
         if (typeof window.attachStreamListeners === 'function') {
             window.attachStreamListeners(source);
         }
@@ -6234,23 +6091,17 @@ function enableDemoMode() {
     // { const p = document.getElementById('fieldCheckPanel'); if (p) p.style.display = 'none'; }  // TEMP-FIELDCHECK
     console.log('[DEMO MODE] Enabled - Generating simulated data');
 
-    // Hard-sever the device link: demo must never actuate real hardware — field
-    // enable, alarm GPIO, reboot, OTA — even if a regulator appears on the network
-    // AFTER demo latched. RFC-2606 .invalid can never resolve, so every fetch and
-    // re-synced form action dies at DNS; the remembered base in localStorage stays
-    // untouched for the next real launch. The capture-phase listener also swallows
-    // form submits outright (their hidden target iframe would otherwise render a
-    // WKWebView error page).
+    // Hard-sever the device link: demo must never actuate real hardware, even if a regulator appears AFTER demo latched.
+    // RFC-2606 .invalid never resolves; the remembered base in localStorage stays for the next real launch. The capture-phase
+    // listener also swallows form submits (their hidden target iframe would render a WKWebView error page).
     API_BASE_URL = 'http://demo.invalid';
     syncFormActionsToDevice();
     document.addEventListener('submit', function (e) {
         if (DEMO_MODE) { e.preventDefault(); e.stopImmediatePropagation(); }
     }, true);
 
-    // Demo feeds handleCSVData() directly (bypassing the CSVData listener that
-    // normally hides the boat splash), so clear the splash here too. Same for the
-    // Connection Lost dialog — the failed-rediscovery path can raise it before
-    // demo's patience window expires.
+    // Demo feeds handleCSVData() directly, bypassing the CSVData listener that hides the splash; the failed-rediscovery
+    // path can also raise Connection Lost before demo's patience window expires.
     hideWaitingForRegulator();
     closeRecovery();
 
@@ -6265,23 +6116,16 @@ function enableDemoMode() {
     // Adjust body padding to account for banner (also notch-aware).
     document.body.style.paddingTop = 'calc(40px + env(safe-area-inset-top))';
 
-    // Demo has no device to fetch vessel_info.json from, so vesselInfoComplete is
-    // false and the Setup-only tab lock would trap the user on Vessel Info. Vessel
-    // info is meaningless without hardware — mark it complete, pin the landing
-    // (demo bypasses the CSVData listener, so maybeApplyLanding never runs), and
-    // go straight to Live Data → Alternator with free navigation.
+    // No device means no vessel_info.json, and the Setup-only tab lock would trap the user: mark it complete and pin the
+    // landing (demo bypasses the CSVData listener, so maybeApplyLanding never runs).
     vesselInfoComplete = true;
     window._landingApplied = true;
     showMainTab('livedata');
     showSubTab('livedata', 'alternator');
 
-    // The settings arm-gate lives in firmware, so without hardware the Unlock
-    // button can never succeed (and the submit swallower above blocks its form
-    // anyway) — unlock outright so the button disappears and every pane is
-    // browsable. Registered=true opens the Cloud Features sub-tab gate; Fleet
-    // Stats / Leaderboards / Config Sharing are public cloud iframes that load
-    // fine over the phone's own internet. The cloud tab gets a prominent
-    // everything-here-is-fake banner.
+    // The arm-gate lives in firmware, so Unlock can never succeed here: unlock outright. Registered=true opens the Cloud
+    // Features gate; its iframes are public cloud pages that load over the phone's own internet. The cloud tab gets a
+    // prominent everything-here-is-fake banner.
     applySettingsUnlockUI();
     isDeviceRegistered = true;
     demoInjectCloudBanner();
@@ -6304,10 +6148,8 @@ function demoInjectCloudBanner() {
     tab.insertBefore(b, tab.firstChild);
 }
 
-// Brief static mockups for the Cloud Features sub-tabs. The real panes are cloud
-// iframes keyed to a registered device token, so in demo the iframes stay hidden
-// and these render into each pane's status element instead. Buttons are decorative
-// (disabled) — demo is navigate-and-look, not click.
+// Demo-mode mockups for the Cloud Features sub-tabs: the real panes are iframes keyed to a
+// registered device token, so in demo these render into each pane's status element instead.
 function demoFillCloudPanes() {
     const th = 'text-align:left;padding:6px 10px;border-bottom:1px solid rgba(128,128,128,0.35);';
     const td = 'padding:6px 10px;border-bottom:1px solid rgba(128,128,128,0.2);';
@@ -6357,9 +6199,8 @@ function demoRenderSoftwareUpdate() {
 function startDemoData() {
     sendFakeCSVData();
 
-    // 200 ms = the firmware's default CSV1 broadcast period. Anything slower than the
-    // plots' stream-gap limit (max(4×interval, 1500 ms)) stamps a gap marker and breaks
-    // the line on EVERY frame — a 2 s demo cadence rendered as all markers, no traces.
+    // Firmware's default CSV1 period. Slower than the plots' stream-gap limit (max(4×interval, 1500 ms))
+    // stamps a gap marker on every frame and draws no traces.
     demoInterval = setInterval(sendFakeCSVData, 200);
 }
 
@@ -6379,12 +6220,9 @@ function sendFakeCSVData() {
         updateInlineStatus(true);
     }
 
-    // Registry-driven: CSV1/CSV2 frames are `count,` + one value per *_FIELDS entry,
-    // and the handlers DISCARD any frame whose count mismatches — a positional array
-    // rots on every schema change (the old 50-slot version died that way). Values are
-    // fixed-point exactly as firmware sends them (×100 unless noted); unnamed keys
-    // default to 0. Slow sine walks + jitter paint a plausible charge scene:
-    // ~55 A into the bank at ~13.9 V, ~1900 RPM, field ~40%.
+    // CSV1/CSV2 frames are `count,` + one value per *_FIELDS entry and handlers DISCARD a count
+    // mismatch, so build from the registry, never a positional array. Values are fixed-point as
+    // firmware sends them (×100 unless noted); unnamed keys default to 0.
     const t = Date.now() / 1000;
     const rpm = 1900 + 300 * Math.sin(t / 19) + (Math.random() * 60 - 30);
     const ampsClean = 55 + 9 * Math.sin(t / 13);              // filtered/PV traces ride this
@@ -6448,12 +6286,12 @@ function sendFakeCSVData() {
             EngineRunTime: 19800,
             temperatureThermistor: 92,   // board temp, raw °F
             MaxTemperatureThermistor: 118,
-            // Board field ceilings at rest (0 would read "0.0% now"): neither binds, Max Field % sets the 99% ceiling.
+            // Field ceilings at rest (0 would read "0.0% now"); Max Field % sets the 99% ceiling.
             fieldDutyCeil: 9900,
             fieldCurDutyCeil: 9900,
             fieldHeatDutyCeil: 9900,
             fieldCeilBind: 0,
-            fieldRcOhm: 212,             // ohm x100: the demo's 2.00 ohm coil recorded at 22 °C, at the ~168 °F alternator temperature above with 90 % credit, less the 12 % margin
+            fieldRcOhm: 212,             // ohm x100: 2.00 ohm demo coil corrected to ~168 °F, less the 12 % margin
         };
         const v2 = CSV2_FIELDS.map(k => csv2[k] !== undefined ? csv2[k] : 0);
         csv2Handler({ data: v2.length + ',' + v2.join(',') });
@@ -6462,30 +6300,21 @@ function sendFakeCSVData() {
 
 
 function checkForDemoMode() {
-    // First check 10 s after load, then re-arm every 3 s until a verdict: real data
-    // (never demo), demo enabled, or user chose Continue Offline. CONNECTING is NOT
-    // a demo trigger — slow-WiFi users can sit in CONNECTING for many seconds, and
-    // tripping demo on that state once pinned a permanent demo banner over real
-    // data — but it only DEFERS the check, never disarms it: after a failed scan
-    // the SSE retries http://alternator.local and lives in CONNECTING, so a
-    // one-shot check never fired demo on any WiFi network without the device
-    // (App Review phones are exactly that). Past 30 s with zero packets ever,
-    // CONNECTING stops deferring — that long with no open is a dead address, not
-    // a slow join.
+    // First check at 10 s, then every 3 s until real data, demo, or Continue Offline. CONNECTING defers
+    // (slow WiFi joins sit there; tripping demo on it pinned a demo banner over real data) but only for
+    // 30 s: a failed scan leaves SSE retrying alternator.local in CONNECTING, and App Review needs demo.
     const t0 = performance.now();
     const check = () => {
         if (window._firstCsvPacketReceived || DEMO_MODE || isOfflineMode) return;
         const patient = performance.now() - t0 < 30000;
         const st = source ? source.readyState : EventSource.CLOSED;
         if (discoveryInProgress || st === EventSource.OPEN || (st === EventSource.CONNECTING && patient)) {
-            // A /24 sweep can outlast the 10 s grace — demo mode must not win
-            // the race against a discovery that's about to find the device.
+            // A /24 discovery sweep can outlast the 10 s grace; demo must not win that race.
             setTrackedTimeout(check, 3000);
             return;
         }
-        // No live SSE. no-cors probe of the AP gateway distinguishes "on the setup
-        // hotspot mid-provisioning" (show the browser hint) from "no device at
-        // all" (App Review — MUST still get demo mode).
+        // No live SSE. A no-cors probe of the AP gateway separates "on the setup hotspot" (show the
+        // hint) from "no device at all" (App Review: MUST still get demo mode).
         fetchWithTimeout('http://192.168.4.1/', { mode: 'no-cors' }, 2500)
             .then(() => showHotspotSetupHint())
             .catch(() => {
@@ -6560,7 +6389,6 @@ function reinitializeXAxisForNewMode() {
     const intervalSec = intervalMs / 1000;
 
     if (useTimestamps) {
-        // SWITCHING TO TIMESTAMP MODE
         const now = Math.floor(Date.now() / 1000);
 
         if (currentTempData && currentTempData[0]) {
@@ -6587,8 +6415,6 @@ function reinitializeXAxisForNewMode() {
             }
         }
     } else {
-        // SWITCHING TO RELATIVE MODE
-        // Initialize all plot X-axes with relative time (seconds ago)
         if (currentTempData && currentTempData[0]) {
             for (let i = 0; i < currentTempData[0].length; i++) {
                 currentTempData[0][i] = -(currentTempData[0].length - 1 - i) * intervalSec;
@@ -6622,7 +6448,6 @@ let plotRenderTracker = {
     startTime: performance.now(),
     lastReportTime: performance.now(),
 
-    // Per-plot counters
     plots: {
         current: { count: 0, totalTime: 0, maxTime: 0 },
         voltage: { count: 0, totalTime: 0, maxTime: 0 },
@@ -6630,7 +6455,6 @@ let plotRenderTracker = {
         temperature: { count: 0, totalTime: 0, maxTime: 0 }
     },
 
-    // Overall stats
     totalRenderTime: 0,
     peakRenderTime: 0,
     dataPointsProcessed: 0,
@@ -6667,18 +6491,16 @@ let currentTempData, voltageData, rpmData, temperatureData;
 // plots (they share the same x-axis basis and scroll in lockstep). 0 = no event; bits match
 // firmware: 1=OV 2=iExcess 4=LoadDump. Shifted with the data series each CSV1 frame.
 let protEventData = [];
-// Stream-gap marker, one slot per buffer sample, index-aligned to protEventData and shared by the
-// four short-term plots plus the two tuning plots. 0 = contiguous; >0 = seconds of telemetry missing
-// at that seam. The relative-time x-axis is positional, so a disconnect has no width of its own —
-// without this the samples either side of a gap render as adjacent and the outage is invisible.
+// Stream-gap marker per buffer sample, index-aligned to protEventData, shared by the four short-term
+// and two tuning plots. 0 = contiguous; >0 = seconds missing at that seam. The relative-time x-axis
+// is positional, so without this a disconnect is invisible.
 let gapMarkData = [];
 // Charge-mode code per buffer sample for the mode ribbon between the Current and Voltage
 // plots. 1-8 = firmware CHARGE_STAGE_* (via gLastChargeStage, 2 Hz CSV4 cadence), 9 = shutdown
 // override (CSV1 shutdownPhase, per-frame), 0 = unknown/no-data → bare track.
 let modeStripData = [];
 
-// Every call to init*Plot() attaches a new ResizeObserver with a 1000 ms debounce.
-// Store and disconnect the previous observer before creating a new one, or the handlers stack up.
+// init*Plot() attaches a new ResizeObserver each call; disconnect the previous one or handlers stack.
 let currentTempResizeObserver = null;
 let voltageResizeObserver = null;
 let rpmResizeObserver = null;
@@ -6818,23 +6640,19 @@ function startInterpLoop() {
         if (state.arrivalTime === 0) return false;
         const elapsedMs = performance.now() - state.arrivalTime;
         const tLinear = Math.min(1, elapsedMs / state.lerpDuration);
-        // Smoothstep easing: slow-start → fast-middle → slow-end.
-        // Looks more organic than linear; also softens the "square step" on slow-updating sensors.
+        // Smoothstep easing; softens the square step on slow-updating sensors.
         const t = tLinear * tLinear * (3 - 2 * tLinear);
         const last = dataArray[1].length - 1;
         const elapsedSec = elapsedMs / 1000;
 
-        // Smooth x-axis scrolling — eliminates discrete jump when y-data shifts at packet arrival.
-        // Relative (seconds-ago) mode: reconstruct entire x-array each frame, offsetting left by elapsed.
-        // Absolute (epoch) mode: pin both x[0] and x[last] so range width stays constant — prevents
-        //   left-edge jump when the shift-buffer drops the oldest sample at each SSE arrival.
+        // Smooth x-scroll between packets. Relative mode: rebuild the x-array offset by elapsed time.
+        // Absolute (epoch) mode: pin x[0] and x[last] so range width survives the shift-buffer drop.
         if (dataArray[0][last] > 1e9) {
             const now = Date.now() / 1000;
             const intervalSec = (window._lastKnownInterval || 200) / 1000;
             dataArray[0][last] = now;
-            // Anchor left edge; prevents 4px tick snap at 5Hz. Skip when the anchor would land
-            // right of x[1] — after a gap longer than the buffer, x[1] still holds a pre-gap
-            // stamp and anchoring would make x non-monotonic, which uPlot cannot render.
+            // Anchor left edge (prevents 4px tick snap at 5 Hz). Skip when the anchor lands right of x[1]:
+            // after a gap longer than the buffer x[1] is pre-gap, and non-monotonic x breaks uPlot.
             const anchor = now - last * intervalSec;
             if (last < 1 || anchor <= dataArray[0][1]) dataArray[0][0] = anchor;
         } else {
@@ -6847,9 +6665,8 @@ function startInterpLoop() {
         for (let s = 0; s < seriesCount; s++) {
             const p = state.prevY[s];
             const n = state.nextY[s];
-            // A null prev is the gap seam or the empty prefill — lerping from it yields nextY*t,
-            // which animates the first real sample up from zero. Snap instead. A null NEXT is a
-            // sensor that has gone unavailable (no battery shunt): hold the gap, never lerp toward 0.
+            // A null prev (gap seam or empty prefill) would lerp up from zero: snap instead. A null
+            // next is a sensor gone unavailable (no shunt): hold the gap, never lerp toward 0.
             dataArray[s + 1][last] = (p == null || n == null) ? n : lerp(p, n, t);
         }
         return true;
@@ -7130,9 +6947,8 @@ function displayAvailableVersions() {
 function confirmUpdate(form, version) {
     xConfirm(`ALTERNATOR WILL BE AUTOMATICALLY DISABLED FOR SAFETY\n\nUpdate process takes 2-3 minutes. Do not interfere with auto-reboots. When finished, the web interface will be accessible in the usual way, but you must HARD-REFRESH your browser (Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows/Linux) to load the new web files — otherwise your browser will keep showing the old cached UI. The Software Update sub-tab in Cloud Features will then confirm the new version.\n\nIf process fails, you may try again with better internet. If the whole thing bricks, you may always start fresh with the factory golden image (connect FactoryReset wire, pin 9 in RJ3, Orange/White to GND), which will never force updates.\n\nWhether the update completes or fails, Alternator Enable returns to the setting it had before the update.`).then(confirmed => {
         if (!confirmed) return;
-        // UpdateToVersion is arm-gated in firmware (a stale/replayed update URL must never
-        // reboot the device); the OK click above is the acknowledgment, so arm just-in-time.
-        // The arm window is RAM-only and dies at the update reboot seconds later.
+        // UpdateToVersion is arm-gated in firmware (a replayed URL must never reboot the device); the
+        // OK click is the acknowledgment, so arm just-in-time. The RAM-only arm dies at the update reboot.
         armDevice('Starting a firmware update.')
             .then(ok => {
                 if (!ok) return;   // password prompt cancelled or refused: nothing starts
@@ -7145,37 +6961,88 @@ function confirmUpdate(form, version) {
 }
 
 // Shows the "Update in progress…" full-screen overlay used by both the manual
-// "Change to X.X.XX" flow and the forced-update flow. The message text tells
-// mobile users to fully close + reopen the app once the device finishes — that's
-// the standard live-update apply trigger (matches Capgo/CodePush/Expo pattern).
+// "Change to X.X.XX" flow and the forced-update flow.
 function showUpdateInProgressOverlay(versionStr) {
     forcedUpdateInProgressUntil = Date.now() + 6 * 60 * 1000;
-    const overlay = document.getElementById('forced-update-overlay');
-    if (!overlay) return;
+    const banner = document.getElementById('forced-update-banner');
+    if (banner) banner.style.display = 'none';
+    const overlay = fuOverlay();
     overlay.style.display = 'flex';
-    overlay.innerHTML = fuPanel(`
-          <div style="margin-bottom: 12px; font-weight: bold; font-size: 16px;">
-              Update in progress…
-          </div>
-          <p style="margin: 8px 0 4px 0; font-size: 15px;">
-              Downloading firmware v<strong>${versionStr}</strong> and rebooting.
-          </p>
-          <p style="margin: 12px 0 4px 0; font-size: 13px; color: #999;">
-              Takes 2-3 minutes total. When it finishes, <strong>hard-refresh</strong> this tab to load the updated dashboard — Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows/Linux. A regular refresh may show stale cached files. The app refreshes its own interface automatically when it reconnects.
-          </p>
-          <p style="margin: 12px 0 0; font-size: 11px; color: #777;">
-              Do not power-cycle the device during the update.
-          </p>`);
+    overlay.innerHTML = fuInProgressPanel(versionStr);
+    fuOffPaintCurrent();
 }
 
-// When running inside the iOS (Capacitor) app, kick off a parallel download of
-// the matching web bundle. The LiveUpdate plugin fetches it via the stable
-// ota.xengineering.net proxy (otaBaseUrl in LiveUpdate.swift), which forwards to
-// the Supabase Storage OTA bucket. The device firmware update is still triggered
-// by the form submit; this just keeps the app's local web UI in sync. Silently
-// no-ops in a regular browser. Pre-staging only: once the device is back on the
-// new firmware, match-on-connect finds this bundle identical to what the device
-// serves and applies it (or pulls from the device if this download never landed).
+// Created on first use by either the manual or the forced path; not in index.html.
+function fuOverlay() {
+    let overlay = document.getElementById('forced-update-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'forced-update-overlay';
+        overlay.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.75);
+            z-index: 9999;
+            display: none;
+            justify-content: center;
+            align-items: center;
+            padding: 16px;
+        `;
+        document.body.appendChild(overlay);
+    }
+    return overlay;
+}
+
+// The overlay covers the header switch, so it carries its own OFF. paintOnOff keeps it current.
+function fuOffBtnHtml() {
+    return `
+                  <button type="button" id="fu-off-btn" onclick="alternatorSet(0)"
+                          style="display:block; width:100%; margin-top:10px; background:#333; color:#ddd; font-weight:600; font-size:14px; border:1px solid #555; border-radius:5px; padding:10px 16px; cursor:pointer;">
+                      ${g_onOffDevice === 0 ? 'Alternator is OFF' : 'Turn Alternator OFF'}
+                  </button>`;
+}
+
+function fuOffPaint(v, pendingV) {
+    const b = document.getElementById('fu-off-btn');
+    if (!b) return;
+    const known = (v === 0 || v === 1);
+    const pending = pendingV === 0 && v !== 0;
+    b.textContent = v === 0 ? 'Alternator is OFF' : pending ? 'Turning Alternator OFF…' : 'Turn Alternator OFF';
+    b.style.boxShadow = pending ? 'inset 0 0 0 2px #7fe9df' : '';
+    if (known) b.setAttribute('aria-pressed', v === 0 ? 'true' : 'false');
+    else b.removeAttribute('aria-pressed');
+}
+
+// After an innerHTML rebuild: repaint from the device state plus any press still awaiting its echo.
+function fuOffPaintCurrent() {
+    const p = pendingToggles.get('OnOff');
+    fuOffPaint(g_onOffDevice, p ? p.desiredValue : undefined);
+}
+
+function fuInProgressPanel(versionStr) {
+    return fuPanel(`
+                  <div style="margin-bottom: 12px; font-weight: bold; font-size: 16px;">
+                      Update in progress…
+                  </div>
+                  <p style="margin: 8px 0 4px 0; font-size: 15px;">
+                      Downloading firmware v<strong>${versionStr}</strong> and rebooting.
+                  </p>
+                  <p style="margin: 12px 0 4px 0; font-size: 13px; color: #999;">
+                      Takes 2-3 minutes total. When it finishes, <strong>hard-refresh</strong> this tab to load the updated dashboard — Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows/Linux. A regular refresh may show stale cached files. The app refreshes its own interface automatically when it reconnects.
+                  </p>
+                  ${fuOffBtnHtml()}
+                  <p style="margin: 12px 0 0; font-size: 11px; color: #777;">
+                      Do not power-cycle the device during the update.
+                  </p>
+            `);
+}
+
+// In the iOS (Capacitor) app, pre-stage the matching web bundle via the LiveUpdate plugin; no-op in a
+// browser. Match-on-connect applies it once the device runs the new firmware (or pulls from the
+// device if this download never landed).
 async function kickOffAppWebUpdate(version) {
     if (!window.Capacitor || !window.Capacitor.isNativePlatform || !window.Capacitor.isNativePlatform()) {
         return;
@@ -7221,9 +7088,8 @@ function updateFirmwareVersion(versionInt) {
     }
 }
 
-// The hidden spans are filled through the batched DOM scheduler, so on the first frame they are
-// still empty when this runs: the frame's own values are the source, the spans only a fallback,
-// and an unreadable fallback is left alone rather than read as zero.
+// Hidden spans fill via the batched DOM scheduler, so on the first frame they are still empty: the
+// frame's values are the source, the spans a fallback, and an unreadable fallback is skipped, not 0.
 function updateDeviceId(upper, lower) {
     if (!Number.isFinite(upper) || !Number.isFinite(lower)) {
         upper = parseInt(document.getElementById('deviceIdUpperID').textContent, 10);
@@ -7237,7 +7103,7 @@ function updateDeviceId(upper, lower) {
         // Decode device ID (16-char hex from upper and lower 32 bits)
         const deviceIdHex = deviceIdUpper.toString(16).padStart(8, '0') +
             deviceIdLower.toString(16).padStart(8, '0');
-        const macAddress = deviceIdHex.toUpperCase();  // Use all 16 chars
+        const macAddress = deviceIdHex.toUpperCase();
         noteStreamUid(macAddress);
 
         // Update profile display + System panel (latter shown when cloud features locked)
@@ -7251,10 +7117,8 @@ function updateDeviceId(upper, lower) {
 }
 
 //forced OTA stuff
-// Set when user clicks "Update Now" on the forced-update modal. Suppresses the
-// modal from re-rendering on subsequent CSV2 ticks while the download is in
-// flight. Page reload after device reboot clears it naturally; the 6-minute
-// timeout below is a fallback for failed updates so user can retry.
+// Set on "Update Now"; stops the forced-update modal re-rendering on CSV2 ticks mid-download. The
+// reboot reload clears it; the 6-minute window is the fallback so a failed update can retry.
 let forcedUpdateInProgressUntil = 0;
 
 // Convert firmware version int to string (e.g., 35 → "0.0.35")
@@ -7334,10 +7198,12 @@ function formatDeadline(unixTimestamp) {
 function handleForcedUpdate(data) {
     const hasForcedUpdate = data.hasForcedUpdate === 1;
     const forcedVersionInt = data.forcedFwVersionInt || 0;
-    // Return early only when the forced-update UI was never created: an unconditional early
-    // return here made the clearing branch below unreachable, so a cancelled forced update
-    // left the blocking overlay + disabled inputs stuck until a hard reload.
+    // Return early only when the forced-update UI was never created, or a cancelled forced update
+    // never reaches the clearing branch below (overlay and disabled inputs stick until reload).
     if ((!hasForcedUpdate || forcedVersionInt === 0) && !document.getElementById('forced-update-banner')) {
+        // A manual install's in-progress panel has no forced UI behind it: it clears when its window runs out.
+        const ov = document.getElementById('forced-update-overlay');
+        if (ov && ov.style.display !== 'none' && Date.now() >= forcedUpdateInProgressUntil) ov.style.display = 'none';
         return;
     }
     const deadline = data.forcedUpdateDeadline || 0;
@@ -7365,32 +7231,17 @@ function handleForcedUpdate(data) {
         document.body.insertBefore(banner, document.body.firstChild);
     }
 
-    let overlay = document.getElementById('forced-update-overlay');
-    if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.id = 'forced-update-overlay';
-        overlay.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.75);
-            z-index: 9999;
-            display: none;
-            justify-content: center;
-            align-items: center;
-            padding: 16px;
-        `;
-        document.body.appendChild(overlay);
-    }
+    const overlay = fuOverlay();
+    // An install already started (Update Now, or a manual "Change to version") keeps the screen
+    // until its window runs out, whatever the forced-update state does meanwhile.
+    const updateActive = Date.now() < forcedUpdateInProgressUntil;
 
     if (!hasForcedUpdate || forcedVersionInt === 0) {
         // Clear only on the shown→cleared transition — a steady-state enableAllInputs() every
         // CSV2 frame would trample disables owned by other features (knee-learn cell locks etc.).
-        if (banner.style.display !== 'none' || overlay.style.display !== 'none') {
+        if (banner.style.display !== 'none' || (overlay.style.display !== 'none' && !updateActive)) {
             banner.style.display = 'none';
-            overlay.style.display = 'none';
+            if (!updateActive) overlay.style.display = 'none';
             enableAllInputs();
         }
         return;
@@ -7398,8 +7249,7 @@ function handleForcedUpdate(data) {
 
     const versionStr = firmwareIntToString(forcedVersionInt);
     const now = Math.floor(Date.now() / 1000);
-    // deadline === 0 means none was set in cloud — treat as "upgrade required now"
-    // rather than "deadline passed" which falsely implies the user missed a window.
+    // deadline 0 = none set in cloud: "upgrade required now", not "deadline passed".
     const noDeadlineSet = !deadline || deadline === 0;
     const isPastDeadline = !noDeadlineSet && now >= deadline;
     const requireBlocking = noDeadlineSet || isPastDeadline;
@@ -7408,24 +7258,8 @@ function handleForcedUpdate(data) {
         banner.style.display = 'none';
         overlay.style.display = 'flex';
 
-        // If user already pressed Update Now within the last few minutes, show
-        // a progress message instead of re-rendering the prompt every 5 s.
-        const updateActive = Date.now() < forcedUpdateInProgressUntil;
         if (updateActive) {
-            overlay.innerHTML = fuPanel(`
-                  <div style="margin-bottom: 12px; font-weight: bold; font-size: 16px;">
-                      Update in progress…
-                  </div>
-                  <p style="margin: 8px 0 4px 0; font-size: 15px;">
-                      Downloading firmware v<strong>${versionStr}</strong> and rebooting.
-                  </p>
-                  <p style="margin: 12px 0 4px 0; font-size: 13px; color: #999;">
-                      Takes 2-3 minutes total. When it finishes, <strong>hard-refresh</strong> this tab to load the updated dashboard — Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows/Linux. A regular refresh may show stale cached files. The app refreshes its own interface automatically when it reconnects.
-                  </p>
-                  <p style="margin: 12px 0 0; font-size: 11px; color: #777;">
-                      Do not power-cycle the device during the update.
-                  </p>
-            `);
+            overlay.innerHTML = fuInProgressPanel(versionStr);
         } else {
             overlay.innerHTML = fuPanel(`
                   <div style="margin-bottom: 12px; font-weight: bold; font-size: 16px;">
@@ -7439,16 +7273,19 @@ function handleForcedUpdate(data) {
                           style="display:block; width:100%; margin-top:4px; background:linear-gradient(180deg,#35d6c7,#23a99c); color:#06302d; font-weight:700; font-size:14px; border:none; border-radius:5px; padding:10px 16px; cursor:pointer;">
                       Update Now
                   </button>
+                  ${fuOffBtnHtml()}
                   <p style="margin: 12px 0 0; font-size: 11px; color: #777;">
                       To postpone, restart with WiFi disconnected or in Factory Mode.
                   </p>
             `);
         }
+        fuOffPaintCurrent();
 
         disableAllInputs();
 
     } else {
         // Not past deadline yet — warning banner only
+        if (updateActive) { banner.style.display = 'none'; return; }
         overlay.style.display = 'none';
         banner.style.display = 'block';
 
@@ -7468,21 +7305,14 @@ function handleForcedUpdate(data) {
 }
 
 // ── Admin config push notices ────────────────────────────────────────────────────────────
-// Two separate states, both carried as plain counts on CSV2:
-//   cfgPushPending — a config is staged in the cloud and will apply at the next restart. The
-//     device learns this from the 6 h forced-update poll, so a watching owner can restart early
-//     instead of waiting out the 24/72 h maintenance ladder. Dismissible; it is only a heads-up.
-//   cfgPushApplied — a push already rewrote settings on the previous boot. NOT dismissible: the
-//     only button acks it on the device, because "your settings were changed remotely" must not
-//     be missable. Survives reboots in NVS until that ack lands.
-// Detail text (the admin note, the changed-key list) comes from one /configPush fetch, done
-// lazily when a modal is first shown — CSV2 is positional integers and can't carry strings.
+// cfgPushPending: a config is staged in the cloud (learned from the 6 h forced-update poll) and applies
+//   at next restart; dismissible heads-up. cfgPushApplied: a push rewrote settings last boot; NOT
+//   dismissible (the only button acks it on the device; survives reboots in NVS until acked).
+// Detail text comes from one lazy /configPush fetch: CSV2 is positional integers and can't carry strings.
 let cfgPushDetail = null;         // last /configPush body
 let cfgPushDetailFor = -1;        // pending count the cached detail was fetched for
-// Pending count the user dismissed with "Later"; re-arms when the count changes or drops to 0.
-// Keyed on the count, not the config id, because CSV2 is positional integers — so an admin who
-// swaps one queued push for a DIFFERENT push of the same size, with no poll in between, will not
-// re-pop the notice on a dashboard left open. A page reload always re-arms it.
+// Pending count dismissed with "Later"; re-arms when the count changes or drops to 0. Keyed on the
+// count (CSV2 carries no config id), so a same-size replacement push won't re-pop until reload.
 let cfgPushPendingDismissed = 0;
 
 function cfgPushEnsureDetail(pendingCount) {
@@ -7504,9 +7334,8 @@ function cfgPushOverlay() {
     return ov;
 }
 
-// Panel body is assembled from trusted pieces only: counts are numbers, the changed-key list is
-// firmware CONFIG_MANIFEST constants, and the admin note was stripped of quotes/angle brackets
-// on arrival in executeCheckForcedUpdate. Keep it that way if a new field is added here.
+// Built from trusted pieces only: numbers, firmware CONFIG_MANIFEST key names, and an admin note
+// stripped of quotes/angle brackets in executeCheckForcedUpdate. Keep it that way for new fields.
 function cfgPushPanel(title, inner) {
     return `
       <div style="background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100vh - 60px); display:flex; flex-direction:column;">
@@ -7579,9 +7408,8 @@ function cfgPushShowPending(count, note) {
         </button>`);
     ov.style.display = 'flex';
     document.getElementById('cfgpush-restart-btn').onclick = async () => {
-        // RebootRegulator sits behind the /get arm gate — arm just-in-time (same pattern as
-        // triggerForcedUpdate) or an unarmed dashboard gets a silent 403 while this popup
-        // claims "Restarting". The panel stays up until arming succeeds.
+        // RebootRegulator is behind the /get arm gate: arm just-in-time or an unarmed dashboard gets a
+        // silent 403 while this claims "Restarting". The panel stays up until arming succeeds.
         try {
             if (!(await armDevice('Restarting the regulator.'))) return;
         } catch (e) {
@@ -7605,9 +7433,7 @@ function handleConfigPush(data) {
     const ov = document.getElementById('cfgpush-overlay');
     const shown = ov && ov.style.display !== 'none';
 
-    // Clear a panel the device no longer has a reason to show (admin cancelled the push, or the
-    // ack landed). Mirrors the forced-update bug where an unconditional early return left a
-    // cancelled overlay stuck on screen until a hard reload.
+    // Clear a panel the device no longer has a reason to show (push cancelled, or the ack landed).
     if (!applied && !pending) {
         if (shown) ov.style.display = 'none';
         if (pending !== cfgPushPendingDismissed) cfgPushPendingDismissed = 0;
@@ -7625,17 +7451,16 @@ function handleConfigPush(data) {
     }
 }
 
-// Disable all form inputs (when past deadline). Stamps each input it disables so enableAllInputs
-// releases ONLY those — disables owned by other features (knee-learn cell locks, ready-gated
-// commit buttons, demo-mode props) must not be trampled by this path running every CSV2 frame.
+// Stamps each input it disables so enableAllInputs releases ONLY those: disables owned by other
+// features (knee-learn cell locks, ready-gated commit buttons, demo props) must survive per-frame runs.
 let fuInputsDisabled = false;
 function disableAllInputs() {
     const inputs = document.querySelectorAll('input, button, select, textarea');
     inputs.forEach(input => {
-        // Keep the forced-update button live; keep the modal-shell dialog (#xdlg-overlay)
-        // live too — disabling its OK/Cancel deadlocks the update-confirm prompt this same
-        // blocking path opens (it runs every telemetry tick while the dialog is awaiting).
-        if (input.type !== 'hidden' && !input.classList.contains('forced-update-btn') && !input.closest('#xdlg-overlay')) {
+        // Keep live: the forced-update button, the modal-shell dialog (#xdlg-overlay; disabling its
+        // OK/Cancel deadlocks the update-confirm prompt this path opens every tick), and the overlay's
+        // own Alternator OFF button (OFF is never conditional).
+        if (input.type !== 'hidden' && !input.classList.contains('forced-update-btn') && !input.closest('#xdlg-overlay') && !input.closest('#forced-update-overlay')) {
             if (!input.disabled) input.dataset.fuDisabled = '1';   // stamp only inputs THIS feature disabled
             input.disabled = true;
             input.style.opacity = '0.5';
@@ -7671,9 +7496,7 @@ async function triggerForcedUpdate(versionStr) {
             return;
         }
         kickOffAppWebUpdate(versionStr);  // No-op in browser; in iOS app downloads matching web bundle in parallel
-        // showUpdateInProgressOverlay sets forcedUpdateInProgressUntil (suppresses the prompt modal
-        // re-rendering on CSV2 ticks for 6 min) and renders "in progress" immediately so the user
-        // gets feedback before the next CSV2 tick (~5 s away).
+        // Renders "in progress" now (next CSV2 tick is ~5 s away) and suppresses the prompt for 6 min.
         showUpdateInProgressOverlay(versionStr);
 
         const form = document.createElement('form');
@@ -7778,31 +7601,6 @@ function scheduleDOMUpdateOptimized(elementId, newContent) {
     }
 }
 
-let frameTimeTracker = {
-    lastFrameTime: performance.now(),
-    frameTimes: [],
-    worstFrame: 0
-};
-
-function trackFrameTime() {
-    const now = performance.now();
-    const frameTime = now - frameTimeTracker.lastFrameTime;
-    frameTimeTracker.lastFrameTime = now;
-
-    if (frameTimeTracker.frameTimes.length > 0) { // Skip first frame
-        frameTimeTracker.frameTimes.push(frameTime);
-        frameTimeTracker.worstFrame = Math.max(frameTimeTracker.worstFrame, frameTime);
-
-        if (frameTimeTracker.frameTimes.length > 100) {
-            frameTimeTracker.frameTimes.shift();
-        }
-
-        if (frameTime > 20) { // More than 20ms = under 50fps
-            diagWarn(`[PERF] Slow frame: ${frameTime.toFixed(2)}ms`);
-        }
-    }
-}
-
 //globals for axes configuration from ESP32
 const CONFIG_CHECK_INTERVAL_SECONDS = 1.0;
 
@@ -7820,12 +7618,8 @@ function getConfigCheckInterval(webgaugesIntervalMs) {
     return Math.max(1, Math.round((CONFIG_CHECK_INTERVAL_SECONDS * 1000) / webgaugesIntervalMs));
 }
 
-// Snap an axis range outward to "nice" round bounds (~5 ticks across the span).
-// Live autoscaling plots call setData every frame; if the range tracked the raw
-// data min/max it would shift by sub-pixel amounts each frame and uPlot would
-// regenerate the tick labels continuously (the "horrid axis redraw"). Snapping to
-// a grid means the bounds — and therefore the ticks — only move when the data
-// actually crosses a grid line, not on every frame.
+// Snap an axis range outward to round bounds (~5 ticks). Live autoscale calls setData every frame, so
+// tracking raw min/max would re-tick the axis continuously; bounds move only when data crosses a grid line.
 function niceAxisRange(lo, hi) {
     if (!isFinite(lo) || !isFinite(hi)) return [0, 1];
     if (hi <= lo) hi = lo + 1;
@@ -7836,26 +7630,20 @@ function niceAxisRange(lo, hi) {
     return [Math.floor(lo / step) * step, Math.ceil(hi / step) * step];
 }
 
-// Stable replacement for uPlot.rangeNum(mn, mx, pad, true) on live autoscaling
-// axes: pads by `pad` fraction of the span, then snaps to the nice grid above so
-// the ticks stop jittering. Pass the same pad the old rangeNum call used.
+// Jitter-free stand-in for uPlot.rangeNum(mn, mx, pad, true): pad by `pad` × span, then niceAxisRange.
 function stableAutoRange(mn, mx, pad) {
     if (mn == null || mx == null || !isFinite(mn) || !isFinite(mx)) return [0, 1];
     const m = (mx - mn) * (pad || 0);
     return niceAxisRange(mn - m, mx + m);
 }
 
-// Computes a padded min/max range from selected series in a data array.
-// minSpan prevents zooming in too far; marginFrac adds padding; hardMin clamps the lower bound.
-// visibleCount (optional): only scan the last N points (the on-screen X window) so an outlier that
-//   has scrolled off the left edge of the 5-min buffer can't pin the axis to something you can't see.
-// plot (optional): the uPlot instance, used to skip series the user has hidden in the legend so a
-//   hidden trace can't drag the axis either. Both params are optional — omitted = old whole-buffer,
-//   all-series behaviour.
+// Padded min/max over selected series. minSpan floors the zoom; hardMin clamps the lower bound.
+// visibleCount (optional) scans only the on-screen tail so an off-screen outlier can't pin the axis;
+// plot (optional) skips legend-hidden series.
 function computeScaleRange(dataArray, seriesIndices, minSpan, marginFrac, hardMin, visibleCount, plot) {
     let lo = Infinity, hi = -Infinity;
     for (const idx of seriesIndices) {
-        if (plot && plot.series[idx] && plot.series[idx].show === false) continue;  // hidden series: ignore
+        if (plot && plot.series[idx] && plot.series[idx].show === false) continue;
         const arr = dataArray[idx];
         const start = (visibleCount && visibleCount < arr.length) ? arr.length - visibleCount : 0;
         for (let i = start; i < arr.length; i++) {
@@ -7883,18 +7671,15 @@ function computeScaleRange(dataArray, seriesIndices, minSpan, marginFrac, hardMi
     return { min: lo, max: hi };
 }
 
-// Number of trailing buffer points currently on-screen. The buffer always holds LIVE_BUFFER_SEC
-// (5 min) but only liveWindowSec is drawn, so this is what autoscale should look at — not the whole
-// buffer. +1 so the partial point at the left edge is included.
+// Trailing buffer points on screen (the buffer holds LIVE_BUFFER_SEC, only liveWindowSec is drawn);
+// +1 includes the partial left-edge point.
 function visiblePointCount() {
     const intervalMs = window._lastKnownInterval || 200;
     return Math.ceil((liveWindowSec * 1000) / intervalMs) + 1;
 }
 
-// Recompute the auto Y range for every auto-scaled live plot, from ONLY the visible window and ONLY
-// the currently-shown series. Called once per data frame (applyNow=false — the rAF loop applies the
-// stored ranges during interpolation), and on-demand with applyNow=true when the legend visibility
-// or the X-window length changes, so those rescale instantly even when no data is streaming.
+// Recompute auto Y ranges from the visible window and shown series only. applyNow=false per data
+// frame (the rAF loop applies them); true on legend or X-window changes, to rescale with no stream.
 function recomputeAutoScales(applyNow) {
     const vc = visiblePointCount();
     if (autoScaleCurrent && !autoScaleCurrentLocked) {
@@ -7931,11 +7716,9 @@ function recomputeAutoScales(applyNow) {
     }
 }
 
-// Shift one null column into every CSV1-fed buffer so uPlot breaks the trace at the seam, and
-// record how much time is missing there. Called from processCSVDataOptimized when the regulator's
-// own frame clock shows a hole: frames it built never got here — dropped from its send queue while
-// the link was stalled, or this client was away or backgrounded. Nothing can replay them
-// (AsyncEventSource does not queue for absent clients), so the missing span can only be marked.
+// Shift a null column into every CSV1-fed buffer so uPlot breaks the trace, and record the missing
+// time. Used when the regulator's frame clock shows a hole (send-queue drops on a stalled link, or this
+// client was away); AsyncEventSource does not replay for absent clients, so the span can only be marked.
 function insertStreamGap(gapSec) {
     for (const b of [currentTempData, voltageData, rpmData, temperatureData, pidTuningData, cvTuningData, cvPidData]) {
         if (!b || !b[1]) continue;
@@ -7947,9 +7730,8 @@ function insertStreamGap(gapSec) {
         // Timestamp mode only (epoch x); the relative ramp is static and must not be shifted.
         // Park the seam mid-gap so x stays sorted — uPlot requires monotonic x.
         if (b[0][last] > 1e9) {
-            // The interp loop drags x[last] to wall-clock even while the stream is dead — clamp back
-            // to the true last-arrival stamp, or the seam lands in the future and the next appended
-            // frame breaks monotonicity.
+            // The interp loop drags x[last] to wall-clock while the stream is dead; clamp back to the
+            // last-arrival stamp or the seam lands in the future and the next frame breaks monotonicity.
             b[0][last] = Math.min(b[0][last], Date.now() / 1000 - gapSec);
             const prevLast = b[0][last];
             for (let i = 1; i <= last; i++) b[0][i - 1] = b[0][i];
@@ -7979,16 +7761,11 @@ function processCSVDataOptimized(data) {
 
         const now = useTimestamps ? Math.floor(Date.now() / 1000) : null;
 
-        // Measure actual inter-arrival time and update lerpDuration for all plots.
-        // Clamp to [100, 1000]ms to avoid wild values at startup or after long gaps.
+        // Inter-arrival time sets lerpDuration, clamped to [100, 1000] ms against startup/gap outliers.
         const _arrivalNow = performance.now();
-        // Two clocks. The regulator stamps every CSV1 frame with its own millis (sendMs) and a
-        // per-frame counter (WifiHeartBeat), so a hole in THOSE means frames were built and never got
-        // here: dropped from the regulator's send queue while the link was stalled, or this client was
-        // away. A hole in arrival time alone means the frames were held by a TCP retransmit stall on
-        // the WiFi path and then delivered in one burst - nothing is missing, so no seam: a seam there
-        // would mark data as absent that is on screen. Arrival time is the fallback only when the
-        // device clock went backwards (reboot) or the frame carries no sendMs (older firmware).
+        // Two clocks. A hole in the regulator's own sendMs/WifiHeartBeat means frames were built and never
+        // arrived (seam). A hole in arrival time alone is a TCP retransmit stall delivered in a burst:
+        // nothing is missing, so no seam. Arrival time is the fallback only on a device-clock reset or no sendMs.
         const sendMs = Number(data.sendMs);
         const hb = Number(data.WifiHeartBeat);
         if (processCSVDataOptimized._lastArrival > 0) {
@@ -8044,7 +7821,6 @@ function processCSVDataOptimized(data) {
         if ('MeasuredAmps' in data) window._lastMeasAmps = altCurrent;
         if ('BatteryV' in data) window._lastBatteryV = parseFloat(data.BatteryV) / 100;
 
-        // Shift all current data left and add new data at the end
         const prevY_current = [
             currentTempData[1][currentTempData[1].length - 1],
             currentTempData[2][currentTempData[2].length - 1],
@@ -8128,11 +7904,9 @@ function processCSVDataOptimized(data) {
         plotInterp.rpm.arrivalTime = performance.now();
 
         // ALWAYS UPDATE DATA STRUCTURES - Temperature plot data
-        // Buffer holds DISPLAY units (converted at append; remapped in place on a unit flip by
-        // retargetTempPlotsForUnit) so every setData/autoscale path stays unit-agnostic.
-        // null (not NaN) with no alternator probe, same convention as battCurrent above: uPlot's gap test
-        // is `!= null`, which NaN passes, and a non-finite lineTo is a no-op — so a NaN would bridge the
-        // dead span with a straight line instead of breaking the trace.
+        // Buffer holds DISPLAY units (remapped in place by retargetTempPlotsForUnit on a unit flip).
+        // null (not NaN) with no probe: uPlot's gap test is `!= null`, which NaN passes, and a non-finite
+        // lineTo is a no-op, so NaN would bridge the dead span with a straight line.
         const altTempRaw = 'AlternatorTemperatureF' in data ? toDisplayTemp(parseFloat(data.AlternatorTemperatureF) / 100) : 0;
         const altTemp = Number.isFinite(altTempRaw) ? altTempRaw : null;
 
@@ -8157,15 +7931,11 @@ function processCSVDataOptimized(data) {
         plotInterp.temperature.nextY = [altTemp, fieldPct];
         plotInterp.temperature.arrivalTime = performance.now();
 
-        // All four live-plot buffers are now shifted for this frame — recompute every auto Y range
-        // from the visible window + shown series. applyNow=false: the rAF render loop applies the
-        // stored ranges during interpolation.
+        // All four live buffers are shifted; recompute auto Y ranges (the rAF loop applies them).
         recomputeAutoScales(false);
 
         // ALWAYS UPDATE DATA STRUCTURES - protection-event and stream-gap markers
-        // Shift both marker arrays in lockstep with the data series (always, regardless of
-        // useTimestamps — the data scrolls left through the buffer either way) and append
-        // this frame's values at the end so each marker stays pinned to its sample.
+        // Shifted in lockstep with the data series in both x modes so each marker stays on its sample.
         const bufLen = currentTempData ? currentTempData[1].length : 0;
         if (bufLen > 0) {
             if (protEventData.length !== bufLen) protEventData = new Array(bufLen).fill(0);
@@ -8298,9 +8068,8 @@ function updatePlotConfiguration(data) {
         cachedYmin2 = data.Ymin2; cachedYmax2 = data.Ymax2;
         cachedYmin3 = data.Ymin3; cachedYmax3 = data.Ymax3;
         cachedYmin4 = data.Ymin4; cachedYmax4 = data.Ymax4;
-        // Re-range in place — destroying/recreating the plots here made the
-        // page jump every time a Y limit was edited and echoed back. Plots in
-        // autoscale mode skip the set; the per-frame autoscale pass owns them.
+        // Re-range in place (recreating the plots jumps the page). Autoscaled plots skip this; the
+        // per-frame autoscale pass owns them.
         if (currentTempPlot && !autoScaleCurrent) currentTempPlot.setScale('current', { min: Ymin1, max: Ymax1 });
         if (voltagePlot && !autoScaleVoltage) voltagePlot.setScale('voltage', { min: Ymin2 / 100, max: Ymax2 / 100 });
         if (rpmPlot && !autoScaleRPM) rpmPlot.setScale('rpm', { min: Ymin3, max: Ymax3 });
@@ -8309,10 +8078,8 @@ function updatePlotConfiguration(data) {
         configChanged = true;
     }
 
-    // Sample interval changed → re-grid the fixed 5-min buffer (point spacing changed) and rebuild plots.
-    // Finite and positive first: newMaxPoints divides by this, so a 0 or a sentinel-turned-NaN makes
-    // new Array(newMaxPoints) throw RangeError, and the throw kills the WHOLE CSV3 dispatcher — every
-    // echo and settings readout stops updating with nothing on screen to say so.
+    // Interval changed → re-grid the fixed 5-min buffer and rebuild plots. Finite and positive first: a 0
+    // or NaN makes new Array(newMaxPoints) throw, and the throw silently kills the WHOLE CSV3 dispatcher.
     if (Number.isFinite(data.webgaugesinterval) && data.webgaugesinterval > 0
         && data.webgaugesinterval !== cachedWebgaugesInterval) {
         cachedWebgaugesInterval = data.webgaugesinterval;
@@ -8326,8 +8093,7 @@ function updatePlotConfiguration(data) {
         if (rpmPlot) { rpmPlot.destroy(); initRPMPlot(); }
         if (temperaturePlot) { temperaturePlot.destroy(); initTemperaturePlot(); }
 
-        // Tuning plots' 5-min buffers are interval-sized too — re-grid them at the new point spacing.
-        // (Window changes never reach here; only an actual interval change reallocates these.)
+        // Tuning plots' 5-min buffers are interval-sized too; re-grid them at the new spacing.
         if (pidTuningPlot) rebuildPidTuningWindow();
         if (cvTuningPlot) rebuildCVTuningWindow();
         if (cvPidPlot) rebuildCVPidWindow();
@@ -8381,17 +8147,14 @@ function updatePlotConfiguration(data) {
     }
 }
 
-// protEventMask bit groups. PROT_EVT_BITS is the "a protection fired" set that earns a red marker;
-// PROT_EVT_KD rides in the same mask but is NOT a protection (no cap bound — the CV D term only
-// trimmed the current setpoint) and gets its own shading on the Voltage plot. Masking here is
-// load-bearing: an unmasked truthy test paints a D-term frame as a red protection line with an empty label.
+// PROT_EVT_BITS = "a protection fired" (red marker). PROT_EVT_KD shares the mask but is NOT a
+// protection (the CV D term trimmed the setpoint) and gets its own Voltage-plot shading. Masking is
+// load-bearing: an unmasked truthy test paints a D-term frame as a red line with an empty label.
 const PROT_EVT_BITS  = 0x07;
 const PROT_EVT_KD    = 0x08;
 
-// uPlot draw hook — paint a thin vertical line at every buffer sample where a protection
-// fired this frame, plus a tiny abbreviation at the top (OV / iX / LD). Shared by all four
-// short-term plots; protEventData is index-aligned to u.data[0]. Labels are de-cluttered by
-// a minimum pixel gap and never touch the series legend.
+// uPlot draw hook: dashed red line at each sample where a protection fired, labelled OV / iX / LD
+// (de-cluttered by a min pixel gap). Shared by the short-term plots; protEventData aligns to u.data[0].
 function drawProtectionMarkers(u) {
     if (!protEventData || !protEventData.length) return;
     const xd = u.data[0];
@@ -8430,14 +8193,9 @@ function drawProtectionMarkers(u) {
     ctx.restore();
 }
 
-// uPlot draw hook — teal band across every run of samples where the CV D term trimmed the current
-// setpoint (protEventMask bit 8). Wired to the Voltage plot ONLY: the D term is a voltage-loop actor,
-// so the band is signal there and noise on the current/RPM/temp plots.
-// Consecutive frames are merged into one span rather than drawn per-sample: the D term fires on
-// back-to-back 10 Hz voltage-loop ticks, so per-sample lines would render as a picket fence. A lone
-// tick still gets a floor width or it would be a zero-pixel invisible rect.
-// Teal matches the Plot 6 band in plot_cvlog.py, and is deliberately not the protections' red —
-// a D-term engagement is the loop working, not a trip.
+// uPlot draw hook: teal band over runs where the CV D term trimmed the setpoint (bit 8); Voltage plot only.
+// Consecutive 10 Hz ticks merge into one span (else a picket fence); a lone tick gets a floor width.
+// Teal matches Plot 6 in plot_cvlog.py, deliberately not the protections' red: the loop working, not a trip.
 const KD_FILL_RGBA = 'rgba(0,131,143,0.16)';
 const KD_TEXT_RGBA = 'rgba(0,131,143,0.95)';
 function drawKdShading(u) {
@@ -8501,9 +8259,8 @@ const MODE_STRIP_META = {
 };
 let _modeStripLegendKey = '';
 
-// Called from the 60fps interp frame while the Plots tab is visible, so the bands scroll
-// in lockstep with the plots' x-axis. Bands are x-aligned to currentTempPlot's plot area
-// (past the y-axis gutter) via valToPos on the shared x buffer.
+// Runs in the 60fps interp frame while Plots is visible so bands scroll with the plots; x-aligned to
+// currentTempPlot's plot area via valToPos on the shared x buffer.
 function drawModeStrip() {
     const cv = document.getElementById('mode-strip-canvas');
     const u = currentTempPlot;
@@ -8630,11 +8387,9 @@ function initModeStripTip() {
     cv.addEventListener('pointerleave', () => { tip.style.display = 'none'; });
 }
 
-// uPlot draw hook — paint a grey band at every buffer sample where telemetry resumed after an
-// outage, labelled with how much time is missing. Deliberately NOT the protection markers' red
-// dashed line: a gap is absent data, not an event. On the relative-time axis the seam has zero
-// width, so the label carries the duration the axis cannot. Registered on the four short-term
-// plots and both tuning plots; gapMarkData is index-aligned to u.data[0].
+// uPlot draw hook: grey band at each sample where telemetry resumed after an outage, labelled with the
+// missing time (a relative-time seam has zero width). Deliberately not the protections' red: a gap is
+// absent data, not an event. On the short-term and tuning plots; gapMarkData aligns to u.data[0].
 function drawGapMarkers(u) {
     if (!gapMarkData || !gapMarkData.length) return;
     const xd = u.data[0];
@@ -8675,8 +8430,7 @@ function applyLiveWindowToPlots() {
     [currentTempPlot, voltagePlot, rpmPlot, temperaturePlot].forEach(p => {
         if (p && p.data) { try { p.setData(p.data, true); } catch (e) {} }
     });
-    // The visible window just changed size, so the set of on-screen points (what autoscale looks at)
-    // changed too — rescale immediately so the Y range tracks the new window without waiting for data.
+    // The on-screen point set changed; rescale now without waiting for data.
     recomputeAutoScales(true);
 }
 
@@ -8792,9 +8546,8 @@ function updateWeatherAlerts() {
     gpsAlert.style.display = gpsMissing ? 'block' : 'none';
     gpsStaleAlert.style.display = gpsStale ? 'block' : 'none';
 
-    // In AP mode the fetch is impossible and "Update Weather Now" is dimmed and inert with the rest
-    // of the forecast block (.gate-ap), so this alert would point at a control that can't be used;
-    // the offline note in that slot says it instead.
+    // In AP mode the fetch is impossible and "Update Weather Now" is inert (.gate-ap); the offline note in
+    // that slot covers it, so this alert would point at an unusable control.
     const apMode = (window._lastKnownMode === 1);   // 1 = MODE_AP
     if (weatherValid === 0 && !gpsMissing && !gpsStale && !apMode) {
         weatherAlert.style.display = 'block';
@@ -8803,9 +8556,8 @@ function updateWeatherAlerts() {
     }
 }
 
-// Age of the last successful Open-Meteo fetch, printed under the forecast table. Without it a table
-// of numbers from two days ago reads exactly like one fetched a minute ago. TS carries the age in ms
-// with its own never-fetched sentinel: the shared 999999 is a real 17-minute age on a 6-hour feed.
+// Age of the last Open-Meteo fetch, shown under the forecast table. TS carries ms with its own
+// never-fetched sentinel: the shared 999999 is a real 17-minute age on a 6-hour feed.
 function updateWeatherForecastAge(ageMs) {
     const el = document.getElementById('weather-forecast-age');
     if (!el || ageMs === undefined) return;
@@ -8856,6 +8608,7 @@ function updateAllEchosOptimized(data) {
         { key: 'n2kExtraTempInstance', id: 'n2kExtraTempInstance_echo', transform: v => v },
         { key: 'n2kTempSource', id: 'n2kTempSource_echo', transform: v => (N2K_TEMP_SOURCE_NAMES[v] ?? v) },
         { key: 'n2kChgrEnable', id: 'n2kChgrEnable_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
+        { key: 'n2kConvStatEnable', id: 'n2kConvStatEnable_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'n2kChgrInstance', id: 'n2kChgrInstance_echo', transform: v => v },
         { key: 'n2kChgrCfgEnable', id: 'n2kChgrCfgEnable_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
         { key: 'n2kChgrMode', id: 'n2kChgrMode_echo', transform: v => (N2K_CHARGER_MODE_NAMES[v] ?? v) },
@@ -8878,6 +8631,7 @@ function updateAllEchosOptimized(data) {
         { key: 'dvccSrcType', id: 'rvcSel_echo', transform: v => v == 1 ? 'in use' : 'not in use' },
         { key: 'dvccInst', id: 'dvccInst_echo', transform: v => v == 0 ? 'Any' : v },
         { key: 'dvccSilenceS', id: 'dvccSilenceS_echo', transform: v => v },
+        { key: 'dvccVicCutHold', id: 'dvccVicCutHold_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'dvccSettleS', id: 'dvccSettleS_echo', transform: v => v },
         { key: 'dvccCvlMin', id: 'dvccCvlMin_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'dvccCvlMax', id: 'dvccCvlMax_echo', transform: v => (v / 100).toFixed(2) },
@@ -8891,8 +8645,7 @@ function updateAllEchosOptimized(data) {
         { key: 'ChargedDetectionTime', id: 'ChargedDetectionTime_echo', transform: v => v },
         { key: 'MinRPMForField', id: 'MinRPMForField_echo', transform: v => v },
         { key: 'bmsLogic', id: 'bmsLogic_echo', transform: v => v == 1 ? 'On' : 'Off' },
-        // 0 = charge while the input is energized. That reads LOW at the ESP32 (the opto inverts),
-        // which is what the old Low/High labels meant — and what installers read backwards.
+        // 0 = charge while the input is energized (reads LOW at the ESP32; the opto inverts).
         { key: 'bmsLogicLevelOff', id: 'bmsLogicLevelOff_echo', transform: v => v == 0 ? 'Present' : 'Absent' },
         { key: 'AlarmActivate', id: 'AlarmActivate_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'GeneralFaultAlarm', id: 'GeneralFaultAlarm_echo', transform: v => v == 1 ? 'On' : 'Off' },
@@ -8942,7 +8695,6 @@ function updateAllEchosOptimized(data) {
         { key: 'TargetVoltageMode', id: 'TargetVoltageMode_echo', transform: v => v == 1 ? 'ON' : 'OFF' },
         { key: 'absorptionCompleteTime', id: 'absorptionCompleteTime_echo', transform: v => Math.round(v / 1000) },
         { key: 'FLOAT_DURATION', id: 'FLOAT_DURATION_echo', transform: v => (v / 3600).toFixed(2) },
-        { key: 'AutoShuntGainCorrection', id: 'AutoShuntGainCorrection_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'ShuntLead', id: 'ShuntLead_echo', transform: v => v == 1 ? 'Negative lead' : v == 2 ? 'Positive lead' : 'Not set' },
         { key: 'AutoAltCurrentZero', id: 'AutoAltCurrentZero_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'WindingTempOffset', id: 'WindingTempOffset_echo', transform: v => Math.round(toDisplayTempDelta(v)) },
@@ -9004,7 +8756,7 @@ function updateAllEchosOptimized(data) {
         { key: 'LoadDumpN3', id: 'LoadDumpN3_echo', transform: v => Math.round(v) },
         { key: 'HardOCTripAmps', id: 'HardOCTripAmps_echo', transform: v => (v / 10).toFixed(1) },
         { key: 'HardOCDebounceMs', id: 'HardOCDebounceMs_echo', transform: v => Math.round(v) },
-        { key: 'IExcessFrac', id: 'IExcessFrac_echo', transform: v => (v / 10).toFixed(1) },          // ×1000 → % of command; shared "Slope" echo also reflects IExcessFracBulk (written in lockstep, no separate span)
+        { key: 'IExcessFrac', id: 'IExcessFrac_echo', transform: v => (v / 10).toFixed(1) },          // ×1000 → % of command; also stands for IExcessFracBulk (written in lockstep)
         { key: 'IExcessFloorA', id: 'IExcessFloorA_echo', transform: v => (v / 10).toFixed(1) },      // ×10 → A
         { key: 'IExcessCeilA', id: 'IExcessCeilA_echo', transform: v => (v / 10).toFixed(1) },        // ×10 → A (alternator detector)
         { key: 'IExcessBaseA', id: 'IExcessBaseA_echo', transform: v => (v / 10).toFixed(1) },        // ×10 → A (trip-line intercept / CV base)
@@ -9182,10 +8934,8 @@ function updateAllEchosOptimized(data) {
     const specialDisplays = updateAllEchosOptimized._specialDisplays || (updateAllEchosOptimized._specialDisplays = [
         { key: 'totalPowerCycles', id: 'totalPowerCyclesID', transform: v => v },
         {
-            // Persisted plant time constant (ms) from the Plant Delay sweep fit. Adopt it into the
-            // session variable ONLY when this session has no fresher fit (sysidFitTauMs<=0), so a
-            // brand-new in-session sweep is never clobbered by a slightly-stale echo during the
-            // commit round-trip. Drives the readout beside the Compute button.
+            // Persisted plant time constant (ms) from the Plant Delay fit. Adopt it ONLY when this session
+            // has no fresher fit (sysidFitTauMs<=0), so a new in-session sweep is never clobbered by a stale echo.
             key: 'systemIDPlantTauMs',
             id: 'faPlantTau_readout',
             transform: v => v,
@@ -9212,9 +8962,8 @@ function updateAllEchosOptimized(data) {
 
     echoUpdates.forEach(update => {
         if (update.key in data) {
-            // Most transforms end in .toFixed(), and NaN.toFixed() is the string "NaN". Print the
-            // em dash instead, so a sentinel echo reads like every other absent value on the page,
-            // unless the entry names its own absent text (nan:, a string or a function of the frame).
+            // NaN.toFixed() is the string "NaN": print the em dash like every other absent value, unless
+            // the entry names its own absent text (nan:, a string or a function of the frame).
             const raw = data[update.key];
             const absent = typeof update.nan === 'function' ? update.nan(data) : update.nan;
             const newValue = (typeof raw === 'number' && !Number.isFinite(raw)) ? (absent || '—') : update.transform(raw);
@@ -9224,10 +8973,8 @@ function updateAllEchosOptimized(data) {
         }
     });
 
-    // Load-dump derived "time to act" labels: the tier counters step once per INA228 reading (loadDumpStep,
-    // measured ~6 ms apart, worst ~18 ms), then the duty cut waits for the next control tick (~13 ms apart,
-    // worst ~30 ms). Range = N readings + 0..one tick; worst = N worst readings + one worst tick.
-    // Driven by the CSV3 echo so the label tracks the firmware value.
+    // Load-dump "time to act": tier counters step once per INA228 reading (~6 ms, worst ~18 ms), then the
+    // duty cut waits for the next control tick (~13 ms, worst ~30 ms). Range = N readings + 0..one tick.
     [['LoadDumpN1', 'LoadDumpN1_tta'], ['LoadDumpN2', 'LoadDumpN2_tta'], ['LoadDumpN3', 'LoadDumpN3_tta']].forEach(([key, id]) => {
         if (key in data) {
             const el = document.getElementById(id);
@@ -9239,12 +8986,9 @@ function updateAllEchosOptimized(data) {
         }
     });
 
-    // Sync <select> elements to current firmware values.
-    // Mid-edit guard: without it the CSV3 poll snapped a not-yet-Set selection back to
-    // the live value, so clicking Set submitted the OLD value (bit us on AmpSensorRange).
-    // pendingEdit is set on change, cleared when the form submits or the firmware echo
-    // matches the dropdown (edit landed or was moot), so a walked-away edit can't block
-    // sync forever.
+    // Sync <select>s to firmware values. Mid-edit guard: the CSV3 poll must not snap a not-yet-Set
+    // selection back (Set would submit the OLD value). pendingEdit clears on submit or when the echo
+    // matches, so a walked-away edit can't block sync forever.
     const selectSyncs = updateAllEchosOptimized._selectSyncs || (updateAllEchosOptimized._selectSyncs = [
         { key: 'AmpSensorRange',        name: 'AmpSensorRange' },
         { key: 'timeSourceMode',        name: 'timeSourceMode' },
@@ -9339,10 +9083,9 @@ function submitMessage() {
     }
 }
 
-// A group Save posts EVERY input in the group, so an untouched blank box would arrive as an empty
-// value and the /get handler would read it back as 0 and wipe that setting. Disabled controls are
-// not serialized: blank boxes are disabled for the duration of the submit and re-enabled straight
-// after. Returns false — cancelling the submit — when nothing in the group was filled in.
+// A group Save posts EVERY input, and the /get handler reads a blank box as 0 and wipes that setting.
+// Disabled controls aren't serialized, so blanks are disabled across the submit. Returns false (cancel)
+// when nothing in the group was filled in.
 function dropEmpty(form) {
     const all = Array.from(form.querySelectorAll('input[type="number"]'));
     const blank = all.filter(i => i.value.trim() === '');
@@ -9379,47 +9122,24 @@ document.addEventListener('input', function (e) {
 }, true);
 
 //this allows user to turn the alternator OFF even without entering a passoword, for safety reasons, but not ON
-// Master switch, expanded header (#header-onoff) and collapsed strip (#hcs-onoff). A segmented pair of
-// buttons, never a slider: the left half always sends OnOff=0 and the right half always sends OnOff=1 —
-// what the control is painting never decides what a press sends. (A checkbox slider sends the opposite
-// of whatever it happens to show, and a paint that lagged or reverted turned an intended OFF into an
-// ON — bench, 2026-09-15.) Display: the filled half, its state word and its aria-pressed are the
-// regulator's own OnOff from CSV1 (~10 Hz, the same frame as the field-status word); before the first
-// frame nothing is filled and both halves read as offers, rather than defaulting to a state we have not
-// been told; the pressed half holds a ring until the regulator echoes it or the echoReconcile grace
-// runs out. Nothing in this
-// path sends on a paint, a resync, a timeout or a failure — only a press sends, and it sends once.
-// OFF is the safety override: no arming, no confirm, no condition — one fetch.
-// src/n: this tab's page-load nonce and its press counter, logged by the firmware next to the write and
-// used there to drop an ON that arrives out of order or twice (an OnOff=1 landed 32 ms after the user's
-// OnOff=0 and re-energized the field). OFF is never gated.
+// Master switch (#header-onoff, #hcs-onoff): a segmented pair, never a slider. Each half always sends
+// its own value; the paint never decides what a press sends. Paint = the regulator's CSV1 OnOff (nothing
+// filled before the first frame); the pressed half rings until echoed. Only a press sends, once. OFF needs
+// no arming or confirm. src/n (tab nonce + press counter) lets firmware drop an out-of-order or repeated ON.
 let g_onOffDevice = null;   // last OnOff the regulator reported (a CSV1 frame, or a write reply); null until the first of either
 const g_clientTabId = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
 let g_clientWriteN = 0;
 function clientWriteTag() { return '&src=' + g_clientTabId + '&n=' + (++g_clientWriteN); }
 
-// A control write that never arrives looks, from the browser, exactly like one the regulator refused.
-// On 2026-09-15 a master-switch press died in the air while the device's own radio sat at -30 dBm with
-// zero reconnects and a 107 ms worst loop — the link drops whole requests while looking healthy — so a
-// press that "did not take" was a lost packet, not a firmware fault. Resend instead of losing it.
-// Two things make the resend safe, and BOTH are load-bearing:
-//   1. The URL, and therefore its n, is built ONCE by the caller. The firmware's per-tab guard discards
-//      a repeat, so a retry can never apply the command twice.
-//   2. myN !== g_clientWriteN means the user has pressed again since. Stop, and let the newer press own
-//      the outcome — a retried ON landing after a newer OFF is the 32 ms field re-energize bug in reverse.
-// Only a SILENT failure is retried. Any HTTP status is the regulator answering and is never re-sent.
+// A write that never arrives looks like a refusal from here, and the link drops whole requests while
+// looking healthy, so silent failures are resent. Safe because (1) the URL and its n are built ONCE by
+// the caller, so the firmware's per-tab guard discards a repeat, and (2) a newer press (myN !== g_clientWriteN)
+// stops the retry. Only SILENT failures retry; any HTTP status is an answer and is never re-sent.
 const CONTROL_WRITE_TRIES = 3;
-const CONTROL_WRITE_TIMEOUT_MS = 1600;   // ~10x the worst observed reply; 3 tries stays inside the old 5 s
-// Hedge: send a SECOND copy of the same url while the first is still unanswered, rather than sitting out
-// the full 1600 ms timeout waiting for an answer that is never coming. A press that dies in the air is
-// the common failure, not a refusal. 500 ms because the widest loss burst in the 2026-09-16 hotspot
-// capture was two consecutive 5 Hz pings (under 400 ms) and the phone's own SYN retransmit is ~1 s — a
-// hedge fired inside the burst would just be lost alongside the original. First attempt only: past that
-// the link is bad, more copies buy less than they cost, and every duplicate that DOES land writes a line
-// into the 200-line /consolehist.txt ring. Safe by construction, not by luck — the url, and therefore its
-// n, is built once by the caller, so the firmware's clientWriteTrack drops a copy whose n it already
-// applied, and an OFF is idempotent regardless. One cost: with EVERY copy silent the no-answer alert
-// now takes ~5.3 s instead of ~4.8 s, because the hedge's copy outlives the first by its own offset.
+const CONTROL_WRITE_TIMEOUT_MS = 1600;   // ~10x the worst observed reply; 3 tries stay under 5 s
+// Hedge: on the first attempt only, send a second copy of the same url after 500 ms unanswered. 500 ms
+// clears the widest observed loss burst (two 5 Hz pings, <400 ms) and beats the phone's ~1 s SYN retransmit;
+// later attempts don't hedge (duplicates cost /consolehist.txt lines). Safe: same n, firmware drops repeats.
 const CONTROL_WRITE_HEDGE_MS = 500;
 // onDeviceState (optional): called at most once with the 0/1 the regulator put in its reply body. Any
 // copy's answer serves — they carry the same command. See alternatorSet for why the reply is painted.
@@ -9430,10 +9150,8 @@ function sendControlWrite(url, myN, onDeviceState) {
         if (!onDeviceState || reported || !r || !r.ok || typeof r.text !== 'function') return;
         r.text().then(body => {
             const t = String(body).trim();
-            // A copy the firmware dropped as a duplicate answers 200 with an EMPTY body (its handler
-            // never sets inputMessage). That is the guard working, not an error — but it is not a STATE
-            // either, and Number("") is 0, so a numeric parse reads an ignored ON as "the field is off"
-            // and paints it. Exact string match only; anything else carries no information.
+            // A copy the firmware dropped as a duplicate answers 200 with an EMPTY body, and Number("") is 0,
+            // so a numeric parse would paint an ignored ON as off. Exact string match only.
             if (reported || (t !== '0' && t !== '1')) return;
             const v = Number(t);
             reported = true;
@@ -9474,11 +9192,11 @@ function paintOnOff(v, pendingV) {
     });
     document.querySelectorAll('#header-onoff .onoff-half, #hcs-onoff .onoff-half').forEach(b => {
         b.classList.toggle('onoff-pending', Number(b.dataset.v) === pendingV);
-        // The fill and the state word are the sighted channels; aria-pressed is the third one. Only
-        // set once the device state is known — an unknown state must announce neither half as current.
+        // aria-pressed only once the device state is known: an unknown state announces neither half.
         if (known) b.setAttribute('aria-pressed', Number(b.dataset.v) === v ? 'true' : 'false');
         else b.removeAttribute('aria-pressed');
     });
+    fuOffPaint(v, pendingV);
 }
 
 function alternatorSet(want) {
@@ -9491,39 +9209,23 @@ function alternatorSet(want) {
     const settle = () => { pendingToggles.delete('OnOff'); paintOnOff(g_onOffDevice); };
     const url = buildURL('/get?OnOff=' + want + clientWriteTag());
     const myN = g_clientWriteN;   // the press counter clientWriteTag() just minted for THIS url
-    // The regulator answers this write with its own OnOff, written AFTER the handler changed the
-    // variable ("0" / "1", the /get handler in 3_functions.ino). That reply is device truth in exactly
-    // the sense a CSV1 frame is, and it is causally later than the write — but it comes back on its own
-    // fresh connection instead of the stream's. The stream is what stalls: lwIP holds it through a
-    // retransmit for 1.5-4.5 s on a lossy hop, ~11 % of the time in the 2026-09-16 hotspot capture. That
-    // is where "I pressed it and nothing happened" comes from — the field had already obeyed and the echo
-    // was stuck behind a held socket. So the reply paints too. It is still never a guess: only a body of
-    // exactly 0 or 1, and only while this press is still this tab's newest. The pendingToggles entry is
-    // deliberately LEFT in place, so echoReconcile goes on shielding this paint from a CSV1 frame that was
-    // built before the write landed; the next frame that agrees settles it, and a protection that cuts the
-    // field right afterwards still shows up on its own frame.
+    // The write reply carries the regulator's OnOff after the handler ran (the /get handler in 3_functions.ino):
+    // device truth on a fresh connection, while the stream can sit 1.5-4.5 s in an lwIP retransmit. So the reply
+    // paints too, only for an exact 0/1 and only while this is the tab's newest press. pendingToggles stays set so
+    // echoReconcile shields the paint from frames built before the write; the next agreeing frame settles it.
     const paintFromReply = v => {
         if (myN !== g_clientWriteN) return;   // a newer press owns the paint
         const pending = pendingToggles.get('OnOff');
         if (!pending) return;                 // the stream already settled this press, and it is fresher than this reply
-        // Order this paint against the stream on the REGULATOR's clock, not the browser's. Every frame
-        // carries the device's own millis (sendMs); interpolating from the last one gives device-now, and
-        // the reply is already in hand, so the write was applied at or before that instant. A frame
-        // stamped EARLIER was built before the write and must not undo this paint. The first frame stamped
-        // at or after it is the stream catching up and wins outright, agreeing or not — which is what
-        // stops a SECOND writer's change from hiding behind echoReconcile's 2.5 s grace (tab A presses ON,
-        // tab B presses OFF 25 ms later: without this, A sits on its own stale ON for the whole grace).
-        // No usable device clock yet means no way to place this paint in time, so let the stream win
-        // outright instead: a brief flip to the pre-write state is survivable, a lie for 2.5 s is not.
+        // Order this paint against the stream on the REGULATOR's clock: frames stamped (sendMs) before device-now
+        // were built before the write and must not undo it; the first frame at or after it wins outright, so a 2nd
+        // writer's change can't hide behind echoReconcile's 2.5 s grace. No device clock yet: let the stream win.
         const lastSend = processCSVDataOptimized._lastSendMs;
         const lastArrival = processCSVDataOptimized._lastArrival;
         if (Number.isFinite(lastSend) && lastArrival > 0) {
             pending.deviceFloorMs = lastSend + (performance.now() - lastArrival);
-            // A reboot restarts sendMs near zero, so without an escape every later frame would sit below
-            // the floor forever and the switch would stop repainting. sessionId IS the boot identity, so
-            // test that directly rather than guessing with a stopwatch: the device holds a stalled client
-            // for 20 s (setAckTimeout in events.onConnect), so a frame delivered LATE can legitimately be
-            // that old, and any wall-clock backstop short enough to be useful would fire on those instead.
+            // A reboot restarts sendMs near zero; sessionId is the boot identity, so test it directly. No wall-clock
+            // backstop: the device holds a stalled client 20 s (setAckTimeout), so a late frame can be that old.
             pending.floorSessionId = (g_lastCsv1 && g_lastCsv1.sessionId !== undefined) ? Number(g_lastCsv1.sessionId) : undefined;
             pending.floorSetAt = Date.now();   // belt for the one case sessionId cannot see: 32-bit millis wrapping at ~49.7 days
         } else {
@@ -9539,9 +9241,8 @@ function alternatorSet(want) {
             if (r.ok) return;
             settle();
             if (r.status === 403) {
-                // settingsUnlocked only MIRRORS a window the device owns, so the mirror never decides
-                // anything here: the write goes out and only the device's own refusal is reported. A 403
-                // means the device is locked — another client locked it, or it rebooted. Re-sync now.
+                // settingsUnlocked only mirrors the device's window; a 403 means the device is locked
+                // (another client, or a reboot). Re-sync.
                 syncArmState();
                 // xAlert("Settings must be unlocked to turn alternator ON");   // i find this intrusive
                 xAlert('The regulator refused this — its controls are locked. Press Unlock Controls, then press ON again.',
@@ -9555,9 +9256,8 @@ function alternatorSet(want) {
             }
         })
         .catch(() => {
-            // No answer is not a refusal: the request may well have landed (an ON the regulator logged came
-            // back to the browser as a timeout on the bench), so nothing is flipped — the filled segment
-            // shows what the regulator is actually doing.
+            // No answer is not a refusal (the write may have landed), so nothing is flipped: the filled
+            // segment shows what the regulator is actually doing.
             settle();
             xAlert('Sent ' + CONTROL_WRITE_TRIES + ' times and the regulator never answered, so the command most '
                    + 'likely never reached it. The OFF / ON control shows what it is actually doing'
@@ -9587,10 +9287,8 @@ function lockSettingsManually() {
     armTokenSet(null);
     applySettingsLockUI();
 }
-// Tooltip / "s"-badge open-close — this one handler owns ALL of it (no inline onclicks):
-// tap a badge to open, tap the same badge again to close, tap anywhere else to close.
-// Taps inside the box are ignored so its text stays selectable for copying.
-// Capture phase so a stopPropagation() in some other handler can't strand a box open.
+// Sole owner of tooltip / "s"-badge open-close (no inline onclicks); taps inside the box are ignored so
+// text stays selectable. Capture phase so another handler's stopPropagation() can't strand a box open.
 document.addEventListener("click", function (e) {
     if (e.target.closest(".tooltip-box")) return;
     const tip = e.target.closest(".tooltip, .sinfo");
@@ -9624,12 +9322,9 @@ function closeTooltipBoxes() {
     window.removeEventListener("resize", _tipReflow);
 }
 
-// Place an open box in VIEWPORT coordinates. position:fixed is load-bearing, not cosmetic:
-// the card grids are CSS multi-column, and Chromium SLICES an absolutely-positioned box that
-// crosses a column break — the tail of a long tooltip painted as a second orphaned box at the
-// top of the next column. A fixed box is outside the fragmentation context so it cannot split.
-// Placement is measured (park at 0,0, read back where that landed) rather than computed from
-// offsets, so it stays right even when an ancestor's transform makes it the containing block.
+// Place an open box in VIEWPORT coordinates. position:fixed is load-bearing: Chromium slices an absolute
+// box that crosses a CSS multi-column break; a fixed box is outside the fragmentation context. Placement is
+// measured (park at 0,0, read back) so it survives an ancestor transform becoming the containing block.
 function placeTooltipBox(tip) {
     const box = tip && tip.querySelector(".tooltip-box");
     if (!box) return;
@@ -9644,12 +9339,10 @@ function placeTooltipBox(tip) {
     const vw = document.documentElement.clientWidth;
     const vh = document.documentElement.clientHeight;
     const M = 8;
-    // Centred under the badge, then pulled inside both edges — a right-side icon opening a
-    // 300px centred box used to widen the page into horizontal scroll on phones.
+    // Centred under the badge, clamped inside both edges (else horizontal scroll on phones).
     let x = Math.max(M, Math.min(a.left + a.width / 2 - b.width / 2, vw - M - b.width));
-    // Below the badge by preference. A fixed box cannot be scrolled into view the way the old
-    // absolute one could, so when it won't fit below it flips above the badge, and only clamps
-    // into the viewport (covering the badge) when it fits neither way.
+    // Below the badge; a fixed box can't be scrolled into view, so flip above when it won't fit, and
+    // clamp into the viewport (covering the badge) only when it fits neither way.
     const safeTop = _tipSafeTop() + M;
     let y = a.bottom + 5;
     if (y + b.height > vh - M) {
@@ -9738,9 +9431,8 @@ async function initializeProfileTab() {
     }
     const formData = new FormData();
 
-    // "Checking..." banner is delay-shown: a fast /checkRegistration round-trip shows nothing
-    // (it used to flash a bright box in dark mode on every Cloud tab open); only a slow check
-    // surfaces it. Colors come from the cloud-banner-* classes so dark mode can theme them.
+    // "Checking..." banner is delay-shown so a fast /checkRegistration shows nothing; colors come from
+    // the cloud-banner-* classes so dark mode can theme them.
     const banner = document.getElementById('profile-loading-banner');
     const bannerText = document.getElementById('profile-loading-text');
     if (banner) banner.style.display = 'none'; // clear a stale error banner from a prior open
@@ -9976,43 +9668,32 @@ async function handleVesselInfoSave(event) {
             updateEchoIfChanged('SolarWatts_echo', vesselData.solar_watts);
             updateEchoIfChanged('BatteryCapacity_Ah_echo', vesselData.battery_capacity_ah);
 
-            // Orientation changed on an existing profile → the stored level reference was captured
-            // in the old orientation and no longer applies. Remind, then run the other popups in
-            // sequence (each waits for the previous to close — never stacked).
+            // Orientation changed on an existing profile → the stored level reference no longer applies.
+            // Remind, then run the other popups in sequence (never stacked).
             const _orientChanged = _prevOrient !== null && isFinite(_prevOrient)
                 && _prevOrient !== vesselData.imu_mount_orientation;
             // A ✕-dismiss from a pre-flash session lives in sessionStorage and would mute a
             // factory-fresh device's popup in a reused tab — a true first save re-arms it.
             if (result.firstSave === true) sessionStorage.removeItem('socSeedDismissed');
-            // Kick the deferred-seed poll off HERE, not at its step below: the firmware's Core-1 write
-            // and the rest of this chain (Prerequisites screen, battery-defaults /exportConfig) then run
-            // against the same wall clock instead of end to end. Awaited at the step that shows it.
+            // Start the deferred-seed poll now so the firmware's Core-1 write and the rest of this chain run
+            // concurrently; awaited at the step that shows it.
             const _socSeedPolled = socSeedPoll().catch(() => null);   // started now, awaited later - never let it reject unhandled
-            // First install only: true once Next is pressed on the Commissioning Prerequisites screen. ✕,
-            // "I'll do this later" and a failed config read leave it false — no wizard — but the rest of
-            // the chain still runs.
+            // First install only: true once Next is pressed on Commissioning Prerequisites. ✕, "later" and a
+            // failed config read leave it false (no wizard); the rest of the chain still runs.
             let _goWizard = false;
             (_orientChanged
                 ? xAlert('Because the mounting orientation changed, the saved level reference (Level offsets) no longer matches how the device sits, and heel/pitch will read wrong until it is recaptured.\n\nWith the boat sitting level, press Zero Now in the Vessel Info section to re-zero.', 'Re-do Level Offsets')
                 : Promise.resolve())
-                // First install: describe the hardware BEFORE anything is recommended from it — Before You
-                // Start, then Commissioning Prerequisites (sensor roles, shunt). The battery-defaults proposal
-                // below reads battTempProbeEnable from its own /exportConfig, so it sees the Prerequisites
-                // writes (awaited in commPrepFinish) with no extra plumbing. The screen's handoff to
-                // Charge Rate Limits is deferred to the tail of this chain. Guarded so a failure here never
-                // blocks the save result.
+                // First install: Before You Start, then Commissioning Prerequisites, BEFORE anything is recommended
+                // from the hardware. The battery-defaults proposal reads its own /exportConfig, so it sees those
+                // writes. The handoff to Charge Rate Limits is deferred to the tail. Never blocks the save result.
                 .then(() => { if (result.firstSave === true) return maybeShowCommPrereqs().then(go => { _goWizard = go === true; }).catch(() => { }); })
-                // async, never blocks the save result. On a first install the Prerequisites screen has just
-                // closed, so the wait box covers the populator's own /exportConfig read (~1-2 s of device time).
-                // Armed on EVERY save now, not just the first: changing battery type/capacity/voltage makes a
-                // later save do that same read, and that gap used to run with no indicator at all.
+                // Async, never blocks the save result. The wait box covers the populator's /exportConfig read
+                // (~1-2 s of device time) on every save, since a type/capacity/voltage change does the same read.
                 .then(() => { vesselNextStepWait(true); return maybeProposeBatteryDefaults(vesselData, _prevBatt, result.firstSave === true); })
-                // Factory-fresh device: the firmware runs its deferred SoC seed on Core 1 some time
-                // after this save responds, so poll /socseed until the snapshot lands (a single
-                // fixed delay raced the Core-1 write and could miss the popup forever). Show it and
-                // WAIT for the user to close it BEFORE commissioning: the wizard opens the commission
-                // modal and socSeedMaybeAutoOpen suppresses itself over that modal, so a SoC popup
-                // deferred until after the wizard opened would never appear this session.
+                // Factory-fresh device: the deferred SoC seed runs on Core 1 after this save responds, so poll
+                // /socseed (a fixed delay raced it). Show it and WAIT before commissioning: socSeedMaybeAutoOpen
+                // suppresses itself over the commission modal, so a popup deferred past the wizard never appears.
                 .then(async () => {
                     vesselNextStepWait(true);   // every save, not just the first: the wait is the same length either way
                     await _socSeedPolled;       // usually already resolved - the poll started when the save responded
@@ -10023,9 +9704,8 @@ async function handleVesselInfoSave(event) {
                 })
                 // First save only: one-time heads-up that the device restarts itself for maintenance.
                 .then(() => { if (result.firstSave === true) return maintAckShow(); })
-                // First save only, Next was pressed on Prerequisites: Charge Rate Limits → tach alignment →
-                // wizard, the same handoff commPrepFinish makes itself on a re-commission. ← Back reopens
-                // Prerequisites, whose Next then hands off immediately (the deferral was consumed above).
+                // First save, Next pressed on Prerequisites: Charge Rate Limits → tach alignment → wizard (the
+                // handoff commPrepFinish makes on a re-commission). ← Back reopens Prerequisites, which then hands off.
                 .then(() => { if (_goWizard) { vesselNextStepWait(true); openRpmCap(openRpmAlign, commPrepReopen); } })
                 // Tail of the chain, never stacked: firmware just set the change flag if voltage/capacity/
                 // chemistry moved. No-op on a first save (no finished pass to invalidate).
@@ -10043,18 +9723,13 @@ async function handleVesselInfoSave(event) {
 }
 
 // ===== Battery-defaults populator =====
-// After a Vessel Info save that sets or changes battery type / capacity / system voltage,
-// propose chemistry-appropriate starting values for the charge-stage and protection settings
-// and show them in a Now → Proposed modal with per-row apply checkboxes. Never applies
-// silently; every setting stays individually editable afterward. Bulk/Absorption proposals
-// are deliberately conservative (lifetime over capacity) and the summary tells the user to
-// verify against the manufacturer's data sheet. Type "other" skips the whole pass.
+// After a Vessel Info save that sets/changes battery type, capacity or system voltage, propose chemistry
+// starting values in a Now → Proposed modal with per-row apply checkboxes. Never applies silently.
+// Bulk/Absorption lean conservative (lifetime over capacity). Type "other" skips the whole pass.
 
-// Compile-time firmware defaults in UI units — fallback "Now" when a key is absent from /exportConfig.
-// MUST track the global initialisers in Xregulator.ino; 16 of these had drifted away from the
-// firmware, so a fresh device with an unwritten key showed a fabricated "Now" and mis-flagged the
-// row as changed. Voltage/current entries are the 12 V seeds — InitSystemSettings multiplies them
-// by seedVScale for a 24/36/48 V bank, so this fallback is only exact at 12 V.
+// Compile-time firmware defaults in UI units: the "Now" fallback when /exportConfig lacks a key. MUST
+// track the global initialisers in Xregulator.ino (drift shows a fabricated "Now" and a false changed flag).
+// Voltage/current entries are 12 V seeds (InitSystemSettings scales by seedVScale), exact only at 12 V.
 const BATTDEF_FW_DEFAULT = {
     BulkVoltage: 13.9, AbsorptionVoltage: 13.9,
     UseFloat: 0, FloatVoltage: 13.6, FLOAT_DURATION: 8, RebulkVoltage: 13.1, RebulkCurrent_A: 10,
@@ -10079,15 +9754,10 @@ const BATTDEF_FROM_STORED = {
     AbsorptionTimeoutMs: v => v / 60000 // ms → minutes
 };
 const BATTDEF_MODE_NAMES = ['No Float (idle)', 'Voltage Float', 'Zero-Current Float'];
-// Per-chemistry rationale shown under the proposal summary. Framed around what each battery wants —
-// these are battery-specific recommendations, NOT alternator limits (the alternator has its own).
-// Each entry is a fn of the copy context built by deriveBatteryDefaults() (class-scaled bulk and
-// hard-cut volts, their per-cell equivalents, cell count, and the derived current limit in amps),
-// so the cited numbers match 12/24/36/48 V banks. Per-cell figures are printed alongside every
-// voltage: the bus number moves with the class, the per-cell number never does, and per-cell is the
-// form an owner checks against a data sheet. limA is 0 when bank capacity is unknown — every
-// amp figure has to drop out with it. An owner sees exactly ONE of these three, chosen by battery
-// type, so no paragraph may lean on a comparison with another chemistry.
+// Per-chemistry rationale under the proposal summary: battery recommendations, NOT alternator limits.
+// Each is a fn of deriveBatteryDefaults()'s copy context so cited numbers match 12/24/36/48 V; per-cell
+// figures go beside every voltage (the form an owner checks on a data sheet). limA is 0 when capacity is
+// unknown and every amp figure must drop out. An owner sees ONE, so none may compare to another chemistry.
 const BATTDEF_CEILING_COPY = d => 'The hard overvoltage cut is set to ' + d.hard + ' V (' + d.hardCell + ' V per cell across ' + d.cells
     + ' cells): brief voltage excursions do not harm a lead-acid battery (its damage mechanisms accumulate over minutes to years), '
     + 'so rather than cut the field on momentary spikes, the ceiling is placed where the connected DC equipment \u2014 not the battery \u2014 '
@@ -10118,10 +9788,8 @@ const BATTDEF_CHEM_COPY = {
         + BATTDEF_CEILING_COPY(d)
 };
 
-// Notice tiers for the battdef modal, severity carried by the header colour: warn = doing this
-// destroys the battery, limit = the regulator cannot do this yet, info = why a proposed value
-// differs from the plain recommendation. Glyphs are geometric shapes (U+25B2/U+25B3), never the
-// emoji-presentation "‼" — iOS renders that in colour.
+// Notice tiers, severity carried by header colour: warn = destroys the battery, limit = regulator can't do
+// this yet, info = why a proposal differs. Geometric glyphs only, never emoji "‼" (iOS renders it in colour).
 const BATTDEF_NOTICE_TIER = {
     warn:  { glyph: '▲', border: 'rgba(252,165,165,0.32)', bg: 'rgba(252,165,165,0.055)', hdBg: 'rgba(252,165,165,0.09)',  fg: '#fca5a5' },
     limit: { glyph: '△', border: 'rgba(230,162,60,0.30)',  bg: 'rgba(230,162,60,0.05)',   hdBg: 'rgba(230,162,60,0.085)',  fg: '#e6a23c' },
@@ -10138,23 +9806,18 @@ function battDefNotice(tier, title, body) {
         + '<div style="padding:6px 10px 9px; font-size:0.86em; line-height:1.5; color:#b9b9b9;">' + body + '</div></div>';
 }
 
-// Per-chemistry Battery Health capacity-trend tuning. 12V-referenced rested open-circuit-voltage
-// curves at the fixed SoC breakpoints {100,90,80,60,40,30,20,15,10,5,0}; firmware scales by
-// SYSTEM_VOLTAGE_CLASS/12 at lookup, so these are entered as 12V values regardless of system voltage.
-// Firmware loads the chemistry-matched curve into capOcvVolt[] at commissioning (applyChemistryOcvPreset,
-// 8_functions.ino), so these presets drive BOTH the SoC seed and the capacity anchor; AGM rests slightly
-// above lead-acid. The anchor window differs because lead-acid/AGM voltage maps to SoC across the whole
-// range (anchor can sit at a shallow, non-damaging rest), while flat LiFePO4 only reads reliably at the bottom knee.
+// Per-chemistry Battery Health capacity-trend tuning. 12V-referenced rested OCV curves at SoC breakpoints
+// {100,90,80,60,40,30,20,15,10,5,0}; firmware scales by SYSTEM_VOLTAGE_CLASS/12 and loads them at commissioning
+// (applyChemistryOcvPreset, 8_functions.ino), so they drive the SoC seed and the capacity anchor.
+// Anchor windows differ: lead/AGM OCV tracks SoC across the range, flat LiFePO4 only at the bottom knee.
 const CAP_OCV_PRESETS = {
     lifepo4:   [13.60, 13.40, 13.30, 13.20, 13.10, 13.00, 12.90, 12.80, 12.50, 12.00, 10.00],
     agm:       [12.85, 12.70, 12.55, 12.35, 12.15, 12.05, 11.90, 11.80, 11.70, 11.60, 11.50],
     lead_acid: [12.70, 12.50, 12.40, 12.20, 12.00, 11.90, 11.80, 11.73, 11.65, 11.55, 11.40]
 };
-// restFloor = minutes at rest before the OCV is trusted (Battery University BU-903: lithium ~90 min,
-// lead-acid ≥4 h for surface charge to dissipate; AGM recombines a bit faster). settleRate = the
-// dV/dt "stopped moving" gate in mV/10min, ANDed with restFloor. LiFePO4 settles fast so hold it tight
-// (2); lead-acid/AGM surface charge lingers, so loosen to ~3.5 — their OCV curve is steep at the anchor
-// SoC, so a looser voltage gate costs negligible SoC accuracy but lets a point actually capture.
+// restFloor = minutes at rest before OCV is trusted (BU-903: lithium ~90 min, lead-acid ≥4 h; AGM a bit
+// faster). settleRate = dV/dt "stopped moving" gate (mV/10min), ANDed with restFloor: tight for fast-settling
+// LiFePO4; ~3.5 for lead/AGM, whose steep OCV at the anchor makes a looser gate cost negligible SoC accuracy.
 const CAP_CHEM_ANCHOR = {
     lifepo4:   { lowMax: 20, span: 70, restFloor: 90,  settleRate: 2.0 },   // bottom knee only, deep cycle (flat mid-curve)
     agm:       { lowMax: 50, span: 40, restFloor: 180, settleRate: 3.5 },
@@ -10172,17 +9835,13 @@ function ocvBlobsEqual(a, b) {
 }
 
 function deriveBatteryDefaults(type, capAh, sysV, battProbe) {
-    // bulkV/absV lean gentle for stress/lifetime: LiFePO4 13.9 V ≈ high-90s% SoC well below 14.4+;
-    // AGM at 14.4; flooded higher (14.6) because it needs the extra to counter stratification and its
-    // dominant killer is UNDERcharge (sulfation), not overcharge. limC is the opposite philosophy: high
-    // charge current REDUCES sulfation and lengthens life, so AGM is 1.0C (quality AGM cells tolerate several-C in-rush).
-    // Flooded stays 0.20C — it genuinely gasses and heats. These are battery-specific; the alternator's
-    // own current ceiling is a separate limit.
+    // bulkV/absV lean gentle for lifetime; flooded runs higher (14.6) because its dominant killer is
+    // UNDERcharge (sulfation/stratification). limC is the opposite: high current REDUCES sulfation, so AGM
+    // is 1.0C; flooded stays 0.20C (it gasses and heats). Battery-specific; the alternator ceiling is separate.
     const T = {
-        // Lithium vAlmHi 14.4: the external-source tripwire sounds ABOVE the whole cut ladder
-        // (hardware rung 14.3) but BELOW the BMS trip floor (~14.5) — an external charger
-        // overdriving the bank alarms before any BMS acts. AGM/lead keep 15.8, below their own
-        // 15.9/16.0 cuts (approach alarm; no BMS race there) — deliberate, don't "fix".
+        // Lithium vAlmHi 14.4 sits ABOVE the whole cut ladder (hardware rung 14.3) but BELOW the BMS trip
+        // floor (~14.5), so an external charger overdriving the bank alarms first. AGM/lead 15.8 sits below
+        // their 15.9/16.0 cuts (approach alarm, no BMS race): deliberate, don't "fix".
         lifepo4:   { bulkV: 13.9, absV: 13.9, floatV: null, durH: null, rebulkV: 13.1, socBlock: 90, socAllow: 80, tailC: 0.05, tailPct: 5, chgDetV: 13.8, limC: 0.50, cold: 1, hot: 1, hotF: 113, peukert: 1.05, chgEff: 99, vAlmHi: 14.4, vAlmLo: 11.9, socAlm: 10, absBase: 30, absMax: 45,  ovMeasMargin: 0.1 },
         agm:       { bulkV: 14.4, absV: 14.4, floatV: 13.6, durH: 8,    rebulkV: 12.5, socBlock: 97, socAllow: 90, tailC: 0.02, tailPct: 2, chgDetV: 14.2, limC: 1.00, cold: 0, hot: 0, hotF: 122, peukert: 1.10, chgEff: 93, vAlmHi: 15.8, vAlmLo: 11.8, socAlm: 40, absBase: 60, absMax: 180, ovMeasMargin: 0.5 },
         lead_acid: { bulkV: 14.6, absV: 14.6, floatV: 13.4, durH: 8,    rebulkV: 12.4, socBlock: 97, socAllow: 90, tailC: 0.02, tailPct: 2, chgDetV: 14.3, limC: 0.20, cold: 0, hot: 0, hotF: 122, peukert: 1.25, chgEff: 88, vAlmHi: 15.8, vAlmLo: 11.5, socAlm: 40, absBase: 90, absMax: 240, ovMeasMargin: 0.5 }
@@ -10211,35 +9870,22 @@ function deriveBatteryDefaults(type, capAh, sysV, battProbe) {
     rows.push({ param: 'SOC_BlockRebulk_percent', label: 'SoC Block Rebulk Above (%)', value: T.socBlock });
     rows.push({ param: 'SOC_AllowRebulk_percent', label: 'SoC Allow Rebulk Below (%)', value: T.socAllow });
     if (C) {
-        const lim = r1(T.limC * C);   // /get handler clamp widened to 2000 A, so no mirror cap here
+        const lim = r1(T.limC * C);   // /get clamps at 2000 A, so no mirror cap here
         rows.push({ param: 'TailCurrent_A', label: 'Tail Current (A)', value: r1(T.tailC * C) });
         rows.push({ param: 'BattCurrentLimitA', label: 'Battery Charge Current Limit (A)', value: lim });
         rows.push({ param: 'MaximumAllowedBatteryAmps', label: 'High Current Alarm (Battery) (A)', value: Math.round(1.25 * lim) });
     }
     rows.push({ param: 'ChargedVoltage', label: 'Max Charge Detection Voltage (V)', value: r2(T.chgDetV * kV) });
     rows.push({ param: 'TailCurrent', label: 'Max Charge Detection Tail Current (%)', value: T.tailPct });
-    // Over-voltage ladder, chained top-down from the battery's BMS charge-disconnect voltage.
-    // Lithium: the hardware (INA228) rung sits 0.2 V x class below the surveyed BMS trip floor —
-    // BMS trips compare the HIGHEST cell while we regulate pack voltage, so the pack-referred
-    // margin must cover imbalance; the software instant cut rides 0.1 x class under it so software
-    // always acts before the electrical backstop. AGM/flooded: no BMS in the picture — lead-acid
-    // damage is time-integrated, indifferent to brief bounded spikes, so the ceiling protects the
-    // DC loads' published continuous ratings instead of the battery. The timed-tier trip lines
-    // fit between the shed line and the software cut. Per PROTECTION_TIMING_OVERHAUL_SPEC the LOW tier
-    // RIDES the Group 2 shed line rather than sitting above it, which is why lithium reads 0.10/0.10/0.20:
-    // its shed-to-software-cut corridor is only 0.1 V wide, so there is nowhere above the shed line to put
-    // LOW. Lead/AGM has a 5.1 V corridor, so its tiers do sit 0.1/0.2 clear of the 0.50 shed margin.
-    // Lithium scales linearly because its rung IS per-cell: the BMS trips on the highest cell while we
-    // regulate the pack sum, so the pack-referred imbalance allowance really is N x the per-cell offset
-    // (a 50 mV outlier eats 0.75 V at 16S vs 0.15 V at 4S). The lead/AGM ceiling is the opposite — a DC
-    // LOAD rating, class-invariant in kind — so it stops scaling at the equipment: 16.0 x 4 = 64 V on a
-    // 48 V bank, above the ~60 V ceiling of most 48 V gear.
+    // OV ladder, chained top-down from the BMS charge-disconnect. Lithium: hardware (INA228) rung 0.2 V x class
+    // under the BMS trip floor (BMS compares the highest cell, we regulate the pack, so linear scaling covers
+    // imbalance); software cut 0.1 x class under that. Lead/AGM: no BMS; damage is time-integrated, so the
+    // ceiling protects DC loads instead and caps at 60 V (48 V gear). Per PROTECTION_TIMING_OVERHAUL_SPEC LOW
+    // RIDES the shed line, so lithium (0.1 V corridor) reads 0.10/0.10/0.20; lead/AGM tiers clear the 0.50 shed.
     const hwLimit = (type === 'lifepo4') ? 14.3 * kV : Math.min(16.0 * kV, 60);
     const hardSD = hwLimit - 0.1 * kV;
-    // The three target-relative rungs are per-cell and scale, but a capped ceiling can leave no room for
-    // them: 48 V flooded at 2.43 V/cell would put MID at 61.2 V under a 60 V cap. Compress all three by
-    // one factor so MID lands just under the software cut, rather than proposing a ladder that cannot fit.
-    // No-ops at 12/24/36 V on every chemistry — only 48 V lead has a corridor short enough to bind.
+    // A capped ceiling can leave no room for the target-relative rungs (48 V flooded MID would be 61.2 V
+    // under 60 V): compress all three so MID lands just under the software cut. Binds only at 48 V lead.
     let shedM = T.ovMeasMargin * kV;
     let loM = ((type === 'lifepo4') ? 0.10 : 0.60) * kV;
     let midM = ((type === 'lifepo4') ? 0.20 : 0.70) * kV;
@@ -10258,9 +9904,8 @@ function deriveBatteryDefaults(type, capAh, sysV, battProbe) {
     rows.push({ param: 'VoltageAlarmHigh', label: 'High Voltage Alarm (V)', value: r2(T.vAlmHi * kV) });
     rows.push({ param: 'VoltageAlarmLow', label: 'Low Voltage Alarm (V)', value: r2(T.vAlmLo * kV) });
     rows.push({ param: 'SocAlarmLow', label: 'Low State of Charge Alarm (%)', value: T.socAlm });
-    // A battery temperature from ANY source (probe, NMEA 2000, VE.Direct, RV-C — the caller's measuredSrc)
-    // is what gives the lockouts and the derate something to read, so all four rows are proposed only with
-    // one fitted. With none, nothing is proposed and whatever is stored stays.
+    // A battery temperature from ANY source (the caller's measuredSrc) feeds the lockouts and derate, so
+    // these rows are proposed only with one fitted; otherwise the stored values stay.
     if (battProbe === 1) {
         rows.push({ param: 'coldChargeLockoutEnable', label: 'Cold-Charge Lockout', value: T.cold, show: v => v ? 'On' : 'Off' });
         rows.push({ param: 'battTempDerateEnable', label: 'Battery-Temp Gain Derate', value: 1, show: v => v ? 'On' : 'Off' });
@@ -10288,35 +9933,29 @@ function deriveBatteryDefaults(type, capAh, sysV, battProbe) {
         rows.push({ param: 'bhStepDeltaA', label: 'Resistance Test — Step Delta (A)', value: step });
     }
 
-    // Voltage D term — only the two params that actually vary with bank voltage are proposed here (V/s
-    // and V thresholds, × class). Kd (voltage-normalized 12 V-equivalent), the back-off cap (flat amps),
-    // the voltage filter (ms) and the mode (one-sided vs two-sided) are universal — one value works on
-    // every bank, so like Kp/Ki they are not proposed here; they live in Setup → Voltage. These match the server rescale
-    // (×class) exactly, so on a voltage-class change a defaults bank reads back as "matches".
-    // CvKdDeadbandVps is a SAFETY MARGIN, not a threshold: commissioning's Step-5 ripple fit measures the
-    // real threshold and this rides on top of it; 0.4×class here is only the pre-commissioning fallback.
+    // Voltage D term: only the two class-scaled params are proposed (V/s and V thresholds, × class, matching
+    // the server rescale so a defaults bank reads "matches" after a class change). Kd, back-off cap, filter and
+    // mode are universal and live in Setup → Voltage. CvKdDeadbandVps is a SAFETY MARGIN atop the Step-5
+    // ripple-fit threshold; 0.4×class is only the pre-commissioning fallback.
     rows.push({ param: 'CvKdDeadbandVps', label: 'Voltage-Rise Tolerance — Safety Margin (V/s)', value: r2(0.4 * kV) });
-    // 0.5 matches the Xregulator.ino CvKdArmV seed — kept tight so D stays off the sag-recovery climb
-    // (1.25 armed the D brake 1.25 V early on OV-recovery climbs and chopped the recovering field).
+    // 0.5 matches the Xregulator.ino CvKdArmV seed; tight so D stays off the sag-recovery climb (wider arms
+    // the D brake early on OV-recovery climbs and chops the recovering field).
     rows.push({ param: 'CvKdArmV', label: 'Voltage D Term — Arm Window Below Target (V)', value: r2(0.5 * kV) });
 
-    // Setpoint slew is a per-bank V/s rate, so like the D-term thresholds it scales × class (0.15 V/s on 12V
-    // rides as 0.30 on 24V / 0.45 on 36V / 0.60 on 48V). 12V base 0.15 matches the firmware initializer's seedVScale seed.
+    // Setpoint slew is per-bank V/s, so it scales × class; 12V base 0.15 matches the firmware seedVScale seed.
     rows.push({ param: 'vTgtRampUp', label: 'Voltage Setpoint — Rise Rate (V/s)', value: r2(0.15 * kV) });
     rows.push({ param: 'vTgtRampDn', label: 'Voltage Setpoint — Fall Rate (V/s)', value: r2(0.15 * kV) });
 
-    // α doubles on LiFePO4 (stiff plant → tiny post-event errors; P/I must double for usable
-    // regulation/recovery pace) while Td halves so the effective D gain Kd = Td·Kp stays constant —
-    // surplus D authority against a locally-stiff plant is a documented failure mode ("sub-ceiling
-    // relay", CV_Loop_Dev_Summary.md 07-21). ρ stays chemistry-independent.
+    // α doubles on LiFePO4 (stiff plant: tiny post-event errors, P/I must double for usable pace) while Td
+    // halves so Kd = Td·Kp stays constant; surplus D on a locally-stiff plant is a documented failure mode
+    // ("sub-ceiling relay", CV_Loop_Dev_Summary.md 07-21). ρ is chemistry-independent.
     const isLfp = (type === 'lifepo4');
     rows.push({ param: 'cvAlpha', label: 'Voltage Loop Aggressiveness (α)', value: isLfp ? 0.10 : 0.05 });
     rows.push({ param: 'CvKdTd', label: 'Voltage D Term — Derivative Time (s)', value: isLfp ? 0.42 : 0.85 });
     rows.push({ param: 'cvPiZero', label: 'Voltage Loop Ki/Kp Ratio (ρ)', value: 0.5 });
 
-    // Context for BATTDEF_CHEM_COPY. Cell counts are per 12 V of nominal bus (lead-acid/AGM 6 × 2 V,
-    // LiFePO4 4 × 3.2 V), so × kV gives the real series count and every per-cell figure comes out
-    // identical on a 12/24/36/48 V bank. Trailing zeros are trimmed so 3.600 reads as 3.6.
+    // Context for BATTDEF_CHEM_COPY. Cell counts are per 12 V of nominal bus, so × kV gives the real
+    // series count and per-cell figures are class-invariant. Trailing zeros trimmed (3.600 → 3.6).
     const cellsPer12 = { lifepo4: 4, agm: 6, lead_acid: 6 }[type];
     const perCell = v => v.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
     const copy = {
@@ -10361,14 +10000,12 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
             prevBatt.type !== type ||
             prevBatt.cap !== Number(vessel.battery_capacity_ah) ||
             prevBatt.volt !== Number(vessel.battery_voltage));
-        // Silent on purpose: this is every ordinary re-save of unchanged vessel info, so a note here
-        // would fire on each save. The recommender is reachable on demand from System Settings, so
-        // this return is no longer a one-way door. `manual` skips the gate entirely.
+        // Silent on purpose: this is every ordinary re-save of unchanged vessel info. The recommender is
+        // reachable on demand from System Settings; `manual` skips the gate.
         if (!manual && !firstSave && !battChanged) return;
         if (type === 'other') { _battDefSkipNote('No recommendations are made for the Other battery type. Inspect every charge-stage and protection setting under Setup and adjust each one individually.', manual); return; }
-        // A successful /saveVesselInfo proves the device is armed (that endpoint is arm-gated);
-        // this tab's mirror can be stale after a reload. Re-sync and proceed — a genuinely
-        // unarmed device fails the /exportConfig below, which already shows a visible skip note.
+        // A successful /saveVesselInfo (arm-gated) proves the device is armed; this tab's mirror can be stale.
+        // Re-sync and proceed: a genuinely unarmed device fails /exportConfig below with a visible skip note.
         if (!settingsUnlocked) syncArmState();
 
         // Current values from the device (raw NVS strings)
@@ -10399,9 +10036,8 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
 
         const typeName = { lifepo4: 'LiFePO4', agm: 'AGM', lead_acid: 'Lead Acid' }[type] || type;
         const capTxt = (Number(vessel.battery_capacity_ah) > 0) ? Number(vessel.battery_capacity_ah) + ' Ah, ' : '';
-        // Charge targets/limits don't yet move with temperature (setpoint temp-comp is unbuilt; the
-        // battery temperature itself comes from the measured source chain). Inline here
-        // (one message, in context) rather than a separate popup after this modal.
+        // Charge targets/limits don't move with temperature (setpoint temp-comp is not built); said inline
+        // here rather than as a separate popup after this modal.
         const _tc = (typeof displayTempUnit !== 'undefined' && displayTempUnit === 1);
         let noticeHtml = '';
         if (type === 'agm' || type === 'lead_acid') {
@@ -10421,9 +10057,8 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
             noticeHtml += battDefNotice('limit', 'Battery temperature source',
                 'No battery temperature is reporting. Charging will not run until one does, or until the source is set to Not fitted under Setup > Battery > Battery Temperature (the cold and hot charge lockouts and their limits live there too). Fit one of the ring-lug probes from the kit to the battery\'s negative terminal and assign it to Battery, or feed battery temperature in from an NMEA 2000 battery monitor, a VE.Direct monitor with a temperature sensor, or an RV-C source.');
         }
-        // Voltage float is allowed without a shunt (2026-09-09): absorption then ends on its time limit
-        // instead of tail current, the way a solar controller floats with no shunt, unless a network battery
-        // monitor supplies the current. Say which exit will run.
+        // Voltage float is allowed without a shunt: absorption ends on its time limit instead of tail current,
+        // unless a network battery monitor supplies the current. Say which exit will run.
         if (der.useFloat === 1 && shuntPresent !== 1 && !battMon) {
             noticeHtml += battDefNotice('info', 'Float without a shunt runs on time',
                 'The battery shunt is marked absent, so the regulator cannot see the battery\'s own current. Absorption will end on its time limit (Absorption Timeout under Setup > Battery) instead of on tail current, and float then holds the float voltage. Declaring the shunt and entering its resistance, or turning on Use as Battery Monitor under Setup > Integrations, switches the exit to tail current.');
@@ -10479,15 +10114,13 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
         document.querySelectorAll('#battdef-body .battdef-cb:checked').forEach(cb => picked.push(changed[+cb.dataset.i]));
         if (!picked.length) return;
 
-        // One /get request — every hasParam block in the refactored handler processes independently
+        // One /get request: every hasParam block in the handler processes independently
         const url = '/get?' + picked.map(c => c.param + '=' + encodeURIComponent(c.value)).join('&');
         const ar = await fetchWithTimeout(buildURL(url), {}, 10000);
         if (!ar.ok) { _battDefReport('Could not apply the recommended values (HTTP ' + ar.status + ').' + (manual ? '' : ' The vessel info itself was saved.'), false, manual); return; }
 
-        // HTTP 200 does NOT mean the writes landed: /get answers with the LAST matching handler's
-        // message, or "No message sent..." when nothing matched, so a request whose params were all
-        // unrecognised, out of a handler's constrain() range, or overwritten by another handler in the
-        // same request still comes back 200. Re-read and re-diff instead of trusting the status.
+        // HTTP 200 does NOT mean the writes landed: /get answers with the LAST matching handler's message, so
+        // unrecognised, out-of-range or overwritten params still return 200. Re-read and re-diff.
         let stuck = [];
         try {
             const vr = await fetchWithTimeout(buildURL('/exportConfig'), {}, 10000);
@@ -10510,21 +10143,15 @@ async function maybeProposeBatteryDefaults(vessel, prevBatt, deviceFirstSave, ma
     }
 }
 
-// Surface a battdef skip (else a silent config-fetch failure looks like a clean save) on the banner.
-// The two rows commissioning MEASURES, so the chemistry table's generic value is a downgrade once a
-// wizard run exists. IExcessCeilA is in commissionSnapshotScalarsToBuf's revert set and the Thresholds
-// step raises it past the flat 20 A proposed here; CvKdDeadbandVps is overwritten by the Step-5 ripple
-// fit (see its declaration comment in Xregulator.ino). On a MANUAL launch these arrive unchecked so a
-// re-apply cannot silently undo a measurement — still listed, still checkable if the owner wants the
-// generic value back. Deliberately NOT included: cvAlpha / CvKdTd / cvPiZero (design constants, nothing
-// outside the /get handler writes them) and bhStepLowA / bhStepDeltaA (first-boot seed only).
+// The two rows commissioning MEASURES (IExcessCeilA: raised by the Thresholds step, in
+// commissionSnapshotScalarsToBuf's revert set; CvKdDeadbandVps: the Step-5 ripple fit). A MANUAL launch
+// shows them unchecked so a re-apply can't silently undo a measurement. Deliberately excluded:
+// cvAlpha/CvKdTd/cvPiZero (design constants) and bhStepLowA/bhStepDeltaA (first-boot seed only).
 const BATTDEF_CX_OWNED = new Set(['IExcessCeilA', 'CvKdDeadbandVps']);
 
-// System Settings > Recommend Initial Charging Settings. The save-chain call fires at most once per battery
-// identity per device lifetime, so without this there is no way back to the proposal after a Skip.
-// Re-reads vessel info rather than trusting window.vesselInfo: that mirror can hold another unit's
-// battery block after switching regulators in one browser session, which is how a bench with two
-// identically-specified banks silently gets the wrong ladder.
+// System Settings > Recommend Initial Charging Settings: the save-chain call fires at most once per battery
+// identity, so this is the way back after a Skip. Re-reads vessel info: window.vesselInfo can hold another
+// unit's battery block after switching regulators in one session.
 async function launchBatteryRecommender() {
     if (_battDefResolve) { xAlert('The recommendation list is already open.', 'Recommend Initial Charging Settings'); return; }
     if (cxSetupBusy()) { fileToast(CX_SETUP_BUSY_TXT); return; }
@@ -10553,9 +10180,9 @@ function _battDefReport(txt, ok, manual) {
     md.textContent = txt;
 }
 
-// `manual` = launched from the System Settings button rather than the vessel-info save chain.
-// #vessel-info-message lives inside the Vessel Info tab, so it is off-screen for a manual launch —
-// those get a dialog instead, and text with no markup in it, since xAlert renders plain text.
+// Append a battdef skip reason to the Vessel Info save banner, so a skip doesn't read as a clean save.
+// `manual` = launched from System Settings. #vessel-info-message is off-screen then, so it gets a dialog
+// with markup stripped (xAlert renders plain text).
 function _battDefSkipNote(txt, manual) {
     const md = document.getElementById('vessel-info-message');
     if (manual || !md) { xAlert(String(txt).replace(/<br>/g, '\n').replace(/&rarr;/g, '>').replace(/<[^>]*>/g, ''), 'Recommend Initial Charging Settings'); return; }
@@ -10563,9 +10190,8 @@ function _battDefSkipNote(txt, manual) {
     md.innerHTML += '<br><span style="color:#e6a23c;">' + txt + '</span>';
 }
 
-// One row's "what the device has now" + whether it already matches the recommendation. Extracted so
-// the post-Apply verification re-runs the SAME comparison the modal rendered — a second, hand-rolled
-// diff would drift from this one and report phantom failures.
+// Device's current value + match flag. Shared with the post-Apply verify so both run the SAME comparison
+// (a second hand-rolled diff would drift and report phantom failures).
 function battDefRowState(cfg, row) {
     if (row.blob) {   // OCV curve: comma-joined string, compared numerically not as a scalar
         const nowStr = (cfg[row.param] !== undefined && cfg[row.param] !== '') ? String(cfg[row.param]) : '';
@@ -10581,19 +10207,15 @@ function battDefRowState(cfg, row) {
     return { now: nowUi, match: isFinite(nowUi) && Math.abs(nowUi - row.value) < 0.005 };
 }
 
-// First-save chain only: between two setup screens the page sits idle on the device (SoC-seed poll,
-// then the /exportConfig NVS walk, then the prerequisites write), which reads as a finished save.
-// A note on the Vessel Info banner is out of sight at the bottom of a long form, so the wait gets
-// its own black box in the same family as the screens on either side of it and the sequence never
-// goes blank. Painting is delayed 600 ms so the common fast path never flashes it; a tail swap at
-// 12 s turns the box amber and offers a close X so a stalled chain is not a trap.
+// First-save chain only: between setup screens the device is busy (SoC-seed poll, /exportConfig walk,
+// prerequisites write), which reads as a finished save, so the wait gets its own black box. Painted after
+// 600 ms so the fast path never flashes it; at 12 s it turns amber with a close X so a stall is not a trap.
 let _vesselWaitShowTimer = null;
 let _vesselWaitTailTimer = null;
 
-// The setup screens are click-through (no backdrop) so Alternator Enable, Ignition Override and the Setup tabs
-// stay reachable mid-sequence. That leaves their launchers reachable too, and each screen resolves a promise its
-// sequence awaits: a second launch would replace that resolver and strand the first. Launchers check this first.
-// Only visible screens count: the stalled-wait recovery is "close this box, press Update Vessel Info again".
+// Setup screens are click-through (no backdrop), so their launchers stay reachable, and each screen resolves
+// a promise its sequence awaits: a second launch would strand the first. Launchers check this first. Only
+// visible screens count (stalled-wait recovery is "close this box, press Update Vessel Info again").
 const CX_SETUP_OVERLAYS = ['commprep-modal-overlay', 'fieldres-modal-overlay', 'rpmcap-modal-overlay', 'rpmalign-modal-overlay',
     'battdef-modal-overlay', 'maint-ack-overlay', 'nextstep-modal-overlay'];
 const CX_SETUP_BUSY_TXT = 'A setup screen is already open — finish it or close it first';
@@ -10651,12 +10273,10 @@ function vesselNextStepWait(on, copy) {
 }
 
 // ===== Commissioning Prerequisites screen =====
-// On a first Vessel Info save it runs FIRST, ahead of the battery-defaults popup, so the proposal is
-// derived from the hardware described here; the Charge Rate Limits handoff is then made by the save
-// chain rather than by this screen (_commPrepDeferHandoff). Presents the sensor/current settings
-// commissioning depends on, pre-filled from /exportConfig. Only user-edited fields are written, awaited
-// /get writes on Next (battdef pattern; see commPrepFinish for the write order).
-// Temperature inputs follow the app's display unit; every param is submitted in its native unit.
+// On a first Vessel Info save it runs FIRST, before battery defaults, so the proposal reflects the hardware
+// described here; the save chain then makes the Charge Rate Limits handoff (_commPrepDeferHandoff). Pre-filled
+// from /exportConfig; only user-edited fields are written, as awaited /get writes on Next (see commPrepFinish).
+// Temperature inputs follow the display unit; every param is submitted in its native unit.
 let _commPrereqResolve = null;   // awaited by the vessel-save chain; resolved when the modal closes
 let _commPrepCfg = null;         // /exportConfig snapshot captured at open, for changed-detection
 let _commPrepInit = {};          // input id → initial value string (only changed inputs are written)
@@ -10673,13 +10293,9 @@ let _commPrepWiringInit = 0;     // FieldWiring at open (0 not set, 1 P-type, 2 
 let _commPrepWiring = 0;         // live field-wiring selection
 let _commPrepRpmActive = false;  // deep-linked into the RPM editor from the wizard: suppress the live blue row highlight
 let _commPrepFirstInstall = true; // false on a re-commission: different intro copy
-// Whether Next hands off to the tach-alignment screen. Split from _commPrepFirstInstall because the two
-// questions are different: the intro copy asks "is this their first install", the alignment screen asks
-// "is the engine-speed axis about to be re-measured against". A wholesale restart answers no to the first
-// and YES to the second — it reverts every other setting to pre-commissioning and re-runs all nine steps,
-// and every RPM-binned one of them is measured against this axis (see commissionClearRpmDependents in the
-// firmware, which wipes seven stages when it moves). Continuing a partial run answers no to both: a rescale
-// mid-tune would invalidate the steps already done in that same run.
+// Whether Next hands off to tach alignment ("is the RPM axis about to be re-measured against"), separate from
+// _commPrepFirstInstall (intro copy). A wholesale restart: not first install, but YES, since every RPM-binned
+// step re-runs against it (commissionClearRpmDependents). Continuing a partial run: no to both.
 let _commPrepShowAlign = true;
 let _commPrepDeferHandoff = false; // vessel-save chain: Next resolves the screen instead of opening Charge Rate Limits (the chain does, after battdef / SoC / restart ack)
 let _commPrepOwLast = null;      // last /tempSensors JSON, polled while this screen is open
@@ -10701,10 +10317,9 @@ function commPrepPaintCta() {
 }
 
 // ----- Temperature probes on the prerequisites screen -----
-// Binding the probes is part of commissioning, not homework for afterwards: the wizard stamps the
-// battery-temperature source class it measured against, and an unbound Alternator role leaves the
-// over-temperature protection with no temperature at all. Assignments and the two enable toggles are
-// written immediately (like the Charge-Limit Follow button); the number fields stay staged until Next.
+// Binding probes is part of commissioning: the wizard stamps the battery-temp source class it measured
+// against, and an unbound Alternator role leaves over-temperature protection blind. Assignments and the two
+// toggles write immediately; number fields stay staged until Next.
 function commPrepOwVisible() {
     const ov = document.getElementById('commprep-modal-overlay');
     return !!ov && ov.style.display !== 'none' && document.visibilityState !== 'hidden';
@@ -10728,9 +10343,8 @@ async function commPrepOwPollNow() {
         _commPrepOwBusy = false;
     }
 }
-// Rows are rebuilt only when the id/role/present set changes, so an open role <select> is never torn
-// down mid-choice; the temperature cell updates in place. No age column: a sensor is on the bus or it is
-// not, and one that is listed but has stopped answering says so where its temperature would be.
+// Rows rebuild only when the id/role/present set changes, so an open role <select> survives; temperature
+// cells update in place. A listed sensor that stopped answering says so in its temperature cell.
 const CP_OW_ROLE_LABEL = ['Alternator', 'Battery', 'Extra'];   // firmware roles 0..2; must match OW_ROLE_NAMES
 const CP_OW_STALE_S = 30;                                      // read cadence is 5 s; 30 s of silence is a fault, not jitter
 function commPrepOwRender(j) {
@@ -10810,11 +10424,9 @@ function commPrepOwRender(j) {
     commPrepBattTempGate(j);
     commPrepFieldGateRefresh();
 }
-// Blocking gate. Only the alternator blocks: commissioning drives the alternator hard and the
-// over-temperature protection has nothing to act on without it. A missing battery or other sensor is a
-// warning — battery temperature falls back through its own source chain, and Other feeds nothing the run
-// depends on. Re-evaluated on every poll, so assigning the sensor clears it without reopening the screen.
-// Uses the live Temperature Source selection, not the stored one: Digital chosen here is written by Next.
+// Blocking gate: only the alternator blocks (commissioning drives it hard and over-temp protection needs it);
+// missing battery/other sensors only warn. Re-evaluated each poll. Uses the live Temperature Source
+// selection, not the stored one: Digital chosen here is written by Next.
 const CP_OW_GATE_TITLE = 'Choose the alternator temperature sensor first';
 function commPrepOwGate(j) {
     const body = document.getElementById('commprep-body');
@@ -10839,9 +10451,8 @@ function commPrepOwGate(j) {
         + n + ' sensor' + (n === 1 ? ' is' : 's are') + ' on the bus and none of them is set to Alternator. '
         + (!settingsUnlocked ? 'Unlock controls to set it.' : 'Set it in the table below.');
     if (box.innerHTML !== html) box.innerHTML = html;
-    // Locked settings refuse the assignment, so blocking Next would dead-end the screen — say it, don't
-    // block it. Re-run on every poll, so a lock that lands while the gate is up (arm window expired,
-    // another client disarmed) also gives Next back.
+    // Locked settings refuse the assignment, so blocking Next would dead-end the screen: say it, don't
+    // block. Re-run each poll so a lock landing while the gate is up also gives Next back.
     if (start) {
         if (settingsUnlocked) { start.disabled = true; start.style.opacity = '0.45'; start.style.cursor = 'default'; start.title = CP_OW_GATE_TITLE; }
         else if (start.disabled) commPrepPaintCta();
@@ -10860,11 +10471,9 @@ async function commPrepOwAssign(sel) {
     sel.disabled = true;
     let enabledEarly = null;   // enable turned on ahead of the bind, undone if the bind is refused
     try {
-        // The assignment IS the enable: there is no separate Installed/None control on this screen to
-        // contradict it. Battery role on → the source chain may read it; role off → it may not. The
-        // enable goes on BEFORE the bind: with one probe on the bus and both enables off, the firmware's
-        // enumerate re-binds it to Alternator between the clear and the re-bind, and the re-bind is then
-        // refused as already assigned.
+        // The assignment IS the enable (no separate Installed/None control here). Enable goes on BEFORE the
+        // bind: with one probe on the bus and both enables off, the firmware's enumerate re-binds it to
+        // Alternator between the clear and the re-bind, which is then refused as already assigned.
         if (newRole === 1 && oldRole !== 1) { await commPrepOwSetEnable('battTempProbeEnable', true); enabledEarly = 'battTempProbeEnable'; }
         if (newRole === 2 && oldRole !== 2) { await commPrepOwSetEnable('extraTempProbeEnable', true); enabledEarly = 'extraTempProbeEnable'; }
         await owWriteRole(id, oldRole, newRole);
@@ -10908,16 +10517,15 @@ async function commPrepOwScan() {
     }
 }
 function commPrepFetchCfg() {
-    // The in-app demo has no device to read; the screen now fails closed on a failed read, so give it a recorded install.
+    // Demo has no device to read and the screen fails closed on a failed read, so give it a recorded install.
     if (DEMO_MODE) return Promise.resolve({ config: { TempSource: '0', BatteryShuntPresent: '1', ShuntLead: '1', FieldResistance: '2.000', FieldResTrefC: '22.0', FieldWiring: '1' }, tables: {} });
     return fetchWithTimeout(buildURL('/exportConfig'), {}, 10000)
         .then(r => r.ok ? r.json() : null)
         .catch(e => { diagLog('commissioning prerequisites config fetch failed:', e); return null; });
 }
 
-// Maintenance-restart acknowledgement — first Vessel Info save only, sequenced after the SoC
-// popup and before the Charge Rate Limits handoff. Static body in index.html; any close
-// path resolves the save-chain promise.
+// Maintenance-restart acknowledgement: first Vessel Info save only, after the SoC popup and before the
+// Charge Rate Limits handoff. Any close path resolves the save-chain promise.
 let _maintAckResolve = null;
 function maintAckShow() {
     return new Promise(res => {
@@ -10930,29 +10538,24 @@ function maintAckClose() {
     if (_maintAckResolve) { _maintAckResolve(); _maintAckResolve = null; }
 }
 
-// Pre-flight for EVERY commissioning run, not only the first. A re-commission needs the same
-// Charge-Limit Follow check and the same sensor settings confirmed before the wizard re-measures
-// the system; the values are simply already filled in. firstInstall also decides what Next hands
-// off to — tach alignment is a first-install-only screen. deferHandoff (the vessel-save chain):
-// Next resolves true instead of opening Charge Rate Limits — the chain opens it after the
-// battery-defaults, SoC and restart-ack screens; every other exit resolves false.
+// Pre-flight for EVERY commissioning run (a re-commission confirms the same Charge-Limit Follow and sensor
+// settings, pre-filled). firstInstall picks the intro copy and, unless showAlign overrides, whether Next goes
+// to tach alignment. deferHandoff (vessel-save chain): Next resolves true instead of opening Charge Rate
+// Limits; every other exit resolves false.
 async function openCommPrereqs(firstInstall, deferHandoff, showAlign) {
     _commPrepFirstInstall = !!firstInstall;
     _commPrepShowAlign = (showAlign === undefined) ? !!firstInstall : !!showAlign;
     _commPrepDeferHandoff = !!deferHandoff;
     try {
-        // A successful /saveVesselInfo proves the device is armed; this tab's mirror can be stale after a
-        // reload (same case as the battery-defaults popup). This screen now opens seconds after the save,
-        // and both the role selects and the Next write are gated on the mirror, so the resync is awaited
-        // alongside the config read (one small request — never the longer of the two) instead of racing
-        // the first assignment.
+        // A successful /saveVesselInfo proves the device is armed but this tab's mirror can be stale; the role
+        // selects and the Next write are gated on it, so await the resync alongside the config read, not racing.
         const armP = settingsUnlocked ? null : syncArmState();
         const cfgP = commPrepFetchCfg();
         vesselNextStepWait(true);
         const [j] = await Promise.all([cfgP, armP]);
         vesselNextStepWait(false);
-        // A failed read used to skip the screen, and with it the field-resistance gate, on the way to the
-        // wizard. It now fails closed: the screen opens with a Retry, and ✕ / "I'll do this later" still leave.
+        // A failed read fails closed (the field-resistance gate must not be skipped): the screen opens with
+        // a Retry, and ✕ / "I'll do this later" still leave.
         if (j) commPrepShowCfg(j);
         else commPrepShowCfgError();
         document.getElementById('commprep-modal-overlay').style.display = 'flex';
@@ -10963,9 +10566,8 @@ async function openCommPrereqs(firstInstall, deferHandoff, showAlign) {
     }
 }
 function commPrepShowCfg(j) {
-    // Same response also carries the RPM cap tables the NEXT screen needs, so hand them over
-    // rather than making openRpmCap re-fetch. The cap tables live in the "learning" namespace and
-    // nothing this screen writes can touch them, so the snapshot cannot go stale in between.
+    // The same response carries the RPM cap tables the NEXT screen needs; hand them over. They live in the
+    // "learning" namespace, which nothing here writes, so the snapshot can't go stale.
     _rpmCapTablesPre = j.tables || null;
     _commPrepCfg = j.config || {};
     commPrepRender(_commPrepCfg);
@@ -11089,11 +10691,9 @@ function commPrepRender(cfg) {
     const wiring = (wRaw === 1 || wRaw === 2) ? wRaw : 0;
     _commPrepWiringInit = wiring; _commPrepWiring = wiring;
 
-    // The charge block (Bulk/Absorption/Float/current/protection) appears ONLY for Other — every other
-    // chemistry got these proposed by the battery-defaults populator, which bails for Other and leaves
-    // nothing set. Battery temperature limits are not here at all: they are non-critical for the run. The
-    // populator proposes the cold/hot lockout enables and the hot limit from chemistry; the cold floor
-    // (MinChargeTempF) stays at the firmware default until edited under Setup > Battery.
+    // The charge block (Bulk/Absorption/Float/current/protection) appears ONLY for Other: the battery-defaults
+    // populator proposes them for every other chemistry and bails for Other. Battery temperature limits are not
+    // here (non-critical for the run); MinChargeTempF stays at the firmware default until edited in Setup.
     const chem = (window.vesselInfo && String(window.vesselInfo.battery_type || '').toLowerCase()) || '';
     const isOther = chem === 'other';
 
@@ -11120,9 +10720,8 @@ function commPrepRender(cfg) {
         '<div style="' + capCss + '">' + cap + '</div></div>';
     const grpHdr = t => '<div style="font-size:11px; color:#9cc; letter-spacing:0.04em; text-transform:uppercase; margin:2px 0 8px;">' + t + '</div>';
 
-    // Phone-only laptop nudge. This is the first screen of the flow and the first one that is a form,
-    // so it is where a small screen starts to hurt; the vessel-info landing nudge (smallScreenSetupMsg)
-    // never fires on a re-commission, which reaches this screen too.
+    // Phone-only laptop nudge. First form screen of the flow, and the vessel-info landing nudge
+    // (smallScreenSetupMsg) never fires on a re-commission, which reaches this screen too.
     const smallScreen = _isPhoneSizedScreen()
         ? '<p style="font-size:13px; line-height:1.5; color:#bbb; margin:0 0 14px;"><strong style="color:#e0e0e0;">Use a laptop or tablet if you can.</strong> Setup and Commissioning works on a phone, but it\'s a worse UX on a small screen.</p>'
         : '';
@@ -11157,9 +10756,8 @@ function commPrepRender(cfg) {
         vSrcBtn(0, 'Onboard') + vSrcBtn(1, 'NMEA 2000') + vSrcBtn(3, 'Victron') +
         '</div><div style="' + capCss + '">Decides when charging moves from bulk to absorption to float, and back to bulk. The onboard sensor drives all control loops regardless. Choose an external source if the Regulator Ground Wire is longer than 6 ft, smaller than 12 AWG, or if there&rsquo;s a shunt in the negative lead not connected to the regulator via Cable 2 pins 9 and 10.</div></div>';
 
-    // Which measured battery-temperature source is live right now. Painted from the last CSV2 frame here
-    // and kept current by renderBattTempReadouts while the screen is open. The "none found" choice (Not
-    // fitted / Rescan) is commPrepBattTempGate, run on every probe poll.
+    // Live measured battery-temperature source, kept current by renderBattTempReadouts while open. The
+    // "none found" choice (Not fitted / Rescan) is commPrepBattTempGate, run on every probe poll.
     const battTempSeg = '<div style="' + rowCss + '"><label style="' + lblCss + '">Battery temperature</label>' +
         '<div id="commprep-batttemp" style="font-size:13px; color:#ddd;">' + commPrepBattTempText() + '</div>' +
         '<div style="' + capCss + '">The cold and hot charge lockouts and the voltage-loop temperature correction need a measured battery temperature. The kit\'s ring-lug probe goes on the battery\'s negative terminal, never the positive.</div></div>';
@@ -11178,9 +10776,8 @@ function commPrepRender(cfg) {
         '<button type="button" id="commprep-fw-2" class="cap-mode-btn' + (wiring === 2 ? ' cap-mode-active' : '') + '" onclick="commPrepWiring(2)">N-type</button>' +
         '</div><div style="' + capCss + '">The software cannot detect the jumper position. Please specify it here.</div></div>';
 
-    // Shell only — commPrepOwRender fills the rows, the warnings and the Next gate from /tempSensors while
-    // the screen is open, and hides the whole block on a thermistor install with a bare 1-Wire bus. Assigning
-    // Battery or Other here is what turns their source on; there is no separate enable to contradict the table.
+    // Shell only: commPrepOwRender fills rows, warnings and the Next gate from /tempSensors, and hides the
+    // block on a thermistor install with a bare bus. Assigning Battery or Other here turns their source on.
     const owBlock = '<div id="commprep-ow" style="display:none;">' +
         '<div style="' + rowCss + '">' + grpHdr('Digital Temperature Sensors') +
         '<div style="' + capCss + ' margin-top:0; margin-bottom:7px;">Set what each sensor measures. Warm one by hand to identify it — its reading rises within a few seconds.</div>' +
@@ -11255,9 +10852,8 @@ function commPrepRender(cfg) {
     document.querySelectorAll('#commprep-body input[type=number]').forEach(el => { _commPrepInit[el.id] = el.value; });
 }
 
-// Turns Charge-Limit Follow off from the prerequisites screen. Written immediately rather than
-// staged with the number fields: it must hold even if this screen is dismissed with ✕, and a
-// failure has to be visible before the run starts rather than silently skipped.
+// Written immediately, not staged with the number fields: it must hold even if the screen is dismissed
+// with ✕, and a failure must be visible before the run starts.
 async function commPrepDvccOff() {
     if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
     const btn = document.getElementById('commprep-dvcc-btn');
@@ -11342,12 +10938,9 @@ function commPrepWiring(v) {
     commPrepFieldGateRefresh();
 }
 
-// Field wiring gate: the drive-heat limit is built on it, so Next waits for a wiring choice; says why on one line
-// under Next. Shunt location rides the same gate: with a shunt installed, the battery-voltage correction and the
-// field resistance test's shunt method depend on it. The resistance itself is the next screen's (fieldResOpen).
-// Unlike the other Next gates it also blocks while settings are locked: Next's writes are dropped then, and the
-// first-install chain can still reach the wizard if settings unlock before its handoff. Locked, only what the
-// device already holds counts.
+// Field wiring gate: the drive-heat limit is built on it; shunt location rides the same gate (battery-voltage
+// correction and the resistance test's shunt method need it). Unlike the other Next gates it also blocks
+// while locked (Next's writes are dropped then); locked, only what the device already holds counts.
 function commPrepFieldGateReason() {
     const w = settingsUnlocked ? _commPrepWiring : _commPrepWiringInit;
     const haveW = w === 1 || w === 2;
@@ -11424,6 +11017,7 @@ function commPrepCollectChanges() {
 // (commPrepContinue) hands off to the commissioning wizard — immediately, or (vessel-save chain) by resolving
 // true so the chain opens Charge Rate Limits later.
 async function commPrepFinish(start) {
+    if (!start && !(await cxSetupLeaveConfirm())) return;
     const changes = _commPrepCfg ? commPrepCollectChanges() : [];   // no snapshot: the config read failed and nothing was shown to edit
     _commPrepRpmActive = false;
     document.getElementById('commprep-modal-overlay').style.display = 'none';
@@ -11457,6 +11051,15 @@ function commPrepContinue() {
     openRpmCap(_commPrepShowAlign ? openRpmAlign : openCommissionModal, commPrepReopen);
 }
 
+// Every exit from a screen before the wizard skips the wizard too, and after a first install the only way back is the
+// Commissioning tab, so leaving is confirmed and the dialog names it.
+function cxSetupLeaveConfirm() {
+    return xConfirm('Leaving now skips the commissioning wizard.'
+        + (fieldResMissing() ? ' Until the field resistance is measured, the field stays off and the alternator does not charge.' : '')
+        + '\n\nTo come back to it, go to Setup ▸ Alternator ▸ Commissioning.',
+        { title: 'Leave Commissioning Setup', okText: 'Leave', cancelText: 'Go back', focus: 'cancel' });
+}
+
 // "I'll do this later" on either screen: no wizard, the rest of a vessel-save chain still runs.
 function commPrepEndChain() {
     _commPrepDeferHandoff = false;
@@ -11468,7 +11071,8 @@ function commPrepEndChain() {
 function commPrepReopen() { document.getElementById('commprep-modal-overlay').style.display = 'flex'; }
 
 // ✕ — dismiss without writing edits (mirrors the battdef Skip/✕).
-function commPrepClose() {
+async function commPrepClose() {
+    if (!(await cxSetupLeaveConfirm())) return;
     _commPrepRpmActive = false;
     document.getElementById('commprep-modal-overlay').style.display = 'none';
     _commPrepDeferHandoff = false;
@@ -11477,11 +11081,10 @@ function commPrepClose() {
 }
 
 // ===== Field Resistance screen (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1) =====
-// Engine off, the regulator holds the field at a few planned field voltages and reads the current from the battery
-// shunt's step (method 1) or the owner's meter (method 2); the firmware plans the holds and does the math. Opened by
-// the Prerequisites screen's Next (mode 'chain') and by Setup ▸ Alternator ▸ Field Resistance ▸ Measure ('setup').
-// Every /fieldResTest request is the run's heartbeat (the firmware ends it 8 s after the last one), so the poll runs
-// while the screen is open and every way off the screen stops a run. Only Next / Save writes the result (save=1).
+// Engine off, the regulator holds the field at planned field voltages and reads current from the shunt's step
+// (method 1) or the owner's meter (method 2); firmware plans holds and does the math. Every /fieldResTest request
+// is the run's heartbeat (firmware ends it 8 s after the last), so polling runs while open and every exit stops
+// a run. Only Next / Save writes the result (save=1).
 let _fr = null;
 const FR_POLL_MS = 500;
 // A poll's reply lost on the link is resent 2-2.5 s later. The heartbeat counts requests, not replies, so a stuck poll
@@ -11685,8 +11288,9 @@ async function frNext() {
     if (chain) commPrepContinue();
 }
 // ✕, "I'll do this later" and Close: a run stops with the screen.
-function frLater() {
+async function frLater() {
     if (!_fr) return;
+    if (_fr.mode === 'chain' && (!(await cxSetupLeaveConfirm()) || !_fr)) return;
     if (_fr.st && _fr.st.st === 1) frRequest('abort=1').catch(() => { });
     const chain = _fr.mode === 'chain';
     frCloseOverlay();
@@ -11907,11 +11511,10 @@ function frRunUpdate() {
     if (tbl && _fr.tableHtml !== html) { _fr.tableHtml = html; tbl.innerHTML = html; }
 }
 
-// The holds as they complete: field volts, amps, each hold's own volts / amps and the alternator temperature when its
-// amps came in (the hold in progress shows the temperature now), with every shunt cycle under its hold, kept or dropped,
-// and any probe voltage the low hold moved up from. cur is the hold in progress: in 'run' its row shows the planned field
-// volts and liveA, in 'fail' whatever cycles it finished. On the result screen cur is -1. Once the top and middle are both
-// in, the resistance is worked through as their slope, so the owner can see why it sits below every V / A.
+// Holds table: field volts, amps, per-hold V/A and the alternator temperature at its reading, shunt cycles
+// (kept or dropped) under each hold, and any probe voltage the low hold moved up from. cur = the hold in
+// progress (-1 on the result screen). With top and middle both in, R is shown as their slope (why it sits
+// below every V/A).
 function frHoldsTableHtml(st, cur, liveA, mode) {
     const running = mode === 'run';
     const n = FR_HOLD_NAMES.length;
@@ -11980,14 +11583,11 @@ function frToggleBatt() {
 }
 
 // ===== Charge Rate Limits screen (pre-commissioning) =====
-// Standalone dark modal between the Prerequisites screen and tach alignment
-// (commPrepFinish → openRpmCap → [Continue in Low/High] → openRpmAlign → wizard). Seeds BOTH the Low
-// and High RPM/current cap tables at once via /get?capBothSave (firmware writes both blobs regardless
-// of the live mode); the chosen Continue button then sets HiLow, so the mode the user picks is the one
-// active for commissioning. The Amps/kW toggle mirrors the live RPM Table — values are held canonically
-// in amps and cross-derived to kW at the live battery voltage for display and on save.
+// Standalone dark modal between Prerequisites and tach alignment (commPrepFinish → openRpmCap → Continue
+// Low/High → openRpmAlign → wizard). /get?capBothSave seeds BOTH Low and High tables; the Continue button
+// picked sets HiLow, so that mode is active for commissioning. Held in amps; kW is derived at live battery V.
 let _rpmCap = null;         // { rpm:[10], lo:[10], hi:[10] (amps), unit:'amps'|'kw' }
-let _rpmCapNext = null;     // handoff after a Continue button: openRpmAlign (first install) or openCommissionModal (re-commission)
+let _rpmCapNext = null;     // handoff after a Continue button: openRpmAlign (when tach alignment shows) or openCommissionModal
 let _rpmCapBack = null;     // ← Back target: reopen Prerequisites; null only when that screen was skipped
 let _rpmCapTablesPre = null; // tables handed over by the Prerequisites screen's /exportConfig; null → fetch our own
 
@@ -11995,22 +11595,24 @@ async function openRpmCap(next, back) {
     _rpmCapNext = next || openRpmAlign;
     _rpmCapBack = back || null;
     if (!settingsUnlocked) { vesselNextStepWait(false); _rpmCapNext(); return; }   // locked → can't write tables; skip ahead
+    // A table that did not come back whole is never shown as zeros: Continue would store the zeros and the
+    // alternator would make no current. The screen offers Retry instead, with both Continue buttons hidden.
+    const arr = (t, k) => String(t[k] || '').split(',').map(s => parseFloat(s));
+    const whole = t => ['rpmPoints', 'capTable', 'capTableLo'].every(k => { const a = arr(t, k); return a.length === 10 && a.every(v => isFinite(v)); });
     let tables = _rpmCapTablesPre || {};
     _rpmCapTablesPre = null;   // one-shot: a ← Back and second Next re-reads from the device
-    if (!Object.keys(tables).length) {
+    if (!whole(tables)) {
         try {
             const r = await fetchWithTimeout(buildURL('/exportConfig'), {}, 10000);
-            if (r.ok) tables = (await r.json()).tables || {};
-        } catch (e) { diagLog('charge-rate limits load failed:', e); }
+            tables = r.ok ? ((await r.json()).tables || {}) : {};
+        } catch (e) { tables = {}; diagLog('charge-rate limits load failed:', e); }
     }
-    const arr = k => String(tables[k] || '').split(',').map(s => parseFloat(s));
-    const rpm = arr('rpmPoints'), hi = arr('capTable'), lo = arr('capTableLo');
-    _rpmCap = {
+    _rpmCap = whole(tables) ? {
         unit: 'amps',
-        rpm: Array.from({ length: 10 }, (_, i) => isFinite(rpm[i]) ? Math.round(rpm[i]) : 0),
-        hi: Array.from({ length: 10 }, (_, i) => isFinite(hi[i]) ? hi[i] : 0),
-        lo: Array.from({ length: 10 }, (_, i) => isFinite(lo[i]) ? lo[i] : 0)
-    };
+        rpm: arr(tables, 'rpmPoints').map(v => Math.round(v)),
+        hi: arr(tables, 'capTable'),
+        lo: arr(tables, 'capTableLo')
+    } : null;
     vesselNextStepWait(false);   // armed by commPrepFinish; the table read above was the last gap
     const backBtn = document.getElementById('rpmcap-back-btn');
     if (backBtn) backBtn.style.display = _rpmCapBack ? '' : 'none';
@@ -12021,7 +11623,15 @@ async function openRpmCap(next, back) {
 }
 
 function rpmCapRender() {
-    const s = _rpmCap, u = (s.unit === 'kw') ? 'kW' : 'A';
+    const s = _rpmCap;
+    ['rpmcap-continue-btn', 'rpmcap-continue-high-btn'].forEach(id => { const b = document.getElementById(id); if (b) b.style.display = s ? '' : 'none'; });
+    if (!s) {
+        document.getElementById('rpmcap-body').innerHTML =
+            '<p style="font-size:15px;line-height:1.5;margin:0 0 12px;">The regulator\'s current limit tables could not be read, so there is nothing to edit yet. Check the connection and try again.</p>' +
+            '<button type="button" class="btn-primary btn-sm" onclick="openRpmCap(_rpmCapNext, _rpmCapBack)">Retry</button>';
+        return;
+    }
+    const u = (s.unit === 'kw') ? 'kW' : 'A';
     const step = (s.unit === 'kw') ? '0.01' : '1';
     let rows = '';
     for (let i = 0; i < 10; i++) {
@@ -12075,7 +11685,8 @@ function rpmCapSetUnit(unit) {
 // charge-rate mode, then hand off to tach alignment. mode: 0 = Low, 1 = High.
 async function rpmCapContinue(mode) {
     const s = _rpmCap;
-    if (s && settingsUnlocked) {
+    if (!s) return;   // tables never read; rpmCapRender offers Retry
+    if (settingsUnlocked) {
         let url = '/get?capBothSave=1';
         for (let i = 0; i < 10; i++) {
             const hiKw = ampsToKW(s.hi[i]), loKw = ampsToKW(s.lo[i]);
@@ -12086,10 +11697,9 @@ async function rpmCapContinue(mode) {
             url += '&rpmCapPwrLo' + i + '=' + (isFinite(loKw) ? loKw : 0);
         }
         url += '&capLimitMode=' + (s.unit === 'kw' ? 1 : 0);
-        // Both requests are load-bearing: proceeding past a failed one strands the wizard in the wrong
-        // mode with no sign of it. Keep the screen open and make the user retry instead. The device stages
-        // the save and its main loop writes the blobs one per pass, so the HTTP 200 means accepted, not
-        // stored — advance only once /capSaveState reports IDLE.
+        // Both requests are load-bearing: proceeding past a failed one strands the wizard in the wrong mode
+        // unseen. The device stages the save and writes the blobs one per main-loop pass, so HTTP 200 means
+        // accepted, not stored: advance only once /capSaveState reports IDLE.
         try {
             const r = await fetchWithTimeout(buildURL(url), {}, 10000);
             if (!r.ok) throw new Error('rejected (HTTP ' + r.status + ')');
@@ -12113,21 +11723,20 @@ async function rpmCapContinue(mode) {
     document.getElementById('rpmcap-modal-overlay').style.display = 'none';
     (_rpmCapNext || openRpmAlign)();
 }
-// ← Back to the Prerequisites screen, which now precedes this one on both the first install and a re-commission.
+// ← Back to the Prerequisites screen (precedes this one on first install and re-commission).
 function rpmCapBack() {
     document.getElementById('rpmcap-modal-overlay').style.display = 'none';
     if (_rpmCapBack) _rpmCapBack();
 }
 // ✕ — bail out of the setup flow (does NOT open the wizard), mirroring rpmAlignCancel.
-function rpmCapCancel() {
+async function rpmCapCancel() {
+    if (!(await cxSetupLeaveConfirm())) return;
     document.getElementById('rpmcap-modal-overlay').style.display = 'none';
 }
 
 // ===== Themed alert/confirm (dark modal shell) =====
-// Replaces every native xAlert()/await xConfirm() in the app. One lazily-created overlay; concurrent
-// requests queue behind _xDlgQueue so a second dialog can never clobber the first's resolver.
-// xConfirm resolves true ONLY on an explicit OK click. Unlike native confirm, these do not
-// block the JS thread — callers await them.
+// One lazily-created overlay; requests queue behind _xDlgQueue so a second dialog never clobbers the
+// first's resolver. xConfirm resolves true ONLY on an explicit OK. Non-blocking: callers await them.
 let _xDlgQueue = Promise.resolve();
 function _xDlgShow(msg, opts) {
     const o = opts || {};
@@ -12160,9 +11769,8 @@ function _xDlgShow(msg, opts) {
         let settled = false;
         const done = v => { if (settled) return; settled = true; ov.style.display = 'none'; resolve(v); };
         let exB = null, cancel = null;
-        // Optional third action, e.g. "Go to the setting". Gets its own full-width row above
-        // Cancel/OK (btns wraps) so a descriptive label still fits at phone width. Resolves like
-        // Cancel — the caller's action replaces the submit, it never proceeds as well.
+        // Optional third action (e.g. "Go to the setting") on its own full-width row so a long label fits
+        // at phone width. Resolves like Cancel: the caller's action replaces the submit.
         btns.style.flexWrap = 'wrap';
         if (o.extra && o.extra.text) {
             exB = document.createElement('button');
@@ -12174,12 +11782,14 @@ function _xDlgShow(msg, opts) {
         }
         if (o.confirm) {
             cancel = document.createElement('button');
+            cancel.id = 'xdlg-cancel';
             cancel.textContent = o.cancelText || 'Cancel';
             cancel.style.cssText = 'flex:1; background:#3a3a3a; border:1px solid #555; color:#ddd; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;';
             cancel.onclick = () => done(o.prompt ? null : false);
             btns.appendChild(cancel);
         }
         const okB = document.createElement('button');
+        okB.id = 'xdlg-ok';
         okB.textContent = o.okText || 'OK';
         okB.style.cssText = 'flex:1; background:linear-gradient(180deg,#35d6c7,#23a99c); color:#06302d; font-weight:700; font-size:13px; border:none; border-radius:5px; padding:9px 16px; cursor:pointer;';
         okB.onclick = () => done(o.prompt ? inp.value : true);
@@ -12219,9 +11829,8 @@ function xConfirm(msg, opts) {
     _xDlgQueue = p.then(() => { }, () => { });
     return p;
 }
-// Jump Setup to the control for a form input name and flash it. Protections cards carry their
-// label in a sibling .protections-name instead of a .form-row, so the row to flash is found per
-// layout rather than assumed.
+// Jump Setup to the control for a form input name and flash it. Protections cards carry their label in a
+// sibling .protections-name, not a .form-row, so the row is found per layout.
 function goToSettingByName(inputName) {
     const inp = document.querySelector('#settings [name="' + inputName + '"]');
     if (!inp) return false;
@@ -12235,9 +11844,8 @@ function goToSettingByName(inputName) {
     return true;
 }
 
-// Turns a validator's warnAction into the confirm dialog's third button. A warning that names a
-// setting living on another tab is worth acting on, not just reading — this takes the user there
-// and abandons the submit.
+// Turns a validator's warnAction into the confirm dialog's third button: takes the user to a setting on
+// another tab and abandons the submit.
 function xWarnExtra(result) {
     const a = result && result.warnAction;
     if (!a) return undefined;
@@ -12252,12 +11860,10 @@ function xConfirmSubmit(form, msg) {
 }
 
 // ===== Re-commission prompts =====
-// Two triggers, both dismissible, at most one per app open. (a) A finished pass older than three years:
-// a bank's internal resistance climbs as it ages, and that resistance IS the plant gain the voltage loop's
-// gains were derived from — so the loop slowly gets more aggressive than commissioning intended. (b) A
-// Vessel Info voltage/capacity/chemistry change, which invalidates the measured gain outright (firmware
-// sets the flag inside /saveVesselInfo). Age is judged against the BROWSER clock; the device soft clock
-// can be unset at sea. "Silence" persists in NVS until the next pass; "Ignore" re-asks next app open.
+// Two dismissible triggers, at most one per app open: (a) a finished pass older than three years (bank IR
+// rises with age, and IR IS the plant gain the voltage-loop gains came from); (b) a Vessel Info voltage/
+// capacity/chemistry change (firmware sets the flag in /saveVesselInfo). Age uses the BROWSER clock (device
+// soft clock can be unset at sea). "Silence" persists in NVS until the next pass; "Ignore" re-asks next open.
 const RECOMMISSION_MAX_AGE_S = 3 * 365.25 * 24 * 3600;
 const CX_NAV_HINT = 'To re-commission: go to Setup → Alternator → Commissioning and press Start Commissioning.';
 
@@ -12292,11 +11898,9 @@ async function checkRecommissionPrompt() {
 }
 
 // ===== First-boot SoC seed popup =====
-// The firmware records a one-shot snapshot of the boot-time voltage seed (served at /socseed).
-// Auto-opens once per device (SocSeedAck flag in NVS) after the first CSV packet — or, on a
-// factory-fresh device, as a step of the first Vessel Info save chain, after the Prerequisites and
-// battery-defaults screens (the firmware defers the seed until real chemistry/capacity exist).
-// Reopens any time from the header SOC readout.
+// One-shot snapshot of the boot-time voltage seed (/socseed). Auto-opens once per device (SocSeedAck in NVS)
+// after the first CSV packet, or on a factory-fresh device as a step of the first Vessel Info save chain (the
+// firmware defers the seed until chemistry/capacity exist). Reopens from the header SOC readout.
 let _socSeedData = null;
 let _socSeedResolve = null;   // resolved when the SoC popup closes, so the vessel-save chain can wait for it before commissioning
 
@@ -12308,9 +11912,8 @@ async function socSeedFetch() {
     return _socSeedData;
 }
 
-// Ladder for the deferred-seed poll, in ms between tries. Front-loaded on purpose: the Core-1
-// write usually lands within a few hundred ms of the save responding, and a flat 1 s tick made
-// every one of those wait out the full second. Same total budget (~4.7 s) as the flat ladder.
+// Deferred-seed poll ladder (ms between tries), front-loaded: the Core-1 write usually lands within a few
+// hundred ms of the save responding. ~4.7 s total budget.
 const SOCSEED_POLL_MS = [150, 250, 450, 750, 1200, 1900];
 
 // Poll /socseed until the firmware's deferred Core-1 seed lands, or the ladder runs out.
@@ -12456,7 +12059,7 @@ function socSeedRender(s) {
     const foot = '<div style="margin-top:14px; padding-top:10px; border-top:1px solid #333; font-size:11px; color:#777;">This is a one-time starting estimate. From here SOC tracks measured amp-hours in and out, and it self-corrects over time: every detected full charge re-anchors SOC to 100&nbsp;%, and deep discharges followed by a rest let the regulator measure the bank\'s true usable capacity.</div>';
 
     // _socSeedResolve is set only when this popup is a step in the first-run vessel-save chain,
-    // where the Commissioning Prerequisites screen opens next — so "Next", not "Finish". Opened
+    // where the maintenance-restart notice and Charge Rate Limits follow — so "Next", not "Finish". Opened
     // standalone from the header SOC readout it resolves nothing and just dismisses: "Done".
     const nextLabel = _socSeedResolve ? 'Next &rarr;' : 'Done';
     const finish = '<button onclick="socSeedClose(true)" style="display:block; margin:14px auto 0; background:linear-gradient(180deg,#35d6c7,#23a99c); color:#06302d; font-weight:700; font-size:13px; border:none; border-radius:5px; padding:8px 28px; cursor:pointer;">' + nextLabel + '</button>';
@@ -12470,10 +12073,8 @@ function populateProfileForm(profile) {
 }
 
 
-// Handle profile update/registration form submission
-// Profile Update Flow:
-// First time: /getAuthToken returns registered:false → calls /registerProfile → register-device edge function creates account & token
-// Updates: /getAuthToken returns registered:true → calls /updateProfile → update-profile edge function validates token & updates profile
+// First time: /getAuthToken registered:false → /registerProfile (register-device edge fn creates account & token).
+// Updates: registered:true → /updateProfile (update-profile edge fn validates token & updates profile).
 function handleProfileUpdate(event) {
     event.preventDefault();
 
@@ -12491,8 +12092,8 @@ function handleProfileUpdate(event) {
     if (deviceUidSpan) {
         formData.append('deviceUID', deviceUidSpan.textContent);
     }
-    // Identity only — the firmware's /registerProfile & /updateProfile no longer read vessel
-    // fields; the cloud profile's vessel columns fill from the config snapshot.
+    // Identity only: /registerProfile & /updateProfile don't read vessel fields; the cloud profile's
+    // vessel columns fill from the config snapshot.
 
     messageDiv.style.display = 'block';
     messageDiv.style.backgroundColor = '#e3f2fd';
@@ -12511,10 +12112,8 @@ function handleProfileUpdate(event) {
                 body: formData
             }, 8000);
         })
-        // Text-first parse: cloud sends JSON {success,error} on 4xx/409, but the firmware
-        // can also reply with plain text (403 "Settings not armed" while locked, empty body on
-        // 502/503). Reading text and tolerating a parse failure surfaces every error path
-        // instead of throwing a misleading "Network error" on non-JSON replies.
+        // Text-first parse: the cloud sends JSON {success,error}, but the firmware can reply plain text (403
+        // "Settings not armed", empty body on 502/503), so a non-JSON reply surfaces its real error.
         .then(response => response.text().then(text => {
             let data = {};
             try { data = text ? JSON.parse(text) : {}; } catch (e) { data = {}; }
@@ -12603,18 +12202,22 @@ async function resetVoltageLoop() {
         .catch(err => console.warn('Reset error:', err));
 }
 
+// The visibility test pollWhenVisible applies, also used by the live-frame-driven CSV refetches.
+function panelOnScreen(elId) {
+    const el = document.getElementById(elId);
+    return document.visibilityState === 'visible' && !!el && el.offsetParent !== null;
+}
+
 // ===== PID TUNING SCORE LOG =====
 
 let _tuningLogPollTimer = null;
 
-// Run fn only while elId is actually rendered (offsetParent is null under any display:none ancestor tab)
-// and the browser tab is foreground. The 1 s ticker is browser-side only; the guarded call is what hits
-// the device. lastRun resets on hide so the panel refreshes the moment it comes back on screen.
+// Run fn only while elId is rendered (offsetParent is null under any display:none ancestor) and the tab is
+// foreground; the 1 s ticker is browser-side only. lastRun resets on hide so the panel refreshes on return.
 function pollWhenVisible(fn, elId, periodMs) {
     let lastRun = 0;
     return setInterval(() => {
-        const el = document.getElementById(elId);
-        if (document.visibilityState !== 'visible' || !el || el.offsetParent === null) { lastRun = 0; return; }
+        if (!panelOnScreen(elId)) { lastRun = 0; return; }
         const now = Date.now();
         if (now - lastRun >= periodMs) { lastRun = now; fn(); }
     }, 1000);
@@ -12759,7 +12362,7 @@ function renderTuningLog(data) {
             <td style="padding:2px 5px;">${r.wp}</td>
             <td style="padding:2px 5px;">${r.wf != null ? r.wf : '—'}</td>
             <td style="padding:2px 5px;">${r.rpm.toFixed(0)}</td>
-            <td style="padding:2px 5px;">${toDisplayTemp(r.temp).toFixed(1)}</td>
+            <td style="padding:2px 5px;">${Number.isFinite(r.temp) ? toDisplayTemp(r.temp).toFixed(1) : '—'}</td>
             <td style="padding:2px 5px;">${r.worst.toFixed(1)}</td>
             <td style="padding:2px 5px;">${r.t.toFixed(0)}</td>
             <td style="padding:2px 5px;">${(r.bv != null ? r.bv : 0).toFixed(2)}</td>
@@ -12775,8 +12378,6 @@ function commitTuningScore() {
     const status = document.getElementById('tuningCommitStatus');
     if (btn) btn.disabled = true;
     if (status) status.textContent = 'Sending…';
-    // Note: r.ok must be checked — firmware returns 403 while settings are
-    // locked before the commit flag is ever set.
     fetch(buildURL('/get?commitTuningScore=1'))
         .then(r => {
             if (!r.ok) {
@@ -12803,16 +12404,13 @@ async function resetTuningLog() {
         .catch(() => {});
 }
 
-// Manual reset for the Control Accuracy panel. Clears all three loops' accumulators AND the
-// live excursion stopwatches on the device; the cells fall to dashes until fresh challenged
-// time accrues.
+// Clears all three loops' accumulators and the live excursion stopwatches; cells show dashes until challenged time accrues.
 async function resetAccuracyScores() {
     if (!await xConfirm('Reset the Control Accuracy numbers (tracking and excursions for all three loops)?')) return;
     fetch(buildURL('/resetAccuracyScores'), { method: 'POST' }).catch(() => {});
 }
 
-// Diagnostics expander: fetches /accstate on open and renders the raw v4 accumulators + live
-// excursion state. On-demand only — kept out of CSV2.
+// On-demand only (expander open) — deliberately kept out of CSV2.
 function fetchAccState() {
     const el = document.getElementById('accStateBody');
     if (!el) return;
@@ -12842,9 +12440,7 @@ function fetchAccState() {
 }
 
 // ===== Overvoltage History (Live Data ▸ Diag) =====
-// Lifetime OV histogram + counters from device RTC RAM (/getOvTelemetry), fetched when the
-// section opens. Band edges are built from the returned bulk + k (SYSTEM_VOLTAGE_CLASS/12), so
-// nothing is hardcoded client-side; time_ms arrives as decimal strings (uint64-safe).
+// Band edges scale by the returned k (SYSTEM_VOLTAGE_CLASS/12); time_ms arrives as decimal strings (uint64-safe).
 function fetchOvTelemetry() {
     const body = document.getElementById('ovtBinsBody');
     fetch(buildURL('/getOvTelemetry'))
@@ -12868,8 +12464,7 @@ function fetchOvTelemetry() {
             const fmtDwell = ms => ms >= 90000 ? (ms / 60000).toFixed(2) + ' min' : (ms / 1000).toFixed(2) + ' s';
             let lastActive = -1;
             for (let i = 0; i < nBins; i++) if (d.events[i] || Number(d.time_ms[i])) lastActive = i;
-            // One zero row above the highest active band, so the table shows coverage continues upward
-            // (an empty histogram shows band 0 as its zero row).
+            // One zero row above the highest active band shows coverage continues upward.
             const capRow = Math.min(lastActive + 1, nBins - 1);
             let rows = '';
             for (let i = 0; i <= capRow; i++) {
@@ -12899,9 +12494,8 @@ function resetOvTelemetryLifetime() {
 }
 
 // ── Oscillation damper (hunt governor) — Live Data ▸ Diag ▸ Alternator ─────────────────────
-// Live state rides CSV1 (huntDerate / huntFreqHz / huntState) so gain and state can never
-// disagree by a frame; the episode table is the device's own /huntledger.csv, re-read on open.
-// The verdict strings below are the firmware's internal tokens — map them, never print raw.
+// Live state rides CSV1 so gain and state never disagree by a frame. Verdicts are firmware
+// tokens — map them, never print raw.
 const HG_VERDICT = {
     'damped': 'Wobble stopped',
     'damped-partial': 'Wobble halved — reduced gain kept',
@@ -12910,13 +12504,11 @@ const HG_VERDICT = {
     'recovered': 'Settled on its own',
     'damped-dterm': 'Wobble stopped — voltage damper switched off here',
     'dterm-no-resp': 'Voltage damper was not the cause — turned back on',
-    // Rows written before the abort verdicts were split carry plain 'aborted' for BOTH levers;
-    // they render as a gain test and cannot be told apart retroactively.
+    // Legacy rows carry plain 'aborted' for both levers and render as a gain test.
     'aborted-dterm': 'Not concluded — voltage damper test interrupted, conditions changed',
 };
 
-// Wording is driven by state first, gain second: the derate alone cannot separate "inside a
-// mapped trouble spot" from "testing a cut right now", and those mean different things.
+// State first, gain second: the derate alone can't tell "in a mapped pocket" from "testing a cut now".
 function hgStateWord(state, pct, enabled) {
     if (enabled === false) return 'Off — hunting persists at full gain';
     switch (state) {
@@ -12930,11 +12522,8 @@ function hgStateWord(state, pct, enabled) {
     }
 }
 
-// The master switch appears twice: the canonical row in Setup > Alternator > Tuning > Current >
-// Controller Parameters (next to the PID Ki it derates) and a mirror in this Diag card, which is the
-// screen a user is actually on when they decide to switch it off. Both post the same HuntGovEnable;
-// this keeps the other checkbox visually in step during the ~1 s before the firmware echo lands,
-// because updateCheckbox() freezes BOTH while the toggle is pending.
+// Setup ▸ Tuning ▸ Controller Parameters and this Diag card both post HuntGovEnable. Sync the other box
+// here: updateCheckbox() freezes BOTH while the toggle is pending (~1 s until the echo).
 function huntGovToggle(el, checkboxId, hiddenId, mirrorId) {
     if (!handleUserToggle(checkboxId, hiddenId, 'HuntGovEnable')) return;
     const mirror = document.getElementById(mirrorId);
@@ -12955,9 +12544,7 @@ function huntGovLiveOnCsv1(data) {
     if (g) g.textContent = on ? pct + '%' : '100%';
     const f = document.getElementById('hgFreqNow');
     if (f) f.textContent = (on && freq > 0) ? freq.toFixed(2) + ' Hz' : 'none';
-    // A test just concluded (state left 1/4): the episode record and map changed on the device —
-    // re-pull them if the section is open, so the list and plot can never sit stale against the
-    // live status line. 1.5 s grace lets the firmware queue the record first.
+    // Test concluded (left state 1/4): re-pull ledger + map if open. 1.5 s lets the firmware queue the record.
     if (hgPrevHuntState !== null && hgPrevHuntState !== state
         && (hgPrevHuntState === 1 || hgPrevHuntState === 4)) {
         const det = document.getElementById('hgLedgerList');
@@ -12965,12 +12552,10 @@ function huntGovLiveOnCsv1(data) {
         if (sec && sec.open) setTimeout(fetchHuntLedger, 1500);
     }
     hgPrevHuntState = state;
-    // Live engine-speed marker on the speed map: redraw at most 1/s, only when the plot is on
-    // screen and the marker would visibly move.
+    // Live "now" marker on the speed map.
     hgNowRpm = 'RPM' in data ? Number(data.RPM) || 0 : 0;
     if (hgMapU && Date.now() - hgNowLastDrawMs > 1000 && Math.abs(hgNowRpm - hgNowDrawnRpm) >= 5) {
-        // offsetParent forces a style/layout flush, so the visibility test is read last: only on
-        // the ~1/s frames that already cleared the throttle, never on every 10 Hz CSV1 frame.
+        // offsetParent forces a layout flush — test it only after the throttle, never on every 10 Hz frame.
         const mapEl = document.getElementById('hgMapPlot');
         if (mapEl && mapEl.offsetParent) {
             hgNowLastDrawMs = Date.now();
@@ -12979,8 +12564,7 @@ function huntGovLiveOnCsv1(data) {
     }
 }
 
-// Voltage-damper (D-term) lever readout — CSV2 cadence is plenty (it moves on pocket entry/exit
-// and test open/close). Old firmware without the field leaves the row at its placeholder.
+// Voltage-damper (D-term) lever readout; CSV2 cadence suffices (changes only on pocket entry/exit, test open/close).
 let hgKdScaleLast = 100;   // last CSV2 huntKdScale, read by hgStateWord on the faster CSV1 cadence
 function huntGovLiveOnCsv2(data) {
     if (data.huntKdScale === undefined) return;
@@ -12996,8 +12580,7 @@ function fetchHuntLedger() {
     const count = document.getElementById('hgEpisodeCount');
     const link = document.getElementById('hgRawLink');
     if (link) link.href = buildURL('/huntledger');   // Capacitor: a bare /huntledger href resolves to localhost
-    // note() covers every empty/error path, so it also hides the episode map — the map only
-    // ever shows in the success path below, fed from the same parse as the list.
+    // Every empty/error path hides the map; it only shows on success, fed from the same parse as the list.
     const note = m => {
         if (list) list.innerHTML = '<div style="padding:6px 0;color:var(--text-muted);">' + m + '</div>';
         const w = document.getElementById('hgMapWrap');
@@ -13012,10 +12595,8 @@ function fetchHuntLedger() {
             const rows = (lines.length && lines[0].indexOf('epoch,') === 0) ? lines.slice(1) : [];
             if (count) count.textContent = rows.length ? String(rows.length) : 'none';
             if (!rows.length) {
-                // Don't claim "never detected" until the map confirms there are no pockets either —
-                // pockets can outlive their evidence rows (ledger cap-trim), and a freshly-mapped
-                // pocket's record may not be readable yet. renderHuntMap fetches /huntmap and
-                // writes the honest note for whichever case holds.
+                // No "never detected" claim until /huntmap confirms no pockets: pockets outlive
+                // cap-trimmed ledger rows. renderHuntMap writes the note.
                 renderHuntMap([], true);
                 return;
             }
@@ -13028,23 +12609,18 @@ function fetchHuntLedger() {
                 const freq = Number(c[3]), a0 = Number(c[4]), aEnd = Number(c[5]);
                 const steps = Number(c[6]), verdict = c[7], derate = Number(c[8]);
                 eps.push({ rpm: rpm, verdict: verdict, derate: derate });
-                // Episodes logged before the clock synced carry a meaningless epoch — say so
-                // rather than printing 1970.
+                // epoch <= 2020-01-01 = logged before clock sync.
                 const when = epoch > 1577836800 ? new Date(epoch * 1000).toLocaleString()
                                                 : 'time unknown — logged before clock sync';
-                // D-lever records carry the voltage-movement metric (V/s), not field swing — the
-                // D-driven wobble lives in volts and barely registers in the field drive.
-                // Which lever an abort was testing comes from the verdict token alone — both abort
-                // rows log steps = 1, so steps can never be used to tell them apart.
+                // D-lever rows carry voltage movement (V/s), not field swing. The lever comes from the
+                // verdict token alone: both abort verdicts log steps = 1.
                 const isAbort = (verdict === 'aborted' || verdict === 'aborted-dterm');
                 const isDterm = (verdict === 'damped-dterm' || verdict === 'dterm-no-resp' || verdict === 'aborted-dterm');
                 const facts = [
                     (rpm > 0 ? rpm + ' rpm' : 'engine speed not recorded'),
                     (cv ? 'voltage-limited' : 'current-limited'),
                     freq.toFixed(2) + ' Hz wobble',
-                    // "aborted" is logged with no end amplitude — the episode never reached a verdict.
-                    // Its aEnd is a 0 placeholder meaning "no post reading exists", so no abort row
-                    // may ever print an end value; the baseline unit follows the lever.
+                    // Abort rows: aEnd is a 0 placeholder (no post reading) — never print an end value.
                     (isAbort ? (isDterm ? 'voltage movement ' + a0.toFixed(2) + ' V/s at the start'
                                         : 'field swing ' + a0.toFixed(1) + '% at the start')
                         : isDterm ? 'voltage movement ' + a0.toFixed(2) + ' → ' + aEnd.toFixed(2) + ' V/s'
@@ -13067,12 +12643,9 @@ function fetchHuntLedger() {
         .catch(() => { note('Not available.'); if (count) count.textContent = '—'; });
 }
 
-// ── Speed map: live gain-vs-speed profile (trapezoid pockets from /huntmap) + episode dots ──
-// The firmware's pocket map IS the control rule; this plot draws it verbatim: full gain
-// everywhere, the Damped Gain across each pocket core, linear taper over the wings. Dots are
-// ledger evidence (blue filled = verified, amber hollow = did not respond, grey hollow = the test
-// was interrupted and concluded nothing); the dashed vertical is the live engine speed off CSV1. Colors are fixed and CVD-validated against both card
-// surfaces; axis/grid theming comes from the uPlot wrapper.
+// ── Speed map: gain-vs-speed profile (trapezoid pockets from /huntmap) + episode dots ──
+// Draws the firmware's pocket map verbatim (it IS the control rule). Colors are fixed and
+// CVD-validated against both card surfaces; axis/grid theming comes from the uPlot wrapper.
 let hgMapU = null;
 let hgMapData = { xs: [], profile: [], kept: [], rest: [], xlo: 0, xhi: 1000 };
 let hgMapState = { pockets: [], cut: 50, wing: 15, enabled: 1 };
@@ -13081,10 +12654,8 @@ let hgNowDrawnRpm = -1;
 let hgNowLastDrawMs = 0;
 let hgPrevHuntState = null;   // last huntState seen on CSV1 — a transition out of testing re-pulls the ledger/map
 
-// JS mirror of the firmware's huntMapGain(), in percent — Ki pockets (lever 0) only; D pockets
-// (lever 1) act on the voltage damper, not this gain, and draw as their own shading. Damper off =
-// firmware applies full gain everywhere, so the profile draws flat; shading and dots still show
-// the retained map.
+// Mirror of firmware huntMapGain(), in percent. Ki pockets (lever 0) only — D pockets (lever 1)
+// act on the voltage damper and draw as shading.
 function hgProfileGain(r) {
     if (!hgMapState.enabled) return 100;
     const cut = hgMapState.cut, wing = hgMapState.wing / 100;
@@ -13115,10 +12686,8 @@ function hgMapYRange() {
     return [Math.max(0, Math.min(80, Math.floor((mn - 8) / 10) * 10)), 105];
 }
 
-// Entry point from fetchHuntLedger: pulls the live map, then draws it with the episode dots.
 // A failed /huntmap (old firmware, demo mode) degrades to a flat full-gain line + dots.
-// noEpisodeRows: the ledger parse found nothing — the note under the list is written HERE, after
-// the map answers whether pockets exist, so the text can never contradict the live status line.
+// noEpisodeRows: the list note is written here, after the map says whether pockets exist.
 function renderHuntMap(eps, noEpisodeRows) {
     fetch(buildURL('/huntmap'))
         .then(r => r.ok ? r.json() : null)
@@ -13172,11 +12741,9 @@ function hgMapBuild(eps) {
         for (let i = 0; i < xs.length; i++) {
             if (xs[i] !== e.rpm || kept[i] !== null || rest[i] !== null || dkept[i] !== null || abrt[i] !== null) continue;
             if (e.verdict === 'damped' || e.verdict === 'damped-partial') kept[i] = e.derate * 100;
-            // D-verified dot sits at the Ki gain (usually 100%) — the pocket it made acts on the
-            // voltage damper, drawn as purple shading, not on this line
+            // D-verified dot sits at the Ki gain; its pocket draws as purple shading
             else if (e.verdict === 'damped-dterm') dkept[i] = e.derate * 100;
-            // An interrupted test proved nothing about the belt or the engine governor, so it can
-            // never share the amber "did not respond" series — that verdict is a real finding.
+            // Aborts never share the amber "did not respond" series — that verdict is a real finding.
             else if (e.verdict === 'aborted' || e.verdict === 'aborted-dterm') abrt[i] = e.derate * 100;
             else rest[i] = e.derate * 100;
             break;
@@ -13244,8 +12811,7 @@ function hgMapBuild(eps) {
     }).observe(el);
 }
 
-// Clear System: pockets + episode record + any test in flight, all together, on the device.
-// Arm-gated on the firmware side like every other mutation — a locked dashboard gets a 403.
+// Clears pockets, episode record and any in-flight test. Firmware arm-gates it (403 when locked).
 async function clearHuntSystem() {
     if (!await xConfirm('Permanently erase everything the Oscillation Damper has learned — the speed map AND the episode record? Gain returns to 100% everywhere until a new wobble is verified. This cannot be undone.')) return;
     const status = document.getElementById('hgClearStatus');
@@ -13269,8 +12835,6 @@ function commitCVTuningScore() {
     const status = document.getElementById('cvTuningCommitStatus');
     if (btn) btn.disabled = true;
     if (status) status.textContent = 'Sending…';
-    // Note: r.ok must be checked — firmware returns 403 while settings are
-    // locked before the commit flag is ever set.
     fetch(buildURL('/get?commitCVTuningScore=1'))
         .then(r => {
             if (!r.ok) {
@@ -13310,11 +12874,8 @@ function restartCVTest() {
         });
 }
 
-// Boat loading splash: the inline script in index.html shows it immediately on a
-// Capacitor cold launch (themed, flash-free). It hides on the first CSVData packet
-// (CSVData listener below) or when demo mode starts. hideWaitingForRegulator() is
-// idempotent and fades the overlay out. The safety timeout below guarantees it can
-// never stick if neither real nor demo telemetry ever arrives.
+// Boat loading splash, shown by the inline script in index.html on a Capacitor cold launch. Hides on
+// the first CSVData packet or demo start; the DOMContentLoaded timeout below stops it ever sticking.
 window._firstCsvPacketReceived = false;
 function hideWaitingForRegulator() {
     const el = document.getElementById('waiting-for-regulator');
@@ -13324,15 +12885,13 @@ function hideWaitingForRegulator() {
     setTimeout(() => { el.style.display = 'none'; }, 480);
 }
 
-// Delay applied to the Diag fast-scope kick when Diag is entered by the cold-open landing (below),
-// so first paint and telemetry wiring finish before the waveform/flipbook fetches start. Consumed
-// (and cleared) by the one showSubTab('livedata','diag') that follows.
+// Cold-open delay for the Diag fast-scope kick, so first paint finishes before waveform fetches.
+// Consumed and cleared by the next showSubTab('livedata','diag').
 let diagScopeKickDelayMs = 0;
 const COLD_OPEN_SCOPE_DELAY_MS = 4000;
 
-// Phone-sized screens only: coarse pointer rules out a laptop in a narrow window, and the SHORTER
-// viewport edge catches a phone held either way (landscape width is ~850, its height ~400).
-// Tablets sit well above this (iPad portrait's short edge is 768) and are not nudged.
+// Coarse pointer excludes a narrow laptop window; the short edge catches a phone in either
+// orientation (iPad short edge is 768, not nudged).
 function _isPhoneSizedScreen() {
     try {
         const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
@@ -13340,10 +12899,7 @@ function _isPhoneSizedScreen() {
     } catch (e) { return false; }
 }
 
-// Recommendation, never a gate: setup is a long form plus a wizard with tables and plots, and it is
-// done once. Fires only on the incomplete-vessel-info landing, so it cannot reach a set-up boat.
-// The address is quoted live — API_BASE_URL in the app (discovered IP, else alternator.local), the
-// page's own origin in a browser — so the user has something to type rather than "this address".
+// Recommendation, never a gate; only fires on the incomplete-vessel-info landing.
 function smallScreenSetupMsg() {
     let addr = '';
     try { addr = IS_CAPACITOR ? API_BASE_URL : window.location.origin; } catch (e) { addr = ''; }
@@ -13355,9 +12911,7 @@ function smallScreenSetupMsg() {
         + 'Everyday monitoring is fine on a phone — it is the one-time setup that wants the bigger screen.';
 }
 
-// Landing tab, applied once on open: always Live Data → Diag, so Charging System Health is the
-// first thing seen (fixed destination — the field state must not decide what the user sees first).
-// Vessel Info incomplete overrides to Setup.
+// Always Live Data ▸ Diag (fixed — field state must not pick the landing); incomplete Vessel Info → Setup.
 function applyLandingTab() {
     try {
         if (!vesselInfoComplete) {
@@ -13367,16 +12921,13 @@ function applyLandingTab() {
             return;
         }
         showMainTab('livedata');
-        // Diag's fast scope pulls a waveform + the flipbook the moment the tab shows; on a cold
-        // open that competes with the rest of the app coming up. Hand showSubTab a delay for this
-        // one entry only — manual Diag clicks stay immediate.
+        // Delay the fast-scope kick for this cold-open entry only; manual Diag clicks stay immediate.
         diagScopeKickDelayMs = COLD_OPEN_SCOPE_DELAY_MS;
         showSubTab('livedata', 'diag');
     } catch (err) {}
 }
 
-// Hold until both signals are ready: first telemetry packet (device is talking, splash gone) and
-// the vessel-info fetch (vesselInfoComplete). Guards the fetch-vs-packet race; runs once.
+// Waits for both the first telemetry packet and the vessel-info fetch (either may land first); runs once.
 window._vesselInfoLoaded = false;
 window._landingApplied = false;
 function maybeApplyLanding() {
@@ -13387,14 +12938,10 @@ function maybeApplyLanding() {
     checkRecommissionPrompt().catch(() => { });   // once per app open; self-suppresses when nothing is due
 }
 document.addEventListener('DOMContentLoaded', () => {
-    // The splash is visible by default (see index.html) and hides on the first
-    // CSVData packet or when demo mode starts. This safety net guarantees it can
-    // never stick if neither ever arrives. In a normal browser the page is served
-    // by the device, so the first packet clears it almost immediately.
+    // Safety net: the splash must never stick if neither a packet nor demo start arrives.
     setTimeout(() => { if (!window._firstCsvPacketReceived) hideWaitingForRegulator(); }, 20000);
 });
 
-// Poll while the tuning score section is open
 document.addEventListener('DOMContentLoaded', () => {
     const section = document.getElementById('tuningScoreSection');
     if (!section) return;
@@ -13419,16 +12966,13 @@ function fetchCVTuningLog() {
         .catch(() => {});
 }
 
-// Shared s/m/h formatter for the Control Accuracy panel + its diagnostics expander.
 function fmtT(s) {
     return !(s > 0) ? '0s' : (s < 90 ? Math.round(s) + 's'
         : (s < 5400 ? (s / 60).toFixed(1) + 'm' : (s / 3600).toFixed(1) + 'h'));
 }
 
-// Control Accuracy cell writer with render-stamp caching. Dash rule keys on `observedS`
-// (the metric's own denominator), NOT the value: 0 observed → "—" ("not observed" is never
-// shown as "perfect"). higherBetter=true colors green ABOVE the first threshold (tracking %);
-// false colors green BELOW it (recovery time).
+// Dash keys on observedS (the metric's denominator), not the value: "not observed" must
+// never read as "perfect".
 function accCell(elId, txt, v, t1, t2, higherBetter, observedS) {
     const el = document.getElementById(elId);
     if (!el) return;
@@ -13453,8 +12997,7 @@ function accCovLine(elId, txt) {
 }
 
 function renderCVTuningLog(data) {
-    // CV live accuracy mirror: data.live = [Tracking % (in-band of challenged time),
-    // worst over-voltage (mV 12V-equiv), 0, 0]. The always-on panel is fed off CSV2.
+    // data.live = [tracking % of challenged time, worst over-voltage mV (12V-equiv), 0, 0].
     const live = data.live || [];
     {
         const el0 = document.getElementById('cvLiveScore0');
@@ -13480,7 +13023,7 @@ function renderCVTuningLog(data) {
         }
     }
 
-    // Commit section: show when Waveform Generator is active, enable button when ≥1 scored HIGH cycle
+    // data.ta = Waveform Generator active; data.tc = scored HIGH cycles
     const cvCommitSection = document.getElementById('cvTuningCommitSection');
     if (cvCommitSection) {
         cvCommitSection.style.display = data.ta ? '' : 'none';
@@ -13492,10 +13035,8 @@ function renderCVTuningLog(data) {
         }
     }
 
-    // Current settings for row highlighting — read from echo spans
     const curVkp = parseFloat(document.getElementById('VoltageKp_echo')?.textContent);
     const curVki = parseFloat(document.getElementById('VoltageKi_echo')?.textContent);
-    // curVkd removed — D term removed
     const curWa  = parseFloat(document.getElementById('cvWaveAmplitudeV_echo')?.textContent);
     const curWp  = parseInt(document.getElementById('cvWavePeriodSec_echo')?.textContent);
     const curCr  = parseInt(document.getElementById('cvConsecutiveReads_echo')?.textContent);
@@ -13505,7 +13046,7 @@ function renderCVTuningLog(data) {
     if (!tbody) return;
 
     tbody.innerHTML = records.map(r => {
-        const scoreColor = r.s < 10 ? '#22c55e' : r.s < 20 ? '#eab308' : '#ef4444';   // CV loop: good < 10
+        const scoreColor = r.s < 10 ? '#22c55e' : r.s < 20 ? '#eab308' : '#ef4444';
         const isMatch = !isNaN(curVkp) &&
             Math.abs(r.vkp - curVkp) < 0.001 &&
             Math.abs(r.vki - curVki) < 0.001 &&
@@ -13513,7 +13054,7 @@ function renderCVTuningLog(data) {
             r.wp === curWp && r.cr === curCr;
         const rowStyle = isMatch ? 'background:rgba(99,102,241,0.18);' : '';
 
-        const lowScoreColor = (r.ls || 0) < 10 ? '#22c55e' : (r.ls || 0) < 20 ? '#eab308' : '#ef4444';   // CV loop: good < 10
+        const lowScoreColor = (r.ls || 0) < 10 ? '#22c55e' : (r.ls || 0) < 20 ? '#eab308' : '#ef4444';
         return `<tr style="${rowStyle}">
             <td style="padding:2px 4px;">${r.n}</td>
             <td style="padding:2px 4px;color:${scoreColor};font-weight:bold;">${r.s.toFixed(2)}</td>
@@ -13550,7 +13091,7 @@ function renderCVTuningLog(data) {
             <td style="padding:2px 4px;">${r.ld}</td>
             <td style="padding:2px 4px;">${r.hoc}</td>
             <td style="padding:2px 4px;">${r.rpm.toFixed(0)}</td>
-            <td style="padding:2px 4px;">${r.tmp.toFixed(1)}</td>
+            <td style="padding:2px 4px;">${Number.isFinite(r.tmp) ? toDisplayTemp(r.tmp).toFixed(1) : '—'}</td>
             <td style="padding:2px 4px;">${r.bv.toFixed(2)}</td>
             <td style="padding:2px 4px;">${r.soc.toFixed(1)}</td>
             <td style="padding:2px 4px;">${r.cvt.toFixed(2)}</td>
@@ -13562,9 +13103,7 @@ function renderCVTuningLog(data) {
     }).join('');
 }
 
-// Non-blocking warning when the CV wave period is set below the point where the high phase can
-// still fit the steady-state peak-to-peak window (settle + 1s skip + 3s eval ≈ a 14s period).
-// The value is always sent (returns true); the warning just tells the user P2P may read n/a.
+// 14 s ≈ shortest period whose high phase fits settle + 1 s skip + 3 s P2P eval. Never blocks the submit.
 function warnCvPeriod(form) {
     const v = parseInt(form.cvWavePeriodSec?.value, 10);
     if (v >= 8 && v < 14) {
@@ -13580,7 +13119,6 @@ async function resetCVTuningLog() {
         .catch(() => {});
 }
 
-// Poll while the CV tuning section is open
 document.addEventListener('DOMContentLoaded', () => {
     const section = document.getElementById('cvTuningScoreSection');
     if (!section) return;
@@ -13744,18 +13282,12 @@ function renderSysidSweepLog(data) {
     }).join('');
 }
 
-// Format a tuning-record wall-clock timestamp (firmware epoch seconds, 0 = clock not synced
-// when the run was committed). >1577836800 = after 2020-01-01, i.e. a real synced time.
+// ts: firmware epoch s, 0 = clock not synced; > 1577836800 (2020-01-01) = a real synced time.
 function fmtTuningTs(ts) {
     return (ts && ts > 1577836800) ? new Date(ts * 1000).toLocaleString() : '—';
 }
 
-// Plain-English cause the banner shows next to a field OFF word. Driven by the firmware
-// FieldEventReason (CSV1 fieldEventReason), which maps 1:1 to the enum in Xregulator.ino.
-// CHARGING_DISABLED (10) is the one code the firmware can't disambiguate — it fires for BOTH the
-// master Alternator-Enable switch being off AND a completed charge cycle (IDLE) — so we split it
-// here using the header switch state and the live charge stage (gLastChargeStage). Only shown when
-// the field is actually OFF (status 0/undefined); ACTIVE/RAMP/MANUAL/WAITING clear it.
+// Codes map 1:1 to the FieldEventReason enum in Xregulator.ino (CSV1 fieldEventReason).
 function fieldOffReasonText(reasonCode) {
     switch (reasonCode) {
         case 1:  return 'temperature sensor stale';
@@ -13768,11 +13300,8 @@ function fieldOffReasonText(reasonCode) {
         case 8:  return 'voltage sensors disagree';
         case 9:  return 'protection lockout active';
         case 10: {
-            // The firmware collapses four causes into one code: chargingEnabled = (Ignition && OnOff),
-            // cleared again by the Idle stage. Both inputs are on hand here — Ignition and OnOff both ride
-            // CSV1 at ~10 Hz (g_onOffDevice) — so name the one that is actually off rather than printing
-            // the shared word. Ignition first: with the key off, the app switch says nothing about why the
-            // field is down.
+            // Firmware collapses ignition off, switch off and Idle into one code (chargingEnabled =
+            // Ignition && OnOff); split it from CSV1. Ignition first: key off makes the switch moot.
             const ign = (typeof g_lastCsv1 === 'object' && g_lastCsv1 && g_lastCsv1.Ignition !== undefined)
                 ? Number(g_lastCsv1.Ignition) : NaN;
             if (ign === 0) return 'ignition off';
@@ -13813,10 +13342,8 @@ function fieldOffReasonText(reasonCode) {
     }
 }
 
-// Minimal BMS On/Off Control (Setup > Integrations): the raw opto input, plus what it means now.
-// present/absent is the WIRE, not the ESP32 pin — the opto inverts, and the firmware already undid it.
-// The polarity choice and the enable both come from the CSV3 settings echo, so the effect word stays
-// blank until that cache exists rather than guessing a direction.
+// present/absent = the WIRE, not the ESP32 pin (the opto inverts; firmware already undid it).
+// Effect stays a dash until the CSV3 echo exists — never guess the polarity.
 function renderBmsSignalRow(present) {
     const setText = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
     setText('bmsSigWord_ID', present ? 'present' : 'absent');
@@ -13827,9 +13354,8 @@ function renderBmsSignalRow(present) {
     setText('bmsSigEffect_ID', permits ? 'charging permitted' : 'charging blocked');
 }
 
-// Switch panel wires on data Cable 3 (Charge Rate = pin 5, Force Float = pin 7). Word = the raw
-// debounced opto state, always live so an installer can prove the wiring; effect = what that state is
-// doing right now, which is nothing at all unless Physical Panel Override is on.
+// Cable 3 switch panel (Charge Rate = pin 5, Force Float = pin 7). Word = raw debounced opto state,
+// always live so an installer can prove the wiring.
 function renderPanelSwitchRows(hiAsserted, floatAsserted) {
     const setText = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
     setText('panelHiRateWord_ID', hiAsserted ? 'energized' : 'dead/open');
@@ -13849,9 +13375,7 @@ function renderPanelSwitchRows(hiAsserted, floatAsserted) {
     setText('panelForceFloatEffect_ID', floatAsserted ? 'Force Maintain Mode engaged' : 'Force Maintain Mode off');
 }
 
-// The commissioning wizard's own override warning. Driven from the same echo as the gates below so
-// it appears and clears live during a run, and read straight from the CSV3 cache on wizard open so the
-// first step does not wait for the next event-driven frame.
+// Wizard override warning. Sync reads the CSV3 cache on open so step one need not wait for a frame.
 function cxPanelOverrideStrip(on) {
     const el = document.getElementById('cx-panel-override-warn');
     if (el) el.style.display = on ? 'block' : 'none';
@@ -13862,10 +13386,8 @@ function cxPanelOverrideOn() {
     return !!c3 && Number(c3.PhysicalPanelOverride) === 1;
 }
 function cxPanelOverrideStripSync() { cxPanelOverrideStrip(cxPanelOverrideOn()); }
-// The pre-wizard screens are their own overlays, so the wizard's strip is not on screen for them —
-// and Charge Rate Limits is exactly where the flow writes HiLow, which the Cable-3 switch owns while
-// the override is on. Clone the wizard's element so the copy can never drift; the clone drops the id
-// (ids stay unique) and carries the class cxPanelOverrideStrip drives, so it tracks the live echo too.
+// Pre-wizard overlays (Charge Rate Limits writes HiLow, which the Cable-3 switch owns under override)
+// get a clone of the wizard strip; its class lets cxPanelOverrideStrip drive it live.
 function cxPanelOverrideStripHtml() {
     const src = document.getElementById('cx-panel-override-warn');
     if (!src) return '';
@@ -13876,27 +13398,24 @@ function cxPanelOverrideStripHtml() {
     return el.outerHTML;
 }
 
-// Grey the two controls the switch panel takes over, so neither is ever a live but inert knob. The
-// source of truth is the firmware echo, not the checkbox, and nothing is greyed until that echo has
-// actually arrived. Called from the CSV3 handler, which is where the echo lands.
+// Greys the controls the switch panel takes over. Source of truth is the firmware echo, not the checkbox.
 function syncPanelOverrideGates(on) {
     cxPanelOverrideStrip(on);
     for (const id of ['chargeRatePanelGate', 'maintainModePanelGate']) {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('is-gated', !!on);
     }
-    // pointer-events:none stops mouse and touch only; Tab + Enter would still fire the handlers and the
-    // firmware would record the keystroke as the app's stored choice.
+    // pointer-events:none misses Tab+Enter, which would record a keystroke as the stored choice.
     for (const id of ['chargeRateLowBtn', 'chargeRateHighBtn', 'MaintainMode_checkbox']) {
         const el = document.getElementById(id);
         if (el) el.disabled = !!on;
     }
 }
 
-// The firmware's CSV3 FieldResDefault: 1 while the skipped-test 2 ohm default stands in (12 V, nothing measured).
+// FieldResDefault = 1 while the skipped-test 2 ohm default stands in (12 V, nothing measured).
 function fieldResDefaultIn(c3) { return !!c3 && Number(c3.FieldResDefault) === 1; }
-// No Field Resistance measured and no 12 V skipped-test default: the firmware holds its 10 A ceiling at 0, so the field
-// stays off with no off-reason of its own (ctrlLimiter reads 15). False until the first CSV3 frame says otherwise.
+// Neither measured nor defaulted: firmware holds the 10 A ceiling at 0, so the field stays off with
+// no off-reason of its own (ctrlLimiter reads 15).
 function fieldResMissing() {
     const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : null;
     return !!c3 && c3.FieldResistance !== undefined && !Number.isFinite(Number(c3.FieldResistance)) && !fieldResDefaultIn(c3);
@@ -13998,10 +13517,8 @@ document.addEventListener('DOMContentLoaded', () => {
 let cvTuningPlot = null;
 let cvTuningData = null;
 let cvTuningPlotResizeObserver = null;
-// Corner "lock" button — same semantics as the Plots tab locks: freeze the Y
-// autoscale at its current ranges while data keeps streaming. _cvLockWasAuto
-// remembers which scales were auto at lock time so unlock returns only those
-// to auto (explicit manual ranges survive a lock/unlock cycle).
+// Corner lock freezes Y autoscale while data streams. _cvLockWasAuto records which scales were
+// auto at lock time so unlock restores only those (manual ranges survive).
 let cvYAxesLocked = false;
 let _cvLockWasAuto = { volts: false, amps: false };
 
@@ -14012,11 +13529,9 @@ let cvPidPlotResizeObserver = null;
 let cvPidAmpsMin = null, cvPidAmpsMax = null;
 let cvPidSeriesVisible = { p: true, i: true, d: true, icv: true };
 
-// Cache of last-seen CSV1 values for the CV tuning plot.
-// voltageTarget and Icv ride CSV1 (fast stream) — updated in processCSVDataOptimized.
-// BatteryV_raw is CSV1 and is read directly from data; it is NOT cached here.
+// Last-seen CSV1 values for the CV tuning plot (set in processCSVDataOptimized).
 let cvPlotCache = { voltageTarget: null, Icv: null };
-let _lastBatteryV = null;  // last CSV1 BatteryV_raw in volts (÷100 applied)
+let _lastIBV = null;  // last CSV1 IBV in volts (÷100 applied): the INA228 reading the CV loop regulates, not the ADS1115 BatteryV_raw
 
 // Local axis range state — JS only, not firmware-persisted.
 let cvXTime    = null;   // null = use global xTime
@@ -14034,10 +13549,8 @@ let cvTuningSeriesVisible = {
 
 function initCVTuningDataStructures() {
     const intervalMs = window._lastKnownInterval || 200;
-    // Buffer ALWAYS holds the full 5 min (LIVE_BUFFER_SEC), independent of the selected X window —
-    // so switching to 5M always has history and a window change never reallocates or loses data.
-    // The x-scale range fn (in initCVTuningPlot) draws only the selected window; sizing here is by
-    // interval alone. Mirrors the main live plots (reinitializePlotsWithNewTiming).
+    // Always sized for the full LIVE_BUFFER_SEC, not the selected X window, so a window change
+    // never reallocates or loses history (same as reinitializePlotsWithNewTiming).
     const maxPoints = Math.ceil(LIVE_BUFFER_SEC * 1000 / intervalMs);
     const intervalSec = intervalMs / 1000;
     const xAxisData = [];
@@ -14108,15 +13621,9 @@ function initCVTuningPlot() {
             },
         ],
         scales: {
-            // ALL ranges are fns, not arrays: re-read each redraw, so window changes and
-            // manual Y edits take effect via plain setData — no destroy/recreate, no
-            // layout jump. Null Y globals = default autoscale fit.
-            // x: fixed [-width, 0] with the right edge pinned at 0 — NOT data-driven [x[0], x[last]].
-            // applyInterp() slides x[last] left by elapsedSec each frame and snaps it back at every
-            // packet arrival; feeding that sawtooth into the range makes the whole axis (ticks + data)
-            // shiver left/right 5x/sec. Width is the SELECTED window (cvXTime, else xTime), NOT the
-            // buffer span — the 5-min buffer holds the history, this just draws the visible slice, so a
-            // window change re-ranges in place via plain setData with no realloc.
+            // All ranges are fns, re-read each redraw, so window/Y edits apply via plain setData.
+            // x is fixed [-w, 0], never data-driven: applyInterp() slides x[last] each frame and snaps it
+            // back on packet arrival, which would make the axis shiver. w = selected window, not buffer span.
             x:     { time: false, auto: false, range: () => { const w = (cvXTime && cvXTime > 0) ? cvXTime : (xTime || 30); return [-w, 0]; } },
             volts: { range: (u, mn, mx) => (cvVoltsMin !== null && cvVoltsMax !== null) ? [cvVoltsMin, cvVoltsMax] : stableAutoRange(mn, mx, 0.1) },
             amps:  { range: (u, mn, mx) => (cvAmpsMin  !== null && cvAmpsMax  !== null) ? [cvAmpsMin,  cvAmpsMax]  : stableAutoRange(mn, mx, 0.1) },
@@ -14130,10 +13637,8 @@ function initCVTuningPlot() {
     cvTuningPlot = new uPlot(opts, cvTuningData, plotEl);
     createCVTuningLegend();
 
-    // Corner auto checkbox + lock button — same convention as the Plots tab.
-    // Checkbox controls both Y axes (volts + amps): checked = auto-fit (null globals),
-    // unchecked = pin to what's shown. Lock freezes the current auto range while data
-    // keeps streaming (auto stays on). Checkbox is the only way back to auto-fit.
+    // Auto checkbox + lock, same convention as the Plots tab. The checkbox drives both Y axes and is
+    // the only way back to auto-fit; lock freezes the auto range while data streams.
     plotEl.style.position = 'relative';
     const existingLock = plotEl.querySelector('.autoscale-ctrl');
     if (existingLock) existingLock.remove();
@@ -14178,8 +13683,7 @@ function initCVTuningPlot() {
         lockBtnCV.style.opacity = cvYAxesLocked ? '1' : '0.6';
     });
 
-    // Click-to-edit Y limits. Typing pins that axis and unchecks auto (also pinning
-    // the other axis if it was still auto); the checkbox is the only way back to auto-fit.
+    // Typing a Y limit pins that axis, pins the other if still auto, and unchecks auto.
     const cvDropAuto = otherIsVolts => {
         if (otherIsVolts) { if (cvVoltsMin === null && cvTuningPlot) { cvVoltsMin = cvTuningPlot.scales.volts.min; cvVoltsMax = cvTuningPlot.scales.volts.max; } }
         else { if (cvAmpsMin === null && cvTuningPlot) { cvAmpsMin = cvTuningPlot.scales.amps.min; cvAmpsMax = cvTuningPlot.scales.amps.max; } }
@@ -14255,9 +13759,7 @@ function queueCVTuningPlotUpdate() {
 }
 
 // ── CV P/I/D decomposition plot ───────────────────────────────────────────
-// Shows how the three PI(D) terms build the current setpoint: P (Kp×error),
-// I (the integrator cv_I), D (−Kd trim: removes on a fast rise, adds on a fast fall below target), and Icv (the clamped sum).
-// Shares the CV tuning plot's X window (cvXTime). Single amps axis, autoscaled.
+// D = −Kd trim: removes on a fast rise, adds on a fast fall below target. Icv = the clamped sum.
 function initCVPidDataStructures() {
     const intervalMs = window._lastKnownInterval || 200;
     const maxPoints = Math.ceil(LIVE_BUFFER_SEC * 1000 / intervalMs);
@@ -14369,11 +13871,7 @@ function rebuildCVPidWindow() {
     if (cvPidPlot) cvPidPlot.setData(cvPidData);
 }
 
-// Resize the rolling window WITHOUT losing history or recreating the plot:
-// rebuild the x axis at the new length, right-align the newest overlapping
-// samples into it (shrink keeps the newest tail; grow pads the past with
-// nulls), and let setData re-run the range fns. The plot DOM, lock button,
-// legend, and Y-edit boxes all survive untouched.
+// Right-aligns the newest overlapping samples into a rebuilt buffer; the plot DOM survives.
 function rebuildCVTuningWindow() {
     const old = cvTuningData;
     initCVTuningDataStructures();
@@ -14391,8 +13889,7 @@ function setCVXTime(val) {
     const v = parseFloat(val);
     if (!isFinite(v) || v <= 0) return;
     cvXTime = v;
-    // Re-window in place: the buffer already holds 5 min, so just re-run the x-range fn — no realloc,
-    // no history loss (the old rebuild truncated history to the new window and lost the rest).
+    // Buffer already holds 5 min: re-run the x-range fn only (no realloc, no history loss).
     if (cvTuningPlot && cvTuningData) cvTuningPlot.setData(cvTuningData, true);
     if (cvPidPlot && cvPidData) cvPidPlot.setData(cvPidData, true);   // P/I/D plot shares cvXTime
     updateCVXButtons();
@@ -14514,8 +14011,7 @@ function _brushUpdateSelectionUI() {
     const left = Math.max(0, _brushTimeToPixel(_brushState.from));
     const right = _brushTimeToPixel(_brushState.to);
     sel.style.left = left + 'px';
-    // Minimum 20px wide so even tiny selections (e.g. "1h" on 30-day-wide data)
-    // are visually obvious as "I selected something" instead of a 1px sliver.
+    // 20 px floor keeps a tiny selection (1 h of 30 days) visible.
     sel.style.width = Math.max(20, right - left) + 'px';
     _brushEl('dashboard-brush-duration').textContent =
         _brushFormatDuration(_brushState.to - _brushState.from);
@@ -14572,13 +14068,10 @@ function _brushWireDrag() {
         const span = _brushState.dataMax - _brushState.dataMin;
         const trackW = track.clientWidth || 1;
         const dms = (dpx / trackW) * span;
-        // Visual-only during drag — charts re-render on drag end, keeping things snappy.
-        // Pre-clamp the dragged edge so _brushClamp (designed for pan) doesn't shift
-        // the fixed edge when the dragged edge hits a data boundary. That was the
-        // un-physical feeling: drag the left handle off the left edge → right handle
-        // also moved. Now resize feels like a real edge-grab.
+        // Visual-only during drag (charts re-render on release). Pre-clamp the dragged edge so
+        // _brushClamp (built for pan) doesn't shift the fixed edge at a data boundary.
         const opts = { skipEmit: true };
-        const MIN_SPAN = 60 * 1000; // 1 minute
+        const MIN_SPAN = 60 * 1000;
         const dMin = _brushState.dataMin;
         const dMax = _brushState.dataMax;
         if (mode === 'pan') {
@@ -14630,9 +14123,7 @@ function _brushWireSnap() {
     const allBtns = document.querySelectorAll('.dashboard-brush-snap-btn');
     allBtns.forEach(btn => {
         btn.addEventListener('click', () => {
-            // Visual feedback: highlight the clicked snap, clear others. Helps user
-            // confirm "1h" or "All" actually fired (selection on the brush may be
-            // very narrow when the data range is wide).
+            // Highlight the snap that fired; the brush selection itself may be a sliver on wide data.
             allBtns.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             if (btn.getAttribute('data-all') === 'true') {
@@ -14652,9 +14143,7 @@ function _brushWireSnap() {
     });
 }
 
-// Render the "Last data: HH:MM (Nm ago)" indicator. Color-graded:
-// green ≤5min, yellow ≤30min, red >30min. Called from ltInitBrush
-// + every 10s via a tracked timer so "X ago" stays current.
+// "Last data" indicator; ltInitBrush re-runs it every 10 s so "X ago" stays current.
 function _brushUpdateStaleness() {
     const ago = _brushEl('dashboard-staleness-ago');
     const tEl = _brushEl('dashboard-staleness-time');
@@ -14681,9 +14170,7 @@ function _brushUpdateStaleness() {
 }
 
 // CLOUD FEATURES - Dark mode for embedded Vercel pages
-// The cloud pages live in iframes and can't see this dashboard's dark-mode toggle.
-// We tell them: ?dark=N on the URL for flash-free first paint, plus a SET_THEME
-// postMessage when the user flips the toggle while a cloud tab is open.
+// Iframes can't see the toggle: ?dark=N gives a flash-free first paint, SET_THEME covers later flips.
 function cloudDarkParam() {
     return document.body.classList.contains('dark-mode') ? '1' : '0';
 }
@@ -14758,9 +14245,7 @@ async function loadFleetStatsInIframe() {
 }
 
 // CLOUD FEATURES - Config Sharing
-// Browse the shared config library (Vercel page). Passes the device token so the page
-// can offer "load onto my regulator", which it relays back via a LOAD_CONFIG_TO_DEVICE
-// postMessage (handled below) — the cloud page can't reach the LAN device directly.
+// The device token lets the page offer "load onto my regulator" (relayed by _configShareHandleMessage).
 async function loadConfigSharingInIframe() {
     if (DEMO_MODE) { demoFillCloudPanes(); return; }
     const statusEl = document.getElementById('configsharing-status');
@@ -14783,8 +14268,7 @@ async function loadConfigSharingInIframe() {
     }
 }
 
-// Relay a chosen library config from the Config Sharing iframe onto this regulator.
-// The iframe (cloud origin) can't POST to the LAN device, so it asks the parent to.
+// The cloud-origin iframe can't POST to the LAN device, so it asks the parent to.
 function _configShareHandleMessage(e) {
     if (e.origin !== 'https://supabase-nine-ashy.vercel.app') return;
     if (!e.data || e.data.type !== 'LOAD_CONFIG_TO_DEVICE' || !e.data.config) return;
@@ -14881,9 +14365,7 @@ async function factoryReset() {
         .catch(err => {
             diagError("Factory reset error:", err);
 
-            // Timeout or network error means the device is resetting (expected behavior).
-            // TypeError covers every engine's network-failure message: Chrome 'Failed to
-            // fetch', WebKit/iOS 'Load failed', Firefox 'NetworkError...'.
+            // Timeout or network failure (TypeError in every engine) = the device is resetting.
             if (err.message === 'Request timeout' || err instanceof TypeError) {
                 xAlert("Factory reset complete!\n\nThe device is restarting.\n\nPage will reload in some seconds.");
                 setTrackedTimeout(() => {
@@ -14898,18 +14380,15 @@ async function factoryReset() {
         });
 }
 
-// Drives every .conn-dot instance (one leads the collapsed strip, one sits by the
-// wordmark) — replaced the old WIFI CONNECTED/DISCONNECTED corner pill. While the user
-// has chosen offline mode the dot stays orange, so the staleness watchdog's repeating
-// updateInlineStatus(false) must not repaint it red.
+// In offline mode the dot stays orange: the staleness watchdog's repeated
+// updateInlineStatus(false) must not paint it red.
 function updateInlineStatus(isConnected) {
     document.querySelectorAll('.conn-dot').forEach(d => {
         d.classList.toggle('conn-dot--offline', !isConnected && isOfflineMode);
         d.classList.toggle('conn-dot--down', !isConnected && !isOfflineMode);
     });
     if (!isConnected) {
-        // Kill the "WiFi off in M:SS" countdown — once the radio drops, no more updates
-        // arrive to tick it to zero, so it would otherwise freeze on screen as a stale artifact
+        // No more updates will tick the "WiFi off in M:SS" countdown, so hide it rather than freeze it.
         const wifiWakeStatus = document.getElementById('wifi-wake-status');
         if (wifiWakeStatus) wifiWakeStatus.style.display = 'none';
     }
@@ -14917,21 +14396,15 @@ function updateInlineStatus(isConnected) {
 
 
 // ── Live-feed stall notice ───────────────────────────────────────────────────────────────────────
-// The page had exactly one threshold: nine seconds of silence, then the connection dot turns red and
-// every reading greys out. Below nine seconds nothing moved and nothing said why, which reads as the
-// regulator having stopped rather than the connection to it having dropped — and a stall of a few
-// seconds is the common case. This is the earlier, softer tier, and it is strictly live-display: it
-// says what is happening now and leaves as soon as it is over. The permanent record of an outage is
-// the console (the backfill marker) and the regulator's own log — not this.
+// Softer tier before the 9 s grey-out, so a short stall reads as the link dropping, not the regulator
+// stopping. Live-display only; the outage record is the console backfill marker and the regulator log.
 const STALL_NOTICE_MS = 3500;   // silence before the overlay appears
-const STALL_GREY_MS = 9000;     // unchanged tier: dot red + setReadingsStale(true)
+const STALL_GREY_MS = 9000;     // dot red + setReadingsStale(true)
 const STALL_CLEAR_MS = 4000;    // how long "flowing again" lingers — same dwell as fileToast
 let stallState = { on: false, startMs: 0, hideTimer: null };
 
-// Fixed overlay, built on demand, exactly like fileToast — nothing here may take layout space or the
-// page would jump every time the link hiccups. No dismiss control on purpose: it is not interactive
-// (pointer-events:none), it leaves on its own, and a tap target that moves under your finger during
-// commissioning is worse than the notice itself.
+// Fixed overlay like fileToast: must take no layout space. No dismiss control on purpose — a tap
+// target that appears under a finger mid-commissioning is worse than the notice.
 function stallNoticeText(html) {
     let t = document.getElementById('stall-toast');
     if (!t) { t = document.createElement('div'); t.id = 'stall-toast'; document.body.appendChild(t); }
@@ -14945,8 +14418,7 @@ function hideStallNotice() {
     if (stallState.hideTimer) { clearTrackedTimeout(stallState.hideTimer); stallState.hideTimer = null; }
 }
 
-// gapMs is the age of the last packet received, so the number is the true age of what is on screen —
-// not the time since this overlay appeared.
+// gapMs = age of the last packet (true age of what is on screen), not time since the overlay appeared.
 function renderStallNotice(gapMs) {
     let t = 'No data from the regulator for <b>' + Math.round(gapMs / 1000) + ' s</b>. '
         + 'It keeps running on its own &mdash; this is the connection, not the regulator.';
@@ -14954,8 +14426,7 @@ function renderStallNotice(gapMs) {
     stallNoticeText(t);
 }
 
-// First packet back. startMs is the last packet BEFORE the outage and handleCSVData has already moved
-// lastEventTime to now, so this reports the real length of the gap, then gets out of the way.
+// startMs = last packet BEFORE the outage, so this reports the real gap length.
 function endStallNotice() {
     if (!stallState.on) return;
     stallState.on = false;
@@ -14984,11 +14455,8 @@ function resetParameter(parameterName) {
     submitMessage();
 }
 
-// Force the charge stage machine back to Bulk (CC) and re-run the whole bulk→absorption→float cycle.
-// Firmware only honors it while an auto charge stage owns the field (the button is disabled otherwise
-// in the CSV2 handler); a full pack climbs back to target and the tail logic returns it to float/idle
-// within seconds. Does NOT fix a stuck-forever absorption caused by a broken tail exit (steady load /
-// no shunt) — call that out in the warning so the button isn't mistaken for that fix.
+// Firmware honors it only while an auto charge stage owns the field (CSV2 handler disables the button
+// otherwise). It cannot fix absorption stuck on a tail exit that never fires; the warning says so.
 async function restartChargeCycle() {
     if (!settingsUnlocked) {
         xAlert("Please unlock controls first");
@@ -15009,13 +14477,8 @@ async function restartChargeCycle() {
 let consolePaused = false;
 
 // ── Console buffer (persistent, coalesced) ───────────────────────────────────
-// Every line is kept in a 1000-entry ring
-// (window.consoleLog) so Download Logs and the remote log relay can export the
-// whole session. Consecutive identical messages coalesce into one line with a
-// (xN) count instead of flooding the log (e.g. repeated integrator resets).
-// Persisted to localStorage (throttled) so a page refresh or a backgrounded
-// Capacitor app keeps the history. Each entry stores an epoch so the live view
-// shows time-only while the export shows date + time.
+// window.consoleLog feeds Download Logs and the remote log relay. Identical consecutive lines coalesce
+// into (xN); persisted to localStorage (throttled) to survive a refresh or a backgrounded app.
 const CONSOLE_MAX_LINES = 1000;
 const CONSOLE_LS_KEY = 'xreg_console_v1';
 window.consoleLog = window.consoleLog || [];   // [{ t: epochMs, msg, count }]
@@ -15035,7 +14498,7 @@ function saveConsoleLogNow() {
     consoleLsDirty = false;
 }
 
-// Render one buffer entry to a string. withDate = full date+time (export); else time-only (live view).
+// withDate = date + time (export); else time only (live view).
 function formatConsoleEntry(e, withDate) {
     const d = new Date(e.t);
     const stamp = withDate ? d.toLocaleString() : d.toLocaleTimeString();
@@ -15043,8 +14506,7 @@ function formatConsoleEntry(e, withDate) {
     return `[${stamp}] ${e.msg}${suffix}`;
 }
 
-// Append one raw firmware message (no timestamp). updateDisplay=false while paused —
-// the line is still buffered so the export stays complete; the screen catches up on resume.
+// updateDisplay=false while paused: still buffered so the export stays complete.
 function appendConsoleLine(msg, updateDisplay) {
     const buf = window.consoleLog;
     const last = buf[buf.length - 1];
@@ -15077,7 +14539,6 @@ function appendConsoleLine(msg, updateDisplay) {
     requestAnimationFrame(() => { consoleDiv.scrollTop = consoleDiv.scrollHeight; });
 }
 
-// Full session as text — used by Download Logs and the remote relay (date + time + counts).
 function getConsoleText() {
     return window.consoleLog.map(e => formatConsoleEntry(e, true)).join('\n');
 }
@@ -15095,16 +14556,9 @@ function renderConsoleFromBuffer() {
     requestAnimationFrame(() => { consoleDiv.scrollTop = consoleDiv.scrollHeight; });
 }
 
-// The regulator keeps its own 200-line console ring (/consolehist.txt) with device timestamps, and it
-// keeps writing to it while this browser's event stream is down — the stream itself discards anything
-// it cannot deliver the moment it has no listener. So after a reconnect, splice what the regulator said
-// during the gap back into the on-screen log instead of leaving a silent hole in it. Bounded by the
-// ring: an outage longer than 200 messages recovers only the tail.
-// Lines are placed by AGE: the response carries the device's uptime at send (X-Device-Millis) and each
-// line carries its uptime at queue time, so a line lands at (now - age) on this browser's own clock —
-// no device time source needed, which an AP-mode browser user does not have. The epoch column is the
-// fallback for firmware without the header, and only works when the device clock was synced.
-// Returns the number of lines spliced back in, or -1 if the regulator could not be asked.
+// Splices the regulator's 200-line /consolehist.txt ring into the log after a reconnect (the stream
+// drops undeliverable lines). Lines are placed by age via X-Device-Millis, so no device clock is
+// needed (AP mode has none); epoch is the fallback. Returns lines spliced, or -1 if unreachable.
 async function consoleBackfillFromDevice(gapStartMs, gapEndMs) {
     if (DEMO_MODE) return -1;
     let raw, devNow = NaN, fetchedAt = 0;
@@ -15150,12 +14604,8 @@ async function consoleBackfillFromDevice(gapStartMs, gapEndMs) {
 
 // Throttled persistence: flush at most every 3s, plus on tab hide / unload.
 loadConsoleLog();
-// Device reports "<random NVS install ID>|<firmware version>". Either part changing
-// (NVS erase / factory reset, or a reflash) means old history is stale — drop it.
-// Called from the SSE open handler, NOT at script parse: in Capacitor the base URL isn't
-// resolved until discovery finishes, so a parse-time fetch silently never reached the device.
-// SSE open is also the moment new console lines start arriving, and re-running per reconnect
-// catches a mid-session reflash.
+// Device reports "<random NVS install ID>|<firmware version>"; either changing means stale history.
+// Runs from the SSE open handler, not at parse: in Capacitor the base URL resolves only after discovery.
 function checkInstallIdFreshness() {
     fetch(buildURL('/installid')).then(r => r.text()).then(id => {
         id = (id || '').trim();
@@ -15188,7 +14638,6 @@ function copyConsole() {
         return;
     }
 
-    // Try modern clipboard API first
     if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(() => {
         }).catch(err => {
@@ -15240,8 +14689,7 @@ function updateAlarmStatus(data) {
 
     if (!alarmLed || !alarmText) return;
 
-    // 0 silent, 1 sounding, 2 condition present but silenced (Silence button; clears when the condition ends
-    // or a different one lands).
+    // Alarm_Status: 0 silent, 1 sounding, 2 condition present but silenced.
     const st = Number(data.Alarm_Status);
     if (st === 1) {
         alarmLed.style.backgroundColor = '#ff0000';
@@ -15262,11 +14710,8 @@ function updateAlarmStatus(data) {
 }
 
 //Graying when wifi disconnects
-// One body class, not per-element inline styles. The old version enumerated value classes
-// ('.reading span, .reading-value'); the header was rebuilt as .reading-duo, nothing matched
-// any more, and the stall notice went on promising a grey-out that never happened. It also had
-// no counterpart, so the one element that did still match stayed faded until a page reload.
-// Which elements fade is now a container-scoped rule in styles.css (.readings-stale).
+// One body class; what fades is the container-scoped .readings-stale rule in styles.css. Do not
+// enumerate value classes here: they silently stop matching when the header markup changes.
 function setReadingsStale(stale) {
     if (document.body.classList.contains('readings-stale') === stale) return;
     document.body.classList.toggle('readings-stale', stale);
@@ -15329,13 +14774,9 @@ function initPlotDataStructures() {
     gapMarkData = new Array(maxPoints).fill(0);
 }
 
-// Splits factory for scales whose range can be user-pinned (manual). Auto mode
-// reproduces uPlot's default numeric splits exactly (multiples of the increment
-// it chose for the space), so autoscale look and perf are unchanged. Manual mode
-// keeps those nice interior ticks but labels the EXACT min/max at the plot
-// corners, dropping any interior tick that would crowd an endpoint label — the
-// printed corner values are always the user's pinned bounds, i.e. exactly what
-// the click-to-edit boxes (attachYAxisEdit) read and write.
+// Auto mode reproduces uPlot's default numeric splits exactly. Manual mode keeps those ticks but
+// labels the EXACT pinned min/max at the corners (what attachYAxisEdit reads and writes), dropping
+// any interior tick that would crowd an endpoint label.
 function edgeLabeledSplits(isManual) {
     return (u, axisIdx, mn, mx, incr) => {
         const ticks = [];
@@ -15347,14 +14788,9 @@ function edgeLabeledSplits(isManual) {
     };
 }
 
-// =====================================================================
-// On-plot Y-axis editing — makes each Y axis's extreme tick labels
-// directly editable. uPlot draws tick labels on canvas, so they can't
-// take click handlers themselves; instead an invisible click zone sits
-// over each axis's min and max label. Clicking it summons an edit box
-// in place, prefilled with the current bound. Enter (or tap away)
-// applies, Escape cancels, and where the chart supports automatic
-// ranging, clearing the value and pressing Enter returns it to auto.
+// ===== On-plot Y-axis editing =====
+// uPlot draws tick labels on canvas, so invisible click zones over each axis's min/max label summon an
+// edit box. Enter or blur applies, Escape cancels, empty + Enter calls cfg.auto() when present.
 // cfgs: [{ scale, apply(min,max), auto() optional, decimals optional }]
 function attachYAxisEdit(u, cfgs) {
     if (!u || !u.over) return;
@@ -15373,8 +14809,7 @@ function attachYAxisEdit(u, cfgs) {
         return String(parseFloat(v.toFixed(d)));
     };
 
-    // Touch: taller tap targets and a wider edit box (the box also gets a
-    // 16px font from CSS — anything smaller makes iOS auto-zoom the page)
+    // Coarse pointer: bigger targets. The box's 16px CSS font stops iOS auto-zooming the page.
     const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
     const HOT_H = coarse ? 28 : 18, HOT_W = 46, INP_W = coarse ? 76 : 58;
     const zones = [];
@@ -15427,12 +14862,8 @@ function attachYAxisEdit(u, cfgs) {
             ['mousedown', 'touchstart', 'dblclick', 'click'].forEach(ev =>
                 hot.addEventListener(ev, e => e.stopPropagation()));
             const zone = { cfg, isMax, onRight, hot };
-            // Open on mouseup, NOT click: uPlot installs a capture-phase click
-            // listener on .u-wrap (its drag-end click suppressor) whose moved-cursor
-            // check is always true over the axis strip, so it swallows every click
-            // before it can reach this element — a click handler here never fires.
-            // The armed flag ignores mouseups from drags that started elsewhere
-            // (e.g. releasing a plot-area zoom drag on top of an axis label).
+            // Open on mouseup, NOT click: uPlot's capture-phase click suppressor on .u-wrap swallows
+            // every click over the axis strip. armed ignores mouseups from drags that began elsewhere.
             let armed = false;
             hot.addEventListener('mousedown', () => { armed = true; });
             hot.addEventListener('mouseleave', () => { armed = false; });
@@ -15457,11 +14888,8 @@ function attachYAxisEdit(u, cfgs) {
         });
     });
 
-    // Place the zones over the extreme tick labels: vertically centered on the
-    // plot area's top/bottom edge (where uPlot centers those labels), anchored
-    // to the plot-edge side of the axis strip so a rotated axis title at the
-    // strip's far edge stays unclickable. Re-run every draw — offsets move on
-    // resize and axis-width changes.
+    // Zones sit on the plot area's top/bottom edge (where uPlot centers the extreme labels), on the
+    // plot side of the strip so the rotated axis title stays unclickable. Re-run every draw.
     const position = () => {
         const oL = u.over.offsetLeft, oT = u.over.offsetTop,
             oW = u.over.offsetWidth, oH = u.over.offsetHeight;
@@ -15479,9 +14907,7 @@ function attachYAxisEdit(u, cfgs) {
     position();
 }
 
-// Persist a Y-axis range to the regulator (same params the settings forms use).
-// Settings writes are arm-gated — while the dashboard is locked the new range
-// still applies, it just stays local to this browser session.
+// Arm-gated: while locked the new range still applies, but only in this browser session.
 function sendYAxisSetting(params) {
     if (!settingsUnlocked) return;
     const q = new URLSearchParams(params);
@@ -15528,11 +14954,8 @@ function initCurrentTempPlot() {
                 dash: [4, 2]
             },
             {
-                // The exact process variable the CC current PID acts on in AdjustFieldLearnMode — the
-                // OutputPIDSigSrc-selected signal (default EMA at OutputPIDFilterTC, or MA(N), or raw).
-                // Off by default — toggle via legend. Dashed because at the ~34 ms default TC it sits
-                // almost exactly on the raw blue trace at this plot's sample rate; the dash is what
-                // makes it visible when overlapping. Diverges from raw during fast ripple/resonance.
+                // The CC current PID's process variable (OutputPIDSigSrc-selected). Dashed because at
+                // the default filter TC it sits almost exactly on the raw blue trace.
                 label: "Alt Current filtered (A)",
                 stroke: "#009688",
                 width: 1,
@@ -15547,8 +14970,8 @@ function initCurrentTempPlot() {
             pct: { auto: false, range: () => [pctMin1, pctMax1] }     // fn so click-to-edit Field % range survives redraws
         } : {
             x: { time: false, range: (u, dMin, dMax) => [-liveWindowSec, 0] },
-            current: { auto: false, range: () => [Ymin1, Ymax1] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging
-            pct: { auto: false, range: () => [pctMin1, pctMax1] }     // fn so click-to-edit Field % range survives redraws
+            current: { auto: false, range: () => [Ymin1, Ymax1] },
+            pct: { auto: false, range: () => [pctMin1, pctMax1] }
         },
         axes: useTimestamps ? [
             { grid: { show: true } },
@@ -15598,7 +15021,7 @@ function initCurrentTempPlot() {
                             { label: "Alternator Current (A)", color: "#2196F3" },
                             { label: "Field Current (A)", color: "#9C27B0" },
                             { label: "Field %", color: "#9E9E9E" },
-                            // off:true → default hidden, matching the series show:false above (filtered = the CC PID's PV)
+                            // off:true must match the series' show:false above
                             { label: "Alt Current filtered (A)", color: "#009688", off: true }
                         ], u);
 
@@ -15717,8 +15140,8 @@ function initVoltagePlot() {
             pct: { auto: false, range: () => [pctMin2, pctMax2] }     // fn so click-to-edit Field % range survives redraws
         } : {
             x: { time: false, range: (u, dMin, dMax) => [-liveWindowSec, 0] },
-            voltage: { auto: false, range: () => [Ymin2 / 100, Ymax2 / 100] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging
-            pct: { auto: false, range: () => [pctMin2, pctMax2] }     // fn so click-to-edit Field % range survives redraws
+            voltage: { auto: false, range: () => [Ymin2 / 100, Ymax2 / 100] },
+            pct: { auto: false, range: () => [pctMin2, pctMax2] }
         },
         axes: useTimestamps ? [
             { grid: { show: true } },
@@ -15877,8 +15300,8 @@ function initRPMPlot() {
             pct: { auto: false, range: () => [pctMin3, pctMax3] }     // fn so click-to-edit Field % range survives redraws
         } : {
             x: { time: false, range: (u, dMin, dMax) => [-liveWindowSec, 0] },
-            rpm: { auto: false, range: () => [Ymin3, Ymax3] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging
-            pct: { auto: false, range: () => [pctMin3, pctMax3] }     // fn so click-to-edit Field % range survives redraws
+            rpm: { auto: false, range: () => [Ymin3, Ymax3] },
+            pct: { auto: false, range: () => [pctMin3, pctMax3] }
         },
 
         axes: useTimestamps ? [
@@ -16037,8 +15460,8 @@ function initTemperaturePlot() {
             pct: { auto: false, range: () => [pctMin4, pctMax4] }     // fn so click-to-edit Field % range survives redraws
         } : {
             x: { time: false, range: (u, dMin, dMax) => [-liveWindowSec, 0] },
-            temperature: { auto: false, range: () => [toDisplayTemp(Ymin4), toDisplayTemp(Ymax4)] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging (Ymin4/Ymax4 stay native °F)
-            pct: { auto: false, range: () => [pctMin4, pctMax4] }     // fn so click-to-edit Field % range survives redraws
+            temperature: { auto: false, range: () => [toDisplayTemp(Ymin4), toDisplayTemp(Ymax4)] },
+            pct: { auto: false, range: () => [pctMin4, pctMax4] }
         },
         axes: useTimestamps ? [
             { grid: { show: true } },
@@ -16164,9 +15587,8 @@ function initTemperaturePlot() {
 }
 
 //Staleness stuff
-// Dims an entire metric-row when the metric doesn't apply in the current GPS mode (anchored vs underway).
-// Targets the closest .metric-row ancestor so label and value both gray together.
-// Distinct from stale styling: stale = data is old; mode-inactive = data isn't contextually relevant.
+// Greys the whole .metric-row when the metric doesn't apply in the current GPS mode (anchored vs
+// underway) — distinct from stale, which means the data is old.
 function applyModeStyle(valueElementId, isApplicable, inactiveTitle) {
     const el = document.getElementById(valueElementId);
     if (!el) return;
@@ -16200,15 +15622,9 @@ function updateIMUMovingState(sogRaw) {
     }
 }
 
-// FUTURE FIX: these colours never render. applyStaleStyleByAge() writes an inline style.color on
-// these same three elements every tick — including in its FRESH branch, where it assigns
-// var(--reading) — and an inline colour beats the .anchor-good/warn/bad class rules in styles.css.
-// The fix is in applyStaleStyleByAge, not here: it must use a stale/fresh class, or
-// removeProperty('color') on the fresh path. Tuning the thresholds below changes nothing until then.
-// Placeholder thresholds — adjust once real-world data is available
-// Roll (heel deviation 2min): warn=5°, bad=12°
-// Pitch (pitch deviation 2min): warn=3°, bad=8°
-// Yaw (heading swing 2min): warn=20°, bad=45°
+// FUTURE FIX: these colours never render. applyStaleStyleByAge() writes an inline style.color on the
+// same three elements every tick (fresh branch too), which beats the .anchor-* class rules. Fix it
+// there (stale/fresh class, or removeProperty('color') when fresh); tuning thresholds changes nothing.
 function updateAnchorColorCoding(data) {
     function applyAnchorColor(elementId, rawValue, scale, warnThresh, badThresh) {
         const el = document.getElementById(elementId);
@@ -16233,8 +15649,6 @@ function updateAnchorColorCoding(data) {
         applyAnchorColor('imu_heading_swing_120s_ID',   data.imu_heading_swing_120s,   10,  20, 45);  // TODO: tune thresholds
 }
 
-// Reorders the two context-sensitive card-groups inside the IMU grid so
-// the relevant mode's section appears first. Runs only when moving state changes.
 window._lastIMUMovingStateForReorder = undefined;
 function reorderIMUSections(moving) {
     const neutralGroup = document.getElementById('imu-current-motion-group');
@@ -16272,7 +15686,6 @@ function updateIMUModeStyles() {
         'imu_heading_swing_120s_ID',
     ].forEach(id => applyModeStyle(id, !moving, 'Active at anchor only (SOG < 1.3 kt)'));
 
-    // Reorder card-groups so the contextually active section is on top
     if (window._lastIMUMovingStateForReorder !== moving) {
         window._lastIMUMovingStateForReorder = moving;
         reorderIMUSections(moving);
@@ -16298,8 +15711,7 @@ function applyStaleStyleByAge(elementId, ageMs, staleThreshold = STALE_THRESHOLD
     element._lastStaleState = cacheKey;
 
     if (isStale) {
-        // Light mode: fade toward light gray (harder to see on white bg)
-        // Dark mode: fade toward dark gray (harder to see on dark bg)
+        // Fade toward the background in either theme
         element.style.opacity = "0.5";
         element.style.color = isDark ? "#444444" : "#999999";
         element.style.fontStyle = "italic";
@@ -16311,15 +15723,9 @@ function applyStaleStyleByAge(elementId, ageMs, staleThreshold = STALE_THRESHOLD
         element.title = "";
     }
 }
-// Active-limit cue: teal pill on the governing figure's label (ctrlLimiter 1 alt current,
-// 2 thermal, 3 CV voltage, 4 battery limit, 5 field at max duty → header duty readout,
-// 6 protection → brown duty digits (no fill) + a lone brown P left of the charge stage,
-// 7 battery above target → voltage pill + muted BATT > TARGET word in the same slot,
-// 10 manual field and 11 min-field floor → duty pill, 11 also gets a MIN FIELD word,
-// 15 board's 10 A field-current ceiling and 16 field-drive heat limit → duty pill + 10 A FIELD / DRIVE HEAT word;
-// 15 with no Field Resistance entered → NO FIELD Ω word and no pill, the field is off).
-// 10 needs no word of its own: the field-status readout already prints MANUAL.
-// Alt temp digits also go red >2°F over the limit.
+// Active-limit cue: teal pill on the governing figure's label. ctrlLimiter: 1 alt current, 2 thermal,
+// 3 CV voltage, 4 battery limit, 5 max duty, 6 protection, 7 batt above target, 10 manual field,
+// 11 min-field floor, 15 board 10 A field ceiling (no Field Resistance → NO FIELD Ω, no pill), 16 drive heat.
 function updateHeaderLimiterColors(sa) {
     const RED = "#f44336", NORM = "var(--reading)";
     const limFresh = (performance.now() - (window._ctrlLimiterAtMs || 0)) < 5000;  // 10× CSV4 cadence
@@ -16445,8 +15851,7 @@ function updateAllStalenessStyles() {
     // there are no per-field spans to grey.
 
     // --- Baro / ambient — dedicated timestamps ---
-    // Both come from the BMP388 on a 4s read cycle, so they get their own threshold
-    // rather than borrowing the alternator-temp one.
+    // BMP388 reads every 4 s, hence its own threshold.
     applyStaleStyleByAge("baroPressureID", sa.baroPressure, STALE_THRESHOLD_BOARD_MS);
     applyStaleStyleByAge("ambientTempID", sa.ambientTemp, STALE_THRESHOLD_BOARD_MS);
     // INA228 die temperature: 1 Hz reads, and the firmware stops trusting it (REASON_DIE_TEMP_LOST) after the same 10 s.
@@ -16532,21 +15937,14 @@ function startStalenessDetection() {
 
 
 
-// Custom legend creation function. Legend item order must match series order
-// (item i → series i+1; slot 0 is the x axis). Pass the uPlot instance to make
-// entries click-to-toggle; visibility persists per plot in localStorage so it
-// survives reloads and the re-inits triggered by time-axis mode changes.
-// uPlot wraps stroke/fill/dash in accessor fns (fnOrSelf) at init, so series[i].dash
-// is () => [..], not the array. Resolve it to the array (or null) for the legend.
+// createCustomLegend: item i labels series i+1 (slot 0 is x), so item order must match the series.
+// uPlot wraps stroke/fill/dash in accessor fns at init, so series[i].dash is () => [..], not the array.
 function seriesDashOf(plot, idx) {
     const s = plot && plot.series[idx];
     if (!s || s.dash == null) return null;
     return typeof s.dash === 'function' ? s.dash(plot, idx) : s.dash;
 }
 
-// Legend swatch that mirrors the series line style: a dashed rule when the series
-// carries a dash pattern, a solid bar otherwise — so a legend can never disagree
-// with the trace it labels.
 function legendSwatchCss(color, dash) {
     return (Array.isArray(dash) && dash.length)
         ? `width:16px;height:0;border-top:2px dashed ${color};`
@@ -16617,8 +16015,7 @@ flex-wrap: wrap;
                 vis[item.label] = shown;
                 try { localStorage.setItem(visKey, JSON.stringify(vis)); } catch (e) { }
                 paint();
-                // Showing/hiding a series changes which traces drive the autoscale — rescale now so
-                // it's instant even when no data is streaming (one of the four live plots only).
+                // Rescale now so a toggle is instant even with no data streaming (the four live plots only).
                 if (u === currentTempPlot || u === voltagePlot || u === rpmPlot || u === temperaturePlot) {
                     recomputeAutoScales(true);
                 }
@@ -16632,10 +16029,8 @@ flex-wrap: wrap;
 
     plotContainer.appendChild(legendDiv);
 
-    // Sync uPlot to the legend's resolved state after the constructor finishes (init hook —
-    // an immediate setSeries redraw is unsafe there). Must set show:true too, not just hide:
-    // a saved "on" preference has to override a series built show:false, or the legend paints
-    // ON while the trace stays hidden and the next click toggles it OFF (looks like a dead toggle).
+    // Sync uPlot after the constructor (a setSeries redraw is unsafe inside the init hook). Must also
+    // set show:true: a saved "on" must override a series built show:false, or the toggle looks dead.
     if (u && initialVis.length) {
         requestAnimationFrame(() => initialVis.forEach(([idx, s]) => u.setSeries(idx, { show: s })));
     }
@@ -16656,9 +16051,8 @@ function applySettingsUnlockUI() {
     hideSettingsAccess();
 }
 
-// The Unlock Controls button — arms the device's settings write window (the arm state lives in
-// firmware, so stale/replayed URLs from other tabs stay rejected while locked). It stays armed
-// until Lock Controls, another client's lock, or a reboot — nothing relocks on a timer.
+// Arm state lives in firmware, so stale/replayed URLs from other tabs stay rejected while locked.
+// Stays armed until Lock Controls, another client's lock, or a reboot — never relock on a timer.
 function armSettings() {
     const button = document.getElementById('settings_arm_btn');
     const msg = document.getElementById('settings_arm_msg');
@@ -16686,9 +16080,8 @@ function armSettings() {
 }
 
 // ── Settings password (Setup > System) ────────────────────────────────────────────────
-// Off: the arm gate as it always was. On: /armSettings wants the password and answers with a token
-// that buildURL then carries on every arm-gated request, so the unlock is this client's alone. The
-// password is remembered per unit on this device after the first unlock; a rejection forgets it.
+// On: /armSettings takes the password and returns a token buildURL carries on arm-gated requests,
+// so the unlock is this client's alone. Remembered per unit; a rejection forgets it.
 let g_pwRequired = false;
 function pwKey() { return 'xregPw:' + (controlUid() || ''); }
 function pwRemembered() { try { return localStorage.getItem(pwKey()) || null; } catch (e) { return null; } }
@@ -16909,10 +16302,8 @@ async function removeBoatRegulator(p, live) {
     await refreshUnitIdentity();
 }
 
-// Writes the pairing (add=true) or its removal on the OTHER unit, at its own address. Unlocks it
-// first: with its settings password on, this unit's remembered password is tried before asking
-// (one password per boat is the normal case) and the token-gated unlock is left as is; without
-// one, a unit that was locked is relocked after the write so it is never left open.
+// Writes the pairing (add) or removal on the OTHER unit. Tries this unit's remembered password first
+// (one per boat is normal); a password-less unit that was locked is relocked after the write.
 async function remotePairWrite(other, me, add) {
     const base = other.base || ('http://' + (other.ip || other.host));
     const where = base.replace(/^https?:\/\//, '');
@@ -16976,11 +16367,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => { const c = document.getElementById('boatCard'); if (c && c.offsetParent !== null && !discoveryInProgress) refreshUnitIdentity(); }, 30000);
 });
 
-// Native settings submits land in the hidden-form iframe. A named iframe's second-and-later
-// navigations push joint session-history entries, so Back/Forward (and Firefox reloads, which
-// restore iframe URLs) would silently re-issue an old /get?... settings write. Recycling the
-// iframe after every response keeps each submit a FIRST navigation (history replace, never
-// push), so no stale settings URL can ever be replayed by browser navigation.
+// A named iframe's later navigations push joint history entries, so Back/Forward (and Firefox reload)
+// would replay an old /get?... write. Recycling it after each response keeps every submit a first navigation.
 (function recycleHiddenFormIframe() {
     function watch(frame) {
         frame.addEventListener('load', function () {
@@ -17047,15 +16435,12 @@ function updateGPSDisplay(lat, lon) {
             source.style.color = 'var(--accent)';
         }
     }
-    // Show the "Use automatic GPS" clear button only while manual is engaged.
     if (clearBtn) clearBtn.style.display = manualActive ? 'block' : 'none';
 }
 
 
 
-// Cap mode uses same pending/revision system as checkboxes.
-// Throws on non-OK like submitChargeRateModeImmediately: the firmware answers 403 while
-// settings are locked and fetch() treats that as success (same class as the 2026-07-20 incident).
+// Throws on non-OK: the firmware answers 403 while locked, and fetch() treats that as success.
 async function submitCapLimitModeImmediately(desiredValue) {
     const params = new URLSearchParams();
     params.set('capLimitMode', String(desiredValue));
@@ -17116,25 +16501,19 @@ function updateTogglesFromData(data) {
             // Pending toggle handling (prevent bounce / double-toggle)
             const pending = pendingToggles.get(dataKey);
             if (pending) {
-                // Initialize timeout once
                 if (pending.deadlineMs === undefined) {
                     pending.deadlineMs = Date.now() + 2500; // ms to wait for ESP32 echo
                 }
 
-                // ESP32 has NOT echoed desired value yet
                 if (value !== pending.desiredValue) {
                     // Still waiting → keep optimistic UI, do not overwrite
                     if (Date.now() <= pending.deadlineMs) {
                         return;
                     }
 
-                    // Timed out → accept ESP32 state, clear pending
                     pendingToggles.delete(dataKey);
-                    // fall through and apply ESP32 state
                 } else {
-                    // Echo matches desired value → success, clear pending
                     pendingToggles.delete(dataKey);
-                    // fall through (UI already matches)
                 }
             }
 
@@ -17153,9 +16532,8 @@ function updateTogglesFromData(data) {
         const invertedManual = data.ManualFieldToggle === undefined ? undefined : (data.ManualFieldToggle === 0 ? 1 : 0);
         updateCheckbox("ManualFieldToggle_checkbox", invertedManual, "ManualFieldToggle");
         updateCheckbox("PhysicalPanelOverride_checkbox", data.PhysicalPanelOverride, "PhysicalPanelOverride");
-        // The master switch (#header-onoff / #hcs-onoff) is painted from CSV1 (~10 Hz), not here: CSV3 is
-        // event-driven with a 60 s fallback and settingWrite() does not set settingsDirty, so this echo
-        // lagged the field by up to a minute. Two writers on one control would just restore that lag.
+        // The master switch (#header-onoff / #hcs-onoff) is painted from CSV1 only: CSV3 is event-driven
+        // with a 60 s fallback and would lag the field. Do not add a second writer here.
         // HiLow / charge rate mode handled via pendingToggles in CSVData3 handler
         updateCheckbox("VeData_checkbox", data.VeData, "VeData");
         if (data.BattMonSrc !== undefined) {
@@ -17172,6 +16550,7 @@ function updateTogglesFromData(data) {
         updateCheckbox("n2kAltTempEnable_checkbox", data.n2kAltTempEnable, "n2kAltTempEnable");
         updateCheckbox("n2kExtraTempEnable_checkbox", data.n2kExtraTempEnable, "n2kExtraTempEnable");
         updateCheckbox("n2kChgrEnable_checkbox", data.n2kChgrEnable, "n2kChgrEnable");
+        updateCheckbox("n2kConvStatEnable_checkbox", data.n2kConvStatEnable, "n2kConvStatEnable");
         updateCheckbox("n2kChgrCfgEnable_checkbox", data.n2kChgrCfgEnable, "n2kChgrCfgEnable");
         updateCheckbox("n2kEngRpmEnable_checkbox", data.n2kEngRpmEnable, "n2kEngRpmEnable");
         updateCheckbox("n2kEngDynEnable_checkbox", data.n2kEngDynEnable, "n2kEngDynEnable");
@@ -17181,6 +16560,7 @@ function updateTogglesFromData(data) {
         updateCheckbox("rvcDcEnable_checkbox", data.rvcDcEnable, "rvcDcEnable");
         updateCheckbox("rvcFaultEnable_checkbox", data.rvcFaultEnable, "rvcFaultEnable");
         updateCheckbox("dvccEn_checkbox", data.dvccEn, "dvccEn");
+        updateCheckbox("dvccVicCutHold_checkbox", data.dvccVicCutHold, "dvccVicCutHold");
         // The override toggles live only in the Run Without Failed Sensors modal (rwfsRender reads the echo cache).
         rwfsOnSettingsEcho(data);
         updateCheckbox("bmsLogic_checkbox", data.bmsLogic, "bmsLogic");
@@ -17190,15 +16570,13 @@ function updateTogglesFromData(data) {
         updateCheckbox("InvertAltAmps_checkbox", data.InvertAltAmps, "InvertAltAmps");
         updateCheckbox("InvertBattAmps_checkbox", data.InvertBattAmps, "InvertBattAmps");
         updateCheckbox("BatteryShuntPresent_checkbox", data.BatteryShuntPresent, "BatteryShuntPresent");
-        // Single point that drives the whole no-shunt UI: body.no-batt-current greys every
-        // .gate-batt-current setting and hides every .req-batt-current readout (styles.css).
-        // Only touch it when the echo is actually present.
+        // Single driver of the no-shunt UI: body.no-batt-current greys .gate-batt-current and hides
+        // .req-batt-current (styles.css). Only touched when the echo is present.
         if ('BatteryShuntPresent' in data) {
             const noShunt = String(data.BatteryShuntPresent) === '0' || (parseFloat(data.ShuntResistanceMicroOhm) || 0) <= 0;  // mirror firmware HAS_BATT_SHUNT
             document.body.classList.toggle('no-batt-current', noShunt);
-            // The Float Phase card itself is not gated: voltage float runs on the absorption time limit
-            // with no shunt. Zero-current float is the one float mode that is a battery-current control
-            // law, so only that option goes (the firmware demotes a stored 2 to 1 the same way).
+            // Voltage float runs on the absorption time limit without a shunt; only zero-current float (2)
+            // needs battery current (the firmware demotes a stored 2 to 1).
             const zc = document.querySelector('select[name="UseFloat"] option[value="2"]');
             if (zc) zc.disabled = noShunt;
         }
@@ -17213,13 +16591,10 @@ function updateTogglesFromData(data) {
         updateCheckbox("AlarmLatchEnabled_checkbox", data.AlarmLatchEnabled, "AlarmLatchEnabled");
         updateCheckbox("MaintainMode_checkbox", data.MaintainMode, "MaintainMode");
         updateCheckbox("TargetVoltageMode_checkbox", data.TargetVoltageMode, "TargetVoltageMode");
-        updateCheckbox("AutoShuntGainCorrection_checkbox", data.AutoShuntGainCorrection, "AutoShuntGainCorrection");
         updateCheckbox("AutoAltCurrentZero_checkbox", data.AutoAltCurrentZero, "AutoAltCurrentZero");
         updateCheckbox("CVTuningMode_checkbox", data.CVTuningMode, "CVTuningMode");
-        // updateCheckbox only touches the checkbox; the floating test panel reads device-active state via
-        // getField("CVTuningMode") (the hidden input), so mirror device truth into it too — otherwise the
-        // panel never sees the test turn off and stays open / re-arms on the next settings save. Skip while a
-        // local toggle is pending so the optimistic UI isn't stomped by a stale echo.
+        // The floating test panel reads device state from the hidden CVTuningMode input, so mirror the
+        // echo into it (else the panel never sees the test end). Skip while a local toggle is pending.
         const _cvHidden = document.getElementById("CVTuningMode");
         if (_cvHidden && data.CVTuningMode !== undefined && !pendingToggles.has("CVTuningMode")) {
             _cvHidden.value = String(data.CVTuningMode);
@@ -17242,9 +16617,7 @@ function updateTogglesFromData(data) {
         updateCheckbox("solarLearnEnable_checkbox", data.solarLearnEnable, "solarLearnEnable");
         updateCheckbox("solarUseConsEnable_checkbox", data.solarUseConsEnable, "solarUseConsEnable");
         if (data.solarUseConsEnable !== undefined) window.solarUseConsEnable = Number(data.solarUseConsEnable);
-        // Stash the three settings that decide whether this phone's position is wanted at
-        // all — phonePositionWanted() reads them, and the 60 s poster asks for no location
-        // until one of them is on. Echo-driven, so a change made on another client lands here too.
+        // phonePositionWanted() reads these three; echo-driven, so another client's change lands here too.
         if (data.weatherModeEnabled !== undefined) window.weatherModeEnabled = Number(data.weatherModeEnabled);
         if (data.gpsPositionSource  !== undefined) window.gpsPositionSource  = Number(data.gpsPositionSource);
         if (data.speedSourceMode    !== undefined) window.speedSourceMode    = Number(data.speedSourceMode);
@@ -17252,7 +16625,7 @@ function updateTogglesFromData(data) {
         updateFloatVisibility();
 
 
-        updateTuningModeUI(data.TuningMode);  // unified Begin/Stop Test button (no checkbox anymore)
+        updateTuningModeUI(data.TuningMode);  // unified Begin/Stop Test button
         updateCheckbox("socInfoAvailable_checkbox", data.socInfoAvailable, "socInfoAvailable");
         updateCheckbox("CloudFeatures_checkbox", data.CloudFeatures, "CloudFeatures");
         updateCheckbox("RemoteDiagnostics_checkbox", data.RemoteDiagnostics, "RemoteDiagnostics");
@@ -17272,7 +16645,7 @@ function updateTogglesFromData(data) {
             const af = document.activeElement;
             if (!(af && /^tuningWaveform_btn/.test(af.id || ''))) syncTuningWaveformUI(data.tuningWaveform);
         }
-        // WiFi Napping only applies in Client mode (a SoftAP can't sleep) — hide the row in AP mode.
+        // The cloud status labels read CloudFeatures_checkbox, echoed above.
         updateCloudStatus();
         if (data.CloudFeatures !== undefined) {
             updateCloudFeaturesTabVisibility(data.CloudFeatures === 1);
@@ -17298,9 +16671,8 @@ function updateTogglesFromData(data) {
         updateCheckbox("cvRiseGovEnable_checkbox", data.cvRiseGovEnable, "cvRiseGovEnable");
         updateCheckbox("cvRecovEnable_checkbox", data.cvRecovEnable, "cvRecovEnable");
         updateCheckbox("cvRecovBoostEnable_checkbox", data.cvRecovBoostEnable, "cvRecovBoostEnable");
-        // Manual-test slew-mode pill: reflect the saved mode unless the user just clicked (pend window guards the flicker).
-        // Number.isFinite before the | 0: NaN|0 is 0, which would tick the "Off" pill and assert a mode
-        // the device never sent.
+        // Pend window stops the echo flickering a just-clicked pill. Number.isFinite before | 0: NaN|0 is 0,
+        // which would tick "Off" for a mode the device never sent.
         if (Number.isFinite(data.testSlewMode) && Date.now() > _testSlewModePendMs) {
             const _tsr = document.querySelector('.seg-pill input[name="testSlewMode"][value="' + (data.testSlewMode | 0) + '"]');
             if (_tsr) _tsr.checked = true;
@@ -17411,9 +16783,7 @@ function updateCvGainModeUI(data) {
     const kdManBlk  = document.getElementById('cvKdManualBlock');
     if (kdAutoBlk) kdAutoBlk.style.display = auto ? '' : 'none';
     if (kdManBlk)  kdManBlk.style.display  = auto ? 'none' : '';
-    // Always-on "Active gains" line — the gains the loop is running RIGHT NOW, in 12V-equiv space,
-    // TEMPERATURE-CORRECTED. Firmware cvComputedKp/Ki (CSV3) are the BASE (no derate); the active
-    // gain = base × the battery-temp scale (CSV2 cvTempDerateScale, applied in both modes). This is
+    // Active gains = CSV3 base cvComputedKp/Ki × CSV2 cvTempDerateScale (both modes), 12V-equiv —
     // deliberately distinct from the "From commissioning" line, which shows the un-derated base.
     const activeEl = document.getElementById('cvActiveGains');
     if (activeEl) {
@@ -17444,20 +16814,15 @@ function updateCvGainModeUI(data) {
     syncCvDependentVis();
 }
 
-// Grey the fields that only matter when their master toggle is On, so the panel never offers a
-// live but inert knob — and never hides one either. The derate coefficient + status are
-// meaningless unless battTempDerateEnable (computeCvTempScale returns 1.0 when off). Driven off
-// the live checkbox state (set by updateCheckbox / handleUserToggle just before this runs).
-// (The CV D-term knobs live on the CV tuning tab and stay visible; the D term itself
-// is gated by cvHelpersEnabled in firmware.)
+// Grey (never hide) fields that only matter when their master toggle is On. Reads the live checkbox,
+// which updateCheckbox / handleUserToggle set just before this runs.
 function syncCvDependentVis() {
     const derate = document.getElementById('battTempDerateEnable_checkbox');
     const dd = document.getElementById('cvDerateDetailBlock');
     if (dd && derate) dd.classList.toggle('is-gated', !derate.checked);
 }
 
-// Live "what Set will apply" preview under the Aggressiveness (α) box — typed α if editing, else the
-// device's committed value.
+// Live "what Set will apply" preview under the Aggressiveness (α) box.
 function previewCvAlpha() {
     const out = document.getElementById('cvAlphaPreview');
     if (!out) return;
@@ -17473,12 +16838,9 @@ function previewCvAlpha() {
     out.innerHTML = `Will apply: <strong>Kp ≈ ${g.Kp.toFixed(1)}</strong>, <strong>Ki ≈ ${g.Ki.toFixed(1)}</strong> (12 V-equiv) · battery stiffness ${((window._cvKdc || 0) * 1000).toFixed(1)} mV/A`;
 }
 
-// Battery-temperature derate readout. Pulls the commissioning reference temp + source from CSV3
-// (g_lastCsv3) and the live battery temperature, its source, the applied scale and the inert flag from
-// CSV2 (g_lastCsv2) — two channels, so it reads the caches rather than the single `data` arg. Honours
-// the °F/°C toggle via toDisplayTemp(). CommissionTempF is sent °F×10 with -32768 = unset;
-// CommissionTempSrc 0 = legacy, 5 = the retired board stamp (either leaves the derate inert); cvTempDerateScale
-// is ×1000; battTempActiveF is °F×10 with ROLL_EMPTY = none.
+// Reads both caches (CSV3 commissioning ref, CSV2 live temp/scale/inert). Encodings: CommissionTempF
+// °F×10, -32768 = unset; CommissionTempSrc 0 legacy / 5 retired board stamp (both inert);
+// cvTempDerateScale ×1000; battTempActiveF °F×10, ROLL_EMPTY = none.
 function renderBattTempDerate() {
     const el = document.getElementById('battTempDerate_status');
     if (!el) return;
@@ -17516,15 +16878,12 @@ function renderBattTempDerate() {
 }
 
 // ===== Battery / Extra temperature (Setup > Temperature) =====
-// Source codes shared with CSV2 battTempActiveSrc and the firmware batteryTempF() accessor:
-// 0 none, 1 probe, 2 NMEA 2000 (127508), 3 VE.Direct (T field), 4 RV-C (DC_SOURCE_STATUS_2). Code 5 (the
-// board stand-in) was retired 2026-09-18; the slot stays so the remaining codes keep their values.
+// Codes shared with CSV2 battTempActiveSrc and firmware batteryTempF(): 0 none, 1 probe, 2 NMEA 2000
+// (127508), 3 VE.Direct, 4 RV-C. 5 is a retired slot, kept so the other codes keep their values.
 const BATT_TEMP_SRC_NAMES = ['none', 'probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'none'];
 // battTempSource setting labels (index = wire code): 0 Automatic, 1..4 pinned sources, 6 Not fitted.
 const BATT_TEMP_SOURCE_OPTION_NAMES = ['Automatic', 'Battery probe', 'NMEA 2000', 'VE.Direct', 'RV-C', 'Automatic', 'Not fitted'];
-const TEMP_NA_X10 = -9999;   // pre-0.0.5 firmware sent this for NAN on the CSV2 x10 temperature
-                             // fields; they now send ROLL_EMPTY. Kept as a FLOOR (n <= TEMP_NA_X10)
-                             // so this bundle still reads an older device correctly.
+const TEMP_NA_X10 = -9999;   // older firmware's NAN sentinel on CSV2 x10 temps; used as a floor
 
 function tempX10(v) {
     const n = Number(v);
@@ -17545,9 +16904,7 @@ function battTempActiveAgeMs(src) {
 }
 let _battTempActiveSrc = 0;   // last CSV2 battTempActiveSrc with a finite value, for the staleness pass
 
-// Battery + extra temperature readouts: the Setup > Temperature status row, Live Data > Battery,
-// Live Data > ESP32 (extra probe) and the header Batt chip. Fed by every CSV2 frame and re-run on a
-// °F/°C flip from the cached frame.
+// Fed by every CSV2 frame; re-run from the cached frame on a °F/°C flip.
 function renderBattTempReadouts(data) {
     const set = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
     const lbl = tempUnitLabel();
@@ -17570,14 +16927,13 @@ function renderBattTempReadouts(data) {
     const extraF = tempX10(data.ExtraTempF);
     set('extraTemp_ID', fmt(extraF));
     set('extraTempSetup_ID', fmt(extraF));
-    const xwm = document.querySelector('#extraTemp-display .wm-inline');   // absent-probe watermarks now render "—"; this hides the row outright until the extra probe has read
+    const xwm = document.querySelector('#extraTemp-display .wm-inline');   // hides the row until the extra probe has read
     if (xwm) { const d = Number.isFinite(extraF) ? '' : 'none'; if (xwm.style.display !== d) xwm.style.display = d; }
 }
 
 // ----- 1-Wire probe registry (Setup > Temperature > Temperature Sensors) -----
-// /tempSensors is polled every 5 s only while that sub-tab is on screen. Rows are keyed by probe id and
-// the table is rebuilt only when the id/role/present set changes, so an open role <select> is never
-// torn down mid-choice; the temperature/age/count cells update in place.
+// The table rebuilds only when the id/role/present set changes, so an open role <select> is never
+// torn down mid-choice; temp/age cells update in place.
 const OW_ROLE_NAMES = ['Alternator', 'Battery', 'Extra'];             // TempRole 0..2; -1 = unassigned
 const OW_ASSIGN_PARAM = ['owAssignAlt', 'owAssignBatt', 'owAssignExtra'];
 let _owLast = null;        // last /tempSensors JSON
@@ -17585,8 +16941,7 @@ let _owSig = null;         // id:role:present signature of the rendered rows; nu
 let _owBusy = false;       // a /tempSensors fetch is in flight
 let _owScanUntilMs = 0;    // "Scanning" shown until this time after a scan or assignment request
 
-// Two consumers now: the identification table in Setup > Temperature and the per-probe
-// ok/fail tallies in Live Data > ESP32. Poll while either is on screen.
+// Polls while either consumer (Setup > Temperature table, Live Data > ESP32 tallies) is on screen.
 function owTabVisible() {
     if (document.visibilityState === 'hidden') return false;
     const on = (tabId, mainId) => {
@@ -17765,11 +17120,8 @@ if (typeof window.learningTableInitialized === 'undefined') {
     window.learningTableInitialized = false;
 }
 
-// TEST-MODE PROTECTION DISABLE — shared firmware flag exposed via three toggles
-// (one on each of Plant Delay / Current Tuning / Voltage Tuning pages). When the
-// user flips one, this helper mirrors the new state to the other two checkboxes
-// optimistically so a mid-flight page switch doesn't show stale state, then
-// delegates to handleUserToggle for the actual pending/echo plumbing.
+// TEST-MODE PROTECTION DISABLE: one firmware flag, three toggles (Plant Delay / Current / Voltage Tuning).
+// Mirror the flip to the other two optimistically so a mid-flight page switch never shows stale state.
 const TEST_PROT_CHECKBOXES = [
     'testProtectionsEnabled_plant_checkbox',
     'testProtectionsEnabled_current_checkbox',
@@ -17795,8 +17147,8 @@ let currentCapMode = 'amps'; // tracks active mode; updated by setCapMode()
 
 let currentChargeRateMode = 'high'; // tracks active mode; updated by setChargeRateMode()
 
-// Throws on any non-OK response: the firmware answers 403 while settings are locked, which fetch()
-// treats as success — swallowing that once left a wizard run silently in High (2026-07-20 incident).
+// Throws on non-OK: the firmware answers 403 while locked, which fetch() treats as success —
+// swallowed, it would leave a wizard run silently in High.
 async function submitChargeRateModeImmediately(desiredValue) {
     const params = new URLSearchParams();
     params.set('HiLow', String(desiredValue));
@@ -17829,10 +17181,8 @@ function handleChargeRateModeToggle(mode) {
     pendingToggles.set('HiLow', { desiredValue: desiredValue, baseRev: lastSeenRev });
     setChargeRateMode(mode); // optimistic UI immediately
     submitChargeRateModeImmediately(desiredValue).catch(err => {
-        // Only a refusal (403 while locked) proves the mode did not move. A 4s timeout does not: the
-        // write is normally applied and echoed a moment later, so reverting here bounced the buttons
-        // and the alert claimed something false. Leave the pending entry alone and let the CSVData3
-        // HiLow reconciler settle it against the device (it accepts the device value after 2.5s).
+        // Only a refusal (403) proves the mode did not move; a timeout usually still applies. Leave the
+        // pending entry for the CSVData3 HiLow reconciler (accepts the device value after 2.5 s).
         if (!err || !err.deviceRejected) return;
         pendingToggles.delete('HiLow');
         setChargeRateMode(mode === 'low' ? 'high' : 'low');   // undo the optimistic flip
@@ -17855,15 +17205,9 @@ function submitSimpleParam(paramName, val, extra) {
         .catch(err => diagLog(paramName + ' submit failed: ' + err));
 }
 
-// System voltage (12/24/36/48 V) lives in Vessel Info (firmware global SYSTEM_VOLTAGE_CLASS) — the single source of truth.
-// When the user changes it and saves, /saveVesselInfo rescales the whole charge-voltage profile by
-// newV/oldV — the OV-ladder rungs (timed-tier margins, software hard shutdown, hardware shutdown)
-// scale x ratio like every other volt-domain setting (chain-preserving). This warns first with an
-// old→new preview (read from the live echo values) and returns false if the user cancels, so the
-// save can be aborted.
-// oldV/newV are 12/24/36/48; window._nominalStored holds the last-loaded class (set from the vessel fetch).
-// plan (fieldWindingSavePlan) carries the field-side ratio: oldV/newV while the winding is unchanged, otherwise
-// whatever the winding move and the class clamp on it make it.
+// System voltage lives in Vessel Info (SYSTEM_VOLTAGE_CLASS). /saveVesselInfo rescales every
+// volt-domain setting, OV-ladder rungs included, by newV/oldV. Returns false on cancel to abort the save.
+// plan (fieldWindingSavePlan) carries the field-side ratio: oldV/newV unless the winding moves.
 async function confirmVoltageRescale(oldV, newV, plan) {
     const ratio = newV / oldV;
     const fr = (plan && Number.isFinite(plan.fr)) ? plan.fr : oldV / newV;
@@ -18162,10 +17506,8 @@ function altHealthEraseLine(plan) {
         : '';
 }
 
-// Level offsets row (Zero Now): the offsets are averaged over ~2s on the device before they echo back, so show a
-// quiet inline "calculating…" instead of a dead label. The window also suppresses the immediate
-// CSV3 echo of the OLD offsets (see the CSV3 listener); the capture-complete frame lands after it.
-// 4.5s comfortably covers the ~2s capture and the firmware's 5s timeout safety net.
+// Zero Now: the device averages offsets over ~2 s before echoing. startImuZero's 4.5 s "calculating…"
+// window covers that and suppresses the CSV3 echo of the OLD offsets (see the CSV3 listener).
 function renderImuZeroLabel(data) {
     const el = document.getElementById('imuZeroStatus_ID');
     if (!el || !data) return;
@@ -18175,9 +17517,7 @@ function renderImuZeroLabel(data) {
         ? `heel ${hOff.toFixed(1)}° / pitch ${pOff.toFixed(1)}°`
         : 'none stored';
 }
-// "Reading now" line under the Zero Now buttons: the live, offset-corrected attitude, so a capture can be
-// checked on the spot — level and still after a good Zero Now reads near 0.0. Rides CSV1 (~10 Hz), unlike
-// the stored offsets in the label above, which ride CSV3.
+// Live offset-corrected attitude (CSV1) so a Zero Now can be checked on the spot: level and still reads ~0.0.
 function renderImuLiveAttitude(data) {
     const el = document.getElementById('imuLiveAttitude_ID');
     if (!el || !data) return;
@@ -18195,10 +17535,8 @@ function startImuZero() {
     // Vessel Info save still captures offsets in the right vessel frame (device adopts it in RAM).
     const orientSel = document.querySelector('#vessel-info-form input[name="imuMountOrientation"]:checked');
     submitSimpleParam('ZeroIMU', 1, orientSel ? { imuOrient: orientSel.value } : null);
-    // The firmware fires exactly one capture-complete CSV3 frame; if it lands inside the suppress
-    // window above it gets skipped, and the next event-driven frame may be 60s away — leaving the
-    // label stuck on "calculating…". So resolve from the cached CSV3 once the window closes rather
-    // than waiting for a fresh frame.
+    // The single capture-complete CSV3 frame may land inside the suppress window and the next frame
+    // may be 60 s away, so resolve from the cached CSV3 once the window closes.
     setTimeout(() => renderImuZeroLabel(g_lastCsv3), 4600);
 }
 
@@ -18232,7 +17570,6 @@ function kwToAmps(kw) {
 function setCapMode(mode) {
     currentCapMode = mode;
 
-    // Update toggle button states
     const ampsBtn = document.getElementById('capModeAmpsBtn');
     const kwBtn = document.getElementById('capModeKWBtn');
     if (ampsBtn) ampsBtn.classList.toggle('cap-mode-active', mode === 'amps');
@@ -18242,7 +17579,6 @@ function setCapMode(mode) {
     const modeInput = document.getElementById('capLimitMode_input');
     if (modeInput) modeInput.value = (mode === 'kw') ? '1' : '0';
 
-    // Apply derived/editable styling to all 10 rows
     for (let i = 0; i < 10; i++) {
         const ampInput = document.getElementById(`rpmCapCurrentTable${i}_input`);
         const kwInput = document.getElementById(`rpmCapKW${i}_input`);
@@ -18277,26 +17613,21 @@ function setCapMode(mode) {
 // mirrors the fault codes in fieldOffReasonText(). Used to colour a fault red vs a normal OFF gray.
 const FIELD_FAULT_REASONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 19, 22, 23, 24, 27, 28, 29, 31, 32]);
 
-// Single OFF-state classifier shared by the minimized pill AND the expanded status word so the two
-// can never disagree. reason 10 while enabled = engine-on-but-not-charging (IDLE); faults = FAULT.
-// 20 (solar-forecast rest), 21 (BMS on/off signal) and 30 (waiting for the first battery temperature
-// reading) are the same shape as 10: switched on, running, deliberately not charging.
+// Shared by the minimized pill and the expanded status word so the two never disagree. 10/20/21/25/30
+// while enabled = switched on, running, deliberately not charging (IDLE).
 function classifyFieldOff(reason, enabled) {
     if (FIELD_FAULT_REASONS.has(reason)) return { word: 'FAULT', pillCls: 'st-fault', expClass: 'field-status-fault' };
-    if ((reason === 10 || reason === 20 || reason === 21 || reason === 30) && enabled) return { word: 'IDLE',  pillCls: 'st-idle',  expClass: 'field-status-idle' };
+    if ((reason === 10 || reason === 25 || reason === 20 || reason === 21 || reason === 30) && enabled) return { word: 'IDLE',  pillCls: 'st-idle',  expClass: 'field-status-idle' };
     return { word: 'OFF', pillCls: 'st-off', expClass: 'field-status-inactive' };
 }
 
-// State word + colour class for the minimized pill. Read from the live header DOM (field-status +
-// charge-stage) so it tracks whatever the expanded header shows; the charge-stage badge already
-// resolves BULK/ABSORPTION/FLOAT and the commissioning/test override words.
+// Reads the live header DOM, so the pill tracks whatever the expanded header shows.
 function computeStripState() {
     const txt = id => (document.getElementById(id)?.textContent || '').trim().toUpperCase();
     const fs = txt('field-status');
     const cs = txt('charge-stage');
-    // Protection (ctrlLimiter 6) deliberately does NOT claim this slot: the field is still live and
-    // the stage word is still true, so it would cost the user the charge stage for a limit that is
-    // only trimming output. syncHeaderStrip() appends the brown P marker to whatever word wins here.
+    // Protection (ctrlLimiter 6) never claims this slot: the field is live and the stage word still true.
+    // syncHeaderStrip() appends the brown P to whatever word wins.
     const limFresh = (performance.now() - (window._ctrlLimiterAtMs || 0)) < 5000;
     if (cs === 'COMMISSIONING')                    return { label: 'SETUP', cls: 'st-test' };
     if (cs === 'PLANT TEST' || cs === 'CURR TEST') return { label: 'TEST',  cls: 'st-test' };
@@ -18319,9 +17650,8 @@ function computeStripState() {
     return { label: off.word, cls: off.pillCls };
 }
 
-// Header minimize: mirrors the live header values into the collapsed strip. No-op unless collapsed,
-// so the 500ms poll below is free while the header is expanded. Fields are grouped Alt│Batt│Engine;
-// CSS container queries decide which are visible at the current width.
+// No-op unless collapsed, so the 500 ms poll is free while expanded. CSS container queries pick the
+// visible fields.
 function syncHeaderStrip() {
     const hdr = document.querySelector('.permanent-header');
     if (!hdr || !hdr.classList.contains('header-collapsed')) return;
@@ -18398,13 +17728,9 @@ window.addEventListener("load", function () {
     // DEBUG CODE
     const originalGetElementById = document.getElementById;
     let warnedElements = new Set();
-    // IDs that are intentionally absent at times (created on demand, or only present
-    // while a transient dialog is open) — these are checked-then-created/guarded, so a
-    // null lookup is expected, not a stale reference. Don't flag them.
+    // IDs absent by design (created on demand or only while a dialog is open): null is expected, don't flag.
     const optionalElementIds = new Set(['recoveryDialog', 'lt-cloud-hint', 'faflip-pause-btn', 'xdlg-overlay', 'mode-strip-tip']);
-    // Whole subtrees rendered conditionally — a null lookup is expected, not a stale reference.
-    // commprep-*: the commissioning-prereq modal renders chemistry-gated inputs (LiFePO4 / Other / shunt),
-    // each probed check-then-use by commPrepCollectChanges, which no-ops on absence.
+    // Conditionally rendered subtrees. commprep-*: chemistry-gated inputs, probed check-then-use.
     const optionalElementPrefixes = ['commprep-'];
 
     document.getElementById = function (id) {
@@ -18423,9 +17749,7 @@ window.addEventListener("load", function () {
 
     interceptDualControlSubmissions();
 
-    // Mobile: every <input type="number"> gets inputmode="decimal" so iOS shows
-    // the decimal keypad (with a `.` key) instead of the telephone-style numeric pad.
-    // Done at runtime to avoid editing 201 individual inputs in HTML.
+    // Mobile: inputmode="decimal" so iOS shows the decimal keypad (with `.`), not the phone-style pad.
     document.querySelectorAll('input[type="number"]').forEach(el => {
         if (!el.hasAttribute('inputmode')) el.setAttribute('inputmode', 'decimal');
     });
@@ -18496,13 +17820,8 @@ window.addEventListener("load", function () {
         if (darkToggle) darkToggle.checked = true;
     }
 
-    // Pre-telemetry placeholder view only: the Setup tab with its static sub-tab default
-    // (Alternator > Basic). Do NOT force Vessel Info here — vesselInfoComplete is still
-    // its initial false at this point (the vessel-info fetch is async and hasn't resolved),
-    // and forcing vessel-info would leave it as the active settings sub-tab even after a
-    // complete device lands on Live Data. The real landing (Live Data when complete, or
-    // Setup > Vessel Info when not) is applied by maybeApplyLanding() once both the
-    // vessel-info fetch and first telemetry packet have resolved.
+    // Placeholder view only. Do NOT force Vessel Info here: vesselInfoComplete is still false (async fetch)
+    // and it would stay the active sub-tab. maybeApplyLanding() picks the real landing later.
     showMainTab('settings');
     // // Simple WiFi disconnect tracking - ping every 10 seconds
     // setTrackedInterval(() => {
@@ -18533,11 +17852,11 @@ window.addEventListener("load", function () {
 
     // currentModeID is a <span> that displays the mode NAME, not a number; the numeric mode
     // lives in window._lastKnownMode (set from data.currentMode). Undefined until the first
-    // CSVData2 arrives → non-AP (toggle enabled); the live echo below then corrects it.
+    // CSV1 frame arrives → non-AP (toggle enabled); the live echo below then corrects it.
     updateCloudFeaturesToggleState(window._lastKnownMode);
 
     // Apply the real mode as soon as the first telemetry sets window._lastKnownMode. The live
-    // echo (currentMode branch) also calls updateCloudFeaturesToggleState each CSVData2, so this
+    // currentMode readout in the CSV1 handler also calls updateCloudFeaturesToggleState every 4th frame, so this
     // is just a fast-path fallback, not the sole source.
     let modeInitialized = false;
     const modeCheck = setTrackedInterval(() => {
@@ -18546,13 +17865,12 @@ window.addEventListener("load", function () {
             modeInitialized = true;
             clearInterval(modeCheck);
         }
-    }, 100); // Check every 100ms until CSVData2 arrives
+    }, 100); // Check every 100ms until the first CSV1 frame arrives
 
     // Clean up if taking too long
     setTrackedTimeout(() => clearInterval(modeCheck), 5000);
 
-    // setupKWInputListeners stays here — needs dirtyInputs, learningTableHasChanges,
-    // and showLearningTableSaveButton which are defined in this scope
+    // Defined here for closure access to dirtyInputs, learningTableHasChanges, showLearningTableSaveButton
     function setupKWInputListeners() {
         for (let i = 0; i < 10; i++) {
             const kwInput = document.getElementById(`rpmCapKW${i}_input`);
@@ -18628,7 +17946,6 @@ window.addEventListener("load", function () {
         setTableStatus('fuel-table-status', 'Unsaved changes');
     }
 
-    // Add change listeners to all learning table inputs
     document.querySelectorAll('#learning-table-form input[type="number"]').forEach(input => {
         input.addEventListener('input', function () {
             learningTableHasChanges = true;
@@ -18668,9 +17985,7 @@ window.addEventListener("load", function () {
         });
     });
 
-    // Enter inside a table cell should behave like clicking out: blur the field (leaving the
-    // Save button visible for a deliberate click), NOT submit the form. A native Enter-submit
-    // fired "Saving..." immediately and bypassed the intended Save-button step.
+    // Enter in a table cell blurs (Save stays a deliberate click) instead of submitting the form.
     document.querySelectorAll('#learning-table-form input[type="number"], #fuel-table-form input[type="number"]').forEach(input => {
         input.addEventListener('keydown', function (e) {
             if (e.key === 'Enter') {
@@ -18686,9 +18001,8 @@ window.addEventListener("load", function () {
             return false;
         }
 
-        // Changing an RPM breakpoint re-keys every learned keep-alive floor to the wrong RPM, so the
-        // firmware wipes the knee tracker. Warn first — if the user is only editing Cap (A)/(kW)
-        // or Keep-Alive cells, no breakpoint moved and this never fires.
+        // Moving an RPM breakpoint makes the firmware wipe the learned keep-alive floors (re-keyed to the
+        // wrong RPM), so confirm first. Cap/Keep-Alive-only edits skip this.
         const markPending = () => {
             dirtyInputs.forEach(id => {
                 const el = document.getElementById(id);
@@ -18733,10 +18047,8 @@ window.addEventListener("load", function () {
             return false;
         }
 
-        // In litres mode the GPH cells show L/hr but the firmware stores gallons. Swap in the
-        // gallons value for the browser's synchronous serialization, restore the display on the
-        // next tick — same trick as convertTempFormIfNeeded(). Done BEFORE the pending map is
-        // filled so the recorded values are gallons and match the CSV3 echo.
+        // Litres mode: cells show L/hr but firmware stores gallons. Swap in gallons for the synchronous
+        // submit and restore next tick, before the pending map is filled so it matches the CSV3 echo.
         if (displayVolUnit === 1) {
             const restore = [];
             for (let i = 0; i < 10; i++) {
@@ -18782,31 +18094,21 @@ window.addEventListener("load", function () {
         initializeEventSource();
     }
 
-    // Stream listeners — extracted so initializeEventSource() can re-bind them on
-    // every reconnect. Before this refactor, after the first SSE reconnect the
-    // new EventSource had no CSV/console listeners and telemetry went silent.
+    // Re-bound by initializeEventSource() on every reconnect; a new EventSource starts with no listeners.
     window.attachStreamListeners = function (source) {
-        // Console event listener
-        // Timestamp = time received by app (not time sent by regulator).
-        // Messages throttled by firmware: max 5 per 700ms (adjustable).
+        // Timestamp = app receive time. Firmware throttles to 5 messages per 700 ms.
         source.addEventListener("console", function (event) {
             // Always buffer (so the export stays complete); only touch the screen when not paused.
             appendConsoleLine(event.data, !consolePaused);
         });
 
-        // Staleness detection - check if data is still flowing
-        // Created ONCE per page life: attachStreamListeners re-runs on every SSE
-        // reconnect attempt, and an unguarded interval here leaked one stacked
-        // copy per attempt (a day of flaky boat WiFi = dozens of 2s sweeps).
+        // Created once per page life: this function re-runs on every reconnect and would stack intervals.
         if (!window.stalenessWatchdogStarted) {
             window.stalenessWatchdogStarted = true;
             setTrackedInterval(function () {
-                // A hidden tab legitimately stops receiving, demo/offline mode never receives at all,
-                // and before the first packet there is no "again" to report — the boat splash owns
-                // that state. Counting any of them would put a gap on screen that never happened.
+                // No stall notice for a hidden tab, demo/offline mode or before the first packet: no real gap.
                 const timeSinceLastEvent = Date.now() - lastEventTime;
-                // The grey-out tier predates the notice and ran in every state; it stays above the
-                // notice's early return so a page that never gets its first packet still greys at 9 s.
+                // Grey-out runs in every state, so it sits above the early return (a never-connected page still greys).
                 if (timeSinceLastEvent > STALL_GREY_MS) { // 9 seconds without data = disconnected
                     updateInlineStatus(false);
                     setReadingsStale(true); //gray out
@@ -18829,9 +18131,7 @@ window.addEventListener("load", function () {
         const handleCSVData = function (e) {
 
             lastEventTime = Date.now();
-            // Unconditional, unlike the notice below: the grey tier also fires with no notice on
-            // screen (hidden tab, offline mode, before the first packet), so it cannot be cleared
-            // from endStallNotice.
+            // Unconditional: the grey tier also fires with no notice on screen, so endStallNotice can't clear it.
             setReadingsStale(false);
             if (stallState.on) endStallNotice();   // first packet back closes the grey strip's count-up
 
@@ -18872,33 +18172,23 @@ window.addEventListener("load", function () {
             g_lastCsv1 = data;  // cache for the diagnostics snapshot in log exports
             noteStreamRx('csv1');
 
-            // Thermal tuning plot: cache the two fast (CSV1) series for the live ring.
             try { thermalLiveOnCsv1(data); } catch (e) { }
 
-            // Wind dial + trend plot: cache the fast (CSV1) wind series, drive the dial.
             try { windLiveOnCsv1(data); } catch (e) { }
 
-            // Header Limit panel: stamp CSV1 freshness, re-render while open.
+            // Header Limit panel
             try { whyPanelOnCsv1(data); } catch (e) { }
 
-            // CV plant-fit (commissioning stage 6): capture {t, battery voltage, measured amps} while a fit runs.
-            try { cvFitOnCsv1(data); } catch (e) { }
-
-            // Live iExcess detector sparkline (Group 3, alternator): peak excess vs min threshold E.
             try { iExcessLiveOnCsv1(data); } catch (e) { }
 
-            // Commissioning modal RPM sparkline (no-ops while the modal is closed).
             try { cxRpmSparkOnCsv1(data); } catch (e) { }
 
-            // Oscillation damper live state (Diag ▸ Alternator) — gain, wobble frequency, state word.
+            // Oscillation damper live state (Diag > Alternator)
             try { huntGovLiveOnCsv1(data); } catch (e) { }
 
-            // Vessel Info ▸ Level offsets: live attitude under the Zero Now buttons.
             try { renderImuLiveAttitude(data); } catch (e) { }
 
-            // Update all "session window" labels with the current elapsed time since
-            // "Reset Peak Values" was pressed (or boot). One CSV1 field drives every
-            // .session-window-label span on the diagnostics page in one pass.
+            // Elapsed time since Reset Peak Values (or boot) for every .session-window-label.
             if (data.perfCountersResetElapsedS !== undefined) {
                 const sessionWindowText = formatSessionWindow(data.perfCountersResetElapsedS);
                 document.querySelectorAll('.session-window-label').forEach(el => {
@@ -18910,9 +18200,7 @@ window.addEventListener("load", function () {
                 lastSeenRev = data.stateRevision;
             }
 
-            // Banner ignition indicator — driven off CSV1 (~10 Hz) so toggling the override
-            // (or the real ignition wire changing) shows in the banner within ~0.1 s instead
-            // of waiting up to 5 s for a CSV2 frame.
+            // Banner ignition rides CSV1 (~10 Hz) so an override toggle shows within ~0.1 s, not CSV2's 5 s.
             if (data.Ignition !== undefined) {
                 const ignitionStatus = document.getElementById('ignition-status');
                 if (ignitionStatus) {
@@ -18935,18 +18223,12 @@ window.addEventListener("load", function () {
             }
             if (data.Icv !== undefined) cvPlotCache.Icv = parseFloat(data.Icv);
 
-            // Cache mode for other functions to use
             if (data.currentMode !== undefined) {
                 window._lastKnownMode = data.currentMode;
                 updateCloudStatus();
-                // Client-mode-only rows (STA signal/disconnects, cloud upload age, Upload Now)
-                // are meaningless when the regulator IS the access point — hide them there.
-                // body.ap-mode drives every internet-dependent control: .gate-ap greys them and
-                // .gate-note-ap prints the reason (styles.css). .ap-only-row is the inverse — the
-                // Solar offline note, shown ONLY here. Nothing is hidden: the manual position entry,
-                // the "Use automatic GPS" clear button and the array settings all stay reachable
-                // (a stale manual position has no other UI escape). A pause left over from the last
-                // fetch releases itself in firmware once the forecast goes stale (analyzeWeatherMode).
+                // body.ap-mode greys internet-dependent controls (.gate-ap) with a reason (.gate-note-ap) and shows
+                // .ap-only-row (styles.css). Nothing is hidden: a stale manual position has no other escape. A leftover
+                // forecast pause releases itself in firmware once the forecast goes stale (analyzeWeatherMode).
                 document.body.classList.toggle('ap-mode', Number(data.currentMode) === 1);
             }
             window._debugData = data;
@@ -18957,28 +18239,19 @@ window.addEventListener("load", function () {
             const dutyCycleDisplay = document.getElementById('dutyCycleID3');
             const dutyPercentSign  = document.getElementById('dutyCyclePercentSign');
 
-            // Master Alternator Enable, painted from CSV1 — the SAME frame as fieldActiveStatus below.
-            // It used to come off the CSV3 settings echo, which settingWrite() does not mark dirty, so
-            // the switch could sit at OFF for up to 60 s beside a live MANUAL 50% field-status word.
-            // Everything downstream of here (the OFF classifier, fieldOffReasonUpdate, the reason-10
-            // banner) reads g_onOffDevice, so it must be set BEFORE them or they judge the new frame
-            // against the previous frame's switch. g_onOffDevice is always the device's truth; only the
-            // PAINT waits behind a pending press (echoReconcile), and a paint never sends anything.
+            // Master switch painted from CSV1, the same frame as fieldActiveStatus. g_onOffDevice (device truth)
+            // must be set BEFORE the OFF classifier / fieldOffReasonUpdate / reason-10 banner, which read it.
+            // Only the PAINT waits behind a pending press (echoReconcile); a paint never sends anything.
             if (data.OnOff !== undefined) {
                 g_onOffDevice = Number(data.OnOff);
-                // deviceFloorMs is set only when a write REPLY painted the switch (alternatorSet): the
-                // device clock at the moment the regulator answered, so the write was already applied by
-                // then. A frame stamped before that is older than what is on screen and is dropped. The
-                // first frame stamped at or after it is newer than the reply and wins whether it agrees or
-                // not, so another client's change lands on the next frame instead of waiting out the grace.
+                // deviceFloorMs (set only by a write reply in alternatorSet) = device clock when the write was
+                // applied. Older frames are dropped; the first frame at/after it wins, agreeing or not.
                 const onoffPending = pendingToggles.get('OnOff');
                 const onoffFloor = onoffPending ? onoffPending.deviceFloorMs : undefined;
                 const frameSendMs = Number(data.sendMs);
                 if (onoffFloor !== undefined && Number.isFinite(frameSendMs)) {
-                    // Two escapes from a floor the device clock can no longer be compared against: a
-                    // different boot (sendMs restarted), and 30 s of wall clock for a millis wrap. 30 s
-                    // clears the device's own 20 s hold on a stalled client, so a legitimately held frame
-                    // is still judged on its stamp rather than let through by the clock running out.
+                    // Escapes when the stamp can't be compared: new boot (sessionId) or 30 s wall clock (millis
+                    // wrap). 30 s exceeds the device's 20 s stalled-client hold, so held frames are still judged.
                     const rebooted = onoffPending.floorSessionId !== undefined
                                      && Number(data.sessionId) !== onoffPending.floorSessionId;
                     if (frameSendMs >= onoffFloor || rebooted || Date.now() - onoffPending.floorSetAt > 30000) {
@@ -19041,15 +18314,12 @@ window.addEventListener("load", function () {
                     else if ((key === "RPM" && rwfsFlags.IgnoreRPM) || (key === "MeasuredAmps" && rwfsFlags.IgnoreAltCurrent)) {
                         newTextContent = "ignored";
                     }
-                    // Values scaled by 1000 on server
                     else if (["imu_vertical_accel_g", "imu_total_accel_g"].includes(key)) {
                         newTextContent = (value / 1000).toFixed(3);
                     }
-                    // Values scaled by 100 on server
                     else if (["imu_msi_score", "imu_vomit_pct", "imu_anchorage_comfort"].includes(key)) {
                         newTextContent = (value / 100).toFixed(1);
                     }
-                    // Sea state minutes — display as hours (raw minutes, no server scaling)
                     else if (["imu_min_moving_gentle", "imu_min_moving_moderate", "imu_min_moving_rough", "imu_min_moving_extreme",
                               "imu_min_stat_gentle", "imu_min_stat_moderate", "imu_min_stat_rough", "imu_min_stat_extreme"].includes(key)) {
                         newTextContent = (value / 60).toFixed(1);
@@ -19057,7 +18327,12 @@ window.addEventListener("load", function () {
                     else if (key === "AlternatorTemperatureF") {
                         newTextContent = toDisplayTemp(value / 100).toFixed(1);
                     }
-                    // Currents (Alt + Batt) — 3 sig figs: integer at ≥100, 1 dec at ≥10, 2 dec below.
+                    // Banner amps: fixed 1 decimal at every magnitude so the decimal point never
+                    // walks as ripple crosses 10/100 A (the 3-sig-fig scheme stays on data tabs).
+                    else if ((elementId === "header-alt-current" || elementId === "header-batt-current")
+                             && (key === "MeasuredAmps" || key === "Bcur")) {
+                        newTextContent = (value / 100).toFixed(1);
+                    }
                     else if (key === "MeasuredAmps" || key === "Bcur") {
                         const amps = value / 100;
                         const abs = Math.abs(amps);
@@ -19072,12 +18347,10 @@ window.addEventListener("load", function () {
                         newTextContent = (value / 100).toFixed(1);
                     }
 
-                    // Values scaled by 100 on server
                     else if (["iiout"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
 
-                    // Value scaled by 1000000 on server  
                     else if (["MaximumLoopTime"].includes(key)) {
                         newTextContent = (value / 1000000).toFixed(3);
                     }
@@ -19148,14 +18421,12 @@ window.addEventListener("load", function () {
                 ["imu_vertical_accel_g_ID", "imu_vertical_accel_g"],
                 ["imu_yaw_rate_dps_ID", "imu_yaw_rate_dps"],
                 ["imu_total_accel_g_ID", "imu_total_accel_g"],
-                // imu_msi_score, imu_vomit_pct, imu_anchorage_comfort moved to CSV2 otherFields — those fields are in CSV2
             ];
 
             // Update alarm status, this is GPIO21 buzzer/alarm
             updateAlarmStatus(data);
 
             // Other fields - update every 4th cycle - fields that are in CSV1_FIELDS
-            // (fields that moved to CSV2 were relocated to CSV2 otherFields)
             const otherFields = [
                 ["AltTempID", "AlternatorTemperatureF"],
                 ["VictronVoltageID", "VictronVoltage"],
@@ -19180,8 +18451,8 @@ window.addEventListener("load", function () {
                 window._lastGaugeRender = _gaugeNow;
             }
             processCSVDataOptimized(data); // this is for plotting
-            if (data.BatteryV_raw !== undefined) {
-                _lastBatteryV = data.BatteryV_raw / 100;
+            if (data.IBV !== undefined) {
+                _lastIBV = data.IBV / 100;
                 if (_testPanelCurrentTest === 'cv') updateCVPanelDelta();
             }
 
@@ -19192,7 +18463,6 @@ window.addEventListener("load", function () {
                 updateFuelTableHighlight(data);   // fuel breakpoints are keyed to raw RPM, a CSV1 field
             }
 
-            // One-time check to hide tabs in AP mode
             if (!settingsUnlocked) {
                 document.getElementById('settings-section').classList.add("locked");
             }
@@ -19255,27 +18525,17 @@ window.addEventListener("load", function () {
             // pidInitialized is also a CSV2 field — same reason it must run here, not in CSV3.
             updatePidInitializedDisplay(data);
 
-            // Thermal tuning plot: sample the live ring off this CSV2 frame (~5s).
             try { thermalLiveOnCsv2(data); } catch (e) { }
 
-            // Wind trend plot: refresh Beaufort/gale watermark + bank one ring column (~5s).
             try { windLiveOnCsv2(data); } catch (e) { }
 
-            // Solar ledger: today's predicted/actual tiles + the pause bar in force (~5s).
             try { solarLedgerOnCsv2(data); } catch (e) { }
 
-            // Gate-tuning readouts: render the firmware 10s extremes next to each threshold.
             try { gateReadoutOnCsv2(data); } catch (e) { }
 
-            // Oscillation damper: voltage-damper (D-term) lever state rides CSV2.
             try { huntGovLiveOnCsv2(data); } catch (e) { }
 
-            // IMU zero/level status moved to the CSV3 listener (offsets now ride CSV3 for a fast echo)
-
-            // Beaufort scale + gale duration (from the 2-min SUSTAINED true wind, never the
-            // gust) now drive the Wind Trend plot watermark — computed in windLiveOnCsv2().
-
-            // voltageTarget and Icv moved to CSV1 (fast stream) — cvPlotCache is updated in handleCSVData
+            try { n2kBusOnCsv2(data); } catch (e) { console.warn('n2kBusOnCsv2:', e); }
 
             if (data.stateRevision !== undefined) {
                 lastSeenRev = data.stateRevision;
@@ -19334,9 +18594,8 @@ window.addEventListener("load", function () {
                 }
             } catch (err) { /* never let indicator break CSV2 dispatch */ }
 
-            // Device Clock (System card). Latch the regulator-vs-browser offset here and let a local
-            // 1 Hz ticker paint it — CSV2 only lands every 5 s, so painting on arrival would freeze
-            // the seconds digit in 5 s steps.
+            // Device Clock: latch the device-vs-browser offset; a local 1 Hz ticker paints it (CSV2 lands every
+            // 5 s, so painting on arrival would step the seconds digit).
             try {
                 if (data.deviceEpoch !== undefined) {
                     const ep = Number(data.deviceEpoch);
@@ -19367,8 +18626,6 @@ window.addEventListener("load", function () {
                     updateLoggingStatus(data.loggingActive);
                 }
             } catch (err) { /* never let pill logic break CSV2 dispatch */ }
-
-            // (SOGNMEA-driven IMU moving-state graying moved to the CSVData4 / NavStream handler)
 
             updateAnchorColorCoding(data);
 
@@ -19466,8 +18723,8 @@ window.addEventListener("load", function () {
                     else if (["timeToFullChargeMin", "timeToFullDischargeMin"].includes(key)) {
                         newTextContent = formatMinutesToDHM(value);
                     }
-                    // Cumulative sample totals: abbreviate (204 K / 8.98 M / 3.28 B) so long uptimes don't overflow the row
-                    else if (key === "imu_total_samples_accel" || key === "imu_total_samples_gyro") {
+                    // Cumulative sample / message totals: abbreviate (204 K / 8.98 M / 3.28 B) so long uptimes don't overflow the row
+                    else if (key === "imu_total_samples_accel" || key === "imu_total_samples_gyro" || key === "n2kTxCount") {
                         newTextContent = abbrevCount(num);
                     }
                     // IMU raw accel/gyro values scaled by 1000 or 100
@@ -19492,21 +18749,17 @@ window.addEventListener("load", function () {
                         "imu_heel_deviation_120s", "imu_pitch_deviation_120s"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
-                    // IMU comfort scores sent ×100 (0–100 scale, already constrained in firmware) — these
-                    // moved here from CSV1; their /100 scaling branch had to move with them or they render
-                    // raw (e.g. 99.4 → 9940). 1 decimal, matching the old CSV1 formatting.
+                    // IMU comfort scores ×100 (0–100 scale, constrained in firmware)
                     else if (["imu_msi_score", "imu_vomit_pct", "imu_anchorage_comfort"].includes(key)) {
                         newTextContent = (value / 100).toFixed(1);
                     }
-                    // Sea-state exposure counters — firmware sends raw minutes, displayed as hours. Also
-                    // moved from CSV1; without /60 here the raw minutes show as "hours" (76 min → "76 hr").
+                    // Sea-state exposure counters: firmware sends raw minutes, displayed as hours
                     else if (["imu_min_moving_gentle", "imu_min_moving_moderate", "imu_min_moving_rough", "imu_min_moving_extreme",
                               "imu_min_stat_gentle", "imu_min_stat_moderate", "imu_min_stat_rough", "imu_min_stat_extreme"].includes(key)) {
                         newTextContent = (value / 60).toFixed(1);
                     }
-                    // Thermistor -99 sentinel = no sensor connected (must precede the temperature
-                    // branch below or toDisplayTemp turns it into -73 in °C mode). Covers the live
-                    // reading plus the Session/Lifetime worst-value readouts.
+                    // Thermistor -99 = no sensor (live + Session/Lifetime worst). Must precede the temperature
+                    // branch or toDisplayTemp shows -73 in °C mode.
                     else if (["temperatureThermistor", "MaxTemperatureThermistor", "MaxTemperatureThermistor_AllTime"].includes(key) && num === -99) {
                         newTextContent = "—";
                     }
@@ -19530,7 +18783,6 @@ window.addEventListener("load", function () {
                     else if (key === "inaDieTempF" || key === "inaDieTempMaxF") {
                         newTextContent = toDisplayTemp(value / 10).toFixed(1);
                     }
-                    // Values scaled by 100 on server (existing)
                     else if (["IBVMax", "ChargeCycles", "ChargeCycles_AllTime", "thermalPenaltyAmps", "MeasuredAmpsMax", "SOC_percent", "VictronCurrent", "performanceRatio", "UVThresholdHigh",
                         "PeakVoltage_AllTime", "MinVoltage", "MinVoltage_AllTime", "AvgSOC_AllTime", "AvgSpeed_AllTime", "InsulationLifePercent", "GreaseLifePercent",
                         "BrushLifePercent", "pKwHrToday", "pKwHrTomorrow", "pKwHr2days", "AvgSpeed", "MeasuredAmpsMax_AllTime", "SOGNMEA", "ApparentWindSpeedNMEA", "TrueWindSpeedNMEA", "VMGNMEA", "VMGUpwind",
@@ -19542,11 +18794,9 @@ window.addEventListener("load", function () {
                         // (only the matching *_avg_* values are scaled ×100). They fall through to the default integer render below.
                         newTextContent = (value / 100).toFixed(2);
                     }
-                    // GPS coordinates scaled by 1,000,000 on server
                     else if (["LatitudeNMEA", "LongitudeNMEA"].includes(key)) {
                         newTextContent = (value / 1000000).toFixed(6);
                     }
-                    // Value scaled by 1000000 on server  
                     else if (["LastSessionMaxLoopTime", "MaximumLoopTime"].includes(key)) {
                         newTextContent = (value / 1000000).toFixed(3);
                     }
@@ -19589,8 +18839,7 @@ window.addEventListener("load", function () {
                     else if (["FLOAT_DURATION"].includes(key)) {
                         newTextContent = (value / 3600).toFixed(2);
                     }
-                    // Values scaled by 1000 on server (existing)
-                    else if (["DynamicShuntGainFactor", "DynamicAltCurrentZero", "ChargedEnergy", "DischargedEnergy", "AlternatorChargedEnergy", "ChargedEnergy_AllTime",
+                    else if (["DynamicAltCurrentZero", "ChargedEnergy", "DischargedEnergy", "AlternatorChargedEnergy", "ChargedEnergy_AllTime",
                         "DischargedEnergy_AllTime", "AlternatorChargedEnergy_AllTime", "SolarChargedEnergy",
                         "SolarChargedEnergy_AllTime"].includes(key)) {
                         newTextContent = (value / 1000).toFixed(3);
@@ -19629,11 +18878,9 @@ window.addEventListener("load", function () {
                     else if (key === "LastSessionDuration" || key === "CurrentSessionDuration") {
                         newTextContent = formatSecondsAuto(value);
                     }
-                    // Distance values scaled by 10 on server
                     else if (["TotalDistance", "TotalDistance_AllTime"].includes(key)) {
                         newTextContent = (value / 10).toFixed(1);
                     }
-                    // Speed values scaled by 100 on server
                     else if (["MaxSpeed", "UVToday", "UVTomorrow", "UVDay2", "MaxSpeed_AllTime"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
@@ -19652,7 +18899,6 @@ window.addEventListener("load", function () {
                     else if (key === "FieldResistance") {
                         newTextContent = (value / 1000).toFixed(3);
                     }
-                    // Values scaled by 100 on server (pid and learning fields)
                     else if (["pidSetpoint", "TailCurrent_A", "RebulkVoltage", "SOC_BlockRebulk_percent", "SOC_AllowRebulk_percent", "DutySlowRampRate", "VoltageKi", "VoltageKp"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
@@ -19677,29 +18923,16 @@ window.addEventListener("load", function () {
                         newTextContent = (value / 100).toFixed(1);
                     }
 
-                    // Banner amps: fixed 1 decimal at every magnitude so the decimal point never
-                    // walks as ripple crosses 10/100 A (the 3-sig-fig scheme stays on data tabs).
-                    if (Number.isFinite(num)
-                        && (elementId === "header-alt-current" || elementId === "header-batt-current")
-                        && (key === "MeasuredAmps" || key === "Bcur")) {
-                        newTextContent = (value / 100).toFixed(1);
-                    }
-
                     // ONLY UPDATE DOM IF VALUE ACTUALLY CHANGED
                     const cacheKey = `${elementId}_${key}`;
                     if (lastValues.get(cacheKey) !== newTextContent) {
                         lastValues.set(cacheKey, newTextContent);
                         scheduleDOMUpdateOptimized(elementId, newTextContent);
                     }
-
-                    if (data.deviceIdUpper !== undefined && data.deviceIdLower !== undefined) {
-                        updateDeviceId(data.deviceIdUpper, data.deviceIdLower);
-                    }
                 }
             };
 
             //stuff for wifi wake countdown and charging mode:
-            // (ignition indicator lives in the CSV1 handler so the banner updates at ~10 Hz)
             const chargingMode = document.getElementById('charging-mode');
             const bulkStageValue = document.getElementById('BulkStageID');
             if (chargingMode && bulkStageValue) {
@@ -19738,7 +18971,6 @@ window.addEventListener("load", function () {
                 ["MaxAlternatorTemperatureF_ID", "MaxAlternatorTemperatureF"],
                 ["temperatureThermistorID", "temperatureThermistor"],
                 ["MaxTemperatureThermistorID", "MaxTemperatureThermistor"],
-                // VictronCurrent readout moved to the CSVData4 / NavStream handler
                 ["LatitudeNMEA_ID", "LatitudeNMEA"],
                 ["LongitudeNMEA_ID", "LongitudeNMEA"],
                 ["SatelliteCountNMEA_ID", "SatelliteCountNMEA"],
@@ -19756,8 +18988,6 @@ window.addEventListener("load", function () {
                 ["UVTomorrowID", "UVTomorrow"],
                 ["UVDay2ID", "UVDay2"],
                 ["weatherDataValidID", "weatherDataValid"],
-                ["DynamicShuntGainFactor_display", "DynamicShuntGainFactor"],
-                ["DynamicShuntGainFactor_card", "DynamicShuntGainFactor"],  // Live Data card — was a duplicate id that lost by document order and froze at 1.000
                 ["DynamicAltCurrentZero_display", "DynamicAltCurrentZero"],
                 ["InsulationLifePercentID", "InsulationLifePercent"],
                 ["GreaseLifePercentID", "GreaseLifePercent"],
@@ -19809,8 +19039,6 @@ window.addEventListener("load", function () {
                 ["BufferedRecordCountID", "BufferedRecordCount"],
                 ["BufferedRecordPercentID", "BufferedRecordPercent"],
                 ["BufferedRecordCapID", "BufferedRecordCap"],
-                // COG/SOG/STW/Leeway/VMG/VMGUpwind readouts moved to the CSVData4 / NavStream handler.
-                // Apparent/true wind render in the Wind dial + trend plot (windLiveOnCsv1/2/4).
                 ["VMGTargetBearing_echo", "VMGTargetBearing"],
                 ["cpuLoadCore0_display", "cpuLoadCore0"],
                 ["cpuLoadCore0Max_display", "cpuLoadCore0Max"],
@@ -19897,7 +19125,7 @@ window.addEventListener("load", function () {
                 ["imu_min_stat_rough_ID",      "imu_min_stat_rough"],
                 ["imu_min_stat_extreme_ID",    "imu_min_stat_extreme"],
 
-                // IMU Diagnostics (imuEnabled/imuMountOrientation moved to CSV3 handler — those fields are in CSV3)
+                // IMU Diagnostics
                 ["imu_fifo_overrun_count_ID", "imu_fifo_overrun_count"],
                 // 80MHz low-power loop health — paired with the FIFO overrun count above
                 ["loopWorst80Win_ID", "loopWorst80Win_ms"],
@@ -19944,10 +19172,8 @@ window.addEventListener("load", function () {
                 ["innerTermD_display", "innerTermD"],
 
                 ["voltageCtrlActive_display", "voltageControlActive"],
-                // voltageTarget and Icv moved to CSV1 otherFields (those fields are in CSV1 at indices 32, 33)
                 ["voltageError_display", "voltageError"],
                 ["cv_I_display", "cv_I"],
-                // cv_D_display removed — D term removed
                 // IMU comfort/comfort metrics (in CSV2)
                 ["imu_msi_score_ID", "imu_msi_score"],
                 ["imu_vomit_pct_ID", "imu_vomit_pct"],
@@ -19977,7 +19203,7 @@ window.addEventListener("load", function () {
                 ["tempResolutionFixCrcFailCountID", "tempResolutionFixCrcFailCount"],
                 ["tempEnumerateFailCountID", "tempEnumerateFailCount"],
 
-                // Firmware diagnostics (moved from CSV3 otherFields — all in CSV2_FIELDS)
+                // Firmware diagnostics
                 ["currentRPMTableIndex_display", "currentRPMTableIndex"],
                 ["overheatCount0_display", "overheatCount0"],
                 ["overheatCount1_display", "overheatCount1"],
@@ -19989,7 +19215,6 @@ window.addEventListener("load", function () {
                 ["overheatCount7_display", "overheatCount7"],
                 ["overheatCount8_display", "overheatCount8"],
                 ["overheatCount9_display", "overheatCount9"],
-                // safeHours0-9 removed — not in any CSV field array (stale references)
                 ["pidSetpoint_display", "pidSetpoint"],
                 ["timeSinceLastOverheat_display", "timeSinceLastOverheat"],
                 ["FreeInternalRamID", "FreeInternalRam"],
@@ -19997,6 +19222,7 @@ window.addEventListener("load", function () {
                 ["LargestInternalBlockID", "LargestInternalBlock"],
                 ["FreePSRAMID", "FreePSRAM"],
                 ["TotalPSRAMID", "TotalPSRAM"],
+                ["LargestPSRAMBlockID", "LargestPSRAMBlock"],
                 ["HeapfragID", "Heapfrag"],
                 ["ft_ReadAnalogInputs_win_ID", "ft_ReadAnalogInputs_win"],
                 ["ft_ReadAnalogInputs_ses_ID", "ft_ReadAnalogInputs_ses"],
@@ -20083,7 +19309,6 @@ window.addEventListener("load", function () {
                 ["systemIDRiseAvg_ID", "systemIDRiseAvg"],
                 ["systemIDFallAvg_ID", "systemIDFallAvg"],
 
-                // Fields moved from CSV1 otherFields — all in CSV2_FIELDS
                 ["VeTimeID", "VeTime"],
                 ["MaximumLoopTimeID", "MaximumLoopTime"],
                 ["ft_loop_win_ID", "loopTime5sWindow_ms"],
@@ -20118,7 +19343,6 @@ window.addEventListener("load", function () {
                 ["ft_bhFlushCapNVS_ses_ID", "ft_bhFlushCapNVS_ses"],
                 ["ft_kneeLearnService_win_ID", "ft_kneeLearnService_win"],
                 ["ft_kneeLearnService_ses_ID", "ft_kneeLearnService_ses"],
-                // HeadingNMEA readout moved to the CSVData4 / NavStream handler
                 ["EngineCyclesID", "EngineCycles"],
                 ["WifiStrengthID", "WifiStrength"],
                 ["LittleFsFreeKbID", "LittleFsFreeKb"],
@@ -20193,7 +19417,7 @@ window.addEventListener("load", function () {
                 ["nvsFullSaveWorstMs_ID", "nvsFullSaveWorstMs"],
                 ["nvsFullSaveCount_ID", "nvsFullSaveCount"],
 
-                // 28 ignition-cycle watermarks — hi/lo spans next to each primary value on the dashboard.
+                // Ignition-cycle watermarks — hi/lo spans next to each primary value on the dashboard.
                 // IBV and vacc are sent ×10 and rendered with toFixed(1) in the formatter chain above.
                 ["MeasAmpsID_hi",                "wmIgn_amps_hi"],     ["MeasAmpsID_lo",                "wmIgn_amps_lo"],
                 ["AltTempID_hi",                 "wmIgn_altTempF_hi"], ["AltTempID_lo",                 "wmIgn_altTempF_lo"],
@@ -20204,7 +19428,6 @@ window.addEventListener("load", function () {
                 ["SOGNMEA_ID_hi",                "wmIgn_SOG_hi"],      ["SOGNMEA_ID_lo",                "wmIgn_SOG_lo"],
                 ["VMGNMEA_ID_hi",                "wmIgn_VMGman_hi"],   ["VMGNMEA_ID_lo",                "wmIgn_VMGman_lo"],
                 ["VMGUpwind_ID_hi",              "wmIgn_VMGup_hi"],    ["VMGUpwind_ID_lo",              "wmIgn_VMGup_lo"],
-                // AWS/TWS hi/lo watermarks dropped with the old wind text rows (now the dial + trend plot).
                 ["imu_heel_deg_ID_hi",           "wmIgn_heel_hi"],     ["imu_heel_deg_ID_lo",           "wmIgn_heel_lo"],
                 ["imu_pitch_deg_ID_hi",          "wmIgn_pitch_hi"],    ["imu_pitch_deg_ID_lo",          "wmIgn_pitch_lo"],
                 ["imu_vertical_accel_g_ID_hi",   "wmIgn_vacc_hi"],     ["imu_vertical_accel_g_ID_lo",   "wmIgn_vacc_lo"],
@@ -20214,7 +19437,6 @@ window.addEventListener("load", function () {
                 ["extraTemp_ID_hi",              "wmIgn_extraTempF_hi"], ["extraTemp_ID_lo",            "wmIgn_extraTempF_lo"],
 
                 // Victron VE.Direct solar/MPPT live (CS/MPPT/ERR codes decoded separately below).
-                // Solar power/voltage/derived-current readouts moved to the CSVData4 / NavStream handler.
                 ["VictronYieldTodayID",         "VictronYieldToday_kWh"],
                 ["VictronMaxPowerTodayID",      "VictronMaxPowerToday_W"],
                 ["VictronYieldYesterdayID",     "VictronYieldYesterday_kWh"],
@@ -20243,9 +19465,8 @@ window.addEventListener("load", function () {
                 }
             })();
 
-            // NMEA2000 received battery data (127508 V/A/T + 127506 SOC) — Setup → Integrations
-            // status row plus its Live Data → Integrations mirror (li_ ids; set2 writes both).
-            // Staleness comes from the TS stream ages (window.sensorAges); values ride CSV2.
+            // N2K received battery (127508 V/A/T + 127506 SOC): Setup > Integrations row + li_ Live Data mirror
+            // (set2 writes both). Values ride CSV2; staleness from the TS ages.
             (function () {
                 const row = document.getElementById('n2kRxBatt_row');
                 const card = document.getElementById('li_n2kRxBatt_card');
@@ -20265,23 +19486,19 @@ window.addEventListener("load", function () {
                 const stale = Math.min(battAge, socAge) > STALE_MS;
                 set2('n2kRxBattStatus_ID', stale ? 'stale' : 'live');
                 setDim(stale ? '0.5' : '');
-                const NA = -1999999999;  // firmware sends -2000000000 for a missing float field
-                const num = (v, div, fix, unit) => (v === undefined || Number(v) <= NA) ? '—' : (Number(v) / div).toFixed(fix) + unit;
+                // A missing float arrives as NaN (battNaToNaN already rewrote the firmware's sentinel).
+                const num = (v, div, fix, unit) => !Number.isFinite(Number(v)) ? '—' : (Number(v) / div).toFixed(fix) + unit;
                 set2('n2kRxBattV_ID', num(data.n2kRxBattV, 100, 2, ' V'));
                 set2('n2kRxBattA_ID', num(data.n2kRxBattA, 100, 1, ' A'));
                 const tRaw = Number(data.n2kRxBattTempF);
-                set2('n2kRxBattTempF_ID', (data.n2kRxBattTempF === undefined || tRaw <= NA) ? '—' : toDisplayTemp(tRaw / 10).toFixed(1) + ' ' + tempUnitLabel());
+                set2('n2kRxBattTempF_ID', !Number.isFinite(tRaw) ? '—' : toDisplayTemp(tRaw / 10).toFixed(1) + ' ' + tempUnitLabel());
                 const soc = Number(data.n2kRxSoc);
                 set2('n2kRxSoc_ID', (data.n2kRxSoc === undefined || soc < 0) ? '—' : soc + '\u00A0%');
             })();
 
-            // Field caps — Setup → the Max Field (%), Max Field Volts, Field Current Ceiling and Field
-            // Drive Heat Ceiling rows. The loop enforces the lowest of the four (CSV2 fieldDutyCeil) and
-            // the firmware names which one (fieldCeilBind), so mark that row and show what the volts cap
-            // works out to against the live bus beside its value: without that the loop obeys a bound
-            // no box shows. The echo span, NOT getElementById('MaxDuty') — that resolves to the legacy
-            // hidden input at the bottom of index.html, which nothing populates (always "0"). Same idiom
-            // as altSweepSyncCeiling.
+            // Field caps: the loop enforces the lowest of four (fieldDutyCeil) and fieldCeilBind names which, so mark
+            // that row and show the volts cap as duty against the live bus. Read the echo span, NOT
+            // getElementById('MaxDuty'): that is a legacy hidden input nothing populates (always "0").
             (function () {
                 if (data.fieldDutyCeil === undefined) return;
                 const ceil = Number(data.fieldDutyCeil) / 100;
@@ -20311,10 +19528,8 @@ window.addEventListener("load", function () {
                 }
                 const asDuty = document.getElementById('MaxFieldVolts_asDuty');
                 if (!asDuty) return;
-                // While the volts cap is limiting, the enforced ceiling IS its duty — use it exactly.
-                // Otherwise solve 100 × volts / bus here, capped at the 99% bootstrap limit like the
-                // firmware term; the bus is the INA228 reading the firmware solves against (IBV), off
-                // the 1 s frame rather than the firmware's 2 s filter, so it can differ by ripple.
+                // Volts cap limiting: the enforced ceiling IS its duty. Otherwise 100 × volts / IBV, capped at 99%
+                // like the firmware; IBV here is the 1 s frame, not the firmware's 2 s filter, so ripple can differ.
                 let d = NaN;
                 if (voltsLimiting) {
                     d = ceil;
@@ -20327,9 +19542,7 @@ window.addEventListener("load", function () {
                 if (asDuty.textContent !== txt) asDuty.textContent = txt;
             })();
 
-            // NMEA 0183 link health — Live Data → Integrations. The two counters are the whole point:
-            // they prove the port, the baud and the polarity are right regardless of whether any
-            // sentence type is understood. Values ride CSV2, staleness comes from TS.
+            // NMEA 0183 link health: the counters prove port/baud/polarity even when no sentence type is understood.
             (function () {
                 const card = document.getElementById('li_n183Sentences_ID');
                 if (!card || data.n183Sentences === undefined) return;
@@ -20347,9 +19560,7 @@ window.addEventListener("load", function () {
                     : (age >= 999999 || age > 20000) ? 'stale' : 'live');
             })();
 
-            // DVCC follow status — Setup → Integrations (Charge-Limit Follow card) status row plus
-            // its Live Data → Integrations mirror (li_ ids) and the card-header state word.
-            // Values ride CSV2; staleness from TS.
+            // DVCC follow status: Setup row, li_ Live Data mirror and card-header word. Values CSV2, staleness TS.
             (function () {
                 // Banner first: it is global, so it must not depend on the Integrations markup
                 // that the two early-returns below guard.
@@ -20365,8 +19576,7 @@ window.addEventListener("load", function () {
                 const word = (st === 5) ? (words[5] + (reasons[Number(data.dvccUntrustReason)] || '')) : (words[st] || String(st));
                 set2('dvccStateWord_ID', word);
                 setText('integStateFollow', words[st] || String(st));  // header state: word only, no reason suffix
-                const NA = -1999999999;
-                const num = (v, div, fix, unit) => (v === undefined || Number(v) <= NA) ? '—' : (Number(v) / div).toFixed(fix) + unit;
+                const num = (v, div, fix, unit) => !Number.isFinite(Number(v)) ? '—' : (Number(v) / div).toFixed(fix) + unit;
                 set2('dvccCvl_ID', num(data.dvccRxCvl, 100, 2, ' V'));
                 set2('dvccCcl_ID', num(data.dvccRxCcl, 10, 1, ' A'));
                 const src = Number(data.dvccRxSrcAddr);
@@ -20386,10 +19596,8 @@ window.addEventListener("load", function () {
                 const rst = document.getElementById('dvccReset_row');
                 if (rst) rst.classList.toggle('is-gated', st !== 5);
 
-                // Per-dialect cards (Victron CAN / RV-C). Only the selected dialect is decoded at
-                // all, so its card carries the reception evidence and the other says plainly that
-                // it is idle. Source of truth is the firmware echo, not the <select> (which can sit
-                // mid-edit). Both cards stay untouched until that echo has actually arrived.
+                // Per-dialect cards: only the selected dialect is decoded. Read the firmware echo, not the <select>
+                // (may be mid-edit); leave both cards untouched until the echo arrives.
                 const srcTxt = (document.getElementById('dvccSrcType_echo') || {}).textContent || '';
                 if (!/RV-C|Victron/.test(srcTxt)) return;
                 const isRvc = srcTxt.indexOf('RV-C') >= 0;
@@ -20429,16 +19637,12 @@ window.addEventListener("load", function () {
                 if (btnRvc) { btnRvc.disabled = isRvc; setText('rvcUseBtn', isRvc ? 'In use' : 'Use RV-C'); }
             })();
 
-            // (live engine fuel flow + economy GPH/NMPG readouts moved to the CSVData4 / NavStream handler)
-
             // Session fuel-economy curve (mpg vs RPM). try/catch so a chart bug can't break the dispatcher.
             try { if (typeof window.updateFuelCurve === 'function') window.updateFuelCurve(data); }
             catch (e) { console.warn('fuel curve update failed:', e); }
 
-            // Refresh the barometer panel (Other tab) each CSV2 cycle. Cheap no-op if the
-            // panel hasn't been initialized yet (tab never opened). try/catch so a bug in
-            // the baro module can never break the rest of the dispatcher (firmware version,
-            // device id, etc. live downstream of this line).
+            // Barometer panel (Other tab); no-op until initialized. try/catch so a baro bug can't break the
+            // dispatcher (firmware version, device id run downstream).
             if (typeof window.updateBaroDisplay === 'function') {
                 try { window.updateBaroDisplay(data, window.sensorAges); }
                 catch (e) { console.warn('baro update failed:', e); }
@@ -20464,11 +19668,9 @@ window.addEventListener("load", function () {
                 }
             }
 
-            // Control Accuracy v4 (always-on, fed off CSV2). Raw accumulators → ratios derived
-            // here: Tracking % = in-band/challenged, mean recovery = out-of-band s / excursions,
-            // coverage line shows the challenged/quiet/constrained split. Dash keys on each
-            // metric's own denominator ("not observed" is never shown as "perfect"). Color
-            // thresholds are placeholders pending fleet percentile data (spec §8.1).
+            // Control Accuracy v4: raw CSV2 accumulators -> Tracking % = in-band/challenged, mean recovery =
+            // out-of-band s / excursions. Dash keys on each metric's own denominator ("not observed" != "perfect").
+            // Color thresholds are placeholders pending fleet percentile data (spec §8.1).
             const accLoop = pfx => ({
                 valid: parseFloat(data[pfx + 'ValidS']) || 0,
                 act:   parseFloat(data[pfx + 'ActiveS']) || 0,
@@ -20510,30 +19712,20 @@ window.addEventListener("load", function () {
 
             updateAllEchosOptimized(data);
 
-            // Update toggle states
             updateTogglesFromData(data);
-            // capLimitMode / HiLow pending toggle confirmation handled in CSVData3 handler
 
             updateLifeIndicators(data);
 
-            // gLastChargeStage now rides CSV4 (2 Hz) — not set here, see the CSVData4 listener
-
-            // TuningMode/CVTuningMode are CSV3 (settings-echo) fields, NOT present in this CSV2
-            // frame — read them from the echo-backed hidden inputs (same idiom as elsewhere,
-            // e.g. tuningStopTest/updateTestActivePanel) instead of the undefined data.* members.
+            // TuningMode/CVTuningMode are CSV3 fields, absent from this CSV2 frame: read the echo-backed inputs.
             const tuningModeActive = parseInt(getField("TuningMode") ?? 0) === 1;
             const cvTuningModeActive = parseInt(getField("CVTuningMode") ?? 0) === 1;
 
             const chargeStageEl = document.getElementById('charge-stage');
             if (chargeStageEl) {
                 const stage = data.chargeStageDisplay;
-                // Commissioning outranks the test/stage labels: the wizard reuses the PLANT/CURR/CV
-                // test modes internally and rests between steps on the real charge stage (e.g. TARGET V),
-                // so whenever the wizard modal is open we show COMMISSIONING regardless of which step is
-                // underway or whether a step is actively driving the field. Gated on the modal being open
-                // (NOT commissionState) so a paused-but-closed commission doesn't hijack the pill while
-                // the device is charging normally. The per-step running flags are folded in so the pill
-                // still reads COMMISSIONING during a step even if the modal was dragged/closed.
+                // Commissioning outranks test/stage labels: the wizard reuses the test modes and rests on real stages.
+                // Gated on the modal being open (NOT commissionState) so a paused-but-closed commission doesn't hijack
+                // the pill; the per-step running flags keep COMMISSIONING during a step with the modal closed.
                 const cxModalOpen = (() => {
                     const ov = document.getElementById('commission-modal-overlay');
                     return !!ov && ov.style.display === 'block';
@@ -20554,9 +19746,8 @@ window.addEventListener("load", function () {
                     chargeStageEl.textContent = 'WAVE GEN';
                     chargeStageEl.className = 'charge-stage charge-stage-test';
                 } else if ((altLive.sweepState | 0) !== 0) {
-                    // Gate-tuning field sweep owns the field directly and the whole min-select chain
-                    // is bypassed, so ctrlLimiter is forced to 0 and every limiter cue goes quiet.
-                    // Without this the banner reads BULK/ABSORPTION while nothing it names is running.
+                    // Field sweep bypasses the min-select chain (ctrlLimiter forced 0); without this the banner
+                    // names a stage that isn't running.
                     chargeStageEl.textContent = 'TUNING SWEEP';
                     chargeStageEl.className = 'charge-stage charge-stage-test';
                 } else if (stage === 1) {
@@ -20593,9 +19784,8 @@ window.addEventListener("load", function () {
             }
             updateVoltageModeGreyout(data.chargeStageDisplay);
 
-            // Restart-charge-cycle button (Live Data → Battery): only actionable while an auto charge
-            // stage owns the field — BULK/ABSORPTION/FLOAT/IDLE. Disabled in Manual/Maintain/Target-V/
-            // Commissioning/field-off, matching the firmware guard that would otherwise drop the request.
+            // Restart-charge-cycle: only while an auto stage owns the field (BULK/ABSORPTION/FLOAT/IDLE),
+            // matching the firmware guard that drops the request otherwise.
             const restartBtn = document.getElementById('restart-charge-cycle-btn');
             if (restartBtn) {
                 const s = data.chargeStageDisplay;
@@ -20606,8 +19796,6 @@ window.addEventListener("load", function () {
                     : 'Only available while charging automatically (Bulk / Absorption / Float / Idle)';
             }
 
-            // Update the test-active floating panel (TuningMode/CVTuningMode are CSV3 echoes,
-            // read via the echo-backed hidden inputs — not present in this CSV2 frame)
             _testActiveCSV1 = tuningModeActive ? 'curr' : cvTuningModeActive ? 'cv' : null;
             updateTestActivePanel();
 
@@ -20654,13 +19842,11 @@ window.addEventListener("load", function () {
                 try { whyPanelRefreshOpen(); } catch (e) { }   // Limit panel headline follows the limiter code
             }
 
-            // Sole gLastChargeStage source — CSV2's copy is a stale pre-built snapshot that could
-            // briefly regress a fresh stage transition, so it no longer writes this.
+            // Sole gLastChargeStage source: CSV2's copy is a stale pre-built snapshot that can regress a transition.
             if (data.chargeStage !== undefined) gLastChargeStage = data.chargeStage;
 
-            // NMEA 0183 decoded heading — Live Data → Integrations only. Deliberately NOT merged into
-            // HeadingNMEA/_navLast: that field is the NMEA2000 source and everything downstream
-            // assumes one origin for it. -10 is the firmware's "nothing decoded" sentinel (-1 ×10).
+            // NMEA 0183 heading, Live Data > Integrations only. NOT merged into HeadingNMEA/_navLast: downstream
+            // assumes one (NMEA2000) origin. -10 = firmware "nothing decoded" sentinel.
             if (data.n183Heading !== undefined) {
                 const hEl = document.getElementById('li_n183Heading_ID');
                 if (hEl) {
@@ -20769,18 +19955,13 @@ window.addEventListener("load", function () {
             g_lastCsv3 = data;  // cache for cvBinToCsv header
             noteStreamRx('csv3');
 
-            // Fast phone-speed watch follows the speedSourceMode echo: start the GNSS
-            // watch when the user selects phone, stop it when they leave. Wrapped so a
-            // geolocation failure can never take down the rest of this dispatcher.
+            // Phone GNSS speed watch follows the speedSourceMode echo; wrapped so a geolocation failure can't kill this.
             try {
                 if (data.speedSourceMode !== undefined) updatePhoneSpeedPoster(data.speedSourceMode);
             } catch (e) { }
 
-            // IMU zero/level calibration status (offsets sent deg ×100). Rides CSV3 so it
-            // echoes within ~one tick of capture instead of waiting up to 5s. While a capture
-            // is running we hold the "calculating…" label (set on the Zero Now click) and skip the
-            // immediate /get echo of the OLD offsets; the capture-complete CSV3 frame lands after
-            // the window and shows the new value (or restores the prior value on a firmware abort).
+            // IMU zero/level status (offsets deg ×100) rides CSV3 for a ~one-tick echo. During a capture, hold the
+            // "calculating…" label and skip the stale /get echo; the capture-complete frame shows the result.
             try {
                 if (Date.now() >= (window._imuZeroCalcUntil || 0)) {
                     renderImuZeroLabel(data);
@@ -20789,27 +19970,6 @@ window.addEventListener("load", function () {
             try { fieldWindingOnCsv3(data); } catch (e) { }
 
             //CSVData3
-            /*             ## 🎯 **Summary**
-            ```
-            ┌─────────────────────┐
-            │ data = {...}        │  ← 200+ values stored here
-            │ (all CSV values)    │
-            └─────────────────────┘
-                      │
-                      │  ┌──────────────────────────────┐
-                      └─→│ otherFields = [...]          │  ← Whitelist of ~40 items
-                         │ (which ones to display)      │
-                         └──────────────────────────────┘
-                                    │
-                                    ↓
-                         ┌──────────────────────────────┐
-                         │ updateFields(otherFields)    │
-                         │                              │
-                         │ For each item in whitelist:  │
-                         │  - Get value from data       │
-                         │  - Apply scaling if needed   │
-                         │  - Update HTML element       │
-                         └──────────────────────────────┘ */
             if (data.stateRevision !== undefined) {
                 lastSeenRev = data.stateRevision;
             }
@@ -20913,11 +20073,9 @@ window.addEventListener("load", function () {
                     else if (key === "overheatingPenaltyTimer") {
                         newTextContent = (value).toFixed(0);
                     }
-                    // Special handling for imuEnabled (in CSV3)
                     else if (key === "imuEnabled") {
                         newTextContent = value === 1 ? "Enabled" : "Disabled";
                     }
-                    // Special handling for imuMountOrientation (in CSV3)
                     else if (key === "imuMountOrientation") {
                         const orientations = ["Fwd Bulkhead", "Aft Bulkhead", "Port Wall", "Stbd Wall"];
                         newTextContent = orientations[value] || `Unknown (${value})`;
@@ -20930,7 +20088,6 @@ window.addEventListener("load", function () {
                     else if (key === "FieldResistance") {
                         newTextContent = (value / 1000).toFixed(3);
                     }
-                    // Values scaled by 100 
                     else if (["pidSetpoint", "TailCurrent_A", "RebulkVoltage", "SOC_BlockRebulk_percent", "SOC_AllowRebulk_percent", "DutySlowRampRate", "VoltageKi", "VoltageKp"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
                     }
@@ -20957,7 +20114,6 @@ window.addEventListener("load", function () {
 
             // Other fields for CSVData3 - update every cycle (no throttling since server controls timing)
             const otherFields = [
-                // Step 2: This array is a whitelist - it says "only update these specific HTML elements with these specific data values".
                 // IMU settings (these fields live in CSV3)
                 ["imuEnabled_ID", "imuEnabled"],
                 ["imuMountOrientation_ID", "imuMountOrientation"],
@@ -20965,12 +20121,10 @@ window.addEventListener("load", function () {
             ];
 
             // CSVData3
-            updateFields(otherFields);   // Step 3: Process the whitelist
+            updateFields(otherFields);
             updatePidTuningConfiguration(data);
 
-            // Update test-active panel with sysid phase.
-            // systemIDActive is in CSV2_FIELDS, not CSV3 — read from DOM,
-            // which CSV2 otherFields already keeps current via ["systemIDActive_ID", "systemIDActive"].
+            // systemIDActive is a CSV2 field: read it from the DOM, kept current by CSV2 otherFields.
             const sysidPhaseNum = parseInt(getField("systemIDActive_ID") ?? 0);
             _testActiveCSV3 = sysidPhaseNum > 0 ? 'sysid' : null;
             if (_testPanelCurrentTest === 'sysid') {
@@ -21131,9 +20285,8 @@ window.addEventListener("load", function () {
                     if (minDutyInput && minDutyInput !== focused && !dirtyInputs.has(minDutyInput.id)) {
                         const p = pendingTableValues.get(minDutyInput.id);
                         if (p) {
-                            // 2 dp, not 1: the unmeasured-bin baseline is 0.25%, which rounds to
-                            // "0.3" at 1 dp and then never matches the typed value, so the pending
-                            // highlight hangs until its deadline instead of confirming.
+                            // 2 dp: the unmeasured-bin baseline 0.25% rounds to "0.3" at 1 dp, never matches,
+                            // and the pending highlight hangs until its deadline.
                             const incoming = data[`rpmMinDutyTable${i}`] !== undefined
                                 ? (data[`rpmMinDutyTable${i}`] / 100).toFixed(2)
                                 : undefined;
@@ -21171,8 +20324,6 @@ window.addEventListener("load", function () {
             updateAllEchosOptimized(data);
             updateTogglesFromData(data);
 
-            // (active RPM row highlight + PID-initialized display live in the CSV2 handler —
-            //  currentRPMTableIndex and pidInitialized are CSV2 fields, undefined in this CSV3 frame)
             drawGlyphs();
 
 
@@ -21260,7 +20411,6 @@ window.addEventListener("load", function () {
 
 
 
-    // Improve legend appearance with clean lines and responsive spacing
     const style = document.createElement('style');
     style.textContent = `
 .u-legend {
@@ -21317,6 +20467,7 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("n2kAltTempEnable_checkbox").checked = (document.getElementById("n2kAltTempEnable").value === "1");
     document.getElementById("n2kExtraTempEnable_checkbox").checked = (document.getElementById("n2kExtraTempEnable").value === "1");
     document.getElementById("n2kChgrEnable_checkbox").checked = (document.getElementById("n2kChgrEnable").value === "1");
+    document.getElementById("n2kConvStatEnable_checkbox").checked = (document.getElementById("n2kConvStatEnable").value === "1");
     document.getElementById("n2kChgrCfgEnable_checkbox").checked = (document.getElementById("n2kChgrCfgEnable").value === "1");
     document.getElementById("n2kEngRpmEnable_checkbox").checked = (document.getElementById("n2kEngRpmEnable").value === "1");
     document.getElementById("n2kEngDynEnable_checkbox").checked = (document.getElementById("n2kEngDynEnable").value === "1");
@@ -21326,6 +20477,7 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("rvcDcEnable_checkbox").checked = (document.getElementById("rvcDcEnable").value === "1");
     document.getElementById("rvcFaultEnable_checkbox").checked = (document.getElementById("rvcFaultEnable").value === "1");
     document.getElementById("dvccEn_checkbox").checked = (document.getElementById("dvccEn").value === "1");
+    document.getElementById("dvccVicCutHold_checkbox").checked = (document.getElementById("dvccVicCutHold").value === "1");
     document.getElementById("battTempProbeEnable_checkbox").checked = (document.getElementById("battTempProbeEnable").value === "1");
     document.getElementById("extraTempProbeEnable_checkbox").checked = (document.getElementById("extraTempProbeEnable").value === "1");
     document.getElementById("hotChargeLockoutEnable_checkbox").checked = (document.getElementById("hotChargeLockoutEnable").value === "1");
@@ -21342,7 +20494,6 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("TempSource_checkbox").checked = (document.getElementById("TempSource").value === "1");
     document.getElementById("timeAxisModeChanging_checkbox").checked = (document.getElementById("timeAxisModeChanging").value === "1");
     document.getElementById("weatherModeEnabled_checkbox").checked = (document.getElementById("weatherModeEnabled").value === "1");
-    // TuningMode has no checkbox anymore — the unified Begin/Stop Test button reflects it via updateTuningModeUI().
     document.getElementById("socInfoAvailable_checkbox").checked = (document.getElementById("socInfoAvailable").value === "1");
     document.getElementById("CloudFeatures_checkbox").checked = (document.getElementById("CloudFeatures").value === "1");
     document.getElementById("RemoteDiagnostics_checkbox").checked = (document.getElementById("RemoteDiagnostics").value === "1");
@@ -21389,10 +20540,8 @@ async function handleClearBuffer(form) {
     )) form.submit();
 }
 
-// Zero a set of dashboard fields AND invalidate both update caches so the next
-// CSV frame is guaranteed to refresh them. Without the cache invalidation,
-// if the next firmware value coincidentally matches what was cached pre-reset,
-// scheduleDOMUpdateOptimized short-circuits and the DOM stays at '0' forever.
+// Zero dashboard fields AND invalidate both update caches; otherwise a next value equal to the pre-reset
+// cache short-circuits scheduleDOMUpdateOptimized and the DOM stays at '0'.
 function resetDisplayValuesAndCaches(ids) {
     ids.forEach(id => {
         const el = document.getElementById(id);
@@ -21436,9 +20585,7 @@ function handleResetPerfCounters() {
                 'vl_last_ms_ID', 'vl_avg_10s_ID', 'vl_worst_10s_ID', 'vl_over2x_10s_ID',
                 'vl_avg_2m_ID', 'vl_worst_2m_ID', 'vl_over2x_2m_ID',
                 'vl_avg_at_ID', 'vl_worst_at_ID', 'vl_over2x_at_ID',
-                // Sensor Health + Read Gaps + NVS cards — firmware clears these in the same
-                // handler, so zero them here too or the page looks like the button missed them
-                // until the next CSV frame lands.
+                // Firmware clears these in the same handler; zero them too so the page doesn't lag a frame.
                 'adsI2CErrorCount_ID', 'ina228ErrorCount_ID', 'inaBusReadWorstUs_ID', 'inaBusSlowCount_ID',
                 'imuFifoFetchWorstUs_ID', 'imuFifoWorstSamples_ID',
                 'ch2GapWorst_ID', 'ch0GapWorst_ID', 'csv2BuildWorst_ID', 'csv2SendWorst_ID',
@@ -21528,16 +20675,9 @@ function updatePidInitializedDisplay(data) {
     }
 }
 
-// uPlot sizes itself to clientWidth at construction. All six live charts are built once at load
-// (initCurrentTempPlot()... near startInterpLoop()) while their tab is display:none, i.e. at width 0.
-// Each has a ResizeObserver that fixes this when the element gains size, but that's debounced, so the
-// chart shows squished until the observer fires. Call this the moment a chart's tab/sub-tab becomes
-// visible to size it immediately. The clientWidth>0 guard makes it a no-op for any chart whose
-// sub-tab is still hidden, so it's safe to call for the whole Plots/Tuning family unconditionally.
-// Backstop for live plots built at width 0 while their tab is hidden: if resize-on-show and the
-// ResizeObserver both miss, the plot stays 0-wide and uPlot draws a blank box. Called per frame from
-// the interp loop only while the owning tab is visible; steady-state cost is one property compare
-// (setSize fires only on a real width mismatch).
+// uPlot sizes to clientWidth at construction, so live plots built under a hidden tab start 0-wide. Backstop for
+// when resizeLivePlotsOnShow and the ResizeObserver both miss: called per frame from the interp loop while the
+// tab is visible; setSize fires only on a real mismatch.
 function healPlotWidth(plot, elId, height) {
     if (!plot) return;
     const el = document.getElementById(elId);
@@ -21546,9 +20686,8 @@ function healPlotWidth(plot, elId, height) {
     if (w > 0 && plot.width !== w) plot.setSize({ width: w, height });
 }
 
-// Chart width for every uPlot build/resize: the live container width when visible; when the
-// container is hidden (clientWidth 0) fall back to `fallback` CLAMPED TO THE VIEWPORT, so a
-// chart built under a hidden tab can never be born wider than a phone screen.
+// Live container width when visible; when hidden, `fallback` CLAMPED TO THE VIEWPORT so a chart built under a
+// hidden tab is never born wider than a phone screen.
 function plotFitWidth(el, fallback, cap) {
     const avail = Math.max(240, document.documentElement.clientWidth - 40);
     const w = (el && el.clientWidth) ? el.clientWidth : Math.min(fallback, avail);
@@ -21597,6 +20736,8 @@ function showMainTab(tabName) {
 
     // Charts in this tab were built at width 0 while it was hidden — size them now (no debounce wait).
     if (tabName === 'plots' || tabName === 'tuning') resizeLivePlotsOnShow();
+    // A main-tab switch can reveal Setup > Integrations without re-entering showSubTab.
+    if (tabName === 'settings' && typeof n2kNodesKick === 'function') n2kNodesKick();
 
     mainTabs.forEach(tab => {
         if (tab.getAttribute('onclick').includes(tabName)) {
@@ -21614,9 +20755,7 @@ function showMainTab(tabName) {
     }
 
     if (tabName === 'livedata') {
-        // Ensure a sub-tab is always visible; on first visit none may be active yet.
-        // Same destination as applyLandingTab() so an early manual click isn't yanked
-        // to another sub-tab when the landing finally applies.
+        // Ensure a sub-tab is visible; same destination as applyLandingTab() so an early click isn't yanked later.
         if (!document.querySelector('#livedata .sub-tab-content.active')) {
             showSubTab('livedata', 'diag');
         }
@@ -21703,7 +20842,7 @@ function showSubTab(parentTab, subTabName, evt = null) {
     }
 
 
-    // Initialize / refresh the barometer panel whenever the Weather/Solar tab is opened (baro lives there now)
+    // Initialize / refresh the barometer panel whenever the Weather/Solar tab is opened
     if (parentTab === 'livedata' && subTabName === 'weathersolar') {
         if (typeof window.initBaroPanel === 'function') window.initBaroPanel();
         // Draw the Wind Trend plot now it's visible (it needs a non-zero width to size).
@@ -21716,6 +20855,7 @@ function showSubTab(parentTab, subTabName, evt = null) {
 
     // Probe registry polls only while its sub-tab is on screen — fetch once on entry.
     if (parentTab === 'settings' && subTabName === 'temperature' && typeof owPollNow === 'function') owPollNow();
+    if (parentTab === 'settings' && subTabName === 'integrations' && typeof n2kNodesKick === 'function') n2kNodesKick();
 
     // Resume the Fast Alt-Current scope only if its Waveforms section is expanded and on-screen
     if (parentTab === 'livedata' && subTabName === 'diag') {
@@ -21789,9 +20929,8 @@ function showDiagPanel(panelName, evt = null) {
     }
 }
 
-// Capacity trend needs a rested-voltage curve to anchor SoC. Known chemistries get one from the
-// Vessel-Info populator; type "other" gets none, so prompt the user to enter their own. Unknown
-// (vessel info not yet loaded) shows no note so it never flashes on boot. DCIR is unaffected either way.
+// Type "other" gets no rested-voltage curve from the populator, so prompt for one. Unknown (vessel info not yet
+// loaded) shows nothing so it never flashes on boot. DCIR is unaffected either way.
 function updateBattHealthChemNote() {
     const note = document.getElementById('capChemNote');
     if (!note) return;
@@ -21847,10 +20986,8 @@ function showAltTab(group, panelId) {
 
 }
 
-// Dedicated switcher for the Tuning alt-panel's inner tabs. NOT showSubTab: #tuning is
-// nested under Setup > Alternator, so the generic showSubTab('settings',...) querySelectors would
-// clobber these panels — the same reason showBatteryPanel/showDiagPanel exist. Uses private
-// .tuning-tab/.tuning-panel classes so the outer sub-tab machinery can never reach them.
+// NOT showSubTab: #tuning is nested under Setup > Alternator, so its querySelectors would clobber these panels
+// (same reason as showBatteryPanel/showDiagPanel). Private .tuning-tab/.tuning-panel classes keep it isolated.
 function showTuningPanel(name, evt = null) {
     document.querySelectorAll('#tuning .tuning-panel').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('#tuning .tuning-tab').forEach(b => b.classList.remove('active'));
@@ -21892,8 +21029,7 @@ function goToVoltageTuning() {
         requestAnimationFrame(() => sec.scrollIntoView({ behavior: 'smooth', block: 'start' }));
     }
 }
-// Commissioning is the FIRST alt-tab under Setup > Alternator (id="alt-panel-commissioning").
-// It used to be a Tuning sub-tab — deep-links go through here, never goToTuning('commissioning').
+// Commissioning is the FIRST alt-tab under Setup > Alternator; deep-link here, never goToTuning('commissioning').
 function goToCommissioning() {
     showMainTab('settings');
     showSubTab('settings', 'alternator');
@@ -21914,10 +21050,8 @@ function goToOvLadder() {
     ssRevealEl(card && card.querySelector('.protections-name'));
 }
 
-// Live Data > Diag is results-only; its knobs are the 6th alt-tab under Setup > Alternator.
-// ck (optional, 'c1'..'c4') also selects that checkpoint pill and scrolls its card into view.
-// The pill is .click()ed rather than class-swapped: the filter's active state is private to
-// initDiagCheckpoints, so only a real click keeps the pill and the shown cards in agreement.
+// Live Data > Diag is results-only; its knobs are an alt-tab under Setup > Alternator. ck ('c1'..'c4') selects that
+// checkpoint pill via .click() (the filter state is private to initDiagCheckpoints) and scrolls its card into view.
 function goToDiagSettings(ck) {
     showMainTab('settings');
     showSubTab('settings', 'alternator');
@@ -21933,12 +21067,9 @@ function goToDiagSettings(ck) {
     if (card) requestAnimationFrame(() => card.scrollIntoView({ behavior: 'smooth', block: 'start' }));
 }
 
-// Header safety strip for charge-limit follow (#dvcc-banner). Follow ON while the state is
-// anything but FOLLOWING means the clamps are NAN and the regulator is running its own targets
-// — safe in direction, but an owner who enabled follow may believe the sender is the backstop and
-// have left local targets that only made sense behind it. States: 1 waiting, 4 stale,
-// 5 untrusted. Never call this a protection: no limit received is not a fault, it is the
-// absence of a request.
+// Header strip for charge-limit follow: follow ON but not FOLLOWING (1 waiting, 4 stale, 5 untrusted) means the
+// clamps are NAN and local targets rule, which an owner relying on the sender may not expect. Never call this a
+// protection: no limit received is not a fault.
 const DVCC_NOTICE_GRACE_MS = 60000;   // a GX rebooting or booting after us must not raise a banner
 let dvccNoticeSince = 0;
 
@@ -21985,9 +21116,8 @@ function goToDvccFollow() {
     requestAnimationFrame(() => sec.scrollIntoView({ behavior: 'smooth', block: 'start' }));
 }
 
-// Oscillation Damper: the Diag card carries the live state, its switch and seven knobs live
-// next to the PID Ki they act on. Ancestor details are force-opened — Controller Parameters
-// ships open, but a user who collapsed it would otherwise get an invisible scroll target.
+// Oscillation Damper knobs live next to the PID Ki they act on. Ancestor <details> are force-opened so a
+// collapsed Controller Parameters isn't an invisible scroll target.
 function goToHuntSettings() {
     goToTuning('current');
     const row = document.getElementById('huntGovSetupRow');
@@ -22047,13 +21177,11 @@ function goToGateTuningCapture() {
 // Frozen page response stuff
 function showRecoveryOptions() {
     // Don't show multiple recovery dialogs.
-    // querySelector (not getElementById) so the load-time MISSING-ELEMENT debug
-    // shim doesn't false-flag this pre-creation existence check.
+    // querySelector, not getElementById: the MISSING-ELEMENT debug shim would flag this check.
     if (document.querySelector('#recoveryDialog')) return;
 
-    // Retry re-scans the network, so a moved address heals itself. By the time this dialog is
-    // up that scan has already run once and found nothing, so the text says what is left to
-    // check rather than promising another search will help.
+    // Retry re-scans the network; by now one scan already found nothing, so the text says what is left
+    // to check rather than promising another search will help.
     let addressHint;
     if (IS_CAPACITOR && phoneIsOffline()) {
         // The phone, not the regulator, is the problem — say so instead of sending
@@ -22069,9 +21197,8 @@ function showRecoveryOptions() {
             : `Searched this network and the phone-hotspot range (172.20.10.2&ndash;14); nothing answered. Retry searches again. If the regulator runs on a phone's hotspot, check the hotspot is still switched on &mdash; a phone turns it off by itself once nothing is connected to it.`;
     }
 
-    // Access-point users have no router to fall back on: offer the one-tap join
-    // instead of sending them out to Settings > Wi-Fi. The SSID is written with
-    // textContent after insertion — it is user-editable text, never markup.
+    // AP users have no router: offer the one-tap join instead of Settings > Wi-Fi. The SSID is set via
+    // textContent after insertion (user-editable text, never markup).
     const joinBlock = wifiJoinPlugin() ? `
       <button onclick="joinRegulatorHotspot('recoveryJoinStatus')" style="width:100%; margin-top:10px; background:#2b3f4a; border:1px solid #3f6070; color:#9fd8e8; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;">Join Regulator WiFi</button>
       <p style="font-size:11px; color:#777; margin:6px 0 0;">Asks this phone to join <b id="recoveryJoinSsid"></b>, the hotspot the regulator broadcasts in access-point mode. Its name and password live under Setup &#9656; System.</p>
@@ -22114,9 +21241,8 @@ function showRecoveryOptions() {
 }
 function retryConnection() {
     if (!IS_CAPACITOR && CAN_DISCOVER && !DEMO_MODE) {
-        // Reloading a dead address throws away the only page that can still find the regulator:
-        // the cross-origin /identify probes need a running page. Search instead, and leave the
-        // dialog up showing it — a unit that answers elsewhere navigates the tab itself.
+        // Reloading a dead address discards the only page that can run the cross-origin /identify probes.
+        // Search instead; a unit that answers elsewhere navigates the tab itself.
         const btn = document.querySelector('#recoveryDialog button[onclick="retryConnection()"]');
         if (btn) { btn.disabled = true; btn.textContent = 'Searching\u2026'; }
         window._rediscoveryTried = false;
@@ -22161,10 +21287,8 @@ function enterOfflineMode() {
     });
 }
 
-// Called from the SSE 'open' handler when a reconnect succeeds after the user
-// had clicked "Continue Offline". Mirrors enterOfflineMode's selectors so the
-// same set of elements is re-enabled. The connection dot itself is reset by
-// updateInlineStatus(true) which the 'open' handler already calls.
+// Called from the SSE 'open' handler after "Continue Offline". Mirrors enterOfflineMode's selectors; the
+// connection dot is reset by updateInlineStatus(true) in that handler.
 function exitOfflineMode() {
     if (!isOfflineMode) return;
     isOfflineMode = false;
@@ -22244,10 +21368,8 @@ function validateSettings() {
 }
 
 
-// Reads the ten breakpoint rows as the firmware does: row 0 always counts, later rows only
-// while RPM is non-zero, and the first zero ends the table (5_functions.ino fuelRate_GPH).
-// Burn values come back in the DISPLAY unit, not gallons — for the curve and the row
-// highlight only. The gallons truth is _fuelGphShadow.
+// Reads rows as the firmware does (5_functions.ino fuelRate_GPH): row 0 always, later rows while RPM > 0, first
+// zero ends. Burn values are in the DISPLAY unit (curve + highlight only); the gallons truth is _fuelGphShadow.
 function readFuelTablePoints() {
     const pts = [];
     for (let i = 0; i < 10; i++) {
@@ -22441,22 +21563,6 @@ function setupInputValidation() {
     }, 100); // Small delay to ensure all data is loaded
 }
 //Dynamic adjustment factors
-function resetDynamicShuntGain() {
-    if (!settingsUnlocked) {
-        xAlert("Please unlock controls first");
-        return;
-    }
-
-    const formData = new FormData();
-    formData.append("ResetDynamicShuntGain", "1");
-
-    fetchWithTimeout(buildURL("/get?" + new URLSearchParams(formData).toString()), {}, 8000)
-        .then(() => {
-            //   diagLog("SOC gain factor reset requested");
-        })
-        .catch(err => diagError("Reset failed:", err));
-}
-
 function resetDynamicAltZero() {
     if (!settingsUnlocked) {
         xAlert("Please unlock controls first");
@@ -22474,9 +21580,8 @@ function resetDynamicAltZero() {
 }
 
 
-// Small cloud-state badge on the Charging System Health + Speed (boat performance) panels. Uses signals the
-// dashboard already has — currentMode (AP=1) and the CloudFeatures toggle. Local-only states are grey;
-// cloud-on is green. (A "synced N ago" upgrade would need a firmware sync-timestamp — not wired yet.)
+// Small cloud-state badge on the Charging System Health + Speed (boat performance) panels, from currentMode
+// (AP=1), the CloudFeatures toggle and each panel's live syncAgoS. Local-only states are grey; cloud-on is green.
 function updateCloudStatus() {
     const ap = (window._lastKnownMode === 1);   // 1 = Access Point
     const cb = document.getElementById('CloudFeatures_checkbox');
@@ -22498,9 +21603,8 @@ function updateCloudStatus() {
     set('perf-cloud-status', (typeof perfLive !== 'undefined') ? perfLive.syncAgoS : null);
 }
 
-// Cloud off used to HIDE this tab, which read as "my regulator doesn't have that feature".
-// It now stays visible and greyed; body.cloud-off swaps its panels for the .gate-note-cloud
-// explanation (styles.css), so landing on it is informative instead of a wall of failing iframes.
+// Cloud off keeps this tab visible and greyed (hidden reads as "feature missing"); body.cloud-off swaps its
+// panels for the .gate-note-cloud explanation (styles.css).
 function updateCloudFeaturesTabVisibility(enabled) {
     document.body.classList.toggle('cloud-off', !enabled);
     const cloudTab = document.querySelector('.main-tab[onclick*="cloudfeatures"]');
@@ -22523,11 +21627,9 @@ function updateCloudFeaturesToggleState(currentMode) {
     updateUploadNowButtonState(currentMode);
 }
 
-// "Upload Now" (forceCloudFlush) is a dead button unless cloud uploads can actually happen:
-// the loop() drain is gated behind CloudFeatures==1 + client mode + WiFi. So gray it out in
-// AP mode (no internet) OR when Cloud Features is OFF. Records keep buffering either way and
-// upload automatically once on WiFi with cloud on; "Clear" stays enabled (purely local wipe).
-// mode is optional — falls back to the last known currentMode for cloud-toggle/CSV callers.
+// "Upload Now" (forceCloudFlush) needs CloudFeatures==1 + client mode + WiFi (the loop() drain gate), so grey it
+// in AP mode or with cloud off. Records keep buffering either way; "Clear" stays enabled (purely local wipe).
+// mode is optional; falls back to the last known currentMode.
 function updateUploadNowButtonState(mode) {
     const uploadBtn = document.getElementById('cloudUploadNowBtn');
     if (!uploadBtn) return;
@@ -22555,9 +21657,7 @@ function drawGlyphs() {
     const svg = document.getElementById('glyphOverlay');
     if (!wrap || !svg) return;
 
-    // Read ALL rects before any DOM write to avoid repeated forced reflows.
-    // getBoundingClientRect after innerHTML='' forces a synchronous layout on
-    // every call because the DOM is dirty — reading first keeps it one reflow.
+    // Read ALL rects before any DOM write: a read after innerHTML='' forces a synchronous layout per call.
     const br = wrap.getBoundingClientRect();
     const glyphTeal = getComputedStyle(document.documentElement).getPropertyValue('--glyph-teal');
     const glyphBlack = getComputedStyle(document.documentElement).getPropertyValue('--glyph-black');
@@ -22734,10 +21834,9 @@ function updateLifeIndicators(data) {
 }
 
 
-// Open-loop field modes (manual / limp-home) command duty directly, bypassing the current-limiting
-// loop. Each duty-percent drives the field class / winding times as hard as on a 12V system (4× for a 12 V
-// winding at 48V, 1× for a bus-rated one), so a duty that's safe at 12V can over-current a 12 V winding on a
-// higher bank. Returns a paragraph to append to the mode's own warning, or '' when the ratio is 1.
+// Open-loop field modes (manual / limp-home) command duty directly, bypassing the current loop. A 12 V winding on a
+// higher bank is driven k× harder per duty-percent (4× at 48 V, 1× for a bus-rated winding), so a duty safe at 12 V
+// can over-current it. Returns a paragraph for the mode's warning, or '' when the ratio is 1.
 function openLoopHighVoltageNote() {
     const nsv = parseInt(window._nominalStored, 10) || 12;
     const k = 1 / webFieldScale(false);
@@ -22749,14 +21848,10 @@ function openLoopHighVoltageNote() {
         + 'output current.';
 }
 
-// (The limp-home warning is now the summary box of the Run Without Failed Sensors screen — rwfsSummary.)
-
 // ===== Run Without Failed Sensors (SENSOR_FAULTS_AND_OPTIONAL_SENSORS_SPEC.md §2.6, §4.6-§4.8, §6) =====
-// One data model for the Setup > System card, the #sensor-banner header line, the modal and the
-// commissioning Prep gate. Inputs: the CSV3 settings echo (the six override keys + the two numbers, and
-// IgnitionOverride for the engine-speed acknowledgement), CSV2 (sensorFaultMask, battTempState, limpTier,
-// sensorSteadyMask) and CSV1 (fieldEventReason).
-// IgnitionOverride is a Setup > Engine setting, not a sensor override (owner 2026-10-11): no row here.
+// One model for the Setup > System card, #sensor-banner, the modal and the commissioning Prep gate. Inputs: CSV3
+// (override keys, numbers, IgnitionOverride), CSV2 (sensorFaultMask, battTempState, limpTier, sensorSteadyMask), CSV1
+// (fieldEventReason). IgnitionOverride is a Setup > Engine setting, not a sensor override: no row here.
 const RWFS_KEYS = ['IgnoreTemperature', 'IgnoreRPM', 'IgnoreAltCurrent', 'IgnoreBattVMain', 'IgnoreBattV2', 'LimpHome'];
 const rwfsFlags = { IgnoreTemperature: 0, IgnoreRPM: 0, IgnoreAltCurrent: 0, IgnoreBattVMain: 0, IgnoreBattV2: 0, LimpHome: 0,
                     LimpDutyPct: 30, NoRpmCurrentA: 0, seen: false };
@@ -22796,9 +21891,8 @@ function rwfsMainVText(d) {
     if (!ign2) return 'Charging stays off: the second battery voltage is not reading, so there is no voltage to run on. Tick Second battery voltage as well for plain fixed field duty with no usable battery voltage, or wait for that reading to return.';
     return 'Plain fixed field duty with no usable battery voltage (the second reading is ignored too): no fast over-voltage cut, no timed over-voltage tiers, no INA228 firmware latch, no plausibility or disagreement checks, no charge stages, and the regulator\'s own drive-heat limit freezes at its last value. Only the INA228 hardware alert remains.';
 }
-// §11 mirror of the firmware's required-fault set: the fault mask expanded to SENSORS (a dead chip is every
-// reading it carries), minus the owner's overrides and Not fitted. NAMES only; the count comes from the
-// firmware in CSV2 (reqFaultCount).
+// §11 mirror of the firmware's required-fault set (a dead chip faults every reading it carries; minus overrides
+// and Not fitted). NAMES only; the count comes from CSV2 reqFaultCount.
 const RWFS_BIT_NAMES = ['alternator temperature', 'engine speed', 'alternator current', 'main battery voltage', 'second battery voltage', 'battery voltage readings disagree', 'battery temperature', 'ADS1115 analog input chip', 'INA228 battery monitor chip', 'regulator drive temperature (INA228)'];
 function rwfsThermistorSelected() { return Number(g_lastCsv3 && g_lastCsv3.TempSource) === 1; }
 function rwfsCountedBits() {
@@ -22827,28 +21921,30 @@ function rwfsFaultNames(bits) {
     if (b & (1 << 9)) out.push(RWFS_BIT_NAMES[9]);
     return out.join(', ');
 }
-// Which rows a fault points at (outline + "This is what stopped charging"); pretick = tick the box when opened
-// from the banner; note = a line under the rows. Reason-specific first, where the reason carries information the
-// mask does not (a disagreement or a tach-lie involves two readings); otherwise every counted failed sensor is
-// outlined and the box is pre-ticked only for a single fault (two or more is the owner's choice of which to drop).
+// Rows a fault points at (outline), pretick (when opened from the banner), note (line under the rows). Reason-specific
+// first where the reason says more than the mask (disagreement, tach-lie: two readings); otherwise outline every counted
+// fault and pretick only a single one (with two or more, which to drop is the owner's choice).
 function rwfsCauseFor(r) {
+    // Rows by key, never by position: indices shift when a row is removed.
+    const R = k => RWFS_ROWS.findIndex(row => row.key === k);
+    const TEMP = R('IgnoreTemperature'), RPM = R('IgnoreRPM'), ALTI = R('IgnoreAltCurrent'), V1 = R('IgnoreBattVMain'), V2 = R('IgnoreBattV2');
     switch (r) {
-        case 2: case 3: case 4: return (rwfsMask & 1) ? { rows: [0], pretick: true } : { rows: [], pretick: false };
+        case 2: case 3: case 4: return (rwfsMask & 1) ? { rows: [TEMP], pretick: true } : { rows: [], pretick: false };
         case 19: return (rwfsFlags.IgnoreRPM === 1)
             // Engine speed already ignored: this cut is the only thing that stops the field when the engine stalls with
             // the key on, so ignoring the alternator current as well must not be the suggested way out.
-            ? { rows: [3], pretick: false, note: 'The field is driven hard but no alternator current is measured. Engine speed is already ignored, so this is an engine stopped with the key on, a dead alternator, or an open field circuit. Do not ignore the alternator current as well: this cut is the only thing that stops the field when the engine stalls with the key on.' }
-            : { rows: [1, 3], pretick: false, note: 'The field is driven hard but no alternator current is measured: a false engine-speed signal, a current sensor stuck at zero, or an open field circuit / dead alternator. Run without the one you can rule out.' };
-        case 5:  return { rows: [4, 5], pretick: false, note: 'Both battery-voltage readings are outside the plausible range.' };
-        case 6: case 8: return { rows: [4, 5], pretick: false, note: 'The two battery-voltage readings disagree. Run without the one you trust less.' };
-        case 32: return { rows: [4], pretick: false, note: 'The regulator\'s drive temperature (read from the INA228 chip) is lost, and the field-drive heat protection depends on it. The only way to run without it is to run without the INA228 chip, which also drops the main battery voltage.' };
+            ? { rows: [ALTI], pretick: false, note: 'The field is driven hard but no alternator current is measured. Engine speed is already ignored, so this is an engine stopped with the key on, a dead alternator, or an open field circuit. Do not ignore the alternator current as well: this cut is the only thing that stops the field when the engine stalls with the key on.' }
+            : { rows: [RPM, ALTI], pretick: false, note: 'The field is driven hard but no alternator current is measured: a false engine-speed signal, a current sensor stuck at zero, or an open field circuit / dead alternator. Run without the one you can rule out.' };
+        case 5:  return { rows: [V1, V2], pretick: false, note: 'Both battery-voltage readings are outside the plausible range.' };
+        case 6: case 8: return { rows: [V1, V2], pretick: false, note: 'The two battery-voltage readings disagree. Run without the one you trust less.' };
+        case 32: return { rows: [V1], pretick: false, note: 'The regulator\'s drive temperature (read from the INA228 chip) is lost, and the field-drive heat protection depends on it. The only way to run without it is to run without the INA228 chip, which also drops the main battery voltage.' };
         default: break;
     }
     const f = rwfsCountedBits();
     const rows = [];
     RWFS_ROWS.forEach((row, i) => { if (row.bit >= 0 && (f & (1 << row.bit))) rows.push(i); });
-    if (f & (1 << 5)) { if (!rows.includes(4)) rows.push(4); if (!rows.includes(5)) rows.push(5); }
-    if ((f & (1 << 9)) && !rows.includes(4)) rows.push(4);   // drive temperature has no row; its only override is Main battery voltage (the INA228 chip)
+    if (f & (1 << 5)) { if (!rows.includes(V1)) rows.push(V1); if (!rows.includes(V2)) rows.push(V2); }
+    if ((f & (1 << 9)) && !rows.includes(V1)) rows.push(V1);   // drive temperature has no row; its only override is Main battery voltage (the INA228 chip)
     return { rows, pretick: rows.length === 1 && rwfsReqCount === 1 };
 }
 function rwfsBattTempState() { return (g_lastCsv2 && g_lastCsv2.battTempState !== undefined) ? Number(g_lastCsv2.battTempState) : NaN; }
@@ -22948,10 +22044,9 @@ function rwfsActiveList() {
 }
 function rwfsModalOpen() { const ov = document.getElementById('rwfs-modal-overlay'); return !!ov && ov.style.display === 'flex'; }
 
-// Header line, driven by the firmware's required-fault set (CSV2 sensorFaultMask + reqFaultCount),
-// not by the one reason the ladder shows: two or more faults are named together, and a fault that lands with the
-// key off is still named (quiet style). No automatic run exists (owner ruling 2026-10-02): a fault stops charging
-// until it reads again or the owner chooses Options. Then: a sensor reading again after an override > any override active.
+// Header line from the firmware's required-fault set (CSV2 sensorFaultMask + reqFaultCount), not the ladder's one
+// reason: multiple faults are named together; a key-off fault is named quietly. No automatic run exists: a fault stops
+// charging until it reads again or the owner picks Options. Then: reading again after an override > any override active.
 function updateSensorBanner() {
     const el = document.getElementById('sensor-banner');
     if (!el) return;
@@ -23263,10 +22358,9 @@ function rwfsCommissioningBlock() {
     return '';
 }
 
-// Everything manual mode stops enforcing, in the firmware's own priority order (selectFieldControlMode
-// in 6_functions.ino returns MODE_NORMAL_MANUAL at PRIORITY 2, above every check below it) plus the
-// field floor, which governor_apply skips for manual. Keep this list in step with that function —
-// a warning that under-states the bypass list is worse than no warning.
+// Everything manual mode stops enforcing, in the firmware's priority order (selectFieldControlMode in 6_functions.ino,
+// MODE_NORMAL_MANUAL at PRIORITY 2) plus the field floor governor_apply skips for manual. Keep in step with that
+// function: a warning that under-states the bypass list is worse than none.
 function manualFieldBypassText() {
     return 'Manual mode drives the field straight from the Manual Field PWM box. It is a bench and '
         + 'diagnostic mode: while it is on, the regulator stops protecting the alternator and the battery.\n\n'
@@ -23288,10 +22382,8 @@ function manualFieldBypassText() {
         + openLoopHighVoltageNote();
 }
 
-// Entering manual is the only switch in the app that REMOVES protections, so it asks first and puts
-// the switch back if the answer is no. Leaving manual (back to Auto) always goes straight through.
-// The confirm has to run before handleUserToggle, or a cancel would leave a pending desired value
-// behind that the next settings echo would fight.
+// Entering manual REMOVES protections, so confirm first and restore the switch on no; leaving goes straight through.
+// The confirm runs before handleUserToggle, or a cancel leaves a pending desired value the next echo would fight.
 function manualFieldToggleChanged(cb) {
     if (!cb) return;
     const wantManual = !cb.checked;                           // checked = Auto; the position just chosen
@@ -23315,11 +22407,9 @@ function manualFieldToggleApply(cb, manual) {
     if (!handleManualFieldToggle('ManualFieldToggle_checkbox')) return;
     syncSegmented('ManualFieldToggle_checkbox');
     if (DEMO_MODE) return;
-    // fetch, not the hidden-iframe form submit: a submit has no timeout, so on a stalled link it can
-    // land minutes later and flip the mode after the user's next press, and its answer is invisible.
-    // src/n let the firmware log the sender and drop a write that arrives out of order (same tag and
-    // guard as the master switch). A REFUSAL repaints from the last echo and is never re-sent; only a
-    // silent failure is retried, by sendControlWrite, which reuses this url so n never changes.
+    // fetch, not the hidden-iframe submit: a submit has no timeout, can land minutes later and flip the mode after the
+    // next press, and its answer is invisible. src/n tag as for the master switch. A REFUSAL repaints from the last echo
+    // and is never re-sent; only a silent failure is retried (sendControlWrite reuses this url, so n never changes).
     const v = manual ? 1 : 0;
     const repaint = () => {
         pendingToggles.delete('ManualFieldToggle');
@@ -23373,12 +22463,8 @@ function handleManualFieldToggle(checkboxId) {
 }
 
 // ===== Segmented A/B controls =====
-// Render peer-choice settings (mode A vs mode B) as a segmented control instead of
-// an on/off slider, reusing the existing hidden checkbox plumbing untouched. The
-// visible buttons drive the hidden checkbox; firmware sync, pendingToggles, the
-// onchange handler and form submit all still flow through that checkbox.
-// data-seg-for names the hidden checkbox; each button's data-checked is the
-// checked-state ("0"/"1") that button represents.
+// Peer-choice settings as segmented buttons driving the existing hidden checkbox (firmware sync, pendingToggles,
+// onchange and submit still flow through it). data-seg-for names the checkbox; data-checked is each button's state.
 function syncSegmented(checkboxId) {
     const cb = document.getElementById(checkboxId);
     if (!cb) return;
@@ -23436,11 +22522,8 @@ function getEchoText(id, fallback = '?') {
 }
 
 // ── "s" signal-info badges (Protections + Setup▸Diag) ────────────────────────────────────
-// Each badge states: the signal a setting acts on / is compared to, the physical source
-// (INA228 / ADS1115 / on-chip ADC / PWM command / temp sensor), the filter and its time
-// constant, and where the value gets set. Content is built from the SAME echo spans the
-// settings UI already maintains, so it is regenerated on open and re-rendered on every
-// CSV3 / AltSettings frame while a box is open — live values stay hot without new telemetry.
+// Each states the signal, physical source, filter/time constant and where it is set. Built from the settings echo
+// spans, re-rendered on open and on every CSV3 / AltSettings frame while open, so live values need no new telemetry.
 let _sinfoOpenN = 0;
 
 function sinfoRender(el) {
@@ -23811,9 +22894,8 @@ let pidTuningSeriesVisible = {
 
 function initPidTuningDataStructures() {
     const intervalMs = window._lastKnownInterval || 200;
-    // Buffer ALWAYS holds the full 5 min (LIVE_BUFFER_SEC), independent of the selected X window (xTime) —
-    // so switching to 5M always has history and a window change never reallocates or loses data. The
-    // x-scale range fn (in initPidTuningPlot) draws only the selected window. Mirrors the main live plots.
+    // Buffer ALWAYS holds LIVE_BUFFER_SEC regardless of the X window (xTime), so a window change never reallocates
+    // or loses data; the x-scale range fn in initPidTuningPlot draws only the selected window.
     const maxPoints = Math.ceil(LIVE_BUFFER_SEC * 1000 / intervalMs);
 
     if (maxPoints <= 0 || maxPoints > 10000 || isNaN(maxPoints)) {
@@ -23846,9 +22928,8 @@ function initPidTuningDataStructures() {
 // the left amps axis persists on the regulator as yyMin/yyMax).
 let pidDutyRange = null;
 try { pidDutyRange = JSON.parse(localStorage.getItem('pidDutyRange')) || null; } catch (e) { }
-// Auto checkbox state for the PID plot's left amps axis. When on, the amps axis
-// auto-fits the data instead of using the firmware yyMin/yyMax. pidAmpsLock pins
-// the auto range at a frozen value (lock button) while auto stays on.
+// pidAmpsAuto: the amps axis auto-fits the data instead of firmware yyMin/yyMax; pidAmpsLock pins that auto range
+// (lock button) while auto stays on.
 let pidAmpsAuto = localStorage.getItem('pidAmpsAuto') === 'true';
 let pidAmpsLock = null;   // [min,max] frozen by the lock button, or null
 
@@ -23908,17 +22989,14 @@ function initPidTuningPlot() {
             x: {
                 time: false,
                 auto: false,
-                // fn (not static array) so setData(...) re-runs it after rebuildPidTuningWindow
-                // resizes the buffer — re-windows in place with no destroy/recreate.
-                // Fixed [-width, 0] with the right edge pinned at 0, NOT data-driven [x[0], x[last]]:
-                // applyInterp() slides x[last] left then snaps it back each packet, which a data-driven
-                // range renders as an x-axis tick shiver. Width derived from the buffer tracks the window.
+                // fn so setData() re-runs it after rebuildPidTuningWindow resizes the buffer. Fixed [-w, 0], NOT data-driven:
+                // applyInterp() slides x[last] left then snaps it back each packet, which a data-driven range renders as
+                // an x-axis tick shiver.
                 range: () => { const w = (xTime && xTime > 0) ? xTime : 30; return [-w, 0]; }   // selected window, NOT buffer span — 5-min buffer holds history, this draws the visible slice
             },
             amps: {
-                // Default auto (NOT auto:false): uPlot only refreshes the data min/max it
-                // passes here when the scale is auto, which the auto-fit branch needs.
-                // Manual (auto off) returns the firmware yyMin/yyMax; lock pins the frozen range.
+                // Default auto (NOT auto:false): uPlot only passes fresh data min/max when the scale is auto, which
+                // auto-fit needs. Manual returns firmware yyMin/yyMax; lock pins the frozen range.
                 range: (u, mn, mx) => pidAmpsLock ? pidAmpsLock
                     : (pidAmpsAuto ? stableAutoRange(mn, mx, 0.1) : [yyMin, yyMax])
             },
@@ -23987,11 +23065,8 @@ function initPidTuningPlot() {
 
     pidTuningPlot = new uPlot(opts, pidTuningData, plotEl);
 
-    // Corner auto checkbox + lock — same convention as the Plots tab. The checkbox
-    // drives the left Current axis: checked = auto-fit, unchecked = the firmware
-    // yyMin/yyMax. Checking also returns the right Duty axis to its default range.
-    // Lock freezes the current auto range while data streams. The checkbox is the
-    // only way back to auto-fit — no hidden clear-the-box gesture.
+    // Corner auto checkbox + lock (Plots-tab convention): checked = auto-fit the Current axis, unchecked = firmware
+    // yyMin/yyMax; checking also resets the Duty axis. Lock freezes the auto range; the checkbox is the only way back.
     plotEl.style.position = 'relative';
     const exPidAs = plotEl.querySelector('.autoscale-ctrl'); if (exPidAs) exPidAs.remove();
     pidAmpsLock = null;
@@ -24054,11 +23129,8 @@ function initPidTuningPlot() {
     ]);
 }
 
-// Resize the PID rolling window WITHOUT recreating the plot: rebuild the x axis at
-// the new length, right-align the newest overlapping samples (shrink keeps the newest
-// tail; grow pads the past with zeros), and let setData re-run the range fns. The plot
-// DOM, autoscale/lock controls, legend, and Y-edit boxes all survive untouched.
-// (Mirrors rebuildCVTuningWindow — destroy/recreate flashed and jumped the plot.)
+// Resize the PID window WITHOUT recreating the plot (destroy/recreate flashed and jumped it): rebuild x, right-align
+// the newest overlapping samples (grow leaves the past null), setData re-runs the range fns. Mirrors rebuildCVTuningWindow.
 function rebuildPidTuningWindow() {
     const old = pidTuningData;
     initPidTuningDataStructures();
@@ -24270,10 +23342,7 @@ function interceptDualControlSubmissions() {
 function populateYearDropdown() {
     const yearSelect = document.querySelector('[name="BOAT_YEAR"]');
     if (yearSelect) {
-        // Range: 1900 floor (no real recreational boats older), current year + 5
-        // ceiling so the dropdown is still valid for the next 5 calendar years
-        // without a code change. Descending order puts the most-likely selections
-        // near the top. Default selection is the current calendar year.
+        // 1900 floor; current year + 5 ceiling so it stays valid without a code change. Default = current year.
         const currentYear = new Date().getFullYear();
         for (let year = currentYear + 5; year >= 1900; year--) {
             const option = document.createElement('option');
@@ -24324,11 +23393,9 @@ function groupInt(n) {
     return Math.abs(r) >= 10000 ? r.toLocaleString('en-US') : String(r);
 }
 
-// Integer readouts that must stay unpunctuated. RPM: a comma would appear at 10000 and walk the
-// banner width, and RPMID is parsed back out of the DOM. firmwareVersionInt: major*10000 +
-// minor*100 + patch, so "1,0,203" is not a version. The others are read back with parseInt off
-// textContent (BulkStage, WifiWakeSecondsRemaining, weatherDataValid, every systemID* result)
-// or are identifier halves.
+// Integer readouts that stay unpunctuated. RPM: a comma at 10000 walks the banner width, and RPMID is parsed back from
+// the DOM. firmwareVersionInt = major*10000 + minor*100 + patch. The rest are parseInt'd off textContent (BulkStage,
+// WifiWakeSecondsRemaining, weatherDataValid, systemID*) or are identifier halves.
 const NO_GROUP_KEYS = new Set([
     'RPM', 'RPMMax', 'RPMMax_AllTime', 'faDomRpm', 'faSesPkpkRpm',
     'wmIgn_RPM_hi', 'wmIgn_RPM_lo', 'currentRPMTableIndex',
@@ -24355,7 +23422,6 @@ function abbrevCount(n) {
 }
 
 // Auto-scale a seconds count into the most readable two-unit form.
-// < 60s → "45s", < 60m → "12m 34s", < 24h → "3h 45m", otherwise → "2d 3h".
 function formatSecondsAuto(seconds) {
     if (isNaN(seconds) || seconds === null || seconds === undefined || seconds < 0) return '-';
     const s = Math.floor(seconds);
@@ -24386,12 +23452,10 @@ function getLogNameSuffix() {
 }
 
 
-// One save path for the whole Download Logs batch — real payloads and error-marker
-// files alike, so every batch always produces the full file set. deliverFile gives
-// per-platform delivery + feedback; the batch accumulates (ready bar in iOS Safari,
-// cache files in the app) and is shared in one go.
+// One save path for the whole Download Logs batch, error-marker files included, so a batch is always the full set.
+// deliverFile handles per-platform delivery; the batch is shared in one go.
 function saveLogFile(name, text, mime = 'text/plain') {
-    deliverFile(name, text, mime);
+    return deliverFile(name, text, mime);
 }
 
 // Batch wrapper: the whole set rides ONE share sheet, and the batch is closed even if a
@@ -24405,32 +23469,39 @@ async function downloadLogsRun() {
     if (DEMO_MODE) return;   // deliberate no-op: log pulls hog a device that isn't there
     const ts = getLogTimestamp();
     const sfx = getLogNameSuffix();
-    // Commissioning-wizard rest hold rides a 2 s heartbeat; these transfers hog the device server
-    // and the cvlog binary→CSV conversion blocks the JS thread, so the interval timer can starve
-    // past the firmware dead-man — which drops the rest hold and the field ramps up mid-wizard.
-    // Ping manually between steps whenever the wizard is open.
+    // The wizard rest hold rides a 2 s heartbeat; these transfers hog the device server and cvlog conversion blocks JS, so
+    // the interval can starve past the firmware dead-man (rest hold drops, field ramps mid-wizard). Ping between steps.
     const wizardHb = () => { if (cxHeartbeatTimer) cxGet('commissionHeartbeat=1').catch(() => { }); };
-    // Pull the device CSVs one at a time. Firing them as concurrent native <a>
-    // downloads overran the ESP32 async server (stalled transfers → Chrome
-    // "resume"). Blob download also lets a.download win over the handler's
-    // Content-Disposition filename, so pidlog keeps its timestamp suffix.
+    // Sequential blob fetches: concurrent native <a> downloads overran the ESP32 async server. Blob also lets a.download
+    // beat the handler's Content-Disposition, so pidlog keeps its timestamp suffix.
+    // ring = a device log /resetlogs clears. It holds the only copy, so the reset waits until all three are retrieved and saved.
     const files = [
-        { href: '/thermallog.csv', name: `thermallog_${ts}${sfx}.csv` },
-        { href: '/pidlog.csv', name: `pidlog_${ts}${sfx}.csv` },
+        { href: '/thermallog.csv', name: `thermallog_${ts}${sfx}.csv`, ring: 'temperature' },
+        { href: '/pidlog.csv', name: `pidlog_${ts}${sfx}.csv`, ring: 'control-loop' },
+        // The bus log has rows only once NMEA 2000 has run: with it off now, a missing or header-only file is expected.
+        { href: '/n2kbuslog.csv', name: `n2kbuslog_${ts}${sfx}.csv`, optional: !(Number(g_lastCsv2 && g_lastCsv2.n2kBusVerdict) > 0) },
     ];
+    const saves = [];    // { saved: deliverFile promise, ring } for every file in this batch
+    const missed = [];   // rings that did not download
     for (const f of files) {
         const text = await fetchLogText(f.href);
         wizardHb();
-        // A failed fetch still emits the file with the failure named inside — a silently missing
-        // file cost a disaster's worth of evidence (2026-07-22 Safari session).
-        saveLogFile(f.name, text != null ? text
-            : `# ${f.href} download FAILED after retry (connection error) — data was NOT retrieved\n`, 'text/csv');
+        if (f.optional && (text == null || text.trim().split('\n').length < 2)) continue;
+        // A failed fetch still emits the file with the failure named inside: a silently missing file loses evidence.
+        saves.push({ ring: !!f.ring, saved: saveLogFile(f.name, text != null ? text
+            : `# ${f.href} download FAILED after retry (connection error) — data was NOT retrieved\n`, 'text/csv') });
+        if (f.ring && text == null) missed.push(f.ring);
     }
 
     // CV log is binary→CSV converted client-side — a device fetch too, so keep
     // it after the CSVs to avoid overlapping streams.
-    await downloadCvLog(ts, sfx);
+    const cv = await downloadCvLog(ts, sfx);
     wizardHb();
+    saves.push({ ring: true, saved: cv.saved });
+    if (!cv.retrieved) missed.push('voltage-tuning');
+    const missedList = missed.length < 3 ? missed.join(' and ')
+        : missed.slice(0, -1).join(', ') + ', and ' + missed[missed.length - 1];
+    const missedWhat = missedList + (missed.length > 1 ? ' logs' : ' log') + ' did not download';
 
     // Console file: device-side history ring first (survives page reloads and browser changes),
     // then this browser session's buffer. Always emitted.
@@ -24453,15 +23524,16 @@ async function downloadLogsRun() {
         }).join('\n');
     }
     const sessionText = getConsoleText();
-    saveLogFile(`console_${ts}${sfx}.txt`,
-        '=== Device console history (from the regulator, last 200 messages) ===\n'
+    saves.push({ ring: false, saved: saveLogFile(`console_${ts}${sfx}.txt`,
+        (missed.length ? '=== Device logs NOT cleared ===\nThe ' + missedWhat
+                         + ', so /resetlogs was not sent and the regulator still holds every log.\n\n' : '')
+        + '=== Device console history (from the regulator, last 200 messages) ===\n'
         + devSection
         + '\n\n=== This browser session ===\n'
-        + (sessionText || '(no messages received in this browser session)') + '\n');
+        + (sessionText || '(no messages received in this browser session)') + '\n') });
 
-    // Diagnostics snapshot (frozen dashboard state) as JSON, with the vessel record embedded —
-    // a log cannot be read without it (voltage class, alternator size, bank Ah + chemistry),
-    // and one file beats the separate vesselinfo_*.json this bundle used to add.
+    // Diagnostics snapshot JSON with the vessel record embedded: a log can't be read without it (voltage class,
+    // alternator size, bank Ah + chemistry).
     const snapObj = getDiagnosticsSnapshot();
     const vesselRaw = await fetchLogText('/vessel_info.json');
     wizardHb();
@@ -24471,12 +23543,19 @@ async function downloadLogsRun() {
     } catch (e) {
         snapObj.vessel_info = { error: '/vessel_info.json did not parse: ' + e.message };
     }
-    saveLogFile(`snapshot_${ts}${sfx}.json`, JSON.stringify(snapObj, null, 2), 'application/json');
+    saves.push({ ring: false, saved: saveLogFile(`snapshot_${ts}${sfx}.json`, JSON.stringify(snapObj, null, 2), 'application/json') });
 
-    setTimeout(() => {
-        fetch(buildURL('/resetlogs'), { method: 'POST' })
-            .catch(err => console.warn('Log reset failed:', err));
-    }, 5000);
+    // Waits on every file, not just the rings, so the verdict lands after the share sheet closes rather than behind it.
+    Promise.all(saves.map(s => s.saved)).then(ok => {
+        if (!missed.length && saves.every((s, i) => !s.ring || ok[i])) {
+            setTimeout(() => {
+                fetch(buildURL('/resetlogs'), { method: 'POST' })
+                    .catch(err => console.warn('Log reset failed:', err));
+            }, 5000);
+            return;
+        }
+        fileToast('Regulator logs not cleared: ' + (missed.length ? 'the ' + missedWhat : 'not every file was saved') + '.', 9000);
+    });
 }
 
 
@@ -24495,9 +23574,8 @@ function startLogs() {
         .catch(() => { });
 }
 
-// Paint the pause/resume toggle's visual state (dot color + label + the dataset
-// flag toggleLogs reads). Pure render — no reconciliation. Its dot carries the
-// state (pulsing green = recording, amber = paused), the label names the action.
+// Pure render of the pause/resume toggle (no reconciliation). The dot carries the state (pulsing green = recording,
+// amber = paused); the label names the action.
 function renderLoggingToggle(on) {
     g_loggingActive = on ? 1 : 0;  // remembered for the log-relay capture-state stamp
     const toggle = document.getElementById('logToggleBtn');
@@ -24507,10 +23585,8 @@ function renderLoggingToggle(on) {
     toggle.dataset.recording = on ? '1' : '0';   // so toggleLogs() knows which call to make
 }
 
-// Reflect live logging state (CSV2 slot 439). Honors a pending optimistic toggle
-// so a STALE echo (loggingActive only streams on CSV2's ~5s cadence) cannot snap
-// the button back to its pre-click state during the round-trip. Same pendingToggles
-// + deadline guard as faUpdatePauseBtn / updateSegToggle.
+// Live logging state (CSV2 slot 439). Honors a pending optimistic toggle so a STALE echo (~5 s CSV2 cadence) can't snap
+// the button back mid-round-trip. Same guard as faUpdatePauseBtn / updateSegToggle.
 function updateLoggingStatus(loggingActive) {
     const on = Number(loggingActive) === 1;
     const pending = pendingToggles.get('loggingActive');
@@ -24526,10 +23602,8 @@ function updateLoggingStatus(loggingActive) {
     renderLoggingToggle(on);
 }
 
-// Single button toggles pause/resume. Flips the button IMMEDIATELY (optimistic)
-// instead of waiting for the ~5s CSV2 echo — the old behavior left the button
-// looking dead for seconds, so a second "did it work?" click flip-flopped the
-// state and could leave logging silently paused for a whole session.
+// Flips IMMEDIATELY (optimistic) rather than waiting ~5 s for the CSV2 echo: a dead-looking button invites a second
+// click that flip-flops the state and can leave logging silently paused.
 function toggleLogs() {
     const toggle = document.getElementById('logToggleBtn');
     if (!toggle) return;
@@ -24540,21 +23614,15 @@ function toggleLogs() {
 }
 
 // ── Silent cloud log relay ────────────────────────────────────────────────
-// Fulfils an admin "pull" window. The admin opens a window by flagging the
-// device's cloud row (SQL). On its next poll this app fetches all logs from the
-// device over LAN, bundles + gzips them, and uploads to a private Supabase
-// Storage bucket via a signed URL. Fully silent, gated on cloud registration.
-// A failed upload leaves the window open → retried on the next poll.
-// The owner's Remote Diagnostics switch (Setup ▸ System) gates the poll on top of that,
-// independently of Cloud Features.
+// Fulfils an admin "pull" window (flagged on the device's cloud row): the next poll fetches all logs over LAN, gzips and
+// uploads them to a private Supabase Storage bucket via signed URL. Silent; gated on cloud registration and the owner's
+// Remote Diagnostics switch (independent of Cloud Features). A failed upload leaves the window open for the next poll.
 let g_cloudToken = null;
 let g_logRelayBusy = false;
 let g_loggingActive = 1;  // last-known Stop/Start state (1=recording, 0=user-paused); stamped into bundles
 let g_remoteDiagnostics = null;  // owner's Remote Diagnostics switch from the CSV3 echo; null = not echoed yet, so nothing is asked of the cloud
 
-// Adaptive poll cadence: 60s baseline while the app is open, ramps to 10s once a
-// log request is seen, and stays fast until 1hr passes with no new request. Lets a
-// rare support session (5-6 back-to-back pulls) feel snappy without 24/7 fast polling.
+// Adaptive cadence: a rare support session (5-6 back-to-back pulls) feels snappy without 24/7 fast polling.
 const LOG_POLL_SLOW_MS = 60000;           // baseline cadence
 const LOG_POLL_FAST_MS = 10000;           // burst cadence after a request is seen
 const LOG_POLL_FAST_WINDOW_MS = 3600000;  // stay fast until 1hr with no new request
@@ -24633,27 +23701,18 @@ async function fetchLogArrayBuffer(path) {
     } catch (e) { return null; }
 }
 
-// Frozen diagnostics snapshot — last-received telemetry objects, no device fetch.
-// csv1 = live numbers, csv2 = diagnostics/timing/health, csv3 = settings echo, ts = staleness ages.
-// NOTE: values are RAW as transmitted (display /N scaling is applied later per-field), so e.g.
-// BatteryV reads 1401, not 14.01 — see the CSV field map for per-field scale factors.
-// Age one cached block against CSV1's clock. Both stamps are device millis() as unsigned 32-bit, so
-// the subtraction is done in that arithmetic (>>> 0) and stays correct across the ~49-day wrap.
-// A block can legitimately be NEWER than the reference — only one channel sends per loop iteration,
-// so CSV4/CSV2/CSV3/TS routinely land a few ms after the last CSV1 — and that lands in the top half
-// of the unsigned range. Report those as 0 rather than 4.29 billion, which would flag every capture.
+// Age a cached block against CSV1's clock in unsigned 32-bit millis() arithmetic (>>> 0), correct across the ~49-day
+// wrap. A block can be NEWER than CSV1 (one channel sends per loop iteration), landing in the top half of the range:
+// report 0, not 4.29 billion.
 function deviceAgeMs(blockSendMs, refSendMs) {
     const b = Number(blockSendMs), r = Number(refSendMs);
     if (!Number.isFinite(b) || !Number.isFinite(r)) return null;
     const d = (r - b) >>> 0;
     return d > 0x80000000 ? 0 : d;
 }
-// One row per channel: is this cached block from the live run, and how old is it?
-// device_age_ms is authoritative but only exists if the block parsed at least once; client_age_ms is
-// this browser's own clock since that block last arrived and is the only signal when a channel is
-// being rejected outright. `stale` is true if EITHER exceeds the channel budget, or the block is from
-// a different boot than CSV1 — the settings echo disagreeing with the live log is exactly the trap
-// this exists to make visible (2026-08-21: a pre-OTA CSV3 read PidKi 3.808 while the loop ran 5.0515).
+// Per channel: is this cached block from the live run, and how old? device_age_ms is authoritative once the block has
+// parsed; client_age_ms is the only signal while a channel is rejected outright. `stale` if EITHER exceeds the budget or
+// the boot differs from CSV1: a stale settings echo disagreeing with the live log is the trap this exposes.
 function buildStreamFreshness() {
     const blocks = { csv1: g_lastCsv1, csv2: g_lastCsv2, csv3: g_lastCsv3, csv4: g_lastCsv4, ts: g_lastTs };
     const refSession = g_lastCsv1 ? Number(g_lastCsv1.sessionId) : null;
@@ -24692,14 +23751,9 @@ function buildStreamFreshness() {
     return out;
 }
 
-// Frozen diagnostics snapshot — last-received telemetry objects, no device fetch.
-// csv1 = live numbers, csv2 = diagnostics/timing/health, csv3 = settings echo, csv4 = nav/wind/solar,
-// ts = staleness ages. Each block is cached independently and can be stale on its own, so `freshness`
-// carries the per-block verdict — read it before trusting any value here against a same-click log.
-// NOTE: values are RAW as transmitted (display /N scaling is applied later per-field), so e.g.
-// BatteryV reads 1401, not 14.01 — see the CSV field map for per-field scale factors.
-// One exception: the firmware's "not available" sentinel (ROLL_EMPTY, -2000000000) is rewritten to
-// NaN at parse time and so serialises here as JSON null. A null means no reading, not a zero.
+// Frozen last-received telemetry (no device fetch). Blocks are cached independently and can be stale alone: read
+// `freshness` before trusting a value against a same-click log. Values are RAW as transmitted (BatteryV 1401, not 14.01),
+// except the ROLL_EMPTY sentinel (-2000000000), NaN'd at parse and serialised as null: no reading, not zero.
 function getDiagnosticsSnapshot() {
     return {
         captured_at: new Date().toISOString(),
@@ -24734,11 +23788,12 @@ async function pollLogRequest() {
 
         g_logRelayBusy = true;
 
-        // Fetch every log from the device over LAN (tolerate individual failures).
-        // SEQUENTIAL, matching downloadLogs(): 13 concurrent transfers overran the ESP32 async
-        // server (stalled/reset connections), silently dropping files from the support bundle.
-        // Small text first, large binaries last.
+        // Fetch every log over LAN SEQUENTIALLY, tolerating individual failures: concurrent transfers overran the ESP32
+        // async server and silently dropped files. Small text first, large binaries last.
         const debugText   = await fetchLogText('/debug');            // diagnostics dump (net-task cores, loop profiler sections)
+        // Bus recording starts after /debug (its PSRAM figures must not include the 160 KB ring) and records while the
+        // fetches below run, so most of its 10 s costs no extra time. Never throws.
+        const canCapRun   = await logRelayCanCaptureStart();
         const vesselInfo  = await fetchLogJson('/vessel_info.json'); // boat/alternator/battery config + identity
         const systemid    = await fetchLogJson('/systemidlog');
         const tuning      = await fetchLogJson('/tuninglog');
@@ -24751,9 +23806,13 @@ async function pollLogRequest() {
         const faflipBuf   = await fetchLogArrayBuffer('/faflip.bin');    // Reference Flipbook (FFLP) — parsed to per-page metadata-rich CSV below
         const cvB64       = await fetchLogBase64('/cvlog.bin');
         const longtermB64 = await fetchLogBase64('/longTermPlots.bin');  // multi-day trend ring (whole-trip context)
+        const n2kbuslog   = await fetchLogText('/n2kbuslog.csv');        // per-minute NMEA 2000 bus health, 24 h
+        const canCap      = await logRelayCanCaptureFinish(canCapRun);   // { text, status }; text null when skipped or failed
 
         const logsIncluded = [];
         const logs = {};
+        if (n2kbuslog != null) { logs.n2kbuslog = n2kbuslog; logsIncluded.push('n2kbuslog'); }
+        if (canCap.text != null) { logs.can_capture = canCap.text; logsIncluded.push('can_capture'); }
         if (thermal != null) { logs.thermal = thermal; logsIncluded.push('thermal'); }
         if (pid != null) { logs.pid = pid; logsIncluded.push('pid'); }
         if (cvB64 != null) { logs.cv_base64 = cvB64; logsIncluded.push('cv'); }
@@ -24761,9 +23820,8 @@ async function pollLogRequest() {
         if (tuning != null) { logs.tuning = tuning; logsIncluded.push('tuning'); }
         if (cvtuning != null) { logs.cvtuning = cvtuning; logsIncluded.push('cvtuning'); }
         if (famatrix != null) { logs.famatrix = famatrix; logsIncluded.push('famatrix'); }
-        // Oscilloscope + reference-flipbook waveforms as metadata-rich CSV (commented header with
-        // per-capture RPM/temp/time + both raw and boxcar-16 filtered columns) — the same content the
-        // Download CSV buttons produce, lossless at mV resolution and self-describing without the blob.
+        // Scope + flipbook waveforms as metadata-rich CSV (same content as the Download CSV buttons): lossless at mV
+        // resolution and self-describing without the blob.
         if (fascopeBuf) {
             const sd = parseFastScope(fascopeBuf);
             if (sd && sd.count) { logs.fastscope_csv = buildFaScopeCsv(sd); logsIncluded.push('fastscope'); }
@@ -24811,6 +23869,7 @@ async function pollLogRequest() {
                 logs_included: logsIncluded,
                 compressed: canGzip,
                 logging_paused: (Number(g_loggingActive) !== 1),  // true = user froze logs (deliberate capture); false = live rolling window
+                can_capture: canCap.status,   // 'included', or why the 10 s bus recording is missing
             },
             config_echo: g_lastCsv3 || null,
             logs: logs,
@@ -24866,6 +23925,316 @@ async function pollLogRequest() {
 document.addEventListener('DOMContentLoaded', () => {
     g_logPollTimer = setTimeout(pollLogRequest, 8000);
 });
+
+// ── NMEA 2000 bus health (CSV2), device roster (/n2kNodes), bus recording (/canCapture) ──
+const N2K_BUS_WORDS = ['Off', 'Connected', 'Nothing heard', 'Receive errors', 'Nobody answering', 'Restarted after errors'];
+
+function n2kBusVerdictText(code, data) {
+    switch (code) {
+        case 1: {
+            const n = Number(data.n2kNodesHeard);
+            if (!Number.isFinite(n) || n < 1) return 'Connected.';
+            return 'Connected. ' + groupInt(n) + (n === 1 ? ' device' : ' devices') + ' on the bus.';
+        }
+        case 2: return 'Nothing heard on the bus yet.';
+        case 3: return 'Errors receiving from the bus. Check the two terminators (one at each end of the backbone) and the connectors.';
+        case 4: return 'No other device is acknowledging the regulator’s messages. Check for 12 V between pins 2 and 3 of the NMEA 2000 connector, and that the drop cable reaches the backbone.';
+        case 5: {
+            const n = Number(data.n2kBusOffCount);
+            const times = (!Number.isFinite(n) || n < 1) ? ''
+                : (n === 1 ? ' (once since startup)' : ' (' + groupInt(n) + ' times since startup)');
+            return 'The regulator’s NMEA 2000 controller shut down after repeated bus errors and restarted' + times + '. Check the cable and the bus power.';
+        }
+    }
+    return '';
+}
+
+function n2kBusOnCsv2(data) {
+    if (data.n2kBusVerdict === undefined) return;
+    const raw = Number(data.n2kBusVerdict);
+    const known = Number.isInteger(raw) && raw >= 0 && raw <= 5;
+    const code = known ? raw : 0;
+    const setText = (el, txt) => { if (el && el.textContent !== txt) el.textContent = txt; };
+
+    const box = document.getElementById('n2kBusHealth');
+    if (box) {
+        const wasHidden = box.style.display === 'none';
+        const disp = code > 0 ? '' : 'none';
+        if (box.style.display !== disp) box.style.display = disp;
+        const st = document.getElementById('n2kBusStatus');
+        if (st) {
+            if (st.dataset.v !== String(code)) st.dataset.v = String(code);
+            // Every text stays filled (hidden ones only invisible) so the shared cell keeps the longest one's height.
+            st.querySelectorAll('[data-code]').forEach(sp => {
+                const c = Number(sp.dataset.code);
+                setText(sp, n2kBusVerdictText(c, data));
+                sp.classList.toggle('on', c === code);
+            });
+        }
+        if (wasHidden && code > 0) n2kNodesKick();
+    }
+
+    setText(document.getElementById('li_n2kBusVerdict_ID'),
+        known ? N2K_BUS_WORDS[code] : (Number.isFinite(raw) ? 'Code ' + raw : '—'));
+    // Frames Received reaches millions over a long uptime, so it abbreviates like Messages Sent; the fault counts stay exact.
+    const count = (k, v) => {
+        const n = Number(v);
+        return (Number.isFinite(n) && n >= 0) ? (k === 'n2kRxFrames' ? abbrevCount(n) : groupInt(n)) : '—';
+    };
+    for (const k of ['n2kNodesHeard', 'n2kRxFrames', 'n2kTec', 'n2kRec', 'n2kBusOffCount', 'n2kRxLost']) {
+        setText(document.getElementById('li_' + k + '_ID'), count(k, data[k]));
+    }
+}
+
+// Devices on the bus: polls only while the disclosure is open and on screen. A hidden tick skips rather than
+// stopping the timer, so coming back to the tab resumes without a restart path; closing it stops the timer.
+let _n2kNodesTimer = null;
+let _n2kNodesBusy = false;
+let _n2kNodesHtml = null;   // last rendered body; null until the first successful read
+
+function n2kNodesVisible() {
+    if (document.visibilityState !== 'visible') return false;
+    const det = document.getElementById('n2kNodesDetails');
+    if (!det || !det.open || det.offsetParent === null) return false;
+    for (let el = det.parentElement; el; el = el.parentElement) {
+        if (el.tagName === 'DETAILS' && !el.open) return false;   // closed card: content-visibility can keep offsetParent
+    }
+    return true;
+}
+function n2kNodesToggle(det) {
+    if (det.open) {
+        if (!_n2kNodesTimer) _n2kNodesTimer = setTrackedInterval(() => { if (n2kNodesVisible()) n2kNodesFetch(); }, 5000);
+        n2kNodesFetch();
+    } else if (_n2kNodesTimer) {
+        clearTrackedInterval(_n2kNodesTimer);
+        _n2kNodesTimer = null;
+    }
+}
+function n2kNodesKick() {
+    if (n2kNodesVisible()) n2kNodesFetch();
+}
+document.addEventListener('visibilitychange', n2kNodesKick);
+// toggle does not bubble, but capture still reaches document: re-read when the NMEA 2000 card itself is reopened.
+document.addEventListener('toggle', e => {
+    const det = document.getElementById('n2kNodesDetails');
+    if (det && e.target !== det && e.target.open && e.target.contains && e.target.contains(det)) n2kNodesKick();
+}, true);
+
+async function n2kNodesFetch() {
+    if (_n2kNodesBusy || DEMO_MODE) return;
+    _n2kNodesBusy = true;
+    try {
+        const r = await fetchWithTimeout(buildURL('/n2kNodes'), { cache: 'no-store' }, 6000);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        n2kNodesRender(await r.json());
+    } catch (e) {
+        // A transient miss keeps the last good table; only a list that never loaded shows the failure.
+        if (_n2kNodesHtml === null) {
+            const body = document.getElementById('n2kNodesBody');
+            if (body) body.innerHTML = '<tr><td colspan="4" class="n2k-nodes-empty">'
+                + _cfgEsc('Could not read the device list: ' + canCapErrText(e)) + '</td></tr>';
+        }
+    } finally {
+        _n2kNodesBusy = false;
+    }
+}
+
+// model/sw/serial are strings other devices put on the bus: always escaped.
+function n2kNodesRender(j) {
+    const body = document.getElementById('n2kNodesBody');
+    if (!body) return;
+    const self = Number(j && j.self);
+    const nodes = (j && Array.isArray(j.nodes)) ? j.nodes.slice() : [];
+    nodes.sort((a, b) => Number(a.addr) - Number(b.addr));
+    const dash = '—';
+    const html = !nodes.length
+        ? '<tr><td colspan="4" class="n2k-nodes-empty">No devices heard yet.</td></tr>'
+        : nodes.map(n => {
+            const addr = Number(n.addr);
+            const model = String(n.model == null ? '' : n.model).trim();
+            const mfg = Number(n.mfg);
+            const sw = String(n.sw == null ? '' : n.sw).trim();
+            const serial = String(n.serial == null ? '' : n.serial).trim();
+            let name;
+            if (Number.isFinite(self) && addr === self) name = 'This regulator';
+            else if (model) name = _cfgEsc(model);
+            else name = 'Unknown device' + (Number.isFinite(mfg) && mfg > 0 ? ' (maker code ' + mfg + ')' : '');
+            const age = Number(n.ageS);
+            const ageTxt = (Number.isFinite(age) && age >= 0) ? '<span class="n2k-node-age">heard ' + owFmtAge(age) + ' ago</span>' : '';
+            return '<tr><td>' + (Number.isFinite(addr) ? addr : dash) + '</td>'
+                + '<td>' + name + ageTxt + '</td>'
+                + '<td>' + (sw ? _cfgEsc(sw) : dash) + '</td>'
+                + '<td>' + (serial ? _cfgEsc(serial) : dash) + '</td></tr>';
+        }).join('');
+    if (html !== _n2kNodesHtml) { body.innerHTML = html; _n2kNodesHtml = html; }
+}
+
+// Shared by Record Bus Traffic and the log relay. 409/503 refusals carry {"ok":0,"err":...}, so the body is
+// read whatever the status.
+function canCapErrText(e) {
+    const m = String((e && e.message) || e || '');
+    if ((e && e.name === 'AbortError') || /timeout/i.test(m)) return 'no answer from the regulator';
+    if (/failed to fetch|load failed|networkerror/i.test(m)) return 'the connection failed';
+    return m;
+}
+async function canCapJson(path, timeoutMs) {
+    const r = await fetchWithTimeout(buildURL(path), { cache: 'no-store' }, timeoutMs);
+    let j = null;
+    try { j = await r.json(); } catch (e) { }
+    if (!j || typeof j !== 'object') throw new Error('the regulator answered HTTP ' + r.status);
+    return j;
+}
+function canCapDeviceUid() {
+    return ((document.getElementById('profile-device-uid') || {}).textContent
+        || (document.getElementById('systemDeviceUID_ID') || {}).textContent || '').trim();
+}
+// The firmware's Content-Disposition name when this origin may read it (a cross-origin app request only
+// can if the header is exposed); otherwise the same pattern built here.
+function canCapFileName(resp) {
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(resp.headers.get('Content-Disposition') || '');
+    const fromHdr = m ? m[1].trim().replace(/[\\/:*?"<>|]/g, '-') : '';
+    if (fromHdr) return fromHdr;
+    const uid = canCapDeviceUid().replace(/[^A-Za-z0-9_-]/g, '') || 'unknown';
+    const d = new Date(), p = v => String(v).padStart(2, '0');
+    return 'xreg-can-' + uid + '-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate())
+        + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + '.log';
+}
+// The deadline covers the body too: fetchWithTimeout stops timing once headers arrive.
+async function canCapFetchFile(timeoutMs) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        try {
+            const r = await fetch(buildURL('/canCapture'), { cache: 'no-store', signal: ctrl.signal });
+            const text = await r.text();
+            if (r.ok) return { text: text, name: canCapFileName(r) };
+            throw new Error('the regulator answered HTTP ' + r.status);
+        } catch (e) {
+            if (attempt === 1) throw e;
+        } finally {
+            clearTimeout(timer);
+        }
+        await new Promise(res => setTimeout(res, 800));
+    }
+}
+const canCapSleep = ms => new Promise(res => setTimeout(res, ms));
+
+function canCapShow(text, frac, tone) {
+    const box = document.getElementById('canCapStatus');
+    if (!box) return;
+    if (box.style.display === 'none') box.style.display = '';
+    box.dataset.tone = tone || '';
+    const bar = box.querySelector('.can-cap-bar');
+    if (bar) bar.style.visibility = (frac == null) ? 'hidden' : 'visible';
+    const fill = document.getElementById('canCapBarFill');
+    if (fill && frac != null) fill.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + '%';
+    const t = document.getElementById('canCapText');
+    if (t && t.textContent !== text) t.textContent = text;
+}
+const canCapSentence = s => { s = String(s).trim(); return /[.!?]$/.test(s) ? s : s + '.'; };
+
+let _canCapBusy = false;
+async function canCaptureStart() {
+    if (DEMO_MODE) { xAlert('Demo mode: no regulator is connected, so there is nothing to record.'); return; }
+    if (_canCapBusy) return;
+    const inp = document.getElementById('canCapSeconds');
+    const s = Number(inp && inp.value);
+    if (!Number.isInteger(s) || s < 1 || s > 60) { canCapShow('Enter a duration from 1 to 60 seconds.', null, 'err'); return; }
+    const btn = document.getElementById('canCapBtn');
+    _canCapBusy = true;
+    if (btn) btn.disabled = true;
+    try {
+        canCapShow('Starting the recording.', 0);
+        let start;
+        try { start = await canCapJson('/canCapture?start=1&s=' + s, 6000); }
+        catch (e) { canCapShow('Recording not started: ' + canCapSentence(canCapErrText(e)), null, 'err'); return; }
+        if (Number(start.ok) !== 1) {
+            canCapShow('Recording not started: ' + canCapSentence(start.err ? String(start.err) : 'the regulator refused it'), null, 'err');
+            return;
+        }
+
+        const t0 = Date.now();
+        const deadline = t0 + (s + 15) * 1000;
+        let st = null;
+        let seenRecording = false;
+        while (true) {
+            if (Date.now() > deadline) { canCapShow('The recording did not finish in time.', null, 'err'); return; }
+            await canCapSleep(1000);
+            try { st = await canCapJson('/canCapture?status=1', 4000); } catch (e) { continue; }   // a missed poll is retried
+            if (st.state === 'ready') break;
+            if (st.state === 'recording') {
+                seenRecording = true;
+                const ms = Number(st.elapsedMs), frames = Number(st.frames), cap = Number(st.cap);
+                const secs = Number.isFinite(ms) ? Math.min(s, Math.floor(ms / 1000)) : 0;
+                const frac = Math.max(Number.isFinite(ms) ? ms / (s * 1000) : 0,
+                                      (Number.isFinite(frames) && cap > 0) ? frames / cap : 0);
+                canCapShow('Recording: ' + secs + ' of ' + s + ' s'
+                    + (Number.isFinite(frames) ? ', ' + groupInt(frames) + ' frames' : ''), frac);
+            } else if (seenRecording || Date.now() - t0 > 3000) {
+                canCapShow('The recording was cleared before it could be downloaded.', null, 'err');
+                return;
+            }
+        }
+
+        canCapShow('Downloading the recording.', 1);
+        let got;
+        try { got = await canCapFetchFile(30000); }
+        catch (e) { canCapShow('Could not download the recording: ' + canCapSentence(canCapErrText(e)), null, 'err'); return; }
+        deliverFile(got.name, got.text, 'text/plain');
+        fetchWithTimeout(buildURL('/canCapture?free=1'), {}, 5000).catch(() => { });
+
+        const frames = Number(st.frames), cap = Number(st.cap), secs = Number(st.elapsedMs) / 1000;
+        const dur = Number.isFinite(secs) ? ' over ' + (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + ' s' : '';
+        const full = Number.isFinite(frames) && cap > 0 && frames >= cap;
+        canCapShow('Recording ready: ' + (Number.isFinite(frames) ? groupInt(frames) + ' frames' : 'done') + dur + '.'
+            + (full ? ' It stopped early because it was full.' : ''), null, 'ok');
+    } finally {
+        _canCapBusy = false;
+        if (btn) btn.disabled = false;
+    }
+}
+
+// Log-relay half: a 10 s recording of its own, only while NMEA 2000 runs and no other recording is on the device.
+// Neither function throws; a failure becomes the meta.can_capture string and the rest of the bundle goes on.
+const LOG_RELAY_CANCAP_S = 10;
+async function logRelayCanCaptureStart() {
+    try {
+        if (!(Number(g_lastCsv2 && g_lastCsv2.n2kBusVerdict) > 0)) return { status: 'skipped: NMEA 2000 off' };
+        const st = await canCapJson('/canCapture?status=1', 4000);
+        if (st.state !== 'idle') return { status: 'skipped: a recording was already on the device (' + st.state + ')' };
+        const r = await canCapJson('/canCapture?start=1&s=' + LOG_RELAY_CANCAP_S, 6000);
+        if (Number(r.ok) !== 1) return { status: 'skipped: ' + (r.err || 'refused') };
+        return { started: true, t0: Date.now(), id: Number(r.id), status: 'started' };
+    } catch (e) {
+        return { status: 'skipped: ' + canCapErrText(e) };
+    }
+}
+async function logRelayCanCaptureFinish(run) {
+    if (!run || !run.started) return { text: null, status: (run && run.status) || 'skipped' };
+    let ours = true;
+    try {
+        const deadline = run.t0 + (LOG_RELAY_CANCAP_S + 15) * 1000;
+        let st = null;
+        while (true) {
+            try { st = await canCapJson('/canCapture?status=1', 4000); } catch (e) { st = null; }
+            if (st && st.state === 'idle') return { text: null, status: 'failed: recording cleared before download' };
+            // The owner's Record press after ours ended replaces the ring; a different id is theirs, so leave it.
+            if (st && Number(st.id) !== run.id) {
+                ours = false;
+                return { text: null, status: 'skipped: replaced by a recording the owner started' };
+            }
+            if (st && st.state === 'ready') break;
+            if (Date.now() > deadline) return { text: null, status: 'failed: not ready in time' };
+            await canCapSleep(1000);
+        }
+        const got = await canCapFetchFile(30000);
+        return { text: got.text, status: 'included' };
+    } catch (e) {
+        return { text: null, status: 'failed: ' + canCapErrText(e) };
+    } finally {
+        if (ours) { try { await fetchWithTimeout(buildURL('/canCapture?free=1'), {}, 5000); } catch (e) { } }
+    }
+}
 // ── Voltage Mode Greyout ─────────────────────────
 // stage: 1=bulk, 2=absorption, 3=float, 4=manual, 5=maintain, 6=target voltage, 7=idle, 0/other=off
 
@@ -24889,9 +24258,7 @@ let thermalLogPlots = [null, null, null, null];
 let thermalLogResizeObservers = [null, null, null, null];
 let thermalWindowMin = 30;
 
-// Per-plot Y-axis manual ranges for the thermal-log plots. null = auto-fit (the
-// default). Each plot has its own corner "auto" checkbox + on-plot edit boxes,
-// same self-contained model as every other plot — no external controls.
+// Per-plot Y manual ranges; null = auto-fit (default). Each plot has its own corner auto checkbox + on-plot edit boxes.
 let thermalY = { p0: { temp: null, amps: null }, p2: { amps: null } };
 
 // Legend checkbox visibility state (session only, not persisted)
@@ -24946,10 +24313,8 @@ function drawThermalWatermark(u) {
     ctx.restore();
 }
 
-// Direction bands for the (sign-flipped) PID decomposition plot: teal above zero =
-// more amps allowed, red below = amps being cut. Tints clamp at the zero crossing so
-// an autoscaled view that excludes zero tints as one regime; the corner labels are
-// pinned to the plot box (not the zero line) because the direction holds at any zoom.
+// Direction bands for the sign-flipped PID plot: teal above zero = more amps, red below = amps cut. Tints clamp at zero
+// so a view excluding zero tints as one regime; labels pin to the plot box since direction holds at any zoom.
 function drawThermalDirectionBands(u) {
     const ctx = u.ctx;
     const { left, top, width, height } = u.bbox;
@@ -24973,14 +24338,10 @@ function drawThermalDirectionBands(u) {
     ctx.restore();
 }
 
-// ---------------------------------------------------------------------------
-// Fetch
-// ---------------------------------------------------------------------------
-// Sampled off the live CSV stream. One
-// column per THERMAL_SAMPLE_MS, driven by the CSV2 frame (~5s) so it can never
-// need a manual refresh. measAmps/uTarget ride CSV1 (cached every 10Hz frame);
-// the rest ride CSV2. Anti-windup is OR-accumulated across frames so
-// sub-sample CV-bleed events still show as ticks.
+// ===== Fetch =====
+// Sampled off the live CSV stream: one column per THERMAL_SAMPLE_MS, driven by the CSV2 frame (~5 s), never needing a
+// manual refresh. measAmps/uTarget ride CSV1 (cached at 10 Hz), the rest CSV2. Anti-windup is OR-accumulated across
+// frames so sub-sample CV-bleed events still show as ticks.
 const THERMAL_SAMPLE_MS = 5000;          // one column per 5s (~720 cols/hr ≈ 1 pt/px on an 800px plot)
 const THERMAL_MAX_WINDOW_MIN = 60;       // longest selectable window
 const THERMAL_RING_CAP = 900;            // hard cap (>720 for cadence jitter headroom)
@@ -24994,14 +24355,11 @@ let _thermalCsv1 = { measAmps: 0, uTarget: 0 };   // latest CSV1 values (10Hz)
 let _thermalAntiWindupAccum = 0;                  // OR-accumulated between samples
 let _thermalLastSampleMs = 0;
 
-// Called from the CSV1 frame handler — cache the two fast series the plot needs.
 function thermalLiveOnCsv1(data) {
     if ('MeasuredAmps' in data) _thermalCsv1.measAmps = Number(data.MeasuredAmps) / 100;
     if ('uTargetAmps' in data) _thermalCsv1.uTarget = Number(data.uTargetAmps) / 100;
 }
 
-// Called from the CSV2 frame handler (~5s). Accumulates the anti-windup latch
-// across frames, then appends one ring column per THERMAL_SAMPLE_MS.
 function thermalLiveOnCsv2(data) {
     if (Number(data.outerAntiWindupFired)) _thermalAntiWindupAccum = 1;
 
@@ -25010,16 +24368,18 @@ function thermalLiveOnCsv2(data) {
     _thermalLastSampleMs = now;
 
     const r = _thermalRing;
+    // uPlot's range scan skips only null: one NaN column makes the whole axis range NaN.
+    const fin = x => Number.isFinite(x) ? x : null;
     r.ts.push(now);
-    r.tempFilt.push(Number(data.tempFiltered) / 100);
-    r.tempProjected.push(Number(data.tempPIDInput_d) / 100);
-    r.tempSetpoint.push(Number(data.tempPIDSetpoint_d) / 100);
-    r.penalty.push(Number(data.thermalPenaltyAmps) / 100);
-    r.measAmps.push(_thermalCsv1.measAmps);
-    r.uTarget.push(_thermalCsv1.uTarget);
-    r.outerP.push(Number(data.outerTermP) / 100);
-    r.outerI.push(Number(data.outerTermI) / 100);
-    r.lookahead.push(Number(data.outerTermLookahead) / 100);
+    r.tempFilt.push(fin(Number(data.tempFiltered) / 100));
+    r.tempProjected.push(fin(Number(data.tempPIDInput_d) / 100));
+    r.tempSetpoint.push(fin(Number(data.tempPIDSetpoint_d) / 100));
+    r.penalty.push(fin(Number(data.thermalPenaltyAmps) / 100));
+    r.measAmps.push(fin(_thermalCsv1.measAmps));
+    r.uTarget.push(fin(_thermalCsv1.uTarget));
+    r.outerP.push(fin(Number(data.outerTermP) / 100));
+    r.outerI.push(fin(Number(data.outerTermI) / 100));
+    r.lookahead.push(fin(Number(data.outerTermLookahead) / 100));
     r.flags.push(Number(data.thermalFlags) | 0);
     r.antiWindup.push(_thermalAntiWindupAccum);
     r.stage.push(Number(data.chargeStageDisplay) | 0);
@@ -25050,10 +24410,9 @@ function thermalRenderAll() {
     renderThermalPlot1([t, cT(r.tempFilt), cT(r.tempProjected), cT(r.tempSetpoint), r.penalty, r.measAmps, r.uTarget], t[0]);
     // State strip gets snapshot copies so a resize-redraw can't index a grown ring against a stale time axis.
     renderThermalPlotState([t, new Array(n).fill(null)], t[0], r.flags.slice(), r.antiWindup.slice(), r.stage.slice(), t);
-    // Display-layer sign flip: firmware terms are penalty-signed (+ = cut amps); the plot
-    // shows effect on the current target (+ = more amps). thermallog.csv keeps penalty sign.
-    // The firmware P term includes the look-ahead share; subtracting it out makes the three
-    // plotted series additive: present-temp + look-ahead + integrator = total penalty.
+    // Display sign flip: firmware terms are penalty-signed (+ = cut amps); the plot shows effect on the target (+ = more
+    // amps); thermallog.csv keeps penalty sign. Firmware P includes the look-ahead share; subtracting it makes
+    // present + look-ahead + integrator = total penalty.
     const flip = a => a.map(v => v == null ? null : -v);
     const pPresent = r.outerP.map((v, i) => v == null ? null : v - (r.lookahead[i] || 0));
     renderThermalPlot2([t, flip(pPresent), flip(r.lookahead), flip(r.outerI)], t[0]);
@@ -25073,13 +24432,9 @@ const thermalZoomPlugin = {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Mode decode
-// ---------------------------------------------------------------------------
-// Tableau 10 — one hue per stage, red reserved for Shutdown alone.
-// antiWindup is the tick marker; it sits on the background strip above the
-// bands, so it's drawn theme-aware (near-black on light, white on dark)
-// rather than from this value.
+// ===== Mode decode =====
+// Tableau 10, one hue per stage; red reserved for Shutdown. antiWindup ticks sit on the strip above the bands, so they
+// are drawn theme-aware rather than from this value.
 const THERMAL_MODE_COLORS = {
     shutdown: '#d62728',    // red — alarm
     bulk: '#1f77b4',        // blue
@@ -25125,16 +24480,10 @@ function _thermalResizeObserver(plotIdx, elId, h) {
     thermalLogResizeObservers[plotIdx] = obs;
 }
 
-// ---------------------------------------------------------------------------
-// Plot 1 
-// ---------------------------------------------------------------------------
-// Corner "auto" checkbox + "lock" button for a thermal-log plot — same convention
-// as the Plots-tab and PID/CV tuning plots. These live-stream off CSV2, so the
-// auto-fit axes crawl as data arrives and
-// a lock is needed. `bucket` is the thermalY entry for this plot; `keys` are its axis
-// names within that bucket. Checked = auto-fit (null ranges); unchecked = pin each
-// axis to what's shown. Lock freezes the current auto range while data keeps streaming
-// (auto stays on). The lock button's id is `<id>-lock` so thermalPinAxis can reset it.
+// ===== Plot 1 =====
+// Corner "auto" checkbox + "lock" for a thermal-log plot (Plots-tab convention); these stream off CSV2 so auto axes crawl
+// and need a lock. `bucket` is this plot's thermalY entry, `keys` its axes. Checked = auto (null ranges); unchecked = pin
+// to what's shown. Lock freezes the auto range (auto stays on). Lock id is `<id>-lock` so thermalPinAxis can reset it.
 function addThermalAutoBox(el, id, getPlot, bucket, keys) {
     if (!el) return;
     el.style.position = 'relative';
@@ -25187,8 +24536,7 @@ function renderThermalPlot1(data, tMin) {
         select: { show: true },
         series: [
             { label: null },
-            // Tableau 10 palette — one warm color per plot (filtered temp = the
-            // headline signal gets red); setpoint is a neutral gray reference line.
+            // Tableau 10: filtered temp (the headline signal) red; setpoint a neutral gray reference.
             {
                 label: 'Temp Filtered (' + tempUnitLabel() + ')', stroke: '#d62728', width: 2,
                 scale: 'temp',
@@ -25258,8 +24606,7 @@ function renderThermalPlot1(data, tMin) {
             thermalLogPlots[0].setSize({ width: el.clientWidth, height: H });
     });
 
-    // Click-to-edit Y limits. Typing pins the axis and unchecks the corner auto
-    // box; that checkbox is the only way back to auto — no hidden gesture.
+    // Click-to-edit Y limits: typing pins the axis and unchecks the auto box (the only way back to auto).
     attachYAxisEdit(thermalLogPlots[0], [
         { scale: 'temp', decimals: 0, apply: (mn, mx) => thermalPinAxis(0, 'p0', 'temp', 'autoscale-thermal0-cb', mn, mx) },
         { scale: 'amps', decimals: 0, apply: (mn, mx) => thermalPinAxis(0, 'p0', 'amps', 'autoscale-thermal0-cb', mn, mx) }
@@ -25284,7 +24631,7 @@ function renderThermalPlot2(data, tMin) {
         select: { show: true },
         series: [
             { label: null },
-            // Additive decomposition (display-flipped, see updateThermalPlots):
+            // Additive decomposition (display-flipped, see thermalRenderAll):
             // present-temp + look-ahead + integrator = total penalty.
             { label: 'Present Temp (P)', stroke: '#1f77b4', width: 1.5, scale: 'amps' },
             { label: 'Look-Ahead', stroke: '#2ca02c', width: 1.5, scale: 'amps' },
@@ -25322,8 +24669,7 @@ function renderThermalPlot2(data, tMin) {
             thermalLogPlots[2].setSize({ width: el.clientWidth, height: H });
     });
 
-    // Click-to-edit Y limits. Typing pins the axis and unchecks the corner auto
-    // box; that checkbox is the only way back to auto — no hidden gesture.
+    // Click-to-edit Y limits: typing pins the axis and unchecks the auto box (the only way back to auto).
     attachYAxisEdit(thermalLogPlots[2], [
         { scale: 'amps', decimals: 0, apply: (mn, mx) => thermalPinAxis(2, 'p2', 'amps', 'autoscale-thermal2-cb', mn, mx) }
     ]);
@@ -25387,8 +24733,7 @@ function renderThermalPlotState(data, tMin, flagsArr, antiWindupArr, stageArr, t
                         const antiBottom = barTop - 4;
 
                         ctx.save();
-                        // Clip to plot area — prevents drawing over axes when
-                        // data extends outside the current window
+                        // Clip to the plot area so out-of-window data never draws over the axes
                         ctx.beginPath();
                         ctx.rect(plotLeft, plotTop, plotWidth, plotHeight);
                         ctx.clip();
@@ -25506,7 +24851,6 @@ function _createThermalLegend(container, plotIdx, items) {
         span.textContent = item.label;
         span.style.cssText = 'color:var(--text-dark);';
 
-        // Apply initial opacity to match default visibility
         bar.style.opacity = cb.checked ? '1' : '0.3';
         span.style.opacity = cb.checked ? '1' : '0.5';
 
@@ -25526,12 +24870,9 @@ function _createThermalLegend(container, plotIdx, items) {
     container.appendChild(div);
 }
 
-// ---------------------------------------------------------------------------
-// Y axis range controls
-// ---------------------------------------------------------------------------
-// On-plot Y box → pin one axis: store the manual range in thermalY, uncheck this
-// plot's corner auto box, and apply it. The scale range fn reads thermalY on every
-// redraw, so this sticks across data updates.
+// ===== Y axis range controls =====
+// On-plot Y box pins one axis: store it in thermalY, uncheck this plot's auto box, apply. The range fn reads
+// thermalY on every redraw, so it sticks across data updates.
 function thermalPinAxis(plotIdx, bucketKey, axis, cbId, mn, mx) {
     thermalY[bucketKey][axis] = [mn, mx];
     const cb = document.getElementById(cbId); if (cb) cb.checked = false;
@@ -25569,14 +24910,14 @@ function thermalPinAxis(plotIdx, bucketKey, axis, cbId, mn, mx) {
 // ==================== WIND DIAL + TREND PLOT ====================
 // Apparent-wind dial (B&G-style: needle = apparent angle, two LCD readouts) plus a
 // True/Apparent trend plot sampled off the CSV stream like the Temp Tuning plot:
-// wind speed/angle ride CSV1 (10Hz, cached) and one ring column is banked per
+// wind speed/angle ride CSV4 (~2 Hz, cached) and one ring column is banked per
 // WIND_SAMPLE_MS off the CSV2 frame (~5s). Last 60 min, ~720 points.
 const WIND_SAMPLE_MS = 5000;          // one column per 5s
 const WIND_MAX_WINDOW_MIN = 60;       // longest selectable window
 const WIND_RING_CAP = 900;            // hard cap (>720 for cadence jitter headroom)
 
 let _windRing = { ts: [], tDir: [], tSpd: [], aDir: [], aSpd: [] };
-let _windCsv1 = { aDir: 0, aSpd: 0, tDir: 0, tSpd: 0 };   // latest CSV1 wind (already scaled)
+let _windCsv1 = { aDir: 0, aSpd: 0, tDir: 0, tSpd: 0 };   // latest CSV4 wind (already scaled)
 // Latest NavStream (CSV4) raw values cached for cross-listener consumers — e.g. the barometer
 // Zambretti forecast, which runs on the CSV2 cadence but needs live heading + true wind angle.
 window._navLast = window._navLast || {};
@@ -25590,12 +24931,11 @@ let _windWmBeaufort = '';             // watermark strings, refreshed on CSV2
 let _windWmGale = '';
 
 // CSV1 (10Hz): redraw the dial (needle + LCDs) from the cached wind values so the
-// needle animates smoothly at frame rate. The wind values themselves ride CSV2 (the
-// NMEA wind fields are in the CSV2 payload), so they're cached in windLiveOnCsv2 below.
+// needle animates smoothly at frame rate. The wind values themselves ride CSV4 and are
+// cached in windLiveOnCsv4 below.
 function windLiveOnCsv1(data) {
-    // Apparent wind can be absent (no instrument): rotate(NaN ...) is an invalid SVG attribute, which
-    // parks the needle at 0 deg and reads as "wind dead ahead". Hide the needle instead and blank the
-    // LCDs — a pointer left at its last angle over two blank readouts is the same lie more quietly.
+    // Apparent wind can be absent: rotate(NaN) is invalid SVG and parks the needle at 0 deg ("dead ahead"). Hide
+    // the needle and blank the LCDs; a stale pointer over blank readouts is the same lie.
     const aDirOk = Number.isFinite(_windCsv1.aDir), aSpdOk = Number.isFinite(_windCsv1.aSpd);
     const needle = document.getElementById('windNeedle');
     if (needle) {
@@ -25606,10 +24946,8 @@ function windLiveOnCsv1(data) {
     const lcdA = document.getElementById('windLcdAng'); if (lcdA) lcdA.textContent = aDirOk ? Math.round(_windCsv1.aDir) + '°' : '—';
 }
 
-// CSV4 / NavStream (~2Hz): cache the scaled wind values (the NMEA wind fields now ride CSV4).
-// The dial redraws off this cache at 10Hz in windLiveOnCsv1; the trend ring banks off it in
-// windLiveOnCsv2. Field location and reader location MUST agree — the reads moved here with the
-// fields when AWS/AWA/TWS/TWA moved CSV2 → CSV4.
+// CSV4 / NavStream (~2 Hz): cache the scaled wind values. The dial redraws off this cache at 10 Hz (windLiveOnCsv1)
+// and the trend ring banks off it in windLiveOnCsv2. Field location and reader location MUST agree.
 function windLiveOnCsv4(data) {
     if ('ApparentWindSpeedNMEA' in data) _windCsv1.aSpd = Number(data.ApparentWindSpeedNMEA) / 100;  // ×100 → knots
     if ('ApparentWindAngleNMEA' in data) _windCsv1.aDir = Number(data.ApparentWindAngleNMEA);        // integer degrees
@@ -25617,9 +24955,8 @@ function windLiveOnCsv4(data) {
     if ('TrueWindAngleNMEA' in data) _windCsv1.tDir = Number(data.TrueWindAngleNMEA);
 }
 
-// CSV2 (~5s): refresh the Beaufort/gale watermark (sustainedTWS/currentGaleMinutes stay on CSV2),
-// then bank one ring column from the wind cache filled by windLiveOnCsv4. The dial redraws off the
-// same cache at 10Hz in windLiveOnCsv1.
+// CSV2 (~5 s): refresh the Beaufort/gale watermark (sustainedTWS/currentGaleMinutes ride CSV2), then bank one ring
+// column from the windLiveOnCsv4 cache.
 function windLiveOnCsv2(data) {
     // Beaufort + gale from the 2-min SUSTAINED true wind (sustainedTWS ×10), never the gust.
     const twsKt = Number(data.sustainedTWS) / 10;
@@ -25759,7 +25096,6 @@ function windTrendRender() {
     };
     windTrendPlot = new uPlot(opts, data, el);
     requestAnimationFrame(() => { const w = _windPlotW(el); if (windTrendPlot && w > 0) windTrendPlot.setSize({ width: w, height: H }); });
-    // Click-to-edit Y limits — typing pins the axis and unchecks the corner auto box.
     attachYAxisEdit(windTrendPlot, [
         { scale: 'dir', decimals: 0, apply: (mn, mx) => windPinAxis('dir', mn, mx) },
         { scale: 'spd', decimals: 1, apply: (mn, mx) => windPinAxis('spd', mn, mx) }
@@ -25776,10 +25112,8 @@ function windPinAxis(axis, mn, mx) {
     if (windTrendPlot) windTrendPlot.setScale(axis, { min: mn, max: mx });
 }
 
-// Plot width. #windtrend-plot is width:100% + overflow:hidden, so its clientWidth is now
-// stable (a stale-wide uPlot canvas is clipped and can't inflate the box) and already
-// accounts for card padding. That self-feedback via clientWidth is what made the trend
-// plot grow without bound; the parent card-group is only a fallback before layout settles.
+// #windtrend-plot is width:100% + overflow:hidden, so a stale-wide canvas can't inflate its clientWidth
+// (that self-feedback grew the plot without bound). The parent is only a pre-layout fallback.
 function _windPlotW(el) {
     if (!el) return 0;
     return el.clientWidth || (el.parentElement && el.parentElement.clientWidth) || 0;
@@ -25801,7 +25135,7 @@ function _windResizeObserver(elId, h) {
 function highlightWindWindowBtn(minutes) {
     [5, 15, 30, 60].forEach(v => {
         const btn = document.getElementById('ww-' + v);
-        if (btn) btn.classList.toggle('on', v === minutes);   // segmented-control active pill
+        if (btn) btn.classList.toggle('on', v === minutes);
     });
 }
 function setWindWindow(minutes) {
@@ -25813,7 +25147,7 @@ function setWindWindow(minutes) {
 function setWindTrendMode(mode) {
     windTrendMode = mode;
     const tb = document.getElementById('wind-mode-true'), ab = document.getElementById('wind-mode-app');
-    if (tb) tb.classList.toggle('on', mode === 'true');   // segmented-control active pill
+    if (tb) tb.classList.toggle('on', mode === 'true');
     if (ab) ab.classList.toggle('on', mode === 'app');
     windY = { dir: null, spd: null };   // true direction and apparent angle span different ranges — back to auto
     if (windTrendPlot) { windTrendPlot.destroy(); windTrendPlot = null; }
@@ -25911,11 +25245,9 @@ function validateBatterySettings(proposedChanges) {
         return { valid: false, error: 'Rebulk Voltage must be lower than Float Voltage.' };
     }
 
-    // WARN, never block: a charge target at or above the absolute software cut is unreachable — the
-    // field is cut before the bank gets there, so absorption never completes and nothing else says why.
-    // Worth a warning because the two values live in different sections (charge stages vs Protections)
-    // and the first-boot seed places the cut for lithium (14.3/14.2 x class) whatever the chemistry, so
-    // a lead/AGM owner typing a 14.4 absorption can land above their own cut without ever seeing it.
+    // WARN, never block: a charge target at or above the software cut is unreachable, so absorption never
+    // completes. The two live in different sections and the first-boot seed places the cut for lithium
+    // whatever the chemistry, so a lead/AGM absorption can silently land above it.
     {
         const cut = state.AlternatorHardShutdownV;
         const targets = [['Bulk Voltage', state.BulkVoltage], ['Absorption Voltage', state.AbsorptionVoltage],
@@ -26072,13 +25404,9 @@ function validateAndSubmitFieldCollapseDelay(form) {
     return true;
 }
 
-// ── Over-voltage ladder: the two rungs move together ─────────────────────────
-// The software cut (AlternatorHardShutdownV) must sit 0.05 V x class/12 under the hardware backstop
-// (VoltageHardwareLimit), and the /get handler clamps it on every write — so typing a software cut at
-// or above the backstop put the old value straight back in the echo with nothing on this page saying
-// why (the clamp only speaks on the console). Same rule here, ahead of the submit: offer the joint
-// move, which the handler reads as one request and so cannot clamp against the value being replaced,
-// or say plainly that the backstop is at its ceiling. Band and ceiling mirror 3_functions.ino.
+// Over-voltage ladder: software cut (AlternatorHardShutdownV) must sit 0.05 V x class/12 under VoltageHardwareLimit,
+// and /get clamps it silently. Offer the joint move (one request, so it can't clamp against the old value).
+// Band and ceiling mirror 3_functions.ino.
 const OV_LADDER_HW_MAX = 70;     // firmware constrain() on VoltageHardwareLimit
 function ovLadderBand() { return 0.05 * ((parseInt(window._nominalStored, 10) || 12) / 12); }
 
@@ -26158,18 +25486,13 @@ function updateFloatVisibility(pendingVal) {
 
 
 
-// CV / Voltage Tuner Log — decodes /cvlog.bin (68-byte header + N x entrySize little-endian
-// CvLogEntry structs) to CSV. entrySize comes from the header, never assumed; shorter legacy
-// strides still parse (see the hasOvFilt / hasTargSlewed / hasPidTerms gates below).
-// Field meanings live on struct CvLogEntry in Xregulator.ino — this parser must track it.
+// Decodes /cvlog.bin (68-byte header + count x entrySize little-endian CvLogEntry) to CSV. entrySize comes
+// from the header; shorter legacy strides parse via the has* gates. Must track struct CvLogEntry in Xregulator.ino.
 // awState: 0=normal 1=frozen(supervisor/D/slew) 2=saturated 3=bleeding 4=bumpless 5=target wind-down
 
 const CV_LOG_HEADER_SIZE = 68;
-const CV_LOG_MIN_ENTRY_SIZE = 51;   // minimum accepted stride (ovFilt-era); actual stride comes from the header
+const CV_LOG_MIN_ENTRY_SIZE = 51;   // minimum accepted stride (ovFilt-era)
 
-// parseCvBin(buf)
-// Returns a decoded object with arrays for each field plus the header params.
-// Returns null on bad input.
 function parseCvBin(buf) {
     if (!buf || buf.byteLength < CV_LOG_HEADER_SIZE + CV_LOG_MIN_ENTRY_SIZE) {
         return null;
@@ -26184,7 +25507,7 @@ function parseCvBin(buf) {
     const voltKi = view.getFloat32(12, true);
     const voltInterval = view.getUint32(16, true);
     const kdDeadband = view.getFloat32(20, true);   // deadband line BASE (V/s) — b of clamp(floor, b + m·spLimited, ceil)
-    const kd         = view.getFloat32(24, true);   // VoltageKd_active (A/(V/s)) — the gain the trim law multiplies (typed knob pre-2026-07-21)
+    const kd         = view.getFloat32(24, true);   // VoltageKd_active (A/(V/s)); older logs: the typed knob
     const kdArmV     = view.getFloat32(28, true);   // CvKdArmV (V)
     const kdOneSided = view.getFloat32(32, true);   // CvKdOneSided (0/1)
     const kdVoltFiltTC = view.getFloat32(36, true); // CvKdVoltFiltTC (ms) — D-term voltage EMA TC
@@ -26319,9 +25642,7 @@ function parseCvBin(buf) {
 }
 
 
-// cvBinToCsv(d)
-// Converts a parsed cvlog object to a CSV string.
-// First row is a settings comment; second row is column headers.
+// Leading `#` rows record the settings in force; the column-header row follows them.
 function cvBinToCsv(d, csv3) {
     const lines = [];
 
@@ -26341,13 +25662,11 @@ function cvBinToCsv(d, csv3) {
         `# FastOV: OvMeasMarginV=${fmtRaw(c.OvMeasMarginV, 3)}V OvPredMarginV=${fmtRaw(c.OvPredMarginV, 3)}V` +
         ` TdPred=${fmtRaw(c.TdPred, 3)}s DvdtTC=${fmtDiv(c.DvdtTC, 10, 1)}ms ovFiltTC=${ovFiltTC}ms` +
         ` KHard=${fmtDiv(c.KHard, 10, 1)}A/V` +
-        ` AwBleedRate=${fmtDiv(c.AwBleedRate, 10, 1)}A/s` +  // AwRecoverRate removed from header — hardcoded to 0.1 in firmware
+        ` AwBleedRate=${fmtDiv(c.AwBleedRate, 10, 1)}A/s` +  // no AwRecoverRate: hardcoded 0.1 in firmware
         ` IExcessArmMarginV=${fmtRaw(c.IExcessArmMarginV, 3)}V` +
         ` IExcessFrac=${fmtDiv(c.IExcessFrac, 10, 1)}% IExcessTau=${fmtRaw(c.IExcessTau, 0)}ms`
     );
-    // Full D-term trim equation — every constant needed to reconstruct kdTrim_A from
-    // cvDSlope_Vps + spLimited_A alone (the 12:48 2026-07-21 diag needed slope/floor/ceil and the
-    // ACTIVE gain, none of which the old header carried).
+    // Full D-term trim equation: every constant needed to reconstruct kdTrim_A from cvDSlope_Vps + spLimited_A.
     const fmtHdr = (v, dec) => (v !== undefined && !isNaN(v)) ? v.toFixed(dec) : 'N/A';
     lines.push(
         `# VoltageD: VoltageKdActive=${d.kd.toFixed(2)}A/(V/s) CvKdDeadbandVps=${d.kdDeadband.toFixed(3)}V/s` +
@@ -26361,14 +25680,12 @@ function cvBinToCsv(d, csv3) {
         ` ExcessMode=1: kdTrim = KdActive*(cvDSlope -/+ band) past the band, continuous from 0;` +
         ` ExcessMode=0 (legacy): kdTrim = KdActive*cvDSlope, latched past band, re-arm at half; both clamp ±CvKdMaxTrimA`
     );
-    // Loop-shape toggles: with cvHelpersEnabled=0 the D term never runs at all, and with
-    // cvRiseGovEnable=0 targSlewed follows targV exactly. Without these a reader cannot tell
-    // "D term never triggered" from "D term was switched off".
+    // Without these a reader can't tell "D term never triggered" from "switched off": cvHelpersEnabled=0
+    // disables the D term, cvRiseGovEnable=0 makes targSlewed follow targV exactly.
     lines.push(
         `# Toggles: cvHelpersEnabled=${fmtRaw(c.cvHelpersEnabled, 0)} cvRiseGovEnable=${fmtRaw(c.cvRiseGovEnable, 0)} HuntGovEnable=${fmtRaw(c.HuntGovEnable, 0)}`
     );
-    // Tach calibration is hand-entered per install, so the rpm column carries an unknown scale error.
-    // Recording it stops a later reader deriving pulley ratios or shaft orders from logged rpm (07-24).
+    // Tach calibration is hand-entered per install, so logged rpm carries an unknown scale error.
     lines.push(
         `# Tach: RPMScalingFactor=${fmtRaw(c.RPMScalingFactor, 0)} PulleyRatio=${fmtDiv(c.PulleyRatio, 100, 2)}` +
         ` — both set by hand at commissioning against the boat's own gauge; the rpm column is INDICATIVE.` +
@@ -26381,19 +25698,13 @@ function cvBinToCsv(d, csv3) {
         `# capReason codes: 0=none(unclamped) 1=KHard_G1(predictive) 2=KHard_G2(measured) 3=iExcess 4=loadDump 5=iExcessBulk(current-control phase)`
     );
 
-    // kdActive = the D term ACTUALLY trimmed current. kdTrim lands on the single row of the
-    // voltage-loop tick that trimmed, so a raw !=0 test plots as isolated pixels; holding it across the
-    // interval that trim governs Icv for is what the firmware actually did. This is ground truth, not a
-    // reconstruction: kdTrim!=0 ⟺ the D term acted on that VL tick — already logged, no gate re-derivation.
-    // kdArmed = the DISTANCE half of the gate alone (close enough to target to arm, slope ignored) —
-    // deliberately NOT the same thing as kdActive. Gated on targSlewed vs cvKdFiltV, which is what the
-    // firmware compares (voltageTargetSlewed − g_cvKdFiltV); falls back to targV / battV_filt on logs
-    // that predate those fields. CvKdArmV=0 means always-armed.
+    // kdActive: kdTrim lands only on the VL tick that trimmed; hold it across the interval that trim governs Icv.
+    // kdArmed: the distance half of the gate only (slope ignored), deliberately not kdActive. Compares targSlewed
+    // vs cvKdFiltV like the firmware, falling back to targV / battV_filt on older logs. CvKdArmV=0 = always-armed.
     const kdActive = new Array(d.count);
     const kdArmed = new Array(d.count);
     const armFloor = new Array(d.count);   // the voltage above which the distance gate opens
-    // Per-row EFFECTIVE deadband — the line evaluated at that row's slew-limited command, exactly the
-    // firmware's gate value. Falls back to the flat base on logs predating the full-equation header.
+    // Per-row effective deadband (the firmware's gate value); flat base on logs predating the full-equation header.
     const dbLive = (i) => {
         if (d.kdDbSlope === undefined || isNaN(d.kdDbSlope)) return d.kdDeadband;
         return Math.min(d.kdDbCeil, Math.max(d.kdDbFloor, d.kdDeadband + d.kdDbSlope * d.spLimited[i]));
@@ -26411,7 +25722,6 @@ function cvBinToCsv(d, csv3) {
         }
     }
 
-    // Column headers
     lines.push([
         't_s',
         'battV', 'targV', 'vError_V', 'dvdt_Vs', 'vPred',
@@ -26430,8 +25740,7 @@ function cvBinToCsv(d, csv3) {
         'huntDerate', 'huntFreq_Hz', 'huntState',
     ].join(','));
 
-    // No battery shunt -> battI is INA input noise and dBcur_dt its slope; blank both columns,
-    // matching the firmware-side /cvlog.csv. Same reason the ovFilt/recovActive columns blank.
+    // No battery shunt -> battI is INA noise and dBcur_dt its slope; blank both, matching firmware /cvlog.csv.
     const noBattCsv = document.body.classList.contains('no-batt-current');
 
     for (let i = 0; i < d.count; i++) {
@@ -26470,18 +25779,14 @@ function cvBinToCsv(d, csv3) {
 }
 
 
-// downloadCvLog()
-// Fetches /cvlog.bin, decodes, saves as timestamped CSV.
-// ts/sfx come from the caller so the whole batch shares one click-time name. Reading them
-// here instead let the Filename Tag box be retyped mid-transfer, tagging this file with the
-// NEXT run's name while pidlog kept the current one.
+// ts/sfx come from the caller so the whole batch shares one click-time name (Filename Tag can change mid-transfer).
 async function downloadCvLog(ts = getLogTimestamp(), sfx = getLogNameSuffix()) {
-    // Failure still emits the file with the cause named inside (see saveLogFile rationale), and
-    // the fetch retries once — Safari's teardown of the preceding pidlog connection can kill
-    // this one at connect time.
-    const fail = (why) => {
+    // Failure still emits the file naming the cause (see saveLogFile). Retry once: Safari's teardown of the
+    // preceding pidlog connection can kill this fetch at connect time.
+    // Returns { retrieved, saved }: retrieved=false means the device may still hold rows this file lacks.
+    const fail = (why, retrieved = false) => {
         console.error(`CV log: ${why}`);
-        saveLogFile(`cvlog_${ts}${sfx}.csv`, `# CV log unavailable: ${why} — data was NOT retrieved\n`, 'text/csv');
+        return { retrieved, saved: saveLogFile(`cvlog_${ts}${sfx}.csv`, `# CV log unavailable: ${why} — data was NOT retrieved\n`, 'text/csv') };
     };
     let buf = null, fetchErr = null;
     for (let attempt = 0; attempt < 2 && buf == null; attempt++) {
@@ -26496,8 +25801,9 @@ async function downloadCvLog(ts = getLogTimestamp(), sfx = getLogNameSuffix()) {
     }
     if (buf == null) return fail(`download failed after retry (${fetchErr})`);
 
+    // The firmware sends zero bytes for an empty or unallocated ring; a shorter-than-one-row body was cut off.
     if (buf.byteLength < CV_LOG_HEADER_SIZE + CV_LOG_MIN_ENTRY_SIZE) {
-        return fail('device returned an empty log — run in Auto mode with voltage control active first, or the log buffer failed to allocate at boot (check serial for "cvLog: PSRAM malloc failed")');
+        return fail('device returned an empty log — run in Auto mode with voltage control active first, or the log buffer failed to allocate at boot (check serial for "cvLog: PSRAM malloc failed")', buf.byteLength === 0);
     }
 
     const d = parseCvBin(buf);
@@ -26506,7 +25812,7 @@ async function downloadCvLog(ts = getLogTimestamp(), sfx = getLogNameSuffix()) {
     }
 
     const csv = cvBinToCsv(d, g_lastCsv3);
-    deliverFile(`cvlog_${ts}${sfx}.csv`, csv, 'text/csv');
+    return { retrieved: true, saved: deliverFile(`cvlog_${ts}${sfx}.csv`, csv, 'text/csv') };
 }
 
 //SYSTEMID System ID section
@@ -26532,9 +25838,7 @@ const CS_TARGET_V    = 6;
 const CS_IDLE        = 7;
 const CS_COMMISSION  = 8;
 
-// ── Test Active Floating Panel ──────────────────────────────────────────────
-// Panel sits outside .tab-content in the HTML so position:fixed keeps it
-// visible regardless of which tab is active.
+// ── Test Active Floating Panel (outside .tab-content so position:fixed keeps it visible on every tab) ──
 
 let _testActiveCSV1 = null;   // 'curr' | 'cv' | null  (updated from CSV1/2 stream)
 let _testActiveCSV3 = null;   // 'sysid' | null                     (updated from CSV3 stream)
@@ -26551,11 +25855,8 @@ function getActiveTestKey() {
     return _testActiveCSV3 || _testActiveCSV1 || null;
 }
 
-// Shared draggable-panel helper for the hardcoded floating dark panels. Drag by `handle`,
-// clamp the panel fully inside the viewport (never off-screen) on both axes, touch-aware,
-// skipped on mobile (those panels are CSS bottom sheets), and re-clamped on viewport resize.
-// Idempotent. Used by the Test Active panel and the Commissioning panel. (The Plant Delay
-// sysid modal has its own equivalent, sysidInitDrag, with the same behaviour.)
+// Shared drag for the hardcoded floating dark panels: clamped inside the viewport, touch-aware, off on
+// mobile (CSS bottom sheets), re-clamped on resize. sysidInitDrag is the sysid modal's equivalent.
 function makePanelDraggable(panel, handle) {
     if (!panel || !handle || handle._dragInit) return;
     handle._dragInit = true;
@@ -26563,9 +25864,7 @@ function makePanelDraggable(panel, handle) {
     let startX, startY, startL, startT;
     function onDown(e) {
         if (window.innerWidth <= 600) return;   // mobile = fixed bottom sheet, not draggable
-        // Don't hijack taps on the header's controls (e.g. the ✕ close button). On iOS
-        // WebView a touchstart + preventDefault here would otherwise swallow the button's
-        // tap, leaving ✕ unresponsive on iPad. Grabbing the title/empty area still drags.
+        // Don't hijack taps on header controls: on iOS WebView touchstart + preventDefault swallows the ✕ tap.
         if (e.target && e.target.closest && e.target.closest('button, a, input, select, textarea, label')) return;
         const pt = e.touches ? e.touches[0] : e;
         const r = panel.getBoundingClientRect();
@@ -26601,14 +25900,11 @@ function makePanelDraggable(panel, handle) {
     window.addEventListener('resize', () => positionFloatingPanel(panel));
 }
 
-// Every other popup drags by its title bar with no per-popup wiring. A popup panel is the child of a
-// full-viewport position:fixed layer (dimmed backdrop or click-through overlay); its title bar is the
-// panel's first element child. Moved with a translate so the layer's flex/margin centering is untouched;
-// the offset is dropped once the panel is hidden or removed, so it reopens in its normal place.
-// A press on a dimmed backdrop that lands over another popup's title bar drags THAT popup, so stacked
-// popups can both be moved while the backdrop still blocks everything else beneath it.
+// Universal title-bar drag: a popup panel is the child of a full-viewport fixed layer; its title bar is its first
+// child. Moved by translate so the layer's centering is untouched; the offset drops once hidden, so it reopens in place.
+// A press on a dimmed backdrop over another popup's title bar drags THAT popup, so stacked popups are all movable.
 (function initUniversalPopupDrag() {
-    if (IS_CAPACITOR) return;   // browsers only (owner ruling 2026-10-03): the apps keep native touch scrolling, with no page-wide non-passive touchstart
+    if (IS_CAPACITOR) return;   // browsers only: the apps keep native touch scrolling (no page-wide non-passive touchstart)
     const NO_DRAG = 'button, a, input, select, textarea, label, [contenteditable="true"]';
     // Visible viewport without scrollbars: what an inset:0 fixed layer actually spans.
     const vpW = () => document.documentElement.clientWidth || window.innerWidth;
@@ -26746,13 +26042,9 @@ function makePanelDraggable(panel, handle) {
     document.addEventListener('touchstart', onDown, { passive: false });
 })();
 
-// Keep a floating panel usable after a viewport resize/rotate. Two modes:
-//  • Un-dragged commissioning panels (_leftPlace) re-anchor to the top-left: left-justified,
-//    vertically centered when they fit, else pinned to the top so the header (✕) is never
-//    pushed off-screen.
-//  • Any other / already-dragged panel is just clamped fully on-screen. Read the live rect,
-//    NOT parseFloat(style.top): the initial "50%" parsed as 50px and, with the centering
-//    transform still live, hurled the header above the viewport in Safari on resize.
+// Keep a floating panel usable after a viewport resize/rotate. Un-dragged commissioning panels (_leftPlace) re-anchor
+// via placeLeftPanel; others are clamped on-screen from the live rect, NOT parseFloat(style.top): the initial "50%"
+// parses as 50px and, with the centering transform live, throws the header above the viewport in Safari.
 function positionFloatingPanel(panel) {
     if (!panel || panel.offsetParent === null) return;   // not visible
     if (window.innerWidth <= 600) return;                // mobile = CSS bottom sheet
@@ -26771,9 +26063,8 @@ function positionFloatingPanel(panel) {
     panel.style.right = 'auto';
 }
 
-// Anchor an un-dragged commissioning panel to the top-left. Height is capped to the REAL visible
-// viewport (window.innerHeight — unlike CSS 100vh, which overcounts under Safari's toolbar) so the
-// header and footer always fit; the body scrolls inside. Centered vertically only when it fits.
+// Height capped to window.innerHeight (CSS 100vh overcounts under Safari's toolbar) so header and footer always
+// fit; the body scrolls inside. Centered vertically only when it fits.
 function placeLeftPanel(panel) {
     const GAP = 20;
     const vh = window.innerHeight;
@@ -26782,10 +26073,8 @@ function placeLeftPanel(panel) {
     panel.style.right = 'auto';
     panel.style.left = GAP + 'px';
     const h = panel.offsetHeight;
-    // Vertical centering is re-evaluated on every render, so a step whose body grows and shrinks
-    // between runs (Keep-Alive Floor: tables and charts appear, then collapse while a run is active) made
-    // the whole panel hop up and down. Once placed, hold the top while the panel still fits fully
-    // on-screen; _holdTop is cleared on phase entry / open so a new step re-centers normally.
+    // Hold the top once placed while the panel still fits, else a step whose body grows and shrinks between runs
+    // (Keep-Alive Floor) makes the panel hop. _holdTop is cleared on phase entry / open so a new step re-centers.
     const cur = parseFloat(panel.style.top);
     if (panel._holdTop && isFinite(cur) && cur >= 0 && cur + h <= vh - GAP) return;
     panel.style.top = (h < vh - 2 * GAP ? Math.round((vh - h) / 2) : GAP) + 'px';
@@ -26872,6 +26161,15 @@ function applyClassScaledInputAttrs() {
     // At 1/3 or 2/3 (12 or 24 V winding at 36V) the step never terminates, so ANY finite step makes typed round values (e.g. 1)
     // a stepMismatch and the native form submit blocks the Set — step-free is the only correct attr.
     document.querySelectorAll('input[name="MinDuty"]').forEach(md => { md.step = mdStep; });
+    // Duty ramp floors are the firmware's DUTY_RAMP_MIN_12V (0.1 %/s) x fieldScale(), rounded UP to the box's own step
+    // so the box never passes a value the firmware rejects and keeps its step grid (step counts from min).
+    ['DutyRampRate', 'DutySlowRampRate'].forEach(n => {
+        const el = document.querySelector('input[name="' + n + '"]');
+        if (!el) return;
+        if (!el.dataset.markupStep) el.dataset.markupStep = el.step;
+        const st = Number(el.dataset.markupStep) || 0.01;
+        el.min = r(Math.ceil(0.1 * fsv / st - 1e-6) * st);
+    });
     const cw = document.querySelector('input[name="cvWaveAmplitudeV"]');
     if (cw) { cw.min = r(0.05 * k); cw.max = r(2.0 * k); cw.step = r(0.05 * k); }
     // Sweep turnaround volt margin: volt-domain, so its default and ceiling are 12V values. Prefill
@@ -26892,11 +26190,9 @@ function applyClassScaledInputAttrs() {
         el.value = (Math.abs(fsv - 1) < 1e-9) ? el.defaultValue : r(base * fsv);
         el.dataset.autoFill = el.value;
     });
-    // D-term deadband + slope ceiling (V/s), arm window (V), target ramp rates (V/s) and the
-    // wind-down stop margin (V) are WYSIWYG per-bus (scale ×class), so their input bounds must
-    // too, else a 24/36/48 V user is capped at the 12 V ceiling. Kd/cap are NOT here — Kd is
-    // voltage-normalized (12 V-equivalent) and the cap is flat amps, both class-invariant; the
-    // stress-test bands are 12 V-equivalent by design (scaled ×class at use), so not here either.
+    // D-term deadband/slope ceiling (V/s), arm window (V), target ramp rates (V/s) and wind-down stop margin (V)
+    // are per-bus (×class), so their bounds scale too. Kd (12 V-normalized), the flat-amp cap and the stress-test
+    // bands (12 V-equivalent, scaled at use) are class-invariant, so not here.
     const db = document.querySelector('input[name="CvKdDeadbandVps"]');
     if (db) { db.max = r(4 * k); db.step = r(0.05 * k); }
     const ds = document.querySelector('input[name="CvKdDbSlope"]');
@@ -26930,10 +26226,10 @@ function applyClassScaledInputAttrs() {
 }
 
 function updateCVPanelDelta() {
-    if (cvPlotCache.voltageTarget === null || _lastBatteryV === null) return;
+    if (cvPlotCache.voltageTarget === null || !Number.isFinite(_lastIBV)) return;
     const el = document.getElementById('test-panel-phase');
     if (!el) return;
-    const delta = _lastBatteryV - (cvPlotCache.voltageTarget / 100);
+    const delta = _lastIBV - (cvPlotCache.voltageTarget / 100);
     const sign  = delta >= 0 ? '+' : '';
     const abs   = Math.abs(delta);
     // Color bands per-cell-scaled by system voltage class (0.05/0.15 V are 12V-referenced)
@@ -26942,7 +26238,6 @@ function updateCVPanelDelta() {
     el.innerHTML = 'Δ <span style="color:' + color + ';font-weight:600;">' + sign + delta.toFixed(3) + ' V</span>';
 }
 
-// Called by the three render functions to push live score data into the panel
 function updateTestPanelScore(score, cycles, phase) {
     const scoreEl  = document.getElementById('test-panel-score');
     const cyclesEl = document.getElementById('test-panel-cycles');
@@ -26963,7 +26258,6 @@ function ensureTestPollRunning(testName) {
     }
 }
 
-// Turn off whichever test is currently shown — called by the ✕ and "Turn Off" button.
 function turnOffActiveTest() {
     const test = _testPanelCurrentTest;
     if (!test) return;
@@ -26986,8 +26280,7 @@ function turnOffActiveTest() {
         .catch(e => console.warn('turnOffActiveTest failed:', e));
 }
 
-// The current-loop test has no checkbox; tuningToggleTest() does the conflict gate inline.
-// CV and Thermal use their own gates below.
+// The current-loop test has no checkbox; tuningToggleTest() gates conflicts inline.
 
 function checkCVTestGate(checkbox) {
     if (!checkbox.checked) return true;
@@ -27004,12 +26297,9 @@ function checkCVTestGate(checkbox) {
         return false;
     }
 
-    // Guard: HIGH-phase target must not exceed BulkVoltage.
-    // updateChargingStage() is NOT suppressed during CVTuningMode. If battV rises
-    // above BulkVoltage+0.1V while the system is in the BULK branch, a BULK→ABSORPTION
-    // transition fires, which resets the absorption tail timer. If Bcur is reading 0
-    // (shunt not active), tailReached is immediately true and the absorption stage will
-    // time out and kill the output mid-test.
+    // HIGH-phase target must not exceed BulkVoltage: updateChargingStage() still runs during CVTuningMode, so battV
+    // above BulkVoltage+0.1V fires BULK→ABSORPTION and resets the tail timer; with Bcur 0 (no shunt) absorption
+    // then times out and kills the output mid-test.
     if (gLastChargeStage === CS_ABSORPTION || gLastChargeStage === CS_FLOAT) {
         const amplitude = getEchoNumber('cvWaveAmplitudeV_echo');
         const bulkV     = getEchoNumber('BulkVoltage_echo');
@@ -27057,9 +26347,7 @@ const SYSID_PHASE_NAMES = {
     9: 'Processing results'
 };
 
-// FieldEventReason codes from firmware enum — must match Xregulator.ino enum FieldEventReason
-// Indexed by the firmware FieldEventReason enum (Xregulator.ino) — the same codes fieldOffReasonText
-// takes. Kept 1:1 with that enum; an earlier copy was off by one and stopped at 16.
+// Indexed 1:1 by the firmware FieldEventReason enum (Xregulator.ino), the same codes fieldOffReasonText takes.
 const SYSID_ABORT_REASONS = {
     0:  'no abort recorded',
     1:  'temperature data stale',
@@ -27095,6 +26383,7 @@ const SYSID_ABORT_REASONS = {
     31: 'two or more required sensors failed',
     32: 'regulator temperature sensor not responding',
     33: 'field resistance test',
+    252: 'Run Without Failed Sensors took the field',
     253: 'a field ceiling clipped the test signal',
     254: 'output could not settle at the stabilize current'
 };
@@ -27141,12 +26430,10 @@ function sysidInitDrag() {
     }
     handle.addEventListener('mousedown',  onDown);
     handle.addEventListener('touchstart', onDown, { passive: false });
-    // Re-clamp on window resize (e.g. laptop browser shrunk or device rotated)
-    // so the panel can't end up partly below the new viewport bottom.
+    // Re-clamp on resize/rotate so the panel can't end up below the new viewport bottom.
     window.addEventListener('resize', sysidClampPanel);
 }
 
-// Show/hide the sine-sweep parameter rows on the Plant Delay tab based on test type.
 function sysidToggleSineParams(val) {
     const el = document.getElementById('sysid-sine-params');
     if (el) el.style.display = (parseInt(val) === 1) ? '' : 'none';
@@ -27184,7 +26471,6 @@ function setTuningWaveform(v) {
 }
 
 // ── Tuning→Current closed-loop sine (Stage 2) ──
-// Show the manual-frequency row (waveform 1) or the auto-sweep block (waveform 2).
 function tuningToggleWaveformUI(val) {
     const v = parseInt(val);
     const man = document.getElementById('tuning-sine-manual');
@@ -27205,8 +26491,7 @@ function setPendingToggleValue(hiddenInputId, dataKey, value) {
     pendingToggles.set(dataKey, { desiredValue: parseInt(value), baseRev: lastSeenRev });
 }
 
-// Swap the unified Begin Test button between its idle and running states. Used for ALL three waveform
-// types — Square / Sine manual run until Stop Test; Sine sweep also flips back when it self-completes.
+// Used for all three waveform types; a sine sweep also flips back when it self-completes.
 function _setTestBtnRunning(running) {
     const btn = document.getElementById('tuningBeginTestBtn');
     if (!btn) return;
@@ -27223,16 +26508,12 @@ function _setTestBtnRunning(running) {
     }
 }
 
-// Single entry point for the Current Target Generator.
-// The Waveform Type selector decides what runs: 0 square / 1 sine manual
-// arm the generator and run continuously until Stop; 2 sine sweep arms then fires the closed-loop
-// frequency sweep. Pressing again while running (Stop Test) disarms.
+// Single entry point for the Current Target Generator: square / sine manual run until Stop; sine sweep arms then
+// fires the closed-loop frequency sweep. Pressing again while running disarms.
 function tuningToggleTest() {
     if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
-    // Already running → this press is a Stop.
     if (parseInt(getField("TuningMode") ?? 0) === 1) { tuningStopTest(); return; }
 
-    // Another loop's test must not be running.
     const conflict = getActiveTestKey();
     if (conflict && conflict !== 'curr') {
         xAlert((TEST_PANEL_META[conflict]?.title ?? conflict) + ' is already running.\n\nTurn it off before starting another test.');
@@ -27292,9 +26573,7 @@ function _startTuningSweepNow() {
                             : (data.done ? 'Sweep complete.' : 'Idle');
                         if (data.done && !data.active) {
                             clearInterval(tuningBodePollTimer); tuningBodePollTimer = null;
-                            // Sweep finished — disarm the generator so the button returns to "Begin Test".
-                            // A completed sweep is a finished test (unlike square/sine-manual, which stay
-                            // armed until the user presses Stop).
+                            // A completed sweep is a finished test: disarm (square/sine-manual stay armed until Stop).
                             setPendingToggleValue('TuningMode', 'TuningMode', 0);
                             fetch(buildURL("/get?TuningMode=0")).catch(() => {});
                             _setTestBtnRunning(false);
@@ -27314,7 +26593,6 @@ function _startTuningSweepNow() {
         .catch(err => { if (statusEl) statusEl.textContent = 'Start failed: ' + err; });
 }
 
-// Stop the current test by disarming the generator — works for square, sine-manual, and a running sweep.
 function tuningStopTest() {
     setPendingToggleValue('TuningMode', 'TuningMode', 0);
     fetch(buildURL("/get?TuningMode=0")).catch(() => {});
@@ -27420,13 +26698,12 @@ function openSystemIDModal() {
     overlay.style.display = 'block';
     sysidInitDrag();
     sysidUpdatePreflight();
+    if (sysidPreflightInterval) clearInterval(sysidPreflightInterval);
     sysidPreflightInterval = setInterval(sysidUpdatePreflight, 1000);
 }
 
-// User-initiated close (the header X and footer buttons). While a test is mid-run, a bare close
-// left an open-loop field test running with zero on-screen indication (the floating Test Active
-// panel deliberately hides for sysid) — so ask: abort, or keep it running in the background?
-// Programmatic closes (abort, apply, poll timeout) call closeSystemIDModal directly.
+// User-initiated close. Mid-run, a bare close leaves an open-loop field test running with no on-screen sign (the
+// Test Active panel hides for sysid), so ask. Programmatic closes call closeSystemIDModal directly.
 async function closeSystemIDModalUser() {
     if (parseInt(getField('systemIDActive_ID') ?? 0) > 0) {
         const abort = await xConfirm(
@@ -27465,7 +26742,6 @@ function sysidRestore() {
     if (ov) ov.classList.remove('sysid-min');
 }
 
-// Update the minimized pill's phase label + progress bar/percent.
 // pct null -> blank bar/percent (idle/preflight); otherwise 0-100.
 function sysidUpdatePill(phaseText, pct) {
     const ph   = document.getElementById('sysid-pill-phase');
@@ -27509,9 +26785,8 @@ function sysidShowScreen(name) {
     sysidClampPanel();
 }
 
-// Keep the floating panel fully on screen. max-height caps its height to the
-// viewport; this nudges its top (and left, once dragged) back inside the edges
-// so the bottom — and the action buttons there — never fall below the fold.
+// max-height caps the panel's height; this nudges top (and left, once dragged) back inside the viewport
+// so the bottom action buttons never fall below the fold.
 function sysidClampPanel() {
     if (window.innerWidth <= 600) return;   // mobile = CSS bottom sheet, no JS positioning
     const panel = document.getElementById('sysid-modal-panel');
@@ -27568,9 +26843,8 @@ function sysidUpdatePreflight() {
                 ? '❌ Mode: ' + stageLabel + ' — charging must be active (not idle or maintain)'
                 : '❌ Mode: Charging not active'));
 
-    // Mutex check: refuse start if any square-wave tuning test is on. Firmware enforces this too;
-    // this preflight row just makes the reason visible before the user clicks Start. Read the raw
-    // hidden <input> value (not the _echo span, which contains "On"/"Off" text).
+    // Refuse start if a tuning test is on (firmware enforces it too; this row shows why). Read the hidden
+    // <input>, not the _echo span ("On"/"Off" text).
     const tuningOn = parseInt(getField("TuningMode") ?? 0) === 1;
     const cvTuningOn = parseInt(getField("CVTuningMode") ?? 0) === 1;
     const sysidRunning = parseInt(getField("systemIDActive_ID") ?? 0) > 0;   // a run this modal was closed over
@@ -27594,9 +26868,7 @@ function sysidUpdatePreflight() {
     document.getElementById('sysid-check-mode').textContent  = modeMsg;
     document.getElementById('sysid-check-tests').textContent = testsMsg;
 
-    // Swap the preflight copy + duration estimate to match the selected test type.
-    // (Progress and Results screens switch themselves elsewhere; this is the only
-    // screen whose text was step-only.)
+    // Preflight copy + duration estimate follow the selected test type; progress/results switch themselves.
     const isSine = parseInt(getField("systemIDTestType_sel") ?? 0) === 1;
     const setDisp = (id, show) => { const el = document.getElementById(id); if (el) el.style.display = show ? '' : 'none'; };
     setDisp('sysid-intro-step',    !isSine);
@@ -27606,9 +26878,8 @@ function sysidUpdatePreflight() {
     const titleEl = document.getElementById('sysid-preflight-title');
     if (titleEl) titleEl.textContent = isSine ? 'Plant Frequency Response' : 'Plant Delay Measurement';
 
-    // Estimated duration. Step: 20s stabilize overhead + 7 hold phases.
-    // Sine: 20s stabilize + sum over the log-spaced sweep of (1 settle + N analysed)
-    // cycles per point, floored at 1.5s each — mirrors the firmware and the progress poll.
+    // Step: 20 s stabilize + 7 hold phases. Sine: 20 s + per log-spaced point (1 settle + N) cycles, floored
+    // at 1.5 s; mirrors the firmware and the progress poll.
     let estSec;
     if (isSine) {
         const f0  = Math.max(0.1, parseFloat(getField("systemIDSineFreqStart_echo") ?? 0.5));
@@ -27681,7 +26952,6 @@ function sysidStartProgressPoll() {
     const rrEl = document.getElementById('systemIDResultsReady_ID');
     if (rrEl) rrEl.textContent = '0';
 
-    // Reset all phase rows
     for (let i = 1; i <= 9; i++) {
         const el = document.getElementById('sysid-p' + i);
         if (el) { el.textContent = '⬜ ' + SYSID_PHASE_NAMES[i]; el.style.color = ''; }
@@ -27707,14 +26977,12 @@ function sysidStartProgressPoll() {
             sysidSineEstMs += Math.max(1500, (1 + cyc) * 1000 / f);
         }
         sysidSineEstMs += 20000;  // stabilize overhead
-        // Generous timeout: twice the estimated sweep + 60s, and never shorter than the
-        // step default. Scales automatically with the sweep range/cycles the user picked.
+        // Twice the estimated sweep + 60 s, never shorter than the step default.
         maxWaitMs = Math.max(maxWaitMs, sysidSineEstMs * 2 + 60000);
     }
 
-    // Wall-clock phase advancement: once we know a phase started, we advance the bar
-    // and labels by timer without waiting for the next CSV2 packet.
-    // CSV2 is the authoritative sync signal — if it shows a higher phase we jump ahead.
+    // Advance bar/labels by wall clock once a phase starts, without waiting for the next CSV2 packet;
+    // CSV2 is authoritative, so a higher phase there jumps ahead.
     let wallPhase = 0;       // phase we're currently displaying (may be ahead of last CSV2)
     let wallPhaseStart = 0;  // Date.now() when wallPhase was last set
 
@@ -27752,11 +27020,9 @@ function sysidStartProgressPoll() {
             document.getElementById('sysid-elapsed').textContent = 'Elapsed: ' + (elapsed / 1000).toFixed(0) + 's';
             sysidUpdatePill('Sine sweep…', pct);
         } else {
-            // Sync to firmware phase if it's ahead of our wall-clock estimate
             if (phase > wallPhase) sysidSetWallPhase(phase);
 
-            // Once a non-stabilise phase is active, advance by holdMs wall time.
-            // This means the UI advances immediately even if the next CSV2 is delayed.
+            // Measured phases advance after holdMs of wall time, even if the next CSV2 is late.
             if (wallPhase >= 2 && wallPhase <= 8) {
                 const elapsed_in_phase = Date.now() - wallPhaseStart;
                 if (elapsed_in_phase >= holdMs && wallPhase < 9) {
@@ -27779,7 +27045,6 @@ function sysidStartProgressPoll() {
         if (ready === 1) {
             clearInterval(sysidPollInterval); sysidPollInterval = null;
             document.getElementById('sysid-modal-overlay').classList.remove('sysid-running');
-            // Mark all phases complete
             for (let i = 1; i <= 9; i++) {
                 const el = document.getElementById('sysid-p' + i);
                 if (el) { el.textContent = '✅ ' + SYSID_PHASE_NAMES[i]; el.style.color = '#4caf50'; }
@@ -27852,14 +27117,11 @@ function showSystemIDResults() {
     const ra = parseFloat(getField("systemIDRiseAvg_ID") ?? -1);
     const fa = parseFloat(getField("systemIDFallAvg_ID") ?? -1);
 
-    // Recommended TC = highest single trial across all rise and fall measurements.
-    // Using the worst-case individual reading (not the average) ensures the filter
-    // is always long enough to cover the slowest response the plant actually showed.
+    // Worst single trial, not the average, so the filter covers the slowest response the plant showed.
     const allValid = [...r, ...f].filter(v => v >= 0);
     sysidSuggestedTC = allValid.length > 0 ? Math.max(...allValid) : 0;
 
     // ── Quality table ────────────────────────────────────────────────────────────
-    // Step amplitude: pass > 10A. Noise peak-to-peak: green < 1A, yellow 1–2A, red ≥ 2A.
     const hasQuality = stepAmp.some(v => v > 0);
     const qTbody = document.getElementById('sysid-quality-body');
     if (qTbody) {
@@ -27952,7 +27214,6 @@ function showSystemIDResults() {
 
 // Render the open-loop plant Bode (sine sweep) results from /sysidbode.
 function showSysidBodeResults() {
-    // Hide the step-test sections; show the Bode section.
     const qsec   = document.getElementById('sysid-quality-section'); if (qsec)   qsec.style.display = 'none';
     const qhint  = document.getElementById('sysid-quality-hint');    if (qhint)  qhint.style.display = 'none';
     const tlabel = document.getElementById('sysid-timing-label');    if (tlabel) tlabel.style.display = 'none';
@@ -27985,11 +27246,8 @@ function showSysidBodeResults() {
                     '<td style="padding:6px 4px; color:' + col + ';">' + rel.toFixed(2) + ' (' + relDb.toFixed(1) + ' dB)</td>' +
                     '<td style="padding:6px 4px;">' + p.ph.toFixed(0) + '</td></tr>';
             }).join('');
-            // ── Fit a first-order-plus-dead-time (FOPDT) plant model from the sweep ──
-            // K = DC gain (low-freq), τ from the −3 dB corner, θ (dead time) from the
-            // phase lag the pole alone can't explain. All cheap closed-form math on ~10
-            // points — the heavy lock-in DFT already ran on the ESP32.
-            const fit = sysidFitFOPDT(pts, g0, data.fs);  // `j` was copied from the commissioning-path call; here the response binds as `data`
+            // ── FOPDT plant fit: K = DC gain, τ from the −3 dB corner, θ from the lag the pole can't explain ──
+            const fit = sysidFitFOPDT(pts, g0, data.fs);
 
             // −3 dB bandwidth: interpolated frequency where gain falls to 0.708× low-freq.
             const f3 = fit.f3Hz;
@@ -28042,23 +27300,19 @@ function showSysidBodeResults() {
         });
 }
 
-// Fit a first-order-plus-dead-time model G(s) = K·e^(−θs)/(τs+1) to the swept-sine
-// Bode points. pts: [{f (Hz), g (A per %duty), ph (output lag, deg)}], g0 = low-freq gain.
-// fsHz = measured current-sensor sample rate (0/absent = unknown, keep every point).
-// Returns {ok, K, tauMs, thetaMs, f3Hz, lambdaMs, Kp, Ki}. All closed-form (sums + atan).
+// Fit G(s) = K·e^(−θs)/(τs+1) to the swept-sine Bode points. pts: [{f (Hz), g (A per %duty), ph (output lag, deg)}],
+// g0 = low-freq gain, fsHz = measured current-sensor sample rate (0/absent = unknown, keep every point).
 function sysidFitFOPDT(pts, g0, fsHz) {
     const out = { ok: false, K: g0, tauMs: 0, thetaMs: 0, f3Hz: null, lambdaMs: 0, Kp: 0, Ki: 0, nDropped: 0 };
     if (!pts || pts.length < 3 || g0 <= 1e-6) return out;
 
-    // Above 3 samples/cycle the lock-in returns the alias, not the plant. Those points sit at the
-    // highest ω, and the θ fit below weights by ω² — one of them alone can flip θ negative. Newer
-    // firmware clamps the sweep so nothing lands here; this covers older logs and manual sweeps.
+    // Above fs/3 the lock-in returns the alias, not the plant; those highest-ω points dominate the ω²-weighted θ fit
+    // and can flip θ negative. Firmware clamps the sweep; this covers older logs and manual sweeps.
     const fMax = (fsHz > 0) ? fsHz / 3 : Infinity;
     const kept = pts.filter(p => p.f <= fMax);
     if (kept.length >= 3) { out.nDropped = pts.length - kept.length; pts = kept; }
 
-    // τ from the interpolated −3 dB corner: find the first segment where relative gain
-    // crosses 0.708×, interpolate the crossing frequency in log-f space, τ = 1/(2π f_c).
+    // τ from the −3 dB corner, interpolated in log-f space: τ = 1/(2π f_c).
     let f3 = null;
     for (let i = 1; i < pts.length; i++) {
         const relPrev = pts[i - 1].g / g0, relCur = pts[i].g / g0;
@@ -28074,9 +27328,8 @@ function sysidFitFOPDT(pts, g0, fsHz) {
     const tauSec = 1 / (2 * Math.PI * f3);
     out.tauMs = tauSec * 1000;
 
-    // θ (dead time) from the phase lag the pole can't explain. A pole contributes
-    // atan(ωτ); dead time adds ωθ on top. Least-squares of (excess lag) = θ·ω through
-    // the origin — naturally weights the high-frequency points where dead time dominates.
+    // θ from the lag the pole can't explain: a pole gives atan(ωτ), dead time adds ωθ. Least-squares through
+    // the origin weights the high-frequency points where dead time dominates.
     let Sva = 0, Sww = 0;
     for (const p of pts) {
         const w = 2 * Math.PI * p.f;
@@ -28088,18 +27341,15 @@ function sysidFitFOPDT(pts, g0, fsHz) {
     if (thetaSec < 0) thetaSec = 0;                 // negative = noise/phase lead; clamp
     out.thetaMs = thetaSec * 1000;
 
-    // IMC PI seed for the current loop (error in A → duty %). Kp = τ/(K(λ+θ)), Ki = Kp/τ
-    // (per-second, matching the Arduino PID SetTunings convention). λ chosen conservatively
-    // — overvoltage is costly here — so this is a safe starting point, not a final tune.
+    // IMC PI seed (A error → duty %): Kp = τ/(K(λ+θ)), Ki = Kp/τ per second (Arduino PID SetTunings convention).
+    // λ is conservative because overvoltage is costly, so this is a starting point, not a final tune.
     const lambdaSec = Math.max(tauSec, 2 * thetaSec);
     out.lambdaMs = lambdaSec * 1000;
     const Kp = tauSec / (g0 * (lambdaSec + thetaSec));
     if (isFinite(Kp) && Kp > 0) {
-        // g0 is A per %duty measured on this alternator and bus, so Kp/Ki land in its duty-space. Stored
-        // PidKp/PidKi are referenced to a 12 V winding on a 12 V bus (recomputeCcGains re-applies × fieldScale(),
-        // winding volts / class, at use), so store the seed / fieldScale(): 12/12 → no-op, and the firmware's
-        // multiply lands back on the measured gain. A device that has not reported its winding counts as
-        // fieldScale() = 1, which can only under-, never over-gain.
+        // g0 is measured A per %duty on this alternator/bus, but stored PidKp/PidKi are 12 V-winding/12 V-bus referenced
+        // (recomputeCcGains multiplies by fieldScale() at use), so store the seed / fieldScale(). An unreported winding
+        // counts as fieldScale() = 1, which can only under-gain.
         const fScale = webFieldScale(true);
         out.Kp = Kp / fScale;
         out.Ki = (Kp / tauSec) / fScale;
@@ -28108,15 +27358,9 @@ function sysidFitFOPDT(pts, g0, fsHz) {
     return out;
 }
 
-// "Biggest actionable disturbance" — worst tone the FIELD can react to, read from the resonance
-// /ripple matrix (/famatrix.csv). Actionable band is [4 Hz, actuator BW], where actuator BW =
-// Readout beside the (usually hidden) Compute button: shows the fitted plant time constant and the
-// actuator bandwidth it implies (1/2πτ), or a muted "run the sweep" prompt when nothing is fitted yet.
-// Fed by the persisted CSV3 echo (survives reboots) and refreshed instantly on a fresh fit.
-// Also renders the static "biggest actionable disturbance" conclusion into #faActionableResult: on a
-// normal slow-field install the actuator band sits below the 4 Hz ripple floor, so no measured tone is
-// ever chaseable — a fixed fact, not worth a button. The interactive Compute scan (#faComputeBtn) is
-// revealed only if a fit ever puts the band above 4 Hz (τ < ~40 ms); otherwise the button stays hidden.
+// Plant τ readout (actuator band 1/2πτ, or a "run the sweep" prompt), fed by the persisted CSV3 echo and a fresh fit.
+// Also renders the fixed conclusion into #faActionableResult: a normal slow field's band is below the 4 Hz ripple
+// floor, so no tone is chaseable. #faComputeBtn is revealed only if a fit puts the band above 4 Hz (τ < ~40 ms).
 function updatePlantTauReadout(tauMs) {
     const el = document.getElementById('faPlantTau_readout');
     const FLOOR_HZ = 4.0;   // matrix FFT peak-search floor (FA_MIN_TONE_HZ)
@@ -28152,11 +27396,9 @@ function updatePlantTauReadout(tauMs) {
     }
 }
 
-// 1/(2π·τ_plant) from the Plant Delay sine fit (sysidFitTauMs). Tones above it are real but
-// un-actionable (field too slow → the iExcess EMA averages them out), so they're excluded.
-// Ranked by residual (amp/freq): a low slow tone survives the EMA far better than a high one.
-// On a slow-field install the band can fall below 4 Hz → nothing is actionable (the common case).
-// See iExcess_Redesign_Spec.md §11.
+// Tones above 1/(2π·τ_plant) are un-actionable (field too slow; the iExcess EMA averages them out). Ranked by
+// residual (amp/freq): a low slow tone survives the EMA far better. On a slow-field install nothing is actionable
+// (the common case). See iExcess_Redesign_Spec.md §11.
 function computeActionableDisturbance() {
     const el = document.getElementById('faActionableResult');
     if (!el) return;
@@ -28211,19 +27453,12 @@ function computeActionableDisturbance() {
     }).catch(e => { el.textContent = 'Matrix fetch failed: ' + e; });
 }
 
-// "Set filters from τ" — same three filters the step test writes, sized from the fitted
-// time constant: current filters get τ/3 (phase margin), voltage smoothing gets full τ.
-// ============================================================================
-// Auto-commissioning orchestrator (spec §12). One-button guided setup of the
-// current-control + over-current chain. Drives existing /get handlers and the
-// existing SystemID / tuning-sweep / matrix endpoints; the operator only holds or
-// slowly changes engine speed when prompted — the regulator drives the field.
-// ============================================================================
+// ===== Auto-commissioning orchestrator (spec §12) =====
+// Drives existing /get handlers and SystemID / tuning-sweep / matrix endpoints; the operator only holds or changes
+// engine speed when prompted.
 const CX_PHASES = ['Prep', 'Field curve', 'Current Control Autotuning', 'Verify Current Control', 'Disturbances', 'Fault Threshold Autotuning', 'Voltage Control Autotuning', 'Keep-Alive Floor & Field Decay', 'Stress Test', 'Charge Health Calibration'];
-// Per-phase caption for the permanent RPM strip — the throttle instruction for THE CURRENT screen.
-// Phases 2/3 (CC sweep, Verify) are speed-referenced: commissionRender swaps in "hold near N RPM"
-// with the upstream step's actual speed (cxRpmRefFor) once one is known; these strings are the
-// fallback when it isn't (fresh device, nothing run yet).
+// Per-phase caption for the RPM strip. commissionRender swaps phases 2/3 to "hold near N RPM" (cxRpmRefFor)
+// once a reference speed is known; these strings are the fallback.
 const CX_RPM_LABELS = [
     'Engine RPM (last ~15 s)',
     'Engine RPM (last ~15 s) — hold roughly steady while the ramp runs',
@@ -28242,24 +27477,17 @@ const CX_RPM_LABELS = [
 // redo past the band below, but NOTHING is gated, rejected, or blocked on engine speed.
 const CX_RPM_LOOSE = 500;   // RPM — offset from the upstream step's speed, or wander within one run
 
-// Reference speed for "hold near N RPM": the speed the upstream step actually ran at.
-// Phase 2 (CC sweep — sized from the Field curve) references the ramp; phase 3 (Verify — checks
-// the tune where it was made) references the plant sweep, falling back to the ramp.
+// Reference speed for "hold near N RPM": phase 2 (CC sweep) references the Field curve ramp; phase 3 (Verify)
+// references the plant sweep, falling back to the ramp.
 function cxRpmRefFor(phase) {
     const fc = (cx.fieldResult && cx.fieldResult.rpmAvg > 0) ? cx.fieldResult.rpmAvg : (cx._fcRpmAvg || 0);
     if (phase === 2) return fc;
     if (phase === 3) return (cx.fit && cx.fit.rpmAvg > 0) ? cx.fit.rpmAvg : ((cx._sidRpmAvg || 0) || fc);
     return 0;
 }
-// Resume path: cx.fieldResult/cx.fit die with the page, but the device keeps the last run's
-// numbers — fetch once per wizard session.
-// Sizing inputs ride along with the RPM references. A step re-run on its own after a reload used to
-// fall straight through to generic constants (a 60 ms plant, a 25 Hz alias cap, 10 A) and grade the
-// result without saying so; these are the same numbers measured on THIS machine. kneeAmps is the
-// honest test for "a saturation curve produced a knee" — it is reset to -1 at every sweep start and
-// only the saturation branch ever sets it, so it stays trustworthy even though `ready` is shared with
-// the onset sweep. /sysidbode's fs falls back to the live sample rate in firmware, so it is always
-// meaningful. The applied values come from the CSV3 echoes instead, which survive a reboot.
+// Resume path: cx.fieldResult/cx.fit die with the page, so fetch the device's last-run RPM references and sizing
+// inputs once per session, else a re-run after reload grades against generic constants. kneeAmps (reset to -1 per
+// sweep, set only by the saturation branch) is the honest "knee found" test; `ready` is shared with the onset sweep.
 function cxRpmRefFetch() {
     if (!cx || cx._rpmRefFetched) return;
     cx._rpmRefFetched = true;
@@ -28298,51 +27526,35 @@ function cxRpmAdvisoryHtml(avg, mn, mx, refAvg, refName, redoTxt) {
 let cx = null;             // orchestrator state object; persists across panel close (in-session resume)
 let cxPollTimer = null;
 let cxHeartbeatTimer = null;   // pings commissionHeartbeat while the modal is open (firmware idle-rest hold)
-// Field-command epoch: bumped whenever a wizard flow (re)acquires field control (sweep, current-check,
-// CV plant fit). A teardown that schedules a DELAYED release (the 2.5 s field-down wait before resTest=0/
-// faCommissionGate=0) stamps the epoch and skips its release writes if a newer flow has since taken the
-// field. Without it, a stale resTest=0 lands mid-run and — since the firmware rest-hold now yields to
-// resTestActive — the disarm drops the field to the commissioning rest floor. cxFieldArm() = one bump.
+// Field-command epoch, bumped whenever a wizard flow (re)acquires the field. A teardown with a DELAYED release (2.5 s
+// field-down wait before resTest=0/faCommissionGate=0) skips its writes if a newer flow took the field: a stale
+// resTest=0 mid-run would drop the field to the commissioning rest floor (the rest-hold yields to resTestActive).
 let cxFieldEpoch = 0;
 function cxFieldArm() { return ++cxFieldEpoch; }
 
 // ── Per-stage run plan (partial re-commissioning) ─────────────────────────────
-// cxPlan[i] = run stage i in the next/active wizard pass (0=Prep … 9=Charge Health Calibration).
-// Prep (0) is ALWAYS run (it snapshots the tune for safe revert + checks preconditions), so it stays
-// true and its checkbox is disabled. The wizard navigation skips any stage left false.
+// cxPlan[i] = run stage i in this pass. Prep (0) always runs (snapshots the tune for revert + checks preconditions),
+// so it stays true with its checkbox disabled. Navigation skips any stage left false.
 let cxPlan = [true, true, true, true, true, true, true, true, true, true];   // one entry per CX_PHASES stage
-// Coupling: (re)running a stage invalidates the downstream stages it feeds, so selecting one
-// force-selects (and locks) those of them that are DONE — a pending one has nothing to lose. Field curve(1) → Plant fit(2)+Verify(3)+CV plant fit(6); Plant fit(2) →
-// Verify(3)+CV plant fit(6); Verify(3) → CV plant fit(6); Disturbances(4) → Thresholds(5).
-// CV plant fit(6) measures the current→voltage plant, downstream of the whole inner current loop.
-// The Stress Test(8) verdict grades the tuned CV loop, so any retune upstream of it (1/2/3/6) stales it.
-// Keep-Alive floor + Field decay(7) is independent — nothing feeds it, it feeds nothing; it runs late so
-// the engine is warm. Tach alignment (RPMScalingFactor/PulleyRatio) is set on a pre-wizard screen,
-// not a stage. (Mirrors commissionDependentsMask() in the firmware.)
+// Re-running a stage stales the downstream stages it feeds, so ticking one force-ticks (and locks) those already DONE.
+// Stress Test(8) grades the tuned CV loop, so 1/2/3/6 stale it; Keep-Alive + Field decay(7) is independent.
+// Mirrors commissionDependentsMask() in the firmware.
 const CX_DEPENDENTS = { 1: [2, 3, 6, 8], 2: [3, 6, 8], 3: [6, 8], 4: [5], 6: [8] };
-// The other direction, derived from the table above (minus the Stress Test, which reads nothing it
-// needs measured): the stages whose MEASURED OUTPUT a stage reads as an input. Plant fit(2) sizes its
-// sweep from the Field curve's proposals; Verify(3) sizes its sweep from the plant fit and the curve's
-// saturation knee; Thresholds(5) reads the ripple map from Disturbances(4); CV plant fit(6) measures
-// the current→voltage plant and needs the inner loop tuned first. Selecting a stage force-selects any
-// of these NOT already done: running a step against inputs nothing ever measured grades a machine we
-// have no numbers for, silently. A prerequisite that IS done is left alone — its stored results are
-// the input. Also the taint table for the Finish summary (a measured step built on a skipped upstream).
+// Inverse of CX_DEPENDENTS minus the Stress Test: the stages whose MEASURED output a stage reads. Ticking a stage
+// force-ticks any of these NOT yet done (else it grades a machine we have no numbers for); a done prerequisite's
+// stored results are the input. Also the taint table for the Finish summary.
 const CX_PREREQS = (() => {
     const r = {};
     for (const k in CX_DEPENDENTS) for (const d of CX_DEPENDENTS[k]) if (d !== 8) (r[d] = r[d] || []).push(+k);
     return r;
 })();
-// Mirror of the firmware's COMMISSION_REQUIRED_MASK: stages 0..7 done = COMMISSIONED. The Stress test(8)
-// and Charge health calibration(9) are optional and never block it, so every "is the pass complete"
-// test in the wizard uses this, not the full ten-bit mask.
+// Mirror of firmware COMMISSION_REQUIRED_MASK: stages 0..7 done = COMMISSIONED. Stress test(8) and Charge health(9)
+// are optional, so every "pass complete" test uses this, not the full ten-bit mask.
 const CX_REQUIRED_MASK = 0x0FF;
 let cxPlanUserSet = false;   // true once the user ticks a box, so CSV3 re-renders stop re-defaulting the plan
-// Stages the plan ticked ITSELF, and why — so unticking the step that needed them releases them again,
-// while a step the user ticked by hand stays put. Forced = done, and a ticked feeder will stale it (the
-// firmware clears its done bit when the feeder re-marks), so it is locked while that feeder is ticked.
-// Pulled = not measured, and a ticked step reads it; unlocked, because unticking it is the natural way
-// to say "not that step either" (its readers come off with it, see cxUnselectReaders).
+// Stages the plan ticked ITSELF, so unticking the step that needed them releases them; hand-ticked steps stay.
+// Forced = done and a ticked feeder will stale it, so locked while that feeder is ticked. Pulled = unmeasured and a
+// ticked step reads it; unlocked, since unticking it removes its readers too (cxUnselectReaders).
 let cxPlanForced = new Set();
 let cxPlanPulled = new Set();
 let cxPlanMaskBasis = -1;    // done-mask the plan was last derived/edited against; a change while idle re-derives it
@@ -28385,11 +27597,9 @@ function cxPlanReadersOf(r, mask) {
 // Mask reads on the plan side are always cxEffMask(): the paused pass has marks the CSV3 echo has not
 // carried back yet, and a just-measured step read as pending would escape its lock.
 function cxPlanLocked(d) { return d !== 0 && cxPlanFeedersOf(d, cxEffMask()).length > 0; }
-// Bring the plan to a consistent state after any edit: every ticked stage's done dependents are ticked
-// (forced), every ticked stage's unmeasured prerequisites are ticked (pulled), and anything the plan
-// ticked itself that nothing needs any more comes back off. A forced stage that has since gone pending
-// (its feeder re-ran) stays ticked as an ordinary pending step; a pulled stage that has since been
-// measured comes off — its readers have their input now.
+// Settle the plan after any edit: ticked stages' done dependents are forced on, their unmeasured prerequisites pulled
+// on, and self-ticked stages nothing needs come back off. A forced stage gone pending stays ticked as an ordinary
+// step; a pulled stage since measured comes off.
 function cxPlanSettle(mask) {
     cxPlan[0] = true;
     // A step the paused pass skipped "for now" is not pulled back in as somebody's prerequisite — that
@@ -28419,9 +27629,8 @@ function cxUnselectReaders(i, mask) {
     if (mask & (1 << i)) return;
     for (const k of cxPlanReadersOf(i, mask)) { cxPlan[k] = false; cxPlanForced.delete(k); cxPlanPulled.delete(k); cxUnselectReaders(k, mask); }
 }
-// Default plan from the persisted done-mask: pre-select the stages NOT yet done (so a fresh device
-// pre-selects everything = "select all", and a single stale step — e.g. one invalidated by an
-// upstream redo — pre-selects just that). A fully-done device (re-commission) defaults to all selected.
+// Default plan: pre-select stages NOT yet done (fresh device = all; one stale step = just it).
+// A fully-done device (re-commission) defaults to all selected.
 function cxDefaultPlanFromMask(mask) {
     const ALL = (1 << CX_PHASES.length) - 1;   // 0x3FF for 10 stages
     const allDone = (mask & ALL) === ALL;
@@ -28456,17 +27665,9 @@ function cxToggleSelectAll(on) {
     cxPlanSettle(cxEffMask());
     renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask);
 }
-// Primary-button intent — derived purely from the ticked plan (cxPlan, post-dependency-cascade) vs
-// the persisted done-mask (cxLastMask), NOT from the firmware state flag. Optional stages are 1..N
-// (Prep always runs and is ignored here). Returns label + help + style + whether to revert.
-//   nothing ticked            → disabled.
-//   nothing done yet          → "Start" (clean first pass over the ticked subset).
-//   every optional step ticked AND something already done → "Clear and restart": a wholesale redo,
-//     so revert to the pre-commissioning snapshot and run the whole walkthrough again.
-//   otherwise (a partial pass over not-yet-done, and/or a TARGETED redo of a few done steps that
-//     force-pulls only their downstream) → "Continue": keep prior work + the snapshot, run the
-//     ticked subset. This is the case that must NOT revert, or the "redo forces downstream" coupling
-//     would be steamrolled by a full restart.
+// Primary-button intent from the ticked plan vs the done-mask, NOT the firmware state flag. All optional steps ticked
+// with something done = "Clear and restart" (revert to snapshot). A partial or targeted redo = "Continue": it must NOT
+// revert, or the "redo forces downstream" coupling would be steamrolled by a full restart.
 function cxStartIntent() {
     let doneCount = 0, planCount = 0, allSelected = true;
     const optional = CX_PHASES.length - 1;   // every step except Prep (always run, ignored here)
@@ -28474,10 +27675,8 @@ function cxStartIntent() {
         if (cxLastMask & (1 << i)) doneCount++;
         if (cxPlan[i]) planCount++; else allSelected = false;
     }
-    // The required steps done but the device isn't COMMISSIONED (state≠2) = a run that was never
-    // committed (Finish dropped, wizard closed at the end, or stopped after the last required step).
-    // Offer to commit it when nothing is ticked to run — or when every step is done and the default
-    // all-ticked plan stands — NOT "clear and restart", which would revert the finished work.
+    // Required steps done but not COMMISSIONED (state≠2) = a run never committed. Offer to commit it when nothing is
+    // ticked, or all is done under the default all-ticked plan; NOT "clear and restart", which reverts finished work.
     const requiredDone = (cxLastMask & CX_REQUIRED_MASK) === CX_REQUIRED_MASK;
     if (cxLastState !== 2 && requiredDone && (planCount === 0 || (doneCount === optional && allSelected)))
         return { label: 'Finish commissioning…', help: 'The required steps are done but the run was never saved. This commits it and marks the device commissioned — nothing is re-run or reverted.', className: 'btn-primary', disabled: false, action: 'finish' };
@@ -28489,8 +27688,6 @@ function cxStartIntent() {
         return { label: 'Clear and restart commissioning…', help: 'Every step is ticked, so this reverts to your pre-commissioning settings and runs the whole walkthrough again from the top.', className: 'btn-secondary', disabled: false, action: 'restart' };
     return { label: 'Continue commissioning…', help: 'Runs just the ticked steps and keeps everything already done. Re-running a step also re-runs the steps it feeds.', className: 'btn-primary', disabled: false, action: 'open' };
 }
-// Dispatch the primary button per cxStartIntent(): a wholesale redo reverts then restarts, anything
-// else opens the wizard to run the ticked plan.
 function commissionPrimaryAction() {
     // The panel is non-blocking, so this tab stays reachable mid-run. A second entry would build a fresh
     // session over the running one and leave its test unwatched — the wizard's own buttons own that run.
@@ -28500,11 +27697,11 @@ function commissionPrimaryAction() {
     if (intent.disabled) return;
     if (intent.action === 'restart') commissionClearAndRestart();
     else if (intent.action === 'finish') commissionCommitUncommitted();
-    else openCommPrereqs(false);   // re-commission: same pre-flight as a first install, minus tach alignment
+    // Same pre-flight as a first install. Tach alignment shows only while nothing is commissioned or in progress: a first
+    // install that left at a pre-wizard screen never reached it.
+    else openCommPrereqs(false, false, cxLastState === 0 && cxLastMask === 0);
 }
-// Commit a completed-but-uncommitted run: every step is done but Finish never fired (wizard closed
-// at the end, or the network dropped between the last step and Finish). Sends commissionDone=1 to
-// persist the new tune and flip the badge to COMMISSIONED — without reopening the wizard or reverting.
+// Commit a completed run whose Finish never fired: commissionDone=1, no wizard reopen, no revert.
 function commissionCommitUncommitted() {
     if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     cxGet('commissionDone=1&cmEpoch=' + Math.floor(Date.now() / 1000)).then(() => {
@@ -28515,10 +27712,9 @@ function commissionCommitUncommitted() {
 }
 // Wizard navigation honouring the plan: next selected stage in 1..last, or -1 if none remain.
 function cxNextSelected(from) { for (let i = from + 1; i < CX_PHASES.length; i++) if (cxPlan[i]) return i; return -1; }
-// Session-side mirror of what the firmware does to the masks when a stage is passed, kept on `cx` so it
-// survives a pause: `passed` = stages this pass has moved beyond (resume never re-offers them unless the
-// user re-ticks one), `doneBits`/`clearBits` = the done-mask edits this pass has made, laid over the CSV3
-// echo by cxEffMask() — the echo trails the request by a push, and Finish reads it right after.
+// Session-side mirror of the firmware's mask edits, kept on cx so it survives a pause: passed = stages this pass moved
+// beyond (resume never re-offers them unless re-ticked); doneBits/clearBits are laid over the CSV3 echo by cxEffMask(),
+// since the echo trails the request by a push and Finish reads it right after.
 function cxPassStage(stage, how) {
     if (!cx) return;
     cx.passed = cx.passed || new Set(); cx.doneBits = cx.doneBits || 0; cx.clearBits = cx.clearBits || 0;
@@ -28530,10 +27726,8 @@ function cxPassStage(stage, how) {
     if (how === 'done') for (const d of (CX_DEPENDENTS[stage] || [])) { cx.doneBits &= ~(1 << d); cx.clearBits |= (1 << d); cx.passed.delete(d); }
 }
 function cxEffMask() { return cx ? ((cxLastMask | (cx.doneBits || 0)) & ~(cx.clearBits || 0)) : cxLastMask; }
-// Mark the stage we're leaving complete (firmware sets its done bit + clears its dependents), then
-// move to the next selected stage — or finish if this was the last one. markDone=false advances
-// WITHOUT setting the done bit, so a step that couldn't actually complete (e.g. a failed CV plant
-// fit on a weak alternator) doesn't get a ✓ or push the device to a false COMMISSIONED badge.
+// Mark the stage done (firmware also clears its dependents), then go to the next selected stage or finish. markDone=false
+// advances without the done bit, so a step that couldn't complete gets no ✓ and no false COMMISSIONED badge.
 function cxAdvance(markDone = true) {
     const cur = cx.phase, nx = cxNextSelected(cur);
     const done = markDone ? cxGet('commissionStageDone=' + cur) : Promise.resolve();
@@ -28544,11 +27738,8 @@ function cxAdvance(markDone = true) {
         if (nx === -1) cxFinish(); else cxGoto(nx);
     }).catch(e => { xAlert('This step could not be marked done: ' + e + '. Nothing moved on; try again.'); commissionRender(); });
 }
-// Shared "Next →"/"Finish" button for the per-phase render functions — only emitted once the step's
-// action is done, so it's always clickable (no disabled-greyed Next cluttering earlier states).
-// label shows the next selected stage, or "Finish" when this is the last one in the plan.
-// markDone=false skips marking this stage complete (passed to cxAdvance); primary=false renders it
-// as the secondary action (e.g. an explicit "skip" after a failed step).
+// Shared Next/Finish button, emitted only once the step's action is done. markDone is passed to cxAdvance;
+// primary=false renders it as the secondary action (e.g. an explicit skip after a failed step).
 function cxNextBtn(markDone = true, primary = true) {
     const nx = cxNextSelected(cx.phase);
     const label = (nx === -1) ? 'Finish' : ('Next: ' + CX_PHASES[nx] + ' →');
@@ -28556,11 +27747,8 @@ function cxNextBtn(markDone = true, primary = true) {
     return '<button onclick="cxAdvance(' + markDone + ')" class="' + cls + '">' + label + '</button>';
 }
 // ── Clean-pass chaining across the cruise-hold stretch (Plant fit → Verify) ──
-// These stages share one held engine speed, so when a result is CLEAN the primary button applies
-// it AND starts the next stage's test in one press (instead of Apply → Next → Run). Only the
-// stages in CX_AUTORUN are ever auto-started — Disturbances needs a drop to idle, and CV plant
-// fit has its own load-steady precondition, so a human press stays required there. Any warning or
-// marginal result falls back to the plain Apply primary and today's manual flow.
+// A CLEAN result's primary button applies it AND starts the next stage's test. Only CX_AUTORUN stages auto-start:
+// Disturbances needs a drop to idle and CV plant fit has its own load-steady precondition.
 const CX_AUTORUN = { 2: () => cxPlantStart(false), 3: () => cxVerifyStart() };
 // applyFn = global apply-function name; it must accept (run) and call cxAdvanceRun() when true.
 function cxApplyRunBtn(applyFn, clean) {
@@ -28583,12 +27771,10 @@ function cxAdvanceRun() {
 }
 
 // ── Universal step navigation: Back / Skip for now / Mark done manually ───────
-// Available on every runnable step (not Prep). Back re-enters an earlier step to redo it; Skip leaves a
-// step outstanding but flagged for manual setup; Mark-done-manually counts it done (unmeasured) so the
-// COMMISSIONED badge can be reached and the nag stops.
+// Back re-enters an earlier step to redo it; Skip leaves it outstanding but flagged for manual setup; Mark done
+// manually counts it done (unmeasured) so COMMISSIONED can be reached. Not on Prep.
 
-// Previous planned runnable step before `from`, or -1 if `from` is the first one (Back never returns
-// to Prep — it's the start gate, not a redoable step).
+// Back never returns to Prep (the start gate, not a redoable step).
 function cxPrevSelected(from) { for (let i = from - 1; i >= 1; i--) if (cxPlan[i]) return i; return -1; }
 
 // Any wizard flow currently commanding the field / mid-measurement. Nav is disabled during a run —
@@ -28605,9 +27791,8 @@ function cxBack() {
     if (prev !== -1) cxGoto(prev);
 }
 
-// Skip the current step "for now": stays outstanding (badge keeps nagging), flagged for the Finish
-// summary. Warns first if the step feeds later ones that are planned: those will run against whatever
-// this step left unmeasured, whether or not they were done before (a planned redo re-marks regardless).
+// Skip "for now": stays outstanding, flagged for the Finish summary. Warns first if planned later steps feed on it:
+// they run against whatever it left unmeasured (a planned redo re-marks regardless).
 async function cxSkip(stage) {
     if (cxRunActive()) return;
     const deps = (CX_DEPENDENTS[stage] || []).filter(d => d !== 8 && cxPlan[d]);
@@ -28645,10 +27830,8 @@ async function cxManual(stage) {
     }).catch(e => xAlert('The step could not be marked done: ' + e + '.'));
 }
 
-// Persistent nav row appended to every runnable step's body (Prep has its own Start flow).
-// The Stress test (8) is an optional reference check: its Skip is consequence-free (never blocks
-// COMMISSIONED) and "Mark done manually" is hidden — there is nothing to set by hand, and hand-marking
-// a verdict would fabricate a result.
+// Nav row appended to every runnable step (Prep has its own Start flow). Stress test (8) is optional: Skip is
+// consequence-free and "Mark done manually" is hidden, since hand-marking a verdict would fabricate a result.
 function cxNavFooter() {
     const s = cx.phase;
     const prev = cxPrevSelected(s);
@@ -28665,12 +27848,9 @@ function cxNavFooter() {
         '</div>';
 }
 
-// Rows for the Finish summary: every step set by hand this run (skipped or hand-marked), plus a taint
-// note for any measured step that was built on a skipped upstream. Reads the persisted masks (reload-proof)
-// unioned with this session's immediate actions, so it is correct even if the CSV3 echo hasn't caught up.
-// Plain-text rows (xAlert renders textContent with pre-line, so no HTML). Reads the persisted masks
-// (reload-proof) unioned with this session's immediate actions, so it is correct even if the CSV3 echo
-// hasn't caught up.
+// Finish-summary rows: every step skipped or hand-marked, plus a taint note for a measured step built on a skipped
+// upstream. Persisted masks (reload-proof) unioned with this session's actions, so correct before CSV3 catches up.
+// Plain text: xAlert renders textContent with pre-line.
 function cxHandledSummaryRows() {
     const h = (cx && cx.handled) || {};
     const rows = [];
@@ -28737,55 +27917,36 @@ function cxDriveGateRefresh() {
     else if (btn.dataset.driveGated) { btn.disabled = false; delete btn.dataset.driveGated; }
   });
 }
-function cxHardV() { const v = getEchoNumber('AlternatorHardShutdownV_echo'); return (v > 0) ? v : NaN; }
 
-// The one true protection statement, per phase. The open-loop / test-current phases — Field curve (1),
-// Plant fit (2), Verify (3), CV plant fit (6), Keep-Alive floor + drain (7) — are guarded only by the fast OV cut +
-// INA228 backstop; the disturbance map (4) and threshold review (5) run under full normal protection.
-// Per-phase protection statement (plain text — the footer wrapper lives in commissionRender).
+// Per-phase protection statement (inline HTML — the footer wrapper lives in commissionRender).
 function cxSafetyText(phase) {
-  const hv = cxHardV();
-  const bv = cxBulkV();
-  // Show the ACTUAL trip (AlternatorHardShutdownV), expressed as live Bulk + the real offset so it
-  // always adds up — the trip is an absolute setting, not a live bulk+0.5, so don't compute the sum.
-  let ov;
-  if (isNaN(hv)) ov = 'the Alternator Hard Shutdown Voltage';
-  else if (!isNaN(bv) && bv > 0) ov = 'Bulk ' + bv.toFixed(2) + ' V + ' + (hv - bv).toFixed(2) + ' = ' + hv.toFixed(2) + ' V (Alternator Hard Shutdown Voltage)';
-  else ov = hv.toFixed(2) + ' V (Alternator Hard Shutdown Voltage)';
-  // Open-loop / test-current steps (Field curve, Plant fit, Verify, CV plant fit, Keep-Alive floor
-  // onset ramp + field-drain cuts) run with only the fast over-voltage hard-shutdown live; the
-  // rest run under full normal protection.
-  // Stage 9 also holds the field open-loop, but it ends its own run on output or bus voltage well
-  // before the hard shutdown — the operator is never the protection.
-  const openLoop = (phase >= 1 && phase <= 3) || phase === 6 || phase === 7 || phase === 9;
+  // Open-loop / test-current steps run with only the fast over-voltage hard-shutdown live. Stage 9 also holds the
+  // field open-loop but ends its own run on output or bus voltage well before the hard shutdown.
+  const openLoop = (phase >= 1 && phase <= 4) || phase === 6 || phase === 7 || phase === 9;
   if (phase === 8) return 'Protections active this step: <strong>all of them, the whole time</strong>.';
   return openLoop
     ? 'Protections active this step: <strong>over-voltage only</strong>.'
     : 'Protections active this step: <strong>all of them</strong>.';
 }
 
-// Deep detail for every step lives on the docs site, not in the panel. target=_blank is
-// REQUIRED: capacitor.config.json sets allowNavigation "*", so a same-tab link would replace
-// the dashboard inside the app with no way back.
+// target=_blank is REQUIRED: capacitor.config.json sets allowNavigation "*", so a same-tab link would replace the
+// dashboard inside the app with no way back.
 const CX_DOC_URL = 'https://docs.xengineering.net/basic-use/commissioning/full-explanation/';
 function cxDocLink(anchor) {
   return ' <a href="' + CX_DOC_URL + '#' + anchor + '" target="_blank" rel="noopener"'
        + ' style="color:#2ec4b6; text-decoration:none; white-space:nowrap;">Full explanation ›</a>';
 }
 
-// A step's screen copy is one actionable line; the paragraph of "why" hides behind the standard
-// "i" badge. Click/tap to open (never hover — the Capacitor build has no pointer), handled by the
-// one global tooltip listener. Give it the reasoning AND the doc link, so the visible line stays
-// a single sentence for the operator who just wants the number set.
+// Step copy stays one actionable line; the "why" and doc link go behind the "i" badge. Click/tap only (the
+// Capacitor build has no hover), handled by the global tooltip listener.
 function cxWhyTip(html) {
   return ' <span class="tooltip" title="Why this setting"><span class="tooltip-box"'
        + ' style="font-size:12px; line-height:1.55; text-align:left; max-width:min(340px, calc(100vw - 36px));">'
        + html + '</span></span>';
 }
 
-// Per-phase technical fine print — the "details" the simple instructions deliberately omit.
-// Shown muted at the bottom of the panel, above the protection statement. Keep these to the
-// few facts that change what the user DOES on this screen; everything else goes in the doc.
+// Per-phase fine print, muted above the protection statement. Keep to facts that change what the user DOES on
+// this screen; everything else goes in the doc.
 function cxFinePrint(phase) {
   switch (phase) {
     case 0: return 'Commissioning runs some semi-automated tests on your alternator and uses the results to optimize configuration settings. Time required is ~ 30 minutes and requires some charging headroom in the battery SOC to avoid tripping overvoltage protections.' + cxDocLink('step-1-prep');
@@ -28804,16 +27965,9 @@ function cxFinePrint(phase) {
   }
 }
 
-// Safe closed-loop verify-sweep parameters, computed from the plant fit (τ) and the field
-// curve (saturation knee / proposed stabilize current) — NOT read off the Tuning ▸ Current
-// tab, whose values are unknown/stale at commissioning time. Floor = baseline operating
-// current; amplitude = small linear perturbation; sweep range brackets the plant corner.
-// Every input resolves the same way: what THIS session measured, else what the device still holds from
-// an earlier one, else a generic constant. `generic` names the inputs that fell all the way through, so
-// the step can say out loud that it is about to grade a sweep sized for a machine we have no numbers
-// for — that used to happen silently after any page reload.
-// Names the inputs a step had to guess at. Silence when nothing was guessed: a run sized from this
-// machine's own measurements needs no commentary.
+// cxVerifyParams: verify-sweep sizing from the plant fit (τ) and field curve, NOT the Tuning ▸ Current tab (stale at
+// commissioning). Each input: this session's measurement, else the device's earlier one, else generic (listed in
+// `generic`). cxSizingNoteHtml names the guessed inputs and stays silent when nothing was guessed.
 function cxSizingNoteHtml(generic, lead) {
     if (!generic || !generic.length) return '';
     return '<div style="margin:0 0 10px;padding:8px 11px;background:#2e2415;border-radius:6px;color:#f0a500;font-size:13px;line-height:1.5;">' +
@@ -28828,26 +27982,20 @@ function cxVerifyParams() {
     if (device > 0) return device;
     generic.push(label); return fallback;
   };
-  // The persisted plant tau has no _echo element — CSV3 adopts it straight into sysidFitTauMs (see the
-  // systemIDPlantTauMs entry in the settings-echo table), which is the same value with or without a
-  // fit this session.
+  // The persisted plant tau has no _echo element: CSV3 adopts it straight into sysidFitTauMs.
   const echoStab = getEchoNumber('SystemIDStabilizeAmps_echo');
   const tau = pick(cx.fit && cx.fit.tauMs, sysidFitTauMs, 60, 'plant time constant');   // ms
   const fc  = 1000 / (2 * Math.PI * tau);                          // plant corner, Hz
   const fStart = Math.min(1.0, Math.max(0.2, fc / 8));
-  // End ~10× the corner and deliberately a bit past the expected crossover so a resonant peak
-  // above the closed-loop bandwidth still lands inside the sweep. Hard-capped at what the current
-  // sensor can resolve (3 samples/cycle, measured during the plant sweep) — a 25 Hz point on a
-  // ~33 Hz sensor measures its own alias. Firmware clamps too; this keeps the request honest.
+  // End ~10× the corner, a bit past expected crossover so a resonant peak still lands inside; capped at fs/3 (a 25 Hz
+  // point on a ~33 Hz sensor measures its own alias). Firmware clamps too; this keeps the request honest.
   const fAlias = pick(cx.fit && cx.fit.fsHz, cx._sidFsHz, 75, 'current-sensor sample rate') / 3;
   const fEnd   = Math.min(25, fAlias, Math.max(15, fc * 10));
   const knee = pick(cx.fieldResult && cx.fieldResult.kneeAmps, cx._fcKneeA, 0, 'saturation knee');
   const stab = pick(cx.fieldResult && cx.fieldResult.propStabA, echoStab,
                     knee > 0 ? knee * 0.4 : 10, 'stabilize current');   // propStabA = 50% of the cap-at-RPM
-  // The wave only swings UP from the floor, so floor and amplitude share the headroom to the
-  // peak. Aim the peak at ~80% of the cap (1.6× the 50% baseline) for a meaty swing, but hold it
-  // ≥15% below the measured saturation knee so the closed-loop response can't clip. Then split:
-  // operating point at 70% of the peak, the rest is swing.
+  // The wave swings only UP from the floor: peak ~1.6× the 50% baseline (~80% of the cap) but ≥15% under the
+  // saturation knee so the closed-loop response can't clip; operating point at 70% of the peak, the rest is swing.
   let peak = stab * 1.6;
   if (knee > 0) peak = Math.min(peak, knee * 0.85);
   const floor = Math.max(3, Math.round(peak * 0.7));
@@ -28855,39 +28003,29 @@ function cxVerifyParams() {
   return { floor, amp, fStart: fStart.toFixed(2), fEnd: fEnd.toFixed(1), cycles: 2, generic };
 }
 
-// Bring the dashboard tab the user should be watching into view — on phase entry and again when a
-// field-action button fires, so the test is on-screen the moment the field moves:
-//   open-loop ramp / open-loop sine / disturbance creep / validation hold → Plots ▸ Short Term
-//   closed-loop sine-sweep verify                                          → Tuning ▸ Current
-// Switching the tab is all it does when the page is already there — pressing Run on a step whose
-// tab is already up moves nothing, so the same tab is never scrolled twice.
+// Bring the tab the user should watch into view on phase entry and when a field-action button fires. A tab already
+// up is left alone, so the same tab is never scrolled twice.
 function cxShowTab(main, sub) {
   try {
     // The wizard panel floats over the page — the tab's live plot sits below the fold behind it.
     const firstPlot = { 'plots|displays': 'current-temp-plot', 'tuning|current': 'pid-tuning-plot', 'tuning|voltage': 'cv-tuning-plot' }[main + '|' + sub];
     const el = firstPlot ? document.getElementById(firstPlot) : null;
-    // Laid out => its main tab, sub-tab and (for Tuning) alt-panel are ALL already the active ones.
-    // Re-selecting them anyway costs a window.scrollTo(0,0) inside showSubTab/showTuningPanel — the
-    // page snaps to the top and the scrollIntoView below drags it back down. The Keep-Alive Floor step
-    // calls this twice per held speed (onset sweep, then the drain run auto-starts), so that
-    // top-and-back-down lurch happened six times in a row.
+    // Laid out => main tab, sub-tab and alt-panel are already active. Re-selecting costs a scrollTo(0,0) in
+    // showSubTab/showTuningPanel that scrollIntoView then drags back (Keep-Alive Floor calls this twice per speed).
     const showing = !!el && el.offsetParent !== null;
     if (showing) return;   // right tab already up — never move the page the user placed
     if (main === 'tuning') { goToTuning(sub); }   // #tuning is an alt-panel, not a main tab
     else { showMainTab(main); showSubTab(main, sub); }
-    // Only a real tab CHANGE scrolls, and it has to: showSubTab/showTuningPanel just slammed the
-    // page to the top, so the plot has to be pulled back down or it sits below the fold. Instant,
-    // not smooth — a fresh tab landing at its plot reads as placement; an animated glide down from
-    // the top reads as the page lurching under you.
+    // A real tab change must scroll: showSubTab/showTuningPanel just slammed the page to the top. Instant, not
+    // smooth; an animated glide down reads as the page lurching.
     if (el) requestAnimationFrame(() => {
       try { el.scrollIntoView({ block: 'start' }); } catch (e) { }
     });
   } catch (e) { /* tab not present — non-fatal */ }
 }
 
-// Every commissioning write goes through here (single /get chokepoint). A refusal rejects like a lost
-// connection: the firmware answers 403 while settings are locked and 409 when a different regulator
-// answered, and reading those as success let the wizard show values stored and tests stopped that were not.
+// Single /get chokepoint for commissioning writes. A refusal rejects like a lost connection: 403 = settings locked,
+// 409 = a different regulator answered; reading those as success showed writes that never landed.
 function cxGet(params) {
     return fetch(buildURL('/get?' + params)).then(r => {
         if (r.ok) return r;
@@ -28914,22 +28052,15 @@ function cxReportStopFailure(what, failed) {
         'Stop not confirmed');
 }
 
-// One per test start, sent with the start request and echoed back in that test's status frames.
-// Only an ACCEPTED start adopts it, which is what lets a poll tell this run's results from the
-// previous run's — the firmware latches results until the next accepted start, and a refused start
-// leaves the old ones sitting there looking finished. Non-zero: 0 is the firmware's "no token".
+// Per-start token echoed in that test's status frames. Only an ACCEPTED start adopts it, so a poll can tell this
+// run's results from the previous run's latched ones. Non-zero: 0 is the firmware's "no token".
 function cxRunTok() { return 1 + Math.floor(Math.random() * 4294967294); }
 
 // ── Screen wake lock ──────────────────────────────────────────────────────────
-// Firmware tests carry a browser-poll deadman: a phone screen that sleeps mid-run aborts the
-// test as "connection lost". Hold a screen wake lock while the wizard or the standalone stress
-// modal is open. The OS drops the lock whenever the page hides — re-acquire on return.
-// The Wake Lock API exists only in a secure context, so over the regulator's plain-HTTP origin
-// (every browser path; the app's WebView origin is secure) navigator.wakeLock is undefined.
-// Fallback there: loop a 2 s 32x32 black video that carries a silent audio track, UNMUTED
-// (the NoSleep.js technique). Unmuted is load-bearing: Chrome holds its media wake lock for an
-// off-screen video only while it is audible, and a muted video stopped keeping iOS awake in
-// iOS 15. Side effect: iOS pauses whatever else is playing audio while the wizard is open.
+// Firmware tests carry a browser-poll deadman: a sleeping phone screen aborts the test, so hold a wake lock while the
+// wizard or stress modal is open (re-acquired on return; the OS drops it when the page hides). The plain-HTTP origin
+// has no navigator.wakeLock: fall back to a looping black video with a silent audio track, UNMUTED (NoSleep.js) —
+// Chrome keeps an off-screen video's wake lock only while audible, and muted stopped working in iOS 15.
 let _wakeLock = null, _wakeLockWant = false, _wakeVideo = null;
 const WAKE_VIDEO_SRC = 'data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAa/bW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAB9AAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAyx0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAACAAAAAgAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAfQAAAAAAABAAAAAAKkbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAoAAAAUABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAACT21pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAg9zdGJsAAAAt3N0c2QAAAAAAAAAAQAAAKdhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAACAAIABIAAAASAAAAAAAAAABFUxhdmM2Mi4yOC4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALWF2Y0MBQsAK/+EAFWdCwArZCWwEQAAAAwBAAAAFA8SJkgEABWjLg8sgAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAAADMQAAAAAAAAAGHN0dHMAAAAAAAAAAQAAABQAAAQAAAAAFHN0c3MAAAAAAAAAAQAAAAEAAABwc3RzYwAAAAAAAAAIAAAAAQAAAAEAAAABAAAABQAAAAIAAAABAAAABgAAAAEAAAABAAAACQAAAAIAAAABAAAACgAAAAEAAAABAAAADAAAAAIAAAABAAAADQAAAAEAAAABAAAAEAAAAAIAAAABAAAAZHN0c3oAAAAAAAAAAAAAABQAAAKEAAAACgAAAAoAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAFBzdGNvAAAAAAAAABAAAAcEAAAJjAAACZoAAAmoAAAJtQAACcsAAAnYAAAJ5QAACfIAAAoIAAAKFQAACiIAAAo4AAAKRQAAClIAAApfAAACvXRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAIAAAAAAAAH0AAAAAAAAAAAAAAAAQEAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAB9AAAAQAAAEAAAAAAjVtZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAB9AAABCgFXEAAAAAAAtaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAFNvdW5kSGFuZGxlcgAAAAHgbWluZgAAABBzbWhkAAAAAAAAAAAAAAAkZGluZgAAABxkcmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAAGkc3RibAAAAH5zdHNkAAAAAAAAAAEAAABubXA0YQAAAAAAAAABAAAAAAAAAAAAAQAQAAAAAB9AAAAAAAA2ZXNkcwAAAAADgICAJQACAASAgIAXQBUAAAAAAB9AAAABPwWAgIAFFYhW5QAGgICAAQIAAAAUYnRydAAAAAAAAB9AAAABPwAAACBzdHRzAAAAAAAAAAIAAAAQAAAEAAAAAAEAAAKAAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAABAAAAAQAAAFhzdHN6AAAAAAAAAAAAAAARAAAAFQAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQAAABUc3RjbwAAAAAAAAARAAAG7wAACYgAAAmWAAAJpAAACbEAAAnHAAAJ1AAACeEAAAnuAAAKBAAAChEAAAoeAAAKNAAACkEAAApOAAAKWwAACnEAAAAac2dwZAEAAAByb2xsAAAAAgAAAAH//wAAABxzYmdwAAAAAHJvbGwAAAABAAAAEQAAAAEAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYyLjEyLjEwMQAAAAhmcmVlAAADjm1kYXTeAgBMYXZjNjIuMjguMTAxAAIwQA4AAAJvBgX//2vcRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY1IHIzMjIyIGIzNTYwNWEgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDI1IC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MCByZWY9MyBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgxOjB4MTExIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0wIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9MSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWludD0yMCBrZXlpbnRfbWluPTIgc2NlbmVjdXQ9NDAgaW50cmFfcmVmcmVzaD0wIHJjX2xvb2thaGVhZD0yMCByYz1jcmYgbWJ0cmVlPTEgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MToxLjAwAIAAAAANZYiED/JigADD7J114AEYIAcAAAAGQZo4H+WAARggBwAAAAZBmlQH+WABGCAHAAAABUGaYD/LARggBwAAAAVBmoA/ywAAAAVBmqA/ywEYIAcAAAAFQZrAP8sBGCAHAAAABUGa4D/LARggBwAAAAVBmwA/ywEYIAcAAAAFQZsgP8sAAAAFQZtAP8sBGCAHAAAABUGbYD/LARggBwAAAAVBm4A/ywEYIAcAAAAFQZugP8sAAAAFQZvAP8sBGCAHAAAABUGb4D/LARggBwAAAAVBmgA/ywEYIAcAAAAFQZogP8sBGCAHAAAABUGaQDvLAAAABUGaYDfLARggBw==';
 function wakeVideoPlay(on) {
@@ -28973,11 +28104,8 @@ document.addEventListener('click', () => {
 function openCommissionModal() {
     if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     wakeLockWant(true);
-    // Every entry from the Commissioning tab opens at Prep with a FRESH session object: the other-sources
-    // acknowledgement and the restore point happen on every pass, and no result from an earlier pass can
-    // ride into a redo of the same step (a stale cx used to reopen on whatever step it last showed, Next
-    // already lit). A run paused with the X — still IN_PROGRESS on the device — is kept aside; cxStart
-    // resumes into it, results intact, when its step is the next one planned.
+    // Every entry opens at Prep with a FRESH session object, so no earlier result rides into a redo. A run paused
+    // with the X (still IN_PROGRESS) is kept aside; cxStart resumes into it when its step is the next one planned.
     // A session closed on Prep is only a wrapper around the run it was about to resume — look through it.
     const paused = (cx && cxLastState === 1) ? ((cx.phase > 0) ? cx : (cx.paused || null)) : null;
     cx = { phase: 0, fieldApplied: false, plantApplied: false, threshApplied: false,
@@ -28987,23 +28115,20 @@ function openCommissionModal() {
            paused: paused };
     document.getElementById('commission-modal-overlay').style.display = 'block';
     cxPanelOverrideStripSync();
-    // Make the panel draggable (idempotent) — drag by the header, clamped on-screen.
     makePanelDraggable(document.getElementById('commission-modal-panel'),
                        document.getElementById('commission-drag-handle'));
     { const p = document.getElementById('commission-modal-panel'); p._leftPlace = true; p._userDragged = false; }
     cxGoto(cx.phase);   // re-render the current phase (commissionRender re-anchors the panel) + restart live-poll
-    // Idle-rest heartbeat: while the dialog is open, tell the firmware to "rest" the field at a low
-    // duty between steps. ~2 s ping vs the 5 s firmware timeout tolerates one dropped ping. The
-    // firmware only acts on this while a session is IN_PROGRESS, so pinging during Prep is harmless.
+    // Idle-rest heartbeat: the firmware rests the field at low duty between steps while pinged. ~2 s ping vs 5 s
+    // timeout tolerates one drop; only acted on while IN_PROGRESS, so pinging during Prep is harmless.
     if (cxHeartbeatTimer) clearInterval(cxHeartbeatTimer);
     cxGet('commissionHeartbeat=1').catch(() => { });
     cxHeartbeatTimer = setInterval(() => { cxGet('commissionHeartbeat=1').catch(() => { }); }, 2000);
 }
 
 function closeCommissionModal() {
-    // Pause ≠ abort: closing leaves the firmware state IN_PROGRESS and KEEPS cx so the flow
-    // resumes on reopen. But never leave a test running, the device in closed-loop tuning, or the
-    // relaxed matrix gate live — clean up whatever this session left active.
+    // Pause ≠ abort: firmware stays IN_PROGRESS and cx is kept for resume, but never leave a test running, the
+    // device in closed-loop tuning, or the relaxed matrix gate live.
     wakeLockWant(false);
     cxStopPoll();
     // Stop the idle-rest heartbeat and explicitly drop the hold, so a clean close resumes normal
@@ -29014,22 +28139,24 @@ function closeCommissionModal() {
     if (cx) {
         if (cx.fieldRunning) stops.push('cancelFieldCurve=1');
         if (cx.plantRunning) stops.push('cancelSystemID=1');
+        if (cx.plantRetryTimer) { clearTimeout(cx.plantRetryTimer); cx.plantRetryTimer = null; }
         if (cx.verifyRunning) stops.push('TuningMode=0');
         if (cx.cvFitRunning) { cx.cvFitDone = true; if (cx.cvFitCdTimer) { clearInterval(cx.cvFitCdTimer); cx.cvFitCdTimer = null; } if (cxPollTimer) { clearTimeout(cxPollTimer); cxPollTimer = null; } stops.push('cvPlantFitCancel=1'); }
         if (cx.fdRunning) { cx.fdRunning = false; stops.push('fieldCutCancel=1'); }
         if (cx.chc && cx.chc.running) { cx.chc.running = false; stops.push('chcCancel=1'); }
         if (cx.cvs && cx.cvs.running) { cx.cvs.running = false; stops.push('cvStressCancel=1'); }
         if (cx.kneeRunning) stops.push('cancelKneeSweep=1');
-        // Modal close is a sweep teardown path: freeze + persist the RPM ripple table (committed cells
-        // from a cut-short sweep are honest data). The rtFieldArmed block below releases the field —
-        // the game runs with rtFieldArmed set for exactly that reason.
+        // Modal close is a sweep teardown path: freeze + persist the ripple table (cut-short cells are honest
+        // data). The rtFieldArmed block below releases the field.
         if (cx.matrixOn) stops.push('ripGameFill=0');
-        // The current-check and the sweep game both COMMAND the field — ramp the current to 0 first,
-        // then release field-control + gate, so closing the wizard mid-test exits gently (the deadman is the
-        // backstop for involuntary closes; this is the clean path for a deliberate X).
+        // Current-check and sweep game COMMAND the field: ramp to 0 first, then release field-control + gate
+        // (the deadman only backstops involuntary closes).
         if (cx.rtFieldArmed) stops.push('resTestTargetA=0', 'resTest=0', 'bcurRtest=0');
         if (cx.matrixOn || cx.rtFieldArmed) stops.push('faCommissionGate=0');
         cx.fieldRunning = cx.plantRunning = cx.verifyRunning = cx.cvFitRunning = cx.kneeRunning = cx.matrixOn = cx.matrixShooting = cx.rtFieldArmed = false;
+        // The current check is ticked off the CSV1 stream, not the modal: left 'leveling' it kept capturing
+        // points at Auto current after the release above, and saved them as the fit. Same reset as cxRtAbort.
+        if (cx.rtestState === 'leveling') { cx.rtestState = 'idle'; cx.rtLastCmd = 0; cx.rtCapturing = false; }
         // Past Finish (Helpful Hints / cloud pitch page) there is nothing to resume — an X here is Done.
         if (cx.finished) { cx = null; cxPlanUserSet = false; }
     }
@@ -29050,19 +28177,15 @@ function closeCommissionModal() {
     }
 }
 
-// Background page plot each phase should reveal on entry, by phase index. cxShowTab switches the tab
-// (and scrolls its first plot into view only when the tab actually changed), so the relevant live
-// graph is on-screen the instant the step opens — not only once its Run button is pressed. Fault
-// Threshold (5) draws its plots inside the modal, so it (and any unlisted phase) keeps the tab up.
+// Background tab each phase reveals on entry, so its live graph is on-screen the instant the step opens.
+// Fault Threshold (5) draws its plots inside the modal, so it (and any unlisted phase) keeps the tab up.
 const CX_PHASE_TAB = { 0: ['plots', 'displays'], 1: ['plots', 'displays'], 2: ['plots', 'displays'], 3: ['tuning', 'current'], 4: ['plots', 'displays'], 6: ['plots', 'displays'], 7: ['plots', 'displays'], 8: ['plots', 'displays'] };
 
 function cxGoto(phase) {
     cxStopPoll();                 // drop any timer from the phase we're leaving
     cx.phase = phase;
-    // Persist the current phase (moves backward on Back) so the checklist survives a page reload /
-    // other clients, and so the firmware re-baselines the in-flight step snapshot on each step entry.
-    // Not for Prep: every entry from the tab opens there, and a paused run's persisted step must keep
-    // its RESUME marker through a Prep-only peek (the Start worker writes phase 0 itself).
+    // Persist the phase (survives reload; firmware re-baselines the step snapshot on entry). Not for Prep: a paused
+    // run's persisted step must keep its RESUME marker through a Prep-only peek (Start writes phase 0 itself).
     if (settingsUnlocked && phase > 0) cxGet('commissionPhase=' + phase).catch(() => { });
     // A new step is the one moment the panel SHOULD re-anchor to this phase's height (placeLeftPanel
     // holds the top across mid-step re-renders otherwise).
@@ -29077,9 +28200,8 @@ function cxGoto(phase) {
 
 function commissionRender() {
     if (!cx) return;
-    // Rebuilding the body collapses the panel's scroll box, which drops the reader back to the top
-    // on every re-render (a run finishing, a result landing). Remember where they were and put them
-    // back; cxGoto zeroes it right after this returns, so a new step still opens at the top.
+    // Rebuilding the body resets the panel's scroll, so restore it. cxGoto zeroes it right after, so a new step
+    // still opens at the top.
     const panel = document.getElementById('commission-modal-panel');
     const keepScroll = panel ? panel.scrollTop : 0;
     const steps = document.getElementById('commission-steps');
@@ -29114,10 +28236,8 @@ function commissionRender() {
     // The Disturbances fine print describes the sweep/map — only relevant on this step's first
     // (sweep) screen, not once the alternator-current-check sub-flow is running. Drop it there.
     if (cx.phase === 4 && (cx.matrixOn || cx.matrixCov)) details = '';
-    // Details fold away behind one word on EVERY step — the panel's job is the instruction, not the
-    // reasoning. The protection statement stays out in the open: it is one sentence, it changes per
-    // step, and it is the only thing on screen naming what is guarding the operator.
-    // Open/closed is remembered per session, so a reader who wants the detail keeps it.
+    // Details fold away on every step; the protection statement stays visible (one sentence, per step, and the only
+    // thing naming what guards the operator). Open/closed is remembered per session.
     b.insertAdjacentHTML('beforeend',
         '<div style="margin-top:14px; padding-top:10px; border-top:1px solid #2c2c2c;">' +
         (details ? '<details class="cx-fp"' + (cxFpOpen ? ' open' : '') + ' ontoggle="cxFpSet(this.open)">' +
@@ -29186,7 +28306,6 @@ function cxPrepRefresh() {
         ? '<strong style="color:#5a5;">ON</strong>'
         : '<strong style="color:#f0a500;">OFF</strong> (switch it on in the top right before starting)';
     // Headroom is advisory only — color warns, but it never blocks commissioning.
-    // Green = comfortable room, orange = tight, red = almost no room (OV trip likely).
     if (isNaN(L.busV) || isNaN(bulk)) { hrEl.innerHTML = '<span style="color:#f0a500;">unknown (no live voltage)</span>'; }
     else {
         const head = bulk - L.busV;
@@ -29195,9 +28314,8 @@ function cxPrepRefresh() {
         hrEl.innerHTML = '<strong style="color:' + color + ';">' + head.toFixed(2) + ' V below Bulk</strong>'
             + ' (' + L.busV.toFixed(2) + ' / ' + bulk.toFixed(2) + ' V)' + note;
     }
-    // Battery-shunt availability (ADVISORY, never blocks — commissioning spec §2). The Battery Charge
-    // Current Limit (G4) needs a healthy INA228 battery shunt; warn if a limit is set but the shunt
-    // isn't available. Read straight from the CSV3 echo cache.
+    // Battery-shunt availability is ADVISORY (commissioning spec §2): the Battery Charge Current Limit (G4) needs a
+    // healthy INA228 shunt, so warn if a limit is set without one.
     const shEl = document.getElementById('cx-prep-shunt');
     if (shEl) {
         const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : {};
@@ -29216,10 +28334,8 @@ function cxPrepRefresh() {
     if (snEl) snEl.innerHTML = sensorBlock ? '<span style="color:#f0a500;">' + sensorBlock + '</span>' : '<strong style="color:#5a5;">all in use and reading</strong>';
     btn.disabled = !engineOk || !ignOn || !fieldOn || !cx.srcAck || !!sensorBlock;
 }
-// Poll a device persist-state endpoint ({state: PENDING|FAILED|IDLE}) until IDLE. The device defers flash
-// writes to its main loop (an in-handler burst froze the whole interface ~2 s), so the HTTP 200 on the
-// request that staged them means "accepted", NOT "saved" — IDLE is the only proof they landed. Never
-// resolves on a timeout or a FAILED report. `what` names the record in the rejection text.
+// Poll a device persist-state endpoint until IDLE. Flash writes are deferred to the main loop, so the request's HTTP
+// 200 means "accepted", NOT "saved"; IDLE is the only proof. Rejects on timeout or FAILED; `what` names the record.
 function awaitDevicePersist(path, timeoutMs, what) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
@@ -29254,10 +28370,8 @@ function cxStart() {
     cxGet('commissionStart=1')
         .then(() => cxAwaitStartPersist(8000))
         .then(() => {
-            // First planned step this pass has not already passed (closeCommissionModal unticks those on a
-            // pause; the set is the backstop for anything ticked since). A run paused with the X resumes
-            // into its step with that step's results intact, but only when it is that next step; a redo
-            // of anything upstream (or a re-ticked plan) starts clean.
+            // First planned step this pass hasn't passed. A run paused with the X resumes into its step, results
+            // intact, only when it is that next step; a redo of anything upstream starts clean.
             const p = cx.paused; cx.paused = null;
             const passed = cx.passed || new Set();
             let nx = -1;
@@ -29272,15 +28386,10 @@ function cxStart() {
 }
 
 // ── Engine-speed (tach) alignment — pre-wizard, standalone modal ──────────────
-// Fires once on first install, after the Prerequisites screen and before the commissioning wizard
-// opens (commPrepFinish → openRpmAlign → openCommissionModal). NOT a wizard stage: it only writes the
-// two tach settings (RPMScalingFactor / PulleyRatio), which persist and stay editable under Setup ▸
-// Engine, so re-commissioning skips it. Needs the engine running to show a live RPM. Nothing here holds
-// the field off, and /get RPMScalingFactor 409s while it is driven, so the copy asks for Alternator
-// Enable off first. Two-way linked to the Setup ▸ Engine RPM fields via the CSV3 echo (getEchoNumber) + the same
-// /get params, so both share one source of truth. The scaling-factor slider pins to 200–3000 but the
-// numeric box carries the true value (any positive integer), so an out-of-range stored value is shown,
-// never silently clamped. Reuses the cx-rpma-* controls and their handlers below.
+// Fires on first install, on Clear and restart, and on a tab start while nothing is commissioned or in progress
+// (commPrepContinue → openRpmCap → openRpmAlign → openCommissionModal), NOT a wizard stage. Writes only
+// RPMScalingFactor/PulleyRatio, shared with Setup ▸ Engine via the CSV3 echo + same /get params; /get RPMScalingFactor
+// 409s while the field is driven. Slider pins to 200–3000; the number box holds the true value, never clamped.
 let _rpmAlignTimer = null;
 function openRpmAlign() {
     if (!settingsUnlocked) { openCommissionModal(); return; }   // can't write settings while locked → skip straight to the wizard
@@ -29297,10 +28406,9 @@ function rpmAlignFinish() {
     document.getElementById('rpmalign-modal-overlay').style.display = 'none';
     openCommissionModal();
 }
-// ✕ — bail out of the setup flow entirely (does NOT open the wizard), mirroring commPrepClose. The
-// tach settings edited so far are already written live and kept; commissioning can be started later
-// from Setup ▸ Alternator ▸ Commissioning.
-function rpmAlignCancel() {
+// ✕ bails out of the setup flow without opening the wizard (mirrors commPrepClose); edits are already written live.
+async function rpmAlignCancel() {
+    if (!(await cxSetupLeaveConfirm())) return;
     rpmAlignStopPoll();
     document.getElementById('rpmalign-modal-overlay').style.display = 'none';
 }
@@ -29336,9 +28444,8 @@ function rpmAlignRender() {
 // iOS WebKit never focuses a range input during a touch drag, so the activeElement guard in
 // cxRpmAlignRefresh can't see the drag — hold the echo repaint for a beat after any edit instead.
 let _cxRpmaHoldUntil = 0;
-// Paint the Regulator RPM readout. RPM is linear in the scaling factor (RPM ∝ RPMScalingFactor), so
-// while the user drags we show a client-side PREVIEW = live RPM × candidate/stored — no device write,
-// no wipe prompt. candidateSf NaN ⇒ show the true device RPM. "~" marks the previewed (uncommitted) value.
+// RPM ∝ RPMScalingFactor, so mid-drag show a client-side PREVIEW = live RPM × candidate/stored (no write, no wipe
+// prompt). candidateSf NaN ⇒ true device RPM; "~" marks a preview.
 function cxRpmAlignPaintRpm(candidateSf) {
     const rEl = document.getElementById('cx-rpma-rpm');
     if (!rEl) return;
@@ -29379,11 +28486,9 @@ const RPM_SCALE_WIPE_MSG =
     + 'The same data is deleted from the cloud, including your all-time alternator records. This cannot be undone.\n\n'
     + 'Your fuel curve, current-limit tables, and alternator wear hours are kept. The alternator must be off.';
 
-// The wipe warning only matters if there is RPM-indexed learning to lose. A device that has never
-// finished a commissioning pass has nothing measured against the old axis (all the tables the wipe
-// clears are still empty/default), so the first-ever scale change is silent. CommissionEpoch is stamped
-// only at Finish, so it is 0 on a fresh flash AND throughout a first-time install's tach-alignment screen.
-// Fail safe: unknown / offline ⇒ true (warn rather than silently wipe).
+// Warn only if there is RPM-indexed learning to lose. CommissionEpoch is stamped only at Finish, so it is 0 on a fresh
+// flash AND through a first install's tach-alignment screen: the first-ever scale change is silent.
+// Unknown / offline ⇒ true (warn rather than silently wipe).
 async function rpmAxisHasLearning() {
     try {
         const resp = await fetchWithTimeout(buildURL('/recommission.json'), {}, 6000);
@@ -29417,10 +28522,8 @@ async function cxRpmAlignWriteSf() {
             : 'Could not change the RPM scaling factor.', 'Not changed');
     }
 }
-// Setup ▸ Engine "Set". Same commit path as the wizard control: confirm, then READ the reply, so the
-// device's 409 (alternator running) surfaces instead of vanishing into the hidden form target. Its
-// inline onsubmit must return false SYNCHRONOUSLY — an async handler's Promise is truthy and the
-// native submit would fire anyway.
+// Setup ▸ Engine "Set": same commit path as the wizard, READING the reply so a 409 (alternator running) surfaces. Its
+// inline onsubmit must return false SYNCHRONOUSLY: an async handler's Promise is truthy and the native submit fires.
 async function rpmScaleFormSubmit(form) {
     const inp = form.querySelector('input[name="RPMScalingFactor"]');
     if (!inp) return;
@@ -29455,8 +28558,7 @@ function cxRpmAlignRefresh() {
     if (!_ov || _ov.style.display === 'none') return;
     const sf = getEchoNumber('RPMScalingFactor_echo');
     const num = document.getElementById('cx-rpma-sf-num'), sl = document.getElementById('cx-rpma-sf-slider');
-    // Also hold while the wipe-confirm dialog is up: the pending (unsaved) value should stay visible
-    // behind it, not snap back to the echo mid-decision.
+    // Also hold while the wipe-confirm dialog is up, so the pending value doesn't snap back mid-decision.
     const dlg = document.getElementById('xdlg-overlay');
     const editing = Date.now() < _cxRpmaHoldUntil || (dlg && dlg.style.display !== 'none');
     // While mid-edit, keep the RPM readout previewing against the pending box value; otherwise show live.
@@ -29547,9 +28649,8 @@ function cxLiveCeilBind() {
 }
 function cxCutIsOv(code) { return code === 7 || code === 12 || code === 16 || code === 22 || code === 23; }
 
-// The saturation ramp climbs open-loop until output reaches the current limit for the held RPM in
-// the active cap table, so on a nearly-full bank the voltage ceiling arrives first. Both remedies
-// move that crossing: a lower limit ends the ramp sooner, a lower state of charge raises the ceiling.
+// The saturation ramp climbs open-loop to the held RPM's current limit, so on a nearly-full bank the voltage ceiling
+// arrives first. A lower limit ends the ramp sooner; a lower SoC raises the ceiling.
 function cxOvRampAdviceHtml() {
     const col = (currentChargeRateMode === 'low') ? 'Low' : 'High';
     return '<div style="font-size:13px;color:#caa;margin-top:6px;line-height:1.5;">' +
@@ -29560,10 +28661,8 @@ function cxOvRampAdviceHtml() {
         '</ul></div>';
 }
 
-// One abort panel for the ramps and the verify sweep. info = {why, next, v, d} from the firmware
-// latch; without it (older firmware, or a browser-side refusal) this degrades to the raw message it
-// always showed. ovAdvice: true = the ramp OV advice, a function = caller-specific OV advice (the
-// verify sweep's remedy differs), falsy = generic clear-and-retry line even on an OV cut.
+// One abort panel for the ramps and the verify sweep. info = {why, next, v, d} from the firmware latch (absent = raw
+// message). ovAdvice: true = ramp OV advice, function = caller-specific, falsy = generic retry line even on an OV cut.
 function cxRampAbortHtml(lead, msg, info, consoleTag, retryWord, ovAdvice) {
     const wrap = h => '<div style="margin:10px 0;padding:8px 10px;background:#3a2222;border:1px solid #a55;border-radius:6px;color:#f0a500;">' + h + '</div>';
     const fallback = '<span style="font-size:13px;color:#caa;">Open <strong>Live Data → Console</strong> for the firmware reason. If there is no <em>' + consoleTag + '</em> line there, the regulator never ran it — fix the cause above, then ' + retryWord + ' again.</span>';
@@ -29590,11 +28689,8 @@ function cxAbortInfoFrom(j) {
     return { why: j.abortWhy | 0, next: j.abortNext | 0, v: +j.abortV || 0, d: +j.abortD || 0 };
 }
 
-// OV advice for the verify sweep — different remedy than the ramps. The sweep's test current is
-// sized from the field-curve proposals, which come from the RPM-table limit at the test speed, so
-// an OV cut here means that limit exceeds what the bank can absorb — and every earlier step ran
-// against the same limit. The fix is lower the table and restart the WHOLE flow, not a step-local
-// re-run (which the ramp advice offers via lower SoC).
+// Verify-sweep OV remedy: its test current is sized from the RPM-table limit at the test speed, which every earlier step
+// also ran against, so the fix is lower the table and restart the WHOLE flow (not a step-local lower-SoC re-run).
 function cxVerifyOvAdviceHtml() {
     const col = (currentChargeRateMode === 'low') ? 'Low' : 'High';
     return '<div style="font-size:13px;color:#caa;margin-top:6px;line-height:1.5;">' +
@@ -29605,8 +28701,7 @@ function cxVerifyOvAdviceHtml() {
         '</ul></div>';
 }
 function cxVerifyAbortHtml(info) {
-    // A sweep that never ran is not a protection cut — the cut advice below would name a cause that
-    // did not happen.
+    // A sweep that never ran is not a protection cut, so no cut advice.
     if (info && info.text) {
         return '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' + info.text + '</div>' +
             '<div style="margin-top:10px;"><button onclick="cxVerifyStart()" class="btn-primary btn-sm">Re-run</button></div>';
@@ -29654,11 +28749,9 @@ function cxRenderField(b) {
     }
     b.innerHTML = body;
 }
-// The field-driving commissioning tests need the regulator actively charging in current-following
-// AUTO (firmware gate: sysMode == SYS_MODE_AUTO). If the bank is resting (IDLE / charge complete),
-// the engine is off, or a protection is holding the field down, refuse up front with the real cause
-// instead of firing the test and waiting out the 12 s "no start" timeout. We do NOT force a re-bulk —
-// a resting battery simply has nothing to measure. Signal is the fresh CSV1 fieldEventReason.
+// Field-driving tests need AUTO charging (firmware gate: sysMode == SYS_MODE_AUTO). Refuse up front with the real cause
+// (fresh CSV1 fieldEventReason) rather than wait out the 12 s "no start" timeout. Never force a re-bulk: a resting
+// battery has nothing to measure.
 function cxFieldRunBlockReason() {
     const drive = cxDriveOffReason();
     if (drive) return drive;
@@ -29680,9 +28773,8 @@ function cxFieldStart() {
     cxGet('startFieldCurve=1&run=' + tok).then(() => {
         cxStopPoll();
         let waited = 0, sawActive = false, settled = false, framesSeen = 0;
-        // Run token + one-shot latch, as in cxKneeStart: a refused start (2 s cooldown, another test
-        // busy, not AUTO) leaves the LAST curve latched ready, and adopting it here would apply a
-        // previous run's proposals as this one's.
+        // Run token + one-shot latch, as in cxKneeStart: a refused start leaves the LAST curve latched ready, and
+        // adopting it would apply a previous run's proposals.
         const settle = () => { settled = true; cxStopPoll(); };
         cxPollTimer = setInterval(() => {
             waited += 1.5;
@@ -29726,20 +28818,9 @@ function cxFieldApply(run = false) {
 }
 
 // ── Step 8 · Keep-Alive floor — GUIDED onset sweeps at 3 DESCENDING RPMs → Keep-Alive column ──
-// Runs near the END of the wizard (CX_PHASES index 7, right before the Stress Test) so the engine is fully
-// warm from the earlier steps before the first hold at maximum working RPM. Nothing feeds it, and it
-// feeds one thing: that first hold's speed becomes stage 9's maximum working RPM (cxKneeTopRpm).
-// TWO measurements per held speed, walking DOWN the throttle (max working RPM → mid → idle):
-//  1. Onset knee — the field ramp in onset-stop mode (firmware: fieldCurveOnsetMode). Each clean
-//     sweep auto-commits as an anchor; the firmware warm-starts each sweep from the previous point
-//     (onset only rises as RPM falls), so only the first reaches high RPM and only briefly.
-//     applyKneeCurve least-squares fits onset = a + C/RPM across the 3 anchors. SAFETY: the HIGHEST
-//     captured RPM is the zero-ceiling — above it the floor is forced to 0, so the field can always
-//     shut fully off at high speed.
-//  2. Field drain — a field-cut run (firmware fieldCut_tick) at the same held speed: ramp to the
-//     commissioned test current, settle, cut to MinDuty, time command→10%-of-output. The drain time
-//     is RPM-dependent (bench 07-20), so the per-speed points are fitted with a line (cxFdFit),
-//     parallel-shifted up to cover the worst point, and stored as its two tested endpoints.
+// Runs late (index 7) so the engine is warm; its first hold sets stage 9's maximum working RPM (cxKneeTopRpm). Per speed:
+// (1) warm-started onset sweep, fitted by applyKneeCurve as onset = a + C/RPM; SAFETY: floor = 0 above the highest captured
+// RPM so the field can always shut off. (2) field-drain run, RPM-dependent, line-fitted (cxFdFit) and shifted up to the worst point.
 const CX_KNEE_STEPS = [
     { tag: 'your maximum working RPM', hint: 'Rev to ~ the highest RPM you typically run and hold — both tests run back to back, about half a minute total.' },
     { tag: 'a mid/typical cruising RPM', hint: 'Ease the throttle down to a middle speed and hold. (The RPM readout scrambles for ~5 s after each drain test — give it a moment to settle.)' },
@@ -29899,18 +28980,14 @@ function cxKneeStart() {
     cxGet('startKneeSweep=1&run=' + tok).then(() => {
         cxStopPoll();
         let waited = 0, sawActive = false, settled = false, framesSeen = 0;
-        // Two ways a status frame can speak for a run that is not this one, each needing its own guard:
-        // a frame from an EARLIER run (a refused start — 2 s cooldown, another test busy, not AUTO —
-        // never adopts this token, and the firmware's results stay latched looking finished), and a
-        // duplicate of this run's own completion (cxStopPoll cancels only future ticks; responses
-        // already in flight still run, and each one asked to commit — one Record filed four anchors).
+        // Two guards against frames that aren't this run's: the token gate for an EARLIER run (a refused start never adopts
+        // this token and old results stay latched), and settle() against duplicate completions (cxStopPoll cancels only
+        // future ticks; in-flight responses each tried to commit — one Record filed four anchors).
         const settle = () => { settled = true; cxStopPoll(); };
         cxPollTimer = setInterval(() => {
             waited += 1.5;
-            // Outside the token gate: a refused start produces no matching frame, so nothing inside the
-            // gate could report one. framesSeen separates "answering but not running our sweep" from
-            // "not answering" — only the first is given up on at 12 s, because frames that are merely
-            // late still carry a sweep that ran, and throwing that away loses a good point.
+            // Outside the token gate: a refused start produces no matching frame. Give up at 12 s only if frames arrive
+            // (answering but not running our sweep); merely late frames still carry a sweep that ran.
             if (!settled && !sawActive && framesSeen >= 3 && waited > 12) {
                 settle(); cx.kneeRunning = false;
                 cx.kneeAbort = "The sweep never ran. Confirm you are in Auto mode with the engine turning, check Live Data \u25b8 Console, then Record again.";
@@ -29952,17 +29029,14 @@ function cxKneeStart() {
         }, 1500);
     }).catch(e => { cx.kneeRunning = false; xAlert('Automatic current sweep start failed: ' + e); commissionRender(); });
 }
-// Cancel a running onset sweep: fire the firmware abort, stop the poll, and re-render immediately
-// (the firmware's fieldCurveAbortRequested path winds the ramp down on its own).
+// The firmware's fieldCurveAbortRequested path winds the ramp down on its own.
 function cxKneeCancel() {
     cxSendEach(['cancelKneeSweep=1']).then(f => cxReportStopFailure('Cancelling the sweep', f));
     cxStopPoll(); cx.kneeRunning = false; commissionRender();
 }
-// Single Apply for the whole stage: the firmware fits the Keep-Alive column across the anchors
-// (applyKneeCurve, onset = a + C/RPM), then one request stores the drain-vs-RPM result — the
-// fieldDecayTauMs handler flattens any old line first and the endpoint params in the SAME request
-// commission the new one (see the /get handler ordering in 3_functions.ino).
-// go = advance to the next stage once both writes land; a failed write stays on this screen with its alert.
+// Single Apply: the firmware fits the Keep-Alive column (applyKneeCurve, onset = a + C/RPM), then one request stores the
+// drain-vs-RPM line — fieldDecayTauMs flattens the old line first and the endpoint params in the SAME request commission
+// the new one (/get handler ordering in 3_functions.ino). go = advance once both writes land.
 function cxKneeApply(go) {
     const fit = cxFdFit();
     const after = () => { if (go) cxAdvance(true); else commissionRender(); };
@@ -29984,8 +29058,7 @@ function cxKneeDetailsToggle(det) {
     if (det.open) cxFdDraw();
 }
 function cxKneeRestart() { cxGet('clearKneeAnchors=1').then(() => { cx.kneeApplied = false; cx.kneeNoOnset = false; cx.kneeCeilLimited = false; cx.kneeAbort = null; cx.kneeFitResid = undefined; cx.kneeFitWorstIdx = -1; cx.fdRuns = [null, null, null]; cx.fdSkipped = [false, false, false]; cx.fdErr = null; cx.fdApplied = false; cxKneeRefresh(); }).catch(e => xAlert('Clear failed: ' + e)); }
-// The first hold of this step is "your maximum working RPM", so its highest anchor is the measured
-// answer to the question step 10 used to ask. Rounded to 50 and held to the firmware's 800..8000; 0 = no anchors.
+// Highest anchor = the measured maximum working RPM; rounded to 50, held to the firmware's 800..8000, 0 = no anchors.
 function cxKneeTopRpm(anchors) {
     let m = 0;
     for (const a of (anchors || [])) if (a && a.rpm > m) m = a.rpm;
@@ -30008,7 +29081,8 @@ function cxRenderPlant(b) {
     if (cx.plantRunning) body += '<p style="color:#4a9eff;">Sine sweep running… hold RPM steady.</p>';
     else if (cx.plantStop && !fit) body += '<div style="margin:10px 0;padding:8px 10px;background:#3a3322;border:1px solid #a85;border-radius:6px;color:#f0a500;">' + cx.plantStop + '</div>';
     else if (fit) {
-        if (!fit.ok) body += '<div style="margin:10px 0;color:#f0a500;">No −3 dB corner found in the swept range. Widening the sweep and retrying…</div>';
+        if (!fit.ok) body += '<div style="margin:10px 0;color:#f0a500;">No −3 dB corner found in the swept range.' +
+            (cx.plantRetryTimer ? ' Widening the sweep and retrying…' : fit.wide ? ' The widened sweep found none either.' : '') + '</div>';
         else body += '<div style="margin:10px 0; padding:8px 10px; background:#222; border-radius:6px;">' +
             'Plant τ <strong>' + fit.tauMs.toFixed(0) + ' ms</strong>, K ' + fit.K.toFixed(3) + ' A/%, dead time ' + fit.thetaMs.toFixed(0) + ' ms.<br>' +
             'Proposed <strong>Kp ' + fit.Kp.toFixed(3) + '</strong>, <strong>Ki ' + fit.Ki.toFixed(3) + '</strong>; filters τ/3=' + Math.round(fit.tauMs / 3) + ' ms, voltage τ=' + Math.round(fit.tauMs) + ' ms.' +
@@ -30017,8 +29091,7 @@ function cxRenderPlant(b) {
             'the Field curve',
             'This sweep was sized from that run. Re-run it nearer that speed.');
     }
-    // Speed instruction: name the Field curve's measured speed once known; before that, track the plan
-    // (engine is already at cruise when Field curve ran this pass — Plant fit directly follows it).
+    // Name the Field curve's measured speed once known; before that, follow the plan (Plant fit directly follows it).
     if (!cx.plantRunning && !fit) {
         const ref = cxRpmRefFor(2);
         // Measured = done AND not hand-marked: a Field curve marked done by hand left the seeded defaults in place.
@@ -30037,6 +29110,8 @@ function cxRenderPlant(b) {
         body += '<div style="margin-top:12px;">' + action + ' <button onclick="cxPlantStart(false)" class="btn-secondary btn-sm">Re-run</button></div>';
         body += cxRpmStatsLine(fit.rpmAvg || 0, fit.rpmMin || 0, fit.rpmMax || 0);
     }
+    else if (!cx.plantRunning && fit && !cx.plantRetryTimer)
+        body += '<div style="margin-top:12px;"><button onclick="cxPlantStart(false)" class="btn-primary btn-sm">Re-run</button></div>';
     b.innerHTML = body;
 }
 // The firmware's own stop of the plant sweep. /sysidbode carries no reason; CSV2 systemIDAbortReason does:
@@ -30053,23 +29128,37 @@ function cxPlantStopText(code) {
 }
 function cxPlantStart(wide) {
     cxShowTab('plots', 'displays');   // open-loop sine sweep → watch on Plots ▸ Short Term
+    if (!wide) cx._widened = false;   // every press of Run / Re-run gets its own one widened retry
     cx.fit = null; cx.plantApplied = false; cx.plantStop = null; cx.plantRunning = true; commissionRender();
     const fStart = wide ? 0.3 : 0.5, fEnd = wide ? 30 : 20;
+    // Expected sweep length, same model as sysidStartProgressPoll: 20 s stabilize plus (1 settle + N
+    // analysed) cycles per log-spaced point, floored at 1.5 s each.
+    const cyc = Math.max(2, parseInt(getField("systemIDSineCycles_echo"), 10) || 6);   // "?" before the first echo would make it NaN and disarm the backstop
+    let estMs = 20000;
+    for (let i = 0; i < 10; i++) estMs += Math.max(1500, (1 + cyc) * 1000 / (fStart * Math.pow(fEnd / fStart, i / 9)));
+    // Never below 300 s, so the 240 s "never ran" check below always gets to speak first.
+    const backstopS = Math.max(300, (estMs * 2 + 60000) / 1000);
     const tok = cxRunTok();
     cxGet('systemIDTestType=1&systemIDSineFreqStart=' + fStart + '&systemIDSineFreqEnd=' + fEnd)
         .then(() => cxGet('startSystemID=1&run=' + tok))
         .then(() => {
             cxStopPoll();
             let waited = 0, settled = false, framesSeen = 0, sawActive = false, endedPolls = 0;
-            // Run token + one-shot latch, as in cxKneeStart: a refused start (2 s cooldown, another
-            // test busy, not AUTO) leaves the LAST sweep latched ready, and fitting it here would write
-            // a previous run's plant tau and gains.
+            // Run token + one-shot latch, as in cxKneeStart: a refused start leaves the LAST sweep latched ready, and
+            // fitting it would write a previous run's plant tau and gains.
             const settle = () => { settled = true; cxStopPoll(); };
             cxPollTimer = setInterval(() => {
                 waited += 1.5;
-                if (!settled && framesSeen >= 3 && waited > 240) {
+                if (!settled && !sawActive && framesSeen >= 3 && waited > 240) {
                     settle(); cx.plantRunning = false;
                     xAlert('The plant sweep never ran. Confirm you are in Auto mode with the engine turning; open Live Data → Console to see whether the regulator rejected the request, then run again.');
+                    commissionRender(); return;
+                }
+                // Dead-link backstop, not a sweep deadline: twice the expected sweep plus a minute.
+                if (!settled && waited > backstopS) {
+                    settle(); cx.plantRunning = false;
+                    cxGet('cancelSystemID=1').catch(() => { });
+                    cx.plantStop = '<strong>Lost contact with the regulator during the sweep.</strong> Nothing was recorded. Reconnect, then re-run.';
                     commissionRender(); return;
                 }
                 fetch(buildURL('/sysidbode')).then(r => r.json()).then(j => {
@@ -30095,6 +29184,7 @@ function cxPlantStart(wide) {
                             fit.fsHz = j.fs || 0;   // carried to cxVerifyParams to cap the closed-loop sweep
                             // Sweep's engine-speed stats ride along: advisory display + the Verify step's reference speed.
                             fit.rpmAvg = j.rpmAvg || 0; fit.rpmMin = j.rpmMin || 0; fit.rpmMax = j.rpmMax || 0;
+                            fit.wide = wide;
                             cx.fit = fit;
                             if (fit.ok) {
                                 sysidFitTauMs = fit.tauMs; sysidFitKp = fit.Kp; sysidFitKi = fit.Ki;
@@ -30102,9 +29192,18 @@ function cxPlantStart(wide) {
                                 if (settingsUnlocked) cxGet('systemIDPlantTauMs=' + Math.round(fit.tauMs)).catch(() => { });   // readout aid only, never a setting the user is told was saved
                                 updatePlantTauReadout(fit.tauMs);
                             }
-                            cx.plantRunning = false; commissionRender();
-                            if (!fit.ok && !cx._widened) { cx._widened = true; setTimeout(() => cxPlantStart(true), 1500); }
-                        } else { cx.fit = { ok: false }; cx.plantRunning = false; commissionRender(); }
+                            cx.plantRunning = false;
+                            if (!fit.ok && !cx._widened) {
+                                cx._widened = true;
+                                // A close in the next 1.5 s cancels this (closeCommissionModal); the check covers a step change.
+                                cx.plantRetryTimer = setTimeout(() => {
+                                    if (!cx) return;
+                                    cx.plantRetryTimer = null;
+                                    if (cxPanelOpen() && cx.phase === 2 && !cx.plantRunning) cxPlantStart(true);
+                                }, 1500);
+                            }
+                            commissionRender();   // after the timer is set, so the retry window shows "retrying" and no Re-run
+                        } else { cx.fit = { ok: false, wide: wide }; cx.plantRunning = false; commissionRender(); }
                     }
                 }).catch(() => { });
             }, 1500);
@@ -30122,22 +29221,13 @@ function cxPlantApply(run = false) {
 }
 
 // ── Stage 3 · Verify — closed-loop stability check ────────────────────────────
-// Grade the closed-loop verify sweep on damping only. The cascade speed-separation gate is DEFERRED: its
-// voltage-loop-speed reference (cvLoopOmega, α·ρ chord model) estimated ~50 s when the real response is
-// closer to ~5 s, so its ratio/floor were meaningless — shown as a placeholder pending a real analysis.
-//   damping — peak closed-loop gain ≤ 1.15 (an aggressive loop overshoots toward over-voltage — a SAFETY gate)
-// Measured −3 dB bandwidth is still computed and shown for reference (bw < 0 = never rolled off inside the
-// sweep, i.e. above the top frequency). Coherence is deliberately NOT graded: it collapses at the top of every
-// sweep because the roll-off shoulder is dead signal against the alternator's ~0.5 A ripple floor — and that
-// is exactly the region a bandwidth sweep must enter, so a low worst-coherence is the expected result, not a
-// bad run. Trust is confirmed by eye on the Current Control plot instead (cxRenderVerify). railed (field duty
-// clipped → the gain really IS corrupted) is the one measurement flag kept; it's undefined on firmware older
-// than 2026-07-10 (absent there).
+// Grade on damping only: peak closed-loop gain ≤ 1.15 (overshoot heads toward over-voltage, a SAFETY gate); the speed
+// gate is deferred (cvLoopOmega was ~10× off). Coherence is deliberately NOT graded: it always collapses on the roll-off
+// shoulder a bandwidth sweep must enter. railed (duty clipped → gain corrupted) is kept; absent on older firmware.
 function cxVerifyEvaluate(pts, railed) {
     const isRailed = (railed === 1 || railed === true);
-    // −3 dB is referenced to the PEAK gain, not pts[0]: a current loop into a battery is mildly band-pass,
-    // so the low-frequency skirt sits below the passband and a pts[0] reference reports an optimistic corner.
-    // Search the crossing only on the roll-off side of the peak so a low-f droop can't be read as the corner.
+    // −3 dB is referenced to the PEAK gain, not pts[0]: a current loop into a battery is mildly band-pass, so pts[0]
+    // gives an optimistic corner. Search only past the peak so a low-f droop can't read as the corner.
     let peak = 0, peakIdx = 0; pts.forEach((p, i) => { if (p.g > peak) { peak = p.g; peakIdx = i; } });
     const g0 = pts.length ? pts[0].g : 0;
     const topF = pts.length ? pts[pts.length - 1].f : 0;
@@ -30152,10 +29242,8 @@ function cxVerifyEvaluate(pts, railed) {
              pass: valid && dampOK && !isRailed };
 }
 
-// ---- Closed-loop Bode plot for the just-run Verify sweep (gain + phase vs log-frequency) ----
-// pts come straight from /tuningbode ({f,g,ph}) and ride along on cx.verify. Ephemeral — rebuilt on
-// every verify re-render — so prior plot instances and their resize observers are torn down first.
-// <3 points can't draw a curve → no markup, no plot.
+// ---- Closed-loop Bode plot for the Verify sweep (gain + phase vs log-frequency) ----
+// Rebuilt on every verify re-render, so prior plots and resize observers are torn down first.
 let cxBodePlots = [], cxBodeObs = [], cxBodeMagY = null, cxBodePhY = null, cxBodeRaf = 0;
 
 function cxBodeMarkup(pts) {
@@ -30176,9 +29264,8 @@ function cxDrawBode(pts) {
     if (cxBodeRaf) { cancelAnimationFrame(cxBodeRaf); cxBodeRaf = 0; }
     if (typeof uPlot === 'undefined' || !pts || pts.length < 3) return;
 
-    // Build one frame later: the markup was just written via innerHTML into the (scrollable) commissioning
-    // modal, so the target divs need a committed layout before uPlot measures their width — building inline
-    // gave a blank canvas. Every other plot builder here (drawAltTrend/drawPerfPlot/…) defers for this reason.
+    // Build one frame later: the innerHTML targets need a committed layout before uPlot measures their width
+    // (inline gave a blank canvas), same as the other plot builders here.
     cxBodeRaf = requestAnimationFrame(() => {
         cxBodeRaf = 0;
         const magEl = document.getElementById('cx-bode-mag');
@@ -30191,15 +29278,12 @@ function cxDrawBode(pts) {
             let phMin = Infinity, phMax = -Infinity; ph.forEach(v => { if (v < phMin) phMin = v; if (v > phMax) phMax = v; });
             const phPad = Math.max(10, (phMax - phMin) * 0.12);
 
-            // Fresh scale/axis objects per plot — uPlot writes computed min/max onto scale objects, so
-            // sharing one across two instances would let them clobber each other.
-            // Left edge snaps to the decade at/below the first point so the axis opens on a clean decade
-            // boundary (that alignment is what reads as log); right edge snaps up to the nearest nice tick —
-            // a full decade past a ~15 Hz sweep would blank most of the plot.
+            // Fresh scale/axis objects per plot: uPlot writes computed min/max onto them, so sharing would clobber.
+            // Left edge snaps to the decade at/below the first point (reads as log); right edge to the next nice tick,
+            // since a full decade past a ~15 Hz sweep would blank most of the plot.
             const decLo = Math.pow(10, Math.floor(Math.log10(f0)));
             const hiTick = [1, 2, 3, 5, 10, 20, 30, 50, 100].find(v => v >= fN) || fN * 1.15;
-            // Standard log minor ticks: 1..9 in every decade the range spans. Their bunching toward each
-            // decade is the log-axis tell — no hand-picked subset needed.
+            // Standard log minor ticks: 1..9 in every decade.
             const logTicks = [];
             for (let e = -2; e <= 3; e++) for (let k = 1; k <= 9; k++) logTicks.push(k * Math.pow(10, e));
             const isDecade = v => Math.abs(Math.log10(v) - Math.round(Math.log10(v))) < 1e-6;
@@ -30207,16 +29291,13 @@ function cxDrawBode(pts) {
             const mkXAxis = (label) => ({ scale: 'x', grid: { show: true, stroke: '#333' }, stroke: '#8a8a8a', font: '11px sans-serif',
                 label: label, labelSize: label ? 24 : undefined, labelFont: '600 11px sans-serif',
                 splits: (u, ax, mn, mx) => logTicks.filter(v => v >= mn * 0.999 && v <= mx * 1.001),
-                // gridlines at every minor tick; labels only on the decades (0.1/1/10) so the numbers stay
-                // uncluttered and legible down to 320px mobile width.
+                // gridlines at every minor tick; labels only on decades so they stay legible down to 320px.
                 filter: (u, s) => s.map(v => isDecade(v) ? v : null),
                 // don't format a null (a filtered-out tick) — that throws inside draw → blank canvas
                 values: (u, s) => s.map(v => v == null ? null : (v >= 1 ? String(Math.round(v)) : String(+v.toPrecision(1)))) });
             const common = { cursor: { drag: { x: false, y: false } }, legend: { show: false } };
 
-            // uPlot draws one uniform grid stroke for every split, so major and minor lines look identical.
-            // Overdraw just the decades (0.1/1/10) heavier on top of the faint auto-grid: the minors tightening
-            // toward each decade is the unmistakable log-axis tell.
+            // uPlot strokes every split the same, so overdraw the decades heavier on top of the faint auto-grid.
             const drawDecades = u => {
                 const ctx = u.ctx; ctx.save();
                 ctx.strokeStyle = '#6a6a6a'; ctx.lineWidth = 1.5;
@@ -30239,9 +29320,8 @@ function cxDrawBode(pts) {
                 hooks: { draw: [u => {
                     drawDecades(u);
                     const ctx = u.ctx; ctx.save();
-                    // Each reference line carries the whole meaning of the plot, so label it in-canvas at the right
-                    // edge. below=true drops the text under the near-top damping ceiling (a label above it would
-                    // clip); the mid-plot bandwidth line takes its label above.
+                    // Label each reference line in-canvas at the right edge. below=true puts the text under the near-top
+                    // damping ceiling (above would clip); the mid-plot bandwidth line takes its label above.
                     const hline = (yv, col, dash, txt, below) => {
                         const y = u.valToPos(yv, 'y', true);
                         if (y < u.bbox.top || y > u.bbox.top + u.bbox.height) return;
@@ -30287,9 +29367,7 @@ function cxDrawBode(pts) {
 function cxRenderVerify(b) {
     cxRpmRefFetch();
     if (cx.verifyRunning) { b.innerHTML = '<p style="color:#4a9eff;">Closed-loop sweep running…</p>'; return; }
-    // A protection cut the sweep — the firmware discarded the run, so there is nothing to grade.
-    // Named cause + the right remedy replace the old behavior (sweep ran on through the cut +
-    // lockout, and the low duty rail was blamed on field saturation / cruising speed).
+    // A protection cut the sweep and the firmware discarded the run, so there is nothing to grade.
     if (cx.verifyAbort) { b.innerHTML = cxVerifyAbortHtml(cx.verifyAbort); return; }
     if (!cx.verify) {
         const ref = cxRpmRefFor(3);
@@ -30328,9 +29406,8 @@ function cxRenderVerify(b) {
         'the autotuning sweep',
         'The gains being checked were fitted at that speed. Re-run this check nearer it.');
 
-    // Visual trust gate: the numbers are only as good as the sweep looked, so before advancing the user
-    // eyeballs feedback-vs-command on the just-framed 30 s Current Control plot. Replaces the old coherence
-    // auto-warning, which false-failed on clean runs (roll-off coherence is dead signal, not a bad engine).
+    // Visual trust gate: the user eyeballs feedback-vs-command on the 30 s Current Control plot before advancing.
+    // Do not re-add the coherence auto-warning: it false-failed clean runs (roll-off coherence is dead signal).
     const cleanBtn = 'Looks clean — ' + (nx === -1 ? 'finish' : 'continue');
     const confirmText =
         '<div style="margin:8px 0; padding:8px 11px; background:#1b271b; border:1px solid #3c5a3c; border-radius:6px; color:#cfe0cf; font-size:.92em; line-height:1.5;">' +
@@ -30363,8 +29440,7 @@ function cxRenderVerify(b) {
             '<div style="margin-top:10px;"><button onclick="cxDetune()" class="btn-primary btn-sm">Soften 20% &amp; re-verify</button> ' +
             '<button onclick="cxVerifyStart()" class="btn-secondary btn-sm">Re-run</button></div>';
     } else {
-        // Damping passed and the field didn't saturate → stable. Speed separation is not graded for now
-        // (deferred), so the visual confirm gate alone decides advance vs re-run.
+        // Stable and unsaturated; speed separation is not graded, so the visual confirm gate decides.
         body += '<div style="margin:8px 0; color:#5a5;">Passed — stable (peak gain within limit).</div>';
         body += confirmText;
         showConfirmButtons = true;   // buttons render AFTER the Bode plot below
@@ -30379,8 +29455,6 @@ function cxRenderVerify(b) {
 function cxVerifyStart() {
     cxShowTab('tuning', 'current');   // closed-loop sine sweep → watch on Tuning ▸ Current
     cx.verify = null; cx.verifyAbort = null; cx.verifyRunning = true; cxBodeMagY = null; cxBodePhY = null; commissionRender();
-    // Drive the closed-loop sweep from values computed off the plant fit + field curve, not
-    // whatever happens to be on the Tuning ▸ Current tab (unknown/stale at commissioning time).
     const p = cxVerifyParams();
     const tok = cxRunTok();
     cxGet('tuningWaveFloor=' + p.floor + '&waveAmplitude=' + p.amp +
@@ -30430,9 +29504,8 @@ function cxVerifyStart() {
         });
 }
 function cxDetune() {
-    // Base the detune on the device's LIVE gains, not the session fit: sysidFitKp/Ki are page
-    // globals that are 0 unless the sweep ran in THIS session (a Verify-only redo after a
-    // reload would otherwise write PidKp=0/PidKi=0 and kill the current loop).
+    // Detune from the device's LIVE gains: sysidFitKp/Ki are 0 unless the sweep ran this session, and a Verify-only
+    // redo after a reload would write PidKp=0/PidKi=0 and kill the current loop.
     const echoKp = getEchoNumber('PidKp_echo'), echoKi = getEchoNumber('PidKi_echo');
     const baseKp = (Number.isFinite(echoKp) && echoKp > 0) ? echoKp : sysidFitKp;
     const baseKi = (Number.isFinite(echoKi) && echoKi > 0) ? echoKi : sysidFitKi;
@@ -30449,25 +29522,7 @@ function cxVerifyDone() {
     });
 }
 
-// ── Stage 6 · CV plant fit — current square wave → battery-voltage fit → plant K for the α/K auto gains ──
-// Reuses the proven current-tuning square wave (TuningMode, tuningWaveform=0) to COMMAND current; the
-// browser records the live CSV1 (IBV, MeasuredAmps) stream and fits K/τ/L locally (no internet),
-// then writes them via the cvPlantKa/cvPlantKb handlers and switches the CV gain source to Measured. No new firmware control
-// code — TuningMode already gates G1/G2 (fast-OV stays live) and restores bumplessly on exit.
-let cvFitCapture = null;   // {active, samples:[{t,v,iB,iA}], t0} while a fit run is recording
-
-function cvFitOnCsv1(data) {
-    if (!cvFitCapture || !cvFitCapture.active) return;
-    // Capture IBV (the controlled voltage — INA228 bus voltage, the SAME signal the CV PI loop reads,
-    // NOT BatteryV/ADS1115), Bcur (BATTERY current — the §F/§G regression denominator: battery voltage
-    // responds to battery current), and MeasuredAmps (ALTERNATOR current — kept ONLY for the
-    // external-network check ΔI_ext = ΔI_alt − ΔI_batt). All three are CSV1 fields scaled ×100.
-    const v  = ('IBV' in data)          ? parseFloat(data.IBV) / 100          : NaN;
-    const iB = ('Bcur' in data)         ? parseFloat(data.Bcur) / 100         : NaN;
-    const iA = ('MeasuredAmps' in data) ? parseFloat(data.MeasuredAmps) / 100 : NaN;
-    if (!isFinite(v) || !isFinite(iB)) return;
-    cvFitCapture.samples.push({ t: (performance.now() - cvFitCapture.t0) / 1000, v: v, iB: iB, iA: isFinite(iA) ? iA : 0 });
-}
+// ── Stage 6 · CV plant fit — on-device current-pulse train → battery stiffness K for the α/K auto gains ──
 
 // CV gain mirrors of the device settings cvAlpha/cvPiZero — refreshed from the CSV3 echo in
 // updateCvGainModeUI() so previews match what the device will apply.
@@ -30479,15 +29534,12 @@ function cvGainsFromKnorm(Knorm, alpha, rho) {
     const Kp = alpha / Knorm;
     return { Kp: Math.min(120, Math.max(2, Kp)), Ki: Math.min(80, Math.max(1, rho * Kp)) };
 }
-// CV-loop crossover implied by the live gains: with P≈K and C=Kp(1+ρ/s), |CP|=1 lands at ω≈α·ρ (the plant
-// cancels); ×2 covers the diffusion lift of |P| at low frequency. Currently UNUSED — was the CC-verify
-// separation reference, but this chord-model estimate (~50 s) didn't match measured response (~5 s), so the
-// separation gate is deferred (cxVerifyEvaluate). Kept as the seed for a real speed-adequacy analysis later.
+// CV-loop crossover implied by the live gains (ω≈α·ρ, ×2 for low-frequency diffusion lift). UNUSED: the chord model
+// (~50 s) didn't match measured response (~5 s); kept as the seed for a real speed-adequacy analysis.
 function cvLoopOmega() { return 2 * (CV_ALPHA || 0.08) * (CV_PI_ZERO || 0.5); }
 
-// Weak-signal remedy panel — branches on WHY the signal was weak. Ripple-limited (battery moved the
-// full probe amplitude, noise floor was high) reads as reassurance; truly weak offers a stronger,
-// cap-table-bounded re-run when one exists, and names the binding limit when one doesn't.
+// Weak-signal remedy, branched on WHY: ripple-limited (full probe amplitude, high noise floor) reads as reassurance;
+// truly weak offers a stronger cap-table-bounded re-run, or names the binding limit when there is none.
 function cxCVRemedyPanel(r) {
     const rpmTxt = r.rpmAtFit > 0 ? ('a higher RPM than the ~' + r.rpmAtFit + ' RPM you just tested at') : 'a higher RPM';
     const keepWarn = '<p style="font-size:13px;color:#ddd;line-height:1.45;margin-top:8px;">Keeping it is fine — the voltage-loop gains may just be slightly off. If voltage holding later looks poor in <strong>Absorption</strong> (or <strong>Float</strong>, if you use it), tune those gains by hand.</p>';
@@ -30623,8 +29675,8 @@ function cxCVPollFit() {
     });
 }
 
-// Map /cvplantfit.json into the shape cxRenderCVPlant / cxCVPlantApply expect. K20 keeps its field name
-// for compatibility but carries the fast ohmic stiffness (= Ka); Kb is always 0 now.
+// Map /cvplantfit.json into the shape cxRenderCVPlant / cxCVPlantApply expect. K20 is a legacy name for the
+// fast ohmic stiffness (= Ka); Kb is always 0.
 function cvFitFromDevice(j) {
     const edges = cxCVEdges(j);
     if (!j || !j.ok) return { ok: false, reason: (j && j.abort) ? j.abort : 'fit failed — re-run', edges: edges };
@@ -30653,19 +29705,16 @@ function cvFitFromDevice(j) {
         const prevStep = (j.stepA > 0) ? j.stepA : dI;
         const needDI = Math.ceil(prevStep * (SNR_GOAL / Math.max(1, snr)));   // step that would reach a comfortable SNR
         const useDI  = Math.min(needDI, Math.floor(capHead), 100);           // what we can command within the table + backstop
-        // Class-scaled, matching cvpfVScale() in 8_functions.ino: the firmware probes 300 mV per 12V
-        // block (180 mV after an OV fall-back), so on a 48V bank the real amplitude is 1200 mV. Left
-        // fixed, rippleLimited below passed on any bank above 12V and the panel quoted the wrong mV.
+        // Class-scaled, matching cvpfVScale() in 8_functions.ino: 300 mV per 12 V block (180 mV after an OV
+        // fall-back), so a 48 V bank probes 1200 mV.
         const targetDV = ((w & 16) ? 0.18 : 0.30) * ((parseInt(window._nominalStored, 10) || 12) / 12);
         const dV = (j.dV_mV || 0) / 1000;
         remedy = { needDI: needDI, useDI: useDI, capHead: Math.floor(capHead),
                    // Firmware honors any boosted diMax past the fixed ΔV target (unless it OV-fell-back),
                    // so "stronger" is judged against the step last commanded, not the 40 A ceiling.
                    canBoost: (useDI > prevStep + 2) && !(w & 16),
-                   // Warn bit0: the alternator returned under 60% of the commanded step. This is the ONLY
-                   // evidence we have that speed was the binding constraint — capHead is the configured cap
-                   // table at this RPM, not a measurement of what the machine can make there. Without this
-                   // bit the step was delivered in full and asking for more RPM would be a guess.
+                   // Warn bit0: the alternator delivered under 60% of the commanded step, the ONLY evidence speed was
+                   // binding (capHead is the configured cap table, not a measurement); otherwise more RPM is a guess.
                    deliveryShort: !!(w & 1),
                    // Ripple-limited = the ONLY weak-signal warn is SNR and the battery moved essentially
                    // the full probe amplitude: the reading is sound, the noise floor under it was high.
@@ -30705,9 +29754,8 @@ function cxMed(a) {
     return (s.length & 1) ? s[m] : 0.5 * (s[m - 1] + s[m]);
 }
 
-// Wizard-face table: one row per pulse, a step-up and a step-down column. Bold = the edge fed the
-// median; grey "drop" = rejected (with the reason on hover). Footer contrasts the step-up vs step-down
-// medians so a battery that responds differently loading vs unloading is visible, not hidden by the blend.
+// One row per pulse, step-up and step-down columns. Bold = fed the median; grey "drop" = rejected (reason on hover).
+// Footer contrasts the up vs down medians so a battery that loads and unloads differently is visible.
 function cxCVEdgeTable(edges) {
     if (!edges || !edges.length) return '';
     const rows = {};
@@ -30752,13 +29800,9 @@ function cxCVPlantApply() {
 }
 
 // ── Field drain measurement (runs per speed inside the Keep-Alive Floor & Field Decay stage) ────────
-// One firmware "field cut" per held speed: the real current loop ramps to the commissioned
-// stabilize level (at idle, to whatever the alternator makes there), duty freezes 5 s, the field
-// steps to MinDuty (the real over-voltage clamp floor) for 4 s, and the decay is fitted on the
-// 20 kSPS fast current channel (ADS fallback). The browser triggers and polls /fieldcut.json; each
-// run reports its drain time plus the hold-averaged RPM (latched pre-cut — the cut scrambles the
-// tach for ~5 s) and pre-cut amps. cxFdFit turns the per-speed points into the stored drain-vs-RPM
-// line; cxKneeApply writes it.
+// One firmware "field cut" per held speed: ramp to the stabilize level, freeze duty 5 s, step to MinDuty (the real
+// OV clamp floor) for 4 s, fit the decay on the 20 kSPS fast current channel (ADS fallback). RPM is hold-averaged and
+// latched pre-cut (the cut scrambles the tach ~5 s). cxFdFit turns the per-speed points into the stored drain-vs-RPM line.
 let cxFdPlot = null, cxFdObs = null, cxFdRaf = 0, cxFdY = null;
 
 // Firmware abort reasons arrive as raw identifiers (protection enum names) — translate to plain
@@ -30793,12 +29837,9 @@ function cxFdPoll() {
     // Full run ≈ ramp (≤35 s worst case) + 5 s hold + 10 s cut + ease — allow 2 min before giving up.
     const giveUp = () => (performance.now() - (cx._fdPollStart || 0) > 120000);
     fetch(buildURL('/fieldcut.json')).then(r => r.json()).then(j => {
-        // Frames from any run but this one are not ours to read: a refused start (2 s cooldown, another
-        // test busy, not in AUTO) never adopts our token, and the firmware's last result stays latched
-        // looking finished — storing it would file another speed's drain under this slot. An accepted
-        // start adopts the token in the request handler itself, so the first frame back already carries
-        // it; 15 s without one means the start was refused, and waiting out giveUp() would just sit on
-        // "Starting…" for two minutes.
+        // Frames from any run but this one are not ours: a refused start never adopts our token and the last result
+        // stays latched looking finished (storing it files another speed's drain here). An accepted start adopts the
+        // token in the request handler, so 15 s without it means refused.
         if (j.tok !== cx._fdTok) {
             if (performance.now() - (cx._fdPollStart || 0) > 15000) {
                 cx.fdRunning = false; cx.fdErr = 'the test did not start — check the Console for the reason, then retry';
@@ -30834,13 +29875,9 @@ function cxFdPoll() {
 function cxFdCancel() { cxSendEach(['fieldCutCancel=1']).then(f => cxReportStopFailure('Cancelling the drain measurement', f)); }
 function cxFdSkip(idx) { cx.fdSkipped[idx] = true; cx.fdErr = null; commissionRender(); }
 
-// The stored value is the DRAIN time (cut → 10% of output), not the fitted τ — the over-voltage
-// release needs "how long until the coil no longer makes meaningful current", read directly off the
-// trace. The points are RPM-dependent, so: least-squares line over the successful runs,
-// parallel-shifted UP by the worst positive residual (the stored line sits at/above every measured
-// point — an underestimate would release the OV clamp with the field still hot), evaluated at the
-// tested extremes. The firmware lookup clamps to [rpmLo, rpmHi], so only the endpoints are stored.
-// One usable point → flat value; none → null (nothing stored, the previous value stands).
+// Stores the DRAIN time (cut → 10% of output), not the fitted τ: the OV release needs "until the coil no longer makes
+// meaningful current". Least-squares line over the runs, shifted UP by the worst positive residual (underestimating would
+// release the OV clamp with the field still hot); only the endpoints are stored (firmware clamps to [rpmLo, rpmHi]).
 function cxFdFit() {
     const pts = [];
     for (let i = 0; i < CX_KNEE_STEPS.length; i++) {
@@ -30869,9 +29906,8 @@ function cxFdFitText(f) {
         '. The over-voltage response reads this line at the engine speed latched when the episode began, held constant beyond the tested range.';
 }
 
-// Drain-vs-RPM chart under the fit summary: measured cuts, the raw least-squares line, the raised
-// stored line with per-point margins, clamped flat ends, and a cursor pinned to live engine speed
-// (fed from cxRpmSparkOnCsv1; drag to explore the same lookup firmware's fdDrainMsAtRpm performs).
+// Drain-vs-RPM chart: measured cuts, raw fit, raised stored line with per-point margins, clamped flat ends, and a cursor
+// pinned to live RPM (from cxRpmSparkOnCsv1; drag to explore the same lookup as firmware fdDrainMsAtRpm).
 let cxFdFitChart = null;
 function cxFdFitChartMarkup(fit) {
     if (!fit) return '';
@@ -30963,10 +29999,8 @@ function cxFdFitChartDraw() {
     const cTagBg = mk('rect', { rx: 4, height: 20, fill: '#1c1c1c', stroke: '#43cf8e', 'stroke-width': 1 }, cg);
     const cTag = tx(0, 0, '', { fill: '#43cf8e', 'text-anchor': 'middle' }, cg);
     const st = { exploring: false, txt: null };
-    // The readout sits inside the panel's scroll box and is rewritten off the live RPM stream (~10 Hz).
-    // Rewriting it every sample re-flowed the text (a digit more or less flips the wrap) and dragged the
-    // scroll position with it, so: live speed is quantised to 10 RPM and the DOM is touched only when the
-    // sentence actually changes.
+    // The readout is rewritten off live RPM (~10 Hz) inside a scroll box; each rewrite re-flowed and dragged the scroll,
+    // so quantise live speed to 10 RPM and touch the DOM only when the sentence changes.
     const setCursor = (rpm, isLive) => {
         if (!(isFinite(rpm) && rpm > 0)) {
             cg.setAttribute('display', 'none');
@@ -31063,9 +30097,8 @@ function cxFdDraw() {
     });
 }
 
-// Full fit diagnostics → dashboard Console tab (appendConsoleLine, so they ride along in Download Logs / the
-// remote log relay) AND the browser DevTools console. Deliberately NOT on the wizard face — see the brief
-// result panel in cxRenderCVPlant. Same numbers that used to clutter the face, plus the marks.
+// Full fit diagnostics → dashboard Console (appendConsoleLine, so they ride in Download Logs / the remote log relay)
+// and DevTools. Deliberately NOT on the wizard face.
 function cxCVFitSigned(v) { const n = (v == null || !isFinite(v)) ? 0 : v; return (n >= 0 ? '+' : '') + n.toFixed(1); }
 
 function cxCVFitLog(f, m) {
@@ -31083,12 +30116,9 @@ function cxCVFitLog(f, m) {
     try { console.log(L.join('\n')); } catch (e) { }
 }
 
-// Raw fit dump (CV_AUTOTUNE_PLAN.md §7): confidence-record header comments + raw (t, IBV, Bcur, MeasuredAmps)
-// so the field can tell us whether the horizon / step-size / rest-gate transfer across chemistries and sizes.
-// Built ON-DEVICE now (the fit runs in firmware); this just streams /cvfit.csv down as a browser download.
+// Raw fit dump (CV_AUTOTUNE_PLAN.md §7): confidence header + raw (t, IBV, Bcur, MeasuredAmps), built on-device.
 function cxCVFitDownload() {
-    // Raw trace + confidence header live on-device (the fit runs there). Fetched to a blob so
-    // deliverFile can name it like the log batch and give delivery feedback on every platform.
+    // Fetched to a blob so deliverFile names it like the log batch and gives delivery feedback on every platform.
     fetchWithTimeout(buildURL('/cvfit.csv'), {}, 15000)
         .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
         .then(txt => deliverFile(`cvfit_${getLogTimestamp()}${getLogNameSuffix()}.csv`, txt, 'text/csv'))
@@ -31098,27 +30128,19 @@ function cxCVFitDownload() {
 // ── Stage 4 · Disturbances — guided slow sweep populates the matrix ────────────
 function cxRenderMatrix(b) {
     let body = '';
-    // Pause length matters (§11): a ripple value needs TWO agreeing ~2 s stationary windows at a speed
-    // before it commits (agree-twice), so ~6 s per pause. The wizard holds a fixed test current
-    // (25% of the cap-table max ≤2000 RPM) through resTest for the whole sweep — ripple scales with
-    // current, so the table is only comparable across RPM at one amperage.
-    // Deliberately silent on Start Shooting: this description renders only on the pre-start screen,
-    // a screen before that button exists, so naming it here would prompt for it early. The arm overlay
-    // (cxGameArmUpdate) is the only place that asks, at the moment the button actually appears.
+    // A ripple value needs TWO agreeing ~2 s stationary windows to commit, so ~6 s per pause (§11). The test current is
+    // held fixed (25% of the cap-table max ≤2000 RPM) because ripple scales with current. Deliberately silent on Start
+    // Shooting: that button doesn't exist yet on this screen; cxGameArmUpdate asks for it when it appears.
     const sweepDesc = '<p style="font-size:15px;line-height:1.5;">This step uses a Space-Invaders-style game to map current ripple from idle to 2000 RPM. Use the throttle to kill the invaders, observing the shape of the Ripple Map (below the game) as you go. Extra invaders appear where the ripple changes quickly or peaks, to fill in detail there. Once you\'re confident you\'ve captured the peaks, end the game and move on.</p>';
     const sweepStartCta = '<p style="font-size:15px;line-height:1.5;">To begin, <strong>bring the engine to idle and hit "Start Game"</strong>.</p>';
     if (cx.matrixOn) {
-        // Sweep-in-progress view is the "RPM Invaders" game (cxGame* below): y-axis = RPM, invaders
-        // on the sweep's target bins only, killed when the bin commits in /filtripple.csv. The ripple
-        // strip under it plots /filtripple.csv as it populates — a live sanity check on the values
-        // the map is admitting.
+        // Sweep-in-progress view is the "RPM Invaders" game (cxGame*): y = RPM, invaders on target bins only, killed
+        // when the bin commits in /filtripple.csv. The strip below plots /filtripple.csv as a live sanity check.
         body += '<div style="position:relative;">' +
             '<canvas id="cxGame" style="display:block; width:100%; height:400px; background:#161618; border-radius:6px;"></canvas>' +
             '<div id="cxGameToast" style="position:absolute; z-index:2; left:50%; transform:translateX(-50%); top:12px; background:rgba(240,80,60,.92); color:#fff; font-size:12px; font-weight:600; padding:4px 12px; border-radius:12px; opacity:0; transition:opacity .25s; pointer-events:none; max-width:calc(100% - 16px); box-sizing:border-box; text-align:center;"></div>' +
-            // Hold-fire band: the prose half of the pre-shooting screen, from Start Game until Start
-            // Shooting. It carries no scrim — the canvas behind it is drawing the title card, not the
-            // playfield — and sits in the bottom third so the card's art and numbers stay clear above it.
-            // Initial display follows the live flag so a mid-sweep re-render can't flash it over the game.
+            // Hold-fire band from Start Game until Start Shooting: no scrim (the canvas draws the title card), bottom
+            // third so the card stays clear. Display follows the live flag so a mid-sweep re-render can't flash it.
             '<div id="cxGameArm" style="position:absolute; z-index:1; inset:auto 0 0 0; height:34%; display:' + (cx.matrixShooting ? 'none' : 'flex') + '; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:0 18px 10px; box-sizing:border-box; text-align:center; border-radius:6px;">' +
               '<div id="cxGameArmMsg">Hold the engine at idle — measuring your idle speed to set the capture band…</div>' +
               '<button id="cxGameArmBtn" onclick="cxGameBeginShooting()" class="btn-primary" style="display:none; padding:10px 28px; font-size:15px;">Start Shooting</button>' +
@@ -31127,9 +30149,8 @@ function cxRenderMatrix(b) {
             '<div style="font-size:11px; color:#888; margin:8px 0 2px;">Measured filtered ripple vs engine speed, idle at left — <span style="color:#2ec4b6;">alternator</span> / <span style="color:#f0a500;">battery</span> · solid = confirmed, hollow = unconfirmed single reading</div>' +
             '<canvas id="cxGameRip" style="display:block; width:100%; height:130px; background:#161618; border-radius:6px;"></canvas>' +
             '<div id="cx-cov" style="margin:10px 0;">Targets: checking…</div>' +
-            // Always clickable — a hard gate can strand a user whose engine can't reach the remaining
-            // targets. Before the confidence gate is satisfied, cxMatrixDone warns and asks first.
-            // Skip lives here because the universal Skip footer is hidden while the field is commanded.
+            // Always clickable: a hard gate strands an engine that can't reach the remaining targets (cxMatrixDone warns
+            // first). Skip lives here because the universal Skip footer is hidden while the field is commanded.
             '<div style="margin-top:2px; display:flex; flex-wrap:wrap; gap:8px; align-items:center;">' +
               '<button id="cx-sweep-done" onclick="cxMatrixDone()" class="btn-primary btn-sm">I\'m done sweeping</button>' +
               '<span style="flex:1;"></span>' +
@@ -31138,10 +30159,8 @@ function cxRenderMatrix(b) {
     } else if (cx.matrixCov) {
         // Enough coverage already captured → advance is the one primary action; re-sweep is secondary.
         body += cxRtestPanel();  // optional resonance-vs-current characterization (§3.2), non-blocking
-        // The panel owns its own navigation in every state that draws buttons (idle/leveling/done/failed) —
-        // one green primary = the action we want clicked, plus its own Skip/Re-run/Re-sweep. Only when there
-        // is nothing to characterize ('none', or the brief pre-check) does the step need a generic advance;
-        // otherwise we'd double up on "to Thresholds" buttons and green a competing action.
+        // The rtest panel owns navigation in idle/leveling/done/failed; only otherwise does the step need a generic
+        // advance (else two "to Thresholds" buttons).
         const rtPanelNav = (cx.rtestState === 'idle' || cx.rtestState === 'leveling' || cx.rtestState === 'done' || cx.rtestState === 'failed');
         if (!rtPanelNav) body += '<div style="margin-top:12px;">' + cxNextBtn(true, true) + ' <button onclick="cxMatrixStart()" class="btn-secondary btn-sm">Re-sweep</button></div>';
     } else {
@@ -31177,11 +30196,9 @@ function cxMatrixStart() {
     cx.rtestState = undefined; cx.rtest = null; cx.rtestOn = false; cx.rtestRpm = 0;  // re-sweep → re-check resonance
     cxGame.binLo = 0; cxGame.bins = null; cxGame.seeded = false;  // band rebuilt after idle detection
     commissionRender();
-    // Idle-adaptive capture band (§2.5): median of ~4 s of live RPM sets the band floor to idle−50
-    // (a hardcoded 500 floor bricks the done button on engines idling above ~900). Snap to the
-    // 50-RPM grid, clamp to [400, 1200], fall back to 500 if the reading is absent/nonsensical.
-    // The floor bin is a below-idle capture margin only — the coverage gate starts one bin up
-    // (see the gate-floor rule in cxSweepConfidence).
+    // Idle-adaptive capture band (§2.5): median of ~4 s of RPM sets the floor to idle−50 (a fixed 500 bricks the done
+    // button on engines idling above ~900), snapped to the 50-RPM grid, clamped to [400, 1200], fallback 500. The floor
+    // bin is only a below-idle margin; the coverage gate starts one bin up (cxSweepConfidence).
     const samples = [];
     const sampler = setInterval(() => { if (isFinite(cx.liveRpm) && cx.liveRpm > 0) samples.push(cx.liveRpm); }, 300);
     setTimeout(() => {
@@ -31194,10 +30211,8 @@ function cxMatrixStart() {
         cxGame.bins = null;   // next cxGameStart rebuilds on the detected band
         cx.rtFieldArmed = true;   // field under wizard command → closeCommissionModal tears it down
         cx.rtLastCmd = Date.now();
-        // Arm the field + test current now so it starts ramping to setpoint; the fold window
-        // (ripGameFill=1) is deferred to cxGameBeginShooting so nothing is collected until the operator
-        // is on setpoint and presses Start Shooting. Idle stamp + resTest level are staged here so the
-        // deferred wipe (which fires on ripGameFill=1) stamps resTestTargetA + the staged idle.
+        // Arm the field + test current now so it ramps to setpoint; the fold window (ripGameFill=1) waits for Start
+        // Shooting. Idle stamp + resTest level are staged first so the deferred wipe on ripGameFill=1 stamps them.
         cxFieldArm();   // take field ownership → invalidates any pending deferred release from a prior stop
         cxGet('ripGameIdleRpm=' + cx.matrixIdle)
             .then(() => cxGet('resTest=1'))
@@ -31208,20 +30223,10 @@ function cxMatrixStart() {
         commissionRender();
     }, 4000);
 }
-// Sweep targets + confidence gate (RPM_RIPPLE_TABLE_SPEC §2.5). The game draws invaders ONLY on target
-// bins, and the target set only grows, so no invader ever vanishes unshot. Seed (cxSweepSeedTargets):
-// the idle-median bin and the two bins above it (low speed is where peaks usually sit), then coarse
-// anchors CX_SWEEP_MAX_GAP+1 bins apart up to 2000, so no unswept run is wider than CX_RT_BAND and even
-// a peak at a gap's far edge is inside the resonance-check green band. Each poll refines from committed
-// data, per detector: a gap the ripple steps hard across, or one touching the curve's hot top quarter,
-// gets its midpoint (repeatedly, down to bin resolution), and each hot or prominent local peak gets its
-// ±50 neighbors, which walks it to the crest one commit at a time. Engine resonances are broad enough to
-// show 100–200 RPM out, so the coarse grid always sees the hump; a flat curve has no hot zone and
-// finishes on the seed set. Done = every target ALT-committed (the
-// kill ground truth) and no unconfirmed reading out-scoring the confirmed worst; the worst-spot pick
-// spans both detectors (mirrors the cxRtestInit pick). The floor never demands a speed the engine
-// hasn't proven it can hold: targets start at the idle-median bin (the band's bottom bin is a below-idle
-// capture margin most engines can't reach) and refinement reaches below it only after a commit there.
+// Sweep targets + confidence gate (RPM_RIPPLE_TABLE_SPEC §2.5). Invaders are drawn ONLY on target bins and the set only
+// grows, so none vanishes unshot. Seed: idle bin + 2 above, then anchors CX_SWEEP_MAX_GAP+1 bins apart (no unswept run
+// wider than CX_RT_BAND). Polls refine per detector: steep or hot gaps get midpoints, hot/prominent peaks get ±50 neighbors.
+// Done = every target ALT-committed and no unconfirmed reading beats the confirmed worst. Floor starts at the idle bin.
 const CX_SWEEP_MAX_GAP     = 3;     // max consecutive unswept bins between coarse anchors (×50 = 150 RPM = CX_RT_BAND)
 const CX_SWEEP_FINE_BINS   = 3;     // idle bin + the 2 above it: always targets
 const CX_SWEEP_STEEP_FRAC  = 0.25;  // ripple step across a segment ≥ this × that detector's peak → split it
@@ -31236,10 +30241,8 @@ function cxSweepSeedTargets(lo) {
 function cxSweepConfidence(rows) {
     const bandLo = cxGame.binLo || CX_GAME_BIN_LO, hi = CX_GAME_BIN_HI, w = CX_GAME_BIN_W;
     const noBatt = document.body.classList.contains('no-batt-current');   // no shunt → batt cells are INA noise; keep them out of refinement + worst-spot
-    // Gate floor: the idle-median bin (bandLo+w). The bandLo bin sits below median idle by
-    // construction, and idle is usually the hot bin — requiring bandLo bricks the done button on any
-    // engine that can't dip 50 below its own idle. A commit there (either detector — agree-twice =
-    // proven re-holdable) slides the gate floor down so the lowest reachable speed still counts.
+    // Gate floor = the idle-median bin (bandLo+w): bandLo sits below idle by construction, and requiring it bricks the
+    // done button. A commit there (either detector, agree-twice) slides the floor down.
     let commitLo = Infinity;
     for (const p of rows) if ((p.altSt === 2 || (!noBatt && p.battSt === 2)) && p.rpm < commitLo) commitLo = p.rpm;
     const lo = Math.min(bandLo + w, Math.max(bandLo, commitLo));
@@ -31338,16 +30341,13 @@ async function cxMatrixDone() {
     }
     cxMatrixStop();
 }
-// Freeze + persist the table FIRST, then the gentle resTest exit (mirrors cxRtFinish: command 0,
-// let the slew actually get there, then release — firmware deferred-release covers the rest). The
-// epoch guard skips the release writes if a newer flow grabbed the field during the 2.5 s wind-down.
+// Freeze + persist the table FIRST, then the gentle resTest exit via cxFieldWindDown.
 function cxMatrixFieldRelease() {
     cx.matrixOn = false; cx.matrixShooting = false; cxStopPoll(); cx.rtLastCmd = 0; cx.rtFieldArmed = false;
     cxFieldWindDown(['ripGameFill=0', 'resTestTargetA=0'], ['resTest=0', 'faCommissionGate=0'], 'Stopping the ripple sweep');
 }
-// Gentle field release shared by the sweep game and the current-check: the first writes command 0 A, the
-// 2.5 s wait lets the slew reach it, then the second writes release control. Every write is sent even if
-// one before it failed; the release is skipped only when a newer flow took the field during the wait.
+// Gentle field release shared by the sweep game and current-check: command 0 A, wait 2.5 s for the slew, then release.
+// Every write is sent even after a failure; the release is skipped only when a newer flow took the field meanwhile.
 function cxFieldWindDown(first, release, what) {
     const ep = cxFieldEpoch;
     (async () => {
@@ -31361,10 +30361,8 @@ function cxMatrixStop() {
     cxMatrixFieldRelease();
     commissionRender();
 }
-// Skip the ripple map from inside the game (the universal Skip footer is hidden while the field is
-// commanded). Warns that the over-current trip thresholds go unmeasured and must be set by hand, then
-// releases the field and advances — mirrors cxSkip's persist/advance tail so the Finish summary + masks
-// stay correct.
+// Skip from inside the game (the universal Skip footer is hidden while the field is commanded). Mirrors cxSkip's
+// persist/advance tail so the Finish summary + masks stay correct.
 async function cxMatrixSkip() {
     const ok = await xConfirm(
         'Skipping the ripple map means the over-current trip thresholds are NOT measured — they stay at your existing / default ripple. You will then need to set the alternator ripple and over-current protection by hand in Setup → Alternator → Protections. Email joe@xengineering.net for help.\n\nSkip this step?',
@@ -31381,15 +30379,9 @@ async function cxMatrixSkip() {
 }
 
 // ── "RPM Invaders" — the guided sweep as a game ───────────────────────────────
-// Y-axis = RPM (auto-ranged so a low idle slides the floor down, never clipped), trace + ship
-// ride the same CSV1 ring as the sparkline strip (which is hidden while the game owns the screen).
-// TWO invaders per TARGET bin (cxGame.targets — seeded sparse, grown by cxSweepConfidence; every
-// other band bin still folds and earns a green tick, it just has no invader): the near (ship-side)
-// one dies when the bin gets a qualifying pending value, the far one when the agree-twice pair commits. Kills are
-// GROUND TRUTH from the new RPM ripple table's state (rides the /filtripple.csv poll); the charge
-// ring is a local dwell estimate only. A disagree (pending replaced) regrows the near invader +
-// toasts. A FULL ring left unconfirmed for ~3 polls means the §11 admission gates rejected the
-// pause → "not admitted" toast + ring reset — that reject feedback is the whole point.
+// Y = RPM (auto-ranged); trace + ship ride the sparkline's CSV1 ring. TWO invaders per TARGET bin: the near one dies on a
+// qualifying pending value, the far one when the agree-twice pair commits (GROUND TRUTH from /filtripple.csv; the charge
+// ring is a local dwell estimate). A disagree regrows the near invader; a full ring unconfirmed ~3 polls = §11 reject.
 const CX_GAME_BIN_LO = 500, CX_GAME_BIN_HI = 2000;   // default band; cxGame.binLo overrides the floor after idle detection
 const CX_GAME_BIN_W = 50;
 const CX_GAME_CHARGE_S = 4;      // nominal dwell-to-full-ring; real pending usually beats it
@@ -31397,7 +30389,7 @@ const CX_GAME_MISS_MS = 6500;    // full ring unconfirmed this long (~3 polls) =
 const CX_SHOOT_HOLD_MS = 2000;   // current within band of setpoint this long → Start Shooting unlocks (mirrors firmware RIP_SCORE_HOLD_MS)
 const CX_GAME_NEW_S = 5;         // halo on a target added mid-game, so the arrival is noticed
 const cxGame = { active: false, raf: 0, lastT: 0, bins: null, targets: null, confirm: -1, seeded: false, binLo: 0,
-                 coveredExtra: null, parts: [], rip: null, toastT: 0, view: null };
+                 coveredExtra: null, parts: [], rip: null, toastT: 0, view: null, aim: -1 };
 // classic 11×8 invader bitmap
 const _cxInvBmp = ['00100000100', '00010001000', '00111111100', '01101110110',
                    '11111111111', '10111111101', '10100000101', '00011011000'].map(s => s.split('').map(Number));
@@ -31412,9 +30404,8 @@ function cxInvSprite(g, xc, yc, px, col, alpha) {
     g.globalAlpha = 1;
 }
 
-// 5×7 pixel font for the title card. Hand-rolled: the device serves this app off LittleFS with no
-// internet, so a webfont is impossible, and no system font has the invader bitmap's grain. Uppercase
-// and digits only — anything else renders as a blank cell.
+// 5×7 pixel font for the title card: the device serves this app off LittleFS with no internet, so no webfont.
+// Uppercase and digits only; anything else renders as a blank cell.
 const _cxFont = {
     A: '01110,10001,10001,11111,10001,10001,10001', B: '11110,10001,10001,11110,10001,10001,11110',
     C: '01110,10001,10000,10000,10000,10001,01110', D: '11110,10001,10001,10001,10001,10001,11110',
@@ -31454,10 +30445,8 @@ function cxPxText(g, str, xc, y, px, col) {
 }
 let _cxStars = null;   // attract-screen starfield, generated once per page
 
-// Title card — owns the canvas from Start Game until Start Shooting. The playfield used to draw live
-// through that whole stretch (invaders wobbling, ship tracking the throttle, band highlight moving)
-// while nothing was being scored: the fold window does not open until cxGameBeginShooting. Numbers
-// only up here; the full sentence and the button live in the #cxGameArm overlay over the bottom band.
+// Title card owns the canvas from Start Game until Start Shooting, since nothing is scored before the fold window
+// opens (cxGameBeginShooting). Numbers only; the sentence and button live in the #cxGameArm overlay.
 function cxGameAttract(g, w, h, t) {
     if (!_cxStars) _cxStars = Array.from({ length: 70 },
         () => ({ x: Math.random(), y: Math.random(), s: Math.random() }));
@@ -31516,17 +30505,14 @@ function cxGameStop() {
     if (cxGame.raf) { cancelAnimationFrame(cxGame.raf); cxGame.raf = 0; }
     cxRpmStripVis();
 }
-// RPM strip is hidden during the Disturbances sweep game (draws its own trace) and on the read-only
-// Thresholds review (phase 5) — no test runs there, so live RPM steadiness is moot. Also on Charge
-// Health Calibration (phase 9): its schedule chart and Engine speed readouts already carry the speed.
+// RPM strip hidden during the sweep game (draws its own trace), on Thresholds review (5, no test runs) and on Charge
+// Health Calibration (9, its chart already carries the speed).
 function cxRpmStripVis() {
     const strip = document.getElementById('cx-rpm-strip');
     if (strip) strip.style.display = (cxGame.active || (cx && (cx.phase === 5 || cx.phase === 9))) ? 'none' : '';
 }
-// Called from cxMatrixPoll with the parsed /filtripple.csv rows. Kill ground truth is the RPM ripple
-// table's per-bin ALT state: pending (altSt 1) kills the near invader, commit (altSt 2) kills both
-// (batt commits opportunistically alongside — never gated on). A pending VALUE that changed while
-// still pending means the agree-twice pair disagreed → the near invader regrows + toast.
+// Kill ground truth = the ripple table's per-bin ALT state: pending (altSt 1) kills the near invader, commit (2) both.
+// A pending VALUE that changed while still pending = the agree-twice pair disagreed → near invader regrows + toast.
 function cxGamePollBins(rows) {
     if (!cxGame.bins) return;
     const byRpm = {};
@@ -31562,11 +30548,9 @@ function cxGameToast(msg) {
     if (t) { t.textContent = msg; t.style.opacity = 1; }
     cxGame.toastT = 2.4;
 }
-// Hold-fire gate: after arming, the field ramps to the test current — the game must not charge/fire
-// until the measured current has held at setpoint (mirrors firmware ripScoreArmed, which won't fold a
-// bin until then). Runs the whole pre-shooting sequence's copy, idle detection included: the canvas
-// behind it is showing the title card (cxGameAttract), so this is the only prose on screen and it must
-// never go blank. Reveals Start Shooting once steady. cxGame.armReady feeds the card's colour.
+// Hold-fire gate: no charging/firing until measured current has held at setpoint (mirrors firmware ripScoreArmed).
+// Writes all the pre-shooting copy, idle detection included; it is the only prose over the title card, so never blank.
+// Reveals Start Shooting once steady; cxGame.armReady feeds the card's colour.
 function cxGameArmUpdate(now) {
     const ov = document.getElementById('cxGameArm');
     if (!ov) return;
@@ -31697,6 +30681,23 @@ function cxGameDraw(c, t, rpm, curKey, dt) {
         g.fillStyle = 'rgba(46,196,182,0.07)';
         g.fillRect(axisX, yOf(curKey + CX_GAME_BIN_W), w - 6 - axisX, binPx);
     }
+    // The one target to fly to, drawn orange with a band its height across the playfield: the live target being
+    // shot, else the live target nearest the engine speed (lowest before RPM reads). The previous pick holds until
+    // another is a full bin closer, so a speed between two targets doesn't flicker between them.
+    let aimKey = -1, aimD = Infinity;
+    const aimDist = k => isFinite(rpm) ? Math.abs(k + CX_GAME_BIN_W / 2 - rpm) : k;
+    if (curKey >= 0 && cxGameLive(curKey, cxGame.bins[curKey])) aimKey = curKey;
+    else {
+        for (const k in cxGame.bins) if (cxGameLive(+k, cxGame.bins[k]) && aimDist(+k) < aimD) { aimD = aimDist(+k); aimKey = +k; }
+        const prev = cxGame.aim;
+        if (prev >= 0 && prev !== aimKey && cxGame.bins[prev] && cxGameLive(prev, cxGame.bins[prev])
+            && aimDist(prev) <= aimD + CX_GAME_BIN_W) aimKey = prev;
+    }
+    cxGame.aim = aimKey;
+    if (aimKey >= 0) {
+        g.fillStyle = 'rgba(240,165,0,0.12)';
+        g.fillRect(axisX, yOf(aimKey + CX_GAME_BIN_W), w - 6 - axisX, binPx);
+    }
     // covered bins → green strips on the target column (required band + any extras like a low idle)
     const drawTick = rLo => { g.fillRect(tgtX - 16, yOf(rLo + CX_GAME_BIN_W) + 1, 58, binPx - 2); };
     g.fillStyle = 'rgba(85,170,85,0.16)';
@@ -31729,15 +30730,14 @@ function cxGameDraw(c, t, rpm, curKey, dt) {
             g.setLineDash([]); g.lineWidth = 1;
         }
     }
-    // invaders + charge rings — TWO monsters per bin. The ship is left of the target column, so the
-    // NEAR (left) monster dies first on pending; the far (right) one holds out until commit.
-    // A disagree regrows the near one briefly (regrowT flicker) — the pending value was replaced.
+    // TWO monsters per bin: the ship is left of the target column, so the NEAR (left) one dies on pending, the far
+    // one on commit. A disagree regrows the near one briefly (regrowT flicker).
     for (const k in cxGame.bins) {
         const bin = cxGame.bins[k];
         if (!cxGameLive(+k, bin)) continue;
         const cy = yOf(+k + CX_GAME_BIN_W / 2), hot = +k === curKey;
         const wob = Math.sin(t * 2 + bin.wob) * 1.5;
-        const col = bin.pendT ? '#fff' : hot ? '#f0a500' : '#b0b0b8';
+        const col = bin.pendT ? '#fff' : +k === aimKey ? '#f0a500' : '#b0b0b8';
         const px = Math.max(1.1, (binPx - 3) / 9), iw = 11 * px, ih = 8 * px;
         const drawInv = (xOff, alpha) => {
             g.globalAlpha = alpha; g.fillStyle = col;
@@ -31817,9 +30817,8 @@ function cxGameRipDraw() {
     for (const ser of (noBatt ? [['alt', '#2ec4b6', 'altSt']] : [['alt', '#2ec4b6', 'altSt'], ['batt', '#f0a500', 'battSt']])) {
         const pts = rip.filter(p => p[ser[0]] > 0).sort((a, b) => a.rpm - b.rpm);
         if (!pts.length) continue;
-        // Line + solid dots = confirmed (agree-twice) values ONLY. A pending single-window value
-        // draws as a hollow ring off the line so it can't masquerade as measured data — the wizard's
-        // worst-spot pick ignores it.
+        // Line + solid dots = confirmed (agree-twice) values ONLY; a pending single-window value is a hollow ring off
+        // the line so it can't masquerade as measured data.
         const conf = pts.filter(p => p[ser[2]] === 2);
         g.strokeStyle = ser[1]; g.globalAlpha = 0.5; g.beginPath();
         conf.forEach((p, i) => { const x = X(p.rpm), y = Y(p[ser[0]]); i ? g.lineTo(x, y) : g.moveTo(x, y); });
@@ -31850,16 +30849,11 @@ function cxGameRipDraw() {
 }
 
 // ── Guided resonance current-check (RIPPLE_DETECTION_REARCH_SPEC §3.2/§3.3) ──────────────────
-// After the coverage sweep, if measured filtered ripple was captured, the wizard commands the alternator to
-// 3 current levels at the worst-ripple RPM (you hold the speed in the green band and Record each) and fits
-// ripple = a0 + a1·I per detector on the IExcessTau-filtered pk-pk. It writes ONLY the ripFit reference
-// projection (POSTed in cxRtFinish) — the over-current floor is operator-owned and never touched here. The
-// fit surfaces on the Protections ripple-vs-threshold plot. Non-blocking: no ripple, or you skip → the plot
-// stays in its no-data state. State machine on cx.rtestState:
-//   undefined→'checking'→ 'none' (no ripple, silent) | 'idle' (Ready) → 'leveling' (3 commanded steps)
-//   → 'done' (fit) | 'failed'. REQUIRES the matching firmware (resTest/bcurRtest) flashed.
+// After the coverage sweep, command 3 current levels at the worst-ripple RPM and fit ripple = a0 + a1·I per detector on
+// the IExcessTau-filtered pk-pk. Writes ONLY the ripFit reference projection (cxRtFinish); the over-current floor is
+// operator-owned and never touched. cx.rtestState: checking → none | idle → leveling → done | failed.
 const CX_RT_BAND = 150;    // ± RPM considered "in range" (green)
-const CX_RT_MIN_WINS = 3;  // captured ring windows (~2 s each) required before Record unlocks — counts real admissions off /bcurrtest.csv, not a blind timer. 3 = min for a median-of-3 fit point (rejects one outlier); each level's point is a median so more windows only tighten the mean, they aren't needed for correctness
+const CX_RT_MIN_WINS = 3;  // captured ring windows (~2 s each) per level, counted off /bcurrtest.csv; 3 = min for a median-of-3 point (rejects one outlier)
 function cxRtestPanel() {
     if (cx.rtestState === undefined) { cx.rtestState = 'checking'; cxRtestInit(); return '<div style="margin:10px 0;color:#4a9eff;">Checking for resonance…</div>'; }
     if (cx.rtestState === 'checking') return '<div style="margin:10px 0;color:#4a9eff;">Checking for resonance…</div>';
@@ -31914,11 +30908,9 @@ function cxRtestPanel() {
     return h;
 }
 function cxRtestInit() {  // find the RPM with the worst measured filtered ripple → the resonance to characterize (§3.2)
-    // Columns: rpmLo, altFiltPkA, battFiltPkA, altSt, battSt (IExcessTau-filtered pk-pk == detector
-    // mExcessEma pk-pk, captured at the sweep's fixed current). COMMITTED values only (st 2) — a lone
-    // pending candidate never passed the agree-twice test and must not steer the pick. The belt
-    // resonance is mechanical and common to both detectors, so the strongest committed ripple across
-    // either signal locates the RPM to run the 3-level check at (it records both fits in one pass).
+    // Columns: rpmLo, altFiltPkA, battFiltPkA, altSt, battSt (IExcessTau-filtered pk-pk at the sweep's fixed current).
+    // COMMITTED values only (st 2): a pending candidate never passed agree-twice. The belt resonance is mechanical, so
+    // the strongest ripple across either detector picks the RPM (the check records both fits in one pass).
     fetch(buildURL('/filtripple.csv')).then(r => r.text()).then(txt => {
         let bestP = 0, bestRpm = 0; const bl = txt.trim().split('\n');
         for (let i = 1; i < bl.length; i++) {
@@ -31933,11 +30925,9 @@ function cxRtestInit() {  // find the RPM with the worst measured filtered rippl
     }).catch(() => { cx.rtestState = 'none'; commissionRender(); });
 }
 function cxRtReady() {  // user is holding the resonant RPM → arm field-commanding and start level 1
-    // Size the 3 levels from the cap-table ceiling AT THE TEST RPM, not the global table max. With the
-    // §11 stationarity gates the worst-ripple pick can legitimately land at idle, where a global-max
-    // level is unreachable — the command would saturate at the idle ceiling, cluster the 3 points, and
-    // fail the fit's span check. Table rows are "below this RPM" bands in ascending order, so the
-    // binding row is the first breakpoint above the test RPM (amps column is populated in kW mode too).
+    // Size the 3 levels from the cap-table ceiling AT THE TEST RPM, not the global max: the worst-ripple pick can land at
+    // idle, where a global-max level saturates and clusters the points. Rows are "below this RPM" bands in ascending
+    // order, so the binding row is the first breakpoint above the test RPM (amps column is populated in kW mode too).
     let iMax = 0, capAt = 0;
     for (let i = 0; i < 10; i++) {
         const c = document.getElementById('rpmCapCurrentTable' + i + '_input');
@@ -31968,9 +30958,8 @@ function cxRtSetLevel(idx) {
         .catch(e => { const m = document.getElementById('cx-rt-msg'); if (m) m.textContent = 'Could not set this level: ' + e + '. Abort and run the check again.'; });
     commissionRender();
 }
-// Current-check progress as a segmented bar per level (3 levels × CX_RT_MIN_WINS steady windows) —
-// replaces the numeric "N of 5 / M of 3" counters. Active level tints teal as windows land; done
-// levels stay full, future levels dark.
+// Current-check progress: a segmented bar per level (3 × CX_RT_MIN_WINS steady windows); active level tints teal
+// as windows land, done levels full, future dark.
 function cxRtBarsHtml() {
     const lvl = cx.rtLevel || 0, got = Math.min(CX_RT_MIN_WINS, cx.rtWinN || 0);
     let h = '<div style="display:flex;gap:12px;margin-top:10px;">';
@@ -32011,9 +31000,8 @@ function cxRtTick() {
     if (cx.rtBarSig !== barSig) { const bEl = document.getElementById('cx-rt-bars'); if (bEl) bEl.innerHTML = cxRtBarsHtml(); cx.rtBarSig = barSig; }
     if (got < CX_RT_MIN_WINS) { if (msgEl) { msgEl.style.color = '#4a9eff'; msgEl.textContent = 'Hold this RPM — capturing automatically…'; } }
     else if (!cx.rtCapturing) {
-        // Ring rows are firmware-gated stationary (ramp-free), so CX_RT_MIN_WINS admitted in-range windows
-        // is a complete point → capture and step to the next level with no user click. Guard against the
-        // async gap: tick fires several times before cxRtConfirm advances the level.
+        // Ring rows are firmware-gated stationary, so CX_RT_MIN_WINS in-range windows is a complete point: capture and
+        // step with no click. rtCapturing guards the async gap (tick fires several times before cxRtConfirm advances).
         cx.rtCapturing = true;
         if (msgEl) { msgEl.style.color = '#5a5'; msgEl.textContent = 'Point captured — stepping current…'; }
         cxRtConfirm();
@@ -32021,6 +31009,7 @@ function cxRtTick() {
 }
 function cxRtConfirm() {  // capture this level from the most-recent in-range windows (the stable hold)
     fetch(buildURL('/bcurrtest.csv')).then(r => r.text()).then(txt => {
+        if (!cx || cx.rtestState !== 'leveling') return;   // closed or aborted while the read was in flight
         const lines = txt.trim().split('\n'); const inrange = [];
         for (let i = 1; i < lines.length; i++) {
             const c = lines[i].split(','); if (c.length < 5) continue;
@@ -32029,11 +31018,8 @@ function cxRtConfirm() {  // capture this level from the most-recent in-range wi
             const sv = c.length > 5 ? parseFloat(c[5]) || 0 : 0;      // worst positive voltage slope (D-term deadband); 0 = window closed before the slope ring spanned
             if (Math.abs(rpm - cx.rtestRpm) <= CX_RT_BAND) inrange.push({ ia: iAlt, pa: pkAlt, sv: sv });
         }
-        // Record unlocked on ≥CX_RT_MIN_WINS captured in-range ring windows at this level → the last
-        // few windows ARE this level. Use the operating current the ring logged (MeasuredAmps),
-        // NOT the commanded level.
-        // MEDIAN of the recent windows: with the firmware §10/§11 admission gates the ring rows
-        // are already ramp-free, and the median makes the fit point immune to any single outlier window.
+        // The last windows ARE this level (Record unlocked at ≥CX_RT_MIN_WINS). Use the logged operating current
+        // (MeasuredAmps), NOT the commanded level, and the MEDIAN ripple so no single outlier window moves the point.
         const recent = inrange.slice(-8);
         const med = a => { const s = a.slice().sort((x, y) => x - y); return s.length ? (s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : 0; };
         let iaSum = 0;
@@ -32107,16 +31093,13 @@ function cxRtAbort() {
 }
 
 // ── Ripple vs. trip-threshold reference plot (RIPPLE_DETECTION_REARCH_SPEC §4) ──
-// Shared by the permanent Protections plots and the read-only Step-8 review. Draws each detector's trip
-// threshold E(I)=max(floor,min(frac·I,ceil)) — recomputed live from the setting fields — against the stored
-// measured ripple fit (a0+a1·I). Shades any current band where ripple ≥ the binding (lowest) threshold and
-// writes a one-line verdict. NEVER writes anything to the device — the operator owns the floor/ceiling/%.
+// Shared by the Protections plots and the read-only Step-8 review: trip line E(I)=max(floor,min(frac·I,ceil)),
+// recomputed live from the setting fields, vs. the stored ripple fit (a0+a1·I). NEVER writes to the device.
 let cxRipFit = null;   // {alt:{a0,a1,rpm,n,i:[],pk:[]}} from /ripfit; null until first fetch
 function loadRipFit(cb) {
     fetch(buildURL('/ripfit')).then(r => r.json()).then(j => { cxRipFit = j; protUpdateMarginEcho(); cvKdUpdateMarginEcho(); if (cb) cb(); }).catch(() => { if (cb) cb(); });
 }
-// Typed value wins (live preview while editing); else the current echo value. Protections inputs are blank
-// "set new value" boxes, so the live setting normally comes from the echo span.
+// Typed value wins (live preview); else the echo (Protections inputs are blank "set new value" boxes).
 function pField(name, echoId) {
     const el = document.querySelector('input[name="' + name + '"]');
     if (el && el.value !== '' && isFinite(parseFloat(el.value))) return parseFloat(el.value);
@@ -32147,15 +31130,13 @@ function drawRippleThreshPlot(canvasId, cfg) {
     // Settings may not have arrived yet (echo shows '?') → sane fallbacks so the plot is never NaN-broken.
     const floor = isFinite(cfg.floor) ? cfg.floor : 0;
     const ceil = isFinite(cfg.ceil) && cfg.ceil > 0 ? cfg.ceil : 1e6;
-    // Affine trip line per detector: E = clamp(floor, slope·I + base, ceil). base 0 = through-origin (legacy).
     const lines = (cfg.lines || []).filter(l => isFinite(l.slope) && isFinite(l.base));
     const E = (l, I) => Math.max(floor, Math.min(l.slope * I + l.base, ceil));
     const bindE = I => lines.length ? Math.min.apply(null, lines.map(l => E(l, I))) : floor;  // lowest line = first to false-trip
-    const maxE = I => lines.length ? Math.max.apply(null, lines.map(l => E(l, I))) : floor;   // y-autoscale must cover the TOP line too, or it clips flat at the canvas edge — a phantom "ceiling"
+    const maxE = I => lines.length ? Math.max.apply(null, lines.map(l => E(l, I))) : floor;   // autoscale must cover the TOP line, else it clips flat into a phantom "ceiling"
     const rf = cfg.ripFit, hasFit = rf && rf.n > 0;
     const rip = I => rf.a0 + rf.a1 * I;
-    // Unit hooks (default = the original amps behaviour): yDec > 0 enables sub-1 tick steps and decimal
-    // labels for small-range quantities like the V/s deadband plot.
+    // yDec > 0: sub-1 tick steps and decimal labels for small ranges (V/s deadband plot).
     const unit = cfg.unit || 'A', yDec = cfg.yDec || 0;
     let yMax = floor;
     for (let I = 0; I <= xMax; I += xMax / 60) yMax = Math.max(yMax, maxE(I), hasFit ? rip(I) : 0);
@@ -32186,9 +31167,7 @@ function drawRippleThreshPlot(canvasId, cfg) {
     }
     g.fillStyle = '#aaa'; g.textAlign = 'center'; g.fillText(cfg.xLabel || 'Nominal Alternator Current', padL + plotW / 2, cssH - 4);
     g.save(); g.translate(11, padT + plotH / 2); g.rotate(-Math.PI / 2); g.fillText(cfg.yLabel || 'Ripple Amps', 0, 0); g.restore();
-    // Clamp guides: drawn only when the shared floor/ceiling actually bends a line within the visible
-    // range, so a flattened ramp is self-explanatory. Ceiling label sits left (lines are low there),
-    // floor label right, to stay clear of the line ends.
+    // Clamp guides only when floor/ceiling bends a line in view. Ceiling label left, floor right, clear of line ends.
     const clampNote = lines.length > 1 ? ' — applies to both lines' : '';
     const minBase = lines.length ? Math.min.apply(null, lines.map(l => l.base)) : Infinity;
     const maxEnd = lines.length ? Math.max.apply(null, lines.map(l => l.slope * xMax + l.base)) : -Infinity;
@@ -32200,10 +31179,8 @@ function drawRippleThreshPlot(canvasId, cfg) {
     };
     if (ceil < maxEnd) clampGuide(ceil, 'Ceiling' + clampNote, true);
     if (floor > minBase) clampGuide(floor, 'Floor' + clampNote, false);
-    // Threshold line(s): floor → slope ramp → ceiling. Inline labels clamp to the right edge (they're
-    // long enough to overflow a phone-width canvas) and sit above the line's value at the label's END,
-    // so the monotonic ramp can never rise through the text. cfg.hideLabels drops them where a legend
-    // below the chart already names the lines.
+    // Inline labels clamp to the right edge (overflow on phone width) and sit above the line's value at the
+    // label's END so the rising ramp never crosses the text. cfg.hideLabels: a legend below names the lines.
     let lastLabelY = 1e9;
     lines.forEach(l => {
         g.strokeStyle = l.color; g.lineWidth = 2; g.setLineDash([]);
@@ -32217,7 +31194,7 @@ function drawRippleThreshPlot(canvasId, cfg) {
         const lx = Math.max(padL + 2, Math.min(sx(Il) + 3, padL + plotW - lw - 2));
         const Iend = ((lx + lw - padL) / plotW) * xMax;
         let ly = Math.max(padT + 10, sy(E(l, Iend)) - 4);
-        if (Math.abs(lastLabelY - ly) < 12) ly = lastLabelY - 12;   // de-collide only genuine overlaps — the one-sided test hoisted every lower label above the top line
+        if (Math.abs(lastLabelY - ly) < 12) ly = lastLabelY - 12;   // two-sided: a one-sided test hoists every lower label above the top line
         lastLabelY = ly;
         g.fillText(l.label, lx, ly);
     });
@@ -32248,7 +31225,6 @@ function drawRippleThreshPlot(canvasId, cfg) {
     }
     if (cfg.verdictId) { const vd = document.getElementById(cfg.verdictId); if (vd) vd.innerHTML = (cfg.verdictFn || rippleVerdict)(rf, bindE, xMax); }
 }
-// Per-plot X-axis-length control (operator-adjustable, persisted). Default 0–150 A.
 function rippleXmax(id) {
     const el = document.getElementById(id);
     let v = el ? parseFloat(el.value) : NaN;
@@ -32256,10 +31232,7 @@ function rippleXmax(id) {
     else localStorage.setItem(id, v);
     return v;
 }
-// The two permanent Protections plots. Threshold lines recompute client-side on every keystroke (pField
-// reads the typed value before saving); the ripple line is fixed measured data (cxRipFit).
-// Safety Margin has no firmware parameter — it's a client-side helper that writes IExcessBaseA.
-// Echo it back by inverting that: margin = saved CV base − ripple-at-idle. Blank without a Step-7 fit.
+// Safety Margin has no firmware parameter (it writes IExcessBaseA); echo = saved CV base − ripple-at-idle.
 function protUpdateMarginEcho() {
     const el = document.getElementById('IExcessSafetyMargin_echo');
     if (!el) return;
@@ -32304,9 +31277,8 @@ function protApplyMargin() {
 }
 
 // ── Voltage-slope vs deadband reference plot (CV D-term) — the V/s twin of the G3 ripple card ──
-// Measured worst-positive voltage slope (the /ripfit "slp" record, captured in the same Step-5 current
-// check) drawn against the flat deadband the damper (D term) runs. Red shading = ordinary ripple alone
-// would engage the damper at that current.
+// Measured worst-positive voltage slope (/ripfit "slp", from the Step-5 current check) vs. the damper
+// deadband. Red shading = ordinary ripple alone would engage the damper at that current.
 function slopeVerdict(rf, bindE, xMax) {
     if (!rf || !(rf.n > 0)) return 'Run the current check in <strong>Commissioning ▸ Step 5 (Disturbances)</strong> to overlay the measured voltage slope.';
     const rip = I => rf.a0 + rf.a1 * I;
@@ -32338,12 +31310,9 @@ function renderSlopeDeadbandPlot() {
         verdictId: haveDb ? 'slopeDeadbandVerdict' : null, verdictFn: slopeVerdict
     });
 }
-// Voltage-class multiplier (1 / 2 / 3 / 4 at 12/24/36/48 V). The deadband clamps below are V/s, which scales
-// with the bus class — unlike the G3 amps twin these were copied from, where the clamps are class-invariant.
+// Voltage-class multiplier (1-4 at 12-48 V): V/s deadband clamps scale with bus class (G3 amps clamps don't).
 function dbndClassK() { return (parseInt(window._nominalStored, 10) || 12) / 12; }
-// The runtime clamps the evaluated deadband to [CvKdDbFloor, CvKdDbCeil], so a margin past the ceiling
-// is dead travel (D already effectively off — that's the enable toggle's job). Slider spans exactly to
-// that ceiling: no artificial cap, and no clipping of the useful range below it.
+// Runtime clamps the deadband to [CvKdDbFloor, CvKdDbCeil], so the margin slider spans exactly to that ceiling.
 function dbndCeil() { const c = getEchoNumber('CvKdDbCeil_echo'); return (isFinite(c) && c > 0) ? c : 3.5 * dbndClassK(); }
 // Deadband Safety-Margin Set — derives the parallel deadband line from the measured slope fit:
 // slope = fit slope (b1), base = fit intercept (b0) + margin. Exact twin of the G3 protApplyMargin.
@@ -32367,14 +31336,11 @@ function cvKdUpdateMarginEcho() {
 }
 
 // ── Stage 5 · Current Threshold Setting — sets the affine over-current trip line (G3) ─────────
-// The measured ripple fit (a0 + a1·I) drives the recommendation: slope = a1, CV base = a0 + margin, so
-// the CV trip line runs parallel to the ripple the Safety Margin above it; the CC line is the same slope,
-// IExcessCcOffsetA above CV. Writes IExcessFrac+FracBulk (kept equal → parallel), Base, CcOffset, Floor,
-// Ceil — the same settings mirrored on Protections ▸ G3. Path B: no measured fit → hand-set only, no margin.
+// slope = fit a1, CV base = a0 + margin (parallel to the ripple); CC = same slope, IExcessCcOffsetA above CV.
+// Same settings as Protections ▸ G3. No measured fit → hand-set only, no margin.
 const CX_THR_LIMS = { slope: [2, 50], base: [0, 150], ccoff: [0, 150], floor: [1, 20], ceil: [5, 200], margin: [0, 150] };  // mirrors the /get constrain() ranges in 3_functions.ino — widened together
-// Lithium (LiFePO4) keeps tight over-current protection (BMS-disconnect cliff). Every other chemistry —
-// AGM, flooded, unknown — tolerates brief current excursions, so the wizard recommends a much larger
-// trip-line margin AND a raised ceiling (else the ceiling clips the margin back down).
+// Lithium keeps tight over-current protection (BMS-disconnect cliff); other chemistries tolerate brief
+// excursions, so they get a larger margin AND a raised ceiling (else the ceiling clips the margin).
 function cxIsNonLithium() {
     const t = (window.vesselInfo && window.vesselInfo.battery_type) || '';
     return !!t && t !== 'lifepo4';
@@ -32403,7 +31369,7 @@ function cxRenderThresh(b) {
         ? 'Set how far the over-current trip line sits above the ripple measured in the Disturbances step. For lead-acid and AGM, 30 A is recommended.'
           + cxWhyTip('A brief spike does lead-acid and AGM batteries no harm, and a high trip lets an engine-speed blip ride through instead of cutting the charge. The voltage protections stay the fast defense.'
                      + cxDocLink('step-6-fault-threshold-autotuning'))
-        // Lithium copy was already one line and carries no "why" to hide, so it keeps the visible doc link.
+        // No "why" to hide in the lithium copy, so its doc link stays visible.
         : 'Set the margin so the over-current trip line clears the ripple measured in the Disturbances step. A 5 A margin works well for most installations.'
           + cxDocLink('step-6-fault-threshold-autotuning');
     cx.thrEdited = false;
@@ -32455,12 +31421,9 @@ function cxRenderThresh(b) {
     b.innerHTML = body;
     loadRipFit(() => { cxThrInit(); cxThrDraw(); cxDbndInit(); cxDbndDraw(); cxThrGoRender(true); });
 }
-// Accept-and-go. Both halves of this step already wrote their recommended values on entry
-// (cxThrInit / cxDbndInit), so this is a plain advance — nothing extra to apply. Rendered from the
-// init callback, not the body string, so it cannot be pressed before those writes have landed.
-// Withheld when either half has no measured fit: there the numbers are carried-over defaults rather
-// than a recommendation, the details stay open, and the hand-set prompts are the actual work.
-// The "defaults" label holds only while the owner has not touched a margin; after that it is plain Next.
+// Both halves already wrote their recommendations on entry (cxThrInit / cxDbndInit), so this is a plain
+// advance, rendered from the init callback so it can't be pressed before those writes land. "Defaults"
+// label only when both fits exist and no margin has been touched.
 function cxThrGoRender(fold) {
     const go = document.getElementById('cxThrGo'); if (!go) return;
     const q = document.getElementById('cxThrQuick');
@@ -32481,9 +31444,8 @@ function cxThrGoRender(fold) {
 function cxThrDetailsToggle(det) {
     if (det.open) { cxThrDraw(); cxDbndDraw(); }
 }
-// Seed wizard-local state from the fit + current device settings; on first entry apply the per-chemistry
-// margin recommendation (5 A lithium, 30 A non-lithium) plus the matching over-current ceiling (20/40 A),
-// and persist them so Next alone suffices. The raised ceiling is absolute, so it applies even with no fit.
+// First entry applies and persists the per-chemistry margin (5 A lithium / 30 A other) and the 40 A
+// non-lithium ceiling (even with no fit) so Next alone suffices.
 function cxThrInit() {
     const rf = (cxRipFit && cxRipFit.alt && cxRipFit.alt.n > 0) ? cxRipFit.alt : null;
     if (!cx.thr) cx.thr = {};
@@ -32494,7 +31456,7 @@ function cxThrInit() {
     if (st.ccoff == null) st.ccoff = dNum('IExcessCcOffsetA_echo', 0);
     if (!st.init) {
         const nonLith = cxIsNonLithium();
-        if (nonLith) st.ceil = cxThrClamp('ceil', 40);   // raise so a 30 A margin isn't clipped; lithium's ceiling is left untouched
+        if (nonLith) st.ceil = cxThrClamp('ceil', 40);   // so a 30 A margin isn't clipped
         if (rf) {
             st.margin = nonLith ? 30 : 5;
             st.slope = cxThrClamp('slope', rf.a1 * 100);   // firmware stores slope as % of command
@@ -32507,7 +31469,7 @@ function cxThrInit() {
             st.slope = dNum('IExcessFrac_echo', 10);
             st.base = dNum('IExcessBaseA_echo', 0);
             st.init = true;
-            if (nonLith) cxThrWrite(['ceil']);   // non-lithium ceiling is absolute — apply even with no ripple fit
+            if (nonLith) cxThrWrite(['ceil']);
         }
     }
     const noFit = !rf;
@@ -32551,7 +31513,7 @@ function cxThrDraw() {
         ripFit: st.rf, xMax: xMax, hideLabels: true
     });
 }
-// Persist the named fields to G3. 'slope' writes both firmware slopes (CV + CC) so the lines stay parallel.
+// 'slope' writes both firmware slopes (CV + CC) so the lines stay parallel.
 function cxThrWrite(keys) {
     const st = cx.thr; if (!st) return;
     const q = [];
@@ -32566,10 +31528,8 @@ function cxThrWrite(keys) {
 }
 
 // ── Thresholds step, part 2: D-term deadband line from the measured voltage-slope fit ─────────
-// Parallel-line construction, exact twin of the G3 flow: slope = fit b1, base = fit b0 + margin,
-// auto-applied on first entry (like cxThrInit) so Next alone suffices; the slider re-writes on
-// release. Floor/ceiling come from the device settings (they clamp the runtime evaluation).
-// No fit → hand-set input, writes base + slope 0 (flat), nothing auto-written.
+// Twin of the G3 flow: slope = fit b1, base = fit b0 + margin, auto-applied on first entry; slider writes
+// on release. No fit → hand-set flat deadband, nothing auto-written.
 function cxDbndInit() {
     const rf = (cxRipFit && cxRipFit.slp && cxRipFit.slp.n > 0) ? cxRipFit.slp : null;
     if (!cx.dbnd) cx.dbnd = {};
@@ -32580,10 +31540,7 @@ function cxDbndInit() {
     if (st.ceil == null) st.ceil = dNum('CvKdDbCeil_echo', 3.5 * k);
     if (!st.init) {
         if (rf) {
-            // Safety margin ON TOP of the auto-measured ripple threshold (base = measured intercept +
-            // this). Slider starting default = class-scaled 0.4 V/s, in raw bus units (rescaled on a
-            // class change like vTgtRamp* — V/s rates are NOT stored 12 V-equivalent); operator drags
-            // it from there. The margin rides the whole line, so every current keeps the same headroom.
+            // Class-scaled 0.4 V/s start, raw bus units (V/s rates are NOT stored 12 V-equivalent).
             st.margin = 0.4 * k;
             st.slope = Math.max(0, rf.a1);
             st.base = Math.min(dbndCeil(), Math.max(0, rf.a0 + st.margin));
@@ -32631,7 +31588,7 @@ function cxDbndHandSet() {
     if (!isFinite(v)) { xAlert('Enter a deadband in V/s first.'); return; }
     const st = cx.dbnd || (cx.dbnd = {});
     st.base = Math.min(dbndCeil(), Math.max(0, v));
-    st.slope = 0;   // hand-set = one number = a flat line, so no stale measured slope survives underneath it
+    st.slope = 0;   // hand-set is flat; no stale measured slope survives underneath
     cxDbndWrite(); cxDbndReflect(); cxDbndDraw();
 }
 function cxDbndDraw() {
@@ -32647,10 +31604,7 @@ function cxDbndDraw() {
     });
 }
 
-// Reads the DEVICE echoes, not this session's run results: the summary states what the regulator is
-// running now, which is the thing the user wants confirmed, and it stays true across a page reload —
-// off the session objects it claimed nothing had been applied whenever the page had been refreshed
-// mid-wizard.
+// Reads DEVICE echoes, not session run results, so it states what the regulator runs and survives a page reload.
 function cxAppliedSummary() {
     const rows = [];
     const stab = getEchoNumber('SystemIDStabilizeAmps_echo'), step = getEchoNumber('SystemIDStepAmplitude_echo');
@@ -32662,24 +31616,19 @@ function cxAppliedSummary() {
         if (tcF > 0 && tcS > 0) g += '; filters ' + Math.round(tcF) + '/' + Math.round(tcS) + ' ms';
         rows.push(g);
     }
-    // Over-current floor is operator-owned (Protections), echoed here not "applied" by commissioning. The
-    // ceiling and trip-line margin ARE set by the Fault Threshold step, per chemistry (30 A / 40 A non-lithium).
+    // Over-current floor is operator-owned (Protections): echoed, not "applied" by commissioning.
     const flr = getEchoNumber('IExcessFloorA_echo');
     if (flr > 0) rows.push('Over-current floor (set in Protections): ' + flr.toFixed(1) + ' A');
     return rows.length ? rows.join('<br>') : 'The regulator is running its seeded defaults — no commissioning step has written a value yet.';
 }
 // ══════════ CV Stress Test (wizard stage 8, Step 9 + standalone Tuning-tab modal) ══════════
-// Firmware engine: /get?cvStressStart=1 → poll /cvstress.json (the poll doubles as the
-// browser-alive deadman). The firmware ENDS the run itself once the bus re-settles at the
-// target — the operator never presses Finish. Rendering is shared between the wizard body
-// and the standalone modal (Setup → Alternator → Tuning → Stress Test) via cvsResultsHtml/cvsFixesHtml.
-// Flow: charge at idle until the bus holds steady and stops settling up → park CV at an achievable target
-// (idle avg − CvStressDropV) → snap the throttle → the OV protection fires on a REACHABLE setpoint.
+// /get?cvStressStart=1 → poll /cvstress.json (the poll is the browser-alive deadman); the firmware ends the
+// run itself once the bus re-settles. Charge at idle → park CV at a reachable target (idle avg − CvStressDropV)
+// → snap the throttle.
 let _cvsTune = null;   // last-seen tune values from /cvstress.json — feeds the corrective buttons
 
-// A hung fetch (wedged connection during the electrically noisy snap) neither resolves nor
-// rejects, which froze the poll chain silently until the firmware's 20 s browser-alive deadman
-// aborted the run. Cap every status poll at 4 s so a stall becomes a catch → normal retry.
+// A hung fetch during the noisy snap never settles and would stall the poll chain until the firmware's
+// 20 s deadman aborts the run; the 4 s cap turns a stall into a catch → normal retry.
 function cvsFetchStatus() {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 4000);
@@ -32712,7 +31661,7 @@ function cvsParseLast(s) {
              rpmSlew: v[17], rpmMax: v[18], battA: v[19] / 10, targetV: (v[20] || 0) / 100, softStim: v[21] === 1,
              wobIdleV: (v[22] || 0) / 100, wobCvV: (v[23] || 0) / 100, wobPostV: (v[24] || 0) / 100,
              stabBandV: (v[25] || 0) / 100, failBandV: (v[26] || 0) / 100, failPhase: v[27] || 0,
-             // Appended 2026-07-28; older blobs lack them — leave undefined so the card never renders a fake 0
+             // Absent in older blobs; never let the card render a fake 0
              armAltA: v.length >= 31 ? v[28] / 10 : undefined,
              ccAvgA: v.length >= 31 ? v[29] / 10 : 0, ccRipA: v.length >= 31 ? v[30] / 10 : 0, stored: true };
 }
@@ -32727,12 +31676,12 @@ function cvsResultsHtml(j) {
     const overall = j.overall === 0 ? '<span style="color:#5a5;">PASS</span>' : j.overall === 1 ? '<span style="color:#c9a227;">MARGINAL</span>' : '<span style="color:#e05a4e;">FAIL</span>';
     let h = '<div style="margin:10px 0;padding:10px 12px;background:#222;border-radius:6px;">';
     h += '<div style="font-size:16px;font-weight:600;margin-bottom:6px;">Verdict: ' + overall + '</div>';
-    // Bands come from firmware (already × V/12; failBand reflects the live CvStressFailBandV). Pre-band stored blobs report 0 → fall back to the 12V-equiv constants × k (nominal/12).
+    // Firmware bands are already class-scaled; older blobs report 0 → 12 V-equivalent constants × k.
     const k = (parseInt(window._nominalStored, 10) || 12) / 12;
     const stabBand = (j.stabBandV > 0 ? j.stabBandV : 0.10 * k).toFixed(2);
     const failBand = (j.failBandV > 0 ? j.failBandV : 0.25 * k).toFixed(2);
     if (j.outcome === 3) {
-        // The test never armed. failPhase 3 = target unreachable (bank too stiff for the headroom — a setup condition, not a loop defect); 2 = the forced constant-voltage approach never reached the target (or wobbled past the fail band there); anything else (incl. legacy blobs without the field) = swinging beyond the fail band at idle.
+        // Never armed. failPhase 3 = target unreachable (setup, not a loop defect); 2 = CV approach never reached target; else (incl. old blobs) = idle swing past the fail band.
         h += '<div style="font-size:13px;color:#e0a0a0;">' + (j.failPhase === 3
             ? 'The bank could not be pulled down by the requested Target Headroom: the loop shed all its charging current and the voltage still sat above the target. This is a property of a very large or very full bank — not a control fault. Reduce Target Headroom (Setup ▸ Alternator ▸ Tuning ▸ Stress Test) and re-run.'
             : j.failPhase === 2
@@ -32743,7 +31692,7 @@ function cvsResultsHtml(j) {
         return h;
     }
     const preWob = Math.max(j.wobIdleV || 0, j.wobCvV || 0);
-    // Wobble fields are measured swings; 0 = blob from firmware that only recorded loose settles — show the band ceiling, never a fake 0.00.
+    // wobPostV 0 = not recorded (older firmware): show the band ceiling, never a fake 0.00.
     const swingV = j.wobPostV || 0;
     const stabTxt = j.gStab === 2 ? 'never re-settled'
                   : swingV > 0 ? 'within ' + swingV.toFixed(2) + ' V / 3 s'
@@ -32782,9 +31731,8 @@ function cvsResultsHtml(j) {
 // Corrective actions, keyed to the failure signature. Shared by the wizard and the Diag modal; each puts
 // its own re-run button directly under the card, so the card carries none.
 let _cvsFixCtx = null;   // j of the last render — the card re-renders in place after each write so every from → to stays current
-// One fix as the exact write it makes from the live tune values; null when the setting is already at its limit.
-// The Measured gain source derives Kd = Td·Kp, so Soften raises Td by the inverse of the α cut: the D term is the surge brake,
-// and cutting P and I must not take it down with them.
+// null = setting already at its limit. Measured gain source derives Kd = Td·Kp, so Soften raises Td by the
+// inverse of the α cut: D is the surge brake and must not drop with P and I.
 function cvsFixPlan(kind, t) {
     const f2 = v => v.toFixed(2), f3 = v => v.toFixed(3);
     const softer  = 'After a protection trip releases, current rebuilds more slowly, so a second trip is less likely. Voltage also recovers more slowly when a load switches on.';
@@ -32895,8 +31843,7 @@ function cxStressPoll() {
             return;
         }
         if (j.ready && cx.cvs._sawActive) { cx.cvs.running = false; cx.cvs.err = j.ok ? null : (j.abort || 'no result'); commissionRender(); return; }
-        // Never saw the run go active — the start was refused (busy/cooldown/engine off). Give up
-        // instead of polling a stale previous result forever.
+        // Never went active: start refused (busy/cooldown/engine off); stop rather than poll a stale result.
         if (!cx.cvs._sawActive && performance.now() - (cx.cvs._pollStart || 0) > 15000) {
             cx.cvs.running = false; cx.cvs.err = 'did not start — see the Console for the reason'; commissionRender(); return;
         }
@@ -32909,26 +31856,18 @@ function cxStressArmLive(j) {
            ' V</strong> · RPM peak <strong>' + Math.round(j.rpmMax) + '</strong>';
 }
 // ── Step 10 · Charge Health Calibration — the alternator's speed lead ─────────────────────────
-// One run on the firmware's clock, four throttle cycles drawn as a speed schedule the operator
-// follows: idle, climb at CHC_PACE_RPM_S to the test top (CHC_TOP_FRAC of the entered maximum
-// working RPM), hold, ease back to idle. Cycle 1 sizes the field at its top hold — the fastest the
-// machine turns all run, so nothing later exceeds what the sizing already proved safe — and the
-// duty is frozen there. Cycles 2-4 run at that frozen duty and the firmware fits each one on its
-// own; the browser averages the closest pair of the three and writes altLeadSec. The cycles chain
-// with no button press between them, deliberately: a button between cycles would pin the frozen
-// field while nobody is driving, which is where the 2026-09-09 bench run aborted.
+// Four throttle cycles on the firmware's clock. Cycle 1 sizes and freezes the field at its top hold (the
+// fastest speed all run); firmware fits cycles 2-4, the browser averages the closest pair → altLeadSec.
+// Cycles chain with no button press: a button between them would pin the frozen field with nobody driving.
 const CHC_PAIR_DISAGREE = 0.30;      // closest pair of cycle fits differing by more than this share of their mean is flagged
 // Firmware abort reasons a lower test current can relieve (7_functions.ino chcFinish strings). NOT the
 // "charge-rate limit at the test speed is too small" refusal — lowering the share makes that one worse.
 const CHC_CEILING_RE = /output reached the charge-rate limit|bus reached the charge target|field reached its ceiling|moved the frozen field/;
 const CHC_TOP_FRAC = 0.50;           // test top as a share of maxWorkingRpm. MUST equal CHC_TOP_FRAC in Xregulator.ino
-const CHC_PACE_RPM_S = 200;          // schedule ramp pace, rpm/s (5 s per 1000 rpm). MUST equal CHC_PACE_RPM_S in Xregulator.ino
+const CHC_PACE_RPM_S = 200;          // schedule ramp pace, rpm/s. MUST equal CHC_PACE_RPM_S in Xregulator.ino
 const CHC_SETTLE_S = 10, CHC_SIZE_HOLD_S = 8, CHC_TOP_HOLD_S = 3, CHC_MIN_RAMP_S = 2, CHC_CYCLES = 4;   // MUST equal CHC_SETTLE_IDLE_MS / CHC_SIZE_HOLD_MS / CHC_TOP_HOLD_MS / CHC_MIN_RAMP_MS / 1+CHC_MEAS_CYCLES in Xregulator.ino
 const CHC_HOLD_ABOVE_IDLE = 400;     // the top must clear idle by this or the passes have no range. MUST equal CHC_HOLD_ABOVE_IDLE in Xregulator.ino
-// The corridor. band(t) = [min(target over t±slack) − m, max(target over t±slack) + m], m = max(floor, frac × target(t)).
-// The time smear adds nothing on a hold, opens the ramps by ±slack×pace and rounds the corners with no
-// per-segment special-casing; the speed cushion grows with speed because tracking error does (the
-// percentage takes over above floor/frac ≈ 1670 rpm). The firmware's "at the top" test for the freeze
+// Corridor: target smeared over t±slack, ± max(floor, frac × target). The firmware's freeze "at the top" test
 // uses the same floor/frac (CHC_TOL_FLOOR_RPM / CHC_TOL_FRAC), so in range on screen = sizing allowed.
 const CHC_LANE_SLACK_S = 2.0;        // the operator may be this far ahead of or behind the schedule
 const CHC_LANE_FLOOR_RPM = 250;      // speed cushion at low speed
@@ -32946,11 +31885,9 @@ function cxChcAdvSet(open) { if (cx && cx.chc) cx.chc.advOpen = open; }
 function cxChcIdleNowText() {
     return 'Engine speed ' + ((cx && isFinite(cx.liveRpm) && cx.liveRpm > 0) ? Math.round(cx.liveRpm).toLocaleString() + ' rpm' : '—');
 }
-// Setup-screen facts only the device has: the charge-rate limit at the test top (/chc.json topCapA,
-// from the same code that sizes the run) and whether a maximum working RPM is on file. With none on
-// file, step 8's highest held speed is adopted — cxKneeApply normally stores it; this covers anchors
-// that were captured but never applied. The on-file check reads /chc.json, not the CSV3 echo, which
-// may not have arrived yet and would make a stored maximum look absent.
+// Device-only setup facts from /chc.json: charge-rate limit at the test top, and whether maxWorkingRpm is on
+// file (not the CSV3 echo, which may not have arrived). None on file → adopt step 8's top held speed
+// (covers anchors captured but never applied by cxKneeApply).
 function cxChcSetupFetch(force) {
     const c = cx.chc, now = performance.now();
     const onSetup = () => cx && cx.phase === 9 && cx.chc === c && !c.started && !c.done;
@@ -33036,9 +31973,8 @@ function cxChcBandAt(P, t) {
     const m = Math.max(CHC_LANE_FLOOR_RPM, CHC_LANE_FRAC * cxChcTargetAt(P, t));
     return [lo - m, hi + m];
 }
-// Seconds since the run's clock started: the firmware's own runMs, carried forward locally between
-// polls, so the chart and the control loop read the same schedule. Before the first poll lands, the
-// Start press stands in.
+// Run time from firmware runMs, extrapolated locally between polls so chart and control loop share one
+// schedule; the Start press stands in before the first poll.
 function cxChcRunT(c) {
     const j = c.j;
     if (j && j.active && j.runMs != null) return (j.runMs + (performance.now() - c._rxAt)) / 1000;
@@ -33098,7 +32034,7 @@ function cxChcDraw(cv, c, P, t, rpm, running) {
         tr.push([X(a[0]), Y(a[1]), X(b[0]), Y(b[1]), b[1] >= bd[0] && b[1] <= bd[1]]);
     }
     if (tr.length) {
-        // Water under the trail: the trail redrawn 7 times, each copy lower and fainter, so the trail reads as the sea surface.
+        // Water under the trail: lower, fainter copies so the trail reads as the sea surface.
         g.lineWidth = 2.1; g.lineCap = 'butt'; g.lineJoin = 'round';
         for (let j = 7; j >= 1; j--) {
             const dy = j * 1.7, al = (0.17 * (1 - (j - 1) / 7)).toFixed(3);
@@ -33265,8 +32201,7 @@ function cxChcBoat(g, x, y, rgb, type, pitch, tau) {
     }
     g.restore();
 }
-// The live loop: the boat, the trail, the cue and the live rows are updated in place every frame.
-// Nothing here rebuilds the panel — a poll only refreshes cx.chc.j.
+// Per-frame in-place update; never rebuilds the panel (a poll only refreshes cx.chc.j).
 function cxChcAnim() {
     const c = cx && cx.chc;
     if (!c || !c.running || cx.phase !== 9) { if (c) c._anim = false; return; }
@@ -33317,8 +32252,7 @@ function cxChcCancel() { cxSendEach(['chcCancel=1']).then(f => cxReportStopFailu
 function cxChcPoll() {
     const c = cx && cx.chc;
     if (!c || !c.running) return;
-    // The schedule is bounded (under four minutes at the highest allowed top) and the firmware ends
-    // itself — generous.
+    // 10 min: the schedule is under 4 min at the highest top and the firmware ends itself.
     const giveUp = () => (performance.now() - (c._t0 || 0) > 600000);
     fetch(buildURL('/chc.json')).then(r => r.json()).then(j => {
         c.j = j; c._rxAt = performance.now();
@@ -33392,9 +32326,8 @@ function cxRenderChc(b) {
     let body = '';
     if (c.err) body += warnBox('<strong>' + c.err + '</strong>');
 
-    // The one instruction slot, above the chart in every state: plain text before Start, the lit cue while
-    // a run is live (cxChcAnim rewrites both lines and flips it amber). styles.css fixes its heights, so
-    // the chart under it never moves when the words change.
+    // One instruction slot above the chart in every state (cxChcAnim rewrites it live). styles.css fixes its
+    // heights so the chart never moves when the words change.
     const cue = (lit, l2) => '<div id="chcCue" class="cx-cue cx-cue-lane' + (lit ? '' : ' cx-cue-idle') + '">' +
         '<div class="cx-cue-l1" id="chcCueL1">Adjust throttle to keep engine speed in range band</div>' +
         '<div class="cx-cue-l2" id="chcCueL2">' + l2 + '</div></div>';
@@ -33402,15 +32335,13 @@ function cxRenderChc(b) {
         ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();cxChcSetMax();}"' +
         ' style="width:104px;background:#0f1416;border:1px solid #383e42;border-radius:6px;color:#e6edef;padding:8px 10px;font-size:16px;font-variant-numeric:tabular-nums;">';
 
-    // 1 · setup: the schedule preview with Start on it. The maximum working RPM normally arrives from
-    //   step 8 (cxKneeTopRpm) and, with the test current, sits in Advanced; it is asked on the chart only
-    //   when the device has none on file, or the one on file leaves the test no room.
+    // 1 · setup. Max working RPM normally comes from step 8 and sits in Advanced; asked on the chart only
+    //   when none is on file or it leaves the test no room.
     if (!c.started && !c.done) {
         cxChcSetupFetch(false);
         const maxRpm = cxChcMaxRpm();
         const top = maxRpm > 0 ? Math.round(CHC_TOP_FRAC * maxRpm) : 0;
-        // Range check against the idle the engine is showing now — the same guard the firmware applies
-        // at Start, said here so a too-low number is caught before any throttle work.
+        // Same guard the firmware applies at Start, against current idle, so a too-low max is caught early.
         const idleNow = (isFinite(cx.liveRpm) && cx.liveRpm > 0) ? cx.liveRpm : 0;
         const tooLow = top > 0 && idleNow > 0 && top < idleNow + CHC_HOLD_ABOVE_IDLE;
         const ready = maxRpm > 0 && !tooLow;
@@ -33474,9 +32405,8 @@ function cxRenderChc(b) {
         return;
     }
 
-    // 3 · stopped early. A run that finished with exactly one cycle fitted is not ok on the firmware
-    //   side (nothing to check it against) but still has answers worth showing — it takes the result
-    //   screen below, which says so and stores nothing.
+    // 3 · stopped early. A one-cycle-fit run is !ok on the firmware side but still takes the result screen
+    //   below, which says so and stores nothing.
     const d = c.done;
     if (!d || !(d.ok || cxChcPair(d.lead).n === 1)) {
         body += warnBox('<strong>Stopped early.</strong> ' + ((d && d.abort) || 'no reason reported') + '.');
@@ -33516,7 +32446,7 @@ function cxRenderChc(b) {
     body += kv('Speed range', fmt(d.idleRpm) + ' – ' + fmt(d.top) + ' rpm');
     body += kv('Field held at', d.duty.toFixed(1) + '%');
     body += kv('Output range', d.minA.toFixed(0) + ' – ' + d.peakA.toFixed(0) + ' A');
-    // Reference only — nothing is done with the pace figures, they just say what the operator gave.
+    // Reference only; the pace figures feed nothing.
     if (d.rateAvg >= 0)
         body += kv('Throttle pace', 'min ' + d.rateMin.toFixed(0) + ' · avg ' + d.rateAvg.toFixed(0) +
                    ' · max ' + d.rateMax.toFixed(0) + ' rpm/s');
@@ -33569,9 +32499,8 @@ function cxRenderStress(b) {
     b.innerHTML = body;
     if (!j) fetch(buildURL('/cvstress.json')).then(r => r.json()).then(jj => {
         if (jj.tune) _cvsTune = jj.tune;
-        // Follow the device, never latch: the firmware DISCARDS this blob the moment a retune stales
-        // the verdict (cvStressForgetLast), so a cached string would put a dead result card back on
-        // screen after an upstream step was re-run inside the same wizard pass.
+        // Follow the device, never latch: firmware discards this blob when a retune stales the verdict
+        // (cvStressForgetLast), so a cached string would resurrect a dead result card.
         const fresh = jj.last || '';
         if (fresh !== (s.lastBlob || '')) { s.lastBlob = fresh; if (cx.phase === 8 && !s.running) commissionRender(); }
         s.j = s.j || null;
@@ -33581,7 +32510,7 @@ function cxRenderStress(b) {
 // ── Standalone modal (Setup ▸ Alternator ▸ Tuning ▸ Stress Test) — bhw-style shell ──
 let cvsD = null;   // { pane:'pre'|'run'|'done', renderedPane, j, poll }
 function cvsGet(params) {
-    return fetch(buildURL('/get?' + params));
+    return cxGet(params);   // rejects on 403/409, so a locked or misaddressed write reaches the caller's .catch
 }
 function cvsOpen() {
     if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
@@ -33605,14 +32534,20 @@ function cvsClose() {
     wakeLockWant(false);
     if (cvsD) {
         if (cvsD.poll) { clearInterval(cvsD.poll); cvsD.poll = null; }
-        if (cvsD.j && cvsD.j.active) cvsGet('cvStressCancel=1').catch(() => { });
+        if (cvsD.j && cvsD.j.active) cvsGet('cvStressCancel=1').catch(e => xAlert('Stopping the stress test on close failed: ' + e));
         cvsD.pane = 'pre'; cvsD.renderedPane = null;
     }
     document.getElementById('cvs-modal-overlay').style.display = 'none';
 }
 function cvsStartD() {
-    cvsGet('cvStressStart=1').catch(() => { });
+    cvsGet('cvStressStart=1').catch(e => {
+        cvsD.pane = 'pre'; cvsD.renderedPane = null; cvsRenderD();
+        xAlert('Start failed: ' + e);
+    });
     cvsD.pane = 'run'; cvsD.renderedPane = null; cvsD._sawActive = false; cvsD._runStart = Date.now(); cvsRenderD();
+}
+function cvsCancelD() {
+    cvsGet('cvStressCancel=1').catch(e => xAlert('Cancel failed: ' + e));
 }
 function cvsPollD() {
     if (!cvsD || document.getElementById('cvs-modal-overlay').style.display !== 'block') return;
@@ -33642,14 +32577,14 @@ function cvsRenderD() {
                     '<div style="font-size:14.5px;line-height:1.5;">Accelerate briskly to about <strong>half of max RPM</strong>, then straight back to idle — a rapid throttle blip. The test ends itself once the voltage settles back.</div></div>' +
                     '<div id="cvsArmLiveD" style="font-size:13.5px;margin:8px 0;"></div>' +
                     '<div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap;">' +
-                    '<button onclick="cvsGet(\'cvStressCancel=1\')" class="btn-danger-ghost btn-sm">Cancel</button></div>';
+                    '<button onclick="cvsCancelD()" class="btn-danger-ghost btn-sm">Cancel</button></div>';
             }
             const el = document.getElementById('cvsArmLiveD'); if (el) el.innerHTML = cxStressArmLive(j);
         } else {
             if (rebuild || cvsD._runPh === 3 || !document.getElementById('cvsPhaseD')) {
                 b.innerHTML = '<p style="color:#4a9eff;">Setting up — keep the engine at idle.</p>' +
                     '<p id="cvsPhaseD" style="font-size:13px;color:#ddd;"></p>' +
-                    '<button onclick="cvsGet(\'cvStressCancel=1\')" class="btn-danger-ghost btn-sm">Cancel</button>';
+                    '<button onclick="cvsCancelD()" class="btn-danger-ghost btn-sm">Cancel</button>';
             }
             const el = document.getElementById('cvsPhaseD'); if (el) el.textContent = cvsPhaseText(j.phase, j);
         }
@@ -33687,36 +32622,24 @@ function cvsPreLive() {
                : ' <span style="color:#f0a500;">(start the engine first)</span>');
 }
 
-// ===== Measured current-sensor zero (engine running, field at 0%) =====
-// Measured here, at Finish, while the engine is still running and the machine is at its warmest:
-// the device brings the field to 0% by itself (a control-tick hold, REASON_ALTZERO_MEASURE), waits
-// out the rotor drain, averages the sensor for ten seconds and releases the field. Nothing is
-// captured during the run itself — the wizard's rest hold between steps sits at 4%, never 0.
-// Declining costs nothing and the offset stays where it was. The number goes into AlternatorCOffset
-// as a delta; the learned temp-comp fit stays a drift tracker on top of it.
-const CX_ALTZERO_MIN_RPM = 400;   // mirrors ALTZERO_MIN_RPM in Xregulator.ino
-const CX_ALTZERO_HOWTO = 'Setup > Alternator > Measured Zero (Engine Running) has a Zero Now button to try again any time.';
+// ===== Measured current-sensor zero (field at 0%, engine running or stopped) =====
+// Measured at Finish, machine warmest: the device holds the field at 0% (REASON_ALTZERO_MEASURE), waits out
+// rotor drain, averages 10 s and releases. Nothing is captured during the run (rest hold sits at 4%). Result
+// goes into AlternatorCOffset as a delta; temp-comp tracks drift on top.
+const CX_ALTZERO_HOWTO = 'Setup > Alternator > Measured Zero has a Zero Now button to try again any time.';
 
 function cxZeroState() {
     return fetch(buildURL('/zerofitstate')).then(r => r.json()).catch(() => null);
 }
 
-function cxAltZeroWhere(j) {
-    const t = (j.capAltF === null || j.capAltF === undefined) ? j.capBoardF : j.capAltF;
-    return Math.round(Number(j.capRpm)) + ' RPM'
-        + ((t === null || t === undefined) ? '' : ', ' + toDisplayTemp(Number(t)).toFixed(0) + tempUnitLabel());
-}
-
-// Requests one measurement and waits it out behind the shared setup wait box: a silent gap between
-// two popups in this chain reads as a finished step. The device owns the deadline
-// (ALTZERO_FORCE_TIMEOUT_MS, 90 s) and reports every refusal by code; the poll here only outlasts
-// it, so the only way to reach the fallback alert is a lost link.
+// Waits behind the shared setup wait box (a silent gap between popups reads as a finished step). The device
+// owns the deadline (ALTZERO_FORCE_TIMEOUT_MS, 90 s); this poll only outlasts it, so the fallback = lost link.
 async function cxAltZeroRun() {
     try { await cxGet('AltZeroCaptureNow=1'); }
     catch (e) { await xAlert('The zero measurement could not start: ' + e + '.\n\n' + CX_ALTZERO_HOWTO, 'Not measured'); return null; }
     vesselNextStepWait(true, {
         title: 'Measuring the Sensor Zero',
-        head: 'Keep the engine running and hold the throttle steady.',
+        head: 'Checking whether the engine is running.',
         sub: 'The regulator turns the field off by itself, measures, and turns it back on. Under a minute; stay on this page.'
     });
     try {
@@ -33737,7 +32660,8 @@ async function cxAltZeroRun() {
             if (ph !== lastPhase) {                 // live progress: the box copy is set once at show time
                 lastPhase = ph;
                 const head = document.getElementById('nextstep-head');
-                if (head && ALTZERO_PHASE_TEXT[ph]) head.textContent = ALTZERO_PHASE_TEXT[ph] + '. Keep the engine running.';
+                const txt = altZeroPhaseText(j);
+                if (head && txt) head.textContent = txt + '.';
             }
         }
         await xAlert('The regulator stopped answering while it was measuring.\n\n' + CX_ALTZERO_HOWTO, 'Not measured');
@@ -33750,29 +32674,25 @@ async function cxAltZeroOffer() {
     if (!j) return;                                  // endpoint unreachable: never hold up Finish
     if (Number(j.capHeld) !== 1) {
         if (Number(j.capApplied) === 1) return;      // already applied this run, nothing new captured
-        const lv = cxLive();
-        if (!(lv.rpm > CX_ALTZERO_MIN_RPM)) return;  // engine already shut down: nothing to offer
         if (!await xConfirm('The alternator current sensor hasn\'t been zeroed. The regulator will '
-            + 'turn the field off for under a minute to measure its offset. Keep the engine running.',
+            + 'turn the field off for under a minute to measure its offset.',
             { title: 'Zero the current sensor', okText: 'Measure now', cancelText: 'Skip' })) return;
         j = await cxAltZeroRun();
         if (!j) return;
     }
     if (!await xConfirm('Measured offset: ' + (Number(j.capA) >= 0 ? '+' : '')
-        + Number(j.capA).toFixed(2) + ' A (field off, ' + cxAltZeroWhere(j)
+        + Number(j.capA).toFixed(2) + ' A (field off, ' + altZeroWhere(j)
         + '). Correct all future readings by this amount?',
         { title: 'Current sensor zero', okText: 'Apply', cancelText: 'Leave as is' })) return;
     await cxGet('altZeroApply=1').catch(e => xAlert('The zero could not be applied: ' + e + '.\n\n' + CX_ALTZERO_HOWTO, 'Not applied'));
 }
 
 function cxFinish() {
-    // commissionDone persists the new tune the moment Finish fires (so a ✕ on the Helpful Hints
-    // page below can't lose it); the close/reset/navigate tail moves behind the Done button.
-    // cmEpoch: the browser's wall clock stamps the pass — the device's own clock may never have been set.
+    // Persist on Finish so a ✕ on Helpful Hints can't lose the tune; close/navigate waits for Done.
+    // cmEpoch = browser clock (the device clock may never have been set).
     cxGet('commissionDone=1&cmEpoch=' + Math.floor(Date.now() / 1000)).then(async () => {
-        // The session's own marks ride over the CSV3 echo (cxEffMask): the last step's done bit is usually
-        // still in flight here. "Complete" means the REQUIRED stages — the firmware's COMMISSIONED test —
-        // not all ten; the Stress test and Charge health calibration are optional and never block it.
+        // cxEffMask: the last step's done bit is usually still in flight on CSV3. "Complete" = the REQUIRED
+        // stages (firmware's COMMISSIONED test); Stress test and Charge health calibration are optional.
         const mask = cxEffMask();
         const _ALL = (1 << COMMISSION_STEPS.length) - 1;
         const allDone = (mask & _ALL) === _ALL;
@@ -33787,15 +32707,11 @@ function cxFinish() {
             const opt = [8, 9].filter(i => !(mask & (1 << i))).map(i => COMMISSION_STEPS[i].name).join(' and ');
             await xAlert('Commissioned. The optional ' + opt + ' did not run — it can be run any time from the Commissioning tab.');
         }
-        // Before anything that might end with the engine shut down: the sensor zero needs it running.
+        // First, while the machine is at its warmest: the sensor zero is best taken hot.
         await cxAltZeroOffer();
-        // Commissioning runs in Low charge rate by default (gentler on small banks). Offer to restore
-        // High so the alternator delivers full output in normal use; the Low/High tables are both set.
-        // ONLY once the device is COMMISSIONED (required stages done): a partial finish comes back for
-        // the remaining required steps, and those must run in Low too (2026-07-20: this prompt after a
-        // partial pass put a stress test at the High cap). A later pass for an optional step re-picks its
-        // mode on the Charge Rate Limits screen, so the offer is safe once the required set is done.
-        // The switch failure is surfaced, never swallowed.
+        // Commissioning runs in Low charge rate; offer High back ONLY once COMMISSIONED: remaining required steps
+        // must also run in Low (offering after a partial pass put a stress test at the High cap). Optional-step
+        // passes re-pick their mode on the Charge Rate Limits screen.
         if (requiredDone && currentChargeRateMode === 'low' &&
             await xConfirm('You commissioned in Low charge rate. Switch to High now so the alternator delivers its full output in normal use?',
                 { title: 'Commissioning complete', okText: 'Switch to High', cancelText: 'Stay in Low' })) {
@@ -33832,16 +32748,9 @@ function cxShowHelpfulHints() {
 }
 
 // ===== Post-commissioning cloud-registration pitch =====
-// Deliberately AFTER commissioning, not after the Vessel Info save: the first upload from a
-// commissioned regulator carries a real tune and real measurements, so it is worth something.
-//
-// Eligibility is settled by a live /checkRegistration, which is the device itself opening a TLS
-// connection to the cloud — a pass proves internet AND answers "already registered?" in one trip.
-// It is fired when the Helpful Hints page paints so the ~1-3 s round-trip hides behind reading time.
-// The cheap disqualifiers are checked first, before any network cost:
-//   AP (hotspot) mode   — no internet path exists, and body.ap-mode greys the tab
-//   Cloud Features off  — body.cloud-off greys the tab and swaps its panels for a note
-//   already registered  — session flag; the probe re-confirms it anyway
+// After commissioning, not Vessel Info, so the first upload carries a real tune. /checkRegistration is the
+// device's own TLS trip to the cloud (proves internet + answers "registered?"), fired when Helpful Hints
+// paints so the 1-3 s hides behind reading time. Cheap disqualifiers first: AP mode, Cloud off, registered.
 let _cxCloudProbe = null;
 function cxCloudProbeStart() {
     _cxCloudProbe = null;
@@ -33855,9 +32764,7 @@ function cxCloudProbeStart() {
         .catch(() => null);   // no internet, or the staged op was superseded — either way, no pitch
 }
 
-// null result = the regulator could not reach the cloud. Unresolved at 3 s = same treatment: the
-// user pressed Done and must not be held, and a silent skip costs nothing (the Registration tab
-// is still there). Both fall through to the pre-existing Done behaviour.
+// null (no cloud) or unresolved at 3 s → no pitch: Done must not be held, and the Registration tab remains.
 async function cxCloudPitchDue() {
     const probe = _cxCloudProbe; _cxCloudProbe = null;   // consume: a second Done can't reuse a stale verdict
     if (!probe) return false;
@@ -33888,8 +32795,7 @@ const CX_CLOUD_PITCH_HTML =
     'Contact info and location are never shared.<br>' +
     'The <strong>Delete My Account</strong> button removes all stored Cloud data, and the regulator keeps working locally either way. A record of which firmware versions this regulator has installed, and when, is kept under its serial number for safety recalls and support.</p>';
 
-// Terminal page, same shell as Helpful Hints. OK is the only exit — it lands on the Registration
-// form rather than committing anything, so there is nothing here to decline.
+// Terminal page, same shell as Helpful Hints. Neither button commits anything, and No Thanks is not remembered.
 function cxShowCloudPitch() {
     const b = document.getElementById('commission-body');
     if (!b) { cxCloudPitchNo(); return; }
@@ -33898,9 +32804,8 @@ function cxShowCloudPitch() {
         '<button onclick="cxCloudPitchNo()" class="btn-secondary" style="width:100%; padding:9px; margin-top:8px;">No Thanks</button>';
 }
 
-// showMainTab('cloudfeatures') alone re-inits the profile form; the sub-tab call is added only when
-// a previous visit left a different Cloud sub-tab active, so the common path stages one cloud op,
-// not two (a second would supersede the first and surface as a "could not reach cloud" banner).
+// Sub-tab call only when another Cloud sub-tab is active: a second staged cloud op supersedes the first
+// and surfaces as a "could not reach cloud" banner.
 function cxCloudPitchGo() {
     closeCommissionModal(); cx = null; cxPlanUserSet = false;
     showMainTab('cloudfeatures');
@@ -33908,8 +32813,6 @@ function cxCloudPitchGo() {
     if (mp && !mp.classList.contains('active')) showSubTab('cloudfeatures', 'myprofile');
 }
 
-// Declining lands where Finish always landed — the Commissioning checklist, showing the pass
-// they just completed. Registration stays one tab away; nothing here is a one-shot offer.
 function cxCloudPitchNo() {
     closeCommissionModal(); cx = null; cxPlanUserSet = false;
     goToCommissioning();
@@ -33918,7 +32821,7 @@ function cxCloudPitchNo() {
 async function cxHintsDone() {
     if (await cxCloudPitchDue()) { cxShowCloudPitch(); return; }
     closeCommissionModal(); cx = null; cxPlanUserSet = false;   // re-default the plan next time
-    goToCommissioning();   // land on the Commissioning checklist
+    goToCommissioning();
 }
 async function commissionAbort() {
     if (!await xConfirm('Abort this run and put every setting back to how it was before it started? Steps finished during this run are discarded too — the device returns to exactly its pre-run state (one that was commissioned before the run is commissioned again). To keep finished steps and come back later, use Stop instead.',
@@ -33927,10 +32830,8 @@ async function commissionAbort() {
     cxGet('commissionAbort=1').then(() => { xAlert('Reverted to pre-commissioning settings.'); closeCommissionModal(); cx = null; cxPlanUserSet = false; }).catch(e => xAlert('Abort failed: ' + e));
 }
 
-// Stop for now: keep every finished step (done marks + applied values), undo only the step in progress
-// (the device restores that step's entry snapshot, as a reboot would), and land on the checklist with
-// the remaining steps ticked. The origin snapshot stays on the device, so Abort / Clear-and-restart can
-// still fully revert later.
+// Keeps finished steps, undoes only the step in progress (device restores its entry snapshot). The origin
+// snapshot stays on the device, so Abort / Clear-and-restart can still fully revert later.
 async function commissionStop() {
     if (!await xConfirm('Stop commissioning for now? Every finished step is kept. The step you are on is discarded — its settings go back to what they were when it began — and it runs again when you continue.',
         { title: 'Stop commissioning', okText: 'Stop', cancelText: 'Keep going' })) return;
@@ -33942,9 +32843,8 @@ async function commissionStop() {
     }).catch(e => xAlert('Stop failed: ' + e));
 }
 
-// The ten wizard steps, mirrored from CX_PHASES, with a one-line plain-English purpose.
-// Single source for the Commissioning tab checklist; indices match the persisted commissionPhase.
-// (Tach alignment is a pre-wizard step, set on its own screen — not in this list.)
+// Mirrors CX_PHASES; indices match the persisted commissionPhase. Tach alignment is a pre-wizard
+// screen, not in this list.
 const COMMISSION_STEPS = [
     { name: 'Prep', desc: 'Preconditions checked, current tune snapshotted for safe revert.' },
     { name: 'Field curve', desc: 'Map field duty → current and find the saturation knee.' },
@@ -33959,28 +32859,21 @@ const COMMISSION_STEPS = [
 ];
 let cxLastState = 0;   // remembered from the last CSV3 frame, for the clear/restart confirm text
 
-// Render the whole Commissioning tab status block: badge + overall line + step checklist (with
-// per-step run checkboxes) + clear/restart button. Driven by persisted state (0/1/2), current
-// phase (0..10, 10 = finished; moves backward on Back), and the per-stage done bitmask (bit i = stage i complete).
+// state 0/1/2; phase 0..10 (10 = finished; moves backward on Back); mask bit i = stage i done.
 function renderCommissionStatus(state, phase, mask, manual) {
     cxLastState = state;
     cxLastPhase = phase;
     cxLastMask = mask || 0;
     if (manual !== undefined) cxLastManual = manual || 0;   // 3-arg internal re-renders keep the last value
     manual = cxLastManual;
-    // If the device reports NOT_COMMISSIONED while we still hold in-session state past Prep — and the
-    // panel is closed — drop it so a resume can't reopen a phase the device no longer backs (an Abort
-    // from another client, for instance). Gated on the panel being closed so a freshly-started flow
-    // (Prep→phase 1) can't be nuked by a late CSV3 frame still carrying the pre-start state.
+    // Device says NOT_COMMISSIONED (e.g. Abort from another client) → drop stale session state. Only with the
+    // panel closed: a late CSV3 frame carrying the pre-start state must not nuke a freshly started flow.
     const _panelOpen = cxPanelOpen();
     if (state === 0 && !_panelOpen && cx && (cx.phase > 0 || cx.paused)) { cx = null; }
 
-    // Run plan: until the user touches a checkbox it is the pending stages (a fresh device pre-selects
-    // all, a single stale step pre-selects just that one). A hand-edited plan is kept, but a stage that
-    // goes stale on the device while nothing is open or paused (tach rescale, RPM-table edit) is added
-    // to it — never silently left out of the next pass. Frozen while a pass is open or paused (cx set):
-    // the wizard reads it live, and a paused pass must come back to the plan it left — closeCommissionModal
-    // has already taken the passed steps off it. Every run-ending path resets cxPlanUserSet.
+    // Default plan = pending stages until the user touches a checkbox. A hand-edited plan still gains any stage
+    // that goes stale while nothing is open or paused. Frozen while a pass is open or paused (cx set): the wizard
+    // reads it live, and closeCommissionModal already pruned passed steps. Run-ending paths reset cxPlanUserSet.
     if (!cxPlanUserSet) { if (!_panelOpen && !cx) cxDefaultPlanFromMask(cxLastMask); }
     else if (cxLastMask !== cxPlanMaskBasis && !_panelOpen && !cx) {
         const staled = cxPlanMaskBasis & ~cxLastMask;
@@ -34005,19 +32898,16 @@ function renderCommissionStatus(state, phase, mask, manual) {
     }
 
     const cl = document.getElementById('commission-checklist');
-    // Every plan-side read goes through cxEffMask(): while a pass is paused the checkboxes are live, and
-    // cxLastMask lags what the pass has just measured — a fresh done step read as pending got no lock.
+    // Plan-side reads use cxEffMask(): while paused, cxLastMask lags what the pass just measured.
     const effMask = cxEffMask();
     if (cl) {
         cl.innerHTML = COMMISSION_STEPS.map((s, i) => {
-            const done = !!(cxLastMask & (1 << i));   // ✓ now comes from the per-stage done mask
+            const done = !!(cxLastMask & (1 << i));
             const hand = !!(manual & (1 << i));        // set by hand (skip / mark-done-manually)
             // "Current" = the step the wizard is on. Done always wins, so a finished current step shows ✓.
             const current = (state === 1) && (i === phase) && (phase < COMMISSION_STEPS.length) && !done;
             const prep = (i === 0);
-            // Locked: a ticked feeder will re-measure what this done step was built on, so it must run again
-            // and cannot be unticked on its own — untick the feeder to release it. Frozen while the wizard
-            // is open (the running pass reads the plan live).
+            // Locked: a ticked feeder re-measures what this step was built on, so it must re-run (untick the feeder to release).
             const lockedBy = prep ? [] : cxPlanFeedersOf(i, effMask);
             const locked = lockedBy.length > 0;
             const lockNames = lockedBy.map(k => COMMISSION_STEPS[k].name).join(' and ');
@@ -34027,9 +32917,7 @@ function renderCommissionStatus(state, phase, mask, manual) {
                           : locked ? 'Runs again because ' + lockNames + ' is ticked — re-measuring that makes this result stale. Untick that step to release this one.'
                           : (done ? 'Run this step again in the next pass (the steps it feeds run again too)'
                                   : 'Run this step in the next commissioning pass');
-            // Status badge sits at the RIGHT of the row (not between the checkbox and the name) so a
-            // completed step is unmistakable next to the run checkboxes. Big bold ✓ DONE when complete;
-            // ▶ RUNNING while the wizard is open on this step, ▶ RESUME when paused (modal closed); ○ otherwise.
+            // Badge at the RIGHT of the row so a done step is unmistakable next to the run checkboxes.
             let badge;
             if (done && hand) {
                 // Hand-marked complete (unmeasured): counts toward COMMISSIONED but flagged so it's honest.
@@ -34064,13 +32952,10 @@ function renderCommissionStatus(state, phase, mask, manual) {
                 '</div>';
         }).join('');
     }
-    // Master "Select all steps" reflects whether every optional stage (1..last) is selected.
     const sa = document.getElementById('commission-select-all');
     if (sa) { sa.checked = cxPlan.slice(1).every(Boolean); sa.disabled = _panelOpen; }
 
-    // Primary button label/class/help adapt to the ticked plan vs. the done-mask (see cxStartIntent):
-    // Start (nothing done) / Continue (partial pass or targeted redo) / Clear-and-restart (all ticked
-    // with work already done). The old separate clear-row is folded into this one button.
+    // Start / Continue / Clear-and-restart, from the ticked plan vs. the done-mask (see cxStartIntent).
     const sb = document.getElementById('commission-start-btn');
     const sh = document.getElementById('commission-start-help');
     const intent = cxStartIntent();
@@ -34082,13 +32967,9 @@ function renderCommissionStatus(state, phase, mask, manual) {
     if (sh) sh.textContent = _panelOpen ? 'The wizard is open — carry on there, or use its Stop or Abort button.' : intent.help;
 }
 
-// Clear progress & start over: revert to the pre-commissioning snapshot (firmware also resets
-// state→0, phase→0) and reopen the wizard fresh at Prep. A COMMISSIONED device has no snapshot to
-// revert (discarded on Finish) and its Abort is a firmware no-op, so nothing is sent and nothing is
-// cleared: the good tune stays as the starting point, the marks stay until each step re-measures, and
-// the fresh run snapshots it all again at Start (Abort then restores exactly this). Either way the plan
-// is pinned to every step, as user-set: the default plan would re-derive to "pending only" from the
-// first CSV3 frame during the pre-flight and the restart would run just the two optional steps.
+// Not COMMISSIONED: revert to the pre-commissioning snapshot and reopen at Prep. COMMISSIONED: no snapshot exists
+// (Abort is a firmware no-op), so nothing is sent; the tune is the starting point and Start re-snapshots. Either
+// way the plan is pinned to every step as user-set, or the first CSV3 frame re-derives it to "pending only".
 async function commissionClearAndRestart() {
     if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
     const committed = (cxLastState === 2);
@@ -34103,18 +32984,12 @@ async function commissionClearAndRestart() {
         cxPlanForced.clear(); cxPlanPulled.clear();
         for (let i = 0; i < CX_PHASES.length; i++) cxPlan[i] = true;
         if (!committed) {
-            // Clear the local mirror and repaint so the checklist ✓ marks flip to ○ the instant the
-            // user clicks — otherwise they linger until the next CSV3 frame round-trips the now-zeroed
-            // done-mask back (CSV3 is event-driven, so that lag is user-visible).
+            // Clear the local mirror now; CSV3 is event-driven, so stale ✓ marks would linger visibly.
             cxLastState = 0; cxLastPhase = 0; cxLastMask = 0; cxLastManual = 0;
         }
         renderCommissionStatus(cxLastState, cxLastPhase, cxLastMask, cxLastManual);
-        // Wholesale restart: prerequisites → Low/High limits → TACH ALIGNMENT → wizard. The alignment
-        // screen belongs in a revert-and-redo — everything else is being put back to pre-commissioning and
-        // re-measured, and the engine-speed axis is what the re-measuring is done against. It opens on the
-        // values already stored (rpmAlignRender seeds from the RPMScalingFactor/PulleyRatio echoes), and
-        // commissionAbort does not touch them: the snapshot commissionSnapshotScalarsToBuf writes carries
-        // no tach fields. So it reads where you left it, not a default — leave it alone and press Continue.
+        // Wholesale restart includes TACH ALIGNMENT: re-measuring is done against the engine-speed axis. It opens
+        // on the stored values (commissionAbort's snapshot carries no tach fields), so Continue keeps them.
         openCommPrereqs(false, false, true);
     }).catch(e => xAlert('Clear failed: ' + e));
 }
@@ -34130,8 +33005,7 @@ function applySysidBodeFilters() {
         .catch(err => console.error("Filter set from τ failed:", err));
 }
 
-// "Apply PID seed" — write the IMC starting Kp/Ki to the current loop. A starting point;
-// the user refines with the square-wave tuner. Kd left untouched (PI seed).
+// IMC starting Kp/Ki for the current loop; Kd untouched (PI seed).
 function applySysidPidSeed() {
     if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
     if (!(sysidFitKp > 0)) { xAlert("No PID seed available — re-run the sweep."); return; }
@@ -34145,9 +33019,8 @@ function applySysidPidSeed() {
 
 function applySystemIDResults() {
     if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
-    // PID feedback gets plant/3 to preserve phase margin inside the control loop.
-    // Voltage smoothing gets the full plant delay because its consumers run on
-    // slower (seconds) timescales; the CV D term's dV/dt has its own separate filter.
+    // PID feedback gets plant/3 to preserve phase margin; voltage smoothing gets the full plant delay (its
+    // consumers run on seconds timescales; the CV D term's dV/dt has its own filter).
     const tcFast = Math.max(1, Math.round(sysidSuggestedTC / 3));
     const tcSlow = Math.max(1, Math.round(sysidSuggestedTC));
     const tcFastEnc = encodeURIComponent(tcFast);
@@ -34162,10 +33035,8 @@ function applySystemIDResults() {
 }
 
 
-// Auto-unlock via URL parameter for local automation (e.g. SwiftBar shortcut). Param name
-// kept from the password era so existing shortcuts still work; any value arms. One-shot:
-// the param is stripped from the URL right away so refreshing/back-navigating this tab
-// later re-arms nothing — beyond this, arming only ever happens from the Unlock button.
+// ?autopass=<any> auto-unlocks for local automation (SwiftBar); name kept so existing shortcuts work.
+// Stripped from the URL at once so refresh/back re-arms nothing.
 window.addEventListener('load', function () {
   const qs = new URLSearchParams(window.location.search);
   if (qs.get('autopass')) {
@@ -34176,9 +33047,8 @@ window.addEventListener('load', function () {
   }
 });
 
-// Live Data → Diag checkpoint pills (C1–C4) — same pattern as the Protections filter below,
-// but filtering whole <details class="checkpoint-section"> blocks (data-checkpoints is
-// space-separated; an empty list means All-view only, e.g. Wear Rate / Accuracy Scores).
+// Diag checkpoint pills (C1–C4) — same pattern as the Protections filter below, filtering .checkpoint-param
+// cards by their space-separated data-checkpoints (an empty list shows only under All).
 (function initDiagCheckpoints() {
     // Pills live only in Setup → Alternator → Diag (the knobs). Live Data → Diag is results-only, never filtered.
     const panel = document.getElementById('settings-diag');
@@ -34211,7 +33081,6 @@ window.addEventListener('load', function () {
 })();
 
 // Protections alt-tab — filter pills + intro toggling + empty-phase hiding.
-// Scoped to #alt-panel-protections so it can't affect the rest of the site.
 (function initProtectionsFilters() {
   const panel = document.getElementById('alt-panel-protections');
   if (!panel) return;
@@ -34275,8 +33144,7 @@ window.addEventListener('load', function () {
   window.addEventListener('resize', renderRipplePlots);
 })();
 
-// Deadband card (Tuning ▸ Voltage ▸ Voltage D term) — live redraw + measured-slope overlay wiring,
-// same pattern as the Protections ripple plot above.
+// Deadband card (Tuning ▸ Voltage ▸ Voltage D term) — same wiring as the Protections ripple plot above.
 (function initSlopeDeadbandCard() {
   const cv = document.getElementById('slopeDeadbandPlot');
   if (!cv) return;
@@ -34300,16 +33168,13 @@ window.addEventListener('load', function () {
 })();
 
 // BAROMETER PANEL (Other tab) — Zambretti forecast + 14-day history plot
-// Lives in its own IIFE so locals don't leak into the global namespace.
-// Public hooks (window.*) are how the rest of the app pokes us:
-// window.initBaroPanel()              — call on Other-tab activation (idempotent)
-// window.updateBaroDisplay(data, sa)  — call from CSV2 dispatcher each cycle
+// window.initBaroPanel() on Other-tab activation (idempotent); window.updateBaroDisplay(data, sa) from the CSV2 dispatcher.
 (function () {
   'use strict';
 
   const BARO_HISTORY_SIZE = 1008;              // must match firmware (7 days × 6 samples/h)
-  const SAMPLE_INTERVAL_MIN = 10;              // ditto — firmware samples every 10 min
-  const FETCH_INTERVAL_MS = 10 * 60 * 1000;    // refresh history every 10 min while tab visible
+  const SAMPLE_INTERVAL_MIN = 10;              // must match firmware
+  const FETCH_INTERVAL_MS = 10 * 60 * 1000;    // background refetch once the panel has opened
   const STALE_MS_NMEA = 10000;                 // mirrors STALE_THRESHOLD_TEMP_MS-style logic for NMEA fields
 
   // 26-slot Zambretti forecast table (slot 1 = best, slot 26 = worst).
@@ -34343,7 +33208,7 @@ window.addEventListener('load', function () {
     'Stormy, possibly worse'
   ];
 
-  // Pressure zones (mbar). Colors mirror the prototype palette and degrade gracefully in dark mode.
+  // Pressure zones (mbar); dark = dark-mode color.
   const ZONES = [
     { min: -Infinity, max: 980,      name: 'STORMY',   color: '#c62828', dark: '#e57373', range: 'below 980 mbar' },
     { min: 980,       max: 1000,     name: 'RAIN',     color: '#ef6c00', dark: '#ffb74d', range: '980–1000 mbar' },
@@ -34379,8 +33244,8 @@ window.addEventListener('load', function () {
     fetchTimer = setInterval(() => { if (panelVisible) fetchBaroHistory(); }, FETCH_INTERVAL_MS);
   };
 
-  // Note: we don't have a "tab hidden" hook so panelVisible stays true. Fetches are cheap (~8 KB)
-  // so re-fetching every 5 min in the background is fine.
+  // Note: we don't have a "tab hidden" hook so panelVisible stays true. Fetches are cheap (~2 KB)
+  // so re-fetching every 10 min in the background is fine.
 
   window.updateBaroDisplay = function (data, sa) {
     if (!data) return;
@@ -34391,7 +33256,6 @@ window.addEventListener('load', function () {
       return;
     }
 
-    // Zone
     const dark = document.body.classList.contains('dark-mode');
     const zone = pressureZone(p);
     const zoneColor = dark ? zone.dark : zone.color;
@@ -34400,10 +33264,9 @@ window.addEventListener('load', function () {
     setText('baroZoneSub', zone.range);
 
     // 3-hour tendency from buffer
-    const samplesPer3h = Math.round((3 * 60) / SAMPLE_INTERVAL_MIN);  // 36
+    const samplesPer3h = Math.round((3 * 60) / SAMPLE_INTERVAL_MIN);  // 18
     let delta = null;
     if (baroBufferEpochAtEnd > 0) {
-      // Newest non-NaN sample is at the last filled slot; walk back samplesPer3h slots.
       const lastIdx = lastFilledIdx();
       if (lastIdx >= samplesPer3h) {
         const oldP = baroBuffer[lastIdx - samplesPer3h];
@@ -34428,7 +33291,7 @@ window.addEventListener('load', function () {
 
     let forecastStr, methodLabel, methodSub;
     if (delta !== null && headingFresh && trueWindFresh && latFresh) {
-      // heading + true wind angle now ride CSV4/NavStream; read them from the nav cache (LatitudeNMEA stays on CSV2)
+      // heading + TWA ride CSV4/NavStream (nav cache); LatitudeNMEA stays on CSV2
       const twdEarth = (parseFloat(window._navLast.HeadingNMEA) + parseFloat(window._navLast.TrueWindAngleNMEA) + 360) % 360;
       const z = zambretti(p, delta, twdEarth, parseFloat(data.LatitudeNMEA), new Date());
       forecastStr = z.text;
@@ -34458,7 +33321,7 @@ window.addEventListener('load', function () {
       .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.arrayBuffer(); })
       .then(buf => parseHistory(buf))
       .then(() => { if (baroPlot) refreshPlot(); else buildBaroPlot(); })
-      .catch(e => { /* offline / not yet implemented in older firmware — quietly skip */ });
+      .catch(e => { /* offline — quietly skip */ });
   }
 
   function parseHistory(arrayBuf) {
@@ -34471,8 +33334,7 @@ window.addEventListener('load', function () {
     if (count !== BARO_HISTORY_SIZE) return;
     if (arrayBuf.byteLength < 8 + count * 2) return;
 
-    // Firmware stores samples circularly with `head` = next write slot. The newest sample
-    // is at (head - 1) mod count; oldest unwritten slots are zero. Walk back chronologically.
+    // Ring with head = next write slot; unwritten slots are 0. Unroll oldest → newest.
     for (let i = 0; i < count; i++) {
       const ringIdx = (head - count + i + count) % count;
       const raw = view.getUint16(8 + ringIdx * 2, true);
@@ -34527,7 +33389,7 @@ window.addEventListener('load', function () {
       scale: 'y', decimals: 0,
       apply: (mn, mx) => {
         baroYManual = [mn, mx];
-        autoscaleY = false;                       // typing pins the axis and unchecks auto
+        autoscaleY = false;
         const cb = document.getElementById('baroAutoscaleY'); if (cb) cb.checked = false;
         localStorage.setItem('baroYManual', JSON.stringify(baroYManual));
         refreshPlot();
@@ -34703,8 +33565,8 @@ window.addEventListener('load', function () {
 
 // LONG TERM PLOTS — native render of the on-device month-long ring.
 // Mirrors the barometer pattern: lazy fetch of a binary ring on tab open,
-// parse header + records, derive each record's time from a single lastEpoch +
-// ring position (no per-record timestamp), render with uPlot. Supabase data
+// parse header + records, take each record's own timestamp (an unsynced 0 falls
+// back to lastEpoch + ring position), render with uPlot. Supabase data
 // tier (older than the local ring) stitches in later. Public: initLongTermPlots().
 // Record layout MUST match firmware LongTermRecord (144 B).
 (function () {
@@ -34736,24 +33598,20 @@ window.addEventListener('load', function () {
   const ONAVG = [
     ['battVolt',100], ['battCurr',10], ['altCurr',10], ['victronCurr',10], ['duty',100]
   ];
-  // ONAVG key -> its envelope validMask bit. A clear bit means the window held NO valid
-  // sample of that field (battCurr on a unit with no battery shunt is dead in every record),
-  // so its engine-on accumulator is a zero-initialised artifact, never a measurement.
+  // ONAVG key -> envelope validMask bit. Clear bit = no valid sample in the window (e.g. battCurr with no
+  // shunt), so that engine-on accumulator is a zero artifact, never a measurement.
   const ONAVG_VALID_BIT = ONAVG.map(([k]) => ENV.findIndex(([ek]) => ek === k));
 
-  // Only a genuine power-off should break the trace. Cadence jitter or a few missed
-  // samples must NOT insert a gap-marker — ltBin nulls a whole bin that contains one,
-  // so over-eager gaps blank the chart at low zoom. Break only on big gaps (≥ ~20 min).
+  // Break only on a real power-off: ltBin nulls any bin containing a gap marker, so over-eager gaps
+  // (cadence jitter, a few missed samples) blank the chart at low zoom.
   function ltGapThreshold(interval) { return Math.max((interval || 600) * 4, 1200); }
 
-  // Battery volts and barometric pressure can't physically read <= 0 — a 0 is a boot /
-  // commissioning transient (sensors not settled), not data. Null it so those samples don't
-  // drag the line/band to the floor on the first record after a boot. Every other field
-  // (currents, speeds, angles, SOC) has legitimate zeros — those pass through untouched.
+  // battVolt/baro can't physically read <= 0: a 0 is a boot transient, nulled so it can't drag the line
+  // to the floor. Other fields have legitimate zeros.
   function ltNz(k, v) { return ((k === 'battVolt' || k === 'baro') && v != null && v <= 0) ? null : v; }
 
   // Header (16 B LE): u16 head, u16 count, u16 capacity, u16 recordSize,
-  // u32 lastEpoch, u32 intervalSec. Then capacity × recordSize raw records.
+  // u32 lastEpoch, u32 intervalSec.
   function parseLT(buf) {
     const dv = new DataView(buf);
     if (buf.byteLength < 16) return null;
@@ -34763,8 +33621,7 @@ window.addEventListener('load', function () {
     const recSize   = dv.getUint16(6, true);
     const lastEpoch = dv.getUint32(8, true);
     const interval  = dv.getUint32(12, true) || 600;   // seconds between records
-    // Body is `count` records in chronological order (the endpoint no longer sends the
-    // whole ring), so the buffer is 16 + count*recSize.
+    // Body is count records, oldest first (not the whole ring): 16 + count*recSize.
     if (!recSize || buf.byteLength < 16 + count * recSize) return null;
 
     const fields = {};
@@ -34783,11 +33640,8 @@ window.addEventListener('load', function () {
     // Record layout (144 B): u32 timestamp @0, i32 lat @4, i32 lon @8, u32 validMask @12,
     // envelope [min,max,avg]×17 from @16, avg-only ×6 after, u8 chargeStage + pad @130,
     // v4 tail: onAvg[5] i16 @132, activeFrac u8 @142 + pad.
-    // Records arrive in chronological order (oldest first), so read them linearly.
-    // Unsynced ring (device never got wall-clock time — e.g. AP mode, no NTP): lastEpoch is 0
-    // and every record's timestamp is 0. Anchor the newest record to the browser clock and
-    // space backward by interval, so PSRAM history plots on a sensible recent axis instead of
-    // collapsing to 1970 (which falls outside every live view → blank charts).
+    // Unsynced ring (no wall clock, e.g. AP mode): timestamps are 0 → anchor the newest to the browser
+    // clock and space back by interval, else history collapses to 1970 and every view is blank.
     const anchorEpoch = lastEpoch || Math.floor(Date.now() / 1000);
     let prevTs = null;
     for (let i = 0; i < count; i++) {
@@ -34814,15 +33668,11 @@ window.addEventListener('load', function () {
         fields[k].avg.push((valid & (1 << (ENV.length + ai))) ? ltNz(k, dv.getInt16(ao, true) / scale) : null);
         ao += 2;
       });
-      // chargeStage u8 sits right after the avg-only block (display code 0-7).
+      // chargeStage u8 sits right after the avg-only block (display code 0-8).
       stage.push(dv.getUint8(base + 16 + ENV.length * 6 + AVG.length * 2));
-      // v4 tail (record ≥144 B): onAvg[5] i16 at base+132, activeFrac u8 at base+142.
-      // cover = engine-on % (activeFrac/2); 0 = engine never ran → onAvg null (line
-      // breaks). An all-empty window (battVolt validMask bit clear) has UNKNOWN engine
-      // state → cover null. Older 132 B records: cover null → onAvg baked = wall avg,
-      // so charts fed by pre-v4 firmware keep their solid center line. Each onAvg also
-      // needs its OWN field valid bit (ONAVG_VALID_BIT) — activeFrac alone says the engine
-      // ran, not that the field was measurable.
+      // cover = engine-on % (activeFrac/2); 0 → onAvg null. battVolt valid bit clear = unknown engine state →
+      // cover null. Each onAvg also needs its OWN valid bit (activeFrac says the engine ran, not that the field
+      // was measurable). Pre-v4 132 B records: cover null, onAvg = wall avg so the solid line survives.
       if (recSize >= 144) {
         const af = dv.getUint8(base + 142);
         cover.push((valid & 1) ? af / 2 : null);
@@ -34868,9 +33718,7 @@ window.addEventListener('load', function () {
   try { ltSeriesHidden = JSON.parse(localStorage.getItem('lt_series_hidden') || '{}') || {}; } catch (e) { ltSeriesHidden = {}; }
   function ltSaveSeriesHidden() { try { localStorage.setItem('lt_series_hidden', JSON.stringify(ltSeriesHidden)); } catch (e) {} }
 
-  // Equal-width bins over [fromSec,toSec], capped at maxBins, ENVELOPE-PRESERVING:
-  // bin min = min of mins, bin max = max of maxes, bin avg = avg of avgs (nulls skipped).
-  // Re-run per visible range so zoomed views show finer detail with bounded point count.
+  // Envelope-preserving bins: min of mins, max of maxes, avg of avgs; re-run per visible range.
   function ltBin(fromSec, toSec, maxBins) {
     const t = ltData.t, N = ltData.n;
     let lo = 0, hi = N;
@@ -34909,7 +33757,7 @@ window.addEventListener('load', function () {
           sum += f.avg[j]; cnt++;
         }
         o.avg.push(cnt ? sum / cnt : null);
-        o.min.push(isFinite(mn) ? mn : null);    // finite-or-null only
+        o.min.push(isFinite(mn) ? mn : null);
         o.max.push(isFinite(mx) ? mx : null);
       });
       AVG.forEach(([k]) => {
@@ -34918,10 +33766,8 @@ window.addEventListener('load', function () {
         for (let j = i; j < end; j++) if (f.avg[j] != null) { sum += f.avg[j]; cnt++; }
         o.avg.push(cnt ? sum / cnt : null);
       });
-      // Engine-on averages bin COVERAGE-WEIGHTED (a 100%-on window outweighs a 2%
-      // sliver; a plain mean would weight them equally). Unknown coverage (pre-v4
-      // rows, onAvg already baked = wall avg) weights as a full window. ah = Ah
-      // delivered in the bin: Σ(onAvg·onTime), exact given the weighted sums.
+      // Engine-on averages are coverage-weighted; unknown coverage (pre-v4) weighs as a full window.
+      // ah = Ah delivered in the bin: Σ(onAvg·onTime).
       ONAVG.forEach(([k]) => {
         const f = ltData.fields[k], o = out.fields[k];
         let wsum = 0, wtot = 0;
@@ -34954,8 +33800,6 @@ window.addEventListener('load', function () {
     return out;
   }
 
-  // Re-bin the ring to [fromSec,toSec] and push to every chart (synced X; Y auto-fits to
-  // the visible binned data). The guard stops our setScale from re-triggering the hook.
   function ltRenderAll(fromSec, toSec) {
     if (!ltData || !ltCharts.length) return;
     // A zero/negative-width x-range makes uPlot null out its scales and draw nothing.
@@ -34967,9 +33811,7 @@ window.addEventListener('load', function () {
       c._bin = b;   // crosshair legend reads cover/ah per binned point from here
       const data = [ b.t ];
       const scaleVals = {};   // scaleName → arrays feeding that scale (for explicit range calc)
-      // s.temp series convert °F→display here (ltData/bins stay native °F); the cursor
-      // legend reads u.data so it inherits the conversion, and the explicit scale ranges
-      // below are computed from the converted arrays.
+      // s.temp series convert °F→display here (ltData/bins stay °F); legend and scale ranges read the converted arrays.
       const cT = a => (displayTempUnit === 1 && a) ? a.map(v => v == null ? null : toDisplayTemp(v)) : a;
       c.spec.series.forEach(s => {
         // s.on → engine-on-weighted line; s.dataKey → wall-avg companion series
@@ -34987,8 +33829,7 @@ window.addEventListener('load', function () {
       });
       c.plot.setData(data);          // rebuilds series paths (auto-scale may null out; we override below)
       c.plot.setScale('x', { min: fromSec, max: toSec });
-      // Set every Y-scale EXPLICITLY from the visible data. uPlot's own auto-range was
-      // intermittently leaving scales null (→ nothing drawn), so we compute min/max here.
+      // Explicit Y ranges: uPlot's auto-range intermittently left scales null (→ nothing drawn).
       const ov = ltYOverride[c.id] || {};
       c.spec.scales.forEach(sc => {
         if (ov[sc.name]) { c.plot.setScale(sc.name, { min: ov[sc.name][0], max: ov[sc.name][1] }); return; }
@@ -35004,8 +33845,7 @@ window.addEventListener('load', function () {
     });
     ltRendering = false;
     ltDrawStageBar();   // repaint the charge-stage strip over the same range
-    // Reflect the rendered range back onto the brush selection (keeps the brush in sync
-    // whether the range came from the brush itself or from a chart drag-zoom).
+    // Sync the brush to the rendered range (it may have come from a chart drag-zoom).
     if (_brushState && _brushState.nativeSink) {
       _brushState.from = fromSec * 1000; _brushState.to = toSec * 1000;
       if (typeof _brushUpdateSelectionUI === 'function') _brushUpdateSelectionUI();
@@ -35014,10 +33854,8 @@ window.addEventListener('load', function () {
   }
   const ltZoomDebounced = debounce((min, max) => { if (min != null && max != null) ltRenderAll(min, max); }, 120);
 
-  // Hand the relocated dashboard-brush its data bounds + a sink into ltRenderAll, wire
-  // it once, and show it. Brush works in ms; ltRenderAll in seconds.
-  // Returns true if a saved window pref was applied (and thus already rendered), so the
-  // caller skips its own default render instead of clobbering the restored window.
+  // Brush works in ms, ltRenderAll in seconds. Returns true if a saved window pref was applied (already
+  // rendered), so the caller skips its default render.
   function ltInitBrush(minSec, maxSec, latestSec) {
     if (typeof _brushState === 'undefined' || !_brushState) return false;
     _brushState.nativeSink = (fromMs, toMs) => ltRenderAll(fromMs / 1000, toMs / 1000);
@@ -35031,7 +33869,7 @@ window.addEventListener('load', function () {
     const bEl = document.getElementById('dashboard-brush'); if (bEl) bEl.style.display = 'block';
     const mn = document.getElementById('dashboard-brush-data-min'); if (mn) mn.textContent = _brushFormatTime(_brushState.dataMin);
     const mx = document.getElementById('dashboard-brush-data-max'); if (mx) mx.textContent = _brushFormatTime(_brushState.dataMax);
-    // Cadence note in the sticky brush bar — true rate from the .bin header, not a hardcode
+    // Cadence from the .bin header, not a hardcode
     const sn = document.getElementById('dashboard-sample-note');
     if (sn && ltData && ltData.interval) sn.textContent = 'Sampled every ' + Math.round(ltData.interval / 60) + ' min';
     _brushUpdateSelectionUI();
@@ -35066,10 +33904,8 @@ window.addEventListener('load', function () {
     return !!ltWindowPref;
   }
 
-  // First-open default view (no saved window pref): frame the most recent data rather than the
-  // whole ring. When only a recent slice is populated (AP mode, older records null), a full-span
-  // render bins every real point into the last column → a collapsed vertical sliver at the right
-  // edge. Frame = span of non-null samples, capped to the latest 24h for multi-session rings.
+  // First-open view: frame the non-null span (capped to the latest 24 h). A full-span render of a mostly
+  // empty ring bins every real point into the last column → a sliver at the right edge.
   function ltRecentDataView(loSec, hiSec) {
     const N = ltData.n, t = ltData.t, fields = ltData.fields, keys = Object.keys(fields);
     let dataLo = null, dataHi = null;
@@ -35098,9 +33934,7 @@ window.addEventListener('load', function () {
     vline(Math.floor(Date.now() / 1000), 'rgba(244,67,54,0.55)', [4, 3]);   // live edge "now"
   }
 
-  // Build one chart ONCE (empty); ltRenderAll feeds it binned data. drag-x zoom →
-  // re-bins ALL charts (synced); dbl-click resets the range.
-  // Bottom legend shows live values at the cursor (setCursor hook).
+  // Built once (empty); ltRenderAll feeds binned data. Drag-x zoom re-bins ALL charts; dbl-click resets.
   function buildLtChart(id, spec) {
     const el = document.getElementById(id);
     if (!el || typeof uPlot === 'undefined') return;
@@ -35111,12 +33945,8 @@ window.addEventListener('load', function () {
     spec.series.forEach(s => {
       const group = [di];
       avgIdx.push(di);
-      // Show sample markers only when the series is sparse. points:{show:false} drew NOTHING
-      // for an isolated non-null sample (uPlot needs two consecutive non-null points to draw a
-      // line, and with markers off a lone point is invisible) — so the first record or two after
-      // a boot, or any point flanked by null windows, rendered as a blank chart. Markers ≤8
-      // visible points; beyond that it's a clean line.
-      // s.faint = wall-clock-avg companion: thin, dashed, translucent under the solid engine-on line.
+      // Markers at ≤8 points: uPlot draws no line for a lone non-null sample, so without markers a sparse
+      // series renders blank. s.faint = wall-clock-avg companion under the solid engine-on line.
       series.push({ label: s.label, scale: s.scale,
                     stroke: s.faint ? hexAlpha(s.color, 0.55) : s.color,
                     width: s.faint ? 1 : 2, dash: s.faint ? [5, 5] : undefined,
@@ -35139,12 +33969,8 @@ window.addEventListener('load', function () {
                   splits: edgeLabeledSplits(() => !!(ltYOverride[id] && ltYOverride[id][sc.name])),
                   values: sc.fmt ? (u, ticks) => ticks.map(sc.fmt) : undefined });
     });
-    // Keep the X-axis time ticks lined up across every stacked chart. uPlot reserves a
-    // right-hand gutter (~size 50 + labelSize 30 = 80px) for any secondary (side:1) axis.
-    // Charts with only a left axis (Currents, Speeds, Angles, Motion) would otherwise
-    // extend their plot area that 80px further right and their shared X scale would not
-    // match the charts that DO have a secondary axis (Voltage&SOC, Temp&Baro, RPM&Duty).
-    // Reserve an identical but invisible right gutter on single-axis charts to match.
+    // uPlot reserves an ~80 px right gutter for a side:1 axis; give single-axis charts an invisible one so
+    // the stacked charts' X ticks line up.
     if (!spec.scales.some(sc => sc.side === 1)) {
       axes.push({ scale: spec.scales[0].name, side: 1, label: '',
                   grid: { show: false }, ticks: { show: false },
@@ -35163,18 +33989,15 @@ window.addEventListener('load', function () {
       sw.style.cssText = 'width:11px;height:11px;border-radius:2px;display:inline-block;background:' + (s.faint ? hexAlpha(s.color, 0.55) : s.color) + ';';
       const val = document.createElement('b');
       item.appendChild(sw); item.appendChild(document.createTextNode(s.label + ': ')); item.appendChild(val);
-      // Click the legend item to toggle that series (and its envelope band) on/off.
       item.addEventListener('click', () => {
         const show = !plot.series[seriesGroups[i][0]].show;
         seriesGroups[i].forEach(idx => plot.setSeries(idx, { show }));
         item.style.opacity = show ? '1' : '0.4';
-        // Persist visibility by stable series key (true = hidden).
         ltSeriesHidden[id] = ltSeriesHidden[id] || {};
         if (show) delete ltSeriesHidden[id][s.key]; else ltSeriesHidden[id][s.key] = true;
         ltSaveSeriesHidden();
       });
-      // Restore persisted visibility (keyed by series key). Dim the legend item now;
-      // the matching plot.setSeries() runs after the plot is created (see below).
+      // Dim now; the matching plot.setSeries() runs once the plot exists (below).
       if (ltSeriesHidden[id] && ltSeriesHidden[id][s.key]) {
         item.style.opacity = '0.4';
       }
@@ -35230,15 +34053,13 @@ window.addEventListener('load', function () {
     entry.plot = plot;
     ltCharts.push(entry);
 
-    // Apply persisted legend hides now that the plot exists (opacity was set in the loop above).
     if (ltSeriesHidden[id]) {
       spec.series.forEach((s, i) => {
         if (ltSeriesHidden[id][s.key]) seriesGroups[i].forEach(idx => plot.setSeries(idx, { show: false }));
       });
     }
 
-    // Y-axis controls: per-scale manual Min/Max + Apply + Auto (reset). Persisted; absent
-    // → that axis auto-fits to the visible binned data (enforced in ltRenderAll).
+    // Y-axis controls: per-scale manual Min/Max + Apply + Auto; absent → auto-fit (enforced in ltRenderAll).
     const ctrl = document.createElement('div');
     ctrl.style.cssText = 'display:flex;justify-content:center;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px;font-size:11px;color:#888;';
     ctrl.appendChild(document.createTextNode('Y-axis:'));
@@ -35291,8 +34112,7 @@ window.addEventListener('load', function () {
     }
   }
 
-  // Display-unit flip: chart specs bake unit-dependent labels, and ltYOverride's F-scale
-  // values are typed in display units — remap the persisted override, then tear down and
+  // Unit flip: specs bake unit labels and the F-scale override is in display units, so remap it and
   // rebuild from the native-°F ltData at the same range.
   window.ltOnTempUnitChanged = function (prevUnit) {
     const ov = ltYOverride['lt-temp-plot'];
@@ -35310,18 +34130,10 @@ window.addEventListener('load', function () {
 
   function buildAllLtPlots() {
     if (!ltCharts.length) {
-    // Groupings mirror the cloud "My History" viewer minus the eliminated fields
-    // (u_target_amps, temp_margin, ign_duty, eng_duty). Every envelope-recorded field
-    // gets band:true; line-only series (Board temp, Baro, COG, Heading, Leeway)
-    // are avg-only in the 132 B record itself, so a band would need a record-layout
-    // change. heel/pitch (Motion) is a local-only bonus.
-    // Solid line on battery/alternator current, battery voltage and duty = ENGINE-ON
-    // average (on:true); the faint dashed companion (dataKey) is the wall-clock average
-    // including engine-off time — the two diverge exactly in mixed run/rest windows.
-    // Victron/Solar keeps the wall-clock line as its solid: solar charges engine-off,
-    // so engine-gating its center line would hide at-anchor charging.
-    // No battery shunt fitted (body.no-batt-current mirrors firmware HAS_BATT_SHUNT): battery
-    // current is dead in every record, so drop the series rather than offer an empty legend entry.
+    // Groupings mirror the cloud "My History" viewer. Line-only series (Board temp, Baro, COG, Heading, Leeway)
+    // are avg-only in the record, so a band would need a layout change. Solid line on currents/voltage/duty =
+    // ENGINE-ON average (on:true); the faint dashed companion (dataKey) is the wall-clock average. Victron/Solar
+    // stays wall-clock (it charges engine-off). No shunt (body.no-batt-current = HAS_BATT_SHUNT): drop battCurr.
     const noBattShunt = document.body.classList.contains('no-batt-current');
     buildLtChart('lt-current-plot', {
       title: 'Currents (A)',
@@ -35385,12 +34197,9 @@ window.addEventListener('load', function () {
     ltBuildStageLegend();
 
     }
-    // When the local ring holds little (< ~1h span — always true right after an OTA
-    // reboot until the field-off dump persists it), lean on cloud: anchor the view to the
-    // last 24h and auto-pull cloud history. Otherwise show the full local span.
-    // The 24h jump only pays off when the cloud tier can actually backfill the empty window;
-    // with cloud off / AP mode there's nothing to fill it, so show whatever the local ring
-    // holds (otherwise a fresh-flash PSRAM ring plots as a blank 24h view).
+    // Sparse local ring (< 1 h, e.g. right after an OTA reboot) with cloud on: anchor to the last 24 h and
+    // auto-pull cloud history. With cloud off / AP mode nothing can backfill, so show the local span
+    // (else a fresh PSRAM ring plots as a blank 24 h view).
     const nowSec = Math.floor(Date.now() / 1000);
     const localSpan = (ltData.n >= 2) ? (ltData.t[ltData.n - 1] - ltData.t[0]) : 0;
     const sparse = localSpan < 3600 && ltCloudEnabled();
@@ -35398,20 +34207,16 @@ window.addEventListener('load', function () {
     const loSec = sparse ? (nowSec - 86400) : ltData.t[0];
     const hiSec = sparse ? nowSec : ltData.t[ltData.n - 1];
     ltFullRange = [loSec, hiSec];
-    // Order matters: brush (sets nativeSink) → cloud state (reach) → render. The render's
-    // ltCloudMaybePull then fires exactly ONE pull (loSec < oldest in the sparse case).
-    // A restored window pref renders itself inside ltInitBrush; only render here when none
-    // applied, else the default render clobbers the restored window back to the full span.
+    // Order matters: brush (sets nativeSink) → cloud state → render, so the render fires exactly ONE pull.
+    // A restored window pref already rendered inside ltInitBrush; rendering again would clobber it.
     const appliedPref = ltInitBrush(loSec, hiSec, sparse ? nowSec : (ltData.lastEpoch || hiSec));
     ltCloudInit(oldestBoundary);
     if (!appliedPref) {
       const [vFrom, vTo] = sparse ? [loSec, hiSec] : ltRecentDataView(loSec, hiSec);
       ltRenderAll(vFrom, vTo);
     }
-    // Force each chart to its real container width + repaint. Charts can get stuck at
-    // the 320px fallback if first built before the sub-tab had laid out; the per-chart
-    // ResizeObserver never corrects it because `el` itself doesn't change size. Run on
-    // every open (idempotent) so a reopen also fixes any stale narrow sizing.
+    // Charts built before the sub-tab laid out stick at the 320 px fallback, and their ResizeObserver never
+    // fires because `el` doesn't resize; force real widths on every open.
     requestAnimationFrame(() => requestAnimationFrame(ltResizeAll));
     setTimeout(ltResizeAll, 250);   // fallback for late layout (card width applied after activate)
   }
@@ -35420,9 +34225,8 @@ window.addEventListener('load', function () {
     ltCharts.forEach(c => {
       const el = document.getElementById(c.id);
       if (!el) return;
-      // Size to the parent CARD's content width, not the .plot-container's — uPlot's root
-      // is `width: min-content`, so the container collapses to ~the canvas width (e.g. 324px)
-      // and reading it just re-pins the narrow size. The card is a full-width block.
+      // Size to the CARD, not .plot-container: uPlot's root is `width: min-content`, so the container
+      // collapses to the canvas width and re-pins the narrow size.
       const card = el.closest('.settings-card');
       const w = Math.floor((card ? card.clientWidth : el.clientWidth)) - 22;  // minus card padding
       if (w > 50) c.plot.setSize({ width: w, height: 300 });
@@ -35430,7 +34234,6 @@ window.addEventListener('load', function () {
     ltDrawStageBar();   // chart widths/x-gutter just changed → realign the stage strip
   }
 
-  // Fill the charge-stage legend once (swatch + label per code) from the shared palette.
   function ltBuildStageLegend() {
     const el = document.getElementById('lt-stage-legend');
     if (!el || el.childElementCount) return;
@@ -35442,9 +34245,8 @@ window.addEventListener('load', function () {
       item.appendChild(sw); item.appendChild(document.createTextNode(LT_STAGE_NAMES[code]));
       el.appendChild(item);
     });
-    // Bare-track entry: the strip leaves stage 0 (field not active) and no-data gaps unpainted,
-    // so its swatch uses the same rgba(128,128,128,0.15) fill as the track (+ faint border so the
-    // near-transparent swatch is still findable). No causal claim — not "engine off".
+    // Bare-track entry: stage 0 and no-data gaps stay unpainted, so the swatch matches the track fill (+ a faint
+    // border to stay findable). Labelled "Not Charging", not "engine off": no causal claim.
     const off = document.createElement('span');
     off.style.cssText = 'display:inline-flex;align-items:center;gap:4px;';
     const osw = document.createElement('span');
@@ -35453,9 +34255,7 @@ window.addEventListener('load', function () {
     el.appendChild(off);
   }
 
-  // Paint the charge-stage strip over the currently-rendered range. One bar (not per-chart
-  // shading); its painted region is x-aligned to a reference chart's plot area so it sits
-  // under the curves, past the y-axis gutter. Stage 0/off and gaps are left as bare track.
+  // One strip (not per-chart shading), x-aligned to a reference chart's plot area past the y-axis gutter.
   function ltDrawStageBar() {
     const cv = document.getElementById('lt-stage-bar');
     if (!cv || !ltData || !ltData.stage || !ltCurRange) return;
@@ -35479,10 +34279,8 @@ window.addEventListener('load', function () {
     const span = (toSec - fromSec) || 1;
     ctx.fillStyle = 'rgba(128,128,128,0.15)';   // bare track behind everything
     ctx.fillRect(x0, 0, x1 - x0, cssH);
-    // Per-pixel DOMINANT stage (no binning, never microscopic): accumulate each stage run's
-    // time-overlap into the pixel column(s) it covers, then paint each column the stage that
-    // held it longest. Stage 0/off (and no-data) winning a column → bare track. Zooming in
-    // shrinks each column's time slice, so short stages emerge instead of aliasing at zoom-out.
+    // Each pixel column is painted the stage that held it longest (time-overlap accumulated per column), so
+    // short stages emerge on zoom-in instead of aliasing; stage 0 winning → bare track.
     const t = ltData.t, st = ltData.stage, ig = ltData.isGap || [], N = ltData.n;
     const interval = ltData.interval || 600;
     const W = x1 - x0, pxN = Math.max(1, Math.round(W));
@@ -35530,11 +34328,8 @@ window.addEventListener('load', function () {
     else { card.style.display = 'none'; }   // hide the whole card, not just the text
   }
 
-  // Freshness banner. Long-term points are min/max/avg ENVELOPES the firmware commits once
-  // per closing window (ltData.interval — ~10 min in production), NOT instant writes — so the
-  // newest point lags live by up to one interval. This is the averaging window, not slow
-  // PSRAM. Banner shows the countdown to the next averaged point, and once that point is due
-  // (the device should have committed it) flips to a one-tap Refresh that re-pulls the ring.
+  // Points are envelopes committed once per window (ltData.interval), so the newest lags live by up to one
+  // interval. Countdown to the next point; once due, a one-tap Refresh re-pulls the ring.
   let _ltFreshTimerId = null;
   function ltUpdateFreshness() {
     const banner = document.getElementById('lt-freshness-banner');
@@ -35568,17 +34363,12 @@ window.addEventListener('load', function () {
   }
 
   // CLOUD STITCH — history older than the local ring (LOCAL_DATA_SYSTEMS_PLAN 1b).
-  // Lazy + cloud-gated: when Cloud Features is on and the device is registered,
-  // brushing past the oldest local record pulls a matching 10-min min/max/avg
-  // aggregate from Supabase (get-history, date-range) and PREPENDS it into ltData,
-  // so it renders as one continuous band+line across the SAME 7 charts. Pulled in
-  // 30-day chunks, each older than the last; reaching the loaded edge opens + fetches
-  // the next chunk. When cloud is off/unregistered the pre-ring region simply stays
-  // empty (one-line hint), never an error, and the in-ring month is never greyed.
+  // Cloud-gated and lazy: brushing past the oldest local record pulls 30-day chunks of the 10-min aggregate
+  // from Supabase get-history and PREPENDS them into ltData. Cloud off/unregistered → the pre-ring region
+  // stays empty (one-line hint), never an error.
   // No lookback ceiling: registered history is advertised as unlimited, so the chain runs until
-  // the cloud answers with an empty chunk (see ltCloudPull). A chunk that lands entirely inside a
-  // period the boat was powered off ends it early — the same truncation that has always applied
-  // to gaps, now reachable at any age rather than only inside the first year.
+  // LT_CLOUD_GAP_PROBES + 1 consecutive empty 30-day windows (see ltCloudPull); a power-off period
+  // longer than that (~7 months) ends it early.
   const LT_CLOUD_CHUNK_S    = 30 * 86400;   // pull 30 days of older history per request
   const LT_CLOUD_GAP_PROBES = 6;            // empty 30-day windows stepped over before declaring the end
   // JS field key → sensor_history column prefix (envelope: _min/_max/_avg; avg-only: _avg).
@@ -35590,23 +34380,19 @@ window.addEventListener('load', function () {
     soc:'soc', baro:'baro', ambTemp:'amb_temp', cog:'cog', heading:'heading',
     leeway:'leeway', altZero:'alt_zero'
   };
-  // Engine-on-weighted average columns + coverage (engine_on_pct, 0-100). Rows older
-  // than the fw that added them come back null → cover null → onAvg falls back to
-  // the wall avg, same as pre-v4 local records.
+  // Engine-on-weighted average columns + coverage (engine_on_pct, 0-100). Older rows return null → onAvg
+  // falls back to the wall avg, as for pre-v4 local records.
   const LT_CLOUD_ONCOL = {
     battVolt:'batt_volt_onavg', battCurr:'batt_curr_onavg', altCurr:'alt_curr_onavg',
     victronCurr:'victron_curr_onavg', duty:'duty_cycle_onavg'
   };
-  // oldest    = oldest record actually LOADED (drives the brush clamp — never move it for an
-  //             empty window, or the brush opens onto blank space)
-  // probeFrom = top of the next window to REQUEST; set only while stepping back over confirmed
-  //             empty windows, so a retry after a network failure doesn't re-ask for them
+  // oldest = oldest LOADED record (brush clamp; never move it for an empty window or the brush opens on blank).
+  // probeFrom = next window to REQUEST, set only while stepping over confirmed-empty windows (no re-ask on retry).
   let ltCloud = { avail: undefined, fetching: false, oldest: null, probeFrom: null, exhausted: false };
 
   function ltCloudEnabled() {
-    // Source of truth is the checkbox — the settings echo (updateCheckbox) keeps
-    // CloudFeatures_checkbox.checked current but does NOT write the hidden
-    // #CloudFeatures input's .value (it stays "0"), so reading that gave false negatives.
+    // Read the checkbox: updateCheckbox keeps .checked current but never writes the hidden #CloudFeatures
+    // input's .value (it stays "0").
     const cb = document.getElementById('CloudFeatures_checkbox');
     if (cb) return !!cb.checked;
     const cf = document.getElementById('CloudFeatures');
@@ -35614,10 +34400,7 @@ window.addEventListener('load', function () {
   }
   function ltIso(sec) { return new Date(sec * 1000).toISOString().replace(/\.\d+Z$/, 'Z'); }
 
-  // One-line note below the brush, shown when cloud history isn't available. mode:
-  //   'off' — Cloud Features off but available (Client mode) → tell them they can enable it
-  //   'ap'  — Access Point mode → Cloud Features can't be enabled, so don't suggest it
-  //   null  — cloud on → hide the note
+  // mode: 'off' (Client mode, can enable cloud), 'ap' (can't enable, don't suggest), null (cloud on → hide).
   function ltCloudHint(mode) {
     let el = document.getElementById('lt-cloud-hint');
     if (!el) {
@@ -35633,9 +34416,7 @@ window.addEventListener('load', function () {
     el.style.display = mode ? '' : 'none';
   }
 
-  // Map get-history rows (must be ascending) into parallel arrays in ltData's field
-  // shape, dropping any overlap with already-loaded data and breaking the line where
-  // the 10-min cadence is interrupted (power-off period).
+  // rows must be ascending. Drops overlap with loaded data; gap-breaks across power-off periods.
   function ltCloudRowsToSlice(rows, interval, boundarySec) {
     const t = [], isGap = [], stage = [], cover = [], fields = {};
     ENV.forEach(([k]) => fields[k] = { min:[], max:[], avg:[] });
@@ -35652,11 +34433,10 @@ window.addEventListener('load', function () {
     for (const r of rows) {
       const ts = Math.floor(Date.parse(r.timestamp) / 1000);
       if (!isFinite(ts) || ts >= boundarySec) continue;   // drop overlap with loaded data
-      // Skip invalid/boot windows: a battery can't read 0 V, so batt_volt_avg<=0 means
-      // the device sampled before sensors were ready (each reboot leaves one). Bridge over
-      // it rather than letting every trace dive to 0. Legit zeros (SOG, VMG) are kept.
+      // batt_volt_avg <= 0 = a boot window sampled before sensors were ready: skip the row so traces don't dive
+      // to 0. A null is kept: firmware nulls an untrusted reading and the rest of the row is real.
       const bv = num(r.batt_volt_avg);
-      if (bv == null || bv <= 0) continue;
+      if (bv != null && bv <= 0) continue;
       if (prevTs != null && (ts - prevTs) > ltGapThreshold(interval)) pushGap((prevTs + ts) / 2);
       prevTs = ts;
       t.push(ts); isGap.push(false);
@@ -35680,14 +34460,11 @@ window.addEventListener('load', function () {
     return { t, fields, isGap, stage, cover, n: t.length };
   }
 
-  // Reorder ltData strictly by ascending timestamp. A single out-of-order point makes
-  // uPlot draw a line segment that jumps backward across the chart (looks like an extra
-  // crossing line). Reorders all parallel arrays (t, isGap, every field) by one index map.
+  // Out-of-order or duplicate points make uPlot draw a line jumping backward across the chart.
   function ltSortData() {
     if (!ltData || ltData.n < 2) return;
     const ot = ltData.t;
-    // Sort by timestamp AND drop exact-duplicate timestamps (keep first). Dedup guards
-    // against any double-prepend; a backward-jumping point or duplicate both draw wrong.
+    // Sort and drop duplicate timestamps (keep first); guards against a double-prepend.
     const sortIdx = ot.map((_, i) => i).sort((a, b) => ot[a] - ot[b]);
     const idx = []; let last = null;
     for (const i of sortIdx) { if (ot[i] === last) continue; idx.push(i); last = ot[i]; }
@@ -35761,7 +34538,7 @@ window.addEventListener('load', function () {
   }
 
   // Pull the next older 30-day chunk (cloud-gated, deduped, chains while the brushed range
-  // still extends past the loaded edge). Terminated by an empty chunk, not by an age limit.
+  // still extends past the loaded edge). Terminated by a run of empty chunks, not by an age limit.
   async function ltCloudPull() {
     if (!ltData || ltCloud.fetching || ltCloud.exhausted) return;
     if (!ltCloudEnabled()) { ltCloud.avail = false; return; }
@@ -35775,11 +34552,9 @@ window.addEventListener('load', function () {
       if (!token) { ltCloud.avail = false; ltCloudClampReach(); return; }  // not registered → no cloud tier
       ltCloud.avail = true;
       const interval = ltData.interval || 600;
-      // An empty chunk means "nothing in THIS window", not "nothing older" — a boat laid up for a
-      // season leaves whole empty months in front of real data. Step back over them before giving
-      // up. Bounded: LT_CLOUD_GAP_PROBES empty windows in a row ends it, so a lay-up longer than
-      // LT_CLOUD_GAP_PROBES * 30 days still truncates there. ltCloudPrepend draws the seam gap
-      // across whatever was skipped, so the chart never joins two eras with a straight line.
+      // An empty chunk means nothing in THIS window (a laid-up boat leaves empty months), so step back up to
+      // LT_CLOUD_GAP_PROBES empty windows before giving up; a longer lay-up truncates there. ltCloudPrepend
+      // draws the seam gap across the skip.
       let win = boundary, slice = null;
       for (let probe = 0; probe <= LT_CLOUD_GAP_PROBES; probe++) {
         const startSec = win - LT_CLOUD_CHUNK_S;
@@ -35807,9 +34582,7 @@ window.addEventListener('load', function () {
     } finally {
       ltCloud.fetching = false;
     }
-    // Re-render so the stitched data appears. If the ring was sparse (no real local
-    // span), show the whole freshly-loaded range; otherwise keep the current range (and
-    // if it still passes the new loaded edge, that re-triggers a pull → next chunk).
+    // Keeping the current range re-triggers a pull if it still passes the new loaded edge (next chunk).
     if (wasSparse && ltData.n >= 2 && ltData.t[ltData.n - 1] > ltData.t[0]) {
       ltRenderAll(ltData.t[0], ltData.t[ltData.n - 1]);
     } else if (ltCurRange) {
@@ -35823,16 +34596,13 @@ window.addEventListener('load', function () {
     if (isFinite(fromSec) && fromSec < ltCloudOldestSec()) ltCloudPull();
   }
 
-  // oldestSec = the boundary below which cloud fills (oldest local record, or `now` when
-  // the local ring is empty). No auto-pull here — the initial ltRenderAll's
-  // ltCloudMaybePull triggers exactly one pull when the view reaches past `oldest`
-  // (which it does in the sparse case, where loSec is well before oldest). Calling a pull
-  // here too caused a concurrent double-fetch (fetching flag was reset) → duplicate data.
+  // oldestSec = boundary below which cloud fills. Do not pull here: the initial ltRenderAll's ltCloudMaybePull
+  // already fires one, and a second races it (this resets the fetching flag) → duplicate data.
   function ltCloudInit(oldestSec) {
     ltCloud = { avail: undefined, fetching: false, oldest: oldestSec, exhausted: false };
     if (!ltCloudEnabled()) {
       ltCloud.avail = false;
-      const apMode = (window._lastKnownMode === 1);   // 1 = Access Point (numeric mode source of truth; the currentModeID span shows the NAME)
+      const apMode = (window._lastKnownMode === 1);   // 1 = Access Point (the currentModeID span shows the NAME)
       ltCloudHint(apMode ? 'ap' : 'off');
       return;
     }
@@ -35840,10 +34610,7 @@ window.addEventListener('load', function () {
     ltCloudExtendReach();
   }
 
-  // Re-fetch the on-device ring on EVERY tab open (the endpoint now sends only the
-  // populated records, so it's cheap) → the local portion is always current. Cloud stays
-  // lazy: re-stitched on brush-past-horizon. Charts are built once; subsequent opens
-  // refresh their data.
+  // Re-fetch the ring on EVERY tab open (cheap: only populated records are sent); cloud stays lazy.
   window.initLongTermPlots = function () {
     fetch(buildURL('/longTermPlots.bin'), { cache: 'no-cache' })
       .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.arrayBuffer(); })
@@ -35901,10 +34668,7 @@ window.addEventListener('load', function () {
     resizeObs = new ResizeObserver(() => { if (plot) plot.setSize({ width: plotFitWidth(el, 600), height: 300 }); });
     resizeObs.observe(el);
 
-    // Auto checkbox (top-right) — same convention as the other plots. No lock button:
-    // this is an RPM-domain curve that redraws on new fuel data, not a streaming
-    // time-series, so unchecking (pin to what's shown) covers the freeze case.
-    // Checked = auto-fit (null manual range); unchecked = pin to what's shown.
+    // Auto checkbox; no lock button (RPM-domain curve, not a streaming series: unchecking pins what's shown).
     el.style.position = 'relative';
     const exFuelAs = el.querySelector('.autoscale-ctrl'); if (exFuelAs) exFuelAs.remove();
     const fuelAsDiv = document.createElement('div');
@@ -35913,7 +34677,7 @@ window.addEventListener('load', function () {
     fuelAsDiv.innerHTML = '<input type="checkbox" id="autoscale-fuel-cb" style="cursor:pointer;width:12px;height:12px;margin:0;"><label for="autoscale-fuel-cb" style="cursor:pointer;user-select:none;">auto</label>';
     el.appendChild(fuelAsDiv);
     const fuelAsCb = document.getElementById('autoscale-fuel-cb');
-    fuelAsCb.checked = (yManual == null);   // null manual range = auto-fit
+    fuelAsCb.checked = (yManual == null);
     fuelAsCb.addEventListener('change', e => {
       if (e.target.checked) { yManual = null; localStorage.removeItem('fuelCurveYRange'); }
       else if (plot) { yManual = [plot.scales.mpg.min, plot.scales.mpg.max]; localStorage.setItem('fuelCurveYRange', JSON.stringify(yManual)); }
@@ -35971,18 +34735,13 @@ window.addEventListener('load', function () {
   };
 })();
 
-// Fast alternator-current scope (Plots → Scope). Pulls /fastscope.bin — a 500 ms
-// raw capture at 20 kSPS — and renders it as amps vs milliseconds. Zoom buttons
-// show the LAST N ms of the capture (ms is ground truth); the hint reports how many engine
-// and alternator revolutions that window spans, from the live RPM and PulleyRatio.
+// Fast alternator-current scope (Plots → Scope): /fastscope.bin, a 500 ms raw capture at 20 kSPS, as amps vs ms.
 let fastScopePlot = null;
 let fastScopeData = null;
 let fastScopeViewMs = 200;   // shared X window (ms) for BOTH the scope and the Reference Flipbook; capped at the 200 ms flipbook page length
-let fastScopeAmpsMin = null, fastScopeAmpsMax = null;  // null = auto-scale; set via the click-to-edit Y widget, persisted to localStorage like the other plots
+let fastScopeAmpsMin = null, fastScopeAmpsMax = null;  // null = auto-scale; persisted
 let fastScopePaused = false;
-// Raw and Filtered are independent show/hide toggles (plot series 1 and 2), not an A/B switch.
-// Raw = the full 20 kHz samples; Filtered = the boxcar-16 the analysis uses (≈550 Hz bandwidth).
-// Any combination is allowed, including both or neither. Default: Raw on, Filtered on.
+// Independent show/hide toggles (series 1, 2). Filtered = the boxcar-16 the analysis uses (≈550 Hz).
 let fastScopeShowRaw = true;
 let fastScopeShowFilt = true;
 const FA_SCOPE_BOXCAR_N = 16;   // matches the firmware FA_DECIM — first null 20 kHz/16 = 1.25 kHz, −3 dB ≈ 550 Hz
@@ -35999,9 +34758,7 @@ function fastScopeBoxcar(amps, N) {
     }
     return out;
 }
-// Plot data is always [tMs, rawAmps, filteredAmps] — both series columns are present every
-// frame; the toggles control series visibility (show), not which column is computed. The
-// boxcar over ~5 k samples is cheap, so we compute it unconditionally.
+// Both columns always computed (cheap); the toggles only set series visibility.
 function fastScopeViewData() {
     if (!fastScopeData) return [[], [], []];
     return [fastScopeData.tMs, fastScopeData.amps, fastScopeBoxcar(fastScopeData.amps, FA_SCOPE_BOXCAR_N)];
@@ -36040,11 +34797,7 @@ function parseFastScope(buf) {
     return { rate, count, zeroMv, apv, atten, state, rpm, altTempF, epoch, tMs, amps };
 }
 
-// How many engine and alternator turns the currently-shown window spans. Engine speed is the
-// live tach reading (window._debugData.RPM); the alternator turns PulleyRatio times faster
-// (Alt_RPM = RPM × PulleyRatio, matching the firmware's Alt_RPM). The count scales with the View
-// buttons because the window is fastScopeViewMs wide. Approximate — RPM is a live reading, not
-// measured off this trace, so a sudden RPM change mid-capture won't be reflected exactly.
+// Approximate: uses live RPM (not measured off this trace); alternator = RPM × PulleyRatio, as firmware Alt_RPM.
 function fastScopeRevHint() {
     const rpm = parseFloat((window._debugData || {}).RPM);
     if (!isFinite(rpm) || rpm < 1) return 'Engine stopped — no revolutions to show.';
@@ -36063,16 +34816,14 @@ function initFastScopePlot() {
     const opts = {
         width: plotFitWidth(plotEl, 360, 800),
         height: 300,
-        // No title: the view buttons re-window one capture, so any fixed "250 ms" label is wrong once zoomed. Signal is named on the Y axis instead.
+        // No title: a fixed duration label is wrong once zoomed; the Y axis names the signal.
         series: [
             {},
             { label: "Raw (A)", stroke: "#2196F3", width: 1, points: { show: false }, scale: "amps", show: fastScopeShowRaw },
             { label: "Filtered (A)", stroke: "#FF9800", width: 1.5, points: { show: false }, scale: "amps", show: fastScopeShowFilt }
         ],
         scales: {
-            // x window pinned by a range fn (re-read each redraw) to the last fastScopeViewMs of the
-            // capture — so a refresh or zoom never flashes through the full 250 ms range. auto:false
-            // keeps setData from re-fitting x. dEnd = newest sample time.
+            // Range fn pins x to the last fastScopeViewMs so a refresh or zoom never flashes the full range.
             x: {
                 time: false,
                 auto: false,
@@ -36082,9 +34833,8 @@ function initFastScopePlot() {
                     return [Math.max(0, tEnd - fastScopeViewMs), tEnd];
                 }
             },
-            // Default auto (NOT auto:false): uPlot only recomputes the data min/max it passes to
-            // this fn when the scale is auto, so the auto-fit branch AND the "auto" checkbox need
-            // fresh extents on each setData. Manual pin returns the saved range. Mirrors the CV plot.
+            // Leave auto on (NOT auto:false): uPlot only passes fresh data min/max to this fn when the scale is
+            // auto, and both auto-fit and the "auto" checkbox need them.
             amps: {
                 range: (u, mn, mx) => (fastScopeAmpsMin != null && fastScopeAmpsMax != null)
                     ? [fastScopeAmpsMin, fastScopeAmpsMax]
@@ -36102,9 +34852,7 @@ function initFastScopePlot() {
     };
     fastScopePlot = new uPlot(opts, [[], [], []], plotEl);
 
-    // Auto checkbox (top-right) — same convention as the other plots. No "lock" button:
-    // this is a one-shot capture, not a streaming autoscale loop. Checked = auto-fit (null
-    // range vars); unchecked = pin to whatever is currently shown.
+    // Auto checkbox; no lock button (one-shot capture, not a streaming autoscale loop).
     plotEl.style.position = 'relative';
     const existingAs = plotEl.querySelector('.autoscale-ctrl');
     if (existingAs) existingAs.remove();
@@ -36115,7 +34863,7 @@ function initFastScopePlot() {
     plotEl.appendChild(asDiv);
     if (fastScopePaused) { const pb = document.getElementById('fastscope-pause-btn'); if (pb) pb.textContent = 'Resume'; }
     const faCb = document.getElementById('autoscale-fastscope-cb');
-    faCb.checked = (fastScopeAmpsMin == null);  // null range vars = auto-fit
+    faCb.checked = (fastScopeAmpsMin == null);
     faCb.addEventListener('change', e => {
         if (e.target.checked) { fastScopeAmpsMin = null; fastScopeAmpsMax = null; }
         else if (fastScopePlot) { fastScopeAmpsMin = fastScopePlot.scales.amps.min; fastScopeAmpsMax = fastScopePlot.scales.amps.max; }
@@ -36123,8 +34871,7 @@ function initFastScopePlot() {
         if (fastScopePlot) fastScopePlot.setData(fastScopePlot.data);
     });
 
-    // Click-to-edit Y limits — the same shared widget every other plot uses; persisted to localStorage.
-    // Editing pins the range and unchecks auto; the auto checkbox is the only way back to auto-fit.
+    // Editing pins the range and unchecks auto; the checkbox is the only way back to auto-fit.
     attachYAxisEdit(fastScopePlot, [{
         scale: 'amps', decimals: 2,
         apply: (mn, mx) => { fastScopeAmpsMin = mn; fastScopeAmpsMax = mx; faCb.checked = false; fastScopeSaveAmpsRange(); if (fastScopePlot) fastScopePlot.setData(fastScopePlot.data); }
@@ -36186,10 +34933,8 @@ function fetchFastScope(silent) {
         .catch(e => { if (status) status.textContent = 'Capture unavailable (' + e.message + ').'; });
 }
 
-// Pause freezes the displayed capture by halting the ~5 s auto-refresh. The on-chart Pause
-// button (top-right of the scope plot) is the only control; press Resume to re-arm the refresh.
-// Resume must re-arm the timer itself: it may never have been started (page loaded straight onto
-// a paused panel) and a fetch here beats waiting out the next 5 s tick.
+// Pause halts the ~5 s auto-refresh. Resume re-arms the timer itself (it may never have started, e.g. page
+// loaded onto a paused panel) and fetches now rather than waiting out the next tick.
 function fastScopePauseToggle(btn) {
     fastScopePaused = !fastScopePaused;
     if (btn) { btn.textContent = fastScopePaused ? 'Resume' : 'Pause'; btn.classList.toggle('active', fastScopePaused); }
@@ -36199,10 +34944,7 @@ function fastScopePauseToggle(btn) {
     fetchFastScope();  // non-silent: overwrites the stale "Paused" status line immediately
 }
 
-// Build a metadata-rich CSV for one scope capture: a commented header (capture time, RPM, alt
-// temp, rate, range — all stamped at capture in the FSC1 blob) followed by BOTH the raw 20 kHz
-// samples and the boxcar-16 filtered version (what the analysis sees). Shared by the Download CSV
-// button and the remote log relay so both carry identical, self-describing content.
+// Shared by the Download CSV button and the remote log relay, so both carry identical content.
 function buildFaScopeCsv(d) {
     const filt = fastScopeBoxcar(d.amps, FA_SCOPE_BOXCAR_N);
     const when = (d.epoch && d.epoch > 1577836800) ? new Date(d.epoch * 1000).toISOString() : 'clock not set';
@@ -36218,7 +34960,6 @@ function buildFaScopeCsv(d) {
     return csv;
 }
 
-// Export the currently-shown scope capture as CSV (header + raw + boxcar-16 filtered).
 function downloadFaScopeCsv() {
     if (!fastScopeData || !fastScopeData.count) { xAlert('No scope capture yet — wait a few seconds for the first capture.'); return; }
     const csv = buildFaScopeCsv(fastScopeData);
@@ -36227,21 +34968,15 @@ function downloadFaScopeCsv() {
     deliverFile('Alt Scope Capture ' + stamp + '.csv', csv, 'text/csv');
 }
 
-// Live Data → Diag sub-tab (item 1). Opens the relocated scope/flipbook and starts the
-// ~5 s scope auto-refresh (item 2). The refresh polls /fastscope.bin only while the Diag
-// panel is the active sub-tab AND the page is visible; a tick that finds the panel hidden
-// SKIPS (never clears the timer — a self-terminating tick left the scope dead with no
-// guaranteed restart path). A skipped tick is 3 DOM reads, and hidden pages get the browser's
-// ≥60 s background-timer throttle anyway, so the idle cost on a phone is nil. The fetch
-// runs on the Core-0 web task — the only control-loop cost is the ~0.1–0.2 ms ring-snapshot
-// spinlock wait (verified safe in the audit).
+// Live Data → Diag: ~5 s scope auto-refresh, polling only while the panel is active and the page visible.
+// A hidden-panel tick SKIPS, never clears the timer (a self-terminating tick left the scope dead with no restart
+// path). The fetch runs on the Core-0 web task; control-loop cost is only the ~0.1–0.2 ms ring-snapshot spinlock.
 let fastDiagAutoTimer = null;
 function fastDiagIsVisible() {
     if (document.visibilityState !== 'visible') return false;
     const panel = document.getElementById('livedata-diag');
     if (!panel || !panel.classList.contains('active')) return false;
-    // The scope lives in the Waveforms <details> on the Diag tab; only live when that section is
-    // expanded AND actually on-screen (offsetParent is null when display:none)
+    // Waveforms <details> must be open AND on-screen (offsetParent is null under display:none).
     const det = document.getElementById('fa-monitor-details');
     return !!(det && det.open && det.offsetParent !== null);
 }
@@ -36251,7 +34986,7 @@ function fastDiagStartAuto() {
     fastDiagFlipTick = 0;
     fastDiagAutoTimer = setInterval(() => {
         if (!fastDiagIsVisible()) return;  // silent skip — the timer outlives every hide
-        if (!fastScopePaused) fetchFastScope(true);  // silent: no "Fetching…" flash on the 5 s tick. Pause freezes the scope only, not the flipbook below.
+        if (!fastScopePaused) fetchFastScope(true);  // Pause freezes the scope only, not the flipbook below.
         // Flipbook poll every 6th tick (~30 s): reference bands freeze themselves, so their
         // buttons light up here with no manual press. Silent + non-disruptive (see fetchFastFlip).
         if (++fastDiagFlipTick % 6 === 0) fetchFastFlip(true);
@@ -36263,20 +34998,16 @@ function fastDiagOnOpen() {
     fetchFastFlip();   // always re-pull on open so freshly-frozen reference pages show without a manual Refresh
     fastDiagStartAuto();
 }
-// Foregrounding refreshes on the spot rather than showing a stale capture for up to 5 s. Also the
-// safety net for webviews (Capacitor) that suspend timers on background: setInterval survives, but
-// a suspended tick may have been missed entirely.
+// Foregrounding refreshes at once instead of showing a stale capture; also covers webviews (Capacitor)
+// whose suspended timers may have missed a tick.
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || !fastDiagIsVisible()) return;
     fastDiagStartAuto();
     if (!fastScopePaused) fetchFastScope(true);
 });
 
-// Build a metadata-rich CSV for one flipbook page: commented header (capture time, RPM, mean amps,
-// reference-band/anomaly type, range — all stored per page) + raw and boxcar-16 filtered columns.
-// Shared by the download button and the relay. NOTE: per-page temperature is not available — RPM
-// and capture time are stored in each FaFlipPage, but board/alt temp is not (adding it needs a
-// firmware struct change that would invalidate already-saved pages).
+// Shared by the download button and the relay. No per-page temperature: adding it to FaFlipPage needs a
+// firmware struct change that would invalidate already-saved pages.
 function buildFaFlipPageCsv(pg) {
     const when = (pg.epoch && pg.epoch > 1577836800) ? new Date(pg.epoch * 1000).toISOString() : 'clock not set';
     const type = pg.isAnomaly ? ('anomaly k=' + pg.patternK + ' score=' + pg.score.toFixed(2))
@@ -36293,7 +35024,6 @@ function buildFaFlipPageCsv(pg) {
     return csv;
 }
 
-// Per-page CSV export of the currently-shown flipbook waveform (item 8).
 function downloadFaFlipPageCsv() {
     if (!fastFlipPages || fastFlipSelected < 0) { xAlert('Select a flipbook page first.'); return; }
     const pg = fastFlipPages[fastFlipSelected];
@@ -36305,11 +35035,6 @@ function downloadFaFlipPageCsv() {
     deliverFile('Alt Waveform ' + tag + ' ' + stamp + '.csv', csv, 'text/csv');
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Reference flipbook (Plots → Scope, second card). Pulls /faflip.bin: 8-byte header
-// then fixed 2020-byte pages — slots 0..refSlots-1 are the per-1000-RPM reference
-// pages, the rest are anomaly captures. Layout pinned by static_assert in firmware.
-// ─────────────────────────────────────────────────────────────────────────────
 // ── Fast current channel (faEnabled/faAlarmEnable): segmented Off/On toggles + the chart Pause/Resume (faAnomPause) ──
 // updateSegToggle mirrors updateCheckbox's pending-toggle reconciliation so an in-flight
 // optimistic press isn't reverted by a stale echo before the regulator confirms.
@@ -36362,9 +35087,6 @@ function faAnomPauseToggle() {
     faUpdatePauseBtn(next);
     fetchWithTimeout(buildURL('/get?faAnomPause=' + next), {}, 5000).then(() => {}).catch(() => {});
 }
-// Live Oscilloscope: Raw and Filtered are independent show/hide toggles (depress/return per
-// click) — any combination including both traces at once or neither. Each button drives its
-// own plot series' visibility; the button's cap-mode-active class mirrors the shown state.
 function fastScopeViewToggle(which, btn) {
     if (which === 'raw') fastScopeShowRaw = !fastScopeShowRaw;
     else fastScopeShowFilt = !fastScopeShowFilt;
@@ -36382,18 +35104,13 @@ let fastFlipPages = null;
 let fastFlipPlot = null;
 let fastFlipSelected = -1;
 let faFlipAxis = {};   // per-slot Y-axis state, in-session only: { auto, locked, min, max }
-// Raw/Filtered toggles mirror the live scope above (same two series, same colors). Default
-// matches the scope: Raw on, Filtered on. Independent show/hide, any combination allowed.
 let faFlipShowRaw = true;
 let faFlipShowFilt = true;
-// Frame paging: a page is 200 ms; the shared Time-window buttons split it into N equal frames
-// (200 ms = 1 frame = whole page; 100 ms = 2; 50 ms = 4; …). faFlipFrame is which one is shown,
-// 0 = the FIRST window. We page from the start (the scope above stays trailing/live) so the
-// reference always opens at frame 1, with the on-plot ‹ › arrows stepping through.
+// Frame paging: the shared Time-window buttons split the 200 ms page into N equal frames. 0 = the FIRST
+// window: paging runs from the start (the scope above stays trailing/live).
 let faFlipFrame = 0;
 
-// How many equal time-windows the current view splits a page into, and the [lo,hi] ms span of
-// the active frame. The last frame is clamped back so every frame keeps the full window width.
+// The last frame is clamped back so every frame keeps the full window width.
 function faFlipFrameCount() {
     const pg = fastFlipPages && fastFlipPages[fastFlipSelected];
     const tEnd = (pg && pg.t_ms && pg.t_ms.length) ? pg.t_ms[pg.t_ms.length - 1] : 200;
@@ -36426,8 +35143,6 @@ function faFlipUpdateNav() {
     if (prev) prev.disabled = (f <= 0);
     if (next) next.disabled = (f >= n - 1);
 }
-// Raw and Filtered are independent show/hide toggles for the flipbook plot, identical in
-// behaviour to fastScopeViewToggle on the scope above.
 function faFlipViewToggle(which) {
     if (which === 'raw') faFlipShowRaw = !faFlipShowRaw;
     else faFlipShowFilt = !faFlipShowFilt;
@@ -36440,6 +35155,9 @@ function faFlipViewToggle(which) {
         fastFlipPlot.setSeries(2, { show: faFlipShowFilt });
     }
 }
+// Reference flipbook (Plots → Scope, second card). Pulls /faflip.bin: 8-byte header
+// then fixed 8020-byte pages — slots 0..refSlots-1 are the per-1000-RPM reference
+// pages, the rest are anomaly captures. Layout pinned by static_assert in firmware.
 const FASTFLIP_PAGE_BYTES = 8020;
 const FASTFLIP_NSAMP = 4000;
 
@@ -36480,9 +35198,7 @@ function parseFastFlip(buf) {
                 pg.amps_t[s] = (mv - pg.zeroMv) * pg.apv / 1000;
                 pg.t_ms[s] = s * 1000 / rate;
             }
-            // Filtered trace built client-side from the raw samples with the SAME boxcar-16 the
-            // live scope uses — the saved page only stores raw mV, so the filtered overlay costs
-            // no extra storage and matches what the analysis sees (≈550 Hz bandwidth).
+            // Page stores raw mV only; the filtered overlay is the same client-side boxcar-16 as the scope.
             pg.filt_t = fastScopeBoxcar(pg.amps_t, FA_SCOPE_BOXCAR_N);
         }
         pages.push(pg);
@@ -36496,20 +35212,14 @@ function initFastFlipPlot() {
     fastFlipPlot = new uPlot({
         width: plotFitWidth(plotEl, 360, 800),
         height: 300,   // match the scope plot above it so the two stacked charts read as the same size
-        // No fixed-ms title: the shared Time window buttons re-window this page, so any "200 ms"
-        // label is wrong once zoomed (mirrors the scope, which titles via the Y axis instead).
+        // No fixed-ms title: the shared Time-window buttons re-window this page.
         title: "Reference Waveform — 20 kHz",
-        // Raw + Filtered, same two series and colors as the live scope above so the stacked plots
-        // read alike. Toggled by faFlipViewToggle; data is always [t, raw, filtered] each render.
         series: [
             {},
             { label: "Raw (A)", stroke: "#2196F3", width: 1, points: { show: false }, scale: "amps", show: faFlipShowRaw },
             { label: "Filtered (A)", stroke: "#FF9800", width: 1.5, points: { show: false }, scale: "amps", show: faFlipShowFilt }
         ],
         scales: {
-            // x pinned to the active frame (faFlipFrameRange) — the page is split into N windows of
-            // the shared fastScopeViewMs width and the ‹ › arrows step through them, opening at the
-            // first frame. Same window width as the scope above, so both stacked plots match.
             x: {
                 time: false,
                 auto: false,
@@ -36524,10 +35234,8 @@ function initFastFlipPlot() {
         legend: { show: false }
     }, [[], []], plotEl);
 
-    // Per-page Y-axis controls — same auto / lock / click-to-edit widget as the other plots,
-    // but each flipbook slot remembers its own state for the session (faFlipAxis keyed by slot).
-    // The waveform is absolute current (not AC-coupled), so each page sits at its own DC level
-    // and is auto-fit independently rather than sharing one scale.
+    // Per-slot Y-axis state: the waveform is absolute current (not AC-coupled), so each page sits at its own
+    // DC level and auto-fits independently.
     plotEl.style.position = 'relative';
     const existing = plotEl.querySelector('.autoscale-ctrl');
     if (existing) existing.remove();
@@ -36538,8 +35246,7 @@ function initFastFlipPlot() {
     plotEl.appendChild(ctrl);
     faUpdatePauseBtn(_faAnomPause);  // reflect last-known pause state on (re)build
 
-    // On-plot frame paging — ‹ prev / next › arrows + "Frame n / N" label, top-left so they clear
-    // the Pause/auto/lock cluster top-right. Hidden whenever the page is a single frame (200 ms).
+    // Frame-paging arrows top-left, clear of the Pause/auto/lock cluster top-right.
     const existingNav = plotEl.querySelector('#faflip-nav');
     if (existingNav) existingNav.remove();
     const nav = document.createElement('div');
@@ -36627,12 +35334,11 @@ function fastFlipRender(slot) {
     const pg = fastFlipPages[slot];
     if (!pg || !pg.used) return;
     fastFlipSelected = slot;
-    faFlipFrame = 0;   // new page always opens on the first frame
+    faFlipFrame = 0;
     document.querySelectorAll('.fastflip-band').forEach(b => b.classList.toggle('active', +b.dataset.slot === slot));
     const meta = document.getElementById('fastflip-meta');
     if (meta) {
-        // > 2020 guard (not just truthy): legacy pages froze before the libc clock was set and
-        // hold a small non-zero epoch that would render as 1/1/1970 — show "clock not set" instead.
+        // > 2020 guard, not truthy: legacy pages hold a small non-zero pre-clock epoch (would show 1970).
         const when = pg.epoch > 1577836800 ? new Date(pg.epoch * 1000).toLocaleDateString() : 'clock not set';
         // Band 0 reads "100–1000" (engines don't idle below ~100 RPM); higher bands span full 1000-RPM ranges
         const bandLabel = pg.band === 0 ? '100–1000' : (pg.band * 1000) + '–' + (pg.band * 1000 + 999);
@@ -36643,10 +35349,7 @@ function fastFlipRender(slot) {
     }
     initFastFlipPlot();
     if (fastFlipPlot) {
-        // Re-fit to the real container width every render. The plot is built once (often while the
-        // Diag tab is still hidden, so clientWidth was 0 → it fell back to the tiny 360 px default
-        // and stayed stuck narrow). The scope above it does the same setSize on tab open; matching
-        // it here keeps the two stacked charts the same size. Height matches the scope (300).
+        // Re-fit every render: built while the Diag tab is hidden, it falls back to 360 px and sticks narrow.
         const fpEl = document.getElementById('fastflip-plot');
         const w = plotFitWidth(fpEl, 360, 800);
         if (fastFlipPlot.width !== w || fastFlipPlot.height !== 300) fastFlipPlot.setSize({ width: w, height: 300 });
@@ -36667,8 +35370,7 @@ function fastFlipBuildButtons() {
     fastFlipPages.forEach(pg => {
         const b = document.createElement('button');
         b.type = 'button';
-        // Both rows share the same class — only one button is ever .active (green) across both,
-        // because fastFlipRender toggles it on every .fastflip-band by matching slot.
+        // Shared class across both rows so only one button is ever .active (fastFlipRender matches by slot).
         b.className = 'btn-secondary btn-sm fastscope-zoom fastflip-band';
         b.dataset.slot = pg.slot;
         if (pg.isRef) {
@@ -36688,10 +35390,8 @@ function fastFlipBuildButtons() {
     });
 }
 
-// auto=true is the silent background poll (from the Diag auto-loop): it refreshes the page
-// buttons so freshly-frozen reference bands light up on their own, but never flashes the
-// status line and never yanks the plot away from a page you're currently examining. Manual
-// Refresh / open / re-baseline call it without auto, so they always re-render.
+// auto=true (background poll): refreshes the page buttons but never flashes the status line or yanks the
+// plot off the page being examined. Manual Refresh / open / re-baseline always re-render.
 function fetchFastFlip(auto) {
     const status = document.getElementById('fastflip-status');
     if (status && !auto) status.textContent = 'Fetching…';
@@ -36730,12 +35430,9 @@ function fetchFastFlip(auto) {
 // ════════════ Battery Health (active DCIR test + capacity-vs-cycles trend) ════════════
 function bhSet(id, t) { const e = document.getElementById(id); if (e) e.textContent = t; }
 
-// DCIR normalized to a 25°C (77°F) reference. Resistance rises as the bank cools, so a cold run
-// reads high; this brings every row onto a common footing so the trend isn't just temperature.
-// Only a MEASURED battery temperature can do it: tF is null on a run that had none, and those rows
-// keep their raw DCIR with no @25 value rather than being corrected by something that is not the bank.
-// ~0.6%/°F ≈ 1%/°C, the same model as the battery-temp CV-gain derate.
-// Number.isFinite, not isFinite: isFinite(null) is true (null coerces to 0) and would "normalize" from 0 °F.
+// DCIR normalized to 25°C (77°F); resistance rises as the bank cools. Only a MEASURED battery temperature
+// may do it: tF null → raw DCIR, no @25 value. ~0.6%/°F ≈ 1%/°C, same model as the battery-temp CV-gain derate.
+// Number.isFinite, not isFinite: isFinite(null) is true and would "normalize" from 0 °F.
 const BH_TREF_F = 77, BH_TEMPCO_PER_F = 0.006;
 function bhDcir25(dcir, tF) {
   if (!(dcir > 0) || !Number.isFinite(tF)) return null;
@@ -36750,14 +35447,12 @@ function bhWhen(epoch) {
 }
 
 // ════════ Battery-health DCIR test wizard (mirrors the commissioning modal) ════════
-// Three panes — precheck → running (live countdown) → result — driven off the /batteryHealth
-// poll. The run itself, and the protection-drop during it, are firmware-side; this only walks
-// the user through it. Countdown uses firmware totalMs/elapsedMs so a reopened modal recomputes
-// remaining without a client-side start-time it would lose on close.
+// The run and its protection-drop are firmware-side; this only walks the user through it. The countdown
+// uses firmware totalMs/elapsedMs so a reopened modal recomputes the remaining time.
 let bhw = null;   // { pane:'pre'|'run'|'done', renderedPane, startedAt, j, poll }
 
 function bhwGet(params) {
-  return fetch(buildURL('/get?' + params));
+  return cxGet(params);   // rejects on 403/409, so a locked or misaddressed write reaches the caller's .catch
 }
 // Live precheck snapshot — RPM/voltage/alt-current off CSV1 (via cxLive), AUTO bit off CSV2
 // thermalFlags, battery shunt + Bcur off CSV3/CSV1.
@@ -36773,6 +35468,7 @@ function bhwLive() {
 }
 
 function bhwOpen() {
+  if (!settingsUnlocked) { xAlert('Unlock controls first.'); return; }
   if (!bhw) bhw = { pane: 'pre', renderedPane: null, startedAt: 0, j: null, poll: null };
   bhw.renderedPane = null;   // force a full pane rebuild on (re)open
   document.getElementById('bhw-modal-overlay').style.display = 'block';
@@ -36810,7 +35506,7 @@ function bhwStart() {
   if (btn) btn.disabled = true;   // prevent double-fire; bhwPoll flips to the run pane once state==1
   bhwGet('BatteryHealthTest=1').then(() => setTimeout(bhwPoll, 400)).catch(e => xAlert('Start failed: ' + e));
 }
-function bhwAbort() { bhwGet('bhAbort=1').then(() => setTimeout(bhwPoll, 300)).catch(() => { }); }
+function bhwAbort() { bhwGet('bhAbort=1').then(() => setTimeout(bhwPoll, 300)).catch(e => xAlert('Abort failed: ' + e)); }
 function bhwRestart() { bhw.pane = 'pre'; bhw.startedAt = 0; bhw.renderedPane = null; bhwRender(); }
 
 function bhwRender() {
@@ -37157,12 +35853,9 @@ function rippleMapThemeDark() {
     return (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) < 128;
 }
 
-// Auto-refresh policy. The heatmap is otherwise event-driven: page load, entering the Diag
-// sub-tab, expanding the section, and once after Clear Map. A standing poll is not free —
-// /famatrix.csv emits ~115 B per learned cell, so a full 1200-cell map is ~140 kB per fetch,
-// several times the whole SSE telemetry stream. But a freshly cleared map sits empty on screen
-// with no event coming to fill it. So poll only while the map is nearly empty, then stop and
-// let the event triggers carry it.
+// The heatmap is event-driven (load, tab entry, expand, after Clear Map); a standing poll is costly (~115 B
+// per cell, ~140 kB for a full map, several times the SSE stream). Poll only while the map is nearly empty
+// (e.g. just cleared), then let the events carry it.
 const RIPPLEMAP_POLL_MS = 10000;
 const RIPPLEMAP_POLL_UNTIL_CELLS = 10;
 let rippleMapPollId = null;
@@ -37174,9 +35867,8 @@ function rippleMapPollSync(nCells) {
     if (nCells >= RIPPLEMAP_POLL_UNTIL_CELLS) {
         rippleMapPollStop();
     } else if (rippleMapPollId === null) {
-        // The first tick taken off the Diag tab stops the poll again (the visibility gate in
-        // drawRippleMap); re-entering the tab redraws and restarts it while the map is still nearly
-        // empty. document.hidden covers the backgrounded Capacitor WebView, where timers still run.
+        // drawRippleMap's visibility gate stops the poll off the Diag tab; re-entry restarts it.
+        // document.hidden covers the backgrounded Capacitor WebView, where timers still run.
         rippleMapPollId = setTrackedInterval(() => { if (!document.hidden) drawRippleMap(); }, RIPPLEMAP_POLL_MS);
     }
 }
@@ -37206,10 +35898,8 @@ function drawRippleMap() {
         rippleMapInfoDefault();
         rippleMapPollSync(rippleMapCells.length);
     }).catch(() => {
-        // A failed fetch is the case the poll exists for (device away after Clear Map). Only the
-        // .then() above re-armed it, so once the hidden-canvas stop had fired, re-entering the tab
-        // with the device still away made exactly one attempt and then none.
-        rippleMapPollSync(rippleMapCells.length);
+        // Re-arm on failure too: the poll exists for a device that is away after Clear Map.
+        rippleMapPollSync((rippleMapCells || []).length);
     });
 }
 
@@ -37321,13 +36011,9 @@ function rippleMapPointer(ev) {
         : rpmLo + '–' + (rpmLo + f.RPW) + ' RPM × ' + ampLo + '–' + (ampLo + f.APW) + ' A — not learned yet';
 }
 
-// Immediate visual clear for the Clear Map / Reset Worsts buttons. The firmware clear is async
-// (Clear Map is deferred to Core 1, Reset Worsts commits in the /get handler), so without this the
-// table/heatmap only change on the next telemetry cycle — and the heatmap is never re-fetched at all.
-// The values below mirror the firmware zero-state renders so the blank matches a fresh device.
-// lastValues (the dispatcher's telemetry cache) is deliberately NOT touched: the dispatcher repaints a
-// span only when the incoming value differs from its cache, so it keeps skipping the pre-clear value
-// and can't overwrite these blanks until firmware actually reports zeros.
+// Immediate visual clear for Clear Map / Reset Worsts: the firmware clear is async and the heatmap is never
+// re-fetched on its own. Values mirror the firmware zero-state. lastValues is deliberately NOT touched: the
+// dispatcher repaints only on change, so it can't overwrite these blanks until firmware reports zeros.
 const FA_CLEARED = {
     faSesPkpkWorst_ID: '0.00', faSesPkpkRpm_ID: '0', faSesPkpkAmps_ID: '0.0', faSesPkpkTempF_ID: '—', faSesPkpkEpoch_ID: '—',
     faDomAmp_ID: '0.00', faDomFreq_ID: '0.0', faDomRpmCtx_ID: '0', faDomAmps_ID: '0.0', faDomTempF_ID: '—', faDomEpoch_ID: '—'
@@ -37360,14 +36046,9 @@ function rippleWorstsClearVisual() {
 setTimeout(drawRippleMap, 1500);
 
 // ================================== SETTINGS SEARCH ==================================
-// Find-any-setting search: spotlight card on desktop (Search button in the main tab row,
-// >=768px), top sheet on phones opened by pulling down while the page is already at the
-// top. Index is built from the live Setup DOM on first open (one entry per .form-row:
-// label + tooltip text + tab/panel breadcrumb), so new settings are searchable with no
-// registration anywhere. Selecting a result replays the same switcher chain the goTo*
-// helpers use (showSubTab / showAltTab / showBatteryPanel / showTuningPanel), opens any
-// enclosing <details>, scrolls to the row and flashes it. All identifiers are ss-prefixed;
-// nothing outside this block calls in.
+// Desktop spotlight (Search button, >=768px) / phone top sheet (pull down at page top). Index is built from
+// the live Setup DOM on first open, so new settings need no registration. Selecting replays the goTo*
+// switcher chain (showSubTab / showAltTab / showBatteryPanel / showTuningPanel). All identifiers ss-prefixed.
 let ssIndexData = null;     // [{label, tip, crumbs, el}] built once per page load
 let ssVocab = null;         // completion-chip vocabulary, frequency-sorted
 let ssDom = null;
@@ -37385,10 +36066,8 @@ function ssCleanLabel(t) {
     return s.trim();
 }
 
-// Visible text of one .protections-name, with the tooltip, the "s" signal badge, the group tag and
-// every live readout removed — echoes read "?" until the first CSV frame and the Load Dump tiers
-// carry a second readout line, all of which would otherwise be indexed as part of the name.
-// Removing a span leaves its surrounding "( )" behind, so empty parens are collapsed after.
+// .protections-name text minus tooltip, badge, group tag and live readouts (echoes read "?" before the first
+// CSV frame), which would otherwise be indexed as part of the name; leftover "( )" is collapsed.
 function ssProtText(nameEl) {
     const c = nameEl.cloneNode(true);
     c.querySelectorAll('.tooltip, .sinfo, .protections-tag, [id$="_echo"], [id$="_live"], [id$="_tta"]')
@@ -37424,9 +36103,7 @@ function ssCrumbs(node, names) {
         if (el.tagName === 'DETAILS') {
             const sum = el.querySelector(':scope > summary');
             if (sum) {
-                // Strip the live at-a-glance state and the "shared" badge from Integrations
-                // card headers so the breadcrumb is the stable card name, not
-                // "NMEA 2000 Rx On · Tx Off" or "Charge-Limit Follow shared".
+                // Strip Integrations live state + "shared" badge so the crumb is the stable card name.
                 const sc = sum.cloneNode(true);
                 sc.querySelectorAll('.integ-state, .integ-badge, .tooltip').forEach(n => n.remove());
                 crumbs.push(ssTidy(sc.textContent));
@@ -37464,11 +36141,8 @@ function ssBuildIndex() {
         list.push({ label: cell.dataset.ssLabel, tip: '', crumbs: ssCrumbs(cell, names), el: cell });
     });
 
-    // Protections cards use .protections-name + a sibling control block, not .form-row, so without
-    // this pass the entire over-voltage/over-current ladder — the safety settings people go looking
-    // for by name — is unsearchable. One card can hold several parameters (the Over-Voltage Ladder
-    // holds six), in which case it leads with a title row that owns no control; that title becomes
-    // the last breadcrumb so the results stay distinguishable.
+    // Protections cards use .protections-name, not .form-row. A multi-parameter card leads with a title row
+    // that owns no control; it becomes the last breadcrumb so results stay distinguishable.
     document.querySelectorAll('#settings .protections-param').forEach(card => {
         const rows = Array.from(card.querySelectorAll(':scope > .protections-name'));
         const ctlFor = r => {
@@ -37665,10 +36339,8 @@ function ssNavigate(entry) {
     ssRevealEl(entry.el);
 }
 
-// Reveal one Setup element: switch every enclosing tab/panel to it, scroll it into view, flash it.
-// Split out of ssNavigate so dialogs that name a setting on another tab can take the user there.
-// Ancestor walk mirrors the goTo* helpers: collect switcher calls innermost-first, run them
-// outermost-first so main tab, sub-tab, alt-tab and inner panel are all set before scrolling.
+// Also used by dialogs that name a setting on another tab. Switcher calls are collected innermost-first
+// and run outermost-first, so every enclosing tab/panel is set before scrolling.
 function ssRevealEl(row) {
     if (!row) return;
     // Protections cards are display:none under a group pill that excludes them, so a jump into a
@@ -37711,9 +36383,8 @@ function ssRevealEl(row) {
     });
 }
 
-// Phone trigger: pull down while the page is already scrolled to the top. Badge descends as
-// feedback; release past the threshold opens search. The non-passive touchmove listener is
-// attached only for the duration of an armed touch so normal scrolling never pays for it.
+// Phone trigger: pull down at page top, release past the threshold. The non-passive touchmove listener is
+// attached only for an armed touch so normal scrolling never pays for it.
 function ssInitPull() {
     if (!('ontouchstart' in window)) return;
     const THRESH = 70;
@@ -37776,11 +36447,9 @@ ssInitPull();
 // ================================ END SETTINGS SEARCH ================================
 
 // ================================ APP-USAGE TRACKER ================================
-// Page opens/dwell + button presses, POSTed as deltas to the device /track endpoint
-// (~1/min while visible, plus on hide/close). The device accumulates and uploads to the
-// cloud daily. Keys are page ids / derived button names — adding a page or button needs
-// no registry edit anywhere: pages key off showMainTab/showSubTab args, buttons off a
-// delegated listener. Dwell counts VISIBLE time only (Page Visibility API).
+// Page opens/dwell + button presses, POSTed as deltas to /track (~1/min while visible, plus on hide/close);
+// the device uploads daily. No registry: pages key off showMainTab/showSubTab args, buttons off a delegated
+// listener. Dwell counts VISIBLE time only.
 
 const USAGE_LS_KEY = 'xreg_usage_pending';
 const USAGE_FLUSH_MS = 60000;
@@ -37846,10 +36515,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
-// Key derivation shared by the click listener and the stats card's reverse label lookup.
-// Priority: data-an > onclick fn(+up to two leading string args — the 2nd arg keeps panel
-// switchers like showAltTab from merging into one key) > submitMessage's form-row input
-// name > element id. Returns null for tab switches (page tracking covers those).
+// Priority: data-an > onclick fn + up to two leading string args (the 2nd keeps showAltTab panels apart)
+// > submitMessage's form-row input name > element id. null for tab switches (page tracking covers them).
 function usageKeyFor(el) {
     if (el.classList.contains('sub-tab') || el.classList.contains('main-tab')) return null;
     let key = el.getAttribute('data-an');
@@ -38211,14 +36878,9 @@ function solarLedgerClearConfirm() {
 }
 
 // ==================== LIMIT PANEL (header "What is limiting charging") ====================
-// Names the one thing setting charging (CSV4 ctrlLimiter), the number it is held against, and
-// where that number is set. Codes 1-9 hold output DOWN; code 11 (min field floor) holds it UP, and
-// code 10 (manual) means the operator's own PWM setting is the answer.
-// Read-only; every value comes from the CSV1/CSV2/CSV4 caches and the
-// settings echoes, so it re-renders on each arriving frame while open. Only the two sentence blocks
-// reserve space (two lines tall, so a limiter flip does not twitch the box); a block with nothing to
-// say for this limiter is display:none and the panel is genuinely shorter for it. The severity tone
-// (--why-tone) is set on the panel here and colours the header dot and the verdict's left bar.
+// Names the one thing setting charging (CSV4 ctrlLimiter), the number it is held against, and where it is set.
+// Codes 1-9 hold output DOWN; 11 (min field floor) holds it UP; 10 (manual) = the operator's PWM is the answer.
+// Only the two sentence blocks reserve space (two lines, so a limiter flip doesn't twitch the box).
 let _whyOpen = false;
 let _whyOpener = null;
 let _whyCsv1AtMs = 0;
@@ -38239,9 +36901,8 @@ function whyPanelOpen(opener) {
     document.addEventListener('keydown', _whyKeydown);
     const p = document.getElementById('why-panel');
     if (p) {
-        // Draggable by its header (idempotent; makePanelDraggable no-ops below 600px, where the CSS
-        // makes it a bottom sheet). A placement survives close/reopen — the element is never rebuilt —
-        // so only re-clamp it, and leave an un-dragged panel to the CSS top-centre anchor.
+        // makePanelDraggable is idempotent and no-ops below 600px (CSS bottom sheet). A dragged placement survives
+        // close/reopen, so only re-clamp it; an un-dragged panel keeps the CSS top-centre anchor.
         makePanelDraggable(p, document.getElementById('why-drag-handle'));
         if (p._userDragged) positionFloatingPanel(p);
         p.focus({ preventScroll: true });
@@ -38264,11 +36925,9 @@ function _whyOwnVoltageSetting() {
     return parseFloat(getEchoText(id, ''));
 }
 
-// Who published the DVCC charge limits. Identity is collected passively from PGN 60928 / 126996 and is
-// often absent (nothing can be requested with transmit off), so every part degrades on its own: a named
-// manufacturer, else a bare bus address, else no attribution. Worth the words because on a Victron system
-// the publisher is usually a Cerbo GX passing on its own merged DVCC settings, NOT the battery's BMS —
-// and that decides whether the owner goes to the GX or to the battery to change the number.
+// Publisher identity is collected passively (PGN 60928 / 126996) and often absent, so each part degrades on
+// its own. On a Victron system the publisher is usually a Cerbo GX passing on DVCC, NOT the BMS, which
+// decides whether the owner goes to the GX or the battery to change the number.
 function _whyLimitAuthority(c2) {
     const src = Number(c2.dvccRxSrcAddr);
     const mfg = Number(c2.dvccAuthMfg || 0);
@@ -38286,10 +36945,9 @@ function _whyLimitAuthority(c2) {
     return 'Sent by an external charge authority, not set here — a battery BMS, or a gateway passing on its charge limits.';
 }
 
-// Block C — every ceiling on alternator current, each in alternator amps, the one the firmware says is binding
-// (ctrlLimiter) marked. Mirrors the firmware min-select: RPM table − temperature, warm-up ramp, battery charge
-// limit + house, external CCL (+ house with a shunt). Rows only appear/disappear on real events; the temperature
-// row has hysteresis so a penalty hovering near zero cannot flicker it.
+// Block C — every ceiling on alternator current (alternator amps), the binding one (ctrlLimiter) marked. Mirrors
+// the firmware min-select: RPM table − temperature, warm-up ramp, battery limit + house, external CCL (+ house
+// with a shunt). The temperature row has hysteresis so a penalty hovering near zero cannot flicker it.
 let _whyTempRowOn = false;
 function _whyRenderLimits(lim, d) {
     const box = document.getElementById('why-lims');
@@ -38365,9 +37023,8 @@ function whyPanelRender() {
     const cap  = f(c1, 'rpmCeilingAmps', 100), bcur = f(c1, 'Bcur', 100);
     set('why-rpm', rpmTxt(rpm)); set('why-alt', amps(alt)); set('why-duty', amps(duty));
 
-    // Alternator = Battery + House, from the ROUNDED tiles so the three always add up on screen. "House" is
-    // alternator minus battery, i.e. house loads minus any other charge source — the same quantity the
-    // firmware adds to battery-side limits (loadOffsetFilt). Negative = other sources out-produce the loads.
+    // From the ROUNDED tiles so Alternator = Battery + House adds up on screen. House = alt − batt (firmware
+    // loadOffsetFilt); negative = other sources out-produce the loads.
     const haveBatt = Number.isFinite(bcur) && Number.isFinite(alt) && !document.body.classList.contains('no-batt-current');
     const altR = Math.round(alt), battR = Math.round(bcur), houseR = altR - battR;
     document.querySelectorAll('#why-flow .why-batt-part').forEach(el => el.classList.toggle('why-gone', !haveBatt));
@@ -38461,10 +37118,8 @@ function whyPanelRender() {
                       + 'restore temperature, engine-speed, battery and current protection.';
                 break;
             case 11: {
-                // The floor is the ONLY limit that raises output. Which of the two floors is binding is
-                // read off the published value rather than re-derived: the firmware already merged the
-                // scalar into the per-speed value (getMinimumFieldForRPM) and added the copper-temperature
-                // correction, so the scalar owns it only when the enforced floor still equals the setting.
+                // Which floor binds is read off the published value, not re-derived: firmware merges the scalar into
+                // getMinimumFieldForRPM and adds copper-temp correction, so the scalar owns it only if they still match.
                 const floorPct = f(c2, 'fieldDutyFloor', 100);
                 const minSet = parseFloat(getEchoText('MinDuty_echo', ''));
                 const scalarOwns = Number.isFinite(floorPct) && Number.isFinite(minSet) && Math.abs(floorPct - minSet) < 0.05;
@@ -38477,12 +37132,9 @@ function whyPanelRender() {
                 break;
             }
             case 12: {
-                // Deliberate zero-current command. Which of the two is answering matters: Maintain is a
-                // manual override that suspends the charge-stage machine, zero-current float is the float
-                // stage doing its job with the rebulk criteria still armed. Tested as "stage is Float"
-                // rather than "stage is Maintain": zeroFloatActive requires TargetVoltageMode == 0, so
-                // Float is the only stage it can show, while Maintain-with-Target-Voltage displays as
-                // TARGET_V and would fail a === 5 test.
+                // Maintain (manual override, stage machine suspended) vs zero-current float (rebulk still armed).
+                // Tested as "stage is not Float": zeroFloatActive requires TargetVoltageMode == 0 so it only shows as
+                // Float, while Maintain-with-Target-Voltage displays as TARGET_V and would fail a === 5 test.
                 const maint = Number(gLastChargeStage) !== 3;
                 head = (maint ? 'Maintain Mode' : 'Zero-current float')
                      + ' — battery held at 0 A on purpose. The alternator is carrying ' + amps(alt)
@@ -38534,12 +37186,9 @@ function whyPanelRender() {
             default:
                 head = 'Waiting for data';
         }
-        // Severity tone. Teal = nothing to fix: nothing limiting (0), the min-field floor (11) and the
-        // Hi->Lo glide (14), which both push output UP; the deliberate zero-current command (12); and the
-        // warm-up ramp (13), which is on its way up by itself. Red = a protection is cutting output (6).
-        // Amber = a real ceiling the owner can act on, Manual mode (10) included since its
-        // protections are off, and the board's own field ceilings (15 10 A, 16 drive heat).
-        // Grey stays for the no-data / not-charging states, which never reach here.
+        // Teal = nothing to fix (0; 11 and 14 push output UP; 12 deliberate zero-current; 13 ramping up itself).
+        // Red = a protection is cutting output (6). Amber = a real ceiling the owner can act on, incl. Manual (10,
+        // protections off) and the board ceilings (15 10 A, 16 drive heat). Grey = no-data / not charging.
         const TONE_OK = [0, 11, 12, 13, 14];
         tone = TONE_OK.indexOf(lim) >= 0 ? 'tone-ok'
              : (lim === 6) ? 'tone-alarm'
@@ -38556,9 +37205,8 @@ function whyPanelRender() {
         panel.classList.toggle('tone-alarm', tone === 'tone-alarm');
     }
 
-    // Block D — the external authority's limits, only while one is in charge (DVCC following = 3).
-    // Fully removed otherwise: dvccState changes on a real event, not frame to frame, so collapsing it
-    // costs no stability and it was the whole of the panel's dead space.
+    // Block D — external authority's limits, only while DVCC is following (3). Collapsing it costs no stability:
+    // dvccState changes on real events, not frame to frame.
     const extOn = !!c1 && running && Number(c2.dvccState) === 3;
     hide('why-ext', !extOn);
     if (extOn) {

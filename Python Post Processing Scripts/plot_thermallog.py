@@ -33,13 +33,7 @@ plt.rcParams.update({
     "legend.handleheight": 1.5,
 })
 
-# ---------------------------------------------------------------------------
-# 1. File selector
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 2. Load and parse
-# ---------------------------------------------------------------------------
+# ===== Load and parse =====
 path = pick_file(prefix="thermallog_", title="Select Thermal Log")
 if not path:
     raise SystemExit("No file selected.")
@@ -47,7 +41,6 @@ if not path:
 basename = os.path.splitext(os.path.basename(path))[0]
 print(f"Loading: {path}")
 
-# Parse CONST row
 constants = {}
 with open(path) as f:
     for line in f:
@@ -61,15 +54,13 @@ with open(path) as f:
 kp       = constants.get("kp",       float("nan"))
 ki       = constants.get("ki",       float("nan"))
 lookahead = constants.get("lookahead", float("nan"))
-# limit/warn/crit added to CONST 2026-06-26 so the limit + protection-trip lines can be
-# drawn. Older logs omit them (NaN) — the reference-line code below skips on NaN.
+# CONST keys absent from older logs read as NaN; the code below skips on NaN.
 temp_limit = constants.get("limit", float("nan"))
 temp_warn  = constants.get("warn",  float("nan"))
 temp_crit  = constants.get("crit",  float("nan"))
-# kidownfrac added to CONST 2026-06-26 (hybrid asymmetric below-setpoint integral bleed ratio).
-# Older logs omit it (NaN).
+# kidownfrac: hybrid asymmetric below-setpoint integral bleed ratio.
 kidownfrac = constants.get("kidownfrac", float("nan"))
-# slopewin added to CONST 2026-06-26 (tunable slope backward-difference window, s). Older logs omit it.
+# slopewin: slope backward-difference window (s).
 slopewin = constants.get("slopewin", float("nan"))
 const_label = f"Kp={kp}  Ki={ki}  Lookahead={lookahead}s"
 if slopewin == slopewin:  # not NaN
@@ -104,7 +95,7 @@ numeric_cols = [
     "duty_pct", "RPM", "battV", "measAmps_A", "penaltyAmps_A", "flags",
     "chargeStageDisplay", "outerP", "outerI", "lookahead", "impliedPenalty",
     "antiWindupFired", "thermalSlope_F_sec",
-    "freezeWhy", "penaltyRaw_A", "iCeil_A"  # iCeil_A repurposed from holdEst_A 2026-06-26; iCeil<outerI = clamp deleting earned hold
+    "freezeWhy", "penaltyRaw_A", "iCeil_A"  # iCeil<outerI = clamp deleting earned hold
 ]
 
 for col in numeric_cols:
@@ -122,7 +113,6 @@ else:
     df["t_plot"] = df["t_ms"]
     time_label = "Time (ms)"
 
-# Decode flags and stage
 flags = pd.to_numeric(df["flags"], errors="coerce").fillna(0).astype("int64")
 df["chargeStageDisplay"] = pd.to_numeric(df["chargeStageDisplay"], errors="coerce").fillna(0).astype("int64")
 
@@ -130,9 +120,7 @@ df["f_tempPIDActive"] = ((flags // (2**0)) % 2).astype(int)
 df["f_autoMode"]      = ((flags // (2**4)) % 2).astype(int)
 df["f_shutdown"]      = ((flags // (2**5)) % 2).astype(int)
 
-# ---------------------------------------------------------------------------
-# 3. Mode-change events
-# ---------------------------------------------------------------------------
+# ===== Mode-change events =====
 THERMAL_MODE_COLORS = {
     "shutdown":   "#c62828",
     "bulk":       "#2e7d32",
@@ -176,18 +164,13 @@ def mode_label_color(row):
 
     return "IDLE", THERMAL_MODE_COLORS["idle"]
 
-# ---------------------------------------------------------------------------
-# 4. State strip
-#    - Color-coded mode timeline bar
-#    - antiWindupFired as vertical red ticks
-# ---------------------------------------------------------------------------
+# ===== State strip: mode timeline bar + antiWindupFired red ticks =====
 def draw_state_strip(ax, df, state_changes):
     ax.set_ylim(0, 3)
     ax.set_yticks([])
     ax.set_xlim(df["t_plot"].iloc[0], df["t_plot"].iloc[-1])
     ax.set_xlabel(time_label, fontsize=13)
 
-    # Build mode segments
     boundaries = state_changes + [len(df) - 1]
     prev_t = df["t_plot"].iloc[0]
     prev_row = df.iloc[0]
@@ -232,9 +215,7 @@ def save_fig(fig, suffix):
     print(f"Saved: {out}")
 
 
-# ---------------------------------------------------------------------------
-# Shared style
-# ---------------------------------------------------------------------------
+# ===== Shared style =====
 GRID_KW = dict(alpha=0.4, linewidth=0.7)
 
 _checkbox_refs = []  # keep CheckButtons alive — GC drops them without this
@@ -264,9 +245,7 @@ def _make_checkbox_panel(fig, lines):
     _checkbox_refs.append(check)
     return check
 
-# ---------------------------------------------------------------------------
-# PLOT 1 — Temperature control & penalty output
-# ---------------------------------------------------------------------------
+# ===== PLOT 1 — Temperature control & penalty output =====
 fig1 = plt.figure(figsize=(16, 8), num="Plot 1 — Temp Control & Penalty")
 gs1  = gridspec.GridSpec(2, 1, height_ratios=[5, 1], hspace=0.08)
 ax1a = fig1.add_subplot(gs1[0])
@@ -309,27 +288,20 @@ draw_state_strip(ax1s, df, state_changes)
 fig1.suptitle(f"Temp Control & Penalty  |  {const_label}")
 # save_fig(fig1, "plot1_temp")
 
-# ---------------------------------------------------------------------------
-# PLOT 2 — PID term decomposition
-# ---------------------------------------------------------------------------
+# ===== PLOT 2 — PID term decomposition =====
 fig2 = plt.figure(figsize=(16, 8), num="Plot 2 — PID Term Decomposition")
 gs2  = gridspec.GridSpec(2, 1, height_ratios=[5, 1], hspace=0.08)
 ax2  = fig2.add_subplot(gs2[0])
 ax2s = fig2.add_subplot(gs2[1], sharex=ax2)
 fig2.subplots_adjust(right=0.80)
 
-# Display flip to match the dashboard decomposition plot: the CSV logs penalty sign
-# (+ = cut amps); plotted here as effect on the current target (+ = more amps).
-# The logged P term includes the look-ahead share — subtracting it makes the three
-# series additive: present + lookahead + integrator = total penalty. impliedPenalty
-# (voltage-loop info) is logged but deliberately not plotted on this thermal view.
-# thermalSlope is °F/s, not an amps contribution — it keeps its own sign.
+# Sign flipped to match the dashboard: CSV + = cut amps, plotted + = more amps. Logged P includes the
+# look-ahead, so subtracting it makes present + lookahead + integrator = total. thermalSlope (°F/s) keeps its sign.
 ax2.plot(df["t_plot"], -(df["outerP"] - df["lookahead"]), color="#1565c0", lw=2.2, label="present temp (P)")
 ax2.plot(df["t_plot"], -df["lookahead"],       color="#2e7d32", lw=2.2, label="look-ahead")
 ax2.plot(df["t_plot"], -df["outerI"],          color="#f9a825", lw=2.2, label="integrator (I)")
-# Integral ceiling cap−FF (repurposed iCeil_A column, 2026-06-26). When the yellow integrator
-# trace is pushed DOWN onto this dashed line, the I≤cap−FF clamp is deleting earned holding
-# integral (RPM dip / FF spike) — watch the temperature axis for a reheat on recovery.
+# Integrator pushed DOWN onto this line = the I<=cap−FF clamp deleting earned holding integral (RPM dip /
+# FF spike); expect a reheat on recovery.
 if "iCeil_A" in df.columns and df["iCeil_A"].notna().any():
     ax2.plot(df["t_plot"], -df["iCeil_A"], color="#9c27b0", lw=1.3, linestyle="--",
              alpha=0.8, label="integral ceiling (cap−FF)")
@@ -360,9 +332,7 @@ draw_state_strip(ax2s, df, state_changes)
 fig2.suptitle(f"PID Term Decomposition  |  {const_label}")
 # save_fig(fig2, "plot2_pid")
 
-# ---------------------------------------------------------------------------
-# PLOT 3 — Constraint context
-# ---------------------------------------------------------------------------
+# ===== PLOT 3 — Constraint context =====
 fig3 = plt.figure(figsize=(16, 8), num="Plot 3 — Constraint Context")
 gs3  = gridspec.GridSpec(2, 1, height_ratios=[5, 1], hspace=0.08)
 ax3  = fig3.add_subplot(gs3[0])
@@ -390,11 +360,7 @@ draw_state_strip(ax3s, df, state_changes)
 fig3.suptitle(f"Constraint Context  |  {const_label}")
 # save_fig(fig3, "plot3_constraints")
 
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# PLOT 4 — Battery Voltage & RPM
-# ---------------------------------------------------------------------------
+# ===== PLOT 4 — Battery Voltage & RPM =====
 fig4 = plt.figure(figsize=(16, 8), num="Plot 4 — Battery Voltage & RPM")
 gs4  = gridspec.GridSpec(2, 1, height_ratios=[5, 1], hspace=0.08)
 ax4a = fig4.add_subplot(gs4[0])
@@ -402,11 +368,9 @@ ax4b = ax4a.twinx()
 ax4s = fig4.add_subplot(gs4[1], sharex=ax4a)
 fig4.subplots_adjust(right=0.80)
 
-# Left axis: battery voltage
 ax4a.plot(df["t_plot"], df["battV"],
           color="#1565c0", lw=2.5, label="battV")
 
-# Right axis: RPM / 100
 ax4b.plot(df["t_plot"], df["RPM"] / 100.0,
           color="#f9a825", lw=2.2, label="RPM/100")
 
@@ -416,7 +380,6 @@ ax4b.set_ylabel("RPM / 100", color="#f9a825")
 ax4a.grid(**GRID_KW)
 plt.setp(ax4a.get_xticklabels(), visible=False)
 
-# Combined legend (same pattern as Plot 1)
 lines4  = ax4a.get_lines() + ax4b.get_lines()
 labels4 = [l.get_label() for l in lines4]
 _leg4 = ax4b.legend(lines4, labels4, loc="upper left")
@@ -429,14 +392,10 @@ draw_state_strip(ax4s, df, state_changes)
 fig4.suptitle(f"Battery Voltage & RPM  |  {const_label}")
 # save_fig(fig4, "plot4_batt_rpm")
 
-# ---------------------------------------------------------------------------
-# Linked x-axis zoom — syncs all plot windows when any one is zoomed/panned.
-# Registers xlim_changed on the primary (top) axes of each figure; sub-axes
-# within a figure already share x via sharex so only one per figure is needed.
-# ---------------------------------------------------------------------------
+# ===== Linked x-axis zoom (one primary axis per figure; sub-axes already sharex) =====
 _all_primary_axes = [ax1a, ax2, ax3, ax4a]
 _all_figs         = [fig1, fig2, fig3, fig4]
-_syncing = [False]   # mutable container so the closure can write to it
+_syncing = [False]
 
 def _on_xlim_changed(changed_ax):
     if _syncing[0]:
@@ -455,9 +414,7 @@ def _on_xlim_changed(changed_ax):
 for _ax in _all_primary_axes:
     _ax.callbacks.connect("xlim_changed", _on_xlim_changed)
 
-# ---------------------------------------------------------------------------
-# File Trimmer
-# ---------------------------------------------------------------------------
+# ===== File Trimmer =====
 _trim_total_s = df["t_s"].iloc[-1]
 
 def _fmt_trim_t(t):
@@ -502,6 +459,11 @@ def _do_trim(event=None):
         for _tln in _lines[:_header_idx]:
             _tf.write(_tln)
         _tf.write(_header_line + "\n")
+        # The firmware writes CONST on the line AFTER the header, so the parse above read it as
+        # a data row (ts_ms "CONST" -> NaN) and dropped it.
+        for _tln in _lines[_header_idx + 1:]:
+            if _tln.startswith("CONST"):
+                _tf.write(_tln.rstrip("\r\n") + "\n")
         _tout.to_csv(_tf, index=False, header=False, columns=_col_names)
     _trim_status_lbl.set_text(f"Saved: {_tname}  ({len(_tout)} rows)")
     fig1.canvas.draw_idle()
@@ -523,9 +485,7 @@ _trim_status_lbl = fig1.text(
 fig1.text(0.03, 0.043, "Trim file:", fontsize=10, color="#1a1a1a",
           fontweight="bold", verticalalignment="center")
 
-# ---------------------------------------------------------------------------
 print("Tip: use the checkboxes on the right of each plot to show/hide series.")
-# Grab-and-drag panning on every window (plotlayout.enable_pan).
 for _pfig in _all_figs:
     enable_pan(_pfig)
 

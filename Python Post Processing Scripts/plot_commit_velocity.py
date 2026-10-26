@@ -59,7 +59,6 @@ deletions  = [c["deletions"] for c in commits]
 net        = [c["insertions"] - c["deletions"] for c in commits]
 cumulative = list(np.cumsum(net))
 
-# Color bars: green if net positive, red-ish if net negative
 bar_colors = ["#2ecc71" if n >= 0 else "#e74c3c" for n in net]
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
@@ -94,12 +93,10 @@ ax2.set_ylabel("Cumulative net lines")
 ax2.set_xlabel("Commit date")
 ax2.grid(alpha=0.3)
 
-# X-axis formatting
 ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
 ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
 plt.setp(ax2.xaxis.get_majorticklabels(), rotation=35, ha="right", fontsize=9)
 
-# Summary box
 total_ins = sum(insertions)
 total_del = sum(deletions)
 summary = (

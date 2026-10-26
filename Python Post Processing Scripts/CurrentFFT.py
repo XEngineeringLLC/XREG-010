@@ -9,9 +9,7 @@ from pathlib import Path
 
 AMPS_PER_VOLT = 250.0   # sensor scale factor — adjust to match your current probe
 
-# =========================
-# Sensor conversion
-# =========================
+# ===== Sensor conversion =====
 def volts_to_amps(volts: np.ndarray) -> np.ndarray:
     """
     AC-coupled current signal:
@@ -20,9 +18,7 @@ def volts_to_amps(volts: np.ndarray) -> np.ndarray:
     return volts * AMPS_PER_VOLT
 
 
-# =========================
-# File picker
-# =========================
+# ===== File picker =====
 def pick_csv_file() -> str:
     root = Tk()
     root.withdraw()
@@ -44,9 +40,7 @@ def pick_csv_file() -> str:
     return file_path
 
 
-# =========================
-# CSV loader
-# =========================
+# ===== CSV loader =====
 def load_csv_auto(csv_path: str) -> pd.DataFrame:
     for sep in ["\t", ",", ";"]:
         try:
@@ -67,9 +61,7 @@ def load_csv_auto(csv_path: str) -> pd.DataFrame:
     return df
 
 
-# =========================
-# FFT
-# =========================
+# ===== FFT =====
 def compute_fft(time_s: np.ndarray, amps: np.ndarray):
     mask = np.isfinite(time_s) & np.isfinite(amps)
     time_s = time_s[mask]
@@ -121,9 +113,7 @@ def find_top_frequencies(freqs: np.ndarray, amplitudes: np.ndarray, fmax: float,
     }).sort_values("frequency_hz").reset_index(drop=True)
 
 
-# =========================
-# Plotting
-# =========================
+# ===== Plotting =====
 def plot_time_domain(time_s: np.ndarray, amps: np.ndarray, file_name: str):
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.plot(time_s, amps, linewidth=1)
@@ -169,9 +159,7 @@ def plot_frequency_domain_full(freqs: np.ndarray, amplitudes: np.ndarray, file_n
     fig.tight_layout()
     return fig, ax
 
-# =========================
-# Main
-# =========================
+# ===== Main =====
 def main():
     csv_path = pick_csv_file()
     if not csv_path:

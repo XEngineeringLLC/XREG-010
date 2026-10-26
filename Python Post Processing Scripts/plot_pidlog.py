@@ -47,13 +47,7 @@ plt.rcParams.update({
     "legend.handleheight": 1.5,
 })
 
-# ---------------------------------------------------------------------------
-# 1. File selector
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 2. Load and parse
-# ---------------------------------------------------------------------------
+# ===== Load and parse =====
 path = pick_file(prefix="pidlog_", title="Select PID Log")
 if not path:
     raise SystemExit("No file selected.")
@@ -61,26 +55,19 @@ if not path:
 basename = os.path.splitext(os.path.basename(path))[0]
 print(f"Loading: {path}")
 
-# Robust header search.
-#
-# The ESP32 chunked response uses a fixed line buffer. If that buffer is too
-# small, the comment block and header row get concatenated on the same physical
-# line. We scan every line for "ts_ms", then slice from that token onward.
-#
-# FIX: the file is TAB-delimited. Split on \t (falling back to comma so the
-# script still works if someone saves a comma-separated variant).
+# A too-small ESP32 line buffer can glue the comment block onto the header line, so the header starts
+# at the first "ts_ms" token wherever it appears.
 
 with open(path, encoding="utf-8", errors="replace") as _f:
     _lines = _f.readlines()
 
 _header_idx  = None
 _header_line = None
-_sep         = "\t"          # default; will be confirmed below
+_sep         = "\t"
 
 for _i, _raw in enumerate(_lines):
     if "ts_ms" in _raw:
         _header_idx  = _i
-        # Drop anything before "ts_ms" (e.g. a truncated comment fragment)
         _header_line = _raw[_raw.find("ts_ms"):].strip()
         break
 
@@ -93,8 +80,6 @@ if _header_idx is None:
 
 print(f"Header found at file line {_header_idx}: {_header_line[:80]}...")
 
-# ── FIX 1: choose the right delimiter ──────────────────────────────────────
-# Prefer tab if there are tabs in the header; fall back to comma.
 if "\t" in _header_line:
     _sep = "\t"
 else:
@@ -106,14 +91,8 @@ print(f"Delimiter: {repr(_sep)}  |  Columns ({len(_col_names)}): {_col_names}")
 from io import StringIO
 _data_text = "".join(_lines[_header_idx + 1:])
 
-# ── FIX 3: recover a merged header+first-data line ──────────────────────────
-# Some downloaded pidlogs lose the newline after the header: the header's last
-# column name gets its tail chopped and the first data row is glued straight
-# onto it (e.g. "...,voltLoopIntervalMs,inaI971296,6,1,12.586,..."). That makes
-# the header split produce 2N-1 tokens (N-1 clean names + 1 garbled name+ts_ms +
-# N-1 numeric values), and pandas chokes on the duplicate numeric "names".
-# Detect that case, restore the canonical firmware header, and peel the embedded
-# first data row back out (ts_ms is the trailing integer on the garbled token).
+# Some pidlogs lose the newline after the header, gluing the first data row onto a chopped last column
+# name (2N-1 tokens). Restore the canonical header and peel the first row back out.
 import re
 # Canonical pidlog header — must match the firmware header in 3_functions.ino.
 EXPECTED_HEADER = [
@@ -150,7 +129,7 @@ if _sep == "," and len(_col_names) != _N:
 
 df = pd.read_csv(
     StringIO(_data_text),
-    sep=_sep,           # ← FIX 1: was always comma
+    sep=_sep,
     names=_col_names,
     on_bad_lines="skip"
 )
@@ -160,10 +139,6 @@ if "ts_ms" not in df.columns:
         f"ERROR: 'ts_ms' not in parsed columns: {list(df.columns)}"
     )
 
-# ── FIX 2: normalise column names ──────────────────────────────────────────
-# The firmware logs "battV_filt_V" but the rest of the
-# script uses the shorter alias "battV_filt".
-# Rename once here so every downstream reference works without change.
 _rename = {}
 for _col in list(df.columns):
     if _col == "battV_filt_V":
@@ -208,13 +183,11 @@ else:
     df["t_plot"] = df["t_ms"]
     time_label = "Time (ms)"
 
-# Derived signals
 df["pid_saturation"] = (df["pidUnsatOutput"] - df["pidOutput"]).abs()
 df["duty_clamp"]     = (df["dutyRequest"] - df["dutyApplied"]).abs()
 
-# Gain label — supports both old (gainKp) and new (innerKp) column names. innerKp/Ki/Kd are the
-# EFFECTIVE gains handed to the PID, so innerKi moves whenever the oscillation damper derates:
-# report the span, never row 1 alone, or a mid-log derate reads as a constant gain.
+# innerKp/Ki/Kd are the EFFECTIVE gains and innerKi moves when the oscillation damper derates: report
+# the span, never row 1 alone. Old logs name them gainKp/Ki/Kd.
 def _gain_label(cols):
     for c in cols:
         if c in df.columns:
@@ -240,8 +213,7 @@ df["TargetVoltageMode"]         = _to_int("TargetVoltageMode")
 
 _flags_num = pd.to_numeric(df["flags"], errors="coerce").fillna(0)
 df["f_govBypass"] = (_flags_num // 16 % 2).astype(int)
-df["f_cvBatt"]    = (_flags_num // 32 % 2).astype(int)   # bit5 (§G): inner loop regulating BATTERY current
-                                                          # (pidInput = battI, not measAmps) — see shading below
+df["f_cvBatt"]    = (_flags_num // 32 % 2).astype(int)   # bit5 (§G): inner loop regulating BATTERY current (pidInput = battI)
 
 _ov_num = pd.to_numeric(df["ovFlags"] if "ovFlags" in df.columns else pd.Series(0, index=df.index), errors="coerce").fillna(0)
 df["f_fastOvActive"]  = (_ov_num       % 2).astype(int)   # bit 0
@@ -250,9 +222,7 @@ df["f_hardClamp"]     = (_ov_num // 4  % 2).astype(int)   # bit 2
 df["f_iExcess"]       = (_ov_num // 8  % 2).astype(int)   # bit 3
 df["f_loadDump"]      = (_ov_num // 16 % 2).astype(int)   # bit 4
 
-# ---------------------------------------------------------------------------
-# 3. Stage colors and mode helpers
-# ---------------------------------------------------------------------------
+# ===== Stage colors and mode helpers =====
 STAGE_COLORS = {
     0: ("#777777", "NONE"),
     1: ("#2e7d32", "BULK"),
@@ -307,9 +277,7 @@ state_changes = df.index[
 if state_changes and state_changes[0] == 0:
     state_changes = state_changes[1:]
 
-# ---------------------------------------------------------------------------
-# 4. Reusable drawing helpers
-# ---------------------------------------------------------------------------
+# ===== Reusable drawing helpers =====
 GRID_KW = dict(alpha=0.4, linewidth=0.7)
 
 
@@ -321,7 +289,6 @@ def draw_state_strip(ax, df, state_changes):
 
     span = df["t_plot"].iloc[-1] - df["t_plot"].iloc[0]
 
-    # Stage bar — top portion of the strip
     boundaries = state_changes + [len(df) - 1]
     prev_t   = df["t_plot"].iloc[0]
     prev_row = df.iloc[0]
@@ -339,7 +306,6 @@ def draw_state_strip(ax, df, state_changes):
             prev_row = df.loc[idx]
         prev_t = t
 
-    # VLoop ticks — bottom portion, dense field: bold near-black label
     vloop_rows = df[df["voltageLoopRanThisTick"] == 1]
     for t in vloop_rows["t_plot"]:
         ax.axvline(x=t, ymin=0.0, ymax=0.30,
@@ -388,9 +354,7 @@ def make_fig(title_suffix, num):
     return fig, ax, axs
 
 
-# ---------------------------------------------------------------------------
-# PLOT 1 — Voltage: what the voltage loop sees
-# ---------------------------------------------------------------------------
+# ===== PLOT 1 — Voltage: what the voltage loop sees =====
 fig1, ax1, ax1s = make_fig("Plot 1 — Voltage Loop Input", "Plot 1 — Voltage")
 ax1b = ax1.twinx()
 
@@ -427,9 +391,7 @@ for t in df.loc[df["enteringTargetVoltageMode"] == 1, "t_plot"]:
 
 # save_fig(fig1, "plot1_voltage")
 
-# ---------------------------------------------------------------------------
-# PLOT 2 — CV loop
-# ---------------------------------------------------------------------------
+# ===== PLOT 2 — CV loop =====
 fig2, ax2, ax2s = make_fig("Plot 2 — CV Loop (Icv, cv_I, limits)  [NOTE: post-OV-cap uTargetAmps not logged]", "Plot 2 — CV Loop")
 ax2b = ax2.twinx()
 
@@ -460,9 +422,7 @@ for t in df.loc[df["voltageLoopRanThisTick"] == 1, "t_plot"]:
 
 # save_fig(fig2, "plot2_outer_loop")
 
-# ---------------------------------------------------------------------------
-# PLOT 3 — Output current PID internals
-# ---------------------------------------------------------------------------
+# ===== PLOT 3 — Output current PID internals =====
 fig3 = plt.figure(figsize=(18, 10), num="Plot 3 — Output Current PID")
 gs3  = gridspec.GridSpec(3, 1, height_ratios=[3, 2, 0.5], hspace=0.10)
 ax3a = fig3.add_subplot(gs3[0])
@@ -518,7 +478,6 @@ _h3b, _ = ax3b.get_legend_handles_labels()
 _leg3b = ax3b.legend(loc="upper left")
 _leg3b.set_draggable(True)
 
-# One checkbox panel for both ax3a and ax3b lines
 _h3a_lines = [l for l in ax3a.get_lines() if not l.get_label().startswith("_")]
 _h3b_lines = [l for l in ax3b.get_lines() if not l.get_label().startswith("_")]
 _cb3 = _make_checkbox_panel(fig3, _h3a_lines + _h3b_lines)
@@ -531,9 +490,7 @@ draw_state_strip(ax3s, df, state_changes)
 
 # save_fig(fig3, "plot3_inner_pid")
 
-# ---------------------------------------------------------------------------
-# PLOT 4 — Duty pipeline + actual amps
-# ---------------------------------------------------------------------------
+# ===== PLOT 4 — Duty pipeline + actual amps =====
 fig4, ax4, ax4s = make_fig("Plot 4 — Duty Pipeline & Measured Amps", "Plot 4 — Duty")
 ax4b = ax4.twinx()
 
@@ -565,9 +522,7 @@ draw_state_strip(ax4s, df, state_changes)
 
 # save_fig(fig4, "plot4_duty")
 
-# ---------------------------------------------------------------------------
-# PLOT 5 — Engine RPM
-# ---------------------------------------------------------------------------
+# ===== PLOT 5 — Engine RPM =====
 fig5, ax5, ax5s = make_fig("Plot 5 — Engine RPM", "Plot 5 — RPM")
 
 if "rpm" in df.columns:
@@ -591,12 +546,7 @@ draw_state_strip(ax5s, df, state_changes)
 
 # save_fig(fig5, "plot5_rpm")
 
-# ---------------------------------------------------------------------------
-# PLOT 6 — Protection flags + battery current
-#
-# Diagnoses: which protection layers fired, when, and what the battery
-#            current / load-dump derivative looked like at those moments.
-# ---------------------------------------------------------------------------
+# ===== PLOT 6 — Protection flags + battery current =====
 fig6 = plt.figure(figsize=(18, 9), num="Plot 6 — Protection Flags & Battery Current")
 gs6  = gridspec.GridSpec(3, 1, height_ratios=[3, 1.0, 0.5], hspace=0.10)
 ax6a = fig6.add_subplot(gs6[0])
@@ -632,7 +582,6 @@ _leg6a = ax6a_r.legend(_h6a, [l.get_label() for l in _h6a], loc="upper left")
 _leg6a.set_draggable(True)
 _cb6 = _make_checkbox_panel(fig6, _h6a)
 
-# Red shading where fastOvActive
 _in_ov = False
 _ov_start = None
 for _i, _row in df.iterrows():
@@ -684,10 +633,7 @@ ax6b.grid(**GRID_KW)
 draw_state_strip(ax6s, df, state_changes)
 # save_fig(fig6, "plot6_protection")
 
-# ---------------------------------------------------------------------------
-# PLOT 7 — Loop timing diagnostics (ch1IntervalMs, voltLoopIntervalMs, inaIntervalMs)
-# Only rendered when the new timing columns are present (firmware post-May2026).
-# ---------------------------------------------------------------------------
+# ===== PLOT 7 — Loop timing diagnostics (only when the timing columns are present) =====
 _timing_cols = [c for c in ("ch1IntervalMs", "voltLoopIntervalMs", "inaIntervalMs") if c in df.columns]
 
 if _timing_cols:
@@ -726,14 +672,9 @@ if _timing_cols:
     draw_state_strip(ax7s, df, state_changes)
     ax7.set_xlabel(time_label)
 
-# ---------------------------------------------------------------------------
-# PLOT 8 — iExcess (Group 3) detector: averaged excess vs fire threshold E
-# Only rendered when the detector trace columns are present (firmware post-Jun2026).
-# This is THE validation panel for IExcessTau / IExcessFloorA: confirm mExcessEma
-# stays well below E during a clean high-current hold (ripple averaged out) and
-# crosses E promptly on a real over-current. Shaded bands mark ticks where an
-# iExcess flag was latched (CV bit3 or Bulk bit1 in ovFlags).
-# ---------------------------------------------------------------------------
+# ===== PLOT 8 — iExcess (Group 3) detector: averaged excess vs fire threshold E =====
+# Validates IExcessTau / IExcessFloorA: mExcessEma should stay well below E on a clean high-current
+# hold and cross it promptly on a real over-current.
 _have_iex = ("mExcessEma" in df.columns and "iExcessThreshold" in df.columns)
 if _have_iex:
     fig8, (ax8, ax8s) = plt.subplots(2, 1, figsize=(16, 6),
@@ -764,11 +705,7 @@ if _have_iex:
     draw_state_strip(ax8s, df, state_changes)
     ax8.set_xlabel(time_label)
 
-# ---------------------------------------------------------------------------
-# Linked x-axis zoom — syncs all plot windows when any one is zoomed/panned.
-# Registers xlim_changed on the primary (top) axes of each figure; sub-axes
-# within a figure already share x via sharex so only one per figure is needed.
-# ---------------------------------------------------------------------------
+# ===== Linked x-axis zoom (one primary axis per figure; sub-axes already sharex) =====
 _all_primary_axes = [ax1, ax2, ax3a, ax4, ax5, ax6a]
 _all_figs         = [fig1, fig2, fig3, fig4, fig5, fig6]
 if _timing_cols:
@@ -777,7 +714,7 @@ if _timing_cols:
 if _have_iex:
     _all_primary_axes.append(ax8)
     _all_figs.append(fig8)
-_syncing = [False]   # mutable container so the closure can write to it
+_syncing = [False]
 
 def _on_xlim_changed(changed_ax):
     if _syncing[0]:
@@ -798,9 +735,7 @@ for _ax in _all_primary_axes:
 
 fig1.subplots_adjust(bottom=0.10)
 
-# ---------------------------------------------------------------------------
-# File Trimmer
-# ---------------------------------------------------------------------------
+# ===== File Trimmer =====
 _trim_total_s = df["t_s"].iloc[-1]
 
 def _fmt_trim_t(t):
@@ -866,9 +801,7 @@ _trim_status_lbl = fig1.text(
 fig1.text(0.03, 0.043, "Trim file:", fontsize=10, color="#1a1a1a",
           fontweight="bold", verticalalignment="center")
 
-# ---------------------------------------------------------------------------
 print("Tip: use the checkboxes on the right of each plot to show/hide series.")
-# Grab-and-drag panning on every window (plotlayout.enable_pan).
 for _pfig in _all_figs:
     enable_pan(_pfig)
 

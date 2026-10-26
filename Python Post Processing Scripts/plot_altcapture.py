@@ -43,13 +43,7 @@ AMPS_FLOOR = 1.5     # altAmpsFloorA (A) — floor under the output band
 MIN_DUTY   = 5.0     # altMinDuty (eligibility)
 MIN_BATT_V = 8.0     # ALT_MIN_BATT_V (eligibility)
 
-# ---------------------------------------------------------------------------
-# 1. File selector  (REMINDER: select THERMAL LOGS as input)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 2. Load thermal log
-# ---------------------------------------------------------------------------
+# ===== Load thermal log (REMINDER: select THERMAL LOGS as input) =====
 def load(path):
     ts=[]; tFa=[]; dutya=[]; rpma=[]; vbusa=[]; ampsa=[]
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -195,9 +189,7 @@ for i in range(N):
     last=ts[i]; fRpm[i],fDuty[i],fVbus[i],fAmps[i]=r,d,v,a
 
 
-# ---------------------------------------------------------------------------
-# 3. Detector replay
-# ---------------------------------------------------------------------------
+# ===== Detector replay =====
 NONTEMP = ("rpm","duty","vbus","amps")
 def compute(p):
     full=[False]*N; tempok=[False]*N
@@ -233,9 +225,7 @@ def compute(p):
     return full, tempok, axisok
 
 
-# ---------------------------------------------------------------------------
-# 4. Figure + sliders
-# ---------------------------------------------------------------------------
+# ===== Figure + sliders =====
 fig,(ax1,ax2,ax3)=plt.subplots(3,1,figsize=(15,9.5),sharex=True,
                                gridspec_kw={"height_ratios":[3,3,2]})
 plt.subplots_adjust(left=0.07,right=0.99,top=0.91,bottom=0.42,hspace=0.25)

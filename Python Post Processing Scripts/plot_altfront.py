@@ -77,13 +77,7 @@ X_AXES = {
 }
 
 
-# -----------------------------------------------------------------------------
-# File picker
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Data loader
-# -----------------------------------------------------------------------------
+# ===== Data loader =====
 def load_front(path):
     """Returns (df, source) where source is 0=LEARNED, 1=FIXED.
 
@@ -127,9 +121,7 @@ def source_label(source):
             1: "FIXED (loaded curve)"}.get(source, "unknown")
 
 
-# -----------------------------------------------------------------------------
-# Tab 1 - Overview
-# -----------------------------------------------------------------------------
+# ===== Tab 1 - Overview =====
 def build_overview_figure(df, source, fname):
     fig = plt.figure(figsize=(13, 8))
     fig.suptitle(f"Alternator Steady-State Operating Points - {os.path.basename(fname)}",
@@ -188,9 +180,7 @@ def build_overview_figure(df, source, fname):
     return fig
 
 
-# -----------------------------------------------------------------------------
-# Main window
-# -----------------------------------------------------------------------------
+# ===== Main window =====
 class FrontViewer:
     def __init__(self, df, source, fname):
         self.df     = df
@@ -266,7 +256,6 @@ class FrontViewer:
         def redraw(*_):
             self._redraw_curve()
 
-        # X-axis radio buttons
         tk.Label(ctrl, text="X axis:", bg="#ebebeb", font=("Helvetica", 8),
                  anchor="e", width=11).grid(row=1, column=0, sticky="e", padx=(8, 2))
         xrow = tk.Frame(ctrl, bg="#ebebeb")
@@ -377,9 +366,7 @@ class FrontViewer:
         self.fc_canvas.draw_idle()
 
 
-# -----------------------------------------------------------------------------
-# Entry point
-# -----------------------------------------------------------------------------
+# ===== Entry point =====
 if __name__ == "__main__":
     path = pick_file(prefix="Alternator Health Data", title="Select Alternator Health Export", reminder="Select health export to view:")
     if not path:

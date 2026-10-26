@@ -85,9 +85,8 @@ bool writeFile(fs::FS &fs, const char *path, const char *message) {
   file.flush();
   file.close();
 
-  // Truncated write — LittleFS full or other I/O failure. Delete the partial
-  // file so the next boot reads "no setting" (and Pattern B re-initializes the
-  // default) instead of "" → toFloat()→0.0 → silent zeroing of a critical setting.
+  // Delete a truncated file: a missing file re-seeds the default, a partial one parses "" -> 0.0 and
+  // silently zeroes a critical setting.
   if (written != expected) {
     Serial.printf("writeFile: truncated write on %s (%u/%u bytes) — deleting\n",
                   path, (unsigned)written, (unsigned)expected);
@@ -119,12 +118,9 @@ bool fsRemove(const char *path) {
   return result;
 }
 
-// ==== NVS settings layer ====
-// Settings live in the NVS "settings" namespace as strings (not LittleFS).
-// Rationale + full key map: Working Markdown Docs/NVS_SETTINGS_KEY_MAP.md.
-// NVS keys cap at 15 chars — long names map to short NK_* keys below; the
-// alt*/perf* registry tables (7_functions.ino) key off entry names truncated
-// to 15 chars, so keep new registry names unique in their first 15 chars.
+// ==== NVS settings layer ==== (key map: Working Markdown Docs/NVS_SETTINGS_KEY_MAP.md)
+// NVS keys cap at 15 chars. The alt*/perf* registry tables (7_functions.ino) key off entry names
+// truncated to 15 chars, so new registry names must be unique in their first 15 chars.
 #define NK_AbsorptionTimeoutMs "AbsorptionTmtMs"
 #define NK_AbsorptionVoltage "AbsorptionVoltg"
 #define NK_AlarmActivate "AlarmActivate"
@@ -134,7 +130,7 @@ bool fsRemove(const char *path) {
 #define NK_AlternatorNominalAmps "AltrntrNmnlAmps"
 #define NK_AmpSensorRange "AmpSensorRange"
 #define NK_AutoAltCurrentZero "AutoAltCurrntZr"
-#define NK_AutoShuntGainCorrection "AutShntGnCrrctn"
+// #define NK_AutoShuntGainCorrection "AutShntGnCrrctn"   // RETIRED 2026-10-25 with auto shunt gain correction (a full-to-full count cannot see a gain error) — key reserved, never reuse
 #define NK_AwBleedRate "AwBleedRate"
 #define NK_AwSeedProtectMs "AwSeedProtectMs"
 #define NK_BatteryCOffset "BatteryCOffset"
@@ -161,8 +157,7 @@ bool fsRemove(const char *path) {
 #define NK_FastSetpointRiseHeadroomV "FstStpntRsHdrmV"
 #define NK_FastSetpointRiseRate "FastSetpontRsRt"
 #define NK_FastSetpointRiseWindowMs "FstStpntRsWndwM"
-// RETIRED (2026-08-20, unreferenced): kept so the 15-char NVS key is never handed to a new setting.
-// Stale values may still sit in NVS on units flashed before this; nothing reads them.
+// RETIRED key, reserved: never hand this NVS key string to a new setting.
 // #define NK_FieldAdjustmentInterval "FldAdjstmntIntr"
 #define NK_FieldResistance "FieldResistance"
 #define NK_FieldResTrefC "FieldResTrefC"
@@ -269,6 +264,7 @@ bool fsRemove(const char *path) {
 #define NK_RPMScalingFactor "RPMScalingFactr"
 #define NK_RpmAxisWipePend "RpmAxWipePend"
 #define NK_RpmAxisWipeLoc "RpmAxWipeLoc"
+#define NK_impBootAct "impBootAct"      // hex IBA_*/AXW_* bits an import left for the next boot (applyImportConfig), removed when read
 #define NK_R_fixed "R_fixed"
 #define NK_RebulkCurrent_A "RebulkCurrent_A"
 #define NK_RebulkVoltage "RebulkVoltage"
@@ -329,10 +325,8 @@ bool fsRemove(const char *path) {
 #define NK_HuntSteadyPct "HuntSteadyPct"
 #define NK_HuntQualifyScans "HuntQualScans"
 #define NK_HuntTrigPct "HuntTrigPct"
-// Accepted ranges for the oscillation-damper (hunt-governor) knobs. Single source of truth for the
-// /settings handlers AND the NVS load path — they used to carry the same numbers separately, and the
-// load path silently lost them (HuntCutPct = 0 from a garbage NVS string zeroes inner Ki in every
-// learned pocket). The /settings handlers in 3_functions.ino constrain() against these macros.
+// Accepted ranges for the hunt-governor knobs, shared by the /settings handlers (3_functions.ino) and the
+// NVS load path. A garbage NVS HuntCutPct = 0 would zero inner Ki in every learned pocket.
 #define HUNT_GOV_ENABLE_MIN     0
 #define HUNT_GOV_ENABLE_MAX     1
 #define HUNT_CUT_PCT_MIN       25
@@ -347,9 +341,8 @@ bool fsRemove(const char *path) {
 #define HUNT_STEADY_PCT_MAX    10
 #define HUNT_QUALIFY_SCANS_MIN  2
 #define HUNT_QUALIFY_SCANS_MAX  6
-// No upper bound: a 12 V winding on a 48 V bus sees a quarter the duty swing for the same wobble, so the useful
-// bar is a property of the install, not a range we can pick. The floor only keeps 0 (= every scan
-// detects) out of the detector.
+// No upper bound: the useful bar depends on the install (a 12 V winding on 48 V sees 1/4 the duty swing).
+// The floor only keeps 0 (= every scan detects) out.
 #define HUNT_TRIG_PCT_MIN   0.01f
 #define NK_reseedCorrEnable "reseedCorrEn"
 #define NK_dutySlewEnable "dutySlewEn"
@@ -361,16 +354,13 @@ bool fsRemove(const char *path) {
 #define NK_ripFitAlt  "ripFitAlt"
 // Measured voltage-slope projection (CV D-term deadband) — same encoding, slope points in V/s
 #define NK_slpFitAlt  "slpFitAlt"
-// Measured-ripple capture admission gates (§10.8/§11) — own knobs, deliberately DECOUPLED from the
-// fa* anomaly-detector gates so tuning capture admission can't loosen detector arming.
-// NK "ripRpmMargin" is RETIRED — key abandoned in NVS, never reuse it for a different meaning.
+// Ripple capture admission gates (§10.8/§11): deliberately separate from the fa* detector gates so tuning
+// capture can't loosen detector arming. Retired key "ripRpmMargin": never reuse.
 #define NK_ripWinMs "ripWinMs"
 #define NK_ripDriftFloorA "ripDriftFloorA"
 #define NK_ripDriftPct "ripDriftPct"
-// RETIRED NVS keys — never reuse these key strings for a new setting (old devices still hold
-// stored values under them): "cvPlantTau", "cvPlantL" (removed 2026-07-03; τ/L fit retired);
-// "cvPlantK" (2026-07-08 — the single-point gain became the derived Ka + Kb·√t curve);
-// "battTmpProxyEn" (2026-09-18 — the board-temperature battery stand-in was removed).
+// RETIRED NVS keys, still holding values on old devices — never reuse: "cvPlantTau", "cvPlantL",
+// "cvPlantK", "battTmpProxyEn".
 #define NK_CommissionTempF "CommissionTmpF"
 #define NK_CommissionEpoch "CommissionEpch"
 #define NK_cmAgeAck "cmAgeAck"
@@ -378,9 +368,8 @@ bool fsRemove(const char *path) {
 #define NK_battMaxMode "battMaxMode"   // battery V/I plot sampling: 0=window mean, 1=max-magnitude
 #define NK_battTempDerateEn "battTmpDerEn"
 #define NK_battTempCoeff "battTmpCoeff"
-// CV D term (2026-07-17). The four keys "SlopeBleedK"/"CvBrakeThrVps"/"CvBrakeTauMs"/"CvBrakeArmV"
-// are RETIRED orphans — the 2026-07-15 flashed device holds brake-semantics values under them.
-// NEVER reuse those strings: a fielded SlopeBleedK=50 read as VoltageKd would be a wrong gain.
+// CV D term. Retired keys "SlopeBleedK"/"CvBrakeThrVps"/"CvBrakeTauMs"/"CvBrakeArmV" hold old brake values
+// on fielded devices — NEVER reuse (SlopeBleedK=50 read as VoltageKd would be a wrong gain).
 #define NK_VoltageKd "VoltageKd"
 #define NK_CvKdDeadbandVps "CvKdDeadband"
 #define NK_CvKdOneSided "CvKdOneSided"
@@ -398,14 +387,14 @@ bool fsRemove(const char *path) {
 #define NK_CvKdTd "CvKdTd"
 #define NK_SolarWatts "SolarWatts"
 #define NK_StartupRiseRate "StartupRiseRate"
-#define NK_PhysicalPanelOverride "PhysPanelOvrrd"   // renamed from the dead placeholder "SwtchCntrlOvrrd"; that string is retired, never reuse it
+#define NK_PhysicalPanelOverride "PhysPanelOvrrd"   // old key "SwtchCntrlOvrrd" is retired, never reuse it
 #define NK_SwitchingFrequency "SwitchingFrqncy"
 #define NK_SystemIDStepAmplitude "SystmIDStpAmplt"
 #define NK_systemIDTestType "SysIDTestType"
 #define NK_systemIDSineFreqStart "SysIDSineFStrt"
 #define NK_systemIDSineFreqEnd "SysIDSineFEnd"
 #define NK_sysidPlantTau "sysidPlantTau"
-#define NK_fieldDecayTau "fieldDecayTau"       // commissioned field drain time command→10% (ms) — worst-case (longest) endpoint of the drain-vs-RPM line, or the flat value; key name is historical
+#define NK_fieldDecayTau "fieldDecayTau"       // field drain time command→10% (ms): longest endpoint of the drain-vs-RPM line, or the flat value; key name is historical
 #define NK_fdDrainLoMs "fdDrainLoMs"           // drain-vs-RPM line: drain (ms) at NK_fdDrainRpmLo (wizard-fitted, shifted to sit at/above every measured point)
 #define NK_fdDrainHiMs "fdDrainHiMs"           // drain-vs-RPM line: drain (ms) at NK_fdDrainRpmHi
 #define NK_fdDrainRpmLo "fdDrainRpmLo"         // drain-vs-RPM line: lowest tested RPM; lookup clamps here, never extrapolates
@@ -476,6 +465,8 @@ bool fsRemove(const char *path) {
 #define NK_altbaseSec "altbaseSec"
 #define NK_altRefSrc "altRefSrc"
 #define NK_AltWipePend "AltWipePend"
+#define NK_PerfWipePend "PerfWipePend"   // "1" = a boat-performance Clear All's or records import's cloud wipe is still owed
+#define NK_recSeedOwed "recSeedOwed"   // hex: 1 / 2 = imported alt-health My History / boat-performance fronts, 4 / 8 = the same curves owed to a new cloud record after re-registration; still owed to this unit's cloud
 #define NK_altWindV "altWindV"   // field winding the alt-health record was built on
 #define NK_bmsLogic "bmsLogic"
 #define NK_bmsLogicLevelOff "bmsLogicLevlOff"
@@ -488,7 +479,7 @@ bool fsRemove(const char *path) {
 #define NK_displayTempUnit "displayTempUnit"
 #define NK_displayVolUnit "displayVolUnit"
 #define NK_gpsManualActive "gpsManualActive"
-#define NK_timeSourceMode "gpsTimeSourceMd"   // legacy key string: predates the 2026-08-24 position/time split
+#define NK_timeSourceMode "gpsTimeSourceMd"   // legacy key string from before the position/time split
 #define NK_gpsPositionSource "gpsPosSource"
 #define NK_speedSourceMode "speedSourceMode"
 #define NK_hardwarePresent "hardwarePresent"
@@ -540,8 +531,7 @@ bool fsRemove(const char *path) {
 #define NK_yyMax "yyMax"
 #define NK_yyMin "yyMin"
 // WiFi provisioning + IMU level calibration
-// Retired admin-password keys "password"/"passwordHash" (arm-gate replaced the password,
-// 2026-07) may still hold orphaned values in fielded NVS — never repurpose those key strings.
+// Retired keys "password"/"passwordHash" may hold orphaned values in fielded NVS — never repurpose.
 #define NK_ssid "ssid"
 #define NK_pass "pass"
 #define NK_apssid "apssid"
@@ -556,7 +546,7 @@ bool fsRemove(const char *path) {
 #define NK_imu_zero "imu_zero"
 #define NK_imu_mnt_state "imu_mnt_state"
 
-// Fast alt-current diagnostic knobs (Pattern B). Value strings ≤15 chars (NVS key limit).
+// Fast alt-current diagnostic knobs (Pattern B). Key strings ≤15 chars (NVS key limit).
 #define NK_faEnabled "faEnabled"
 #define NK_faAlarmEnable "faAlarmEnable"
 #define NK_faAnomPause "faAnomPause"
@@ -567,7 +557,7 @@ bool fsRemove(const char *path) {
 #define NK_faAttenDownAmps "faAttenDnA"
 #define NK_faPeakMinA "faPeakMinA"
 // Auto Min% learning ("knee tracker") knobs (keys <= 15 chars)
-// NK "minPctSystem" is RETIRED (master-toggle experiment, 2026-07-19 only) — key abandoned in NVS, never reuse it.
+// Retired key "minPctSystem": never reuse.
 #define NK_kneeLearnEnable "kneeLearnEn"
 #define NK_kneeMarginPct   "kneeMarginPct"
 #define NK_kneeOnsetA      "kneeOnsetA"
@@ -585,11 +575,8 @@ bool fsRemove(const char *path) {
 #define NK_cfgPushNotify   "cfgPushNotify"   // "<n>|<key,key,...>" receipt written by an applied config push, read back one boot later for the dashboard popup, cleared by its ack
 #define NK_cfgSchema       "cfgSchema"       // persisted settings-schema version (runSettingsMigrations)
 
-// Vessel Info. Was /vessel_info.json on LittleFS; moved into NVS so the boat's identity,
-// geometry and chemistry survive a formatOnFail and ride the manifest export like every
-// other setting. The JSON is now a derived view (vesselInfoJson()), not the store.
-// NK_vesselSaved is the "user has completed Vessel Info" sentinel — tier 3, so an imported
-// config can never assert it on a device that never filled the form.
+// Vessel Info lives in NVS (survives formatOnFail, rides the manifest export); vesselInfoJson() is a derived view.
+// NK_vesselSaved is the "Vessel Info completed" sentinel — tier 3, so an import can never assert it.
 #define NK_boatLenFt       "boatLenFt"
 #define NK_boatDispLbs     "boatDispLbs"
 #define NK_boatType        "boatType"
@@ -627,7 +614,10 @@ bool fsRemove(const char *path) {
 #define NK_n2kEngInst      "n2kEngInst"
 #define NK_n2kEngDynEn     "n2kEngDynEn"
 #define NK_n2kEngBitsEn    "n2kEngBitsEn"
+#define NK_n2kConvStatEn   "n2kConvStatEn"
 #define NK_n2kSrcAddr      "n2kSrcAddr"
+#define NK_n2kInstDesc1    "n2kInstDesc1"
+#define NK_n2kInstDesc2    "n2kInstDesc2"
 #define NK_rvcTxEn         "rvcTxEn"
 #define NK_rvcChgrEn       "rvcChgrEn"
 #define NK_rvcDcEn         "rvcDcEn"
@@ -644,6 +634,7 @@ bool fsRemove(const char *path) {
 #define NK_dvccSettleS     "dvccSettleS"
 #define NK_dvccCvlMin      "dvccCvlMin"
 #define NK_dvccCvlMax      "dvccCvlMax"
+#define NK_dvccVicCutHold  "dvccVicCutHold"
 // Battery + extra temperature probes, battery-temperature source chain, hot-charge lockout
 // (BATTERY_TEMP_SENSORS_SPEC.md §6). owAddr* hold a 16-char lowercase hex ROM code, "" = unassigned.
 #define NK_battTempProbeEnable    "battTmpPrbEn"
@@ -664,11 +655,9 @@ bool fsRemove(const char *path) {
 #define NK_owAddrAlt              "owAddrAlt"
 #define NK_owAddrBatt             "owAddrBatt"
 #define NK_owAddrExtra            "owAddrExtra"
-// Plausible-CVL window bounds, absolute volts and deliberately class-agnostic so one pair covers
-// 12/24/36/48 V. Same numbers the /settings handlers in 3_functions.ino constrain to. The window
-// must also stay ordered, low < high: an inverted or
-// degenerate window latches DVCC follow to UNTRUSTED against every healthy BMS and "Reset Trust"
-// re-latches within a tick, so it is unrecoverable from the UI.
+// Plausible-CVL window, absolute volts, class-agnostic (covers 12-48 V); the /settings handlers clamp to the
+// same numbers. Must stay low < high: an inverted window latches DVCC follow UNTRUSTED against every healthy
+// BMS and "Reset Trust" re-latches within a tick, unrecoverable from the UI.
 #define DVCC_CVL_ABS_MIN 1.0f
 #define DVCC_CVL_ABS_MAX 70.0f
 
@@ -725,11 +714,8 @@ bool settingRemove(const char *key) {
   return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND;  // already-absent counts as removed
 }
 
-// Range guard for the NVS load path (InitSystemSettings). The /settings handlers constrain what they
-// accept, but NVS is also written raw by config import and the cloud config push — both of which only
-// take effect through a reboot, so this load-side clamp is the one chokepoint that covers every writer.
-// A missing or corrupt NVS string parses to 0, which is inside no useful range. Writes the corrected
-// value back so the corruption cannot re-surprise on the next boot.
+// Load-side range clamp: config import and cloud push write NVS raw and take effect via reboot, so this is
+// the one chokepoint covering every writer (a missing/corrupt string parses to 0). Writes the fix back.
 long clampLoadedSetting(const char *name, const char *nvsKey, long value, long lo, long hi) {
   long clamped = (value < lo) ? lo : ((value > hi) ? hi : value);
   if (clamped != value) {
@@ -741,17 +727,10 @@ long clampLoadedSetting(const char *name, const char *nvsKey, long value, long l
 
 #define SETTINGS_SCHEMA_VERSION 4
 
-// Cumulative settings-schema migration chain. Runs once at boot, right after the last NVS
-// settings loader (initWeatherModeSettings), so steps see the fully seeded key set — a step
-// that transforms a key already loaded this boot must also fix the RAM global. Standing rules:
-//  - Any key rename/retire/unit-scale/enum change ships a permanent numbered step here in the
-//    SAME commit; steps are never edited or deleted once shipped.
-//  - NVS key strings are never reused or repurposed (firmware-internals.md).
-//  - Pure additions need NO step: a missing key falls back to its hardcoded default at load.
-//  - Steps must be idempotent: the schema stamp is written LAST, so a power cut mid-step
-//    re-runs that whole step on the next boot.
-// Defined later in the merged sketch (Xregulator.ino / 7_functions.ino), so step 3->4 needs them
-// declared here — an .ino merge hoists function prototypes, never variable declarations.
+// Runs once at boot after the last NVS loader: a step that transforms an already-loaded key must fix the RAM
+// global too. Any key rename/retire/unit/enum change ships a permanent numbered step (never edited once
+// shipped); pure additions need none. Steps must be idempotent: the stamp is written LAST.
+// Externs: an .ino merge hoists function prototypes, never variable declarations.
 extern float altRpmLineRms;
 extern float altThermSec;
 void runSettingsMigrations() {
@@ -761,31 +740,20 @@ void runSettingsMigrations() {
       case 0:
         break;  // 0->1: stamp only — fielded pre-schema settings are valid as-is
       case 1:
-        // 1->2: SwitchControlOverride (key "SwtchCntrlOvrrd", a dead placeholder) became
-        // PhysicalPanelOverride ("PhysPanelOvrrd") on 2026-09-06 with the opposite sense (old 1 = web owns
-        // the modes = new 0), so the value is not carried over; the retired key is erased.
+        // 1->2: retired "SwtchCntrlOvrrd"; PhysPanelOvrrd has the opposite sense, so no value is carried over.
         settingRemove("SwtchCntrlOvrrd");
         break;
       case 2:
-        // 2->3: the alternator-health steadiness gate moved from max-min spread bands to rms departure
-        // from a fitted line on 2026-09-09. altRpmTol -> altRpmLineRms/altRpmRateMax, altDutyTolPct ->
-        // altDutyLineRms/altDutySlewMax, altAmpsTolPct/altAmpsFloorA -> altAmpsLinePct/altAmpsLineFlrA.
-        // The measured quantity changed, so a stored spread is not a valid rms limit: the old keys are
-        // erased and the new ones take their defaults rather than carrying a number over.
+        // 2->3: steadiness gate changed from max-min spread to rms line departure. A stored spread is not a
+        // valid rms limit, so the old keys are erased and the new ones take their defaults.
         settingRemove("altRpmTol");
         settingRemove("altDutyTolPct");
         settingRemove("altAmpsTolPct");
         settingRemove("altAmpsFloorA");
         break;
       case 3:
-        // 3->4: the 2026-09-19 gate retune. The admission gate's smear is set by how fast the OUTPUT is
-        // ramping, not by how straight engine speed is, so altRpmLineRms loosens 12 -> 48 and the new
-        // altAmpsSlewPct / altAmpsSlewFlrA pair takes over the job; altThermSec halves 40 -> 20 because
-        // the dwell was blocking records without bounding anything. altSettingsLoad() seeds every registry
-        // knob into NVS on first boot and reads NVS thereafter, so a re-flash alone leaves a fielded device
-        // on the old numbers — the two changed knobs are rewritten here, in NVS and in the RAM globals
-        // altSettingsLoad() already filled (it runs earlier in setup). The new pair needs no step: a key
-        // that does not exist yet takes its hardcoded default.
+        // 3->4: gate retune (altRpmLineRms 12 -> 48, altThermSec 40 -> 20). altSettingsLoad() seeds NVS on
+        // first boot, reads it thereafter, and already ran this boot, so NVS and the RAM globals are both rewritten.
         altRpmLineRms = 48.0f; settingWrite("altRpmLineRms", String(altRpmLineRms, 4).c_str());
         altThermSec   = 20.0f; settingWrite("altThermSec",   String(altThermSec, 4).c_str());
         break;
@@ -797,24 +765,14 @@ void runSettingsMigrations() {
 }
 
 // ── Auto-commissioning snapshot / restore ────────────────────────────────────
-// Phase 0 captures every setting the commissioning flow may overwrite as one
-// positional CSV in a single NVS key, so an explicit abort reverts to the
-// pre-commissioning tune. The field order is fixed and MUST match between save and
-// restore. (Positional CSV, not JSON — dependency-free, matches the codebase ethos.)
-// Field count of the positional snapshot CSV. Bump when adding a field — commissionRestore accepts only an
-// exact match, so a snapshot from a different field set is refused rather than misread slot-for-slot.
+// Phase 0 stores every setting the flow may overwrite as one positional CSV in one NVS key (explicit abort
+// reverts to it). Bump the count when adding a field: commissionRestore accepts only an exact match.
 static const int COMMISSION_SNAP_FIELDS = 26;
 extern float altLeadSec;   // alt-health registry knob, defined in 7_functions.ino (stage 9 writes it)
 
-// Serialize the current scalar tune into `key` as one positional CSV. 12th field = HiLow (charge-rate
-// mode — the app's stored selection HiLowUserSel, not the effective HiLow, which the switch panel owns
-// while the override is on) so a revert never strands the user in the wrong mode; fields 13/14 = IExcessBaseA/CcOffsetA (the
-// affine trip-line the Thresholds step writes). Fields 15-26 (2026-09-14) are the rest of what the wizard
-// steps write, so Stop/Abort's "back to how it was" holds for every step: plant tau (stage 2), D-term
-// deadband base + slope (5), CV plant Ka/Kb + gain mode (6), drain worst-case + the drain-vs-RPM line (7),
-// alternator output lead (9). Appended, never inserted: commissionRestoreScalars refuses any other count.
-// This scalar set IS the whole positional snapshot; the Min% floor table is backed up separately (see the
-// deferred-Start worker, cxStartPersistService).
+// Uses HiLowUserSel (the app's stored choice), not the effective HiLow the switch panel owns while its
+// override is on. Fields are appended, never inserted. The Min% floor table is backed up separately
+// (cxStartPersistService).
 void commissionSnapshotScalarsToBuf(char *buf, size_t n) {
   snprintf(buf, n,
            "%.4f,%.4f,%.3f,%.3f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,%.3f,%d,%.1f,%.1f,"
@@ -832,41 +790,22 @@ void commissionSnapshotScalars(const char* key) {
   settingWrite(key, buf);
 }
 
-// In-flight step snapshot: re-taken on each step entry, so it holds the scalar tune as of the START of the
-// step currently running (every finished step is already baked in). A reboot mid-wizard restores it to undo
-// ONLY the interrupted step. Scalars only — a partially-swept Min% floor is left as valid data and the
-// un-done step is simply re-run.
+// Re-taken at each step entry, so a mid-wizard reboot undoes ONLY the interrupted step. Scalars only — a
+// partially-swept Min% floor stays as valid data and the step is re-run.
 void commissionStepSnapshot() {
   commissionSnapshotScalars(NK_commissionStepSnap);
 }
 
-// Discard the measured-ripple projections. Sibling of cvStressForgetLast below: a stored measurement
-// whose defining conditions moved is not stale data to be labelled, it is a measurement of a quantity
-// this device no longer computes. And it is not inert — ripFitAlt draws the red "ripple crosses the trip
-// line" shading and the verdict on the Protections plot, so a stale fit is an active false alarm.
-//
-// Scope, from the capture path (faFiltRippleUpdate): the pk-pk is an IExcessTau low-pass sampled over a
-// ripWinMs window, split in half for the min-of-halves estimator. Both knobs change the QUANTITY, not its
-// precision, so both invalidate ripFitAlt.
-//   ripple / slope: which stored fit the caller's change invalidates — the two are independent.
-//   ripFitAlt (ripple) is the pk-pk of the IExcessTau low-pass over a ripWinMs window, so BOTH of those
-//   knobs kill it. slpFitAlt (slope) is the worst positive slope of g_cvKdFiltV, the D term's own filtered
-//   voltage: CvKdVoltFiltTC IS that filter and ripWinMs IS the window the slope is taken over, so both of
-//   those kill it, while IExcessTau only decides which windows were admitted — an admitted point stays a
-//   valid slope, so a tau change must not throw it away. A tach rescale relabels the RPM of both, so both.
-// NOT in scope for either knob: the Resonance & Ripple Map. faWindowFinalize measures the raw decimated
-// stream (dmv / faToneBuf) over its own fixed FA_WIN_DECIM_N window with hard-coded EMAs (FA_EMA_ALPHA,
-// FA_AMPS_EMA_ALPHA). Neither knob reaches it. Earlier console copy told the operator to clear the map;
-// that was wrong on both counts — it named the one table these knobs cannot affect, and left the two
-// they do affect in place.
+// Discard stored ripple / slope fits whose defining conditions moved. Not inert: ripFitAlt drives the
+// Protections plot's trip-line shading and verdict. ripFitAlt dies on IExcessTau or ripWinMs; slpFitAlt on
+// CvKdVoltFiltTC or ripWinMs (not IExcessTau, which only gates admission); a tach rescale kills both.
+// The Resonance & Ripple Map uses its own fixed window and EMAs, so these knobs never clear it.
 void ripFitForget(bool ripple, bool slope, const char *why) {
   bool hadRip = ripple && (ripFitAlt.nPts > 0);
   bool hadSlp = slope && (slpFitAlt.nPts > 0);
   if (ripple) { memset(&ripFitAlt, 0, sizeof(ripFitAlt)); settingRemove(NK_ripFitAlt); }
   if (slope)  { memset(&slpFitAlt, 0, sizeof(slpFitAlt)); settingRemove(NK_slpFitAlt); }
-  // Generic consequence: the callers cover two different failures — a knob change makes the stored fit a
-  // measurement of a quantity the device no longer computes, while a tach rescale leaves the measurement
-  // intact but relabels the RPM it was taken at. "No longer valid" is true of both.
+  // Wording covers both callers: a knob change (wrong quantity) and a tach rescale (wrong RPM label).
   if (hadRip || hadSlp) {
     const char *what = (hadRip && hadSlp) ? "ripple and voltage-slope current-check fits are no longer valid and were"
                        : hadRip           ? "ripple current-check fit is no longer valid and was"
@@ -886,10 +825,8 @@ bool commissionRestoreScalars(const char* key) {
                  &v[6], &v[7], &v[8], &v[9], &v[10], &v[11], &v[12], &v[13],
                  &v[14], &v[15], &v[16], &v[17], &v[18], &v[19],
                  &v[20], &v[21], &v[22], &v[23], &v[24], &v[25]);
-  // Exact count only. A short read means a truncated/corrupt snapshot, or one written by a build with a
-  // different field set — either way the slots no longer mean what this code assumes. Refuse rather than
-  // half-apply values into live control parameters. Log here, not at the call sites: the boot path discards
-  // the return value, and leaving the snapshot in NVS would make every later revert repeat this silently.
+  // Exact count only: a short read is a corrupt snapshot or another build's field set, so refuse rather than
+  // half-apply. Log and drop it here: the boot path ignores the return, so a kept key would repeat silently.
   if (n != COMMISSION_SNAP_FIELDS) {
     queueConsoleMessageF("Commissioning: snapshot unreadable (%d of %d fields) - settings NOT reverted",
                          n, COMMISSION_SNAP_FIELDS);
@@ -952,7 +889,7 @@ bool commissionRestore() {
 // Put the lifecycle bookkeeping back to exactly what it was before the run that is being aborted
 // (written by the deferred Start worker on every fresh Start). Returns false when no record exists —
 // the caller then falls back to the legacy zeroing.
-static void cvStressForgetLast();   // defined below, next to the done-mask helpers it belongs with
+static void cvStressForgetLast();
 
 bool commissionRestorePreRun() {
   if (!settingExists(NK_commissionPreRun)) return false;
@@ -979,7 +916,7 @@ void commissionSetState(uint8_t st) {
   settingWrite(NK_commissionState, String((int)st).c_str());
 }
 
-// Persist the current wizard phase (0=Prep…8=Stress test, 9=finished; moves backward on Back). Drives
+// Persist the current wizard phase (0=Prep…9=Charge health calibration, 10=finished; moves backward on Back). Drives
 // the Commissioning tab checklist so step progress survives a page reload / new client.
 void commissionSetPhase(uint8_t p) {
   commissionPhase = p;
@@ -987,34 +924,19 @@ void commissionSetPhase(uint8_t p) {
 }
 
 // ── Per-stage completion tracking ─────────────────────────────────────────────
-// commissionDoneMask carries one bit per stage (0=Prep, 1=Field curve … 7=Min% floor + Field decay,
-// 8=Stress test, 9=Charge health calibration). New stages are APPENDED, never inserted: the mask is
-// stored in NVS, so reusing an existing bit index would silently reinterpret a fielded device's
-// history as a stage it never ran. It is the source of truth for the per-step ✓ marks and for the default checkbox
-// selection of a partial re-run. commissionState (0/1/2) is the lifecycle badge and is DERIVED from
-// the mask wherever it is recomputed below.
+// commissionDoneMask: one bit per stage, stored in NVS. New stages are APPENDED, never inserted — reusing a
+// bit would reinterpret a fielded device's history. commissionState (0/1/2) is DERIVED from the mask.
 #define COMMISSION_STAGE_COUNT 10
-#define COMMISSION_ALL_DONE    0x3FF  // bits 0..9 set = every stage complete (7 = Min% floor + Field decay, 8 = CV stress test, 9 = Charge health calibration)
-// COMMISSIONED requires only bits 0..7: the Stress test(8) is a diagnostic reference check that writes
-// no settings, and the Charge health calibration(9) needs a battery that will accept current, which is
-// not always true on the day — neither may block the badge or keep the nag alive. Their done bits still
-// drive the per-step ✓. The Stress test's goes stale on upstream retunes like any other stage; the
-// calibration's does not (commissionDependentsMask lists it under nothing) — it measures the machine's
-// speed lead, not the tune.
+#define COMMISSION_ALL_DONE    0x3FF  // bits 0..9 (7 = Min% floor + Field decay, 8 = CV stress test, 9 = Charge health calibration)
+// COMMISSIONED requires only bits 0..7: Stress test (8) writes no settings and Charge health calibration (9)
+// needs a battery that accepts current. Their bits still drive the ✓; 8 goes stale on upstream retunes,
+// 9 never does (it measures the machine's speed lead, not the tune).
 #define COMMISSION_REQUIRED_MASK 0x0FF
 static bool commissionRequiredComplete() { return (commissionDoneMask & COMMISSION_REQUIRED_MASK) == COMMISSION_REQUIRED_MASK; }
 
-// Downstream stages invalidated when an upstream stage is (re)completed — see the coupling
-// analysis: Field curve(1) feeds Plant fit(2) + Verify(3); Plant fit(2) feeds Verify(3);
-// Disturbances(4) feeds Thresholds(5). CV plant fit(6) measures the current→voltage plant, which
-// sits downstream of the whole inner current loop — so any current-loop retune (Field curve 1,
-// Plant fit 2, or Verify 3) makes the CV fit stale and clears bit 6. The Stress test(8) verdict
-// grades the tuned CV loop, so it goes stale with any retune upstream of it (1/2/3/6). Min% floor +
-// Field decay(7) is independent — nothing feeds it, it feeds nothing; it runs late so the engine is
-// warm for the max-RPM hold. Tach alignment (RPMScalingFactor/PulleyRatio) is set on a pre-wizard
-// screen, not a stage — a later rescale invalidates the binned stages via
-// commissionClearRpmDependents. Re-doing an upstream stage clears its dependents' done bits; the
-// wizard forces them into the same run to be re-measured.
+// Re-completing an upstream stage clears its dependents' done bits (the wizard re-runs them). Stage 7 is
+// independent (runs late so the engine is warm for the max-RPM hold). Tach alignment is a pre-wizard
+// screen, not a stage; a rescale clears binned stages via commissionClearRpmDependents.
 static uint16_t commissionDependentsMask(int stage) {
   switch (stage) {
     case 1: return (1 << 2) | (1 << 3) | (1 << 6) | (1 << 8);  // Field curve → Plant fit, Verify, CV plant fit, Stress test
@@ -1059,20 +981,16 @@ void commissionManualStage(int stage) {
   cxLedgerLogStage(stage, "manual");
 }
 
-// Derive the lifecycle byte from the mask: none done → NOT, required stages done (stress test
-// optional) → COMMISSIONED, anything in between → IN_PROGRESS. Called at FINISH only — during an
-// active wizard, commissionState is held at IN_PROGRESS explicitly (set by commissionStart) so the
-// badge reads "in progress" even while the mask is briefly still all-set on a re-commission.
+// Called at FINISH only — during an active wizard commissionState is held at IN_PROGRESS (commissionStart)
+// even while the mask may still be all-set on a re-commission.
 void commissionRecomputeState() {
   uint8_t st = (commissionDoneMask == 0) ? 0 : (commissionRequiredComplete() ? 2 : 1);
   if (st != commissionState) commissionSetState(st);
 }
 
-// The stress verdict grades ONE tuned CV loop. The moment a retune clears its done bit the stored
-// blob stops being a statement about this device, so it has to go with the bit — otherwise the
-// wizard's Step 9, the standalone Tuning modal and the config export all keep serving a verdict for
-// a loop that no longer exists. Called from every path that clears bit 8 by invalidation; NOT from
-// commissionSkipStage, where skipping means "not run this pass", not "the old one is wrong".
+// The stress verdict grades one tuned CV loop, so it goes with bit 8 on every invalidation path (else the
+// wizard, Tuning modal and config export serve a verdict for a loop that no longer exists). NOT called from
+// commissionSkipStage: a skip means "not run this pass", not "the old one is wrong".
 static void cvStressForgetLast() {
   if (cvsLastBlob[0] == '\0') return;
   cvsLastBlob[0] = '\0';
@@ -1110,12 +1028,9 @@ void commissionClearStage(int stage) {
   if (commissionState == 2 && !commissionRequiredComplete()) commissionSetState(1);
 }
 
-// A tach rescale (RPMScalingFactor/PulleyRatio change) moves the engine-RPM axis every binned stage
-// was measured against, so all of them must be re-run. Hangs off the SETTING change, wherever it comes
-// from (pre-wizard alignment screen or normal Settings). Clears every RPM-binned wizard stage; only
-// Prep(0) and Stress test(8) are exempt — the stress verdict grades recovery behavior, which a
-// display-axis rescale can't stale. Min% floor + Field decay(7) IS binned (per-RPM onset anchors AND
-// the drain-vs-RPM line endpoints), so it clears.
+// A tach rescale moves the RPM axis every binned stage was measured against, whichever screen made it.
+// Only Prep(0) and Stress test(8) are exempt (a display-axis rescale can't stale the recovery verdict);
+// stage 7 is binned (per-RPM onsets + drain-vs-RPM endpoints).
 void commissionClearRpmDependents() {
   uint16_t rpmBits = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
   commissionDoneMask &= ~rpmBits;
@@ -1126,13 +1041,10 @@ void commissionClearRpmDependents() {
 }
 
 // ── Deferred commissioning-start persist ─────────────────────────────────────
-// Start used to retire its whole restore point (origin snapshot + Min% blobs + state keys, ~7 NVS
-// commits) inside the /get handler; on the shared network task that starved the SSE stream and froze
-// the interface ~2 s. The handler now stages everything in RAM — atomic at the click — and
-// cxStartPersistService(), called once per loop() pass, retires ONE commit per pass. Write order is
-// the crash guarantee: commissionState=1 is committed LAST, so a persisted state byte proves the
-// whole restore point is on flash; a reboot mid-burst boots as "never started". The wizard polls
-// /cxStartState and advances only on IDLE — the HTTP 200 means accepted, not saved.
+// The /get handler only stages the restore point in RAM (~7 inline NVS commits froze SSE ~2 s on the shared
+// network task); cxStartPersistService() retires ONE commit per loop() pass. commissionState=1 is committed
+// LAST, so a persisted state byte proves the whole restore point is on flash. The wizard advances only on
+// /cxStartState IDLE — HTTP 200 means accepted, not saved.
 static char  cxStartTuneCsv[320];   // scalar tune at the click — origin snapshot AND step baseline
 static float cxStartMinDuty[RPM_TABLE_SIZE], cxStartKneeFloor[RPM_TABLE_SIZE], cxStartKneeKnee[RPM_TABLE_SIZE];
 static bool  cxStartKneeFrozen[RPM_TABLE_SIZE];
@@ -1164,15 +1076,10 @@ void cxStartPersistBegin(bool resuming) {
   xSemaphoreGive(cxStartMutex);
 }
 
-// Cancel a still-pending Start (abort/done raced the worker). Fresh start: nothing has run, so this
-// is an exact teardown to the pre-click state — NOT a revert, and the caller must not fall into the
-// live-run teardown (which would demote a previously-commissioned device whose re-run never began).
-// Resume: just stop the worker — the original committed snapshot is intact for the normal teardown.
-// Whole body under cxStartMutex: once the take succeeds the worker is provably between cases, so the
-// machine cannot advance again (it re-reads step under the lock) and the compensating writes below
-// can never interleave with an in-flight staged write. Returns with the cancel COMPLETE.
-// The fresh/resume/none verdict is decided under that same take: a caller that instead re-read the
-// step could branch on a Start the worker had already retired to state=1 and skip the live teardown.
+// Cancel a still-pending Start. Fresh: exact teardown to the pre-click state (NOT a revert; the caller must
+// not run the live-run teardown, which would demote a previously-commissioned device). Resume: just stop the
+// worker. All under cxStartMutex, verdict included: the worker can't advance or interleave, and a caller
+// re-reading the step could miss a Start already retired to state=1.
 CxStartCancel cxStartPersistCancel() {
   if (!cxStartMutex) return CX_CANCEL_NONE;
   xSemaphoreTake(cxStartMutex, portMAX_DELAY);  // worker holds it at most one staged NVS write
@@ -1196,11 +1103,9 @@ CxStartCancel cxStartPersistCancel() {
   return fresh ? CX_CANCEL_FRESH : CX_CANCEL_RESUME;
 }
 
-// Retire one staged write per call — called every loop() pass, no-op when idle. Each case runs
-// under cxStartMutex, so a Cancel from the network task can only land BETWEEN cases, never inside
-// one — the old lock-free double-checks left an instruction-wide window where a mid-case cancel
-// was overwritten by the advance, resurrecting a torn-down Start all the way to commissionSetState(1).
-// The take is zero-timeout: a Cancel/Begin holding the lock just costs this pass, never a loop stall.
+// Retire one staged write per call (every loop() pass, no-op when idle). Each case runs under cxStartMutex,
+// so a Cancel can only land BETWEEN cases — a mid-case cancel overwritten by the advance would resurrect a
+// torn-down Start. Zero-timeout take: a held lock costs this pass, never a loop stall.
 void cxStartPersistService() {
   if (cxStartPersistStep == 0) return;  // lock-free fast path — Begin publishes step=1 via the mutex
   if (!cxStartMutex || xSemaphoreTake(cxStartMutex, 0) != pdTRUE) return;
@@ -1273,10 +1178,8 @@ size_t fsUsedBytes() {
   return result;
 }
 
-// Short-try variant for the main loop's periodic free-space stat: a busy mutex means
-// skip this round (caller keeps the previous value) rather than stalling the loop.
-// Zero-tick take: this runs in the control path with field possibly on, so it must never
-// wait on a Core-0 holder (a /huntledger read, console flush) even briefly.
+// Zero-tick take for the loop's periodic free-space stat: runs in the control path with field possibly on, so
+// a busy mutex skips this round (caller keeps the old value) rather than waiting on a Core-0 holder.
 bool fsStatsTry(size_t &total, size_t &used) {
   if (!fsMutex || xSemaphoreTake(fsMutex, 0) != pdTRUE) return false;
   total = LittleFS.totalBytes();
@@ -1301,13 +1204,9 @@ void fsReleaseLock() {
   }
 }
 
-// Versioned PSRAM-blob persistence — the shared scaffold for "accumulate in
-// PSRAM, dump to a versioned LittleFS blob at field-off, restore at boot."
-// Built for the long-term-plot ring and the alternator/boat matrices so each
-// system stops re-hand-rolling the header, fsLock, chunked I/O, watchdog resets,
-// and layout-change guard. The sensor ring + eff matrix predate this and keep
-// their own copies; retrofit them onto this later. Field-off only (LittleFS
-// writes can stall a core ~300 ms — never on a live control loop).
+// Versioned PSRAM-blob persistence: accumulate in PSRAM, dump to a versioned LittleFS blob at field-off,
+// restore at boot. Field-off only: LittleFS writes can stall a core ~300 ms. The sensor ring + eff matrix
+// still keep their own copies of this logic.
 struct PsramBlobHeader {
   uint32_t magic;       // caller-chosen dataset id
   uint32_t version;     // caller-chosen layout version (bump on record-layout change)
@@ -1316,11 +1215,8 @@ struct PsramBlobHeader {
   uint32_t userWord;    // caller flags (e.g. "reference finalized"); 0 if unused
 };
 
-// Dump `count` records to a versioned LittleFS blob. Records live in `base` as a
-// ring of `capacity` slots starting at `startIdx`, written in logical order so a
-// circular buffer dumps chronologically; a plain array passes startIdx=0,
-// count=capacity (no wrap). Body goes out in ≤2 contiguous spans. Removes the
-// partial file on any short write. Returns records written (0 on failure).
+// Dumps `count` records of ring `base[capacity]` from `startIdx` in chronological order (a plain array
+// passes startIdx=0, count=capacity). Removes the partial file on a short write. Returns records written.
 uint32_t writePsramBlob(const char *path, uint32_t magic, uint32_t version,
                         uint32_t userWord, const void *base, size_t recordSize,
                         uint32_t capacity, uint32_t startIdx, uint32_t count) {
@@ -1363,14 +1259,8 @@ uint32_t writePsramBlob(const char *path, uint32_t magic, uint32_t version,
   return count;
 }
 
-// Restore a writePsramBlob() blob into linear buffer `destBase` (`destCapacity`
-// slots). Validates magic/version/recordSize; on any mismatch or short read it
-// deletes the file and returns 0. Returns records restored (≤ destCapacity), and
-// the stored userWord via `userWordOut` if non-null. `deleteAfter` removes the
-// file post-restore (rings set true to avoid double-upload; grids set false).
-// Header-only peek: what version is the blob on disk? readPsramBlob DELETES a file whose version
-// does not match, so a migrating caller must ask first rather than try the old version speculatively.
-// 0 = absent, unreadable, or not this magic.
+// Header-only version peek (0 = absent/unreadable/other magic). readPsramBlob DELETES a version mismatch,
+// so a migrating caller must ask first.
 uint32_t psramBlobVersion(const char *path, uint32_t magic) {
   if (!fsExists(path)) return 0;
   fsTakeLock();
@@ -1383,6 +1273,9 @@ uint32_t psramBlobVersion(const char *path, uint32_t magic) {
   return ok ? hdr.version : 0;
 }
 
+// Restore a writePsramBlob() blob into linear buffer `destBase` (`destCapacity` slots). A magic/version/recordSize
+// mismatch deletes the file and returns 0; a short body read returns 0. Returns records restored (≤ destCapacity)
+// and the stored userWord via `userWordOut` if non-null. `deleteAfter` removes the file once the header passes.
 uint32_t readPsramBlob(const char *path, uint32_t magic, uint32_t version,
                        void *destBase, size_t recordSize, uint32_t destCapacity,
                        uint32_t *userWordOut, bool deleteAfter) {
@@ -1428,17 +1321,10 @@ uint32_t readPsramBlob(const char *path, uint32_t magic, uint32_t version,
 }
 
 // ── Append-extend a writePsramBlob file (flash-wear optimization for high-cadence rings) ──────
-// A circular PSRAM ring persisted by full-file rewrite erases every block on each flush; at a
-// 15/30-min field-off cadence that is the dominant lifetime flash-write source. Instead, the
-// periodic flush APPENDS only the records pushed since the last flush (LittleFS "a" touches just
-// the tail block), and a full writePsramBlob() compaction runs only when the file would grow past
-// ~2× the ring. The file is one chronological oldest→newest sequence (compacted body + appended
-// tail); restoreRingBlob() derives the true record count from file size and keeps the newest
-// `capacity`, so a plain writePsramBlob snapshot (zero appends) restores identically — no format
-// version bump, old field files stay valid.
-//
-// Appends the newest `delta` records of ring `base[capacity]` (slots ending at head-1, oldest of
-// those first → chronological). Returns bytes written, 0 on any failure (caller then compacts).
+// Periodic flushes APPEND only the records pushed since the last flush (touches just the tail block); a full
+// writePsramBlob() compaction runs only when the file would pass ~2x the ring. restoreRingBlob() derives the
+// count from file size and keeps the newest `capacity`, so a plain snapshot restores identically.
+// Appends the newest `delta` records (slots ending at head-1) oldest first. Returns bytes written, 0 on failure.
 uint32_t appendRingBlob(const char *path, const void *base, size_t recordSize,
                         uint32_t capacity, uint32_t head, uint32_t delta) {
   if (!base || recordSize == 0 || capacity == 0 || delta == 0 || delta > capacity) return 0;
@@ -1458,14 +1344,14 @@ uint32_t appendRingBlob(const char *path, const void *base, size_t recordSize,
   return ok ? delta * (uint32_t)recordSize : 0;
 }
 
-// Restore a (possibly append-extended) writePsramBlob file into linear `base` (tail=0, head=count).
-// File may hold MORE than `capacity` records (accumulated appends) — keeps the newest `capacity`.
-// Validates magic/version/recordSize (mismatch → delete + 0). *fileRecordsOut = total records on
-// disk (may exceed capacity → caller compacts when capped). Returns records restored (≤ capacity).
+// Restores into linear `base`, keeping the newest `capacity` records (appends can overfill). Header mismatch
+// deletes the file. *fileRecordsOut = records on disk (> capacity means the caller should compact); *userWordOut =
+// the header's userWord (0 on a mismatch or a failed read).
 uint32_t restoreRingBlob(const char *path, uint32_t magic, uint32_t version,
                          void *base, size_t recordSize, uint32_t capacity,
-                         uint32_t *fileRecordsOut) {
+                         uint32_t *fileRecordsOut, uint32_t *userWordOut) {
   if (fileRecordsOut) *fileRecordsOut = 0;
+  if (userWordOut) *userWordOut = 0;
   if (!base || recordSize == 0 || capacity == 0 || !fsExists(path)) return 0;
   fsTakeLock();
   File f = LittleFS.open(path, "r");
@@ -1493,6 +1379,7 @@ uint32_t restoreRingBlob(const char *path, uint32_t magic, uint32_t version,
   fsReleaseLock();
   if (wdtMainTaskSubscribed) esp_task_wdt_reset();
   if (fileRecordsOut) *fileRecordsOut = fileRecords;
+  if (userWordOut) *userWordOut = hdr.userWord;
   return keep;
 }
 
@@ -1500,10 +1387,8 @@ void performDeepFactoryReset() {
   Serial.println("\n=== DEEP FACTORY RESET INITIATED ===");
   queueConsoleMessage("DEEP FACTORY RESET: Scorched-earth reset starting...");
 
-  // Step 0: Preserve cloud identity (authToken) across the wipe so that pressing
-  // Erase All Memory does NOT lock the user out of their cloud account. Token is
-  // held in a stack buffer for the ~2-3 second wipe; power-loss in that window
-  // loses the token and requires support contact for re-registration.
+  // Preserve the cloud authToken so Erase All Memory doesn't lock the user out of their cloud account.
+  // Power loss during the ~2-3 s wipe loses it (support must re-register the device).
   char savedToken[256] = { 0 };   // 256 matches /debugToken; cloud sets no length cap on issued tokens
   {
     nvs_handle_t h;
@@ -1524,17 +1409,28 @@ void performDeepFactoryReset() {
       Serial.println("RESET: No authToken to preserve (device unregistered)");
     }
   }
+  // The rest of the cloud identity rides along. The cloud keeps this unit's ledger rows keyed on
+  // (device_uid, seq) and silently drops a repeated seq, so the counter must not restart at 1. The
+  // registration nonce is what recovers a token whose registration reply was lost.
+  uint32_t savedLedgerSeq = cxLedgerSeq;
+  String savedRegNonce;
+  {
+    nvs_handle_t h;
+    char nb[33] = { 0 };
+    size_t len = sizeof(nb);
+    if (nvs_open("cloud", NVS_READONLY, &h) == ESP_OK) {
+      if (nvs_get_str(h, "regNonce", nb, &len) == ESP_OK) savedRegNonce = nb;
+      nvs_close(h);
+    }
+  }
 
-  // Console delivery window comes BEFORE the wipe: once NVS is erased, every ms until
-  // restart is a chance for a background task to re-persist something, so from the
-  // format onward we sprint to ESP.restart() with no delays.
+  // Console delivery delay comes BEFORE the wipe: after the format, sprint to ESP.restart() with no delays
+  // so no background task gets a chance to re-persist something.
   queueConsoleMessage("DEEP FACTORY RESET: Wiping all settings and data, restarting...");
   delay(1500);
 
-  // Step 1: Unmount and reformat LittleFS (userdata partition - rings, logs, buffer files;
-  // user settings AND Vessel Info live in NVS and are wiped in Step 2). fsMutex is taken
-  // and deliberately NEVER released — any task that would re-create a file before the
-  // restart blocks on its timeout instead. The reboot clears the mutex.
+  // Step 1: reformat LittleFS (settings and Vessel Info live in NVS, wiped in Step 2). fsMutex is taken and
+  // deliberately NEVER released, so any task that would re-create a file blocks until the reboot.
   Serial.println("RESET: Acquiring FS mutex and unmounting LittleFS...");
   if (fsMutex) {
     xSemaphoreTake(fsMutex, pdMS_TO_TICKS(5000));  // Block other FS ops
@@ -1565,10 +1461,8 @@ void performDeepFactoryReset() {
     Serial.println("RESET: NVS flash reinitialized");
   }
 
-  // NO InitSystemSettings() here. RAM still holds the user's live values, and its
-  // create-if-missing re-seed would write all of them straight back into the freshly
-  // erased NVS — the bug that made settings survive this reset. The reboot below
-  // reruns setup() with pristine compile-time defaults instead.
+  // NO InitSystemSettings() here: RAM still holds the user's live values and its create-if-missing re-seed
+  // would write them straight back into the erased NVS. The reboot reruns setup() with compile-time defaults.
 
   // Step 3: Restore preserved authToken so cloud account survives the wipe
   if (savedToken[0] != '\0') {
@@ -1584,6 +1478,14 @@ void performDeepFactoryReset() {
       }
     }
   }
+  if (savedRegNonce.length() == 32) {
+    nvs_handle_t h;
+    if (nvs_open("cloud", NVS_READWRITE, &h) == ESP_OK) {
+      if (nvs_set_str(h, "regNonce", savedRegNonce.c_str()) == ESP_OK) nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+  if (savedLedgerSeq > 0) settingWrite(NK_cxLedgerSeq, String((unsigned long)savedLedgerSeq).c_str());
 
   Serial.println("=== DEEP FACTORY RESET COMPLETE - RESTARTING ===\n");
   Serial.flush();
@@ -1642,11 +1544,9 @@ uint8_t owUnassignedCount() {
   return n;
 }
 
-// Bus search, registry merge and role binding. Called from initializeHardware() at boot and from
-// TempTask (Core 0) afterwards; it owns the bus for the search, so never from loop(). Auto-binds the
-// alternator role only in the one-probe / digital-alternator-sensor (TempSource 0) / both-extra-enables-off
-// case (fielded single-probe devices and a replaced alternator probe) — on a thermistor install a lone probe
-// is a battery or extra probe awaiting its role — and queues the persist for owRoleService(); no NVS write here.
+// Called from initializeHardware() at boot and TempTask (Core 0) after; it owns the bus, so never from loop().
+// Auto-binds the alternator role only with one probe, TempSource 0 and both extra enables off (on a thermistor
+// install a lone probe is a battery/extra probe awaiting its role). The persist is queued for owRoleService().
 void owEnumerate() {
   static bool unassignedNoticeSent = false;  // one console line per boot
   sensors.begin();
@@ -1705,9 +1605,8 @@ void owEnumerate() {
       if (owProbes[i].present && memcmp(owProbes[i].addr, tempRoleAddr[r], sizeof(DeviceAddress)) == 0) { tempRoleSlot[r] = (int8_t)i; break; }
     }
   }
-  // Only a role that has NEVER been assigned auto-binds. A stored alternator probe that is absent is a fault
-  // to report, not a slot to fill: the lone remaining probe (on the battery or in the engine room) was
-  // silently bound as the alternator probe and persisted over the real one's address (audit 2026-09-27).
+  // Only a never-assigned role auto-binds: an absent stored alternator probe is a fault to report, not a slot
+  // to fill (else the lone remaining battery/engine-room probe overwrites the real one's address).
   if (tempRoleSlot[TR_ALT] < 0 && !tempRoleAssigned[TR_ALT] && nFound == 1 && TempSource == 0 && battTempProbeEnable == 0 && extraTempProbeEnable == 0) {
     int8_t only = -1;
     for (uint8_t i = 0; i < owProbeCount; i++) if (owProbes[i].present) { only = (int8_t)i; break; }
@@ -1794,27 +1693,42 @@ static void owMirrorAltResult(bool good, float tempF) {
   portEXIT_CRITICAL(&owMux);
 }
 
-// DS18B20 reader, 5 s cadence. Rejects CRC fails, all-0xFF and the power-on 85C/185F signature, holds
-// the last good value on any fault (freshness tracked separately), re-enumerates after a disconnect and
-// re-applies 12-bit resolution if an EEPROM or sensor reset changed it. tempTaskHealthy is owned by
-// checkTempTaskHealth(); this task only ever sets it true.
-// Multi-drop (BATTERY_TEMP_SENSORS_SPEC.md §3): one Skip ROM convert covers every probe on the bus, then
-// the scratchpads are read in turn — the alternator (ALT role, tempDeviceAddress) first with the checks
-// above (its outcome mirrored into its own owProbes[] row by owMirrorAltResult), then every other present
-// probe into owProbes[] whether bound or not; a BATT/EXTRA-bound probe
-// also updates its role global when that role's enable is 1. Only the ALT result drives lastReadWasSuccess
-// (the 1 s retry); a BATT/EXTRA miss only feeds its own 3-cycle re-enumeration streak. An engine start
-// (RPM crossing 200) forces one immediate cycle. This task NEVER calls settingWrite — a flash write on
-// Core 0 stalls Core 1 while the cache is off — so role auto-binds wait in owRolePersistPending[] for
-// owRoleService() in loop().
-// Reads core0Busy as a courtesy but must NEVER set it — TempTask runs during active charging, and
-// core0Busy gates AdjustFieldLearnMode, so setting it would freeze both control loops ~190-750 ms every 5 s.
-// CRC-8 of eight zero bytes is 0, which matches byte 8, so a scratchpad that sampled every data bit low (a
-// slow rising edge on a long run while presence still answers) passes the CRC and decodes as a valid 32.0 F.
-// Not a reading, on every probe path.
+// TempTask (DS18B20, 5 s cadence; BATTERY_TEMP_SENSORS_SPEC.md §3): one Skip ROM convert for the whole bus, then
+// each scratchpad in turn. Only the ALT result drives the 1 s retry. Never calls settingWrite (a Core-0 flash
+// write stalls Core 1); auto-binds wait for owRoleService(). Never SETS core0Busy: it gates AdjustFieldLearnMode,
+// so setting it would freeze both control loops ~190-750 ms every 5 s. tempTaskHealthy is owned by checkTempTaskHealth().
+// An all-zero scratchpad passes CRC-8 (CRC of zeros is 0) and decodes as 32.0 F (slow rising edge on a long
+// run while presence still answers). Not a reading, on every probe path.
 static bool owScratchAllZero(const uint8_t *sp) {
   for (int b = 0; b < 9; b++) if (sp[b] != 0) return false;
   return true;
+}
+
+// Config byte derived from global resolution (9..12 bit -> 0x1F/0x3F/0x5F/0x7F); target is 12-bit (0x7F)
+#define DS18B20_CFG_BYTE (0x1F | ((resolution - 9) << 5))
+
+// Reset marker in the scratchpad alarm bytes TH/TL (nothing uses the alarms). RAM-only while setAutoSaveScratchPad(false):
+// a probe reset reloads TH/TL from EEPROM, which never holds it.
+#define OW_MARK_TH 0x58
+#define OW_MARK_TL 0x52
+
+// sp: a CRC-good scratchpad from addr. Raw 0x0550 with the marker is a real 85.0 C; without it the probe reset and holds
+// its power-on value, so one timed re-convert replaces it. False = no reading from this probe this cycle.
+static bool owVetPowerOn(const uint8_t *addr, uint8_t *sp) {
+  if (sp[2] == OW_MARK_TH && sp[3] == OW_MARK_TL) return true;
+  uint8_t w[9];
+  memcpy(w, sp, sizeof(w));
+  w[2] = OW_MARK_TH;
+  w[3] = OW_MARK_TL;
+  w[4] = DS18B20_CFG_BYTE;
+  sensors.writeScratchPad(addr, w);
+  if (((sp[1] << 8) | sp[0]) != 0x0550) return true;
+  tempPowerOn85Count++;
+  if (!sensors.requestTemperaturesByAddress(addr)) return false;
+  vTaskDelay(pdMS_TO_TICKS(sensors.millisToWaitForConversion(resolution)));  // fixed wait: a clone's done-poll can report done early
+  lastTempTaskHeartbeat = millis();
+  return sensors.readScratchPad(addr, sp) && OneWire::crc8(sp, 8) == sp[8] && !owScratchAllZero(sp)
+         && sp[2] == OW_MARK_TH && sp[3] == OW_MARK_TL;
 }
 
 void TempTask(void *parameter) {
@@ -1830,9 +1744,6 @@ void TempTask(void *parameter) {
   static bool engineWasRunning = false;
   static uint8_t tempConsecFail = 0;          // consecutive cycles with no good ALT read; an empty bus search counts too
   static unsigned long lastTempFailAlert = 0;
-
-// Config byte derived from global resolution (9..12 bit -> 0x1F/0x3F/0x5F/0x7F); target is 12-bit (0x7F)
-#define DS18B20_CFG_BYTE (0x1F | ((resolution - 9) << 5))
 
   for (;;) {
     unsigned long now = millis();
@@ -1877,9 +1788,8 @@ void TempTask(void *parameter) {
               tempConsecFail = 0;
             }
           }
-          // While charging the 20s control-staleness gate is armed, so a failed enumerate must
-          // retry fast — stacked 5s delays here are what cut the field on a brief bus glitch. Engine-off
-          // keeps the slow retry to save standby power (field is already off, staleness can't cut it).
+          // While charging the 20 s control-staleness gate is armed, so a failed enumerate retries fast (stacked
+          // 5 s delays cut the field on a brief glitch); engine-off keeps the slow retry for standby power.
           vTaskDelay(pdMS_TO_TICKS(g_engineSpinningNow ? 1000 : 5000));
           continue;
         }
@@ -1887,7 +1797,9 @@ void TempTask(void *parameter) {
       }
     }
 
-    if (core0Busy) {
+    // Courtesy only, and not while the engine spins: a cloud op can hold core0Busy ~48 s, past the 20 s alternator
+    // temperature staleness cut that arms 15 s after start, so a slow upload at engine start cut a healthy probe.
+    if (core0Busy && !g_engineSpinningNow) {
       tempCoreBusySkipCount++;
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
@@ -1923,15 +1835,9 @@ void TempTask(void *parameter) {
       if (owProbes[i].present && tempRoleSlot[TR_ALT] != (int8_t)i) otherPresent++;
     }
 
-    // A single isConnected() false-negative is usually OneWire noise (field-PWM coupling), not a real
-    // disconnect — at a user-set 19kHz every 1-Wire bit slot spans switching edges (~5 CRC fails/min,
-    // a third never recovering); at the 400Hz default edges are sparse and hits are rare (2 in 48min,
-    // both recovered, 2026-08-21). Either way corruption is
-    // probabilistic and an immediate re-roll usually lands clean (the CRC retry recovers ~2/3 the same
-    // way). Retry in place before counting a miss. Tearing down enumeration on a counted miss forces the
-    // slow re-enumerate path and its retry delays, which can stack past the 20s control-staleness gate
-    // and needlessly cut the field. Only re-enumerate after 3 consecutive counted misses; otherwise
-    // fast-retry (1s, post-failure) and keep the enumerated address so a good read clears staleness.
+    // A single isConnected() false-negative is usually field-PWM coupling noise and an immediate re-roll usually
+    // lands clean, so retry in place before counting a miss. Re-enumerate only after 3 consecutive counted misses:
+    // the slow re-enumerate path's delays can stack past the 20 s control-staleness gate and cut the field.
     if (altOk && !sensors.isConnected(tempDeviceAddress)) {
       vTaskDelay(pdMS_TO_TICKS(5));
       if (!sensors.isConnected(tempDeviceAddress)) {
@@ -1954,9 +1860,7 @@ void TempTask(void *parameter) {
     sensors.requestTemperatures();
 
     {
-      // Poll for conversion complete instead of a fixed 2000ms block.
-      // Timeout is resolution-based per library + small guard band. isConversionComplete() is wired-AND:
-      // it reads 0 until the slowest probe on the bus finishes.
+      // isConversionComplete() is wired-AND: it reads 0 until the slowest probe on the bus finishes.
       unsigned long convStart = millis();
       unsigned long convTimeout = sensors.millisToWaitForConversion(resolution) + 50;
 
@@ -1972,8 +1876,7 @@ void TempTask(void *parameter) {
       }
     }
 
-    // ALT (alternator) scratchpad: the original single-probe path, unchanged. Its failure exits go to
-    // altDone so the other probes are still read this cycle; an OTA start still leaves via cleanup.
+    // ALT scratchpad. Failure exits go to altDone so the other probes are still read; an OTA start leaves via cleanup.
     if (altOk) {
       if (sensors.readScratchPad(tempDeviceAddress, scratchPad)) {
 
@@ -2012,15 +1915,12 @@ void TempTask(void *parameter) {
           goto altDone;
         }
 
+        // CHECK 3: Power-on signature (0x0550 = 85°C = 185°F)
+        if (!owVetPowerOn(tempDeviceAddress, scratchPad)) goto altDone;
+
         int16_t raw = (scratchPad[1] << 8) | scratchPad[0];
         float tempC = raw / 16.0f;
         float tempF = tempC * 1.8f + 32.0f;
-
-        // CHECK 3: Power-on signature (0x0550 = 85°C = 185°F)
-        if (raw == 0x0550) {
-          tempPowerOn85Count++;
-          goto altDone;
-        }
 
         // CHECK 4: Verify resolution; auto-correct if EEPROM or reset changed it
         if (scratchPad[4] != DS18B20_CFG_BYTE) {
@@ -2032,7 +1932,6 @@ void TempTask(void *parameter) {
           }
 
           {
-            // Poll for conversion complete after resolution fix; same approach as primary wait.
             unsigned long convStart2 = millis();
             unsigned long convTimeout2 = sensors.millisToWaitForConversion(resolution) + 50;
 
@@ -2078,19 +1977,20 @@ void TempTask(void *parameter) {
 
           AlternatorTemperatureF = tempF;
           lastValidTemp = tempF;
-          // tempTaskHealthy is owned by checkTempTaskHealth(): setting it here raced the 5 s check and left
-          // tempTaskAlarm latched on after a recovery (audit 2026-09-27).
+          // Do not set tempTaskHealthy here: it races checkTempTaskHealth()'s 5 s check and latches tempTaskAlarm.
           thisReadSucceeded = true;
           MARK_FRESH(IDX_ALTERNATOR_TEMP);
-          wmIgnUpdate(wmIgn_altTempF, AlternatorTemperatureF);  // ignition-cycle watermark
+          if (!IgnoreTemperature && !LimpHome) {   // statistics only: an owner-ignored reading is not data
+            wmIgnUpdate(wmIgn_altTempF, AlternatorTemperatureF);  // ignition-cycle watermark
 
-          if (AlternatorTemperatureF > MaxAlternatorTemperatureF) {
-            pendingMaxTemp = AlternatorTemperatureF;
-            writeMaxTemp = true;
-          }
-          if (AlternatorTemperatureF > MaxAlternatorTemperatureF_AllTime) {
-            pendingMaxTempAllTime = AlternatorTemperatureF;
-            writeMaxTempAllTime = true;
+            if (AlternatorTemperatureF > MaxAlternatorTemperatureF) {
+              pendingMaxTemp = AlternatorTemperatureF;
+              writeMaxTemp = true;
+            }
+            if (AlternatorTemperatureF > MaxAlternatorTemperatureF_AllTime) {
+              pendingMaxTempAllTime = AlternatorTemperatureF;
+              writeMaxTempAllTime = true;
+            }
           }
         } else {
           tempOutOfRangeCount++;
@@ -2102,9 +2002,8 @@ void TempTask(void *parameter) {
 
 altDone:
     if (altOk) owMirrorAltResult(thisReadSucceeded, AlternatorTemperatureF);  // every ALT exit above lands here except the OTA goto cleanup
-    // Every other PRESENT probe in the registry, bound or not, so the assignment card shows live values.
-    // A role whose enable setting is 0 is read into the registry but does not touch its role global or
-    // freshness stamp. The ALT slot was handled above and never re-read here.
+    // Read every other PRESENT probe, bound or not, so the assignment card shows live values. A role whose
+    // enable is 0 updates only the registry, not its role global or freshness stamp.
     {
       const int8_t altSlot = tempRoleSlot[TR_ALT];
       for (uint8_t i = 0; i < owProbeCount; i++) {
@@ -2125,13 +2024,11 @@ altDone:
           }
           if (allFF) {
             absent = true;  // nothing answered this ROM: gone from the bus (all-0xFF never passes CRC, so it is tested first)
-          } else if (crcOk) {
+          } else if (crcOk && owVetPowerOn(owProbes[i].addr, scratchPad)) {
             int16_t raw = (scratchPad[1] << 8) | scratchPad[0];
-            if (raw != 0x0550) {  // 0x0550 = power-on 85C signature: skip this cycle
-              if (scratchPad[4] != DS18B20_CFG_BYTE) sensors.setResolution(owProbes[i].addr, resolution);  // this device only, no re-convert; the next cycle reads at 12-bit
-              tempF = (raw / 16.0f) * 1.8f + 32.0f;
-              good = (tempF > -50 && tempF < 300);
-            }
+            if (scratchPad[4] != DS18B20_CFG_BYTE) sensors.setResolution(owProbes[i].addr, resolution);  // this device only, no re-convert; the next cycle reads at 12-bit
+            tempF = (raw / 16.0f) * 1.8f + 32.0f;
+            good = (tempF > -50 && tempF < 300);
           }
         }
         portENTER_CRITICAL(&owMux);
@@ -2220,8 +2117,7 @@ uint32_t httpsUploadWorstMs = 0;
 
 void httpsTask(void *param) {
   if (otaInProgress) {
-    // Returning from a FreeRTOS task function aborts in vPortTaskWrapper (panic-reboot) —
-    // self-delete cleanly instead, matching TempTask. Unreachable today, latent trap otherwise.
+    // Returning from a FreeRTOS task aborts in vPortTaskWrapper (panic-reboot), so self-delete instead.
     httpsTaskHandle = NULL;
     vTaskDelete(NULL);
     return;  // never reached — silences no-return analysis
@@ -2289,10 +2185,10 @@ void httpsTask(void *param) {
           break;
         }
         case HTTPS_UPLOAD_BOATPERF:
-          opSuccess = executeUploadBoatPerf(request.payload);
+          opSuccess = executeUploadBoatPerf(request);   // may hand request.payload to Core 1 (then nulls it)
           break;
         case HTTPS_UPLOAD_ALTHEALTH:
-          opSuccess = executeUploadAltHealth(request.payload);
+          opSuccess = executeUploadAltHealth(request);
           break;
         case HTTPS_UPLOAD_CX_LEDGER:
           opSuccess = executeUploadCxLedger(request.payload);  // sets cxLedgerUpState itself (2 = trim due, -1 = retry)
@@ -2332,6 +2228,10 @@ void httpsTask(void *param) {
           executeResetAltHealthCloud();
           opSuccess = true;
           break;
+        case HTTPS_RESET_BOAT_PERF:
+          executeResetBoatPerfCloud();
+          opSuccess = true;
+          break;
         case HTTPS_CLOUD_OP:
           executeCloudOp();
           opSuccess = true;
@@ -2339,7 +2239,7 @@ void httpsTask(void *param) {
       }
 
       unsigned long opDuration = millis() - opStart;
-      httpsUploadLastMs = (uint32_t)opDuration;                                 // Core-0 cloud op time, dashboard Core-0 section
+      httpsUploadLastMs = (uint32_t)opDuration;
       if ((uint32_t)opDuration > httpsUploadWorstMs) httpsUploadWorstMs = (uint32_t)opDuration;
 
       if (opDuration > 9000) {
@@ -2350,20 +2250,18 @@ void httpsTask(void *param) {
         if (opSuccess) {
           consecutiveFailures = 0;
         } else {
-          // Transport-level failures (WiFi drop, connect fail, send fail, read
-          // timeout) return from executeUploadPayload before its response
-          // handling, leaving the buffered in-flight marker set — clear it here
-          // or uploadBufferedRecords() refuses to queue forever and the full
-          // ring silently drops every new snapshot. The record itself stays in
-          // the ring for retry. (Idempotent: parsed-response failure paths
-          // already cleared it.)
-          if (lastUploadWasBuffered && sensorRingInFlightIndex >= 0) {
-            sensorRingInFlightIndex = -1;
+          // Transport-level failures return before executeUploadPayload's response handling, leaving the
+          // in-flight marker set; clear it or uploadBufferedRecords() refuses to queue forever and the full
+          // ring drops every new snapshot. The record stays in the ring for retry. Only on a transport failure
+          // (code still 0): a parsed reply already released the marker, and Core 1 may own it again by now.
+          if (lastHttpResponseCode == 0 && lastUploadWasBuffered && sensorRingInFlightIndex >= 0) {
             lastUploadWasBuffered = false;
+            sensorRingInFlightIndex = -1;
           }
         }
-        if (!opSuccess && lastHttpResponseCode != 400 && lastHttpResponseCode != 401) {
-          // Don't count 400/401 as failures - they indicate bad data that gets auto-deleted
+        if (!opSuccess && lastHttpResponseCode != 400) {
+          // Don't count 400 as a failure - it is bad data that gets auto-deleted. A 401 (credentials,
+          // or a gateway rejection) keeps its record and backs off like any other failure.
           consecutiveFailures++;
           //Serial.printf("Consecutive failures: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);MAX_CONSECUTIVE_FAILURES);
 
@@ -2393,10 +2291,8 @@ void httpsTask(void *param) {
   }
 }
 // SENSOR AGGREGATION FUNCTIONS
-// Init at boot: reset the in-progress accumulator windows. The PSRAM ring
-// itself is restored by restoreSensorRingFromLittleFS() right after this.
-// Also one-shot scrub of the legacy /sensor_buffer/ dir from pre-May2026
-// firmware — no-op on fresh devices.
+// Resets the accumulator windows (the PSRAM ring is restored by restoreSensorRingFromLittleFS() right
+// after) and scrubs the legacy /sensor_buffer/ dir old firmware left behind.
 void initSensorBuffer() {
   resetSensorWindow();
   resetAccelWindow();
@@ -2571,10 +2467,8 @@ void resetSensorWindow() {
   currentWindow->solarVolt_area_v_us = 0;
   currentWindow->solarVolt_valid_us = 0;
 
-  // 64-bit clock, NOT micros(): micros() is 32-bit and wraps every 71.6 min. Subtracting a wrapped
-  // value in uint64 gave one ~1.8e19 us delta per wrap, which swamped every area/valid_us pair and
-  // uploaded a window of 0.00 averages beside real min/max (22 rows dead-lettered 2026-09-08/09,
-  // one per 71.6 min of uptime, "Invalid battery voltage range").
+  // 64-bit clock, NOT micros(): a 32-bit wrap (every 71.6 min) gave a ~1.8e19 us delta that swamped every
+  // area/valid_us pair and uploaded 0.00 averages beside real min/max.
   currentWindow->lastUpdateTime_us = (uint64_t)esp_timer_get_time();
   currentWindow->windowStartTime = millis();
 }
@@ -2663,7 +2557,6 @@ void updateSensorWindow() {
   uint64_t delta_us;
 
   if (currentWindow->lastUpdateTime_us == 0) {
-    // First call after reset - no delta yet
     delta_us = 0;
   } else {
     delta_us = now_us - currentWindow->lastUpdateTime_us;
@@ -2671,7 +2564,6 @@ void updateSensorWindow() {
 
   currentWindow->lastUpdateTime_us = now_us;
 
-  // If this is the first call (delta_us == 0), skip accumulation but still update min/max
   bool shouldAccumulate = (delta_us > 0);
 
   // Engine-running-weighted accumulators — engine spinning (tach gate), NOT field-on,
@@ -2681,7 +2573,7 @@ void updateSensorWindow() {
 
   // Battery voltage — only a fresh, trusted INA228 reading (§10.1): with commit-on-valid a dead chip
   // leaves its last good value in IBV, and an owner-ignored main voltage is not data either.
-  if (ibvFresh() && !IgnoreBattVMain) {
+  if (ibvFresh() && !IgnoreBattVMain && !LimpHome) {
     int32_t battVolt = (int32_t)(getBatteryVoltage() * 100.0);
     if (battVolt < currentWindow->battVolt_min) currentWindow->battVolt_min = battVolt;
     if (battVolt > currentWindow->battVolt_max) currentWindow->battVolt_max = battVolt;
@@ -2695,10 +2587,8 @@ void updateSensorWindow() {
     }
   }
 
-  // Battery current - CONDITIONAL on the shunt (same pattern as baro/alt-temp below). No shunt ->
-  // Bcur is INA input noise and SOC_percent is a frozen NVS value; leaving the window untouched
-  // keeps *_valid_us at 0, which the uploader turns into JSON null instead of invented numbers.
-  // Bcur is always the INA228 shunt, so its own stamp decides freshness (§10.6).
+  // Battery current only with a shunt: without one Bcur is INA input noise and SOC a frozen NVS value. An
+  // untouched window keeps *_valid_us at 0, which uploads JSON null. Bcur's own stamp decides freshness (§10.6).
   if (HAS_BATT_SHUNT && bcurFresh()) {
     int32_t battCurr = (int32_t)(Bcur * 100.0);
     if (battCurr < currentWindow->battCurr_min) currentWindow->battCurr_min = battCurr;
@@ -2715,7 +2605,7 @@ void updateSensorWindow() {
 
   // Alternator current — only a fresh reading (§10.5): with commit-on-valid a dead sensor leaves its
   // last good value in MeasuredAmps, and an untouched window uploads null rather than a held number.
-  if (altAmpsFresh()) {
+  if (altAmpsFresh() && !IgnoreAltCurrent && !LimpHome) {
     int32_t altCurr = (int32_t)(MeasuredAmps * 100.0);
     if (altCurr < currentWindow->altCurr_min) currentWindow->altCurr_min = altCurr;
     if (altCurr > currentWindow->altCurr_max) currentWindow->altCurr_max = altCurr;
@@ -2775,7 +2665,7 @@ void updateSensorWindow() {
   // A held reading is not data: the selected source must have committed within 90 s (engine-off poll is 60 s).
   uint32_t altTempTs = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
   bool altTempFresh = altTempTs != 0 && (uint32_t)(millis() - altTempTs) <= 90000UL;
-  if (!isnan(TempToUse) && TempToUse != -99 && altTempFresh) {
+  if (!isnan(TempToUse) && TempToUse != -99 && altTempFresh && !IgnoreTemperature && !LimpHome) {
     int32_t altTemp = (int32_t)(TempToUse * 100.0);
     if (altTemp < currentWindow->altTemp_min) currentWindow->altTemp_min = altTemp;
     if (altTemp > currentWindow->altTemp_max) currentWindow->altTemp_max = altTemp;
@@ -2807,8 +2697,8 @@ void updateSensorWindow() {
     }
   }
 
-  // An ignored engine speed is not data, and engineSpinning() already reports it as stopped.
-  if (!IgnoreRPM) {
+  // An ignored engine speed (or any reading in Limp Home) is not data, and engineSpinning() already reports it as stopped.
+  if (!IgnoreRPM && !LimpHome) {
     int32_t rpm = (int32_t)RPM;
     if (rpm < currentWindow->rpm_min) currentWindow->rpm_min = rpm;
     if (rpm > currentWindow->rpm_max) currentWindow->rpm_max = rpm;
@@ -2880,12 +2770,9 @@ void updateSensorWindow() {
     }
   }
 
-  // A speed-source switch does not empty the 60-s ring in updateSustainedSpeed(), so for one window
-  // after it sogSust1m still carries the OLD source's samples while the stamp below would name the
-  // NEW one — and a mislabelled cloud speed record is permanent. Hold the record off for a full ring
-  // window after any change. Detected by watching the variable rather than by an invalidator call at
-  // each writer: the ring and its NMEA feeder live elsewhere, and a future writer would not know to
-  // call one.
+  // A speed-source switch doesn't empty updateSustainedSpeed()'s 60-s ring, so sogSust1m carries the OLD
+  // source under the NEW stamp for one window (and a mislabelled cloud speed record is permanent): hold the
+  // record off a full ring window. Detected by watching the variable so a future writer can't skip it.
   static uint8_t sustSrcSeen = 0xFF;   // 0xFF = first pass, establish the baseline without a hold-off
   static uint32_t sustSrcChangedMs = 0;
   static bool sustSrcHold = false;
@@ -2935,8 +2822,7 @@ void updateSensorWindow() {
     }
   }
 
-  // Apparent wind - CONDITIONAL on freshness. Ungated, a boat with no wind instrument
-  // accumulated the 0.0 initialiser as measured data and the cloud drew a solid 0-kt line.
+  // Apparent wind: gated so a boat with no wind instrument doesn't record the 0.0 initialiser as data.
   if (IS_SEEN(IDX_APPARENT_WIND_SPEED) && !IS_STALE(IDX_APPARENT_WIND_SPEED)) {
     int32_t aws = (int32_t)(ApparentWindSpeedNMEA * 100.0);
     if (aws < currentWindow->aws_min) currentWindow->aws_min = aws;
@@ -3000,24 +2886,24 @@ void updateSensorWindow() {
   }
 
   updateGPSBuffer();
-  double smoothLat, smoothLon;
-  getSmoothedGPS(smoothLat, smoothLon);
-  currentWindow->lat_current = smoothLat;
-  currentWindow->lon_current = smoothLon;
+  // Only a fresh fix moves the position (a lost GPS would upload its frozen smoothing buffer); else 0/0 uploads null.
+  if (IS_SEEN(IDX_LATITUDE_NMEA) && !IS_STALE(IDX_LATITUDE_NMEA) && !IS_STALE(IDX_LONGITUDE_NMEA)) {
+    double smoothLat, smoothLon;
+    getSmoothedGPS(smoothLat, smoothLon);
+    currentWindow->lat_current = smoothLat;
+    currentWindow->lon_current = smoothLon;
+  }
 }
 
-// A window whose sensor was absent for the whole window must upload JSON null, not the untouched
-// min/max init sentinels (999900 / -999900) and not a 0.0 average. A fabricated number here is
-// permanent: it lands in the cloud time series and every aggregate that reads the column.
-// Cloud rule (CLOUD_PLATFORM.md): no firmware-written column is NOT NULL, so null always ingests.
+// A sensor absent all window uploads JSON null, never the min/max init sentinels or a 0.0 average: a
+// fabricated number is permanent in the cloud series. No firmware-written cloud column is NOT NULL.
 static const char *ltJsonNumP(char *buf, size_t n, double v, bool valid, int decimals) {
   if (valid) snprintf(buf, n, "%.*f", decimals, v);
   else       strncpy(buf, "null", n);
   return buf;
 }
-// Two decimals is the wire precision for every x100 accumulator. The x1000 IMU accel columns pass
-// 3 through ltJsonNumP directly, matching their min/max "%.3f"; at two decimals a 0.012 g average
-// would upload as 0.01.
+// Two decimals for every x100 accumulator; the x1000 IMU accel columns call ltJsonNumP with 3 (at 2, a
+// 0.012 g average would upload as 0.01).
 static const char *ltJsonNum(char *buf, size_t n, double v, bool valid) {
   return ltJsonNumP(buf, n, v, valid, 2);
 }
@@ -3030,96 +2916,79 @@ static const char *ltJsonInt(char *buf, size_t n, long v, bool valid) {
   return buf;
 }
 
-// Build the cloud upload JSON for one sensor snapshot into the global
-// payloadBuffer. Returns bytes written (excluding null terminator), 0 on
-// overflow. Used by the PSRAM-ring upload path (uploadBufferedRecords).
-// All payload values come from the snapshot itself (snap.window + snap.imu);
-// lifetime/session accumulators moved to the 24h config snapshot upload.
+// Builds one snapshot's upload JSON into payloadBuffer from the reduced record only (averages were divided at
+// roll, see pushSensorSnapshot). Returns bytes written, 0 on overflow.
 size_t buildSnapshotJson(const SensorSnapshot &snap) {
-// Per-window avg = time-weighted area / valid microseconds, then un-scale.
-// Three scale factors in play: SensorWindow uses ×100 for most fields but RAW for rpm;
-// ImuWindow uses ×100 for heel/pitch but ×1000 for vertical/total accel.
-#define SAFE_AVG_100(area, valid)  ((valid) > 0 ? ((double)(area) / (double)(valid)) / 100.0  : 0.0)
-#define SAFE_AVG_1000(area, valid) ((valid) > 0 ? ((double)(area) / (double)(valid)) / 1000.0 : 0.0)
-#define SAFE_AVG_RAW(area, valid)  ((valid) > 0 ? ((double)(area) / (double)(valid))          : 0.0)
+// Averages arrive un-scaled (pushSensorSnapshot divided area / valid us and removed the ×100 / ×1000 / raw-rpm
+// scale); min/max are still the window's scaled integers and are un-scaled here.
   time_t finalTs = reconstructTimestamp((time_t)snap.collectionTime);
   const char *timestampStr = formatTimestamp(finalTs);
   // Battery current + SoC upload as null when the window never saw a shunt (BatteryShuntPresent=0
-  // or no shunt resistance): the accumulators are skipped upstream, so valid_us == 0 is the signal.
-  // engine-on avg rides its own battCurr_on_us — active_us can be non-zero while battCurr never accumulated.
-  const bool bcOk  = snap.window.battCurr_valid_us > 0;
-  const bool socOk = snap.window.soc_valid_us > 0;
+  // or no shunt resistance): the accumulators are skipped upstream, so the roll left a NaN average, the signal here.
+  // engine-on avg rode its own battCurr_on_us at roll — active_us can be non-zero while battCurr never accumulated.
+  const bool bcOk  = !isnan(snap.battCurr.avg);
+  const bool socOk = !isnan(snap.soc.avg);
   char bcMinS[16], bcMaxS[16], bcAvgS[16], bcOnAvgS[16], socMinS[16], socMaxS[16], socAvgS[16];
-  // Same rule for the VE.Direct shunt and the four wind fields: updateSensorWindow skips their
-  // accumulators while the source is stale or never seen, so valid_us == 0 means absent. The cloud
-  // nulls the 9999 min/max sentinels itself but plots a 0.0 average as data, which is the flat
-  // 0-kt / 0 A line a boat without the instrument used to draw.
-  const bool vcOk  = snap.window.victronCurr_valid_us > 0;
-  const bool awsOk = snap.window.aws_valid_us > 0;
-  const bool twsOk = snap.window.tws_valid_us > 0;
-  const bool awaOk = snap.window.awa_valid_us > 0;
-  const bool twaOk = snap.window.twa_valid_us > 0;
+  // Same for the VE.Direct shunt and wind fields: accumulators skip a stale/never-seen source. The cloud nulls
+  // the 9999 min/max sentinels itself but plots a 0.0 average as data.
+  const bool vcOk  = !isnan(snap.victronCurr.avg);
+  const bool awsOk = !isnan(snap.aws.avg);
+  const bool twsOk = !isnan(snap.tws.avg);
+  const bool awaOk = !isnan(snap.awa.avg);
+  const bool twaOk = !isnan(snap.twa.avg);
   char vcMinS[16], vcMaxS[16], vcAvgS[16], vcOnAvgS[16];
   char awsMinS[16], awsMaxS[16], awsAvgS[16], twsMinS[16], twsMaxS[16], twsAvgS[16];
   char awaMinS[16], awaMaxS[16], awaAvgS[16], twaMinS[16], twaMaxS[16], twaAvgS[16];
   // Same rule for the nav fields: sog/cog/heading accumulate only while IS_SEEN + fresh, vmg/leeway only
-  // while not NaN, so valid_us == 0 means the instrument was absent all window. cog and heading are
+  // while not NaN, so a NaN average means the instrument was absent all window. cog and heading are
   // avg-only — no min/max sentinel exists for the cloud to null, so their 0.00 was permanent.
-  const bool sogOk = snap.window.sog_valid_us > 0;
-  const bool vmgOk = snap.window.vmg_valid_us > 0;
-  const bool lwOk  = snap.window.leeway_valid_us > 0;
-  const bool cogOk = snap.window.cog_valid_us > 0;
-  const bool hdgOk = snap.window.heading_valid_us > 0;
+  const bool sogOk = !isnan(snap.sog.avg);
+  const bool vmgOk = !isnan(snap.vmg.avg);
+  const bool lwOk  = !isnan(snap.leeway.avg);
+  const bool cogOk = !isnan(snap.cog.avg);
+  const bool hdgOk = !isnan(snap.heading.avg);
+  // Position stays at the reset's 0/0 when GPS was stale or absent all window (updateSensorWindow).
+  const bool posOk = snap.lat_current != 0.0 || snap.lon_current != 0.0;
   char sogMinS[16], sogMaxS[16], sogAvgS[16], vmgMinS[16], vmgMaxS[16], vmgAvgS[16];
-  char lwMinS[16], lwMaxS[16], lwAvgS[16], cogAvgS[16], hdgAvgS[16];
-  // Same absent-vs-zero rule for the four accumulators added in payload_v 6: battery temperature
-  // (no qualifying source), the EXTRA probe (unassigned on most boats), and VE.Direct panel power
-  // and voltage (no MPPT). A 0 uploaded as data is a lie in every one of them.
-  const bool btOk  = snap.window.battTemp_valid_us > 0;
-  const bool etOk  = snap.window.extraTemp_valid_us > 0;
-  const bool spOk  = snap.window.solarPower_valid_us > 0;
-  const bool svOk  = snap.window.solarVolt_valid_us > 0;
+  char lwMinS[16], lwMaxS[16], lwAvgS[16], cogAvgS[16], hdgAvgS[16], latS[16], lonS[16];
+  // Same rule for battery temp (no qualifying source), the EXTRA probe (usually unassigned) and VE.Direct
+  // panel power/voltage (no MPPT).
+  const bool btOk  = !isnan(snap.battTemp.avg);
+  const bool etOk  = !isnan(snap.extraTemp.avg);
+  const bool spOk  = !isnan(snap.solarPower.avg);
+  const bool svOk  = !isnan(snap.solarVolt.avg);
   char btMinS[16], btMaxS[16], btAvgS[16], etMinS[16], etMaxS[16], etAvgS[16];
   char spMinS[16], spMaxS[16], spAvgS[16], svMinS[16], svMaxS[16], svAvgS[16];
-  // The remaining ten accumulators had NO validity flag at all. Their min/max are safe — the cloud's
-  // cleanSentinelValue() nulls the 999900 defaults — but SAFE_AVG_* returns 0.0 on an empty
-  // denominator and a 0.0 average uploads as a measurement: a boat with no barometer drew a flat
-  // 0 hPa baro_avg, no alt-temp probe a 0 F line, no IMU a 0 g line, engine-off windows a 0 V onavg.
-  // Only the averages are guarded here; min/max are deliberately left alone, because they are still
-  // recorded on the first sample of a window (delta_us == 0) and that is truthful data.
-  // Exception: battery voltage, alternator current and rpm skip their whole block while stale or
-  // ignored, and their max sentinel is 0, a value the cloud cannot tell from a reading; an untouched
-  // pair (min still above max) uploads null.
-  // (The 2026-09-08/09 "Invalid battery voltage range" dead letters were NOT empty windows — they
-  // were the 32-bit micros() wrap, fixed at the clock in resetSensorWindow/updateSensorWindow.)
-  // The x1000 IMU accel min/max and the wave period are the exception: their sentinels scale to
-  // 999.9 / -999.9 / 0 and -1, which the cloud's list does not know, so they are nulled here BY
-  // SENTINEL (a window's single real sample still uploads).
-  const bool bvMmOk  = snap.window.battVolt_min <= snap.window.battVolt_max;
-  const bool acMmOk  = snap.window.altCurr_min  <= snap.window.altCurr_max;
-  const bool rpmMmOk = snap.window.rpm_min      <= snap.window.rpm_max;
+  // The rest: min/max are left alone (the cloud's cleanSentinelValue() nulls the 999900 defaults, and a
+  // window's first sample is truthful data), but an average is NaN on an empty denominator, so averages
+  // are guarded. Battery voltage, alt current and rpm have a max sentinel of 0, which the cloud can't tell
+  // from a reading: an untouched pair (min > max) uploads null. The x1000 IMU accel min/max and wave period
+  // sentinels aren't on the cloud's list, so they are nulled here BY SENTINEL.
+  const bool bvMmOk  = snap.battVolt.min <= snap.battVolt.max;
+  const bool acMmOk  = snap.altCurr.min  <= snap.altCurr.max;
+  const bool rpmMmOk = snap.rpm.min      <= snap.rpm.max;
   char bvMinS[16], bvMaxS[16], acMinS[16], acMaxS[16], rpmMinS[16], rpmMaxS[16];
-  const bool bvOk   = snap.window.battVolt_valid_us    > 0;
-  const bool acOk   = snap.window.altCurr_valid_us     > 0;
-  const bool baroOk = snap.window.baro_valid_us        > 0;
-  const bool atOk   = snap.window.altTemp_valid_us     > 0;
-  const bool ttOk   = snap.window.tempTherm_valid_us   > 0;
-  const bool ambOk  = snap.window.ambTemp_valid_us     > 0;
-  const bool rpmOk  = snap.window.rpm_valid_us         > 0;
-  const bool dcOk   = snap.window.dutyCycle_valid_us   > 0;
-  const bool azOk   = snap.window.altZero_valid_us     > 0;
-  const bool utaOk  = snap.window.uTargetAmps_valid_us > 0;
-  // Engine-on averages divide by active_us (duty) or the channel's own *_on_us, 0 for every window
-  // the engine never spun; engine-on percent divides by dutyCycle_valid_us, which never skips a tick.
-  const bool onOk   = snap.window.active_us > 0;
+  const bool bvOk   = !isnan(snap.battVolt.avg);
+  const bool acOk   = !isnan(snap.altCurr.avg);
+  const bool baroOk = !isnan(snap.baro.avg);
+  const bool atOk   = !isnan(snap.altTemp.avg);
+  const bool ttOk   = !isnan(snap.tempTherm.avg);
+  const bool ambOk  = !isnan(snap.ambTemp.avg);
+  const bool rpmOk  = !isnan(snap.rpm.avg);
+  const bool dcOk   = !isnan(snap.dutyCycle.avg);
+  const bool azOk   = !isnan(snap.altZero.avg);
+  const bool utaOk  = !isnan(snap.uTargetAmps.avg);
+  // Engine-on averages were divided at roll by active_us (duty) or the channel's own *_on_us, NaN for every
+  // window the engine never spun; engine-on percent by dutyCycle_valid_us, which never skips a tick.
+  const bool onOk   = !isnan(snap.dutyCycleOnAvg);
   char bvAvgS[16], acAvgS[16], baroAvgS[16], atAvgS[16], ttAvgS[16], ambAvgS[16];
   char rpmAvgS[16], dcAvgS[16], azAvgS[16], utaAvgS[16];
   char bvOnAvgS[16], acOnAvgS[16], dcOnAvgS[16], engPctS[16];
-  // Same rule on the IMU window: no accelerometer fitted leaves every valid_us at 0.
-  const bool heelOk = snap.imu.heel_valid_us            > 0;
-  const bool ptchOk = snap.imu.pitch_valid_us           > 0;
-  const bool vaccOk = snap.imu.vertical_accel_valid_us  > 0;
-  const bool taccOk = snap.imu.total_accel_valid_us     > 0;
+  // Same rule on the IMU channels: no accelerometer fitted leaves every IMU average NaN.
+  const bool heelOk = !isnan(snap.heel.avg);
+  const bool ptchOk = !isnan(snap.pitch.avg);
+  const bool vaccOk = !isnan(snap.vertical_accel.avg);
+  const bool taccOk = !isnan(snap.total_accel.avg);
   char heelAvgS[16], ptchAvgS[16], vaccAvgS[16], taccAvgS[16];
   char vaccMinS[16], vaccMaxS[16], taccMinS[16], taccMaxS[16], wpS[16];
   int written = snprintf(
@@ -3130,16 +2999,9 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     "\"token\":\"%s\","
     "\"timestamp\":\"%s\","
     "\"firmware_version_int\":%d,"
-    // payload_v = ingest payload schema version; bump when this body's shape changes.
-    // Edge fn inserts an explicit column whitelist, so it safely ignores this. See CLOUD_PLATFORM.md §3a.
-    // v2 adds imu_suspicious (IMU install-validation flag).
-    // v3 adds engine-on-weighted averages (*_onavg) + engine_on_pct coverage.
-    // v4 adds sog_sust1m_max — the window's best 60-s average SOG, which now feeds the
-    // cloud speed board in place of sog_max (a single-sample peak).
-    // v5 adds speed_source_phone — true when the window's standing sog_sust1m_max was
-    // phone-GPS-sourced (selectable speedSourceMode), so leaderboards can disqualify.
-    // v6 adds batt_temp / extra_temp / solar_power / solar_volt min-max-avg, and drops the
-    // tempMargin accumulator (derivable from alt_temp and the TemperatureLimitF setting).
+    // payload_v = ingest schema version; bump when this body's shape changes. The edge fn inserts an explicit
+    // column whitelist, so it ignores this field (CLOUD_PLATFORM.md §3a). v2 imu_suspicious, v3 *_onavg +
+    // engine_on_pct, v4 sog_sust1m_max, v5 speed_source_phone, v6 batt/extra temp + solar (tempMargin dropped).
     "\"payload_v\":6,"
     "\"current_time_source\":%d,"
     // Battery
@@ -3164,7 +3026,7 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     "\"sog_min\":%s,\"sog_max\":%s,\"sog_avg\":%s,"
     "\"sog_sust1m_max\":%.2f,"
     "\"speed_source_phone\":%s,"
-    "\"lat_current\":%.6f,\"lon_current\":%.6f,"
+    "\"lat_current\":%s,\"lon_current\":%s,"
     // NMEA wind & sailing
     "\"aws_min\":%s,\"aws_max\":%s,\"aws_avg\":%s,"
     "\"tws_min\":%s,\"tws_max\":%s,\"tws_avg\":%s,"
@@ -3207,106 +3069,110 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
     timestampStr,
     firmwareVersionInt,
     (int)currentTimeSource,
-    ltJsonNum(bvMinS, sizeof(bvMinS), snap.window.battVolt_min / 100.0, bvMmOk),
-    ltJsonNum(bvMaxS, sizeof(bvMaxS), snap.window.battVolt_max / 100.0, bvMmOk),
-    ltJsonNum(bvAvgS, sizeof(bvAvgS), SAFE_AVG_100(snap.window.battVolt_area_v_us, snap.window.battVolt_valid_us), bvOk),
-    ltJsonNum(bcMinS, sizeof(bcMinS), snap.window.battCurr_min / 100.0, bcOk),
-    ltJsonNum(bcMaxS, sizeof(bcMaxS), snap.window.battCurr_max / 100.0, bcOk),
-    ltJsonNum(bcAvgS, sizeof(bcAvgS), SAFE_AVG_100(snap.window.battCurr_area_v_us, snap.window.battCurr_valid_us), bcOk),
-    ltJsonNum(acMinS, sizeof(acMinS), snap.window.altCurr_min / 100.0, acMmOk),
-    ltJsonNum(acMaxS, sizeof(acMaxS), snap.window.altCurr_max / 100.0, acMmOk),
-    ltJsonNum(acAvgS, sizeof(acAvgS), SAFE_AVG_100(snap.window.altCurr_area_v_us, snap.window.altCurr_valid_us), acOk),
-    snap.window.dutyCycle_min / 100.0, snap.window.dutyCycle_max / 100.0,
-    ltJsonNum(dcAvgS, sizeof(dcAvgS), SAFE_AVG_100(snap.window.dutyCycle_area_v_us, snap.window.dutyCycle_valid_us), dcOk),
-    ltJsonNum(vcMinS, sizeof(vcMinS), snap.window.victronCurr_min / 100.0, vcOk),
-    ltJsonNum(vcMaxS, sizeof(vcMaxS), snap.window.victronCurr_max / 100.0, vcOk),
-    ltJsonNum(vcAvgS, sizeof(vcAvgS), SAFE_AVG_100(snap.window.victronCurr_area_v_us, snap.window.victronCurr_valid_us), vcOk),
-    ltJsonNum(socMinS, sizeof(socMinS), snap.window.soc_min / 100.0, socOk),
-    ltJsonNum(socMaxS, sizeof(socMaxS), snap.window.soc_max / 100.0, socOk),
-    ltJsonNum(socAvgS, sizeof(socAvgS), SAFE_AVG_100(snap.window.soc_area_v_us, snap.window.soc_valid_us), socOk),
-    ltJsonInt(rpmMinS, sizeof(rpmMinS), (long)snap.window.rpm_min, rpmMmOk),
-    ltJsonInt(rpmMaxS, sizeof(rpmMaxS), (long)snap.window.rpm_max, rpmMmOk),
-    ltJsonInt(rpmAvgS, sizeof(rpmAvgS), (long)SAFE_AVG_RAW(snap.window.rpm_area_v_us, snap.window.rpm_valid_us), rpmOk),
-    snap.window.altTemp_min / 100.0, snap.window.altTemp_max / 100.0,
-    ltJsonNum(atAvgS, sizeof(atAvgS), SAFE_AVG_100(snap.window.altTemp_area_v_us, snap.window.altTemp_valid_us), atOk),
-    snap.window.tempTherm_min / 100.0, snap.window.tempTherm_max / 100.0,
-    ltJsonNum(ttAvgS, sizeof(ttAvgS), SAFE_AVG_100(snap.window.tempTherm_area_v_us, snap.window.tempTherm_valid_us), ttOk),
-    snap.window.ambTemp_min / 100.0, snap.window.ambTemp_max / 100.0,
-    ltJsonNum(ambAvgS, sizeof(ambAvgS), SAFE_AVG_100(snap.window.ambTemp_area_v_us, snap.window.ambTemp_valid_us), ambOk),
-    snap.window.baro_min / 100.0, snap.window.baro_max / 100.0,
-    ltJsonNum(baroAvgS, sizeof(baroAvgS), SAFE_AVG_100(snap.window.baro_area_v_us, snap.window.baro_valid_us), baroOk),
-    snap.window.uTargetAmps_min / 100.0, snap.window.uTargetAmps_max / 100.0,
-    ltJsonNum(utaAvgS, sizeof(utaAvgS), SAFE_AVG_100(snap.window.uTargetAmps_area_v_us, snap.window.uTargetAmps_valid_us), utaOk),
-    ltJsonNum(sogMinS, sizeof(sogMinS), snap.window.sog_min / 100.0, sogOk),
-    ltJsonNum(sogMaxS, sizeof(sogMaxS), snap.window.sog_max / 100.0, sogOk),
-    ltJsonNum(sogAvgS, sizeof(sogAvgS), SAFE_AVG_100(snap.window.sog_area_v_us, snap.window.sog_valid_us), sogOk),
-    snap.window.sogSust1m_max / 100.0,
-    snap.window.sogSustPhone ? "true" : "false",
-    snap.window.lat_current, snap.window.lon_current,
-    ltJsonNum(awsMinS, sizeof(awsMinS), snap.window.aws_min / 100.0, awsOk),
-    ltJsonNum(awsMaxS, sizeof(awsMaxS), snap.window.aws_max / 100.0, awsOk),
-    ltJsonNum(awsAvgS, sizeof(awsAvgS), SAFE_AVG_100(snap.window.aws_area_v_us, snap.window.aws_valid_us), awsOk),
-    ltJsonNum(twsMinS, sizeof(twsMinS), snap.window.tws_min / 100.0, twsOk),
-    ltJsonNum(twsMaxS, sizeof(twsMaxS), snap.window.tws_max / 100.0, twsOk),
-    ltJsonNum(twsAvgS, sizeof(twsAvgS), SAFE_AVG_100(snap.window.tws_area_v_us, snap.window.tws_valid_us), twsOk),
-    ltJsonNum(vmgMinS, sizeof(vmgMinS), snap.window.vmg_min / 100.0, vmgOk),
-    ltJsonNum(vmgMaxS, sizeof(vmgMaxS), snap.window.vmg_max / 100.0, vmgOk),
-    ltJsonNum(vmgAvgS, sizeof(vmgAvgS), SAFE_AVG_100(snap.window.vmg_area_v_us, snap.window.vmg_valid_us), vmgOk),
-    ltJsonNum(lwMinS, sizeof(lwMinS), snap.window.leeway_min / 100.0, lwOk),
-    ltJsonNum(lwMaxS, sizeof(lwMaxS), snap.window.leeway_max / 100.0, lwOk),
-    ltJsonNum(lwAvgS, sizeof(lwAvgS), SAFE_AVG_100(snap.window.leeway_area_v_us, snap.window.leeway_valid_us), lwOk),
-    ltJsonNum(awaMinS, sizeof(awaMinS), snap.window.awa_min / 100.0, awaOk),
-    ltJsonNum(awaMaxS, sizeof(awaMaxS), snap.window.awa_max / 100.0, awaOk),
-    ltJsonNum(awaAvgS, sizeof(awaAvgS), SAFE_AVG_100(snap.window.awa_area_v_us, snap.window.awa_valid_us), awaOk),
-    ltJsonNum(twaMinS, sizeof(twaMinS), snap.window.twa_min / 100.0, twaOk),
-    ltJsonNum(twaMaxS, sizeof(twaMaxS), snap.window.twa_max / 100.0, twaOk),
-    ltJsonNum(twaAvgS, sizeof(twaAvgS), SAFE_AVG_100(snap.window.twa_area_v_us, snap.window.twa_valid_us), twaOk),
-    ltJsonNum(cogAvgS, sizeof(cogAvgS), SAFE_AVG_100(snap.window.cog_area_v_us, snap.window.cog_valid_us), cogOk),
-    ltJsonNum(hdgAvgS, sizeof(hdgAvgS), SAFE_AVG_100(snap.window.heading_area_v_us, snap.window.heading_valid_us), hdgOk),
-    ltJsonNum(azAvgS, sizeof(azAvgS), SAFE_AVG_100(snap.window.altZero_area_v_us, snap.window.altZero_valid_us), azOk),
+    ltJsonNum(bvMinS, sizeof(bvMinS), snap.battVolt.min / 100.0, bvMmOk),
+    ltJsonNum(bvMaxS, sizeof(bvMaxS), snap.battVolt.max / 100.0, bvMmOk),
+    ltJsonNum(bvAvgS, sizeof(bvAvgS), snap.battVolt.avg, bvOk),
+    ltJsonNum(bcMinS, sizeof(bcMinS), snap.battCurr.min / 100.0, bcOk),
+    ltJsonNum(bcMaxS, sizeof(bcMaxS), snap.battCurr.max / 100.0, bcOk),
+    ltJsonNum(bcAvgS, sizeof(bcAvgS), snap.battCurr.avg, bcOk),
+    ltJsonNum(acMinS, sizeof(acMinS), snap.altCurr.min / 100.0, acMmOk),
+    ltJsonNum(acMaxS, sizeof(acMaxS), snap.altCurr.max / 100.0, acMmOk),
+    ltJsonNum(acAvgS, sizeof(acAvgS), snap.altCurr.avg, acOk),
+    snap.dutyCycle.min / 100.0, snap.dutyCycle.max / 100.0,
+    ltJsonNum(dcAvgS, sizeof(dcAvgS), snap.dutyCycle.avg, dcOk),
+    ltJsonNum(vcMinS, sizeof(vcMinS), snap.victronCurr.min / 100.0, vcOk),
+    ltJsonNum(vcMaxS, sizeof(vcMaxS), snap.victronCurr.max / 100.0, vcOk),
+    ltJsonNum(vcAvgS, sizeof(vcAvgS), snap.victronCurr.avg, vcOk),
+    ltJsonNum(socMinS, sizeof(socMinS), snap.soc.min / 100.0, socOk),
+    ltJsonNum(socMaxS, sizeof(socMaxS), snap.soc.max / 100.0, socOk),
+    ltJsonNum(socAvgS, sizeof(socAvgS), snap.soc.avg, socOk),
+    ltJsonInt(rpmMinS, sizeof(rpmMinS), (long)snap.rpm.min, rpmMmOk),
+    ltJsonInt(rpmMaxS, sizeof(rpmMaxS), (long)snap.rpm.max, rpmMmOk),
+    ltJsonInt(rpmAvgS, sizeof(rpmAvgS), (long)snap.rpm.avg, rpmOk),
+    snap.altTemp.min / 100.0, snap.altTemp.max / 100.0,
+    ltJsonNum(atAvgS, sizeof(atAvgS), snap.altTemp.avg, atOk),
+    snap.tempTherm.min / 100.0, snap.tempTherm.max / 100.0,
+    ltJsonNum(ttAvgS, sizeof(ttAvgS), snap.tempTherm.avg, ttOk),
+    snap.ambTemp.min / 100.0, snap.ambTemp.max / 100.0,
+    ltJsonNum(ambAvgS, sizeof(ambAvgS), snap.ambTemp.avg, ambOk),
+    snap.baro.min / 100.0, snap.baro.max / 100.0,
+    ltJsonNum(baroAvgS, sizeof(baroAvgS), snap.baro.avg, baroOk),
+    snap.uTargetAmps.min / 100.0, snap.uTargetAmps.max / 100.0,
+    ltJsonNum(utaAvgS, sizeof(utaAvgS), snap.uTargetAmps.avg, utaOk),
+    ltJsonNum(sogMinS, sizeof(sogMinS), snap.sog.min / 100.0, sogOk),
+    ltJsonNum(sogMaxS, sizeof(sogMaxS), snap.sog.max / 100.0, sogOk),
+    ltJsonNum(sogAvgS, sizeof(sogAvgS), snap.sog.avg, sogOk),
+    snap.sogSust1m_max / 100.0,
+    snap.sogSustPhone ? "true" : "false",
+    ltJsonNumP(latS, sizeof(latS), snap.lat_current, posOk, 6),
+    ltJsonNumP(lonS, sizeof(lonS), snap.lon_current, posOk, 6),
+    ltJsonNum(awsMinS, sizeof(awsMinS), snap.aws.min / 100.0, awsOk),
+    ltJsonNum(awsMaxS, sizeof(awsMaxS), snap.aws.max / 100.0, awsOk),
+    ltJsonNum(awsAvgS, sizeof(awsAvgS), snap.aws.avg, awsOk),
+    ltJsonNum(twsMinS, sizeof(twsMinS), snap.tws.min / 100.0, twsOk),
+    ltJsonNum(twsMaxS, sizeof(twsMaxS), snap.tws.max / 100.0, twsOk),
+    ltJsonNum(twsAvgS, sizeof(twsAvgS), snap.tws.avg, twsOk),
+    ltJsonNum(vmgMinS, sizeof(vmgMinS), snap.vmg.min / 100.0, vmgOk),
+    ltJsonNum(vmgMaxS, sizeof(vmgMaxS), snap.vmg.max / 100.0, vmgOk),
+    ltJsonNum(vmgAvgS, sizeof(vmgAvgS), snap.vmg.avg, vmgOk),
+    ltJsonNum(lwMinS, sizeof(lwMinS), snap.leeway.min / 100.0, lwOk),
+    ltJsonNum(lwMaxS, sizeof(lwMaxS), snap.leeway.max / 100.0, lwOk),
+    ltJsonNum(lwAvgS, sizeof(lwAvgS), snap.leeway.avg, lwOk),
+    ltJsonNum(awaMinS, sizeof(awaMinS), snap.awa.min / 100.0, awaOk),
+    ltJsonNum(awaMaxS, sizeof(awaMaxS), snap.awa.max / 100.0, awaOk),
+    ltJsonNum(awaAvgS, sizeof(awaAvgS), snap.awa.avg, awaOk),
+    ltJsonNum(twaMinS, sizeof(twaMinS), snap.twa.min / 100.0, twaOk),
+    ltJsonNum(twaMaxS, sizeof(twaMaxS), snap.twa.max / 100.0, twaOk),
+    ltJsonNum(twaAvgS, sizeof(twaAvgS), snap.twa.avg, twaOk),
+    ltJsonNum(cogAvgS, sizeof(cogAvgS), snap.cog.avg, cogOk),
+    ltJsonNum(hdgAvgS, sizeof(hdgAvgS), snap.heading.avg, hdgOk),
+    ltJsonNum(azAvgS, sizeof(azAvgS), snap.altZero.avg, azOk),
     (int)snap.chargeStage,
-    ltJsonNum(bvOnAvgS, sizeof(bvOnAvgS), SAFE_AVG_100(snap.window.battVolt_on_area_v_us, snap.window.battVolt_on_us), snap.window.battVolt_on_us > 0),
-    ltJsonNum(bcOnAvgS, sizeof(bcOnAvgS), SAFE_AVG_100(snap.window.battCurr_on_area_v_us, snap.window.battCurr_on_us), snap.window.battCurr_on_us > 0),
-    ltJsonNum(acOnAvgS, sizeof(acOnAvgS), SAFE_AVG_100(snap.window.altCurr_on_area_v_us, snap.window.altCurr_on_us), snap.window.altCurr_on_us > 0),
-    ltJsonNum(vcOnAvgS, sizeof(vcOnAvgS), SAFE_AVG_100(snap.window.victronCurr_on_area_v_us, snap.window.victronCurr_on_us), snap.window.victronCurr_on_us > 0),
-    ltJsonNum(dcOnAvgS, sizeof(dcOnAvgS), SAFE_AVG_100(snap.window.dutyCycle_on_area_v_us, snap.window.active_us), onOk),
-    ltJsonNum(engPctS, sizeof(engPctS),
-              dcOk ? 100.0 * (double)snap.window.active_us / (double)snap.window.dutyCycle_valid_us : 0.0, dcOk),
-    ltJsonNum(btMinS, sizeof(btMinS), snap.window.battTemp_min / 100.0, btOk),
-    ltJsonNum(btMaxS, sizeof(btMaxS), snap.window.battTemp_max / 100.0, btOk),
-    ltJsonNum(btAvgS, sizeof(btAvgS), SAFE_AVG_100(snap.window.battTemp_area_v_us, snap.window.battTemp_valid_us), btOk),
-    ltJsonNum(etMinS, sizeof(etMinS), snap.window.extraTemp_min / 100.0, etOk),
-    ltJsonNum(etMaxS, sizeof(etMaxS), snap.window.extraTemp_max / 100.0, etOk),
-    ltJsonNum(etAvgS, sizeof(etAvgS), SAFE_AVG_100(snap.window.extraTemp_area_v_us, snap.window.extraTemp_valid_us), etOk),
-    ltJsonNum(spMinS, sizeof(spMinS), snap.window.solarPower_min / 100.0, spOk),
-    ltJsonNum(spMaxS, sizeof(spMaxS), snap.window.solarPower_max / 100.0, spOk),
-    ltJsonNum(spAvgS, sizeof(spAvgS), SAFE_AVG_100(snap.window.solarPower_area_v_us, snap.window.solarPower_valid_us), spOk),
-    ltJsonNum(svMinS, sizeof(svMinS), snap.window.solarVolt_min / 100.0, svOk),
-    ltJsonNum(svMaxS, sizeof(svMaxS), snap.window.solarVolt_max / 100.0, svOk),
-    ltJsonNum(svAvgS, sizeof(svAvgS), SAFE_AVG_100(snap.window.solarVolt_area_v_us, snap.window.solarVolt_valid_us), svOk),
-    // IMU values read from the frozen ImuSnapshot — values matching the moment
-    // the window was rolled, not whatever imuWindow currently holds at upload time.
-    snap.imu.heel_min / 100.0, snap.imu.heel_max / 100.0,
-    ltJsonNum(heelAvgS, sizeof(heelAvgS), SAFE_AVG_100(snap.imu.heel_area_v_us, snap.imu.heel_valid_us), heelOk),
-    snap.imu.pitch_min / 100.0, snap.imu.pitch_max / 100.0,
-    ltJsonNum(ptchAvgS, sizeof(ptchAvgS), SAFE_AVG_100(snap.imu.pitch_area_v_us, snap.imu.pitch_valid_us), ptchOk),
-    ltJsonNumP(vaccMinS, sizeof(vaccMinS), snap.imu.vertical_accel_min / 1000.0, snap.imu.vertical_accel_min != 999900, 3),
-    ltJsonNumP(vaccMaxS, sizeof(vaccMaxS), snap.imu.vertical_accel_max / 1000.0, snap.imu.vertical_accel_max != -999900, 3),
-    ltJsonNumP(vaccAvgS, sizeof(vaccAvgS), SAFE_AVG_1000(snap.imu.vertical_accel_area_v_us, snap.imu.vertical_accel_valid_us), vaccOk, 3),
-    ltJsonNumP(taccMinS, sizeof(taccMinS), snap.imu.total_accel_min / 1000.0, snap.imu.total_accel_min != 999900, 3),
-    ltJsonNumP(taccMaxS, sizeof(taccMaxS), snap.imu.total_accel_max / 1000.0, snap.imu.total_accel_max != 0, 3),
-    ltJsonNumP(taccAvgS, sizeof(taccAvgS), SAFE_AVG_1000(snap.imu.total_accel_area_v_us, snap.imu.total_accel_valid_us), taccOk, 3),
-    snap.imu.msi_score,
-    snap.imu.vomit_pct,
-    snap.imu.anchorage_comfort,
-    ltJsonNum(wpS, sizeof(wpS), snap.imu.wave_period / 1000.0, snap.imu.wave_period != -1000),
-    (unsigned int)snap.imu.slam_count,
-    snap.imu.slam_peak_max / 1000.0,
-    snap.imu.suspicious ? "true" : "false");
-#undef SAFE_AVG_100
-#undef SAFE_AVG_1000
+    ltJsonNum(bvOnAvgS, sizeof(bvOnAvgS), snap.battVoltOnAvg, !isnan(snap.battVoltOnAvg)),
+    ltJsonNum(bcOnAvgS, sizeof(bcOnAvgS), snap.battCurrOnAvg, !isnan(snap.battCurrOnAvg)),
+    ltJsonNum(acOnAvgS, sizeof(acOnAvgS), snap.altCurrOnAvg, !isnan(snap.altCurrOnAvg)),
+    ltJsonNum(vcOnAvgS, sizeof(vcOnAvgS), snap.victronCurrOnAvg, !isnan(snap.victronCurrOnAvg)),
+    ltJsonNum(dcOnAvgS, sizeof(dcOnAvgS), snap.dutyCycleOnAvg, onOk),
+    ltJsonNum(engPctS, sizeof(engPctS), snap.enginePct, dcOk),
+    ltJsonNum(btMinS, sizeof(btMinS), snap.battTemp.min / 100.0, btOk),
+    ltJsonNum(btMaxS, sizeof(btMaxS), snap.battTemp.max / 100.0, btOk),
+    ltJsonNum(btAvgS, sizeof(btAvgS), snap.battTemp.avg, btOk),
+    ltJsonNum(etMinS, sizeof(etMinS), snap.extraTemp.min / 100.0, etOk),
+    ltJsonNum(etMaxS, sizeof(etMaxS), snap.extraTemp.max / 100.0, etOk),
+    ltJsonNum(etAvgS, sizeof(etAvgS), snap.extraTemp.avg, etOk),
+    ltJsonNum(spMinS, sizeof(spMinS), snap.solarPower.min / 100.0, spOk),
+    ltJsonNum(spMaxS, sizeof(spMaxS), snap.solarPower.max / 100.0, spOk),
+    ltJsonNum(spAvgS, sizeof(spAvgS), snap.solarPower.avg, spOk),
+    ltJsonNum(svMinS, sizeof(svMinS), snap.solarVolt.min / 100.0, svOk),
+    ltJsonNum(svMaxS, sizeof(svMaxS), snap.solarVolt.max / 100.0, svOk),
+    ltJsonNum(svAvgS, sizeof(svAvgS), snap.solarVolt.avg, svOk),
+    // IMU values frozen when the window rolled, not the live imuWindow.
+    snap.heel.min / 100.0, snap.heel.max / 100.0,
+    ltJsonNum(heelAvgS, sizeof(heelAvgS), snap.heel.avg, heelOk),
+    snap.pitch.min / 100.0, snap.pitch.max / 100.0,
+    ltJsonNum(ptchAvgS, sizeof(ptchAvgS), snap.pitch.avg, ptchOk),
+    ltJsonNumP(vaccMinS, sizeof(vaccMinS), snap.vertical_accel.min / 1000.0, snap.vertical_accel.min != 999900, 3),
+    ltJsonNumP(vaccMaxS, sizeof(vaccMaxS), snap.vertical_accel.max / 1000.0, snap.vertical_accel.max != -999900, 3),
+    ltJsonNumP(vaccAvgS, sizeof(vaccAvgS), snap.vertical_accel.avg, vaccOk, 3),
+    ltJsonNumP(taccMinS, sizeof(taccMinS), snap.total_accel.min / 1000.0, snap.total_accel.min != 999900, 3),
+    ltJsonNumP(taccMaxS, sizeof(taccMaxS), snap.total_accel.max / 1000.0, snap.total_accel.max != 0, 3),
+    ltJsonNumP(taccAvgS, sizeof(taccAvgS), snap.total_accel.avg, taccOk, 3),
+    snap.msi_score,
+    snap.vomit_pct,
+    snap.anchorage_comfort,
+    ltJsonNum(wpS, sizeof(wpS), snap.wave_period / 1000.0, snap.wave_period != -1000),
+    (unsigned int)snap.slam_count,
+    snap.slam_peak_max / 1000.0,
+    snap.suspicious ? "true" : "false");
   if (written <= 0 || written >= PAYLOAD_BUFFER_SIZE) return 0;
   return (size_t)written;
+}
+
+// The oldest record is stamped "time unknown" and no real clock is set: uploads go oldest first, so nothing in the ring
+// can drain until one arrives (the maintenance reboot ladder must not wait on that).
+bool sensorUploadsHeldForClock() {
+  if (!sensorRing || ringIsEmpty() || clockIsReal()) return false;
+  return sensorRing[sensorRingTail].collectionTime <= 0;
 }
 
 void uploadBufferedRecords() {
@@ -3317,6 +3183,7 @@ void uploadBufferedRecords() {
     Serial.println("uploadBufferedRecords: skipping — not registered");
     return;
   }
+  if (sensorUploadHoldUntilMs && (int32_t)(millis() - sensorUploadHoldUntilMs) < 0) return;
   if (!canUploadNow()) return;
 
   // One upload in flight at a time. Core 0 advances the tail when it succeeds
@@ -3325,6 +3192,15 @@ void uploadBufferedRecords() {
 
   SensorSnapshot snap;
   if (!peekTailSnapshot(&snap)) return;
+  // Stamp unknown (closed without a real clock, or restored from a previous boot): never dated off the cold-boot estimate.
+  if (snap.collectionTime <= 0 && !clockIsReal()) {
+    if (forceCloudFlushPending) {
+      forceCloudFlushPending = false;
+      queueConsoleMessageF("Cloud sync: %u records wait for the clock to be set (internet time, GPS or the phone app)",
+                           (unsigned)sensorRingCount);
+    }
+    return;
+  }
 
   size_t written = buildSnapshotJson(snap);
   if (written == 0) {
@@ -3341,10 +3217,12 @@ void uploadBufferedRecords() {
   if (req.payload) {
     strncpy(req.payload, payloadBuffer, req.payloadCap - 1);
     req.payload[req.payloadCap - 1] = '\0';
-    if (xQueueSend(httpsQueue, &req, 0) == pdTRUE) {
-      sensorRingInFlightIndex = (int32_t)sensorRingTail;
-      lastUploadWasBuffered = true;
-    } else {
+    // Set before the send: a fast-failing httpsTask clear that ran ahead of the set would strand it.
+    sensorRingInFlightIndex = (int32_t)sensorRingTail;
+    lastUploadWasBuffered = true;
+    if (xQueueSend(httpsQueue, &req, 0) != pdTRUE) {
+      sensorRingInFlightIndex = -1;
+      lastUploadWasBuffered = false;
       free(req.payload);
       Serial.println("uploadBufferedRecords: httpsQueue full, will retry next tick");
     }
@@ -3354,16 +3232,31 @@ void uploadBufferedRecords() {
 // Defined here, ahead of the ring dump/restore section that owns it, because the drain-to-empty
 // path in executeUploadPayload below flags the file stale.
 #define SENSOR_RING_BACKUP_PATH  "/sensor_ring_backup.bin"
-// The ring emptied by consumption, so the Phase-4 dump on flash is stale: left in place it is
-// restored at the next boot and every record is re-POSTed (the cloud answers a repeat with success,
-// so that costs bandwidth, not data). Raw remove: fsExists() would re-take the non-recursive fsMutex
-// and block 5 s. Runs ONLY from the loop's field-cut flash pass (sensorRingBackupStale): the upload
-// task's last response can land seconds after the field re-engaged, and flash never moves with the field on.
+// The ring emptied by consumption, so the flash dump is stale (restored at boot, every record would be
+// re-POSTed: bandwidth, not data). Raw remove: fsExists() would re-take the non-recursive fsMutex and block 5 s.
+// Runs ONLY from the loop's field-cut flash pass: flash never moves with the field on.
 void sensorRingDropBackupFile() {
   fsTakeLock();
   LittleFS.remove(SENSOR_RING_BACKUP_PATH);
   fsReleaseLock();
   fsFreeDirty = true;
+}
+
+// Request body in 4 KB slices, feeding the WDT and checking GLOBAL_TIMEOUT between them: one large write runs
+// unfed until fully acked (lwIP's ~5.7 KB window = one RTT per 5.7 KB), and past ~330 ms RTT a full batch
+// outran the 16 s panic WDT. A stalled slice gives up after connect()'s 7 s CONNECT_TIMEOUT.
+bool cloudWriteBody(WiFiClientSecure &client, const char *payload, size_t len, uint32_t start) {
+  const size_t SLICE = 4096;
+  size_t off = 0;
+  while (off < len) {
+    size_t n = (len - off < SLICE) ? (len - off) : SLICE;
+    size_t w = client.write((const uint8_t *)payload + off, n);
+    if (w == 0) return false;
+    off += w;
+    esp_task_wdt_reset();
+    if (millis() - start > GLOBAL_TIMEOUT) return false;
+  }
+  return true;
 }
 
 bool executeUploadPayload(const char *payload) {
@@ -3376,9 +3269,8 @@ bool executeUploadPayload(const char *payload) {
   }
   WiFiClientSecure client;
   client.setInsecure();
-  // setTimeout omitted: Stream::setTimeout is ms (not seconds as some docs claim) and
-  // the read loops below use available()+read() polling with explicit millis() deadlines,
-  // so the Stream-level timeout doesn't gate anything here.
+  // No setTimeout: Stream::setTimeout is ms, and the read loops below poll available()+read() against
+  // explicit millis() deadlines, so it gates nothing here.
   client.setHandshakeTimeout(HANDSHAKE_TIMEOUT / 1000);  // this API takes seconds
 
   uint32_t start = millis();
@@ -3387,7 +3279,8 @@ bool executeUploadPayload(const char *payload) {
   // Pre-resolve DNS (worst ~15 s on dead cellular) so it can't stack into the same unfed-WDT
   // window as the up-to-14 s connect below; the connect's own lookup then hits the lwIP cache.
   IPAddress hostIP;
-  if (!WiFi.hostByName(host, hostIP)) {
+  // hostByName returns 1 on success and the lwIP error code on failure, never 0
+  if (WiFi.hostByName(host, hostIP) != 1) {
     Serial.println("Upload: DNS fail");
     return false;
   }
@@ -3438,8 +3331,7 @@ bool executeUploadPayload(const char *payload) {
 
   // ===== Stream payload directly =====
   size_t payloadLen = strlen(payload);
-  size_t sent = client.write((const uint8_t *)payload, payloadLen);
-  if (sent != payloadLen) {
+  if (!cloudWriteBody(client, payload, payloadLen, start)) {
     Serial.println("Payload send fail");
     client.stop();
     return false;
@@ -3449,6 +3341,7 @@ bool executeUploadPayload(const char *payload) {
   // ===== Read status line + drain headers (no header parsing/no truncation spam) =====
   int httpCode = 0;
   bool ackConfirmed = false;
+  bool tokenGone = false;   // the cloud's 401 says this device's row no longer exists
   uint32_t readStart = millis();
 
   // 1) Read ONLY the first line (status line). READ_TIMEOUT is idle — each byte restarts it.
@@ -3512,10 +3405,8 @@ drain_headers:
   }
 
 done_headers:
-  // Read the small ack body: the edge function returns {"success":true,...} on a real ingest.
-  // A captive portal answering 200 with a login page has no such marker, so the ring slot is
-  // kept and retried instead of being dropped on a lie. Retries are duplicate-safe (the server
-  // treats a (device_uid,timestamp) collision as an idempotent 200).
+  // Require the edge function's {"success":true} ack: a captive portal answering 200 with a login page must
+  // keep the ring slot for retry. Retries are duplicate-safe ((device_uid,timestamp) collision = idempotent 200).
   {
     char bodyBuf[257];
     size_t bodyLen = 0;
@@ -3530,6 +3421,7 @@ done_headers:
       if (millis() - start > GLOBAL_TIMEOUT) break;
       delay(1);
     }
+    tokenGone = strstr(bodyBuf, "token_not_found") != nullptr;
   }
   client.stop();
 
@@ -3546,10 +3438,8 @@ done_headers:
   if (httpCode == 200 && ackConfirmed) lastCloudUploadOkMs = millis();
 
   // ===== Handle PSRAM-ring slot based on response code =====
-  // sensorRingInFlightIndex was set by uploadBufferedRecords() when it queued
-  // this request. On 200 → pop tail (slot consumed). On 400/401 → also pop
-  // (bad data, no point retrying). On network/server error → leave ring as-is
-  // and the next uploadBufferedRecords() tick will re-queue the same slot.
+  // 200 or 400 (bad data) pop the tail; 401 and network/server errors keep it for the next tick. A 401 says
+  // nothing about the record: draining on it lost every queued window whenever the cloud's device lookup failed.
   if (lastUploadWasBuffered && sensorRingInFlightIndex >= 0) {
     if (httpCode == 200 && ackConfirmed) {
       popTailSnapshot();
@@ -3571,30 +3461,37 @@ done_headers:
           queueConsoleMessage(messageBuffer);
         }
       }
-      sensorRingInFlightIndex = -1;
 
-    } else if (httpCode == 400 || httpCode == 401) {
+    } else if (httpCode == 400) {
       Serial.printf("HTTP %d: dropping bad-data ring slot\n", httpCode);
       popTailSnapshot();
       // A drain can end on a rejected record too, and the dump is just as stale then (see the 200 branch).
       if (ringIsEmpty() && !sensorRingAnnouncedEmpty) { sensorRingAnnouncedEmpty = true; sensorRingBackupStale = true; }
       snprintf(messageBuffer, MESSAGE_BUFFER_SIZE, "Cleared bad data (%u queued)", (unsigned)sensorRingCount);
       queueConsoleMessage(messageBuffer);
-      sensorRingInFlightIndex = -1;
 
     } else {
-      // Network/server error — or a 200 whose body lacked the edge-function ack
+      // 401, network/server error — or a 200 whose body lacked the edge-function ack
       // (captive portal / interception). Keep slot for retry on next tick.
       Serial.printf("⚠ HTTP %d%s: keeping ring slot for retry\n", httpCode, (httpCode == 200) ? " (no ack in body)" : "");
+      // A 401 never changes on retry: a gone row clears the token like the Cloud-tab check (the ring waits for
+      // re-registration); any other 401 (gateway) holds sensor uploads 10 min instead of retrying every 13 s.
+      if (httpCode == 401 && tokenGone) {
+        Serial.println("Clearing invalid credentials - device ready for re-registration");
+        queueConsoleMessage("Cloud: ready to register");
+        clearAuthToken();
+      } else if (httpCode == 401) {
+        sensorUploadHoldUntilMs = millis() + 600000UL;
+      }
       if (httpCode == 200) {
         queueConsoleMessage("Cloud sync failed (server reply was not the cloud's ack - captive portal?)");
       } else {
         snprintf(messageBuffer, MESSAGE_BUFFER_SIZE, "Cloud sync failed (HTTP %d)", httpCode);
         queueConsoleMessage(messageBuffer);
       }
-      sensorRingInFlightIndex = -1;  // allow re-queue next tick
     }
     lastUploadWasBuffered = false;
+    sensorRingInFlightIndex = -1;  // publish last: Core 1 queues the next slot as soon as it reads -1
   } else if (lastUploadWasBuffered && httpCode != 200) {
     // Buffered flag set but no in-flight ring slot (shouldn't normally happen).
     snprintf(messageBuffer, MESSAGE_BUFFER_SIZE, "Cloud sync failed (HTTP %d)", httpCode);
@@ -3605,17 +3502,24 @@ done_headers:
   return (httpCode == 200 && ackConfirmed);
 }
 
-// PSRAM sensor-snapshot ring (replaces the old LittleFS /buffer/*.json layout).
-// One slot per completed SENSOR_UPLOAD_INTERVAL window. Push is microseconds;
-// no flash I/O, no Core 1 stall. Drain to Supabase happens from the cloud-
-// feature block in loop() under the same field-off gate as uploadBufferedRecords.
-// On overflow, the oldest unread slot is dropped.
+// Time-weighted window average, un-scaled; NaN when the channel never accumulated (the builder's "absent" signal).
+static inline float snapAvg(int64_t area, uint64_t valid, double scale) {
+  return valid > 0 ? (float)(((double)area / (double)valid) / scale) : NAN;
+}
+static inline SensorChan snapChan(int32_t mn, int32_t mx, int64_t area, uint64_t valid, double scale) {
+  SensorChan c;
+  c.min = mn;
+  c.max = mx;
+  c.avg = snapAvg(area, valid, scale);
+  return c;
+}
+
+// PSRAM sensor-snapshot ring: one slot per SENSOR_UPLOAD_INTERVAL window, push is microseconds (no flash, no
+// Core 1 stall). Drained from loop()'s cloud block; on overflow the oldest unread slot is dropped.
 inline bool ringIsFull()  { return sensorRingCount >= SENSOR_RING_SIZE; }
 inline bool ringIsEmpty() { return sensorRingCount == 0; }
 
-// Push current window snapshot. Drops oldest if ring is full (unless the
-// oldest slot is currently being uploaded — then drop the new sample instead
-// so we don't yank the rug out from Core 0 mid-upload).
+// Drops the oldest if full, unless that slot is mid-upload on Core 0 — then the new sample is dropped.
 void pushSensorSnapshot(time_t collectionTime) {
   if (!sensorRing) return;
   // Index RMWs under sensorRingMux (Core 0 pops concurrently). The big struct
@@ -3638,49 +3542,57 @@ void pushSensorSnapshot(time_t collectionTime) {
     Serial.println("sensorRing full + tail in-flight; dropping newest snapshot");
     return;
   }
-  sensorRing[sensorRingHead].collectionTime = (int64_t)collectionTime;
-  sensorRing[sensorRingHead].window = *currentWindow;  // struct copy from PSRAM to PSRAM
+  SensorSnapshot &s = sensorRing[sensorRingHead];
+  const SensorWindow &w = *currentWindow;
+  s.collectionTime = (int64_t)collectionTime;
+  // Reduce the closed window here, once: ~30 software double divisions (~60 us on Core 1) replace the 888 B accumulator
+  // copy, and buildSnapshotJson on Core 0 prints stored values.
+#define SNAP_CHAN(ch, scale) s.ch = snapChan(w.ch##_min, w.ch##_max, w.ch##_area_v_us, w.ch##_valid_us, scale)
+  SNAP_CHAN(battVolt, 100.0);    SNAP_CHAN(battCurr, 100.0);  SNAP_CHAN(altCurr, 100.0);    SNAP_CHAN(victronCurr, 100.0);
+  SNAP_CHAN(soc, 100.0);         SNAP_CHAN(baro, 100.0);      SNAP_CHAN(altTemp, 100.0);    SNAP_CHAN(tempTherm, 100.0);
+  SNAP_CHAN(ambTemp, 100.0);     SNAP_CHAN(rpm, 1.0);         SNAP_CHAN(dutyCycle, 100.0);  SNAP_CHAN(altZero, 100.0);
+  SNAP_CHAN(sog, 100.0);         SNAP_CHAN(cog, 100.0);       SNAP_CHAN(heading, 100.0);    SNAP_CHAN(aws, 100.0);
+  SNAP_CHAN(awa, 100.0);         SNAP_CHAN(tws, 100.0);       SNAP_CHAN(twa, 100.0);        SNAP_CHAN(leeway, 100.0);
+  SNAP_CHAN(vmg, 100.0);         SNAP_CHAN(uTargetAmps, 100.0); SNAP_CHAN(battTemp, 100.0); SNAP_CHAN(extraTemp, 100.0);
+  SNAP_CHAN(solarPower, 100.0);  SNAP_CHAN(solarVolt, 100.0);
+#undef SNAP_CHAN
+  s.battVoltOnAvg    = snapAvg(w.battVolt_on_area_v_us,    w.battVolt_on_us,    100.0);
+  s.battCurrOnAvg    = snapAvg(w.battCurr_on_area_v_us,    w.battCurr_on_us,    100.0);
+  s.altCurrOnAvg     = snapAvg(w.altCurr_on_area_v_us,     w.altCurr_on_us,     100.0);
+  s.victronCurrOnAvg = snapAvg(w.victronCurr_on_area_v_us, w.victronCurr_on_us, 100.0);
+  s.dutyCycleOnAvg   = snapAvg(w.dutyCycle_on_area_v_us,   w.active_us,         100.0);
+  s.enginePct = w.dutyCycle_valid_us > 0 ? (float)(100.0 * (double)w.active_us / (double)w.dutyCycle_valid_us) : NAN;
+  s.sogSust1m_max = w.sogSust1m_max;
+  s.sogSustPhone  = w.sogSustPhone;
+  s.lat_current   = w.lat_current;
+  s.lon_current   = w.lon_current;
   // Freeze the IMU subset (caller resets imuWindow right after, so we capture
   // the closing window's values here before they get clobbered).
-  ImuSnapshot &is = sensorRing[sensorRingHead].imu;
-  is.heel_min                  = imuWindow->heel_min;
-  is.heel_max                  = imuWindow->heel_max;
-  is.heel_area_v_us            = imuWindow->heel_area_v_us;
-  is.heel_valid_us             = imuWindow->heel_valid_us;
-  is.pitch_min                 = imuWindow->pitch_min;
-  is.pitch_max                 = imuWindow->pitch_max;
-  is.pitch_area_v_us           = imuWindow->pitch_area_v_us;
-  is.pitch_valid_us            = imuWindow->pitch_valid_us;
-  is.vertical_accel_min        = imuWindow->vertical_accel_min;
-  is.vertical_accel_max        = imuWindow->vertical_accel_max;
-  is.vertical_accel_area_v_us  = imuWindow->vertical_accel_area_v_us;
-  is.vertical_accel_valid_us   = imuWindow->vertical_accel_valid_us;
-  is.total_accel_min           = imuWindow->total_accel_min;
-  is.total_accel_max           = imuWindow->total_accel_max;
-  is.total_accel_area_v_us     = imuWindow->total_accel_area_v_us;
-  is.total_accel_valid_us      = imuWindow->total_accel_valid_us;
-  is.msi_score                 = imu_msi_score;
-  is.vomit_pct                 = imu_vomit_pct;
-  is.anchorage_comfort         = imu_anchorage_comfort;
-  is.wave_period               = imuWindow->wave_period;
-  is.slam_count                = imuWindow->slam_count;
-  is.slam_peak_max             = imuWindow->slam_peak_max;
-  // Per-window bias judgement. The mount verdict is NOT decided here — imuZeroFinalizeIfDue owns it, because
-  // a running window cannot tell a bad mount from a heeled boat. This path must stay free of NVS writes: it
-  // runs on the Core-1 control tick with the field live. SAFE_AVG_* is #undef'd above buildSnapshotJson, so
-  // the averages are inline.
-  const bool haveImuData = imuWindow->total_accel_valid_us >= IMU_WINDOW_MIN_VALID_US;
+  const ImuWindow &iw = *imuWindow;
+  s.heel           = snapChan(iw.heel_min,  iw.heel_max,  iw.heel_area_v_us,  iw.heel_valid_us,  100.0);
+  s.pitch          = snapChan(iw.pitch_min, iw.pitch_max, iw.pitch_area_v_us, iw.pitch_valid_us, 100.0);
+  s.vertical_accel = snapChan(iw.vertical_accel_min, iw.vertical_accel_max, iw.vertical_accel_area_v_us, iw.vertical_accel_valid_us, 1000.0);
+  s.total_accel    = snapChan(iw.total_accel_min, iw.total_accel_max, iw.total_accel_area_v_us, iw.total_accel_valid_us, 1000.0);
+  s.msi_score         = imu_msi_score;
+  s.vomit_pct         = imu_vomit_pct;
+  s.anchorage_comfort = imu_anchorage_comfort;
+  s.wave_period       = iw.wave_period;
+  s.slam_count        = iw.slam_count;
+  s.slam_peak_max     = iw.slam_peak_max;
+  // Per-window bias judgement only; imuZeroFinalizeIfDue owns the mount verdict (a running window can't tell a
+  // bad mount from a heeled boat). No NVS writes: Core-1 control tick, field live.
+  const bool haveImuData = iw.total_accel_valid_us >= IMU_WINDOW_MIN_VALID_US;
   bool biasSuspect = false;
   if (haveImuData) {
-    float heelAvg  = imuWindow->heel_valid_us  ? (float)((double)imuWindow->heel_area_v_us  / (double)imuWindow->heel_valid_us)  / 100.0f : 0.0f;
-    float pitchAvg = imuWindow->pitch_valid_us ? (float)((double)imuWindow->pitch_area_v_us / (double)imuWindow->pitch_valid_us) / 100.0f : 0.0f;
+    float heelAvg  = iw.heel_valid_us  ? (float)((double)iw.heel_area_v_us  / (double)iw.heel_valid_us)  / 100.0f : 0.0f;
+    float pitchAvg = iw.pitch_valid_us ? (float)((double)iw.pitch_area_v_us / (double)iw.pitch_valid_us) / 100.0f : 0.0f;
     biasSuspect = (fabsf(heelAvg) > IMU_BIAS_SUSPECT_DEG || fabsf(pitchAvg) > IMU_BIAS_SUSPECT_DEG);
   }
-  is.suspicious = !haveImuData || !imuZeroCaptured
-                  || imuMountState != IMU_MOUNT_OK || biasSuspect;
+  s.suspicious = !haveImuData || !imuZeroCaptured
+                 || imuMountState != IMU_MOUNT_OK || biasSuspect;
   // Charge stage at window-roll time (cloud upload is deferred minutes/hours, so
   // we can't read live state at JSON-build time). Matches the LT-ring capture.
-  sensorRing[sensorRingHead].chargeStage = getChargeStageDisplayCode();
+  s.chargeStage = getChargeStageDisplayCode();
   portENTER_CRITICAL(&sensorRingMux);
   sensorRingHead = (sensorRingHead + 1) % SENSOR_RING_SIZE;
   sensorRingCount++;
@@ -3692,8 +3604,7 @@ void pushSensorSnapshot(time_t collectionTime) {
   sensorRingAnnouncedEmpty = false;
 }
 
-// Peek at oldest unread snapshot without removing it. Caller passes a pointer
-// to a SensorSnapshot it'll copy into. Returns false if ring is empty or busy.
+// Copy the oldest unread snapshot into `out` without removing it. False if the ring is empty or unallocated.
 bool peekTailSnapshot(SensorSnapshot *out) {
   if (!sensorRing || ringIsEmpty() || !out) return false;
   *out = sensorRing[sensorRingTail];
@@ -3717,11 +3628,11 @@ void popTailSnapshot() {
   portEXIT_CRITICAL(&sensorRingMux);
 }
 
-// Binary-format file used by Phase 3 (shutdown dump + boot restore) so the
+// Binary-format file used by the shutdown Phase 4 dump and the boot restore so the
 // PSRAM ring survives a power-cycle when WiFi/cloud couldn't drain everything
 // during the 30-min ignition-off window.
 #define SENSOR_RING_BACKUP_MAGIC 0x53524258u  // 'SRBX'
-#define SENSOR_RING_BACKUP_VER   4u  // v4: SensorWindow dropped tempMargin and wifiStr, gained battTemp/extraTemp/solarPower/solarVolt
+#define SENSOR_RING_BACKUP_VER   5u  // bump on any SensorSnapshot layout change
 
 struct SensorRingBackupHeader {
   uint32_t magic;
@@ -3730,11 +3641,8 @@ struct SensorRingBackupHeader {
   uint32_t entrySize;  // sizeof(SensorSnapshot) — sanity guard against struct layout change
 };
 
-// One-shot bulk dump of the PSRAM ring to LittleFS. Called from shutdown
-// Phase 4 when the 30-min cloud drain window expired with records remaining.
-// Returns number of snapshots written, or 0 if ring was empty / on error.
-// Blocking flash write is acceptable here — the field is already off and the
-// device is about to sleep.
+// Bulk dump of the PSRAM ring at shutdown Phase 4 (30-min cloud drain window expired with records left).
+// Blocking flash write is fine: the field is off and the device is about to sleep.
 uint16_t dumpSensorRingToLittleFS() {
   if (!sensorRing || ringIsEmpty()) return 0;
   fsTakeLock();
@@ -3745,10 +3653,16 @@ uint16_t dumpSensorRingToLittleFS() {
     return 0;
   }
   fsFreeDirty = true;
+  // Tail and count taken together: httpsTask pops on core 0 during the dump, and a live count bound dropped the
+  // newest record for each pop. A record popped meanwhile is written anyway and re-uploads once.
+  portENTER_CRITICAL(&sensorRingMux);
+  const uint16_t tail = sensorRingTail;
+  const uint16_t count = sensorRingCount;
+  portEXIT_CRITICAL(&sensorRingMux);
   SensorRingBackupHeader hdr = {
     SENSOR_RING_BACKUP_MAGIC,
     SENSOR_RING_BACKUP_VER,
-    (uint32_t)sensorRingCount,
+    (uint32_t)count,
     (uint32_t)sizeof(SensorSnapshot),
   };
   size_t hdrWritten = f.write((const uint8_t *)&hdr, sizeof(hdr));
@@ -3760,8 +3674,8 @@ uint16_t dumpSensorRingToLittleFS() {
     return 0;
   }
   uint16_t written = 0;
-  uint16_t idx = sensorRingTail;
-  for (uint16_t i = 0; i < sensorRingCount; i++) {
+  uint16_t idx = tail;
+  for (uint16_t i = 0; i < count; i++) {
     size_t n = f.write((const uint8_t *)&sensorRing[idx], sizeof(SensorSnapshot));
     if (n != sizeof(SensorSnapshot)) {
       Serial.printf("dumpSensorRingToLittleFS: short write at entry %u\n", i);
@@ -3778,11 +3692,8 @@ uint16_t dumpSensorRingToLittleFS() {
   return written;
 }
 
-// Boot-time restore: read the LittleFS backup file (if present) and re-push
-// each snapshot into the empty PSRAM ring. Delete the file regardless of
-// success — a partial restore is acceptable, but leaving a stale backup
-// around would cause double-uploads on the next boot.
-// Returns count restored. Safe to call when no backup file exists.
+// Boot restore into the empty ring. The file is deleted regardless: a partial restore is acceptable, a stale
+// backup would double-upload next boot.
 uint16_t restoreSensorRingFromLittleFS() {
   if (!sensorRing) return 0;
   if (!fsExists(SENSOR_RING_BACKUP_PATH)) return 0;
@@ -3819,8 +3730,10 @@ uint16_t restoreSensorRingFromLittleFS() {
       Serial.printf("restoreSensorRingFromLittleFS: short read at entry %u\n", i);
       break;
     }
-    // Push directly into the ring (bypass pushSensorSnapshot to avoid the
-    // currentWindow copy — we have the full snapshot already).
+    // A negative-millis marker counts from the previous boot's clock: against this boot's time base it became a
+    // plausible but wrong epoch. 0 takes reconstructTimestamp's unknown-time fallback, as a detected reboot does.
+    if (tmp.collectionTime < 0) tmp.collectionTime = 0;
+    // Direct push: pushSensorSnapshot would copy currentWindow.
     sensorRing[sensorRingHead] = tmp;
     sensorRingHead = (sensorRingHead + 1) % SENSOR_RING_SIZE;
     if (sensorRingCount < SENSOR_RING_SIZE) sensorRingCount++;
@@ -3835,10 +3748,6 @@ uint16_t restoreSensorRingFromLittleFS() {
   return restored;
 }
 
-// Snapshot current sensor window into the PSRAM ring. Replaces the old
-// LittleFS write path; this is microseconds and does not stall Core 1.
-// Actual upload to Supabase happens later from the cloud-feature block
-// (gated by field-off settle, or forced by the "Upload Now" button).
 // Rescale a SensorWindow ×100 value to a long-term record's target scale (divisor =
 // 100/targetScale: 1 for ×100, 10 for ×10, 100 for ×1) and clamp to int16.
 static inline int16_t ltScale(int32_t v100, int32_t divisor) {
@@ -3848,15 +3757,9 @@ static inline int16_t ltScale(int32_t v100, int32_t divisor) {
   return (int16_t)s;
 }
 
-// Derive one LongTermRecord from the closing SensorWindow + ImuWindow and push it
-// into the month-long PSRAM ring. Called every SENSOR_UPLOAD_INTERVAL from
-// uploadSensorHistory() (both paths) so the fixed-cadence timeline never gaps within
-// a session. validMask bit per field (set only when that field had valid data):
-//   ENVELOPE 0..16: battVolt battCurr altCurr victronCurr rpm duty altTemp tempTherm
-//                   sog tws vmg aws awa twa heel pitch soc
-//   AVG-ONLY 17..22: baro ambTemp cog heading leeway altZero
-//   POSITION 23: lat/lon. (Mirror this order in the dashboard JS.)
-// envelope (min,max,avg) from currentWindow; avg = area/valid, then rescaled+clamped.
+// One LongTermRecord from the closing SensorWindow + ImuWindow into the month-long PSRAM ring, every
+// SENSOR_UPLOAD_INTERVAL so the timeline never gaps. The validMask bit order (see the calls below) is
+// mirrored in the dashboard JS.
 #define LT_ENV(dst, field, divisor, bit) do { \
   if (currentWindow->field##_valid_us > 0) { \
     int32_t _a = (int32_t)(currentWindow->field##_area_v_us / (int64_t)currentWindow->field##_valid_us); \
@@ -3921,10 +3824,8 @@ void pushLongTermRecord() {
   }
   rec.chargeStage = getChargeStageDisplayCode();
 
-  // v4 tail: coverage + engine-on-weighted averages. Coverage = active/observed,
-  // ×2 (0.5% steps), ROUNDED — a window with <0.25% engine time rounds to 0 and is
-  // treated as "engine never ran" (XFF-style discard; the min/max band keeps any spike).
-  // Divisors mirror the LT_ENV calls above. rec zero-init leaves activeFrac 0 otherwise.
+  // Coverage = active/observed in 0.5% steps, ROUNDED: <0.25% engine time rounds to 0 = "engine never ran"
+  // (the min/max band keeps any spike). Divisors mirror the LT_ENV calls above.
   if (currentWindow->dutyCycle_valid_us > 0 && currentWindow->active_us > 0) {
     uint64_t obs = currentWindow->dutyCycle_valid_us;
     uint64_t fr = (currentWindow->active_us * 200ULL + obs / 2) / obs;
@@ -3980,11 +3881,9 @@ void uploadSensorHistory() {
   resetAccelWindow();
 }
 
-// Long-term plot ring persistence. Durable month-long cache (NOT drained like the sensor ring),
-// so restore keeps the file (deleteAfter=false). To spare flash, the periodic field-off flush
-// APPENDS only records pushed since the last flush (see appendRingBlob); a full writePsramBlob
-// compaction runs only for the first write, when the file would exceed ~2× the ring, or if an
-// append fails. Field-off only — called on the field-off-settled edge + at shutdown.
+// Long-term ring persistence: a durable month-long cache (NOT drained), so restore keeps the file. Periodic
+// flushes append only new records; a full compaction runs on the first write, past ~2x the ring, or when an
+// append fails. Field-off only.
 void dumpLongTermRing() {
   if (dbgRingsSynthetic) return;   // fillmax/clearmax: RAM ring is synthetic/empty — keep the real flash blob
   if (!longTermRing || longTermCount == 0) return;
@@ -4021,7 +3920,7 @@ void restoreLongTermRing() {
   if (!longTermRing) return;
   uint32_t fileRecords = 0;
   uint32_t n = restoreRingBlob(LONGTERM_BACKUP_PATH, LONGTERM_BACKUP_MAGIC, LONGTERM_BACKUP_VER,
-                               longTermRing, sizeof(LongTermRecord), LONGTERM_RING_SIZE, &fileRecords);
+                               longTermRing, sizeof(LongTermRecord), LONGTERM_RING_SIZE, &fileRecords, nullptr);
   if (n == 0) { longTermFileRecords = 0; longTermPushSeq = 0; longTermFlushedSeq = 0; return; }
   longTermCount = (uint16_t)n;
   longTermHead = (n >= LONGTERM_RING_SIZE) ? 0 : (uint16_t)n;
@@ -4033,11 +3932,24 @@ void restoreLongTermRing() {
   Serial.printf("restoreLongTermRing: restored %u of %u file records\n", (unsigned)n, (unsigned)fileRecords);
 }
 
-// ===== Zero-drift characterization log (temporary diagnostic) =====
-// Flush the PSRAM ring to LittleFS so a reboot doesn't lose the session. Field-off only (the
-// caller gates it). Mirrors dumpLongTermRing: the periodic flush APPENDS only samples new since
-// the last flush; a full writePsramBlob compaction runs only for the first write, past ~2× the
-// ring, or on append failure.
+// ===== Zero-drift characterization log =====
+// Header userWord of /zerolog.bin and /zerofit.bin = the AlternatorCOffset their amps are on (float bits), so data on
+// another offset (any setter, a power cut before the flush, another unit's records) is shifted at load. 0 = written
+// before the basis was recorded, taken as the live offset; a 0.0 offset is therefore stored as -0.0f.
+static uint32_t zeroBasisWord(float off) {
+  if (off == 0.0f) off = -0.0f;
+  uint32_t w;
+  memcpy(&w, &off, sizeof(w));
+  return w;
+}
+static float zeroBasisFromWord(uint32_t w) {
+  float f;
+  memcpy(&f, &w, sizeof(f));
+  return (w == 0 || !isfinite(f)) ? zeroBasisA : f;
+}
+
+// Flush the PSRAM ring so a reboot keeps the session. Field-off only (caller gates). Same append/compact
+// scheme as dumpLongTermRing.
 void dumpZeroLog() {
   if (dbgRingsSynthetic) return;   // fillmax/clearmax: RAM ring is synthetic/empty — keep the real flash blob
   if (!zeroLogRing || zeroLogCount == 0) return;
@@ -4054,7 +3966,7 @@ void dumpZeroLog() {
     return;
   }
   uint16_t startIdx = (zeroLogCount < ZEROLOG_RING_SIZE) ? 0 : zeroLogHead;  // oldest record
-  uint32_t n = writePsramBlob(ZEROLOG_PATH, ZEROLOG_MAGIC, ZEROLOG_VER, 0,
+  uint32_t n = writePsramBlob(ZEROLOG_PATH, ZEROLOG_MAGIC, ZEROLOG_VER, zeroBasisWord(zeroBasisA),
                               zeroLogRing, sizeof(ZeroLogRecord),
                               ZEROLOG_RING_SIZE, startIdx, zeroLogCount);
   if (n > 0) {
@@ -4067,8 +3979,7 @@ void dumpZeroLog() {
 // Boot init: load the enable toggle, alloc the PSRAM ring, restore any persisted records
 // (linearized tail=0, head=count). Called from setup() after kneeLearnInit().
 void zeroLogInit() {
-  // Default ON (permanent subsystem — it is the temp-comp correction's data source). A unit that
-  // previously stored "0" keeps its choice; only first-ever boot seeds the new default.
+  // Default ON (permanent subsystem: the temp-comp correction's data source); a stored "0" is kept.
   if (!settingExists(NK_ZeroLogEnable)) settingWrite(NK_ZeroLogEnable, "1");
   else ZeroLogEnable = (settingRead(NK_ZeroLogEnable).toInt() != 0);
   if (!zeroLogRing) {
@@ -4076,14 +3987,16 @@ void zeroLogInit() {
     if (!zeroLogRing) { Serial.println("FATAL: zeroLogRing ps_malloc failed"); return; }
     memset(zeroLogRing, 0, ZEROLOG_RING_SIZE * sizeof(ZeroLogRecord));
   }
-  uint32_t fileRecords = 0;
+  zeroBasisA = AlternatorCOffset;
+  uint32_t fileRecords = 0, basisWord = 0;
   uint32_t n = restoreRingBlob(ZEROLOG_PATH, ZEROLOG_MAGIC, ZEROLOG_VER,
-                               zeroLogRing, sizeof(ZeroLogRecord), ZEROLOG_RING_SIZE, &fileRecords);
+                               zeroLogRing, sizeof(ZeroLogRecord), ZEROLOG_RING_SIZE, &fileRecords, &basisWord);
   zeroLogCount = (uint16_t)n;
   zeroLogHead  = (n >= ZEROLOG_RING_SIZE) ? 0 : (uint16_t)n;
   zeroLogFileRecords = fileRecords;               // may exceed ring size → next capped flush compacts
   zeroLogPushSeq = zeroLogFlushedSeq = 0;         // file already holds every restored record
   prev_zeroLogHead = zeroLogHead;
+  zeroLogShiftAmps(zeroBasisFromWord(basisWord) - zeroBasisA);
   if (n > 0) Serial.printf("zeroLogInit: restored %u of %u file records\n", (unsigned)n, (unsigned)fileRecords);
 }
 
@@ -4102,13 +4015,15 @@ void zeroLogResetAll() {
 // (RAM only), and flushes to flash field-off only (60s-settled, every 30 min, new-data-gated — same
 // flash discipline as dumpLongTermRing). The flush is the only flash write; sampling is trivial.
 void zeroLogService() {
-  // A shift staged by altZeroApply lands here, on the core that appends to and fits from these rings.
-  if (pendingZeroShiftA != 0.0f) {
-    portENTER_CRITICAL(&zeroShiftMux);
-    float shift = pendingZeroShiftA;
-    pendingZeroShiftA = 0.0f;
-    portEXIT_CRITICAL(&zeroShiftMux);
-    zeroHistoryShiftAmps(shift);
+  // An AlternatorCOffset change from any path lands here, on the core that appends to and fits from these rings.
+  static uint32_t basisMovedMs = 0;
+  const float off = AlternatorCOffset;
+  if (isfinite(off) && off != zeroBasisA) {
+    const float d = zeroBasisA - off;
+    zeroLogShiftAmps(d);
+    zeroFitShiftAmps(d);
+    zeroBasisA = off;
+    basisMovedMs = millis() | 1u;
   }
   if (!zeroLogRing || !ZeroLogEnable) return;
   uint32_t now = millis();
@@ -4117,26 +4032,27 @@ void zeroLogService() {
   // a different job), so we track field-off start here for the 5 s sampling threshold.
   static uint32_t lastFieldOnMs = 0;
   if (fieldActiveStatus > 0) lastFieldOnMs = now;
-  if ((now - lastFieldOnMs) >= ZEROLOG_FIELDOFF_MIN_MS) {
-    uint32_t interval = (RPM >= 200) ? ZEROLOG_RUN_INTERVAL_MS : ZEROLOG_IDLE_INTERVAL_MS;
+  // An owner-ignored alternator current (or Limp Home) is no zero-drift sample. Spinning as the control tick reads it:
+  // the ignition stands in for an ignored tach.
+  if ((now - lastFieldOnMs) >= ZEROLOG_FIELDOFF_MIN_MS && !IgnoreAltCurrent && !LimpHome) {
+    uint32_t interval = g_engineSpinningNow ? ZEROLOG_RUN_INTERVAL_MS : ZEROLOG_IDLE_INTERVAL_MS;
     static uint32_t lastSampleMs = 0;
-    if (lastSampleMs == 0 || (now - lastSampleMs) >= interval) {
-      // Right after a reboot AlternatorTemperatureF is still NaN (DS18B20 not read yet).
-      // Defer the sample (don't advance lastSampleMs) so it captures a real temperature
-      // instead of a fabricated one — the sensor reads within ~1 s of boot, so this adds
-      // no visible gap. Past the grace window the sensor is absent, so log ZEROLOG_TEMP_BLANK
-      // (rendered as an empty CSV cell) rather than block the log forever or invent a value.
-      bool tempValid = !isnan(AlternatorTemperatureF);
-      if (!tempValid && now < ZEROLOG_TEMP_GRACE_MS) return;
+    // A reading taken on the old offset stays fresh for altAmpsFresh's 1 s window; none of it is logged on the new basis.
+    const bool basisSettling = basisMovedMs != 0 && (now - basisMovedMs) <= 1000UL;
+    if (!basisSettling && (lastSampleMs == 0 || (now - lastSampleMs) >= interval)) {
+      // Just after boot AlternatorTemperatureF is NaN until the DS18B20 reads (~1 s): defer the sample rather
+      // than fabricate one. Past the grace window the sensor is absent, so log ZEROLOG_TEMP_BLANK (empty CSV cell).
+      const bool tempIgnored = IgnoreTemperature || LimpHome;   // owner-ignored: blank, as an absent probe
+      bool tempValid = !tempIgnored && !isnan(AlternatorTemperatureF);
+      if (!tempValid && !tempIgnored && now < ZEROLOG_TEMP_GRACE_MS) return;
       if (!altAmpsFresh()) return;   // a held (stale) current is not a zero-drift sample (§10.5); the sample waits
 
       lastSampleMs = now;
       ZeroLogRecord &r = zeroLogRing[zeroLogHead];
       r.epoch       = (uint32_t)getCurrentTimestamp();
-      // Add back what the live correction already took out, so a row means the same thing whether or
-      // not AutoAltCurrentZero is on. Without this the fit consumes its own residual and the EMA
-      // blend settles the applied correction on half the true offset. AlternatorCOffset is NOT added
-      // back: zfC's job is the drift on top of the commissioned/operator offset, not the whole zero.
+      // Add back the live correction so a row means the same with AutoAltCurrentZero on or off (else the fit
+      // consumes its own residual and the EMA settles on half the offset). AlternatorCOffset is NOT added back:
+      // zfC models drift on top of the commissioned/operator offset.
       r.amps        = MeasuredAmps + ((AutoAltCurrentZero == 1) ? DynamicAltCurrentZero : 0.0f);
       r.p2pAmps     = altAmpsP2P;
       r.rpm         = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
@@ -4165,39 +4081,38 @@ void zeroLogService() {
     lastFlushMs = now;
   }
   // The fit-history ring normally reaches flash only after an accepted daily fit; a shift made by
-  // zeroHistoryShiftAmps would otherwise wait up to a day (or be lost to a reboot) to land.
+  // zeroFitShiftAmps would otherwise wait up to a day to land (the header basis re-shifts it at boot meanwhile).
   if ((rising || periodic) && zeroFitHistCount > 0 && prev_zeroFitHistHead != zeroFitHistHead) {
     dumpZeroFit();
   }
   prevFieldOff = ffSettled;
 }
 
-// Ends a request. A hold that was engaged (phase >= ramp) stamps altZeroHoldEndMs so the RPM
+// Ends a request. A running-engine hold that was engaged (phase >= ramp) stamps altZeroHoldEndMs so the RPM
 // gates stay masked through the LM2907 re-bias tail while the field comes back.
 static void altZeroEnd(uint8_t rej) {
-  if (altZeroCapPhase >= ALTZERO_PH_RAMP) altZeroHoldEndMs = millis();
+  if (altZeroCapPhase >= ALTZERO_PH_RAMP && !altZeroCapEngineOff) altZeroHoldEndMs = millis();
+  altZeroHoldField  = 0;
   altZeroCapPhase   = ALTZERO_PH_IDLE;
   altZeroRejReason  = rej;
   AltZeroCaptureNow = 0;
 }
 
-// Called every loop pass, right after zeroLogService(). Runs one requested measurement of the
-// alternator current sensor's zero: confirms the engine is turning while the tach can still be
-// trusted, then lets the control tick hold the field at 0% (tick.altZeroMeasuring), waits out the
-// rotor drain and averages the reading. With no field there is no output current, so the average
-// IS the sensor's zero error, at operating temperature, on this installation. Writes nothing: the
-// result is held for the operator to apply. Live RPM is deliberately NOT a gate once the hold is
-// on — at 0% field the LM2907 pickup may read low or zero on a running engine (that is why the
-// wizard's rest hold sits above 0%) — and the RPM recorded with the capture is the one latched
-// before the field came down.
+// One requested alt current sensor zero measurement: read the tach while it is trustworthy (running or stopped),
+// let the control tick hold the field at 0% (tick.altZeroMeasuring), wait out the rotor drain, average. With no
+// field the average IS the sensor's zero error. Writes nothing (operator applies it). Live RPM is NOT a gate
+// once the hold is on: at 0% field the LM2907 may read low/zero on a running engine, so RPM is latched first.
 void altZeroCaptureService() {
   uint32_t now = millis();
+  static uint32_t fieldOnMs    = 0;   // last pass the field was on: the drain is counted from here, not from the request
+  if (fieldActiveStatus > 0) fieldOnMs = now;
   static uint32_t reqMs        = 0;   // request accepted (0 = none in flight)
   static uint32_t phaseMs      = 0;   // current phase entered
   static uint32_t lastSampleMs = 0;
   static double   sum          = 0.0;
   static uint32_t n            = 0;
   static float    p2pWorst     = 0.0f;
+  static bool     capAuto      = false;   // the window's zero-correction state, latched at its start
 
   if (AltZeroCaptureNow != 1) { reqMs = 0; return; }
 
@@ -4211,24 +4126,26 @@ void altZeroCaptureService() {
     }
   }
   if ((now - reqMs) >= ALTZERO_FORCE_TIMEOUT_MS) {
-    uint8_t rej = (altZeroCapPhase == ALTZERO_PH_ENGINE) ? ALTZERO_RJ_ENGINE
-                : (altZeroCapPhase == ALTZERO_PH_RAMP)   ? ALTZERO_RJ_FIELD : ALTZERO_RJ_SHORT;
+    uint8_t rej = (altZeroCapPhase <= ALTZERO_PH_RAMP) ? ALTZERO_RJ_FIELD : ALTZERO_RJ_SHORT;
     altZeroEnd(rej); reqMs = 0;
     queueConsoleMessage("Alt zero: gave up - the measurement did not finish in time");
     return;
   }
 
   switch (altZeroCapPhase) {
-    case ALTZERO_PH_ENGINE:
-      if (RPM >= ALTZERO_MIN_RPM) {
-        altZeroCapRpm   = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
-        altZeroCapPhase = ALTZERO_PH_RAMP; phaseMs = now;
-        queueConsoleMessageF("Alt zero: measuring at %d RPM - field held at 0%%", (int)altZeroCapRpm);
-      } else if ((now - phaseMs) >= ALTZERO_ARM_GRACE_MS) {
-        altZeroEnd(ALTZERO_RJ_ENGINE); reqMs = 0;
-        queueConsoleMessage("Alt zero: refused - engine not running (needs 400 RPM)");
-      }
+    case ALTZERO_PH_ENGINE: {
+      bool running = (RPM >= ALTZERO_MIN_RPM);
+      // A low reading soon after the field was on may be the LM2907's post-cut false zero on a running engine.
+      if (!running && (now - fieldOnMs) < ALTZERO_ARM_GRACE_MS && (now - phaseMs) < ALTZERO_ARM_GRACE_MS) return;
+      altZeroCapRpm       = (int16_t)constrain((long)lroundf(RPM), -32768L, 32767L);
+      altZeroCapEngineOff = running ? 0 : 1;
+      altZeroHoldField    = (running || fieldActiveStatus > 0) ? 1 : 0;
+      altZeroCapPhase     = ALTZERO_PH_RAMP; phaseMs = now;
+      if (running)               queueConsoleMessageF("Alt zero: measuring at %d RPM - field held at 0%%", (int)altZeroCapRpm);
+      else if (altZeroHoldField) queueConsoleMessage("Alt zero: measuring with the engine off - field held at 0%");
+      else                       queueConsoleMessage("Alt zero: measuring with the engine off");
       return;
+    }
 
     case ALTZERO_PH_RAMP:                               // the tick is bringing the duty down
       if (fieldActiveStatus == 0) { altZeroCapPhase = ALTZERO_PH_DRAIN; phaseMs = now; }
@@ -4240,12 +4157,18 @@ void altZeroCaptureService() {
         queueConsoleMessage("Alt zero: window lost - the field came back on");
         return;
       }
-      // Settle against the drain this install actually measured in stage 7, not a guessed constant.
-      uint32_t settleMs = (uint32_t)(ALTZERO_SETTLE_MULT * fdDrainMsAtRpm((float)altZeroCapRpm));
+      // Settle against the drain this install actually measured in stage 7, not a guessed constant. Engine off has no
+      // RPM to pick a drain from (and a dead tach can hide a running one), so it waits out the longest. So does an
+      // owner-ignored tach (or Limp Home).
+      float drainMs = (altZeroCapEngineOff || IgnoreRPM || LimpHome)
+                        ? fmaxf((float)fieldDecayTauMs, fmaxf((float)fdDrainLoMs, (float)fdDrainHiMs))
+                        : fdDrainMsAtRpm((float)altZeroCapRpm);
+      uint32_t settleMs = (uint32_t)(ALTZERO_SETTLE_MULT * drainMs);
       if (settleMs < ALTZERO_SETTLE_MIN_MS) settleMs = ALTZERO_SETTLE_MIN_MS;
-      if ((now - phaseMs) >= settleMs) {
+      if ((now - fieldOnMs) >= settleMs) {
         altZeroCapPhase = ALTZERO_PH_AVG; phaseMs = now;
         lastSampleMs = 0; sum = 0.0; n = 0; p2pWorst = 0.0f;
+        capAuto = (AutoAltCurrentZero == 1);
       }
       return;
     }
@@ -4259,8 +4182,10 @@ void altZeroCaptureService() {
       if (lastSampleMs == 0 || (now - lastSampleMs) >= ALTZERO_SAMPLE_MS) {
         lastSampleMs = now;
         // Skip a bad reading rather than fold it in: NaN fails every gate below by comparing false,
-        // so one of them would carry the whole window past the accept checks.
-        if (!(isnan(MeasuredAmps) || isinf(MeasuredAmps)) && altAmpsFresh()) {   // a held (stale) reading is not a sample (§10.5)
+        // so one of them would carry the whole window past the accept checks. A sample taken after the zero
+        // correction was switched mid-window is on the other basis, so it is skipped too.
+        if (!(isnan(MeasuredAmps) || isinf(MeasuredAmps)) && altAmpsFresh()   // a held (stale) reading is not a sample (§10.5)
+            && (AutoAltCurrentZero == 1) == capAuto) {
           sum += (double)MeasuredAmps;
           n++;
           if (altAmpsP2P > p2pWorst) p2pWorst = altAmpsP2P;
@@ -4290,41 +4215,42 @@ void altZeroCaptureService() {
   }
   altZeroCapA      = mean;
   altZeroCapP2P    = p2pWorst;
+  altZeroCapAuto   = capAuto ? 1 : 0;
   altZeroCapN      = (uint16_t)((n > 65535u) ? 65535u : n);
-  altZeroCapTempF  = isinf(AlternatorTemperatureF) ? NAN : AlternatorTemperatureF;  // NaN when the
-  altZeroCapBoardF = isinf(ambientTemp) ? NAN : ambientTemp;                        // probe is absent
+  altZeroCapTempF  = (isinf(AlternatorTemperatureF) || IgnoreTemperature || LimpHome)   // NaN when the probe is
+                     ? NAN : AlternatorTemperatureF;                                     // absent or owner-ignored
+  altZeroCapBoardF = isinf(ambientTemp) ? NAN : ambientTemp;                        // NaN when the board sensor is absent
   altZeroCapEpoch  = (uint32_t)getCurrentTimestamp();   // 0 until the clock is set - display only
   altZeroCapHeld   = 1;
   altZeroEnd(ALTZERO_RJ_NONE); reqMs = 0;
-  queueConsoleMessageF("Alt zero: captured %.2f A at %d RPM (n=%u, p2p=%.2f A) - field released",
-                       mean, (int)altZeroCapRpm, (unsigned)altZeroCapN, p2pWorst);
+  if (altZeroCapEngineOff)
+    queueConsoleMessageF("Alt zero: captured %.2f A with the engine off (n=%u, p2p=%.2f A)",
+                         mean, (unsigned)altZeroCapN, p2pWorst);
+  else
+    queueConsoleMessageF("Alt zero: captured %.2f A at %d RPM (n=%u, p2p=%.2f A) - field released",
+                         mean, (int)altZeroCapRpm, (unsigned)altZeroCapN, p2pWorst);
 }
 
-// Fold the held capture into the operator-facing offset so the live reading sits at zero at this
-// temperature. A DELTA, not an assignment: whatever else is already being subtracted (a hand-entered
-// offset, a converged fit) stays subtracted and the total lands on the truth. Returns false when
-// there is nothing held to apply.
+// Fold the held capture into AlternatorCOffset as a DELTA, not an assignment: whatever else is already
+// subtracted (hand-entered offset, converged fit) stays, and the total lands on the truth.
 bool altZeroApply() {
-  // Runs on the async web task while Core 1 keeps capturing. Snapshot the held window first so the
-  // ledger row and the console line describe exactly the number that went into the offset, even if
-  // a fresh window lands mid-call.
+  // Runs on the async web task while Core 1 keeps capturing: snapshot the held window so the ledger row and
+  // console line describe exactly the number applied.
   if (!altZeroCapHeld) return false;
   uint32_t epoch = altZeroCapEpoch;
   float    capA  = altZeroCapA;
   float    capP  = altZeroCapP2P;
   uint16_t capN  = altZeroCapN;
   int16_t  capR  = altZeroCapRpm;
+  uint8_t  capOff = altZeroCapEngineOff;
   float    capTA = altZeroCapTempF;
   float    capTB = altZeroCapBoardF;
+  uint8_t  capAuto = altZeroCapAuto;
 
   float before = AlternatorCOffset;
-  AlternatorCOffset = before + capA;
+  AlternatorCOffset = before + capA;   // zeroLogService moves the recorded zero-log rows and fit history onto it
   settingWrite(NK_AlternatorCOffset, String(AlternatorCOffset, 3).c_str());
-  // Every later zero-log row moves by -capA and the recorded ones must move with it, but on Core 1,
-  // which owns the rings (zeroLogService appends, zeroFitCompute reads): stage the delta, never walk them here.
-  portENTER_CRITICAL(&zeroShiftMux);
-  pendingZeroShiftA = pendingZeroShiftA - capA;
-  portEXIT_CRITICAL(&zeroShiftMux);
+  if (!capAuto) zeroCorrFollowOffset(-capA);
 
   char tA[16], tB[16];
   if (isnan(capTA)) strcpy(tA, "null"); else snprintf(tA, sizeof(tA), "%.1f", capTA);
@@ -4332,8 +4258,8 @@ bool altZeroApply() {
   char d[256];
   snprintf(d, sizeof(d),
            "{\"t\":\"alt_zero\",\"delta\":%.3f,\"off_before\":%.3f,\"off_after\":%.3f,"
-           "\"rpm\":%d,\"n\":%u,\"p2p\":%.3f,\"altF\":%s,\"boardF\":%s,\"epoch\":%u}",
-           capA, before, AlternatorCOffset, (int)capR, (unsigned)capN,
+           "\"rpm\":%d,\"eng_off\":%u,\"n\":%u,\"p2p\":%.3f,\"altF\":%s,\"boardF\":%s,\"epoch\":%u}",
+           capA, before, AlternatorCOffset, (int)capR, (unsigned)capOff, (unsigned)capN,
            capP, tA, tB, (unsigned)epoch);
   cxLedgerLogTest(d);
 
@@ -4367,54 +4293,35 @@ void clearSensorBuffer() {
 }
 
 // ===== ESP32 CONFIG SNAPSHOT FUNCTIONS =====
-// Build config snapshot JSON: { device_uid, token, snapshot_timestamp, settings: {…}, state: {…} }
-// settings = the full manifest + alt/perf-registry set from manifestConfigObject (~260 keys, grows
-// automatically as settings are added, stored verbatim as jsonb) → device_settings_snapshots,
-// owner-visible only, never leaderboards. state → device_state_daily + an UPSERT of the lifetime
-// fields into device_statistics. Field names and grouping mirror configsnapshot_picker.html.
-// snprintf's size argument is size_t: once offset passes the buffer end cfgRemain(offset) goes
-// negative and converts to an enormous size_t, defeating the bound. Clamp to 0.
+// { device_uid, token, snapshot_timestamp, settings: {…}, state: {…} }. settings = manifestConfigObject
+// stored verbatim as jsonb (device_settings_snapshots, owner-only); state → device_state_daily + a lifetime
+// UPSERT into device_statistics. Field names/grouping mirror configsnapshot_picker.html.
+// Clamp to 0: past the buffer end a negative remainder converts to an enormous size_t and defeats the bound.
 static inline size_t cfgRemain(int off) {
   return (off >= CONFIG_PAYLOAD_SIZE) ? (size_t)0 : (size_t)(CONFIG_PAYLOAD_SIZE - off);
 }
 
 // ─── CLOUD_DAILY_LIST — the 24 h scalar telemetry contract ──────────────────────────────────────
-// Declared ONCE, here, the same way CSV3 is declared once as CSV3_LIST: the JSON key, its format
-// specifier and the expression that fills it can never drift apart, because the emit below is
-// generated from this list. Add a row and the payload, the drift gate and the migration checklist
-// all see it at the same time.
-//
-// Everything here is a SCALAR — a single number per 24 h snapshot. Series, maps, tables and rings
-// are deliberately out of scope (the alt-health trend, the damper pocket map and the ripple matrix
-// stay device-side). Anything worth min/max/avg belongs in buildSnapshotJson instead, which runs
-// per window; this list is for values that either change too slowly to window (alternator health,
-// wear) or are counters that only mean anything cumulatively.
-//
-// CLOUD CONTRACT: update-config-snapshot spreads EVERY state key into the flat device_state_daily
-// INSERT, so a key with no column 500s the WHOLE daily snapshot — settings blob included. The
-// matching column MUST exist on device_state_daily before this firmware ships. cloud_drift_check.py
-// enforces that against the Seed on every build.
-//
+// Declared ONCE (like CSV3_LIST); the emit below is generated from it, so key, format and expression can't drift.
+// SCALARS only: per-window min/max/avg belongs in buildSnapshotJson; series/maps/rings stay device-side.
+// CLOUD CONTRACT: update-config-snapshot spreads EVERY state key into the device_state_daily INSERT, so a key
+// with no column 500s the WHOLE snapshot. The column MUST exist before this firmware ships (cloud_drift_check.py).
 // X(json_key, printf_format, expression)
 #define CLOUD_DAILY_LIST(X) \
-  /* Alternator health verdict. The raw front points ride update-alt-health for the cloud re-fit; \
-     these four are the device's own conclusion, which the cloud cannot reconstruct from the front \
-     alone (scoring needs the live observations, which never leave the boat). */ \
+  /* Alternator health verdict: the device's own conclusion, which the cloud can't rebuild from the front \
+     points (scoring needs live observations that never leave the boat). */ \
   X(alt_health_pct,             "%.1f",  (double)altWorstPct()) \
   X(alt_health_status,          "%d",    (int)altStatus()) \
   X(alt_coverage_pct,           "%.1f",  (double)altCoveragePct()) \
   X(alt_obs_count,              "%d",    (int)altFrontCount()) \
-  /* Arrhenius wear model (5_functions.ino). Integrated at the control tick against instantaneous \
-     temperature — the cloud cannot approximate it from alt_temp_avg, because damage rate is \
-     exponential in temperature and a window mean understates every excursion. */ \
+  /* Arrhenius wear (5_functions.ino), integrated per control tick: damage is exponential in temperature, \
+     so the cloud can't approximate it from alt_temp_avg. */ \
   X(insulation_life_pct,        "%.3f",  (double)InsulationLifePercent) \
   X(grease_life_pct,            "%.3f",  (double)GreaseLifePercent) \
   X(brush_life_pct,             "%.3f",  (double)BrushLifePercent) \
   X(predicted_life_hours,       "%.1f",  (double)PredictedLifeHours) \
-  /* Protection trips. SESSION counters — zeroed at boot and by the web reset buttons — so a row is \
-     "since last boot or reset", NOT a daily delta; differencing consecutive rows is only valid while \
-     last_session_duration_s keeps growing. The OV family has a lifetime twin in RTC and rides \
-     ov_telemetry instead; these have none, which is why they are worth capturing daily at all. */ \
+  /* Protection trips: SESSION counters (zeroed at boot and by the reset buttons), NOT daily deltas; \
+     differencing rows is valid only while last_session_duration_s grows. OV lifetime counts ride ov_telemetry. */ \
   X(prot_iexcess_count,         "%lu",   (unsigned long)g_iExcessCount) \
   X(prot_ina_ov_count,          "%lu",   (unsigned long)g_inaOVCount) \
   X(prot_hard_oc_count,         "%lu",   (unsigned long)g_hardOCCount) \
@@ -4439,7 +4346,7 @@ static inline size_t cfgRemain(int off) {
   X(wifi_reconnects_total,      "%d",    (int)wifiReconnectsTotal) \
   X(min_free_heap_kb,           "%d",    (int)MinFreeHeap) \
   X(heap_frag_pct,              "%d",    (int)Heapfrag) \
-  X(largest_internal_block_kb,  "%lu",   (unsigned long)(LargestInternalBlock / 1024)) \
+  X(largest_internal_block_kb,  "%lu",   (unsigned long)LargestInternalBlock) \
   X(littlefs_free_kb,           "%d",    (int)LittleFsFreeKb) \
   X(nvs_full_save_worst_ms,     "%u",    (unsigned)nvsFullSaveWorstMs) \
   X(loop_worst_us,              "%d",    (int)MaximumLoopTime) \
@@ -4453,12 +4360,9 @@ static inline size_t cfgRemain(int off) {
   /* Which app slot the unit is actually running: 0 factory, 1 ota_0. Factory is never written by \
      OTA, so a fleet unit still reporting 0 has never taken an over-the-air update. */ \
   X(current_partition_type,     "%d",    (int)currentPartitionType) \
-  /* Black box: the previous session's last-alive snapshot, read out of RTC noinit RAM at boot. \
-     bb_valid 0 means the magic did not survive, which is itself the diagnostic — it proves the 3.3 V \
-     rail actually died rather than the firmware resetting. Until now this existed only as one \
-     console line, so a fielded unit's crash left nothing behind. Every row but bb_valid is null while \
-     the RTC copy is invalid: the floats are then whatever the RAM held, and a NaN prints "nan", which \
-     is not JSON and would 400 the whole snapshot. bb_alt_temp_f also nulls the -999 "no probe" marker. */ \
+  /* Black box: the previous session's last-alive snapshot from RTC noinit RAM. bb_valid 0 (magic lost) proves \
+     the 3.3 V rail died rather than a firmware reset. Other rows are null while invalid: the floats are garbage \
+     and "nan" is not JSON (would 400 the snapshot). bb_alt_temp_f also nulls the -999 "no probe" marker. */ \
   X(bb_valid,                   "%d",    (int)(g_blackBoxPrevValid ? 1 : 0)) \
   X(bb_up_s,                    "%s",    ltJsonInt(bbUpS, sizeof(bbUpS), (long)(g_blackBoxPrev.upMillis / 1000UL), g_blackBoxPrevValid)) \
   X(bb_batt_v,                  "%s",    ltJsonNum(bbVS, sizeof(bbVS), (double)g_blackBoxPrev.ibv, g_blackBoxPrevValid && isfinite((double)g_blackBoxPrev.ibv))) \
@@ -4468,16 +4372,13 @@ static inline size_t cfgRemain(int off) {
   X(bb_alt_temp_f,              "%s",    ltJsonInt(bbTS, sizeof(bbTS), (long)g_blackBoxPrev.altTempF, g_blackBoxPrevValid && g_blackBoxPrev.altTempF != -999)) \
   X(bb_sys_mode,                "%s",    ltJsonInt(bbModeS, sizeof(bbModeS), (long)g_blackBoxPrev.sysMode, g_blackBoxPrevValid)) \
   X(bb_charge_stage,            "%s",    ltJsonInt(bbStgS, sizeof(bbStgS), (long)g_blackBoxPrev.chargeStage, g_blackBoxPrevValid)) \
-  /* IMU install verdict + the two rare-but-dramatic lifetime event counters. imu_suspicious on \
-     sensor_history says a window's motion data is untrustworthy; imu_install_code says WHY \
-     (0 OK, 1 never zeroed, 2 mount not vertical, 3 zeroed pre-mount-check, 4 no IMU), which is the \
-     difference between a support answer and a shrug. Capsize/pitchpole are threshold events on \
-     heel and cannot be recovered from the per-window envelope. */ \
+  /* IMU install verdict: imu_install_code says WHY a window is imu_suspicious (0 OK, 1 never zeroed, 2 mount \
+     not vertical, 3 zeroed pre-mount-check, 4 no IMU). Capsize/pitchpole are heel threshold events the \
+     per-window envelope can't recover. */ \
   X(imu_install_code,           "%d",    (int)imuInstallCode()) \
   X(imu_capsize_count,          "%lu",   (unsigned long)imu_capsize_count) \
   X(imu_pitchpole_count,        "%lu",   (unsigned long)imu_pitchpole_count) \
-  /* Bus / sensor error counters. Session-scoped like the protection block. These are the only \
-     evidence that a fielded unit's hardware is degrading rather than its tuning. */ \
+  /* Bus / sensor error counters, session-scoped: the evidence of degrading hardware vs tuning. */ \
   X(err_ads_i2c,                "%lu",   (unsigned long)adsI2CErrorCount) \
   X(err_ina228,                 "%lu",   (unsigned long)ina228ErrorCount) \
   X(err_imu_i2c,                "%lu",   (unsigned long)imu_i2c_error_count) \
@@ -4497,22 +4398,25 @@ static inline size_t cfgRemain(int off) {
   X(err_temp_reread_fail,       "%lu",   (unsigned long)tempRereadFailCount) \
   X(err_temp_res_fix_crc_fail,  "%lu",   (unsigned long)tempResolutionFixCrcFailCount) \
   X(err_temp_enumerate_fail,    "%lu",   (unsigned long)tempEnumerateFailCount) \
-  /* 1-Wire census. ow_unassigned_count > 0 means the owner has a probe fitted and doing nothing — \
-     a support answer we currently have no way to see from here. */ \
+  /* 1-Wire census. ow_unassigned_count > 0 = a probe fitted but doing nothing. */ \
   X(ow_probe_count,             "%d",    (int)owProbeCount) \
   X(ow_unassigned_count,        "%d",    (int)owUnassignedCount()) \
   X(err_n183_checksum,          "%lu",   (unsigned long)n183ChecksumErrCount) \
   X(n183_sentences,             "%lu",   (unsigned long)n183SentenceCount) \
   X(n2k_tx_count,               "%lu",   (unsigned long)n2kTxCount) \
   X(n2k_tx_drops,               "%lu",   (unsigned long)n2kTxDropCount) \
-  /* DVCC follow health — whether an external charge authority is actually being followed, and why \
-     not when it isn't. 0 off, 1 waiting, 2 settling, 3 following, 4 stale, 5 untrusted; untrust \
+  /* NMEA 2000 bus health over the last 24 h of the per-minute history (n2kBusDailyRefresh, run at the emit site). \
+     Worst verdict: 0 never ran, 1 OK, 2 nothing heard, 3 receive errors, 4 nobody answering, 5 bus-off. */ \
+  X(n2k_bus_worst,              "%d",    n2kDayWorst) \
+  X(n2k_bus_off_count,          "%d",    n2kDayBusOffs) \
+  X(n2k_rx_lost,                "%d",    n2kDayRxLost) \
+  X(n2k_nodes_max,              "%d",    n2kDayNodesMax) \
+  /* DVCC follow state: 0 off, 1 waiting, 2 settling, 3 following, 4 stale, 5 untrusted; untrust \
      reason 0 none, 1 CVL out of window, 2 CCL implausible, 3 flapping. */ \
   X(dvcc_state,                 "%d",    (int)dvccState) \
   X(dvcc_untrust_reason,        "%d",    (int)dvccUntrustReason) \
-  /* VE.Direct MPPT. The analog half (panel W / V) rides the per-window payload as min/max/avg; \
-     these are the codes and the charger's own daily totals, which have no meaningful average. \
-     -1 on the three codes means VE.Direct never spoke, not "no error". */ \
+  /* VE.Direct MPPT codes + daily totals (panel W/V ride the per-window payload). -1 on the three codes \
+     means VE.Direct never spoke, not "no error". */ \
   X(victron_charge_state,       "%d",    (int)VictronChargeState) \
   X(victron_mppt_mode,          "%d",    (int)VictronMPPTMode) \
   X(victron_error,              "%d",    (int)VictronError) \
@@ -4520,18 +4424,15 @@ static inline size_t cfgRemain(int off) {
   X(victron_max_power_today_w,  "%.1f",  (double)VictronMaxPowerToday_W) \
   X(victron_yield_yest_kwh,     "%.2f",  (double)VictronYieldYesterday_kWh) \
   X(victron_max_power_yest_w,   "%.1f",  (double)VictronMaxPowerYesterday_W) \
-  /* Which source batteryTempF() was actually using when the snapshot was built: 0 none, 1 probe, \
-     2 NMEA 2000, 3 VE.Direct, 4 RV-C. Names the provenance of batt_temp_* in \
-     sensor_history, which carries the numbers but not where they came from. */ \
+  /* batteryTempF() source at build time (provenance of sensor_history batt_temp_*): 0 none, 1 probe, \
+     2 NMEA 2000, 3 VE.Direct, 4 RV-C. */ \
   X(batt_temp_src,              "%d",    (int)battTempActiveSrc) \
   /* Lifetime count of adaptive-table updates: says whether the learning is still moving or has \
      settled, which no snapshot of the tables themselves can tell you. */ \
   X(total_learning_events,      "%lu",   (unsigned long)totalLearningEvents) \
-  /* INA228 die temperature, session peak. The only sensor sitting AT the power stage — amb_temp_* \
-     is the BMP388 out in the bulk of the board and barely moves while Q3/D5 heat up. Rides ltJsonNum \
-     because it is NAN until the read site's warm-up + corroboration gate passes, and a literal null \
-     is what the column wants there; a fabricated 0.0 would be a permanent fake in the time series. \
-     idtMaxS is declared at the emit site below, the same way buildSnapshotJson declares bcMinS. */ \
+  /* INA228 die temp, session peak — the only sensor AT the power stage (amb_temp_* is the BMP388, which barely \
+     moves while Q3/D5 heat). NAN until the read site's warm-up gate passes, so ltJsonNum sends null, never a \
+     fake 0.0. idtMaxS is declared at the emit site. */ \
   X(ina_die_temp_max_f,         "%s",    ltJsonNum(idtMaxS, sizeof(idtMaxS), (double)inaDieTempMaxF, isfinite(inaDieTempMaxF))) \
   /* Lifetime seconds the field sat at each board ceiling (6_functions.ino updateFieldDerateCeilings): how \
      often an installation runs into the drive-heat law or the 10 A rating, which nothing else records. */ \
@@ -4543,31 +4444,23 @@ static inline size_t cfgRemain(int off) {
 
 bool buildConfigPayload() {
   time_t now_ts = time(NULL);
-  const char *timestampStr = formatTimestamp(now_ts);
+  // An unconfirmed clock (soft clock restored from NVS, or never set) sends an empty stamp and the
+  // cloud stamps the row with its own time; the soft clock got rows back-dated or rejected as 1970.
+  const char *timestampStr = clockIsReal() ? formatTimestamp(now_ts) : "";
 
   int offset = snprintf(configPayloadBuffer, CONFIG_PAYLOAD_SIZE,
     "{\"device_uid\":\"%s\",\"token\":\"%s\",\"snapshot_timestamp\":\"%s\","
-    // payload_v = ingest payload schema version; bump when this body's shape changes.
-    // Edge fn destructures named keys so it ignores this; present for version tracing.
-    // v2 adds state.ov_telemetry (lifetime OV histogram + counters → device_statistics jsonb).
-    // v3 nests settings.tables (RPM/fuel tables) so the daily settings jsonb equals the full
-    // /exportConfig record, and update-config-snapshot projects the vessel keys → user_profiles.
-    // v4 renames settings.commissioning_results → learned_state and drops its stress_test
-    // (moved to the commissioning ledger, COMMISSIONING_LEDGER_SPEC.md).
-    // v5 adds the CLOUD_DAILY_LIST scalar block to state{} — alternator health verdict, Arrhenius
-    // wear model, protection trips, stability + black box, bus/sensor error counters, VE.Direct MPPT.
+    // payload_v = ingest schema version; bump when this body's shape changes (edge fn ignores it, tracing only).
+    // v2 state.ov_telemetry, v3 settings.tables (settings jsonb = full /exportConfig record), v4
+    // commissioning_results -> learned_state minus stress_test (now in the ledger), v5 CLOUD_DAILY_LIST block.
     "\"payload_v\":5,"
     "\"settings\":",
     device_id_hex, authToken.c_str(), timestampStr);
   if (offset < 0 || offset >= CONFIG_PAYLOAD_SIZE) return false;
 
   // ─── Settings ───────────────────────────────────────────────────────────────
-  // Manifest-driven: the complete settings set as raw NVS strings,
-  // sharing CONFIG_MANIFEST (8_functions.ino) with /exportConfig — one source of truth,
-  // so the fleet config snapshot can never drift behind the dashboard as settings are
-  // added. update-config-snapshot stores it verbatim as one jsonb column (no per-key DB).
-  // tables{} nests INSIDE settings (like learned_state) so the cloud record is the
-  // complete boat with zero cloud schema change.
+  // Raw NVS strings from CONFIG_MANIFEST (8_functions.ino), shared with /exportConfig so the snapshot can't
+  // drift behind the dashboard. tables{} nests INSIDE settings so the cloud record is the complete boat.
   {
     String cfgObj = manifestConfigObject();
     cfgObj.remove(cfgObj.length() - 1);   // reopen the object to append the tables section
@@ -4623,20 +4516,15 @@ bool buildConfigPayload() {
     ",\"current_weather_mode\":%d,\"uv_today\":%.2f",
     currentWeatherMode, UVToday);
 
-  // Fast alt-current channel: per-session worst scalars (fleet aggregation, consumer 5).
-  // CLOUD CONTRACT: update-config-snapshot spreads EVERY state key into the
-  // device_state_daily INSERT (flattenForInsert) — an unknown key 500s the whole daily
-  // snapshot. The fa_pkpk_worst_session / fa_peak_worst_a_session / fa_peak_worst_hz_session
-  // columns MUST exist in device_state_daily before this firmware is flashed.
+  // Fast alt-current channel per-session worsts. Like every state key, these columns MUST exist in
+  // device_state_daily before this firmware ships or the whole daily snapshot 500s.
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
     ",\"fa_pkpk_worst_session\":%.2f,\"fa_peak_worst_a_session\":%.2f,\"fa_peak_worst_hz_session\":%.1f",
     faSesPkpkWorstA, faSesPeakWorstA, faSesPeakWorstHz);
 
-  // Lifetime OV excursion telemetry (RTC-RAM histogram + counters — OvTelemetry in Xregulator.ino).
-  // One nested object → device_statistics.ov_telemetry (jsonb); the edge fn must route it there and
-  // EXCLUDE it from the device_state_daily flatten (a nested value in that INSERT 500s the snapshot).
-  // time_ms as decimal strings (uint64 dwell is beyond JS 53-bit integers). After a true power cut
-  // the struct zeroes and the next snapshot reports lower values — edge fn overwrites as-is, accepted.
+  // Lifetime OV telemetry (OvTelemetry, Xregulator.ino): one nested object → device_statistics.ov_telemetry; the
+  // edge fn must EXCLUDE it from the device_state_daily flatten (a nested value 500s that INSERT). time_ms as
+  // decimal strings (uint64 exceeds JS 53-bit). A true power cut zeroes the struct; the cloud overwrites as-is.
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
     ",\"ov_telemetry\":{\"soft\":%lu,\"sw_hard\":%lu,\"ina\":%lu,\"kd\":%lu,"
     "\"tier_low\":%lu,\"tier_mid\":%lu,\"bulk\":%.2f,\"k\":%.2f,"
@@ -4653,18 +4541,11 @@ bool buildConfigPayload() {
     offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "%s\"%llu\"", i ? "," : "", (unsigned long long)g_ovTel.timeMs[i]);
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "]}");
 
-  // Control Accuracy numbers since the last MANUAL reset. The post-upload auto-reset is disabled
-  // (see the upload-success branch below), so consecutive daily snapshots are a RUNNING TOTAL, not
-  // independent one-day samples — differencing two rows is what isolates a day.
-  // CLOUD CONTRACT: like every state key, these are spread into the device_state_daily INSERT —
-  // the 6 columns (acc_cur_rms_a, acc_cur_peak_a, acc_volt_rms_mv, acc_volt_peak_mv,
-  // acc_therm_rms_f, acc_therm_peak_f) MUST exist in device_state_daily before this firmware ships,
-  // or the whole daily snapshot 500s.
-  // v4 SEMANTICS BREAK (fw > 0.0.46): the *_rms columns now carry Tracking/containment % (0-100,
-  // in-band fraction of challenged/binding time — spec CONTROL_ACCURACY_V4_ROUTINE_SPEC.md); the
-  // *_peak columns keep their physical units (worst damaging overshoot: A, 12V-equiv mV, °F over
-  // limit). NOT trend-continuous with v2/v3 rows — filter fleet trends on firmware_version_int.
-  // -1 = never challenged today (distinguishes "not observed" from "0% tracking").
+  // Control Accuracy since the last MANUAL reset (post-upload auto-reset is disabled): daily rows are a RUNNING
+  // TOTAL; difference two rows to isolate a day. The 6 columns MUST exist in device_state_daily before shipping.
+  // v4 semantics (fw > 0.0.46, CONTROL_ACCURACY_V4_ROUTINE_SPEC.md): *_rms = tracking/containment % (0-100),
+  // *_peak = worst overshoot (A, 12V-equiv mV, °F over limit); not trend-continuous with v2/v3 rows (filter on
+  // firmware_version_int). -1 = never challenged today.
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
     ",\"acc_cur_rms_a\":%.2f,\"acc_cur_peak_a\":%.2f,"
     "\"acc_volt_rms_mv\":%.0f,\"acc_volt_peak_mv\":%.0f,"
@@ -4677,11 +4558,11 @@ bool buildConfigPayload() {
     accThermWorstOverF);
 
   // ─── 24 h scalar telemetry (CLOUD_DAILY_LIST above) ────────────────────────
-  // Format string and argument list are BOTH generated from the one list, so a row can never be
-  // half-added. Adjacent string literals concatenate, so CLOUD_DAILY_LIST(CD_FMT) is a single
+  // Format and args both generated from the one list: CLOUD_DAILY_LIST(CD_FMT) concatenates into a single
   // literal and CLOUD_DAILY_LIST(CD_ARG) is the matching comma-led argument tail.
   char idtMaxS[16];   // ina_die_temp_max_f — see the row's comment in CLOUD_DAILY_LIST
   char bbUpS[16], bbVS[16], bbDS[16], bbRpmS[16], bbAS[16], bbTS[16], bbModeS[16], bbStgS[16];   // bb_* rows, same null pattern
+  n2kBusDailyRefresh();
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
                      CLOUD_DAILY_LIST(CD_FMT) CLOUD_DAILY_LIST(CD_ARG));
 
@@ -4703,16 +4584,14 @@ int executeUploadConfig(const char *payload) {
 
   WiFiClientSecure client;
   client.setInsecure();
-  // setTimeout omitted: Stream::setTimeout is ms (not seconds as some docs claim) and
-  // the read loops below use available()+read() polling with explicit millis() deadlines,
-  // so the Stream-level timeout doesn't gate anything here.
+  // No setTimeout: it is ms and gates nothing here (see executeUploadPayload).
   client.setHandshakeTimeout(HANDSHAKE_TIMEOUT / 1000);  // this API takes seconds
 
   uint32_t start = millis();
   esp_task_wdt_reset();
 
   IPAddress hostIP;  // pre-resolve: keep DNS out of the connect's unfed-WDT window (see executeUploadPayload)
-  if (!WiFi.hostByName(host, hostIP)) {
+  if (WiFi.hostByName(host, hostIP) != 1) {
     Serial.println("Config: DNS fail");
     return 0;
   }
@@ -4748,8 +4627,7 @@ int executeUploadConfig(const char *payload) {
 
   // ===== Stream payload directly =====
   size_t payloadLen = strlen(payload);
-  size_t sent = client.write((const uint8_t *)payload, payloadLen);
-  if (sent != payloadLen) {
+  if (!cloudWriteBody(client, payload, payloadLen, start)) {
     Serial.println("Config: Payload send fail");
     client.stop();
     return 0;
@@ -4843,12 +4721,9 @@ done_headers_cfg:
   return httpCode;
 }
 
-// Mirrors executeUploadConfig() exactly (proven HTTPS pattern) — only the endpoint + result
-// signaling differ. Ships a commissioning-ledger event batch to log-commissioning-event and
-// stamps cxLedgerUpState for the Core-1 drain service: 2 = cloud has the rows, trim the sent
-// file prefix; -1 = transport/server failure, leave the file and retry. HTTP 400 also stamps 2:
-// a batch the edge fn rejects as malformed would poison the queue forever if retried — the
-// (device_uid, seq) gap it leaves is the audit trail.
+// Same HTTPS pattern as executeUploadConfig(), to log-commissioning-event. Stamps cxLedgerUpState for the
+// Core-1 drain: 2 = cloud has the rows, trim the sent prefix; -1 = failure, retry. HTTP 400 also stamps 2: a
+// malformed batch retried would poison the queue forever; the (device_uid, seq) gap is the audit trail.
 bool executeUploadCxLedger(const char *payload) {
   if (WiFi.status() != WL_CONNECTED) { cxLedgerUpState = -1; return false; }
   if (WiFi.RSSI() < -80) { cxLedgerUpState = -1; return false; }
@@ -4862,7 +4737,7 @@ bool executeUploadCxLedger(const char *payload) {
   esp_task_wdt_reset();
 
   IPAddress hostIP;  // pre-resolve: keep DNS out of the connect's unfed-WDT window (see executeUploadPayload)
-  if (!WiFi.hostByName(host, hostIP)) {
+  if (WiFi.hostByName(host, hostIP) != 1) {
     Serial.println("CxLedger: DNS fail");
     cxLedgerUpState = -1;
     return false;
@@ -4894,8 +4769,7 @@ bool executeUploadCxLedger(const char *payload) {
     (unsigned)strlen(payload));
 
   size_t payloadLen = strlen(payload);
-  size_t sent = client.write((const uint8_t *)payload, payloadLen);
-  if (sent != payloadLen) {
+  if (!cloudWriteBody(client, payload, payloadLen, start)) {
     Serial.println("CxLedger: Payload send fail");
     client.stop();
     cxLedgerUpState = -1;
@@ -4950,9 +4824,32 @@ drain_headers_cxl:
   }
 
 done_headers_cxl:
+  // The sent prefix of the ledger file is trimmed on success, so it must be the edge function's ack
+  // ({"success":true,...}), not any 200: a captive portal's login page would otherwise lose the batch.
+  bool cxAck = false;
+  {
+    char bodyBuf[129];
+    size_t bodyLen = 0;
+    uint32_t bodyStart = millis();
+    while (httpCode == 200 && client.connected() && bodyLen < sizeof(bodyBuf) - 1 && (millis() - bodyStart < READ_TIMEOUT)) {
+      esp_task_wdt_reset();
+      if (client.available()) bodyStart = millis();
+      while (client.available() && bodyLen < sizeof(bodyBuf) - 1) bodyBuf[bodyLen++] = (char)client.read();
+      bodyBuf[bodyLen] = '\0';
+      // strstr on the raw bytes tolerates HTTP/1.1 chunked framing around the JSON
+      if (strstr(bodyBuf, "\"success\":true")) { cxAck = true; break; }
+      if (millis() - start > GLOBAL_TIMEOUT) break;
+      delay(1);
+    }
+  }
   client.stop();
   esp_task_wdt_reset();
 
+  if (httpCode == 200 && !cxAck) {
+    queueConsoleMessage("Commissioning ledger: reply was not the cloud's (captive portal?) — will retry");
+    cxLedgerUpState = -1;
+    return false;
+  }
   if (httpCode == 200) {
     queueConsoleMessage("Commissioning ledger uploaded");
     cxLedgerUpState = 2;
@@ -4969,23 +4866,35 @@ done_headers_cxl:
   return false;
 }
 
-// Shared response-body buffer for the two front sync-backs (boat + alt). PSRAM, allocated once and
-// kept (both sync paths run sequentially in the same httpsTask worker). Must hold the boat pair at
-// full cap (2 × 4096 pts). A read that fills it completely is reported and NOT parsed — a truncated
-// front must never wholesale-replace a good local one.
-static char *syncBody = nullptr;
-#define SYNC_BODY_CAP 524288u
-static char *syncBodyGet() {
-  if (!syncBody) syncBody = (char *)ps_malloc(SYNC_BODY_CAP);
-  return syncBody;
+// The boat + alt sync-backs read the cloud's reply into the upload's own block: cloudWriteBody() has handed every payload
+// byte to mbedTLS before the first reply byte is read, and the block's cap bounds the reply. A read that fills it at the
+// cap is NOT parsed: a truncated front must never replace a good one.
+
+// One console line per failure streak: an allocation that keeps failing every 15 min stays quiet until that slot
+// (SYNC_NOTE_*) succeeds again. Free size is a counter; the largest block is cpuLoadTask's cached walk.
+void syncAllocNote(uint8_t slot, bool ok, size_t bytes) {
+  static volatile bool failing[4] = { false, false, false, false };
+  if (slot >= 4) return;
+  if (ok) { failing[slot] = false; return; }
+  if (failing[slot]) return;
+  failing[slot] = true;
+  uint32_t walkAt = largestPsramAtMs, nowMs = millis();   // stamp first: cpuLoadTask can write it at any moment
+  uint32_t ageS = ((int32_t)(nowMs - walkAt) > 0) ? (nowMs - walkAt) / 1000UL : 0;
+  queueConsoleMessageF("%s sync: no %u KB PSRAM block for the %s (free %u KB, largest %u KB %lus ago) - retrying each cycle, logged again only after one succeeds",
+                       (slot & 1) ? "Alternator health" : "Boat performance", (unsigned)((bytes + 1023) / 1024),
+                       (slot < 2) ? "upload" : "cloud reply", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                       (unsigned)LargestPSRAMBlock, (unsigned long)ageS);
 }
 
-// Drains HTTP response headers (already past the status line) up to the blank line, capturing
-// Content-Length (-1 when absent / headers never completed) and Transfer-Encoding: chunked. Lets
-// the sync-back callers tell a mid-body connection drop from a complete short body — BEFRONT1 has
-// no terminator, so a truncated body parses cleanly and would wholesale-replace the local front.
-// (Probed 2026-08-14: the Supabase/Cloudflare edge over HTTP/1.1 sends chunked, no Content-Length,
-// so the chunked path is the live one; Content-Length is kept for framing changes upstream.)
+// Core 1, before a boat or alt sync allocates: nothing on the HTTPS task, nothing queued, and no reply waiting for Core 1,
+// so at most one sync block is alive at a time.
+bool frontSyncTurnFree() {
+  return !core0Busy && uxQueueMessagesWaiting(httpsQueue) == 0 && !frontSyncHandoffPending();
+}
+
+// Drains headers past the status line, capturing Content-Length (-1 if absent/incomplete) and chunked encoding,
+// so callers can tell a mid-body drop from a short body: BEFRONT1 has no terminator, so a truncated body parses
+// cleanly and would replace the local front. The Supabase/Cloudflare edge sends chunked with no Content-Length.
 static long drainHeadersCaptureLen(WiFiClientSecure &client, uint32_t startMs, bool *chunked) {
   uint32_t drainStart = millis();
   char line[48];
@@ -5014,23 +4923,43 @@ static long drainHeadersCaptureLen(WiFiClientSecure &client, uint32_t startMs, b
   return contentLen;
 }
 
-// Reads a response body into buf (cap-1 usable), DE-CHUNKING when the response is chunked — the raw
-// reader used to store the chunk framing (hex size lines) into the CSV, and a chunk boundary landing
-// mid-row could admit a column-shifted garbage front point. Sets *complete=false when a chunked
-// body's terminating 0-chunk never arrived, or a Content-Length body came up short: the caller must
-// not hand an incomplete body to the wholesale-replacing front ingest.
-static size_t readSyncBody(WiFiClientSecure &client, char *buf, size_t cap, bool chunked,
-                           long contentLen, uint32_t startMs, bool *complete) {
+// Reads a body into *bufIO (cap-1 usable), DE-CHUNKING a chunked response (framing in the CSV could admit a
+// column-shifted garbage front point). *complete=false when the 0-chunk or the Content-Length never fully
+// arrived: the caller must not feed an incomplete body to the wholesale-replacing front ingest.
+// A full block grows (doubling, up to maxCap) by new block + copy + free: ps_realloc would copy inside the heap lock.
+// *full = it filled anyway, at maxCap or (*growFailed) with no PSRAM block for the next size.
+static size_t readSyncBody(WiFiClientSecure &client, char **bufIO, size_t *capIO, size_t maxCap, bool chunked,
+                           long contentLen, uint32_t startMs, bool *complete, bool *full, bool *growFailed) {
+  char *buf = *bufIO;
+  size_t cap = *capIO;
   size_t bl = 0;
   bool done = false;
+  *full = false;
+  *growFailed = false;
   uint32_t bodyStart = millis();
   uint8_t cs = 0;       // chunked state: 0 = size line, 1 = payload, 2/3 = CR/LF after payload
   long remain = 0;
   bool sawSize = false, inExt = false;
-  while (!done && client.connected() && bl < cap - 1 && (millis() - bodyStart < READ_TIMEOUT)) {
+  while (!done && !*full && client.connected() && (millis() - bodyStart < READ_TIMEOUT)) {
     esp_task_wdt_reset();
     if (client.available()) bodyStart = millis();
-    while (!done && client.available() && bl < cap - 1) {
+    while (!done && client.available()) {
+      if (bl >= cap - 1) {
+        size_t ncap = (cap >= maxCap / 2) ? maxCap : cap * 2;
+        char *nb = (cap < maxCap) ? (char *)ps_malloc(ncap) : nullptr;
+        if (!nb) {
+          *full = true;
+          *growFailed = (cap < maxCap);
+          break;
+        }
+        memcpy(nb, buf, bl);
+        free(buf);
+        buf = nb;
+        cap = ncap;
+        *bufIO = buf;
+        *capIO = cap;
+        esp_task_wdt_reset();
+      }
       char c = (char)client.read();
       if (!chunked) { buf[bl++] = c; continue; }
       switch (cs) {
@@ -5068,7 +4997,8 @@ static size_t readSyncBody(WiFiClientSecure &client, char *buf, size_t cap, bool
 
 // Mirrors executeUploadConfig() exactly (proven HTTPS pattern) — only the endpoint + log labels
 // differ. Uploads the boat-performance aggregates to the update-boat-performance edge function.
-bool executeUploadBoatPerf(const char *payload) {
+bool executeUploadBoatPerf(HttpsRequest &req) {
+  const char *payload = req.payload;
   if (WiFi.status() != WL_CONNECTED) return false;
   if (WiFi.RSSI() < -80) return false;
   if (!isRegistered || authToken.isEmpty()) return false;
@@ -5081,7 +5011,7 @@ bool executeUploadBoatPerf(const char *payload) {
   esp_task_wdt_reset();
 
   IPAddress hostIP;  // pre-resolve: keep DNS out of the connect's unfed-WDT window (see executeUploadPayload)
-  if (!WiFi.hostByName(host, hostIP)) {
+  if (WiFi.hostByName(host, hostIP) != 1) {
     Serial.println("BoatPerf: DNS fail");
     return false;
   }
@@ -5108,7 +5038,7 @@ bool executeUploadBoatPerf(const char *payload) {
     host, SUPABASE_ANON_KEY, (unsigned)strlen(payload));
 
   size_t payloadLen = strlen(payload);
-  if (client.write((const uint8_t *)payload, payloadLen) != payloadLen) {
+  if (!cloudWriteBody(client, payload, payloadLen, start)) {
     Serial.println("BoatPerf: Payload send fail");
     client.stop();
     return false;
@@ -5139,48 +5069,55 @@ bool executeUploadBoatPerf(const char *payload) {
   }
 drain_headers_bp:
   long bpContentLen;
-  bool bpChunked, bpComplete;
+  bool bpChunked, bpComplete, bpFull, bpGrowFailed;
   bpContentLen = drainHeadersCaptureLen(client, start, &bpChunked);
-  // Read the response BODY (both pruned BEFRONT1 blocks) into the shared PSRAM sync buffer.
+  // Read the response BODY (both pruned BEFRONT1 blocks) into the upload's own block: the batch is already sent.
   {
-    char *bpBody = syncBodyGet();
-    if (!bpBody) { client.stop(); return false; }   // PSRAM alloc failed — skip, retry next cycle
-    size_t bl = readSyncBody(client, bpBody, SYNC_BODY_CAP, bpChunked, bpContentLen, start, &bpComplete);
+    size_t bpCap = req.payloadCap;
+    size_t bl = readSyncBody(client, &req.payload, &bpCap, PERF_UPLOAD_BUF_SIZE, bpChunked, bpContentLen, start,
+                             &bpComplete, &bpFull, &bpGrowFailed);
+    req.payloadCap = (uint32_t)bpCap;
+    char *bpBody = req.payload;
     bpBody[bl] = '\0';
     client.stop();
     esp_task_wdt_reset();
+    syncAllocNote(SYNC_NOTE_BOAT_BACK, !bpGrowFailed,
+                  (bpCap >= (size_t)PERF_UPLOAD_BUF_SIZE / 2) ? (size_t)PERF_UPLOAD_BUF_SIZE : bpCap * 2);
 
-    bool success = (httpCode == 200);
-    if (success && bl >= SYNC_BODY_CAP - 1) {
-      // Buffer filled completely → the front CSV may be cut mid-stream. Never parse a possibly-
-      // truncated front (the ingest replaces the local front wholesale).
-      queueConsoleMessage("WARN: boat-perf sync response overran the sync buffer — front NOT updated");
-      if (timeIsSynced) lastBoatPerfSyncEpoch = (int64_t)time(NULL);
-      perfClearPending();   // upload itself succeeded; only the sync-back is unusable
-      return success;
-    }
-    if (success && !bpComplete) {
-      // Chunked terminator (or Content-Length worth of body) never arrived → connection dropped
-      // mid-body. Same rule as the overrun guard: a truncated front must never reach the
-      // wholesale-replacing ingest.
-      queueConsoleMessageF("WARN: boat-perf sync body truncated (%u bytes, incomplete) — front NOT updated",
-                           (unsigned)bl);
-      if (timeIsSynced) lastBoatPerfSyncEpoch = (int64_t)time(NULL);
-      perfClearPending();   // upload itself succeeded; only the sync-back is unusable
-      return success;
-    }
+    // Success is the edge function's reply, not just a 200: its front CSV always opens with BEFRONT1, which a
+    // captive portal's login page does not.
+    bool success = (httpCode == 200) && strstr(bpBody, "BEFRONT1") != nullptr;
     if (success) {
       if (timeIsSynced) lastBoatPerfSyncEpoch = (int64_t)time(NULL);   // for the "synced N ago" badge
-      perfClearPending();   // cloud accepted the batch (raw history) → drop the pending points
-      if (perfIngestFrontCsv(bpBody)) {
-        // Field-off-gate the flash write: a LittleFS write stalls the flash cache (both cores).
-        // If the field re-engaged while this upload was in flight, skip — the in-memory front is
-        // already updated, and the field-off Gate-2 edge persists it later (no data loss).
-        if (fieldActiveStatus <= 0) boatPerfSave();   // persist the cloud's pruned fronts
-        queueConsoleMessage("Boat performance: fronts updated from cloud");
-      } else {
-        queueConsoleMessage("Boat performance uploaded (no front in response)");
+      bool ingest = true;
+      if (bpFull) {
+        // Buffer filled completely → the front CSV may be cut mid-stream. Never parse a possibly-
+        // truncated front (the ingest replaces the local front wholesale). A failed grow was already noted.
+        if (!bpGrowFailed) queueConsoleMessage("WARN: boat-perf sync response overran the sync buffer — front NOT updated");
+        ingest = false;
+      } else if (!bpComplete) {
+        // Chunked terminator (or Content-Length worth of body) never arrived → connection dropped
+        // mid-body. Same rule as the overrun guard.
+        queueConsoleMessageF("WARN: boat-perf sync body truncated (%u bytes, incomplete) — front NOT updated",
+                             (unsigned)bl);
+        ingest = false;
+      } else if (rpmAxisWipePending || perfCloudWipePending) {
+        // A Clear All / tach rescale landed while this upload was in flight: the reply was rebuilt from the raw rows
+        // the pending wipe is about to delete, so it must not overwrite the cleared fronts.
+        queueConsoleMessage("Boat performance uploaded — fronts NOT updated (cloud wipe pending)");
+        ingest = false;
       }
+      // The pending queues and fronts belong to Core 1: boatPerf_tick drops the points this batch carried and
+      // ingests the reply there (perfApplySync).
+      if (ingest && bl + 1 < bpCap) {   // in place: a TLSF shrink only splits off the tail
+        char *fit = (char *)ps_realloc(bpBody, bl + 1);
+        if (fit) bpBody = fit;
+      }
+      req.payload = nullptr;   // perfHandSync owns the block from here on every path
+      if (!perfHandSync(ingest, bpBody))
+        queueConsoleMessage("Boat performance uploaded; sync hand-off failed (PSRAM), batch will be re-sent");
+    } else if (httpCode == 200) {
+      queueConsoleMessage("BoatPerf upload: reply was not the cloud's (captive portal?) — will retry");
     } else if (httpCode > 0) {
       snprintf(messageBuffer, MESSAGE_BUFFER_SIZE, "BoatPerf upload failed HTTP %d", httpCode);
       queueConsoleMessage(messageBuffer);
@@ -5192,7 +5129,8 @@ drain_headers_bp:
 // Alternator (charging-system) health v2 upload — clone of executeUploadBoatPerf. POST the
 // best-ever record batch, read the fitted ALTCURVE1 curve from the HTTP response BODY, and
 // persist it. Same WiFiClientSecure raw-write + manual-read pattern (low internal RAM).
-bool executeUploadAltHealth(const char *payload) {
+bool executeUploadAltHealth(HttpsRequest &req) {
+  const char *payload = req.payload;
   if (WiFi.status() != WL_CONNECTED) return false;
   if (WiFi.RSSI() < -80) return false;
   if (!isRegistered || authToken.isEmpty()) return false;
@@ -5205,7 +5143,7 @@ bool executeUploadAltHealth(const char *payload) {
   esp_task_wdt_reset();
 
   IPAddress hostIP;  // pre-resolve: keep DNS out of the connect's unfed-WDT window (see executeUploadPayload)
-  if (!WiFi.hostByName(host, hostIP)) {
+  if (WiFi.hostByName(host, hostIP) != 1) {
     Serial.println("AltHealth: DNS fail");
     return false;
   }
@@ -5232,7 +5170,7 @@ bool executeUploadAltHealth(const char *payload) {
     host, SUPABASE_ANON_KEY, (unsigned)strlen(payload));
 
   size_t payloadLen = strlen(payload);
-  if (client.write((const uint8_t *)payload, payloadLen) != payloadLen) {
+  if (!cloudWriteBody(client, payload, payloadLen, start)) {
     Serial.println("AltHealth: Payload send fail");
     client.stop();
     return false;
@@ -5263,52 +5201,53 @@ bool executeUploadAltHealth(const char *payload) {
   }
 drain_headers_ah:
   long ahContentLen;
-  bool ahChunked, ahComplete;
+  bool ahChunked, ahComplete, ahFull, ahGrowFailed;
   ahContentLen = drainHeadersCaptureLen(client, start, &ahChunked);
-  // Read the response BODY (the pruned BEFRONT1 front CSV) into the shared PSRAM sync buffer.
+  // Read the response BODY (the pruned BEFRONT1 front CSV) into the upload's own block: the batch is already sent.
   {
-    char *ahBody = syncBodyGet();
-    if (!ahBody) { client.stop(); return false; }   // PSRAM alloc failed — skip, retry next cycle
-    size_t bl = readSyncBody(client, ahBody, SYNC_BODY_CAP, ahChunked, ahContentLen, start, &ahComplete);
+    size_t ahCap = req.payloadCap;
+    size_t bl = readSyncBody(client, &req.payload, &ahCap, ALT_UPLOAD_BUF_SIZE, ahChunked, ahContentLen, start,
+                             &ahComplete, &ahFull, &ahGrowFailed);
+    req.payloadCap = (uint32_t)ahCap;
+    char *ahBody = req.payload;
     ahBody[bl] = '\0';
     client.stop();
     esp_task_wdt_reset();
+    syncAllocNote(SYNC_NOTE_ALT_BACK, !ahGrowFailed,
+                  (ahCap >= (size_t)ALT_UPLOAD_BUF_SIZE / 2) ? (size_t)ALT_UPLOAD_BUF_SIZE : ahCap * 2);
 
-    bool success = (httpCode == 200);
-    if (success && bl >= SYNC_BODY_CAP - 1) {
-      // Buffer filled completely → the front CSV may be cut mid-stream. Never parse a possibly-
-      // truncated front (the ingest replaces the local front wholesale).
-      queueConsoleMessage("WARN: alt-health sync response overran the sync buffer — front NOT updated");
-      if (timeIsSynced) lastAltHealthSyncEpoch = (int64_t)time(NULL);
-      altClearPending();   // upload itself succeeded; only the sync-back is unusable
-      return success;
-    }
-    if (success && !ahComplete) {
-      // Chunked terminator (or Content-Length worth of body) never arrived → connection dropped
-      // mid-body. Same rule as the overrun guard: a truncated front must never reach the
-      // wholesale-replacing ingest.
-      queueConsoleMessageF("WARN: alt-health sync body truncated (%u bytes, incomplete) — front NOT updated",
-                           (unsigned)bl);
-      if (timeIsSynced) lastAltHealthSyncEpoch = (int64_t)time(NULL);
-      altClearPending();   // upload itself succeeded; only the sync-back is unusable
-      return success;
-    }
+    // Success is the edge function's reply, not just a 200 (see executeUploadBoatPerf).
+    bool success = (httpCode == 200) && strstr(ahBody, "BEFRONT1") != nullptr;
     if (success) {
       if (timeIsSynced) lastAltHealthSyncEpoch = (int64_t)time(NULL);   // for the "synced N ago" badge
-      altClearPending();   // cloud accepted the batch (raw history) → drop the pending points
-      if (rpmAxisWipePending || altCloudWipePending) {
+      bool ingest = true;
+      if (ahFull) {
+        // Buffer filled completely → the front CSV may be cut mid-stream. Never parse a possibly-
+        // truncated front (the ingest replaces the local front wholesale). A failed grow was already noted.
+        if (!ahGrowFailed) queueConsoleMessage("WARN: alt-health sync response overran the sync buffer — front NOT updated");
+        ingest = false;
+      } else if (!ahComplete) {
+        // Chunked terminator (or Content-Length worth of body) never arrived → connection dropped
+        // mid-body. Same rule as the overrun guard.
+        queueConsoleMessageF("WARN: alt-health sync body truncated (%u bytes, incomplete) — front NOT updated",
+                             (unsigned)bl);
+        ingest = false;
+      } else if (rpmAxisWipePending || altCloudWipePending) {
         // A Start Over / tach rescale landed while this upload was in flight: the reply was rebuilt from
         // the raw rows the pending wipe is about to delete, so it must not overwrite the cleared front.
         queueConsoleMessage("Alternator health uploaded — front NOT updated (cloud wipe pending)");
-      } else if (altIngestFrontCsv(ahBody)) {
-        // Field-off-gate the flash write: a LittleFS write stalls the flash cache (both cores).
-        // If the field re-engaged while this upload was in flight, skip — the in-memory front is
-        // already updated, and the field-off Gate-2 edge persists it later (no data loss).
-        if (fieldActiveStatus <= 0) altHealthSave();   // persist the cloud's pruned front
-        queueConsoleMessage("Alternator health: front updated from cloud");
-      } else {
-        queueConsoleMessage("Alternator health uploaded (no front in response)");
+        ingest = false;
       }
+      // Pending queue and front belong to Core 1: altHealth_tick applies the result (altApplySync).
+      if (ingest && bl + 1 < ahCap) {   // in place: a TLSF shrink only splits off the tail
+        char *fit = (char *)ps_realloc(ahBody, bl + 1);
+        if (fit) ahBody = fit;
+      }
+      req.payload = nullptr;   // altHandSync owns the block from here on every path
+      if (!altHandSync(ingest, ahBody))
+        queueConsoleMessage("Alternator health uploaded; sync hand-off failed (PSRAM), batch will be re-sent");
+    } else if (httpCode == 200) {
+      queueConsoleMessage("AltHealth upload: reply was not the cloud's (captive portal?) — will retry");
     } else if (httpCode > 0) {
       snprintf(messageBuffer, MESSAGE_BUFFER_SIZE, "AltHealth upload failed HTTP %d", httpCode);
       queueConsoleMessage(messageBuffer);
@@ -5380,7 +5319,7 @@ bool usageMergeDelta(const char *body) {
     uint32_t n = kv.value()["n"] | 0U;
     uint32_t ms = kv.value()["ms"] | 0U;
     if (ms > 14400000UL) ms = 14400000UL;  // one delta can't claim >4 h of dwell (client-bug guard)
-    char key[32];
+    char key[sizeof(UsageSlot::key)];
     usageMakeKey(key, sizeof(key), 'p', kv.key().c_str());
     usageAdd(key, n, ms);
     UsageOpenTime_AllTime += ms / 1000.0;
@@ -5388,7 +5327,7 @@ bool usageMergeDelta(const char *body) {
   JsonObject b = doc["b"];
   for (JsonPair kv : b) {
     uint32_t n = kv.value() | 0U;
-    char key[32];
+    char key[sizeof(UsageSlot::key)];
     usageMakeKey(key, sizeof(key), 'b', kv.key().c_str());
     usageAdd(key, n, 0);
   }
@@ -5461,7 +5400,7 @@ bool executeUploadUsage(const char *payload) {
   esp_task_wdt_reset();
 
   IPAddress hostIP;  // pre-resolve: keep DNS out of the connect's unfed-WDT window (see executeUploadPayload)
-  if (!WiFi.hostByName(host, hostIP)) {
+  if (WiFi.hostByName(host, hostIP) != 1) {
     Serial.println("Usage: DNS fail");
     return false;
   }
@@ -5488,7 +5427,7 @@ bool executeUploadUsage(const char *payload) {
     host, SUPABASE_ANON_KEY, (unsigned)strlen(payload));
 
   size_t payloadLen = strlen(payload);
-  if (client.write((const uint8_t *)payload, payloadLen) != payloadLen) {
+  if (!cloudWriteBody(client, payload, payloadLen, start)) {
     Serial.println("Usage: Payload send fail");
     client.stop();
     return false;
@@ -5678,10 +5617,8 @@ void syncTimeFromNTP() {
   // Manual mode gate: only AUTO and NTP-forced ever fall through to NTP.
   if (timeSourceMode == TSRC_NMEA || timeSourceMode == TSRC_PHONE) return;
   if (currentMode != MODE_CLIENT || WiFi.status() != WL_CONNECTED) {
-    // WiFi not ready yet (typical on cold boot before association). Arm a
-    // fast retry so the next checkTimeSync() tick fires ~60s from now
-    // instead of waiting the full 12h. Underflow on early-boot millis is
-    // intentional and handled by unsigned wraparound in the gate.
+    // WiFi not ready (typical on cold boot): arm a fast retry ~60 s out instead of the full 12 h. Early-boot
+    // millis underflow is intentional; the gate's unsigned wraparound handles it.
     lastTimeSyncAttempt = millis() - (TIME_SYNC_INTERVAL - 60000UL);
     return;
   }
@@ -5692,24 +5629,16 @@ void syncTimeFromNTP() {
   core0Busy = true;
   esp_task_wdt_reset();
 
-  // Sync status is reset BEFORE configTime() on purpose: sntp_init() fires a request immediately,
-  // and resetting afterwards could wipe a COMPLETED that had already landed.
-  //
-  // Why not getLocalTime(): it only tests tm_year > 2016, so any plausible-looking libc clock
-  // satisfies it instantly. restoreSoftClock() puts exactly such a clock up on a cold boot — an
-  // NVS epoch as old as the last field-off — so the old code returned "synced" before a single
-  // packet arrived, adopted the stale epoch as timeBase, stamped it TIME_NTP, and took the full
-  // 12h throttle. Two harms: uploads carried days-old timestamps, and the source left
-  // TIME_ESTIMATED, which is the one value syncTimeFromPhone() lets bypass its 24h skew guard —
-  // so the phone could no longer correct the very clock that was wrong.
+  // Reset sync status BEFORE configTime(): sntp_init() fires a request immediately, and resetting after could
+  // wipe a COMPLETED that already landed. Not getLocalTime(): it only tests tm_year > 2016, so the stale soft
+  // clock restoreSoftClock() puts up on a cold boot passes instantly — stamping a days-old epoch TIME_NTP, which
+  // also blocks syncTimeFromPhone() (it bypasses its 24 h skew guard only for a clock that is not real, clockIsReal()).
   sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
-  // Single-shot — no retry loop, no delay(500). checkTimeSync() retries on its
-  // normal TIME_SYNC_INTERVAL cadence. A retry loop with delay(500) would
-  // block Core 1 for up to 10.5s (3×3000ms timeout + 3×500ms) if NTP is down.
-  // Same 3s Core-1 budget the getLocalTime(&timeinfo, 3000) call used to have.
-  // sntp_get_sync_status() self-clears on the read that returns COMPLETED, so read it once.
+  // Single-shot 3 s wait, no retry loop: checkTimeSync() retries on its TIME_SYNC_INTERVAL cadence, and a loop
+  // would block Core 1 for seconds if NTP is down. sntp_get_sync_status() self-clears on the read that returns
+  // COMPLETED, so read it once.
   bool sntpAnswered = false;
   uint32_t sntpWaitStart = millis();
   while (millis() - sntpWaitStart < 3000) {
@@ -5723,10 +5652,11 @@ void syncTimeFromNTP() {
     timeBaseMillis = millis();
     timeIsSynced = true;
     currentTimeSource = TIME_NTP;
+    clockRealTag = CLOCK_REAL_TAG;
     lastTimeSyncAttempt = millis();
 
     queueConsoleMessage("Time synced from NTP");
-    Serial.printf("NTP synced: epoch=%ld\n", timeBase);
+    Serial.printf("NTP synced: epoch=%lld\n", (long long)timeBase);
     core0Busy = false;
     return;
   }
@@ -5744,20 +5674,15 @@ bool canUploadNow() {
 }
 
 // FAST ALTERNATOR-CURRENT CHANNEL — GPIO3 / ADC1_CH2
-// Hardware: CH1 buffer output (U9 pins 6+7) jumpered to J3 pin 11 (net EXTRA6, C66
-// removed). 3.33 mV/A at the node for the 300 A sensor; zero amps = 1.25 V. Spec:
-// Working Markdown Docs/CV_Loop_Dev_Summary.md, "Fast alternator-current ADC channel".
-// This channel is an INSTRUMENT — never a control input; nothing here may couple
-// into control or protections. Sampling is hardware-timed continuous DMA (crystal-
-// derived, ~ppm); CPU stalls can only delay the drain, never bend sample spacing.
-// Consumers: disturbance matrix, failure detector (plug-in stub), live scope,
-// reference flipbook, fleet scalars.
-// A board with a broken/missing jumper reads pegged full-scale through the R110
-// pullup (fail-obvious by design) — the subsystem detects that and goes dormant.
+// Hardware: CH1 buffer output (U9 pins 6+7) jumpered to J3 pin 11 (net EXTRA6, C66 removed). 3.33 mV/A at the
+// node for the 300 A sensor; 0 A = 1.25 V. Spec: Working Markdown Docs/CV_Loop_Dev_Summary.md.
+// INSTRUMENT ONLY — nothing here may couple into control or protections. Hardware-timed continuous DMA: CPU
+// stalls delay the drain, never bend sample spacing. A broken/missing jumper reads pegged full-scale through the
+// R110 pullup (fail-obvious by design); the subsystem then goes dormant.
 
 #define FA_ADC_CHANNEL ADC_CHANNEL_2  // GPIO3
 #define FA_SAMPLE_RATE_HZ 20000
-#define FA_RAW_RING_N 10000  // 500 ms @ 20 kSPS — live scope depth (≥3 engine revs above ~360 RPM, so a slow 400 RPM idle still shows a few). uint16 head/count cap is 65535, so this has headroom.
+#define FA_RAW_RING_N 10000  // 500 ms @ 20 kSPS live scope depth (≥3 revs above ~360 RPM); uint16 head/count caps at 65535
 #define FA_FRAME_SAMPLES 256
 #define FA_FRAME_BYTES (FA_FRAME_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES)
 #define FA_POOL_BYTES (FA_FRAME_BYTES * 12)  // ~150 ms of driver-pool slack (internal RAM — the DMA pool must be DRAM)
@@ -5765,10 +5690,8 @@ bool canUploadNow() {
 #define FA_ZERO_MV 1250.0f                   // hall sensor 2.5 V @ 0 A → ÷2 divider
 #define FA_RAILED_RAW 4090                   // 12-bit code treated as railed full-scale
 #define FA_DECIM 16                          // boxcar-16 → 1.25 kSPS effective (nulls at 1.25 kHz)
-#define FA_WIN_DECIM_N 625                   // 0.5 s tone/gate/matrix window, decimated samples (crystal-timed).
-                                             // Kept short so the per-window flat-top FFT tracks RPM with less
-                                             // drift smear. The DETECTOR window is decoupled (FA_DET_WIN_N,
-                                             // fixed 2 s) so its analysis length is independent.
+#define FA_WIN_DECIM_N 625                   // 0.5 s tone/gate/matrix window (decimated samples); short so the
+                                             // FFT tracks RPM with less smear. Detector window is FA_DET_WIN_N.
 // 6 dB ceiling ≈ +150..+210 A above zero (S3 sources spec full-scale anywhere 1.75–1.95 V).
 // BENCH-VERIFY the real rail point, then set switch-up ~30 A below the measured ceiling,
 // switch-down ~30 A below that (hysteresis). Defaults assume the conservative 1.75 V end.
@@ -5790,6 +5713,7 @@ static adc_continuous_handle_t faAdcHandle = NULL;
 static portMUX_TYPE faRingMux = portMUX_INITIALIZER_UNLOCKED;
 static int16_t *faRawRing = NULL;   // PSRAM — calibrated mV, int16
 static uint16_t faRingHead = 0;     // next write index
+static volatile uint16_t faRingFill = 0;  // samples held, saturates at FA_RAW_RING_N; fill state can't key on faTotalSamples, which wraps every 59.6 h
 static uint16_t faDecimWinN = 0;  // decimated samples this window — drives window length + winMeanAmps
 // (The decimated stream itself is consumed live in faProcessDecimated — Goertzel bank, EMAs and
 // pk-pk min/max — so it is never stored. The detector reads the raw stream, faDetWin.)
@@ -5809,14 +5733,10 @@ static float faMvSlope6 = 1750.0f / 4095.0f, faMvOff6 = 0.0f;
 static float faMvSlope12 = 3100.0f / 4095.0f, faMvOff12 = 0.0f;
 
 // ── Disturbance matrix (consumer 1) ──
-// 80 RPM bins (50 RPM, 0–4000) × 15 amps bins (20 A starting at 5 A) = 1200 cells in
-// PSRAM. Each cell holds the top-6 (frequency, amplitude) peaks — matched across windows
-// by frequency ±5% and RECENT-AVERAGED (a running 1/N mean, N = FA_CELL_AVG_N windows:
-// cumulative while warming up, then a fixed 1/N weight so the cell tracks the machine
-// lately and never freezes — smooths single-window noise without the outlier-blindness of
-// a max-envelope) — plus ONE broadband pk-pk (the composite envelope an iExcess threshold
-// must actually clear; if pk-pk ≫ sum of stored bands, energy exists outside the surveyed
-// 10–400 Hz range) and a saturating window count (trustworthiness, independent of N).
+// 80 RPM bins (50 RPM, 0–4000) × 15 amps bins (20 A from 5 A) = 1200 PSRAM cells. Each holds the top-6
+// (freq, amp) peaks, matched across windows by freq ±5% and recent-averaged (running 1/min(n,N) mean: tracks
+// the machine lately, never freezes, no max-envelope outlier blindness), ONE broadband pk-pk (the envelope an
+// iExcess threshold must clear; pk-pk ≫ sum of bands = energy outside 10–400 Hz) and a saturating window count.
 #define FA_RPM_BIN_W 50
 #define FA_RPM_BINS 80
 #define FA_AMP_BIN_W 20
@@ -5840,16 +5760,10 @@ struct FaCell {
   uint16_t pkpkAX100;   // mean broadband pk-pk of the decimated stream, A ×100
   uint16_t windows;     // qualified windows merged (saturating)
 };
-// FaCell carries no filtered-ripple fields (RPM_RIPPLE_TABLE_SPEC): the raw matrix is always-on and
-// welcomes every operating point; the filtered pk-pk lives in the game-scoped 1-D ripTab below,
-// rated at ONE fixed commanded current.
-// NOTE (§12, built then REVERTED): a "detector's-eye excursion peak" per cell
-// (max mExcessEma while armed+unclamped) was added here and fed to a threshold-recommendation
-// verdict. Timeline analysis of the vicious-cycle log killed it: the recorded excursions were one
-// commanded throttle blip + five post-trip RECOVERY OVERSHOOTS (duty ramping 7 pts past its steady
-// value) — the protection's own dynamics. Recommending floors from them deafens the protection to
-// cover a control defect. Do not re-add without solving that self-reference (e.g., exclude a window
-// after any trip release).
+// FaCell has no filtered-ripple fields: the filtered pk-pk lives in the game-scoped ripTab (RPM_RIPPLE_TABLE_SPEC),
+// rated at ONE fixed commanded current. Do not re-add a per-cell "detector's-eye excursion peak" (§12) feeding a
+// threshold recommendation: the recorded excursions are the protection's own recovery overshoots, so it deafens
+// the protection to cover a control defect — unless windows after any trip release are excluded.
 static FaCell *faMatrix = NULL;  // PSRAM — FA_RPM_BINS × FA_AMP_BINS cells
 uint16_t faCellsUsed = 0;        // cells with ≥1 qualified window (diagnostics)
 // Highest Tone in Map (dashboard headline) — strongest single tone across the whole learned map,
@@ -5860,34 +5774,20 @@ uint16_t faDomRpm = 0;           // RPM (bin center) where it occurs
 static uint32_t faMatrixDirtyWindows = 0;
 static volatile bool faPendingMatrixClear = false;  // set by /get handler (Core 0), executed on Core 1
 
-// ── Measured filtered ripple capture (RIPPLE_DETECTION_REARCH_SPEC §3.1) ──
-// For BOTH detectors, run an always-on IExcessTau LOW-PASS EMA directly on the sensor current — INA228
-// Bcur for the battery (G4) detector, ADS1115 MeasuredAmps for the alternator (G3) detector — and take
-// the pk-pk (max−min) of that low-passed signal over each 0.5 s window. Because the (slow) setpoint
-// cancels in a pk-pk, this EQUALS the detector's own mExcessEma pk-pk — the real number it trips on —
-// WITHOUT needing the loop bound, so the battery figure is measurable even in bulk. This is NOT the old
-// drift-removed AC pk-pk: that high-pass kept the fast belt content the IExcessTau low-pass is meant to
-// attenuate, so it read far too large. Qualifying windows fold into the game-scoped ripTab below
-// (RPM_RIPPLE_TABLE_SPEC) — used only to PICK the current-check RPM and to draw the Protections
-// reference plot. It NEVER moves the over-current floor. Called every INA fast-read (5 ms poll,
-// field-active) from 5_functions.ino.
-// ADMISSION (spec §10): a window folds only if it was genuinely steady — the IExcessTau low-pass passes
-// slow current ramps straight through, so a ramping window would record the RAMP size (10–20 A) as
-// "ripple" and peak-hold it forever. Gates: min sample count, no protection clamp, command travel
-// within limit, per-detector 300 ms-EMA drift within limit, same-RPM-bin (table fold only). NO wizard
-// relaxation — a steady-state quantity cannot be measured while ramping; the wizard's instructed
-// pauses are the admission windows. Live readouts: ROLL_RIPCMDEXC/RIPALTEXC/RIPBATTEXC on the Diag page.
-#define FILT_RIPPLE_ADM_TC 0.300f      // admission-EMA time constant (s) — heavy enough that belt ripple averages out of it, so its window spread measures operating-point drift, not ripple. Matches Path A's 300 ms precedent. NOT the measurement filter.
+// ── Measured filtered ripple capture (RIPPLE_DETECTION_REARCH_SPEC §3.1, admission §10) ──
+// Always-on IExcessTau low-pass of each detector's sensor current (Bcur battery G4, MeasuredAmps alt G3), pk-pk
+// per window: the slow setpoint cancels, so this EQUALS the detector's mExcessEma pk-pk, even in bulk. Used only
+// to pick the current-check RPM and draw the Protections plot; NEVER moves the over-current floor. The low-pass
+// passes ramps, so only steady windows fold; NO wizard relaxation (its instructed pauses are the admission windows).
+#define FILT_RIPPLE_ADM_TC 0.300f      // admission-EMA TC (s): heavy enough that belt ripple averages out, so its spread measures drift. NOT the measurement filter.
 // Capture-gate knobs (Pattern B, Diag ▸ Measured-Ripple Capture Gating card; each has a live
 // pass/fail readout there). Own settings, NOT the fa* anomaly-detector gates.
-float ripWinMs = 2000.0f;       // ms — pk-pk measurement window. Must hold ≥2 periods of the slowest disturbance to characterize (idle hunt ~1 s → 2 s default; the old 500 ms saw hunt as drift and rejected it). CAVEAT: the window defines the measured quantity — fits captured under a different length are not comparable, so the handler calls ripFitForget (both fits) on a change; the Resonance & Ripple Map is NOT affected (own fixed window) and needs nothing. NVS NOTE: devices flashed before 2026-07-01 hold 500 in NVS — set 2000 on the Diag card after flashing.
+float ripWinMs = 2000.0f;       // ms — pk-pk window; must hold ≥2 periods of the slowest disturbance (idle hunt ~1 s). Defines the measured quantity, so a change calls ripFitForget (both fits).
 float ripDriftFloorA = 2.0f;    // A — floor shared by the command-travel gate AND the stationarity gate (mean-shift tolerance below which a window always passes)
 float ripDriftPct = 5.0f;       // % of window-mean alt current — command-travel gate ONLY (commands are ripple-free, so amplitude gating stays correct for them; the sensor gates are stationarity-based below)
-// Stationarity gate (spec §11 — replaces the §10.8 amplitude drift gate): a window is "steady" if its
-// two HALVES have (nearly) the same mean — a transient/ramp walks the mean monotonically (half-means
-// differ by ~half the excursion), while hunt/ripple recurs (half-means cancel). Self-scaling: tolerance
-// grows with the window's own measured pk-pk, so a dirty-but-stationary idle admits while a same-size
-// ramp rejects. Design-time constants, not knobs — they set the SHAPE of the test, not an operating point.
+// Stationarity gate (§11): steady = the window's two HALVES have (nearly) the same mean. A ramp walks the mean
+// (half-means differ ~half the excursion); hunt/ripple cancels. Tolerance scales with the window's own pk-pk, so
+// a dirty-but-stationary idle admits while a same-size ramp rejects. Design constants, not knobs.
 #define RIP_STAT_K 0.25f           // mean-shift tolerance as a fraction of that sensor's full-window filtered pk-pk. A linear ramp shifts the half-means by 0.50×pk-pk → rejected with 2× margin; a ≥2-cycle hunt shifts them <0.1×pk-pk → admitted with 2.5× margin.
 #define RIP_RPM_STAT_FLOOR 10.0f   // RPM — mean-shift floor for the RPM stationarity test (tach jitter tolerance)
 #define RIP_CROSS_MIN 4            // table fold only — min crossings of the measurement EMA about its 300 ms baseline per window. A one-shot transient crosses ~2×; real ripple/hunt crosses constantly. Ring exempt (median-of-8 already robust; must not starve the wizard hold).
@@ -5895,15 +5795,10 @@ uint32_t g_ripAltAdmitCount = 0;   // windows that passed ALL alt-fold gates (th
 uint32_t g_ripBattAdmitCount = 0;  // same for the battery detector
 
 // ── RPM ripple table (RPM_RIPPLE_TABLE_SPEC) ──
-// 1-D per-50-RPM-bin filtered pk-pk (both detectors), filled ONLY while the RPM Invaders game holds
-// a fixed commanded current through resTest. Replaces the FaCell filtered layer, which had no
-// reproducibility test, smeared the amp axis with a max, and captured at whatever current AUTO
-// produced (the 6.27 A @ 1125 phantom). Agree-twice commit: pending → second qualifying window within
-// tolerance commits the AVERAGE of the pair; disagree replaces the pending. Cells are immutable once
-// committed; the whole table is wiped at game start and persisted (frozen) on every teardown path,
-// including Abort — refreshing the data = re-run the sweep. No expiry timer: a game-scoped table
-// can't cross-session pair. §11 gates, live readouts, and admit counters stay always-on upstream;
-// ONLY this fold is game-gated.
+// 1-D per-50-RPM-bin filtered pk-pk (both detectors), filled ONLY while the RPM Invaders game holds a fixed
+// commanded current through resTest. Agree-twice commit: a second qualifying window within tolerance commits
+// the pair's AVERAGE, a disagreement replaces the pending. Committed cells are immutable; the table is wiped at
+// game start and persisted on every teardown path including Abort. Only this fold is game-gated.
 #define RIPTAB_BINS 40               // [0, 2000) RPM in 50-RPM bins
 #define RIPTAB_PATH "/riptab.bin"
 #define RIPTAB_MAGIC 0x52495054u     // 'RIPT'
@@ -5929,6 +5824,7 @@ struct RipTab { RipTabSession sess; RipTabCell cell[RIPTAB_BINS]; };
 static RipTab ripTab;                       // ~410 B — static, not worth a PSRAM alloc
 volatile bool ripGameFill = false;          // fold window is OPEN (game running); set on Core 1 at wipe
 static volatile bool ripTabPendingWipe = false;  // /get arm → wipe+stamp runs on Core 1 (faMatrixMaybeFlush) so it can't race the folds
+static volatile bool ripTabPendingClear = false; // tach rescale: zero the table only — the wipe above also opens the game's fold window
 static volatile bool ripTabPendingSave = false;  // /get disarm (or deadman) → persist runs on Core 1
 static volatile uint16_t ripIdleRpmStage = 0;    // browser sends idle BEFORE arming; stamped into the session at wipe
 static float altFiltEma = 0.0f, battFiltEma = 0.0f;             // IExcessTau low-pass of each sensor current (A) — the MEASUREMENT
@@ -5942,11 +5838,9 @@ static float battFiltH1Min = 1e9f, battFiltH1Max = -1e9f, battFiltH2Min = 1e9f, 
 static float altFiltH1Sum = 0.0f, altFiltH2Sum = 0.0f, battFiltH1Sum = 0.0f, battFiltH2Sum = 0.0f;
 static float rpmH1Sum = 0.0f, rpmH2Sum = 0.0f;                  // RPM half-means → RPM stationarity + mean-RPM binning
 static uint32_t filtRippleH1N = 0, filtRippleH2N = 0;
-// Admission gates (steady-state qualification — spec §11). Command travel (setpointLimited max−min,
-// ripple-free by construction) exactly rejects every commanded ramp: test level steps, warmup,
-// big-step gentling, Hi→Lo glide. Protection latch rejects any window a clamp touched (G1/G2, iExcess,
-// load dump). Sensor steadiness is the half-mean stationarity test (per-detector — a stationary-alt /
-// ramping-batt window folds alt only). The 300 ms EMAs remain ONLY as the crossings baseline.
+// Admission gates (§11). Command travel (setpointLimited max−min, ripple-free) rejects every commanded ramp;
+// the protection latch rejects any window a clamp touched; sensor steadiness is the per-detector half-mean test.
+// The 300 ms EMAs remain ONLY as the crossings baseline.
 static float altAdmEma = 0.0f, battAdmEma = 0.0f;               // 300 ms baselines for the crossings tally (NOT the measurement, NOT a drift gate)
 static float cmdWinMin = 1e9f, cmdWinMax = -1e9f;               // setpointLimited travel over the window
 static float filtRippleWinRpmMin = 1e9f, filtRippleWinRpmMax = -1e9f;  // window RPM span → RPM stationarity self-scale
@@ -5960,12 +5854,9 @@ static bool filtRippleArmed = false;   // false until the first sample seeds the
 static uint16_t altFiltCross = 0, battFiltCross = 0;
 static bool altAboveAdm = false, battAboveAdm = false;   // sign of (measurement − baseline) last sample
 
-// CV D-term deadband capture (CV_Dterm_Deadband_Commissioning_Spec): worst positive slope of the D
-// term's own filtered voltage per §11 window, for the bcurRtest ring. g_cvKdFiltV is refreshed by the
-// same INA fast-read block that calls faFiltRippleUpdate, so the exact signal the D term differentiates
-// is fresh here; the slope is the control path's own sliding backward-diff (~VoltageLoopInterval span,
-// 6_functions.ino kdBuf) so the measured noise floor and the runtime cvDSlope are the same quantity.
-// Min-of-halves like the pk-pk estimator: a one-shot rise inflates one half only; real ripple recurs.
+// CV D-term deadband capture (CV_Dterm_Deadband_Commissioning_Spec): worst positive slope of g_cvKdFiltV per
+// window, using the control path's own sliding backward-diff (6_functions.ino kdBuf), so the measured noise
+// floor and the runtime cvDSlope are the same quantity. Min-of-halves, like the pk-pk estimator.
 #define KDSLP_BUF_N 64
 static uint32_t kdSlpT[KDSLP_BUF_N];
 static float kdSlpV[KDSLP_BUF_N];
@@ -5993,13 +5884,10 @@ static void filtRippleWinReset(float rpm, uint32_t now) {
   slpH1Max = slpH2Max = 0.0f;
 }
 
-// Active 3-current resonance test (COMMISSIONING_SPEC §3.2): when armed, log each completed window's
-// (rpm, operating current, pk-pk) so the browser can fit ripple = a0 + a1·I and project to max output.
-// Logged for BOTH detectors in the same window: battery (iX100/pkpkX100, INA path) and alternator
-// (iAltX100/altPkpkX100, ADS path) — so the browser fits a battery slope AND a symmetric bulk slope.
-// pk-pk here is the IExcessTau low-passed pk-pk (same quantity as the FaCell fill), so the fit matches
-// what the detector trips on. This keeps MULTIPLE samples so a slope can be fit. RAM-only (ephemeral
-// test), cleared on arm. Ring appends only while bcurRtestActive; the FaCell fill runs always.
+// Active 3-current resonance test (COMMISSIONING_SPEC §3.2): while armed, log each window's (rpm, current,
+// pk-pk) for BOTH detectors (battery iX100/pkpkX100 via INA, alternator iAltX100/altPkpkX100 via ADS) so the
+// browser fits ripple = a0 + a1·I and projects to max output. pk-pk is the IExcessTau low-passed one the
+// detector trips on. RAM-only, cleared on arm.
 #define BCUR_RTEST_CAP 64
 // slopeVpsX1000: worst positive slope of g_cvKdFiltV over the window (V/s, min-of-halves) — the CV
 // D-term deadband measurement. 0 = slope ring hadn't spanned a full diff window yet (browser skips).
@@ -6012,26 +5900,20 @@ volatile uint16_t bcurRtestCount = 0;  // appends stop at CAP; browser stops wel
 volatile bool resTestActive = false;
 volatile float resTestTargetA = 0.0f;
 volatile uint32_t resTestLastCmdMs = 0;       // deadman: browser refreshes this; loop auto-releases if it goes stale
-// Deferred release: on resTest=0 the loop slews the field to ~0 FIRST (still current-controlled, so the
-// target-relative over-voltage stays suppressed) THEN drops resTestActive — so CV re-enters from a
-// low-voltage state and ramps the field back up FROM BELOW the charge target, instead of resuming at the
-// test's high held current and slamming the soft OV (G2) the instant voltage control re-arms.
+// Deferred release: on resTest=0 the loop slews the field to ~0 FIRST (still current-controlled), THEN drops
+// resTestActive, so CV re-enters from below the charge target instead of slamming the soft OV (G2).
 volatile bool resTestReleasing = false;
 #define RES_TEST_DEADMAN_MS 8000UL            // > the browser's ~3 s keepalive; catches a closed/crashed wizard
-// Ripple-game scoring gate: no bin may fold until the measured current has held AT resTestTargetA for
-// RIP_SCORE_HOLD_MS. Without it the first invaders "die" while the field is still ramping up from the ~4%
-// rest floor, locking a bogus near-zero-current ripple into the idle bin (the exact spot resonance lives).
-// Set in the resTest control block (which owns setpointLimited/targetCurrent), read in faFiltRippleUpdate.
+// No bin folds until measured current has held AT resTestTargetA for RIP_SCORE_HOLD_MS: otherwise the first
+// folds land while the field ramps from the ~4% rest floor, locking near-zero ripple into the idle bin.
+// Set in the resTest control block, read in faFiltRippleUpdate.
 #define RIP_SCORE_HOLD_MS 2000UL
 volatile bool ripScoreArmed = false;
 
 
-// Fold forensics (diagnostic ring, RAM-only): snapshots the window behind every ripTab fold event so
-// a phantom table value stays traceable without a live CSV log — the "why won't this bin settle"
-// trace. event: 'P' pending set, 'D' disagree (pending replaced; otherX100 = the value it replaced),
-// 'C' commit (otherX100 = the partner it averaged with). pkpkX100 is always the window's own value.
-// Never touches control or the table. Read by /ripforensic.csv. Overwrites oldest; a torn row is a
-// harmless stale read.
+// Fold forensics (RAM-only ring, read by /ripforensic.csv): the window behind every ripTab fold event, so a
+// phantom value stays traceable. event: 'P' pending set, 'D' disagree (otherX100 = replaced value), 'C' commit
+// (otherX100 = averaged partner). Overwrites oldest; a torn row is a harmless stale read.
 #define RIP_FORENSIC_CAP 32
 struct RipForensicPt { uint16_t rpm, ampLo, meanX100, pkpkX100, shiftX100, cmdTravelX100, crossings, otherX100; uint8_t detector; char event; };
 RipForensicPt ripForensic[RIP_FORENSIC_CAP];
@@ -6055,15 +5937,13 @@ static void ripForensicPush(uint8_t det, uint16_t rpm, int ampLo, float meanA, u
   if (ripForensicCount < 65535) ripForensicCount++;
 }
 
-// Fold one INA battery-current sample (bcur) + the co-sampled ADS alternator current (macur) into the
-// measured filtered-ripple capture. ALWAYS-ON — the map fills during normal running too (§3.1); the
-// resonance-test ring only appends while bcurRtestActive. Called every INA fast-read from 5_functions.ino.
-// See the block comment above: pk-pk is of the IExcessTau LOW-PASS of each sensor, == the detector's own
-// mExcessEma pk-pk, so the map/ring read exactly what the trip reads. rpm bins the cell; altMean is the
-// cell's amp axis; the battery figure rides in the same cell (its own current is logged only in the ring).
+// Fold one INA battery-current sample + the co-sampled ADS alternator current into the measured filtered-ripple
+// capture. ALWAYS-ON (§3.1); the resonance-test ring appends only while bcurRtestActive. See the block above.
 void faFiltRippleUpdate(float bcur, float macur, float rpm) {
   uint32_t now = millis();
   if (IgnoreRPM) { filtRippleArmed = false; return; }   // the map is RPM-indexed; nothing to file a window under (§4.8)
+  // The ripple of an ignored current or bus-voltage reading must not size the OV margins this map feeds.
+  if (IgnoreAltCurrent || IgnoreBattVMain || LimpHome) { filtRippleArmed = false; return; }
   if (!filtRippleArmed) {  // seed the EMAs, start a fresh window, measure next time
     altFiltEma = macur; battFiltEma = bcur;
     altAdmEma = macur; battAdmEma = bcur;
@@ -6091,10 +5971,8 @@ void faFiltRippleUpdate(float bcur, float macur, float rpm) {
   battAdmEma += admAlpha * (bcur  - battAdmEma);
   { bool a = (altFiltEma  >= altAdmEma);  if (a != altAboveAdm)  { altFiltCross++;  altAboveAdm  = a; }   // crossings tally — fold gate + forensics (see decl)
     bool b = (battFiltEma >= battAdmEma); if (b != battAboveAdm) { battFiltCross++; battAboveAdm = b; } }
-  // D-term deadband capture: the control path's sliding backward-diff of g_cvKdFiltV (same window
-  // clamp, same full-ring fallback as the kdBuf block in 6_functions.ino), folded as a per-half
-  // worst-positive below. No slope until the ring spans one window — mirrors "no cvDSlope until
-  // one interval" at CV entry.
+  // D-term deadband capture: same sliding backward-diff as 6_functions.ino's kdBuf (window clamp, full-ring
+  // fallback). No slope until the ring spans one window, like cvDSlope at CV entry.
   float kdSlpNow = 0.0f; bool kdSlpOk = false;
   kdSlpT[kdSlpHead] = now;
   kdSlpV[kdSlpHead] = g_cvKdFiltV;
@@ -6144,10 +6022,8 @@ void faFiltRippleUpdate(float bcur, float macur, float rpm) {
   if (g_fastOvClampActive) filtRippleWinProt = true;
   filtRippleWinN++;
   if (now - filtRippleWinStartMs >= (uint32_t)ripWinMs && filtRippleWinN > 0) {
-    // Committed pk-pk = the LESSER of the two half-window pk-pks (§11 min-of-halves): a one-shot event
-    // inflates only one half, so the min stays honest; anything real (period ≤ half the window) recurs
-    // in both. The FULL-window pk-pk is kept as the stationarity self-scale — for a ramp it equals the
-    // whole excursion, which is exactly the size the mean-shift test must reject against.
+    // Committed pk-pk = min of the two half-window pk-pks (§11): a one-shot inflates one half only. The FULL-window
+    // pk-pk is the stationarity self-scale: for a ramp it equals the whole excursion the mean-shift test must reject.
     float altPkFull  = altFiltWinMax  - altFiltWinMin;
     float battPkFull = battFiltWinMax - battFiltWinMin;
     float altPk   = fminf(altFiltH1Max  - altFiltH1Min,  altFiltH2Max  - altFiltH2Min);
@@ -6157,13 +6033,9 @@ void faFiltRippleUpdate(float bcur, float macur, float rpm) {
     uint16_t altV  = (uint16_t)fminf(altPk  * 100.0f + 0.5f, 65535.0f);
     uint16_t battV = (uint16_t)fminf(battPk * 100.0f + 0.5f, 65535.0f);
     // ── Steady-state admission gates (spec §11 — stationarity, not smallness) ────────────────────
-    // "Steady" = the window's two halves have (nearly) the same mean. A transient/throttle ramp walks
-    // the mean monotonically (half-means differ by ~half the full excursion); dirty-but-stationary
-    // operation (idle hunt, load churn) swings hard but recurs, so the half-means cancel. Tolerance
-    // self-scales on that sensor's own full-window pk-pk — the dirtier the signal, the more mean
-    // movement is allowed. This is what lets a "dirty speed" in while still rejecting ramps: the old
-    // amplitude drift gate rejected hunting idle every window, which starved the map at the exact RPM
-    // that trips the bulk over-current supervisor.
+    // Half-mean shift tolerance self-scales on the sensor's full-window pk-pk, so dirty-but-stationary operation
+    // (idle hunt) admits while ramps reject. Do not revert to an amplitude drift gate: it rejected hunting idle
+    // every window, starving the map at the exact RPM that trips the bulk over-current supervisor.
     uint32_t minN = (uint32_t)(ripWinMs * 0.1f);            // ~60% of expected samples at the ~6 ms INA cadence
     bool halvesOk = (filtRippleH1N >= minN / 4) && (filtRippleH2N >= minN / 4);  // both half-means must be real averages, not a few stray samples
     float altShift = 1e9f, battShift = 1e9f, rpmShift = 1e9f, rpmMean = 0.0f;
@@ -6191,16 +6063,13 @@ void faFiltRippleUpdate(float bcur, float macur, float rpm) {
                     && (cmdTravel <= limCmd);                // a commanded ramp is not ripple
     bool altSteady  = commonOk && (altShift  <= limStatAlt);
     bool battSteady = commonOk && (battShift <= limStatBatt);
-    // RPM stationarity replaces the old same-bin edge-margin gate, and the table bins on the window-MEAN
-    // RPM — a hunt wobbling across a 50-RPM boundary attributes to its center of mass instead of being
-    // rejected (the straddle rejection was the other half of the idle starvation).
+    // Bins on the window-MEAN RPM, so a hunt wobbling across a 50-RPM boundary attributes to its center of mass
+    // instead of being rejected (a straddle rejection also starves idle).
     bool rpmOk = (filtRippleWinRpmMin > 0.0f) && (rpmShift <= limStatRpm);
     int rpmBin = (int)(rpmMean / FA_RPM_BIN_W);
     bool tabValid = rpmOk && rpmMean > 0.0f && rpmBin >= 0 && rpmBin < RIPTAB_BINS;
-    // Crossings gate (table fold only, per-detector): the measurement EMA must cross its 300 ms baseline
-    // ≥ RIP_CROSS_MIN times in the window — a one-shot that slipped the stationarity test crosses ~2×,
-    // real ripple/hunt crosses constantly. The test ring is exempt (a wizard hold must not starve; the
-    // browser's median-of-8 is the robustness there).
+    // Crossings gate (table fold only): a one-shot that slipped the stationarity test crosses the 300 ms baseline
+    // ~2×, real ripple constantly. The test ring is exempt (the browser's median-of-8 covers it; holds must not starve).
     bool altFold  = tabValid && altSteady  && (altFiltCross  >= RIP_CROSS_MIN);
     // No shunt → Bcur is the raw INA228 input (noise when nothing is wired across it), and the battery
     // over-current detector this map feeds is itself HAS_BATT_SHUNT-gated — never fold battery ripple.
@@ -6209,10 +6078,7 @@ void faFiltRippleUpdate(float bcur, float macur, float rpm) {
     // not) — a frozen counter with green gate rows points at protection/starve.
     if (altFold)  g_ripAltAdmitCount++;
     if (battFold) g_ripBattAdmitCount++;
-    // Agree-twice fold, game-gated (RPM_RIPPLE_TABLE_SPEC §2.3): first qualifying window becomes the
-    // pending candidate; a second that agrees (±33% or ±0.5 A) commits the AVERAGE of the pair and
-    // freezes that detector's cell; a disagree replaces the pending (the monster regrows). Every event
-    // is forensic-logged so an unsettled bin stays explainable.
+    // Agree-twice fold, game-gated (RPM_RIPPLE_TABLE_SPEC §2.3); every event is forensic-logged.
     if (ripGameFill && ripScoreArmed && (altFold || battFold)) {   // ripScoreArmed: current held at target ≥2s — never fold at the rest floor
       RipTabCell *c = &ripTab.cell[rpmBin];
       uint16_t rpmU = (uint16_t)fminf(rpm + 0.5f, 65535.0f);
@@ -6277,19 +6143,12 @@ void faFiltRippleUpdate(float bcur, float macur, float rpm) {
 }
 
 // ── Flat-top windowed FFT ──
-// One FFT per 0.5 s window over the decimated 1.25 kSPS AC stream. Replaces the 16-bin log
-// Goertzel bank, which scalloped: its bins spaced ~28% apart with main lobes only ~f/10 wide
-// left gaps a tone could fall into and read up to ~6x low (a 28 Hz, 8.7 A real tone read 4.1 A).
-// The FFT has uniform 0.5 Hz-class resolution with no gaps. Flat-top window = amplitude-accurate
-// (near-zero scalloping); single transform per window, NO run-to-run averaging. faToneBuf holds
-// this window's raw current (window mean removed at finalize for an exact DC reference);
-// faFftRe/Im are the zero-padded transform workspace. All PSRAM.
+// One FFT per 0.5 s window over the decimated 1.25 kSPS stream. Do not go back to a log-spaced Goertzel bank: its
+// gaps between bins let a tone read up to ~6x low. Flat-top = amplitude-accurate, no run-to-run averaging. faToneBuf
+// holds the window's raw current (mean removed at finalize); faFftRe/Im are the zero-padded workspace. All PSRAM.
 #define FA_FFT_N 1024                       // power-of-2 transform size (zero-padded from 625)
-#define FA_MIN_TONE_HZ 4.0f                 // peak-search floor. Below ~one cycle per window
-                                            // (1/T = 2 Hz at 0.5 s) a tone isn't resolvable, and the
-                                            // flat-top window's wide flat main lobe smears any near-DC
-                                            // residual up into the lowest bins as a phantom 1-2 Hz tone.
-                                            // 4 Hz clears both; real tones of interest start ~10 Hz.
+#define FA_MIN_TONE_HZ 4.0f                 // peak-search floor: below ~1 cycle/window (2 Hz) nothing resolves,
+                                            // and flat-top leakage fakes a 1-2 Hz tone. Real tones start ~10 Hz.
 static float *faToneBuf = NULL;             // PSRAM — FA_WIN_DECIM_N raw decimated current samples (window mean removed at finalize)
 static float *faFftRe = NULL, *faFftIm = NULL;  // PSRAM — FA_FFT_N transform workspace
 static float *faFtWin = NULL;               // PSRAM — FA_WIN_DECIM_N flat-top window table
@@ -6298,22 +6157,17 @@ static float *faTwidRe = NULL, *faTwidIm = NULL;  // PSRAM — FA_FFT_N/2 twiddl
 static uint16_t *faBitRev = NULL;           // PSRAM — FA_FFT_N bit-reversal permutation
 
 // ── Steady-state gate (independent of the alt-health detector, deliberately cheap) ──
-// 1 s-TC EMAs on RPM and on this channel's own amps. The 1 s constant kills the 10 Hz
-// band ~60× and the 28 Hz band ~175× — the gate must not see the resonances being
-// measured. Over the 0.5 s window: RPM EMA inside one bin with ≥10 RPM edge margin; amps
-// EMA drift ≤ max(2 A, 5% of mean); no protection active; no attenuation switch; no
-// railed codes; no sample loss (wall-clock audit vs the crystal-timed sample count).
+// The 1 s RPM EMA attenuates the 10/28 Hz bands ~60x/~175x so the gate doesn't see the resonances it measures.
+// Over the window: RPM EMA inside one bin with edge margin, amps EMA drift within limit, no protection, no
+// attenuation switch, no railed codes, no sample loss (wall-clock audit vs crystal-timed count).
 #define FA_EMA_ALPHA (1.0f / 1250.0f)  // 1 s TC — RPM EMA (binning, page label, detector ctx)
-// Amps gate EMA: 300 ms TC, fast enough that an end-of-window current collapse shows as drift
-// (1 s was too slow — a ~38 A tail collapse moved it only ~2 A, under the floor, so it passed).
+// Amps gate EMA 300 ms: fast enough that an end-of-window current collapse shows as drift (1 s let a ~38 A collapse pass).
 #define FA_AMPS_EMA_ALPHA (1.0f / 375.0f)  // 300 ms TC at the 1250 SPS decimated rate
-#define FA_RPM_EDGE_MARGIN 2.0f    // guard band each side of a 50-RPM bin edge; m carves 2m RPM of map dead-zone per bin (2 -> 8%). The same-bin (no-straddle) test is the real correctness gate; this is just fringe-filing guard.
+#define FA_RPM_EDGE_MARGIN 2.0f    // guard band each side of a 50-RPM bin edge (m carves 2m RPM dead-zone per bin); the same-bin test is the real gate
 #define FA_WIN_WALL_MAX_MS 580UL   // 0.5 s nominal (625 @ 1250 SPS) + ~80 ms loop-jitter margin; beyond this the window lost samples (DMA pool overflow)
 
 // ── User-tunable knobs (Pattern B settings — NVS-backed, echoed on CSV3) ──
-// Converted from the design-time #defines above so the bench rail point and the steady-state
-// gate can be retuned in the field without a reflash. Defaults equal the #define values, so a
-// fresh device behaves identically. Detector internals stay design-time (spec: no user knob).
+// Defaults equal the #defines above. Detector internals stay design-time (spec: no user knob).
 bool faEnabled = true;                       // global ON/OFF for the whole fast-alt subsystem
 bool faAlarmEnable = false;                  // FAULT verdict drives the audible alarm (AlarmActivate-gated)
 bool faAnomPause = false;                    // freeze the anomaly flipbook slots (stop overwrites)
@@ -6343,13 +6197,9 @@ static unsigned long faWinStartMs = 0;
 // faSesPeakWorstHz are declared in Xregulator.ino (buildConfigPayload above reads them).
 
 // ── Reference flipbook (consumer 4) ──
-// ONE axis: 1000-RPM bands. A page is captured when its band has no snapshot, amps are
-// 20–100 A, and the steady-state gate passed. 20 kSPS (raw ring, no decimation), 200 ms,
-// ~8 KB/page. Full rate so the rectifier-ripple shape stays unaliased across the whole RPM
-// band — the 6-pulse ripple is 0.6·PulleyRatio·engineRPM Hz, which exceeds the old 5 kSPS
-// Nyquist (2.5 kHz) above idle; 20 kSPS holds clean to the top of the 5000-RPM bands.
-// Pages FREEZE once captured; only the re-baseline button clears the book.
-// Anomaly-triggered captures (detector fired) are stored alongside for before/after.
+// One page per 1000-RPM band, captured once (amps 20–100 A, steady gate passed) at full 20 kSPS for 200 ms:
+// 6-pulse ripple (0.6·PulleyRatio·RPM Hz) exceeds 5 kSPS Nyquist above idle. Pages FREEZE once captured; only
+// re-baseline clears them. Anomaly captures (detector fired) are stored alongside for before/after.
 #define FA_FLIP_BANDS 5  // 1000-RPM bands, 0–4999
 #define FA_FLIP_ANOM 4   // anomaly capture slots (round-robin)
 #define FA_FLIP_SLOTS (FA_FLIP_BANDS + FA_FLIP_ANOM)
@@ -6381,22 +6231,13 @@ static volatile bool faPendingFlipWipeAll = false;  // tach rescale: wipe ALL 9 
 uint8_t faDetectLastK = 0;  // dashboard field: winning fault class of the last FAULT verdict, 0 = quiet
 static unsigned long faDetectMsgMs = 0, faAnomCapMs = 0, faDetTrendMsgMs = 0;
 
-// Failure detector (consumer 2).
-// The algorithm is the FAD core further down: a faithful port of rect_fault_detector.py,
-// gated 18/18 against the synthetic set on desktop both before and after integration.
-// It does NOT read the scope ring or the decimated stream — crest picking needs the raw
-// 20 kSPS stream — so each measurement window's raw samples are also captured into
-// faDetWin (window-aligned to within one boxcar-16 group). A qualified window ARMS a job
-// on that buffer; the Core-0 faDetTask runs the analysis and faDetectorPoll() consumes the
-// verdict on Core 1 ~tens of ms later (latency is irrelevant — a human response takes minutes,
-// and keeping the heavy math off Core 1 is the whole point). Division of
-// labor: first-line pk-pk-vs-cell-history detection
-// belongs to the disturbance matrix (consumer 1); this detector covers cold start (no cell
-// history yet), fault classification (winning k), and triggering the flipbook capture.
-#define FA_DET_WIN_N 40000  // 2 s raw detector capture. DECOUPLED from the 0.5 s tone window
-                            // (FA_WIN_DECIM_N) so the detector keeps its 2 s analysis length: it
-                            // fills across 4 consecutive CLEAN tone windows (faWindowFinalize resets the
-                            // capture on any non-clean window), preserving "one contiguous clean 2 s capture".
+// Failure detector (consumer 2): the FAD core below, a faithful port of rect_fault_detector.py (18/18 on the
+// synthetic set). Crest picking needs the raw 20 kSPS stream, so each window's raw samples also go to faDetWin.
+// A qualified window ARMS a job; faDetTask (Core 0) runs the heavy analysis off Core 1 and faDetectorPoll()
+// consumes the verdict on Core 1. The disturbance matrix does first-line detection; this covers cold start,
+// fault classification (winning k) and flipbook triggering.
+#define FA_DET_WIN_N 40000  // 2 s raw detector capture, DECOUPLED from the 0.5 s tone window: fills across 4
+                            // consecutive CLEAN windows (any non-clean window restarts it).
 #define FA_DET_MIN_PERIOD_MS 60000UL              // one analysis per minute is plenty
 static int16_t *faDetWin = NULL;  // PSRAM — window-aligned raw capture (detector input)
 static int faDetWinN = 0;
@@ -6530,11 +6371,8 @@ static void faFft() {
 
 static void faWinReset() {
   faDecimWinN = 0;
-  // Detector capture is DECOUPLED from this 0.5 s window (FA_DET_WIN_N = 2 s): it accumulates
-  // ACROSS windows and is NOT zeroed here. We only resume/pause filling around an active job;
-  // faWindowFinalize zeroes faDetWinN on a non-clean window (restart contiguous-clean capture),
-  // and faDetectorPoll zeroes it on completion. The boxcar-16 group may straddle a boundary
-  // (raw/decimated skew ≤15 samples, 0.75 ms) — immaterial for a self-referenced detector.
+  // The 2 s detector capture accumulates ACROSS windows and is NOT zeroed here (faWindowFinalize zeroes it on a
+  // non-clean window, faDetectorPoll on completion); only resume/pause filling around an active job.
   faDetFilling = (!faDetBusy && faDetWin != NULL);
   faWinRailed = false;
   faWinProtection = false;
@@ -6542,7 +6380,6 @@ static void faWinReset() {
   faWinRpmEmaMax = faWinAmpsEmaMax = faWinDAmpH1Max = faWinDAmpH2Max = -1e9f;
   faWinAmpsSum = 0.0;
   faWinStartMs = millis();
-  // (No spectral state to clear — the FFT reads faToneBuf[0..faDecimWinN-1] fresh each window.)
 }
 
 // Fold one found peak into a cell: ±5% frequency match → recent-average (1/min(n+1,N)); else take a
@@ -6603,35 +6440,27 @@ static void faWindowFinalize() {
     rollUpdate(ROLL_RPMEDGE, fminf(faWinRpmEmaMin - rpmBinLo * FA_RPM_BIN_W,
                                    (rpmBinLo + 1) * FA_RPM_BIN_W - faWinRpmEmaMax));
     rollUpdate(ROLL_AMPSDRIFT, faWinAmpsEmaMax - faWinAmpsEmaMin);
-    // Same EMA spread minus this window's own effective limit (floor vs pct-of-mean, whichever binds).
-    // <=0 means the drift gate passed; the 10s peak of this is the dashboard's exact pass/fail signal —
-    // no client-side recompute or raw-INA proxy for the mean current.
+    // Spread minus this window's effective limit: <=0 = drift gate passed; its 10 s peak is the dashboard's exact
+    // pass/fail signal.
     rollUpdate(ROLL_AMPSDRIFTEXC, (faWinAmpsEmaMax - faWinAmpsEmaMin) - ampsDriftMax);
     bool binValid = (rpmBinLo >= 0 && rpmBinLo < FA_RPM_BINS);
     if (faCommissionGate) {
-      // Commissioning Phase-2 variant: the operator creeps the throttle up continuously, so the
-      // strict dead-steady gate (edge margin + amps-steady) would qualify nothing. Relax to
-      // "RPM stayed inside one 50-RPM bin during this 0.5 s window" — drift allowed, no edge
-      // margin, no amps-steadiness. The map is a bootstrap (floor + ongoing refinement), so
-      // one window/bin is coverage, not depth. Strict gate stays for normal-operation accumulation.
+      // Commissioning Phase-2: the operator creeps the throttle continuously, so the strict gate would qualify
+      // nothing. Relaxed to "RPM stayed in one 50-RPM bin this window"; one window/bin is coverage, not depth.
       gated = (rpmBinLo == rpmBinHi) && binValid;
     } else {
       gated = rpmSteady && ampsSteady && binValid;
     }
     if (IgnoreRPM) gated = false;   // matrix/flipbook are RPM-binned; the RPM-free detector below still runs (§4.8)
-    // Detector arming is RPM-FREE (see faMaybeArmDetector): a clean, current-steady window with
-    // real current flowing is enough — no RPM-steadiness or valid-bin requirement. This keeps
-    // fault detection working when the tach is dead or erratic, the failure modes that motivated
-    // a self-referenced detector. The matrix/flipbook below still require the full RPM gate.
+    // Detector arming is RPM-FREE (clean, current-steady, real current flowing) so fault detection keeps working
+    // with a dead or erratic tach, the failure modes a self-referenced detector exists for.
     detWindowOk = (ampsSteady && winMeanAmps >= FA_AMP_BIN_LO);
     if (detWindowOk) faMaybeArmDetector(winMeanAmps);
     if (gated && faMatrix) {
       int ampBin = (int)((winMeanAmps - FA_AMP_BIN_LO) / FA_AMP_BIN_W);
       if (winMeanAmps >= FA_AMP_BIN_LO && ampBin >= 0 && ampBin < FA_AMP_BINS) {
-        // Flat-top windowed FFT of this window's AC samples (zero-padded to FA_FFT_N), single-
-        // sided amplitude spectrum, then local maxima with 3-bin parabolic interpolation. Uniform
-        // resolution, no scalloping gaps — the bug the log Goertzel bank had (a 28 Hz tone read
-        // ~2x low). Magnitudes are taken on the fly to avoid a full 512-bin spectrum buffer.
+        // Flat-top FFT (zero-padded to FA_FFT_N), single-sided amplitude, local maxima with 3-bin parabolic
+        // interpolation. Magnitudes are computed on the fly to avoid a full 512-bin spectrum buffer.
         for (int i = 0; i < FA_WIN_DECIM_N; i++) faFftRe[i] = (faToneBuf[i] - winMeanAmps) * faFtWin[i];
         for (int i = FA_WIN_DECIM_N; i < FA_FFT_N; i++) faFftRe[i] = 0.0f;
         for (int i = 0; i < FA_FFT_N; i++) faFftIm[i] = 0.0f;
@@ -6684,7 +6513,7 @@ static void faWindowFinalize() {
         if (np > FA_CELL_PEAKS) np = FA_CELL_PEAKS;
         int cellIdx = rpmBinLo * FA_AMP_BINS + ampBin;
         FaCell *c = &faMatrix[cellIdx];
-        float apvK = faAmpsPerVolt() * 0.001f;
+        float apvK = faAmpsPerVolt() * 0.001f * faCalGain;   // same calibrated scale as the cell's tones (faMvToAmps); the offset cancels in a pk-pk
         // Min-of-halves broadband pk-pk: keep the SMALLER of the two half-windows' extremes. A one-shot
         // transient inflates only one half, so the min stays honest; real ripple (period ≤ quarter-window)
         // recurs in both. Feeds the map cell AND the worst-ripple hold, so both reject single spikes.
@@ -6792,9 +6621,8 @@ static void faProcessDecimated(int16_t dmv) {
   }
   faWinAmpsSum += ampsNow;
   if (g_loadDumpActive || alarmLatch) faWinProtection = true;  // "no protection active" gate leg
-  // Buffer the raw decimated current for this window's flat-top FFT; the window MEAN (not the
-  // lagging 1 s EMA) is subtracted in one shot at finalize. Subtracting the EMA here left a
-  // residual DC offset the flat-top's wide flat main lobe read as a phantom ~1-2 Hz tone.
+  // Raw current buffered for the FFT; the window MEAN is subtracted at finalize. Do not subtract the lagging EMA
+  // here: its residual DC reads as a phantom ~1-2 Hz tone through the flat-top's wide main lobe.
   if (faToneBuf && faDecimWinN < FA_WIN_DECIM_N) faToneBuf[faDecimWinN] = ampsNow;
   faDecimWinN++;
   if (faDecimWinN >= FA_WIN_DECIM_N) TIMED_CALL(ft_faWindowFinalize, faWindowFinalize());
@@ -6811,11 +6639,8 @@ static inline void faProcessSample(int16_t mv) {
   }
 }
 
-// Bounded drain — called from loop() every pass via TIMED_CALL(ft_fastAltDrain, ...).
-// Empties the driver's DMA pool in ≤256-sample chunks, hard-capped at ~1 ms. Pool overflow
-// during a long loop stall silently drops samples; a window that lost samples is junk
-// spectrally, but it is also time-dilated and non-steady, so the steady-state gate
-// rejects it before anything is recorded.
+// faDrain (below): bounded ≤1 ms drain of the DMA pool from loop(). Samples lost to pool overflow during a stall
+// leave a time-dilated, non-steady window that the steady-state gate rejects.
 // Bring the continuous-ADC driver up (handle + 6 dB config + start). Shared by faInit() and
 // the runtime OFF->ON path in faDrain(). Buffers must already be allocated by faInit().
 static bool faStartDriver() {
@@ -6908,8 +6733,10 @@ void faDrain() {
         if (++idx >= FA_RAW_RING_N) idx = 0;
       }
       faRingHead = (uint16_t)idx;
+      int fill = faRingFill + stagedN;
+      faRingFill = (uint16_t)(fill > FA_RAW_RING_N ? FA_RAW_RING_N : fill);
+      faTotalSamples += (uint32_t)stagedN;   // inside the lock: faScopeSnapshot reads it with the head to see how far the writer got
       portEXIT_CRITICAL(&faRingMux);
-      faTotalSamples += (uint32_t)stagedN;
     }
     // Presence: consistently railed for ~10 s while the ADS path agrees current is low
     // (a 6 dB over-range at high output also rails — that is NOT a missing jumper).
@@ -6957,12 +6784,9 @@ static void faCapturePage(int slot, uint16_t rpm, float amps, uint8_t isAnom, ui
 }
 
 // ── Failure detector (consumer 2) — algorithm core ──
-// Faithful C++ port of the offline prototype (rect_fault_detector.py, 18/18 on the synthetic
-// gate). The algorithm bodies live in 8_functions.ino; the type definitions it shares with the
-// consumers below (FadJob / FadResult / FADV_*) are defined here because they are used
-// by value/sizeof in this file, which precedes 8_functions.ino in the Arduino build.
-// Verdicts. QUIET doubles as "no-signal" (too little periodicity/crests to analyze) —
-// every consumer treats it as silence.
+// Port of rect_fault_detector.py; bodies in 8_functions.ino. The shared types are defined here because this
+// file uses them by value/sizeof and precedes 8_functions.ino in the build.
+// QUIET doubles as "no-signal" — every consumer treats it as silence.
 #define FADV_QUIET 0
 #define FADV_HEALTHY 1
 #define FADV_TREND 2
@@ -7042,11 +6866,9 @@ struct FadJob {
 static FadJob *faDetJob = NULL;   // PSRAM — analysis state machine (alloc'd once in faInit)
 static uint8_t *faDetMem = NULL;  // PSRAM — ~1.9 MB carved workspace (fadCarve)
 
-// Cross-core handoff (Core 1 control loop <-> faDetTask on Core 0), using the FreeRTOS primitives
-// the rest of the firmware uses cross-core (proven on this silicon), not hand-placed fences: a
-// task notification arms the worker, a binary semaphore returns the verdict. faDetBusy still gates
-// faDetWin refill so Core 1 never writes the buffer while the worker reads it. faDetTaskHandle /
-// faResultSem are declared in Xregulator.ino. Detail: Working Markdown Docs/Fault_Detector_Dev_Summary.md.
+// Cross-core handoff (Core 1 <-> faDetTask on Core 0) via FreeRTOS primitives, not hand-placed fences: a task
+// notification arms the worker, a binary semaphore returns the verdict. faDetBusy keeps Core 1 from refilling
+// faDetWin while the worker reads it. Detail: Working Markdown Docs/Fault_Detector_Dev_Summary.md.
 FadResult faSharedResult;
 
 // Whole-analysis compute time (us) on the Core-0 worker — last run + worst since ResetPerfCounters.
@@ -7057,19 +6879,16 @@ void faDetTask(void *pv) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // block until Core 1 arms a job (the notify is the barrier)
     FadResult res;
-    // CPU compute time, immune to Core-0 network/WiFi preemption: ulRunTimeCounter accumulates ONLY
-    // the cycles this task actually executes — time the analysis is paused while WiFi/lwIP borrows
-    // the core is NOT counted. The catch is units: the run-time-stats counter on this silicon ticks
-    // in CPU CLOCK CYCLES, not microseconds — divide by the live CPU MHz to get true microseconds.
-    // getCpuFrequencyMhz() keeps it correct even in the 80 MHz engine-off idle (CPU is 240 MHz
-    // whenever the dashboard is actually open).
+    // CPU compute time immune to WiFi/lwIP preemption: ulRunTimeCounter counts only this task's run time, in esp_timer
+    // MICROSECONDS on this core (CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER), not clock cycles: dividing by the CPU
+    // MHz, as this did until 2026-10-25, read 240x low. It accrues at each switch-out, so the slice still running at the
+    // second read is not counted yet (a few ms under WiFi preemption).
     TaskStatus_t ts;
     vTaskGetInfo(NULL, &ts, pdFALSE, eInvalid);
     uint32_t c0 = (uint32_t)ts.ulRunTimeCounter;
     fadStep(faDetJob, 0, &res);  // straight-line: runs the whole analysis to completion
     vTaskGetInfo(NULL, &ts, pdFALSE, eInvalid);
-    uint32_t cpuMHz = getCpuFrequencyMhz();
-    uint32_t computeUs = ((uint32_t)ts.ulRunTimeCounter - c0) / (cpuMHz ? cpuMHz : 240);
+    uint32_t computeUs = (uint32_t)ts.ulRunTimeCounter - c0;
     faDetLastComputeUs = computeUs;
     if (computeUs > faDetWorstComputeUs) faDetWorstComputeUs = computeUs;
     faSharedResult = res;
@@ -7077,10 +6896,8 @@ void faDetTask(void *pv) {
   }
 }
 
-// Verdict consumer — called from loop() every pass via TIMED_CALL(ft_faDetector, ...). The heavy
-// fadStep work runs on faDetTask (Core 0); this only consumes a finished result (cheap, one
-// non-blocking semaphore poll). TREND verdicts are log-only.
-// Side-effects stay on Core 1 to avoid faFlip cross-core races.
+// Verdict consumer (loop(), every pass): one non-blocking semaphore poll for a faDetTask result. TREND verdicts
+// are log-only. Side-effects stay on Core 1 to avoid faFlip cross-core races.
 void faDetectorPoll() {
   if (!faResultSem || xSemaphoreTake(faResultSem, 0) != pdTRUE) return;  // no verdict ready
   FadResult res = faSharedResult;
@@ -7117,11 +6934,9 @@ void faDetectorPoll() {
   }
 }
 
-// Highest Tone in Map headline — peak-held at the matrix merge site (faWinFinalize) from each
-// qualified window's loudest tone, reported PEAK-TO-PEAK (2 × the stored sine amplitude) so it
-// matches the max−min a user eyeballs on the live waveform. It is NOT re-derived from the
-// persistent map (a full-map scan would always return the historical worst and immediately undo
-// a reset). Clear it ONLY here: Reset Worsts (ResetRipplePeaks) and Clear Map (FastAltClearMatrix).
+// Highest Tone in Map headline: peak-held at the matrix merge from each qualified window's loudest tone, in
+// PEAK-TO-PEAK (2 × sine amplitude). NOT re-derived from the map (a scan returns the historical worst and undoes
+// a reset). Cleared ONLY here: Reset Worsts (ResetRipplePeaks) and Clear Map (FastAltClearMatrix).
 void faDomReset() {
   faDomAmpAX100 = 0;
   faDomFreqHzX10 = 0;
@@ -7134,15 +6949,11 @@ void faDomReset() {
 // Qualified-window hook — called only when a window passed the steady-state gate and
 // landed in a matrix cell (the matrix merge has already happened by this point).
 static void faQualifiedWindowHook(int rpmBandLo, float meanAmps) {
-  // Reference flipbook: freeze-once page per 1000-RPM band, 20–100 A only. The waveform is the
-  // point, so it's captured immediately regardless of clock — NEVER gated on time, or a headless
-  // AP session (no client connected) would lose its references entirely. If the first capture
-  // happened before any clock was available (epoch 0), allow ONE re-capture once time syncs, so
-  // the permanent page ends up with a real timestamp instead of "clock not set".
+  // Reference flipbook, 20–100 A only. Captured regardless of clock (never time-gated, or a headless AP session
+  // loses its references); a page captured at epoch 0 gets ONE re-capture once time syncs.
   if (faFlip && meanAmps >= 20.0f && meanAmps <= 100.0f) {
     int band = rpmBandLo / 1000;
-    // Defensive: band 0 must not freeze a near-zero-RPM page (engines don't idle below ~100 RPM).
-    // Bounds-check band BEFORE indexing faFlip[band] for the capture-needed test.
+    // Band 0 must not freeze a near-zero-RPM page (engines don't idle below ~100 RPM).
     if (band >= 0 && band < FA_FLIP_BANDS && !(band == 0 && faRpmEma < 100.0f)
         && (!faFlip[band].used || (faFlip[band].epoch == 0 && timeIsSynced))) {
       faCapturePage(band, (uint16_t)fmaxf(faRpmEma, 0.0f), meanAmps, 0, 0, 0.0f);
@@ -7156,19 +6967,10 @@ static void faQualifiedWindowHook(int rpmBandLo, float meanAmps) {
   }
 }
 
-// Failure-detector arming — RPM-INDEPENDENT, deliberately split out of faQualifiedWindowHook
-// (which is RPM-gated because the matrix and reference flipbook are binned/labelled by engine
-// speed). The detection algorithm in 8_functions.ino is fully self-referenced — it reads
-// neither the tach nor any RPM-derived value — so its trigger must NOT inherit the matrix's
-// RPM-steadiness requirement. Several rectifier/stator faults corrupt the LM2907 RPM, and
-// re-coupling the trigger to RPM would blind the detector in exactly those cases. The caller
-// arms on a clean, current-steady window with real current flowing; the operating RPM bin is
-// irrelevant here. A qualified window ARMS the analysis job (far too heavy for the Core-1
-// control loop — it stalled it ~30 ms once a minute); the Core-0 faDetTask runs it and
-// faDetectorPoll() fires the consumers on Core 1 (console alert, CSV2 faDetectK, anomaly
-// flipbook capture) when the verdict lands. faDetWin holds exactly this window's raw 20 kSPS
-// stream, frozen while the job runs. faDetCtxRpm is captured as page metadata only — if the
-// tach is dead it records the broken value, which is itself diagnostic.
+// Failure-detector arming is RPM-INDEPENDENT, split out of the RPM-gated faQualifiedWindowHook: the algorithm
+// never reads the tach, and several rectifier/stator faults corrupt the LM2907 RPM, so an RPM-gated trigger
+// would blind it in exactly those cases. The analysis is far too heavy for Core 1 (it stalled the control
+// loop ~30 ms), so this only arms faDetTask. faDetCtxRpm is page metadata; a dead tach's value is itself diagnostic.
 static void faMaybeArmDetector(float meanAmps) {
   if (faDetJob && faDetTaskHandle && !faDetBusy && faDetWinN == FA_DET_WIN_N
       && millis() - faDetLastStartMs >= FA_DET_MIN_PERIOD_MS) {
@@ -7225,6 +7027,13 @@ void faMatrixMaybeFlush() {
     ripTab.sess.epoch = timeIsSynced ? (uint32_t)time(NULL) : 0;
     ripGameFill = true;
   }
+  if (ripTabPendingClear) {
+    ripTabPendingClear = false;
+    memset(&ripTab, 0, sizeof(ripTab));
+    ripTab.sess.ibvMinV = 1e9f;
+    ripTab.sess.ibvMaxV = -1e9f;
+    ripTabPendingSave = true;   // no game teardown will save it
+  }
   if (ripTabPendingSave) {
     ripTabPendingSave = false;
     ripTabFlush();
@@ -7277,16 +7086,23 @@ void faMatrixMaybeFlush() {
   }
 }
 
-// Snapshot the scope ring for the /fastscope.bin endpoint. Header (24 B, little-endian):
-// u32 magic 'FSC1', u16 sampleRate/10, u16 count, u16 zero-amps mV, u16 ampsPerVolt,
-// u8 attenIs12, u8 chanState, u16 RPM, i16 altTempF (whole °F, INT16_MIN = no probe had read),
-// u32 epoch (0 = clock not synced), u16 reserved. Then count × int16 calibrated mV, oldest-first. The capture is the trailing
-// ring ending NOW, so RPM/temp/epoch are stamped at request time = capture-end time.
-// Returns total bytes filled (0 = caller buffer too small).
+// /fastscope.bin snapshot. Header (24 B, little-endian): u32 magic 'FSC1', u16 sampleRate/10, u16 count, u16
+// zero-amps mV, u16 ampsPerVolt, u8 attenIs12, u8 chanState, u16 RPM, i16 altTempF (whole °F, INT16_MIN = no
+// probe read), u32 epoch (0 = unsynced), u16 reserved; then count × int16 calibrated mV, oldest-first. The
+// capture ends NOW, so RPM/temp/epoch are capture-end values. Returns bytes filled (0 = buffer too small).
+// The ring is copied FA_SCOPE_COPY_CHUNK samples per faRingMux hold, so the drain on Core 1 never spins on more
+// than one chunk; samples the drain overwrote before their chunk was copied are dropped from the front of the capture.
+#define FA_SCOPE_COPY_CHUNK 256   // 512 B per hold: the same size as faDrain's own section (one ADC frame)
 size_t faScopeSnapshot(uint8_t *buf, size_t cap) {
-  uint16_t count = (faChanState == 1 && faRawRing)
-                     ? ((faTotalSamples >= FA_RAW_RING_N) ? (uint16_t)FA_RAW_RING_N : (uint16_t)faTotalSamples)
-                     : 0;
+  uint16_t count = 0, head = 0;
+  uint32_t total0 = 0;
+  if (faChanState == 1 && faRawRing) {
+    portENTER_CRITICAL(&faRingMux);
+    count = faRingFill;
+    head = faRingHead;
+    total0 = faTotalSamples;
+    portEXIT_CRITICAL(&faRingMux);
+  }
   size_t need = 24 + (size_t)count * 2;
   if (!buf || cap < need) return 0;
   uint32_t magic = 0x46534331UL;  // 'FSC1'
@@ -7294,8 +7110,7 @@ size_t faScopeSnapshot(uint8_t *buf, size_t cap) {
   uint16_t zeroMv = (uint16_t)FA_ZERO_MV;
   uint16_t apv = (uint16_t)faAmpsPerVolt();
   uint16_t rpm = (uint16_t)fmaxf(0.0f, fminf(RPM, 65535.0f));
-  // (int16_t)NAN is undefined behaviour and stamped garbage into the header. Same blank convention
-  // as the zero-log's altTempFx10.
+  // (int16_t)NAN is UB; blank convention matches the zero-log's altTempFx10.
   int16_t altTempF = INT16_MIN;   // blank
   if (isfinite(AlternatorTemperatureF)) {   // lroundf out of int16 range is undefined; -32767 floor keeps INT16_MIN unreachable
     float t = AlternatorTemperatureF;
@@ -7316,33 +7131,55 @@ size_t faScopeSnapshot(uint8_t *buf, size_t cap) {
   buf[23] = 0;
   if (count > 0) {
     int16_t *out = (int16_t *)(buf + 24);
-    portENTER_CRITICAL(&faRingMux);
-    uint16_t head = faRingHead;
-    if (count >= FA_RAW_RING_N) {  // full ring: oldest sample sits at head
-      size_t tail = (size_t)(FA_RAW_RING_N - head);
-      memcpy(out, faRawRing + head, tail * 2);
-      if (head > 0) memcpy(out + tail, faRawRing, (size_t)head * 2);
-    } else {  // partial: data is [0, head)
-      memcpy(out, faRawRing, (size_t)count * 2);
+    // Oldest sample at start (the head when full; partial data is [0, head)). The writer continues from head, so it
+    // reaches output offset i on its (dist0 + i + 1)th sample after the snapshot point.
+    const uint32_t start = ((uint32_t)head + FA_RAW_RING_N - count) % FA_RAW_RING_N;
+    const uint32_t dist0 = (uint32_t)FA_RAW_RING_N - count;
+    uint32_t lost = 0;   // leading offsets that may hold newer samples
+    for (uint32_t off = 0; off < count; off += FA_SCOPE_COPY_CHUNK) {
+      uint32_t k = count - off;
+      if (k > FA_SCOPE_COPY_CHUNK) k = FA_SCOPE_COPY_CHUNK;
+      const uint32_t pos = (start + off) % FA_RAW_RING_N;
+      const uint32_t run = (uint32_t)FA_RAW_RING_N - pos;   // samples before the ring wraps
+      portENTER_CRITICAL(&faRingMux);
+      const uint32_t written = faTotalSamples - total0;
+      if (run >= k) {
+        memcpy(out + off, faRawRing + pos, (size_t)k * 2);
+      } else {
+        memcpy(out + off, faRawRing + pos, (size_t)run * 2);
+        memcpy(out + off + run, faRawRing, (size_t)(k - run) * 2);
+      }
+      portEXIT_CRITICAL(&faRingMux);
+      if (written > dist0 + off) {
+        uint32_t torn = written - dist0;
+        if (torn > off + k) torn = off + k;
+        if (torn > lost) lost = torn;
+      }
     }
-    portEXIT_CRITICAL(&faRingMux);
+    if (lost) {
+      memmove(out, out + lost, (size_t)(count - lost) * 2);
+      count = (uint16_t)(count - lost);
+      need = 24 + (size_t)count * 2;
+      memcpy(buf + 6, &count, 2);
+    }
   }
   return need;
 }
 
 // Copy the most recent maxN raw samples (calibrated mV, oldest-first) into dst.
-// Returns samples copied, 0 if the channel isn't sampling. Same mux-held copy as
-// faScopeSnapshot. Consumer: the field-decay test (decay record + calibration means).
+// Returns samples copied, 0 if the channel isn't sampling. One faRingMux hold for the whole
+// copy. Consumer: the field-decay test (decay record + calibration means).
 int faGrabRecent(int16_t *dst, int maxN) {
   if (faChanState != 1 || !faRawRing || !dst || maxN <= 0) return 0;
-  int count = (faTotalSamples >= (uint32_t)FA_RAW_RING_N) ? FA_RAW_RING_N : (int)faTotalSamples;
+  int count = (int)faRingFill;
+  const bool full = (count >= FA_RAW_RING_N);
   if (count > maxN) count = maxN;
   if (count <= 0) return 0;
   portENTER_CRITICAL(&faRingMux);
   uint16_t head = faRingHead;  // next write = oldest sample when the ring is full
   // newest `count` samples end just before head
   int start = (int)head - count;
-  if (faTotalSamples < (uint32_t)FA_RAW_RING_N) {
+  if (!full) {
     if (start < 0) start = 0;  // partial fill: data is [0, head)
     memcpy(dst, faRawRing + start, (size_t)count * 2);
   } else {

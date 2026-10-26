@@ -18,23 +18,11 @@ safe to call.
 import matplotlib.pyplot as plt
 
 
-# ---------------------------------------------------------------------------
-# Grab-and-drag panning
-# ---------------------------------------------------------------------------
-# Left-drag inside a plot pans it — no need to arm the toolbar's pan tool first.
-# Built on the Axes' own start_pan/drag_pan/end_pan (the same machinery the toolbar
-# drives) so log scales, fixed aspect and shared axes all behave.
-#
-# Per-axes opt-outs, both honoured here:
-#   ax.set_navigate(False)   -> never panned. Correct for widget axes (CheckButtons,
-#                               TextBox, Button): it also stops the toolbar's rubber-band
-#                               zoom from mangling them.
-#   ax._pan_x_only = True    -> drag pans x but never y. For the event/state strips, whose
-#                               y range is a fixed 0..1 layout, not data.
-#
-# Drag ownership: a press is ignored when the toolbar has a mode armed, when it lands on a
-# draggable legend, or when it lands on an artist registered in fig._pan_block_artists —
-# otherwise a legend drag would pan the axes underneath it at the same time.
+# ===== Grab-and-drag panning =====
+# Left-drag pans via the Axes' own start_pan/drag_pan/end_pan, so log scales, aspect and shared axes behave.
+# Opt-outs: ax.set_navigate(False) never pans (widget axes; also blocks rubber-band zoom);
+# ax._pan_x_only = True pans x only (event/state strips). A press is ignored when a toolbar mode is armed
+# or it lands on a draggable legend or an artist in fig._pan_block_artists.
 
 def _pan_axes_at(fig, x, y):
     """Every navigable axes whose box contains the point — plural, because a twinx() pair

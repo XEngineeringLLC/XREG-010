@@ -14,16 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Battery-temperature source chain helpers (defined in 6_functions.ino next to computeCvTempScale)
+// Battery-temp source helpers (6_functions.ino)
 bool tempProbeFresh(uint8_t idx);
 const char *battTempSrcName(uint8_t src);
-// Sensor-fault helpers (6_functions.ino, next to reasonToString) — the auto prototypes miss these
+// Sensor-fault helpers (6_functions.ino); the auto prototypes miss these
 bool fieldReasonIsFault(FieldEventReason r);
 uint16_t sensorOverriddenBits();
-uint16_t sensorBitsForReason(FieldEventReason r);
 const char *sensorFaultName(uint8_t bit);
 void sensorFaultNames(uint16_t bits, char *out, size_t n);
 const char *reasonToString(FieldEventReason r);
+bool alarmBatteryVoltage(float &v);
+static bool chargeDecisionExternalV(float &out);
 
 void SystemTime(const tN2kMsg &N2kMsg) {
   unsigned char SID;
@@ -32,8 +33,14 @@ void SystemTime(const tN2kMsg &N2kMsg) {
   tN2kTimeSource TimeSource;
 
   if (ParseN2kSystemTime(N2kMsg, SID, SystemDate, SystemTime, TimeSource)) {
-    lastNmea2kSystemTimeMs = millis();  // freshness for priority chain (NMEA > Phone > NTP)
-    syncTimeFromGPS(SystemDate, SystemTime);
+    // Senders with no fix or an unset clock still transmit (NA, or a 1970/1980 date); stamping those
+    // fresh would block phone and NTP time for as long as they keep coming.
+    time_t t = (time_t)SystemDate * 86400 + (time_t)SystemTime;
+    if (!N2kIsNA(SystemDate) && !N2kIsNA(SystemTime) && SystemTime >= 0.0 && SystemTime < 86401.0
+        && t > 1577836800 && t < 4102444800LL) {   // 2020 .. 2100
+      lastNmea2kSystemTimeMs = millis();  // freshness for priority chain (NMEA > Phone > NTP)
+      syncTimeFromGPS(SystemDate, SystemTime);
+    }
 
     if (NMEA2KVerbose) {
       OutputStream->println("System time:");
@@ -69,9 +76,8 @@ void Rudder(const tN2kMsg &N2kMsg) {
     OutputStream->println(N2kMsg.PGN);
   }
 }
-// §10.8: a received field is usable only when it is available AND inside a plausibility window. The
-// library's N2kIsNA catches 0xFFFF alone; 0xFFFE (out of range) and the other reserved codes decode as
-// real numbers (a 0xFFFE battery temperature reads ~720 °F, a 0xFFFE SOG ~1273 kn).
+// §10.8: a field is usable only when available AND plausible. N2kIsNA catches 0xFFFF alone; 0xFFFE and
+// the other reserved codes decode as real numbers (0xFFFE battery temp ~720 °F, SOG ~1273 kn).
 static inline bool n2kIn(double v, double lo, double hi) {
   return !N2kIsNA(v) && !isnan(v) && v >= lo && v <= hi;
 }
@@ -104,19 +110,14 @@ void Heading(const tN2kMsg &N2kMsg) {
     // PrintLabelValWithConversionCheckUnDef("  Deviation (deg): ", Deviation, &RadToDeg, true);
     // PrintLabelValWithConversionCheckUnDef("  Variation (deg): ", Variation, &RadToDeg, true);
   } else {
-    // Parsing failed - do NOT call MARK_FRESH, data will go stale automatically
     OutputStream->print("Failed to parse PGN: ");
     OutputStream->println(N2kMsg.PGN);
   }
 }
 //*****************************************************************************
-// Best 60-second average speed over ground — the number behind the Sustained Speed
-// record and the fleet speed board. SOG arrives at ~0.5 Hz (COGSOG throttles itself to
-// 2 s), so the window is integrated time-weighted from timestamped samples instead of
-// binned; the metric stays correct if that cadence ever changes. Samples are stored at
-// most 1/s so the ring always spans more than a minute whatever the source rate. A score
-// needs a fully covered 60 s with no gap past SUST_MAX_GAP_MS — a NMEA dropout must not
-// be able to manufacture a record out of two samples an hour apart.
+// Best 60 s time-weighted mean SOG (Sustained Speed record). Integrated from timestamped samples so it
+// is cadence-independent; a score needs a fully covered 60 s with no gap past SUST_MAX_GAP_MS, so an
+// NMEA dropout cannot manufacture a record from two samples far apart.
 void updateSustainedSpeed(float sogKn) {
   static uint8_t head = 0, count = 0;
   if (!sustT || !sustV) return;   // PSRAM ring (allocated in setup)
@@ -178,9 +179,8 @@ void COGSOG(const tN2kMsg &N2kMsg) {
     const bool cogOk = n2kIn(COG, 0.0, N2K_TWO_PI);
     const bool sogOk = n2kIn(SOG, 0.0, 30.9);   // 60 kn
     if (!cogOk && !sogOk) return;
-    // When the user has selected phone GPS as the speed/course source, NMEA writes are
-    // suppressed entirely (freshness stamps still land, for /debug diagnostics) so the
-    // record chain and leaderboard flag never mix sources.
+    // Phone GPS selected: NMEA values are not written (freshness stamps still land, for /debug) so
+    // the record chain and leaderboard flag never mix sources.
     if (cogOk) {
       lastNmea2kCogMs = millis();
       if (speedSourceMode != SPD_SRC_PHONE) {
@@ -245,7 +245,7 @@ void GNSS(const tN2kMsg &N2kMsg) {
 
       LatitudeNMEA = Latitude;
       LongitudeNMEA = Longitude;
-      SatelliteCountNMEA = nSatellites;
+      SatelliteCountNMEA = (nSatellites == 0xFF) ? 0 : nSatellites;   // 0xFF is the N2K "not available" code, not 255 satellites
       lastNmea2kGnssMs = millis();  // freshness for GPS priority chain (NMEA > Phone)
       currentGpsSource = GPS_NMEA;  // NMEA wins when present; consumePhoneGps() flips this when NMEA goes stale
 
@@ -256,11 +256,9 @@ void GNSS(const tN2kMsg &N2kMsg) {
       //Serial.printf("Valid GNSS data stored - LatNMEA: %f, LonNMEA: %f, SatNMEA: %d\n", LatitudeNMEA, LongitudeNMEA, SatelliteCountNMEA);
     } else {
       //Serial.println("GNSS data invalid - values are NaN, zero, or out of range");
-      // Invalid data - do NOT call MARK_FRESH, let data go stale
     }
   } else {
     //Serial.println("GNSS parsing FAILED!");
-    // Parse failed - do NOT call MARK_FRESH, let data go stale
   }
 }
 //*****************************************************************************
@@ -303,7 +301,7 @@ void BatteryConfigurationStatus(const tN2kMsg &N2kMsg) {
   double PeukertExponent;
   int8_t ChargeEfficiencyFactor;
 
-  if (NMEA2KVerbose != 1) return;  // display-only handler; unconditional prints firehosed the console at bus rate
+  if (NMEA2KVerbose != 1) return;  // display-only handler; prints would flood the console at bus rate
   if (ParseN2kBatConf(N2kMsg, BatInstance, BatType, SupportsEqual, BatNominalVoltage, BatChemistry, BatCapacity, BatTemperatureCoefficient, PeukertExponent, ChargeEfficiencyFactor)) {
     PrintLabelValWithConversionCheckUnDef("Battery instance: ", BatInstance, 0, true);
     OutputStream->print("  - type: ");
@@ -347,7 +345,7 @@ void DCStatus(const tN2kMsg &N2kMsg) {
     n2kRxSoh = (StateOfHealth > 100) ? -1 : (int)StateOfHealth;
     if (n2kRxSoc >= 0 || n2kRxSoh >= 0) MARK_FRESH(IDX_N2K_SOC);
   }
-  if (NMEA2KVerbose == 1) {  // print firehose gated like SystemTime
+  if (NMEA2KVerbose == 1) {
     OutputStream->print("DC instance: ");
     OutputStream->println(DCInstance);
     OutputStream->print("  - type: ");
@@ -379,9 +377,8 @@ void BatteryStatus(const tN2kMsg &N2kMsg) {
     }
     return;
   }
-  // Ingest V/A/T from the selected battery bank — a shunt or BMS "virtual shunt" bridged
-  // onto N2K. V/A are display/telemetry only; T is a batteryTempF() candidate (source 2) for the
-  // charge lockouts and the CV derate. Missing fields stay NAN, never fabricated.
+  // Selected bank (shunt or BMS "virtual shunt" on N2K): V/A are display only; T is batteryTempF()
+  // source 2 (charge lockouts, CV derate). Missing fields stay NAN.
   if (BatteryInstance == n2kRxBattInstance) {
     const bool vOk = n2kIn(BatteryVoltage, 0.0, 70.0 * ((double)SYSTEM_VOLTAGE_CLASS / 12.0));
     const bool aOk = n2kIn(BatteryCurrent, -2000.0, 2000.0);
@@ -408,13 +405,12 @@ void Speed(const tN2kMsg &N2kMsg) {
   tN2kSpeedWaterReferenceType SWRT;
 
   if (ParseN2kBoatSpeed(N2kMsg, SID, SOW, SOG, SWRT)) {
-    // Surface speed-through-water (SOW) for the boat-performance polar — removes current,
-    // unlike SOG. SOG stays sourced from the COG/SOG rapid PGN (its canonical source).
+    // STW feeds the performance polar (removes current); SOG comes from the COG/SOG rapid PGN.
     if (n2kIn(SOW, 0.0, 30.9)) {   // 60 kn
       STWNMEA = SOW * 1.94384;      // m/s → knots
       MARK_FRESH(IDX_STW_NMEA);
     }
-    if (NMEA2KVerbose == 1) {      // prints only — the STW store above always runs
+    if (NMEA2KVerbose == 1) {
       OutputStream->print("Boat speed:");
       PrintLabelValWithConversionCheckUnDef(" SOW:", N2kIsNA(SOW) ? SOW : msToKnots(SOW));
       PrintLabelValWithConversionCheckUnDef(", SOG:", N2kIsNA(SOG) ? SOG : msToKnots(SOG));
@@ -423,10 +419,14 @@ void Speed(const tN2kMsg &N2kMsg) {
     }
   }
 }
+// Stamped only by a true-wind PGN: IDX_TRUE_WIND_SPEED can't tell upstream from derived (the
+// derivation stamps it too).
+static volatile uint32_t trueWindUpstreamMs = 0;
+
 void WindSpeed(const tN2kMsg &N2kMsg) {
-  static unsigned long lastWindUpdate = 0;
-  if (millis() - lastWindUpdate < 2000) return;
-  lastWindUpdate = millis();
+  // Apparent and true arrive as separate 130306 messages: each kind has its own 2 s throttle, checked after the reference decode, so neither starves the other.
+  static unsigned long lastApparentWindMs = 0;
+  static unsigned long lastTrueWindMs = 0;
 
   unsigned char SID;
   double WindSpeed;
@@ -434,25 +434,28 @@ void WindSpeed(const tN2kMsg &N2kMsg) {
   tN2kWindReference WindReference;
 
   if (ParseN2kWindSpeed(N2kMsg, SID, WindSpeed, WindAngle, WindReference)) {
-    // F-RES-04: bail entirely if both fields NA; otherwise update each independently. An out-of-window
-    // field (0xFFFE and friends) is treated exactly like NA.
+    // F-RES-04: an out-of-window field (0xFFFE and friends) is treated exactly like NA.
     if (!n2kIn(WindSpeed, 0.0, 77.2)) WindSpeed = N2kDoubleNA;   // 150 kn
     if (!n2kIn(WindAngle, 0.0, N2K_TWO_PI)) WindAngle = N2kDoubleNA;
     if (N2kIsNA(WindSpeed) && N2kIsNA(WindAngle)) return;
 
-    // PGN 130306 carries either apparent OR true wind — branch on WindReference so
-    // true-wind values never land in apparent globals (calculateDerivedMetrics would
-    // run apparent→true math on them again). True_North/Magnetic are earth-frame TWD,
-    // converted to boat-relative TWA via HeadingNMEA; True_boat/True_water are already boat-relative.
+    // PGN 130306 carries apparent OR true wind; true values must never land in the apparent globals
+    // (calculateDerivedMetrics would convert them again). True_North/Magnetic are earth-frame TWD,
+    // True_boat/True_water already boat-relative.
     bool isTrue = (WindReference == N2kWind_True_North ||
                    WindReference == N2kWind_Magnetic ||
                    WindReference == N2kWind_True_boat ||
                    WindReference == N2kWind_True_water);
 
+    unsigned long &lastKindMs = isTrue ? lastTrueWindMs : lastApparentWindMs;
+    if (millis() - lastKindMs < 2000) return;
+    lastKindMs = millis();
+
     if (isTrue) {
       if (!N2kIsNA(WindSpeed)) {
         TrueWindSpeedNMEA = WindSpeed * 1.94384;
         MARK_FRESH(IDX_TRUE_WIND_SPEED);
+        trueWindUpstreamMs = millis() ? millis() : 1;
       }
       if (!N2kIsNA(WindAngle)) {
         float angDeg = WindAngle * 180.0 / PI;
@@ -460,11 +463,8 @@ void WindSpeed(const tN2kMsg &N2kMsg) {
         while (angDeg >= 360.0)  angDeg -= 360.0;
         if ((WindReference == N2kWind_True_North || WindReference == N2kWind_Magnetic) &&
             !IS_STALE(IDX_HEADING_NMEA)) {
-          // Earth-frame TWD → boat-relative TWA. The subtraction is frame-valid only when wind and
-          // heading share a reference (both true-north or both magnetic); on a mismatch shift the
-          // heading into the wind's frame with the variation PGN 127250 carries (true = magnetic +
-          // east-positive variation). Unknown reference or missing variation falls back to the raw
-          // subtract — off by local variation, same as the pre-fix behavior.
+          // TWD - heading is valid only in a shared reference; on a mismatch shift heading by the
+          // 127250 variation (true = magnetic + east-positive variation). Unknown ref or no variation: raw subtract.
           float headingForFrame = HeadingNMEA;
           if (!isnan(HeadingVariationDeg) && HeadingRefNMEA >= 0) {
             bool windIsTrueNorth = (WindReference == N2kWind_True_North);
@@ -477,9 +477,7 @@ void WindSpeed(const tN2kMsg &N2kMsg) {
           while (twa >= 360.0)   twa -= 360.0;
           TrueWindAngleNMEA = twa;
         } else {
-          // True_boat / True_water → already boat-relative
-          // (or earth-frame without heading — fall through; better than nothing for Zambretti
-          //  which adds heading back in JS)
+          // Already boat-relative, or earth-frame with no heading (Zambretti adds heading back in JS)
           TrueWindAngleNMEA = angDeg;
         }
         MARK_FRESH(IDX_TRUE_WIND_ANGLE);
@@ -510,9 +508,7 @@ void WaterDepth(const tN2kMsg &N2kMsg) {
   double Offset;
 
   if (ParseN2kWaterDepth(N2kMsg, SID, DepthBelowTransducer, Offset)) {
-    // Store effective depth (transducer + offset if available; raw transducer otherwise).
-    // Offset > 0 = depth below waterline; Offset < 0 = depth below keel. Either way the sum is the
-    // physical water depth at the transducer position.
+    // Offset > 0 = depth below waterline, < 0 = below keel; either way the sum is stored as depth.
     if (n2kIn(DepthBelowTransducer, 0.0, 2000.0)) {
       double effectiveDepth_m = DepthBelowTransducer + (n2kIn(Offset, -100.0, 100.0) ? Offset : 0.0);
       if (effectiveDepth_m >= 0) {
@@ -563,30 +559,22 @@ void Attitude(const tN2kMsg &N2kMsg) {
   }
 }
 void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
-  // Victron proprietary fast-packet (VREG carrier): dispatched here, ahead of the receive gate,
-  // because the DVCC follow decode has its own master switch — and ONLY to its own decoder, so
-  // "receive off" still means nothing reaches the verbose print or the handler-table scan.
-  // Gate matches dvccRawFrameTap's (NMEA2KData || dvccEn) on purpose: the UI tells the user to
-  // watch the decoded CVL/CCL and confirm them against the GX BEFORE enabling follow, which is
-  // impossible if this carrier only decodes once follow is already on. Decode-only — the clamps
-  // stay gated on dvccEn at their application sites and in dvccTick.
+  // VREG carrier: handled ahead of the receive gate (DVCC has its own switch) and only by its own decoder.
+  // Gate matches dvccRawFrameTap's (NMEA2KData || dvccEn): the UI asks the user to verify decoded CVL/CCL
+  // against the GX BEFORE enabling follow. Decode only; the clamps stay gated on dvccEn.
   if (N2kMsg.PGN == 126720UL) {
     if ((dvccEn == 1 || NMEA2KData == 1) && dvccSrcType == 0) VictronVreg126720(N2kMsg);
     return;
   }
-  // Who is on the bus (spec §15): PGN 60928 NAME + 126996 product information. Same pre-gate
-  // placement and gate as the VREG carrier above — a capture is uninterpretable without the
-  // publisher's identity, and identity has to accumulate during the follow-off observe window.
-  // Passive only: with transmit off neither PGN can be requested. These two fall through rather
-  // than returning, so verbose logging and the handler-table scan behave exactly as before.
-  if (N2kMsg.PGN == 60928UL && (dvccEn == 1 || NMEA2KData == 1)) {
+  // Bus identity (spec §15): 60928 NAME + 126996 product info, ungated so the roster fills whenever
+  // ParseMessages runs (a transmit-only node still lists the bus, §16.2). Passive; these fall through to the normal path.
+  if (N2kMsg.PGN == 60928UL) {
     dvccNoteName((uint8_t)N2kMsg.Source, N2kMsg.Data, N2kMsg.DataLen);
-  } else if (N2kMsg.PGN == 126996UL && (dvccEn == 1 || NMEA2KData == 1)) {
+  } else if (N2kMsg.PGN == 126996UL) {
     dvccNoteProductInfo(N2kMsg);
   }
-  // Receive toggle off: drop bus data here. ParseMessages may still be running purely to service
-  // the transmit node's protocol layer (address claim, heartbeat), which the library handles
-  // before this handler — the user's "receive off" must still mean no nav/battery data flows in.
+  // Receive off: ParseMessages may still run to service the transmit node (address claim, heartbeat),
+  // so bus data is dropped here.
   if (NMEA2KData != 1) return;
   int iHandler;
   if (NMEA2KVerbose == 1) {
@@ -602,11 +590,10 @@ void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
 }
 
 // ===== DVCC-style charge-limit follow (CVL/CCL) — spec: Working Markdown Docs/DVCC_FOLLOW_SPEC.md =====
-// Decode lives here (raw tap + 126720 handler): bounded arithmetic on already-received frames, no
-// allocation, no I/O, no flash. The 1 Hz brain (dvccTick) runs the trust state machine and publishes
-// the clamps the control path reads (dvccCvlV / dvccCclA). Control integration: AdjustFieldLearnMode.
+// Decode here: arithmetic only, no allocation/I/O/flash. dvccTick (1 Hz) runs the trust machine and
+// publishes dvccCvlV / dvccCclA, consumed in AdjustFieldLearnMode.
 
-// Trust-machine constants (protection-adjacent numbers approved by Mark 2026-08-19)
+// Trust-machine constants (protection-adjacent, owner-approved values)
 #define DVCC_CCL_MAX_A 1500.0f     // charge-current limit above this (or negative) = implausible → UNTRUSTED
 #define DVCC_FLAP_DELTA_V 1.0f     // per-12V-class CVL jump between consecutive updates that counts as a flap
 #define DVCC_FLAP_COUNT 5          // more than this many flaps inside the window → UNTRUSTED
@@ -625,9 +612,8 @@ void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
 static float dvccUntrustVal = 0.0f;    // the offending value, for the UI message
 static uint8_t dvccVicLockAddr = 255;  // Victron path: bus address locked as the authority (255 = none)
 
-// Flap detection lives in the INGEST path (per decoded update, per the spec's "between
-// consecutive updates" rule) — a 1 Hz tick sampling the mailbox aliases fast flapping to
-// steady. Ingest and tick both run on the loop task, so no synchronization is needed.
+// Flap detection runs at ingest (per decoded update): a 1 Hz tick would alias fast flapping to steady.
+// Ingest and tick both run on the loop task, so no locking.
 static float dvccFlapLastCvl = NAN;
 static uint32_t dvccFlapWindowStartMs = 0;
 static uint8_t dvccFlapCount = 0;
@@ -639,10 +625,11 @@ static float dvccFlapVal = 0.0f;
 static float dvccVicCvl = NAN;
 static float dvccVicCcl = NAN;
 static bool dvccVicCut = false;  // 0x2108 said do-not-charge → effective CCL forced to 0
+// Last decode time of each held register. Silence is judged on the authority as a whole
+// (dvccRxLastMs), so without these a register that stops arriving while others keep flowing holds forever.
+static uint32_t dvccVicCvlMs = 0, dvccVicCclMs = 0, dvccVicCutMs = 0;
 
-// One clearing point for every piece of decode-side trust state. Called on manual latch reset,
-// master toggle off, and source/instance edits (dvccCfgChanged) — a stale sender lock or flap
-// history must never carry across any of those into judging a fresh authority.
+// A stale sender lock or flap history must never carry into judging a fresh authority.
 static void dvccClearDecodeState() {
   dvccFlapLastCvl = NAN;
   dvccFlapWindowStartMs = 0;
@@ -661,10 +648,8 @@ void initDvccCapture() {
   else queueConsoleMessage("DVCC: node roster PSRAM alloc failed (capture loses sender identity - follow unaffected)");
 }
 
-// Copy free text into a fixed slot for the capture file: pad spaces trimmed, anything outside
-// printable ASCII replaced. Two untrusted sources go through it — the 126996 strings a bus node
-// sends, and the owner-typed battery make/model — and the capture is line-oriented, so a newline
-// or control character reaching it unfiltered would forge header lines.
+// Inputs are untrusted (126996 strings, owner-typed battery make/model) and the capture is
+// line-oriented, so a newline or control character would forge header lines.
 void dvccCopyPlainText(char *dst, size_t dstSz, const char *src) {
   size_t n = 0;
   for (; src[n] != 0 && n + 1 < dstSz; n++) {
@@ -675,10 +660,8 @@ void dvccCopyPlainText(char *dst, size_t dstSz, const char *src) {
   dst[n] = 0;
 }
 
-// Roster slot for a bus address: allocates on first sight, and once full evicts the node heard
-// longest ago. Callers hold dvccCapMux. Returns an INDEX, not a pointer — the Arduino
-// preprocessor hoists its generated prototype above the struct definition in Xregulator.ino,
-// so a function returning DvccNode* does not compile here.
+// Callers hold dvccCapMux. Returns an index, not DvccNode*: the Arduino-generated prototype lands
+// above the struct definition in Xregulator.ino and would not compile.
 static int dvccNodeSlot(uint8_t addr) {
   if (!dvccNodes) return -1;
   for (uint8_t i = 0; i < dvccNodeCount; i++)
@@ -708,9 +691,8 @@ void dvccNoteName(uint8_t src, const unsigned char *d, int len) {
   portENTER_CRITICAL(&dvccCapMux);
   int k = dvccNodeSlot(src);
   if (k >= 0) {
-    // A different NAME on the same address means the node moved or was replaced. The 126996
-    // strings sitting in this slot belong to the previous occupant — dropping them is what stops
-    // a capture from naming the wrong device after an address-claim reshuffle.
+    // A new NAME on this address is a different node: drop the previous occupant's 126996 strings so
+    // the capture does not misname it.
     if (dvccNodes[k].haveName && (dvccNodes[k].unique != (lo & 0x1FFFFFUL) || dvccNodes[k].mfg != (uint16_t)(lo >> 21))) {
       dvccNodes[k].prodCode = 0;
       dvccNodes[k].vicProdId = 0;
@@ -729,9 +711,7 @@ void dvccNoteName(uint8_t src, const unsigned char *d, int len) {
   portEXIT_CRITICAL(&dvccCapMux);
 }
 
-// PGN 126996 Product Information - fast-packet, so it arrives here already reassembled by the core
-// library. The model string is what actually names a node ("Cerbo GX", "Lynx Smart BMS 500"), and
-// the software version is what says which Venus release's DVCC behaviour a capture was taken under.
+// PGN 126996 (fast-packet, reassembled by the library): model names the node, sw version dates the GX's DVCC behavior.
 void dvccNoteProductInfo(const tN2kMsg &N2kMsg) {
   if (!dvccNodes) return;
   unsigned short n2kVer = 0, prodCode = 0;
@@ -753,8 +733,7 @@ void dvccNoteProductInfo(const tN2kMsg &N2kMsg) {
   portEXIT_CRITICAL(&dvccCapMux);
 }
 
-// CSV2 identity of the address the limits are currently arriving from. Called from dvccTick ahead
-// of the follow gate: the observe-before-enable workflow needs it while follow is still off.
+// CSV2 identity of the current limit sender; refreshed even with follow off (observe-before-enable).
 static void dvccAuthIdentityRefresh() {
   uint16_t mfg = 0, prod = 0;
   if (dvccNodes && dvccRxSrcAddr != 255) {
@@ -793,10 +772,8 @@ static void dvccCaptureFrame(unsigned long id, unsigned char len, const unsigned
   dedupKey[slot] = key;
   dedupMs[slot] = now;
   bucket++;
-  // Re-checked under dvccCapMux, not just at entry: the unlocked check above can pass a frame
-  // that is still mid-copy when /dvccCapture (other core) sets the pause. Holding the lock across
-  // the whole slot write is what removes that one-frame tear window - the reader takes the same
-  // lock to set the pause, so a writer has either finished or backs off here.
+  // Pause re-checked under dvccCapMux: the reader (other core) sets it under the same lock, so a
+  // slot write either finishes or backs off, never tears.
   portENTER_CRITICAL(&dvccCapMux);
   if (!dvccCapPause) {
     DvccCapEntry &e = dvccCapRing[dvccCapHead];
@@ -820,9 +797,7 @@ static inline float rvcU16ToAmps(uint16_t raw) {
   return (raw > 64250U) ? NAN : (raw - 32000.0f) * 0.05f;
 }
 
-// Common mailbox write for a decoded limit pair (either dialect). Flap detection happens here,
-// on every real update — the spec's rule is per consecutive UPDATE, and only the ingest path
-// sees them all (the 1 Hz tick would alias a fast flapper to a steady value).
+// Mailbox write for a decoded limit pair (either dialect); flap detection must run here.
 static void dvccIngest(float cvl, float ccl, uint8_t srcAddr, uint8_t priority, uint8_t chgState) {
   if (!isnan(cvl)) {
     if (!isnan(dvccFlapLastCvl) && fabsf(cvl - dvccFlapLastCvl) > DVCC_FLAP_DELTA_V * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f)) {
@@ -882,17 +857,10 @@ static bool dvccDecodeVreg351(const unsigned char *p, int len, float &cvl, float
   return true;
 }
 
-// One Victron VREG register frame (either carrier), payload p = the bytes after the vreg id.
-// 0x2001 VE_REG_LINK_VSET un16 0.01 V/bit, 0xFFFF = not available: confirmed directly by Victron
-// L3 support 2026-08-31 as THE register a GX broadcasts for DVCC voltage control (spec §17).
-// 0x2016 VE_REG_LINK_CHARGE_VOLTAGE_SETPOINT is the other official vset register, decoded
-// identically — not what a GX sends, kept because another Victron node may use it.
-// 0x2015 VE_REG_LINK_CHARGE_CURRENT_LIMIT un16 0.1 A/bit (0xFFFF = limit not available/removed).
-// 0x2108 VE_REG_BMS_IO field layout is from Victron's open Lynx Smart BMS decoder (spec §14);
-// the register id itself and the 0x351 BMS-Can-mirror guess are still capture-pending.
-// A wrong provisional read stays fail-safe by construction: CVL only ever clamps downward and a
-// far-off value trips the plausibility window; CCL only moves a min-selected ceiling.
-// Returns true when the register id was recognized (even if the sender lock rejected it).
+// One Victron VREG register; p = the register value (the bytes after the vreg id, on both carriers). 0x2001 (what a GX sends, per Victron, spec §17)
+// and 0x2016: un16 0.01 V; 0x2015: un16 0.1 A; 0xFFFF = not available. 0x2108 layout is from Victron's
+// Lynx Smart BMS decoder (spec §14); its id and the 0x351 guess are capture-pending. Fail-safe if wrong:
+// CVL only clamps down, CCL only lowers a min-selected ceiling. True = id recognized, even if lock-rejected.
 static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uint8_t src) {
   if (vreg == 0x0351) {
     float cvl = NAN, ccl = NAN;
@@ -900,36 +868,34 @@ static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uin
     if (!dvccVicAcceptSender(src)) return true;
     dvccVicCvl = cvl;
     dvccVicCcl = ccl;
+    dvccVicCvlMs = dvccVicCclMs = millis();
   } else if (vreg == 0x2001 || vreg == 0x2016) {  // target voltage → CVL (0x2001 is the one a GX broadcasts)
     if (len < 2) return false;
     uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
     if (!dvccVicAcceptSender(src)) return true;
-    // 0xFFFF = not available. It is a WITHDRAWAL, not a value: the GX publishes this register only
-    // while DVCC is on and a managed battery (or an ESS Multi) supplies a charge voltage; the DVCC
-    // Maximum Charge Voltage only clamps it, never originates it, so the limit really can go
-    // away while frames keep flowing. Clearing re-ingests NAN and dvccTick drops to WAITING within
-    // 1 s; treating it as an unrecognized frame instead held the last clamp until the silence timeout.
+    // 0xFFFF is a withdrawal, not a value: the GX can drop the limit while frames keep flowing. Clearing
+    // lets dvccTick fall to WAITING within 1 s instead of holding the last clamp until silence timeout.
     dvccVicCvl = (raw == 0xFFFF) ? NAN : raw * 0.01f;
+    dvccVicCvlMs = millis();
   } else if (vreg == 0x2015) {  // current limit → CCL (un16; 0xFFFF clears the held limit, it is NOT a value)
     if (len < 2) return false;
     uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
     if (!dvccVicAcceptSender(src)) return true;
     dvccVicCcl = (raw == 0xFFFF) ? NAN : raw * 0.1f;
+    dvccVicCclMs = millis();
   } else if (vreg == 0x2108) {  // VE_REG_BMS_IO: 2-bit fields, allowed-to-charge at bits 2-3
-    // (0 = unknown, 1 = allowed, 2/3 = not allowed) per Victron's own Lynx Smart BMS decoder,
-    // dbus-ble-sensors/src/victron-lsbms.c. Revatek's whole-byte ==2 reading is ORed in until a
-    // capture picks a winner: both hypotheses mean stop charging, and a spurious cut is the safe
-    // error — 0xFF stays the not-available sentinel so a glitched byte never reads as a cut.
+    // (0 unknown, 1 allowed, 2/3 not; dbus-ble-sensors/src/victron-lsbms.c). Revatek's whole-byte ==2
+    // reading is ORed in until a capture decides: a spurious cut is the safe error. 0xFF = NA, never a cut.
     if (len < 1 || p[0] == 0xFF) return false;
     if (!dvccVicAcceptSender(src)) return true;
     uint8_t atc = (uint8_t)((p[0] >> 2) & 0x03);
     dvccVicCut = (atc >= 2) || (p[0] == 2);
+    dvccVicCutMs = millis();
   } else if (vreg == 0x0100) {  // VE_REG_PRODUCT_ID — identity only, never a limit
-    // Deliberately falls through as UNRECOGNIZED (return false): the caller uses the return value
-    // to decide whether to retry the frame under the other VREG framing, and identity must never
-    // cost us a limit decode on a frame whose id only coincidentally reads as 0x0100.
-    if (len >= 2 && dvccNodes) {
-      uint16_t pid = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    // Returns false on purpose: the caller then retries the other VREG framing, so identity never
+    // costs a limit decode on a frame that only coincidentally reads 0x0100.
+    if (len >= 3 && dvccNodes) {
+      uint16_t pid = (uint16_t)p[1] | ((uint16_t)p[2] << 8);  // value 00 <id lo> <id hi> FE (Ekrano: 00 13 C0 FE = 0xC013)
       uint32_t now = millis();
       portENTER_CRITICAL(&dvccCapMux);
       int k = dvccNodeSlot(src);
@@ -943,9 +909,14 @@ static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uin
   } else {
     return false;
   }
-  // Registers arrive one field per frame — re-ingest the held pair so the trust machine and
-  // telemetry always see the combined view. A do-not-charge command is the strongest limit:
-  // effective CCL 0 (the same obey-zero semantics Mark approved for a literal CCL=0).
+  // Re-ingest the held set so the trust machine sees the combined view; do-not-charge = CCL 0 (obey-zero).
+  // Held registers older than max(Silence Timeout, 60 s) drop: Victron's contract repeats limits more than
+  // once a minute. dvccVicCutHold = owner choice to keep a stale do-not-charge until cleared or full silence.
+  uint32_t now = millis();
+  uint32_t maxAgeMs = (uint32_t)max(dvccSilenceS, 60) * 1000UL;
+  if ((uint32_t)(now - dvccVicCvlMs) > maxAgeMs) dvccVicCvl = NAN;
+  if ((uint32_t)(now - dvccVicCclMs) > maxAgeMs) dvccVicCcl = NAN;
+  if (dvccVicCutHold != 1 && (uint32_t)(now - dvccVicCutMs) > maxAgeMs) dvccVicCut = false;
   dvccIngest(dvccVicCvl, dvccVicCut ? 0.0f : dvccVicCcl, src, 0, 0);
   return true;
 }
@@ -969,11 +940,64 @@ void VictronVreg126720(const tN2kMsg &N2kMsg) {
   }
 }
 
-// Raw-RX tap, registered on the NMEA2000_esp32_xeng fork. Runs in ParseMessages caller context
-// (loop task, core 1) for EVERY received frame — the non-candidate exit is a few integer compares.
-// Carries the §8a capture feed plus the single-frame decodes the core library can't be trusted to
-// surface: RV-C DGNs (fast-packet-range collisions) and the 0xEF00 proprietary VREG carrier.
+// ===== NMEA 2000 bus health, raw capture, per-minute history (NMEA2K_TRANSMIT_SPEC.md §16) =====
+// Same gate as the ParseMessages call in loop(); "NMEA 2000 running" everywhere in §16 means this.
+bool n2kBusRunning() {
+  return (NMEA2KData == 1 || n2kTxEnable == 1 || rvcTxEnable == 1 || dvccEn == 1) && hardwarePresent == 1;
+}
+
+// Only a real clock counts (a cold-boot estimate does not): same rule as the cloud snapshot stamp.
+bool n2kClockTrusted() {
+  return clockIsReal();
+}
+
+// Core 1 only (the push and n2kBusTick). End state is written before active falls, so a reader that sees state 2
+// sees the end stats.
+static void canCapStop(uint8_t why) {
+  const tNMEA2000_esp32::tBusStats &bs = tNMEA2000_esp32::BusStats;
+  uint32_t el = micros() - canCap.startUs;
+  canCap.elapsedUs = (why == 1 || el > canCap.durUs) ? canCap.durUs : el;
+  canCap.tec1 = bs.tec;
+  canCap.rec1 = bs.rec;
+  canCap.missed1 = bs.rxMissed;
+  canCap.overrun1 = bs.rxOverrun;
+  canCap.busOff1 = bs.busOffCount;
+  canCap.why = why;
+  canCap.stopMs = millis();
+  canCap.active = false;
+  canCap.state = 2;
+}
+
+// Called from both raw taps on Core 1, the ring's only writer: entry first, then the count.
+static void canCapPush(unsigned long id, unsigned char len, const unsigned char *buf, uint8_t tx) {
+  uint32_t t = micros() - canCap.startUs;
+  if (t > canCap.durUs) {
+    canCapStop(1);
+    return;
+  }
+  uint32_t n = canCap.count;
+  CanCapEntry &e = canCap.ring[n];
+  e.us = t;
+  e.id = (uint32_t)id;
+  e.len = (len > 8) ? 8 : len;
+  memcpy(e.data, buf, e.len);
+  e.tx = tx;
+  if (tx) canCap.txN++;
+  canCap.count = n + 1;
+  if (n + 1 >= canCap.cap) canCapStop(2);
+}
+
+void n2kRawTxTap(unsigned long id, unsigned char len, const unsigned char *buf) {
+  if (canCap.active) canCapPush(id, len, buf, 1);
+}
+
+// Raw-RX tap (NMEA2000_esp32_xeng fork), loop task core 1, EVERY frame: keep the non-candidate exit cheap.
+// Feeds the §8a capture and the single-frame decodes the library can't surface: RV-C DGNs, 0xEF00 VREG.
 void dvccRawFrameTap(unsigned long id, unsigned char len, const unsigned char *buf) {
+  // Ahead of the gate: bus health and the raw recording take the bus with receive off (§16.2, §16.3).
+  if (canCap.active) canCapPush(id, len, buf, 0);
+  if (id & (tNMEA2000_esp32::RawSffFlag | tNMEA2000_esp32::RawRtrFlag)) return;  // recorded only: no source address, no PGN
+  if (n2kLastSeenMs) n2kLastSeenMs[id & 0xFF] = n2kPassMs;
   if (NMEA2KData != 1 && dvccEn != 1) return;
   uint32_t pgn = (uint32_t)((id >> 8) & 0x1FFFFUL);
   uint8_t pf = (uint8_t)((id >> 16) & 0xFF);
@@ -1016,12 +1040,10 @@ void dvccRawFrameTap(unsigned long id, unsigned char len, const unsigned char *b
       }
     }
   } else {
-    // Victron VREG on the 0xEF00 proprietary single-frame carrier: vreg id at bytes 2-3 (LE),
-    // payload after (framing per the Revatek prior art; provisional until capture validation).
-    // Manufacturer code 358 in the 2-byte proprietary header, same as the 126720 carrier.
-    if (pgn == 61184UL && len >= 5) {
-      // Broadcast or addressed-to-us only — an addressed frame to another charger carries THAT
-      // node's per-charger allocation, never the battery limit (§13).
+    // Victron VREG on the 0xEF00 single-frame carrier: mfr 358 header, vreg id at bytes 2-3 (LE), value from
+    // byte 4. Bench-captured from an Ekrano GX 2026-10-25: 0x2001 = 82 05 00 00 (14.10 V), 0x2002 = 16 05 (13.02 V).
+    if (pgn == 61184UL && len >= 6) {
+      // Broadcast or addressed to us only (§13).
       if (dest != 0xFF && dest != NMEA2000.GetN2kSource()) return;
       uint16_t mfr = ((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) & 0x07FF;
       if (mfr != 358) return;
@@ -1031,9 +1053,227 @@ void dvccRawFrameTap(unsigned long id, unsigned char len, const unsigned char *b
   }
 }
 
-// The 1 Hz brain: trust state machine (spec §3). Publishes dvccCvlV / dvccCclA for the control
-// path. Arithmetic only. The clamps are additionally gated at the application sites on
-// dvccEn == 1, so a mid-session disable kills them even before this tick runs again.
+// The minute being accumulated; file scope so the cloud block can include it.
+static struct {
+  bool open;
+  uint32_t startMs, stamp;
+  uint8_t flags, worst, tec, rec, nodes;
+  uint32_t busOff0, rx0, tx0, lost0, berr0;
+} n2kMin = {};
+
+// One line per verdict, indexed by code - 1; every format takes (number, TEC, REC).
+static const char *const N2K_BUS_SAY[5] = {
+  "NMEA2000: bus OK, %lu other devices heard (TEC %lu, REC %lu)",
+  "NMEA2000: nothing heard on the bus (%lu frames in 30 s, TEC %lu, REC %lu)",
+  "NMEA2000: errors receiving from the bus (%lu bus errors in the last minute, TEC %lu, REC %lu) - check both terminators and the connectors",
+  "NMEA2000: no other device is acknowledging our messages (%lu frames in 10 s, TEC %lu, REC %lu) - check bus power on connector pins 2-3",
+  "NMEA2000: bus-off, the CAN controller restarted (%lu times since boot, TEC %lu, REC %lu) - check the cable and the bus power",
+};
+
+// 1 Hz on Core 1, called every pass with the bus on or off. A few compares a second, a 256-entry count, one row write
+// a minute; never formats anything but the rare console line.
+void n2kBusTick() {
+  static uint32_t lastMs = 0;
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastMs) < 1000UL) return;
+  lastMs = now;
+  const tNMEA2000_esp32::tBusStats &bs = tNMEA2000_esp32::BusStats;
+  bool running = n2kBusRunning();
+
+  // Recording: end time on a silent bus, the bus stopping, and the 15-minute free of a finished ring.
+  if (canCap.active) {
+    if (!running) canCapStop(3);
+    else if ((uint32_t)(micros() - canCap.startUs) > canCap.durUs) canCapStop(1);
+  } else if (canCap.state == 2 && (uint32_t)(now - canCap.stopMs) > 15UL * 60000UL) {
+    CanCapEntry *old = nullptr;
+    portENTER_CRITICAL(&canCapMux);
+    if (canCap.state == 2 && canCap.dlRefs == 0) {
+      old = canCap.ring;
+      canCap.ring = nullptr;
+      canCap.cap = 0;
+      canCap.count = 0;
+      canCap.state = 0;
+    }
+    portEXIT_CRITICAL(&canCapMux);
+    if (old) free(old);
+  }
+
+  static bool wasRunning = false;
+  static uint32_t lostPrev = 0, ovrPrev = 0, ovrRun = 0, ovrSaid = 0, runSinceMs = 0, rxPrev = 0, boPrev = 0, lastRxMs = 0, lastBoMs = 0;
+  // Bus errors counted for code 3 only across ticks that received frames with TEC < 128 on both ends: alone on the wire our
+  // own ACK-error retransmits also count as bus errors, and they must not read as receive errors once a peer appears.
+  static uint32_t berrHist[6];  // counted bus-error total every 10 s; the slot at berrIdx is the one from ~60 s ago
+  static uint32_t berrPrevRaw = 0, berrCounted = 0;
+  static bool berrPrevOk = false;
+  static uint8_t berrIdx = 0, berrTick = 0;
+  static uint8_t cand = 0, said = 0;
+  static uint32_t candMs = 0, lostSaid = 0, lostSaidMs = 0;
+  uint32_t ovr = bs.rxOverrun, lost = bs.rxMissed + ovr, rxNow = bs.rxFrames, boNow = bs.busOffCount, berrNow = bs.busErrors;
+  // Losses from while the drain was off are by design (the queue filling during setup, or with receive switched off), and
+  // BusStats publishes them up to 1 s late (errorMonitorTask's poll): billed only from 2 s into a running stretch.
+  if (!running) runSinceMs = 0;
+  else if (runSinceMs == 0) runSinceMs = now | 1;
+  if (running && (uint32_t)(now - runSinceMs) >= 2000UL) {
+    n2kRxLostRun += lost - lostPrev;
+    ovrRun += ovr - ovrPrev;
+  }
+  lostPrev = lost;
+  ovrPrev = ovr;
+  const bool gotRx = (rxNow != rxPrev);
+  if (gotRx) { rxPrev = rxNow; lastRxMs = now; }
+  if (boNow != boPrev) { boPrev = boNow; lastBoMs = now; }
+
+  if (n2kMin.open && (!running || (uint32_t)(now - n2kMin.startMs) >= 60000UL)) {
+    N2kBusRow r;
+    r.stamp = n2kMin.stamp;
+    r.flags = n2kMin.flags;
+    r.worst = n2kMin.worst;
+    r.tecMax = n2kMin.tec;
+    r.recMax = n2kMin.rec;
+    r.nodesMax = n2kMin.nodes;
+    r.busOffs = (uint8_t)min(boNow - n2kMin.busOff0, (uint32_t)255);
+    r.txFrames = (uint16_t)min(bs.txFrames - n2kMin.tx0, (uint32_t)65535);
+    r.rxFrames = rxNow - n2kMin.rx0;
+    r.rxLost = (uint16_t)min(n2kRxLostRun - n2kMin.lost0, (uint32_t)65535);
+    r.busErrors = (uint16_t)min(berrNow - n2kMin.berr0, (uint32_t)65535);
+    n2kBusLogSeq = n2kBusLogSeq + 1;
+    __sync_synchronize();
+    n2kBusLog[n2kBusLogHead] = r;
+    n2kBusLogHead = (uint16_t)((n2kBusLogHead + 1) % N2K_BUSLOG_N);
+    if (n2kBusLogCount < N2K_BUSLOG_N) n2kBusLogCount++;
+    __sync_synchronize();
+    n2kBusLogSeq = n2kBusLogSeq + 1;
+    n2kMin.open = false;
+    // Lost frames are our drain, never the owner's wiring: console and CSV2 only, at most one line per 10 minutes.
+    if (n2kRxLostRun != lostSaid && (lostSaidMs == 0 || (uint32_t)(now - lostSaidMs) >= 600000UL)) {
+      // Queue full = the loop drained too slowly for a burst; overrun = the receive interrupt was held off (it is not in
+      // IRAM in this core, so a flash write defers it) and the controller's own buffer filled.
+      uint32_t n = n2kRxLostRun - lostSaid, o = ovrRun - ovrSaid;
+      queueConsoleMessageF("NMEA2000: %lu received frames lost since the last report (%lu since boot): %lu with the receive queue full, %lu to a controller overrun",
+                           (unsigned long)n, (unsigned long)n2kRxLostRun, (unsigned long)(n - o), (unsigned long)o);
+      lostSaid = n2kRxLostRun;
+      ovrSaid = ovrRun;
+      lostSaidMs = now;
+    }
+  }
+
+  if (!running) {
+    wasRunning = false;
+    n2kBusVerdictCode = 0;
+    n2kNodesHeard = 0;
+    cand = said = 0;
+    return;
+  }
+  if (!wasRunning) {
+    wasRunning = true;
+    berrPrevRaw = berrNow;
+    berrPrevOk = false;
+    for (uint8_t i = 0; i < 6; i++) berrHist[i] = berrCounted;
+    if (!n2kLastSeenMs) {
+      n2kLastSeenMs = (uint32_t *)ps_malloc(256 * sizeof(uint32_t));
+      if (n2kLastSeenMs) memset(n2kLastSeenMs, 0, 256 * sizeof(uint32_t));
+    }
+    if (!n2kBusLog) {
+      n2kBusLog = (N2kBusRow *)ps_malloc(sizeof(N2kBusRow) * N2K_BUSLOG_N);
+      if (!n2kBusLog) queueConsoleMessage("NMEA2000: bus history PSRAM alloc failed (history and the daily bus summary unavailable)");
+    }
+  }
+  const bool berrOkNow = gotRx && bs.tec < 128;
+  if (berrPrevOk && berrOkNow) berrCounted += berrNow - berrPrevRaw;
+  berrPrevRaw = berrNow;
+  berrPrevOk = berrOkNow;
+  if (++berrTick >= 10) {
+    berrTick = 0;
+    berrHist[berrIdx] = berrCounted;
+    berrIdx = (uint8_t)((berrIdx + 1) % 6);
+  }
+  uint32_t berrPerMin = berrCounted - berrHist[berrIdx];
+
+  int self = (n2kSrcAddrLive >= 0 && n2kSrcAddrLive <= 251) ? n2kSrcAddrLive : -1;
+  uint16_t nodes = 0;
+  if (n2kLastSeenMs) {
+    for (int a = 0; a < 255; a++) {
+      uint32_t t = n2kLastSeenMs[a];
+      if (t != 0 && a != self && (uint32_t)(now - t) <= N2K_HEARD_MS) nodes++;
+    }
+  }
+  n2kNodesHeard = nodes;
+
+  // §16.2 table, first match wins. 128 / 96: error-passive and the TWAI default warning limit.
+  uint32_t tec = bs.tec, rec = bs.rec;
+  bool rx10 = lastRxMs != 0 && (uint32_t)(now - lastRxMs) <= 10000UL;
+  bool rxHeard = lastRxMs != 0 && (uint32_t)(now - lastRxMs) <= N2K_HEARD_MS;
+  uint8_t v;
+  // Also while the controller sits in bus-off / recovering: a bus held dominant never gives recovery its 128 idle sequences.
+  if ((lastBoMs != 0 && (uint32_t)(now - lastBoMs) < 60000UL) || bs.state == 2 || bs.state == 3) v = 5;
+  else if ((n2kTxEnable == 1 || rvcTxEnable == 1) && tec >= 128 && rec < 96 && !rx10) v = 4;
+  else if (rec >= 96 || (rx10 && berrPerMin > 10)) v = 3;
+  else if (!rxHeard) v = 2;
+  else v = 1;
+  n2kBusVerdictCode = v;
+
+  if (v != cand) {
+    cand = v;
+    candMs = now;
+  }
+  if (cand != said && (uint32_t)(now - candMs) >= 10000UL) {
+    said = cand;
+    uint32_t num = (cand == 1) ? nodes : (cand == 3) ? berrPerMin : (cand == 5) ? boNow : 0;
+    queueConsoleMessageF(N2K_BUS_SAY[cand - 1], (unsigned long)num, (unsigned long)tec, (unsigned long)rec);
+  }
+
+  if (n2kBusLog) {
+    if (!n2kMin.open) {
+      bool ck = n2kClockTrusted();
+      n2kMin.open = true;
+      n2kMin.startMs = now;
+      n2kMin.stamp = ck ? (uint32_t)getCurrentTimestamp() : now / 1000UL;
+      n2kMin.flags = ck ? 0 : 1;
+      n2kMin.worst = n2kMin.tec = n2kMin.rec = n2kMin.nodes = 0;
+      n2kMin.busOff0 = boNow;
+      n2kMin.rx0 = rxNow;
+      n2kMin.tx0 = bs.txFrames;
+      n2kMin.lost0 = n2kRxLostRun;
+      n2kMin.berr0 = berrNow;
+    }
+    if (v > n2kMin.worst) n2kMin.worst = v;
+    if (tec > n2kMin.tec) n2kMin.tec = (uint8_t)min(tec, (uint32_t)255);
+    if (rec > n2kMin.rec) n2kMin.rec = (uint8_t)min(rec, (uint32_t)255);
+    if (nodes > n2kMin.nodes) n2kMin.nodes = (uint8_t)min(nodes, (uint16_t)255);
+  }
+}
+
+// CLOUD_DAILY_LIST n2k_* rows: the last 24 h of history plus the open minute. Core 1, the history's writer, so no lock.
+void n2kBusDailyRefresh() {
+  int worst = 0, bo = 0, lost = 0, nodes = 0;
+  if (n2kBusLog) {
+    bool ck = n2kClockTrusted();
+    uint32_t nowUpS = millis() / 1000UL;
+    uint32_t nowEp = ck ? (uint32_t)getCurrentTimestamp() : 0;
+    for (uint16_t i = 0; i < n2kBusLogCount; i++) {
+      const N2kBusRow &r = n2kBusLog[i];
+      uint32_t age = (r.flags & 1) ? nowUpS - r.stamp : (ck ? nowEp - r.stamp : 0);
+      if (age > 86400UL) continue;
+      if (r.worst > worst) worst = r.worst;
+      if (r.nodesMax > nodes) nodes = r.nodesMax;
+      bo += r.busOffs;
+      lost += r.rxLost;
+    }
+  }
+  if (n2kMin.open) {
+    if (n2kMin.worst > worst) worst = n2kMin.worst;
+    if (n2kMin.nodes > nodes) nodes = n2kMin.nodes;
+    bo += (int)(tNMEA2000_esp32::BusStats.busOffCount - n2kMin.busOff0);
+    lost += (int)(n2kRxLostRun - n2kMin.lost0);
+  }
+  n2kDayWorst = worst;
+  n2kDayBusOffs = bo;
+  n2kDayRxLost = lost;
+  n2kDayNodesMax = nodes;
+}
+
+// Trust state machine (spec §3), 1 Hz. The clamps are also gated on dvccEn at the application sites, so
+// a mid-session disable takes effect before the next tick.
 void dvccTick() {
   static uint32_t lastTickMs = 0;
   uint32_t now = millis();
@@ -1058,9 +1298,8 @@ void dvccTick() {
     }
   }
   if (dvccCfgChanged) {
-    // Source/instance edited, or follow just enabled: judge the authority with clean decode
-    // state (sender lock, flap history, held Victron registers). An UNTRUSTED latch is
-    // deliberately preserved — it clears only via the reset button, the master toggle, or reboot.
+    // Clean decode state for a fresh authority. An UNTRUSTED latch deliberately survives: it clears
+    // only via the reset button, the master toggle, or reboot.
     dvccCfgChanged = false;
     settleStartMs = 0;
     settleFrames = 0;
@@ -1073,9 +1312,8 @@ void dvccTick() {
     dvccUntrustReason = 0;  // master off/on is an approved latch-reset path
     settleStartMs = 0;
     settleFrames = 0;
-    // Clear on the OFF transition only. Victron sends CVL and CCL as separate register frames, so
-    // clearing every tick while off meant the held pair was wiped between them and the two limits
-    // could never be read together — exactly the check the UI asks for before follow is enabled.
+    // Clear on the OFF transition only: CVL and CCL arrive in separate Victron frames, and per-tick
+    // clearing would stop the UI from ever showing both before follow is enabled.
     if (!offStateCleared) {
       dvccClearDecodeState();
       offStateCleared = true;
@@ -1093,8 +1331,7 @@ void dvccTick() {
     return;
   }
 
-  // Ingest-side flap detection latched (checked ahead of silence — a lying authority that then
-  // goes quiet must still latch, never quietly re-settle).
+  // Checked ahead of silence: a flapping authority that then goes quiet must still latch.
   if (dvccFlapLatch) {
     dvccFlapLatch = false;
     dvccState = DVCC_UNTRUSTED;
@@ -1119,8 +1356,7 @@ void dvccTick() {
     return;
   }
 
-  // Frames are arriving — validate the latest values every tick (a lying authority must not
-  // keep steering; one implausible value latches UNTRUSTED, never retried automatically).
+  // Validate every tick; one implausible value latches UNTRUSTED, never retried automatically.
   bool cvlOk = isnan(dvccRxCvl) || (dvccRxCvl >= dvccCvlMin && dvccRxCvl <= dvccCvlMax);
   bool cclOk = isnan(dvccRxCcl) || (dvccRxCcl >= 0.0f && dvccRxCcl <= DVCC_CCL_MAX_A);
   if (!cvlOk || !cclOk) {
@@ -1178,6 +1414,21 @@ tN2kChargeState n2kChargeStateFromStage(uint8_t stage) {
   }
 }
 
+// 127750 operating state: the numbers a Victron GX shows as /State. Hub1 (0xFC) is the GX's "External control".
+// No Fault mapping: SYS_MODE_FAULT also covers ordinary stops (shutdown ramp, commissioning rest), so it would lie.
+tN2kConvMode n2kConvModeFromStage(uint8_t stage) {
+  switch (stage) {
+    case CHARGE_STAGE_BULK: return N2kCICS_Bulk;
+    case CHARGE_STAGE_ABSORPTION: return N2kCICS_Absorption;
+    case CHARGE_STAGE_FLOAT:
+    case CHARGE_STAGE_MAINTAIN: return N2kCICS_Float;
+    case CHARGE_STAGE_MANUAL:
+    case CHARGE_STAGE_TARGET_V:
+    case CHARGE_STAGE_COMMISSION: return N2kCICS_Hub1;
+    default: return N2kCICS_Off;  // NONE, IDLE
+  }
+}
+
 // Labelling only — both charger PGNs carry it; nothing in the control path reads it.
 tN2kChargerMode n2kChargerModeSetting() {
   switch (n2kChgrMode) {
@@ -1187,10 +1438,8 @@ tN2kChargerMode n2kChargerModeSetting() {
   }
 }
 
-// The alternator temperature the alarm engine uses: TempSource picks OneWire vs thermistor,
-// -99 is the thermistor's disconnected sentinel. NAN = no usable reading. Same 20s freshness
-// test as the stale alarm / temp-stale field cut — without it a sensor that dies mid-run
-// transmits its last good value forever and the MFD data-lost alarm can never fire.
+// Alarm-engine alternator temp (TempSource: OneWire vs thermistor; -99 = thermistor disconnected), NAN = unusable.
+// 20 s freshness as the stale alarm / temp-stale cut, so a sensor dying mid-run never transmits its last value forever.
 float n2kAltTempF() {
   if (IgnoreTemperature || LimpHome) return NAN;   // running without the alternator temperature: nothing goes on the bus
   unsigned long ts = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
@@ -1199,17 +1448,20 @@ float n2kAltTempF() {
   return (temperatureThermistor == -99) ? NAN : (float)temperatureThermistor;
 }
 
-// ===== RV-C producer — spec: Working Markdown Docs/RVC_TRANSMIT_SPEC.md =====
-// RV-C is a J1939 application layer that shares the 250 kbps wire with NMEA 2000, so its DGNs are
-// composed as tN2kMsg and go out through the same SendMsg path and the same claimed address.
-// Field scalings are RV-C Table 5.3 (spec revision July 31, 2025). Every "not available" value is
-// all-bits-1, the J1939 convention — a source we do not have is NEVER encoded as a number.
+// Bus readings, NAN = not available: the n2kAltTempF rule — an ignored sensor, or any sensor under LimpHome, never goes out.
+static float n2kAltVolts() { return (!LimpHome && !IgnoreBattV2 && battVFresh()) ? BatteryV : NAN; }   // ADS1115, alternator side
+static float n2kBattVolts() { return (!LimpHome && !IgnoreBattVMain && ibvFresh()) ? getBatteryVoltage() : NAN; }
+static float n2kAltAmps() { return (!LimpHome && !IgnoreAltCurrent && altAmpsFresh()) ? MeasuredAmps : NAN; }
+static float n2kRpm() { return (!LimpHome && !IgnoreRPM) ? RPM : NAN; }
+static inline double n2kOrNA(float v) { return isfinite(v) ? (double)v : N2kDoubleNA; }
 
-// Forces SINGLE-FRAME transmit. DGNs 130816-131071 (1FFC7h, 1FFFBh-1FFFDh) sit inside the range
-// the NMEA2000 library treats as proprietary FAST PACKET; without this, SendMsg would prepend a
-// fast-packet sequence byte and split an 8-byte RV-C frame across two CAN frames, which no RV-C
-// node can decode. tNMEA2000::IsFastPacket() returns false for Priority>=0x80, and N2ktoCanID()
-// masks priority to 3 bits, so the wire still carries RV-C's default priority 6.
+// ===== RV-C producer — spec: Working Markdown Docs/RVC_TRANSMIT_SPEC.md =====
+// RV-C shares the 250 kbps J1939 wire with N2K: DGNs are composed as tN2kMsg and go out via the same
+// SendMsg and claimed address. Scalings: RV-C Table 5.3 (rev July 31, 2025). Not available = all-bits-1, never a number.
+
+// Forces single-frame TX: DGNs 130816-131071 sit in the library's proprietary fast-packet range, which
+// would split an 8-byte RV-C frame in two. IsFastPacket() is false for Priority >= 0x80, and N2ktoCanID()
+// masks priority to 3 bits, so the wire still carries priority 6.
 static void rvcBeginMsg(tN2kMsg &m, unsigned long dgn) {
   m.SetPGN(dgn);
   m.Priority = 6 | 0x80;
@@ -1260,19 +1512,10 @@ static uint8_t rvcChargeState() {
   }
 }
 
-// CHARGER_STATUS_3 derating reason (spec Table 6.20.10b) from our banner limiter code. The RV-C
-// enum only names thermal, battery-temperature and battery-voltage causes, so the limiters with
-// no equivalent (RPM/belt cap, max duty, protection recovery, BMS current limit) report the
-// derating bit with reason 255 = not available rather than a wrong named cause.
-// Codes 10 (manual field) and 11 (min field floor) are NOT derating: manual output is whatever the
-// operator typed, and the floor RAISES output. Claiming a derate for either would tell the bus the
-// charger is holding back when it is not. 12 (zero-current command) joins them for the same reason as
-// 10: zero IS the operator's command, not a derate. 13 (warm-up ramp) and 14 (Hi->Lo glide) ARE real
-// derates and fall to the default 255, which is right — the RV-C enum has no name for either. Every code
-// here reports what it reported before it had a name of its own EXCEPT 11, which used to fall through to
-// 1 (derating, reason 0xFF): the floor raises output, so "not derating" is the true statement, and after
-// the ctrlLimiter reorder (6_functions.ino) 11 only wins when no thermal/BMS/battery ceiling binds — so a
-// real derate can no longer hide behind it.
+// CHARGER_STATUS_3 derating (spec Table 6.20.10b). The RV-C enum names only thermal, battery-temp and
+// battery-voltage causes; other limiters report derating with reason 255. 10 (manual), 11 (min field floor,
+// raises output) and 12 (zero-current command) are not derates. 11 wins only when no thermal/BMS/battery
+// ceiling binds (ctrlLimiter order, 6_functions.ino), so a real derate cannot hide behind it.
 static void rvcDeratingFromLimiter(uint8_t &derating, uint8_t &reason) {
   if (ctrlLimiter == 0 || ctrlLimiter == 10 || ctrlLimiter == 11 || ctrlLimiter == 12) { derating = 0; reason = 0; return; }
   derating = 1;
@@ -1285,11 +1528,8 @@ static void rvcDeratingFromLimiter(uint8_t &derating, uint8_t &reason) {
   }
 }
 
-// Highest-severity active fault as an RV-C service point. SPN encoding per spec 3.2.5.5:
-// MSB byte, ISB byte, then 3 LS bits. Under DSA 76 (Charge Controller) the spec defines no SPN
-// table, so ours is documented in RVC_TRANSMIT_SPEC.md §5 — MSB 1 keeps the Charger table's
-// numbering for the points that exist there (DC voltage / DC current / battery temperature) and
-// MSB 2 carries the alternator-specific points the Charger table has no room for.
+// Highest-severity active fault as an RV-C service point (SPN per spec 3.2.5.5). DSA 76 has no SPN table;
+// ours is in RVC_TRANSMIT_SPEC.md §5 (MSB 1 = Charger-table points, MSB 2 = alternator-specific).
 // Returns true when a fault is active; red = severe (charging stopped), else yellow.
 static bool rvcActiveFault(uint8_t &msb, uint8_t &lsb, uint8_t &fmi, bool &red) {
   red = true;
@@ -1345,20 +1585,79 @@ static bool rvcActiveFault(uint8_t &msb, uint8_t &lsb, uint8_t &fmi, bool &red) 
   return false;
 }
 
-// Sends AT MOST one PGN per loop pass (rotating scan for fairness); compose + enqueue is µs-scale
-// because the _xeng driver never blocks — frames the TWAI queue refuses land in the core library's
-// retry ring and eventually drop (counted). Missing sources publish N2K not-available, never a
-// stale/fabricated number; the single-value 130312 is skipped entirely instead.
+// Brings the library's mode, transmit list and device instance in line with the settings. Boot calls it before Open(),
+// which runs the claim; after that only Core 1 may call it (the NMEA2000 object is not thread-safe).
+void n2kApplyNodeConfig(bool live) {
+  static int appliedInst = -1;
+  if (n2kDeviceInstance != appliedInst) {  // a NAME change re-sends the address claim by itself while the node is live
+    NMEA2000.SetDeviceInformationInstances((unsigned char)(n2kDeviceInstance & 0x07),
+                                           (unsigned char)((n2kDeviceInstance >> 3) & 0x1F));
+    appliedInst = n2kDeviceInstance;
+  }
+  NMEA2000.ExtendTransmitMessages(n2kTxEnable == 1 ? N2kTransmitMessages : nullptr);  // never advertise N2K PGNs an RV-C-only node will not send
+  bool want = (n2kTxEnable == 1 || rvcTxEnable == 1);  // RV-C rides the same node: one address claim, one mode
+  if (want == n2kNodeActive) return;
+  if (want) {
+    NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, n2kPreferredAddr);
+    n2kSrcAddrLive = n2kPreferredAddr;
+    if (live) {
+      NMEA2000.Restart();  // starts the address claim; at boot Open() does it
+      queueConsoleMessageF("NMEA2000: joining the bus, claiming address %d", (int)n2kPreferredAddr);
+    }
+  } else {
+    if (n2kSrcAddrLive >= 0 && n2kSrcAddrLive <= 251) n2kPreferredAddr = (uint8_t)n2kSrcAddrLive;
+    NMEA2000.SetMode(tNMEA2000::N2km_ListenOnly, n2kPreferredAddr);
+    n2kSrcAddrLive = -1;
+    if (live) queueConsoleMessage("NMEA2000: left the bus, listening only");
+  }
+  n2kNodeActive = want;
+}
+
+// At most one PGN per pass (rotating scan). The _xeng driver never blocks: refused frames go to the library's
+// retry ring and drop (counted). Missing sources publish NA; the single-value 130312 is skipped instead.
 void nmea2kTransmitTick() {
-  if (n2kTxEnable != 1 && rvcTxEnable != 1) return;
+  static bool n2kCfgInfoSent = false, n2kCfgInfoArmed = false, n2kInstDescPending = false;
+  static uint32_t n2kCfgInfoAtMs = 0;
+  // A GX or display wrote installation description 1 / 2 (126208; a GX shows field 1 as the CustomName). Persisted
+  // at field-off like the address; printable ASCII only, since the text rides the cloud settings JSON.
+  if (NMEA2000.ReadResetInstallationDescriptionChanged()) n2kInstDescPending = true;
+  if (n2kInstDescPending && fieldCutSettled(2000)) {
+    char raw[Max_N2kConfigurationInfoField_len], clean[Max_N2kConfigurationInfoField_len];
+    NMEA2000.GetInstallationDescription1(raw, sizeof(raw));
+    dvccCopyPlainText(clean, sizeof(clean), raw);
+    settingWrite(NK_n2kInstDesc1, clean);
+    NMEA2000.GetInstallationDescription2(raw, sizeof(raw));
+    dvccCopyPlainText(clean, sizeof(clean), raw);
+    settingWrite(NK_n2kInstDesc2, clean);
+    n2kInstDescPending = false;
+  }
+  if (n2kTxEnable != 1 && rvcTxEnable != 1) {
+    n2kCfgInfoSent = n2kCfgInfoArmed = false;
+    return;
+  }
 
   // Persist a claim/renegotiation result. NVS write is deferred to field-off (no flash in the
   // control path); claims normally complete at boot with the field down anyway.
   if (NMEA2000.ReadResetAddressChanged()) {
     n2kSrcAddrLive = NMEA2000.GetN2kSource();
     n2kAddrPending = (uint8_t)n2kSrcAddrLive;
+    if (n2kSrcAddrLive <= 251) n2kPreferredAddr = (uint8_t)n2kSrcAddrLive;  // 254 = lost the claim; keep the last good one
+    n2kCfgInfoSent = false;
   }
-  if (n2kAddrPending != 255 && gpio4IsLow) {
+  // 126998 is on-request only; broadcast it once per join (2 s after a valid claim) in case a GX never asks.
+  if (n2kTxEnable != 1 || !n2kNodeActive || NMEA2000.GetN2kSource() > 251) {
+    n2kCfgInfoSent = false;
+    n2kCfgInfoArmed = false;
+  } else if (!n2kCfgInfoSent) {
+    if (!n2kCfgInfoArmed) {
+      n2kCfgInfoArmed = true;
+      n2kCfgInfoAtMs = millis();
+    } else if (millis() - n2kCfgInfoAtMs >= 2000UL) {
+      NMEA2000.SendConfigurationInformation();  // a refused send stays pending inside the library, which retries it
+      n2kCfgInfoSent = true;
+    }
+  }
+  if (n2kAddrPending != 255 && fieldCutSettled(2000)) {   // settled like the other field-off writers, not the raw cut flag
     settingWrite(NK_n2kSrcAddr, String((int)n2kAddrPending).c_str());
     n2kAddrPending = 255;
   }
@@ -1374,6 +1673,7 @@ void nmea2kTransmitTick() {
                    SLOT_ENG_RAPID,
                    SLOT_ENG_DYN,
                    SLOT_BATTCFG,
+                   SLOT_CONV,          // 127750 converter status: charge state in the numbers a GX uses for /State
                    SLOT_RVC_CHGR,      // ---- RV-C family below this line (see the master gate in the scan) ----
                    SLOT_RVC_CHGR2,
                    SLOT_RVC_CHGR3,
@@ -1385,15 +1685,16 @@ void nmea2kTransmitTick() {
                    SLOT_N };
   // ms. N2K slots use the NMEA-recommended rates; RV-C slots use its "normal broadcast gap"
   // (spec 6.20.8a/6.20.9a/6.20.10a/6.5.2a-6.5.4a). DM_RV re-arms to 1000 ms while faulted.
-  static const uint32_t ivl[SLOT_N] = { 1500, 1500, 1500, 1500, 2000, 2000, 1500, 1500, 100, 500, 15000,
+  static const uint32_t ivl[SLOT_N] = { 1500, 1500, 1500, 1500, 2000, 2000, 1500, 1500, 100, 500, 15000, 1500,
                                         5000, 500, 500, 5000, 500, 500, 500, 5000 };
   static uint32_t nextDue[SLOT_N];
   static bool seeded = false;
   // Per-stream SIDs: each 127508+127506 pair shares one (ties the pair to the same sample set)
   // and each stream bumps its own, so disabling one stream can't freeze another's SID.
-  static uint8_t sidBatt = 0, sidAlt = 0, sidTemp = 0, sidTempExtra = 0;
+  static uint8_t sidBatt = 0, sidAlt = 0, sidTemp = 0, sidTempExtra = 0, sidConv = 0;
   static uint8_t rr = 0;
   static tN2kChargeState lastChgState = N2kCS_Unavailable;
+  static tN2kConvMode lastConvState = N2kCICS_NotAvailable;
   static uint8_t lastRvcState = 0xFF;
   uint32_t now = millis();
   if (!seeded) {  // stagger initial phases so the 1500ms PGNs never bunch into one pass
@@ -1404,6 +1705,9 @@ void nmea2kTransmitTick() {
   // Charge-stage change sends 127507 promptly instead of waiting out its interval
   if (n2kTxEnable == 1 && n2kChgrEnable == 1 && n2kChargeStateFromStage(getChargeStageDisplayCode()) != lastChgState && (int32_t)(now - nextDue[SLOT_CHGR]) < 0) {
     nextDue[SLOT_CHGR] = now;
+  }
+  if (n2kTxEnable == 1 && n2kConvStatEnable == 1 && n2kConvModeFromStage(getChargeStageDisplayCode()) != lastConvState && (int32_t)(now - nextDue[SLOT_CONV]) < 0) {
+    nextDue[SLOT_CONV] = now;
   }
   // Same idea on the RV-C side: CHARGER_STATUS is "5000 ms or on change" (spec 6.20.8a)
   if (rvcTxEnable == 1 && rvcChgrEnable == 1 && rvcChargeState() != lastRvcState && (int32_t)(now - nextDue[SLOT_RVC_CHGR]) < 0) {
@@ -1425,10 +1729,10 @@ void nmea2kTransmitTick() {
         if (n2kBattEnable == 1) {
           sidBatt = (uint8_t)((sidBatt + 1) % 253);
           // Battery temperature: the BATT probe only — never a re-broadcast network value
-          bool battProbeOk = battTempProbeEnable == 1 && tempProbeFresh(IDX_BATT_TEMP_PROBE) && isfinite(BatteryTempProbeF);
+          bool battProbeOk = !LimpHome && battTempProbeEnable == 1 && tempProbeFresh(IDX_BATT_TEMP_PROBE) && isfinite(BatteryTempProbeF);
           SetN2kDCBatStatus(N2kMsg, (unsigned char)n2kBattInstance,
-                            ibvFresh() ? getBatteryVoltage() : N2kDoubleNA,
-                            (HAS_BATT_SHUNT && dataTimestamps[IDX_BCUR] != 0 && (uint32_t)(millis() - dataTimestamps[IDX_BCUR]) <= 2500UL) ? (double)Bcur : N2kDoubleNA,
+                            n2kOrNA(n2kBattVolts()),
+                            (!LimpHome && HAS_BATT_SHUNT && dataTimestamps[IDX_BCUR] != 0 && (uint32_t)(millis() - dataTimestamps[IDX_BCUR]) <= 2500UL) ? (double)Bcur : N2kDoubleNA,
                             battProbeOk ? FToKelvin(BatteryTempProbeF) : N2kDoubleNA,
                             sidBatt);
           composed = true;
@@ -1437,8 +1741,10 @@ void nmea2kTransmitTick() {
       case SLOT_BATT_DC:
         if (n2kBattEnable == 1) {
           SetN2kDCStatus(N2kMsg, sidBatt, (unsigned char)n2kBattInstance, N2kDCt_Battery,
-                         // never echo an NMEA 2000 monitor's own SoC back onto its bus; a VE.Direct monitor's is bridged
-                         (socInfoAvailable && socShownOk() && BattMonSrc != 1) ? (unsigned char)(socShownX100() / 100) : N2kUInt8NA,
+                         // never echo an NMEA 2000 monitor's own SoC back onto its bus; a VE.Direct monitor's is bridged.
+                         // The regulator's own count comes off its shunt, which Limp Home ignores like every sensor.
+                         (socInfoAvailable && socShownOk() && BattMonSrc != 1 && (BattMonSrc != 0 || !LimpHome))
+                           ? (unsigned char)(socShownX100() / 100) : N2kUInt8NA,
                          N2kUInt8NA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA);
           composed = true;
         }
@@ -1448,8 +1754,8 @@ void nmea2kTransmitTick() {
           float tF = n2kAltTempF();
           sidAlt = (uint8_t)((sidAlt + 1) % 253);
           SetN2kDCBatStatus(N2kMsg, (unsigned char)n2kAltInstance,
-                            battVFresh() ? (double)BatteryV : N2kDoubleNA,
-                            (altAmpsFresh() && !IgnoreAltCurrent) ? (double)MeasuredAmps : N2kDoubleNA,
+                            n2kOrNA(n2kAltVolts()),
+                            n2kOrNA(n2kAltAmps()),
                             isfinite(tF) ? FToKelvin(tF) : N2kDoubleNA, sidAlt);
           composed = true;
         }
@@ -1506,7 +1812,7 @@ void nmea2kTransmitTick() {
         break;
       case SLOT_ENG_RAPID:
         if (n2kEngRpmEnable == 1) {
-          SetN2kEngineParamRapid(N2kMsg, (unsigned char)n2kEngInstance, IgnoreRPM ? N2kDoubleNA : (double)RPM);
+          SetN2kEngineParamRapid(N2kMsg, (unsigned char)n2kEngInstance, n2kOrNA(n2kRpm()));
           composed = true;
         }
         break;
@@ -1519,18 +1825,19 @@ void nmea2kTransmitTick() {
             bool hardTempCut = gpio4IsLow && (g_fieldEventReason == REASON_TEMP_CRITICAL || g_fieldEventReason == REASON_TEMP_WARNING || g_fieldEventReason == REASON_TEMP_SUSTAINED);
             float tF = n2kAltTempF();
             if (hardTempCut || (TempAlarm > 0 && isfinite(tF) && tF > TempAlarm)) s1.Bits.OverTemperature = 1;
-            float v = getBatteryVoltage();
-            // same class-scaled disconnected-sensor floor as CheckAlarms
-            if (VoltageAlarmLow > 0 && v < VoltageAlarmLow && v > 8.0f * SYSTEM_VOLTAGE_CLASS / 12.0f) s1.Bits.LowSystemVoltage = 1;
-            // Charge Indicator = not charging when it should be: protective field cut (the same set as
-            // the JS FIELD_FAULT_REASONS — every sensor / over-voltage / over-current / temperature
-            // reason; never a deliberate state) while the engine turns fast enough that the field
-            // would otherwise be allowed.
+            float v = 0.0f;
+            // same trusted reading and class-scaled disconnected-sensor floor as CheckAlarms
+            if (alarmBatteryVoltage(v) && VoltageAlarmLow > 0 && v < VoltageAlarmLow && v > 8.0f * SYSTEM_VOLTAGE_CLASS / 12.0f) s1.Bits.LowSystemVoltage = 1;
+            // Charge Indicator: protective fault cut (same set as JS FIELD_FAULT_REASONS, never a deliberate
+            // state) while RPM would otherwise allow field.
+            // An ignored tach hands "engine running" to the ignition, as the control tick does; Limp Home has neither.
             bool faultCut = gpio4IsLow && fieldReasonIsFault((FieldEventReason)g_fieldEventReason);
-            if (faultCut && RPM > MinRPMForField) s1.Bits.ChargeIndicator = 1;
+            const float rpm = n2kRpm();
+            const bool engineAllowsField = isnan(rpm) ? (IgnoreRPM && !LimpHome && Ignition == 1) : (rpm > MinRPMForField);
+            if (faultCut && engineAllowsField) s1.Bits.ChargeIndicator = 1;
           }
           SetN2kEngineDynamicParam(N2kMsg, (unsigned char)n2kEngInstance, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA,
-                                   battVFresh() ? (double)BatteryV : N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA,
+                                   n2kOrNA(n2kAltVolts()), N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA,
                                    N2kInt8NA, N2kInt8NA, s1, 0);
           composed = true;
         }
@@ -1550,6 +1857,16 @@ void nmea2kTransmitTick() {
                         (bt == N2kDCbt_Flooded && bc == N2kDCbc_LeadAcid) ? N2kDCES_Yes : N2kDCES_No,
                         nv, bc, AhToCoulomb((double)BatteryCapacity_Ah), N2kInt8NA,
                         PeukertExponent_scaled / 100.0, (int8_t)(ChargeEfficiency_scaled / 10));
+          composed = true;
+        }
+        break;
+      case SLOT_CONV:
+        if (n2kConvStatEnable == 1) {
+          lastConvState = n2kConvModeFromStage(getChargeStageDisplayCode());
+          sidConv = (uint8_t)((sidConv + 1) % 253);
+          // N2kTS_NotAvailable, never N2kTS_High: the library gives both the value 3.
+          SetN2kPGN127750(N2kMsg, sidConv, (unsigned char)n2kChgrInstance, lastConvState,
+                          N2kTS_NotAvailable, N2kOS_NotAvailable, N2kDCVS_NotAvailable, N2kRP_NotAvailable);
           composed = true;
         }
         break;
@@ -1578,8 +1895,8 @@ void nmea2kTransmitTick() {
           N2kMsg.AddByte((unsigned char)rvcChgrInstance);
           N2kMsg.AddByte((unsigned char)rvcDcInstance);
           N2kMsg.AddByte((unsigned char)rvcDevPriority);
-          N2kMsg.Add2ByteUInt(rvcVoltsU16(battVFresh() ? BatteryV : NAN));      // measured at the charger = alternator side
-          N2kMsg.Add2ByteUInt(rvcAmpsU16((altAmpsFresh() && !IgnoreAltCurrent) ? MeasuredAmps : NAN));   // delivered by the charger
+          N2kMsg.Add2ByteUInt(rvcVoltsU16(n2kAltVolts()));      // measured at the charger = alternator side
+          N2kMsg.Add2ByteUInt(rvcAmpsU16(n2kAltAmps()));   // delivered by the charger
           N2kMsg.AddByte(rvcTempU8(rvcAltTempC()));        // the charging element's own temperature
           composed = true;
         }
@@ -1620,10 +1937,9 @@ void nmea2kTransmitTick() {
           rvcBeginMsg(N2kMsg, 0x1FFFDUL);
           N2kMsg.AddByte((unsigned char)rvcDcInstance);
           N2kMsg.AddByte((unsigned char)rvcDevPriority);
-          N2kMsg.Add2ByteUInt(rvcVoltsU16(battVFresh() ? BatteryV : NAN));
-          // Spec 6.5.2b: positive = current flowing FROM the source, so alternator output is
-          // positive as measured. No sign flip (that would only apply to a battery instance).
-          N2kMsg.Add4ByteUInt(rvcAmpsU32((altAmpsFresh() && !IgnoreAltCurrent) ? MeasuredAmps : NAN));
+          N2kMsg.Add2ByteUInt(rvcVoltsU16(n2kAltVolts()));
+          // Spec 6.5.2b: positive = current FROM the source, so alternator output needs no sign flip.
+          N2kMsg.Add4ByteUInt(rvcAmpsU32(n2kAltAmps()));
           composed = true;
         }
         break;
@@ -1647,13 +1963,9 @@ void nmea2kTransmitTick() {
           N2kMsg.AddByte(0xFF);         // state of health: a battery datum
           N2kMsg.Add2ByteUInt(0xFFFF);  // capacity remaining: a battery datum
           N2kMsg.AddByte(0xFF);         // relative capacity: a battery datum
-          // AC RMS ripple: not-available BY MEASUREMENT, not by omission. Built and removed
-          // 2026-08-28 — the INA228 bus channel cannot carry this field. See CAN_UPGRADES.md
-          // item 2 for the numbers; the short version is that the INA's own 4x540us averaging
-          // puts a healthy rectifier ripple through at ~0.11 with speed-dependent nulls, while
-          // normal control-loop and charging activity puts 15-70mV into the same number, so a
-          // failing diode reads no higher than a healthy alternator mid-ramp. Needs a fast
-          // AC-coupled voltage tap on an ESP32 ADC1 channel — a board revision.
+          // AC RMS ripple: not available BY MEASUREMENT. Do not re-add from the INA228: its averaging nulls
+          // rectifier ripple while control activity puts 15-70 mV in the same number (CAN_UPGRADES.md item 2).
+          // Needs an AC-coupled tap on an ADC1 channel, a board revision.
           N2kMsg.Add2ByteUInt(0xFFFF);
           composed = true;
         }
@@ -1709,19 +2021,20 @@ void ReadVEData() {
   float solarPower_W = 0.0f;
 
   // Drain budget must exceed worst-case arrival between 2 s ticks (BMV ~900 B/s -> ~1800 B)
-  // or the stream starves and most frames fail checksum. Cheap now: the field-extraction
-  // loop below runs once per tick, not per byte.
+  // or the stream starves and most frames fail checksum.
   int veDrainBudget = 2048;
   uint32_t veFramesBefore = myve.frameCounter;
+  // The library never drops a field from its table: blank every value so only fields in a frame completed during this drain read back.
+  for (int i = 0; i < myve.veEnd; i++) myve.veValue[i][0] = '\0';
   while (veDrainBudget-- > 0 && Serial1.available()) {
-    myve.rxData(Serial1.read());  // corrupted-frame frameIndex clamp lives in the _xeng fork now (textRxEvent)
+    myve.rxData(Serial1.read());  // corrupted-frame frameIndex clamp is in the _xeng fork (textRxEvent)
     yield();
   }
-  // Only read the public table when a NEW checksum-valid frame landed this tick: the table
-  // persists stale values forever, so unconditional MARK_FRESH here defeated IS_STALE (and
-  // integrated phantom solar power) whenever bytes arrived but no frame validated.
+  // Only on a NEW checksum-valid frame: the table keeps stale values forever, so marking fresh without
+  // one defeats IS_STALE and integrates phantom solar power.
   if (myve.frameCounter != veFramesBefore) {
     for (int i = 0; i < myve.veEnd; i++) {
+      if (myve.veValue[i][0] == '\0') continue;  // not in this drain's frames
       if (strcmp(myve.veName[i], "V") == 0) {
         float newVoltage = (atof(myve.veValue[i]) / 1000);
         if (newVoltage > 0 && newVoltage < 100) {  // Sanity check
@@ -1775,7 +2088,9 @@ void ReadVEData() {
       }
       // Battery temperature (degC), present only on a BMV / SmartShunt with a temperature sensor -> batteryTempF() source 3
       if (strcmp(myve.veName[i], "T") == 0) {
-        float tC = atof(myve.veValue[i]);
+        const char *s = myve.veValue[i];
+        const char d = (s[0] == '-') ? s[1] : s[0];  // the SOC digit guard, allowing a sign: "---" would atof to 0 C
+        const float tC = (d >= '0' && d <= '9') ? atof(s) : NAN;
         if (tC >= -40.0f && tC <= 100.0f) {
           VictronBattTempF = tC * 1.8f + 32.0f;
           MARK_FRESH(IDX_VE_BATT_TEMP);
@@ -1817,17 +2132,11 @@ void ReadVEData() {
 }
 
 // ── NMEA 0183 receive ────────────────────────────────────────────────────────
-// Serial2 on GPIO6, its own opto channel and its own connector pin (RJ3 p4) — nothing else on the
-// board or in firmware touches either, so this port is free to run at whatever baud/polarity the
-// attached talker wants. Receive only: no TX pin exists and the front end is one-way.
-//
-// Heading is decoded as a worked example. It is deliberately kept OUT of HeadingNMEA and
-// IDX_HEADING_NMEA: those belong to the NMEA2000 receiver, and silently merging two sources would
-// make "which one am I looking at" unanswerable. Anything that wants to consume 0183 heading for
-// real should become an explicit user-selected source, never an automatic fallback.
+// Serial2 on GPIO6 (own opto channel, RJ3 p4), used by nothing else, so it runs at whatever baud/polarity
+// the talker wants. RX only: no TX pin. Heading is a worked example, deliberately kept OUT of HeadingNMEA /
+// IDX_HEADING_NMEA (the N2K receiver's); real use must be an explicit user-selected source, never a fallback.
 
-// Heading back to absent. -1 is the "nothing decoded" sentinel CSV4_n183Heading already ships,
-// so the client needs no new field to tell a dead talker from a boat pointing north.
+// -1 = nothing decoded (as CSV4_n183Heading already ships), so a dead talker is not read as north.
 void n183ClearHeading() {
   n183HeadingDeg = -1.0f;
   n183HdgRef = 0;
@@ -1847,8 +2156,7 @@ static void n183HandleSentence(char *s) {
   n183SentenceCount++;
   MARK_FRESH(IDX_N183);
 
-  // Address field is <talker><type>, e.g. "HCHDT" — the talker prefix varies by device, the
-  // 3-char type does not, so match on the type only.
+  // Address is <talker><type> (e.g. "HCHDT"); the talker prefix varies by device, so match the type only.
   if (strlen(s) < 6 || s[5] != ',') return;
   const char *type = s + 2;
   uint8_t ref = 0;
@@ -1875,8 +2183,7 @@ static void n183HandleSentence(char *s) {
   MARK_FRESH(IDX_N183_HDG);
 }
 
-// Assemble one byte into the sentence buffer. Returns nothing; commits through n183HandleSentence
-// on a line ending. Pure RAM work — no UART access, so the caller controls all driver-lock cost.
+// Pure RAM work, no UART access: the caller controls all driver-lock cost.
 static char n183Line[96];   // longest standard sentence is 82 B; anything longer is noise
 static uint8_t n183Len = 0;
 static bool n183Overrun = false;
@@ -1898,8 +2205,7 @@ static void n183Feed(char c) {
   n183Len = 0;
   if (n183Overrun) { n183Overrun = false; n183ChecksumErrCount++; return; }
 
-  // Trailing "*HH" is the XOR of everything between '$' and '*'. Sentences without one are rare in
-  // practice and unverifiable, so they are counted as errors rather than trusted.
+  // Sentences without "*HH" are unverifiable, so they count as errors rather than being trusted.
   char *star = strrchr(n183Line, '*');
   if (!star || star != n183Line + completed - 3) { n183ChecksumErrCount++; return; }
   *star = '\0';
@@ -1910,21 +2216,11 @@ static void n183Feed(char c) {
   n183HandleSentence(n183Line);
 }
 
-// HARD REAL-TIME CONTRACT: this must never hold the control loop for more than 500 us.
-// Four independent limits enforce it, so no single estimate has to be right:
-//   1. A per-tick byte cap. 512 B is the most work this can ever be asked to do in one pass.
-//   2. A micros() deadline checked after every 64 B chunk, so the overrun exposure is one chunk,
-//      not one tick. Whatever is not consumed stays in the 2 KB driver ring and is picked up next
-//      tick — backpressure costs latency, never bytes.
-//   3. Block reads. Serial2.read(buf, n) takes the UART lock ONCE per chunk and memcpys, with
-//      timeout_ms = 0 so it never waits. read() byte-at-a-time pays that lock ~2 us PER BYTE and
-//      blew the whole budget on its own; readBytes() would be worse still — it blocks for
-//      getTimeout(), a full second by default. Neither may be used here.
-//   4. Parsing runs over the RAM chunk, not the UART, at roughly 20 ns/byte.
-// Throughput check: 512 B every 50 ms = 10 kB/s, against 3840 B/s arriving at the fastest
-// supported baud (38400). Nearly 3x margin, and the 2 KB ring absorbs a half second of burst.
-// The worst cost actually observed is published as ft_ReadNMEA0183 in the Function Timing table,
-// and the firmware complains to the console on its own if it ever crosses the budget.
+// HARD REAL-TIME CONTRACT: never hold the control loop more than 500 us. Four independent limits:
+// 1. per-tick byte cap; 2. micros() deadline after every 64 B chunk (unread bytes wait in the 2 KB ring);
+// 3. block reads: read(buf, n) takes the UART lock once per chunk and never waits. Never byte-wise read()
+//    (~2 us lock per byte) or readBytes() (blocks for getTimeout(), 1 s); 4. parsing runs on the RAM chunk.
+// 512 B / 50 ms = 10 kB/s vs 3840 B/s at 38400 baud. Worst observed cost: ft_ReadNMEA0183.
 #define N183_DEADLINE_US   250   // checked between chunks; leaves room for one more chunk under the 500 us budget
 #define N183_TICK_MS       50
 #define N183_MAX_PER_TICK  512
@@ -1939,9 +2235,8 @@ void ReadNMEA0183Data() {
   lastRead = nowMs;
 
   const uint32_t t0 = micros();
-  // A talker that goes quiet must stop reading as live. Same 10s DATA_TIMEOUT the NMEA2000
-  // heading ages out on; IDX_N183 can't serve here because it stays fresh on a GPS-only talker.
-  // Inside the t0 window on purpose: everything this function does is policed by N183_BUDGET_US.
+  // Quiet talker ages out (10 s DATA_TIMEOUT, as N2K heading); not IDX_N183, which stays fresh on a
+  // GPS-only talker. Inside the t0 window so the budget covers it.
   if (n183HdgRef != 0 && IS_STALE(IDX_N183_HDG)) n183ClearHeading();
   uint8_t buf[64];
   uint16_t total = 0;
@@ -1954,8 +2249,6 @@ void ReadNMEA0183Data() {
     if ((uint32_t)(micros() - t0) >= N183_DEADLINE_US) break;
   }
 
-  // Self-policing. If the four limits above ever fail to hold the promise, say so out loud once a
-  // minute rather than letting it hide in a stats row nobody is looking at.
   uint32_t spent = micros() - t0;
   if (spent > N183_BUDGET_US) {
     static unsigned long lastGripe = 0;
@@ -1970,18 +2263,30 @@ void ReadNMEA0183Data() {
 void checkAndRestart() {
   unsigned long up = millis();  // device boots at millis()=0, so uptime IS millis(); the 72 h cap keeps us far from the 49.7-day wrap
 
-  // Health requester: LargestInternalBlock (KB, sampled ~4 s by the heap sampler) below the
-  // TLS-death floor continuously for 30 min. Brief HTTPS-handshake dips recover in seconds and
+  // Health requester: LargestInternalBlock (KB, cpuLoadTask's 20 s walk, field cut only) below the
+  // TLS-death floor on every walk for 30 min. Brief HTTPS-handshake dips recover in seconds and
   // reset the timer, so this only latches when the heap is genuinely fragmented.
-  static unsigned long heapLowSince = 0;
-  if (LargestInternalBlock > 0 && LargestInternalBlock < (size_t)REBOOT_HEAP_FLOOR_KB) {
-    if (heapLowSince == 0) heapLowSince = up;
-    if (!maintRebootHealthReq && up - heapLowSince >= REBOOT_HEAP_LOW_HOLD_MS) {
-      maintRebootHealthReq = true;
-      queueConsoleMessage("Maintenance: contiguous RAM low for 30 min - reboot at next quiet window");
+  // Each walk is judged once, by its own stamp: the value held through a charge is never a fresh sample,
+  // and a charge between two low walks counts toward the 30 min.
+  static uint32_t heapLowSince = 0;
+  static bool heapLow = false;
+  static uint32_t heapWalkSeen = 0;
+  uint32_t walkAt = largestInternalAtMs;
+  if (walkAt != heapWalkSeen) {
+    heapWalkSeen = walkAt;
+    __sync_synchronize();  // stamp before value, the reverse of walkInternalHeap()'s stores
+    if (LargestInternalBlock > 0 && LargestInternalBlock < (size_t)REBOOT_HEAP_FLOOR_KB) {
+      if (!heapLow) {
+        heapLow = true;
+        heapLowSince = walkAt;
+      }
+      if (!maintRebootHealthReq && walkAt - heapLowSince >= REBOOT_HEAP_LOW_HOLD_MS) {
+        maintRebootHealthReq = true;
+        queueConsoleMessage("Maintenance: contiguous RAM low for 30 min - reboot at next quiet window");
+      }
+    } else {
+      heapLow = false;
     }
-  } else {
-    heapLowSince = 0;
   }
 
   static unsigned long quietSince = 0;      // continuous-hold start of the current quiet window
@@ -1993,9 +2298,8 @@ void checkAndRestart() {
     return;
   }
 
-  // Absolute holds — no tier reboots through an OTA install or a running guided test
-  // (g_autoTestActive covers commissioning + battery-health + resonance + system-ID + field-cut
-  // + CV stress + protection tests; each is bounded by its own timeout).
+  // Absolute holds: no reboot through an OTA install or a guided test (g_autoTestActive covers them
+  // all; each is bounded by its own timeout).
   if (otaInProgress || g_autoTestActive) {
     quietSince = 0;
     countdownStart = 0;
@@ -2004,16 +2308,20 @@ void checkAndRestart() {
   }
 
   float vScale = SYSTEM_VOLTAGE_CLASS / 12.0f;
-  bool vValid = (IBV > 5.0f);  // a dead/absent INA228 reads ~0 V; sensor-dead must not block the ladder forever
+  // The alarms' voltage (fresh, not owner-ignored, none in Limp Home); a dead/absent INA228 reads ~0 V. Sensor-dead
+  // must not block the ladder forever.
+  float vBatt = 0.0f;
+  bool vValid = alarmBatteryVoltage(vBatt) && vBatt > 5.0f;
   bool engineOff = !engineSpinning() && !g_engineSpinningNow;   // g_engineSpinningNow follows ignition when engine speed is ignored, where engineSpinning() is always false
   bool fieldOff = (fieldActiveStatus == 0);
   bool noClient = (events.count() == 0);
   bool cloudReachable = (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered);
-  // Offline there is nothing to wait for — the flush below dumps the un-uploaded ring to flash.
-  bool cloudIdle = !core0Busy && (bufferedRecordCount == 0 || !cloudReachable);
+  // Offline, or every record waiting on a real clock, there is nothing to wait for — the flush below dumps the
+  // un-uploaded ring to flash.
+  bool cloudIdle = !core0Busy && (bufferedRecordCount == 0 || !cloudReachable || sensorUploadsHeldForClock());
   bool socOk = (!socInfoAvailable || !socShownOk() || socShownX100() >= REBOOT_SOC_FLOOR_X100);
-  bool vQuietOk = (!vValid || IBV >= REBOOT_VBAT_FLOOR_V * vScale);
-  bool vBrownOk = (!vValid || IBV >= REBOOT_VBAT_BROWNOUT_V * vScale);
+  bool vQuietOk = (!vValid || vBatt >= REBOOT_VBAT_FLOOR_V * vScale);
+  bool vBrownOk = (!vValid || vBatt >= REBOOT_VBAT_BROWNOUT_V * vScale);
 
   bool hardTier = (up >= REBOOT_HARD_MS);
   bool relaxedTier = (up >= REBOOT_RELAXED_MS);
@@ -2045,10 +2353,8 @@ void checkAndRestart() {
     }
   }
 
-  // Countdown only when someone could be watching: always in the hard tier, and in the relaxed
-  // tier when a client is connected. Quiet-tier reboots are silent — a client connecting
-  // mid-window breaks noClient and aborts above. Window conditions keep being enforced during
-  // the countdown, so an engine start or brown-out mid-countdown aborts it.
+  // Countdown only when someone could be watching (hard tier, or relaxed with a client). Window
+  // conditions stay enforced, so an engine start or brown-out mid-countdown aborts it.
   if (hardTier || (relaxedTier && !noClient)) {
     if (countdownStart == 0) {
       countdownStart = up;
@@ -2066,9 +2372,7 @@ void checkAndRestart() {
     restartRemainingSec = 1;  // keep banner visible through the shutdown sequence
     Serial.println("=== MAINTENANCE RESTART ===");
 
-    // Graceful field-down: zero PWM immediately and gate the PID via OnOff=0.
-    // OnOff is RAM-only here — LittleFS is not touched, so on reboot the device
-    // returns to whatever OnOff state the user last set.
+    // OnOff=0 is RAM-only: on reboot the device returns to the user's last OnOff state.
     Serial.println("Restart: hard-zero PWM and disable charging");
     apply_pwm_float(0.0f);
     dutyCycle = 0.0f;
@@ -2115,9 +2419,8 @@ void checkAndRestart() {
       resetSensorWindow();
     }
 
-    // Un-uploaded telemetry (offline/AP case — cloudIdle waives the drain when the cloud is
-    // unreachable): bulk-dump the PSRAM ring to flash, same as shutdown Phase 4; setup()
-    // restores and deletes the file on next boot.
+    // Un-uploaded telemetry (offline/AP: cloudIdle waives the drain): dump the PSRAM ring to flash as
+    // shutdown Phase 4 does; setup() restores it on next boot.
     if (!ringIsEmpty()) {
       Serial.printf("Maintenance restart: ring still has %u records - dumping to LittleFS\n",
                     (unsigned)sensorRingCount);
@@ -2129,9 +2432,12 @@ void checkAndRestart() {
     dumpLongTermRing();
     dumpUsageAccum();  // app-usage period counters span the restart via /usage.bin
     solarLedgerFlushNow();  // ledger + live day + learned ratio span the restart too
+    // Best-ever fronts + their unsynced cloud-pending points (a quiet window can fall mid-sail). Field physically
+    // cut only: the 72 h hard tier restarts with the field live, and these are the largest blobs.
+    if (gpio4IsLow) { altHealthSave(); boatPerfSave(); }
 
     if (WiFi.getMode() != WIFI_OFF) {
-      // Console event only — the client has no "status" listener, so that event was composed and dropped
+      // "console" only: the client has no "status" listener
       events.send("Performing maintenance restart", "console");
       delay(500);             // Give events time to actually send
       events.close();         // Close all SSE connections
@@ -2239,9 +2545,8 @@ void captureResetReason() {
   settingWrite(NK_LastResetReason, saveStr.c_str());
 }
 void UpdateEngineFuel(unsigned long elapsedMillis) {
-  // Only calculate fuel consumption if engine is running. (High-RPM glitch reject is below, scaled
-  // to the configured engine — a fixed 6000 ceiling would wrongly cut off high-revving engines.)
-  if (RPM <= 0) {
+  // An ignored tach (or Limp Home) has no trustworthy RPM to look the flow up by (§4.8).
+  if (RPM <= 0 || IgnoreRPM || LimpHome) {
     currentFuelGPH = 0.0f;  // engine off -> no live flow / economy
     currentNMPG = 0.0f;
     fcRun = false;          // break the steady-state run for the session fuel curve
@@ -2267,8 +2572,7 @@ void UpdateEngineFuel(unsigned long elapsedMillis) {
     return;
   }
 
-  // Engine RPM range = the configured fuel table. Top breakpoint defines the curve's bin scale and
-  // a glitch ceiling that scales with the engine (no fixed 6000 cap, so high-rev engines aren't cut off).
+  // Top fuel-table breakpoint sets the curve's bin scale and a glitch ceiling that scales with the engine.
   float fuelTopRPM = fuelTableRPM[validEntries - 1];
   if (fuelTopRPM < 1.0f) fuelTopRPM = 4500.0f;  // guard a degenerate table
   currentFuelTopRPM = fuelTopRPM;               // published for the chart x-axis
@@ -2305,11 +2609,9 @@ void UpdateEngineFuel(unsigned long elapsedMillis) {
   // IS_STALE a frozen speed keeps NMPG live-looking and freezes fuel-curve bins with it.
   currentNMPG = (fuelRate_GPH > 0.0f && SOGNMEA > 0.0f && !IS_STALE(IDX_SOG_NMEA)) ? (SOGNMEA / fuelRate_GPH) : 0.0f;
 
-  // Session fuel-economy curve: settle-then-measure. RPM and boat speed must hold within band
-  // (max-min ≤ tol on each) continuously; once they have held for fuelCurveSettleSec (the boat has
-  // reached true steady speed for that throttle), mpg is averaged over the next fuelCurveSampleSec and
-  // that average freezes the bin (overwriting). Then the settle->sample cycle restarts while still
-  // steady, so a long cruise refreshes the bin. ANY band break / stop / no-GPS reseeds from scratch.
+  // Session fuel-economy curve, settle-then-measure: RPM and SOG must stay in band (max-min <= tol) for
+  // fuelCurveSettleSec, then the mpg mean over fuelCurveSampleSec overwrites the bin and the cycle restarts
+  // while still steady. Any band break / stop / no-GPS reseeds.
   if (!IgnoreRPM && currentNMPG > 0.0f && SOGNMEA > 0.0f && !IS_STALE(IDX_SOG_NMEA)) {   // ignored tach: no RPM-indexed bins (§4.8)
     uint32_t nowMs = millis();
     float r = RPM, s = SOGNMEA;
@@ -2376,10 +2678,7 @@ void UpdateEngineFuel(unsigned long elapsedMillis) {
 }
 void UpdateBatterySOC(unsigned long elapsedMillis) {
   float elapsedSeconds = elapsedMillis / 1000.0f;
-  // =================================================================
-  //     BATTERY STATE MONITORING
-  // =================================================================
-  // This section tracks battery state of charge from ALL sources
+  // ===== Battery state monitoring =====
   float currentBatteryVoltage = getBatteryVoltage();
   Voltage_scaled = currentBatteryVoltage * 100;  // V × 100 for precision
   float batteryCurrentForSoC = getBatteryCurrent();  // dedicated battery source, not alternator
@@ -2388,12 +2687,9 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
   BatteryPower_scaled = (Voltage_scaled * BatteryCurrent_scaled) / 100;  // W × 100
   float batteryPower_W = BatteryPower_scaled / 100.0f;
   float energyDelta_Wh = (batteryPower_W * elapsedSeconds) / 3600.0f;
-  // Battery-side tracking (charge/discharge energy, coulomb/SoC, capacity tracker,
-  // full-charge detection) all need a real Bcur — gate on the shunt, and on a fresh reading
-  // (§10.6: a dead INA228 must not integrate its last value forever).
-  // A stale interval is dropped, not back-filled: the current during a read gap is unknown, and the
-  // 2.5 s window (2 x the slow-mode read) means only a real gap ever lands here. The alternator
-  // stats and voltage averaging below run on every config.
+  // Battery-side tracking needs a real, fresh Bcur (§10.6: a dead INA228 must not integrate its last value
+  // forever). A stale interval is dropped, not back-filled; the 2.5 s window (2x slow-mode read) means only
+  // a real gap lands here.
   if (HAS_BATT_SHUNT && bcurFresh()) {
     static float chargedEnergyAccumulator = 0.0f;
     static float dischargedEnergyAccumulator = 0.0f;
@@ -2405,6 +2701,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
       chargedEnergyAccumulator_AllTime += energyDelta_Wh;
       if (chargedEnergyAccumulator >= 1.0f) {
         ChargedEnergy += (int)chargedEnergyAccumulator;
+        ChargeCycleEnergy += (int)chargedEnergyAccumulator;
         chargedEnergyAccumulator -= (int)chargedEnergyAccumulator;
       }
       if (chargedEnergyAccumulator_AllTime >= 1.0f) {
@@ -2424,17 +2721,14 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
       }
     }
 
-    // =================================================================
-    //     COULOMB COUNTING - BATTERY STATE OF CHARGE TRACKING
-    // =================================================================
-    // Track actual amp-hours into/out of battery with efficiency corrections
+    // ===== Coulomb counting (SoC) =====
 
     static float coulombAccumulator_Ah = 0.0f;
     float batteryCurrent_A = BatteryCurrent_scaled / 100.0f;
     float deltaAh = (batteryCurrent_A * elapsedSeconds) / 3600.0f;
     if (BatteryCurrent_scaled >= 0) {
       // Charging - apply charge efficiency (not all energy makes it in)
-      // ChargeEfficiency_scaled is % × 10 (e.g. 990 = 99.0%), so divide by 1000 to get the multiplier.
+      // ChargeEfficiency_scaled is % x 10 (990 = 99.0 %)
       float batteryDeltaAh = deltaAh * (ChargeEfficiency_scaled / 1000.0f);
       coulombAccumulator_Ah += batteryDeltaAh;
     } else {
@@ -2445,8 +2739,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
       if (dischargeCurrent_A > peukertThreshold) {
         float peukertExponent = PeukertExponent_scaled / 100.0f;
         dischargeCurrent_A = constrain(dischargeCurrent_A, 0, BatteryCapacity_Ah);  // Max 1C
-        // Peukert: effective drain = I*(I/I_rated)^(k-1) — heavier-than-rated discharge must
-        // count FASTER (factor > 1). The ratio was inverted here for years.
+        // Peukert: effective drain = I*(I/I_rated)^(k-1); above-rated discharge counts FASTER (factor > 1).
         float currentRatio = dischargeCurrent_A / PeukertRatedCurrent_A;
         float peukertFactor = pow(currentRatio, peukertExponent - 1.0f);
         peukertFactor = constrain(peukertFactor, 0.5f, 2.0f);  // Sanity limits
@@ -2460,7 +2753,6 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
     if (abs(coulombAccumulator_Ah) >= 0.01f) {
       int deltaAh_scaled = (int)(coulombAccumulator_Ah * 100.0f);
       CoulombCount_Ah_scaled += deltaAh_scaled;
-      shadowCoulombX100 += deltaAh_scaled;  // unsaturated twin — no constrain below
       coulombAccumulator_Ah -= (deltaAh_scaled / 100.0f);  // Keep remainder
     }
 
@@ -2470,56 +2762,42 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
     float SoC_float = (float)CoulombCount_Ah_scaled / (float)capAhX100 * 100.0f;
     SOC_percent = (int)(SoC_float * 100);  // Store as percentage × 100 for 2 decimals
 
-    // Capacity tracker (OCV-anchored): rest detection, low-OCV anchor capture, Ah bridge.
-    // Uses the FILTERED INA228 voltage (getFiltV) — rest/OCV is a slow read where filtering
-    // is correct (not a safety path). The temp coefficient is a property of the BANK, so it takes the
-    // measured battery temperature (°F → °C) and NAN when there is none — normalization then switches
-    // itself off (capTrackOnFull) instead of correcting by a board reading.
-    capTrackTick(BatteryCurrent_scaled / 100.0f, getFiltV(),
+    // Capacity tracker (OCV-anchored) on FILTERED voltage (getFiltV): rest/OCV is a slow read, not a safety path.
+    // Temp coefficient belongs to the bank: measured battery temp in °C, or NAN (normalization then switches off).
+    // An owner-ignored main reading must not set the rest anchor: external decision voltage, else NAN (Ah bridge only).
+    float capV = getFiltV();
+    if (IgnoreBattVMain) { float extCapV; capV = chargeDecisionExternalV(extCapV) ? extCapV : NAN; }
+    capTrackTick(BatteryCurrent_scaled / 100.0f, capV,
                  isfinite(battTempActiveF) ? (battTempActiveF - 32.0f) / 1.8f : NAN, elapsedSeconds);
 
-    // =================================================================
-    //     FULL CHARGE DETECTION - WORKS FROM ANY CHARGING SOURCE
-    // =================================================================
-    // When battery voltage is high AND current is low (tail current),
-    // we know it's fully charged regardless of what's charging it
-    // Units: BatteryCurrent_scaled is A×100. TailCurrent is % of capacity, so the
-    // threshold in A×100 is (TailCurrent/100 × Capacity) × 100 = TailCurrent × Capacity.
-    // Full charge is a charge decision, so it follows BatteryVoltageSource. Voltage_scaled stays the
-    // measured INA228 value the power/energy figures are built from.
+    // ===== Full charge detection (any charging source) =====
+    // BatteryCurrent_scaled is A x 100 and TailCurrent % of capacity, so the threshold is TailCurrent x Capacity.
+    // Decision voltage follows BatteryVoltageSource; Voltage_scaled stays the INA228 value the energy figures use.
+    // An owner-ignored main reading decides nothing unless a usable external source exists.
+    float extV;
+    const bool decisionVTrusted = !IgnoreBattVMain || chargeDecisionExternalV(extV);
     const int ChargeDecisionV_scaled = (int)(getChargeDecisionVoltage() * 100.0f);
-    if ((abs(BatteryCurrent_scaled) <= (TailCurrent * BatteryCapacity_Ah)) && (ChargeDecisionV_scaled >= ChargedVoltage_Scaled)) {
+    if (decisionVTrusted && (abs(BatteryCurrent_scaled) <= (TailCurrent * BatteryCapacity_Ah)) && (ChargeDecisionV_scaled >= ChargedVoltage_Scaled)) {
       FullChargeTimer += elapsedSeconds;
 
       if (FullChargeTimer >= ChargedDetectionTime) {
-        // Captured BEFORE the reset below — this is the drift evidence the gain correction reads.
-        // The SHADOW count is used, not the live one: unclamped, it retains overshoot above capacity,
-        // so drift is visible in both directions (the live counter's top clamp hides over-reading).
-        int preResetShadowX100 = shadowCoulombX100;
         SOC_percent = 10000;  // 100.00%
         CoulombCount_Ah_scaled = BatteryCapacity_Ah * 100;
-        shadowCoulombX100 = BatteryCapacity_Ah * 100;  // full charge = known anchor for both counters
 
         static unsigned long lastFullChargeMessage = 0;
         if (!FullChargeDetected || millis() - lastFullChargeMessage > 60000) {
           char msg[128];
-          queueConsoleMessageF("BATTERY: Full charge detected - SoC reset to 100%% (V=%.2fV >= %.2fV src=%s, I=%.2fA, Timer=%.1fs)",
+          queueConsoleMessageF("BATTERY: Full charge detected - SoC reset to 100%% (V=%.2fV >= %.2fV src=%s, I=%.2fA, Timer=%lus)",
                                ChargeDecisionV_scaled / 100.0, ChargedVoltage_Scaled / 100.0,
                                chargeDecisionVoltageSourceName(),
-                               BatteryCurrent_scaled / 100.0, FullChargeTimer);
+                               BatteryCurrent_scaled / 100.0, (unsigned long)FullChargeTimer);
           lastFullChargeMessage = millis();
         }
 
-        // Capacity measurement at the full anchor (once per event, gated by !FullChargeDetected).
-        // OCV-anchored — capTrackOnFull validates the low anchor + span and emits a dated point.
+        // Once per event: capTrackOnFull validates the low anchor + span and emits a dated point.
         if (!FullChargeDetected) {
-          uint32_t nowEpoch = timeIsSynced ? (timeBase + (millis() - timeBaseMillis) / 1000) : 0;
+          uint32_t nowEpoch = clockIsReal() ? (timeBase + (millis() - timeBaseMillis) / 1000) : 0;
           capTrackOnFull(nowEpoch, isfinite(battTempActiveF) ? (battTempActiveF - 32.0f) / 1.8f : NAN);
-          // Shunt gain correction — once per full-charge event (this block, not the every-2s tick),
-          // fed the pre-reset SHADOW count. Battery current always comes from INA228.
-          if (AutoShuntGainCorrection == 1) {
-            applySocGainCorrection(preResetShadowX100);
-          }
         }
 
         FullChargeDetected = true;
@@ -2532,10 +2810,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
   }
   if (socShownOk()) wmIgnUpdate(wmIgn_SOC, socShownX100() / 100.0f);   // ignition-cycle watermark of the SoC shown (float percent, 0..100)
 
-  // =================================================================
-  //     ALTERNATOR-SPECIFIC TRACKING - ONLY RUNS WHEN ALT IS ON
-  // =================================================================
-  // These metrics are ONLY about the alternator's contribution
+  // ===== Alternator-specific tracking =====
 
   // A held (stale) or owner-ignored reading earns no on-time, energy or fuel (§10.5); the energy terms
   // also need a live, trusted bus voltage (tiers 3/4 hold IBV). LimpHome ignores every sensor.
@@ -2568,11 +2843,7 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
         AlternatorChargedEnergy_AllTime += (int)alternatorEnergyAccumulator_AllTime;
         alternatorEnergyAccumulator_AllTime -= (int)alternatorEnergyAccumulator_AllTime;
       }
-      // =================================================================
-      //     FUEL CONSUMPTION CALCULATION - ALTERNATOR SPECIFIC
-      // =================================================================
-      // Calculate diesel fuel used to produce this electrical energy
-      // Chain: Diesel → Engine (30% eff) → Alternator (50% eff) → Electricity
+      // ===== Alternator fuel attribution =====
 
       float energyJoules = altEnergyDelta_Wh * 3600.0f;
       const float engineEfficiency = 0.30f;              // Engine: fuel → mechanical (30%)
@@ -2602,29 +2873,25 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
     }
   }
 
-  // =================================================================
-  //     CHARGE CYCLE CALCULATION
-  // =================================================================
-  // One cycle = one full battery capacity worth of energy charged.
-  // Nominal bank class comes from user-entered SYSTEM_VOLTAGE_CLASS, never guessed from measured
-  // voltage (a deeply-discharged 24V bank sagging below 16V would mis-bucket as 12V, 2× cycle error).
+  // ===== Charge cycles: one cycle = one battery capacity of energy charged =====
+  // Nominal V is the user-entered class, never measured (a deeply discharged 24 V bank below 16 V would bucket as 12 V).
   float nominalVoltage = (float)SYSTEM_VOLTAGE_CLASS;
 
   float batteryCapacity_Wh = BatteryCapacity_Ah * nominalVoltage;
 
   if (batteryCapacity_Wh > 0) {
-    ChargeCycles = (ChargedEnergy / batteryCapacity_Wh);  //Units: Wh
+    ChargeCycles = (ChargeCycleEnergy / batteryCapacity_Wh);  //Units: Wh
     ChargeCycles_AllTime = (ChargedEnergy_AllTime) / batteryCapacity_Wh;
   }
 
-  // Average-SoC bookkeeping is meaningless without a real Bcur-driven SOC_percent.
-  if (HAS_BATT_SHUNT) {
+  // Average SoC of the SoC shown (the owner's selected network monitor, else the shunt count); none without either.
+  if (socShownOk()) {
     // ===== AVERAGE SOC TRACKING (TIME-WEIGHTED) =====
     static double socAccumulator = 0.0;  // %·s (session)
     // socAccumulator_AllTime and totalSocSampleTime_AllTime are globals, not statics here
     static double totalSocSampleTime = 0.0;  // Session seconds tracked — double so it carries the same fractional seconds as the numerator
 
-    float currentSOC = SOC_percent / 100.0f;  // Convert to actual percentage
+    float currentSOC = socShownX100() / 100.0f;  // Convert to actual percentage
 
     socAccumulator += currentSOC * elapsedSeconds;
     socAccumulator_AllTime += (double)currentSOC * elapsedSeconds;
@@ -2640,11 +2907,16 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
   }
 
 
-  totalVoltageSampleTime_AllTime += elapsedSeconds;
+  totalPoweredTime_AllTime += elapsedSeconds;
 
-  // voltageAccumulator_AllTime = 0.0f; don't do this shit anymore
-  float currentVoltage = getBatteryVoltage();
-  voltageAccumulator_AllTime += currentVoltage * elapsedSeconds;
+  // A held (dead INA), never-read (0 V) or owner-ignored reading would enter the persisted lifetime average at full weight.
+  if (ibvFresh() && !IgnoreBattVMain && !LimpHome) {
+    totalVoltageSampleTime_AllTime += elapsedSeconds;
+
+    // voltageAccumulator_AllTime = 0.0f; don't do this shit anymore
+    float currentVoltage = getBatteryVoltage();
+    voltageAccumulator_AllTime += currentVoltage * elapsedSeconds;
+  }
 
   if (totalVoltageSampleTime_AllTime > 0) {
     AvgVoltage_AllTime = voltageAccumulator_AllTime / totalVoltageSampleTime_AllTime;
@@ -2653,12 +2925,12 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
 // The key is on, for the at-rest alarm gates. A forced-on ignition (IgnitionOverride) is no key at all, so the
 // engine alone says whether the boat is in use and a switch left on at anchor stays silent.
 bool keyOnForAlarms() { return Ignition == 1 && IgnitionOverride != 1; }
-// Engine stopped, for the sailing statistics. A forced-on ignition (IgnitionOverride, a boat with no ignition
-// wire) says nothing, so engine speed decides alone; with engine speed ignored as well nothing can tell
-// motoring from sailing, so none is counted.
+// Engine stopped, for sailing stats. With IgnitionOverride (no ignition wire) engine speed decides alone;
+// with engine speed also ignored nothing can tell motoring from sailing, so none is counted.
 bool sailingEngineOff() {
-  if (IgnitionOverride == 1) return IgnoreRPM == 0 && RPM < 50;
-  return RPM < 50 && Ignition == 0;
+  const bool rpmIgnored = IgnoreRPM || LimpHome;
+  if (IgnitionOverride == 1) return !rpmIgnored && RPM < 50;
+  return (rpmIgnored || RPM < 50) && Ignition == 0;
 }
 void UpdateTravelStatistics(unsigned long elapsedMillis) {
   // ===== DISTANCE CALCULATION - Using GPS position (Haversine) =====
@@ -2684,17 +2956,18 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
     } else {
       double distanceDelta_nm = calculateHaversineDistance(lastLat, lastLon, LatitudeNMEA, LongitudeNMEA);
 
-      // Only act when the fix actually moved. Position is re-read every 2 s but only
-      // refreshes every 60 s on phone GPS, so most ticks see an identical fix (delta 0).
-      if (distanceDelta_nm > 0.0) {
+      // Jitter gate: the baseline moves only once the fix is 10 m away, and SOG < 0.5 kn rebaselines without
+      // counting; otherwise position noise adds miles a day at anchor.
+      const double ODO_DEADBAND_NM = 10.0 / 1852.0;
+      if (distanceDelta_nm >= ODO_DEADBAND_NM) {
         uint32_t nowMs = millis();
         uint32_t dtMs = nowMs - lastFixMs;
         float impliedKn = (dtMs > 0) ? (float)(distanceDelta_nm / (dtMs / 3600000.0)) : 9999.0f;
+        bool sogStopped = !IS_STALE(IDX_SOG_NMEA) && SOGNMEA < 0.5f;
 
-        // Implied-speed gate: a <=5 min gap at <150 kt is real motion (covers ~100 mph
-        // powerboats; real GPS teleports imply hundreds of kt); anything else rebaselines
-        // without polluting the odometer.
-        if (dtMs <= 300000UL && impliedKn < 150.0f) {
+        // Implied-speed gate: a <= 5 min gap at < 150 kt is real motion (fast powerboats; GPS teleports imply
+        // hundreds of kt); anything else rebaselines.
+        if (!sogStopped && dtMs <= 300000UL && impliedKn < 150.0f) {
           static float distanceAccumulator = 0.0f;
           static float distanceAccumulator_AllTime = 0.0f;
           static float sailingDistAccumulator_AllTime = 0.0f;  // engine-off miles (leaderboard)
@@ -2726,12 +2999,8 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
     }
   }
 
-  // LONGEST SINGLE TRIP TRACKING
-  // Trip ends after 60 min continuous (a) GPS invalid OR (b) SOG < 1.5 kn.
-  // Either valid GPS + SOG >= 1.5 kn sample resets both timers.
-  // Boot recovery: if NVS had an in-progress trip, hold in stasis until time
-  // syncs, then resume (epoch < 1 hr old) or finalize (stale). 10-min fallback
-  // forces stale-finalize if time never syncs (e.g., no GPS / no NTP).
+  // Longest single trip: ends after 60 min of invalid GPS or SOG < 1.5 kn. A trip restored from NVS waits for
+  // time sync, then resumes (< 1 h old) or finalizes; no sync within 10 min of boot finalizes it.
   {
     if (tripPendingRecovery) {
       if (timeIsSynced && timeBase > 0) {
@@ -2770,8 +3039,7 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
           currentTripDistanceNm = 0.0f;
         }
         currentTripDistanceNm += tripDistanceDelta_nm;
-        // Stamp wall-clock epoch (project pattern, since GPS/phone time sources don't touch system clock).
-        // Leaving as 0 when time isn't synced means boot recovery conservatively finalizes the trip.
+        // timeBase epoch (GPS/phone time never sets the system clock); left 0 unsynced so boot recovery finalizes.
         if (timeIsSynced) currentTripLastUpdateEpoch = timeBase + (millis() - timeBaseMillis) / 1000;
       } else {
         if (!gpsValid)     timeSinceLastValidGps += elapsedMillis;
@@ -2790,9 +3058,7 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
     }
   }
 
-  // ROLLING 24-HOUR MAX DISTANCE (lb-max-24hr leaderboard)
-  // Ring of 24 hourly buckets; bucket[head] = in-progress hour. Sum = approx
-  // last 24 hr of motion (~1 hr undercount at the leading edge).
+  // Rolling 24 h max distance (lb-max-24hr): 24 hourly buckets, bucket[head] in progress (~1 h leading-edge undercount).
   {
     uint32_t now = millis();
     if (distHourStartMs == 0) distHourStartMs = now;  // first-tick init
@@ -2809,17 +3075,21 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
 
   UpdateAnchorageDetection(gpsValid);
 
-  // ===== SPEED CALCULATION - Using SOGNMEA (time-weighted average) - UNCHANGED =====
+  // ===== Speed: SOGNMEA time-weighted average =====
 
-  // IS_SEEN as well as IS_STALE: a boat with no GPS never stamps, and IS_STALE reads an unstamped 0
-  // as fresh for the first DATA_TIMEOUT of every boot — that window would add 0.0 kt at full weight
-  // to the NVS-persisted lifetime average.
+  // IS_SEEN too: with no GPS, IS_STALE reads an unstamped 0 as fresh for the first DATA_TIMEOUT of every
+  // boot, adding 0 kt at full weight to the persisted lifetime average.
   if (!IS_SEEN(IDX_SOG_NMEA) || IS_STALE(IDX_SOG_NMEA) || SOGNMEA < 0) {
     return;
   }
 
   static double speedAccumulator = 0.0;  // kt·s (session)
   static double totalSpeedSampleTime = 0.0;  // Session seconds — double so it carries the same fractional seconds as the numerator
+  if (avgSpeedResetRequested) {   // zeroing AvgSpeed alone came straight back from these on the next sample
+    avgSpeedResetRequested = false;
+    speedAccumulator = 0.0;
+    totalSpeedSampleTime = 0.0;
+  }
 
   float elapsedSeconds = elapsedMillis / 1000.0f;
 
@@ -2836,10 +3106,8 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
   }
 }
 
-// Anchorage detection — pushes one sample per minute into the PSRAM ring while GPS+depth are
-// both valid. Each push evaluates the trailing sliding 5-hr span; if continuous (no gaps > 10 min)
-// and qualifying (swing < 100 yd, depth varies 2-100 ft), updates DeepestAnchorage_Ft_AllTime
-// with the window's average depth.
+// One sample/min into the PSRAM ring while GPS + depth are valid. A contiguous 5 h span (no gap > 10 min),
+// swing < 100 yd and depth range 2-100 ft updates DeepestAnchorage_Ft_AllTime with its mean depth.
 void UpdateAnchorageDetection(bool gpsValid) {
   if (!anchorageRing) return;
   const uint32_t SAMPLE_INTERVAL_MS  = 60000UL;            // 1-minute sample cadence
@@ -2862,8 +3130,6 @@ void UpdateAnchorageDetection(bool gpsValid) {
   anchorageRingHead = (anchorageRingHead + 1) % ANCHORAGE_RING_SIZE;
   if (anchorageRingCount < ANCHORAGE_RING_SIZE) anchorageRingCount++;
   lastAnchorageSampleMs = now;
-  // Evaluate trailing window. Walk backward from newest, collecting samples until we hit a
-  // gap > GAP_TOLERANCE_MS or run out of samples. Need at least WINDOW_SPAN_MS of contiguous coverage.
   if (anchorageRingCount < 2) return;
   uint16_t newestIdx = (anchorageRingHead + ANCHORAGE_RING_SIZE - 1) % ANCHORAGE_RING_SIZE;
   uint32_t newestMs = anchorageRing[newestIdx].sampleMs;
@@ -2881,7 +3147,6 @@ void UpdateAnchorageDetection(bool gpsValid) {
   // Accept a window one sample short: a full 300-slot ring spans only 299 intervals
   // (~17.94 M ms), so the strict < 18 M ms check could essentially never pass.
   if (spanMs + SAMPLE_INTERVAL_MS < WINDOW_SPAN_MS) return;  // not yet 5 contiguous hours
-  // Compute centroid + depth stats over the valid trailing span.
   double sumLat = 0, sumLon = 0;
   float depthMin = 1e9f, depthMax = -1e9f, depthSum = 0.0f;
   for (uint16_t step = 0; step < spanCount; step++) {
@@ -2897,7 +3162,6 @@ void UpdateAnchorageDetection(bool gpsValid) {
   double centroidLon = sumLon / (double)spanCount;
   float depthAvg = depthSum / (float)spanCount;
   float depthRange = depthMax - depthMin;
-  // Max distance from centroid (Haversine).
   double maxSwingNm = 0;
   for (uint16_t step = 0; step < spanCount; step++) {
     uint16_t idx = (newestIdx + ANCHORAGE_RING_SIZE - step) % ANCHORAGE_RING_SIZE;
@@ -2907,14 +3171,12 @@ void UpdateAnchorageDetection(bool gpsValid) {
   }
   if (maxSwingNm > MAX_SWING_NM) return;
   if (depthRange < MIN_DEPTH_CHANGE_FT || depthRange > MAX_DEPTH_CHANGE_FT) return;
-  // Qualifying anchorage — update lifetime watermark.
   if (depthAvg > DeepestAnchorage_Ft_AllTime) DeepestAnchorage_Ft_AllTime = depthAvg;
 }
 
-// Single source of truth for "engine is spinning" (tach gate). Feeds run-hour
-// accounting AND the sensor-window engine-on-weighted accumulators.
+// Single source of truth for "engine is spinning" (tach gate).
 bool engineSpinning() {
-  return !IgnoreRPM && RPM > 100 && RPM < 20000;   // ignored tach: no hours, starts or engine-on statistics (§4.8)
+  return !IgnoreRPM && !LimpHome && RPM > 100 && RPM < 20000;   // ignored tach (or Limp Home): no hours, starts or engine-on statistics (§4.8)
 }
 
 void UpdateEngineRuntime(unsigned long elapsedMillis) {
@@ -2928,7 +3190,10 @@ void UpdateEngineRuntime(unsigned long elapsedMillis) {
       EngineRunTime += secondsRun;
       EngineRunTime_AllTime += secondsRun;
 
-      int cyclesDelta = (RPM * secondsRun) / 60;
+      static float cyclesFrac = 0.0f;   // carried between ticks: truncating each 2 s tick under-counted 1-3 %
+      float cyc = (RPM * secondsRun) / 60.0f + cyclesFrac;
+      int cyclesDelta = (int)cyc;
+      cyclesFrac = cyc - (float)cyclesDelta;
       EngineCycles += cyclesDelta;
       EngineCycles_AllTime += cyclesDelta;
 
@@ -2937,14 +3202,9 @@ void UpdateEngineRuntime(unsigned long elapsedMillis) {
     }
   }
 
-  // Engine start/stop edge — one console line per transition. Anchors the session
-  // timeline so charging events can be read against engine state.
-  // The whole edge detector FREEZES while g_rpmTachMasked: an abrupt field cut (commissioning stage
-  // 7, or a protection cut) spikes then false-zeros the LM2907 for ~4.6s, and the log line reported
-  // a stop/start the engine never made. Freezing, not suppressing — engineWasRunning is held too, so
-  // a phantom that returns before the mask lifts produces no transition at all, while a stop that is
-  // REAL still announces itself once the mask lifts, just up to ~4.6s late. Run-time and cycle
-  // accounting above are untouched.
+  // Engine start/stop console line. Frozen (engineWasRunning held too) while g_rpmTachMasked: an abrupt field
+  // cut spikes then false-zeros the LM2907 for ~4.6 s. A phantom that ends before the mask lifts logs nothing;
+  // a real stop still logs once it lifts, up to ~4.6 s late.
   if (!g_rpmTachMasked) {
     if (engineIsRunning && !engineWasRunning) {
       queueConsoleMessageF("Engine STARTED (RPM=%d)", (int)RPM);
@@ -3010,11 +3270,6 @@ double calculateHaversineDistance(double lat1, double lon1, double lat2, double 
 
   return R * c;  // Distance in nautical miles
 }
-
-/**
- * UpdateSailingMetrics - Track sailing time and calculate ratio
- * Sailing conditions: sailboat (Vessel Info Type) AND SOG > 0.5 knots AND sailingEngineOff()
- */
 void UpdateSailingMetrics(unsigned long elapsedMillis) {
   bool isSailing = false;
   if (boatIsSail() && !IS_STALE(IDX_SOG_NMEA) && SOGNMEA > 0.5 && sailingEngineOff()) {
@@ -3037,7 +3292,8 @@ void UpdateSailingMetrics(unsigned long elapsedMillis) {
     }
   }
 
-  float total_operational_days = totalSocSampleTime_AllTime / 86400.0f;
+  // Powered time, not the SoC sample time: that one accrues only with a battery shunt.
+  float total_operational_days = totalPoweredTime_AllTime / 86400.0f;
   if (total_operational_days > 0) {
     sailing_ratio = (sailing_days_alltime / total_operational_days) * 100.0f;
   } else {
@@ -3057,8 +3313,7 @@ void UpdateWindMaximums() {
 }
 
 void UpdateBoardTempPressureMaximums() {
-  // Guard per-field — NaN compares false against everything, but watermark updaters
-  // shouldn't ingest NaN. A BMP388 read failure could surface NaN on either channel.
+  // A BMP388 read failure can surface NaN on either channel; keep it out of the watermarks.
   if (!isnan(ambientTemp)) {
     if (ambientTemp > board_temp_max_alltime)        board_temp_max_alltime    = ambientTemp;
     if (ambientTemp < board_temp_min_alltime)        board_temp_min_alltime    = ambientTemp;
@@ -3116,14 +3371,19 @@ int socShownX100() {
   return (BattMonSrc != 0 && !isnan(s)) ? (int)lroundf(s * 100.0f) : SOC_percent;
 }
 float getBatteryVoltage() {
-  // INA228 bus voltage — more accurate (20-bit, no divider drift) and faster in field-on mode.
-  // BatteryV (ADS1115) is retained separately for the cross-sensor disagreement check only.
+  // INA228: 20-bit, no divider drift, faster field-on. BatteryV (ADS1115) is kept only for the disagreement check.
   return IBV;
 }
-// Freshness of the held sensor globals (§10.5 / §10.2 / §10.6): with commit-on-valid a dead sensor
-// leaves its last good value in place, so every accumulator and bus transmitter asks first.
-// Windows are >= 2 x the source's read interval plus margin, so a normal cadence never reads stale.
-// Fake hardware (bench without harnesses) stamps its own values and is always fresh.
+// Alarm battery volts (incl. the N2K Low System Voltage bit): fresh, non-ignored INA228, else the second reading,
+// else none. IBV holds its last good value when the chip dies, so it is never read bare here.
+bool alarmBatteryVoltage(float &v) {
+  if (LimpHome) return false;
+  if (!IgnoreBattVMain && ibvFresh()) { v = IBV; return true; }
+  if (!IgnoreBattV2 && battVFresh()) { v = BatteryV; return true; }
+  return false;
+}
+// Freshness of held sensor globals (§10.5 / §10.2 / §10.6): a dead sensor leaves its last good value, so consumers
+// ask first. Windows are >= 2x the read interval plus margin; fake hardware is always fresh.
 bool altAmpsFresh() {
   if (hardwarePresent == 0) return true;
   uint32_t ts = dataTimestamps[IDX_MEASURED_AMPS];
@@ -3167,9 +3427,8 @@ static bool chargeDecisionExternalV(float &out) {
   return (out > 5.0f) && (out < fminf(85.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f)));
 }
 
-// Battery volts the bulk/absorption/float/rebulk DECISIONS use. Every control loop, protection and
-// dynamic measurement stays on IBV/getFiltV(); only the stage thresholds may follow an external sensor,
-// which is what a long Regulator Ground Wire needs.
+// Battery volts for the stage DECISIONS only; every loop, protection and dynamic measurement stays on IBV/getFiltV().
+// Exists for a long Regulator Ground Wire.
 float getChargeDecisionVoltage() {
   if (BatteryVoltageSource == 0) return getFiltV();
   float ext;
@@ -3251,9 +3510,8 @@ void CheckAlarms() {
       TempToUse = temperatureThermistor;
     }
 
-    // A held reading from a dead probe must not sound for hours (audit 2026-09-27): the selected source must
-    // have stamped within the running / at-rest poll window, and every way of running without the sensor
-    // (owner override, LimpHome) silences these two.
+    // A held reading from a dead probe must not sound for hours: the selected source must have stamped within the
+    // running / at-rest poll window, and every way of running without the sensor (override, LimpHome) silences these.
     const uint32_t altTempTs = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
     const bool altTempTrusted = !IgnoreTemperature && !LimpHome
                                 && altTempTs != 0 && (millis() - altTempTs) <= (g_engineRunning ? 20000UL : 90000UL);
@@ -3346,9 +3604,8 @@ void CheckAlarms() {
 
     // (Alternator-health is advisory-only — no audible alarm.)
 
-    // Fast alt-current pulse-pattern fault (rectifier/stator) — opt-in audible alarm.
-    // Sounds while a FAULT verdict is fresh (seen within the last 2 min); default OFF until
-    // real-capture validation. AlarmActivate-gated like every other condition in this block.
+    // Fast alt-current pulse-pattern fault (rectifier/stator): opt-in, default OFF until real-capture validation.
+    // Sounds while a FAULT verdict is < 2 min old.
     static unsigned long lastFaFaultAlarmMsgMs = 0;
     if (faAlarmEnable && faLastFaultMs != 0 && (millis() - faLastFaultMs < 120000UL)) {
       currentAlarmCondition = true;
@@ -3361,10 +3618,11 @@ void CheckAlarms() {
       lastFaFaultAlarmMsgMs = 0;
     }
 
-    float currentVoltage = getBatteryVoltage();
+    float currentVoltage = 0.0f;
+    const bool voltOk = alarmBatteryVoltage(currentVoltage);
 
     static unsigned long lastVoltHighMsgMs = 0;
-    if (VoltageAlarmHigh > 0 && currentVoltage > VoltageAlarmHigh) {
+    if (voltOk && VoltageAlarmHigh > 0 && currentVoltage > VoltageAlarmHigh) {
       currentAlarmCondition = true;
       alarmReason = "High battery voltage"; alarmBits |= 1UL << 8;
       if (millis() - lastVoltHighMsgMs >= 30000) {
@@ -3379,7 +3637,7 @@ void CheckAlarms() {
     static unsigned long lastVoltLowMsgMs = 0;
     // The > floor rejects a disconnected/0V reading; scale it by bank class (8V on 12V → 16/32V on
     // 24/36/48V) so it stays a "sensor disconnected" floor and never sits above a real low-V alarm point.
-    if (VoltageAlarmLow > 0 && currentVoltage < VoltageAlarmLow && currentVoltage > 8.0 * SYSTEM_VOLTAGE_CLASS / 12.0f) {
+    if (voltOk && VoltageAlarmLow > 0 && currentVoltage < VoltageAlarmLow && currentVoltage > 8.0 * SYSTEM_VOLTAGE_CLASS / 12.0f) {
       currentAlarmCondition = true;
       alarmReason = "Low battery voltage"; alarmBits |= 1UL << 9;
       if (millis() - lastVoltLowMsgMs >= 30000) {
@@ -3411,7 +3669,7 @@ void CheckAlarms() {
       alarmReason = "High alternator current"; alarmBits |= 1UL << 11;
       if (millis() - lastCurHighMsgMs >= 30000) {
         lastCurHighMsgMs = millis();
-        queueConsoleMessageF("High alternator current: %.1fA (limit: %.0fA)",
+        queueConsoleMessageF("High alternator current: %.1fA (limit: %dA)",
                              MeasuredAmps, CurrentAlarmHigh);
       }
     } else {
@@ -3424,7 +3682,7 @@ void CheckAlarms() {
       alarmReason = "High battery current"; alarmBits |= 1UL << 12;
       if (millis() - lastBatCurMsgMs >= 30000) {
         lastBatCurMsgMs = millis();
-        queueConsoleMessageF("High battery current: %.1fA (limit: %.0fA)",
+        queueConsoleMessageF("High battery current: %.1fA (limit: %dA)",
                              abs(Bcur), MaximumAllowedBatteryAmps);
       }
     } else {
@@ -3433,8 +3691,7 @@ void CheckAlarms() {
   }
 
   // ========== TEMP TASK FAILURE ALARM ==========
-  // General-fault class (GeneralFaultAlarm, Alarms page). The condition is raised regardless of AlarmActivate;
-  // the output stage below still needs AlarmActivate. Throttled console reminder every 30s.
+  // General-fault class: raised regardless of AlarmActivate; the output stage below still needs it.
   if (tempTaskAlarm && GeneralFaultAlarm == 1) {
     currentAlarmCondition = true;
     alarmReason = "TempTask failure — temperature monitoring lost"; alarmBits |= 1UL << 13;
@@ -3446,10 +3703,8 @@ void CheckAlarms() {
   }
 
   // ========== TEMP DATA STALE ALARM ==========
-  // Fires when no valid reading for 20s (sensor disconnected or persistent comm failure).
-  // Gated by AlarmActivate, on the engine running (at rest TempTask polls only every 60 s, so the
-  // 20 s rule alarmed with the engine off) and on the sensor not being ignored — the same window
-  // as the field cut. Complements the field cut that fires at the same threshold.
+  // Gated on the engine running (at rest TempTask polls only every 60 s) and the sensor not being ignored:
+  // the same window as the 20 s field cut.
   if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     uint32_t tempIdx = (TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP;
     uint32_t ts = dataTimestamps[tempIdx];
@@ -3470,11 +3725,9 @@ void CheckAlarms() {
   }
 
   // ========== REQUIRED-SENSOR FAULT ALARM (§3.3 as amended by §11) ==========
-  // Driven by the required-fault set, not by the reason holding the field off: with two faults the ladder
-  // shows one, and a fault that lands while the key is off showed nothing. Owner-overridden and Not-fitted
-  // sensors never alarm. Silent at
-  // rest (engine off and key off): the header line carries it until the next start. General-fault class
-  // (GeneralFaultAlarm, Alarms page, owner ruling 2026-09-27).
+  // Driven by the required-fault set, not the reason holding the field off (that shows only one of two faults).
+  // Owner-overridden / Not-fitted sensors never alarm. Silent at rest (engine and key off): the header line carries
+  // it. General-fault class (GeneralFaultAlarm).
   if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     static unsigned long lastSensorFaultMsgMs = 0;
     static char sensorAlarmText[240];
@@ -3498,9 +3751,8 @@ void CheckAlarms() {
   }
 
   // ========== BATTERY TEMPERATURE LOST ALARM (§2.3) ==========
-  // Only while BATT_TEMP_LOST is the one thing holding the field off (a key-off or a LimpHome run with the
-  // reading missing sounds nothing); the block above already names it, this one adds the Automatic-source
-  // wording. Not with a second fault present, whose combined text must stand. General-fault class.
+  // Only while BATT_TEMP_LOST alone holds the field off (key-off or LimpHome sounds nothing); adds the Automatic-source
+  // wording to the block above. Not with a second fault present, whose combined text must stand. General-fault class.
   if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     static unsigned long lastBattTempLostMsgMs = 0;
     if (g_battTempState == 2 && gpio4IsLow && g_fieldEventReason == REASON_BATT_TEMP_LOST && g_reqFaultCount <= 1) {
@@ -3518,12 +3770,9 @@ void CheckAlarms() {
   }
 
   // ========== BATTERY CURRENT LOST ALARM (§11.6, optional sensor declared present) ==========
-  // Owner ruling 2026-09-27: the battery-current source the charge stages read (the regulator shunt, or with none
-  // fitted the network battery monitor) that stops reporting alarms and is named in the header line; charging
-  // continues on voltage alone (the tail-current absorption exit, the current rebulk and, on the shunt, SoC and the
-  // battery charge-current limit wait for a fresh reading). Never a cut. Silent while the INA228 itself is the named
-  // fault (the sensor-fault block above already covers the chip), and silent at rest like the block above.
-  // General-fault class.
+  // The battery-current source the stages read (shunt, else network monitor) going silent alarms but never cuts:
+  // charging continues on voltage (tail exit, current rebulk and, on the shunt, SoC and the charge-current limit wait).
+  // Silent while the INA228 itself is the named fault, and at rest. General-fault class.
   if (AlarmActivate == 1 && GeneralFaultAlarm == 1) {
     static unsigned long lastBattCurLostMsgMs = 0;
     const bool awake = g_engineRunning || (keyOnForAlarms() && OnOff == 1);
@@ -3545,15 +3794,10 @@ void CheckAlarms() {
   }
 
   // ===== INA228 HARDWARE OVERVOLTAGE PROTECTION =====
-  // The ALERT pin pulls GPIO4 low electrically the instant the bus crosses VoltageHardwareLimit —
-  // before any software runs. This block only manages the software latch that keeps the field
-  // suppressed until the condition is confirmed cleared, plus the messaging around it.
-  // SLOW_ALERT is SET, so the comparison uses the averaged ADC value rather than instantaneous
-  // reads — a single noise spike cannot assert ALERT. The averaging window follows the chip mode:
-  // ~4.5 ms (4-sample) in fast charging mode, ~1061 ms (128-sample) with the field off — so while
-  // charging the pin is a near-instant electrical cut. A transparent-mode pin blip that clears
-  // before the 250 ms BUSOL status poll still cuts the field but is never logged here.
-  // New-event detection is throttled to 5 s (I2C cost); the 3 s / 10 s latch checks run every 250 ms.
+  // The ALERT pin pulls GPIO4 low electrically on crossing VoltageHardwareLimit, before any software; this block only
+  // runs the software latch that holds the field off until confirmed clear. SLOW_ALERT: the chip compares its averaged
+  // value (~4.5 ms field-on, ~1061 ms field-off), so one spike can't assert. A blip that clears before the 5 s BUSOL poll
+  // still cuts the field but is never logged. New-event poll every 5 s (I2C cost); latch checks every 250 ms.
 
   if (INADisconnected == 0) {
     static unsigned long lastINA228Check = 0;
@@ -3581,8 +3825,7 @@ void CheckAlarms() {
       // ── 3s early check: fast release for genuine transient spikes ────
       if (!earlyCheckDone && latchAge >= 3000) {
         earlyCheckDone = true;
-        clearINA228AlertLatch(INA.getAddress());
-        alertStatus = readINA228AlertRegister(INA.getAddress());
+        alertStatus = readINA228AlertRegister(INA.getAddress());   // the DIAG_ALRT read itself clears a latched flag
         float busV = INA.getBusVoltage();
 
         // I²C error (0xFFFF) → treat as "still set", hold latch (fail-safe)
@@ -3602,7 +3845,7 @@ void CheckAlarms() {
           // Still set — not a transient. Wait for 10s.
           queueConsoleMessageF(
             "INA228 OV STILL ACTIVE [3s check]: busV=%.3fV limit=%.3fV | "
-            "BUSOL bit still set after clear attempt. Sustained condition. "
+            "BUSOL bit still set. Sustained condition. "
             "Will recheck at 10s.",
             busV, VoltageHardwareLimit);
         }
@@ -3611,7 +3854,6 @@ void CheckAlarms() {
       // ── 10s definitive check ─────────────────────────────────────────
       if (inaOvervoltageLatched && latchAge >= 10000) {
         earlyCheckDone = false;
-        clearINA228AlertLatch(INA.getAddress());
         alertStatus = readINA228AlertRegister(INA.getAddress());
         float busV = INA.getBusVoltage();
 
@@ -3627,8 +3869,7 @@ void CheckAlarms() {
             busV, VoltageHardwareLimit,
             INA_OV_DISAGREE_SUPPRESS_MS / 1000);
         } else {
-          // Still present — hold latch, will recheck on next 10s boundary
-          // by resetting inaOvervoltageTime so the 10s check re-arms.
+          // Still present: restart inaOvervoltageTime so the 10 s check re-arms.
           inaOvervoltageTime = millis();
           if (GeneralFaultAlarm == 1) { currentAlarmCondition = true; alarmReason = "INA228 hardware overvoltage still present"; alarmBits |= 1UL << 17; }
           queueConsoleMessageF(
@@ -3640,9 +3881,7 @@ void CheckAlarms() {
     }
 
     // ── New event detection — throttled to every 5s ───────────────────
-    // Hardware ALERT pin already cut GPIO4 before this runs.
-    // This block detects the event and engages the software latch
-    // so the field stays suppressed even if ALERT deasserts quickly.
+    // ALERT already cut GPIO4; the latch keeps the field off even if ALERT deasserts quickly.
     if (millis() - lastINA228Check >= 5000) {
       lastINA228Check = millis();
       alertStatus = readINA228AlertRegister(INA.getAddress());
@@ -3656,10 +3895,7 @@ void CheckAlarms() {
 
           float busV = INA.getBusVoltage();
 
-          // Note: busV here may be lower than the actual peak because
-          // the INA228 averaged value lags the instantaneous reading
-          // that triggered the ALERT pin. The hardware caught the real peak;
-          // this is a post-event averaged reading.
+          // busV is a post-event averaged reading, lower than the peak the hardware caught.
           queueConsoleMessageF(
             "INA228 HARDWARE ALERT PIN FIRED: busV(avg)=%.3fV limit=%.3fV | "
             "GPIO4 was cut electrically by ALERT pin before this message. "
@@ -3690,10 +3926,9 @@ void CheckAlarms() {
   }
 
   // ========== SILENCE ==========
-  // The Silence button (owner ruling 2026-09-27: the buzzer is continuous, with a software silence) mutes the
-  // buzzer for the condition sounding now. It clears by itself when nothing has sounded for 10 s (a held latch
-  // included) or when a condition outside the silenced set is raised, so a second fault landing during a silenced one
-  // sounds again. A latch whose condition has ended (no bits) stays silenced until Reset Latch.
+  // Silence (the buzzer is continuous) mutes the condition sounding now. Clears after 10 s with nothing sounding (a held
+  // latch included) or when a condition outside the silenced set is raised. A latch whose condition ended (no bits)
+  // stays silenced until Reset Latch.
   if (SilenceAlarm == 1) {
     SilenceAlarm = 0;
     if (outputAlarmState && AlarmActivate == 1) {
@@ -3702,8 +3937,7 @@ void CheckAlarms() {
       queueConsoleMessageF("ALARM SILENCED: %s (sounds again for a different condition)", alarmReason[0] ? alarmReason : "latched alarm");
     }
   }
-  // "Nothing sounding" must hold 10 s: the threshold alarms have no hysteresis, so one 250 ms pass under the line
-  // otherwise ended the silence and the next pass sounded the same condition again.
+  // 10 s hold: threshold alarms have no hysteresis, so one 250 ms pass under the line would end the silence.
   static uint32_t alarmQuietSinceMs = 0;
   if (outputAlarmState) alarmQuietSinceMs = 0;
   else if (alarmQuietSinceMs == 0) alarmQuietSinceMs = millis() ? millis() : 1;
@@ -3739,8 +3973,7 @@ void CheckAlarms() {
 }
 
 
-// Human-readable boot/reset cause for the console boot line. esp_reset_reason()
-// is constant for the whole session, so it can be read lazily when the line is emitted.
+// Boot/reset cause for the console boot line; esp_reset_reason() is constant for the session, so read lazily.
 const char *resetReasonName() {
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON:   return "power-on";
@@ -3767,94 +4000,34 @@ void logDashboardValues() {
   static unsigned long lastDashboardLog = 0;
   if (millis() - lastDashboardLog >= 300000) {  // Every 5 min — periodic time/context anchor
     lastDashboardLog = millis();
-    // No battery shunt -> Bcur is whatever floats on the INA current input and SOC_percent is a
-    // frozen NVS value (coulomb counting is HAS_BATT_SHUNT-gated). Print "n/a" rather than numbers
-    // that read like measurements in a log we later analyse as ground truth.
+    // No shunt: Bcur floats and SOC_percent is a frozen NVS value, so print "n/a" rather than numbers a
+    // log reader would take as measurements.
     char socStr[8], bcurStr[12];
     if (socShownOk()) snprintf(socStr, sizeof(socStr), "%d%%", socShownX100() / 100);
     else strncpy(socStr, "n/a", sizeof(socStr));
     if (HAS_BATT_SHUNT) snprintf(bcurStr, sizeof(bcurStr), "%.1fA", Bcur);
     else strncpy(bcurStr, "n/a", sizeof(bcurStr));
-    // (int)NAN prints 2147483647 on this core; absent probe / out-of-range amps sensor read "n/a".
-    char altIStr[12], altTStr[12];
+    // (int)NAN prints 2147483647 on this core; absent probe / out-of-range amps sensor read "n/a", and so does a
+    // reading the owner ignores (Run Without Failed Sensors, or every one in Limp Home).
+    char ibvStr[12], altIStr[12], altTStr[12], rpmStr[12];
+    if (!IgnoreBattVMain && !LimpHome && ibvFresh()) snprintf(ibvStr, sizeof(ibvStr), "%.2fV", IBV);
+    else                                             strncpy(ibvStr, "n/a", sizeof(ibvStr));
     unsigned long ampsTs = dataTimestamps[IDX_MEASURED_AMPS];
-    if (ampsTs != 0 && millis() - ampsTs <= 10000) snprintf(altIStr, sizeof(altIStr), "%.1fA", MeasuredAmps);
-    else                                           strncpy(altIStr, "n/a", sizeof(altIStr));
-    if (isfinite(AlternatorTemperatureF)) snprintf(altTStr, sizeof(altTStr), "%d°F", (int)AlternatorTemperatureF);
-    else                                  strncpy(altTStr, "n/a", sizeof(altTStr));
-    queueConsoleMessageF("DASHBOARD: IBV=%.2fV SoC=%s AltI=%s BattI=%s AltT=%s RPM=%d",
-                         IBV, socStr, altIStr, bcurStr, altTStr, (int)RPM);
+    if (!IgnoreAltCurrent && !LimpHome && ampsTs != 0 && millis() - ampsTs <= 10000)
+      snprintf(altIStr, sizeof(altIStr), "%.1fA", MeasuredAmps);
+    else
+      strncpy(altIStr, "n/a", sizeof(altIStr));
+    if (!IgnoreTemperature && !LimpHome && isfinite(TempToUse) && TempToUse != -99)   // the owner's selected alternator probe
+      snprintf(altTStr, sizeof(altTStr), "%d°F", (int)TempToUse);
+    else
+      strncpy(altTStr, "n/a", sizeof(altTStr));
+    if (!IgnoreRPM && !LimpHome) snprintf(rpmStr, sizeof(rpmStr), "%d", (int)RPM);
+    else                         strncpy(rpmStr, "n/a", sizeof(rpmStr));
+    queueConsoleMessageF("DASHBOARD: IBV=%s SoC=%s AltI=%s BattI=%s AltT=%s RPM=%s",
+                         ibvStr, socStr, altIStr, bcurStr, altTStr, rpmStr);
   }
 }
 
-void applySocGainCorrection(int preResetShadowX100) {
-  // battery current always comes from INA228
-  if (AutoShuntGainCorrection == 0) {
-    return;
-  }
-
-  unsigned long now = millis();
-  if (now - lastGainCorrectionTime < MIN_GAIN_CORRECTION_INTERVAL) {
-    queueConsoleMessage("SOC Gain: Correction blocked, too soon since last adjustment");
-    return;
-  }
-
-  float expectedCapacity = BatteryCapacity_Ah;
-  // Pre-reset SHADOW coulomb count from the caller (shadowCoulombX100) — unclamped, so it can sit
-  // above capacity at the full anchor. Evidence is two-sided: below capacity = counted too little
-  // (raise gain), above = counted too much (lower gain). A capacity-setting edit mid-cycle can
-  // contaminate one event's evidence; the 5%/event and 0.8-1.2 clamps bound the damage.
-  float calculatedCapacity = preResetShadowX100 / 100.0;
-
-  if (calculatedCapacity < 10 || expectedCapacity < 10) {
-    queueConsoleMessage("SOC Gain: Invalid capacity values, skipping correction");
-    return;
-  }
-
-  float errorRatio = abs(expectedCapacity - calculatedCapacity) / expectedCapacity;
-
-  if (errorRatio > MAX_REASONABLE_ERROR) {
-    queueConsoleMessageF("SOC Gain: Error too large (%.1f%%), ignoring correction",
-                         errorRatio * 100);
-    return;
-  }
-
-  float desiredCorrectionFactor = expectedCapacity / calculatedCapacity;
-  float currentFactor = DynamicShuntGainFactor;
-  float newFactor = currentFactor * desiredCorrectionFactor;
-
-  float maxChange = currentFactor * MAX_GAIN_ADJUSTMENT_PER_CYCLE;
-  if (newFactor > currentFactor + maxChange) {
-    newFactor = currentFactor + maxChange;
-    queueConsoleMessage("SOC Gain: Correction limited to maximum change rate");
-  } else if (newFactor < currentFactor - maxChange) {
-    newFactor = currentFactor - maxChange;
-    queueConsoleMessage("SOC Gain: Correction limited to maximum change rate");
-  }
-
-  if (newFactor > MAX_DYNAMIC_GAIN_FACTOR) {
-    newFactor = MAX_DYNAMIC_GAIN_FACTOR;
-    queueConsoleMessageF("SOC Gain: Factor hit maximum limit (%.2f), check system",
-                         MAX_DYNAMIC_GAIN_FACTOR);
-  } else if (newFactor < MIN_DYNAMIC_GAIN_FACTOR) {
-    newFactor = MIN_DYNAMIC_GAIN_FACTOR;
-    queueConsoleMessageF("SOC Gain: Factor hit minimum limit (%.2f), check system",
-                         MIN_DYNAMIC_GAIN_FACTOR);
-  }
-
-  DynamicShuntGainFactor = newFactor;
-  lastGainCorrectionTime = now;
-  queueConsoleMessageF("SOC Gain: Corrected from %.4f to %.4f (Calc:%.1fAh, Expected:%.1fAh)",
-                       currentFactor, newFactor, calculatedCapacity, expectedCapacity);
-}
-void handleSocGainReset() {
-  if (ResetDynamicShuntGain == 1) {
-    DynamicShuntGainFactor = 1.0;
-    lastGainCorrectionTime = 0;
-    ResetDynamicShuntGain = 0;  // Clear the momentary flag
-    queueConsoleMessage("SOC Gain: Dynamic gain factor reset to 1.0");
-  }
-}
 // ===== Temperature-compensated zero correction (ZERO_DRIFT_TEMPCOMP_SPEC.md) ==================
 // The zero-drift log is the data source; the daily fit builds a line zero(T)=c+b·(T−T_REF),
 // EMA-smoothed across days, and the live correction is clamped to ±3 A.
@@ -3862,9 +4035,8 @@ void handleSocGainReset() {
 // ZFitResult (one regression's output) is declared in Xregulator.ino so Arduino's auto-generated
 // prototype for zeroFitRegress can see the return type.
 
-// Least-squares fit of logged zero (amps) vs one sensor's temperature. Walks the ring newest→oldest,
-// x-centered at T_REF so the intercept IS c, and stops the moment it has both enough points AND a
-// >30 °F span — that block is the freshest data that reaches the required spread.
+// Least-squares zero (A) vs one sensor's temp, newest→oldest, x-centered at T_REF so the intercept IS c. Stops
+// at the first block with enough points AND a >30 °F span: the freshest data with the required spread.
 static ZFitResult zeroFitRegress(int sensor, uint32_t nowEpoch) {
   ZFitResult res; res.ok = false; res.c = res.b = res.r2 = res.residRms = res.span = 0.0f; res.n = 0;
   if (!zeroLogRing || zeroLogCount == 0) return res;
@@ -3925,22 +4097,21 @@ static void zeroFitPushHistory(uint32_t epoch, float c, float b, float r2, uint1
   if (zeroFitHistCount < ZFIT_HIST_SIZE) zeroFitHistCount++;
 }
 
-// Boot: alloc the history ring in PSRAM, restore it from /zerofit.bin (the live equation itself is
-// restored separately from NVS in loadNVSData). Called from setup() near zeroLogInit().
+// Boot: alloc the history ring in PSRAM and restore /zerofit.bin (the live equation comes from NVS in loadNVSData).
 void zeroFitInit() {
   if (!zeroFitHist) {
     zeroFitHist = (ZeroFitRecord *)ps_malloc(ZFIT_HIST_SIZE * sizeof(ZeroFitRecord));
     if (!zeroFitHist) { Serial.println("FATAL: zeroFitHist ps_malloc failed"); return; }
     memset(zeroFitHist, 0, ZFIT_HIST_SIZE * sizeof(ZeroFitRecord));
   }
+  zeroBasisA = AlternatorCOffset;
   uint32_t uw = 0;
   const bool hadFile = fsExists(ZFIT_PATH);
   uint32_t n = readPsramBlob(ZFIT_PATH, ZFIT_MAGIC, ZFIT_VER,
                              zeroFitHist, sizeof(ZeroFitRecord), ZFIT_HIST_SIZE, &uw, false);
   if (hadFile && n == 0) {
-    // The history was discarded (format version bump, or a corrupt file). The live equation in NVS was
-    // fitted from the same rows, so it goes with it: correction 0 until the first clean fit. loadNVSData
-    // ran before this, so the clear sticks and the next NVS flush writes it.
+    // History discarded (version bump or corrupt file): the NVS equation was fitted from it, so it is cleared
+    // too. loadNVSData already ran, so the clear sticks and the next NVS flush writes it.
     zfValid = 0; zfC = 0.0f; zfB = 0.0f; zfR2 = 0.0f; zfSensor = ZF_BOARD;
     zfLastEpoch = 0; zfFlipStreak = 0; zfFlipPending = ZF_BOARD;
     DynamicAltCurrentZero = 0.0f;
@@ -3949,6 +4120,7 @@ void zeroFitInit() {
   zeroFitHistCount = (uint16_t)n;
   zeroFitHistHead  = (n >= ZFIT_HIST_SIZE) ? 0 : (uint16_t)n;
   prev_zeroFitHistHead = zeroFitHistHead;
+  zeroFitShiftAmps(zeroBasisFromWord(uw) - zeroBasisA);
   if (n > 0) Serial.printf("zeroFitInit: restored %u fits\n", (unsigned)n);
 }
 
@@ -3956,7 +4128,7 @@ void zeroFitInit() {
 void dumpZeroFit() {
   if (!zeroFitHist || zeroFitHistCount == 0) return;
   uint16_t startIdx = (zeroFitHistCount < ZFIT_HIST_SIZE) ? 0 : zeroFitHistHead;
-  uint32_t n = writePsramBlob(ZFIT_PATH, ZFIT_MAGIC, ZFIT_VER, 0,
+  uint32_t n = writePsramBlob(ZFIT_PATH, ZFIT_MAGIC, ZFIT_VER, zeroBasisWord(zeroBasisA),
                               zeroFitHist, sizeof(ZeroFitRecord),
                               ZFIT_HIST_SIZE, startIdx, zeroFitHistCount);
   if (n > 0) prev_zeroFitHistHead = zeroFitHistHead;
@@ -4004,8 +4176,9 @@ bool zeroFitCompute() {
     zfFlipStreak = 0; zfFlipPending = cand;
   }
 
-  // Outlier reject vs history median (arms once enough history exists).
-  if (zeroFitHistCount >= ZFIT_OUTLIER_MINHIST) {
+  // Outlier reject vs history median (arms once enough history exists). Not on a flip: the history belongs to the
+  // other sensor, whose c and b sit on a different temperature axis, and a rejected flip retried and failed forever.
+  if (!flip && zeroFitHistCount >= ZFIT_OUTLIER_MINHIST) {
     float cMed, bMed; zeroFitMedians(&cMed, &bMed);
     if (fabsf(best.c - cMed) > ZFIT_OUTLIER_C_A || fabsf(best.b - bMed) > ZFIT_OUTLIER_B) {
       queueConsoleMessageF("Zero-fit: outlier held (c=%.2f med=%.2f b=%.3f med=%.3f)",
@@ -4036,22 +4209,24 @@ bool zeroFitCompute() {
   return true;
 }
 
-// Called every loop. Recomputes the daily fit at most 1×/24 h when engine+field are both off, and
-// updates DynamicAltCurrentZero from the live equation + live temperature every pass.
+// Daily fit at most 1x/24 h with the engine off and the field settled-cut; DynamicAltCurrentZero updates every pass.
 void zeroFitService() {
   uint32_t now = millis();
 
   static uint32_t nextComputeMs = 0;                      // 0 → first attempt as soon as everything's off. Under the
                                                           // signed compare below that only holds while uptime < 24.8 d;
                                                           // reachable only if the field never rested once in 24.8 days.
-  bool everythingOff = (RPM < 200) && (fieldActiveStatus == 0);
+  // fieldCutSettled, not the duty-based fieldActiveStatus: duty 0 with GPIO4 high (solar holding the bus, or a dead or
+  // ignored tach reading 0 RPM) would run both regressions and a LittleFS write inside a live control pass.
+  bool everythingOff = (RPM < 200) && fieldCutSettled(0);
   if ((int32_t)(now - nextComputeMs) >= 0 && everythingOff) {  // signed-delta compare survives the millis() rollover
     bool accepted = zeroFitCompute();
     nextComputeMs = now + (accepted ? ZFIT_INTERVAL_MS : ZFIT_RETRY_MS);  // retry sooner if it held
   }
 
   // Live correction, recomputed every loop (cheap). Uses the chosen sensor's live temperature.
-  float Tlive = (zfSensor == ZF_ALT) ? AlternatorTemperatureF : ambientTemp;
+  // An owner-ignored alternator probe (or Limp Home) is unknown, as in the zero log; the board sensor has no override.
+  float Tlive = (zfSensor == ZF_ALT) ? ((IgnoreTemperature || LimpHome) ? NAN : (float)AlternatorTemperatureF) : ambientTemp;
   float corr;
   if (!zfValid)                          corr = 0.0f;
   else if (isnan(Tlive) || isinf(Tlive)) corr = zfC;                       // temp unknown → offset only
@@ -4059,25 +4234,36 @@ void zeroFitService() {
   DynamicAltCurrentZero = constrain(corr, -ZFIT_CLAMP_A, ZFIT_CLAMP_A);
 }
 
-// A change to AlternatorCOffset moves every later zero-log row by the same amount, because the log
-// stores raw minus that offset. Left alone, the daily fit's 30-day lookback straddles the seam and
-// lands between the two levels. Shift what is already recorded so past and future rows mean the
-// same thing, and the fit-history ring with them (its median is the outlier gate). The live
-// equation (zfC) is NOT touched: future rows land exactly where it already predicts. Flash copies
-// follow at the next field-off flush (zeroLogService), never here — Apply runs with the engine on.
-// Runs on Core 1 from zeroLogService (altZeroApply stages the delta in pendingZeroShiftA from the
-// web task), the same pass that appends rows and runs the daily fit, so nothing straddles the shift.
-void zeroHistoryShiftAmps(float delta) {
-  if (delta == 0.0f || isnan(delta)) return;
-  if (zeroLogRing) {
-    for (uint16_t i = 0; i < zeroLogCount; i++) zeroLogRing[i].amps += delta;   // count == ring size once wrapped
-    zeroLogFileRecords = 0;         // the file holds the old level: the next flush compacts the whole ring
-    prev_zeroLogHead   = 0xFFFF;
+// AlternatorCOffset change: the log stores raw minus the offset, so recorded rows (and the fit history, whose
+// median is the outlier gate) shift with it or the 30-day fit straddles the seam. zfC is not touched here: an offset
+// set from a reading with the correction subtracted leaves future rows where it predicts, and one set with the
+// correction off moves zfC in zeroCorrFollowOffset. Flash follows at the next field-off flush, never here (Apply
+// runs engine-on). Core 1 only: the boot loaders (file header basis vs the live offset) and zeroLogService
+// (zeroBasisA vs the live offset).
+void zeroLogShiftAmps(float delta) {
+  if (delta == 0.0f || !isfinite(delta) || !zeroLogRing) return;
+  for (uint16_t i = 0; i < zeroLogCount; i++) zeroLogRing[i].amps += delta;   // count == ring size once wrapped
+  zeroLogFileRecords = 0;         // the file holds the old level: the next flush compacts the whole ring
+  prev_zeroLogHead   = 0xFFFF;
+}
+void zeroFitShiftAmps(float delta) {
+  if (delta == 0.0f || !isfinite(delta) || !zeroFitHist) return;
+  for (uint16_t i = 0; i < zeroFitHistCount; i++) zeroFitHist[i].c += delta;
+  prev_zeroFitHistHead = 0xFFFF;  // flagged for the next field-off flush
+}
+// An owner offset change made with the correction out of the reading (`delta` = old offset - new, the rows' shift):
+// zfC moves with the rows, so turning the correction on later is right at once instead of re-learning for days.
+// Web task: written with the offset, not at the next field-off save, so a power cut cannot leave the pair split.
+void zeroCorrFollowOffset(float delta) {
+  if (!zfValid || delta == 0.0f || !isfinite(delta)) return;
+  zfC += delta;
+  nvs_handle_t h;
+  if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_blob(h, "ZFitC", &zfC, sizeof(float));
+    nvs_commit(h);
+    nvs_close(h);
   }
-  if (zeroFitHist) {
-    for (uint16_t i = 0; i < zeroFitHistCount; i++) zeroFitHist[i].c += delta;
-    prev_zeroFitHistHead = 0xFFFF;  // flagged for the next field-off flush
-  }
+  queueConsoleMessageF("Zero correction: learned offset moved %+.2f A with the current offset (correction off)", delta);
 }
 
 void handleAltZeroReset() {
@@ -4099,15 +4285,21 @@ void calculateChargeTimes() {
   if (now - lastCalcTime < INA_SLOW_INTERVAL_MS) return;
   lastCalcTime = now;
 
-  float currentAmps = getBatteryCurrent();  // this is for battery state
+  // The shunt, else the selected network monitor, with the SoC shown; either one unknown leaves both times unknown.
+  bool fromNet;
+  const float currentAmps = stageBattCurrentA(fromNet);
+  if (isnan(currentAmps) || !socShownOk()) {
+    timeToFullChargeMin = -999;
+    timeToFullDischargeMin = -999;
+    return;
+  }
+  const float currentSoC = socShownX100() / 100.0f;
 
   if (currentAmps > 0.01) {  // charging
-    float currentSoC = SOC_percent / 100.0;
     float remainingCapacity = BatteryCapacity_Ah * (100.0 - currentSoC) / 100.0;
     timeToFullChargeMin = (int)(remainingCapacity / currentAmps * 60.0);
     timeToFullDischargeMin = -999;           // Not applicable while charging
   } else if (currentAmps < -0.01) {          // discharging
-    float currentSoC = SOC_percent / 100.0;
     float availableCapacity = BatteryCapacity_Ah * currentSoC / 100.0;
     timeToFullDischargeMin = (int)(availableCapacity / (-currentAmps) * 60.0);
     timeToFullChargeMin = -999;  // Not applicable while discharging
@@ -4116,6 +4308,13 @@ void calculateChargeTimes() {
     timeToFullChargeMin = -999;
     timeToFullDischargeMin = -999;
   }
+}
+// The displayed lives follow the stored wear: run at boot load, on every engine-off pass (a manual life set while
+// parked), and after each accrual.
+static void deriveAltLifePercents() {
+  InsulationLifePercent = (1.0f - CumulativeInsulationDamage) * 100.0f;
+  GreaseLifePercent = (1.0f - CumulativeGreaseDamage) * 100.0f;
+  BrushLifePercent = (1.0f - CumulativeBrushDamage) * 100.0f;
 }
 void calculateThermalStress() {
   unsigned long now = millis();
@@ -4131,6 +4330,21 @@ void calculateThermalStress() {
 
   if (RPM < 0.0f || RPM > 10000.0f || isnan(RPM) || isinf(RPM)) {
     return;  // Invalid RPM
+  }
+
+  // Wear accrues only while the alternator turns: the 10,000 h life caps (RPM floored at 100) would otherwise wear a
+  // parked unit to 0 % in ~14 months. The clock still advances so the next run isn't charged for the gap.
+  // alternatorIsOn covers an ignored tach.
+  if (!engineSpinning() && !alternatorIsOn) {
+    lastThermalUpdateTime = now;
+    deriveAltLifePercents();
+    return;
+  }
+  // An owner-ignored alternator temperature is no basis for wear; the clock advances so the gap is never charged later.
+  if (IgnoreTemperature || LimpHome) {
+    lastThermalUpdateTime = now;
+    deriveAltLifePercents();
+    return;
   }
 
 
@@ -4188,9 +4402,7 @@ void calculateThermalStress() {
   CumulativeGreaseDamage = constrain(CumulativeGreaseDamage, 0.0f, 1.0f);
   CumulativeBrushDamage = constrain(CumulativeBrushDamage, 0.0f, 1.0f);
 
-  InsulationLifePercent = (1.0f - CumulativeInsulationDamage) * 100.0f;
-  GreaseLifePercent = (1.0f - CumulativeGreaseDamage) * 100.0f;
-  BrushLifePercent = (1.0f - CumulativeBrushDamage) * 100.0f;
+  deriveAltLifePercents();
 
   // Calculate predicted life hours (minimum of current rates)
   float min_damage_rate = max({ insul_damage_rate, grease_damage_rate, brush_damage_rate });
@@ -4212,22 +4424,25 @@ uint16_t readINA228AlertRegister(uint8_t i2cAddress) {
   Wire.write(0x0B);                                     // DIAG_ALRT register
   if (Wire.endTransmission(false) != 0) return 0xFFFF;  // keep repeated start
   if (Wire.requestFrom(i2cAddress, (uint8_t)2) != 2) return 0xFFFF;
-  return (Wire.read() << 8) | Wire.read();
+  const uint8_t hi = Wire.read();   // two statements: the operands of | are unsequenced
+  const uint8_t lo = Wire.read();
+  return ((uint16_t)hi << 8) | lo;
 }
-bool clearINA228AlertLatch(uint8_t i2cAddress) {
-  Wire.beginTransmission(i2cAddress);
-  Wire.write(0x00);  // CONFIG register
-  Wire.endTransmission(false);
-  Wire.requestFrom(i2cAddress, (uint8_t)2);
-  if (Wire.available() < 2) return false;
-  uint16_t config = (Wire.read() << 8) | Wire.read();
-  // Set ALERT_LATCH_CLEAR bit (bit 3)
-  config |= 0x0008;
-  Wire.beginTransmission(i2cAddress);
-  Wire.write(0x00);
-  Wire.write(config >> 8);
-  Wire.write(config & 0xFF);
-  return Wire.endTransmission() == 0;
+// Never the library setters: each is a read-modify-write whose failed read returns 0, writing MODE 0 (shutdown)
+bool inaWriteAdcConfig(uint16_t word) {
+  const uint8_t addr = INA.getAddress();
+  Wire.beginTransmission(addr);
+  Wire.write(0x01);
+  Wire.write((uint8_t)(word >> 8));
+  Wire.write((uint8_t)(word & 0xFF));
+  if (Wire.endTransmission() != 0) return false;
+  Wire.beginTransmission(addr);
+  Wire.write(0x01);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(addr, (uint8_t)2) != 2) return false;
+  const uint8_t hi = Wire.read();
+  const uint8_t lo = Wire.read();
+  return (((uint16_t)hi << 8) | lo) == word;
 }
 
 // Returns 0..OV_HIST_BINS-1, or -1 if raw bus voltage is at/below Bulk (struct + bin layout
@@ -4245,13 +4460,13 @@ int ovHistBin(float rawV) {
 
 // Called once per control tick in every mode — field state does not gate it, because external
 // charge sources (solar, shore) can drive bus OV with the field off and must still be captured.
-void updateOvHistogram(float rawV, uint32_t nowMs) {
+void updateOvHistogram(float rawV, bool vTrusted, uint32_t nowMs) {
   static uint32_t lastMs = 0;
   static int lastBin = -1;
   uint32_t dt = (lastMs == 0) ? 0 : (nowMs - lastMs);
   if (dt > 1000) dt = 1000;  // clamp: never attribute a boot/stall gap to a bin
   lastMs = nowMs;
-  int bin = ovHistBin(rawV);
+  int bin = vTrusted ? ovHistBin(rawV) : -1;   // an ignored or held reading is no dwell, and ends the event
   if (bin < 0) {
     lastBin = -1;
     return;
@@ -4262,7 +4477,6 @@ void updateOvHistogram(float rawV, uint32_t nowMs) {
 }
 
 // BATTERY_TYPE is free text from Vessel Info, so substring-match the common lithium spellings.
-// Shared by the INA228 threshold rule and the SoC voltage seed.
 bool batteryIsLithium() {
   String bt = BATTERY_TYPE;
   bt.toLowerCase();
@@ -4276,16 +4490,10 @@ void updateINA228OvervoltageThreshold() {
     return;
   }
 
-  // Programs the ALERT comparator from VoltageHardwareLimit — a persisted user setting (top rung
-  // of the OV ladder), no derivation. Guidance: 0.2 V x class/12 below the battery's BMS
-  // charge-disconnect voltage, one rung ABOVE the software instant cut (AlternatorHardShutdownV),
-  // so software gets first shot at every rung and the pin is purely the electrical MCU-hang /
-  // software-failed-to-protect backstop (~0 trips normally). The compare uses the chip's averaged
-  // value (SLOWALERT); while the field is on the chip runs fast mode (4-sample avg, ~4.5 ms), so
-  // the pin is a near-instant electrical cut, not a slow layer. It can never be the timed layer:
-  // AVG applies to ALL active inputs, so slowing the bus average would drag CURRENT register
-  // updates to the same cadence and kill the 5 ms load-dump/CV sampling (TI SLYS021 — the alert
-  // path has no independent delay/deglitch feature).
+  // Programs the ALERT comparator from VoltageHardwareLimit (persisted user setting, top OV rung, no derivation).
+  // Guidance: 0.2 V x class/12 below the BMS charge-disconnect, one rung ABOVE the software instant cut, so the pin is
+  // purely the MCU-hang backstop. SLOWALERT compares the averaged value (~4.5 ms field-on). Never the timed layer: AVG
+  // applies to ALL inputs, so a slower bus average would slow CURRENT updates and kill 5 ms load-dump/CV sampling (TI SLYS021).
 
   const double LSB = 0.003125;                                           // 3.125 mV/LSB
   uint16_t thresholdLSB = (uint16_t)(VoltageHardwareLimit / LSB + 0.5);  // Round instead of truncate
@@ -4366,9 +4574,8 @@ void checkWebFilesExist() {
   }
 }
 
-// Inter-sample gap meter for a slow ADS channel (CH0 battV, CH2 RPM). Called on each
-// VALID reading; records the gap since the previous valid reading. "worst" resets on
-// Reset Peak Values. ch=0 → battV, ch=2 → RPM. Dashboard: Live Data → ESP32.
+// Inter-sample gap meter for a slow ADS channel (ch 0 battV, ch 2 RPM), on each VALID reading. "worst" resets
+// on Reset Peak Values; shown at Live Data → ESP32.
 static inline void adsGapUpdate(uint8_t ch, uint32_t now) {
   uint32_t *prev  = (ch == 0) ? &ch0GapPrevMs  : &ch2GapPrevMs;
   uint16_t *last  = (ch == 0) ? &ch0GapLastMs  : &ch2GapLastMs;
@@ -4386,9 +4593,7 @@ static inline void adsGapUpdate(uint8_t ch, uint32_t now) {
 
 
 void ReadAnalogInputs() {
-  // Outer wrapper — ft_rai_total captures the true worst-case duration including
-  // I2C timeouts. Individual section timers triangulate which sub-block is
-  // responsible when ft_rai_total spikes.
+  // ft_rai_total = true worst case incl. I2C timeouts; the section timers locate which sub-block spiked.
   TIMED_CALL(ft_rai_total, _ReadAnalogInputs_inner());
 }
 
@@ -4436,30 +4641,25 @@ void _ReadAnalogInputs_inner() {
   static unsigned long lastINARead_local = 0;
 
   // Speed mode switch — fast (~4.5ms) when field gate is open, slow (~1061ms) when off.
-  // Four read-modify-writes of ADC_CONFIG, only on transition; no cost on steady state.
+  // One verified ADC_CONFIG write, only on transition; no cost on steady state.
   if (INADisconnected == 0) {
     bool fieldGateOpen = !gpio4IsLow;
     if (fieldGateOpen && !inaFastModeActive) {
-      INA.setAverage(1);                    // 4 samples (register 1)
-      INA.setBusVoltageConversionTime(4);   // 540µs
-      INA.setShuntVoltageConversionTime(4); // 540µs
-      INA.setTemperatureConversionTime(0);  // 50µs — total update: 4×1130µs ≈ 4.5ms, still inside the 5ms poll. Re-asserted every transition so an INA228 brownout (VTCT resets to 1052µs) cannot silently double the cycle
-      IBV_filtered = IBV;                   // reseed EMA so CV loop starts clean
-      inaReadInterval = INA_FAST_INTERVAL_MS;
-      inaFastModeActive = true;
+      if (inaWriteAdcConfig(INA_ADC_CFG_FAST)) {   // ≈ 4.5ms, inside the 5ms poll; re-asserts VTCT after an INA228 brownout
+        IBV_filtered = IBV;                 // reseed EMA so CV loop starts clean
+        inaReadInterval = INA_FAST_INTERVAL_MS;
+        inaFastModeActive = true;
+      }
     } else if (!fieldGateOpen && inaFastModeActive) {
-      INA.setAverage(4);                    // 128 samples (register 4)
-      INA.setBusVoltageConversionTime(7);   // 4120µs
-      INA.setShuntVoltageConversionTime(7); // 4120µs
-      INA.setTemperatureConversionTime(0);  // 50µs — total update: 128×8290µs ≈ 1061ms, inside the 1100ms poll
-      inaReadInterval = INA_SLOW_INTERVAL_MS;
-      inaFastModeActive = false;
+      if (inaWriteAdcConfig(INA_ADC_CFG_SLOW)) {   // 128 samples x 8290µs ≈ 1061ms, inside the 1100ms poll
+        inaReadInterval = INA_SLOW_INTERVAL_MS;
+        inaFastModeActive = false;
+      }
     }
   }
 
-  // Consecutive invalid INA228 reads (I2C error, NaN, outside the plausibility window). The §10.1 stale
-  // rule counts reads rather than wall-clock because reads only happen from loop(): a long loop pass
-  // must not read as a dead chip. Saturates at 255.
+  // Consecutive invalid INA228 reads (I2C error, NaN, out of window), saturating at 255. §10.1 counts reads, not
+  // wall-clock: reads happen only from loop(), so a long loop pass must not read as a dead chip.
   static uint8_t inaMissRun = 0;
   static bool inaMissRunFieldOn = false;   // the current miss run began with the field on: it keeps the field-on threshold even after a cut
   static bool inaLastMissI2c = false;      // the latest miss was an I2C error (NACK) rather than a read outside the window
@@ -4469,10 +4669,8 @@ void _ReadAnalogInputs_inner() {
       && (INADisconnected == 0 || millis() - lastINARead_local >= INA_SLOW_INTERVAL_MS)) {
     {
       lastINARead_local = millis();
-      // Track intervals only while INA228 is in fast mode (~6 ms cadence).
-      // Gating on inaFastModeActive (not fieldActiveStatus) avoids logging a
-      // slow-mode ~1061ms read as a false outlier during gate transitions.
-      // Reset windowed stats on each fast-mode rising edge.
+      // Interval stats only in fast mode (inaFastModeActive, not fieldActiveStatus, so a slow ~1061 ms read is
+      // never a false outlier at gate transitions); windows reset on each fast-mode rising edge.
       static bool lastFastMode = false;
       bool nowFastMode = inaFastModeActive;
       if (nowFastMode && !lastFastMode) resetINA228IntervalWindows();
@@ -4496,22 +4694,18 @@ void _ReadAnalogInputs_inner() {
                      if (inaBusDt > 15000UL) inaBusSlowCount++;          // ≥1 Wire-timeout's worth = bus stall
                      bool shuntOk = (shuntErr == 0) && !isnan(shuntMv);
 
-                     // Regulator Ground Wire on the LOAD side of a shunt in the battery negative lead: charging current
-                     // leaves the negative post through the shunt toward the bus bar, so board ground sits I*Rshunt
-                     // BELOW the post and IBV reads HIGH while charging (low while discharging). The INA228's own
-                     // differential reading IS that drop (charging-positive once InvertBattAmps is applied), so it is
-                     // subtracted. Raw shunt volts only - the current-path calibrations (BatteryCOffset,
-                     // DynamicShuntGainFactor) must not leak into a voltage.
+                     // Regulator Ground Wire on the LOAD side of a battery-negative shunt: board ground sits I*Rshunt
+                     // below the post, so IBV reads HIGH while charging. The INA228's differential reading IS that drop,
+                     // so it is subtracted. Raw shunt volts only: BatteryCOffset must not leak in.
                      if (ShuntLead == 1 && HAS_BATT_SHUNT && shuntOk) {
                        busV -= (InvertBattAmps ? -1.0f : 1.0f) * shuntMv / 1000.0f;
                      }
 
                      busOk = (busErr == 0) && !isnan(busV) && busV > 5.0 && busV < fminf(85.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));  // garbage-reject ceiling scales with class, capped at INA228 85V full scale
                      if (!busOk) inaLastMissI2c = (busErr != 0);
-                     // Sticky for the whole miss run: a chip reset whose LAST dropped read answers (power-on register 0,
-                     // out of window) or that falls between two polls left BOVL at its power-on maximum = hardware OV off
-                     // for up to 30 s (audit 2026-09-27). inaLastMissI2c keeps its "latest miss" meaning for the
-                     // disconnected line below.
+                     // Sticky for the whole miss run: a chip reset whose LAST dropped read answers (power-on 0, out of
+                     // window) or falls between polls leaves BOVL at its power-on maximum = hardware OV off.
+                     // inaLastMissI2c keeps its "latest miss" meaning for the disconnected line below.
                      static bool inaMissRunHadI2c = false;
                      if (!busOk && busErr != 0) inaMissRunHadI2c = true;
                      // The chip ANSWERED (in range or not): it is connected again, whatever it is reading.
@@ -4534,7 +4728,6 @@ void _ReadAnalogInputs_inner() {
                          queueConsoleMessageF("INA228 back after %u dropped reads — configuration and hardware overvoltage threshold re-applied", (unsigned)inaMissRun);
                        }
                        inaMissRunHadI2c = false;
-                       float bcurUnscaled = Bcur;
                        // A shunt NACK with a good bus read must not commit a current made of BatteryCOffset alone.
                        if (shuntOk) {
                          ShuntVoltage_mV = shuntMv;
@@ -4543,18 +4736,13 @@ void _ReadAnalogInputs_inner() {
                          if (InvertBattAmps == 1) {
                            Bcur = -Bcur;
                          }
-                         bcurUnscaled = Bcur;   // the field resistance test's: a SoC-learned gain must not scale R
-                         // battery current always from INA228
-                         if (AutoShuntGainCorrection == 1) {
-                           Bcur = Bcur * DynamicShuntGainFactor;
-                         }
                          BatteryCurrent_scaled = Bcur * 100;
                          MARK_FRESH(IDX_BCUR);
                          aggBcur.add(Bcur);
                        } else {
                          ina228ErrorCount++;
                        }
-                       frtInaSample(bcurUnscaled, IBV, shuntOk);
+                       frtInaSample(Bcur, IBV, shuntOk);
 
                        // IBV EMA — used by getFiltV() and CV loop error terms
                        // dBcur/dt — positive value = load dump (loads disconnected, OV risk)
@@ -4578,9 +4766,8 @@ void _ReadAnalogInputs_inner() {
                          lastIbvEmaMs = nowIna;
                          ibvFreshFlag = true;
 
-                         // No shunt -> the derivative is the slope of INA input noise. Leave g_dBcur_dt
-                         // at 0 and keep the slew roll empty so neither the CSV2 trace nor the
-                         // load-dump gate-tuning readout shows a number that reads like a measurement.
+                         // No shunt: the derivative is input noise, so g_dBcur_dt stays 0 and the slew roll stays
+                         // empty (no fake measurement in CSV2 or the load-dump gate-tuning readout).
                          static float bcurPrev = 0.0f;
                          static uint32_t bcurPrevMs = 0;
                          if (HAS_BATT_SHUNT && shuntOk) {
@@ -4599,18 +4786,18 @@ void _ReadAnalogInputs_inner() {
                          }
                        }
 
-                       // Fold this fast Bcur sample (+ co-sampled MeasuredAmps) into the measured
-                       // filtered-ripple capture (§3.1). ALWAYS-ON: peak IExcessTau-filtered pk-pk per
-                       // FaCell for the map + Protections plot; the 3-level test ring appends only when armed.
+                       // Fast Bcur (+ co-sampled MeasuredAmps) into the filtered-ripple capture (§3.1), always on: peak
+                       // IExcessTau-filtered pk-pk per FaCell; the 3-level test ring appends only when armed.
                        if (shuntOk && altAmpsFresh()) faFiltRippleUpdate(Bcur, MeasuredAmps, RPM);
 
-                       if (IBV > IBVMax)              { IBVMax              = IBV; }
-                       if (IBV > PeakVoltage_AllTime) { PeakVoltage_AllTime = IBV; }
-                       if (IBV < MinVoltage)          { MinVoltage          = IBV; }
-                       if (IBV < MinVoltage_AllTime)  { MinVoltage_AllTime  = IBV; }
-                       wmIgnUpdate(wmIgn_IBV,  IBV);   // ignition-cycle watermarks (lo + hi)
-                       // No shunt -> leave the battery-current watermark at NAN so the records row
-                       // renders empty instead of the hi/lo excursions of an unconnected input.
+                       if (!IgnoreBattVMain && !LimpHome) {   // statistics only: an owner-ignored reading is not data
+                         if (IBV > IBVMax)              { IBVMax              = IBV; }
+                         if (IBV > PeakVoltage_AllTime) { PeakVoltage_AllTime = IBV; }
+                         if (IBV < MinVoltage)          { MinVoltage          = IBV; }
+                         if (IBV < MinVoltage_AllTime)  { MinVoltage_AllTime  = IBV; }
+                         wmIgnUpdate(wmIgn_IBV,  IBV);   // ignition-cycle watermarks (lo + hi)
+                       }
+                       // No shunt: the battery-current watermark stays NAN, not an unconnected input's excursions.
                        if (HAS_BATT_SHUNT && shuntOk) wmIgnUpdate(wmIgn_Bcur, Bcur);
                      } else {
                        ina228ErrorCount++;   // I2C error or implausible read — dropped (no MARK_FRESH), IBV holds
@@ -4635,10 +4822,9 @@ void _ReadAnalogInputs_inner() {
     }
   }
 
-  // §10.1 / §1.4: main battery voltage stale. Read-count rule with a wall-clock backstop; the flag
-  // feeds REASON_VOLTAGE_STALE and sensorFaultMask bit 3 (buildTickSnapshot). 3 s of I2C misses also
-  // names the chip (INADisconnected) for the UI and mask bit 8; the next answered read clears it. A read
-  // that answers but sits outside the window (a bench with no battery) is stale, not a dead chip.
+  // §10.1 / §1.4: main battery voltage stale (read-count rule + wall-clock backstop) -> REASON_VOLTAGE_STALE, mask bit 3.
+  // 3 s of I2C misses also sets INADisconnected (mask bit 8) until the next answered read. An answering read outside
+  // the window (bench, no battery) is stale, not a dead chip.
   {
     uint32_t nowMs = millis();
     static bool prevFieldOn = false;
@@ -4699,10 +4885,8 @@ void _ReadAnalogInputs_inner() {
       } catch (...) {
         inaDieTempF = NAN;
       }
-      // The max is held to a stricter standard than the live readout: it uploads daily and never
-      // comes back down, so a single garbage sample would pollute the fleet record forever. A value
-      // counts only after the warm-up discard AND only if the previous sample sits within
-      // INA_DIETEMP_STEP_F of it. Earliest a reading can reach the max is the 4th sample.
+      // The max uploads daily and never comes down, so it is stricter than the live readout: a value counts only
+      // after warm-up AND with the previous sample within INA_DIETEMP_STEP_F (earliest: the 4th sample).
       if (isfinite(inaDieTempF) && inaDieWarmup >= INA_DIETEMP_WARMUP_SAMPLES) {   // the field-drive heat ceiling's input: out of range ages it like a missing read
         g_fdDieTempF = inaDieTempF;
         MARK_FRESH(IDX_INA_DIE_TEMP);
@@ -4713,12 +4897,8 @@ void _ReadAnalogInputs_inner() {
         if (inaDieWarmup < INA_DIETEMP_WARMUP_SAMPLES) {
           inaDieWarmup++;
         } else if (isfinite(inaDiePrevF) && fabsf(inaDieTempF - inaDiePrevF) <= INA_DIETEMP_STEP_F) {
-          // Second line of defence: once seeded, the max climbs at most INA_DIETEMP_STEP_F per
-          // accepted sample. Corroboration alone is not enough — two IDENTICAL bad reads corroborate
-          // each other — so bound the damage instead of trying to classify every sample. A real die
-          // cannot move faster than this in a second, so a genuine peak is never under-reported;
-          // a stuck-hot read would have to persist for ten-plus consecutive seconds to matter, and
-          // by then the chip is broken rather than glitching.
+          // Second defence: once seeded the max climbs at most INA_DIETEMP_STEP_F per accepted sample, since two
+          // IDENTICAL bad reads corroborate each other. A real die can't move faster, so real peaks are never cut.
           float capped = isfinite(inaDieTempMaxF) ? fminf(inaDieTempF, inaDieTempMaxF + INA_DIETEMP_STEP_F)
                                                   : inaDieTempF;
           if (!isfinite(inaDieTempMaxF) || capped > inaDieTempMaxF) inaDieTempMaxF = capped;
@@ -4729,14 +4909,9 @@ void _ReadAnalogInputs_inner() {
   }
 
   // ── ADS1115 non-blocking state machine ───────────────────────────────────
-  // Sequence {1,0,1,2,1,3} → CH1 = 3/6 samples (fresh CH1 ~13 ms apart, up to ~30 ms)
-  // ADS_WAIT uses time-based 3ms delay — no isConversionDone() I²C poll.
-  // Back-to-back trigger fires next conversion at end of ADS_READ_RESULT,
-  // saving one loop() call per step. Falls back to ADS_IDLE if <2ms elapsed.
-  // Full 6-step cycle ≈ 40ms on the bench (CH1 ~13ms apart, ~75 Hz); CH0/CH2/CH3 each update once per cycle.
-  //
-  // ft_rai_ads_state measures cost per state step (not a full logical read cycle),
-  // which is the correct unit for a non-blocking state machine.
+  // Sequence {1,0,1,2,1,3}: CH1 gets 3/6 samples (~13 ms apart, up to ~30 ms); full cycle ~40 ms. ADS_WAIT is a
+  // time-based 3 ms wait, no isConversionDone() I2C poll; the next conversion triggers back-to-back at the end of
+  // ADS_READ_RESULT. ft_rai_ads_state measures cost per state step, the right unit for a non-blocking machine.
   unsigned long now = millis();
 
   if (ADS1115Disconnected != 0) {
@@ -4772,33 +4947,26 @@ void _ReadAnalogInputs_inner() {
                    // 860 SPS = 1.16ms/conversion; 3ms gives millis() granularity margin
                    if (now - adsStateEntered >= ADS_CONVERSION_MS) {
                      adsState = ADS_READ_RESULT;
-                   } else if (now - adsStateEntered > ADS_TIMEOUT_MS) {
-                     queueConsoleMessage("ADS1115 timeout ch" + String(adsTriggeredChannel));
-                     adsState = ADS_IDLE;  // retry same channel
                    }
                    break;
 
                  case ADS_READ_RESULT:
                    {
-                     // Read conversion register directly - we have already confirmed OS bit is set,
-                     // so we bypass adc.getConversion() which would busy-wait/block the loop unnecessarily
+                     // Read the conversion register directly: ADS_WAIT's fixed ADS_CONVERSION_MS wait covers the
+                     // conversion and the OS bit is never polled; adc.getConversion() would spin on it, blocking the loop
                      Wire.beginTransmission(0x48);
                      Wire.write(ADS1115_REG_POINTER_CONVERT);
                      uint32_t _ads_t0 = (uint32_t)esp_timer_get_time();
                      uint8_t endStatus = Wire.endTransmission(false);
-                     uint32_t _ads_t1 = (uint32_t)esp_timer_get_time();
                      uint8_t bytesReceived = Wire.requestFrom((uint8_t)0x48, (uint8_t)2);
                      uint32_t _ads_t2 = (uint32_t)esp_timer_get_time();
 
-                     // Diagnostic: log when either I2C call stalls >5ms total
+                     // Diagnostic: log when the read stalls >5ms. Total only: endTransmission(false) does no bus I/O in
+                     // core 3.3.8 (the transfer happens inside requestFrom), so a split would always show endTx ~0.
                      if (_ads_t2 - _ads_t0 > 5000) {
                        adsSlowReadCount++;
-                       adsLastSlowEndTxUs   = _ads_t1 - _ads_t0;
-                       adsLastSlowReqFromUs = _ads_t2 - _ads_t1;
-                       Serial.printf("ADS slow read #%lu ch%d: endTx=%luus reqFrom=%luus total=%luus\n",
+                       Serial.printf("ADS slow read #%lu ch%d: total=%luus\n",
                                      (unsigned long)adsSlowReadCount, adsTriggeredChannel,
-                                     (unsigned long)adsLastSlowEndTxUs,
-                                     (unsigned long)adsLastSlowReqFromUs,
                                      (unsigned long)(_ads_t2 - _ads_t0));
                      }
 
@@ -4806,7 +4974,9 @@ void _ReadAnalogInputs_inner() {
 
                      adsLastStepMs = millis();   // the state machine is stepping: the wall-clock stale backstops may count
                      if (readOK) {
-                       Raw = (int16_t)((Wire.read() << 8) | Wire.read());
+                       const uint8_t hi = Wire.read();   // two statements: the operands of | are unsequenced
+                       const uint8_t lo = Wire.read();
+                       Raw = (int16_t)(((uint16_t)hi << 8) | lo);
                      } else {
                        // Drain whatever is in the buffer to leave I2C bus clean
                        while (Wire.available()) Wire.read();
@@ -4881,10 +5051,9 @@ void _ReadAnalogInputs_inner() {
                            {
                              static const float kAmpScale[]  = {100.0f, 150.0f, 250.0f};
                              static const float kSanityLim[] = {250.0f, 370.0f, 600.0f};
-                             // Lower bound is 20 % of full scale, not the mirror of the upper one: an alternator cannot
-                             // source negative current beyond offset and noise, while an unplugged or unpowered sensor
-                             // reads -250 / -375 / -625 A (0 V in) and a reversed clamp reads the true current negated.
-                             // The symmetric window committed the 200 A case as a valid -249 A (audit 2026-09-27).
+                             // Lower bound is 20 % of full scale, not the mirror of the upper: an alternator can't source
+                             // negative current beyond offset and noise, while an unplugged sensor reads -250 / -375 / -625 A
+                             // (0 V in) and a reversed clamp reads the current negated.
                              static const float kNegLim[]    = {40.0f, 60.0f, 100.0f};
                              int rIdx = (AmpSensorRange >= 0 && AmpSensorRange <= 2) ? AmpSensorRange : 1;
                              float ampsCand = (Channel1V - 2.5f) * kAmpScale[rIdx];
@@ -4897,9 +5066,8 @@ void _ReadAnalogInputs_inner() {
                              ampsCand = ampsCand - DynamicAltCurrentZero;
                            }
 
-                           // Out of range = sensor unpowered/unplugged (0 V in reads ~-625 A on the 500 A range).
-                           // Never publish it: MeasuredAmps holds the last sane value, the UI greys it by age,
-                           // and REASON_CURRENT_STALE cuts the field after 10 s.
+                           // Out of range = sensor unpowered/unplugged: never published. MeasuredAmps holds, the UI greys
+                           // it by age, and REASON_CURRENT_STALE cuts the field after 10 s.
                            const bool ampsSane = ampsCand > -kNegLim[rIdx] && ampsCand < kSanityLim[rIdx];
                            g_altAmpsOutOfRange = !ampsSane;
                            {
@@ -4914,13 +5082,12 @@ void _ReadAnalogInputs_inner() {
                            if (ampsSane) {
                              MeasuredAmps = ampsCand;
                              MARK_FRESH(IDX_MEASURED_AMPS);
-                             wmIgnUpdate(wmIgn_amps, MeasuredAmps);  // ignition-cycle watermark
+                             if (!IgnoreAltCurrent && !LimpHome) wmIgnUpdate(wmIgn_amps, MeasuredAmps);  // ignition-cycle watermark
                              aggAltCur.add(MeasuredAmps);
                              ch1FreshFlag = true;  // Signal PID that fresh current data is available
                              // ── EMA filter ─────────────────────────────────────────────────────────
-                             // Output PID EMA (OutputPIDFilterTC → g_pidI_filtered) — the signal the CC
-                             // current loop acts on. iExcess uses its own EMA on raw MeasuredAmps into
-                             // mExcessEma (see the MA block below), not this one.
+                             // Output PID EMA (OutputPIDFilterTC → g_pidI_filtered), the signal the CC loop acts on.
+                             // iExcess has its own EMA (mExcessEma) on raw MeasuredAmps.
                              {
                                static bool amps_filter_init = false;
                                static uint32_t lastAmpsFilterMs = 0;
@@ -4937,16 +5104,14 @@ void _ReadAnalogInputs_inner() {
                            }
 
                            // ── Current amplitude ring + moving averages ──────────────────────────────
-                           // Runs every in-range CH1 sample. Feeds MA and dI/dt to the fast current
-                           // rise supervisor in AdjustFieldLearnMode.
+                           // Feeds MA and dI/dt to the fast current rise supervisor (AdjustFieldLearnMode).
                            if (ampsSane) {
                              uint32_t now_i = millis();
                              iAmpRing[iAmpHead] = { now_i, MeasuredAmps };
                              iAmpHead = (iAmpHead + 1) % I_RING_SIZE;
                              if (iAmpCount < I_RING_SIZE) iAmpCount++;
 
-                             // MA(N) for the Output Current PID signal (iExcess no longer uses an MA —
-                             // the EMA detector reads raw MeasuredAmps into its own mExcessEma).
+                             // MA(N) for the Output Current PID signal only (iExcess uses its own EMA).
                              {
                                int n_pid = OutputPIDMA_N < (int)iAmpCount ? OutputPIDMA_N : (int)iAmpCount;
                                if (n_pid < 1) n_pid = 1;
@@ -4964,7 +5129,7 @@ void _ReadAnalogInputs_inner() {
                            // one-tick lag is acceptable for analysis.
                            cvLog_tick(millis());
 
-                           if (ampsSane) {
+                           if (ampsSane && !IgnoreAltCurrent && !LimpHome) {
                              if (MeasuredAmps > MeasuredAmpsMax)         { MeasuredAmpsMax         = MeasuredAmps; }
                              if (MeasuredAmps > MeasuredAmpsMax_AllTime) { MeasuredAmpsMax_AllTime = MeasuredAmps; }
                            }
@@ -4976,12 +5141,8 @@ void _ReadAnalogInputs_inner() {
                            // Commit-on-valid (§10.3): the candidate lives in rpmCand until it passes every check;
                            // RPM, RPMMax and the lifetime maximum only ever see committed values.
                            float rpmCand = Raw / 32768.0 * 2 * 6.144 * RPMScalingFactor;
-                           // DEBUG — RPM-glitch hunt (the phantom "Engine STARTED RPM=3321" with a clean
-                           // plot). A real start ramps; a lone jump from ~0 to a high value in one read is
-                           // the glitch. Logs the raw ADS conversion code so we can read the actual bad
-                           // value, plus transport status: endStatus=0/bytes=2 means a "clean" read of a
-                           // bad conversion (incomplete or cross-channel mux carryover), not a bus error.
-                           // Remove once root cause is identified.
+                           // DEBUG, RPM-glitch hunt (remove once the root cause is found): logs a lone ~0 -> high jump with the
+                           // raw ADS code. endStatus=0/bytes=2 = a clean read of a bad conversion (incomplete or mux carryover).
                            {
                              static float prevRPMdbg = 0.0f;
                              if (prevRPMdbg < 100.0f && rpmCand > 1000.0f) {
@@ -4994,15 +5155,10 @@ void _ReadAnalogInputs_inner() {
                              }
                              prevRPMdbg = rpmCand;
                            }
-                           // Lone-sample glitch rejection: a real start ramps across >=2 samples (~40ms
-                           // apart via the ADS round-robin); a single <100 -> >1000 jump is field-PWM
-                           // pickup during shutdown or an ADS mux-carryover artifact, never a real engine.
-                           // Hold the last accepted value for one sample and accept on the second
-                           // consecutive high reading — keeps phantoms out of RPM, RPMMax, watermarks,
-                           // aggregates, and CSVs, and stops a lone spike resetting the zero hold.
-                           // The held value is stamped fresh, so the spin-down and zero cuts, and the low-RPM gate
-                           // while tach-lie is not armed, count it as a low read; it leaves rpmUnheldReadMs alone,
-                           // so the tach-lie count, and the gate while tach-lie is armed, do not.
+                           // Lone-sample glitch rejection: a real start ramps over >= 2 samples (~40 ms apart); a single
+                           // < 100 -> > 1000 jump is field-PWM pickup at shutdown or ADS mux carryover. Hold the last value for
+                           // one sample, accept on the second high read. The held value is stamped fresh (spin-down / zero cuts
+                           // and the low-RPM gate without tach-lie armed count it as low) but leaves rpmUnheldReadMs alone.
                            bool rpmHeld = false;
                            {
                              static float rpmLastAccepted = 0.0f;
@@ -5022,13 +5178,13 @@ void _ReadAnalogInputs_inner() {
                            if (rpmCand >= 0 && rpmCand < 10000) {  // Sanity check
                              Channel2V = rpmCand;
                              RPM = rpmCand;
-                             if (IgnoreRPM == 0) {   // an ignored tach is by the owner's word untrustworthy; RPMMax_AllTime has no reset path
+                             if (IgnoreRPM == 0 && !LimpHome) {   // an ignored tach is by the owner's word untrustworthy; RPMMax_AllTime has no reset path
                                if (RPM > RPMMax)         { RPMMax         = RPM; }
                                if (RPM > RPMMax_AllTime) { RPMMax_AllTime = RPM; }
                              }
                              MARK_FRESH(IDX_RPM);
                              if (!rpmHeld) rpmUnheldReadMs = (uint32_t)dataTimestamps[IDX_RPM];
-                             wmIgnUpdate(wmIgn_RPM, RPM);  // ignition-cycle watermark
+                             if (IgnoreRPM == 0 && !LimpHome) wmIgnUpdate(wmIgn_RPM, RPM);  // ignition-cycle watermark
                              adsGapUpdate(2, now);  // CH2 RPM inter-sample gap meter
                              aggRpm.add(RPM);
                              adsMissRun[2] = 0;
@@ -5043,13 +5199,9 @@ void _ReadAnalogInputs_inner() {
                            // real signal range is 0-3.3V per docs/hardware/analoginputsADS1115.md.
                            Channel3V = Raw / 32768.0 * 6.144;
 
-                           // Disconnect detection: per the hardware doc, the lowest legitimate
-                           // V_node is 0.134V (NTC at -40°C). The board ships with a ground jumper
-                           // installed by default, so most units have Channel 3 tied to GND and
-                           // V_node = 0V. A 0.05V floor cleanly distinguishes "no usable sensor"
-                           // (grounded or floating-leakage) from any real reading.
-                           // Commit-on-valid (§10.4): the -99 marker is no longer written as a temperature;
-                           // temperatureThermistor holds the last committed reading and goes stale.
+                           // Lowest legitimate V_node is 0.134 V (NTC at -40 °C); units ship with a ground jumper on Channel 3
+                           // (0 V), so a 0.05 V floor separates "no usable sensor" from any real reading.
+                           // Commit-on-valid (§10.4): temperatureThermistor holds its last reading and goes stale.
                            if (Channel3V < 0.05f) break;
 
                            {
@@ -5083,10 +5235,8 @@ void _ReadAnalogInputs_inner() {
                      adsSeqIdx = (adsSeqIdx + 1) % adsSeqLen;
                      adsCurrentChannel = adsSeq[adsSeqIdx];
 
-                     // Back-to-back trigger: fire next conversion immediately if ≥2ms has
-                     // elapsed since this conversion was triggered. At 860SPS (1.16ms) and
-                     // ~3ms loop cadence this is always true, saving one loop() call per
-                     // channel. Falls back to ADS_IDLE if called too soon (protects WiFi).
+                     // Back-to-back trigger if >= 2 ms since this conversion was triggered (always true at 860 SPS and
+                     // ~3 ms loop cadence); otherwise fall back to ADS_IDLE, which protects WiFi.
                      if (millis() - adsStateEntered >= 2) {
                        adsTriggeredChannel = adsCurrentChannel;
                        adc.setMux(adsMuxCodes[adsTriggeredChannel]);
@@ -5101,11 +5251,9 @@ void _ReadAnalogInputs_inner() {
                }
              }()));
 
-  // §10.2 / §10.3 / §1.4: per-channel stale rules counted in ADS cycles (a long loop pass is not a dead
-  // input), with a 3 s wall-clock backstop that only counts while the state machine is actually
-  // stepping. CH0 (second battery voltage): 4 cycles -> REASON_VOLTAGE2_STALE / mask bit 4. CH2 (engine
-  // speed): 10 cycles, or no ADS1115 at all, reads as a stopped engine for every consumer (RPM table,
-  // MinRPMForField gate, engine-stopped cut).
+  // §10.2 / §10.3 / §1.4: stale rules counted in ADS cycles (a long loop pass is not a dead input), with a 3 s
+  // wall-clock backstop that counts only while the state machine steps. CH0: 4 cycles -> REASON_VOLTAGE2_STALE /
+  // mask bit 4. CH2: 10 cycles, or no ADS1115, reads as a stopped engine for every consumer.
   {
     uint32_t nowMs = millis();
     bool stepping = (ADS1115Disconnected == 0) && ((uint32_t)(nowMs - adsLastStepMs) < 1000UL);
@@ -5116,9 +5264,7 @@ void _ReadAnalogInputs_inner() {
   }
 
   // ── BMP388 forced-mode non-blocking state machine ────────────────────────
-  // x32 pressure, x2 temperature, IIR filter enabled
-  // Trigger conversion, return immediately, poll until ready, burst-read once.
-  // ft_rai_bmp_state measures cost per state step.
+  // x32 pressure, x2 temperature, IIR on. Trigger, poll until ready, burst-read once; timed per state step.
   {
     enum BMPState {
       BMP_IDLE,
@@ -5136,10 +5282,7 @@ void _ReadAnalogInputs_inner() {
                  switch (bmpState) {
 
                    case BMP_IDLE:
-                     // 4s cycle: max age 4s, one missed read 8s — both inside the 10s DATA_TIMEOUT.
-                     // At the old 8s a single missed read hit 16s, which dropped the battery-temp
-                     // gain derate to 1.0, skipped the cold-charge lockout check, and grayed the
-                     // header board-temp readout until the next good read.
+                     // 4 s cycle: max age 4 s, one missed read 8 s, both inside the 10 s DATA_TIMEOUT.
                      if (!BMP388Disconnected && millis() - bmpLastCycleMs >= 4000) {
                        bmp388.startForcedConversion();  // returns immediately if sensor is in sleep
                        bmpTriggerMs = millis();
@@ -5192,13 +5335,7 @@ void _ReadAnalogInputs_inner() {
 }
 
 // ── IMU FIFO Drain ────────────────────────────────────────────────────────────
-// Called from loop() AFTER AdjustFieldLearnMode() so a Wire stall on the IMU
-// cannot delay control-critical voltage/current reads or the field control decision.
-// No collision-avoidance needed here — a slow drain only delays telemetry, not control.
-// Increment the shared I2C error counter and auto-disable the IMU if errors
-// exceed 10 within any 60-second window.  Called from both error paths inside
-// drainIMUFifo() so the threshold is shared across Get_FIFO_Num_Samples and
-// Get_FIFO_Sample failures.
+// drainIMUFifo runs from loop() AFTER AdjustFieldLearnMode so an IMU Wire stall cannot delay control reads.
 static void imuRecordI2CError() {
   static uint32_t windowErrors = 0;
   static unsigned long windowStart = 0;
@@ -5261,12 +5398,8 @@ void drainIMUFifo() {
                  imuFifoWorstSamples = samples_to_read;   // bytes-in-flight at the worst fetch (×7 = bytes)
                }
 
-               // Timestamp the batch end, then backdate each sample by its nominal interval.
-               // The sensor's internal timestamp register (0x40-0x42, 25µs resolution) would give
-               // true sample times but requires FIFO timestamp batching config. Using nominal ODR
-               // intervals instead - error is negligible (<1% at these rates) and avoids the
-               // batch_timestamp=same_value problem which caused dt_us=0 for all but the first
-               // sample, effectively stalling the complementary filter.
+               // Backdate each sample from the batch end by its nominal ODR interval (<1 % error). A shared batch
+               // timestamp gave dt_us=0 to all but the first sample and stalled the complementary filter.
                uint32_t batch_end_us = micros();
                constexpr uint32_t ACCEL_INTERVAL_US = 9615;  // 1,000,000 / 104 Hz
                constexpr uint32_t GYRO_INTERVAL_US = 19231;  // 1,000,000 / 52 Hz
@@ -5447,17 +5580,14 @@ void ReadAnalogInputs_Fake() {
     if (RPM > RPMMax)         { RPMMax         = RPM; }
     if (RPM > RPMMax_AllTime) { RPMMax_AllTime = RPM; }
 
-    // Fake temperatures — fakeTemp walks in °C (10–110), converted to °F at storage to match
-    // the °F-native globals (previously stored raw °C, making the alternator read ~100°F
-    // hotter than its own thermistor in sim).
+    // fakeTemp walks in °C (10–110), converted to °F at storage to match the °F-native globals.
     fakeTemp += (random(-30, 30) / 10.0);
     if (fakeTemp < 10) fakeTemp = 10;
     if (fakeTemp > 110) fakeTemp = 110;
     temperatureThermistor = (int)(fakeTemp * 1.8f + 32.0f);
     ambientTemp = (fakeTemp - (5 + random(-20, 20) / 10.0)) * 1.8f + 32.0f;
-    // Floored at 60°F only so the board-temperature readout looks plausible; the board temperature no
-    // longer stands in for the battery (removed 2026-09-18), so no lockout reads it. Without the
-    // MARK_FRESH the board-temp and baro readouts stay grayed forever.
+    // Floored at 60 °F only so the board-temp readout looks plausible; no lockout reads board temp.
+    // Without the MARK_FRESH the board-temp and baro readouts stay grayed forever.
     if (ambientTemp < 60.0f) ambientTemp = 60.0f;
 
     // Battery temperature as source 1 (probe): without it the default Automatic source reports
@@ -5715,7 +5845,8 @@ bool ensureWebFS() {
     Serial.println("Attempting to mount factory_fs...");
     Serial.flush();
 
-    if (webFS.begin(true, "/web", 10, "factory_fs")) {
+    // no format-on-fail: nothing writes factory_fs, so a format only erases the one copy
+    if (webFS.begin(false, "/web", 10, "factory_fs")) {
       Serial.println("factory_fs mounted successfully");
       Serial.flush();
       Serial.println("Starting validation of web files...");
@@ -5786,7 +5917,7 @@ bool ensureWebFS() {
     Serial.println("\n--- prod_fs mount failed, trying factory_fs fallback ---");
     Serial.flush();
 
-    if (webFS.begin(true, "/web", 10, "factory_fs")) {
+    if (webFS.begin(false, "/web", 10, "factory_fs")) {
       Serial.println("factory_fs mounted successfully (fallback)");
       Serial.flush();
       Serial.println("Starting validation of factory web files (fallback)...");
@@ -5822,7 +5953,7 @@ bool ensureWebFS() {
 void switchToFactoryWebFiles() {
   webFS.end();
   usingFactoryWebFiles = true;
-  if (!webFS.begin(true, "/web", 10, "factory_fs")) {
+  if (!webFS.begin(false, "/web", 10, "factory_fs")) {  // no format: see ensureWebFS
     Serial.println("ERROR: Failed to mount factory web files");
     events.send("CRITICAL: Failed to mount factory web files", "console", millis());
   } else {
@@ -5830,34 +5961,15 @@ void switchToFactoryWebFiles() {
     events.send("Switched to factory web files for recovery", "console", millis());
   }
 }
-void performFactoryReset() {
-  Serial.println("FACTORY RESET: Switching to factory firmware and web files");
-  events.send("FACTORY RESET: Switching to factory firmware and web files", "console", millis());
-
-  const esp_partition_t *factory_partition =
-    esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-
-  if (factory_partition) {
-    esp_ota_set_boot_partition(factory_partition);
-    switchToFactoryWebFiles();
-    Serial.println("Factory reset complete - restarting in 3 seconds");
-    events.send("Factory reset complete - restarting in 3 seconds", "console", millis());
-    delay(3000);
-    ESP.restart();
-  } else {
-    Serial.println("ERROR: Factory partition not found");
-    events.send("ERROR: Factory partition not found", "console", millis());
-  }
-}
 
 void calculateDerivedMetrics() {
   // ===== TRUE WIND CALCULATION =====
-  // Skip if the bus already provided true wind directly (WindSpeed PGN handler populated
-  // it from a True_North / Magnetic / True_boat reference). Only derive from apparent
-  // when no upstream true source is available.
+  // Derive from apparent only when no upstream true-wind PGN is fresh.
+  const uint32_t twUp = trueWindUpstreamMs;
+  const bool upstreamTrueWind = (twUp != 0) && (millis() - twUp <= DATA_TIMEOUT);
   if (!IS_STALE(IDX_APPARENT_WIND_SPEED) && !IS_STALE(IDX_APPARENT_WIND_ANGLE) &&
       (!IS_STALE(IDX_STW_NMEA) || !IS_STALE(IDX_SOG_NMEA)) && !IS_STALE(IDX_HEADING_NMEA) &&
-      IS_STALE(IDX_TRUE_WIND_SPEED)) {
+      !upstreamTrueWind) {
 
     float awaRad = ApparentWindAngleNMEA * PI / 180.0;
 
@@ -5865,9 +5977,7 @@ void calculateDerivedMetrics() {
     float awsX = ApparentWindSpeedNMEA * sin(awaRad);  // Apparent wind X component
     float awsY = ApparentWindSpeedNMEA * cos(awaRad);  // Apparent wind Y component
 
-    // Subtract boat speed (boat speed is in direction of heading, so Y component).
-    // Prefer speed-through-water (STW) — it removes current so true wind isn't contaminated;
-    // fall back to SOG when no water-speed log is present.
+    // Boat speed lies along heading (Y). Prefer STW (removes current), fall back to SOG.
     float boatSpeedTW = (!IS_STALE(IDX_STW_NMEA) && !isnan(STWNMEA)) ? STWNMEA : SOGNMEA;
     float twsX = awsX;
     float twsY = awsY - boatSpeedTW;
@@ -5884,7 +5994,7 @@ void calculateDerivedMetrics() {
     TrueWindSpeedNMEA = NAN;
     TrueWindAngleNMEA = NAN;
   }
-  // (else: bus is providing true wind directly via WindSpeed PGN handler — leave it alone)
+  // (else: bus is providing true wind directly via WindSpeed PGN handler, or the last derived value is not stale yet — leave it alone)
 
   // ===== LEEWAY CALCULATION =====
   if (!IS_STALE(IDX_HEADING_NMEA) && !IS_STALE(IDX_COG_NMEA)) {
@@ -5916,16 +6026,15 @@ void calculateDerivedMetrics() {
   // Session min/max watermarks for both VMGs (dashboard ↑/↓ sidebars)
   wmIgnUpdate(wmIgn_VMGman, VMGNMEA);
   wmIgnUpdate(wmIgn_VMGup, VMGUpwind);
-  // Lifetime best upwind VMG — sailboats only, and only while the engine is effectively off (sailing, RPM<50), so motoring can't pad the record.
-  if (boatIsSail() && isfinite(VMGUpwind) && RPM < 50.0f && VMGUpwind > best_upwind_vmg_alltime) {
+  // Lifetime best upwind VMG — sailboats only, and only while the engine is off by the sailing-stats rule (sailingEngineOff,
+  // which honors an ignored tach), so motoring can't pad the record.
+  if (boatIsSail() && isfinite(VMGUpwind) && sailingEngineOff() && VMGUpwind > best_upwind_vmg_alltime) {
     best_upwind_vmg_alltime = VMGUpwind;
   }
 
   // ===== SUSTAINED TRUE WIND → BEAUFORT & GALE =====
-  // 2-min running average of true wind speed (US NWS "sustained wind" window). Time-aware EWMA so the
-  // window stays ~120 s regardless of call rate. This sustained value — NOT the instantaneous gust — is
-  // the basis for the Beaufort readout and the gale detector: a 34 kt gust isn't a gale, and a brief lull
-  // inside a 40 kt blow doesn't end one. When true wind is stale we can't confirm a gale, so the run ends.
+  // 2-min time-aware EWMA (US NWS "sustained wind"). Beaufort and the gale detector use it, not the gust: a 34 kt gust
+  // isn't a gale, and a brief lull inside a 40 kt blow doesn't end one. Stale true wind can't confirm a gale: the run ends.
   if (!IS_STALE(IDX_TRUE_WIND_SPEED)) {
     static uint32_t lastSustainedMs = 0;
     uint32_t nowMs = millis();
@@ -6030,12 +6139,9 @@ bool ensureLittleFS() {
 
 
 void ensurePreferredBootPartition() {
-  //Boot partition selection. ota_0 is promoted only when it holds the image a completed, RSA-verified
-  //install recorded (recordOta0AsVerified): a slot can hold a well-formed image that never passed
-  //verification (signature rejected, web bundle failed after the firmware entry streamed), and the
-  //bootloader's structural checks cannot tell those apart. GPIO41 held at boot forces factory, clears
-  //the staged-update flags and drops the record — the emergency path back to known-good firmware, and
-  //the unit stays there until the next verified install.
+  //Boot partition selection. ota_0 is promoted only when it holds the image a completed, RSA-verified install
+  //recorded (recordOta0AsVerified): the bootloader's structural checks can't tell an unverified image apart.
+  //GPIO41 held at boot forces factory, clears the staged-update flags and drops the record (emergency path).
   const esp_partition_t *ota0_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
   const esp_partition_t *factory_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
   const esp_partition_t *current_boot = esp_ota_get_boot_partition();
@@ -6046,9 +6152,8 @@ void ensurePreferredBootPartition() {
   bool forceFactory = (digitalRead(41) == LOW);
 
   if (forceFactory) {
-    // Clear any pending update flags to prevent boot loops. Staged-update flags live in the
-    // "update_req" namespace — erasing them from "storage" was a silent no-op that let an
-    // armed staged update survive the recovery jumper.
+    // Clear any pending update flags to prevent boot loops. They live in the "update_req" namespace;
+    // erasing "storage" instead would let an armed staged update survive the recovery jumper.
     clearPendingUpdateNVS();
     clearOta0Record();
 
@@ -6071,10 +6176,9 @@ void ensurePreferredBootPartition() {
   }
 
   if (running == ota0_partition) {
-    // The bootloader only lands here by a trusted path (verified install, gated promotion, USB flash).
-    // Self-record when the record is missing (USB-flashed unit, deep factory reset) or does not match this
-    // image (USB reflash of ota_0 over an older record), so a later factory boot can bring this image back
-    // after an abandoned update. Appended digest only: the bootloader already validated the running image.
+    // Only a trusted path lands here (verified install, gated promotion, USB flash). Self-record when the record
+    // is missing or is for another image, so a later factory boot can bring this one back after an abandoned
+    // update. Appended digest only: the bootloader already validated the running image.
     uint8_t rec[32], cur[32];
     bool haveRec = readOta0Record(rec);
     bool matches = haveRec && appImageAppendedDigest(ota0_partition, cur) && memcmp(rec, cur, 32) == 0;
@@ -6112,10 +6216,8 @@ void ensurePreferredBootPartition() {
     }
   }
 }
-// The settings arm gate — every mutating endpoint calls this. Nothing expires it: only an explicit
-// lock (Lock Controls, or any client's /armSettings?arm=0) or a reboot clears settingsArmed.
-// With the settings password on, the arm belongs to the clients holding a token from /armSettings,
-// so the request itself is what is checked.
+// Settings arm gate for every mutating endpoint. Nothing expires it: only an explicit lock or a reboot clears it.
+// With the settings password on, the arm belongs to /armSettings token holders, so the request itself is checked.
 bool settingsArmActive(AsyncWebServerRequest *request) {
   if (!settingsArmed) return false;
   if (!pwRequired) return true;
@@ -6169,8 +6271,6 @@ void queueConsoleMessage(const String &message) {
   queueConsoleMessage(message.c_str());
 }
 // Copy the oldest unsent ring line out under the lock (the SSE send must happen outside it). False when none.
-// One message per call, one caller-side buffer: the old 5-slot variant cost 5×CONSOLE_MSG_LEN of caller stack
-// and filled a timestamp array nothing ever read (the client stamps app-received time).
 bool popConsoleMessage(char *out) {
   if (!consoleHist || !out) return false;
 
@@ -6225,6 +6325,7 @@ void initializeNVS() {
 // Synchronous full write — for setup() and emergency use only.
 // Not safe to call from loop() — blocks for up to 200ms.
 void saveNVSDataFull() {
+  if (importRebootPending) return;   // a records import just wrote these keys; the reboot loads them
   if (hardwarePresent != 1) return;   // sim mode (HardwarePresent=0): don't persist fake accumulators/extrema
   uint32_t _nvsT0 = millis();
   nvs_handle_t h;
@@ -6261,12 +6362,10 @@ void saveNVSDataFull() {
   if (prev_FieldCurLimS != g_fieldCurLimS)                                  { nvs_set_u32(h, "FieldCurLimS",   g_fieldCurLimS);                                prev_FieldCurLimS = g_fieldCurLimS;                                  chg = true; }
   if (prev_FieldHeatLimSes != g_fieldHeatLimSesS)                           { nvs_set_u32(h, "FieldHeatLimSes", g_fieldHeatLimSesS);                           prev_FieldHeatLimSes = g_fieldHeatLimSesS;                           chg = true; }
   if (prev_FieldCurLimSes != g_fieldCurLimSesS)                             { nvs_set_u32(h, "FieldCurLimSes", g_fieldCurLimSesS);                             prev_FieldCurLimSes = g_fieldCurLimSesS;                             chg = true; }
-  if (prev_ChargeCycles != (int32_t)ChargeCycles)                           { nvs_set_i32(h, "ChrgCycles",     (int32_t)ChargeCycles);                         prev_ChargeCycles = (int32_t)ChargeCycles;                           chg = true; }
+  if (prev_ChargeCycleEnergy != (uint32_t)ChargeCycleEnergy)                { nvs_set_u32(h, "ChrgCycEnergy",  (uint32_t)ChargeCycleEnergy);                    prev_ChargeCycleEnergy = (uint32_t)ChargeCycleEnergy;                chg = true; }
   if (prev_ChargeCycles_AllTime != (int32_t)ChargeCycles_AllTime)           { nvs_set_i32(h, "ChrgCyc_AT",     (int32_t)ChargeCycles_AllTime);                 prev_ChargeCycles_AllTime = (int32_t)ChargeCycles_AllTime;           chg = true; }
-  // App-usage lifetime totals (UsgTime_AT is seconds of visible app time). UsageOpenTime_AllTime is a
-  // double written on the web-server task under usageMutex; an unguarded cross-core read can tear, and a
-  // torn value saved here would be restored as truth at the next boot if power died before the following
-  // save. Snapshot under the mutex; on contention skip these rows (they retry at the next save).
+  // App-usage lifetime totals (UsgTime_AT = seconds of visible app time). UsageOpenTime_AllTime is a double written on
+  // the web task: snapshot under usageMutex (a torn read would be restored as truth); on contention skip, retry next save.
   if (usageMutex && xSemaphoreTake(usageMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     int32_t usgTime  = (int32_t)UsageOpenTime_AllTime;
     int32_t usgOpens = (int32_t)UsageOpens_AllTime;
@@ -6277,9 +6376,10 @@ void saveNVSDataFull() {
     if (prev_UsageDays_AllTime != usgDays)                                  { nvs_set_i32(h, "UsgDays_AT",     usgDays);                                       prev_UsageDays_AllTime = usgDays;                                    chg = true; }
   }
   // Travel + SOC session
-  if (prev_TotalDist != (int32_t)TotalDistance)                             { nvs_set_i32(h, "TotalDist",      (int32_t)TotalDistance);                        prev_TotalDist = (int32_t)TotalDistance;                             chg = true; }
+  // Distances x100 like the trip keys below (keeps the fraction across reboots); new key names since the scale changed.
+  if (prev_TotalDist != (int32_t)(TotalDistance * 100))                     { nvs_set_i32(h, "TotalDist100",   (int32_t)(TotalDistance * 100));                prev_TotalDist = (int32_t)(TotalDistance * 100);                     chg = true; }
   if (prev_AvgSpeed != (int32_t)(AvgSpeed * 100))                           { nvs_set_i32(h, "AvgSpeed",       (int32_t)(AvgSpeed * 100));                     prev_AvgSpeed = (int32_t)(AvgSpeed * 100);                           chg = true; }
-  if (prev_TotalDist_AllTime != (int32_t)TotalDistance_AllTime)             { nvs_set_i32(h, "TotDist_AT",     (int32_t)TotalDistance_AllTime);                prev_TotalDist_AllTime = (int32_t)TotalDistance_AllTime;             chg = true; }
+  if (prev_TotalDist_AllTime != (int32_t)(TotalDistance_AllTime * 100))     { nvs_set_i32(h, "TotDist100_AT",  (int32_t)(TotalDistance_AllTime * 100));        prev_TotalDist_AllTime = (int32_t)(TotalDistance_AllTime * 100);     chg = true; }
   if (prev_AvgSpeed_AllTime != (int32_t)(AvgSpeed_AllTime * 100))           { nvs_set_i32(h, "AvgSpd_AT",      (int32_t)(AvgSpeed_AllTime * 100));             prev_AvgSpeed_AllTime = (int32_t)(AvgSpeed_AllTime * 100);           chg = true; }
   if (prev_spdAccum_AllTime  != speedAccumulator_AllTime)                   { nvs_set_blob(h, "SpdAccum_AT",   &speedAccumulator_AllTime,   sizeof(double));   prev_spdAccum_AllTime  = speedAccumulator_AllTime;                   chg = true; }
   if (prev_spdTime_AllTime   != (uint32_t)totalSpeedSampleTime_AllTime)     { nvs_set_u32(h, "SpdTime_AT",     (uint32_t)totalSpeedSampleTime_AllTime);        prev_spdTime_AllTime   = (uint32_t)totalSpeedSampleTime_AllTime;     chg = true; }
@@ -6290,12 +6390,12 @@ void saveNVSDataFull() {
   if (prev_socTime_AllTime != (uint32_t)totalSocSampleTime_AllTime)         { nvs_set_u32(h, "SocTime_AT",     (uint32_t)totalSocSampleTime_AllTime);          prev_socTime_AllTime = (uint32_t)totalSocSampleTime_AllTime;         chg = true; }
   if (prev_vltAccum_AllTime  != voltageAccumulator_AllTime)                  { nvs_set_blob(h, "VltAccum_AT",   &voltageAccumulator_AllTime, sizeof(double));   prev_vltAccum_AllTime  = voltageAccumulator_AllTime;                  chg = true; }
   if (prev_vltTime_AllTime   != (uint32_t)totalVoltageSampleTime_AllTime)    { nvs_set_u32(h, "VltTime_AT",     (uint32_t)totalVoltageSampleTime_AllTime);      prev_vltTime_AllTime   = (uint32_t)totalVoltageSampleTime_AllTime;    chg = true; }
-  // Don't persist provisional pre-seed SOC/coulomb: a persisted value clears the pending flag next
-  // boot and skips the seed forever. Both guards needed — SOC only sticks if coulombSeedPending is
-  // still true (UpdateBatterySOC re-derives SOC from CoulombCount each tick).
+  if (prev_pwrTime_AllTime   != (uint32_t)totalPoweredTime_AllTime)          { nvs_set_u32(h, "PwrTime_AT",     (uint32_t)totalPoweredTime_AllTime);            prev_pwrTime_AllTime   = (uint32_t)totalPoweredTime_AllTime;          chg = true; }
+  if (prev_timeSinceLastOverheat != timeSinceLastOverheat)                  { nvs_set_u64(h, "OvhtSinceMs",    timeSinceLastOverheat);                         prev_timeSinceLastOverheat = timeSinceLastOverheat;                  chg = true; }
+  // Never persist provisional pre-seed SOC/coulomb: a persisted value clears the pending flag next boot and skips
+  // the seed forever. Both guards: UpdateBatterySOC re-derives SOC from CoulombCount each tick.
   if (!socSeedPending && prev_SOC_percent != (int32_t)SOC_percent)          { nvs_set_i32(h, "SOC_percent",    (int32_t)SOC_percent);                          prev_SOC_percent = (int32_t)SOC_percent;                             chg = true; }
   if (!coulombSeedPending && prev_CoulombCount != (int32_t)CoulombCount_Ah_scaled) { nvs_set_i32(h, "CoulombCount",   (int32_t)CoulombCount_Ah_scaled);               prev_CoulombCount = (int32_t)CoulombCount_Ah_scaled;                 chg = true; }
-  if (!coulombSeedPending && prev_ShadowCoulomb != (int32_t)shadowCoulombX100)     { nvs_set_i32(h, "ShadowCoulomb",  (int32_t)shadowCoulombX100);                    prev_ShadowCoulomb = (int32_t)shadowCoulombX100;                     chg = true; }
   // Health + Thermal + Learning
   if (prev_SessionDur != (uint32_t)CurrentSessionDuration)                  { nvs_set_u32(h, "SessionDur",     (uint32_t)CurrentSessionDuration);              prev_SessionDur = (uint32_t)CurrentSessionDuration;                  chg = true; }
   if (prev_MaxLoop != (int32_t)MaxLoopTime)                                  { nvs_set_i32(h, "MaxLoop",        (int32_t)MaxLoopTime);                          prev_MaxLoop = (int32_t)MaxLoopTime;                                 chg = true; }
@@ -6304,8 +6404,6 @@ void saveNVSDataFull() {
   if (prev_InsulDamage != CumulativeInsulationDamage)                       { nvs_set_blob(h, "InsulDamage",   &CumulativeInsulationDamage, sizeof(float));     prev_InsulDamage = CumulativeInsulationDamage;                       chg = true; }
   if (prev_GreaseDamage != CumulativeGreaseDamage)                          { nvs_set_blob(h, "GreaseDamage",  &CumulativeGreaseDamage,     sizeof(float));     prev_GreaseDamage = CumulativeGreaseDamage;                          chg = true; }
   if (prev_BrushDamage != CumulativeBrushDamage)                            { nvs_set_blob(h, "BrushDamage",   &CumulativeBrushDamage,      sizeof(float));     prev_BrushDamage = CumulativeBrushDamage;                            chg = true; }
-  if (prev_ShuntGain != DynamicShuntGainFactor)                             { nvs_set_blob(h, "ShuntGain",     &DynamicShuntGainFactor,     sizeof(float));     prev_ShuntGain = DynamicShuntGainFactor;                             chg = true; }
-  if (prev_LastGainTime != (uint32_t)lastGainCorrectionTime)                { nvs_set_u32(h, "LastGainTime",   (uint32_t)lastGainCorrectionTime);              prev_LastGainTime = (uint32_t)lastGainCorrectionTime;                chg = true; }
   // Temp-comp zero-correction learned equation (ZERO_DRIFT_TEMPCOMP_SPEC.md). Compare-first → ~1 write/day.
   if (prev_zfValid != zfValid)                                              { nvs_set_i32(h,  "ZFitValid",     zfValid);                                       prev_zfValid = zfValid;                                              chg = true; }
   if (prev_zfSensor != zfSensor)                                            { nvs_set_i32(h,  "ZFitSensor",    zfSensor);                                      prev_zfSensor = zfSensor;                                            chg = true; }
@@ -6396,10 +6494,8 @@ void saveNVSDataFull() {
     chg = true;
   }
 
-  // Soft clock anchor — persist the current wall epoch so a cold power-up can seed a
-  // usable timebase before any live source reports (restoreSoftClock, step 2). Written
-  // whenever time is known; the field-off-edge/shutdown cadence keeps flash wear low
-  // (no periodic commits — same discipline as the rest of this function).
+  // Soft clock anchor: lets a cold power-up seed a timebase before any live source (restoreSoftClock step 2).
+  // No periodic commits: the field-off/shutdown cadence keeps flash wear low.
   if (timeIsSynced && timeBase > 0) {
     nvs_set_u32(h, "SoftClockEp", (uint32_t)getCurrentTimestamp());
     chg = true;
@@ -6407,6 +6503,7 @@ void saveNVSDataFull() {
 
   if (chg) nvs_commit(h);
   nvs_close(h);
+  overheatSafeTimeFlush();
   lastNVSSaveTime = millis();
   uint32_t _nvsElapsed = lastNVSSaveTime - _nvsT0;
   nvsFullSaveLastMs = (_nvsElapsed > 65535UL) ? 65535 : (uint16_t)_nvsElapsed;
@@ -6414,32 +6511,11 @@ void saveNVSDataFull() {
   nvsFullSaveCount++;
 }
 
-// Returns true once fieldActiveStatus has been 0 continuously for 60s + extraMs.
-// Resets the moment the field turns on. Use extraMs to stagger callers so they
-// don't all fire at once after a long charging session.
-bool fieldOffSettled(uint32_t extraMs) {
-  static unsigned long fieldOffAt = 0;
-  if (fieldActiveStatus > 0) {
-    fieldOffAt = 0;
-    return false;
-  }
-  if (fieldOffAt == 0) {
-    fieldOffAt = millis();
-    return false;
-  }
-  return (millis() - fieldOffAt >= 60000UL + extraMs);
-}
 
-// Hardware-gate variant for flash work on the loop. fieldOffSettled keys off fieldActiveStatus,
-// which the control path zeroes whenever applied duty <= 0.01% — true during a live duty-0 CV
-// hold with GPIO4 still up and every field-on clock running (2026-08-13 loop-stall incident:
-// usedBytes/ledger writes fired mid-control at ~100ms). This one requires the field gate
-// physically cut. Anything that touches LittleFS from loop() must gate on THIS.
-// 20s baseline = 2x the fast-OV lockout cap (nextFastOvLockoutMs, 10s) — OV cut/retry churn,
-// crank dips, and the LM2907 ~4.6s false-zero can never reach flash work; must grow if that
-// ladder's cap grows. Long static lockouts (tach-lie 30-120s rungs, cold-charge) DO exceed it
-// and may flush mid-lockout — field is hardware-dead there and re-enable is loop-synchronous,
-// so that is deliberate, not a hole.
+// Hardware gate for flash work on the loop: the field gate physically cut. Not fieldActiveStatus, which reads 0 during
+// a live duty-0 CV hold with GPIO4 up (flash writes there stalled the control loop). Anything touching LittleFS from
+// loop() gates on THIS. 20 s = 2x the fast-OV lockout cap (nextFastOvLockoutMs, 10 s) so OV churn, crank dips and the
+// LM2907 ~4.6 s false-zero never reach flash; grow it with that cap. Longer lockouts may flush: deliberate (field dead).
 bool fieldCutSettled(uint32_t extraMs) {
   static unsigned long fieldCutAt = 0;
   if (!gpio4IsLow) {
@@ -6453,25 +6529,19 @@ bool fieldCutSettled(uint32_t extraMs) {
   return (millis() - fieldCutAt >= 20000UL + extraMs);
 }
 
-// Periodic phased NVS save deleted — nvs_commit() blocks Core 1 for hundreds of ms
-// during sector erase and can collide with the voltage control loop on a transient.
-// All NVS persistence now goes through saveNVSDataFull() at the field-off edge
-// (Xregulator.ino loop) and the shutdown sequence — both run with field off so any
-// commit duration is safe. See git log for the original 9-phase implementation.
+// Do not add a periodic NVS save: nvs_commit() blocks Core 1 for hundreds of ms during sector erase. All NVS
+// persistence goes through saveNVSDataFull() at the field-off edge and at shutdown, both with the field off.
 
-// First-boot SoC seed, deferred from loadNVSData() to the end of setup() so IBV holds a real
-// INA228 reading and BATTERY_TYPE / SYSTEM_VOLTAGE_CLASS / BatteryCapacity_Ah hold the vessel-info
-// values (all were still defaults/zero at loadNVSData time, which seeded 0% every fresh boot).
-// On a factory-fresh device (Vessel Info never saved) it defers further: saveVesselInfoToNvs()
-// re-invokes it after the first Vessel Info save, so the estimate never runs on the compile-time
-// chemistry/capacity defaults. SOC holds the provisional 50% until then; that provisional state is
-// never persisted (saveNVSDataFull guard), so the deferral survives reboots before that save.
+// First-boot SoC seed, run at the end of setup() so IBV and the vessel-info values are real (defaults at loadNVSData).
+// With Vessel Info never saved it waits: saveVesselInfoToNvs() re-invokes it, so it never runs on compile-time defaults.
+// SOC holds a provisional 50 % meanwhile, never persisted (saveNVSDataFull guard), so the deferral survives reboots.
 void seedSocFromVoltage() {
   if (!socSeedPending) return;
   if (!vesselInfoSaved) return;
   socSeedPending = false;
 
-  float voltage = getBatteryVoltage();
+  float voltage = 0.0f;
+  alarmBatteryVoltage(voltage);   // the alarms' source: an owner-ignored or stale reading seeds nothing
   float socM = SYSTEM_VOLTAGE_CLASS / 12.0f;  // bank-class scale for the 12V-referenced thresholds
   int estimatedSoC = 50;                 // fallback if the INA never produced a sane reading
 
@@ -6486,16 +6556,10 @@ void seedSocFromVoltage() {
   if (voltage > 5.0f) {  // same sanity floor as the INA read path
     isLithium = batteryIsLithium();
 
-    // Current compensation: back out open-circuit voltage before the table lookup
-    // (Vocv ≈ Vterm − I·Reff). The published SoC-vs-V curve families at different C-rates are
-    // the rested curve shifted by this term, so one effective resistance per chemistry replaces
-    // them. Reff per 100Ah 12V block including polarization: LFP ~6 mΩ, lead-acid ~12 mΩ;
-    // parallel Ah divides it, series blocks multiply it. Clamped so a bogus current reading
-    // can't wreck the seed.
-    // Reff also scales with temperature (~doubles per −20°C, both chemistries). That resistance belongs
-    // to the BANK, so only a measured battery temperature scales it (probe / NMEA 2000 / VE.Direct / RV-C).
-    // The seed runs at boot, where a probe has often not reported yet: no battery temperature means the
-    // scale stays 1.00 and the estimate is simply uncorrected. The board temperature is not a stand-in.
+    // Back out OCV before the lookup (Vocv ≈ Vterm − I·Reff): one Reff per chemistry replaces the C-rate curve families.
+    // Reff per 100 Ah 12 V block incl. polarization: LFP ~6 mΩ, lead-acid ~12 mΩ; parallel Ah divides, series multiplies;
+    // clamped against a bogus current. Reff ~doubles per −20 °C, scaled only by a measured battery temperature (never the
+    // board's); none at boot leaves the scale at 1.00, uncorrected.
     battSeedTempF = batteryTempF(&battSeedTempSrc);
     if (isfinite(battSeedTempF)) {
       float tC = (battSeedTempF - 32.0f) / 1.8f;
@@ -6545,7 +6609,6 @@ void seedSocFromVoltage() {
     // UpdateBatterySOC re-derives SOC_percent from the coulomb count every tick, so this
     // is the assignment that actually sticks.
     CoulombCount_Ah_scaled = (BatteryCapacity_Ah * SOC_percent) / 100;
-    shadowCoulombX100 = CoulombCount_Ah_scaled;  // external seed re-anchors the shadow twin
     coulombSeedPending = false;
   }
 
@@ -6580,6 +6643,9 @@ void loadNVSData() {
   if (err != ESP_OK) {
     queueConsoleMessage("NVS: No existing data found, using defaults");
     Serial.println("NVS: No existing data found, using defaults");
+    // No namespace (fresh/wiped NVS) = the NOT FOUND case below: seed, or the count keeps its 75 Ah default.
+    socSeedPending = true;
+    coulombSeedPending = true;
     return;
   }
 
@@ -6599,8 +6665,8 @@ void loadNVSData() {
   if (nvs_get_u32(nvs_handle, "DschrgEng_AT", &temp_uint32) == ESP_OK) DischargedEnergy_AllTime = temp_uint32;
   if (nvs_get_u32(nvs_handle, "AltChrgEng_AT", &temp_uint32) == ESP_OK) AlternatorChargedEnergy_AllTime = temp_uint32;
   if (nvs_get_u32(nvs_handle, "SolarEng_AT", &temp_uint32) == ESP_OK) SolarChargedEnergy_AllTime = temp_uint32;
-  if (nvs_get_i32(nvs_handle, "AltFuel_AT", &temp_int32) == ESP_OK) AlternatorFuelUsed_AllTime = temp_int32 / 10.0f;
-  if (nvs_get_i32(nvs_handle, "EngFuel_AT", &temp_int32) == ESP_OK) EngineFuelUsed_AllTime = temp_int32 / 10.0f;
+  if (nvs_get_i32(nvs_handle, "AltFuel_AT", &temp_int32) == ESP_OK) AlternatorFuelUsed_AllTime = temp_int32 / 10.0;
+  if (nvs_get_i32(nvs_handle, "EngFuel_AT", &temp_int32) == ESP_OK) EngineFuelUsed_AllTime = temp_int32 / 10.0;
 
   // Session Runtime Tracking
   if (nvs_get_i32(nvs_handle, "EngineRunTime", &temp_int32) == ESP_OK) EngineRunTime = temp_int32;
@@ -6617,7 +6683,7 @@ void loadNVSData() {
   if (nvs_get_u32(nvs_handle, "FieldHeatLimSes", &temp_uint32) == ESP_OK) g_fieldHeatLimSesS = temp_uint32;
   if (nvs_get_u32(nvs_handle, "FieldCurLimSes", &temp_uint32) == ESP_OK) g_fieldCurLimSesS = temp_uint32;
 
-  if (nvs_get_i32(nvs_handle, "ChrgCycles", &temp_int32) == ESP_OK) ChargeCycles = temp_int32;
+  if (nvs_get_u32(nvs_handle, "ChrgCycEnergy", &temp_uint32) == ESP_OK) ChargeCycleEnergy = temp_uint32;
 
   if (nvs_get_i32(nvs_handle, "ChrgCyc_AT", &temp_int32) == ESP_OK) ChargeCycles_AllTime = temp_int32;
 
@@ -6627,10 +6693,10 @@ void loadNVSData() {
   if (nvs_get_i32(nvs_handle, "UsgDays_AT", &temp_int32) == ESP_OK) UsageDays_AllTime = temp_int32;
 
   // Session Travel Statistics
-  if (nvs_get_i32(nvs_handle, "TotalDist", &temp_int32) == ESP_OK) TotalDistance = temp_int32;
+  if (nvs_get_i32(nvs_handle, "TotalDist100", &temp_int32) == ESP_OK) TotalDistance = temp_int32 / 100.0f;
   if (nvs_get_i32(nvs_handle, "AvgSpeed", &temp_int32) == ESP_OK) AvgSpeed = temp_int32 / 100.0f;
 
-  if (nvs_get_i32(nvs_handle, "TotDist_AT", &temp_int32) == ESP_OK) TotalDistance_AllTime = temp_int32;
+  if (nvs_get_i32(nvs_handle, "TotDist100_AT", &temp_int32) == ESP_OK) TotalDistance_AllTime = temp_int32 / 100.0f;
   if (nvs_get_i32(nvs_handle, "AvgSpd_AT", &temp_int32) == ESP_OK) AvgSpeed_AllTime = temp_int32 / 100.0f;
 
   // Longest single trip (lifetime + in-progress recovery). Boot recovery resolves once time syncs (see Step 4 hook).
@@ -6695,6 +6761,8 @@ void loadNVSData() {
   required_size = sizeof(double);
   nvs_get_blob(nvs_handle, "VltAccum_AT", &voltageAccumulator_AllTime, &required_size);
   if (nvs_get_u32(nvs_handle, "VltTime_AT", &temp_uint32) == ESP_OK) totalVoltageSampleTime_AllTime = temp_uint32;
+  if (nvs_get_u32(nvs_handle, "PwrTime_AT", &temp_uint32) == ESP_OK) totalPoweredTime_AllTime = temp_uint32;
+  { uint64_t v; if (nvs_get_u64(nvs_handle, "OvhtSinceMs", &v) == ESP_OK) timeSinceLastOverheat = v; }
   if (totalVoltageSampleTime_AllTime > 0)
     AvgVoltage_AllTime = voltageAccumulator_AllTime / totalVoltageSampleTime_AllTime;
 
@@ -6710,9 +6778,8 @@ void loadNVSData() {
     SOC_percent = temp_int32;
     Serial.printf("NVS LOAD: SOC_percent = %d (%.2f%%)\n", temp_int32, temp_int32 / 100.0f);
   } else {
-    // No saved SoC. IBV is still 0 here (first INA228 read is the forced ReadAnalogInputs() at the
-    // end of setup) and battery type/voltage/capacity aren't parsed yet (InitSystemSettings), so an
-    // estimate now would always be 0%. Defer to seedSocFromVoltage(); provisional 50% until then.
+    // No saved SoC: IBV is still 0 (first INA228 read is at the end of setup) and vessel info isn't parsed,
+    // so defer to seedSocFromVoltage(); provisional 50 % until then.
     SOC_percent = 5000;
     socSeedPending = true;
     Serial.println("NVS LOAD: SOC_percent NOT FOUND - voltage-based seed deferred to end of setup");
@@ -6722,21 +6789,13 @@ void loadNVSData() {
     CoulombCount_Ah_scaled = temp_int32;
     Serial.printf("NVS LOAD: CoulombCount_Ah_scaled = %d\n", temp_int32);
   } else {
-    // Initialize based on estimated SoC. If the SoC seed is deferred, this provisional value is
-    // re-derived in seedSocFromVoltage() with the real voltage AND the real bank capacity
-    // (BatteryCapacity_Ah here is still the compile-time default, not the vessel-info value).
+    // Provisional: with the seed deferred, seedSocFromVoltage() re-derives it from the real voltage and bank
+    // capacity (BatteryCapacity_Ah is still the compile-time default here).
     CoulombCount_Ah_scaled = (BatteryCapacity_Ah * SOC_percent) / 100;
     coulombSeedPending = true;
 
     Serial.printf("NVS LOAD: CoulombCount NOT FOUND - initialized to %d based on SoC\n",
                   CoulombCount_Ah_scaled);
-  }
-  // Shadow (unclamped) coulomb twin: restore its own key; absent (pre-shadow firmware, or a
-  // pre-seed boot) → re-anchor to the live count, which just means no clamp evidence carried over.
-  if (nvs_get_i32(nvs_handle, "ShadowCoulomb", &temp_int32) == ESP_OK) {
-    shadowCoulombX100 = temp_int32;
-  } else {
-    shadowCoulombX100 = CoulombCount_Ah_scaled;
   }
 
   // Session Health Stats (restore to prior-session variables)
@@ -6752,9 +6811,8 @@ void loadNVSData() {
   nvs_get_blob(nvs_handle, "InsulDamage", &CumulativeInsulationDamage, &required_size);
   nvs_get_blob(nvs_handle, "GreaseDamage", &CumulativeGreaseDamage, &required_size);
   nvs_get_blob(nvs_handle, "BrushDamage", &CumulativeBrushDamage, &required_size);
+  deriveAltLifePercents();
 
-  nvs_get_blob(nvs_handle, "ShuntGain", &DynamicShuntGainFactor, &required_size);
-  if (nvs_get_u32(nvs_handle, "LastGainTime", &temp_uint32) == ESP_OK) lastGainCorrectionTime = temp_uint32;
   // Temp-comp zero-correction learned equation (hold-last-good survives reboot). Old AltZero/LastZeroTime/
   // LastZeroTemp keys are orphaned and intentionally not read.
   if (nvs_get_i32(nvs_handle, "ZFitValid",  &temp_int32) == ESP_OK) zfValid  = temp_int32;
@@ -6787,9 +6845,7 @@ void loadNVSData() {
   nvs_get_blob(nvs_handle, "IMU_PitchMax", &imu_pitch_max_lifetime, &required_size);
   nvs_get_blob(nvs_handle, "IMU_SlamMax", &imu_slam_peak_lifetime, &required_size);
 
-  // imuMountOrientation loads with the rest of the Vessel Info NVS record in InitSystemSettings.
-  // CAPSIZE_THRESHOLD_DEG / PITCHPOLE_THRESHOLD_DEG / SLAM_THRESHOLD_G load from
-  // their own NVS "settings" keys in InitSystemSettings (Pattern B).
+  // imuMountOrientation and the CAPSIZE / PITCHPOLE / SLAM thresholds load in InitSystemSettings (Pattern B).
 
   // Extrema, environment maxima, and UV forecast
   required_size = sizeof(float); nvs_get_blob(nvs_handle, "MaxSpd",      &MaxSpeed,                         &required_size);
@@ -6806,8 +6862,7 @@ void loadNVSData() {
   required_size = sizeof(float); nvs_get_blob(nvs_handle, "BdTmpMinAt",  &board_temp_min_alltime,           &required_size);
   required_size = sizeof(float); nvs_get_blob(nvs_handle, "BaroMaxAt",   &baro_pressure_max_alltime,        &required_size);
   required_size = sizeof(float); nvs_get_blob(nvs_handle, "BaroMinAt",   &baro_pressure_min_alltime,        &required_size);
-  // Guard against NaN/Inf written by older firmware before the runtime isnan
-  // guard existed. Once a watermark turns NaN, comparisons never update it again.
+  // A NaN/Inf watermark from older firmware would never update again (NaN compares false).
   if (!isfinite(board_temp_max_alltime))    board_temp_max_alltime    = -999.0f;
   if (!isfinite(board_temp_min_alltime))    board_temp_min_alltime    =  999.0f;
   if (!isfinite(baro_pressure_max_alltime)) baro_pressure_max_alltime =    0.0f;
@@ -6822,9 +6877,8 @@ void loadNVSData() {
   required_size = sizeof(float); nvs_get_blob(nvs_handle, "UVTomorrow",  &UVTomorrow,                       &required_size);
   required_size = sizeof(float); nvs_get_blob(nvs_handle, "UVDay2",      &UVDay2,                           &required_size);
 
-  // Barometric pressure 14-day history. Buffer is ps_malloc'd in setup() before this
-  // function runs, so it's safe to load directly into it. Missing-key paths leave the
-  // buffer zeroed (its memset default), which JS treats as "no sample".
+  // Barometric pressure 14-day history. Buffer is ps_malloc'd in setup() before this runs; missing keys leave
+  // it zeroed, which JS treats as "no sample".
   if (baroPressureHistory) {
     required_size = BARO_HISTORY_SIZE * sizeof(uint16_t);
     nvs_get_blob(nvs_handle, "BaroHist", baroPressureHistory, &required_size);
@@ -6849,8 +6903,8 @@ void initNVSCache() {
   prev_EngineRunTime = (int32_t)EngineRunTime;
   prev_EngineCycles = (int32_t)EngineCycles;
   prev_AltOnTime = (int32_t)AlternatorOnTime;
-  prev_ChargeCycles = (int32_t)ChargeCycles;
-  prev_TotalDist = (int32_t)TotalDistance;
+  prev_ChargeCycleEnergy = (uint32_t)ChargeCycleEnergy;
+  prev_TotalDist = (int32_t)(TotalDistance * 100);
   prev_AvgSpeed = (int32_t)(AvgSpeed * 100);
   prev_AvgSOC = (int32_t)(AvgSOC * 100);
 
@@ -6873,18 +6927,19 @@ void initNVSCache() {
   prev_UsageOpenTime_AllTime = (int32_t)UsageOpenTime_AllTime;
   prev_UsageOpens_AllTime = (int32_t)UsageOpens_AllTime;
   prev_UsageDays_AllTime = (int32_t)UsageDays_AllTime;
-  prev_TotalDist_AllTime = (int32_t)TotalDistance_AllTime;
+  prev_TotalDist_AllTime = (int32_t)(TotalDistance_AllTime * 100);
   prev_AvgSpeed_AllTime = (int32_t)(AvgSpeed_AllTime * 100);
   prev_spdAccum_AllTime = speedAccumulator_AllTime;
   prev_spdTime_AllTime  = (uint32_t)totalSpeedSampleTime_AllTime;
   prev_vltAccum_AllTime = voltageAccumulator_AllTime;
   prev_vltTime_AllTime  = (uint32_t)totalVoltageSampleTime_AllTime;
+  prev_pwrTime_AllTime  = (uint32_t)totalPoweredTime_AllTime;
+  prev_timeSinceLastOverheat = timeSinceLastOverheat;
   prev_AvgSOC_AllTime = (int32_t)(AvgSOC_AllTime * 100);
 
   // Battery state
   prev_SOC_percent = (int32_t)SOC_percent;
   prev_CoulombCount = (int32_t)CoulombCount_Ah_scaled;
-  prev_ShadowCoulomb = (int32_t)shadowCoulombX100;
 
   prev_SessionDur = (uint32_t)CurrentSessionDuration;
   prev_MaxLoop = (int32_t)MaxLoopTime;
@@ -6898,8 +6953,6 @@ void initNVSCache() {
   prev_GreaseDamage = CumulativeGreaseDamage;
   prev_BrushDamage = CumulativeBrushDamage;
 
-  prev_ShuntGain = DynamicShuntGainFactor;
-  prev_LastGainTime = (uint32_t)lastGainCorrectionTime;
   prev_zfValid = zfValid;
   prev_zfSensor = zfSensor;
   prev_zfC = zfC;
@@ -6973,7 +7026,6 @@ void initNVSCache() {
   prev_UVTomorrow           = UVTomorrow;
   prev_UVDay2               = UVDay2;
 }
-// Helper function to get human-readable subtype names
 String getSubtypeString(esp_partition_type_t type, esp_partition_subtype_t subtype) {
   if (type == ESP_PARTITION_TYPE_APP) {
     switch (subtype) {
@@ -6994,7 +7046,6 @@ String getSubtypeString(esp_partition_type_t type, esp_partition_subtype_t subty
   }
   return "unknown";
 }
-// Helper to verify expected partitions exist with correct sizes
 void checkExpectedPartition(const char *name, esp_partition_type_t type, esp_partition_subtype_t subtype, size_t expectedSize) {
   const esp_partition_t *partition = esp_partition_find_first(type, subtype, name);
   if (partition) {

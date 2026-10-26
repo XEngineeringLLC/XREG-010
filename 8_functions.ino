@@ -31,14 +31,13 @@
 #define FAD_MIN_MODAL_SEGS 20
 #define FAD_SYNC_PARTNER_MIN 0.5f
 
-#define FAD_ACF_LAG_CAP 400  // regime/sync ACF lag ceiling (min(400, n/4) in the prototype)
-#define FAD_SEG_SAMPLES 8192 // reduction chunk: each block sums into a float partial, then folds into a double — preserves the accumulation order the verdict thresholds were tuned against
+#define FAD_ACF_LAG_CAP 400  // regime/sync ACF lag ceiling
+#define FAD_SEG_SAMPLES 8192 // reduction chunk (float partial folded into double): keeps the accumulation order the verdict thresholds were tuned against
 
 // ---- small numeric helpers ----
 
-// k-th smallest, Hoare quickselect with median-of-3 pivot. On return a[k] is the k-th
-// order statistic and a[] is partitioned ≤/≥ around it (the percentile interpolation
-// below relies on that to fetch the next order statistic with a linear scan).
+// k-th smallest (Hoare quickselect, median-of-3 pivot). Leaves a[] partitioned around a[k];
+// fadPercentile relies on that to fetch the next order statistic with a linear scan.
 static float fadSelect(float *a, int n, int k) {
   int lo = 0, hi = n - 1;
   while (lo < hi) {
@@ -79,8 +78,7 @@ static float fadPercentile(float *a, int n, float q) {
 }
 static inline float fadMedian(float *a, int n) { return fadPercentile(a, n, 50.0f); }
 
-// One-way ANOVA by index mod k → (F, bias-corrected RMS effect size). n is small
-// (48-crest blocks / modal-segment concatenations), so double accumulation is cheap.
+// One-way ANOVA by index mod k → (F, bias-corrected RMS effect size).
 static void fadAnova(const float *vals, int n, int k, float *Fout, float *effOut) {
   if (n < 2 * k) { *Fout = 0.0f; *effOut = 0.0f; return; }
   double sum[8] = { 0 }, cnt[8] = { 0 };
@@ -210,10 +208,8 @@ static void fadStart(FadJob *J,
   J->idxOverflow = 0;
 }
 
-// Straight-line detector — runs to completion on the Core-0 worker. Reductions keep the chunked
-// float-partial->double accumulation (FAD_SEG_SAMPLES) so results stay bit-identical to what the
-// verdict thresholds were tuned against; do not flatten them. Rationale + validation:
-// Fault_Detector_Dev_Summary.md.
+// Straight-line detector; runs to completion on the Core-0 worker. Do not flatten the chunked reductions
+// (FAD_SEG_SAMPLES): the verdict thresholds were tuned against their exact results. See Fault_Detector_Dev_Summary.md.
 
 // Crest pick: maxima -> local-contrast threshold -> valley-depth merge. -1 = too few maxima.
 static int fadPick(FadJob *J, float wMs, float frac) {
@@ -545,7 +541,7 @@ static void fadRung(FadJob *J, float wMs, float frac) {
   }
 }
 
-// Whole-analysis driver. deadline is ignored (runs to completion). Returns 1; fills *out.
+// Whole-analysis driver; deadline is ignored (runs to completion).
 static int fadStep(FadJob *J, int64_t deadline, FadResult *out) {
   (void)deadline;
   int n = J->n;
@@ -625,28 +621,13 @@ done:
   return 1;
 }
 
-// Config Sharing — export/import of the cloneable settings set.
-// CONFIG_MANIFEST is the single source of truth for which NVS "settings" keys are shareable.
-// tier 1 = exported AND imported (includes install topology and per-install calibration).
-// tier 3 = exported for fleet snapshot / support but NEVER imported — adopting another boat's
-// value would corrupt this device's own record.
-// Tiers gate IMPORT ONLY, and the import policy is provisional (it may move cloud-side
-// entirely). The EXPORT is never narrowed because of anything import does or might do.
-// The alt-health / boat-perf registry knobs (ALT_SETTINGS / PERF_SETTINGS, 7_functions.ino) are
-// tier-1 shareable too but save through generic loops a literal manifest can't reference, so they
-// are emitted/imported programmatically — a new knob is covered for free. ALL of them export;
-// CFG_REGISTRY_SKIP only blocks import (it is the registry knobs' tier 3).
-// The export deliberately captures every persisted setting INCLUDING runtime/lifecycle/debug state
-// (tier 3) — the daily snapshot doubles as a remote debugging record. Paring down to what is
-// appropriate to apply happens at IMPORT time (tier gate + diff checkboxes), never by omitting from
-// the export. Only identity/secrets (WiFi, tokens, InstallId), the manual-GPS coordinates, and bulky
-// rings whose data already uploads by its own path (DCIR results ride the commissioning ledger;
-// alt-trend buckets ride the alt-health upload) stay out
-// — config_drift_check.py fails the build if a settingWrite key is in neither the manifest nor its
-// EXCLUDE list. User-editable RPM tables are raw "learning"-namespace blobs carried by a separate
-// "tables" section (exportTablesObject), not this manifest.
-// Values are the RAW NVS strings, so import is a byte-identical settingWrite + reboot — no unit
-// conversion, no /get replay. A key absent on the destination is skipped and its own default applies.
+// Config Sharing: CONFIG_MANIFEST is the single source of truth for shareable NVS "settings" keys.
+// tier 1 = exported + imported; tier 3 = exported, never imported (this unit's cloud bookkeeping; alt-health
+// record keys import with that record). Tiers gate IMPORT only: never narrow the export, it doubles as the
+// remote-debug record. ALT_SETTINGS/PERF_SETTINGS knobs are emitted programmatically; RPM tables ride the
+// "tables" section (exportTablesObject). Only credentials/identity and rings uploaded elsewhere stay out;
+// config_drift_check.py fails the build on a settingWrite key in neither this list nor its EXCLUDE list.
+// Values are raw NVS strings: import is a byte-identical settingWrite + reboot; absent keys keep their default.
 struct ConfigManifestEntry { const char *param; const char *nvsKey; uint8_t tier; };
 static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "BulkVoltage", NK_BulkVoltage, 1 },
@@ -696,12 +677,12 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   // Travels with the knobs it describes: a full export's field-duty values sit on this winding's scale, and the boot
   // reconcile (fieldWindingReconcile) converts them to the destination's own effective winding.
   { "fieldWindApplied", NK_fieldWindApplied, 1 },
-  // Tier 3: the owner's answer for THIS rotor's resistance; the owner of a destination boat answers for theirs.
-  { "fieldWindAck", NK_fieldWindAck, 3 },
+  // Keyed to the exact winding:resistance pair, so it only takes effect when both came from the file too.
+  { "fieldWindAck", NK_fieldWindAck, 1 },
   { "PulleyRatio", NK_PulleyRatio, 1 },
-  // Tier 3, not 1: adopting another boat's tach calibration would silently rescale this device's
-  // engine-RPM axis via a direct settingWrite, bypassing the /get guard that arms the wipe.
-  { "RPMScalingFactor", NK_RPMScalingFactor, 3 },
+  // A changed value is written raw like any row; applyImportConfig then arms the axis wipe the /get guard would
+  // have, limited to the speed-indexed data the file does not bring with it.
+  { "RPMScalingFactor", NK_RPMScalingFactor, 1 },
   { "SwitchingFrequency", NK_SwitchingFrequency, 1 },
   { "PidKp", NK_PidKp, 1 },
   { "PidKi", NK_PidKi, 1 },
@@ -955,6 +936,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "n2kEngInstance", NK_n2kEngInst, 1 },
   { "n2kEngDynEnable", NK_n2kEngDynEn, 1 },
   { "n2kEngBitsEnable", NK_n2kEngBitsEn, 1 },
+  { "n2kConvStatEnable", NK_n2kConvStatEn, 1 },
   { "n2kRxBattInstance", NK_n2kRxBattInst, 1 },
   { "rvcTxEnable", NK_rvcTxEn, 1 },
   { "rvcChgrEnable", NK_rvcChgrEn, 1 },
@@ -967,6 +949,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "dvccSrcType", NK_dvccSrcType, 1 },
   { "dvccInst", NK_dvccInst, 1 },
   { "dvccSilenceS", NK_dvccSilenceS, 1 },
+  { "dvccVicCutHold", NK_dvccVicCutHold, 1 },
   { "dvccSettleS", NK_dvccSettleS, 1 },
   { "dvccCvlMin", NK_dvccCvlMin, 1 },
   { "dvccCvlMax", NK_dvccCvlMax, 1 },
@@ -1031,13 +1014,12 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "AlternatorCOffset", NK_AlternatorCOffset, 1 },
   { "BatteryCOffset", NK_BatteryCOffset, 1 },
   { "AutoAltCurrentZero", NK_AutoAltCurrentZero, 1 },
-  { "AutoShuntGainCorrection", NK_AutoShuntGainCorrection, 1 },
   { "BatteryVoltage", NK_BatteryVoltage, 1 },
   { "cvPlantKa", NK_cvPlantKa, 1 },
   { "cvPlantKb", NK_cvPlantKb, 1 },
   { "CommissionTempF", NK_CommissionTempF, 1 },
   { "CommissionTempSrc", NK_CommissionTempSrc, 1 },   // with CommissionTempF: computeCvTempScale trusts the pair, so the recipient needs the DONOR's provenance
-  { "CommissionEpoch", NK_CommissionEpoch, 3 },
+  { "CommissionEpoch", NK_CommissionEpoch, 1 },   // commissioning status: applied by applyImportCommissioning, not the generic loop
   { "maxWorkingRpm", NK_maxWorkingRpm, 1 },
   { "systemIDPlantTauMs", NK_sysidPlantTau, 1 },
   { "fieldDecayTauMs", NK_fieldDecayTau, 1 },
@@ -1047,16 +1029,11 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "fdDrainRpmHi", NK_fdDrainRpmHi, 1 },
   { "ripFitAlt", NK_ripFitAlt, 1 },
   { "slpFitAlt", NK_slpFitAlt, 1 },
-  // Tier 3, not 1: heel/pitch/gyro offsets measured from THIS board's own bolted-down attitude, the
-  // same class as the physical-mount set below. A raw settingWrite import would also land foreign
-  // offsets under this device's own imu_mnt_state, which is tier 3 and never travels with them.
-  { "imu_zero", NK_imu_zero, 3 },
-  // Vessel Info. Param names match the /vessel_info.json view so the blob reads the same
-  // either place. battery_voltage / battery_capacity_ah / solar_watts are NOT repeated here —
-  // they are already BatteryVoltage / BatteryCapacity_Ah / SolarWatts above.
-  // Tier 3 for the physical-mount set: adopting another boat's orientation or IMU distances
-  // yields silently-wrong heel/pitch math rather than an obvious error, and a raw
-  // settingWrite import would bypass the imuMountState invalidation /saveVesselInfo does.
+  // Level calibration of the board's own bolted-down attitude. Travels with imu_mnt_state (the install verdict
+  // judged on this capture); applyImportConfig drops the verdict when the capture or orientation arrives without it.
+  { "imu_zero", NK_imu_zero, 1 },
+  // Vessel Info: param names match /vessel_info.json. battery_voltage / battery_capacity_ah / solar_watts are
+  // already BatteryVoltage / BatteryCapacity_Ah / SolarWatts above.
   { "boat_length_ft", NK_boatLenFt, 1 },
   { "boat_displacement_lbs", NK_boatDispLbs, 1 },
   { "boat_type", NK_boatType, 1 },
@@ -1068,87 +1045,106 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "battery_type", NK_batteryType, 1 },
   { "battery_make_model", NK_battMakeModel, 1 },
   { "alternator_brand_model", NK_altBrandModel, 1 },
-  { "imu_mount_orientation", NK_imuMountOrient, 3 },
-  { "imu_dist_bow_ft", NK_imuDistBowFt, 3 },
-  { "imu_dist_cl_ft", NK_imuDistClFt, 3 },
-  { "imu_height_wl_ft", NK_imuHtWlFt, 3 },
-  { "regulator_name", NK_regName, 3 },
-  { "vesselSaved", NK_vesselSaved, 3 },
-  // ── Debug/support state — persisted runtime intent, lifecycle and small result blobs.
-  //    Tier 3: rides every snapshot/export so a support session sees the device's full picture
-  //    (an engaged override, a half-done commissioning, a pending wipe), but applyImportConfig
-  //    never adopts any of it.
-  { "OnOff", NK_OnOff, 3 },
-  { "ManualFieldToggle", NK_ManualFieldToggle, 3 },
-  { "ManualDutyTarget", NK_ManualDutyTarget, 3 },
-  { "IgnitionOverride", NK_IgnitionOverride, 3 },
-  { "LimpHome", NK_LimpHome, 3 },
-  { "PhysicalPanelOverride", NK_PhysicalPanelOverride, 3 },
-  { "TuningMode", NK_TuningMode, 3 },
-  { "CVTuningMode", NK_CVTuningMode, 3 },
-  { "battMaxMode", NK_battMaxMode, 3 },
-  { "hardwarePresent", NK_hardwarePresent, 3 },
-  { "socInfoAvailable", NK_socInfoAvailable, 3 },
-  { "totalPowerCycles", NK_totalPowerCycles, 3 },
-  { "weatherDataValid", NK_weatherDataValid, 3 },
-  { "gpsManualActive", NK_gpsManualActive, 3 },   // flag only — LatitudeManual/LongitudeManual never export
-  { "VMGTargetBearing", NK_VMGTargetBearing, 3 }, // manual VMG bearing — voyage-transient nav intent, never imported
-  { "LastResetReason", NK_LastResetReason, 3 },
-  { "cfgSchema", NK_cfgSchema, 3 },
+  { "imu_mount_orientation", NK_imuMountOrient, 1 },
+  { "imu_dist_bow_ft", NK_imuDistBowFt, 1 },
+  { "imu_dist_cl_ft", NK_imuDistClFt, 1 },
+  { "imu_height_wl_ft", NK_imuHtWlFt, 1 },
+  { "regulator_name", NK_regName, 1 },
+  { "vesselSaved", NK_vesselSaved, 1 },
+  // ── Runtime intent, lifecycle and small result blobs (exported so support sees the full device state).
+  { "OnOff", NK_OnOff, 1 },
+  { "ManualFieldToggle", NK_ManualFieldToggle, 1 },
+  { "ManualDutyTarget", NK_ManualDutyTarget, 1 },
+  { "IgnitionOverride", NK_IgnitionOverride, 1 },
+  { "LimpHome", NK_LimpHome, 1 },
+  { "PhysicalPanelOverride", NK_PhysicalPanelOverride, 1 },
+  { "TuningMode", NK_TuningMode, 1 },       // both tuning modes are cleared at every boot, so an import of either is inert
+  { "CVTuningMode", NK_CVTuningMode, 1 },
+  { "battMaxMode", NK_battMaxMode, 1 },
+  { "hardwarePresent", NK_hardwarePresent, 1 },
+  { "socInfoAvailable", NK_socInfoAvailable, 1 },
+  { "totalPowerCycles", NK_totalPowerCycles, 1 },
+  { "weatherDataValid", NK_weatherDataValid, 1 },
+  // GPS: the manual position, its flag, and the last fix persisted for the weather lookup. A library submission
+  // leaves them out (script.js _CFG_GPS_KEYS).
+  { "gpsManualActive", NK_gpsManualActive, 1 },
+  { "LatitudeManual", NK_LatitudeManual, 1 },
+  { "LongitudeManual", NK_LongitudeManual, 1 },
+  { "gpsLastFixLat", NK_LatitudeNMEA, 1 },
+  { "gpsLastFixLon", NK_LongitudeNMEA, 1 },
+  { "VMGTargetBearing", NK_VMGTargetBearing, 1 },
+  { "LastResetReason", NK_LastResetReason, 1 },
+  // Which one-time settings conversions have run. Imported capped at this firmware's version, so a file saved on older
+  // firmware gets the same boot conversions its source got when it upgraded.
+  { "cfgSchema", NK_cfgSchema, 1 },
   { "lastAppldCfgId", NK_lastAppldCfgId, 3 },
   // Receipt of an admin config push that applied on the previous boot ("<n>|key,key,..."), held
   // until the dashboard acks it — pairs with lastAppldCfgId to show whether the owner ever saw it.
   { "cfgPushNotify", NK_cfgPushNotify, 3 },
-  { "imu_mnt_state", NK_imu_mnt_state, 3 },
-  { "RpmAxisWipeLoc", NK_RpmAxisWipeLoc, 3 },
+  { "imu_mnt_state", NK_imu_mnt_state, 1 },
+  { "RpmAxisWipeLoc", NK_RpmAxisWipeLoc, 1 },   // "1" = a local axis wipe a reboot cut short; the importer re-runs it at boot as the source would
+  { "impBootAct", NK_impBootAct, 1 },           // same, for an import's own boot-time wipe (applyImportConfig ORs its own bits in after the loop)
+  // Owed cloud wipes act on the records of whichever unit holds them, keyed to its own cloud login.
   { "RpmAxisWipePend", NK_RpmAxisWipePend, 3 },
-  { "AltWipePend", NK_AltWipePend, 3 },   // alt-health Start Over: cloud wipe still owed (lifecycle flag, never imported)
-  { "SocSeedAck", NK_SocSeedAck, 3 },
-  { "SocSeedSnap", NK_SocSeedSnap, 3 },
-  { "commissionAgeAck", NK_cmAgeAck, 3 },
-  { "commissionChangeAck", NK_cmChangeFlag, 3 },
-  { "commissionState", NK_commissionState, 3 },
-  { "commissionPhase", NK_commissionPhase, 3 },
-  { "commissionDoneMask", NK_commissionDoneMask, 3 },
-  { "commissionManualMask", NK_commissionManualMask, 3 },
-  { "cxLedgerSeq", NK_cxLedgerSeq, 3 },
-  { "commissionSnap", NK_commissionSnap, 3 },
-  { "commissionStepSnap", NK_commissionStepSnap, 3 },
-  { "commissionPreRun", NK_commissionPreRun, 3 },
-  { "cvStressLast", NK_cvStressLast, 3 },
-  { "faCalGain", NK_faCalGain, 3 },
-  { "faCalOffA", NK_faCalOffA, 3 },
-  { "altbaseSec", NK_altbaseSec, 3 },
-  { "altRefSrc", NK_altRefSrc, 3 },
-  { "altWindV", NK_altWindV, 3 },   // winding this device's alt-health record is on; imported, it would hide a winding change
+  { "AltWipePend", NK_AltWipePend, 3 },
+  { "PerfWipePend", NK_PerfWipePend, 3 },
+  { "recSeedOwed", NK_recSeedOwed, 3 },   // curves this unit still owes its own cloud record (recSeedOwedSet)
+  { "SocSeedAck", NK_SocSeedAck, 1 },
+  { "SocSeedSnap", NK_SocSeedSnap, 1 },
+  // Imported onto a board with no saved WiFi network, client mode still opens the WiFi setup page.
+  { "first_config_done", NK_first_config_done, 1 },
+  // Commissioning status and the in-flight wizard's restore points: applied by applyImportCommissioning step by
+  // step, never by the generic loop (CFG_IMPORT_DEDICATED).
+  { "commissionAgeAck", NK_cmAgeAck, 1 },
+  { "commissionChangeAck", NK_cmChangeFlag, 1 },
+  { "commissionState", NK_commissionState, 1 },
+  { "commissionPhase", NK_commissionPhase, 1 },
+  { "commissionDoneMask", NK_commissionDoneMask, 1 },
+  { "commissionManualMask", NK_commissionManualMask, 1 },
+  { "cxLedgerSeq", NK_cxLedgerSeq, 3 },   // this unit's ledger sequence with the cloud
+  { "commissionSnap", NK_commissionSnap, 1 },
+  { "commissionStepSnap", NK_commissionStepSnap, 1 },
+  { "commissionPreRun", NK_commissionPreRun, 1 },
+  { "cvStressLast", NK_cvStressLast, 1 },
+  // A write-ahead record of a class change or winding rescale a reboot cut short; the importer's boot replays it.
+  { "rescaleJournal", NK_rescaleJournal, 1 },
+  { "faCalGain", NK_faCalGain, 1 },
+  { "faCalOffA", NK_faCalOffA, 1 },
+  { "bhBaselineAh", NK_bhBaseline, 1 },
+  { "altbaseSec", NK_altbaseSec, 3 },   // imported only with the alt-health record it belongs to (REC_ALT_NVS)
+  { "altRefSrc", NK_altRefSrc, 1 },
+  { "altWindV", NK_altWindV, 3 },   // winding the alt-health record is on: imported only with that record, so it never hides a winding change
   // Address this node claimed on the NMEA 2000 bus and persisted (5_functions.ino), reloaded as the
-  // preferred address at boot. Tier 3: importing it would aim two regulators at the same address.
-  { "n2kSrcAddr", NK_n2kSrcAddr, 3 },
-  // 1-Wire role bindings (ROM codes as 16-char hex): this board's own probes, never another boat's.
-  // Written by the owAssignAlt/Batt/Extra /get actions (a role loop, invisible to config_drift_check.py's
-  // literal hasParam scan), so these names are listed in its MANIFEST_NON_PARAM.
-  { "owAddrAlt", NK_owAddrAlt, 3 },
-  { "owAddrBatt", NK_owAddrBatt, 3 },
-  { "owAddrExtra", NK_owAddrExtra, 3 },
+  // preferred address at boot. Two units on one address re-arbitrate through the normal address claim.
+  { "n2kSrcAddr", NK_n2kSrcAddr, 1 },
+  // 126998 installation descriptions as a GX or display last wrote them over the bus (a GX's name for this unit).
+  { "n2kInstDesc1", NK_n2kInstDesc1, 1 },
+  { "n2kInstDesc2", NK_n2kInstDesc2, 1 },
+  // 1-Wire role bindings (16-hex-char ROM codes); a stored alternator probe missing from this bus is a sensor
+  // fault, never rebound. Set by the owAssign* /get role loop, which config_drift_check.py's hasParam scan
+  // can't see, so these names are in its MANIFEST_NON_PARAM.
+  { "owAddrAlt", NK_owAddrAlt, 1 },
+  { "owAddrBatt", NK_owAddrBatt, 1 },
+  { "owAddrExtra", NK_owAddrExtra, 1 },
+  // The boat's other regulators by hardware uid. Imported without this unit's own entry (CFG_IMPORT_DEDICATED).
+  { "pairList", NK_pairList, 1 },
 };
 static const size_t CONFIG_MANIFEST_COUNT = sizeof(CONFIG_MANIFEST)/sizeof(CONFIG_MANIFEST[0]);
 
-// Registry knobs NEVER IMPORTED (everything in ALT_SETTINGS/PERF_SETTINGS exports, these included —
-// the snapshot doubles as a debugging record, so pause state must be visible):
-//   altPaused / perfPaused — learning pause state, runtime intent not a charge profile
-//   perfSpeedSrc — per-boat speed-sensor topology (STW vs SOG); importing it would bypass
-//     the Clear-All reset perfSettingsHandle fires on change, leaving the learned
-//     surfaces silently mismatched to the new source
-// config_drift_check.py parses this array — keep it a plain literal.
-static const char *CFG_REGISTRY_SKIP[] = { "altPaused", "perfPaused", "perfSpeedSrc" };
-static bool cfgRegistrySkipped(const char *name) {
-  for (size_t i = 0; i < sizeof(CFG_REGISTRY_SKIP)/sizeof(CFG_REGISTRY_SKIP[0]); i++)
-    if (strcmp(name, CFG_REGISTRY_SKIP[i]) == 0) return true;
+// Tier-1 rows applied by dedicated code, not the generic import loop: commissioning status + restore points
+// (applyImportCommissioning), cfgSchema (capped), pairList (own entry removed).
+static const char *CFG_IMPORT_DEDICATED[] = {
+  "commissionState", "commissionPhase", "commissionDoneMask", "commissionManualMask", "CommissionEpoch",
+  "commissionAgeAck", "commissionChangeAck", "commissionSnap", "commissionStepSnap", "commissionPreRun",
+  "cvStressLast", "cfgSchema", "pairList",
+};
+static bool cfgImportDedicated(const char *name) {
+  for (size_t i = 0; i < sizeof(CFG_IMPORT_DEDICATED)/sizeof(CFG_IMPORT_DEDICATED[0]); i++)
+    if (strcmp(name, CFG_IMPORT_DEDICATED[i]) == 0) return true;
   return false;
 }
 
-// Append val as a JSON string literal (quotes + backslash escaped, control characters as \u00XX —
-// a regulator name or another unit's mDNS record can carry anything).
+// JSON string literal; a regulator name or another unit's mDNS record can carry any byte.
 static void cfgAppendJsonStr(String &out, const String &val) {
   out += '"';
   for (size_t i = 0; i < val.length(); i++) {
@@ -1167,27 +1163,20 @@ static void cfgAppendJsonStr(String &out, const String &val) {
   out += '"';
 }
 
-// Append a float as a bare JSON number, or "null" for NaN/Inf (JSON has no NaN literal — a raw
-// nan would make the whole settings blob invalid and 500 the daily snapshot). For the structured
-// commissioning-result arrays/objects below, which want real numbers, not quoted strings.
+// NaN/Inf -> null: a raw nan makes the whole settings blob invalid and 500s the daily snapshot.
 static void cfgAppendNum(String &out, float v, int dec) {
   if (isnan(v) || isinf(v)) { out += "null"; return; }
   out += String(v, dec);
 }
 
-// Append a float array as a JSON array of bare numbers (NaN/Inf → null, via cfgAppendNum).
 static void cfgAppendFloatArr(String &out, const float *a, int n, int dec) {
   out += '[';
   for (int i = 0; i < n; i++) { if (i) out += ','; cfgAppendNum(out, a[i], dec); }
   out += ']';
 }
 
-// Emit the manifest settings as a complete JSON object {"param":"rawNvsStr",...}.
-// Single source of truth for BOTH /exportConfig (sharing) and the daily fleet config
-// snapshot (buildConfigPayload's "settings") — so neither can drift as settings are added.
-// Keys never set are omitted.
-// The alt-health/boat-perf registries are appended generically (ALL knobs — CFG_REGISTRY_SKIP
-// gates import only), so knobs added to those registries are covered without touching the manifest.
+// {"param":"rawNvsStr",...}: the one builder for both /exportConfig and the daily snapshot's "settings"
+// (buildConfigPayload), so neither can drift.
 String manifestConfigObject() {
   String j;
   j.reserve(18432);   // manifest + registry + learned-state blobs (DCIR up to ~5.6KB)
@@ -1201,12 +1190,9 @@ String manifestConfigObject() {
     j += '"'; j += CONFIG_MANIFEST[i].param; j += "\":";
     cfgAppendJsonStr(j, v);
   }
-  // A macro, not a helper: ALT_SETTINGS and PERF_SETTINGS are different struct types,
-  // and a free function taking either by pointer would make Arduino's auto-prototype
-  // generator hoist a prototype above the struct definitions in 7_functions.ino
-  // ("does not name a type"). JSON param = FULL registry name (what the dashboard
-  // sends); NVS key = name truncated to the 15-char cap, mirroring altSettingsLoad/
-  // perfSettingsLoad exactly.
+  // A macro, not a helper: a function taking either registry struct would get an Arduino auto-prototype
+  // hoisted above the struct definitions in 7_functions.ino. JSON param = full registry name; NVS key = name
+  // truncated to 15 chars, mirroring altSettingsLoad/perfSettingsLoad.
   #define CFG_EMIT_REGISTRY(REG, COUNT) \
     for (size_t i = 0; i < COUNT; i++) { \
       char key[16]; \
@@ -1221,32 +1207,22 @@ String manifestConfigObject() {
   CFG_EMIT_REGISTRY(ALT_SETTINGS, ALT_SETTING_COUNT)
   CFG_EMIT_REGISTRY(PERF_SETTINGS, PERF_SETTING_COUNT)
   #undef CFG_EMIT_REGISTRY
-  // Derived read-only: the base 12V-equiv CV gains the voltage loop is ACTUALLY running
-  // (recomputeCvGains sets these from the plant fit under Measured, or = the manual VoltageKp/Ki under
-  // Manual). Emitted so the blob is self-describing — the manual VoltageKp/Ki above are the
-  // dormant fallback whenever cvGainMode=1 (Measured). NOT in CONFIG_MANIFEST, so applyImportConfig
-  // ignores them on the destination (it recomputes its own from its own plant fit).
+  // Derived, read-only: the 12V-equiv base CV gains the voltage loop actually runs (recomputeCvGains), so the blob
+  // is self-describing. Not in CONFIG_MANIFEST: the destination recomputes its own from its plant fit.
   if (!first) j += ',';
   first = false;
   j += "\"cvComputedKp\":"; cfgAppendJsonStr(j, String(cvComputedKp, 2));
   j += ",\"cvComputedKi\":"; cfgAppendJsonStr(j, String(cvComputedKi, 2));
   j += ",\"cvComputedKd\":"; cfgAppendJsonStr(j, String(cvComputedKd, 2));
-  // Learned per-device STATE (measured values that keep evolving after commissioning) — captured
-  // so the owner can monitor it across the fleet and so a local export archives it. Was named
-  // commissioning_results through payload_v 3; renamed because everything here is LIVING state,
-  // not a commissioning event — frozen per-run evidence (incl. the stress test, which lived here
-  // until v4) now goes to the commissioning ledger instead (COMMISSIONING_LEDGER_SPEC.md).
-  // Not in CONFIG_MANIFEST → applyImportConfig ignores it: a boat must never adopt another's
-  // measured results — same contract as cvComputed* above.
+  // Learned per-device state (still evolving after commissioning), for fleet monitoring and local archive; frozen
+  // per-run evidence goes to the commissioning ledger. Not in CONFIG_MANIFEST, so never imported: a boat must
+  // never adopt another's measured results.
   j += ",\"learned_state\":{";
   {
     bool cfirst = true;
-    // Battery-health: baseline capacity (Ah) only. DCIR test results are EVENT data — each run
-    // uploads its own "test" ledger row at finish; they no longer ride the daily snapshot.
+    // Battery-health baseline (Ah) only; DCIR results upload as their own "test" ledger rows.
     if (settingExists(NK_bhBaseline)) { if (!cfirst) j += ','; j += "\"bh_baseline_ah\":"; cfgAppendJsonStr(j, settingRead(NK_bhBaseline)); cfirst = false; }
-    // Capacity-fade: SUMMARY only (latest capacity %, point count). The full bhCapCap-point ring
-    // (~21KB at 512) would overflow the 32KB daily upload buffer; the monitoring signal is the
-    // latest measured capacity, and the full ring is never adopted on import anyway.
+    // Capacity-fade summary only: the full ring (~21 KB at 512 points) would overflow the 32 KB daily upload buffer.
     if (bhCapRing && bhCapCount > 0) {
       if (!cfirst) j += ',';
       float capPct = bhCapRing[(bhCapHead - 1 + bhCapCap) % bhCapCap].capPct;
@@ -1254,27 +1230,21 @@ String manifestConfigObject() {
       j += ",\"bh_capfade_points\":"; cfgAppendJsonStr(j, String(bhCapCount));
       cfirst = false;
     }
-    // ── Learned per-device state (adaptive tables + sensor calibration). Monitored, NEVER imported:
-    //    export-only, so another boat's hardware calibration can't land on this one. Read from the
-    //    live globals, all restored from NVS at boot. Emitted as real JSON numbers/arrays (not the
-    //    quoted strings the manifest uses) so the fleet DB can query them directly. rpm_axis is
-    //    emitted once — every per-RPM array below shares it. ──
+    // ── Adaptive tables + sensor calibration: monitored, never imported. Real JSON numbers (not the manifest's
+    //    quoted strings) so the fleet DB can query them; every per-RPM array shares rpm_axis. ──
     if (!cfirst) j += ',';
     cfirst = false;
     j += "\"rpm_axis\":[";
     for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) j += ','; j += String(rpmTableRPMPoints[i]); }
     j += ']';
-    // Min% duty floor actually in effect (kneeFloor owns it when knee-learning is on, else the
-    // scalar/manual floor), the detected knee, and per-point frozen flags (1 = learning converged).
+    // Min% floor in effect (kneeFloor when knee-learning is on), detected knee, frozen flags (1 = converged).
     j += ",\"min_duty_floor\":"; cfgAppendFloatArr(j, rpmMinDutyTable, RPM_TABLE_SIZE, 2);
     j += ",\"knee_detected\":";  cfgAppendFloatArr(j, kneeKnee, RPM_TABLE_SIZE, 2);
     j += ",\"knee_frozen\":[";
     for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) j += ','; j += (kneeFrozen[i] ? '1' : '0'); }
     j += "],\"knee_fit_a\":"; cfgAppendNum(j, kneeFitA, 3);
-    // Per-RPM current (A) + power (W) ceiling for BOTH Hi and Lo modes, read straight from the
-    // "learning" NVS namespace (read-only) so neither the active nor the inactive live table is
-    // disturbed. A mode with no saved blob emits null (the device runs computed defaults there).
-    // cap_mode = the mode in effect now (1 = Normal/High, 0 = Low).
+    // Hi and Lo cap tables read from the "learning" NVS namespace so neither live table is disturbed; a mode with
+    // no saved blob emits null (it runs computed defaults). cap_mode: 1 = Normal/High, 0 = Low.
     j += ",\"cap_mode\":"; j += String((int)HiLow);
     {
       nvs_handle_t ch; float tmp[RPM_TABLE_SIZE];
@@ -1292,84 +1262,148 @@ String manifestConfigObject() {
       }
       if (haveNvs) nvs_close(ch);
     }
-    // Current-sensor zero-drift fit (zero-offset = offset + slope·(T − T_ref); slope in A/°F) and the
-    // learned shunt-gain correction (1.0 = none). valid=0 until the first accepted fit.
+    // Current-sensor zero-drift fit (zero-offset = offset + slope·(T − T_ref); slope in A/°F). valid=0 until the first
+    // accepted fit.
     j += ",\"zero_fit\":{\"valid\":"; j += String((int)zfValid);
     j += ",\"sensor\":"; j += String((int)zfSensor);
     j += ",\"offset\":"; cfgAppendNum(j, zfC, 6);
     j += ",\"slope\":";  cfgAppendNum(j, zfB, 6);
     j += ",\"r2\":";     cfgAppendNum(j, zfR2, 4);
     j += ",\"epoch\":";  j += String((unsigned long)zfLastEpoch); j += "}";
-    j += ",\"shunt_gain\":"; cfgAppendNum(j, DynamicShuntGainFactor, 4);
   }
   j += "}";
   j += "}";
   return j;
 }
 
-// User-editable RPM tables, read straight from the "learning" NVS namespace (raw
-// float/int blobs the string-settings manifest can't carry). Both the Normal and Low
-// cap tables are emitted regardless of the active HiLow mode. Values are comma-joined
-// raw numbers (amps / watts / duty-%). A blob missing from NVS is omitted.
-String exportTablesObject() {
-  String j;
-  j.reserve(1024);
-  j = "{";
-  nvs_handle_t h;
-  if (nvs_open("learning", NVS_READONLY, &h) != ESP_OK) { j += "}"; return j; }
-  bool first = true;
-  {
-    int pts[RPM_TABLE_SIZE];
-    size_t sz = sizeof(pts);
-    if (nvs_get_blob(h, "rpmPoints", pts, &sz) == ESP_OK && sz == sizeof(pts)) {
-      j += "\"rpmPoints\":\"";
-      for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) j += ','; j += String(pts[i]); }
-      j += '"';
-      first = false;
+// Every "tables" entry, in export order: data the string-settings manifest can't carry. Values are comma-joined raw
+// numbers (amps / watts / duty-% / counts); ripTab and huntPockets join their records with ';'. Both the Normal and
+// Low cap tables are emitted regardless of the active HiLow mode. A table with nothing stored is omitted.
+static const char *const CFG_TABLE_NAMES[] = {
+  "rpmPoints", "capTable", "capPowerTable", "capTableLo", "capPowerTableLo", "minDutyTable",
+  "kneeKnee", "kneeFitA", "kneeFloor", "kneeFrozen",
+  "bk_minDuty", "bk_kneeFlr", "bk_kneeKn", "bk_kneeFrz", "bk_kneeFitA",
+  "overheatCount", "lastOverheat", "cumulativeTime", "totalEvents", "totalOverheats", "totalSafeMs",
+  "fuelRPM", "fuelGPH", "ripTab", "huntPockets", "zeroFit",
+};
+
+static void cfgJoinFloats(String &o, const float *a, int n, int dec) {
+  for (int i = 0; i < n; i++) { if (i) o += ','; o += String(a[i], dec); }
+}
+static void cfgJoinBools(String &o, const bool *a, int n) {
+  for (int i = 0; i < n; i++) { if (i) o += ','; o += (a[i] ? '1' : '0'); }
+}
+
+// Table `name` formatted as this regulator holds it now — the exported value, and the import's before/after
+// comparison. "learning"/"fuel"-namespace blobs come from NVS; the ripple map, damper pockets, zero-drift fit and
+// shunt gain from the live values their files and "storage" keys boot into. False = nothing stored.
+static bool cfgTableValue(const char *name, String &o) {
+  o = "";
+  if (strcmp(name, "ripTab") == 0) {   // an empty map is a value too ("" = none): the importer ends up with none
+    bool any = (ripTab.sess.levelA != 0.0f);
+    for (int r = 0; r < RIPTAB_BINS && !any; r++) any = (ripTab.cell[r].state != 0);
+    if (!any) return true;
+    o = String(ripTab.sess.levelA, 2); o += ','; o += String(ripTab.sess.ibvMinV, 3); o += ','; o += String(ripTab.sess.ibvMaxV, 3);
+    o += ','; o += String((unsigned)ripTab.sess.idleRpm); o += ','; o += String((unsigned long)ripTab.sess.epoch);
+    for (int r = 0; r < RIPTAB_BINS; r++) {
+      const RipTabCell &c = ripTab.cell[r];
+      o += ';'; o += String((unsigned)c.altPkX100); o += ','; o += String((unsigned)c.battPkX100);
+      o += ','; o += String((unsigned)c.altPendX100); o += ','; o += String((unsigned)c.battPendX100); o += ','; o += String((unsigned)c.state);
     }
+    return true;
   }
-  static const char *CFG_TABLE_FKEYS[] = { "capTable", "capPowerTable", "capTableLo", "capPowerTableLo", "minDutyTable" };
-  for (size_t k = 0; k < sizeof(CFG_TABLE_FKEYS)/sizeof(CFG_TABLE_FKEYS[0]); k++) {
-    float f[RPM_TABLE_SIZE];
-    size_t sz = sizeof(f);
-    if (nvs_get_blob(h, CFG_TABLE_FKEYS[k], f, &sz) != ESP_OK || sz != sizeof(f)) continue;
-    if (!first) j += ',';
-    first = false;
-    j += '"'; j += CFG_TABLE_FKEYS[k]; j += "\":\"";
-    for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) j += ','; j += String(f[i], 2); }
-    j += '"';
+  if (strcmp(name, "huntPockets") == 0) {   // an empty map is a value too: the importer ends up with none
+    for (uint8_t i = 0; i < hgPocketN; i++) {
+      if (i) o += ';';
+      o += String(hgPockets[i].lo, 0); o += ','; o += String(hgPockets[i].hi, 0);
+      o += ','; o += String((unsigned long)hgPockets[i].epoch); o += ','; o += String((unsigned)hgPockets[i].lever);
+    }
+    return true;
+  }
+  if (strcmp(name, "zeroFit") == 0) {
+    o = String(zfValid); o += ','; o += String(zfSensor); o += ','; o += String(zfC, 6); o += ',';
+    o += String(zfB, 6); o += ','; o += String(zfR2, 4); o += ','; o += String((unsigned long)zfLastEpoch);
+    return true;
+  }
+  const bool fuel = (strcmp(name, "fuelRPM") == 0 || strcmp(name, "fuelGPH") == 0);
+  nvs_handle_t h;
+  if (nvs_open(fuel ? "fuel" : "learning", NVS_READONLY, &h) != ESP_OK) return false;
+  bool ok = false;
+  size_t sz;
+  if (fuel) {
+    float f[FUEL_TABLE_SIZE]; sz = sizeof(f);
+    if ((ok = (nvs_get_blob(h, name, f, &sz) == ESP_OK && sz == sizeof(f)))) cfgJoinFloats(o, f, FUEL_TABLE_SIZE, name[4] == 'R' ? 1 : 3);
+  } else if (strcmp(name, "rpmPoints") == 0 || strcmp(name, "overheatCount") == 0) {
+    int v[RPM_TABLE_SIZE]; sz = sizeof(v);
+    if ((ok = (nvs_get_blob(h, name, v, &sz) == ESP_OK && sz == sizeof(v))))
+      for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) o += ','; o += String(v[i]); }
+  } else if (strcmp(name, "lastOverheat") == 0 || strcmp(name, "cumulativeTime") == 0) {
+    unsigned long v[RPM_TABLE_SIZE]; sz = sizeof(v);
+    if ((ok = (nvs_get_blob(h, name, v, &sz) == ESP_OK && sz == sizeof(v))))
+      for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) o += ','; o += String(v[i]); }
+  } else if (strcmp(name, "totalEvents") == 0 || strcmp(name, "totalOverheats") == 0) {
+    uint32_t v;
+    if ((ok = (nvs_get_u32(h, name, &v) == ESP_OK))) o = String((unsigned long)v);
+  } else if (strcmp(name, "totalSafeMs") == 0) {
+    uint64_t v; sz = sizeof(v);
+    if ((ok = (nvs_get_blob(h, name, &v, &sz) == ESP_OK && sz == sizeof(v)))) { char b[24]; snprintf(b, sizeof(b), "%llu", (unsigned long long)v); o = b; }
+  } else if (strcmp(name, "kneeFitA") == 0 || strcmp(name, "bk_kneeFitA") == 0) {
+    float v; sz = sizeof(v);
+    if ((ok = (nvs_get_blob(h, name, &v, &sz) == ESP_OK && sz == sizeof(v)))) o = String(v, 3);
+  } else if (strcmp(name, "kneeFrozen") == 0 || strcmp(name, "bk_kneeFrz") == 0) {
+    bool v[RPM_TABLE_SIZE]; sz = sizeof(v);
+    if ((ok = (nvs_get_blob(h, name, v, &sz) == ESP_OK && sz == sizeof(v)))) cfgJoinBools(o, v, RPM_TABLE_SIZE);
+  } else {   // float[RPM_TABLE_SIZE] columns: cap tables, Keep-Alive column, knee floors and knees, their backups
+    float v[RPM_TABLE_SIZE]; sz = sizeof(v);
+    if ((ok = (nvs_get_blob(h, name, v, &sz) == ESP_OK && sz == sizeof(v)))) cfgJoinFloats(o, v, RPM_TABLE_SIZE, 2);
   }
   nvs_close(h);
-  // Fuel-flow curve lives in its own "fuel" namespace (float[FUEL_TABLE_SIZE], not the
-  // learning-namespace RPM tables) — per-engine calibration, cloned like the cap tables.
-  if (nvs_open("fuel", NVS_READONLY, &h) == ESP_OK) {
-    float fr[FUEL_TABLE_SIZE], fg[FUEL_TABLE_SIZE];
-    size_t sr = sizeof(fr), sg = sizeof(fg);
-    if (nvs_get_blob(h, "fuelRPM", fr, &sr) == ESP_OK && sr == sizeof(fr) &&
-        nvs_get_blob(h, "fuelGPH", fg, &sg) == ESP_OK && sg == sizeof(fg)) {
-      if (!first) j += ',';
-      first = false;
-      j += "\"fuelRPM\":\"";
-      for (int i = 0; i < FUEL_TABLE_SIZE; i++) { if (i) j += ','; j += String(fr[i], 1); }
-      j += "\",\"fuelGPH\":\"";
-      for (int i = 0; i < FUEL_TABLE_SIZE; i++) { if (i) j += ','; j += String(fg[i], 3); }
-      j += '"';
-    }
-    nvs_close(h);
+  return ok;
+}
+
+String exportTablesObject() {
+  String j;
+  j.reserve(4096);
+  j = "{";
+  bool first = true;
+  String v;
+  for (size_t k = 0; k < sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0]); k++) {
+    if (!cfgTableValue(CFG_TABLE_NAMES[k], v)) continue;
+    if (!first) j += ',';
+    first = false;
+    j += '"'; j += CFG_TABLE_NAMES[k]; j += "\":";
+    cfgAppendJsonStr(j, v);
   }
   j += "}";
   return j;
 }
 
-// Build the shareable config blob: fw_version + the manifest "config" object + the RPM
-// "tables" object. payload_v 3 = the vessel{} TOC header is GONE — the vessel fields are
-// ordinary manifest keys inside config{}, and the cloud (submit-config) reads them there.
-// Older firmware ignores unknown sections, so blobs remain cross-rev compatible both ways.
-// Derived view of the Vessel Info NVS record, served at /vessel_info.json. Built from the live
-// globals rather than re-reading NVS so it always matches what the loops are running. Numbers stay
-// JSON numbers — the dashboard form tests `!== undefined` and radio-selects on a numeric compare,
-// so a quoted "0" orientation would fail to select. The same fields are also in the manifest
-// half of /exportConfig; this is the ungated, form-shaped view of them.
+// ── Commissioning status on import ───────────────────────────────────────────
+// Values each wizard step writes or was measured against (stage -1 = input of every RPM-binned step 1..7). Per step:
+// all match the file -> file's done/hand-set flags; all untouched -> keep ours; a mix -> not done. A value absent
+// from the file matches only an absent value here. Prep (0) and the Stress test (8) have no rows.
+struct CxImportKey { int8_t stage; const char *name; bool table; };
+static const CxImportKey CX_IMPORT_KEYS[] = {
+  { -1, "RPMScalingFactor", false },
+  { 1, "SystemIDStabilizeAmps", false }, { 1, "SystemIDStepAmplitude", false },
+  { 2, "PidKp", false }, { 2, "PidKi", false }, { 2, "OutputPIDFilterTC", false }, { 2, "VoltageFilterTC", false },
+  { 2, "systemIDPlantTauMs", false },
+  { 3, "PidKp", false }, { 3, "PidKi", false }, { 3, "PidKd", false },
+  { 4, "ripFitAlt", false }, { 4, "slpFitAlt", false }, { 4, "IExcessTau", false }, { 4, "ripTab", true },
+  { 5, "IExcessFrac", false }, { 5, "IExcessFracBulk", false }, { 5, "IExcessBaseA", false }, { 5, "IExcessCcOffsetA", false },
+  { 5, "IExcessFloorA", false }, { 5, "IExcessCeilA", false }, { 5, "CvKdDeadbandVps", false }, { 5, "CvKdDbSlope", false },
+  { 6, "cvPlantKa", false }, { 6, "cvPlantKb", false }, { 6, "cvGainMode", false }, { 6, "CommissionTempF", false },
+  { 6, "CommissionTempSrc", false }, { 6, "BatteryVoltage", false }, { 6, "BatteryCapacity_Ah", false }, { 6, "battery_type", false },
+  { 7, "rpmPoints", true }, { 7, "minDutyTable", true }, { 7, "fieldDecayTauMs", false }, { 7, "fdDrainLoMs", false },
+  { 7, "fdDrainHiMs", false }, { 7, "fdDrainRpmLo", false }, { 7, "fdDrainRpmHi", false },
+  { 9, "altLeadSec", false },
+};
+static const size_t CX_IMPORT_KEY_COUNT = sizeof(CX_IMPORT_KEYS) / sizeof(CX_IMPORT_KEYS[0]);
+// Also sent in "cx_basis": speed-indexed tables an RPMScalingFactor change must wipe unless the file brings them.
+static const char *const CFG_AXIS_BASIS_TABLES[] = { "huntPockets", "overheatCount" };
+
+// /vessel_info.json view, built from the live globals so it matches what the loops run. Numbers stay JSON
+// numbers: the dashboard form radio-selects on a numeric compare, so a quoted "0" orientation would not select.
 String vesselInfoJson() {
   String j;
   j.reserve(768);
@@ -1402,14 +1436,14 @@ String exportConfigJson() {
   j.reserve(20480);   // config (manifest + learned-state blobs) + tables
   j = "{\"fw_version\":\"";
   j += FIRMWARE_VERSION;
+  j += "\",\"source_uid\":\"";   // which regulator saved it: an import onto a unit the source lists as its partner pairs them back
+  j += device_id_hex;
   j += "\",\"payload_v\":4,\"config\":";
   j += manifestConfigObject();
   j += ",\"tables\":";
   j += exportTablesObject();
-  // THIS device's authority on what import refuses: tier-3 manifest rows + the registry skip
-  // list. cfgDiffPreview (script.js) partitions its diff with this so device state can't pose
-  // as an importable change. Names only (no values) and none are ever looked up by
-  // applyImportConfig, so the array is inert to every importer including older firmware.
+  // Tier-3 rows: cfgDiffPreview (script.js) uses this so device state can't pose as an importable change.
+  // Names only, never read by applyImportConfig, so inert to every importer.
   j += ",\"export_only\":[";
   bool first = true;
   for (size_t i = 0; i < CONFIG_MANIFEST_COUNT; i++) {
@@ -1418,21 +1452,28 @@ String exportConfigJson() {
     first = false;
     j += '"'; j += CONFIG_MANIFEST[i].param; j += '"';
   }
-  for (size_t i = 0; i < sizeof(CFG_REGISTRY_SKIP)/sizeof(CFG_REGISTRY_SKIP[0]); i++) {
+  // The values applyImportCommissioning compares step by step, and the speed-indexed tables an engine-speed rescale
+  // checks: the preview sends the file's value of each in "cx_basis", ticked or not. Names only, like export_only.
+  j += "],\"cx_basis_keys\":[";
+  first = true;
+  for (size_t i = 0; i < CX_IMPORT_KEY_COUNT; i++) {
+    bool dup = false;
+    for (size_t k = 0; k < i; k++) if (strcmp(CX_IMPORT_KEYS[k].name, CX_IMPORT_KEYS[i].name) == 0) dup = true;
+    if (dup) continue;
     if (!first) j += ',';
     first = false;
-    j += '"'; j += CFG_REGISTRY_SKIP[i]; j += '"';
+    j += '"'; j += CX_IMPORT_KEYS[i].name; j += '"';
   }
+  for (size_t i = 0; i < sizeof(CFG_AXIS_BASIS_TABLES) / sizeof(CFG_AXIS_BASIS_TABLES[0]); i++) {
+    j += ",\""; j += CFG_AXIS_BASIS_TABLES[i]; j += '"';
+  }
+  j += ",\"AlternatorCOffset\",\"zeroFit\"";   // and the zero-drift fit with the offset it is on: which of the pair the file brought
   j += "]}";
   return j;
 }
 
-// Extract a flat top-level value for "key" from a JSON object starting at 'from'.
-// Quote-delimited needle prevents prefix collisions (e.g. TailCurrent vs TailCurrent_A).
-// §10.9: a FLOAT-valued token is acceptable only if the whole trimmed string parses with strtof and the
-// result is finite in float precision. Rejects "nan", "inf", "nanx", "infx", "1e39", "3.5e38", "1e308",
-// "", and plain text. Applied only where the consumer is a float (paramOk for /get handlers that toFloat,
-// the alt-health / boat-perf registry knobs, numeric config-import rows) — never to ids or names.
+// Whole trimmed string parses with strtof and is finite in float precision (rejects "nan", "infx", "1e39", "").
+// Use only where the consumer is a float, never on ids or names.
 bool floatTokenValid(const char *s) {
   if (!s) return false;
   while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
@@ -1464,29 +1505,102 @@ static bool importValueNonFinite(const char *s) {
   return *end == '\0' && !isfinite((float)v);
 }
 
-// Quoted values fold \" and \\ escapes back (cfgAppendJsonStr produces them — e.g. the
-// imu_zero value is itself a JSON string with quotes).
+// Decode a JSON string body starting just after its opening quote into val; returns the character after the
+// closing quote. cfgAppendJsonStr produces \" \\ and \u00XX — e.g. the imu_zero value is itself a JSON string with
+// quotes, and the pair list separates records with control characters.
+static const char *cfgJsonStrDecode(const char *p, String &val) {
+  val = "";
+  while (*p && *p != '"') {
+    if (*p != '\\' || !p[1]) { val += *p++; continue; }
+    p++;
+    switch (*p) {
+      case 'n': val += '\n'; p++; break;
+      case 'r': val += '\r'; p++; break;
+      case 't': val += '\t'; p++; break;
+      case 'b': val += '\b'; p++; break;
+      case 'f': val += '\f'; p++; break;
+      case 'u': {
+        unsigned cp = 0;
+        int i = 1;
+        for (; i <= 4 && isxdigit((unsigned char)p[i]); i++) cp = cp * 16 + (unsigned)(isdigit((unsigned char)p[i]) ? p[i] - '0' : (tolower((unsigned char)p[i]) - 'a' + 10));
+        if (i <= 4) { val += 'u'; p++; break; }   // malformed: keep the letter
+        p += 5;
+        if (cp == 0) break;                       // a NUL cannot live inside a String
+        if (cp < 0x80) val += (char)cp;
+        else if (cp < 0x800) { val += (char)(0xC0 | (cp >> 6)); val += (char)(0x80 | (cp & 0x3F)); }
+        else { val += (char)(0xE0 | (cp >> 12)); val += (char)(0x80 | ((cp >> 6) & 0x3F)); val += (char)(0x80 | (cp & 0x3F)); }
+        break;
+      }
+      default: val += *p++; break;                // \" \\ \/
+    }
+  }
+  return *p ? p + 1 : p;
+}
+
 static bool cfgJsonExtract(const char *from, const char *key, String &val) {
   String needle = "\"";
   needle += key;
   needle += "\"";
-  const char *p = strstr(from, needle.c_str());
+  // Only a match followed by ':' is the key: a text value spelled like a key name ("engine_make":"Beta") is not.
+  const char *p = nullptr;
+  for (const char *q = strstr(from, needle.c_str()); q && !p; q = strstr(q + 1, needle.c_str())) {
+    const char *c = q + needle.length();
+    while (*c == ' ' || *c == '\t' || *c == '\r' || *c == '\n') c++;
+    if (*c == ':') p = c;
+  }
   if (!p) return false;
-  p += needle.length();
-  while (*p == ' ' || *p == '\t' || *p == ':' ) p++;
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') p++;
   if (*p == '"') {
-    p++;
-    val = "";
-    while (*p && *p != '"') {
-      if (*p == '\\' && p[1]) p++;
-      val += *p++;
-    }
+    cfgJsonStrDecode(p + 1, val);
     return true;
   }
   const char *e = p;
   while (*e && *e != ',' && *e != '}' && *e != ' ' && *e != '\n' && *e != '\r' && *e != '\t') e++;
   val = ""; val.concat(p, e - p);
   return true;
+}
+
+// A copy of the JSON object that is the value of key `name` (first occurrence), so lookups stay inside it: a key
+// missing from "config" must never be picked up from "tables", "cx_basis" or a later array. Caller frees.
+// An admin push wraps a whole export blob in its own "config", so a "config" holding a "config" object is descended.
+static char *cfgObjectDup(const char *body, const char *name) {
+  String needle = "\"";
+  needle += name;
+  needle += "\"";
+  const char *start = nullptr;
+  for (const char *p = strstr(body, needle.c_str()); p && !start; p = strstr(p + 1, needle.c_str())) {
+    const char *q = p + needle.length();
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q != ':') continue;
+    q++;
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q == '{') start = q;
+  }
+  if (!start) return nullptr;
+  int depth = 0;
+  bool inStr = false;
+  const char *e = start;
+  for (; *e; e++) {
+    if (inStr) {
+      if (*e == '\\' && e[1]) e++;
+      else if (*e == '"') inStr = false;
+      continue;
+    }
+    if (*e == '"') inStr = true;
+    else if (*e == '{') depth++;
+    else if (*e == '}' && --depth == 0) { e++; break; }
+  }
+  if (depth != 0) return nullptr;
+  size_t n = (size_t)(e - start);
+  char *buf = (char *)ps_malloc(n + 1);
+  if (!buf) return nullptr;
+  memcpy(buf, start, n);
+  buf[n] = '\0';
+  if (strcmp(name, "config") == 0) {
+    char *inner = cfgObjectDup(buf + 1, "config");
+    if (inner) { free(buf); return inner; }
+  }
+  return buf;
 }
 
 // Strict comma-joined parsers for the "tables" section — exactly n values or reject.
@@ -1515,35 +1629,169 @@ static bool cfgCsvToInt(const String &s, int *out, int n) {
   return true;
 }
 
-// Apply the "tables" section: user-editable RPM tables into the "learning" namespace.
-// A changed rpmPoints set invalidates the knee tracker the same way a manual breakpoint
-// edit does (3_functions.ino handler) — reset BEFORE the imported minDutyTable blob lands
-// so the two stay consistent with the source file.
-// Live arrays reload at the end (import normally reboots; this covers noReboot=1).
-static int applyImportTables(const char *body) {
-  const char *tbl = strstr(body, "\"tables\"");
+// What this import wrote into each table, by CFG_TABLE_NAMES index — the "after" side of the commissioning step
+// comparison for tables whose live value only reloads at the next boot (staged files, "storage" keys).
+static String cfgImpTblVal[sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0])];
+static bool cfgImpTblSet[sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0])];
+static void cfgImpNoteTable(const char *name, const String &v) {
+  for (size_t k = 0; k < sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0]); k++)
+    if (strcmp(CFG_TABLE_NAMES[k], name) == 0) { cfgImpTblVal[k] = v; cfgImpTblSet[k] = true; return; }
+}
+// Table `name` as this regulator will hold it after the import's reboot.
+static bool cfgTableValueAfter(const char *name, String &o) {
+  for (size_t k = 0; k < sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0]); k++)
+    if (strcmp(CFG_TABLE_NAMES[k], name) == 0 && cfgImpTblSet[k]) { o = cfgImpTblVal[k]; return true; }
+  return cfgTableValue(name, o);
+}
+
+static bool cfgCsvToULong(const String &s, unsigned long *out, int n) {
+  int pos = 0;
+  for (int i = 0; i < n; i++) {
+    if (pos >= (int)s.length()) return false;
+    out[i] = strtoul(s.c_str() + pos, nullptr, 10);
+    int c = s.indexOf(',', pos);
+    if (c < 0) return i == n - 1;
+    if (i == n - 1) return false;
+    pos = c + 1;
+  }
+  return true;
+}
+static bool cfgCsvToBool(const String &s, bool *out, int n) {
+  int v[RPM_TABLE_SIZE];
+  if (n > RPM_TABLE_SIZE || !cfgCsvToInt(s, v, n)) return false;
+  for (int i = 0; i < n; i++) out[i] = (v[i] != 0);
+  return true;
+}
+
+// "levelA,ibvMin,ibvMax,idleRpm,epoch;" then RIPTAB_BINS cells "altPk,battPk,altPend,battPend,state" — cfgTableValue's layout.
+// `out` is a RipTab: a struct-typed parameter would trip the Arduino auto-prototype hoisting above its definition.
+static bool cfgParseRipTab(const String &s, void *out) {
+  RipTab &t = *(RipTab *)out;
+  memset(&t, 0, sizeof(t));
+  int semi = s.indexOf(';');
+  if (semi < 0) return false;
+  float f[3];
+  unsigned long u[2];
+  if (sscanf(s.substring(0, semi).c_str(), "%f,%f,%f,%lu,%lu", &f[0], &f[1], &f[2], &u[0], &u[1]) != 5) return false;
+  t.sess.levelA = f[0]; t.sess.ibvMinV = f[1]; t.sess.ibvMaxV = f[2];
+  t.sess.idleRpm = (uint16_t)u[0]; t.sess.epoch = (uint32_t)u[1];
+  int pos = semi + 1;
+  for (int r = 0; r < RIPTAB_BINS; r++) {
+    int end = s.indexOf(';', pos);
+    if (end < 0) end = s.length();
+    unsigned a, b, c, d, st;
+    if (sscanf(s.substring(pos, end).c_str(), "%u,%u,%u,%u,%u", &a, &b, &c, &d, &st) != 5) return false;
+    t.cell[r].altPkX100 = (uint16_t)a; t.cell[r].battPkX100 = (uint16_t)b;
+    t.cell[r].altPendX100 = (uint16_t)c; t.cell[r].battPendX100 = (uint16_t)d; t.cell[r].state = (uint8_t)st;
+    pos = end + 1;
+  }
+  return true;
+}
+
+// Files the loop rewrites from RAM, so an import writes these copies instead; importStagedCommit moves them over the
+// live files at the next boot, before any loader opens them.
+static const struct { const char *staged; const char *live; } CFG_STAGED_FILES[] = {
+  { "/imp_riptab.bin", RIPTAB_PATH },
+  { "/imp_huntpockets.csv", "/huntpockets.csv" },
+};
+
+static void cfgImportNoteChanged(const char *name);
+
+// Push receipt: the tables an owner sets by hand. Learned or accumulated ones (knee state, overheat history, ripple map,
+// damper pockets, zero fit, bk_* backups) move on their own and would raise the popup on every push.
+static const char *const CFG_OWNER_TABLES[] = {
+  "rpmPoints", "capTable", "capPowerTable", "capTableLo", "capPowerTableLo", "minDutyTable", "fuelRPM", "fuelGPH",
+};
+static const size_t CFG_OWNER_TABLE_COUNT = sizeof(CFG_OWNER_TABLES) / sizeof(CFG_OWNER_TABLES[0]);
+static String cfgOwnerTblPre[CFG_OWNER_TABLE_COUNT];
+static bool cfgOwnerTblPreOk[CFG_OWNER_TABLE_COUNT];
+
+// Before anything in the import writes (the class conversion resets the Keep-Alive column). Only while collecting.
+static void cfgOwnerTablesCapturePre() {
+  if (!cfgImportChangedNames) return;
+  for (size_t k = 0; k < CFG_OWNER_TABLE_COUNT; k++) cfgOwnerTblPreOk[k] = cfgTableValue(CFG_OWNER_TABLES[k], cfgOwnerTblPre[k]);
+}
+
+// `fileVal` is the parsed table re-joined the way cfgTableValue formats it, so a re-pushed export reads unchanged.
+static void cfgImportNoteTableChanged(const char *name, const String &fileVal) {
+  if (!cfgImportChangedNames) return;
+  // With the learner on, the Keep-Alive column is its learned floors, not a hand-set table.
+  if (!strcmp(name, "minDutyTable") && settingRead(NK_kneeLearnEnable).toInt() != 0) return;
+  for (size_t k = 0; k < CFG_OWNER_TABLE_COUNT; k++) {
+    if (strcmp(CFG_OWNER_TABLES[k], name) != 0) continue;
+    if (!cfgOwnerTblPreOk[k] || cfgOwnerTblPre[k] != fileVal) cfgImportNoteChanged(name);
+    return;
+  }
+}
+
+// Apply the "tables" section (`tbl` = that object alone). Moved rpmPoints reset the knee tracker and the moved bins'
+// overheat history as a manual breakpoint edit does, BEFORE the imported minDutyTable lands. bk_* blobs belong to
+// applyImportCommissioning. Live arrays reload at the end for noReboot=1.
+static int applyImportTables(const char *tbl, float zfShiftA) {
   if (!tbl) return 0;
   String val;
   int pts[RPM_TABLE_SIZE];
   bool havePts = cfgJsonExtract(tbl, "rpmPoints", val) && cfgCsvToInt(val, pts, RPM_TABLE_SIZE);
-  if (havePts) {
-    bool moved = false;
-    for (int i = 0; i < RPM_TABLE_SIZE; i++) if (pts[i] != rpmTableRPMPoints[i]) moved = true;
-    if (moved) { kneeLearnResetDefaults(); commissionClearStage(7); }   // imported breakpoints moved → Min% floor + Field decay stage stale
+  if (havePts && cfgImportChangedNames) {
+    String o;
+    for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) o += ','; o += String(pts[i]); }
+    cfgImportNoteTableChanged("rpmPoints", o);
+  }
+  bool moved = false;
+  if (havePts && clearMovedRpmBins(rpmTableRPMPoints, pts)) {   // imported breakpoints moved → Min% floor + Field decay stage stale
+    moved = true;
+    kneeLearnResetDefaults();
+    commissionClearStage(7);
   }
   int applied = 0;
+  float impMinDuty[RPM_TABLE_SIZE];
+  bool haveMinDuty = false;
+  bool haveOverheat = false;
   nvs_handle_t h;
-  if (nvs_open("learning", NVS_READWRITE, &h) != ESP_OK) return 0;
-  if (havePts) { nvs_set_blob(h, "rpmPoints", pts, sizeof(pts)); applied++; }
-  static const char *CFG_TABLE_FKEYS[] = { "capTable", "capPowerTable", "capTableLo", "capPowerTableLo", "minDutyTable" };
-  for (size_t k = 0; k < sizeof(CFG_TABLE_FKEYS)/sizeof(CFG_TABLE_FKEYS[0]); k++) {
-    float f[RPM_TABLE_SIZE];
-    if (!cfgJsonExtract(tbl, CFG_TABLE_FKEYS[k], val) || !cfgCsvToFloat(val, f, RPM_TABLE_SIZE)) continue;
-    nvs_set_blob(h, CFG_TABLE_FKEYS[k], f, sizeof(f));
-    applied++;
+  if (nvs_open("learning", NVS_READWRITE, &h) == ESP_OK) {
+    if (havePts) { nvs_set_blob(h, "rpmPoints", pts, sizeof(pts)); applied++; }
+    static const char *CFG_TABLE_FKEYS[] = { "capTable", "capPowerTable", "capTableLo", "capPowerTableLo", "minDutyTable" };
+    for (size_t k = 0; k < sizeof(CFG_TABLE_FKEYS)/sizeof(CFG_TABLE_FKEYS[0]); k++) {
+      float f[RPM_TABLE_SIZE];
+      if (!cfgJsonExtract(tbl, CFG_TABLE_FKEYS[k], val) || !cfgCsvToFloat(val, f, RPM_TABLE_SIZE)) continue;
+      if (cfgImportChangedNames) { String o; cfgJoinFloats(o, f, RPM_TABLE_SIZE, 2); cfgImportNoteTableChanged(CFG_TABLE_FKEYS[k], o); }
+      nvs_set_blob(h, CFG_TABLE_FKEYS[k], f, sizeof(f));
+      if (!strcmp(CFG_TABLE_FKEYS[k], "minDutyTable")) { memcpy(impMinDuty, f, sizeof(f)); haveMinDuty = true; }
+      applied++;
+    }
+    // Per-speed overheat history — one record, all six parts or none.
+    int oc[RPM_TABLE_SIZE];
+    unsigned long lo[RPM_TABLE_SIZE], ct[RPM_TABLE_SIZE];
+    String ev, to, sm;
+    if (cfgJsonExtract(tbl, "overheatCount", val) && cfgCsvToInt(val, oc, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "lastOverheat", val) && cfgCsvToULong(val, lo, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "cumulativeTime", val) && cfgCsvToULong(val, ct, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "totalEvents", ev) && cfgJsonExtract(tbl, "totalOverheats", to) && cfgJsonExtract(tbl, "totalSafeMs", sm)) {
+      memcpy(overheatCount, oc, sizeof(oc));
+      memcpy(lastOverheatTime, lo, sizeof(lo));
+      memcpy(cumulativeNoOverheatTime, ct, sizeof(ct));
+      totalLearningEvents = strtoul(ev.c_str(), nullptr, 10);
+      totalOverheats = strtoul(to.c_str(), nullptr, 10);
+      totalSafeMs = strtoull(sm.c_str(), nullptr, 10);
+      haveOverheat = true;
+    }
+    if (applied) nvs_commit(h);
+    nvs_close(h);
   }
-  if (applied) nvs_commit(h);
-  nvs_close(h);
+  if (haveOverheat) { saveHistoricalDataImmediate(); applied++; }
+  else if (moved) saveHistoricalDataImmediate();   // the cleared bins must survive the import's reboot
+  if (haveMinDuty) {
+    // The learner's own per-bin state, when the file has it, installs as-is; an older file without it gets the
+    // column as commissioning would leave it. Without the latter the boot rebuild restores the learner's old column.
+    float kn[RPM_TABLE_SIZE], fl[RPM_TABLE_SIZE];
+    bool fz[RPM_TABLE_SIZE];
+    bool haveKnee = cfgJsonExtract(tbl, "kneeKnee", val) && cfgCsvToFloat(val, kn, RPM_TABLE_SIZE);
+    float fitA = cfgJsonExtract(tbl, "kneeFitA", val) ? val.toFloat() : 0.0f;
+    bool haveLearner = haveKnee && cfgJsonExtract(tbl, "kneeFloor", val) && cfgCsvToFloat(val, fl, RPM_TABLE_SIZE)
+                       && cfgJsonExtract(tbl, "kneeFrozen", val) && cfgCsvToBool(val, fz, RPM_TABLE_SIZE);
+    if (haveLearner) kneeAdoptLearnedState(impMinDuty, fl, kn, fz, fitA);
+    else kneeAdoptCommittedTable(impMinDuty, haveKnee ? kn : nullptr, fitA);
+  }
   // Fuel curve — separate "fuel" namespace + FUEL_TABLE_SIZE arrays. Both halves must
   // parse or neither is written (a half-updated curve would interpolate wrong).
   float fr[FUEL_TABLE_SIZE], fg[FUEL_TABLE_SIZE];
@@ -1551,6 +1799,10 @@ static int applyImportTables(const char *body) {
       cfgJsonExtract(tbl, "fuelGPH", val) && cfgCsvToFloat(val, fg, FUEL_TABLE_SIZE)) {
     nvs_handle_t fh;
     if (nvs_open("fuel", NVS_READWRITE, &fh) == ESP_OK) {
+      if (cfgImportChangedNames) {
+        String o; cfgJoinFloats(o, fr, FUEL_TABLE_SIZE, 1); cfgImportNoteTableChanged("fuelRPM", o);
+        o = "";   cfgJoinFloats(o, fg, FUEL_TABLE_SIZE, 3); cfgImportNoteTableChanged("fuelGPH", o);
+      }
       nvs_set_blob(fh, "fuelRPM", fr, sizeof(fr));
       nvs_set_blob(fh, "fuelGPH", fg, sizeof(fg));
       nvs_commit(fh);
@@ -1560,17 +1812,69 @@ static int applyImportTables(const char *body) {
       applied += 2;
     }
   }
+  // Ripple map (Disturbances step evidence) and damper pockets: staged files.
+  if (cfgJsonExtract(tbl, "ripTab", val)) {
+    RipTab t;
+    if (val.length() == 0) memset(&t, 0, sizeof(t));
+    if ((val.length() == 0 || cfgParseRipTab(val, &t)) && writePsramBlob(CFG_STAGED_FILES[0].staged, RIPTAB_MAGIC, RIPTAB_VER, 0, &t, sizeof(RipTab), 1, 0, 1) == 1) {
+      cfgImpNoteTable("ripTab", val);
+      applied++;
+    }
+  }
+  if (cfgJsonExtract(tbl, "huntPockets", val)) {
+    fsTakeLock();
+    File f = LittleFS.open(CFG_STAGED_FILES[1].staged, "w");
+    if (f) {
+      int pos = 0;
+      while (pos < (int)val.length()) {
+        int end = val.indexOf(';', pos);
+        if (end < 0) end = val.length();
+        f.print(val.substring(pos, end));
+        f.print('\n');
+        pos = end + 1;
+      }
+      f.close();
+      fsFreeDirty = true;
+      cfgImpNoteTable("huntPockets", val);
+      applied++;
+    }
+    fsReleaseLock();
+  }
+  // Zero-drift fit: "storage"-namespace keys written behind the live values. saveNVSDataFull only writes a key whose
+  // live value moved, so these survive to the reboot that loads them.
+  {
+    String zf;
+    int zv = 0, zs = 0;
+    float zc = 0, zb = 0, zr = 0;
+    unsigned long ze = 0;
+    const bool haveZf = cfgJsonExtract(tbl, "zeroFit", zf) && sscanf(zf.c_str(), "%d,%d,%f,%f,%f,%lu", &zv, &zs, &zc, &zb, &zr, &ze) == 6
+                        && isfinite(zc) && isfinite(zb) && isfinite(zr);
+    nvs_handle_t sh;
+    if (haveZf && nvs_open("storage", NVS_READWRITE, &sh) == ESP_OK) {
+      if (zv != 0 && zfShiftA != 0.0f) {   // zfShiftA: see applyImportConfig
+        zc += zfShiftA;
+        zf = String(zv) + ',' + String(zs) + ',' + String(zc, 6) + ',' + String(zb, 6) + ',' + String(zr, 4) + ',' + String(ze);
+        queueConsoleMessageF("IMPORT: the imported zero correction moved %+.2f A onto this regulator's current offset", zfShiftA);
+      }
+      uint32_t ze32 = (uint32_t)ze;
+      nvs_set_i32(sh, "ZFitValid", zv);
+      nvs_set_i32(sh, "ZFitSensor", zs);
+      nvs_set_blob(sh, "ZFitC", &zc, sizeof(float));
+      nvs_set_blob(sh, "ZFitB", &zb, sizeof(float));
+      nvs_set_blob(sh, "ZFitR2", &zr, sizeof(float));
+      nvs_set_u32(sh, "ZFitEpoch", ze32);
+      cfgImpNoteTable("zeroFit", zf);
+      applied++;
+      nvs_commit(sh);
+      nvs_close(sh);
+    }
+  }
   if (applied) loadLearningTableFromNVS();
   return applied;
 }
 
-// Apply an imported config blob. Only manifest + registry (allowlisted) keys plus the
-// "tables" section are written — anything else in the body is ignored by construction.
-// Returns count applied, or -1 if the body has no "config" object. settingWrite is
-// compare-first so unchanged values cost no flash. Caller reboots so the new set loads cleanly.
-// Battery class / capacity / chemistry moved → the commissioned tune no longer describes the
-// bank. One write path for the nag, shared by /saveVesselInfo (RAM compare) and
-// applyImportConfig (NVS-string compare); each caller keeps its own change detection.
+// Battery class / capacity / chemistry changed: the commissioned tune no longer describes the bank. Shared by
+// /saveVesselInfo and applyImportConfig; each caller does its own change detection.
 void raiseRecommissionNag() {
   commissionChangeFlag = true;
   settingWrite(NK_cmChangeFlag, "1");
@@ -1580,39 +1884,803 @@ static const size_t CFGPUSH_KEYS_CAP = 240;   // bounds the NVS receipt + the /c
 
 static void cfgImportNoteChanged(const char *name) {
   if (!cfgImportChangedNames) return;
+  cfgImportChangedCount++;
   if (cfgImportChangedNames->length() + strlen(name) + 1 > CFGPUSH_KEYS_CAP) return;   // silently stop at the cap; the count is still exact
   if (cfgImportChangedNames->length()) *cfgImportChangedNames += ',';
   *cfgImportChangedNames += name;
 }
 
-// Params renamed across releases: import matches keys by the CURRENT manifest name only, so a blob
-// exported under an old name would silently drop that setting with no IMPORT WARNING. One row per
-// rename. The NVS key stays the same across a rename — only the JSON param name moves.
+// Asked BEFORE the write: settingWrite returns true for an identical value too. No NVS read unless names are being collected.
+static bool cfgImportWillChange(const char *key, const String &val) {
+  if (!cfgImportChangedNames) return false;
+  const String cur = settingRead(key);
+  return cur != val || (cur.length() == 0 && !settingExists(key));
+}
+
+// Renamed params: import matches the current manifest name only, so an old-name blob would silently drop the
+// setting. One row per rename; the NVS key never changes, only the JSON param name.
 static const struct { const char *now; const char *legacy; } CFG_PARAM_ALIASES[] = {
-  { "timeSourceMode", "gpsTimeSourceMode" },   // 2026-08-24 position/time split
+  { "timeSourceMode", "gpsTimeSourceMode" },   // position/time split
 };
 
-int applyImportConfig(const char *body) {
+
+static String cxImpPre[CX_IMPORT_KEY_COUNT];
+static String cxImpPreAxis[sizeof(CFG_AXIS_BASIS_TABLES) / sizeof(CFG_AXIS_BASIS_TABLES[0])];
+static uint16_t cxImpPreDone, cxImpPreMan;
+static uint8_t cxImpPreState;
+static time_t cxImpPreEpoch;
+static bool cxImpPreAgeAck, cxImpPreChange;
+static String cxImpPreStress;
+
+static const char *cfgManifestNvsKey(const char *param) {
+  for (size_t i = 0; i < CONFIG_MANIFEST_COUNT; i++)
+    if (strcmp(CONFIG_MANIFEST[i].param, param) == 0) return CONFIG_MANIFEST[i].nvsKey;
+  return nullptr;
+}
+
+// A step value as this regulator holds it: before the import (after=false) or as it will be after its reboot.
+static String cxImportValue(const char *name, bool table, bool after) {
+  String o;
+  if (table) {
+    if (after) cfgTableValueAfter(name, o);
+    else cfgTableValue(name, o);
+    return o;
+  }
+  const char *nk = cfgManifestNvsKey(name);
+  if (nk) return settingRead(nk);
+  char key[16];
+  snprintf(key, sizeof(key), "%s", name);   // registry knob: NVS key = name truncated to the 15-char cap
+  return settingRead(key);
+}
+
+// The file's value: the preview sends every step value the file holds in "cx_basis", ticked or not, so an unticked
+// row still counts as the file's. A body without it (bench POST of a whole file, admin push) is its own basis.
+static bool cxImportBasis(const char *basis, const char *cfg, const char *tbl, const char *name, bool table, String &v) {
+  if (basis && cfgJsonExtract(basis, name, v)) return true;
+  if (table) return tbl && cfgJsonExtract(tbl, name, v);
+  return cfgJsonExtract(cfg, name, v);
+}
+
+// Same value: exact text, or the same finite number written with different precision.
+static bool cxImportSame(const String &a, const String &b) {
+  if (a == b) return true;
+  if (!floatTokenValid(a.c_str()) || !floatTokenValid(b.c_str())) return false;
+  float x = a.toFloat(), y = b.toFloat();
+  return fabsf(x - y) <= 1e-5f * fmaxf(1.0f, fmaxf(fabsf(x), fabsf(y)));
+}
+
+static void cxImportCapturePre() {
+  for (size_t i = 0; i < CX_IMPORT_KEY_COUNT; i++) cxImpPre[i] = cxImportValue(CX_IMPORT_KEYS[i].name, CX_IMPORT_KEYS[i].table, false);
+  for (size_t i = 0; i < sizeof(CFG_AXIS_BASIS_TABLES) / sizeof(CFG_AXIS_BASIS_TABLES[0]); i++)
+    cxImpPreAxis[i] = cxImportValue(CFG_AXIS_BASIS_TABLES[i], true, false);
+  cxImpPreDone = commissionDoneMask;
+  cxImpPreMan = commissionManualMask;
+  cxImpPreState = commissionState;
+  cxImpPreEpoch = CommissionEpoch;
+  cxImpPreAgeAck = commissionAgeAck;
+  cxImpPreChange = commissionChangeFlag;
+  cxImpPreStress = String(cvsLastBlob);
+}
+
+static void cxImportSetStress(const String &blob) {
+  if (blob.length() && blob.length() < sizeof(cvsLastBlob)) {
+    strlcpy(cvsLastBlob, blob.c_str(), sizeof(cvsLastBlob));
+    settingWrite(NK_cvStressLast, cvsLastBlob);
+  } else {
+    cvsLastBlob[0] = '\0';
+    settingRemove(NK_cvStressLast);
+  }
+}
+
+static void cxImportSetEpoch(time_t e) {
+  CommissionEpoch = e;
+  if (e > 0) {
+    char b[24];
+    snprintf(b, sizeof(b), "%lld", (long long)e);
+    settingWrite(NK_CommissionEpoch, b);
+  } else {
+    settingRemove(NK_CommissionEpoch);
+  }
+}
+
+static void cxLedgerAppend(const char *eventType, int stage, const String &dataJson);
+
+// Applies the file's commissioning status when the body carries it (the preview's "Commissioning status" row).
+// Without it the regulator keeps its own status and the import's own change checks apply as before.
+static bool applyImportCommissioning(const char *cfg, const char *tbl, const char *basis) {
+  String v;
+  if (!cfgJsonExtract(cfg, "commissionDoneMask", v)) return false;
+  const uint16_t fDone = (uint16_t)v.toInt();
+  const uint16_t fMan = cfgJsonExtract(cfg, "commissionManualMask", v) ? (uint16_t)v.toInt() : 0;
+  enum { CX_KEEP = 0, CX_FILE = 1, CX_NONE = 2, CX_EITHER = 3 };
+  uint8_t src[COMMISSION_STAGE_COUNT];
+  bool fileIsPre[COMMISSION_STAGE_COUNT];   // the file's values for this step equal this regulator's pre-import ones
+  bool keyed[COMMISSION_STAGE_COUNT];       // the step has values of its own in CX_IMPORT_KEYS
+  for (int s = 0; s < COMMISSION_STAGE_COUNT; s++) {
+    bool matchFile = true, unchanged = true, same = true, any = false;
+    for (size_t i = 0; i < CX_IMPORT_KEY_COUNT; i++) {
+      const CxImportKey &k = CX_IMPORT_KEYS[i];
+      if (!(k.stage == s || (k.stage == -1 && s >= 1 && s <= 7))) continue;
+      any = true;
+      String now = cxImportValue(k.name, k.table, true), b;
+      if (!cxImportBasis(basis, cfg, tbl, k.name, k.table, b)) b = "";   // not in the file: only an absent value here matches it
+      if (!cxImportSame(now, b)) matchFile = false;
+      if (!cxImportSame(now, cxImpPre[i])) unchanged = false;
+      if (!cxImportSame(b, cxImpPre[i])) same = false;
+    }
+    src[s] = matchFile ? CX_FILE : (unchanged ? CX_KEEP : CX_NONE);
+    fileIsPre[s] = same;
+    keyed[s] = any;
+  }
+  // A step measured on an upstream step's values is only good while those are in force: an upstream from the other
+  // source (that actually differs) leaves the dependent not done. A dependent whose own values match in both sources
+  // follows the source of its first such upstream; a later one from the other source leaves it not done.
+  uint16_t depPinned = 0;
+  for (int u = 0; u < COMMISSION_STAGE_COUNT; u++) {
+    const uint16_t deps = commissionDependentsMask(u);
+    for (int d = 0; d < COMMISSION_STAGE_COUNT; d++) {
+      const uint16_t bd = (uint16_t)(1u << d);
+      if (!keyed[d] || !(deps & bd) || fileIsPre[u] || src[d] == CX_NONE) continue;
+      if (src[u] == src[d]) { depPinned |= bd; continue; }
+      if (fileIsPre[d] && !(depPinned & bd) && src[u] != CX_NONE) { src[d] = src[u]; depPinned |= bd; }
+      else src[d] = CX_NONE;
+    }
+  }
+  // A step with no values of its own follows the steps it rests on: the Stress test its upstream steps, Prep every
+  // step. An upstream whose file values equal this regulator's fits either source. Upstreams from both sources leave
+  // the Stress test not done; Prep stays done if the source whose status it takes had it done (CX_EITHER).
+  bool hasUp[COMMISSION_STAGE_COUNT];
+  for (int s = 0; s < COMMISSION_STAGE_COUNT; s++) {
+    hasUp[s] = false;
+    for (int u = 0; u < COMMISSION_STAGE_COUNT; u++) if (commissionDependentsMask(u) & (1u << s)) hasUp[s] = true;
+  }
+  for (int s = 0; s < COMMISSION_STAGE_COUNT; s++) {
+    if (keyed[s]) continue;
+    bool fileOk = true, keepOk = true;
+    for (int u = 0; u < COMMISSION_STAGE_COUNT; u++) {
+      if (u == s || !keyed[u] || (hasUp[s] && !(commissionDependentsMask(u) & (1u << s)))) continue;
+      if (src[u] == CX_FILE && fileIsPre[u]) continue;
+      if (src[u] != CX_FILE) fileOk = false;
+      if (src[u] != CX_KEEP) keepOk = false;
+    }
+    src[s] = fileOk ? CX_FILE : keepOk ? CX_KEEP : hasUp[s] ? CX_NONE : CX_EITHER;
+  }
+  uint16_t done = 0, man = 0, fromFile = 0;
+  bool allFile = true, allKeep = true, anyFileDone = false, anyKeepDone = false;
+  for (int s = 0; s < COMMISSION_STAGE_COUNT; s++) {
+    const uint16_t bit = (uint16_t)(1u << s);
+    const bool measured = keyed[s] || hasUp[s];   // Prep measures nothing, so it never dates the reminder
+    if (src[s] == CX_FILE) { done |= fDone & bit; man |= fMan & bit; fromFile |= bit; if ((fDone & bit) && measured) anyFileDone = true; }
+    else if (src[s] == CX_KEEP) { done |= cxImpPreDone & bit; man |= cxImpPreMan & bit; if ((cxImpPreDone & bit) && measured) anyKeepDone = true; }
+    else if (src[s] == CX_EITHER) {
+      if (fDone & bit) { done |= bit; man |= fMan & bit; }
+      else if (cxImpPreDone & bit) { done |= bit; man |= cxImpPreMan & bit; }
+    }
+    if (src[s] != CX_FILE) allFile = false;
+    if (src[s] != CX_KEEP) allKeep = false;
+  }
+  commissionDoneMask = done; commissionWriteDoneMask();
+  commissionManualMask = man; commissionWriteManualMask();
+  const time_t fEpoch = cfgJsonExtract(cfg, "CommissionEpoch", v) ? (time_t)strtoll(v.c_str(), nullptr, 10) : 0;
+  const bool fAgeAck = cfgJsonExtract(cfg, "commissionAgeAck", v) && v.toInt() != 0;
+  const bool fChange = cfgJsonExtract(cfg, "commissionChangeAck", v) && v.toInt() != 0;
+  String fStress;
+  cfgJsonExtract(cfg, "cvStressLast", fStress);
+  static const struct { const char *param; const char *nvsKey; } RESTORE_POINTS[] = {
+    { "commissionSnap", NK_commissionSnap }, { "commissionStepSnap", NK_commissionStepSnap }, { "commissionPreRun", NK_commissionPreRun },
+  };
+  if (allFile) {
+    // Every step is the file's: the source regulator's lifecycle exactly, a wizard run in flight and its restore
+    // points included (the next boot undoes the interrupted step as the source's would, Abort reverts to its tune).
+    if (cfgJsonExtract(cfg, "commissionState", v)) commissionSetState((uint8_t)constrain((int)v.toInt(), 0, 2));
+    else commissionRecomputeState();
+    commissionSetPhase(cfgJsonExtract(cfg, "commissionPhase", v) ? (uint8_t)constrain((int)v.toInt(), 0, COMMISSION_STAGE_COUNT) : COMMISSION_STAGE_COUNT);
+    for (auto &rp : RESTORE_POINTS) {
+      if (cfgJsonExtract(cfg, rp.param, v) && v.length()) settingWrite(rp.nvsKey, v.c_str());
+      else settingRemove(rp.nvsKey);
+    }
+    float m[RPM_TABLE_SIZE], f[RPM_TABLE_SIZE], kn[RPM_TABLE_SIZE], fa = 0.0f;
+    bool z[RPM_TABLE_SIZE];
+    if (tbl && cfgJsonExtract(tbl, "bk_minDuty", v) && cfgCsvToFloat(v, m, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "bk_kneeFlr", v) && cfgCsvToFloat(v, f, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "bk_kneeKn", v) && cfgCsvToFloat(v, kn, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "bk_kneeFrz", v) && cfgCsvToBool(v, z, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "bk_kneeFitA", v) && floatTokenValid(v.c_str())) {
+      fa = v.toFloat();
+      commissionBackupMinPct(m, f, kn, z, fa);
+    } else {
+      commissionClearMinPctBackup();
+    }
+    cxImportSetEpoch(fEpoch);
+    commissionAgeAck = fAgeAck;
+    commissionChangeFlag = fChange;
+    cxImportSetStress(fStress);
+  } else if (allKeep) {
+    // No step took the file's status: this regulator's own lifecycle stands, a wizard run in flight included.
+  } else {
+    // A mix of the file's steps and this regulator's: neither run's restore points describe the result, the
+    // reminder dates from the older of the two measurements in force, and either source's change flag stands.
+    commissionRecomputeState();
+    commissionSetPhase(COMMISSION_STAGE_COUNT);
+    for (auto &rp : RESTORE_POINTS) settingRemove(rp.nvsKey);
+    commissionClearMinPctBackup();
+    time_t e = 0;
+    if (anyFileDone && fEpoch > 0) e = fEpoch;
+    if (anyKeepDone && cxImpPreEpoch > 0 && (e == 0 || cxImpPreEpoch < e)) e = cxImpPreEpoch;
+    cxImportSetEpoch(e);
+    commissionAgeAck = false;
+    commissionChangeFlag = (anyFileDone && fChange) || (anyKeepDone && cxImpPreChange);
+    if (src[8] == CX_FILE && (done & (1u << 8))) cxImportSetStress(fStress);
+    else if (src[8] == CX_KEEP && (done & (1u << 8))) cxImportSetStress(cxImpPreStress);
+    else cxImportSetStress(String());
+  }
+  settingWrite(NK_cmAgeAck, commissionAgeAck ? "1" : "0");
+  settingWrite(NK_cmChangeFlag, commissionChangeFlag ? "1" : "0");
+  String d = "{\"done_mask\":";
+  d += String((int)done);
+  d += ",\"manual_mask\":"; d += String((int)man);
+  d += ",\"state\":"; d += String((int)commissionState);
+  d += ",\"from_file_mask\":"; d += String((int)fromFile);
+  d += ",\"file_done_mask\":"; d += String((int)fDone);
+  d += '}';
+  cxLedgerAppend("import", -1, d);
+  if (done != cxImpPreDone || man != cxImpPreMan || commissionState != cxImpPreState || CommissionEpoch != cxImpPreEpoch)
+    cfgImportNoteChanged("commissioning status");
+  queueConsoleMessageF("IMPORT: commissioning status %s (steps done mask 0x%03X, %s)",
+                       allFile ? "copied from the file" : allKeep ? "kept, no step came from the file" : "taken step by step", (unsigned)done,
+                       commissionState == 2 ? "COMMISSIONED" : commissionState == 1 ? "in progress" : "not commissioned");
+  return true;
+}
+
+// Boot-time work an import leaves behind (NK_impBootAct, hex IBA_*/AXW_* bits), ORed into whatever is already owed.
+static void importBootActAdd(uint16_t bits) {
+  uint16_t cur = (uint16_t)strtoul(settingRead(NK_impBootAct).c_str(), nullptr, 16);
+  char b[8];
+  snprintf(b, sizeof(b), "%x", (unsigned)(cur | bits));
+  settingWrite(NK_impBootAct, b);
+}
+
+// setup(), once LittleFS is mounted and before any loader: move each file an import staged over its live copy.
+static void recordsStagedCommit();
+void importStagedCommit() {
+  recordsStagedCommit();
+  for (auto &sf : CFG_STAGED_FILES) {
+    fsTakeLock();
+    if (LittleFS.exists(sf.staged)) {
+      LittleFS.remove(sf.live);
+      if (!LittleFS.rename(sf.staged, sf.live)) LittleFS.remove(sf.staged);
+      fsFreeDirty = true;
+    }
+    fsReleaseLock();
+  }
+}
+
+// setup(), after the last loader: hand the import's boot-time work to loop() (importBootActRun).
+void importBootActionsLoad() {
+  if (!settingExists(NK_impBootAct)) return;
+  pendingImportBootAct = (uint16_t)strtoul(settingRead(NK_impBootAct).c_str(), nullptr, 16);
+  if (!pendingImportBootAct) settingRemove(NK_impBootAct);
+}
+
+// loop(), first pass after the import's reboot; a reboot before this repeats it (every part is idempotent). The record
+// goes here, while the matrix, ripple-map and flipbook wipes are still flags their own services act on shortly after.
+void importBootActRun(uint16_t act) {
+  if (act & AXW_ALL) rpmAxisWipeLocal(act & AXW_ALL);
+  if (act & IBA_PERF) pendingResetBoatPerformance = true;
+  settingRemove(NK_impBootAct);
+}
+
+// ── Equipment records ─────────────────────────────────────────────────────────
+// The boat's own history (/exportRecords, /importRecords): record files byte for byte, their NVS keys and the "storage"
+// namespace. Loaders check each file's magic/version header, so a foreign layout isn't loaded. Imports stage until boot.
+static const char *const REC_ALT_FILES[]  = { "/alttrend.bin", "/altfront.bin", "/altfrontup.bin" };
+static const char *const REC_ALT_NVS[]    = { NK_altbaseSec, NK_altWindV, "altBkSum", "altBkN", "altBkWst", "altBkHr", "altBkHist" };
+static const char *const REC_PERF_FILES[] = { "/sailfront.bin", "/motorfront.bin" };
+static const char *const REC_BH_FILES[]   = { BHRES_PATH, BHCAP_PATH };
+static const char *const REC_SLED_FILES[] = { SLED_PATH, SLED_LIVE_PATH };
+static const char *const REC_ZF_FILES[]   = { ZFIT_PATH, ZEROLOG_PATH };
+static const char *const REC_FA_FILES[]   = { FA_MATRIX_PATH, FA_FLIP_PATH };
+static const char *const REC_HUNT_FILES[] = { "/huntledger.csv" };
+#define REC_N(a) (uint8_t)(sizeof(a) / sizeof(a[0]))
+struct RecGroup { const char *name; const char *const *files; uint8_t nFiles; const char *const *nvs; uint8_t nNvs; bool storage; };
+static const RecGroup REC_GROUPS[] = {
+  { "altHealth",      REC_ALT_FILES,  REC_N(REC_ALT_FILES),  REC_ALT_NVS, REC_N(REC_ALT_NVS), false },
+  { "boatPerf",       REC_PERF_FILES, REC_N(REC_PERF_FILES), nullptr, 0, false },
+  { "battHealth",     REC_BH_FILES,   REC_N(REC_BH_FILES),   nullptr, 0, false },
+  { "solarLedger",    REC_SLED_FILES, REC_N(REC_SLED_FILES), nullptr, 0, false },
+  { "zeroFitHistory", REC_ZF_FILES,   REC_N(REC_ZF_FILES),   nullptr, 0, false },
+  { "resonanceMap",   REC_FA_FILES,   REC_N(REC_FA_FILES),   nullptr, 0, false },
+  { "damperRecord",   REC_HUNT_FILES, REC_N(REC_HUNT_FILES), nullptr, 0, false },
+  { "lifetime",       nullptr, 0, nullptr, 0, true },
+};
+static const size_t REC_GROUP_COUNT = sizeof(REC_GROUPS) / sizeof(REC_GROUPS[0]);
+// Lifetime keys the record leaves alone: the zero-drift fit imports as its own tables row, so unticking that row keeps
+// this unit's. The barometer ring is this unit's own weather history and never imports.
+static const char *const REC_STORAGE_KEEP[] = {
+  "ZFitValid", "ZFitSensor", "ZFitC", "ZFitB", "ZFitR2", "ZFitEpoch",
+  "BaroHist", "BaroHistHead", "BaroHistEpch",
+};
+static bool recStorageKept(const char *key) {
+  for (size_t i = 0; i < sizeof(REC_STORAGE_KEEP) / sizeof(REC_STORAGE_KEEP[0]); i++)
+    if (strcmp(REC_STORAGE_KEEP[i], key) == 0) return true;
+  return false;
+}
+
+static String recStagedPath(const char *live) { return String("/imp_") + (live[0] == '/' ? live + 1 : live); }
+
+// The records JSON as a chain of fixed 16 KB PSRAM blocks, served block by block (hundreds of KB of base64 must stay
+// off the internal heap). Never reallocated: tlsf_realloc copies inside the PSRAM heap lock, which Core 1 takes.
+class RecOut {
+ public:
+  struct Blk { Blk *next; size_t used; char d[16384]; };
+  Blk *head = nullptr, *tail = nullptr;
+  size_t len = 0;
+  bool ok = true;
+  Blk *cur = nullptr;   // read cursor: the block holding byte curAt
+  size_t curAt = 0;
+  RecOut() = default;
+  RecOut(const RecOut &) = delete;
+  RecOut &operator=(const RecOut &) = delete;
+  ~RecOut() { while (head) { Blk *n = head->next; free(head); head = n; } }
+  bool grow() {
+    Blk *b = (Blk *)ps_malloc(sizeof(Blk));
+    if (!b) { ok = false; return false; }
+    b->next = nullptr;
+    b->used = 0;
+    if (tail) tail->next = b; else head = b;
+    tail = b;
+    return true;
+  }
+  void add(const char *s, size_t n) {
+    while (n && ok) {
+      if (!tail || tail->used == sizeof(tail->d)) { if (!grow()) return; }
+      size_t room = sizeof(tail->d) - tail->used;
+      size_t k = (n < room) ? n : room;
+      memcpy(tail->d + tail->used, s, k);
+      tail->used += k; len += k; s += k; n -= k;
+    }
+  }
+  void add(const char *s) { add(s, strlen(s)); }
+  void add(const String &s) { add(s.c_str(), s.length()); }
+  void addStr(const String &v) { String t; cfgAppendJsonStr(t, v); add(t); }
+  void addB64(const uint8_t *d, size_t n) {
+    while (n && ok) {
+      size_t room = tail ? sizeof(tail->d) - tail->used : 0;
+      if (room < 5) { if (!grow()) return; room = sizeof(tail->d); }
+      // Whole 3-byte groups until the last piece, so the pieces concatenate to the one-shot encoding. The -1 leaves
+      // room for the NUL mbedtls writes after its output.
+      size_t take = (room - 1) / 4 * 3;
+      if (take > n) take = n;
+      size_t w = 0;
+      if (mbedtls_base64_encode((unsigned char *)tail->d + tail->used, room, &w, d, take) != 0) { ok = false; return; }
+      tail->used += w; len += w; d += take; n -= take;
+    }
+  }
+  size_t read(uint8_t *out, size_t maxLen, size_t index) {
+    if (!cur || index < curAt) { cur = head; curAt = 0; }
+    while (cur && index >= curAt + cur->used) { curAt += cur->used; cur = cur->next; }
+    size_t w = 0;
+    while (cur && w < maxLen) {
+      size_t off = index + w - curAt;
+      size_t k = cur->used - off;
+      if (k > maxLen - w) k = maxLen - w;
+      memcpy(out + w, cur->d + off, k);
+      w += k;
+      if (off + k == cur->used) { curAt += cur->used; cur = cur->next; }
+    }
+    return w;
+  }
+};
+
+static uint32_t recFnv(const uint8_t *d, size_t n) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < n; i++) { h ^= d[i]; h *= 16777619u; }
+  return h;
+}
+
+// Whole file into PSRAM (caller frees); nullptr when absent, or with *failed set when it could not be read whole.
+static uint8_t *recReadFile(const char *path, size_t *n, bool *failed) {
+  *n = 0;
+  fsTakeLock();
+  File f = LittleFS.open(path, "r");
+  if (!f) { fsReleaseLock(); return nullptr; }
+  size_t sz = f.size();
+  uint8_t *buf = (uint8_t *)ps_malloc(sz ? sz : 1);
+  if (buf) *n = f.read(buf, sz);
+  f.close();
+  fsReleaseLock();
+  if (!buf || *n != sz) { free(buf); *n = 0; *failed = true; return nullptr; }
+  return buf;
+}
+
+// One "storage" entry as "type:value" (BLOB as hex). False for a type this never writes.
+static bool recStorageValue(nvs_handle_t h, const nvs_entry_info_t &info, String &o) {
+  char b[32];
+  switch (info.type) {
+    case NVS_TYPE_U8:  { uint8_t v;  if (nvs_get_u8(h, info.key, &v) != ESP_OK) return false;  snprintf(b, sizeof(b), "u8:%u", (unsigned)v); break; }
+    case NVS_TYPE_I8:  { int8_t v;   if (nvs_get_i8(h, info.key, &v) != ESP_OK) return false;  snprintf(b, sizeof(b), "i8:%d", (int)v); break; }
+    case NVS_TYPE_U16: { uint16_t v; if (nvs_get_u16(h, info.key, &v) != ESP_OK) return false; snprintf(b, sizeof(b), "u16:%u", (unsigned)v); break; }
+    case NVS_TYPE_I16: { int16_t v;  if (nvs_get_i16(h, info.key, &v) != ESP_OK) return false; snprintf(b, sizeof(b), "i16:%d", (int)v); break; }
+    case NVS_TYPE_U32: { uint32_t v; if (nvs_get_u32(h, info.key, &v) != ESP_OK) return false; snprintf(b, sizeof(b), "u32:%lu", (unsigned long)v); break; }
+    case NVS_TYPE_I32: { int32_t v;  if (nvs_get_i32(h, info.key, &v) != ESP_OK) return false; snprintf(b, sizeof(b), "i32:%ld", (long)v); break; }
+    case NVS_TYPE_U64: { uint64_t v; if (nvs_get_u64(h, info.key, &v) != ESP_OK) return false; snprintf(b, sizeof(b), "u64:%llu", (unsigned long long)v); break; }
+    case NVS_TYPE_I64: { int64_t v;  if (nvs_get_i64(h, info.key, &v) != ESP_OK) return false; snprintf(b, sizeof(b), "i64:%lld", (long long)v); break; }
+    case NVS_TYPE_STR: {
+      size_t sz = 0;
+      if (nvs_get_str(h, info.key, nullptr, &sz) != ESP_OK || sz > 512) return false;
+      char s[513];
+      if (nvs_get_str(h, info.key, s, &sz) != ESP_OK) return false;
+      o = "str:"; o += s;
+      return true;
+    }
+    case NVS_TYPE_BLOB: {
+      size_t sz = 0;
+      if (nvs_get_blob(h, info.key, nullptr, &sz) != ESP_OK || sz > 256) return false;
+      uint8_t d[256];
+      if (nvs_get_blob(h, info.key, d, &sz) != ESP_OK) return false;
+      o = "blob:";
+      for (size_t i = 0; i < sz; i++) { char x[3]; snprintf(x, sizeof(x), "%02x", d[i]); o += x; }
+      return true;
+    }
+    default: return false;
+  }
+  o = b;
+  return true;
+}
+
+// Records JSON in PSRAM as an opaque RecOut (void*: a sketch type in a free-function signature breaks the Arduino
+// auto-prototype); serve it with recordsExportRead, release it with recordsExportFree. nullptr on OOM or an unreadable
+// record file. Every group is present, empty ones too, so importing it leaves none. summary = names, sizes and an
+// order-independent content hash (sum of per-item hashes) for the import preview, excluding lifetime keys an import
+// never writes.
+void *recordsExportJson(bool summary, size_t *outLen) {
+  RecOut *o = new (std::nothrow) RecOut();
+  if (!o) return nullptr;
+  o->add("{\"records_v\":1,\"fw_version\":");
+  o->addStr(String(FIRMWARE_VERSION));
+  o->add(",\"records\":{");
+  for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
+    const char *const *files = REC_GROUPS[gi].files;
+    const char *const *nvs = REC_GROUPS[gi].nvs;
+    uint32_t hash = 0;
+    size_t bytes = 0, items = 0;
+    bool readFail = false;
+    if (gi) o->add(",");
+    o->addStr(String(REC_GROUPS[gi].name));
+    o->add(":{");
+    const size_t body = o->len;   // the group body is written in place; a non-empty one is followed by ","
+    if (REC_GROUPS[gi].nFiles) {
+      o->add("\"files\":{");
+      bool first = true;
+      for (uint8_t f = 0; f < REC_GROUPS[gi].nFiles; f++) {
+        size_t n = 0;
+        uint8_t *buf = recReadFile(files[f], &n, &readFail);
+        if (!buf) continue;
+        hash += recFnv(buf, n) ^ recFnv((const uint8_t *)files[f], strlen(files[f]));
+        bytes += n; items++;
+        if (!summary) {
+          if (!first) o->add(",");
+          first = false;
+          o->addStr(String(files[f])); o->add(":\"");
+          o->addB64(buf, n);
+          o->add("\"");
+        }
+        free(buf);
+      }
+      o->add("}");
+    }
+    if (REC_GROUPS[gi].nNvs) {
+      o->add(o->len > body ? ",\"nvs\":{" : "\"nvs\":{");
+      bool first = true;
+      for (uint8_t k = 0; k < REC_GROUPS[gi].nNvs; k++) {
+        if (!settingExists(nvs[k])) continue;
+        String v = settingRead(nvs[k]);
+        String kv = String(nvs[k]) + "=" + v;
+        hash += recFnv((const uint8_t *)kv.c_str(), kv.length());
+        items++;
+        if (!summary) {
+          if (!first) o->add(",");
+          first = false;
+          o->addStr(String(nvs[k])); o->add(":"); o->addStr(v);
+        }
+      }
+      o->add("}");
+    }
+    if (REC_GROUPS[gi].storage) {
+      o->add(o->len > body ? ",\"storage\":{" : "\"storage\":{");
+      nvs_handle_t h;
+      if (nvs_open("storage", NVS_READONLY, &h) == ESP_OK) {
+        nvs_iterator_t it = nullptr;
+        esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, "storage", NVS_TYPE_ANY, &it);
+        bool first = true;
+        while (e == ESP_OK) {
+          nvs_entry_info_t info;
+          nvs_entry_info(it, &info);
+          String v;
+          if (recStorageValue(h, info, v)) {
+            if (!recStorageKept(info.key)) {
+              String kv = String(info.key) + "=" + v;
+              hash += recFnv((const uint8_t *)kv.c_str(), kv.length());
+              items++;
+            }
+            if (!summary) {
+              if (!first) o->add(",");
+              first = false;
+              o->addStr(String(info.key)); o->add(":"); o->addStr(v);
+            }
+          }
+          e = nvs_entry_next(&it);
+        }
+        nvs_release_iterator(it);
+        nvs_close(h);
+      }
+      o->add("}");
+    }
+    if (strcmp(REC_GROUPS[gi].name, "altHealth") == 0) {
+      char es[32];
+      snprintf(es, sizeof(es), ",\"eng_s\":%ld", (long)EngineRunTime_AllTime);
+      o->add(es);
+    }
+    if (!o->ok || readFail) { delete o; return nullptr; }
+    if (o->len > body) o->add(",");
+    char tail[64];
+    snprintf(tail, sizeof(tail), "\"bytes\":%u,\"items\":%u,\"hash\":\"%08lx\"}", (unsigned)bytes, (unsigned)items, (unsigned long)hash);
+    o->add(tail);
+  }
+  o->add("}}");
+  if (!o->ok) { delete o; return nullptr; }
+  *outLen = o->len;
+  return o;
+}
+
+// AsyncWebServer filler for a recordsExportJson result: bytes from index on, sequential calls walk the blocks in order.
+size_t recordsExportRead(void *rec, uint8_t *out, size_t maxLen, size_t index) {
+  return rec ? ((RecOut *)rec)->read(out, maxLen, index) : 0;
+}
+
+void recordsExportFree(void *rec) { delete (RecOut *)rec; }
+
+// Span of the string value of "key" inside obj (no escapes are expected — base64 and hex never carry any).
+static bool recJsonStrSpan(const char *obj, const char *key, const char **start, size_t *len) {
+  String needle = "\"";
+  needle += key;
+  needle += "\"";
+  const char *p = strstr(obj, needle.c_str());
+  if (!p) return false;
+  p += needle.length();
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') p++;
+  if (*p != '"') return false;
+  const char *e = strchr(p + 1, '"');
+  if (!e) return false;
+  *start = p + 1;
+  *len = (size_t)(e - p - 1);
+  return true;
+}
+
+// One "type:value" lifetime entry back into the open "storage" handle.
+static bool recStorageWrite(nvs_handle_t h, const char *key, const String &tv) {
+  int c = tv.indexOf(':');
+  if (c < 1) return false;
+  String t = tv.substring(0, c);
+  const char *v = tv.c_str() + c + 1;
+  if (t == "u8")  return nvs_set_u8(h, key, (uint8_t)strtoul(v, nullptr, 10)) == ESP_OK;
+  if (t == "i8")  return nvs_set_i8(h, key, (int8_t)strtol(v, nullptr, 10)) == ESP_OK;
+  if (t == "u16") return nvs_set_u16(h, key, (uint16_t)strtoul(v, nullptr, 10)) == ESP_OK;
+  if (t == "i16") return nvs_set_i16(h, key, (int16_t)strtol(v, nullptr, 10)) == ESP_OK;
+  if (t == "u32") return nvs_set_u32(h, key, (uint32_t)strtoul(v, nullptr, 10)) == ESP_OK;
+  if (t == "i32") return nvs_set_i32(h, key, (int32_t)strtol(v, nullptr, 10)) == ESP_OK;
+  if (t == "u64") return nvs_set_u64(h, key, (uint64_t)strtoull(v, nullptr, 10)) == ESP_OK;
+  if (t == "i64") return nvs_set_i64(h, key, (int64_t)strtoll(v, nullptr, 10)) == ESP_OK;
+  if (t == "str") return nvs_set_str(h, key, v) == ESP_OK;
+  if (t == "blob") {
+    size_t n = strlen(v) / 2;
+    if (n > 256) return false;
+    uint8_t d[256];
+    for (size_t i = 0; i < n; i++) { char x[3] = { v[2 * i], v[2 * i + 1], 0 }; d[i] = (uint8_t)strtoul(x, nullptr, 16); }
+    return nvs_set_blob(h, key, d, n) == ESP_OK;
+  }
+  return false;
+}
+
+// Apply the `records` groups the body carries; whatever a group lacks is removed so the importer holds what the source
+// held. Files stage first: any decode/write failure removes every staged file and touches nothing else (-2); -1 =
+// malformed. On success sets importRebootPending so this unit's savers don't overwrite the imported keys before reboot.
+int recordsImport(const char *body) {
+  char *rec = cfgObjectDup(body, "records");
+  if (!rec) return -1;
+  char *grp[REC_GROUP_COUNT] = {}, *fo[REC_GROUP_COUNT] = {}, *no[REC_GROUP_COUNT] = {}, *so[REC_GROUP_COUNT] = {};
+  int applied = 0;
+  bool bad = false;
+  // Phase 1: every group's sections, then every file decoded and staged.
+  for (size_t gi = 0; gi < REC_GROUP_COUNT && !bad; gi++) {
+    const RecGroup &G = REC_GROUPS[gi];
+    grp[gi] = cfgObjectDup(rec, G.name);
+    if (!grp[gi]) continue;   // not picked: this regulator keeps its own
+    if (G.nFiles && !(fo[gi] = cfgObjectDup(grp[gi], "files"))) bad = true;
+    if (G.nNvs && !(no[gi] = cfgObjectDup(grp[gi], "nvs"))) bad = true;
+    if (G.storage && !(so[gi] = cfgObjectDup(grp[gi], "storage"))) bad = true;
+    for (uint8_t f = 0; f < G.nFiles && !bad; f++) {
+      const char *live = G.files[f];
+      const char *b64 = nullptr;
+      size_t bl = 0, n = 0;
+      uint8_t *buf = nullptr;
+      if (recJsonStrSpan(fo[gi], live, &b64, &bl)) {
+        mbedtls_base64_decode(nullptr, 0, &n, (const unsigned char *)b64, bl);
+        buf = (uint8_t *)ps_malloc(n ? n : 1);
+        if (!buf || mbedtls_base64_decode(buf, n, &n, (const unsigned char *)b64, bl) != 0) { free(buf); bad = true; break; }
+      }
+      String staged = recStagedPath(live);
+      fsTakeLock();
+      File out = LittleFS.open(staged.c_str(), "w");   // zero bytes = the source had no such file
+      bool ok = (bool)out;
+      if (out) {
+        if (buf && n) ok = (out.write(buf, n) == n);
+        out.close();
+        fsFreeDirty = true;
+      }
+      fsReleaseLock();
+      free(buf);
+      if (!ok) bad = true;
+      else applied++;
+    }
+  }
+  if (bad) {
+    fsTakeLock();
+    for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++)
+      if (grp[gi]) for (uint8_t f = 0; f < REC_GROUPS[gi].nFiles; f++) LittleFS.remove(recStagedPath(REC_GROUPS[gi].files[f]).c_str());
+    fsFreeDirty = true;
+    fsReleaseLock();
+    applied = -2;
+  } else {
+    // Phase 2: the NVS halves.
+    bool lifeIn = false, altIn = false;
+    for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
+      if (REC_GROUPS[gi].storage && grp[gi]) lifeIn = true;
+      if (strcmp(REC_GROUPS[gi].name, "altHealth") == 0 && grp[gi]) altIn = true;
+    }
+    // The other way round: the file's engine hours replace this regulator's under its own alt-health record.
+    if (lifeIn && !altIn && settingExists(NK_altbaseSec)) {
+      for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
+        String fe;
+        if (!REC_GROUPS[gi].storage || !grp[gi] || !cfgJsonExtract(so[gi], "EngRunTime_AT", fe) || !fe.startsWith("i32:")) continue;
+        int32_t ownEng = (int32_t)EngineRunTime_AllTime;
+        nvs_handle_t eh;
+        if (nvs_open("storage", NVS_READONLY, &eh) == ESP_OK) { nvs_get_i32(eh, "EngRunTime_AT", &ownEng); nvs_close(eh); }
+        const double base = settingRead(NK_altbaseSec).toDouble() + (double)strtol(fe.c_str() + 4, nullptr, 10) - (double)ownEng;
+        settingWrite(NK_altbaseSec, String(base, 1).c_str());
+      }
+    }
+    for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
+      if (!grp[gi]) continue;
+      const RecGroup &G = REC_GROUPS[gi];
+      importRebootPending = true;
+      for (uint8_t k = 0; k < G.nNvs; k++) {
+        String v;
+        if (cfgJsonExtract(no[gi], G.nvs[k], v)) settingWrite(G.nvs[k], v.c_str());
+        else settingRemove(G.nvs[k]);
+        applied++;
+      }
+      // The trend axis counts engine seconds from altbaseSec. Without the lifetime totals this regulator keeps its own
+      // engine hours, so the baseline moves by the difference and new trend points continue where the file's stopped.
+      String es;
+      if (strcmp(G.name, "altHealth") == 0 && !lifeIn && cfgJsonExtract(grp[gi], "eng_s", es) && settingExists(NK_altbaseSec)) {
+        int32_t ownEng = (int32_t)EngineRunTime_AllTime;
+        nvs_handle_t eh;
+        if (nvs_open("storage", NVS_READONLY, &eh) == ESP_OK) { nvs_get_i32(eh, "EngRunTime_AT", &ownEng); nvs_close(eh); }
+        const double base = (double)ownEng - (double)es.toInt() + settingRead(NK_altbaseSec).toDouble();
+        settingWrite(NK_altbaseSec, String(base, 1).c_str());
+      }
+      if (G.storage) {
+        nvs_handle_t h;
+        if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
+          // This regulator's lifetime keys the file does not hold go, as its files do: every key the export would
+          // carry (recStorageValue), less the kept ones. Collected first; erasing under the iterator is not allowed.
+          size_t nAll = 0;
+          nvs_iterator_t it = nullptr;
+          for (esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, "storage", NVS_TYPE_ANY, &it); e == ESP_OK; e = nvs_entry_next(&it)) nAll++;
+          nvs_release_iterator(it);
+          char (*gone)[NVS_KEY_NAME_MAX_SIZE] = (char (*)[NVS_KEY_NAME_MAX_SIZE])ps_malloc((nAll + 1) * NVS_KEY_NAME_MAX_SIZE);
+          size_t nGone = 0;
+          it = nullptr;
+          for (esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, "storage", NVS_TYPE_ANY, &it); gone && e == ESP_OK && nGone < nAll; e = nvs_entry_next(&it)) {
+            nvs_entry_info_t info;
+            nvs_entry_info(it, &info);
+            String needle = "\"", v;
+            needle += info.key;
+            needle += "\":";
+            if (!recStorageKept(info.key) && strcmp(info.key, "SoftClockEp") != 0 && !strstr(so[gi], needle.c_str()) && recStorageValue(h, info, v))
+              strlcpy(gone[nGone++], info.key, NVS_KEY_NAME_MAX_SIZE);
+          }
+          nvs_release_iterator(it);
+          for (size_t i = 0; i < nGone; i++) nvs_erase_key(h, gone[i]);
+          free(gone);
+          const char *p = so[gi] + 1;
+          while (true) {
+            p = strchr(p, '"');
+            if (!p) break;
+            String key, tv;
+            p = cfgJsonStrDecode(p + 1, key);
+            while (*p == ' ' || *p == ':') p++;
+            if (*p != '"') break;
+            p = cfgJsonStrDecode(p + 1, tv);
+            if (!key.length() || key.length() >= 16 || recStorageKept(key.c_str())) continue;
+            if (key == "SoftClockEp" && tv.startsWith("u32:")) {   // a clock estimate: moved forward only, never back to the file's save time
+              uint32_t own = 0;
+              if (nvs_get_u32(h, "SoftClockEp", &own) == ESP_OK && own >= (uint32_t)strtoul(tv.c_str() + 4, nullptr, 10)) continue;
+            }
+            if (recStorageWrite(h, key.c_str(), tv)) applied++;
+          }
+          nvs_commit(h);
+          nvs_close(h);
+        }
+      }
+    }
+    if (applied) cfgImportNoteChanged("equipment records");
+  }
+  for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) { free(grp[gi]); free(fo[gi]); free(no[gi]); free(so[gi]); }
+  free(rec);
+  return applied;
+}
+
+// The records' staged files, swapped in by importStagedCommit like the config's own.
+static void recordsStagedCommit() {
+  uint8_t seed = 0, wipe = 0;
+  for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
+    for (uint8_t f = 0; f < REC_GROUPS[gi].nFiles; f++) {
+      const char *live = REC_GROUPS[gi].files[f];
+      String staged = recStagedPath(live);
+      fsTakeLock();
+      if (LittleFS.exists(staged.c_str())) {
+        if (strcmp(live, "/altfront.bin") == 0) wipe |= 1;
+        else if (strcmp(live, "/sailfront.bin") == 0 || strcmp(live, "/motorfront.bin") == 0) wipe |= 2;
+        File sf = LittleFS.open(staged.c_str(), "r");
+        size_t sz = sf ? sf.size() : 0;
+        if (sf) sf.close();
+        LittleFS.remove(live);
+        if (sz == 0 || !LittleFS.rename(staged.c_str(), live)) LittleFS.remove(staged.c_str());
+        else if (strcmp(live, "/altfront.bin") == 0) seed |= 1;
+        else if (strcmp(live, "/sailfront.bin") == 0 || strcmp(live, "/motorfront.bin") == 0) seed |= 2;
+        fsFreeDirty = true;
+      }
+      fsReleaseLock();
+    }
+  }
+  if (seed) recSeedOwedSet(seed, true);
+  // The imported curve replaces this unit's, an empty one too, but the cloud rebuilds each curve from every row this
+  // unit holds there. Its rows go first; the seeded upload waits for the wipe.
+  if (wipe & 1) { altCloudWipePending = true; settingWrite(NK_AltWipePend, "1"); }
+  if (wipe & 2) { perfCloudWipePending = true; settingWrite(NK_PerfWipePend, "1"); }
+  // The replaced curve's unsynced points go with it, or the boot would reload and upload them after the wipe.
+  fsTakeLock();
+  if (wipe & 1) LittleFS.remove("/altpend.bin");
+  if (wipe & 2) { LittleFS.remove("/perfpends.bin"); LittleFS.remove("/perfpendsa.bin"); LittleFS.remove("/perfpendm.bin"); LittleFS.remove("/perfpendma.bin"); }
+  fsReleaseLock();
+}
+
+int applyImportConfig(const char *body, bool cloudPush) {
   if (!body) return -1;
-  const char *cfg = strstr(body, "\"config\"");
-  if (!cfg) return -1;   // malformed / wrong shape — reject, don't half-apply
-  // Voltage class, capacity and chemistry all move the CV plant gain the commissioning fit
-  // measured, so the stored tune no longer describes the bank. /saveVesselInfo raises the
-  // re-commission nag on these three; an import writes NVS raw and reboots, so it has to
-  // detect the same change itself or the nag is silently skipped.
+  char *cfgBuf = cfgObjectDup(body, "config");
+  if (!cfgBuf) return -1;   // malformed / wrong shape — reject, don't half-apply
+  const char *cfg = cfgBuf;
+  char *tblBuf = cfgObjectDup(body, "tables");
+  char *basisBuf = cfgObjectDup(body, "cx_basis");
+  for (size_t k = 0; k < sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0]); k++) cfgImpTblSet[k] = false;
+  String tmp;
+  const bool cxInFile = cfgJsonExtract(cfg, "commissionDoneMask", tmp);   // the file's commissioning status was taken
+  cxImportCapturePre();
+  cfgOwnerTablesCapturePre();
+  const String preRpmScale = settingRead(NK_RPMScalingFactor);
+  const float prePerfSrc = settingRead("perfSpeedSrc").toFloat();
+  const float preCOffset = settingRead(NK_AlternatorCOffset).toFloat();
+  // Class, capacity and chemistry move the CV plant gain the commissioning fit measured. An import writes NVS raw,
+  // so it must detect these changes itself to raise the re-commission nag /saveVesselInfo would.
   String preClass = settingRead(NK_BatteryVoltage);
   String preCap   = settingRead(NK_BatteryCapacity_Ah);
   String preChem  = settingRead(NK_batteryType);
   String preWinding = settingRead(NK_FieldWindingV);
-  // System voltage class is not an ordinary setting — it is the MEANING of every other volt- and
-  // duty-domain value, so it is handled BEFORE the manifest loop rather than inside it. A payload that
-  // carries only the class (a one-key admin push) brings nothing to reinterpret the rest of NVS with, so
-  // run the same conversion /saveVesselInfo runs; a full export carries every converted key, so the loop
-  // below then overwrites the conversion key by key and that import behaves exactly as it did before.
-  // Without this a bare "BatteryVoltage=12" push to a 48V boat left a 57 V bulk target and a 58 V
-  // shutdown trip over a 12 V bank, with nothing able to trip. applyNominalVoltageChange also resets the
-  // Min% floor table and clears the learned oscillation speed pockets (both were class-specific), which
-  // is why the post-loop block below no longer does its own knee reset.
+  // The voltage class is the MEANING of every volt/duty value, so it converts before the manifest loop: a class-only
+  // push gets the conversion /saveVesselInfo runs (else 12 V pushed onto a 48V boat keeps a 57 V bulk target over a
+  // 12 V bank); a full export then overwrites each converted key. applyNominalVoltageChange also resets Min% floors and hunt pockets.
   bool cfgClassBad = false;
   {
     String cv;
@@ -1630,10 +2698,9 @@ int applyImportConfig(const char *body) {
       }
     }
   }
-  // The field winding is the other half of what every field-duty value means, so it converts here too, after the
-  // class (which bounds it). A full export also carries fieldWindApplied and its own knobs, which the loop below
-  // writes over this; whatever field-side value it leaves is converted onto the file's scale after it
-  // (fieldSideConvertUnwritten), and the boot reconcile then moves them all onto this device's effective winding.
+  // The field winding is the other half of what every field-duty value means; it converts after the class (which bounds
+  // it). A full export's fieldWindApplied + knobs overwrite this; fieldSideConvertUnwritten puts any value the file left
+  // onto the file's scale, and the boot reconcile moves all onto this device's effective winding.
   bool cfgWindBad = false;
   {
     String wv;
@@ -1651,10 +2718,8 @@ int applyImportConfig(const char *body) {
   // loops below write (";key;key;"), for fieldSideConvertUnwritten after them.
   const int preWindApplied = settingRead(NK_fieldWindApplied).toInt();
   String cfgWritten = ";";
-  // The field resistance and the alternator temperature recorded with it are adopted only as a pair: a resistance with no
-  // temperature (every 0.0.6 export carries the old 2-ohm seed that way) or a temperature with no resistance is skipped,
-  // so the Prerequisites screen asks for a measurement. Interim rule (owner 2026-10-10): a later cloud step that strips
-  // hardware-specific values before an import is expected to replace it.
+  // Field resistance and the alternator temperature it was measured at import only as a pair (old exports carry a bare
+  // 2-ohm seed); otherwise the Prerequisites screen asks for a measurement. Interim until a cloud-side strip step.
   bool fieldResPair;
   {
     String r, t;
@@ -1665,8 +2730,10 @@ int applyImportConfig(const char *body) {
       queueConsoleMessage("IMPORT: Field Resistance not imported - it travels only with the alternator temperature it was measured at; enter it on this boat");
   }
   int applied = 0;
+  String wrote = ";";   // params the loop below wrote (";name;")
   for (size_t i = 0; i < CONFIG_MANIFEST_COUNT; i++) {
     if (CONFIG_MANIFEST[i].tier == 3) continue;   // export-only: this device's own history, never adopted
+    if (cfgImportDedicated(CONFIG_MANIFEST[i].param)) continue;
     if (cfgClassBad && strcmp(CONFIG_MANIFEST[i].param, "BatteryVoltage") == 0) continue;
     if (cfgWindBad && strcmp(CONFIG_MANIFEST[i].param, "FieldWindingV") == 0) continue;
     if (!fieldResPair && (strcmp(CONFIG_MANIFEST[i].param, "FieldResistance") == 0 || strcmp(CONFIG_MANIFEST[i].param, "FieldResTrefC") == 0)) continue;
@@ -1684,29 +2751,88 @@ int applyImportConfig(const char *body) {
         continue;
       }
       if (strcmp(CONFIG_MANIFEST[i].param, "MinRPMForField") == 0 && val.toInt() < 0) val = "0";
+      // The class and winding steps above already stored those two: they are judged against the pre-import value.
+      const bool changed = !strcmp(CONFIG_MANIFEST[i].param, "BatteryVoltage") ? (cfgImportChangedNames && val != preClass)
+                         : !strcmp(CONFIG_MANIFEST[i].param, "FieldWindingV")  ? (cfgImportChangedNames && val != preWinding)
+                         : cfgImportWillChange(CONFIG_MANIFEST[i].nvsKey, val);
       if (settingWrite(CONFIG_MANIFEST[i].nvsKey, val.c_str())) {
         applied++;
-        cfgImportNoteChanged(CONFIG_MANIFEST[i].param);
+        if (changed) cfgImportNoteChanged(CONFIG_MANIFEST[i].param);
+        wrote += CONFIG_MANIFEST[i].param; wrote += ';';
         if (fieldSideKey(CONFIG_MANIFEST[i].nvsKey)) { cfgWritten += CONFIG_MANIFEST[i].nvsKey; cfgWritten += ';'; }
       }
     }
   }
+  // The live power-cycle count is storage "PowerCycles" (what loadNVSData reads); NK_totalPowerCycles is only the /get
+  // handler's mirror, so the imported count has to land in storage too.
+  if (wrote.indexOf(";totalPowerCycles;") >= 0) {
+    totalPowerCycles = settingRead(NK_totalPowerCycles).toInt();   // as the /get handler does (covers noReboot=1)
+    nvs_handle_t sh;
+    if (nvs_open("storage", NVS_READWRITE, &sh) == ESP_OK) {
+      nvs_set_i32(sh, "PowerCycles", (int32_t)totalPowerCycles);
+      nvs_commit(sh);
+      nvs_close(sh);
+    }
+  }
+  // Schema number capped at this firmware's own: the boot then runs exactly the conversions the file's values still
+  // need, and a file from newer firmware cannot make this one skip a future conversion.
+  if (cfgJsonExtract(cfg, "cfgSchema", tmp) && floatTokenValid(tmp.c_str())) {
+    const String sv = String(constrain((int)tmp.toInt(), 0, SETTINGS_SCHEMA_VERSION));
+    const bool changed = cfgImportWillChange(NK_cfgSchema, sv);
+    if (settingWrite(NK_cfgSchema, sv.c_str())) { applied++; if (changed) cfgImportNoteChanged("cfgSchema"); }
+  }
+  // The other regulators on the source's boat, less this unit itself (copying a partner's list here would name this
+  // unit as its own partner). A source that listed this unit is its partner on the same boat, so the source takes
+  // this unit's place in the list.
+  if (cfgJsonExtract(cfg, "pairList", tmp)) {
+    String keep, srcUid;
+    const bool haveSrc = cfgJsonExtract(body, "source_uid", srcUid) && srcUid.length() == 16 && !srcUid.equalsIgnoreCase(device_id_hex);
+    bool listedHere = false, srcListed = false;
+    int pos = 0;
+    while (pos < (int)tmp.length()) {
+      int end = tmp.indexOf('\x1e', pos);
+      if (end < 0) end = tmp.length();
+      String rec = tmp.substring(pos, end);
+      int us = rec.indexOf('\x1f');
+      String uid = us < 0 ? rec : rec.substring(0, us);
+      if (uid.equalsIgnoreCase(device_id_hex)) listedHere = true;
+      else if (uid.length()) {
+        if (haveSrc && uid.equalsIgnoreCase(srcUid)) srcListed = true;
+        if (keep.length()) keep += '\x1e';
+        keep += rec;
+      }
+      pos = end + 1;
+    }
+    if (listedHere && haveSrc && !srcListed) {
+      String srcName;
+      cfgJsonExtract(cfg, "regulator_name", srcName);
+      if (keep.length()) keep += '\x1e';
+      keep += srcUid; keep += '\x1f'; keep += srcName;
+    }
+    const bool changed = cfgImportWillChange(NK_pairList, keep);
+    if (settingWrite(NK_pairList, keep.c_str())) { applied++; if (changed) cfgImportNoteChanged("pairList"); }
+  }
+  // The install verdict was judged on one level capture in one orientation. A capture or orientation that arrives
+  // without its verdict leaves none (the next Level Zero re-latches it), as /saveVesselInfo does on an orientation change.
+  if ((wrote.indexOf(";imu_zero;") >= 0 || wrote.indexOf(";imu_mount_orientation;") >= 0) && wrote.indexOf(";imu_mnt_state;") < 0)
+    settingRemove(NK_imu_mnt_state);
   // Only nag once a pass has actually been finished (epoch stamped) — a fresh device has
-  // nothing to invalidate, and every key looks "changed" there because none existed.
-  if (CommissionEpoch > 0) {
+  // nothing to invalidate, and every key looks "changed" there because none existed. When the file's commissioning
+  // status came along, applyImportCommissioning decides each step from what is now in force instead.
+  if (CommissionEpoch > 0 && !cxInFile) {
     bool classChanged = (settingRead(NK_BatteryVoltage) != preClass);
     if (classChanged || settingRead(NK_BatteryCapacity_Ah) != preCap
         || settingRead(NK_batteryType) != preChem) {
       raiseRecommissionNag();
     }
-    // Voltage-class change: the conversion above already reset the knee-learned Min% floors (they were
-    // duty values learned at the OLD class, ~2x field per class step, and are NOT in the import payload —
-    // the boot rebuild would otherwise re-apply them over the imported minDutyTable). Only the wizard
-    // stage clear is left to do here; applyImportTables still runs last, so an imported table wins.
+    // The class conversion above already reset the knee-learned Min% floors (duty learned at the OLD class); only the
+    // wizard stage clear is left. applyImportTables runs last, so an imported table wins.
     if (classChanged) {
       commissionClearStage(7);
       queueConsoleMessage("IMPORT WARNING: battery voltage class changed - charge profile, protection trips and field-duty limits converted to the new class for the field winding set in Vessel Info; learned tachometer keep-alive floors reset and learned oscillation speed ranges cleared; recommissioning recommended");
     }
+  } else if (cxInFile && settingRead(NK_BatteryVoltage) != preClass) {
+    queueConsoleMessage("IMPORT: battery voltage class changed - charge profile, protection trips and field-duty limits converted to the new class for the field winding set in Vessel Info");
   }
   if (settingRead(NK_FieldWindingV) != preWinding)
     queueConsoleMessageF("IMPORT WARNING: field winding voltage changed to %sV - field-duty settings and Max Field Volts move onto the new winding's scale, and the alternator-health history is cleared. Confirm the rating on the alternator's datasheet.",
@@ -1715,20 +2841,96 @@ int applyImportConfig(const char *body) {
   // Macro for the same auto-prototype reason as the emit.
   #define CFG_IMPORT_REGISTRY(REG, COUNT) \
     for (size_t i = 0; i < COUNT; i++) { \
-      if (cfgRegistrySkipped(REG[i].name)) continue; \
       String val; \
       if (cfgJsonExtract(cfg, REG[i].name, val)) { \
         char key[16]; \
         snprintf(key, sizeof(key), "%s", REG[i].name); \
         if (!floatTokenValid(val.c_str())) { queueConsoleMessageF("IMPORT WARNING: ignoring non-finite value \"%s\" for %s", val.c_str(), REG[i].name); continue; } \
-        if (settingWrite(key, val.c_str())) { applied++; cfgImportNoteChanged(REG[i].name); if (fieldSideKey(key)) { cfgWritten += key; cfgWritten += ';'; } } \
+        const bool changed = cfgImportWillChange(key, val); \
+        if (settingWrite(key, val.c_str())) { applied++; if (changed) cfgImportNoteChanged(REG[i].name); if (fieldSideKey(key)) { cfgWritten += key; cfgWritten += ';'; } } \
       } \
     }
   CFG_IMPORT_REGISTRY(ALT_SETTINGS, ALT_SETTING_COUNT)
   CFG_IMPORT_REGISTRY(PERF_SETTINGS, PERF_SETTING_COUNT)
   #undef CFG_IMPORT_REGISTRY
   fieldSideConvertUnwritten(preWindApplied, settingRead(NK_fieldWindApplied).toInt(), cfgWritten);
-  applied += applyImportTables(body);
+  // The learned zero correction (zfC) is on the current offset it was learned against, so the two land as a pair, both
+  // written here before the import's reboot. A fit that comes without its offset moves onto this regulator's offset. An
+  // offset that comes without the fit moves this regulator's fit with it, as a typed offset does with auto zero
+  // correction off; with it on, a cloud push is an admin correcting a reading seen in telemetry and the fit stays (the
+  // /get rule), while a config import is a restore and the fit moves.
+  const bool offWritten = (wrote.indexOf(";AlternatorCOffset;") >= 0);
+  const float postCOffset = settingRead(NK_AlternatorCOffset).toFloat();
+  float zfShiftA = 0.0f;
+  if (!offWritten) {
+    String fo;
+    if (cxImportBasis(basisBuf, cfg, tblBuf, "AlternatorCOffset", false, fo) && floatTokenValid(fo.c_str()))
+      zfShiftA = fo.toFloat() - postCOffset;
+  }
+  applied += applyImportTables(tblBuf, zfShiftA);
+  bool zfFromFile = false;
+  for (size_t k = 0; k < sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0]); k++)
+    if (strcmp(CFG_TABLE_NAMES[k], "zeroFit") == 0) zfFromFile = cfgImpTblSet[k];
+  // A file fit equal to this regulator's has no preview row, yet the pair is still the file's.
+  String zfFile, zfLive;
+  if (!zfFromFile && cxImportBasis(basisBuf, cfg, tblBuf, "zeroFit", true, zfFile) && cfgTableValue("zeroFit", zfLive))
+    zfFromFile = (zfFile == zfLive);
+  const float zfFollowA = preCOffset - postCOffset;
+  nvs_handle_t zh;
+  if (offWritten && !zfFromFile && zfFollowA != 0.0f && isfinite(zfFollowA) && (!cloudPush || AutoAltCurrentZero != 1)
+      && nvs_open("storage", NVS_READWRITE, &zh) == ESP_OK) {
+    int32_t zv = 0;
+    float zc = 0.0f;
+    size_t zsz = sizeof(float);
+    if (nvs_get_i32(zh, "ZFitValid", &zv) == ESP_OK && zv != 0
+        && nvs_get_blob(zh, "ZFitC", &zc, &zsz) == ESP_OK && isfinite(zc)) {
+      zc += zfFollowA;
+      nvs_set_blob(zh, "ZFitC", &zc, sizeof(float));
+      nvs_commit(zh);
+      queueConsoleMessageF("IMPORT: the learned zero correction moved %+.2f A with the imported current offset", zfFollowA);
+    }
+    nvs_close(zh);
+  }
+  if (applyImportCommissioning(cfg, tblBuf, basisBuf)) applied++;
+  // A new tach scale moves the engine-RPM axis under every speed-indexed artifact. The ones this file brought are on
+  // its own axis already; the rest of this regulator's are wiped at the next boot, and its cloud records with them.
+  if (settingRead(NK_RPMScalingFactor) != preRpmScale) {
+    String now, b;
+    auto fromFile = [&](const char *name, bool table) {
+      now = cxImportValue(name, table, true);
+      return cxImportBasis(basisBuf, cfg, tblBuf, name, table, b) && cxImportSame(now, b);
+    };
+    uint16_t parts = AXW_ALL;
+    // Records the dashboard posted just before this import are staged on the file's axis too.
+    auto staged = [](const char *live) { fsTakeLock(); bool e = LittleFS.exists(recStagedPath(live).c_str()); fsReleaseLock(); return e; };
+    if (staged("/motorfront.bin")) parts &= ~AXW_MOTORFRONT;
+    if (staged("/altfront.bin")) parts &= ~AXW_ALTHEALTH;
+    if (staged(FA_MATRIX_PATH)) parts &= ~AXW_FAMATRIX;
+    if (staged(FA_FLIP_PATH)) parts &= ~AXW_FAFLIP;
+    if (staged("/huntledger.csv")) parts &= ~AXW_HUNTLOG;
+    if (fromFile("minDutyTable", true)) parts &= ~AXW_KNEE;
+    if (fromFile("huntPockets", true)) parts &= ~AXW_HUNT;
+    if (cxInFile) parts &= ~AXW_CXBITS;   // applyImportCommissioning judged the speed-binned steps against the new scale
+    if (fromFile("overheatCount", true)) parts &= ~AXW_OVERHEAT;
+    if (fromFile("ripTab", true)) parts &= ~AXW_RIPTAB;
+    if (fromFile("ripFitAlt", false)) parts &= ~AXW_RIPFIT_ALT;
+    if (fromFile("slpFitAlt", false)) parts &= ~AXW_RIPFIT_SLP;
+    importBootActAdd(parts);
+    settingWrite(NK_RpmAxisWipePend, "1");
+    rpmAxisWipePending = true;
+    queueConsoleMessage("IMPORT: engine speed scaling changed - this regulator's own speed-indexed learning not in the file is wiped at the next boot");
+  }
+  // A new boat-speed source invalidates every learned performance point, as perfSettingsHandle's Clear All does —
+  // unless the file's own performance curves, learned on that source, came with it.
+  if (settingRead("perfSpeedSrc").toFloat() != prePerfSrc) {
+    fsTakeLock();
+    const bool perfStaged = LittleFS.exists(recStagedPath("/sailfront.bin").c_str());
+    fsReleaseLock();
+    if (!perfStaged) importBootActAdd(IBA_PERF);
+  }
+  free(cfgBuf);
+  free(tblBuf);
+  free(basisBuf);
   return applied;
 }
 
@@ -1750,18 +2952,16 @@ void bhSample(uint32_t nowMs) {
   bhSampleCount++;
 }
 
-// Floor for bhDwellMs, derived so the knobs can never produce an unfittable waveform:
-// the fit averages the last THIRD of each dwell, so the first two thirds must cover the
-// slewed traverse (bhStepDeltaA / TEST_ENTRY_RATE_A) plus a 1s settle margin. Below this
-// the wave is a triangle that never reaches either level and every edge fails the ΔI gate.
+// Floor for bhDwellMs: the fit averages the last third of each dwell, so the first two thirds must cover the slewed
+// traverse (bhStepDeltaA / TEST_ENTRY_RATE_A) plus 1 s settle, or no edge passes the ΔI gate.
 uint32_t bhMinDwellMs() {
   float traverseMs = (bhStepDeltaA / TEST_ENTRY_RATE_A) * 1000.0f;
   return (uint32_t)(1.5f * (traverseMs + 1000.0f));
 }
 
 void bhAbort(const char *reason) {
+  bhTestState = 3;                    // state first: core 1 reads (state 1 && !active) as "run finished, fit it"
   batteryHealthTestActive = false;
-  bhTestState = 3;
   bhAbortReason = reason;
   queueConsoleMessageF("BATT HEALTH: test aborted — %s", reason);
   char ev[192];
@@ -1772,6 +2972,7 @@ void bhAbort(const char *reason) {
 bool bhStartTest() {
   if (bhTestState == 1)        { bhAbortReason = "already running";          return false; }
   if (!bhSamples || !bhResults){ bhAbortReason = "buffers unallocated";      return false; }
+  if (const char *rr = rpmTestRefuseReason()) { bhAbortReason = rr;         return false; }   // engine running is judged on the tach
   if (RPM < 100)               { bhAbortReason = "engine not running";       return false; }
   if (sysMode != SYS_MODE_AUTO){ bhAbortReason = "must be charging in Auto mode";     return false; }   // generator only runs in the AUTO control path
   // altSweepRequested too: a sweep start is two-stage (the HTTP press arms the request, the next
@@ -1803,8 +3004,7 @@ bool bhStartTest() {
   bhTestStartMs  = millis();
   bhLastToggleMs = bhTestStartMs;
   bhAbortReason  = "";
-  // Active flag FIRST: Core-1's bhServiceCompletion reads (bhTestState==1 && !active) as
-  // run-complete, so the reverse order let a loop pass abort the test at the starting gun.
+  // Active flag FIRST: bhServiceCompletion (Core 1) reads (bhTestState==1 && !active) as run-complete.
   batteryHealthTestActive = true;
   bhTestState    = 1;
   queueConsoleMessageF("BATT HEALTH: DCIR test started (%.1f<->%.1fA, %lus dwell, %u edges)",
@@ -1812,26 +3012,21 @@ bool bhStartTest() {
   return true;
 }
 
-// A macro, not a helper: a free function taking BattHealthResult by reference makes
-// Arduino's auto-prototype generator hoist a prototype above the struct definition
-// ("does not name a type"). Keep ALL struct types out of free-function signatures.
+// A macro, not a helper: a free function taking BattHealthResult would get an Arduino auto-prototype hoisted above
+// the struct definition. Keep ALL struct types out of free-function signatures.
 #define BH_APPEND_RESULT(r) do {                         \
     bhResults[bhResultHead] = (r);                       \
     bhResultHead = (bhResultHead + 1) % bhResultCap;     \
     if (bhResultCount < bhResultCap) bhResultCount++;    \
   } while (0)
 
-// Resistance at the dwell timescale (ohmic + polarization within one dwell). The absolute
-// value is timescale-dependent but consistent run-to-run, so the TREND is what matters.
-// SEAM for a 3-level sweep (linearity check): the per-edge math already differences whatever
-// ΔI occurred, so only the generator + reporting need to fan out to multiple magnitudes.
+// Resistance at the dwell timescale (ohmic + polarization): the absolute value depends on dwell, the trend is what
+// matters. A 3-level linearity sweep needs only generator + reporting changes; the per-edge math handles any ΔI.
 void bhComputeDcir() {
   uint32_t bhT0 = micros();   // this fit runs in a field-on loop pass — report its cost so a spike is attributable
   if (bhSampleCount < 8 || bhToggleCount < (int)bhNumEdges + 3) { bhAbort("not enough samples"); return; }
 
-  // Average the SETTLED tail of each level (last `win` ms before its end toggle). End-of-dwell
-  // windows are robust to the transition slew time — both levels are fully settled regardless
-  // of how fast the setpoint got there, so ΔV/ΔI is the same as an abrupt step.
+  // Average the settled tail of each level (last `win` ms before its end toggle), so slew time doesn't matter.
   uint32_t win = bhDwellMs / 3; if (win < 200) win = 200;
 
   float Rsum = 0.0f, Rsq = 0.0f; int Rn = 0;   // Rsq → per-edge std-dev (fit consistency)
@@ -1859,11 +3054,11 @@ void bhComputeDcir() {
   if (Rn < 2) { bhAbort("insufficient valid steps (protections firing or step too small?)"); return; }
 
   BattHealthResult r = {};
-  r.epoch      = timeIsSynced ? (timeBase + (millis() - timeBaseMillis) / 1000) : 0;
+  r.epoch      = clockIsReal() ? (timeBase + (millis() - timeBaseMillis) / 1000) : 0;
   r.dcir_mOhm  = Rsum / Rn;
   r.soh_pct    = (bhCapCount > 0) ? bhCapRing[(bhCapHead - 1 + bhCapCap) % bhCapCap].capPct : NAN;
   r.battTempF  = battTempActiveF;   // measured battery source only (°F); NAN when none — the board temperature is NOT a substitute
-  r.soc_pct    = SOC_percent / 100.0f;
+  r.soc_pct    = socShownX100() / 100.0f;   // the SoC shown: the owner's selected monitor, else this shunt's count
   r.battV      = IBV;
   r.stepLowA   = bhStepLowA;
   r.stepDeltaA = bhStepDeltaA;
@@ -1908,15 +3103,9 @@ void bhServiceCompletion() {
 }
 
 // ════════════════════════ CV PLANT FIT (firmware voltage-loop identification) ════════════════════════
-// Ohmic-anchor pulse train (spec: CV_Gain_Ohmic_Anchor_Redesign_Spec.md): SETTLE (CC at the base level) →
-// PILOT (probe + size the step under the OV/gassing/cap-table guards) → HOLD (CC practice run, capture
-// stepDuty) → REBASE (CC back to the base level, capture baseDuty) → PULSES (4× abrupt base/step duty
-// squares; the 2 s holds give settled baselines either side of every edge) → RELEASE. Fit = per-edge
-// settled ΔV (CVPF_EDGE_V0/V1_MS window, 550-650 ms)/ΔI, median of 8 edges → cvpfKa.
-// REBASE exists so both replayed duties are learned one settle apart instead of a whole setup apart:
-// capturing baseDuty back at SETTLE let engine speed move between the two captures and put them at
-// different plant gains, which flattened every edge (bench 2026-08-04). It also makes the pair
-// self-consistent under load sag — each level is learned at the engine speed the train will replay it at.
+// Ohmic-anchor pulse train (CV_Gain_Ohmic_Anchor_Redesign_Spec.md): SETTLE → PILOT → HOLD (stepDuty) → REBASE
+// (baseDuty) → 4× base/step PULSES → RELEASE; cvpfKa = median over 8 edges of settled ΔV/ΔI. Keep baseDuty captured at
+// REBASE, one settle after the crest: captured at SETTLE, engine speed moves between the two and flattens every edge.
 static const uint32_t CVPF_SAMPLE_INTERVAL_MS = 40;    // CC phases — ample for settled means; bounds buffer fill
 static const uint32_t CVPF_SAMPLE_FAST_MS = 10;        // PULSES/RELEASE — tick-cadence sampling across the edges
 static const uint32_t CVPF_SETTLE_MIN_MS = 2000;
@@ -1935,10 +3124,8 @@ static const float    CVPF_CAP_MARGIN_A   = 5.0f;      // keep the commanded ste
 static const float    CVPF_V_RESERVE = 0.15f;          // keep the projected step peak this far below the hard-OV cut
 static const float    CVPF_GASSING_V_12V = 14.2f;      // ~2.37 V/cell — oxygen-evolution onset on lead-acid
 
-// Volt-domain class scale for the probe. Everything this test measures in VOLTS (the DeltaV target, both
-// OV cushions) is per-cell-equivalent and scales with the bus, same rule as the gassing gate below.
-// Everything it commands in AMPS stays flat: on n series 12V blocks a per-cell-equal step is the same
-// amps, which is why cvpfBaseA/cvpfPilotA/CVPF_DI_MAX_DEFAULT are correctly class-invariant.
+// Volt-domain class scale: everything this test measures in VOLTS (ΔV target, OV cushions) is per-cell and scales
+// with the bus; everything it commands in AMPS (cvpfBaseA/PilotA, CVPF_DI_MAX_DEFAULT) is class-invariant.
 static inline float cvpfVScale() { return (float)SYSTEM_VOLTAGE_CLASS / 12.0f; }
 
 // Lithium does not evolve gas at any charge voltage we permit; every other chemistry does. "other" is treated
@@ -1959,9 +3146,8 @@ void cvpfSample(uint32_t nowMs) {
   cvpfBufCount++;
 }
 
-// Run-mean of ambient conditions for the result card. Called ONLY from the settled tail of the two middle
-// pulse segments (one high step, one low base), so every sample sits on a stable current level — a
-// steady-state average centered on the operating point, never an instant or a transient.
+// Run-mean of conditions for the result card; called only from the settled tails of the two middle pulse segments
+// (one step, one base), so it centers on the operating point.
 static void cvpfAccumConditions() {
   float r = (float)RPM;
   if (cvpfCondN == 0) { cvpfRpmMinAtFit = r; cvpfRpmMaxAtFit = r; }
@@ -1969,7 +3155,7 @@ static void cvpfAccumConditions() {
     if (r < cvpfRpmMinAtFit) cvpfRpmMinAtFit = r;
     if (r > cvpfRpmMaxAtFit) cvpfRpmMaxAtFit = r;
   }
-  cvpfRpmSum += RPM; cvpfBattVSum += IBV; cvpfSocSum += SOC_percent / 100.0f; cvpfCondN++;
+  cvpfRpmSum += RPM; cvpfBattVSum += IBV; cvpfSocSum += socShownX100() / 100.0f; cvpfCondN++;
 }
 
 // One-pass stats over the sample buffer for [t0,t1): mean, linear slope (units per ms), RMS residual about
@@ -2007,14 +3193,9 @@ static void cvpfSizeStep() {
   // The pilot chord (~2-3 s) matches the 2 s pulse holds, so it sizes the step peak directly.
   float Klong    = cvpfPilotK;
   float Kupper   = Klong * 1.5f;                                             // pessimistic (bigger K → smaller ΔI)
-  // CVPF cushions are class-scaled (cvpfVScale), NOT fixed absolute volts. The old rationale — "the probe
-  // ΔV is sensor-resolution-limited, so a fixed step gives full SNR at any bank" — was wrong by two orders
-  // of magnitude: cvpfSNR divides cvpfDV by the RMS residual of the pre-edge window, which is BUS RIPPLE.
-  // The SNR<12 warn bit corresponds to ~25 mV of residual against an INA228 bus LSB of 195 uV, so the metric
-  // is ripple-limited, and ripple scales with the bus. A fixed 300 mV also shrinks the current chord by
-  // 12/class, pinning it near the steep low-current tangent on lead-acid (reads K high -> Kp low).
-  // CVPF_V_RESERVE scales for a second reason: unscaled it left the projected step peak 4x closer to the
-  // hard-OV cut per cell on a 48V bank.
+  // Cushions scale with class (cvpfVScale): cvpfSNR divides by the pre-edge residual, which is bus RIPPLE (scales with
+  // the bus), not sensor resolution. A fixed 300 mV would shrink the chord by 12/class (reads K high on lead-acid), and
+  // an unscaled CVPF_V_RESERVE puts the step peak 4x closer to the hard-OV cut per cell at 48V.
   float headroom = fmaxf(0.05f, AlternatorHardShutdownV - cvpfPilotVbase - CVPF_V_RESERVE * cvpfVScale());
   float di = cvpfDiMaxA;
   di = fminf(di, headroom / fmaxf(1e-3f, Kupper));
@@ -2074,9 +3255,8 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
         cvpfWinStats(nowMs - 1500, nowMs - 200, 0, vP,  sl, rs);                          // last ~1.3s of PILOT
         cvpfWinStats(nowMs - 1500, nowMs - 200, 1, iPn, sl, rs);
         float dIp = iPn - iBn, dVp = vP - vB;
-        // Pilot moved (almost) no current → the main step can't either (output ceiling, a limiter, or
-        // the field circuit). Abort with the numbers now — the old silent fallback K sized a tiny step
-        // and doomed the whole pulse train to flat, all-dropped edges (bench 2026-08-04).
+        // Pilot moved (almost) no current, so the main step can't either. Abort now: a fallback K would size a tiny
+        // step and doom the whole train to flat, all-dropped edges.
         if (dIp < 2.0f) {
           if (boardCeilHoldsField())
             snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
@@ -2092,10 +3272,9 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
         cvpfPilotK     = (dVp > 0.0f) ? (dVp / dIp) : (cvpfTargetDV / fmaxf(1.0f, cvpfPilotA));
         cvpfPilotVbase = isnan(vB) ? IBV : vB;
         cvpfSizeStep();
-        // Gassing gate: past ~2.37 V/cell some charge current goes to oxygen evolution (Tafel resistance
-        // ∝ 1/I_gas), dragging measured dV/dI DOWN → over-gained loop. Refuse rather than measure; judged
-        // on baseline + the projected peak of the step actually sized (stepA·pilotK — tracks boosted
-        // re-runs that exceed the fixed ΔV target, and cap-clamped steps smaller than it).
+        // Gassing gate: past ~2.37 V/cell part of the current evolves oxygen, dragging dV/dI DOWN → over-gained loop.
+        // Judged on baseline + projected peak of the step actually sized (stepA·pilotK), which tracks boosted and
+        // cap-clamped steps.
         if (cvpfChemGasses() && isfinite(cvpfPilotVbase)
             && cvpfPilotVbase + cvpfStepA * cvpfPilotK > CVPF_GASSING_V_12V * (float)SYSTEM_VOLTAGE_CLASS / 12.0f) {
           cvpfAbort("bank too full to measure — this close to full, extra current stops raising the voltage in proportion, which reads the battery's resistance low and over-tunes the loop. Draw the bank down with some loads, then re-run.");
@@ -2109,9 +3288,8 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
     case 2: {  // HOLD — practice run at the sized step; capture the settled duty as the pulse crest
       float target = cvpfBaseA + cvpfStepA;
       cvpfCmdA = target;
-      // Runtime OV guard: first trip → shrink to a 180 mV (12V-equivalent) step and re-hold; still
-      // over-volting → give up. Cushion and reduced target both class-scaled: at 48V a fixed 0.10 V gave a
-      // quarter of the warning time before the hard cut, since the bus traverses it 4x faster per cell.
+      // Runtime OV guard: first trip → re-hold at a 180 mV (12V-equiv) step; second → abort. Both class-scaled: the
+      // bus crosses a fixed cushion 4x faster per cell at 48V.
       if (IBV > AlternatorHardShutdownV - 0.10f * cvpfVScale()) {
         if (!cvpfFellBack) {
           cvpfFellBack = true; cvpfTargetDV = 0.18f * cvpfVScale(); cvpfWarn |= 0x10;
@@ -2128,10 +3306,8 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
       bool inBand = arrived && fabsf(cvpfAmpsEma - target) < fmaxf(3.0f, 0.08f * target);
       if (inBand) { if (cvpfInBandMs == 0) cvpfInBandMs = nowMs; } else cvpfInBandMs = 0;
       bool settled = (elapsed >= CVPF_SETTLE_MIN_MS) && cvpfInBandMs && (nowMs - cvpfInBandMs >= CVPF_INBAND_MS);
-      // Timeout = step unreachable here (railed PID): proceed — the fit divides by MEASURED ΔI.
-      // Exception: (almost) nothing delivered above the settled base ⇒ the replayed pulses would be
-      // flat and every edge would drop; abort with the numbers instead of burning the 18 s train.
-      // (settled implies in-band delivery, so this only fires on the timeout path.)
+      // Timeout = step unreachable (railed PID): proceed, the fit divides by MEASURED ΔI — unless nothing was delivered
+      // above base, when every replayed edge would drop (only reachable on the timeout path).
       if (settled || elapsed >= CVPF_HOLD_TIMEOUT_MS) {
         if (cvpfAmpsEma - cvpfBaseAmps < 2.0f) {
           if (boardCeilHoldsField())
@@ -2164,9 +3340,8 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
       bool inBand = arrived && fabsf(cvpfAmpsEma - cvpfBaseA) < fmaxf(2.0f, 0.15f * cvpfBaseA);
       if (inBand) { if (cvpfInBandMs == 0) cvpfInBandMs = nowMs; } else cvpfInBandMs = 0;
       bool settled = (elapsed >= CVPF_SETTLE_MIN_MS) && cvpfInBandMs && (nowMs - cvpfInBandMs >= CVPF_INBAND_MS);
-      // Walking the setpoint back down is fall-rate limited (TEST_ENTRY_RATE_A), so the budget has to
-      // cover the ramp itself before the settle window: a boosted 100 A step needs 12.5 s just to reach
-      // the base setpoint. A fixed timeout here would capture a mid-ramp duty as the pulse floor.
+      // The walk down is fall-rate limited (TEST_ENTRY_RATE_A; 12.5 s for a boosted 100 A step), so the budget covers
+      // the ramp first; a fixed timeout would capture a mid-ramp duty as the pulse floor.
       uint32_t budget = CVPF_REBASE_SETTLE_MS + (uint32_t)(1000.0f * cvpfStepA / TEST_ENTRY_RATE_A);
       if (elapsed >= budget && !arrived) {
         cvpfAbort("the current loop never walked back down to the baseline inside its time budget — re-run");
@@ -2175,10 +3350,8 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
       if (settled || elapsed >= budget) {
         cvpfBaseDuty = lastAppliedDuty;
         cvpfRebaseRpm = (float)RPM;
-        // The train replays exactly this pair of settled levels, so the measured current gap between them
-        // IS the ΔI every edge will see. Below 2 A the per-edge |dI| test rejects all 8 — say so now
-        // instead of burning the 18 s train. Replaces the old ±8% RPM gate, which compared two speeds
-        // taken at deliberately different alternator loads and so rejected the test's own load sag.
+        // The train replays exactly this pair, so this gap IS every edge's ΔI; below 2 A the per-edge |dI| test rejects
+        // all 8. Do not gate on RPM change here: the two speeds sit at different loads, so it rejects the test's own sag.
         float dIpair = cvpfHoldAmps - cvpfAmpsEma;
         if (dIpair < 2.0f) {
           snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
@@ -2200,9 +3373,7 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
       }
       break; }
     case 4: {  // PULSES — abrupt duty squares; every segment boundary is a measured edge
-      // Same class-scaled cushion as HOLD/REBASE, and it matters most here: these edges are direct-duty,
-      // so nothing paces the rise, and an unscaled 0.10 V gave a 48 V bus a quarter of the warning time
-      // per cell before the hard cut.
+      // Same class-scaled cushion as HOLD/REBASE; matters most here since direct-duty edges have no rise pacing.
       if (IBV > AlternatorHardShutdownV - 0.10f * cvpfVScale()) {
         cvpfAbort("over-voltage during the pulse train — re-run once charging is steady");
         break;
@@ -2320,10 +3491,8 @@ void cvpfProcess() {
   if (cvpfSNR < 12.0f) cvpfWarn |= 0x02;                                 // weak signal vs ripple
   if (!noShunt && dIaltMed > 0.5f
       && fabsf(dIaltMed - cvpfDI) / dIaltMed > 0.15f) cvpfWarn |= 0x08;  // alt vs battery step disagree ⇒ a load moved
-  // Engine drift, measured between LIKE operating points only — SETTLE exit vs REBASE exit are both the
-  // base current, seg 0 vs seg 6 are both the base duty. Comparing across the step instead would just
-  // read the test's own load sag. Advisory: the fit divides by measured ΔI and medians 8 edges, so drift
-  // is second-order here; when it does bite it shows up first as dropped edges (bit2).
+  // Engine drift between LIKE operating points only (SETTLE vs REBASE exit = base current; seg 0 vs 6 = base duty);
+  // across the step it would read the test's own load sag. Advisory: the median fit makes drift second-order.
   float r0 = cvpfSeg0RpmN ? (float)(cvpfSeg0RpmSum / cvpfSeg0RpmN) : 0.0f;
   float r6 = cvpfSeg6RpmN ? (float)(cvpfSeg6RpmSum / cvpfSeg6RpmN) : 0.0f;
   cvpfDriftSetupPct = (cvpfSettleRpm > 100.0f && cvpfRebaseRpm > 0.0f)
@@ -2340,7 +3509,7 @@ void cvpfProcess() {
   // to the instantaneous read only if the pulse train never reached those segments (aborted mid-run).
   cvpfRpmAtFit   = cvpfCondN ? (float)(cvpfRpmSum   / cvpfCondN) : RPM;
   cvpfBattVAtFit = cvpfCondN ? (float)(cvpfBattVSum / cvpfCondN) : IBV;
-  cvpfSocAtFit   = (socInfoAvailable && cvpfCondN) ? (float)(cvpfSocSum / cvpfCondN) : -1.0f;  // −1 → SOC untrustworthy, UI blanks it
+  cvpfSocAtFit   = (socInfoAvailable && socShownOk() && cvpfCondN) ? (float)(cvpfSocSum / cvpfCondN) : -1.0f;  // −1 → SOC untrustworthy, UI blanks it
   cvpfCapHeadroomA = fmaxf(0.0f, g_I_cap - cvpfBaseA - CVPF_CAP_MARGIN_A);   // same clamp cvpfSizeStep applies — the step a re-run can actually get
   cvpfOk = true; cvpfState = 2;
   queueConsoleMessageF("CV plant-fit: K=%.1f mV/A (median of %d/%d edges) dV=%.0f mV dI=%.2f A SNR=%.0f -> Kp %.1f Ki %.1f warn=%d drift setup %+.1f%% train %+.1f%% (%luus)",
@@ -2350,11 +3519,20 @@ void cvpfProcess() {
 
 bool cvpfStartTest(float diMaxReq) {
   if (cvpfState == 1)           { cvpfAbortMsg = "already running";        return false; }
-  if (!cvpfBuf)                 { cvpfAbortMsg = "buffer unallocated";     return false; }
-  if (RPM < 100)                { cvpfAbortMsg = "engine not running";     return false; }
-  if (sysMode != SYS_MODE_AUTO) { cvpfAbortMsg = "must be charging in Auto mode";   return false; }
-  if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) {
-    cvpfAbortMsg = "another test active"; return false;
+  const char *refused = nullptr;
+  if (!cvpfBuf)                      refused = "buffer unallocated";
+  else if (rpmTestRefuseReason())    refused = rpmTestRefuseReason();   // engine running, the drift advisory and the result's speed
+  else if (RPM < 100)                refused = "engine not running";
+  else if (sysMode != SYS_MODE_AUTO) refused = "must be charging in Auto mode";
+  else if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvStressActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested)
+    refused = "another test active";
+  if (refused) {
+    // Published as a failed run: the wizard polls /cvplantfit.json after Start, and a stale ready/ok result would
+    // read as this run's (and Apply would write its gains).
+    cvpfAbortMsg = refused;
+    cvpfOk = false; cvpfReady = true; cvpfState = 3;
+    for (int i = 0; i < 8; i++) { cvpfEdgeK[i] = 0.0f; cvpfEdgeStat[i] = 4; }
+    return false;
   }
   cvpfBufCount = 0; cvpfSampleLastMs = 0;
   cvpfPhase = 0;
@@ -2391,8 +3569,8 @@ bool cvpfStartTest(float diMaxReq) {
 }
 
 void cvpfAbort(const char *reason) {
+  cvpfState = 3; cvpfReady = true; cvpfOk = false;   // state first, as in bhAbort
   cvPlantFitActive = false; cvpfCcActive = false;
-  cvpfState = 3; cvpfReady = true; cvpfOk = false;
   cvpfAbortMsg = reason;
   queueConsoleMessageF("CV plant-fit: aborted — %s", reason);
   cxLedgerLogCvpf();
@@ -2411,42 +3589,25 @@ void cvpfServiceCompletion() {
 }
 
 // ═══════════════ CV STRESS TEST (commissioning stage 8 / standalone Tuning ▸ Stress Test) ═══════════════
-// Provokes the over-voltage protection on a battery of ANY state of charge by first parking the bus at an
-// ACHIEVABLE constant-voltage target, then having the operator snap the throttle. Flow:
-//   1 STAB_IDLE : charge normally at idle ≥10 s, wait for the bus to hold steady (≤0.10 V over 3 s) AND
-//                 stop settling up (≤0.10 V drift over 10 s, waited at most 30 s — the CVS_SETTLEUP_* gate).
-//                 Then target := mean(last 2 s bus V) − CvStressDropV — guaranteed reachable, since idle
-//                 already held above it. At the deadline, a swing ≤ CvStressFailBandV proceeds anyway (swing
-//                 reported, pre-stab graded marginal); beyond it = basic-stability FAIL (test can't run).
-//   2 STAB_CV   : force CV at that target, wait for the bus to re-settle onto it (same tiered rule) to within
-//                 half the headroom — so the approach transient is over BEFORE the watch starts — then arm.
-//   3 ARMED     : operator snaps the throttle; alternator output multiplies and pushes the (now reachable)
-//                 bus over target → the OV protection fires. The watcher counts EVERY protection edge (no
-//                 clustering — rapid re-clamping IS the defect), times the recovery, measures overshoot/valley.
-//                 The snap has CVS_WATCH_MAX_MS to happen; the recovery then gets its own full
-//                 CVS_WATCH_MAX_MS from the PROVOCATION, so a late snap can't starve it.
-//   4 DONE      : grade. The firmware ends the run itself, 5 s after the bus has re-settled at the target —
-//                 the operator never decides when it is over.
-// EVERY ending — graded, stability-fail, or abort — also queues a "test" ledger row, so each
-// attempt (wizard or standalone) reaches the cloud when uploads next become allowed.
-// The test DRIVES the target (no longer a pure observer): it sets ChargingVoltageTargetReq through the
-// cvStressForceCV hook in AdjustField, exactly like TargetVoltageMode. Every protection stays fully armed.
+// Provokes OV protection at any SoC: park the bus at an ACHIEVABLE CV target (idle mean − CvStressDropV, reachable
+// since idle held above it), then the operator snaps the throttle. Phases: 1 STAB_IDLE (steady + settled-up),
+// 2 STAB_CV (re-settled within half the headroom, so the approach is over before arming), 3 ARMED (count EVERY
+// protection edge: rapid re-clamping IS the defect), 4 DONE (firmware ends it 5 s after re-settle). The target is driven
+// via the cvStressForceCV hook; every protection stays armed. Every ending queues a "test" ledger row.
 static const uint32_t CVS_IDLE_MIN_MS       = 10000;   // min idle charge before the stability gate opens
 static const uint32_t CVS_STAB_WIN_MS       = 3000;    // stationarity window (idle and CV)
 static const float    CVS_STAB_BAND_V       = 0.10f;   // max−min of the filtered bus over the window (×V/12) — setup gate, not the graded subject; keep loose enough that normal idle ripple passes
 // The fail band (CvStressFailBandV) and target headroom (CvStressDropV) are user settings — Xregulator.ino globals.
 static const uint32_t CVS_TARGET_AVG_MS     = 2000;    // averaging window for the achievable target
-// Settle-up gate: charging keeps nudging the bus upward long after the 3 s window looks flat; a target
-// fixed against a still-rising average reads low and the parked current dies away. Require the filtered
-// bus to hold within the drift band for the full window (reference re-anchors on any excursion) — with
-// the 0.10 V headroom this is what keeps CV, not the current limit, in command at the parked target.
+// Settle-up gate: charging keeps nudging the bus up after the 3 s window looks flat; a target fixed against a rising
+// average reads low and the parked current dies away, leaving the current limit (not CV) in command.
 static const float    CVS_SETTLEUP_BAND_V   = 0.10f;   // max drift (×V/12) of IBV_filtered around the settle reference
 static const uint32_t CVS_SETTLEUP_WIN_MS   = 10000;   // drift-free hold required before the target is fixed
 static const uint32_t CVS_SETTLEUP_MAX_MS   = 30000;   // settle-up wait cap — proceed anyway so a slow bank can't stall the test
-static const float    CVS_RESETTLE_BAND_V   = 0.15f;   // |bus − target| that counts as "at setpoint" (×V/12) — post-snap recovery band; the ARM gate uses min(this, ½ CvStressDropV), which is what a headroom smaller than this band demands
+static const float    CVS_RESETTLE_BAND_V   = 0.15f;   // |bus − target| counted as at setpoint (×V/12), post-snap; the ARM gate uses min(this, ½ CvStressDropV)
 static const uint32_t CVS_SETTLE_MS         = 5000;    // sustained in-band + stable = recovered / end
 static const uint32_t CVS_IDLESTAB_TO_MS    = 45000;   // idle stability deadline — tight band missed: proceed wobbly (≤ fail band) or basic-stability fail
-static const uint32_t CVS_CVSTAB_TO_MS      = 90000;   // CV settle deadline — the approach onto the target refills current at the Ki rate (closed-loop τ ~25 s on the bench; a 40 s deadline missed arming by 9 mV), so allow several time constants; tiered rule at the deadline like idle
+static const uint32_t CVS_CVSTAB_TO_MS      = 90000;   // CV settle deadline: the Ki-paced approach has τ ~25 s, so allow several time constants; tiered rule at the deadline like idle
 static const uint32_t CVS_WATCH_MAX_MS      = 45000;   // armed watch backstop (never re-settles → no-recovery)
 static const uint32_t CVS_POLL_DEADMAN_MS   = 20000;   // no /cvstress.json poll while active = browser gone
 static const float    CVS_SNAP_RPM_DELTA    = 300.0f;  // rpmMax over arm RPM that counts as "a snap happened"
@@ -2509,7 +3670,7 @@ static uint32_t cvsMaxLockoutMs = 0, cvsFirstEventMs = 0, cvsResettleSinceMs = 0
 static uint32_t cvsProvokedMs = 0;   // first provocation (event or snap) — the recovery watch runs from here
 static bool     cvsSnapDetected = false, cvsRecovered = false, cvsSettled = false, cvsSoftStimulus = false;
 static bool     cvsLoosePost = false;   // post-snap settle was outside the tight band — drives the marginal stability grade (the wobble V is recorded even on a clean settle)
-static uint8_t  cvsFailPhase = 0;       // basic-stability fail kind: 1 idle swing / 2 CV approach / 3 target unreachable (bank too stiff for the headroom) — 0 = the run armed; lets the web card name the criterion that actually failed
+static uint8_t  cvsFailPhase = 0;       // basic-stability fail kind: 1 idle swing / 2 CV approach / 3 target unreachable (bank too stiff); 0 = armed. Named by the web card
 // grade: 0 pass, 1 marginal, 2 fail, 3 n/a. outcome: 1 rode-it-out, 2 event-graded, 3 stability-fail
 static uint8_t  cvsOutcome = 0;
 static uint8_t  cvsGPreStab = 0, cvsGEvents = 3, cvsGHardCut = 3, cvsGRecovery = 3, cvsGStab = 3, cvsGOverall = 3;
@@ -2517,6 +3678,7 @@ static bool     cvsReady = false, cvsOk = false, cvsAborted = false;
 
 bool cvStressStartTest() {
   if (cvStressActive)           { cvStressAbortMsg = "already running";      return false; }
+  if (const char *rr = rpmTestRefuseReason()) { cvStressAbortMsg = rr;      return false; }   // stall and throttle-snap detection read the tach
   if (RPM < 100)                { cvStressAbortMsg = "engine not running";   return false; }
   if (sysMode != SYS_MODE_AUTO) { cvStressAbortMsg = "must be charging in Auto mode"; return false; }
   if (TuningMode || CVTuningMode || systemIDActive || batteryHealthTestActive || resTestActive || fieldCurveActive || fieldCutActive || cvPlantFitActive || protTestActive || (altSweepActive != 0) || altSweepRequested || (chcActive != 0) || chcRequested) {
@@ -2564,14 +3726,9 @@ void cvStressAbort(const char *reason) {
   cxLedgerLogTest(ev);
 }
 
-// Serialize + persist the graded result so the wizard card and Diag survive a reload/reboot.
-// ver-2 positional blob (ver-1 layout is incompatible; the web parser reads the leading version).
-// The three wobble fields, the two graded stability bands (all V×100; bands = constant × V/12
-// at grade time, so failBand reflects the live CvStressFailBandV), the fail phase, then the
-// alternator amps at arm (A×10) and the idle-wait alternator-amps mean/swing (A×10) are
-// appended — the parser reads missing trailing fields as 0, so older blobs degrade gracefully.
-// Also queues the "test" ledger row — every graded ending reaches the cloud, not just the
-// last attempt the wizard's stage-8 row happens to carry.
+// Graded result persisted (survives reload/reboot) and queued as a "test" ledger row. Positional ver-2 blob (V×100,
+// A×10); the web parser reads the leading version and missing trailing fields as 0, so new fields go at the end.
+// Bands = 12V-equiv constant × V/12 at grade time.
 static void cvStressPersistResult() {
   const float k = (float)SYSTEM_VOLTAGE_CLASS / 12.0f;
   snprintf(cvsLastBlob, sizeof(cvsLastBlob),
@@ -2620,9 +3777,8 @@ static void cvStressGrade() {
                        cvsOvershootV, cvsValleyV, cvsRpmSlewMax, cvsSoftStimulus ? " (soft stimulus — snap harder)" : "");
 }
 
-// Basic-stability failure: the bus was swinging beyond CvStressFailBandV at a stabilization
-// deadline (a swing at or under it proceeds with a marginal grade instead — see the phase logic).
-// Recorded as a graded FAIL result — not a silent abort — so the card shows why the test couldn't run.
+// Basic-stability failure: bus swinging beyond CvStressFailBandV at a stabilization deadline. Recorded as a graded
+// FAIL (not a silent abort) so the card shows why the test couldn't run.
 static void cvStressStabilityFail(const char *where) {
   cvStressForceCV = false;
   cvsOutcome = 3; cvsGPreStab = 2;
@@ -2635,7 +3791,20 @@ static void cvStressStabilityFail(const char *where) {
   queueConsoleMessageF("CV stress test: FAIL — %s", where);
 }
 
-// Called every AdjustField pass (before the mode branches, alongside the other test tick machines).
+// ARMED-phase extremes, every AdjustField pass: cvStress_tick skips the hard-OV-cut and lockout passes. Distances
+// reference the COMMANDED cvStressTargetV, not the slewed ChargingVoltageTarget, so a moving target can't rescale them.
+void cvStressTrackEveryPass() {
+  if (!cvStressActive || cvStressPhase != 3) return;
+  if (IBV > cvsPeakV) cvsPeakV = IBV;
+  if (IBV - cvStressTargetV > cvsOvershootV) cvsOvershootV = IBV - cvStressTargetV;   // peak overshoot (even a no-trip near-miss)
+  if (cvsFirstEventMs != 0) {
+    if (IBV < cvsMinV) cvsMinV = IBV;
+    cvsValleyV = fmaxf(0.0f, cvStressTargetV - cvsMinV);                 // valley depth below target (report)
+  }
+  if (fieldCollapseTime != 0 && activeCollapseDelay > cvsMaxLockoutMs) cvsMaxLockoutMs = activeCollapseDelay;
+}
+
+// Called from AdjustField on normal passes (the immediate-cut and lockout passes return before it).
 // Phases 1-2 wait for stationarity; phase 2-3 drive CV at cvStressTargetV via the cvStressForceCV hook.
 void cvStress_tick(uint32_t nowMs) {
   if (!cvStressActive) return;
@@ -2697,19 +3866,15 @@ void cvStress_tick(uint32_t nowMs) {
       }
       break; }
     case 2: {  // STAB_CV — CV forced at the new target; wait for the bus to re-settle onto it, then arm
-      // Arm band is a FRACTION of the commanded headroom and references cvStressTargetV, never the slewed
-      // ChargingVoltageTarget: a fixed 0.15 V band wider than a 0.10 V CvStressDropV armed the instant the
-      // slew landed, bus still at idle level, so the whole approach ran inside the armed watch. Window mean
-      // (not the instantaneous sample) so ripple inside the stability band can't defeat the tighter band.
+      // Arm band = a FRACTION of the commanded headroom around cvStressTargetV (not the slewed target), else a band wider
+      // than CvStressDropV arms at idle level. Window mean, so ripple inside the stability band can't defeat it.
       float armBand  = fminf(CVS_RESETTLE_BAND_V, 0.5f * CvStressDropV) * k;
       float busAvg   = ready ? cvsStabMean(nowMs, CVS_STAB_WIN_MS) : IBV_filtered;
       bool  atTarget = fabsf(busAvg - cvStressTargetV) <= armBand;
       bool  timedOut = elapsed > CVS_CVSTAB_TO_MS;
       float range    = ready ? cvsStabRange(nowMs, CVS_STAB_WIN_MS) : 1e9f;
-      // Deadline tier: the Ki-paced approach can park steady a hair outside the tight arm band
-      // (bench: 9 mV short at the old 40 s deadline), so anything within the full re-settle band
-      // arms with a marginal grade instead of failing — CV stays forced through ARMED, so the bus
-      // keeps closing the last millivolts while waiting for the snap.
+      // Deadline tier: the Ki-paced approach can park a hair outside the arm band; within the full re-settle band it arms
+      // marginal instead of failing (CV stays forced through ARMED, so the bus keeps closing).
       bool  nearTarget = fabsf(busAvg - cvStressTargetV) <= CVS_RESETTLE_BAND_V * k;
       bool  wobblyOk = timedOut && nearTarget && range <= CvStressFailBandV * k;
       if ((stable && atTarget) || wobblyOk) {
@@ -2745,7 +3910,7 @@ void cvStress_tick(uint32_t nowMs) {
       }
       break; }
     case 3: {  // ARMED — CV still forced; the watcher observes. Firmware ends the run itself.
-      if (IBV > cvsPeakV) cvsPeakV = IBV;
+      // Peak / overshoot / valley / max lockout are tracked by cvStressTrackEveryPass().
       if (RPM > cvsRpmMax) cvsRpmMax = RPM;
       if (cvsRpmMax >= cvsArmRpm + CVS_SNAP_RPM_DELTA) cvsSnapDetected = true;
       // Stimulus slew — skipped through the tach false-zero grace so the 0→real re-bias jump after a
@@ -2757,10 +3922,8 @@ void cvStress_tick(uint32_t nowMs) {
         }
         cvsRpmPrev = RPM; cvsRpmPrevMs = nowMs;
       }
-      // OV events = merged-flag trips (G1/G2 OV, iExcess, LoadDump share one flag, so overlapping trips are
-      // already one). Chatter — release, refill, re-trip — is the defect, but a re-trip inside
-      // CVS_EVENT_MERGE_MS of the release is one surge handed between detectors (10-11: two trips ≤0.25 s
-      // apart graded MARGINAL). A merged re-trip still restarts the re-settle clock below.
+      // OV events = merged-flag trips (G1/G2 OV, iExcess, LoadDump share one flag). Chatter is the defect, but a re-trip
+      // within CVS_EVENT_MERGE_MS of the release is one surge handed between detectors; it still restarts the re-settle clock.
       bool clampOn = g_fastOvClampActive;
       if (cvsClampWas && !clampOn) cvsReleaseMs = nowMs;
       cvsClampWas = clampOn;
@@ -2779,14 +3942,6 @@ void cvStress_tick(uint32_t nowMs) {
       // Hard current cut = hard over-current (alternator current sensor) OR load dump (INA228 battery current), NOT the OV clamp.
       cvsHardCuts = (uint16_t)((g_hardOCCount - cvsHoc0) + (g_loadDumpCount - cvsLd0));
       cvsIxTrips  = (uint16_t)(g_iExcessCount - cvsIx0);
-      if (fieldCollapseTime != 0 && activeCollapseDelay > cvsMaxLockoutMs) cvsMaxLockoutMs = activeCollapseDelay;
-      // All three graded distances reference the COMMANDED cvStressTargetV, not the slewed
-      // ChargingVoltageTarget — a target that moves mid-watch would silently rescale them.
-      if (IBV - cvStressTargetV > cvsOvershootV) cvsOvershootV = IBV - cvStressTargetV;   // peak overshoot (even a no-trip near-miss)
-      if (cvsFirstEventMs != 0) {
-        if (IBV < cvsMinV) cvsMinV = IBV;
-        cvsValleyV = fmaxf(0.0f, cvStressTargetV - cvsMinV);                 // valley depth below target (report)
-      }
       // Re-settle detector = provoked (an event fired, or a snap happened) then held in-band + stable
       // for 5 s. Works from BELOW the target (the field-dump valley), which is the real recovery path.
       bool provoked = (cvsFirstEventMs != 0) || cvsSnapDetected;
@@ -2796,10 +3951,8 @@ void cvStress_tick(uint32_t nowMs) {
       else cvsResettleSinceMs = 0;
       if (provoked && !cvsSettled && cvsResettleSinceMs != 0
           && (uint32_t)(nowMs - cvsResettleSinceMs) >= CVS_SETTLE_MS) {
-        // Tight band settles clean at 5 s in-band (grade 0, unchanged). A wobble that never
-        // tightens gets a second CVS_SETTLE_MS of grace, then settles "loose" if within the fail
-        // band — swing reported, graded marginal, never a FAIL. Beyond the fail band it keeps
-        // waiting → WATCH_MAX graded fail as before.
+        // Tight band settles clean at 5 s. A wobble within the fail band gets a second CVS_SETTLE_MS, then settles
+        // "loose" (graded marginal); beyond the fail band it waits out WATCH_MAX (graded fail).
         float range = ready ? cvsStabRange(nowMs, CVS_STAB_WIN_MS) : 1e9f;
         bool  loose = ((uint32_t)(nowMs - cvsResettleSinceMs) >= 2UL * CVS_SETTLE_MS)
                       && range <= CvStressFailBandV * k;
@@ -2813,8 +3966,7 @@ void cvStress_tick(uint32_t nowMs) {
       if (!cvsSettled && elapsed >= CVS_WATCH_MAX_MS && !provoked) {
         cvStressAbort("no throttle snap detected — re-run and snap to ~half max RPM"); return;
       }
-      // The recovery deadline runs from the PROVOCATION, not from arming — a snap late in the
-      // wait no longer starves a healthy recovery into "never re-settled".
+      // Recovery deadline runs from the PROVOCATION, not arming, so a late snap can't starve a healthy recovery.
       if (cvsSettled || (provoked && (uint32_t)(nowMs - cvsProvokedMs) >= CVS_WATCH_MAX_MS)) {   // provoked but never re-settled = graded fail
         cvStressForceCV = false;
         cvStressGrade();
@@ -2858,9 +4010,8 @@ int cvStressJsonBuild(char *buf, int cap) {
 }
 
 // ── Capacity tracker (OCV-anchored) — see Xregulator.ino cap globals + dev doc ──
-// Rested battery voltage → SoC% via the editable capOcvVolt[] table (12V-referenced, scaled
-// to the bank). Table descends in both SoC and voltage. Returns 100 above the top row, 0 below
-// the bottom. This is the INDEPENDENT low anchor that makes fade measurable (no coulomb count).
+// Rested voltage → SoC% via capOcvVolt[] (12V-referenced, descending): the INDEPENDENT low anchor (no coulomb
+// count) that makes fade measurable.
 float ocvToSoC(float restedV) {
   float vScale = (float)SYSTEM_VOLTAGE_CLASS / 12.0f;
   if (restedV >= capOcvVolt[0] * vScale) return 100.0f;
@@ -2902,7 +4053,10 @@ void capTrackTick(float I_batt, float V_filt, float tempC, float dtSec) {
   if (restThresh < 0.2f) restThresh = 0.2f;
 
   // dV/dt of the FILTERED voltage over a ≥2-min window → mV per 10 min (short windows would be all noise)
-  if (isnan(capPrevVForRate)) { capPrevVForRate = V_filt; capPrevVRateMs = nowMs; }
+  // NAN V_filt = no trustworthy voltage: no rest timing and no anchor, the Ah bridge below still runs.
+  const bool vOk = isfinite(V_filt);
+  if (!vOk) capPrevVForRate = NAN;
+  else if (isnan(capPrevVForRate)) { capPrevVForRate = V_filt; capPrevVRateMs = nowMs; }
   else {
     float dtMin = (nowMs - capPrevVRateMs) / 60000.0f;
     if (dtMin >= 2.0f) {
@@ -2911,8 +4065,8 @@ void capTrackTick(float I_batt, float V_filt, float tempC, float dtSec) {
     }
   }
 
-  if (fabsf(I_batt) < restThresh) capRestTimerMs += (uint32_t)(dtSec * 1000.0f);
-  else                            capRestTimerMs = 0;
+  if (vOk && fabsf(I_batt) < restThresh) capRestTimerMs += (uint32_t)(dtSec * 1000.0f);
+  else                                   capRestTimerMs = 0;
 
   bool rested = (capRestTimerMs >= (uint32_t)capRestFloorMin * 60000UL) &&
                 (capLastDvdtMv10 < capSettleRateMv10);
@@ -3024,7 +4178,7 @@ void bhDeserializeResults(const String &blob) {
     r.stepLowA   = bhTok(blob, pos);
     r.stepDeltaA = bhTok(blob, pos);
     r.edgesUsed  = (uint8_t)bhTok(blob, pos);
-    r.dwellMsUsed    = (uint16_t)bhTokU32(blob, pos);   // 0 for pre-upgrade rows (clear history once after flashing)
+    r.dwellMsUsed    = (uint16_t)bhTokU32(blob, pos);   // 0 for pre-upgrade rows
     r.fitSpread_mOhm = bhTok(blob, pos);
     BH_APPEND_RESULT(r);
   }
@@ -3095,14 +4249,11 @@ void bhInitSettings() {
   if (bhNumEdges > BH_MAX_TOGGLES - 3) bhNumEdges = BH_MAX_TOGGLES - 3;
   if (bhStepDeltaA < 5.0f) bhStepDeltaA = 5.0f;   // ΔV must clear ripple/noise; also guards the ΔI validity gate
   if (bhDwellMs < bhMinDwellMs()) bhDwellMs = bhMinDwellMs();
-  // Rings restore from LittleFS blobs; a legacy NVS string (pre-blob firmware) migrates once —
-  // deserialized + dirty flag set so the next field-off flush writes the blob. The legacy key is
-  // removed only AFTER that blob write succeeds (in bhFlushCapNVS), so a reboot before the first
-  // flush can't lose the migrated history.
+  // Rings restore from LittleFS blobs; a legacy NVS string migrates once (dirty set). The legacy key is removed only
+  // after the blob write succeeds (bhFlushCapNVS), so a reboot before the first flush can't lose history.
   {
-    // v1 rows stamped the BOARD temperature into what is now battTempF. Peek the version first —
-    // readPsramBlob deletes a file whose version does not match — then blank that one field and let
-    // the next field-off flush rewrite the ring as v2. DCIR, SoH and the run parameters are kept.
+    // v1 rows hold the BOARD temperature in battTempF. Peek the version first (readPsramBlob deletes a version
+    // mismatch), then blank that field; the next field-off flush rewrites the ring as v2.
     bool bhResLegacy = (psramBlobVersion(BHRES_PATH, BHRES_MAGIC) == BHRES_VER_BOARDTEMP);
     uint32_t nRes = readPsramBlob(BHRES_PATH, BHRES_MAGIC,
                                   bhResLegacy ? BHRES_VER_BOARDTEMP : BHRES_VER,
@@ -3143,89 +4294,78 @@ void bhInitSettings() {
   if (settingExists(NK_capOcvBlob))     capDeserializeOcv(settingRead(NK_capOcvBlob));
 }
 
-String bhBuildStatusJson() {
-  String j = "{";
-  j += "\"state\":" + String(bhTestState);
-  j += ",\"reason\":\"" + String(bhAbortReason) + "\"";
-  j += ",\"lastDcir\":" + String(bhLastResultDcir, 2);
-  j += ",\"baselineAh\":" + String(bhBaselineCapacityAh, 1);
-  j += ",\"low\":" + String(bhStepLowA, 1);
-  j += ",\"delta\":" + String(bhStepDeltaA, 1);
-  j += ",\"dwellMs\":" + String(bhDwellMs);
-  j += ",\"edges\":" + String(bhNumEdges);
-  // Wizard countdown: total run = (2 ring-in + scored + 1 trailing) toggles × dwell; elapsed is
-  // live only while running (0 otherwise) so a reopened modal recomputes remaining without a
-  // client-side start-time it would lose on close. Mirrors the (bhNumEdges + 3) bound in bhStep.
-  j += ",\"totalMs\":" + String((uint32_t)(bhNumEdges + 3) * bhDwellMs);
-  j += ",\"elapsedMs\":" + String(bhTestState == 1 ? (millis() - bhTestStartMs) : 0);
-  j += ",\"results\":[";
-  int start = (bhResultCount < bhResultCap) ? 0 : bhResultHead;
-  for (int n = 0; n < bhResultCount; n++) {
-    BattHealthResult &r = bhResults[(start + n) % bhResultCap];
-    if (n) j += ',';
-    j += "{\"epoch\":" + String(r.epoch);
-    j += ",\"dcir\":" + String(r.dcir_mOhm, 2);
-    j += ",\"soh\":" + (isnan(r.soh_pct) ? String("null") : String(r.soh_pct, 1));
-    j += ",\"tF\":" + (isnan(r.battTempF) ? String("null") : String(r.battTempF, 1));
-    j += ",\"soc\":" + String(r.soc_pct, 1);
-    j += ",\"v\":" + String(r.battV, 2);
-    j += ",\"low\":" + String(r.stepLowA, 1);
-    j += ",\"delta\":" + String(r.stepDeltaA, 1);
-    j += ",\"edges\":" + String((int)r.edgesUsed);
-    j += ",\"dwell\":" + String((unsigned)r.dwellMsUsed);
-    j += ",\"spread\":" + String(r.fitSpread_mOhm, 3) + "}";
+// Bounded append for bhBuildStatusJson: n parks at cap-1 once the buffer is full, which the caller treats as overflow.
+static void bhCat(char *out, size_t cap, size_t &n, const char *fmt, ...) {
+  if (n >= cap - 1) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(out + n, cap - n, fmt, ap);
+  va_end(ap);
+  if (w < 0) return;
+  n = ((size_t)w >= cap - n) ? cap - 1 : n + (size_t)w;
+}
+
+// GET /batteryHealth body, formatted once into a PSRAM buffer the caller streams (sendPsramText) and frees. Polled at
+// 2 Hz during a test with the field live: the Arduino String this replaced regrew under the PSRAM heap lock on every
+// append, up to ~50 KB with both rings full. Returns nullptr, nothing allocated, when the buffer could not be had or the
+// body did not fit its per-entry budget (never a truncated body).
+char *bhBuildStatusJson(size_t *len) {
+  *len = 0;
+  const int rc = bhResultCount, cc = bhCapCount;   // taken once: Core 1 appends a result while a test runs
+  const size_t cap = 1024 + (size_t)CAP_OCV_ROWS * 24 + (size_t)(rc + 1) * 200 + (size_t)(cc + 1) * 110;
+  char *j = (char *)ps_malloc(cap);
+  if (!j) return nullptr;
+  size_t n = 0;
+  char numA[16], numB[16];
+  bhCat(j, cap, n, "{\"state\":%u,\"reason\":\"%s\",\"lastDcir\":%.2f,\"baselineAh\":%.1f,\"low\":%.1f,\"delta\":%.1f,\"dwellMs\":%lu,\"edges\":%u",
+        (unsigned)bhTestState, bhAbortReason, bhLastResultDcir, bhBaselineCapacityAh, bhStepLowA, bhStepDeltaA,
+        (unsigned long)bhDwellMs, (unsigned)bhNumEdges);
+  // Wizard countdown: (2 ring-in + scored + 1 trailing) toggles × dwell, mirroring bhStep's bound. elapsedMs is live
+  // only while running, so a reopened modal can recompute what remains.
+  bhCat(j, cap, n, ",\"totalMs\":%lu,\"elapsedMs\":%lu,\"results\":[",
+        (unsigned long)((uint32_t)(bhNumEdges + 3) * bhDwellMs),
+        (unsigned long)(bhTestState == 1 ? (millis() - bhTestStartMs) : 0UL));
+  int start = (rc < bhResultCap) ? 0 : bhResultHead;
+  for (int k = 0; k < rc; k++) {
+    BattHealthResult &r = bhResults[(start + k) % bhResultCap];
+    bhCat(j, cap, n, "%s{\"epoch\":%lu,\"dcir\":%.2f,\"soh\":%s,\"tF\":%s,\"soc\":%.1f,\"v\":%.2f,\"low\":%.1f,\"delta\":%.1f,\"edges\":%d,\"dwell\":%u,\"spread\":%.3f}",
+          k ? "," : "", (unsigned long)r.epoch, r.dcir_mOhm,
+          ltJsonNumP(numA, sizeof(numA), r.soh_pct, !isnan(r.soh_pct), 1),
+          ltJsonNumP(numB, sizeof(numB), r.battTempF, !isnan(r.battTempF), 1),
+          r.soc_pct, r.battV, r.stepLowA, r.stepDeltaA, (int)r.edgesUsed, (unsigned)r.dwellMsUsed, r.fitSpread_mOhm);
   }
-  j += "]";
-  // Capacity: live status + config echoes + editable OCV table + the dated points
-  j += ",\"capLastPct\":" + (isnan(capLastPct) ? String("null") : String(capLastPct, 1));
-  j += ",\"capLastUpd\":" + String(capLastUpdateEpoch);
-  j += ",\"capAnchored\":" + String(capLowAnchorValid ? 1 : 0);
-  j += ",\"capAnchorSoC\":" + String(capLowAnchorSoC, 1);
-  j += ",\"capRestMin\":" + String(capRestTimerMs / 60000);   // current rest accumulation (min)
-  j += ",\"capDvdt\":" + String(capLastDvdtMv10, 1);
-  j += ",\"capCfg\":{";
-  j += "\"restFrac\":" + String(capRestCurrentFrac, 4);
-  j += ",\"restFloor\":" + String(capRestFloorMin);
-  j += ",\"settleRate\":" + String(capSettleRateMv10, 2);
-  j += ",\"socLowMax\":" + String(capSocLowMax, 1);
-  j += ",\"minSpan\":" + String(capMinSpan, 1);
-  j += ",\"chgEff\":" + String(ChargeEfficiency_scaled / 1000.0f, 4);   // read-only mirror of Battery Monitor tab
-  j += ",\"capacityAh\":" + String(BatteryCapacity_Ah);                 // read-only mirror of Battery Monitor tab (drives % vs rated)
-  j += ",\"fullSoc\":" + String(capFullSoc, 1);
-  j += ",\"refMode\":" + String(capRefMode);
-  j += ",\"tempNorm\":" + String(capTempNormEnable);
-  j += ",\"tempCoeff\":" + String(capTempCoeffPctC, 3);
-  j += ",\"tempRef\":" + String(capTempRefC, 1) + "}";
-  j += ",\"ocv\":[";
-  for (int i = 0; i < CAP_OCV_ROWS; i++) { if (i) j += ','; j += String(capOcvVolt[i], 2); }
-  j += "],\"ocvSoc\":[";
-  for (int i = 0; i < CAP_OCV_ROWS; i++) { if (i) j += ','; j += String((int)capOcvSocPct[i]); }
-  j += "],\"cap\":[";
-  int cstart = (bhCapCount < bhCapCap) ? 0 : bhCapHead;
-  for (int n = 0; n < bhCapCount; n++) {
-    BattCapPoint &p = bhCapRing[(cstart + n) % bhCapCap];
-    if (n) j += ',';
-    j += "{\"epoch\":" + String(p.epoch);
-    j += ",\"ah\":" + String(p.capacityAh, 1);
-    j += ",\"pct\":" + String(p.capPct, 1);
-    j += ",\"socLow\":" + String(p.socLow, 1);
-    j += ",\"conf\":" + String((int)p.conf) + "}";
+  // Capacity: live status + config echoes + editable OCV table + the dated points. capRestMin = current rest accumulation
+  // (min); chgEff and capacityAh are read-only mirrors of the Battery Monitor tab (capacityAh drives % vs rated).
+  bhCat(j, cap, n, "],\"capLastPct\":%s,\"capLastUpd\":%lu,\"capAnchored\":%d,\"capAnchorSoC\":%.1f,\"capRestMin\":%lu,\"capDvdt\":%.1f",
+        ltJsonNumP(numA, sizeof(numA), capLastPct, !isnan(capLastPct), 1), (unsigned long)capLastUpdateEpoch,
+        capLowAnchorValid ? 1 : 0, capLowAnchorSoC, (unsigned long)(capRestTimerMs / 60000), capLastDvdtMv10);
+  bhCat(j, cap, n, ",\"capCfg\":{\"restFrac\":%.4f,\"restFloor\":%u,\"settleRate\":%.2f,\"socLowMax\":%.1f,\"minSpan\":%.1f,\"chgEff\":%.4f,\"capacityAh\":%d,\"fullSoc\":%.1f,\"refMode\":%u,\"tempNorm\":%u,\"tempCoeff\":%.3f,\"tempRef\":%.1f}",
+        capRestCurrentFrac, (unsigned)capRestFloorMin, capSettleRateMv10, capSocLowMax, capMinSpan,
+        (double)(ChargeEfficiency_scaled / 1000.0f), BatteryCapacity_Ah, capFullSoc, (unsigned)capRefMode,
+        (unsigned)capTempNormEnable, capTempCoeffPctC, capTempRefC);
+  bhCat(j, cap, n, ",\"ocv\":[");
+  for (int i = 0; i < CAP_OCV_ROWS; i++) bhCat(j, cap, n, "%s%.2f", i ? "," : "", capOcvVolt[i]);
+  bhCat(j, cap, n, "],\"ocvSoc\":[");
+  for (int i = 0; i < CAP_OCV_ROWS; i++) bhCat(j, cap, n, "%s%d", i ? "," : "", (int)capOcvSocPct[i]);
+  bhCat(j, cap, n, "],\"cap\":[");
+  int cstart = (cc < bhCapCap) ? 0 : bhCapHead;
+  for (int k = 0; k < cc; k++) {
+    BattCapPoint &p = bhCapRing[(cstart + k) % bhCapCap];
+    bhCat(j, cap, n, "%s{\"epoch\":%lu,\"ah\":%.1f,\"pct\":%.1f,\"socLow\":%.1f,\"conf\":%d}",
+          k ? "," : "", (unsigned long)p.epoch, p.capacityAh, p.capPct, p.socLow, (int)p.conf);
   }
-  j += "]}";
+  bhCat(j, cap, n, "]}");
+  if (n >= cap - 1) {
+    free(j);
+    return nullptr;
+  }
+  *len = n;
   return j;
 }
 
-// /debug/fillmax + /debug/clearmax — bench-only "age the unit to its ceiling": every accumulating
-// store is a fixed-cap ring, so a decade-old unit == rings at cap; this forces that state now and
-// times the O(count) worst cases on real hardware. Points are DISPERSED (not clones) so the IDW/LWLR
-// front scans do real work; the zero-drift log's temp span is kept < ZFIT_MIN_SPAN_F ON PURPOSE so
-// zeroFitRegress can't early-exit (worst case — and a synthetic fit can never be accepted). Default is
-// RAM-only: dbgRingsSynthetic freezes every field-off persister until reboot, so flash keeps the real
-// learned blobs and a plain reboot restores them. &persist=yes skips the freeze and runs+times the five
-// real savers inline (end-to-end flash/NVS test) — synthetic data then survives reboot AND reflash
-// (data partitions are not touched by a reflash); recover with Erase All Flash / factory reset. Lives
-// at the sketch tail so every static ring/front symbol (2/3/7_functions) is in scope; registered in
-// setupServer().
+// /debug/fillmax + /debug/clearmax (bench only): fill every fixed-cap ring to cap with DISPERSED points and time the
+// O(count) worst cases. Zero-drift span < ZFIT_MIN_SPAN_F on purpose (no early exit, fit never accepted). Default is
+// RAM-only (dbgRingsSynthetic freezes the savers until reboot); &persist=yes writes synthetic data that survives reflash.
 static uint32_t dbgLcg = 0x1234567u;               // deterministic LCG → identical fill every run
 static inline float dbgRand(float lo, float hi) {
   dbgLcg = dbgLcg * 1664525u + 1013904223u;
@@ -3315,9 +4455,8 @@ void debugFillMax(AsyncWebServerRequest *request) {
     zeroLogPushSeq = zeroLogCount; zeroLogFlushedSeq = 0; zeroLogFileRecords = 0;  // same early-out as above
   }
 
-  // Battery-capacity ring → cap. (The sensor upload ring is deliberately NOT faked: bumping its
-  // count would queue SENSOR_RING_SIZE junk rows to the cloud, and it feeds the Core-0 uploader, not
-  // any O(count) control-path scan — so it tests nothing the growth audit cares about.)
+  // Battery-capacity ring → cap. The sensor upload ring is NOT faked: it would queue junk rows to the cloud and feeds
+  // only the Core-0 uploader, no O(count) control-path scan.
   if (bhCapRing) {
     for (int i = 0; i < bhCapCap; i++) {
       BattCapPoint &p = bhCapRing[i];
@@ -3384,6 +4523,13 @@ void debugFillMax(AsyncWebServerRequest *request) {
 // Zero the in-RAM rings after a fillmax. Persistence stays FROZEN — empty is as un-real as synthetic;
 // reboot restores the real data. sensorRing untouched (never faked; zeroing it would drop real pending uploads).
 void debugClearMax(AsyncWebServerRequest *request) {
+  if (!request->hasParam("confirm") || request->getParam("confirm")->value() != "yes") {
+    request->send(200, "text/plain",
+      "REFUSED. /debug/clearmax zeroes the in-RAM learned rings (alt-health + boat-perf fronts, trend,\n"
+      "long-term, zero-drift and capacity logs) and freezes every field-off saver until reboot.\n"
+      "Bench units only. Re-send as /debug/clearmax?confirm=yes to proceed.\n");
+    return;
+  }
   dbgRingsSynthetic = true;                         // RAM empty ≠ real → keep every field-off persister frozen until reboot
   if (altFront2.source == 0) altFront2.count = 0;   // only clear a LEARNED surface, never an uploaded one
   sailFront.count = 0; motorFront.count = 0;
@@ -3397,14 +4543,9 @@ void debugClearMax(AsyncWebServerRequest *request) {
 }
 
 // ════════════════ Commissioning Ledger (COMMISSIONING_LEDGER_SPEC.md) ════════════════
-// Append-only evidence of commissioning activity: one event per measured stage completion
-// (with that stage's raw curves/results), per skip / hand-set mark, per wizard finish, and
-// per committed Bode sweep. Events stage in PSRAM (cxLedgerAppend, any core), move to
-// /cxledger.bin on Core 1 (cxLedgerFlush, deferred-writes cluster), and drain to the
-// log-commissioning-event edge fn under the field-off cloud gates (cxLedgerDrainService).
-// Cloud dedupes on (device_uid, seq), so retries after a lost response are harmless.
-// Ledger vs daily snapshot: the ledger is frozen per-run evidence; the snapshot's manifest
-// keys + learned_state stay the LIVE values. Same numbers only until something re-learns.
+// Append-only per-run evidence (stage completions, skips/hand-sets, finishes, Bode sweeps). Stages in PSRAM (any core),
+// flushes to /cxledger.bin on Core 1, drains to log-commissioning-event under the field-off cloud gates. Cloud dedupes
+// on (device_uid, seq), so retries are harmless. The daily snapshot keeps the LIVE values; this keeps frozen evidence.
 
 void cxLedgerInit() {
   cxPendBuf  = (char *)ps_malloc(CX_LEDGER_PEND_CAP);
@@ -3412,9 +4553,8 @@ void cxLedgerInit() {
   if (settingExists(NK_cxLedgerSeq)) cxLedgerSeq = (uint32_t)settingRead(NK_cxLedgerSeq).toInt();
 }
 
-// Stage one event row in PSRAM. Safe from either core (spinlock); no flash I/O here.
-// dataJson must be a complete {...} object. Rows that can't fit are counted, and the count
-// is confessed as data.dropped_prior on the next row that makes it through.
+// Stage one event row in PSRAM; safe from either core (spinlock), no flash I/O. dataJson must be a complete {...}.
+// Rows that don't fit are counted and reported as data.dropped_prior on the next row that does.
 static void cxLedgerAppend(const char *eventType, int stage, const String &dataJson) {
   if (!cxPendBuf) return;
   uint32_t seq, dropped;
@@ -3457,15 +4597,14 @@ static void cxLedgerAppend(const char *eventType, int stage, const String &dataJ
     cxPendLen += need;
     ok = true;
   } else {
-    cxLedgerDroppedRows++;
+    cxLedgerDroppedRows += dropped + 1;  // this row plus the earlier drops it would have confessed
   }
   portEXIT_CRITICAL(&cxPendMux);
   if (ok) cxLedgerFlushPending = true;
 }
 
-// The stage-specific evidence payload, read at the moment the stage is marked complete.
-// "applied" objects carry the AFTER values of the settings that stage writes (owner's call:
-// no before/after pairs — the daily snapshot history covers earlier states).
+// Stage-specific evidence, read when the stage is marked complete. "applied" carries AFTER values only; the daily
+// snapshot history covers earlier states.
 static String cxLedgerStageData(int stage) {
   String d;
   d.reserve(1536);
@@ -3677,17 +4816,14 @@ void cxLedgerLogSweep(int which) {
   }
 }
 
-// Event-driven test-result row (event_type "test"): one per test ENDING — graded, failed, or
-// aborted — from any entry point (wizard or standalone). Plain char* signature on purpose:
-// call sites live in earlier .ino files where a String-arg prototype wouldn't survive
-// auto-prototype ordering.
+// One "test" row per test ENDING (graded, failed or aborted), any entry point. Plain char*: callers in earlier .ino
+// files can't see a String-arg prototype under Arduino auto-prototype ordering.
 void cxLedgerLogTest(const char *dataJson) {
   cxLedgerAppend("test", -1, String(dataJson));
 }
 
-// Serialize the LAST COMMITTED record of a scored tuning run into a "test" row.
+// Serialize the LAST COMMITTED record of a scored tuning run (called right after the ring write) into a "test" row.
 // which: 0 = CC square wave (tuningLog), 1 = CV square wave (cvTuningLog), 2 = SystemID step (systemIDLog).
-// Mirrors cxLedgerLogSweep: called from the commit functions in 6_functions right after the ring write.
 void cxLedgerLogTuneRun(int which) {
   String d;
   d.reserve(768);
@@ -3769,9 +4905,8 @@ void cxLedgerLogTuneRun(int which) {
   cxLedgerAppend("test", -1, d);
 }
 
-// CV plant-fit "test" row — success serializes the fit (same shape as the stage-6 wizard row
-// plus conditions); any failure carries the abort text. Called from cvpfAbort and from
-// cvpfServiceCompletion right after cvpfProcess() settles cvpfState.
+// CV plant-fit "test" row: the fit on success (stage-6 shape plus conditions), else the abort text. Called once
+// cvpfState settles (cvpfAbort, cvpfServiceCompletion).
 void cxLedgerLogCvpf() {
   String d;
   d.reserve(512);
@@ -3803,21 +4938,33 @@ void cxLedgerLogCvpf() {
   cxLedgerAppend("test", -1, d);
 }
 
-// Core 1 only (loop() deferred-writes cluster): staged rows → /cxledger.bin. Same policy as
-// the neighboring pendingSave* writers — every row is the product of a user-driven wizard or
-// tuning action, so this flash write never fires autonomously.
+static uint32_t cxHeldLen = 0;   // bytes of rows parked in cxPendSwap after a failed compaction buffer (0 = none)
+
+// Core 1 only (loop() deferred-writes cluster): staged rows → /cxledger.bin. Every row comes from a user-driven
+// wizard or tuning action, so this flash write never fires autonomously; the paced retry of held rows waits for the field cut.
 void cxLedgerFlush() {
+  static uint32_t heldAtMs = 0;
+  static bool noMemNoted = false;      // one console line per run of failed compaction buffers
   if (!cxPendBuf || !cxPendSwap) return;
   char *rows;
   uint32_t n;
-  portENTER_CRITICAL(&cxPendMux);
-  n = cxPendLen;
-  if (n == 0) { portEXIT_CRITICAL(&cxPendMux); return; }
-  rows = cxPendBuf;
-  cxPendBuf = cxPendSwap;   // producers keep appending into the other buffer
-  cxPendSwap = rows;
-  cxPendLen = 0;
-  portEXIT_CRITICAL(&cxPendMux);
+  if (cxHeldLen) {
+    if (millis() - heldAtMs < 60000UL || !fieldCutSettled(10000)) {
+      cxLedgerFlushPending = true;
+      return;
+    }
+    rows = cxPendSwap;
+    n = cxHeldLen;
+  } else {
+    portENTER_CRITICAL(&cxPendMux);
+    n = cxPendLen;
+    if (n == 0) { portEXIT_CRITICAL(&cxPendMux); return; }
+    rows = cxPendBuf;
+    cxPendBuf = cxPendSwap;   // producers keep appending into the other buffer
+    cxPendSwap = rows;
+    cxPendLen = 0;
+    portEXIT_CRITICAL(&cxPendMux);
+  }
 
   // Seq persists BEFORE the rows land: a crash between the two burns a gap in the sequence
   // (harmless) instead of reusing numbers (the cloud would silently drop the reuse as dupes).
@@ -3852,13 +4999,26 @@ void cxLedgerFlush() {
         w.close();
       }
       free(tmp);
+      // The dropped head rows may be the batch in flight: shrink the post-send trim so it never cuts unsent rows.
+      if (cxLedgerUpState == 1 || cxLedgerUpState == 2) cxLedgerUpBytes = (cxLedgerUpBytes > off) ? cxLedgerUpBytes - off : 0;
       if (droppedRows) {
         portENTER_CRITICAL(&cxPendMux);
         cxLedgerDroppedRows += droppedRows;
         portEXIT_CRITICAL(&cxPendMux);
       }
     } else {
-      LittleFS.remove(CX_LEDGER_PATH);  // no PSRAM for compaction — start the file over
+      // No PSRAM for compaction: leave the file whole and park this batch in cxPendSwap. Producers keep filling
+      // cxPendBuf meanwhile (overflow is counted into dropped_prior); no swap happens until the held rows land.
+      fsReleaseLock();
+      cxHeldLen = n;
+      heldAtMs = millis();
+      cxLedgerFlushPending = true;
+      if (!noMemNoted) {
+        noMemNoted = true;
+        queueConsoleMessageF("Commissioning ledger: no %u KB PSRAM block to make room in the queue file - file kept, new rows held in RAM, retrying each minute with the field off",
+                             (unsigned)(CX_LEDGER_FILE_CAP / 1024));
+      }
+      return;
     }
   }
   File f = LittleFS.open(CX_LEDGER_PATH, "a");
@@ -3868,17 +5028,26 @@ void cxLedgerFlush() {
   }
   fsFreeDirty = true;
   fsReleaseLock();
+  if (cxHeldLen) {
+    cxHeldLen = 0;
+    noMemNoted = false;
+    if (cxPendLen) cxLedgerFlushPending = true;   // rows staged while this batch was held
+  }
 }
 
 // Core 1 (cloud-features block; caller gates hardware + field-off — the post-send trim is a
 // flash write). Network gates live here. One batch in flight at a time; sent bytes trim off
 // the file head only after the cloud confirms.
 void cxLedgerDrainService() {
+  static uint32_t trimRetryAtMs = 0;   // 0 = no trim waiting on PSRAM
+  static bool noMemNoted = false;      // one console line per run of failed buffer allocations
   if (cxLedgerUpState == 1) return;                            // batch in flight
   if (cxLedgerUpState == -1) { cxLedgerUpState = 0; return; }  // failed: retry paced by the 60s guard below
   if (cxLedgerUpState == 2) {                                  // cloud has the rows → drop the sent prefix
+    if (trimRetryAtMs && millis() - trimRetryAtMs < 60000UL) return;
+    bool trimmed = true;
     fsTakeLock();
-    File f = LittleFS.open(CX_LEDGER_PATH, "r");
+    File f = (cxLedgerUpBytes > 0) ? LittleFS.open(CX_LEDGER_PATH, "r") : File();   // 0 = compaction already dropped the whole batch
     if (f) {
       uint32_t sz = f.size();
       if (cxLedgerUpBytes >= sz) {
@@ -3893,23 +5062,42 @@ void cxLedgerDrainService() {
           kept = f.read((uint8_t *)tmp, rem);
         }
         f.close();
-        File w = LittleFS.open(CX_LEDGER_PATH, "w");
-        if (w) {
-          if (tmp && kept) w.write((uint8_t *)tmp, kept);
-          w.close();
+        // No buffer or a short read: leave the file whole (the sent rows stay at its head) and retry the trim in a minute;
+        // state stays 2, so nothing is re-sent meanwhile.
+        if (tmp && kept == rem) {
+          File w = LittleFS.open(CX_LEDGER_PATH, "w");
+          if (w) {
+            w.write((uint8_t *)tmp, kept);
+            w.close();
+          }
+        } else {
+          trimmed = false;
         }
         if (tmp) free(tmp);
+        if (!tmp && !noMemNoted) {
+          noMemNoted = true;
+          queueConsoleMessageF("Commissioning ledger: no %u KB PSRAM block to trim the uploaded rows - file kept, retrying each minute",
+                               (unsigned)((rem + 1023) / 1024));
+        } else if (tmp) {
+          noMemNoted = false;
+        }
       }
     }
-    fsFreeDirty = true;
+    if (trimmed) fsFreeDirty = true;
     fsReleaseLock();
+    if (!trimmed) {
+      trimRetryAtMs = millis() | 1u;
+      return;
+    }
+    trimRetryAtMs = 0;
     cxLedgerUpBytes = 0;
     cxLedgerUpState = 0;
     return;
   }
   if (millis() - cxLedgerLastAttemptMs < 60000UL) return;
   if (!(currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && WiFi.RSSI() >= -80)) return;
-  if (cxPendLen > 0 || cxLedgerFlushPending) return;  // let staged rows reach the file first — one batch, not two
+  // Held rows (no compaction buffer) may need this drain's trim to make room for them, so it must not wait on them.
+  if ((cxPendLen > 0 || cxLedgerFlushPending) && !cxHeldLen) return;  // let staged rows reach the file first — one batch, not two
 
   fsTakeLock();
   File f = LittleFS.open(CX_LEDGER_PATH, "r");
@@ -3923,8 +5111,15 @@ void cxLedgerDrainService() {
   if (!body) {
     f.close();
     fsReleaseLock();
+    cxLedgerLastAttemptMs = millis();
+    if (!noMemNoted) {
+      noMemNoted = true;
+      queueConsoleMessageF("Commissioning ledger: no %u KB PSRAM block for the upload batch - rows kept, retrying",
+                           (unsigned)(CX_LEDGER_BATCH_CAP / 1024));
+    }
     return;
   }
+  noMemNoted = false;
   int off = snprintf(body, CX_LEDGER_BATCH_CAP,
                      "{\"device_uid\":\"%s\",\"token\":\"%s\",\"events\":[",
                      device_id_hex, authToken.c_str());

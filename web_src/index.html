@@ -36,22 +36,27 @@
   <meta name="viewport"
     content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <script>
-    // iOS zooms the whole page when a <16px input gets focus and the zoom sticks after
-    // the keyboard closes, leaving permanent sideways scroll. A permanent maximum-scale=1
-    // suppresses that but also kills pinch zoom inside the Capacitor WKWebView (Safari
-    // ignores it for pinch; WKWebView enforces it). Two mechanisms share that one lever:
-    //   PREVENT — touchstart or focusin on an editable control swaps in maximum-scale=1
-    //     before (or just after) WebKit computes its focus zoom; restored when focus
-    //     leaves form controls so pinch stays free.
-    //   RESET — WKWebView's enforcement is RETROACTIVE: applying the clamp while the
-    //     page is zoomed snaps it back to 1x. Focus paths with no touchstart on the
-    //     input itself (label taps, keyboard next-field arrows, programmatic focus)
-    //     used to slip past a touch-only clamp and leave the page stuck zoomed; the
-    //     focusin clamp + the blur-time snap-back now undo those automatically.
-    //   preFocusScale is the arbiter: recorded BEFORE focus lands. ~1.0 means any zoom
-    //     seen later is iOS's focus zoom (undo it); >1.05 means the user deliberately
-    //     pinch-zoomed before typing (leave their zoom alone, never clamp).
-    // UA-gated because Android would honor the clamp with no auto-zoom to prevent.
+    // Blocked site storage (Safari "Block All Cookies", Chrome "Don't allow sites to save data") makes every
+    // localStorage/sessionStorage touch throw, which would halt script.js; swap in an in-memory store.
+    (function () {
+      function memStore() {
+        var m = {};
+        return {
+          getItem: function (k) { k = String(k); return Object.prototype.hasOwnProperty.call(m, k) ? m[k] : null; },
+          setItem: function (k, v) { m[String(k)] = String(v); },
+          removeItem: function (k) { delete m[String(k)]; }
+        };
+      }
+      ['localStorage', 'sessionStorage'].forEach(function (name) {
+        try { window[name].getItem('x'); }
+        catch (e) { try { Object.defineProperty(window, name, { value: memStore(), configurable: true }); } catch (e2) { } }
+      });
+    })();
+  </script>
+  <script>
+    // iOS focus-zooms <16px inputs and the zoom sticks; a permanent maximum-scale=1 also kills WKWebView pinch zoom,
+    // so clamp only while an editable has focus. WKWebView enforces the clamp retroactively (snaps a zoomed page to 1x).
+    // preFocusScale > 1.05 = user pinch-zoomed before typing: never clamp. UA-gated: Android has no focus zoom to prevent.
     (function () {
       if (!(/iPhone|iPad|iPod/.test(navigator.userAgent) ||
             (navigator.userAgent.includes('Mac') && navigator.maxTouchPoints > 1))) return;  // iPadOS 13+ masquerades as Mac
@@ -90,9 +95,8 @@
           if (preFocusScale <= 1.05) meta.setAttribute('content', CLAMP);
         }
       }, { capture: true, passive: true });
-      // Backstop for focus without a touchstart on the input itself: label taps, the
-      // keyboard's next-field arrows, programmatic focus (settings search). Clamping
-      // here may land after the zoom starts — retroactive enforcement undoes it anyway.
+      // Backstop for focus without a touchstart on the input (label taps, keyboard next-field, programmatic focus);
+      // may clamp after the zoom starts, which retroactive enforcement undoes.
       document.addEventListener('focusin', function (e) {
         if (!editable(e.target)) return;
         if (preFocusScale == null) preFocusScale = scaleNow();
@@ -126,16 +130,9 @@
 
 <body><iframe name="hidden-form" style="display:none"></iframe>
 
-  <!-- Boat loading splash. Visible by default and themed by the inline script
-       below (saved dark-mode pref, falling back to the OS scheme) so a Capacitor
-       cold launch paints it instantly with no flash. Hidden on the first CSVData
-       packet (see hideWaitingForRegulator()) or when demo mode starts — no platform
-       check, so it works regardless of whether window.Capacitor is detected. In a
-       normal browser the device-served page connects instantly, so the first packet
-       clears it almost immediately (boat_loader.webp ships only in the app bundle —
-       the ESP32 never serves it — so onerror hides the boat and reflection there,
-       leaving the sea/sky scene instead of a broken-image icon). The boat's bottom
-       edge is its real waterline, so it floats. -->
+  <!-- Boat loading splash: visible by default and themed by the inline script below so a Capacitor cold launch
+       paints with no flash; hidden on the first CSVData packet (hideWaitingForRegulator) or demo start.
+       boat_loader.webp ships only in the app bundle (the ESP32 never serves it), so onerror hides the boat. -->
   <div id="waiting-for-regulator" class="wfr-light" style="display:block;">
    <div class="bl-stage">
     <div class="bl-sky"></div>
@@ -152,10 +149,8 @@
    </div>
   </div>
   <script>
-    // Theme the boat splash during parse (flash-free): switch to the dark scene if
-    // the saved dark-mode pref says so, else follow the OS scheme. Also scale the
-    // fixed 300x600 design stage to COVER the viewport so the tuned layout matches
-    // on any screen. The overlay is already visible (wfr-light by default).
+    // Theme the splash during parse (saved dark-mode pref, else OS scheme) and scale the fixed 300x600
+    // design stage to cover the viewport.
     (function () {
       var el = document.getElementById('waiting-for-regulator');
       if (!el) return;
@@ -169,13 +164,9 @@
 
   <div class="permanent-header">
 
-    <!-- Minimized status strip — one locked-height line, shown only while .header-collapsed.
-         Readouts are grouped Alternator │ Battery │ Engine and reveal in priority order as the
-         strip widens (see the @container rules in styles.css); it never wraps or grows taller.
-         Values and the state pill are mirrored from the live header by syncHeaderStrip(); the
-         OFF / ON control is painted from CSV1 by paintOnOff(). Only the chevron expands; the
-         OFF / ON switch is an isolated control that sends the same explicit commands as the
-         expanded header (alternatorSet). -->
+    <!-- Minimized status strip (only while .header-collapsed): one locked-height line that never wraps; readouts
+         reveal in priority order as it widens (@container rules in styles.css). Values mirrored by syncHeaderStrip(),
+         OFF/ON painted by paintOnOff(). Only the chevron expands. -->
     <div id="header-collapsed-strip">
       <!-- Connection dot: teal = live stream, red = disconnected, orange = offline mode.
            Leads the reading order — everything to its right is only live if this is teal. -->
@@ -200,9 +191,7 @@
       <!-- State word sits RIGHT of the numbers so its width changes (BULK → ABSORPTION →
            PROTECT) grow into the flex spacer and never shift the readouts -->
       <span id="hcs-pill" class="hcs-pill">—</span>
-      <!-- Alternator OFF / ON — isolated control; stopPropagation keeps a press from expanding.
-           Same two-absolute-commands control as the expanded header; CSS hides the action words at
-           strip scale, so the fill alone carries the state here. -->
+      <!-- Same two-absolute-commands OFF/ON control as the expanded header; CSS hides the action words at strip scale. -->
       <span class="hcs-divider"></span>
       <span id="hcs-onoff" class="onoff-switch" role="group" aria-label="Alternator Enable" onclick="event.stopPropagation()">
         <button type="button" class="onoff-half" data-v="0" title="Turn the alternator OFF" aria-label="Turn the alternator off" onclick="alternatorSet(0)"><span class="onoff-state">OFF</span><span class="onoff-act">turn off</span></button>
@@ -290,14 +279,9 @@
         </div>
       </div>
 
-      <!-- Alternator Enable — sits right of chips when screen is wide enough.
-           Two buttons, not a slider: each half is its own absolute command (left half always sends
-           OnOff=0, right half always sends OnOff=1), so what the control is painting can never change
-           what a press sends. A real slider sends the opposite of whatever it shows, and a paint that
-           lagged or reverted turned an intended OFF into an ON. The filled half is the regulator's own
-           state (CSV1 OnOff, ~10 Hz) and prints it as a word; the hollow half prints the action a press
-           would take. Before the first frame neither is filled and both read as offers. The pressed
-           half carries a ring until the regulator echoes it (alternatorSet / paintOnOff, script.js). -->
+      <!-- Alternator Enable: two buttons, not a slider. Each half is an absolute command (left OnOff=0, right OnOff=1),
+           so a lagging paint can never turn an intended OFF into an ON. Filled half = regulator state (CSV1 OnOff);
+           the pressed half rings until echoed (alternatorSet / paintOnOff, script.js). -->
       <div class="alternator-control-tier">
         <div class="alternator-control">
           <span class="control-label">Alternator Enable</span>
@@ -324,10 +308,8 @@
     <div id="sensor-banner" class="header-notice header-notice-alert" style="display:none;"></div>
 
 
-    <!-- Settings Access — the button arms the firmware's settings write window (no password; LAN
-         clients are trusted, this is an acknowledgment). Armed until Lock Controls, another client's
-         lock, or a reboot — nothing relocks on a timer. The button's padlock styling is the ONLY
-         locked-state indicator; the whole tier hides once armed. -->
+    <!-- Settings Access: arms the firmware's settings write window (acknowledgment, no password; LAN is trusted). Armed until
+         Lock Controls, another client's lock, or reboot; never relocks on a timer. The padlock button is the only locked indicator. -->
     <div id="settings-access-section" class="settings-access-tier">
       <div class="password-form-wrapper">
         <form onsubmit="return armSettings();">
@@ -356,14 +338,8 @@
     <button class="main-tab" onclick="showMainTab('plots')">Plots</button>
     <!--<button class="main-tab" onclick="showMainTab('about-sourcecode')">Documentation</button> -->
     <button class="main-tab" onclick="showMainTab('cloudfeatures')"><span class="tab-label-full">Cloud Features</span><span class="tab-label-short">Cloud</span></button>
-    <!-- SETTINGS SEARCH trigger. NOT a .main-tab on purpose — it is a bare icon in the gutter at
-         the right end of the row (see .ss-search-tab), shown only where a mouse/trackpad exists;
-         touch devices open search with the pull-down-at-top gesture (SETTINGS SEARCH block at the
-         end of script.js).
-         width/height are on the <svg> ON PURPOSE: an inline SVG with only a viewBox has no
-         intrinsic size, so if a browser pairs this HTML with a cached pre-search styles.css
-         (no .ss-icon rule) the glyph inflates to the full button width and blows the whole
-         tab row to ~300px tall. The CSS rule still wins when it is present. -->
+    <!-- Settings search: deliberately not a .main-tab (bare icon, mouse/trackpad only; touch uses pull-down, script.js).
+         width/height on the <svg> stop the glyph inflating the tab row if a cached styles.css lacks .ss-icon. -->
     <button class="ss-search-tab" onclick="ssOpen()" title="Search all settings" aria-label="Search all settings"><svg class="ss-icon" width="19" height="19" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2.2"/><line x1="15.5" y1="15.5" x2="21" y2="21" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></button>
   </div>
 
@@ -392,8 +368,7 @@
         <div id="settings-vessel-info" class="sub-tab-content">
           <div class="settings-card">
 
-            <!-- The incomplete-setup gate is the vesselInfoComplete xAlerts in showMainTab/showSubTab
-                 (script.js) — a dead "Initial Setup Required" banner that nothing ever showed was removed here. -->
+            <!-- Incomplete-setup gate lives in showMainTab/showSubTab (vesselInfoComplete xAlerts, script.js). -->
             <form id="vessel-info-form" action="/get" method="GET" target="hidden-form">
 
               <!-- ========== VESSEL INFORMATION SECTION ========== -->
@@ -620,10 +595,8 @@
                   style="cursor:pointer;font-weight:bold;font-size:16px;padding:10px 0;border-bottom:2px solid var(--accent);margin-bottom:10px;">
                   Physical Regulator Installation
                 </summary>
-                <!-- No mounting-alignment check here: the Zero Now button below measures and
-                     corrects residual mount tilt directly, so a perfectly square install is not
-                     required. Gravity-vector "tilt" math can only detect acceleration, never
-                     actual mounting angle. -->
+                <!-- No mounting-alignment check: Zero Now corrects residual mount tilt, and gravity-vector "tilt" math
+                     detects only acceleration, never mounting angle. -->
                 <!-- Alignment Selection Subsection -->
                 <div class="pri-subsection">
                   <h4 class="pri-subsection-title">Alignment Selection</h4>
@@ -760,9 +733,8 @@
                       </span>
                     </div>
                     <div class="form-input">
-                      <!-- Plain buttons, NOT nested <form>s: a nested form's </form> would
-                           close the outer #vessel-info-form early and orphan the Save button.
-                           submitSimpleParam handles the /get fetch. -->
+                      <!-- Plain buttons, not nested <form>s: a nested </form> would close #vessel-info-form early
+                           and orphan the Save button. -->
                       <button type="button" onclick="startImuZero()" class="btn-primary">Zero Now</button>
                       <button type="button" onclick="submitSimpleParam('ClearIMUZero', 1)" class="btn-secondary">Clear</button>
                       <small>Reading now: <span id="imuLiveAttitude_ID">&mdash;</span></small>
@@ -852,8 +824,7 @@
                       onclick="showAltTab('primary', 'settings-diag')">Diag</button>
             </div>
 
-            <!-- Commissioning — first alt-tab. Was a Tuning sub-tab; the wizard is the
-                 entry point for a new install, so it leads the Alternator tabs. -->
+            <!-- Commissioning leads the Alternator tabs: the wizard is a new install's entry point. -->
             <div id="alt-panel-commissioning" class="alt-panel alt-panel-primary">
               <div class="settings-card">
 
@@ -877,10 +848,8 @@
                 <!-- Checklist rendered by renderCommissionStatus(); rows mirror CX_PHASES / COMMISSION_STEPS. -->
                 <div id="commission-checklist" style="background:var(--card-light);padding:6px 16px 12px;border-radius:var(--radius);border-left:4px solid var(--accent);"></div>
 
-                <!-- Start button sits BELOW the checklist so the steps are chosen first. Label/class/help/action
-                     adapt to the ticked plan vs. done-mask in renderCommissionStatus()/cxStartIntent():
-                     Start / Continue / Clear-and-restart. commissionPrimaryAction() routes a wholesale redo
-                     through the revert path. -->
+                <!-- Start sits below the checklist so steps are chosen first. Label/action adapt to the ticked plan vs.
+                     done-mask (renderCommissionStatus/cxStartIntent); a wholesale redo routes through the revert path. -->
                 <button id="commission-start-btn" onclick="commissionPrimaryAction()" class="btn-primary" style="width:100%;padding:12px;margin-top:12px;">Start commissioning…</button>
                 <p id="commission-start-help" style="font-size:12px;color:var(--text-muted);margin:8px 0 0 0;">Only the ticked steps will run.</p>
 
@@ -1215,8 +1184,7 @@
                 </div>
               </div>
 
-              <!-- ===== Tachometer Keep-Alive — Automatic Learning (firmware "knee tracker", knee* vars) — own card, outside the cap-table
-                   scroll wrapper, so it reads as a separate section from the RPM cap table above ===== -->
+              <!-- ===== Tachometer Keep-Alive — Automatic Learning (firmware "knee tracker", knee* vars) ===== -->
               <div class="alt-subsection-card">
                 <div class="knee-learn-panel">
                       <div class="form-row">
@@ -1924,7 +1892,7 @@
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
-                      <input name="DutyRampRate" type="number" step="0.01" min="0" max="9999" />
+                      <input name="DutyRampRate" type="number" step="0.01" min="0.1" max="9999" />
                       <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
                     </form>
                   </div>
@@ -2005,10 +1973,8 @@
               </details><!-- END Rate Limiting -->
 
 
-              <!-- Temperature Settings (closed). Alternator thermal protection plus the analog
-                   thermistor front-end constants. Battery temperature and the charge-temperature
-                   lockouts are in Setup > Battery > Battery Temperature; probe identification and
-                   the probe enables are in Setup > Temperature. -->
+              <!-- Temperature Settings (closed): alternator thermal protection + thermistor constants. Battery temp and charge
+                   lockouts live in Setup > Battery > Battery Temperature; probe ID/enables in Setup > Temperature. -->
               <details class="alt-nested-section">
                 <summary class="alt-summary-nested">Temperature Settings</summary>
 
@@ -2211,10 +2177,13 @@
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Alternator Current Offset (A) (<span id="AlternatorCOffset_echo">?</span>):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">Fixed
-                        offset (A) added to the raw alternator current reading to correct for sensor zero error. Use the
-                        Auto-Zero Reset button to calibrate automatically, or enter a known offset
-                        manually.</span></span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">Amps
+                        subtracted from every alternator current reading to cancel the sensor's zero error. Measured
+                        Zero below sets it for you, or you can enter a known value here. With Alternator Zero
+                        Correction off, a change here moves the learned correction by the same amount, so switching
+                        the correction on later is right from the first reading instead of spending several days
+                        re-learning. With the correction on, a change here leaves the learned correction alone,
+                        because the reading you corrected from already had it taken out.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -2252,7 +2221,11 @@
                         a reading by more than 3 amps. It stays on "learning" until it has watched
                         the alternator go through a wide temperature swing, which normally means a real run
                         followed by a cooldown. Reset Zero throws away what it has learned and starts
-                        again.</span></span>
+                        again. This switch also decides what a change to Alternator Current Offset does to what
+                        it has learned. If it is off when you type a new offset, or was off while Measured Zero
+                        took its reading, the learned amount moves with the offset, so switching this on later is
+                        right at once. If it is on, the learned amount stays put and the offset change shows up
+                        in the reading directly.</span></span>
                   </div>
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
@@ -2282,15 +2255,19 @@
                 <hr />
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                    <span>Measured Zero (Engine Running):</span>
-                    <span class="tooltip">ℹ️<span class="tooltip-box">With the engine running and the
-                        field at 0%, the current sensor should read exactly zero. Whatever it reads instead is its
-                        zero error at operating temperature, on this installation. Zero Now turns the field off by
-                        itself, waits for the rotor to drain, averages the reading for ten seconds, turns the field
-                        back on and reports what it found; Apply folds that number into the Alternator Current
-                        Offset above, where it is stored permanently. The commissioning wizard offers the same
-                        measurement at the finish, when the alternator is warmest. The engine must be running above
-                        400 RPM; charging pauses for under a minute. A reading that is too large or too noisy is
+                    <span>Measured Zero:</span>
+                    <span class="tooltip">ℹ️<span class="tooltip-box">With the field at 0%, the alternator
+                        makes no current, so the current sensor should read exactly zero. Whatever it reads instead
+                        is its zero error on this installation. Zero Now works with the engine running or stopped:
+                        it turns the field off if it is on, waits for the reading to settle, averages it for ten
+                        seconds, and reports what it found. Apply folds that number into the Alternator Current
+                        Offset above, where it is stored permanently. If Alternator Zero Correction was off while it
+                        measured, Apply moves the learned correction by the same amount so the two stay in step. If
+                        it was on, the measurement already had the learned correction taken out, so that correction
+                        stays as it is. The sensor's zero moves a little with
+                        temperature, so measure while the engine compartment is warm, such as right after a run.
+                        The commissioning wizard offers the same measurement at the finish. With the engine
+                        running, charging pauses for under a minute. A reading that is too large or too noisy is
                         refused rather than applied.</span></span>
                   </div>
                   <div class="form-input">
@@ -2426,14 +2403,8 @@
 
 
 
-            <!-- ═══════════════════════════════════════════════════════════
-                 PROTECTIONS — 4th alt-tab inside Setup → Alternator
-                 Phase-first layout (Detection / Response / Recovery) with
-                 group-filter pills. Each card preserves its existing
-                 name=, Set button, and echo span ID so
-                 all existing JS handlers (echo population, handleUserToggle)
-                 continue to work unchanged.
-                 ═══════════════════════════════════════════════════════════ -->
+            <!-- ===== PROTECTIONS alt-tab: phase-first layout (Detection / Response / Recovery) with group-filter pills.
+                 Cards keep their name=, Set button and echo span IDs, which the JS handlers depend on. ===== -->
             <div id="alt-panel-protections" class="alt-panel alt-panel-primary">
 
               <p style="font-size: 12px; color: var(--text-muted); margin: 0 0 12px 0; line-height: 1.5;">
@@ -3520,7 +3491,7 @@
 
             </div><!-- END alt-panel-protections -->
 
-            <!-- Tuning alt-tab panel (was the standalone #tuning main tab) -->
+            <!-- Tuning alt-tab panel -->
   <div id="tuning" class="alt-panel alt-panel-primary">
     <!-- Tuning Sub-tabs -->
     <div class="sub-tabs">
@@ -3960,8 +3931,7 @@
               <details open class="tuning-section">
                 <summary class="tuning-section-title">Live Plot View</summary>
 
-                <!-- PID plot axis controls — Y ranges are edited directly on the plot
-                     (attachYAxisEdit boxes); only the X window control lives here.
+                <!-- PID plot axes: Y ranges are edited on the plot (attachYAxisEdit); only the X window lives here.
                      Buttons re-window in place (no redraw) and persist xTime to the regulator. -->
                 <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0 2px 0; font-size:0.83em; color:var(--text-muted);">
                   <span style="font-weight:600; white-space:nowrap;">Plot axes:</span>
@@ -3986,9 +3956,8 @@
               <details class="tuning-section">
                 <summary class="tuning-section-title">Current Target Generator</summary>
 
-                <!-- Waveform on/off and sweep start share the single "Begin Test" / "Stop Test" button
-                     at the bottom of this panel, driven by Waveform Type. The hidden TuningMode input
-                     (state source for gating/echo) lives in that bottom row. -->
+                <!-- Waveform on/off and sweep start share the "Begin Test" / "Stop Test" button at the bottom of this
+                     panel (by Waveform Type); the hidden TuningMode input (gating/echo state) lives in that row. -->
                 <div class="form-row">
                   <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
                     <span>Waveform Type (<span id="tuningWaveform_echo">?</span>):</span>
@@ -4978,7 +4947,7 @@
                         <th style="padding:3px 4px;">LDf</th>
                         <th style="padding:3px 4px;">HOCf</th>
                         <th style="padding:3px 4px;">RPM</th>
-                        <th style="padding:3px 4px;">Temp</th>
+                        <th style="padding:3px 4px;">Temp<span class="temp-unit-label">°F</span></th>
                         <th style="padding:3px 4px;">BattV</th>
                         <th style="padding:3px 4px;">SOC%</th>
                         <th style="padding:3px 4px;">CVT</th>
@@ -5123,10 +5092,8 @@
                 <!-- ============ VOLTAGE D TERM (helper #2) ============ -->
                 <div class="param-subhead">Voltage D term (rate-of-rise damping)</div>
 
-                <!-- Kd gain mirrors Kp/Ki: derived (Kd = Td x Kp off the commissioned Kp) in Measured,
-                     typed only in Manual — same cvGainMode gate as cvAutoBlock/cvManualBlock. ONLY the
-                     gain follows the mode; the shaping params below (deadband/arm/one-sided/max back-off/
-                     slope ceiling/filter) are not derived and stay visible under both gain sources. -->
+                <!-- Kd follows cvGainMode like Kp/Ki (derived Kd = Td x Kp in Measured, typed in Manual). Only the gain
+                     follows the mode; the shaping params below are not derived and show under both sources. -->
                 <div id="cvKdAutoBlock" style="display:none;">
                   <div class="form-row">
                     <div class="form-label" style="display: flex; align-items: center; justify-content: space-between; font-size:0.9em; opacity:0.85; line-height:1.5;">
@@ -6158,8 +6125,7 @@
 
 
 
-            <!-- Diag alt-tab panel (was the standalone Setup > Diag sub-tab). Checkpoint (C1-C4) gates &
-                 tuning knobs, filtered flat by the View pills. Results display on Live Data > Diag. -->
+            <!-- Diag alt-tab panel: checkpoint (C1-C4) gates & tuning knobs, filtered by the View pills. Results show on Live Data > Diag. -->
         <div id="settings-diag" class="alt-panel alt-panel-primary">
       <p style="font-size:12px;color:var(--text-muted);margin:0 0 10px 0;line-height:1.5;">
         Four independent checkpoints decide what data gets recorded on the Live Data → Diag tab. These are their gates &amp; tuning knobs — pick a pill to see only that checkpoint's settings; a setting shared by two checkpoints shows under both of them.
@@ -6430,9 +6396,8 @@
                   <table class="learning-table c3-band-table">
                     <thead>
                       <tr>
-                        <!-- Column widths live in styles.css (.c3-band-table nth-child !important) — the
-                             .learning-table base pins its columns with !important pixels, so inline
-                             widths here are dead on arrival. -->
+                        <!-- Column widths live in styles.css (.c3-band-table nth-child !important): .learning-table pins
+                             columns with !important pixels, so inline widths here have no effect. -->
                         <th>Signal</th>
                         <th>Wobble <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How far the reading may stray from the straight line drawn through the window. The line itself is free to climb or fall, so a smooth acceleration passes and only genuine roughness fails. Bus voltage and temperature have no line: for those two this is the plain highest-minus-lowest spread. Judged on the smoothed signal, so size it for real operating-point movement, not sensor noise.</span></span></th>
                         <th>Rate limit <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">The steepest that straight line may be. Engine speed is allowed to sweep; the field is held nearly fixed, because a moving field means the regulator is chasing something and the stretch is not one operating point. The output gets its own limit, in percent of the reading per second, and that is the one that decides how far a record taken on the move can drift &mdash; how much output moves while it is being averaged is what a wrongly paired reading turns into. 0 means no limit on the slope.</span></span></th>
@@ -6751,18 +6716,8 @@
         </div> <!-- close settings-alternator -->
 
 
-        <!-- Battery Settings Sub-tab -->
-
-        <!--         // NOTE: BatteryCOffset, InvertBattAmps, socInfoAvailable,
-        // and AutoShuntGainCorrection are routed through validateAndSubmitBatteryNumber /
-        // validateAndSubmitBatteryToggle as a convenience but are not part of any cross-field
-        // guard logic. The validator always passes for these fields. If the guard set ever
-        // expands to include them, the wiring is already in place. -->
-
-
-        <!-- Engine Sub-tab — tach alignment and the drive ratio to the alternator. Two-way
-             linked to the pre-wizard RPM-alignment modal (script.js openRpmAlign) through the
-             CSV3 echo, so both edit the same stored values. -->
+        <!-- Engine Sub-tab: tach alignment + drive ratio. Shares stored values with the pre-wizard RPM-alignment modal
+             (openRpmAlign, script.js) via the CSV3 echo. -->
         <div id="settings-engine" class="sub-tab-content">
           <div class="settings-card">
 
@@ -6839,9 +6794,8 @@
 
           </div>
 
-          <!-- Fuel burn breakpoints. Firmware interpolates straight between the points and holds
-               the first/last value flat past the ends (fuelRate_GPH in 5_functions.ino), which is
-               exactly what drawFuelCurve() draws underneath. -->
+          <!-- Fuel burn breakpoints: drawFuelCurve() must match fuelRate_GPH (5_functions.ino), linear between points
+               and flat past the ends. -->
           <div class="settings-card">
 
             <p class="card-group-title"><span>Fuel Consumption</span>
@@ -6930,6 +6884,8 @@
 
 
         <!-- Battery Settings Sub-tab -->
+        <!-- BatteryCOffset, InvertBattAmps and socInfoAvailable go through the battery validators
+             for convenience only; no cross-field guard covers them. -->
         <div id="settings-battery" class="sub-tab-content">
           <div class="diag-panel-tabs">
             <button class="diag-panel-tab active" onclick="showBatteryPanel('charge', event)">Charge Settings</button>
@@ -6938,12 +6894,9 @@
           <div id="battery-panel-charge" class="diag-panel active">
           <div class="settings-card">
 
-            <!-- System voltage (12/24/36/48 V) and Field Winding Voltage are set in Vessel Info. Changing
-                 either rescales the field-duty knobs (Duty Ramp Rate, knee margins) by winding volts / system
-                 volts, and a system-voltage change also rescales the whole charge profile. The two field caps
-                 (Max Field %, Max Field Volts) are never class-scaled: they describe the alternator. Max Field
-                 Volts follows the winding rating, and the enforced ceiling re-derives from it against the live
-                 bus. Max Field % IS the real per-bus duty cap; 99 = full duty. -->
+            <!-- System voltage and Field Winding Voltage are set in Vessel Info; changing either rescales the field-duty knobs
+                 (winding V / system V); a system-voltage change also rescales the charge profile. Never class-scale the field caps:
+                 Max Field Volts follows the winding rating (ceiling re-derived vs. live bus); Max Field % is the real duty cap, 99 = full. -->
 
             <!-- Phase Definitions — one parent dropdown over the four charge-stage sections; each phase is a nested secondary dropdown -->
             <details style="margin-top: 20px;">
@@ -7869,53 +7822,6 @@
               </div>
             </details>
 
-            <!-- SOC Correction Section -->
-            <details class="gate-batt-current" open style="margin-top: 20px;">
-              <summary
-                style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
-                SOC Correction</summary>
-              <p class="gate-note gate-note-shunt">State-of-charge correction has nothing to correct without a coulomb count, and that needs a battery shunt. None is installed, so the card is greyed. Setup &rarr; Battery &rarr; Measurement Sources &rarr; Battery Shunt Present.</p>
-
-              <div class="form-row">
-                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                  <span>SOC Auto-Correction (<span id="AutoShuntGainCorrection_echo">0</span>):</span>
-                  <span class="tooltip">
-                    ℹ️
-                    <span class="tooltip-box">Automatically corrects battery current readings when full charge is
-                      detected. Requires INA228 battery shunt to be installed.</span>
-                  </span>
-                </div>
-                <div class="form-input">
-                  <form action="/get" method="GET" target="hidden-form">
-                    <span class="toggle-label">Off</span>
-                    <label class="switch">
-                      <input id="AutoShuntGainCorrection_checkbox" type="checkbox"
-                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'AutoShuntGainCorrection').then(ok => { if (ok && handleUserToggle('AutoShuntGainCorrection_checkbox', 'AutoShuntGainCorrection', 'AutoShuntGainCorrection')) { cb.form.submit(); submitMessage(); } });" />
-                      <span class="slider round"></span>
-                    </label>
-                    <span class="toggle-label">On</span>
-                    <input id="AutoShuntGainCorrection" name="AutoShuntGainCorrection" type="number" value=""
-                      style="display:none;" />
-                    <input type="hidden" name="ResetDynamicShuntGain" id="ResetDynamicShuntGain" value="0" />
-                    <button type="button" class="btn-secondary" onclick="resetParameter('ResetDynamicShuntGain')"
-                      id="ResetDynamicShuntGain_button">Reset Factor</button>
-                  </form>
-                </div>
-              </div>
-
-              <hr />
-              <div class="form-row">
-                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                  <span>SOC Gain Factor (Current Value):</span>
-                  <span class="tooltip">ℹ️<span class="tooltip-box">Live read-only multiplier applied to the shunt current measurement. Adjusted automatically by SOC Auto-Correction each time a full charge is detected. Above 1.0 means the shunt was reading low; below 1.0 means it was reading high. Use Reset Factor to return to 1.0.</span></span>
-                </div>
-                <div class="form-input">
-                  <span id="DynamicShuntGainFactor_display"
-                    style="font-weight: bold; color: var(--accent); font-size: 14px;">?</span>
-                </div>
-              </div>
-            </details>
-
             <!-- Other Settings -->
             <details style="margin-top: 20px;">
               <summary
@@ -7962,11 +7868,8 @@
         <div id="settings-temperature" class="sub-tab-content">
           <div class="settings-card">
 
-            <!-- Identification, role assignment and the probe enables only. Everything a probe
-                 FEEDS lives with its subject: alternator thermal limits in Setup > Alternator >
-                 Temperature Settings, battery temperature in Setup > Battery > Battery
-                 Temperature, the Extra probe alarms in Setup > Alarms, and the per-probe
-                 ok/fail counters in Live Data > ESP32 with the rest of the 1-Wire diagnostics. -->
+            <!-- Probe identification, roles and enables only. What a probe feeds lives with its subject: Alternator > Temperature
+                 Settings, Battery > Battery Temperature, Alarms (Extra probe), Live Data > ESP32 (1-Wire counters). -->
             <details class="integ-section" id="tempSensorsSection" open>
               <summary class="integ-section-title">Temperature Sensors</summary>
 
@@ -8151,9 +8054,8 @@
               </div>
             </div>
 
-            <!-- Shown ONLY in Access Point mode (.ap-only-row, script.js): the forecast is the one
-                 part of this tab that needs the internet. Everything else here works offline and
-                 stays reachable — the manual position, its clear button, and the array settings. -->
+            <!-- AP mode only (.ap-only-row, script.js): the forecast is the only part of this tab that needs the internet;
+                 the rest stays usable offline. -->
             <div id="solar-forecast-offline-note" class="ap-only-row"
               style="padding: 12px 15px; border-radius: var(--radius); margin: 20px 0; border-left: 4px solid var(--accent); background: var(--card-light); color: var(--text-dark); font-size: 14px; line-height: 1.5;">
               <strong>The solar forecast needs an internet connection.</strong><br>
@@ -8758,14 +8660,39 @@
           </div>
         </div>
 
-        <!-- Integrations Sub-tab — external-system links in one place: NMEA2000, Victron
-             VE.Direct, Victron CAN (DVCC), RV-C, and the cross-dialect charge-limit follow.
-             One collapsible card per system (details.integ-section), all collapsed by default. -->
+        <!-- Integrations Sub-tab: one collapsible card per external system (details.integ-section). -->
         <div id="settings-integrations" class="sub-tab-content">
           <div class="settings-card">
 
             <details class="integ-section">
               <summary class="integ-section-title">NMEA 2000<span class="integ-state">Rx <span id="integStateN2kRx">?</span> &middot; Tx <span id="integStateN2kTx">?</span></span></summary>
+
+              <!-- Bus health (CSV2 n2kBusVerdict, n2kBusOnCsv2). Hidden while the verdict is Off. Every verdict text sits in one
+                   grid cell, so the box always has the height of the longest and a verdict change never moves the rows below. -->
+              <div id="n2kBusHealth" class="n2k-bus-health" style="display:none;">
+                <div id="n2kBusStatus" class="n2k-bus-status" aria-live="polite">
+                  <span data-code="1"></span>
+                  <span data-code="2"></span>
+                  <span data-code="3"></span>
+                  <span data-code="4"></span>
+                  <span data-code="5"></span>
+                </div>
+
+                <details id="n2kNodesDetails" class="n2k-nodes" ontoggle="n2kNodesToggle(this)">
+                  <summary>Devices on the bus</summary>
+                  <div class="ow-table-wrap">
+                    <table class="usage-table n2k-nodes-table">
+                      <thead>
+                        <tr><th>Address</th><th>Device</th><th>Software</th><th>Serial</th></tr>
+                      </thead>
+                      <tbody id="n2kNodesBody">
+                        <tr><td colspan="4" class="n2k-nodes-empty">Loading</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <p id="n2kNodesNote" class="integ-note">A device's name and software version appear once it announces them. Some devices announce only when they power up.</p>
+                </details>
+              </div>
 
               <p class="integ-copy">Nav, engine and battery data in and out over the 250 kbps CAN backbone. That one port is shared: the Victron VE.Can and RV-C charge limits under Battery Charge Limits over CAN below arrive on the same wire, and they are decoded whenever the receive switch here is on or the follow switch there is.</p>
 
@@ -8831,7 +8758,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Transmit on NMEA2K (<span id="n2kTxEnable_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Broadcast this regulator's data onto the NMEA2000 network so chartplotters and displays can show it and raise their own alarms on it. Joining or leaving the bus happens at boot, so this switch takes effect after a reboot; the message toggles below apply immediately.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Broadcast this regulator's data onto the NMEA2000 network so chartplotters and displays can show it and raise their own alarms on it.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -8850,7 +8777,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Device Instance (<span id="n2kDeviceInstance_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">NMEA2000 device instance for this regulator. Only matters when more than one regulator shares the network — give each its own number. Applied at boot.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">NMEA2000 device instance for this regulator. Only matters when more than one regulator shares the network — give each its own number.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -8868,6 +8795,24 @@
                 <div class="form-input">
                   <span style="font-size: 14px;">address <span id="n2kSrcAddr_ID">-</span> &middot; sent <span id="n2kTxCount_ID">-</span> &middot; dropped <span id="n2kTxDrops_ID">-</span></span>
                 </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Record Bus Traffic (seconds):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Records every message on the bus, the regulator's own included, for the number of seconds entered (1 to 60), then saves it as a text file. Send the file to support when a display or another device is not showing what you expect. Recording does not affect charging.</span></span>
+                </div>
+                <div class="form-input">
+                  <form onsubmit="canCaptureStart(); return false;">
+                    <input id="canCapSeconds" type="number" step="1" min="1" max="60" value="10" inputmode="numeric" />
+                    <button type="button" id="canCapBtn" class="btn-primary" onclick="canCaptureStart()">Record</button>
+                  </form>
+                </div>
+              </div>
+              <!-- Shown from the first Record press on and never hidden again, so later progress and results never move the page. -->
+              <div id="canCapStatus" class="can-cap-status" style="display:none;">
+                <span class="can-cap-bar"><span id="canCapBarFill"></span></span>
+                <span id="canCapText"></span>
               </div>
 
             <!-- Battery -->
@@ -9115,6 +9060,25 @@
 
               <hr />
               <div class="form-row">
+                <div class="form-label">Converter Status (127750) (<span id="n2kConvStatEnable_echo">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Sends the charge stage (bulk, absorption, float) a second way, as Converter Status (PGN 127750). A Victron GX shows the alternator's charge state from this message, not from Charger Status (127507), which is sent either way.</span></span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="n2kConvStatEnable_checkbox" type="checkbox"
+                        onchange="if(handleUserToggle('n2kConvStatEnable_checkbox', 'n2kConvStatEnable', 'n2kConvStatEnable')) { this.form.submit(); submitMessage(); }" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input id="n2kConvStatEnable" name="n2kConvStatEnable" type="number" value="" style="display:none;" />
+                  </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
                 <div class="form-label">Charger Configuration (127510) (<span id="n2kChgrCfgEnable_echo">?</span>):
                   <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Publishes field drive percentage, charger mode and enabled state as Charger Configuration (PGN 127510). Field drive is how hard the regulator is driving the alternator field, and this is the message a chartplotter or Victron system reads it from. It is the only place this regulator publishes field drive.</span></span>
                 </div>
@@ -9341,10 +9305,8 @@
 
             </details>
 
-            <!-- The three cards below are ONE feature: two dialect cards (what to listen for, and
-                 nothing else) plus the shared card holding how limits are vetted and applied for
-                 whichever dialect is selected. The .integ-group rail is the only cue that ties them
-                 together, so a card must never silently grow a setting that is actually shared. -->
+            <!-- The three cards below are one feature: two dialect cards (dialect-only settings) plus the shared vet/apply card.
+                 The .integ-group rail is the only cue tying them together, so a shared setting must never go in a dialect card. -->
             <div class="integ-group">
               <div class="integ-group-title">Battery Charge Limits over CAN</div>
               <p class="integ-group-copy">Obeying the charge limits a managed battery, BMS or Victron GX publishes takes two parts. Pick the dialect your battery authority speaks &mdash; <strong>Victron VE.Can</strong> or <strong>RV-C</strong> &mdash; in its own card; a dialect card holds only what belongs to that dialect. Everything else is <strong>shared</strong> and lives in the Charge-Limit Follow card at the bottom of this group. Only one dialect is decoded and followed at a time.</p>
@@ -9373,6 +9335,25 @@
                 </div>
                 <div class="form-input">
                   <span class="integ-live" id="vicHeardDetail_ID">&mdash;</span>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Hold Stop-Charging Command (<span id="dvccVicCutHold_echo">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">What to do when a Victron battery sends stop charging and then stops repeating it while its other limit messages keep arriving. Off: the command expires once it has not been heard for 60 seconds or the Silence Timeout, whichever is longer, the same as the voltage and current limits. On: charging stays stopped until the battery sends allowed to charge, the sender goes silent altogether, another sender takes over after this one has been silent for 10 seconds, follow is switched off, the Limit Source or RV-C Battery Instance is changed, the trust latch is reset, or the regulator restarts.</span></span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="dvccVicCutHold_checkbox" type="checkbox"
+                        onchange="if(handleUserToggle('dvccVicCutHold_checkbox', 'dvccVicCutHold', 'dvccVicCutHold')) { this.form.submit(); submitMessage(); }" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input id="dvccVicCutHold" name="dvccVicCutHold" type="number" value="" style="display:none;" />
+                  </form>
                 </div>
               </div>
 
@@ -9423,7 +9404,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Transmit RV-C (<span id="rvcTxEnable_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Publishes this regulator onto the CAN port as an RV-C charging source, so RV-C displays and battery systems can see the alternator the same way they see a converter or solar controller. RV-C shares the wire and the address with NMEA 2000, so nothing extra is wired and nothing else has to be turned off. Joining the bus happens once at startup, so a reboot is needed after switching this on. Off by default: on a purely NMEA 2000 boat there is nothing listening.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Publishes this regulator onto the CAN port as an RV-C charging source, so RV-C displays and battery systems can see the alternator the same way they see a converter or solar controller. RV-C shares the wire and the address with NMEA 2000, so nothing extra is wired and nothing else has to be turned off. Off by default: on a purely NMEA 2000 boat there is nothing listening.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9611,7 +9592,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Silence Timeout (s) (<span id="dvccSilenceS_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. When messages resume, a fresh settling period runs before limits apply again.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9666,9 +9647,8 @@
                   <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Opens the raw candidate frames heard on the network as plain hex text — everything in the charge-limit ranges, deduplicated. Used to verify limit decoding against your exact equipment: copy the text and send it to support when setting up a new battery system. Capture runs whenever NMEA2K receive or follow is on and never touches charge control.</span></span>
                 </div>
                 <div class="form-input">
-                  <!-- Anchor, not window.open: in the Capacitor WKWebView window.open can load INTO the
-                       app's own webview (stranding the dashboard); target=_blank on a real anchor is the
-                       proven pattern (/huntledger). href set at click time so buildURL targets the device. -->
+                  <!-- Anchor, not window.open: in the Capacitor WKWebView window.open can load into the app's own webview.
+                       href set at click time so buildURL targets the device. -->
                   <a class="btn-secondary" href="/dvccCapture" target="_blank" rel="noopener" onclick="this.href=buildURL('/dvccCapture')">Open Capture</a>
                 </div>
               </div>
@@ -9677,10 +9657,8 @@
 
             </div><!-- /integ-group: Battery Charge-Limit Follow -->
 
-            <!-- Minimal BMS On/Off Control — the opto digital input (GPIO42) as a charge permission.
-                 Moved here from Battery > Charge Settings 2026-08-23. The Present/Absent labels are
-                 WIRE-level: bmsLogicLevelOff 0 = charge while the input is energized, which reads as
-                 a LOW pin at the ESP32 (opto inverts). Never relabel back to the pin's own logic. -->
+            <!-- Minimal BMS On/Off Control: the opto digital input (GPIO42) as a charge permission. Present/Absent labels are
+                 WIRE-level (bmsLogicLevelOff 0 = charge while energized = LOW pin, opto inverts); never relabel to pin logic. -->
             <details class="integ-section">
               <summary class="integ-section-title">Minimal BMS On/Off Control</summary>
 
@@ -9839,10 +9817,8 @@
               </div>
             </details>
 
-            <!-- Which unit is this? Every value comes from /identify on the connected regulator,
-                 not from local storage, so it names the board actually on the other end of the
-                 connection. The xreg-<id>.local address is the one that cannot be raced by a
-                 second regulator answering to alternator.local. -->
+            <!-- Every value comes from /identify on the connected regulator, not local storage. The xreg-<id>.local address
+                 cannot be raced by a second regulator answering to alternator.local. -->
             <details id="unitIdCard" open style="margin-top: 20px;">
               <summary
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
@@ -9897,9 +9873,8 @@
               </div>
             </details>
 
-            <!-- The boat's other regulators: /identify's paired list, with live status from its peers
-                 list (renderBoatCard). Pairing writes both units (pairWithRegulator), so either
-                 unit's page shows the same list. -->
+            <!-- The boat's other regulators: /identify's paired list + live peer status (renderBoatCard). Pairing writes both
+                 units (pairWithRegulator), so either page shows the same list. -->
             <details id="boatCard" open style="margin-top: 20px;">
               <summary
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
@@ -9952,10 +9927,8 @@
               </div>
             </details>
 
-            <!-- App-only. Joining a named network needs NEHotspotConfiguration, which exists
-                 only in the iOS app; initRegulatorApUi() unhides this card when the plugin is
-                 present. The values are stored on this phone, not on the regulator — the AP
-                 credentials live in the regulator's NVS and are never sent in the echo. -->
+            <!-- iOS app only: joining a named network needs NEHotspotConfiguration; initRegulatorApUi() unhides this card. Values
+                 are stored on this phone; the AP credentials live in the regulator's NVS and are never echoed. -->
             <details id="regApCard" open style="margin-top: 20px; display: none;">
               <summary
                 style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
@@ -10494,9 +10467,8 @@
           </div>
         </div>
 
-        <!-- Vessel Performance Sub-tab — everything configurable for boat performance lives
-             here. The live polar/motoring display, the Sailing/Motoring toggle, the Learning
-             switch and Download CSV stay on the Live Data side. -->
+        <!-- Vessel Performance Sub-tab: all boat-performance config. The live display, Sailing/Motoring toggle, Learning
+             switch and Download CSV stay on Live Data. -->
         <div id="settings-boatperformance" class="sub-tab-content">
           <div class="settings-card">
             <p class="card-group-title"><span>Position, Speed &amp; Course Sources</span>
@@ -11281,11 +11253,6 @@
             </div>
           </div>
 
-          <div class="card req-batt-current">
-            <p>SOC Gain Factor (Auto-Learned)</p>
-            <p class="reading"><span id="DynamicShuntGainFactor_card">1.000</span></p>
-          </div>
-
         </div>
 
         <!-- ===== ENERGY AND STATISTICS ===== -->
@@ -11470,14 +11437,13 @@
                 <text x="100" y="55" text-anchor="middle" font-size="5" fill="#cfd3d6" opacity=".7">ANGLE</text>
                 <rect x="86" y="58" width="28" height="18" rx="3" fill="#c7cdbf" stroke="#0a0c0f" stroke-width="1.1" />
                 <text id="windLcdAng" x="100" y="71.5" text-anchor="middle" font-family="'Courier New',monospace" font-weight="700" font-size="11" fill="#14160f">0°</text>
-                <!-- Needle + hub painted LAST so the pointer sits in FRONT of the LCD readouts; semi-transparent cyan fill so the ANGLE value stays readable through the pointer when it crosses a screen -->
+                <!-- Needle + hub painted last so the pointer sits in front of the LCDs; semi-transparent so the angle stays readable through it -->
                 <g id="windNeedle"><polygon points="60,11 55.5,55 64.5,55" fill="#37d2c9" fill-opacity="0.6" /></g>
                 <circle cx="60" cy="60" r="4.5" fill="#33383e" stroke="#6b7177" stroke-width="1.5" />
               </svg>
             </div>
-            <!-- Beaufort badge + numeric readouts fill the space below the dial so the card height
-                 matches the trend plot. All values are real CSV2 fields (gust/lull = ignition-cycle
-                 AWS hi/lo, true dir/spd = live true wind); badge text comes from _windWmBeaufort. -->
+            <!-- Fills the space below the dial so the card height matches the trend plot. CSV2 fields: gust/lull =
+                 ignition-cycle AWS hi/lo, true dir/spd = live true wind; badge text from _windWmBeaufort. -->
             <div class="wind-beaufort" id="windBeaufort">—</div>
             <div class="wind-stats">
               <div class="wind-stat"><div class="k">Gust</div><div class="v" id="windGust">—</div></div>
@@ -11638,6 +11604,39 @@
             <div class="metric-row">
               <span class="metric-label">Messages Dropped</span>
               <span class="metric-value"><span id="li_n2kTxDrops_ID">&mdash;</span></span>
+            </div>
+          </div>
+          <div class="card-group">
+            <p class="card-group-title"><span>Bus Health</span>
+              <span class="tooltip">ℹ️<span class="tooltip-box">How the regulator's NMEA 2000 connection is doing. Transmit and receive errors are the controller's own error counters: a healthy bus keeps both at or near 0, and transmit errors stuck at 128 mean no other device is acknowledging the regulator's messages. Controller restarts counts how often it shut down after repeated errors and restarted. Frames are the bus's individual packets, and a longer message spans several. Frames missed counts frames that arrived faster than the regulator could read them; it says nothing about the wiring. Counts run from when the regulator started.</span></span>
+            </p>
+            <div class="metric-row">
+              <span class="metric-label">Status</span>
+              <span class="metric-value"><span id="li_n2kBusVerdict_ID">&mdash;</span></span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">Devices Heard</span>
+              <span class="metric-value"><span id="li_n2kNodesHeard_ID">&mdash;</span></span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">Frames Received</span>
+              <span class="metric-value"><span id="li_n2kRxFrames_ID">&mdash;</span></span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">Transmit Errors</span>
+              <span class="metric-value"><span id="li_n2kTec_ID">&mdash;</span></span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">Receive Errors</span>
+              <span class="metric-value"><span id="li_n2kRec_ID">&mdash;</span></span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">Controller Restarts</span>
+              <span class="metric-value"><span id="li_n2kBusOffCount_ID">&mdash;</span></span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">Frames Missed</span>
+              <span class="metric-value"><span id="li_n2kRxLost_ID">&mdash;</span></span>
             </div>
           </div>
         </div>
@@ -11838,7 +11837,7 @@
     </div>
 
     <div id="livedata-boatperformance" class="sub-tab-content">
-      <!-- Boat Performance (Phase 3) — unified sailing/motoring -->
+      <!-- Boat Performance: unified sailing/motoring -->
       <div class="settings-card" style="margin-top:16px;">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
           <p class="card-group-title" style="margin:0;padding:0;border:0;white-space:normal;"><span>Speed
@@ -11943,9 +11942,7 @@
         </div>
       </div>
 
-      <!-- Quick View: compact at-a-glance tiles directly under the polar. Each reuses the live
-           telemetry IDs (so updates/watermarks/staleness keep working); detail panels collapse below.
-           Related pairs share one tile: VMG/Leeway and Heel/Pitch. -->
+      <!-- Quick View tiles reuse the live telemetry IDs, so updates/watermarks/staleness keep working. -->
       <div class="settings-card" style="margin-top:16px;">
         <p class="card-group-title" style="margin:0 0 10px 0;">Quick View</p>
         <div class="vital-grid">
@@ -12042,7 +12039,7 @@
         </details>
       </div>
 
-      <!-- Navigation detail — collapsed by default; primary speed/leeway live in Vital Signs above -->
+      <!-- Navigation detail — collapsed by default; primary speed/leeway live in Quick View above -->
       <div class="settings-card">
         <details>
           <summary style="cursor:pointer;font-weight:bold;font-size:16px;padding:10px 0;border-bottom:2px solid var(--accent);margin:14px 0 10px;">Heading, GPS &amp; VMG</summary>
@@ -12081,7 +12078,7 @@
             </div>
           </div>
 
-          <!-- VMG (manual bearing) — VMG Upwind is shown live in Vital Signs above -->
+          <!-- VMG (manual bearing) — VMG Upwind is shown live in Quick View above -->
           <div class="card-group">
             <p class="card-group-title">VMG (Manual Bearing)</p>
             <div class="metric-row">
@@ -12659,7 +12656,7 @@
           </div>
         </div>
 
-        <!-- engine lifetime stats continue in the same Lifetime Statistics panel (RPM + fuel flow live in Vital Signs) -->
+        <!-- engine lifetime stats continue in the same Lifetime Statistics panel (RPM + fuel flow live in Quick View) -->
 
         <!-- Engine Fuel Consumed -->
         <hr />
@@ -12979,7 +12976,7 @@
                   <form class="gate-ap" action="/get" method="GET" target="hidden-form" style="display:inline;">
                     <input type="hidden" name="forceCloudFlush" value="1">
                     <input type="submit" value="Upload Now" class="btn-primary" id="cloudUploadNowBtn"
-                      title="Force-upload buffered records to the cloud immediately. RECOMMENDED with field OFF. If field is ON: control loop is held for up to 10s during each upload, banner will show WAITING CLOUD. Hardware over-voltage protection stays armed, but a load transient mid-upload could trigger a hard cut. Avoid during dynamic events (RPM ramps, sudden load changes). Bypasses the 70s field-off settle and 13s interval throttle." />
+                      title="Uploads the buffered records to the cloud now instead of on the normal schedule. If the field is on, the upload waits until the field has been off for 20 seconds." />
                   </form>
                   <form action="/get" method="GET" target="hidden-form" style="display:inline;">
                     <input type="hidden" name="ClearBuffer" value="1">
@@ -13037,7 +13034,8 @@
               <span class="metric-label">Largest Free Block (kB)
                 <span class="tooltip">ℹ️
                   <span class="tooltip-box">Largest single contiguous free block in internal RAM. Allocations larger
-                    than this will fail even if total free space looks adequate.</span>
+                    than this will fail even if total free space looks adequate. Measured every 20 seconds while the field
+                    is off; charging shows the last reading taken before it started.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="LargestInternalBlockID">0</span></span>
@@ -13052,10 +13050,21 @@
               <span class="metric-value"><span id="FreePSRAMID">0</span>&nbsp;/&nbsp;<span id="TotalPSRAMID">0</span></span>
             </div>
             <div class="metric-row">
+              <span class="metric-label">Largest Free PSRAM Block (kB)
+                <span class="tooltip">ℹ️
+                  <span class="tooltip-box">Largest single contiguous free block in external SPI RAM. A buffer larger
+                    than this cannot be allocated, even when Free PSRAM shows more. Measured every 20 seconds while the field is
+                    off; charging shows the last reading taken before it started.</span>
+                </span>
+              </span>
+              <span class="metric-value"><span id="LargestPSRAMBlockID">0</span></span>
+            </div>
+            <div class="metric-row">
               <span class="metric-label">Heap Fragmentation (%)
                 <span class="tooltip">ℹ️
                   <span class="tooltip-box">Internal RAM only. 100 × (1 − largest_free_block / total_free). 0% = fully
-                    contiguous; above ~70% warrants attention.</span>
+                    contiguous; above ~70% warrants attention. Measured with Largest Free Block, so charging also shows
+                    the last reading taken before it started.</span>
                 </span>
               </span>
               <span class="metric-value"><span id="HeapfragID">0</span></span>
@@ -13387,9 +13396,8 @@
             <p class="card-group-title">Temperature Sensor Health (DS18B20)</p>
             <p style="font-size:12px;color:var(--text-muted);margin:0 0 12px 0;">Counts since boot. One read failure on startup is normal. Persistent failures need attention; occasional CRC recoveries are fine.</p>
 
-            <!-- Per-probe good/bad read tallies. Filled by owRenderHealth() from the same
-                 /tempSensors poll that drives the Setup > Temperature identification table;
-                 the poll runs while EITHER tab is on screen (owTabVisible in script.js). -->
+            <!-- Filled by owRenderHealth() from the /tempSensors poll shared with Setup > Temperature; the poll runs while
+                 either tab is on screen (owTabVisible, script.js). -->
             <p class="card-group-subtitle" style="font-size:12.5px;font-weight:600;margin:4px 0 6px;">Per probe</p>
             <div class="ow-table-wrap">
               <table class="usage-table ow-table" id="owHealthTable">
@@ -13784,7 +13792,7 @@
                 style="grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; border-bottom: 1px solid var(--border);">
                 <div style="padding: 6px 8px; font-size: 12px; color: #666;">Update System Health Stats
                   <span class="tooltip">ℹ️
-                    <span class="tooltip-box">updateSystemHealthStats() — polls FreeRTOS heap stats, CPU load, fragmentation. Involves system calls that can occasionally stall.</span>
+                    <span class="tooltip-box">updateSystemHealthStats(): reads the heap free-space counters every 4 seconds and, with the field off, refreshes the storage free-space figure. CPU load, fragmentation, and the largest-block readings are measured on the other core.</span>
                   </span>
                 </div>
                 <div style="padding: 6px 8px; font-size: 15px; font-weight: bold; text-align: right;"><span
@@ -14847,14 +14855,12 @@
 
       <div id="diag-panel-alternator" class="diag-panel active">
 
-      <!-- ── Shared fast-channel hardware + steady-state gates — feeds both C1 and C2 ── -->
-
       <!-- Charging System Health -->
       <details class="diag-section" id="c3HealthCard" open>
         <summary class="diag-section-title">Charging System Health</summary>
 
         <div class="settings-card">
-        <!-- Charging-system health summary (v2) — sits directly above the plots -->
+        <!-- Charging-system health summary, directly above the plots -->
         <div style="display:flex;align-items:center;gap:18px;margin:4px 0 10px;flex-wrap:wrap;">
           <div style="min-width:96px;text-align:center;flex-shrink:0;">
             <div style="font-size:11px;color:var(--text-muted);">Charging System Health <span class="tooltip">ℹ️<span class="tooltip-box">Output amps as a percentage of the best the charging system has done in the past under these same conditions. Both sides of the comparison are the same statistic — a sustained multi-second average, the same window the health matrix stores — so a momentary dip can't read as lost health. MEASURED means a recorded best exists at this operating point (within a small matching window); ESTIMATED means it's interpolated.</span></span></div>
@@ -14929,16 +14935,15 @@
 
       </details>
 
-      <!-- ── Waveform instruments (scope + flipbook) — read the same fast channel as C1/C2.
-           id=fa-monitor-details is read by fastDiagIsVisible(); collapsing needs no handler, the
-           5 s tick skips itself while this is closed. ── -->
+      <!-- ── Waveform instruments (scope + flipbook) on the C1/C2 fast channel. fastDiagIsVisible() reads this id; the
+           5 s tick skips itself while closed, so collapsing needs no handler. ── -->
       <details class="diag-section" id="fa-monitor-details" open ontoggle="if(this.open){if(typeof fastDiagOnOpen==='function')fastDiagOnOpen();}">
         <summary class="diag-section-title">Live Oscilloscope &amp; Historical Snapshots</summary>
         <p style="max-width:560px;margin:8px auto 4px;font-size:12px;color:var(--text-muted);text-align:center;">Fast current channel: <span id="faChanState_ID" style="font-weight:600;">?</span></p>
 <div class="settings-card fa-paired-top">
         <div class="form-row form-row-wide" style="align-items:center; gap:8px; flex-wrap:wrap;">
           <span style="font-size:14px; font-weight:600;">Live Oscilloscope</span>
-          <!-- Series selector mirrors the Reference Flipbook header below for UX consistency. Independent show/hide toggles, not an A/B switch: any combination of Raw+Filtered (incl. both or neither). Swatch matches the trace color. Capture auto-refreshes every 5 s; Pause lives on the chart top-right, matching the flipbook. -->
+          <!-- Independent show/hide toggles (not an A/B switch); mirrors the flipbook header. Swatch matches the trace color. -->
           <div class="cap-mode-toggle">
             <button type="button" id="faScopeRawBtn" class="cap-mode-btn cap-mode-active" onclick="fastScopeViewToggle('raw',this)"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#2196F3;margin-right:5px;vertical-align:middle;"></span>Raw</button>
             <button type="button" id="faScopeFiltBtn" class="cap-mode-btn cap-mode-active" onclick="fastScopeViewToggle('filt',this)"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#FF9800;margin-right:5px;vertical-align:middle;"></span>Filtered</button>
@@ -14952,9 +14957,8 @@
           <button type="button" class="btn-secondary btn-sm" onclick="downloadFaScopeCsv()">Download CSV</button>
           <span id="fastscope-status" style="font-size:13px; color:#666;">No capture yet. Refreshes every 5 seconds; each capture is a 20,000-per-second snapshot.</span>
         </div>
-        <!-- Shared time window: these buttons re-window BOTH the scope and the Reference Flipbook
-             below, so the two X axes always span the same milliseconds. Capped at 200 ms because
-             a flipbook page is only 200 ms long. -->
+        <!-- Shared time window: re-windows both the scope and the flipbook below so their X axes match. Capped at 200 ms
+             because a flipbook page is only 200 ms long. -->
         <div class="form-row form-row-wide" style="align-items:center; gap:6px; flex-wrap:wrap; margin-top:6px;">
           <span style="font-size:13px; font-weight:600;">Time window (both plots):</span>
           <button type="button" class="btn-secondary btn-sm fastscope-zoom active" data-ms="200" onclick="fastScopeZoom(200, this)">200 ms</button>
@@ -15180,10 +15184,8 @@
           </div>
           <hr style="border:none;border-top:1px solid var(--border);margin:6px 0;">
 
-          <!-- Speed map: the live gain-vs-speed profile from /huntmap (trapezoid pockets), episode
-               dots from the same /huntledger parse as the list below, and a live engine-speed
-               marker. Built by renderHuntMap(); stays hidden until there is a pocket or an episode
-               with an engine speed. -->
+          <!-- Speed map (renderHuntMap): /huntmap gain-vs-speed pockets, /huntledger episode dots, live engine-speed marker.
+               Hidden until there is a pocket or an episode with an engine speed. -->
           <div id="hgMapWrap" style="display:none;margin-top:10px;">
             <div id="hgMapPlot"></div>
             <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-top:6px;font-size:0.78em;color:var(--text-muted);">
@@ -15887,7 +15889,8 @@
               (about 75 rows per second, covering roughly the last 80 seconds). Logs are automatically cleared after
               download. Pause Logs freezes the log buffers so their contents stay fixed; Resume Logs continues
               recording — the dot on the button shows the state (pulsing green = recording, amber = paused).
-              Start Fresh Log clears the buffers and begins a new log.</span>
+              Start Fresh Log clears the buffers and begins a new log. With NMEA 2000 in use, the download also
+              includes a bus-health log with one row per minute for the last 24 hours.</span>
           </span>
         </div>
         <hr />
@@ -15900,10 +15903,8 @@
           </div>
         </div>
       </div>
-      <!-- X-axis time window — buttons set plotTimeWindow (seconds) for all four live plots.
-           The current setting is shown by highlighting its button (driven from the CSV3 echo
-           in updateAllEchosOptimized), not by a text echo. Y axis is set by clicking its top or
-           bottom number (attachYAxisEdit). -->
+      <!-- X-axis window: buttons set plotTimeWindow (s) for all four live plots; the active button is highlighted from
+           the CSV3 echo (updateAllEchosOptimized), no text echo. Y axis: click its top/bottom number (attachYAxisEdit). -->
       <div class="settings-card">
         <div class="form-row form-row-wide">
           <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
@@ -15971,14 +15972,11 @@
       </div>
     </div>
 
-    <!-- Long Term Plots Sub-tab — native render of the on-device month-long ring
-         (/longTermPlots.bin). Older-than-ring data stitches in from Supabase later.
-         Lazy: initLongTermPlots() runs on first open of this sub-tab. -->
+    <!-- Long Term Plots: native render of the on-device month-long ring (/longTermPlots.bin); older data stitches in
+         from Supabase later. initLongTermPlots() runs lazily on first open. -->
     <div id="plots-longterm" class="sub-tab-content">
-      <!-- Freshness banner — long-term points are min/max/avg ENVELOPES committed once per
-           closing window (interval from the .bin header, ~10 min in production), NOT live
-           writes. So the newest point can be up to one interval old. JS (ltUpdateFreshness)
-           shows the countdown to the next averaged point and a one-tap Refresh once due. -->
+      <!-- Long-term points are min/max/avg envelopes committed once per window (interval from the .bin header, ~10 min),
+           not live, so the newest can be one interval old. ltUpdateFreshness shows the countdown and Refresh. -->
       <div id="lt-freshness-banner" class="settings-card" style="display:none; text-align:center; padding:8px; font-size:13px;"></div>
       <div class="settings-card">
         <div id="longterm-status" style="text-align:center; padding:8px; font-size:13px;">Loading long-term history…</div>
@@ -16043,9 +16041,6 @@
         <div class="plot-container" id="lt-motion-plot"></div>
       </div>
     </div>
-
-    <!-- Scope Sub-tab — fast alternator-current channel (500 ms raw capture, 20 kSPS) -->
-    
 
   </div>
 
@@ -16116,12 +16111,12 @@
 
           <!-- Account Actions -->
           <div class="section-title">Account Management</div>
-          <!-- Explicit public-data disclosure: registering is the consent moment. Spells out exactly
-               what becomes public so consent is informed, not inferred from the email "(kept private)" hint.
-               Plain muted helper text (NOT a flex .form-input — that scrambled the paragraph into columns). -->
+          <!-- Public-data disclosure: registering is the consent moment, so spell out what becomes public. Plain text,
+               not a flex .form-input (that splits the paragraph into columns). -->
           <p style="font-size: 12.5px; color: #777; line-height: 1.55; margin: 8px 0 4px; max-width: 660px;">
-            <strong style="color: #555;">What's public:</strong> Registering shows your username, boat type, and
-            boat length on the public leaderboards, visible to anyone. Your email and location are never shared.
+            <strong style="color: #555;">What's public:</strong> Registering shows your username, boat type, boat
+            length, make/model, and year on the public leaderboards, visible to anyone. Your email, home port, and
+            location are never shared.
             You can leave at any time with <strong style="color: #555;">Delete My Account</strong> — this permanently
             deletes your cloud account and associated cloud data. A record of which firmware versions this regulator
             has installed, and when, is kept under its serial number for safety recalls and support. Your hardware
@@ -16131,9 +16126,7 @@
 
           <hr />
 
-          <!-- Single right-aligned action bar: destructive Delete (ghost) sits left of the primary Save.
-               Delete is type=button + onclick so it never submits the profile form; its own JS confirm
-               (warning + type-DELETE prompt) carries the irreversibility warning. -->
+          <!-- Delete is type=button so it never submits the profile form; its JS confirm carries the irreversibility warning. -->
           <div style="display: flex; justify-content: flex-end; gap: 10px; align-items: center; flex-wrap: wrap;">
             <button type="button" onclick="handleDeleteAllData()" class="btn-danger-ghost" title="Permanently deletes your cloud account and all associated cloud data. Cannot be undone — your hardware device keeps working locally without cloud features. A record of which firmware versions this regulator has installed, and when, is kept under its serial number for safety recalls and support.">Delete My Account</button>
             <input type="submit" value="Save Profile Changes" class="btn-primary" />
@@ -16399,10 +16392,7 @@
     })();
   </script>
 
-  <!-- ── Test Active Floating Panel ──────────────────────────────────────────
-       Lives outside ALL .tab-content divs so position:fixed is never
-       cancelled by a parent display:none when tabs switch.
-  ──────────────────────────────────────────────────────────────────────────-->
+  <!-- ── Test Active Floating Panel: outside all .tab-content divs so a parent display:none never hides it on tab switch. ── -->
   <div id="test-panel-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; z-index:9999; pointer-events:none;">
     <div id="test-panel" style="pointer-events:auto; position:absolute; top:80px; left:20px; background:#1e1e1e; color:#ddd; width:270px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.85); border:1px solid #555; box-sizing:border-box;">
       <!-- Drag handle -->
@@ -16424,10 +16414,7 @@
     </div>
   </div>
 
-  <!-- ── Plant Delay Test Panel ────────────────────────────────────────────
-       Lives outside ALL .tab-content divs so position:fixed is never
-       cancelled by a parent display:none when tabs switch.
-  ──────────────────────────────────────────────────────────────────────────-->
+  <!-- ── Plant Delay Test Panel: outside all .tab-content divs, same reason as the test panel above. ── -->
   <div id="sysid-modal-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; z-index:9000; pointer-events:none;">
     <div id="sysid-modal-panel" style="pointer-events:auto; position:absolute; top:80px; right:20px; background:#1e1e1e; color:#ddd; width:380px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100vh - 100px); overflow-y:auto;">
 
@@ -16636,22 +16623,15 @@
         <button onclick="closeCommissionModal()" style="background:none; border:none; color:#a8a8a8; cursor:pointer; font-size:18px; padding:0 4px; line-height:1;">✕</button>
       </div>
       <div style="padding:20px;">
-        <!-- Physical Panel Override warning — lives in the wizard chrome, ABOVE #commission-body, so it
-             is on screen for every step and every route in, and it stays up because the hazard it names
-             (a hand on the panel moving the charge rate or Maintain mid-run) lasts the whole run.
-             Shown/hidden by cxPanelOverrideStrip() off the CSV3 echo, so turning the override off during
-             the run clears it. -->
+        <!-- Physical Panel Override warning: in the wizard chrome above #commission-body so it shows on every step for the
+             whole run (a hand on the panel can move charge rate/Maintain mid-run). Toggled by cxPanelOverrideStrip() off CSV3. -->
         <div id="cx-panel-override-warn" style="display:none; margin-bottom:14px; padding:9px 11px; background:rgba(240,165,0,0.08); border:1px solid rgba(240,165,0,0.4); border-radius:6px; font-size:12px; line-height:1.5; color:#e6a23c;">
           <strong>Physical Panel Override is on.</strong> The switches on data Cable 3 hold the charge rate and Force &quot;Maintain Mode&quot; &mdash; including the charge rate this wizard asks you to set. Leave the panel alone for the whole run, or turn the override off under Setup &rarr; System &rarr; Security &amp; Maintenance.
         </div>
         <div id="commission-steps" style="display:flex; flex-wrap:wrap; gap:4px 8px; padding-bottom:12px; margin-bottom:14px; border-bottom:1px solid rgba(255,255,255,0.32); font-size:11px; color:#9a9a9a;"></div>
-        <!-- Permanent RPM sparkline — lives ABOVE the per-phase #commission-body so the
-             body's innerHTML re-render each phase never wipes it. Fed off CSV1 (cxRpmSparkOnCsv1).
-             Hidden while the Disturbances sweep game owns the screen (cxGameStart/cxGameStop) — the game
-             draws the same trace + live RPM itself. -->
-        <!-- Live value is an overlay pinned to the sparkline's bottom-right corner (translucent so the
-             trace reads through it) — the per-phase label sentence wraps freely above without ever
-             moving the number. -->
+        <!-- Permanent RPM sparkline: above #commission-body so the per-phase innerHTML re-render never wipes it. Fed by
+             cxRpmSparkOnCsv1; hidden while the Disturbances sweep game draws its own trace (cxGameStart/cxGameStop). -->
+        <!-- Live value overlays the sparkline's bottom-right corner so the wrapping label above never moves the number. -->
         <div id="cx-rpm-strip" style="position:relative; margin-bottom:14px; padding:8px 10px; background:#222; border-radius:6px;">
           <div id="cx-rpm-strip-label" style="font-size:11px; color:#9a9a9a; margin-bottom:4px;">Engine RPM (last ~15 s)</div>
           <canvas id="cxRpmSpark" style="display:block; width:100%; height:48px;"></canvas>
@@ -16703,9 +16683,8 @@
     </div>
   </div><!-- END cvs-modal-overlay -->
 
-  <!-- Config-import diff preview: every setting the incoming file would change, current → new,
-       each row checkbox-selectable (all checked by default; only checked rows are applied),
-       shown BEFORE anything is written. Shared by file Load Configuration and the community library. -->
+  <!-- Config-import diff preview: every setting the file would change (current → new), checkbox-selectable, shown
+       before anything is written. Shared by file Load Configuration and the community library. -->
   <div id="cfgdiff-modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9100; align-items:center; justify-content:center;">
     <div id="cfgdiff-modal-panel" style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100vh - 100px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16724,9 +16703,8 @@
     </div>
   </div><!-- END cfgdiff-modal-overlay -->
 
-  <!-- Battery-defaults populator: after a Vessel Info save that sets/changes battery type, capacity,
-       or system voltage, proposes chemistry-appropriate charge/protection values, Now → Proposed.
-       Never applies silently; Bulk/Absorption voltages deliberately excluded (manufacturer sheet). -->
+  <!-- Battery-defaults populator: after a Vessel Info save that changes battery type, capacity or system voltage, proposes
+       chemistry defaults (Now → Proposed). Never applies silently; Bulk/Absorption deliberately excluded (manufacturer sheet). -->
   <div id="battdef-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16744,11 +16722,8 @@
     </div>
   </div><!-- END battdef-modal-overlay -->
 
-  <!-- Between-screens wait box (first Vessel Info save chain). The device work between two setup
-       screens - the SoC-seed poll, the /exportConfig NVS walk, the prerequisites write - leaves the
-       page looking finished, and a note under the Save button is nowhere anyone is looking. This
-       keeps a black box on screen so the wait reads as the next step in the same sequence.
-       Shown/hidden only by vesselNextStepWait(); the close X appears only on the stall escalation. -->
+  <!-- Between-screens wait box (first Vessel Info save chain): keeps the device work between setup screens visibly part
+       of the sequence. Shown/hidden only by vesselNextStepWait(); the close X appears only on stall escalation. -->
   <div id="nextstep-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9060; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16767,9 +16742,8 @@
     </div>
   </div><!-- END nextstep-modal-overlay -->
 
-  <!-- Maintenance-restart acknowledgement: first Vessel Info save only, after the SoC popup and
-       before the Charge Rate Limits handoff. Static body; maintAckClose() resolves the
-       save-chain promise. -->
+  <!-- Maintenance-restart acknowledgement: first Vessel Info save only, after the SoC popup and before the Charge Rate
+       Limits handoff. maintAckClose() resolves the save-chain promise. -->
   <div id="maint-ack-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:470px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:flex-start; justify-content:space-between; gap:10px; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16782,10 +16756,8 @@
           advantage of non-interrupting moments and forces an immediate reboot only if one wasn't found.
         </p>
 
-        <!-- Steps mirror the three uptime tiers in checkAndRestart() (5_functions.ino): 24 h fully quiet
-             + 5-min hold + silent, 48 h drops noClient/SoC (countdown only when a client is watching),
-             72 h drops engine/field/client and skips the hold, brown-out floor + OTA + g_autoTestActive
-             still defer. The pre-1-day note is the maintRebootHealthReq heap requester. Keep in sync. -->
+        <!-- Steps mirror the three uptime tiers in checkAndRestart() (5_functions.ino) and the maintRebootHealthReq
+             heap requester (pre-1-day note); keep in sync. -->
 
         <div style="display:grid; grid-template-columns:24px 1fr; column-gap:11px; align-items:start;">
           <div style="width:24px; height:24px; border-radius:50%; background:#22403c; border:1px solid #3d6b64; color:#6fd3c6; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center; line-height:1;">1</div>
@@ -16857,11 +16829,9 @@
     </div>
   </div><!-- END maint-ack-overlay -->
 
-  <!-- Commissioning Prerequisites: collects the sensor/current settings commissioning depends on before
-       the wizard measures them. On a first Vessel Info save it comes BEFORE the battery-defaults popup, so
-       the proposal is derived from the hardware described here (the Charge Rate Limits handoff is then
-       made by the save chain, after the SoC and restart-ack screens). Body rendered by commPrepRender()
-       from /exportConfig; only edited fields are written (commPrepFinish). -->
+  <!-- Commissioning Prerequisites: sensor/current settings commissioning depends on. On a first Vessel Info save it precedes
+       the battery-defaults popup so that proposal derives from this hardware. Body by commPrepRender() from /exportConfig;
+       only edited fields are written (commPrepFinish). -->
   <div id="commprep-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:560px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16917,10 +16887,8 @@
     </div>
   </div><!-- END rwfs-modal-overlay -->
 
-  <!-- Charge Rate Limits — pre-commissioning, between the Prerequisites screen and tach alignment
-       (commPrepFinish → openRpmCap → rpmCapContinue → openRpmAlign). Seeds BOTH the Low and High cap
-       tables at once (capBothSave); the chosen Continue button sets the charge-rate mode (HiLow).
-       Body rendered by rpmCapRender(). -->
+  <!-- Charge Rate Limits (pre-commissioning: commPrepFinish → openRpmCap → rpmCapContinue → openRpmAlign). Seeds both Low and
+       High cap tables (capBothSave); the chosen Continue button sets the charge-rate mode (HiLow). Body by rpmCapRender(). -->
   <div id="rpmcap-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16939,10 +16907,8 @@
     </div>
   </div><!-- END rpmcap-modal-overlay -->
 
-  <!-- Tachometer Calibration (engine-speed alignment) — first-install only, between the Prerequisites screen and the
-       commissioning wizard (commPrepFinish → openRpmAlign → openCommissionModal). Needs the engine
-       running with Alternator Enable off (nothing here holds the field off, and a scaling-factor change is
-       refused while it is driven); body rendered by rpmAlignRender(); tach settings are written live as edited. -->
+  <!-- Tachometer Calibration: first install, Clear and restart, or a tab start before any run (openRpmCap → openRpmAlign → openCommissionModal). Engine running with
+       Alternator Enable off: nothing here holds the field off, and a scaling-factor change is refused while driven. -->
   <div id="rpmalign-modal-overlay" style="display:none; position:fixed; inset:0; pointer-events:none; z-index:9050; align-items:flex-start; justify-content:flex-start; overflow:auto; padding:20px; box-sizing:border-box;">
     <div style="pointer-events:auto; position:relative; margin:auto 0; background:#1e1e1e; color:#ddd; width:480px; max-width:calc(100vw - 40px); border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box; max-height:calc(100dvh - 40px); display:flex; flex-direction:column;">
       <div style="padding:10px 16px 9px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; background:#252525; border-radius:8px 8px 0 0; user-select:none;">
@@ -16956,15 +16922,9 @@
     </div>
   </div><!-- END rpmalign-modal-overlay -->
 
-  <!-- Limit panel — names the one thing holding charging back, the number it is held against, and
-       where that number is set. Opened from the header readout labels, the field percentage and the
-       PROTECTION / BATT > TARGET / EXT LIMIT words (every .why-tap); rendered by whyPanelRender() from
-       the CSV1/CSV2/CSV4 caches plus settings echoes. Non-modal (click-through overlay) and draggable
-       by its header, so it can sit beside the readouts it is explaining rather than covering them.
-       Sizing rule: space is RESERVED only for text that rewrites itself while open (the two sentence
-       blocks, held two lines tall so a limiter flip does not twitch the box); a block that is
-       structurally absent (no external authority in charge, no "where" for this limiter) is display:none and the
-       panel is genuinely shorter for it. -->
+  <!-- Limit panel: names what is holding charging back, the number it is held against, and where that is set. Opened from
+       every .why-tap; rendered by whyPanelRender(). Space is reserved only for text that rewrites itself while open (the two
+       sentence blocks, two lines tall so a limiter flip does not twitch the box); absent blocks are display:none. -->
   <div id="why-overlay" class="why-overlay" style="display:none;">
     <div id="why-panel" class="why-panel" role="dialog" aria-labelledby="why-title" tabindex="-1">
       <div id="why-drag-handle" class="why-head">

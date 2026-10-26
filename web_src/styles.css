@@ -24,36 +24,23 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.   */
 
-/* ===========================================================================
-   FEATURE GATES — two tags, one policy each. Read this before adding either.
-
-   .gate-*  a SETTING whose feature is switched off. It stays visible, greyed
-            and inert. Hiding a setting is what makes an owner conclude the
-            regulator cannot do the thing at all, so settings are never hidden.
-            The nearest enclosing card carries a .gate-note-* saying why and
-            naming the switch that turns it back on.
-
-   .req-*   a live READOUT that would only ever show a dash — header chips,
-            Live Data cards, plot legend entries, diag panels. Those ARE hidden,
-            and the panel they lived in carries one .gate-note-* instead of
-            twenty dead rows.
-
-   Triggers are body classes set from the echoes in script.js:
+/* ===== FEATURE GATES — read before adding either tag =====
+   .gate-*  a SETTING whose feature is off: stays visible, greyed and inert, never hidden (hiding
+            tells the owner the regulator can't do it). Its card's .gate-note-* names the switch.
+   .req-*   a live READOUT that would only show a dash: hidden; its panel carries one .gate-note-*.
+   Body classes, set in script.js from echoes:
      no-batt-current   BatteryShuntPresent = 0 (mirrors firmware HAS_BATT_SHUNT)
-     no-soc-src        no-batt-current AND no network battery monitor (BattMonSrc = 0):
-                       nothing supplies SoC or the taper/rebulk current
+     no-soc-src        no-batt-current AND BattMonSrc = 0: nothing supplies SoC or taper/rebulk current
      no-extra-temp     extraTempProbeEnable = 0
      ap-mode           currentMode = 1 (regulator IS the access point)
-     cloud-off         CloudFeatures = 0
-   =========================================================================== */
+     cloud-off         CloudFeatures = 0 */
 body.no-batt-current .req-batt-current { display: none !important; }
 body.no-soc-src .req-soc-src { display: none !important; }
 /* Only the Alternator diag panel survives no-shunt, so drop its now-single-tab switcher. */
 body.no-batt-current #livedata-diag .diag-panel-tabs { display: none !important; }
 
-/* Dimming is applied to the CHILDREN, never the gated element itself: opacity on a parent
-   composites its whole subtree, which would fade the .gate-note explanation along with the
-   controls it is explaining. The note is a direct child and is excluded here. */
+/* Dim the CHILDREN, never the gated element: parent opacity would also fade the .gate-note
+   (a direct child, excluded here). */
 body.no-batt-current .gate-batt-current > *:not(.gate-note),
 body.no-soc-src      .gate-soc-src      > *:not(.gate-note),
 body.no-extra-temp   .gate-extra-temp   > *:not(.gate-note),
@@ -99,9 +86,8 @@ body.cloud-off       .gate-cloud .btn-secondary {
   pointer-events: none;
 }
 
-/* JS-driven gate, for a control whose trigger is not one of the body classes above (a sibling
-   toggle, a live latch state). Same look; script.js flips .is-gated on the container and the
-   .gate-note authored inside it appears with it. */
+/* JS-driven gate for a control whose trigger is not a body class: script.js toggles .is-gated
+   on the container. */
 .is-gated > *:not(.gate-note) { opacity: 0.45; }
 .is-gated input,
 .is-gated select,
@@ -113,9 +99,8 @@ body.cloud-off       .gate-cloud .btn-secondary {
 .is-gated .cap-mode-btn { pointer-events: none; }
 .is-gated > .gate-note { display: block; opacity: 1; }
 
-/* Physical Panel Override gate around the Charge Rate half of .cap-mode-row, so the Limit by
-   (Amps/kW) half beside it stays live. Its own flex row; the note takes a full line of its own
-   when the gate turns it on. */
+/* Physical Panel Override gate around only the Charge Rate half of .cap-mode-row, so the
+   Limit by (Amps/kW) half stays live. */
 .cap-rate-gate {
   display: flex;
   align-items: center;
@@ -237,29 +222,19 @@ body.ap-mode   #cloudfeatures .sub-tab-content {
 
 :root {
   --primary: #333333;
-  /* Dark gray primary */
   --accent: #00a19a;
-  /* Teal accent */
   --bg-light: #f5f5f5;
-  /* Very light gray background */
   --text-dark: #333333;
-  /* Dark text */
   --text-light: #ffffff;
-  /* Light text */
   --card-light: #ffffff;
-  /* White card background */
   --border: #dddddd;
-  /* Light border */
   --reading: #333333;
-  /* Reading text color */
   --radius: 4px;
-  /* Border radius */
   --text-muted: #5f6368;
   /* Muted secondary text (AA contrast on --card-light) */
   --accent-fill: #00807a;
-  /* Filled-pill background. These pills carry WHITE ink in light mode, and white on the brand
-     --accent is only 3.2:1 — the fill has to be darker to clear 4.5. Dark mode puts near-black
-     ink on the same pill, so it keeps the brighter accent (see .dark-mode below). */
+  /* White ink in light mode; white on --accent is only 3.2:1, so the fill is darker to clear
+     4.5. Dark mode uses near-black ink and keeps the brighter accent. */
   --cx-done: #2e7d32;
   --cx-running: #1565c0;
   --cx-manual: #8a6508;
@@ -268,12 +243,8 @@ body.ap-mode   #cloudfeatures .sub-tab-content {
      the best any colour can do on both is 4.08 — so these are a deliberate per-theme pair. */
 }
 
-/* Reserve the scrollbar gutter on every tab so the sticky header is the same width whether
-   or not a tab scrolls. Tall tabs (e.g. Console) show a vertical scrollbar that steals ~15px;
-   reserving that strip everywhere makes short non-scrolling tabs render at the same narrower
-   width, so the space-evenly chip row (Batt/SOC…IGN + Alternator Enable) packs tight on ALL
-   tabs (the wanted look) instead of only the scrolling ones. Needs classic scrollbars to take
-   effect; no effect under iOS overlay scrollbars; harmless on desktop. */
+/* Same width for the sticky header (and its space-evenly chip row) whether or not a tab
+   scrolls. No effect under iOS overlay scrollbars. */
 html { scrollbar-gutter: stable; }
 
 body {
@@ -286,21 +257,17 @@ body {
   font-size: 16px;
   /* iOS: 16px+ prevents auto-zoom on input focus */
 
-  /* iOS safe area padding */
   padding-top: max(0.5rem, env(safe-area-inset-top));
   padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
   padding-left: max(0.5rem, env(safe-area-inset-left));
   padding-right: max(0.5rem, env(safe-area-inset-right));
 
-  /* iOS momentum scrolling */
   -webkit-overflow-scrolling: touch;
 
-  /* Prevent pull-to-refresh */
   overscroll-behavior-y: contain;
 }
 
 
-/* Disable text selection on UI controls (not data) */
 button,
 .btn,
 .tab,
@@ -314,7 +281,6 @@ label,
   -webkit-tap-highlight-color: transparent;
 }
 
-/* Enable text selection on data values */
 .reading-value,
 .metric-value,
 .counter-value,
@@ -326,13 +292,9 @@ textarea {
   user-select: text;
 }
 
-/* Readout layout. Tabular digits keep the width from jittering as digits change.
-   Wrapping is ON so a readout that holds words — a source name, a state, a reset
-   reason — breaks inside its card instead of spilling past the right edge. Number
-   and unit are joined with &nbsp; in the markup ("13.4&nbsp;V"), so a value+unit
-   pair is a single unbreakable token and the unit can never drop to its own line;
-   any new readout with a unit must use &nbsp; too. break-word is the last resort
-   for a single token wider than the card (a long token, a squeezed phone column). */
+/* Units are &nbsp;-joined in the markup ("13.4&nbsp;V") so a unit never wraps to its own line;
+   any new readout with a unit must do the same. Wrapping stays on so word readouts (source
+   name, reset reason) break inside the card. */
 .reading-value,
 .metric-value,
 .metric-value-compact,
@@ -346,12 +308,10 @@ textarea {
   font-feature-settings: "tnum";
 }
 
-/* Prevent accidental zooming */
 * {
   touch-action: manipulation;
 }
 
-/* Scrollable containers get momentum */
 .learning-table-container,
 .tab-section,
 .history-container {
@@ -377,7 +337,6 @@ textarea {
   color: #ff6666 !important;
 }
 
-/* HEARTBEAT Field status indicator styles */
 .field-status-active {
   color: #00a19a !important;
   animation: field-heartbeat 5s ease-in-out infinite;
@@ -464,27 +423,19 @@ textarea {
   }
 }
 
-/* Base */
 .charge-stage {
   font-size: 11px;
   letter-spacing: 0.08em;
   display: block;
   margin-top: 2px;
   font-weight: 500;
-  /* Reserve one line even when blank. MANUAL/unknown/idle stages set textContent=''
-     + charge-stage-hidden (visibility:hidden); an empty block collapses to 0 height
-     despite visibility:hidden, so without this the sticky header shrinks by one line
-     on every transition to/from a blank stage and the whole page jumps. 1.2em == the
-     inherited line-height (cluster line-height:1.2 × this 11px font), so populated and
-     blank states are pixel-identical. */
+  /* Reserve one line when blank: an empty block collapses to 0 height despite visibility:hidden,
+     and the sticky header jumps. 1.2em = inherited line-height (cluster 1.2 x this 11px). */
   min-height: 1.2em;
 }
 
-/* Protection cue (ctrlLimiter 6): a lone brown P inline LEFT of the charge-stage word — same
-   line, so showing/hiding it never changes header height (it grows into the brand row's empty
-   middle). Deliberately the quietest cue in the header: the field is still live and charging,
-   a protection is only trimming output, so nothing here is red and nothing pulses. Red and
-   motion are reserved for the states where the field has actually been cut. */
+/* Protection cue (ctrlLimiter 6): brown P on the charge-stage line, so header height never
+   changes. Deliberately quiet (no red, no pulse): those mean the field has been cut. */
 .stage-row {
   display: flex;
   align-items: baseline;
@@ -516,13 +467,9 @@ textarea {
   .battgt-word .pw-short { display: inline; }
 }
 
-/* Why the field reads OFF — plain-English cause. An OVERLAY (position:absolute, zero layout
-   height): showing/hiding it must never change header height, or the Alternator Enable toggle
-   below jumps while the reason flaps at the RPM threshold (banner-jump fix). Shown/hidden via
-   .show (opacity fade), never display — JS keeps the old text on hide so the fade-out reads.
-   Phone (<768px) anchors to the field cluster as halo'd ghost text; wide (≥768px) anchors to
-   the brand row as a one-line full-width tinted ribbon. pointer-events:none so taps pass
-   through to whatever it covers. */
+/* Why the field reads OFF. Absolute overlay with zero layout height, so a reason flapping at the
+   RPM threshold never moves the Alternator Enable toggle. Toggled via .show (opacity), never
+   display: JS keeps the old text on hide so the fade-out reads. pointer-events:none passes taps. */
 .field-off-reason {
   position: absolute;
   z-index: 6;
@@ -579,43 +526,36 @@ textarea {
   }
 }
 
-/* BULK — aggressive charge → strong green */
 .charge-stage-bulk {
   color: #00c853;
   animation: stage-pulse 3s ease-in-out infinite;
 }
 
-/* ABSORPTION — controlled high voltage → purple */
 .charge-stage-absorption {
   color: #7e57c2;
   animation: stage-pulse 3.5s ease-in-out infinite;
 }
 
-/* FLOAT — idle maintenance → amber */
 .charge-stage-float {
   color: #ffb300;
   animation: stage-pulse 4s ease-in-out infinite;
 }
 
-/* MAINTAIN — lighter / passive → desaturated green */
 .charge-stage-maintain {
   color: #66bb6a;
   animation: stage-pulse 4.5s ease-in-out infinite;
 }
 
-/* TARGET V — active control mode → blue (intentional control) */
 .charge-stage-target-v {
   color: #42a5f5;
   animation: stage-pulse 3.2s ease-in-out infinite;
 }
 
-/* IDLE — post-absorption rest, waiting for rebulk → cool grey-blue (passive, not charging) */
 .charge-stage-idle {
   color: #78909c;
   animation: stage-pulse 5s ease-in-out infinite;
 }
 
-/* TEST ACTIVE — any diagnostic test mode running → bright orange (clearly not normal operation) */
 .charge-stage-test {
   color: #ff9800;
   animation: stage-pulse 1.5s ease-in-out infinite;
@@ -627,12 +567,10 @@ textarea {
   animation: stage-pulse 1.5s ease-in-out infinite;
 }
 
-/* UNKNOWN */
 .charge-stage-unknown {
   color: #666;
 }
 
-/* HIDDEN */
 .charge-stage-hidden {
   visibility: hidden;
 }
@@ -663,7 +601,6 @@ textarea {
 }
 
 
-/* Table Container / Gutter */
 .learning-table-container {
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -698,7 +635,6 @@ textarea {
   min-width: 0;
 }
 
-/* SVG Glyph Overlay */
 #glyphOverlay {
   position: absolute;
   left: 0;
@@ -709,7 +645,6 @@ textarea {
   z-index: 1;
 }
 
-/* Learning Table */
 .learning-table {
   width: 100%;
   min-width: 0;
@@ -773,7 +708,6 @@ textarea {
   width: 48px !important;
 }
 
-/* Table Inputs */
 .learning-table input[type="number"] {
   width: 48px;
   max-width: 48px;
@@ -807,12 +741,10 @@ textarea {
   background: var(--card-light);
 }
 
-/* RPM Cell */
 .rpm-cell {
   position: relative;
 }
 
-/* Row highlighting for active row */
 .learning-table-row {
   background-color: var(--bg-light);
   transition: background-color 0.2s ease;
@@ -926,10 +858,8 @@ textarea {
   opacity: 0.75;
 }
 
-/* Sub-group heading inside a tuning section — groups related parameter rows under one
-   label (e.g. the CV Controller Parameters "Gain selection" / "Temperature compensation"
-   bands). Lighter than the section title: no accent underline, so it reads as a divider
-   within the section rather than a new section. */
+/* Sub-group heading inside a tuning section. No accent underline, so it reads as a divider
+   within the section, not a new section. */
 .param-subhead {
   font-size: 11px;
   font-weight: 700;
@@ -939,7 +869,6 @@ textarea {
   margin: 20px 0 2px;
 }
 
-/* Collapsible tuning sections */
 details.tuning-section > summary.tuning-section-title {
   cursor: pointer;
   list-style: none;
@@ -993,9 +922,8 @@ details.diag-section[open] > summary.diag-section-title::after {
   transform: rotate(-180deg);
 }
 
-/* Setup -> Integrations — one collapsible card per external system. Same chevron pattern as
-   diag-section above; header sized to match the bold-16px accent-underline summaries the
-   nested NMEA2000 <details> still carry inline. No max-width: the settings-card is the column. */
+/* Setup -> Integrations: one collapsible card per external system. No max-width: the
+   settings-card is the column. */
 details.integ-section {
   margin-bottom: 14px;
 }
@@ -1034,7 +962,6 @@ details.integ-section[open] > summary.integ-section-title::after {
   font-size: 13px;
   color: var(--text-muted, #777);
 }
-/* Explanatory copy inside an Integrations card */
 .integ-copy {
   font-size: 13px;
   line-height: 1.55;
@@ -1095,6 +1022,116 @@ details.integ-section[open] > summary.integ-section-title::after {
 .integ-live {
   font-size: 14px;
 }
+
+/* NMEA 2000 bus verdict line (n2kBusOnCsv2). All five texts share one grid cell and only .on is
+   visible, so the box is always as tall as the longest text at the current width and a verdict
+   change never moves the rows below; the short ones sit centred in it. Status, not alarm: the dot
+   is the only colour. */
+.n2k-bus-status {
+  --n2k-dot: #8a8a8a;
+  display: grid;
+  font-size: 14px;
+  line-height: 1.45;
+  margin: 2px 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.06);
+}
+.n2k-bus-status[data-v="1"] { --n2k-dot: #2ec4b6; }
+.n2k-bus-status[data-v="3"],
+.n2k-bus-status[data-v="4"],
+.n2k-bus-status[data-v="5"] { --n2k-dot: #e6a23c; }
+.n2k-bus-status > span {
+  grid-area: 1 / 1;
+  align-self: center;
+  position: relative;
+  padding-left: 17px;
+  min-width: 0;
+  visibility: hidden;
+  overflow-wrap: break-word;
+}
+.n2k-bus-status > span.on { visibility: visible; }
+.n2k-bus-status > span::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.42em;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--n2k-dot);
+}
+
+/* Devices on the bus (n2kNodesRender) */
+details.n2k-nodes {
+  margin: 0 0 12px;
+}
+details.n2k-nodes > summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 4px 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+details.n2k-nodes[open] > summary { margin-bottom: 6px; }
+/* Doubled class: .usage-table (later in this file) right-aligns and nowraps its cells. */
+.usage-table.n2k-nodes-table th,
+.usage-table.n2k-nodes-table td {
+  text-align: left;
+}
+.usage-table.n2k-nodes-table td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.usage-table.n2k-nodes-table td:first-child { white-space: nowrap; }
+.n2k-node-age {
+  display: block;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.n2k-nodes-empty { color: var(--text-muted) !important; }
+@media (max-width: 480px) {
+  .usage-table.n2k-nodes-table th, .usage-table.n2k-nodes-table td { padding: 5px 5px; font-size: 12px; }
+}
+
+/* Record Bus Traffic progress/result line. Shown from the first press on and never hidden again; the
+   bar sits right of the text and keeps its slot when hidden, so nothing moves between phases. */
+.can-cap-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 480px;
+  min-height: 1.45em;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-muted);
+  margin: -2px 0 8px;
+}
+#canCapText {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+.can-cap-bar {
+  order: 2;
+  flex: 0 0 72px;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(127, 127, 127, 0.22);
+  overflow: hidden;
+}
+.can-cap-bar > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.4s linear;
+}
+.can-cap-status[data-tone="ok"] #canCapText { color: var(--reading); }
+.can-cap-status[data-tone="err"] #canCapText { color: #b8781c; }
+.dark-mode .can-cap-status[data-tone="err"] #canCapText { color: #e6a23c; }
 /* No global :disabled rule exists for these buttons; the dialect cards need one so the
    already-selected source reads as inert instead of as the obvious thing to click. */
 .integ-section .btn-primary:disabled,
@@ -1104,9 +1141,8 @@ details.integ-section[open] > summary.integ-section-title::after {
   box-shadow: none;
 }
 
-/* Live Data -> ESP32 Diagnostics — top-level collapsible sections. Values match the inline
-   style the sibling Live Data pages still carry on their bare <details>, so the ESP32 page
-   headers stay visually identical to those while being one class here. */
+/* Live Data -> ESP32 Diagnostics sections. Values match the inline style on the sibling Live
+   Data pages' bare <details>; keep them in step. */
 details.esp32-sec > summary {
   cursor: pointer;
   font-weight: bold;
@@ -1172,11 +1208,9 @@ details.esp32-sec > summary {
   margin-left: 16px;
 }
 
-/* ===== Buttons — universal "Soft Tonal + depth" system =====
-   Tonal backgrounds + colored text + a subtle shadow, shared by every action button.
-   Small one-off buttons keep their inline padding/font (so they stay compact) and just
-   inherit the tonal look from these rules. Nav/filter chips (.sub-tab, .alt-tab-btn) and
-   the segmented .cap-mode controls are styled separately below. */
+/* ===== Buttons — shared tonal system =====
+   One-off buttons keep inline padding/font and inherit only the look. Nav/filter chips
+   (.sub-tab, .alt-tab-btn) and .cap-mode are styled separately below. */
 .btn-primary,
 input[type="submit"],
 .btn-secondary,
@@ -1195,10 +1229,8 @@ input[type="submit"],
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
   transition: background .15s, border-color .15s, color .15s, box-shadow .15s, transform .05s;
 }
-/* Phone widths: a long label ("Reset Temperature Sensor Counters") is wider than the
-   screen, and the base nowrap + fit-content sends it off the right edge. Capping at the
-   container and letting it wrap costs a second line; nowrap costs unreadable text. Inert
-   for a label that already fits — a button only wraps when it cannot fit on one line. */
+/* Phone widths: a long label would run off the right edge under nowrap + fit-content, so cap at
+   the container and let it wrap. */
 @media (max-width: 480px) {
   .btn-primary,
   input[type="submit"],
@@ -1220,7 +1252,7 @@ input[type="submit"]:active,
   box-shadow: 0 1px 1px rgba(0, 0, 0, 0.12);
 }
 
-/* Primary (teal) — also the "Set" submit buttons (!important defeats later input[type=submit] background overrides) */
+/* Primary (teal), also the "Set" submits; !important beats later input[type=submit] overrides */
 .btn-primary,
 input[type="submit"] {
   background: rgba(0, 161, 154, 0.14) !important;
@@ -1242,12 +1274,8 @@ input[type="submit"]:hover {
   color: #4fd6ce !important;
 }
 
-/* Commissioning modal run/start buttons — solid teal gradient + glow so the primary
-   action reads as the obvious thing to click against the hardcoded dark panel. The
-   tonal .btn-primary looks greyed-out here, worst in light mode where the panel stays
-   dark but the button keeps the dark-teal light-mode text. Scoped to these two dark
-   modals (the wizard and the pre-wizard screens) so the global tonal button
-   (and the light-area "Start commissioning…" button) is unchanged. */
+/* Dark commissioning / pre-wizard modals: solid teal so the primary action stands out. Tonal
+   .btn-primary reads greyed on these hardcoded dark panels, worst in light mode. */
 #commission-modal-panel .btn-primary,
 #rpmalign-modal-overlay .btn-primary,
 #commprep-modal-overlay .btn-primary,
@@ -1259,9 +1287,7 @@ input[type="submit"]:hover {
   color: #fff !important;
   border-color: #16c2b8 !important;
   box-shadow: 0 2px 10px rgba(0, 161, 154, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.18);
-  /* Base .btn-primary is nowrap + fit-content (sized for short toolbar buttons); these
-     full-width wizard buttons carry long instructional labels, so let them wrap inside
-     the panel instead of overflowing the right edge. */
+  /* Long instructional labels: wrap inside the panel instead of the base nowrap + fit-content. */
   white-space: normal;
   max-width: none;
 }
@@ -1286,7 +1312,6 @@ input[type="submit"]:hover {
   cursor: not-allowed;
 }
 
-/* Secondary (neutral) */
 .btn-secondary {
   background: rgba(0, 0, 0, 0.05);
   color: var(--text-dark);
@@ -1303,9 +1328,8 @@ a.btn-secondary {
   text-align: center;
 }
 
-/* Cross-navigation shortcut link — jumps between the CV Mode voltage setpoint
-   (Setup -> Alternator) and the Voltage-loop tuning tab, which are edited
-   back-to-back during a tuning session. Tonal-teal to match the button system. */
+/* Cross-nav between the CV Mode voltage setpoint (Setup -> Alternator) and the Voltage-loop
+   tuning tab, edited back-to-back while tuning. */
 .xnav-link {
   display: inline-flex;
   align-items: center;
@@ -1335,12 +1359,8 @@ a.btn-secondary {
   color: #4fd6ce;
 }
 
-/* The Plant Delay (sysid) modal, the Test Active floating panel, and the
-   Commissioning orchestrator panel are hardcoded dark panels, so their
-   .btn-secondary buttons must stay legible even when the app is in light mode
-   (otherwise dark text on a near-black panel reads as "greyed out / unclickable").
-   Also give a genuine disabled state so a blocked Next/Start looks distinct from
-   an enabled one. */
+/* These panels are dark in both themes, so .btn-secondary needs light ink even in light mode,
+   plus a distinct disabled state so a blocked Next/Start reads as blocked. */
 #sysid-modal-panel .btn-secondary,
 #test-panel .btn-secondary,
 #commission-modal-panel .btn-secondary,
@@ -1371,9 +1391,8 @@ a.btn-secondary {
   cursor: not-allowed;
 }
 
-/* Commissioning wizard "Details" disclosure — the technical fine print folds away on EVERY step,
-   so the panel shows the instruction and nothing else unless the reader asks. The protection
-   statement is deliberately NOT inside it. */
+/* Wizard "Details" disclosure folds the fine print on every step. The protection statement is
+   deliberately NOT inside it. */
 #commission-modal-panel details.cx-fp > summary {
   list-style: none;
   cursor: pointer;
@@ -1399,9 +1418,8 @@ a.btn-secondary {
   margin-top: 8px;
 }
 
-/* The loud cue — the only thing on screen that tells the operator to do something RIGHT NOW while a
-   test is live (stage 9's three passes). Full-bleed across the 20px panel padding, big type, three
-   attention pulses on entry so it cannot be mistaken for the previous instruction still standing. */
+/* The only RIGHT-NOW instruction while a test is live (stage 9's passes). Full-bleed across the
+   20px panel padding; entry pulses so it can't pass for the previous instruction. */
 #commission-modal-panel .cx-cue {
   margin: 12px -20px;
   padding: 18px 20px 16px;
@@ -1432,10 +1450,8 @@ a.btn-secondary {
 @media (prefers-reduced-motion: reduce) {
   #commission-modal-panel .cx-cue { animation: none; }
 }
-/* Stage 9's standing direction line sits ABOVE the schedule chart in every state: smaller type than
-   the one-shot cues, and an amber variant while the engine speed is outside the band. Each line
-   reserves two rows (the tallest either wraps to in the 430px panel) and centres its text in them,
-   so the chart under the cue never moves when the words change. */
+/* Stage 9 direction line above the chart; amber while engine speed is out of band. Each line
+   reserves two rows (the tallest wrap in the 430px panel) so the chart never moves. */
 #commission-modal-panel .cx-cue.cx-cue-lane { margin: 0 -20px 4px; padding: 10px 20px; }
 #commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l1,
 #commission-modal-panel .cx-cue.cx-cue-lane .cx-cue-l2 {
@@ -1455,10 +1471,8 @@ a.btn-secondary {
 }
 #commission-modal-panel .cx-cue.off .cx-cue-l2 { color: #f3d9a4; }
 
-/* Disturbances game — the "press Start Shooting" prompt is the only prose over the title card, so it
-   has to win against the card's art. Arcade attract-mode treatment: a two-flash burst every 3 s, never
-   a continuous 1 Hz blink, which makes a whole sentence unreadable. Teal matches the card's number,
-   which also turns teal the moment the current is on setpoint. */
+/* Disturbances game prompt: two-flash burst every 3 s, never a continuous 1 Hz blink, which
+   makes a sentence unreadable. Teal matches the card's on-setpoint number. */
 #cxGameArmMsg {
   color: #cfd2d6;
   font-size: 14px;
@@ -1515,15 +1529,11 @@ a.btn-secondary {
   background: rgba(255, 255, 255, 0.16);
 }
 
-/* ── Plant Delay Test: minimize-to-pill + mobile bottom-sheet ────────────────
-   Minimize (mobile only) collapses the panel to a thin bottom pill carrying live
-   test progress, with the backdrop cleared so the current plot is visible and
-   tappable behind it. Desktop keeps the floating draggable panel untouched. */
+/* ── Plant Delay Test: mobile minimize-to-pill (backdrop clears so the plot stays tappable) + bottom-sheet ── */
 
 /* Minimize button: mobile only — desktop panel never covers the plot. */
 #sysid-min-btn { display: none; }
 
-/* Pill (minimized). Hidden until the overlay carries .sysid-min. */
 #sysid-pill {
   display: none;
   position: fixed;
@@ -1588,7 +1598,6 @@ a.btn-secondary {
    at any scroll position (the header bg is opaque #252525, so content passes cleanly beneath). */
 #commission-drag-handle, #cvs-drag-handle { position: sticky; top: 0; z-index: 1; }
 
-/* Danger (red) */
 .btn-danger {
   background: rgba(214, 69, 62, 0.13);
   color: #c23a34;
@@ -1647,7 +1656,6 @@ a.btn-secondary {
   border-color: rgba(214, 69, 62, 0.46);
 }
 
-/* Compact size modifier — pairs with any .btn-* class to keep a button small */
 .btn-sm {
   padding: 4px 10px !important;
   font-size: 12px !important;
@@ -1669,7 +1677,6 @@ a.btn-secondary {
   margin-top: 12px;
 }
 
-/* Learning Info Grid */
 .learning-info-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -1756,7 +1763,6 @@ a.btn-secondary {
   border-color: var(--accent);
 }
 
-/* Unit tag on its own line under the column name */
 .fuel-th-unit {
   display: block;
   font-weight: 600;
@@ -1840,7 +1846,6 @@ a.btn-secondary {
 
 
 
-/* Sticky Header */
 #stickyHeader {
   position: fixed;
   top: 0;
@@ -1886,7 +1891,6 @@ a.btn-secondary {
 
 
 
-/* Mobile Optimizations */
 @media (max-width: 768px) {
   .learning-info-grid {
     grid-template-columns: 1fr;
@@ -1936,7 +1940,6 @@ a.btn-secondary {
   }
 }
 
-/* Permanent Header */
 .permanent-header {
   background: linear-gradient(135deg, var(--card-light), #f8f9fa);
   border-bottom: 3px solid var(--accent);
@@ -1949,7 +1952,6 @@ a.btn-secondary {
   gap: 12px;
 }
 
-/* Brand row */
 .header-brand-row {
   display: flex;
   align-items: center;
@@ -2000,10 +2002,9 @@ a.btn-secondary {
 
 /* ── Header minimize / collapse (all widths; state in localStorage header_collapsed) ──
    Collapsed = header shrinks to the one-line #header-collapsed-strip. The strip, the two
-   safety banners and the settings auto-lock notice are the only survivors, so a live
-   PROTECTIONS-DISABLED warning, an unfollowed-BMS-limit warning, or the note that settings
-   relocked themselves is never hidden by minimizing (collapse state is remembered, so a
-   returning user would otherwise never see the note that is meant for exactly that moment).
+   safety banners and the sensor-fault line (#sensor-banner) are the only survivors, so a live
+   PROTECTIONS-DISABLED warning, an unfollowed-BMS-limit warning, or a sensor fault is never
+   hidden by minimizing.
    Metric text uses inherit so it follows the header's light/dark colour without a separate
    dark-mode rule. */
 #header-collapsed-strip { display: none; }
@@ -2024,9 +2025,8 @@ a.btn-secondary {
 #header-collapsed-strip > span { flex: none; }
 #header-collapsed-strip .hcs-grow { flex: 1 1 auto; min-width: 0; }
 
-/* state word carries the colour: charging teal, idle slate, manual amber, off black, fault red, test violet.
-   Sits RIGHT of the numbers (against the grow spacer) and is the ONLY shrinkable element, so when a
-   reveal threshold leaves the row tight the word ellipsizes instead of clipping the toggle/chevron. */
+/* The state word is the ONLY shrinkable element, so a tight row ellipsizes it instead of
+   clipping the toggle/chevron. */
 #header-collapsed-strip .hcs-pill { font-weight: 800; letter-spacing: .4px; max-width: 46cqw; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
 #header-collapsed-strip .hcs-pill.st-charging { color: var(--accent); }
 #header-collapsed-strip .hcs-pill.st-idle     { color: #5f7d94; }
@@ -2040,9 +2040,8 @@ a.btn-secondary {
 #header-collapsed-strip .hcs-pill .hcs-p { margin-left: 6px; font-weight: 800; color: #7a4a14; }
 .dark-mode #header-collapsed-strip .hcs-pill .hcs-p { color: #d9a066; }
 
-/* Locked-out CTA: always visible (no @container hide rule). order:100 floats it past the grow
-   spacer to the far-right edge so it reads as a passive corner prompt, not an alarm crowding the
-   readouts. House teal, not red. */
+/* Locked-out CTA: always visible (no @container hide rule); order:100 parks it at the far right
+   as a passive corner prompt. House teal, not red. */
 /* Mirrors #settings_arm_btn (see its rule) — keep the two in step; pill radius is the only
    intentional difference, so it reads as a strip chip at this height. */
 #header-collapsed-strip .hcs-unlock {
@@ -2057,9 +2056,8 @@ a.btn-secondary {
 }
 #header-collapsed-strip .hcs-m { display: inline-flex; align-items: baseline; font-weight: 700; font-variant-numeric: tabular-nums; }
 #header-collapsed-strip .hcs-m i { font-style: normal; font-weight: 400; opacity: .6; margin-left: 2px; font-size: .84em; }
-/* Fixed-width right-aligned value boxes sized for each field's widest case: digit-count
-   changes (97.3 A → 3.2 A) right-align inside the box instead of re-flowing the row, so
-   decimals, units, and group separators never move. */
+/* Fixed-width right-aligned boxes sized for each field's widest case, so digit-count changes
+   (97.3 A -> 3.2 A) never re-flow the row. */
 #header-collapsed-strip .hcs-m > span { display: inline-block; text-align: right; }
 #hcs-volt, #hcs-soc, #hcs-alt, #hcs-batt, #hcs-temp, #hcs-duty { min-width: 5ch; }
 #hcs-rpm { min-width: 4ch; }
@@ -2067,12 +2065,8 @@ a.btn-secondary {
 #header-collapsed-strip .hcs-gsep { display: inline-block; width: 1px; height: 20px; background: rgba(0, 161, 154, .32); margin: 0 3px; }
 #header-collapsed-strip .hcs-divider { display: inline-block; width: 1px; height: 18px; background: rgba(0, 161, 154, .15); }
 
-/* Alternator OFF / ON at strip scale — the expanded header's .onoff-switch, tightened to the strip's
-   one-line height. The tap extender grows to keep the 44px touch minimum at the smaller track height.
-   The strip keeps BARE OFF / ON: the action word is what costs width, and the strip's reveal rungs
-   (the @container blocks above) are measured against this control at exactly 68px — the width of the
-   sliding switch it replaced, so no threshold moves. The fill still carries the state, and a
-   deliberate enable or disable happens in the expanded header, where the wording lives. */
+/* Alternator OFF / ON at strip scale. Keep it BARE OFF / ON at exactly 68px: the @container reveal
+   thresholds above are measured against that width. The tap extender keeps the 44px touch minimum. */
 #header-collapsed-strip .onoff-switch { width: 68px; height: 19px; }
 #header-collapsed-strip .onoff-half { padding: 0 6px; font-size: 10px; letter-spacing: 0.2px; }
 #header-collapsed-strip .onoff-state { display: inline; }
@@ -2082,16 +2076,11 @@ a.btn-secondary {
 /* margin-left buys extra space from the toggle; vertical padding gives a ~40px expand tap target without changing the line height */
 #header-collapsed-strip .hcs-chevron { font-size: 16px; opacity: .55; cursor: pointer; margin-left: 12px; padding: 11px 6px; margin-top: -11px; margin-bottom: -11px; }
 
-/* Narrow band: effective 7px gap + glyph-only unlock chip buy ~120px of row on locked strips —
-   that margin is what lets Alt A reveal at phone widths. The chip sheds "Tap to unlock" and the
-   state word wins the space; the band ends at 478 so the full text only returns where it fits
-   without ellipsizing a short state word. Two spec constraints shape this block: a container
-   query can only style DESCENDANTS of the container (the strip is its own container, so its
-   `gap` property is unreachable — the negative child margins emulate gap 7px), and strip padding
-   must stay constant (padding feeds back into the content-box width these queries measure).
-   This block must sit AFTER the base .hcs-unlock/.hcs-gsep/.hcs-chevron rules — equal
-   specificity, source order decides. NOTE all @container thresholds in this file compare
-   against the strip's CONTENT-BOX width = outer − 28px padding = viewport − 44px on phones. */
+/* Narrow band: 7px effective gap + glyph-only unlock chip free ~120px so Alt A reveals on locked
+   phones. Negative child margins emulate the gap (a container query can't style the container
+   itself); strip padding must stay constant (it feeds the measured width). Must follow the base
+   .hcs-unlock/.hcs-gsep/.hcs-chevron rules (equal specificity). All @container thresholds here
+   measure the strip's CONTENT-BOX width = viewport − 44px on phones. */
 @container (max-width: 478px) {
   #header-collapsed-strip > :not(:first-child) { margin-left: -3px; }
   #header-collapsed-strip .hcs-unlock .u-long { display: none; }
@@ -2101,10 +2090,9 @@ a.btn-secondary {
   #header-collapsed-strip .hcs-pill { letter-spacing: 0; }
 }
 
-/* progressive reveal — State + Volts always; then Alt A → Temp → SOC → RPM(+Eng sep) → Batt A → Duty.
-   Every threshold is the measured width of everything shown at that step plus the worst-case state
-   word (ABSORPTION, 99px at 14px/800), so a reveal never squeezes the word into an ellipsis. The
-   Alt│Batt separator rides with Alt A — it is the first thing in the row and must not appear alone. */
+/* Progressive reveal: State + Volts always, then Alt A → Temp → SOC → RPM(+Eng sep) → Batt A → Duty.
+   Each threshold = measured width at that step + worst-case state word (ABSORPTION, 99px at 14px/800).
+   The Alt│Batt separator rides with Alt A and must never appear alone. */
 #header-collapsed-strip .hcs-alt,
 #header-collapsed-strip .hcs-temp,
 #header-collapsed-strip .hcs-soc,
@@ -2113,10 +2101,8 @@ a.btn-secondary {
 #header-collapsed-strip .hcs-duty,
 #header-collapsed-strip .hcs-asep,
 #header-collapsed-strip .hcs-eng { display: none; }
-/* Alt A budgets a SHORT state word (BULK/IDLE/OFF exact-fit at threshold, headless-Chrome
-   measured); MANUAL/ABSORPTION ellipsize near it — the pill is the only shrinkable element, so
-   a tight row costs state-word characters, never digits. Later rungs keep the original budget
-   (mid word whole, ABSORPTION may clip ~18px just past the rung). */
+/* Alt A budgets a SHORT state word (BULK/IDLE/OFF fit exactly, headless-Chrome measured); longer
+   words ellipsize near it. Later rungs budget a mid-length word whole. */
 @container (min-width: 292px) { #header-collapsed-strip:not(.hcs-locked) .hcs-alt  { display: inline-flex; }
                                 #header-collapsed-strip:not(.hcs-locked) .hcs-asep { display: inline-block; } }
 @container (min-width: 433px) { #header-collapsed-strip:not(.hcs-locked) .hcs-temp { display: inline-flex; } }
@@ -2127,7 +2113,7 @@ a.btn-secondary {
 @container (min-width: 760px) { #header-collapsed-strip:not(.hcs-locked) .hcs-duty { display: inline-flex; } }
 
 /* Locked (.hcs-locked, set by syncHeaderStrip): ladder shifted right for the unlock chip. Alt A
-   reveals against the glyph-only chip of the ≤439 band, so a locked phone still shows amps;
+   reveals against the glyph-only chip of the ≤478 band, so a locked phone still shows amps;
    the later rungs stay budgeted for the full-text chip. */
 @container (min-width: 341px) { #header-collapsed-strip.hcs-locked .hcs-alt  { display: inline-flex; }
                                 #header-collapsed-strip.hcs-locked .hcs-asep { display: inline-block; } }
@@ -2140,7 +2126,6 @@ a.btn-secondary {
 
 .dark-mode #header-collapsed-strip .hcs-gsep { background: rgba(120, 200, 196, .30); }
 .dark-mode #header-collapsed-strip .hcs-divider { background: rgba(120, 200, 196, .18); }
-/* must follow the line above — equal specificity, so ON would otherwise read as OFF in dark mode */
 
 #header-collapse-bar {
   display: flex;
@@ -2167,12 +2152,9 @@ a.btn-secondary {
   }
 }
 
-/* ============================================
-   DASHBOARD-HOSTED LONG-TERM-PLOTS BRUSH
-   Lives in the parent dashboard so it can stick naturally to the dashboard
-   viewport top while the app banner scrolls away normally. Range changes route
-   to the native Long Term charts (script.js _brushEmit nativeSink).
-   ============================================ */
+/* ===== Dashboard-hosted long-term-plots brush =====
+   Lives in the parent dashboard so it sticks to the viewport top while the app banner scrolls
+   away. Range changes route to the native Long Term charts (script.js _brushEmit nativeSink). */
 #dashboard-brush {
   position: sticky;
   top: 0;
@@ -2302,7 +2284,6 @@ a.btn-secondary {
 }
 
 
-/* Row wrapper — stacks vertically by default; goes side-by-side at wider screens */
 .sensor-control-row {
   display: flex;
   flex-direction: column;
@@ -2310,19 +2291,15 @@ a.btn-secondary {
   gap: 8px;
 }
 
-/* Side-by-side only where five chips (~558px, ~609px above 768) plus the ~215px Alternator
-   Enable block and the card padding actually fit; below 900px the default column layout
-   centres the toggle under the chips, the same look as a phone. Was 560px with four chips —
-   with five, the row layout never fits between 560 and ~870, so it only produced a
-   left-aligned toggle with a stray divider on iPad portrait. */
+/* Side-by-side only where five chips (~558px, ~609px above 768) + the ~215px Alternator Enable
+   block + card padding fit; narrower, the column layout centres the toggle under the chips. */
 @media (min-width: 900px) {
   .sensor-control-row {
     flex-direction: row;
     align-items: center;
     gap: 0;
-    /* Neither tier can compress (max-content grid + flex-shrink:0 control), so
-       without wrap a font that renders wider than measured would hang the
-       Alternator Enable block outside the row. Wrap drops it to its own line instead. */
+    /* Neither tier can compress, so a font wider than measured would hang Alternator Enable
+       outside the row; wrap drops it to its own line. */
     flex-wrap: wrap;
     row-gap: 8px;
   }
@@ -2350,8 +2327,6 @@ a.btn-secondary {
   row-gap: 8px;
 }
 
-/* Chip card — each reading pair is its own white card with a teal border */
-/* 3-column grid: label | number (right-aligned) | unit                  */
 /* Number column is fixed-width so digit count changes don't shift layout */
 .reading-duo {
   display: grid;
@@ -2373,9 +2348,8 @@ a.btn-secondary {
   white-space: nowrap;
 }
 
-/* Invisible bold twin (text from data-t) reserves the label's BOLD width at rest, so the
-   pill's font-weight change can't widen the auto-sized label column — chip widths stay
-   constant and the space-evenly grid never redistributes (whole-row jump killer). */
+/* Invisible bold twin (data-t) reserves the label's BOLD width, so the pill's weight change
+   never widens the label column and the space-evenly row never jumps. */
 .duo-lbl::after {
   content: attr(data-t);
   display: block;
@@ -2385,9 +2359,8 @@ a.btn-secondary {
   font-weight: 700;
 }
 
-/* Active-limit cue: solid teal pill on the figure's LABEL so the value never changes
-   weight/colour/size. Negative margin cancels the padding's width so the number column
-   (fixed 3.5em, next in the grid) never shifts when the pill appears. */
+/* Active-limit pill on the LABEL so the value never changes weight/colour/size. Negative margin
+   cancels the padding so the fixed 3.5em number column never shifts. */
 .duo-lbl.limit-pill {
   background: var(--accent);
   color: #fff;
@@ -2397,11 +2370,9 @@ a.btn-secondary {
   margin: -1px -5px;
 }
 
-/* Header duty readout: geometry is CONSTANT in every state — the wrap always carries the
-   pill's padding (negative margin cancels it) and the digits sit right-aligned in a fixed
-   5-character box, so a highlight or digit-count change (5.6 → 100.0) moves nothing.
-   inline-flex: the JS show/hide writes of display:inline on the inner spans stay harmless
-   because flex items blockify. */
+/* Header duty readout: geometry is CONSTANT in every state (wrap always carries the pill padding,
+   digits right-aligned in a fixed 5ch box). inline-flex so JS display:inline writes on the inner
+   spans stay harmless (flex items blockify). */
 #duty-pill-wrap {
   display: inline-flex;
   justify-content: flex-end;
@@ -2418,12 +2389,9 @@ a.btn-secondary {
   min-width: 5ch;
   text-align: right;
 }
-/* ctrlLimiter 5 (machine limit) = teal filled pill. ctrlLimiter 6 (a protection is trimming
-   output) = no fill at all, brown digits: the percentage the protection is governing is the one
-   thing that changes, which is quieter than a red block and still unmissable next to the teal
-   ACTIVE word above it. Background-only / colour-only so the pill never changes layout.
-   !important beats the inline color applyStaleStyleByAge() writes on #dutyCycleID3 and the
-   cluster's .field-status-* !important tints. */
+/* ctrlLimiter 5 (machine limit) = teal filled pill; ctrlLimiter 6 (protection trimming) = brown
+   digits, no fill. Colour/background only, so layout never changes. !important beats
+   applyStaleStyleByAge()'s inline color on #dutyCycleID3 and the .field-status-* !important tints. */
 #duty-pill-wrap.limit-pill { background: var(--accent); }
 #duty-pill-wrap.limit-pill span { color: #fff !important; }
 #duty-pill-wrap.prot-pill span { color: #7a4a14 !important; }
@@ -2465,11 +2433,8 @@ a.btn-secondary {
   width: 100%;
 }
 
-/* Narrow screens: collapse to two columns — triggered only when 5 across would overflow. Five
-   max-content chips measure ~558px (3.5em value columns; the Health chip's label is the
-   widest) and the header card pads 24px a side, so 5-across needs ~606px; below that the row
-   ran past the card edge and the Capacitor webview zoomed out to fit it (measured 2026-09-03
-   at 430-460 with four chips, 2026-09-09 at 520-600 with five). */
+/* Two columns only when 5 across would overflow: five max-content chips (~558px) + 24px card
+   padding a side need ~606px, and overflow makes the Capacitor webview zoom out to fit. */
 @media (max-width: 619px) {
   .sensor-readings-tier {
     grid-template-columns: max-content max-content;
@@ -2486,19 +2451,16 @@ a.btn-secondary {
 
 
 @media (max-width: 480px) {
-  /* Force single-column card grids on narrow screens — prevents label/tooltip wrapping.
-     !important needed because the base .grid rule is defined later in the file (line ~1436)
-     and would otherwise win the cascade.
-     max-width caps the grid at viewport width so 1fr can't inherit a wider-than-viewport
-     container (e.g. caused by cap-mode-row overflow on another panel). */
+  /* Single-column card grids on narrow screens. !important: the base .grid rule comes later in
+     the file. max-width stops 1fr inheriting a wider-than-viewport container. */
   .telemetry-groups,
   .grid {
     columns: 1 !important;
     max-width: calc(100vw - 1rem);
   }
 
-  /* (tooltip-box viewport containment is handled by clampTooltipBox() in script.js —
-     a left-edge CSS anchor here overflowed the RIGHT side for right-half icons) */
+  /* (tooltip-box viewport containment is handled by placeTooltipBox() in script.js —
+     a left-edge CSS anchor here overflows the RIGHT side for right-half icons) */
 
   /* RPM Cap Table mode toggles — wrap "Charge Rate" and "Limit by" onto separate lines */
   .cap-mode-row {
@@ -2540,9 +2502,8 @@ a.btn-secondary {
   text-align: center;
 }
 
-/* Header safety notice strip — amber caution, one tier below the red PROTECTIONS DISABLED
-   banner. Wraps rather than clipping: the text names the cause and the consequence, and on a
-   phone that is three lines. Clickable (jumps to the card that owns it). */
+/* Header safety notice: amber caution, one tier below the red PROTECTIONS DISABLED banner.
+   Wraps rather than clipping (three lines on a phone). */
 .header-notice {
   font-size: 13.5px;
   font-weight: 700;
@@ -2563,43 +2524,17 @@ a.btn-secondary {
   letter-spacing: 0.02em;
 }
 
-/* Red variant of the strip above — the settings auto-lock notice. Geometry is inherited from
-   .header-notice so the two can never disagree; only colour, cursor and the dismiss slot differ.
-   Ordering matters: this must stay AFTER .header-notice (equal specificity, later wins).
-   position:relative is the dismiss button's containing block; box-sizing is explicit because
-   this stylesheet has no global border-box reset and the padding would otherwise overflow. */
+/* Red variant of the strip above — #sensor-banner's alert state (updateSensorBanner). Geometry is inherited from
+   .header-notice so the two can never disagree. Must stay AFTER .header-notice (equal specificity, later wins). */
 .header-notice-alert {
-  position: relative;
-  box-sizing: border-box;
   color: #b00000;
   background: rgba(214, 0, 0, 0.09);
   border-color: rgba(214, 0, 0, 0.45);
   cursor: default;
-  /* Symmetric: the ✕ sits in the right 34px, and the inherited text-align:center would otherwise
-     centre the text on the box rather than on the space it actually has. */
-  padding-right: 34px;
-  padding-left: 34px;
 }
 
-.header-notice-x {
-  position: absolute;
-  right: 2px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  border: none;
-  background: none;
-  color: inherit;
-  font-size: 15px;
-  line-height: 1;
-  cursor: pointer;
-}
-
-/* Unlock Controls — the only locked-state indicator now that the red "Settings are Locked"
-   line is gone, so it is deliberately heavier than a stock .btn-primary. Must stay visually
-   identical to #hcs-unlock (the collapsed strip's "Tap to unlock"). */
+/* Unlock Controls is the only locked-state indicator, so it is deliberately heavier than a stock
+   .btn-primary. Must stay visually identical to #hcs-unlock (the collapsed strip's "Tap to unlock"). */
 #settings_arm_btn {
   display: inline-flex;
   align-items: center;
@@ -2668,7 +2603,6 @@ a.btn-secondary {
   min-width: 0;
 }
 
-/* Dark mode banner styling */
 .dark-mode .permanent-header {
   background: linear-gradient(135deg, #1e1e1e, #2a2a2a);
   border-bottom: 3px solid var(--accent);
@@ -2762,11 +2696,9 @@ a.btn-secondary {
   color: #bbb;
 }
 
-/* Opening a box hands it to placeTooltipBox(), which switches it to position:fixed and places
-   it in viewport coordinates. That is required, not decorative: .grid cards are CSS multi-column
-   and Chromium slices an absolutely-positioned box across a column break. The absolute rules
-   below are only the closed/no-JS resting state — do not add offsets here expecting them to
-   show, and keep the max-height so a long box can never run off the bottom of a fixed viewport. */
+/* An open box is moved to position:fixed by placeTooltipBox(): Chromium slices an absolute box
+   across a .grid column break. The absolute rules below are only the closed resting state, so
+   offsets added here never show; keep max-height so a box can't run off the viewport bottom. */
 .tooltip-box {
   display: none;
   position: absolute;
@@ -2783,9 +2715,8 @@ a.btn-secondary {
   white-space: normal;
   z-index: 999;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-  /* 36px = the 8px placement margin each side plus this box's own 20px of horizontal padding.
-     The sheet has no global border-box reset, so max-width sizes CONTENT — budget for the
-     padding here or a narrow phone gets a box wider than the screen. */
+  /* 36px = 8px placement margin each side + this box's 20px horizontal padding (no global
+     border-box reset, so max-width sizes content). */
   max-width: min(300px, calc(100vw - 36px));
   min-width: 180px;
   width: fit-content;
@@ -2800,10 +2731,8 @@ a.btn-secondary {
   display: block;
 }
 
-/* "s" signal-info badge — same click-to-toggle mechanics as .tooltip, but outlined in a muted
-   gray-blue so it reads as "signal chain" (source / filter / where set) next to the filled "i"
-   help badge. The box content is JS-generated (SINFO table in script.js) at open time and
-   re-rendered on telemetry frames while open, so time constants and derived values stay live. */
+/* "s" signal-info badge: same click-to-toggle as .tooltip, outlined gray-blue. Box content comes
+   from SINFO in script.js and re-renders on telemetry frames while open. */
 .sinfo {
   cursor: pointer;
   position: relative;
@@ -2845,22 +2774,20 @@ a.btn-secondary {
   margin: 3px 0;
 }
 
-/* Flex form-labels use justify-content:space-between; with the s-badge added as a third child
-   the ℹ️ would be stranded mid-row. margin-left:auto absorbs the free space instead, keeping
-   both badges together on the right (and is a no-op when the badge is the only icon). */
+/* With the s-badge as a third child of a space-between label, margin-left:auto keeps both
+   badges together on the right instead of stranding the ℹ️ mid-row. */
 .form-label[style*="space-between"] > .tooltip {
   margin-left: auto;
 }
 
 
-/* Short main-tab labels on phones so all six tabs hold one row */
+/* Short main-tab labels on phones so all four tabs and the search icon hold one row */
 .tab-label-short { display: none; }
 @media (max-width: 600px) {
   .tab-label-full { display: none; }
   .tab-label-short { display: inline; }
 }
 
-/* Main Tab Navigation */
 .main-tabs {
   display: flex;
   flex-wrap: wrap;   /* below ~360px, tabs wrap to a 2nd row instead of clipping off the right edge */
@@ -2900,7 +2827,6 @@ a.btn-secondary {
   position: relative;
 }
 
-/* Tab Content */
 .tab-content {
   display: none;
 }
@@ -2919,10 +2845,8 @@ h2 {
   font-size: 18px;
 }
 
-/* h2 is the ONLY bare element selector in this file that sets a colour, which makes it the one
-   tag that can drag a theme variable onto a panel that is dark in BOTH themes: a bare <h2> in
-   the wizard (cxRenderThresh's two step headings) came out #333 on #1e1e1e — 1.3:1, an invisible
-   title under a fully-lit teal rule. Any heading rendered into these panels needs literal ink. */
+/* Panels dark in both themes need literal heading ink: the bare h2 rule's theme colour put
+   wizard headings at #333 on #1e1e1e (1.3:1). */
 #sysid-modal-panel h2,
 #test-panel h2,
 #commission-modal-panel h2,
@@ -2937,7 +2861,6 @@ h2 {
   color: #e8e8e8;
 }
 
-/* Sub Tab Navigation */
 .sub-tabs {
   background: var(--card-light);
   border: 2px solid var(--accent);
@@ -3099,13 +3022,9 @@ input:focus {
   border-color: var(--accent);
 }
 
-/* Card grids pack like masonry, not like grid rows. CSS Grid stretched every card in a
-   row to the tallest card in that row, so a short card sitting beside a long one carried
-   a slab of dead space inside its own border. Multi-column flows each card to its natural
-   height and starts the next one immediately below it.
-   column-width keeps the same responsive column count auto-fit used to give; column-count
-   is capped by child count (:has) because multicol — unlike auto-fit — will happily render
-   an EMPTY trailing column when there are fewer cards than columns would fit. */
+/* Masonry via multi-column (CSS Grid stretched each card to its row's tallest). column-count is
+   capped by child count (:has) because multicol renders an EMPTY trailing column when there are
+   fewer cards than columns. */
 .grid {
   display: block;
   columns: 220px;
@@ -3118,8 +3037,7 @@ input:focus {
   margin-bottom: 10px;
 }
 
-/* Full-width card inside a masonry grid (replaces the old grid-column: 1 / -1). A lone
-   card gets it for free — one card must never render as a narrow first column. */
+/* Full-width card inside a masonry grid. A lone card must never render as a narrow first column. */
 .grid > .span-all,
 .grid > *:only-child {
   column-span: all;
@@ -3139,16 +3057,10 @@ input:focus {
   }
 }
 
-/* Wind sub-tab: apparent-wind dial (narrow) beside the true/apparent trend plot (wide),
-   stacking on phones. The dial keeps its dark B&G face in both light and dark themes.
-   This card overrides the default 600px settings-card cap so the trend plot gets real
-   width on a wide screen (and stays centered/responsive below that). */
-/* ── Reusable segmented control (page-wide standard) ───────────────────────
-   A boxed group of mutually-exclusive buttons: tinted track, active button = a
-   raised pill. `.seg.accent` fills the active button with the teal accent (use for
-   primary mode toggles); plain `.seg` uses a neutral white pill (use for option
-   pickers like time windows). `.seg-field` stacks a small caps label above a control;
-   wire active state by toggling `.on` on the chosen button. Theme-aware. */
+/* Wind sub-tab (rules further below): the dial keeps its dark B&G face in both themes. */
+/* ── Reusable segmented control (page-wide standard) ──
+   `.seg.accent` = teal active pill for primary mode toggles; plain `.seg` = neutral pill for
+   option pickers. `.seg-field` stacks a caps label above; toggle `.on` on the chosen button. */
 .seg {
   display: inline-flex;
   gap: 2px;
@@ -3183,15 +3095,12 @@ input:focus {
 .dark-mode .seg > button.on { background: #3a3f44; color: #fff; }
 .seg.accent > button.on { background: #00807a; color: #fff; }
 .dark-mode .seg.accent > button.on { background: #00807a; color: #fff; }
-/* `.seg-pill` — a two-way form choice as a compact segmented control: radio-backed <label>s
-   rendered as pills (active = accent fill), with a single caption below that swaps via :has()
-   on the enclosing .form-input. The radio stays in the DOM (visually hidden) so the form still
-   reads/writes it directly, and the pill/caption track programmatic .checked changes on load. */
+/* `.seg-pill`: radio-backed <label>s as pills; the caption below swaps via :has() on the
+   .form-input. The radio stays in the DOM (visually hidden) so the form reads/writes it directly. */
 .seg-pill { display: flex; width: 100%; align-items: stretch; }
 .seg-pill > label {
-  /* Containing block for the hidden absolute radio below — without this, a broad
-     `input { width:100% }` rule (e.g. .pri-subsection's) sizes the radio against <body>,
-     widening the document and making phone webviews zoom out on tab entry. */
+  /* Containing block for the hidden absolute radio: without it a broad `input { width:100% }`
+     sizes the radio against <body> and phone webviews zoom out. */
   position: relative;
   flex: 1 1 0;
   min-width: 0;
@@ -3258,7 +3167,7 @@ input:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 1 1 auto;          /* absorb the extra height when the plot card is taller, centering the dial so the badge+stats below sit flush at the bottom instead of leaving dead space */
+  flex: 1 1 auto;          /* absorbs extra height when the plot card is taller, so the badge+stats sit flush at the bottom */
   padding: 6px 0 2px;
 }
 .wind-dial {
@@ -3403,9 +3312,8 @@ input:focus {
   margin-right: auto;
 }
 
-/* Automatic Min% Learning + the table-details readouts: own recessed sub-card
-   (page-background fill + border + gap) so they read as a distinct section rather
-   than part of the cap table above. Themes via vars (light + dark). */
+/* Automatic Min% Learning + table-details readouts: recessed sub-card, distinct from the cap
+   table above. */
 .alt-subsection-card {
   background: var(--bg-light);
   border: 1px solid var(--border);
@@ -3414,10 +3322,8 @@ input:focus {
   margin-top: 22px;
 }
 
-/* Live Oscilloscope + Reference Flipbook are stacked into one visual unit so the
-   shared-length time axes read as obviously back-to-back: the top card drops its
-   bottom margin/corners, the bottom card drops its top margin/corners and gets a
-   seam line. They keep the same 600px width so the X axes align column-for-column. */
+/* Live Oscilloscope + Reference Flipbook stack as one unit (shared seam, no inner corners); both
+   stay 600px so their X axes align column-for-column. */
 .fa-paired-top {
   margin-bottom: 0;
   border-bottom-left-radius: 0;
@@ -3613,14 +3519,12 @@ hr {
   }
 }
 
-/* Dark mode styling for console */
 .dark-mode .responsive-console {
   background: #000;
   color: #0f0;
   border-color: #333;
 }
 
-/* Pulse animation for visual feedback */
 @keyframes button-pulse {
   0% {
     transform: scale(1);
@@ -3667,8 +3571,7 @@ hr {
   animation: cloud-loading-bounce 1.2s infinite ease-in-out;
 }
 
-/* Registration-banner colors live in classes (not inline) so dark mode can theme them;
-   JS swaps info/error. Light values match the old inline #e3f2fd / #ffebee. */
+/* Banner colours live in classes (not inline) so dark mode can theme them; JS swaps info/error. */
 .cloud-banner-info {
   background: #e3f2fd;
   color: #1976d2;
@@ -3716,7 +3619,6 @@ hr {
   }
 }
 
-/* Dark mode styles — tonal neutral (matches the universal Soft Tonal system) */
 .dark-mode .btn-secondary {
   background: rgba(255, 255, 255, 0.08);
   color: #e0e0e0;
@@ -3732,7 +3634,6 @@ hr {
   transform: translateY(1px);
 }
 
-/* Dark mode pulse animation */
 .dark-mode .btn-secondary.button-pulse {
   animation: button-pulse 0.4s ease-out;
 }
@@ -3778,7 +3679,6 @@ hr {
 }
 
 
-/* Responsive adjustments */
 @media (max-width: 768px) {
 
   .main-tab {
@@ -3812,7 +3712,6 @@ hr {
   }
 }
 
-/* Password form responsive breakpoints */
 @media (max-width: 480px) {
   .password-form {
     flex-direction: column;
@@ -3825,9 +3724,8 @@ hr {
   }
 }
 
-/* Phone (≤480px): stack each form-row's label above its control, and let
-   multi-button control rows (Time Window 5S/10S/…, Download & Logging) wrap
-   to the full width instead of clipping off the right edge. */
+/* Phone: stack each form-row's label above its control; multi-button control rows wrap to
+   full width instead of clipping off the right edge. */
 @media (max-width: 480px) {
   .form-row {
     flex-direction: column;
@@ -3853,9 +3751,8 @@ hr {
     min-width: 0;            /* without this, min-width:auto floors the form at its content width */
   }
 
-  /* Control clusters (.form-row-wide: chip-button rows, card header rows) stay inline
-     and wrap; only plain label+input rows stack into a column. Without this, every
-     button in a wide row lands stretched on its own line. */
+  /* Control clusters (.form-row-wide) stay inline and wrap; only plain label+input rows stack,
+     or every button in a wide row lands stretched on its own line. */
   .form-row-wide {
     flex-direction: row;
     flex-wrap: wrap;
@@ -3863,7 +3760,6 @@ hr {
   }
 }
 
-/* Toggle switch styling */
 .switch {
   position: relative;
   display: inline-block;
@@ -3952,8 +3848,8 @@ input:checked+.slider:before {
   background-color: #00a19a;
 }
 
-/* Connection dot — replaced the WIFI CONNECTED/DISCONNECTED corner pill. Two instances
-   (collapsed strip lead, wordmark lead); updateInlineStatus() drives both by class. */
+/* Connection dot, two instances (collapsed strip lead, wordmark lead); updateInlineStatus()
+   drives both by class. */
 .conn-dot {
   flex: none;
   width: 8px;
@@ -4008,11 +3904,9 @@ input:checked+.slider:before {
   }
 }
 
-/* Stale readings — body.readings-stale, set by the 9 s stall watchdog (setReadingsStale in
-   script.js) and cleared by the next CSV packet. Scoped to the readout CONTAINERS, never to
-   the individual value classes: the header was rebuilt as .reading-duo and the old
-   per-element selector silently stopped matching anything, so the stall notice promised a
-   grey-out that never happened. A readout added inside these blocks fades with the rest. */
+/* Stale readings: body.readings-stale, set by the 9 s stall watchdog (setReadingsStale in
+   script.js), cleared by the next CSV packet. Scope to readout CONTAINERS, never per-value
+   classes, so a readout added inside these blocks fades with the rest. */
 body.readings-stale .sensor-readings-tier,
 body.readings-stale #header-collapsed-strip .hcs-m,
 body.readings-stale .reading,
@@ -4021,7 +3915,6 @@ body.readings-stale .reading-value {
   font-style: italic;
 }
 
-/* Dark Mode */
 .dark-mode {
   --primary: gray;
   --accent: #00a19a;
@@ -4032,9 +3925,8 @@ body.readings-stale .reading-value {
   --border: #444444;
   --reading: #d0d0d0;
   --text-muted: #9aa0a6;
-  /* Body/reading text was literally `gray` (#808080): 4.7:1 on the page but only 4.2:1 on a
-     card, which is where nearly all of it sits. --text-light is ink on an accent fill, so it
-     goes white rather than dim. */
+  /* Text ink is never `gray` (#808080): only 4.2:1 on a card, where most text sits. --text-light
+     is ink on an accent fill, so white. */
   --accent-fill: #00a19a;
   --cx-done: #4caf50;
   --cx-running: #64b5f6;
@@ -4107,7 +3999,7 @@ body.readings-stale .reading-value {
 }
 
 
-/* Dual Counter Display - shows resetable and AllTime values side-by-side */
+/* Dual Counter Display - stacks the AllTime and resettable values, one row each */
 .dual-counter {
   display: flex;
   flex-direction: column;
@@ -4142,9 +4034,8 @@ body.readings-stale .reading-value {
   padding: 0;
 }
 
-/* Center the Leaderboards and Fleet Stats iframe containers on screen (matches the
-   900px max-width of the Vercel-hosted leaderboards.html / fleet-stats.html content).
-   Without this they'd inherit full body width and the 900px content sits left. */
+/* Center the Leaderboards and Fleet Stats iframes to match the 900px max-width of the
+   Vercel-hosted leaderboards.html / fleet-stats.html content. */
 #cloudfeatures-leaderboards .history-container,
 #cloudfeatures-fleetstats .history-container {
   max-width: 900px;
@@ -4182,10 +4073,8 @@ body.readings-stale .reading-value {
   align-items: flex-start;  /* with a wrapped multi-line title, top-align the info icon instead of centering it */
 }
 
-/* title text takes the available width and wraps; the info icon keeps its own fixed column.
-   CONTRACT: the title text must be wrapped in its own <span> — a bare text node makes the
-   tooltip/badge the first span child, and the stretchy slot turns it into a full-width blob.
-   The :not(.tooltip) guard keeps a forgotten wrapper from stretching the icon itself. */
+/* CONTRACT: the title text must be in its own <span>; a bare text node makes the tooltip/badge
+   the first span child and stretches it full-width. :not(.tooltip) guards a forgotten wrapper. */
 .card-group-title > span:first-child:not(.tooltip) {
   flex: 1 1 auto;
   min-width: 0;
@@ -4273,9 +4162,8 @@ body.readings-stale .reading-value {
   text-align: left;
 }
 
-/* Tabular min/avg/max readouts (IMU Window Stats) — a single nowrap value line
-   overruns narrow cards once numbers go negative/wide. Units live in the row name
-   or card title so value columns stay purely numeric. */
+/* Tabular min/avg/max readouts (IMU Window Stats). Units live in the row name or card title so
+   value columns stay purely numeric. */
 .stat-table {
   display: grid;
   grid-template-columns: minmax(0, auto) repeat(3, minmax(0, 1fr));
@@ -4312,10 +4200,8 @@ body.readings-stale .reading-value {
 .dark-mode .stat-cap,
 .dark-mode .stat-name { color: #aaa; }
 
-/* When a stat card gets narrow (e.g. 3-up at the grid's 220px floor), the
-   name + 3 value columns no longer fit on one line. Drop to a per-metric
-   block: name on its own line above its three values. Container query so it
-   responds to the CARD width, not the viewport. */
+/* Narrow stat card (e.g. 3-up at the grid's 220px floor): name on its own line above its three
+   values. Container query so it tracks the CARD width, not the viewport. */
 .stat-card { container-type: inline-size; }
 @container (max-width: 300px) {
   .stat-table { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -4498,10 +4384,8 @@ body.readings-stale .reading-value {
   border-color: #444444;
 }
 
-/* Min/Max watermarks — tiny gray annotations beside primary readings.
-   Tracks lo/hi since boot (ignition cycle).
-   .with-wm pins the watermark to the parent's right edge so layout
-   does not jitter when the primary value's digit count changes. */
+/* Min/Max watermarks (lo/hi since boot). .with-wm pins the watermark to the parent's right edge
+   so a digit-count change never jitters layout. */
 .with-wm {
   display: flex;
   align-items: center;
@@ -4586,7 +4470,6 @@ body.readings-stale .reading-value {
 
 /* ========== PHYSICAL REGULATOR INSTALLATION STYLES ========== */
 
-/* Subsection Containers */
 .pri-subsection {
   background: #fafafa;
   border: 1px solid var(--border);
@@ -4609,7 +4492,6 @@ body.readings-stale .reading-value {
   line-height: 1.5;
 }
 
-/* Orientation Selection Grid */
 .pri-orientation-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -4708,7 +4590,6 @@ body.readings-stale .reading-value {
   line-height: 1.4;
 }
 
-/* Dark Mode Support */
 .dark-mode .pri-subsection {
   background: #1a1a1a;
   border-color: #444444;
@@ -4743,7 +4624,6 @@ body.readings-stale .reading-value {
   color: #cccccc;
 }
 
-/* Responsive adjustments */
 @media (max-width: 768px) {
   .pri-orientation-grid {
     grid-template-columns: 1fr;
@@ -4755,7 +4635,6 @@ body.readings-stale .reading-value {
 
 /* ========== LOCATION IN VESSEL FORM ========== */
 
-/* Form row - two column grid */
 .pri-subsection .form-row {
   display: grid;
   grid-template-columns: 200px 1fr;
@@ -4764,7 +4643,6 @@ body.readings-stale .reading-value {
   margin-bottom: 16px;
 }
 
-/* Left column - label */
 .pri-subsection .form-label {
   font-weight: 500;
   color: var(--text-dark);
@@ -4772,7 +4650,6 @@ body.readings-stale .reading-value {
   font-size: 14px;
 }
 
-/* Right column - input wrapper */
 .pri-subsection .form-input {
   display: flex;
   flex-direction: column;
@@ -4799,7 +4676,6 @@ body.readings-stale .reading-value {
   box-shadow: 0 0 0 3px rgba(0, 161, 154, 0.1);
 }
 
-/* Helper text below input */
 .pri-subsection .form-input small {
   font-size: 12px;
   color: #666666;
@@ -4807,7 +4683,6 @@ body.readings-stale .reading-value {
   margin-top: 4px;
 }
 
-/* HR separator between fields */
 .pri-subsection hr {
   border: none;
   height: 1px;
@@ -4815,7 +4690,6 @@ body.readings-stale .reading-value {
   margin: 12px 0;
 }
 
-/* Dark mode */
 .dark-mode .pri-subsection .form-label {
   color: #cccccc;
 }
@@ -4834,7 +4708,6 @@ body.readings-stale .reading-value {
   background: #444444;
 }
 
-/* Responsive - stack on mobile */
 @media (max-width: 768px) {
   .pri-subsection .form-row {
     grid-template-columns: 1fr;
@@ -4877,9 +4750,7 @@ body.readings-stale .reading-value {
   color: #856404;
 }
 
-/* Responsive grid for configuration rows on mobile.
-   Panel id is settings-weathersolar — these selectors said #settings-weather
-   for months, matched nothing, and the whole mobile layout silently never ran. */
+/* Mobile grid for configuration rows. The panel id is settings-weathersolar, not settings-weather. */
 @media (max-width: 768px) {
   #settings-weathersolar .form-row[style*="grid-template-columns"] {
     grid-template-columns: 1fr !important;
@@ -4946,9 +4817,8 @@ body.readings-stale .reading-value {
     align-items: center;
     gap: 10px;
     margin: 0 0 10px 0;
-    /* Wraps at every width, not just the narrow breakpoint below: the Charge Rate half carries a
-       gate note that takes a whole line of its own when Physical Panel Override is on, which would
-       otherwise push "Limit by" off the row. */
+    /* Wraps at every width: the Charge Rate half's gate note takes a full line when Physical Panel
+       Override is on, which would push "Limit by" off the row. */
     flex-wrap: wrap;
   }
   .cap-mode-label {
@@ -4988,9 +4858,8 @@ body.readings-stale .reading-value {
     cursor: pointer;
     transition: background 0.15s, color 0.15s, box-shadow 0.15s;
   }
-  /* Matches the page-wide `.seg.accent` standard: active = accent-filled pill + white
-     text. rate-low keeps an orange fill so the low-charge state stays visually distinct.
-     Same in both themes for a flat, filled look. */
+  /* Matches `.seg.accent`, same in both themes; rate-low keeps an orange fill so the low-charge
+     state stays distinct. */
   .cap-mode-btn.cap-mode-active {
     background: #00807a;
     color: #fff;
@@ -5010,9 +4879,8 @@ body.readings-stale .reading-value {
     background: #e08600;
     color: #fff;
   }
-  /* Charge Rate Limits table (rpmCapRender — always-dark wizard modal, so colours are literal).
-     Fixed 3-column layout keeps each heading centred over its own column at every width; the
-     cells shrink on narrow phones so the widest value still fits without wrapping or side-scroll. */
+  /* Charge Rate Limits table (rpmCapRender; always-dark wizard modal, so literal colours). Fixed
+     3-column layout keeps headings over their columns; cells shrink so values fit on phones. */
   #rpmcap-body .crl-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
   #rpmcap-body .crl-table th {
     padding: 0 8px 6px;
@@ -5036,9 +4904,8 @@ body.readings-stale .reading-value {
     /* iOS: 16px+ prevents auto-zoom on input focus */
     font-size: 16px;
   }
-  /* The < and + slots are rendered on every row (empty on rows 1..8), and flex makes the input
-     shrink by their width instead of overflowing the cell — that is what keeps all ten inputs on
-     the same centre line, under the heading, down to a 320px phone. */
+  /* The < and + slots exist on every row (empty on rows 1..8); flex shrinks the input by their
+     width, keeping all ten inputs centred under the heading down to a 320px phone. */
   #rpmcap-body .crl-rpm { display: flex; align-items: center; justify-content: center; }
   #rpmcap-body .crl-mk {
     flex: 0 0 14px;
@@ -5070,10 +4937,8 @@ body.readings-stale .reading-value {
 /* Lets a form-row span the full card width instead of the default 480px cap */
 .form-row-wide { max-width: none; }
 
-/* Logging controls: tooltip on the right, equal grid cells fill the rest.
-   auto-fit + minmax keeps every cell at least as wide as the widest nowrap
-   button ("Start Fresh Log" ~165px) and drops the column count (3→2→1)
-   as the card narrows — no fixed breakpoint, so labels can never overlap. */
+/* auto-fit + minmax keeps each cell at least as wide as the widest nowrap button ("Start Fresh
+   Log" ~165px), dropping 3→2→1 columns as the card narrows, so labels never overlap. */
 .log-row { align-items: center; }
 .log-row .log-info { flex-shrink: 0; margin-left: 10px; cursor: pointer; }
 .log-grid {
@@ -5083,24 +4948,19 @@ body.readings-stale .reading-value {
     gap: 8px;
     align-items: stretch;
 }
-/* equalize the cells — kill the per-button min-widths so all three match.
-   border-box is mandatory here: this sheet has no global box-sizing reset, so
-   width:100% alone makes padding+border overflow the grid track and each cell
-   slides under its right neighbor (the recurring button overlap). */
+/* Equalize the cells. border-box is mandatory (no global box-sizing reset): width:100% plus
+   padding overflows the track and each cell slides under its right neighbour. */
 .log-grid > * { width: 100%; margin: 0; box-sizing: border-box; }
 /* two-class specificity to beat the toggle min-width so all cells equalize */
 .log-grid > .btn-log-toggle { min-width: 0; }
 
-/* Time-window buttons wrap instead of overflowing the card on narrow widths.
-   flex-shrink:1 + min-width:0 are mandatory: the base .form-input form rule is
-   flex-shrink:0, so without them this 6-button strip stays rigid, flex-wrap never
-   triggers, and flex-end spills the overflow LEFT under the label + info icon. */
+/* flex-shrink:1 + min-width:0 are mandatory: the base .form-input form is flex-shrink:0, so the
+   strip stays rigid, never wraps, and flex-end spills the overflow LEFT under the label. */
 .time-window-input { min-width: 0; }
 .time-window-input form { flex-wrap: wrap; justify-content: flex-end; flex-shrink: 1; min-width: 0; }
 
-/* the active (current setting) time-window button — solid teal, driven from the CSV3
-   echo in updateAllEchosOptimized.
-   !important needed to beat the base .btn-primary tonal background (also !important). */
+/* Active time-window button, driven from the CSV3 echo in updateAllEchosOptimized. !important
+   beats the base .btn-primary tonal background (also !important). */
 .time-window-input .btn-primary.active {
     background: #00a19a !important;
     color: #fff !important;
@@ -5123,7 +4983,6 @@ body.readings-stale .reading-value {
     100% { box-shadow: 0 0 0 0 rgba(76,175,80,0); }
 }
 
-/* Download = primary teal call-to-action (tonal) */
 .btn-log-primary {
     padding: 8px 15px;
     border-radius: 8px;
@@ -5254,12 +5113,8 @@ body.readings-stale .reading-value {
   font-size: 12px;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   Protections alt-tab — phase-first layout with group-filter pills.
-   Scoped under #alt-panel-protections so it can't collide with the
-   rest of the site. Reuses existing .tooltip / .switch / .btn-primary
-   / .cap-mode-toggle / .password_field styles unchanged.
-   ═══════════════════════════════════════════════════════════════════ */
+/* ═══ Protections alt-tab: phase-first layout with group-filter pills, scoped under
+   #alt-panel-protections. ═══ */
 #alt-panel-protections .protections-filters {
   display: flex;
   flex-wrap: wrap;
@@ -5461,7 +5316,6 @@ body.dark-mode #alt-panel-protections .protections-subhead {
 .g3-line-chip.cc { background: #f0a500; }
 .g3-line-chip.cv { background: #4a9eff; }
 
-/* Dark-mode overrides — match the rest of the site's dark variants. */
 body.dark-mode #alt-panel-protections .protections-filters,
 body.dark-mode #alt-panel-protections .protections-phase,
 body.dark-mode #alt-panel-protections .protections-param,
@@ -5487,12 +5341,9 @@ body.dark-mode #alt-panel-protections .protections-intro p strong {
   color: #fff;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   Setup → Alternator → Diag — checkpoint (C1–C4) filter pills. Mirrors the
-   Protections pill pattern above, but the pills show/hide whole
-   <details class="checkpoint-section"> blocks instead of cards.
-   Scoped under #settings-diag (Live Data → Diag is results-only, unfiltered).
-   ═══════════════════════════════════════════════════════════════════ */
+/* ═══ Setup → Alternator → Diag checkpoint (C1–C4) filter pills: the Protections pill pattern,
+   but they show/hide whole <details class="checkpoint-section"> blocks. Scoped under
+   #settings-diag (Live Data → Diag is results-only, unfiltered). ═══ */
 #settings-diag .checkpoint-filters {
   display: flex;
   flex-wrap: wrap;
@@ -5647,18 +5498,13 @@ body.dark-mode #alt-panel-protections .protections-tag {
   background: #242424;
 }
 
-/* ========================================================================
-   BAROMETER PANEL (Other tab) — conditions header + 14-day pressure plot
-   Pressure-zone colors (storm/rain/change/fair/dry) are scoped inline via
-   updateBaroDisplay() so they pick up dark-mode automatically.
-   ======================================================================== */
+/* ===== BAROMETER PANEL (Other tab) =====
+   Pressure-zone colors are set inline by updateBaroDisplay(), not here. */
 .baro-panel { margin-bottom: 10px; }
 .baro-conditions {
   display: grid;
-  /* auto-fit, not four fixed tracks: the four declared minimums summed to 594px, which
-     is wider than this card at a 768-820px viewport (the 760px media query below keys off
-     the VIEWPORT, so it never fired) and the last block hung 20px past the card edge.
-     auto-fit drops to three or two columns on its own whenever the card is too narrow. */
+  /* auto-fit, not four fixed tracks: the four minimums sum to 594px, wider than this card at
+     768-820px viewports, where the viewport-keyed 760px query below never fires. */
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 12px 18px;
   align-items: center;
@@ -5775,7 +5621,7 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 }
 @media (max-width: 600px) { .baro-plot-container { height: 220px; } }
 
-/* Waiting-for-regulator overlay — placeholder for future sailing-boat animation. */
+/* Waiting-for-regulator overlay; the boat loading scene below draws inside it. */
 #waiting-for-regulator {
   position: fixed;
   inset: 0;
@@ -5793,10 +5639,9 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 }
 #waiting-for-regulator.wfr-hiding { opacity: 0; pointer-events: none; }
 
-/* ── Boat loading scene — Capacitor cold-launch splash (themed dark/light) ──
-   A fixed-size 300x600 design "stage" holds every tuned px value, and the inline
-   script scales it (--bl-scale) to COVER the viewport, so it looks identical on
-   any screen. ── */
+/* ── Boat loading scene: Capacitor cold-launch splash (themed dark/light) ──
+   A fixed 300x600 stage holds every tuned px value; the inline script scales it (--bl-scale)
+   to COVER the viewport. */
 #waiting-for-regulator .bl-stage { position: absolute; left: 50%; top: 50%; width: 300px; height: 600px;
   transform: translate(-50%, -50%) scale(var(--bl-scale, 1.45)); transform-origin: center center; }
 
@@ -5880,11 +5725,8 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .wfr-light .bl-clouds span:nth-child(1) { top: 116px; left: 24px; --s: 1; opacity: 0.9; animation: bl-cloud 90s linear infinite; }
 .wfr-light .bl-clouds span:nth-child(2) { top: 172px; left: 150px; --s: 0.58; opacity: 0.6; animation: bl-cloud 120s linear infinite; }
 
-/* On-plot Y-axis editing (attachYAxisEdit in script.js). The canvas-drawn
-   min/max tick labels of each Y axis get an invisible click zone
-   (.yaxis-hot); clicking summons the edit box (.yaxis-edit) in place.
-   z-index 9 keeps the zones UNDER plot overlay controls (.autoscale-ctrl
-   lock/auto buttons, z-index 10) so those stay clickable. */
+/* On-plot Y-axis editing (attachYAxisEdit in script.js): invisible click zones over the canvas
+   min/max tick labels. z-index 9 keeps them UNDER the .autoscale-ctrl buttons (z-index 10). */
 .yaxis-hot {
   position: absolute;
   z-index: 9;
@@ -5898,10 +5740,8 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   background: rgba(127, 127, 127, 0.10);
 }
 
-/* Touch devices can't hover to discover the zones — keep a faint
-   dashed outline on them at all times instead. The edit box gets a
-   16px font there: smaller fonts make iOS auto-zoom the page on focus
-   (viewport meta doesn't lock zoom). */
+/* Touch devices can't hover, so the zones keep a faint dashed outline. The edit box needs a
+   16px font or iOS auto-zooms the page on focus. */
 @media not ((hover: hover) and (pointer: fine)) {
   .yaxis-hot {
     border-color: rgba(127, 127, 127, 0.35);
@@ -5966,20 +5806,14 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   }
 }
 
-/* ── Generated-file delivery feedback (see deliverFile in script.js) ──────────
-   Toast: confirmation after a browser anchor download or a completed share sheet
-   (the app shares through the native plugins on both platforms). Ready bar: iOS
-   Safari, and app binaries predating those plugins, hold generated files for one
-   tap that opens the system share sheet — anchor clicks save nothing in either
-   app WebView, and Safari drops programmatic clicks once the tap's activation
-   expires. */
-/* ── Live-feed stall notice ───────────────────────────────────────────────────
-   Same fixed-overlay pattern as #file-toast below, at the top instead of the bottom:
-   held while the feed is down, then cleared on the same 4 s dwell once it is back.
-   Fixed + pointer-events:none is the whole point — this appears and disappears on
-   its own schedule, and anything that took layout space would shove the page down
-   every time the link hiccuped. Grey, not amber or red: nothing is wrong with the
-   boat, only with this page's connection to it. */
+/* ── Generated-file delivery feedback (deliverFile in script.js) ──
+   Toast confirms a download or share. Ready bar: iOS Safari and older app binaries need one tap to
+   open the share sheet (anchor clicks save nothing in the app WebViews; Safari drops programmatic
+   clicks once the tap's activation expires). */
+/* ── Live-feed stall notice ──
+   Same fixed overlay as #file-toast, at the top; held while the feed is down, cleared on the same
+   4 s dwell. Fixed + pointer-events:none so link hiccups never shove the page. Grey: the boat is
+   fine, only this page's connection is not. */
 #stall-toast {
   position: fixed;
   left: 50%;
@@ -6006,7 +5840,9 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   left: 50%;
   transform: translateX(-50%);
   bottom: calc(18px + env(safe-area-inset-bottom));
+  width: max-content;
   max-width: min(92vw, 480px);
+  box-sizing: border-box;
   background: rgba(40, 44, 46, 0.95);
   color: #ffffff;
   font-size: 13px;
@@ -6054,11 +5890,9 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
    Trigger button in .main-tabs (index.html) + logic in the SETTINGS SEARCH block at the
    end of script.js. All selectors ss-prefixed. */
 
-/* Trigger: bare icon in a gutter at the right end of the main tab row — deliberately not a tab
-   box, so the real tabs keep their full width and it never reads as a fourth tab that cannot
-   become active. Gated on a mouse/trackpad, NOT on width: touch devices (phone browsers and the
-   iOS app) open search with the pull-down-at-top gesture, and the old min-width:768px gate left
-   a narrow non-touch browser window with no way in at all. */
+/* Trigger: bare icon at the right end of the tab row, not a tab box, so it never reads as a tab
+   that cannot become active. Gate on mouse/trackpad, NOT width: touch devices open search with the
+   pull-down gesture, and a width gate leaves a narrow non-touch window with no way in. */
 .ss-search-tab { display: none; }
 @media (hover: hover) and (pointer: fine) {
   .ss-search-tab {
@@ -6248,26 +6082,21 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .ss-pull.ss-ready { background: var(--accent); border-color: var(--accent); color: #ffffff; }
 .ss-pull .ss-icon { width: 20px; height: 20px; }
 
-/* C3 band matrix — the five steadiness signals as one table (Setup > Alternator > Diag > C3).
-   Grid, inputs and dark-mode handling all come from .learning-table; these rules only cover the
-   signal column, its unit sub-label, and the Floor cells that only output amps uses. */
-/* The cap table pins its first five columns with !important pixel widths — override for four,
-   or the designed 30/24/20/26 split silently renders near-equal and Signal wraps early. */
+/* C3 band matrix (Setup > Alternator > Diag > C3). Grid, inputs and dark mode come from
+   .learning-table; only the signal column, unit sub-label and Floor cells are styled here. */
+/* The .learning-table base pins 5 fixed-pixel columns with !important, so every one is overridden
+   here or the 26/20/20/15/19 split renders near-equal, Signal wraps early and the last column falls off a phone. */
 .c3-band-table th:nth-child(1), .c3-band-table td:nth-child(1) { width: 26% !important; }
 .c3-band-table th:nth-child(2), .c3-band-table td:nth-child(2) { width: 20% !important; }
 .c3-band-table th:nth-child(3), .c3-band-table td:nth-child(3) { width: 20% !important; }
 .c3-band-table th:nth-child(4), .c3-band-table td:nth-child(4) { width: 15% !important; }
 .c3-band-table th:nth-child(5), .c3-band-table td:nth-child(5) { width: 19% !important; }
-/* 5 columns since the straightness gate (wobble / rate limit / floor / window): the .learning-table
-   base pins 5 fixed-pixel columns with !important, so every one of them has to be overridden here
-   or the last column falls off a phone. */
 .c3-band-table td { padding: 6px 5px; vertical-align: middle; }
 .c3-band-table th:first-child { text-align: left; }
 .c3-band-table td.c3-signal { font-size: 12.5px; font-weight: 600; text-align: left; }
 .c3-band-table td.c3-na { color: var(--text-muted); text-align: center; }
-/* Output amps is the only row with two floors (wobble in A, rate in A/s) and the table is pinned to
-   five columns that already only just fit a phone — so they stack in the one cell with a caption
-   between them rather than buying a sixth column that would push the last one off screen. */
+/* Output amps alone has two floors (wobble A, rate A/s): they stack in one cell with a caption,
+   since a sixth column would push the last one off a phone. */
 .c3-band-table td.c3-twin { padding-top: 4px; padding-bottom: 4px; }
 .c3-band-table td.c3-twin .c3-twin-cap {
   display: block;
@@ -6329,13 +6158,11 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   .ow-role-sel { min-width: 6.5em; }
 }
 
-/* ── Limit panel (header "What is limiting charging") ──────────────────────────
-   Non-modal: the overlay is click-through so the header readouts this panel explains stay usable
-   behind it, and the panel is draggable by its header (makePanelDraggable, desktop only).
-   Height is honest — only the two sentence blocks reserve space (they rewrite themselves on every
-   CSV1 frame, so a limiter flip must not twitch the box); a block that is structurally absent is
-   display:none via .why-gone. --why-tone is the severity colour, set on the panel by
-   whyPanelRender(), and drives the header dot and the verdict's left bar together. */
+/* ── Limit panel (header "What is limiting charging") ──
+   Non-modal: the overlay is click-through so the header readouts stay usable; draggable via
+   makePanelDraggable (desktop only). Only the two sentence blocks reserve space (rewritten every
+   CSV1 frame, so a limiter flip must not twitch the box); absent blocks use .why-gone.
+   --why-tone (set by whyPanelRender()) colours the header dot and the verdict's left bar. */
 .why-tap { cursor: pointer; }
 .why-tap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .why-gone { display: none !important; }
@@ -6429,9 +6256,8 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .why-lrow.why-bind .why-lval { color: var(--why-tone); font-weight: 700; }
 .why-pill { flex: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #1b1b1b; background: var(--why-tone); border-radius: 999px; padding: 2px 8px; white-space: nowrap; }
 .why-lsub { margin-top: 3px; font-size: 12px; color: #b9b9b9; }
-/* "your setting: 14.40 V" gets its own line under each row rather than a fourth column: at this
-   panel width the column truncated, and the media query that used to rescue it keys off the
-   VIEWPORT, which says nothing about a 400px panel on a wide desktop. */
+/* "your setting: 14.40 V" gets its own line, not a fourth column (truncates at this panel width;
+   a viewport media query cannot see a 400px panel on a wide desktop). */
 .why-ext-grid .why-own { grid-column: 1 / -1; margin-top: -3px; line-height: 1.25; }
 .why-k { color: #999; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .why-v { font-variant-numeric: tabular-nums; text-align: right; font-weight: 700; color: #2ec4b6; white-space: nowrap; }
@@ -6483,33 +6309,23 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
   .why-head { cursor: default; border-radius: 14px 14px 0 0; }
 }
 
-/* Grab cursor for the panel headers makePanelDraggable takes over — it adds .drag-handle rather than
-   an inline style, so the mobile rule below can win. Dragging is off at <=600px (those panels are CSS
-   bottom sheets), so the header stops advertising itself as a handle there. Ordering matters: this
-   must stay after .why-head, which sets its own cursor at equal specificity. */
+/* Grab cursor via the .drag-handle class makePanelDraggable adds (not inline), so the <=600px rule
+   can win where these panels are bottom sheets. Must stay after .why-head (equal specificity). */
 .drag-handle { cursor: move; }
 @media (max-width: 600px) {
   .drag-handle { cursor: default; }
 }
 
-/* Alternator OFF / ON (expanded header #header-onoff and collapsed strip #hcs-onoff). A segmented
-   control built from two half buttons, NOT a checkbox and NOT a slider: each half stays an absolute
-   command (left always sends OnOff=0, right always OnOff=1), so a stale or reverted paint can never
-   turn an intended OFF into an ON. Three redundant channels carry the live state, so none of them has
-   to be noticed on its own: the live half is FILLED (amber OFF, teal ON) while the other stays a
-   hollow outline, and the live half prints the STATE word in caps while the other prints the ACTION
-   in lower case ("turn on"). paintOnOff() in script.js owns .is-on / .is-off / .onoff-pending; with
-   neither class every half is hollow and both read as offers, which is the honest paint before the
-   first CSV1 frame — the old neutral-grey-track-with-no-knob read as OFF to most people. OFF fills
-   amber, not slate: a de-energized field has to be unmistakable, and it must never wear the accent
-   colour that means the alternator is working. */
+/* Alternator OFF / ON (#header-onoff, #hcs-onoff): two half buttons, NOT a checkbox or slider. Each
+   half is an absolute command (left OnOff=0, right OnOff=1), so a stale paint can never turn an
+   intended OFF into an ON. The live half is FILLED and prints the STATE; the other is hollow and
+   prints the ACTION. paintOnOff() owns .is-on / .is-off / .onoff-pending; neither = both hollow
+   (honest pre-first-frame paint). OFF fills amber, never the accent that means "working". */
 .onoff-switch {
   display: inline-flex;
   align-items: stretch;
-  /* FIXED width, not content width. The two halves swap between a short state word and a long action
-     word, so a content-sized control would measure 133/118/114px across unknown/OFF/ON and shove the
-     chip row sideways every time the regulator changed state. 134px fits the widest (both action
-     words, the pre-first-frame paint); the halves take up the slack. */
+  /* FIXED width: the halves swap short state / long action words, so content width would shove the
+     chip row on every state change. 134px fits the widest (both action words, pre-first-frame). */
   width: 134px;
   height: 26px;
   border-radius: 8px;

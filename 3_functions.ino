@@ -16,11 +16,6 @@
 
 
 
-// hasParam() plus the §10.9 float gate, used ONLY by handlers that parse the value with toFloat(): the
-// whole trimmed token must be a finite float ("nan", "inf", "1e39", "nanx", "" and text are refused), the
-// handler block is skipped as if the parameter were absent, a console line names it once, and every other
-// parameter in the same request is still processed. Ids, tokens and text parameters stay on plain
-// hasParam(): strtod reads a hex id like "0001e315" as infinity.
 // Alternator temperature (C) recorded with a Field Resistance write. 90 s, not n2kAltTempF's 20 s: the engine-off poll is
 // 60 s, and a cold engine is exactly when the resistance is measured. NAN = no reading to record.
 float fieldResProbeC() {
@@ -34,9 +29,8 @@ float fieldResProbeC() {
 // 409 body for a resistance-check answer that no longer matches the unit (fieldWindingAnswerOpen); the dashboard shows it.
 static const char FIELD_WIND_ANSWER_STALE[] = "Not changed: this field winding question was already answered, or the winding or Field Resistance changed after it was asked.";
 
-// The one writer of a Field Resistance: a typed entry (/get, with the temperature it was measured at, typed=true) and the
-// field resistance test (/fieldResTest save=1, the probe at its start). The coil-temperature credit is relative to that
-// temperature. 30 C when there is none. A measured value ends the skipped-test default.
+// Sole writer of Field Resistance: typed entry (/get, typed=true) and /fieldResTest save=1. probeC is the temperature
+// at measurement (typed) or the probe at test start; the coil-temperature credit is relative to it.
 void fieldResRecord(float r, float probeC, bool typed) {
   // Held at the 3 decimals NVS stores: the winding confirmation key is built from this RAM value, and a finer one would
   // stop matching the reloaded value after a reboot and drop a confirmed 24/36/48 V winding back to 12 V values.
@@ -57,8 +51,8 @@ void fieldResRecord(float r, float probeC, bool typed) {
   fieldWindingReconcile("Field Resistance changed");   // a new R re-runs the resistance check on a bus-rated winding
 }
 
-// The test may be skipped for the FD_SKIP_R_OHM default only on a 12 V system with no battery shunt (owner 2026-10-13):
-// there the default cannot bring either field ceiling into play, and without a shunt the test needs a meter.
+// Skipping to the FD_SKIP_R_OHM default is allowed only on 12 V with no battery shunt: there the default cannot bring
+// either field ceiling into play, and without a shunt the test needs a meter.
 bool fieldResSkipAllowed() {
   return SYSTEM_VOLTAGE_CLASS == 12 && !HAS_BATT_SHUNT;
 }
@@ -72,13 +66,15 @@ bool fieldResDefaultInUse() {
 // /fieldResTest skip=1: the owner's explicit choice on the test screen, so it may write flash. The measured pair is removed,
 // so one value is in force.
 void fieldResUseDefault() {
+  // RAM first, default flag before the clear: the control pass on core 1 must never see neither in force, and the
+  // NVS commits below take milliseconds.
+  FieldResDefault = true;
   FieldResistance = NAN;
   FieldResTrefC = NAN;
+  g_fieldDerateDirty = true;
   settingRemove(NK_FieldResistance);
   settingRemove(NK_FieldResTrefC);
-  FieldResDefault = true;
   settingWrite(NK_FieldResDefault, "1");
-  g_fieldDerateDirty = true;
   stateRevision++;
   settingsDirty = true;
   queueConsoleMessageF("Field Resistance test skipped: the regulator uses %.0f ohm (12 V system, no battery shunt). Charging and protection are unchanged; only the Field Amps reading is approximate", FD_SKIP_R_OHM);
@@ -130,10 +126,21 @@ const char *frtRefuseReason(uint8_t method) {
   return nullptr;
 }
 
+// Why a test or tool that reads engine speed may not start, or nullptr. Each start path reports it its own way.
+const char *rpmTestRefuseReason() {
+  if (IgnoreRPM || LimpHome)
+    return "The test needs engine speed. Stop running without it first (Setup > System > Run Without Failed Sensors).";
+  return nullptr;
+}
+
+// Gate for every numeric setting: the boxes are blank by design, and toInt("")/toFloat("") is 0
+// Ids, tokens and text stay on plain hasParam(): a hex id like "0001e315" fails this gate.
 bool paramOk(AsyncWebServerRequest *request, const char *name) {
   if (!request->hasParam(name)) return false;
   const String &v = request->getParam(name)->value();
-  if (!floatTokenValid(v.c_str())) {
+  // strtof takes "1e3" and "0x10", but an integer setting then stores toInt() of them (1, 0)
+  const bool plain = (strpbrk(v.c_str(), "eExX") == nullptr);
+  if (!plain || !floatTokenValid(v.c_str())) {
     static char lastName[40] = "";
     static String lastValue;
     static uint32_t lastMs = 0;
@@ -141,7 +148,7 @@ bool paramOk(AsyncWebServerRequest *request, const char *name) {
     if (!same) {
       strncpy(lastName, name, sizeof(lastName) - 1); lastName[sizeof(lastName) - 1] = '\0';
       lastValue = v; lastMs = millis();
-      queueConsoleMessageF("WRITE REJECTED: %s=\"%s\" is not a finite number", name, v.c_str());
+      queueConsoleMessageF("WRITE REJECTED: %s=\"%s\" is not a %s number", name, v.c_str(), plain ? "finite" : "plain");
     }
     return false;
   }
@@ -178,15 +185,15 @@ enum Csv1Index {
   CSV1_imu_vertical_accel_g,
   CSV1_imu_yaw_rate_dps,
   CSV1_imu_total_accel_g,
-  CSV1_perfCountersResetElapsedS,  // seconds since "Reset Peak Values" press (or boot if never pressed); UI formats as "last X min" / "last X.X hr"
+  CSV1_perfCountersResetElapsedS,  // s since Reset Peak Values press (or boot)
   CSV1_shutdownPhase,
   CSV1_BatteryV_raw,
   CSV1_pidAltPV,  // CC current-PID process variable — the OutputPIDSigSrc-selected signal (EMA/MA/raw)
   CSV1_voltageTarget,
   CSV1_Icv,
   CSV1_WaterDepth_ft,  // NMEA2k depth ×3.28084 (meters → feet), scaled ×10 (0.1 ft); 0 if stale
-  CSV1_Ignition,       // effective ignition state (real GPIO1 wire OR force-on override) — on CSV1 so the banner tracks it at ~10 Hz, not the 5 s CSV2 cadence
-  CSV1_OnOff,          // master Alternator Enable. Here for the same reason as Ignition, and a stronger one: it is the OTHER half of chargingEnabled, so the header switch and the field-status word must come off the SAME frame. Driven from the CSV3 settings echo the switch could read OFF beside a live MANUAL 50% field for up to 60 s (settingWrite does not mark settingsDirty), which is what a bench session saw on 2026-09-15
+  CSV1_Ignition,       // effective ignition (GPIO1 wire OR force-on override); on CSV1 so the banner tracks it at ~10 Hz
+  CSV1_OnOff,          // master Alternator Enable; on CSV1 (other half of chargingEnabled) so the header switch and field-status word come off the same frame
   CSV1_mExcessEma,       // iExcess detector: averaged signed current excess over command (A ×10) — tuning trace
   CSV1_iExcessThreshold, // iExcess detector: computed fire threshold E (A ×10) — tuning trace
   CSV1_mExcessEmaPeak,   // iExcess: per-CSV1-frame peak averaged excess (A ×10) — live sparkline
@@ -198,8 +205,8 @@ enum Csv1Index {
   CSV1_cvKdTrim,         // CV loop D back-off applied at the Icv output (A ×100); plotted negated as the D contribution
   CSV1_cvKdFiltV,        // IBV smoothed by CvKdVoltFiltTC (V ×100) — the D term's slope input; "Voltage for D term" trace
   CSV1_huntDerate,       // hunt-governor live Ki derate (×100; 100 = full gain)
-  CSV1_huntFreqHz,       // hunt-governor last confirmed wobble frequency (Hz ×100; 0 = none seen this session). Rides CSV1 rather than CSV4 so the Diag live row can never show a fresh derate beside a stale frequency
-  CSV1_huntState,        // hunt-governor state: 0 watching (gain follows the pocket map), 1 testing a current-loop gain (Ki) cut, 3 cooldown after a failed test, 4 testing with the voltage damper (D-term) paused (2 unused since v2)
+  CSV1_huntFreqHz,       // hunt-governor last confirmed wobble frequency (Hz ×100; 0 = none this session); on CSV1 so it never lags huntDerate
+  CSV1_huntState,        // hunt-governor state: 0 watching (pocket map), 1 testing a Ki cut, 3 cooldown after a failed test, 4 testing with D-term paused (2 unused)
   CSV1_rpmCeilingAmps,   // RPM-table current ceiling this tick (A ×100) — the header Limit panel's "current limit at this RPM"
 
   CSV1_sessionId,        // boot identity — same value in every channel this boot; proves a cached block is from this run
@@ -243,7 +250,6 @@ enum Csv2Index {
   CSV2_weatherDataValid,
   CSV2_AlarmLatchState,
   CSV2_ResetAlarmLatch,
-  CSV2_DynamicShuntGainFactor,
   CSV2_DynamicAltCurrentZero,
   CSV2_InsulationLifePercent,
   CSV2_GreaseLifePercent,
@@ -537,10 +543,10 @@ enum Csv2Index {
   CSV2_totalSafeHours,
   CSV2_FreeInternalRam,
   CSV2_TotalInternalRam,
-  CSV2_LargestInternalBlock,
+  CSV2_LargestInternalBlock,   // KB (cpuLoadTask walk every 20 s, field cut only; held while charging)
   CSV2_FreePSRAM,
   CSV2_TotalPSRAM,
-  CSV2_Heapfrag,
+  CSV2_Heapfrag,               // % from the same walk, so held while charging too
   CSV2_ft_ReadAnalogInputs_win,
   CSV2_ft_ReadAnalogInputs_ses,
   CSV2_ft_AdjustFieldLearnMode_win,
@@ -626,9 +632,7 @@ enum Csv2Index {
   CSV2_altCoveragePct,      // record-book fill % ×10
   CSV2_altObsCount,         // banked best-ever record count
 
-  // IMU zero/level calibration echo (Phase 2 IMU zero button)
-
-  // Victron VE.Direct solar/MPPT live block (7 fields — PPV/VPV/derived-current moved to CSV4/NavStream)
+  // Victron VE.Direct solar/MPPT live block (PPV/VPV/derived current are on CSV4/NavStream)
   CSV2_VictronChargeState,       // CS code (×1)
   CSV2_VictronMPPTMode,          // MPPT tracker code (×1)
   CSV2_VictronError,             // ERR code (×1)
@@ -636,8 +640,6 @@ enum Csv2Index {
   CSV2_VictronMaxPowerToday,     // H21 max power today (W ×1)
   CSV2_VictronYieldYesterday,    // H22 yield yesterday (kWh ×100)
   CSV2_VictronMaxPowerYesterday, // H23 max power yesterday (W ×1)
-
-  // (live engine fuel flow + economy — currentFuelGPH/currentNMPG — moved to CSV4/NavStream)
 
   // Session fuel-economy curve: mpg per 250-RPM bin (18 bins, 0..4500), naut mi/gal ×100, 0 = empty
   CSV2_fuelCurveNMPG_0,  CSV2_fuelCurveNMPG_1,  CSV2_fuelCurveNMPG_2,
@@ -728,8 +730,7 @@ enum Csv2Index {
   CSV2_ripAltAdmitCount,    // windows that passed ALL alt-fold gates (lifetime; UI diffs frames for rate)
   CSV2_ripBattAdmitCount,   // same for the battery detector
 
-  // Lifetime nav/sailing records (so the Lifetime Statistics panel can show + individually reset
-  // them). Persisted in NVS + uploaded to the leaderboards.
+  // Lifetime nav/sailing records (NVS-persisted, uploaded to the leaderboards)
   CSV2_LongestTripAT,       // longest single trip, nm ×10
   CSV2_Max24hrDistAT,       // max 24-hour distance, nm ×10
   CSV2_DeepestAnchorAT,     // deepest anchorage, ft ×10
@@ -738,16 +739,14 @@ enum Csv2Index {
 
   CSV2_cpuFreqMhz,   // live CPU clock (80 or 240 MHz) — 80 = engine-off low-power throttle, 240 = full speed
 
-  // ADS slow-channel inter-sample gap meters (ms). last = most recent gap between valid
-  // readings, worst = max since Reset Peak Values. Single-shot round-robin: CH0/CH2 each get one
-  // slot in six, ~40 ms apart (~80 ms worst field-on). Dashboard: Live Data → ESP32.
+  // ADS slow-channel inter-sample gap meters (ms). Single-shot round-robin: CH0/CH2 each get one slot in six,
+  // ~40 ms apart (~80 ms worst field-on).
   CSV2_ch0GapLast,   // CH0 battery-voltage read gap, most recent (ms)
   CSV2_ch0GapWorst,  // CH0 battery-voltage read gap, worst since reset (ms)
   CSV2_ch2GapLast,   // CH2 RPM read gap, most recent (ms)
   CSV2_ch2GapWorst,  // CH2 RPM read gap, worst since reset (ms)
 
-  // CSV2 send-cost breakdown (µs): build (snprintf) vs send (events.send). For deciding
-  // whether to chunk the build or the send to shrink the WiFi-send spike.
+  // CSV2 send-cost breakdown (µs): build (snprintf) vs send (events.send)
   CSV2_csv2BuildLast,   // CSV2 build (snprintf) time, previous cycle (µs)
   CSV2_csv2BuildWorst,  // CSV2 build time, worst since reset (µs)
   CSV2_csv2SendLast,    // CSV2 send (events.send) time, previous cycle (µs)
@@ -819,7 +818,7 @@ enum Csv2Index {
   CSV2_n183ChecksumErrs,  // NMEA 0183 sentences that failed checksum — climbs on wrong polarity or a noisy line
   CSV2_ft_ReadNMEA0183_win,  // NMEA 0183 drain worst us (window) — the 0.5 ms control-loop budget check
   CSV2_ft_ReadNMEA0183_ses,  // NMEA 0183 drain worst us (session)
-  CSV2_fieldDutyCeil,     // enforced field-duty ceiling ×100 — ccDutyCeiling(), the lowest of Max Field %, the Max Field Volts term, fieldCurDutyCeil and fieldHeatDutyCeil (fieldCeilBind names the binding one). Neither setting alone tells a log which cap was binding
+  CSV2_fieldDutyCeil,     // enforced field-duty ceiling ×100: ccDutyCeiling(), lowest of Max Field %, the Max Field Volts term, fieldCurDutyCeil, fieldHeatDutyCeil (fieldCeilBind names the binding one)
   CSV2_dvccAuthMfg,       // NAME manufacturer code of the node publishing the limits (358 = Victron, 2046 = open code; 0 = identity never heard)
   CSV2_dvccAuthProd,      // its 126996 product code, else its Victron VREG 0x0100 product id, else 0
   CSV2_ovTierLowCount,    // timed OV cut, LOW tier — session rising-edge counter (lifetime twin in ov_telemetry)
@@ -848,10 +847,10 @@ enum Csv2Index {
   CSV2_wmIgn_battTempF_lo,  CSV2_wmIgn_battTempF_hi,   // BatteryTempProbeF (°F, int)
   CSV2_wmIgn_extraTempF_lo, CSV2_wmIgn_extraTempF_hi,  // ExtraTempF (°F, int)
 
-  CSV2_fieldDutyFloor,      // enforced field-duty FLOOR x100 — governor_apply's resolved max(Min Field %, this speed's Keep-Alive %), 0 when the floor is bypassed (shutdown, sysID, protection clamp, MANUAL). Twin of CSV2_fieldDutyCeil
+  CSV2_fieldDutyFloor,      // enforced field-duty FLOOR x100: governor_apply's max(Min Field %, this speed's Keep-Alive %), 0 when bypassed (shutdown, sysID, protection clamp, MANUAL)
 
   CSV2_inaDieTempF,         // INA228 internal die temperature (°F x10; ROLL_EMPTY = no reading)
-  CSV2_inaDieTempMaxF,      // session max of the above (°F x10; ROLL_EMPTY = nothing has cleared the warm-up + corroboration gate yet). This is the value that uploads daily
+  CSV2_inaDieTempMaxF,      // session max of the above (°F x10; ROLL_EMPTY = nothing has cleared the warm-up + corroboration gate yet); uploads daily
 
   CSV2_voltStaleCount,      // session count of REASON_VOLTAGE_STALE field events (main battery voltage, INA228)
   CSV2_volt2StaleCount,     // session count of REASON_VOLTAGE2_STALE field events (second battery voltage, ADS1115)
@@ -875,6 +874,16 @@ enum Csv2Index {
   CSV2_fieldCurLimSesS,     // session seconds held at the 10 A ceiling (ResetFieldCurLimTime)
   CSV2_dieTempLostCount,    // session count of REASON_DIE_TEMP_LOST field events
 
+  // NMEA 2000 bus health (NMEA2K_TRANSMIT_SPEC.md §16.2; 5_functions.ino n2kBusTick)
+  CSV2_n2kBusVerdict,       // 0 off, 1 OK, 2 nothing heard, 3 receive errors, 4 nobody answering, 5 bus-off (numbered by severity)
+  CSV2_n2kTec,              // CAN transmit error counter (TEC), driver's 1 s status poll
+  CSV2_n2kRec,              // CAN receive error counter (REC)
+  CSV2_n2kRxFrames,         // frames received since Reset Peak Values (same reset as n2kTxCount)
+  CSV2_n2kBusOffCount,      // bus-off recoveries since boot
+  CSV2_n2kRxLost,           // received frames lost (driver queue full + controller FIFO overrun) while NMEA 2000 runs, since boot
+  CSV2_n2kNodesHeard,       // distinct source addresses heard within N2K_HEARD_MS (75 s), ours excluded
+  CSV2_LargestPSRAMBlock,   // largest contiguous free PSRAM block, KB (cpuLoadTask walk every 20 s, field cut only; held while charging)
+
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
 
@@ -882,8 +891,7 @@ enum Csv2Index {
 };
 
 enum Csv4Index {
-  // NavStream: live nav / wind / solar / fuel readouts — sent every 500 ms (2 Hz).
-  // Sits between CSV1 (10 Hz control-loop) and CSV2 (5 s status); the dial/compass/speed/solar/fuel gauges need ~2 Hz.
+  // NavStream: live nav / wind / solar / fuel readouts — sent every 500 ms (2 Hz), the rate the gauges need.
   CSV4_HeadingNMEA,             // heading (deg, int)
   CSV4_SOGNMEA,                 // speed over ground (knots ×100)
   CSV4_COGNMEA,                 // course over ground (deg, int)
@@ -914,15 +922,11 @@ enum Csv4Index {
   CSV4_FIELD_COUNT  // = 27
 };
 
-// CSV3 wire contract, declared ONCE. CSV3_LIST is expanded four ways: the Csv3Index enum, the
-// snprintf format string, the snprintf argument list, and the field-name list the build reads to
-// regenerate CSV3_FIELDS in web_src/script.js. Adding a setting means adding ONE line here.
-//
-// Comments in here MUST be /* */ block comments. A // comment swallows the continuation
-// backslash and truncates the macro, and every expansion truncates together and consistently --
-// so the count/order gate in compress_web.sh cannot see it. The static_assert on
-// CSV3_EXPECTED_FIELDS is what catches it, at compile time.
-#define CSV3_EXPECTED_FIELDS 448
+// CSV3 wire contract, declared ONCE: expanded into the Csv3Index enum, the snprintf format and argument list, and the
+// field-name list the build uses to regenerate CSV3_FIELDS in web_src/script.js.
+// Comments inside MUST be /* */: a // swallows the continuation backslash and truncates every expansion consistently,
+// which only the CSV3_EXPECTED_FIELDS static_assert catches.
+#define CSV3_EXPECTED_FIELDS 449
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -931,7 +935,7 @@ enum Csv4Index {
   X(FloatVoltage, "%d", SafeInt(FloatVoltage, 100)) \
   X(SwitchingFrequency, "%d", SafeInt(SwitchingFrequency)) \
   X(yyMin, "%d", SafeInt(yyMin)) \
-  X(retired1, "%d", 0)                                                                                            /* was FieldAdjustmentInterval — dead slot, sends 0; kept so CSV3 indices never renumber */ \
+  X(retired1, "%d", 0)                                                                                            /* dead slot, sends 0; kept so CSV3 indices never renumber */ \
   X(ManualDutyTarget, "%d", SafeInt(ManualDutyTarget, 100)) \
   X(PhysicalPanelOverride, "%d", SafeInt(PhysicalPanelOverride)) \
   X(waveAmplitude, "%d", SafeInt(waveAmplitude)) \
@@ -1099,9 +1103,9 @@ enum Csv4Index {
   X(IExcessCeilA, "%d", SafeInt(IExcessCeilA, 10))                                                                /* threshold ceiling (A ×10) */ \
   X(IExcessTau, "%d", SafeInt(IExcessTau))                                                                        /* EMA time constant (ms, raw int) */ \
   X(OutputPIDSigSrc, "%d", OutputPIDSigSrc) \
-  X(TdPred, "%.3f", TdPred)                                                                                       /* %.3f */ \
-  X(OvMeasMarginV, "%.3f", OvMeasMarginV)                                                                         /* %.3f */ \
-  X(OvPredMarginV, "%.3f", OvPredMarginV)                                                                         /* %.3f */ \
+  X(TdPred, "%.3f", TdPred) \
+  X(OvMeasMarginV, "%.3f", OvMeasMarginV) \
+  X(OvPredMarginV, "%.3f", OvPredMarginV) \
   X(OutputPIDMA_N, "%d", OutputPIDMA_N) \
   X(OutputPIDFilterTC, "%d", (int)OutputPIDFilterTC) \
   X(VoltageFilterTC, "%d", (int)VoltageFilterTC) \
@@ -1129,7 +1133,6 @@ enum Csv4Index {
   X(IgnoreLearningDuringPenalty, "%d", SafeInt(IgnoreLearningDuringPenalty)) \
   X(LogAllLearningEvents, "%d", SafeInt(LogAllLearningEvents)) \
   X(CloudFeatures, "%d", SafeInt(CloudFeatures)) \
-  X(AutoShuntGainCorrection, "%d", SafeInt(AutoShuntGainCorrection)) \
   X(AutoAltCurrentZero, "%d", SafeInt(AutoAltCurrentZero)) \
   X(WindingTempOffset, "%d", SafeInt(WindingTempOffset)) \
   X(ManualLifePercentage, "%d", SafeInt(ManualLifePercentage)) \
@@ -1155,7 +1158,6 @@ enum Csv4Index {
   X(cvWavePeriodSec, "%d", (int)cvWavePeriodSec) \
   X(cvKOvershoot, "%d", SafeInt(cvKOvershoot, 10)) \
   X(cvConsecutiveReads, "%d", (int)cvConsecutiveReads) \
-  /* 8 dead slots — kept to preserve CSV3 indices, all send 0 */ \
   X(webgaugesinterval, "%d", SafeInt(webgaugesinterval)) \
   X(plotTimeWindow, "%d", SafeInt(plotTimeWindow)) \
   X(Ymin1, "%d", SafeInt(Ymin1)) \
@@ -1287,7 +1289,7 @@ enum Csv4Index {
   X(cvRecovFlareBandV, "%d", SafeInt(cvRecovFlareBandV, 1000))                                                    /* arrival flare band (V per 12V block); ×1000 */ \
   X(cvRecovFlareFrac, "%d", SafeInt(cvRecovFlareFrac, 100))                                                       /* arrival flare ceiling floor, fraction of recovery goal; ×100 */ \
   X(TachLieEnable, "%d", (int)TachLieEnable)                                                                      /* tach-lie plausibility cut enable (0/1) */ \
-  X(n2kTxEnable, "%d", SafeInt(n2kTxEnable))                                                                      /* NMEA2000 transmit master (0/1) — mode applied at boot */ \
+  X(n2kTxEnable, "%d", SafeInt(n2kTxEnable))                                                                      /* NMEA2000 transmit master (0/1) */ \
   X(n2kDeviceInstance, "%d", SafeInt(n2kDeviceInstance))                                                          /* N2K device instance */ \
   X(n2kBattEnable, "%d", SafeInt(n2kBattEnable))                                                                  /* battery 127508+127506 pair (0/1) */ \
   X(n2kBattInstance, "%d", SafeInt(n2kBattInstance)) \
@@ -1305,6 +1307,7 @@ enum Csv4Index {
   X(n2kEngInstance, "%d", SafeInt(n2kEngInstance)) \
   X(n2kEngDynEnable, "%d", SafeInt(n2kEngDynEnable))                                                              /* 127489 engine dynamic (0/1) */ \
   X(n2kEngBitsEnable, "%d", SafeInt(n2kEngBitsEnable))                                                            /* discrete warning bits inside 127489 (0/1) */ \
+  X(n2kConvStatEnable, "%d", SafeInt(n2kConvStatEnable))                                                          /* 127750 converter status (0/1) */ \
   X(n2kRxBattInstance, "%d", SafeInt(n2kRxBattInstance))                                                          /* battery instance to ingest (127508/127506 receive) */ \
   X(dvccEn, "%d", SafeInt(dvccEn))                                                                                /* DVCC follow master (0/1) */ \
   X(dvccSrcType, "%d", SafeInt(dvccSrcType))                                                                      /* authority dialect: 0 Victron VE.Can (VREG), 1 RV-C */ \
@@ -1313,6 +1316,7 @@ enum Csv4Index {
   X(dvccSettleS, "%d", SafeInt(dvccSettleS))                                                                      /* settling time (s) */ \
   X(dvccCvlMin, "%d", SafeInt(dvccCvlMin, 100))                                                                   /* plausible-CVL window low (V ×100) */ \
   X(dvccCvlMax, "%d", SafeInt(dvccCvlMax, 100))                                                                   /* plausible-CVL window high (V ×100) */ \
+  X(dvccVicCutHold, "%d", SafeInt(dvccVicCutHold))                                                                /* Victron do-not-charge held after it stops arriving (0/1) */ \
   X(HuntCutPct, "%d", (int)HuntCutPct)                                                                            /* damper test/pocket gain, % of user Ki */ \
   X(HuntVerifyPct, "%d", (int)HuntVerifyPct)                                                                      /* damper verify bar, % ripple reduction required */ \
   X(HuntWingPct, "%d", (int)HuntWingPct)                                                                          /* damper pocket taper width, % of speed per side */ \
@@ -1324,7 +1328,7 @@ enum Csv4Index {
   X(NMEA0183Invert, "%d", (int)NMEA0183Invert)                                                                    /* NMEA 0183 UART polarity: 0 RS-232-level talker, 1 TTL-level talker */ \
   X(displayVolUnit, "%d", SafeInt(displayVolUnit))                                                                /* fuel volume display preference: 0 US gallons, 1 litres */ \
   X(gpsPositionSource, "%d", (int)gpsPositionSource)                                                              /* 0=auto, 1=NMEA-forced, 2=phone-forced (position only; the clock is CSV3_timeSourceMode) */ \
-  X(MaxFieldVolts, "%d", SafeInt(MaxFieldVolts, 10))                                                              /* field-volt cap (x10). The enforced ceiling it produces is CSV2_fieldDutyCeil — voltage-dependent, so it lives on the 5s channel, not here */ \
+  X(MaxFieldVolts, "%d", SafeInt(MaxFieldVolts, 10))                                                              /* field-volt cap (x10); the enforced ceiling is CSV2_fieldDutyCeil */ \
   X(OvTierLoMarginV, "%.3f", OvTierLoMarginV)                                                                     /* timed OV cut LOW-tier margin above target (V, %.3f) */ \
   X(OvTierLoDwellMs, "%d", SafeInt(OvTierLoDwellMs))                                                              /* timed OV cut LOW-tier continuous dwell (ms; 0 = tier off) */ \
   X(OvTierMidMarginV, "%.3f", OvTierMidMarginV)                                                                   /* timed OV cut MID-tier margin above target (V, %.3f) */ \
@@ -1337,7 +1341,7 @@ enum Csv4Index {
   X(solarUseConsEnable, "%d", SafeInt(solarUseConsEnable))                                                        /* 0/1 — size the solar-pause bar from predicted consumption */ \
   X(solarConsMarginPct, "%d", SafeInt(solarConsMarginPct, 100))                                                   /* x100 — headroom over predicted consumption (%) */ \
   X(solarLearnRatePct, "%d", SafeInt(solarLearnRatePct, 100))                                                     /* x100 — per-day blend weight into performanceRatio (%) */ \
-  X(rvcTxEnable, "%d", SafeInt(rvcTxEnable))                                                                      /* RV-C transmit master (0/1) — bus mode applied at boot */ \
+  X(rvcTxEnable, "%d", SafeInt(rvcTxEnable))                                                                      /* RV-C transmit master (0/1) */ \
   X(rvcChgrEnable, "%d", SafeInt(rvcChgrEnable))                                                                  /* RV-C CHARGER_STATUS / _2 / _3 / CONFIGURATION_STATUS (0/1) */ \
   X(rvcDcEnable, "%d", SafeInt(rvcDcEnable))                                                                      /* RV-C DC_SOURCE_STATUS_1/2/3 at the alternator instance (0/1) */ \
   X(rvcFaultEnable, "%d", SafeInt(rvcFaultEnable))                                                                /* RV-C DM_RV diagnostic message (0/1) */ \
@@ -1360,7 +1364,7 @@ enum Csv4Index {
   X(CommissionTempSrc, "%d", SafeInt(CommissionTempSrc))                                                          /* battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown, 5 = retired board stamp) */ \
   X(maxWorkingRpm, "%d", SafeInt(maxWorkingRpm))                                                                  /* stage-9 setup screen; 0 = never entered */ \
   X(RemoteDiagnostics, "%d", SafeInt(RemoteDiagnostics))                                                          /* owner switch for the dashboard's support log-relay poll (0/1) */ \
-  X(retired2, "%d", 0)                                                                                            /* was ShuntGroundComp — dead slot, sends 0; kept so CSV3 indices never renumber */ \
+  X(retired2, "%d", 0)                                                                                            /* dead slot, sends 0; kept so CSV3 indices never renumber */ \
   X(BatteryVoltageSource, "%d", SafeInt(BatteryVoltageSource))                                                /* charge-decision battery volts: 0 INA228, 1 NMEA 2000, 3 Victron */ \
   X(IgnoreAltCurrent, "%d", SafeInt(IgnoreAltCurrent))                                                          /* run without alternator current (0/1) — voltage-only regulation */ \
   X(IgnoreBattVMain, "%d", SafeInt(IgnoreBattVMain))                                                            /* run without the INA228 bus voltage (0/1) — fixed duty */ \
@@ -1376,11 +1380,10 @@ enum Csv4Index {
   X(FieldWindingV, "%d", (int)FieldWindingV)                                                                       /* field winding rated voltage from Vessel Info, V */ \
   X(fieldWindApplied, "%d", (int)fieldWindApplied)                                                                 /* winding the field-side knobs are scaled for; below FieldWindingV = held on 12 V values until the owner confirms */ \
   X(sessionId, "%u", (unsigned)g_sessionId)                                                                   /* boot identity — matches CSV1_sessionId while this cached block is from the live run */ \
-  X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when this settings echo was built. CSV3 is event-driven with a 60 s */ \
-  /* fallback, so an age much past ~60 s means the echo stopped arriving and every */ \
-  /* setting in this block predates whatever the device is actually running. */
+  X(sendMs, "%u", (unsigned)millis())                                                                             /* millis() when built; CSV3 resends at least every 60 s, */ \
+  /* so an age well past ~60 s means the echo stopped */ \
+  /* and these settings may be stale. */
 
-// The four expansions of CSV3_LIST. Adding a setting means one line in the list above and nothing here.
 #define CSV3_ENUM_X(name, fmt, expr) CSV3_##name,
 #define CSV3_FMT_X(name, fmt, expr)  "," fmt
 #define CSV3_ARG_X(name, fmt, expr)  , expr
@@ -1439,14 +1442,11 @@ enum TsIndex {
   TS_DieTemp,       // INA228 die temperature: age of the last valid sample (IDX_INA_DIE_TEMP), the field-drive heat ceiling's input
 
   TS_sessionId,     // boot identity — matches CSV1_sessionId while this cached block is from the live run
-  TS_sendMs,        // millis() when this payload was built. Every other TS field is an AGE, so without this
-                    // a frozen block reads as a set of plausible ages that simply stopped advancing.
+  TS_sendMs,        // millis() when built; every other TS field is an AGE, so this is what exposes a frozen block
 
   TS_FIELD_COUNT  // = 42
 };
 
-
-// Cap current table functions
 float getCapCurrentForRPM(float rpm);
 void saveCapCurrentTableToNVS();
 void loadCapCurrentTableFromNVS();
@@ -1454,14 +1454,11 @@ void loadCapTablesForMode(int mode);
 
 int SafeInt(double f, int scale = 1) {
   // where this is matters, don't move!!
-  // Param widened to double so AllTime accumulators don't narrow at call sites; float callers promote implicitly.
-  // NaN/Inf -> ROLL_EMPTY, not -1: -1 is a legitimate reading for signed currents, angles, deltas and
-  // Celsius temperatures, so "no sensor" and "a real -1" were indistinguishable on the wire. The browser
-  // rewrites anything <= -1999999999 to NaN at parse time and every renderer prints an em dash for it.
+  // double so AllTime accumulators don't narrow. NaN/Inf -> ROLL_EMPTY, not -1 (a real reading for signed values);
+  // the browser parses anything <= -1999999999 as NaN and renders an em dash.
   return isnan(f) || isinf(f) ? ROLL_EMPTY : (int)round(f * scale);
 }
-// %.1f on a NAN emits "nan", which is not valid JSON and kills the whole record at the parser. The
-// tuning/sysid/CV ledger records stamp NAN when no probe had read; null is the honest carrier.
+// %.1f on NAN emits "nan", invalid JSON that kills the whole ledger record; emit null instead.
 const char *jsonNum1(char *buf, size_t n, float v) {
   if (isnan(v) || isinf(v)) snprintf(buf, n, "null");
   else snprintf(buf, n, "%.1f", v);
@@ -1475,7 +1472,6 @@ void loadAPCredentials(bool forceDefaults = false) {
     return;
   }
 
-  // Load custom credentials from NVS
   if (settingExists(NK_apssid)) {
     esp32_ap_ssid = settingRead(NK_apssid);
     esp32_ap_ssid.trim();
@@ -1502,12 +1498,9 @@ void loadAPCredentials(bool forceDefaults = false) {
 void setupWiFi() {
   Serial.println("\n=== WiFi Setup Starting ===");
 
-  // Boot-mode straps:
-  //   GPIO41 LOW — boot the factory partition (emergency recovery from a bad OTA)
-  //   GPIO45 LOW — force CONFIG mode (WiFi setup / password recovery); alternator DISABLED, deliberately:
-  //                config mode means settings are unknown/unconfigured, so charging must not run
-  //   GPIO46     — LOW = AP mode, HIGH = Client mode. Both run the alternator fully, so holding 46 LOW is
-  //                the credential-free emergency path: join the ALTERNATOR_WIFI-<unit id> network, browse to 192.168.4.1
+  // Boot straps: GPIO41 LOW = factory partition (recovery from a bad OTA); GPIO45 LOW = CONFIG mode with the alternator
+  // DISABLED (settings unknown, so no charging); GPIO46 LOW = AP mode, HIGH = Client. Both run the alternator, so 46 LOW
+  // is the credential-free emergency path (ALTERNATOR_WIFI-<unit id>, 192.168.4.1).
 
   // Harness wires (RJ3 pins 11/12), documented as read "during a restart". Read once: loop() re-enters
   // here from standby to raise the radio in the mode already chosen, and a live re-read could flip
@@ -1523,7 +1516,6 @@ void setupWiFi() {
     strapsLatched = true;
   }
 
-  // GPIO45 = Configuration Mode Override (always checked first)
   if (forceConfigMode) {
     Serial.println("=== GPIO45 LOW: FORCED CONFIGURATION MODE ===");
     Serial.println("=== ALTERNATOR DISABLED FOR SAFETY - Use GPIO46 LOW for emergency operation ===");
@@ -1535,12 +1527,7 @@ void setupWiFi() {
     return;  // Exit setupWiFi() - alternator will not run
   }
 
-  // GPIO46 = Operational Mode Selection (checked early to allow emergency AP access on first boot)
-  // This check happens before isFirstBoot to ensure AP mode works even on first boot
-  // Rationale: If user has no WiFi or WiFi router is down, they can still run the regulator in AP mode
-  // This allows emergency operation: GPIO41 low = factory firmware, GPIO41 high = OTA firmware (if valid OTA exists, else factory)
-  // GPIO46 low = AP mode regardless of any credentials of any kind
-  // Settings persist in userdata partition; AP credentials default to ALTERNATOR_WIFI-<unit id>/alternator123
+  // Checked before isFirstBoot so AP mode works on first boot too, regardless of any saved credentials.
 
   if (requestAPMode) {
     Serial.println("=== GPIO46 LOW: OPERATIONAL AP MODE ===");
@@ -1548,7 +1535,8 @@ void setupWiFi() {
     setupAccessPoint();
     currentMode = MODE_AP;
     CloudFeatures = 0;
-    if (webFS.exists("/index.html.gz")) {
+    static const bool haveIndexGz = webFS.exists("/index.html.gz");   // first pass only: the wake re-entry from loop() must not read flash
+    if (haveIndexGz) {
       Serial.println("Serving full alternator interface in AP mode");
       setupServer();
     } else {
@@ -1557,7 +1545,6 @@ void setupWiFi() {
     }
     return;
   }
-  // Check if this is truly first boot (no configuration has ever been done)
   bool isFirstBoot = !settingExists(NK_first_config_done);
 
   if (isFirstBoot) {
@@ -1570,10 +1557,8 @@ void setupWiFi() {
     return;
   }
 
-  // Check if the device has ever been configured with WiFi credentials before
   bool hasClientConfig = settingExists(NK_ssid);
 
-  // Load and cache WiFi client credentials once
   if (hasClientConfig) {
     String ssid = settingRead(NK_ssid);
     String pass = settingRead(NK_pass);
@@ -1595,7 +1580,6 @@ void setupWiFi() {
 
   Serial.println("=== GPIO46 HIGH: CLIENT MODE REQUESTED ===");
 
-  // If no saved credentials, enter config mode
   if (!hasClientConfig || !cached_wifi_creds_valid || strlen(cached_wifi_ssid) == 0) {
     Serial.println("=== NO CLIENT CREDENTIALS: ENTERING CONFIGURATION MODE ===");
     Serial.println(!hasClientConfig ? "Reason: No saved credentials file" : "Reason: Empty SSID");
@@ -1629,19 +1613,11 @@ void setupWiFi() {
 }
 
 // ── Per-unit identity ───────────────────────────────────────────────────────────────
-// More than one regulator can share a LAN (twin engines, a dealer bench). They all answer to
-// alternator.local, and whichever wins the resolver race owns the name: on 2026-09-09 the same
-// query returned two different boards 90 minutes apart, and the dashboard followed it without
-// saying anything. Everything below is derived from the eFuse UID, so it can only mean one
-// unit. alternator.local is kept exactly as it was for single-regulator installs and for the
-// tooling and docs that already use it.
+// Several regulators can share a LAN and all answer to alternator.local (whichever wins the resolver race), so
+// everything below derives from the eFuse UID. alternator.local stays for single-regulator installs and tooling.
 
-// Six hex of the UID — short enough to read off a screen, unique across any real fleet.
-// Which six matters: device_id_hex prints ESP.getEfuseMac() big-endian, and that call packs the
-// six MAC bytes LITTLE-endian, so the string is the MAC reversed — its TAIL is the OUI, shared by
-// every module, and the per-chip bytes sit right after the always-zero high half. Taking the tail
-// (pre-2026-09-14) gave two bench boards, dc:b4:d9:1a:62:28 and :58, the same "d9b4dc" — same
-// mDNS hostname, same delegated alternator.local, same default AP SSID.
+// Six hex of the UID. device_id_hex prints getEfuseMac() big-endian over little-endian-packed MAC bytes, so the string
+// is the MAC reversed: its TAIL is the OUI shared by every module. Take the six after the always-zero high half.
 const char *regulatorUid6() {
   static char u6[7] = "";
   if (!u6[0]) {
@@ -1663,14 +1639,12 @@ const char *regulatorHostName() {
   return h;
 }
 
-// What a human picks from in the app. Never empty — an unnamed board still has to be
-// distinguishable from the one next to it.
+// Never empty: an unnamed board must still be distinguishable from the one next to it.
 String regulatorDisplayName() {
   return REGULATOR_NAME[0] ? String(REGULATOR_NAME) : (String("XREG-") + regulatorUid6());
 }
 
-// Two unprovisioned units in radio range would otherwise broadcast the same SSID, which is
-// exactly the out-of-the-box state of a twin-engine install.
+// Per-unit so two unprovisioned units in range (a twin-engine install) don't broadcast the same SSID.
 String defaultApSsid() {
   return String("ALTERNATOR_WIFI-") + regulatorUid6();
 }
@@ -1686,12 +1660,8 @@ static void mdnsRefreshName() {
   mdns_service_txt_item_set("_xreg", "_tcp", "name", regulatorDisplayName().c_str());
 }
 
-// alternator.local is the DELEGATED name here, not the primary one. The primary hostname has to
-// be unique per unit because it is the SRV target of the advertised service: with a shared
-// primary, resolving unit B's service hands back a name that unit A also answers to, and the
-// browse comes back pointing at the wrong board. A delegated hostname carries no netif binding,
-// so its address is re-published whenever the interface address moves (reconnect, DHCP change,
-// AP<->STA). Cheap and idempotent.
+// alternator.local is a DELEGATED name: the primary hostname must be unique because it is the SRV target, or resolving
+// unit B's service lands on unit A. A delegated name has no netif binding, so republish whenever the address moves.
 void mdnsPublishIdentity() {
   IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
   if ((uint32_t)ip == 0) return;
@@ -1739,12 +1709,8 @@ void startMdnsOnce() {
 }
 
 // ── Access: settings password, paired regulators, network peers ─────────────────────────────────
-// Password: the arm gate is untouched until Setup > System turns the password on. With it on,
-// /armSettings needs pw= and answers with a token; every mutating request then carries tok=
-// (settingsArmActive checks it), so an unlock belongs to the client that typed the password rather
-// than to every page on the network. Only a salted SHA-256 is stored. Five wrong tries buy a 60 s
-// lockout; a pin-11 recovery boot clears the requirement, the same physical-access rule that already
-// resets the hotspot credentials.
+// With the password on, /armSettings needs pw= and returns a token; mutating requests carry tok= (settingsArmActive), so
+// an unlock belongs to one client. Salted SHA-256 only; 5 wrong tries = 60 s lockout; a pin-11 recovery boot clears it.
 static void copyField(char *dst, size_t n, const String &src) {
   strncpy(dst, src.c_str(), n - 1);
   dst[n - 1] = '\0';
@@ -1792,7 +1758,10 @@ bool pwStore(const char *pw) {
   char salt[17], h[65];
   snprintf(salt, sizeof(salt), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
   sha256Hex(salt, pw, h);
-  if (!settingWrite(NK_pwSalt, salt) || !settingWrite(NK_pwHash, h) || !settingWrite(NK_pwReq, "1")) return false;
+  // Requirement off first, on last: salt and hash commit separately, and a cut between them left a new salt beside the
+  // old hash, a complete-looking record no password verifies. Interrupted this way, the next boot has no password.
+  if (!settingWrite(NK_pwReq, "0") || !settingWrite(NK_pwSalt, salt) || !settingWrite(NK_pwHash, h)
+      || !settingWrite(NK_pwReq, "1")) return false;
   strcpy(pwSaltHex, salt);
   strcpy(pwHashHex, h);
   pwRequired = true;
@@ -1817,10 +1786,8 @@ void accessRecoveryClear() {
   }
 }
 
-// Paired regulators: the units the owner said are on this boat (Setup > System > Regulators on this
-// boat). Stored as uid<US>name records joined by <RS>, so a name can hold any printable text. Both
-// units store each other; the dashboard writes both sides (its own over the same origin, the other's
-// cross-origin after arming it), so neither firmware has to trust a claim made by the other.
+// Paired regulators (Setup > System > Regulators on this boat), stored as uid<US>name records joined by <RS>. The
+// dashboard writes both units' lists, so neither firmware trusts a claim made by the other.
 #define PAIR_MAX 8
 struct PairedUnit { char uid[17]; char name[33]; };
 static PairedUnit pairList[PAIR_MAX];
@@ -1950,10 +1917,8 @@ void accessInit() {
   Serial.printf("ACCESS: settings password %s, %u paired regulator(s)\n", pwRequired ? "ON" : "off", (unsigned)pairCount);
 }
 
-// Peers: every other regulator this unit can hear on the network, from a browse of the private
-// _xreg._tcp service. Own core-0 task because one query blocks ~3 s. The result is pre-rendered
-// JSON behind a mutex, so /identify only copies it. Everything here is network input: bounded,
-// escaped by cfgAppendJsonStr, rendered as text by the dashboard.
+// Peers: other regulators heard via a browse of _xreg._tcp. Own core-0 task (one query blocks ~3 s); the result is
+// pre-rendered JSON behind peerMux. All network input: bounded, escaped by cfgAppendJsonStr, rendered as text.
 #define PEER_MAX 12
 #define PEER_STALE_MS 120000UL   // one missed 30 s query must not flicker a unit out of the list
 #define PEERS_JSON_CAP 3072
@@ -2057,9 +2022,8 @@ void peerListAppendJson(String &out) {
   }
 }
 
-// A failed join only prints WiFi.status()==6 ("not connected"), which can't tell a wrong
-// password from an AP refusing the association (e.g. an MVNO hotspot device cap) from an SSID
-// not found. This logs the AP's real disconnect reason so phone-hotspot joins are diagnosable.
+// WiFi.status()==6 can't tell a wrong password from an AP refusing association (e.g. a hotspot device cap) or a
+// missing SSID; this names the AP's actual disconnect reason.
 static const char *wifiDisconnectReasonStr(uint8_t reason) {
   switch (reason) {
     case 2:   return "AUTH_EXPIRE";
@@ -2083,11 +2047,9 @@ static const char *wifiDisconnectReasonStr(uint8_t reason) {
 
 // 0 = no disconnect event received; written from the WiFi task, read by the boot-connect verdict
 static volatile uint8_t lastStaDiscReason = 0;
-// One outage's record for pollWiFiLinkState() below. An outage starts at the first disconnect event after
-// a GOT_IP; that event's reason is the cause — the reconnect engine's failed rejoins fire more events with
-// their own reasons, so those only bump the count. Events before the first GOT_IP of the boot are ignored
-// (the boot join has its own verdict log). Single aligned words written by the event task and read by the
-// loop: no lock, no allocation, no waiting on either side.
+// One outage's record for pollWiFiLinkState(): an outage starts at the first disconnect after a GOT_IP and that event's
+// reason is the cause; later failed rejoins only bump the count. Events before the boot's first GOT_IP are ignored.
+// Single aligned words, event task writes, loop reads: no lock.
 static volatile uint32_t staUpMs         = 0;   // millis of the last GOT_IP; 0 = never up this boot
 static volatile uint32_t staOutageStartMs = 0;  // millis of the first event of the current/last outage
 static volatile uint8_t  staDropReason   = 0;   // that first event's reason
@@ -2113,21 +2075,17 @@ static void onWiFiStaGotIp(WiFiEvent_t event, WiFiEventInfo_t info) {
   staUpMs = millis();
 }
 
-// The loop's 5 s link poll, called from loop() under the Client-mode radio-up gate. Drops are reported
-// from here and never from the event task: queueConsoleMessageF formats into a 256 B stack buffer and the
-// loop is where every other console writer runs. Cost is one WiFi.status() per 5 s as before, plus one
-// snprintf (and one WiFi.RSSI()) per drop — nothing on a quiet pass. A drop shorter than the poll interval
-// never shows as a status edge, so the pending record is checked on a connected pass too. While the link
-// is down the line reaches no browser live; it lands in the /consolehist.txt ring and
-// consoleBackfillFromDevice() splices it on screen once the stream is back.
+// 5 s link poll from loop() (Client-mode radio-up gate). Drops are reported here, never from the event task:
+// queueConsoleMessageF formats into a 256 B stack buffer. A drop shorter than the poll never shows as a status edge,
+// so the pending record is checked on connected passes too.
 void pollWiFiLinkState() {
   static unsigned long lastWiFiStatusCheck = 0;
-  static bool lastWiFiConnected = true;
+  static bool lastWiFiConnected = (WiFi.status() == WL_CONNECTED);   // seeded on the first call: a failed boot join is not a drop
   if (millis() - lastWiFiStatusCheck <= 5000) return;
   lastWiFiStatusCheck = millis();
   bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
   bool pending = staDropPending;
-  staDropPending = false;
+  if (pending) staDropPending = false;   // clearing unread would wipe an outage start that landed between the two lines
   uint8_t r = staDropReason;
   uint32_t t0 = staOutageStartMs, up = staUpMs;
   uint16_t n = staDropEvents;
@@ -2283,8 +2241,7 @@ h1{color:#333;margin-bottom:1rem;font-size:24px}
 <div class='bookmark-info'><strong>For easy future access:</strong><br>Bookmark this address: <span class='ip-address'>192.168.4.1</span></div>
 <p style='margin-top:24px;font-size:14px;color:#666'><strong>Network:</strong> %APSSID%<br><strong>Device IP:</strong> 192.168.4.1</p>
 </div></body></html>)HTML";
-    // %APSSID% is substituted live: the AP name is per-unit now, so a baked-in one would be wrong
-    // on every board but the first. One-shot captive-portal page, not in the control path.
+    // %APSSID% is substituted live: the AP name is per-unit.
     String page(PAGE);
     page.replace("%APSSID%", esp32_ap_ssid);
     request->send(200, "text/html", page);
@@ -2293,10 +2250,8 @@ h1{color:#333;margin-bottom:1rem;font-size:24px}
   Serial.println("Landing page ready");
 }
 
-// Re-entrant on purpose. Engine-off standby powers the radio all the way down
-// (enterLowPowerStandby -> WiFi.mode(WIFI_OFF)) to save standby draw, so ignition-on and the GPIO5
-// wake button have to be able to raise the softAP again. A one-shot guard here left the radio off
-// until a reboot. Only the mDNS start below stays one-shot.
+// Re-entrant on purpose: engine-off standby sets WIFI_OFF, so ignition-on and the GPIO5 wake button must be able to
+// raise the softAP again. Only the mDNS start stays one-shot.
 void setupAccessPoint() {
   Serial.println("=== SETTING UP ACCESS POINT ===");
   Serial.println("Using SSID: '" + esp32_ap_ssid + "'");
@@ -2326,10 +2281,7 @@ void setupAccessPoint() {
     Serial.println("DNS server start result: " + String(dnsStarted));
     Serial.println("DNS server started for captive portal");
 
-    // Start mDNS in AP mode too (best-effort for alternator.local).
-    // No MDNS.end() — core 3.3.8 mdns teardown null-derefs the netif (see client path); start once.
-    // One guard for both modes: this path and the STA path used to hold separate flags, so a
-    // device that joined WiFi and later raised the AP called MDNS.begin() twice.
+    // One startMdnsOnce() guard for both the AP and STA paths (never MDNS.end(), see startMdnsOnce).
     startMdnsOnce();
     Serial.printf("mDNS on the AP: alternator.local + %s.local (may not work on all devices in AP mode)\n",
                   regulatorHostName());
@@ -2462,9 +2414,8 @@ void setupWiFiConfigServer() {
       esp32_ap_ssid = defaultApSsid();
     }
 
-    // Blank client SSID = user only came for AP settings — leave stored client creds untouched
-    // (mirrors the blank-hotspot_ssid handling; an unconditional write here wiped working WiFi).
-    // Deliberate erase goes through the explicit forget_client checkbox instead.
+    // Blank client SSID = user only came for AP settings: leave stored client creds untouched (an unconditional write
+    // wiped working WiFi). Deliberate erase goes through the forget_client checkbox.
     bool forgetClient = (ssid[0] == '\0' && request->hasParam("forget_client", true));
     if (ssid[0] != '\0') {
       settingWrite(NK_ssid, ssid);
@@ -2496,11 +2447,10 @@ void setupWiFiConfigServer() {
 
     Serial.println("=== CONFIGURATION SAVED - RESTARTING ===");
     settingWrite(NK_first_config_done, "1");
-    // ESPAsyncWebServer 3.x writes a response only AFTER the handler returns (_runMiddlewareChain()
-    // then _send() in WebRequest.cpp), so an in-handler ESP.restart() threw the 200 away and left the
-    // portal stuck on "Saving..." forever - a chip reset sends no FIN/RST, so the browser never errors.
-    rebootRequested = true;
+    // ESPAsyncWebServer 3.x sends the response only after the handler returns, so an in-handler ESP.restart() drops the
+    // 200 and leaves the portal stuck on "Saving..." (a chip reset sends no FIN/RST).
     rebootRequestedAt = millis();
+    rebootRequested = true;
   });
 
   server.onNotFound([](AsyncWebServerRequest *request) {
@@ -2516,23 +2466,16 @@ void setupWiFiConfigServer() {
   Serial.println("=== WIFI CONFIG SERVER SETUP COMPLETE ===");
 }
 
-// Raw WiFiClientSecure POST for the 4 registration/profile cloud ops (/checkRegistration
-// /registerProfile /updateProfile /deleteAllData — executed via executeCloudOp on the httpsTask
-// worker, never inside a web handler). Deliberately NOT HTTPClient: HTTPClient::getString() hangs on
-// TLS, and http.begin(url) with no WiFiClientSecure has undefined behavior on https URLs. Pattern
-// mirrors executeUploadPayload() in 2_functions.ino. Returns HTTP status code (e.g. 200,
-// 401) on success, or a negative sentinel on transport failure:
-//   -1 = low heap, -2 = connect fail, -3 = handshake/global timeout, -4 = send fail,
-//   -5 = read timeout / no status line.
-// responseBuf is null-terminated on return; pass nullptr if body not needed.
+// Raw WiFiClientSecure POST for the 4 registration/profile cloud ops, run via executeCloudOp on the httpsTask worker,
+// never in a web handler. Not HTTPClient: getString() hangs on TLS. Mirrors executeUploadPayload() in 2_functions.ino.
+// Returns the HTTP status, or -1 low heap, -2 connect fail, -3 handshake/global timeout, -4 send fail, -5 read timeout /
+// no status line. responseBuf is null-terminated on return; nullptr if the body is not needed.
 int doCloudPOST(const char *endpointPath, const char *payload,
                 char *responseBuf, size_t responseBufSize) {
   if (responseBuf && responseBufSize > 0) responseBuf[0] = '\0';
 
-  // Hard floor only — setInsecure() TLS footprint is ~5-10 KB. Do not raise it:
-  // a 40 KB threshold (sized for setCACert) tripped right after sensor uploads
-  // while heap wasn't reclaimed yet. A real OOM makes client.connect() return
-  // false → -2 with diagnostic.
+  // Hard floor only (setInsecure TLS needs ~5-10 KB). Do not raise it: 40 KB tripped right after sensor uploads before
+  // heap was reclaimed; a real OOM fails client.connect() -> -2.
   if (ESP.getMaxAllocHeap() < 15000) {
     Serial.printf("doCloudPOST(%s): heap critically low (max alloc %u), aborting\n",
                   endpointPath, ESP.getMaxAllocHeap());
@@ -2542,7 +2485,8 @@ int doCloudPOST(const char *endpointPath, const char *payload,
   // Pre-resolve DNS with a WDT feed so a slow lookup (~15 s worst on dead cellular) can't stack
   // into the same unfed window as the up-to-14 s TCP+TLS connect; connect() then hits the lwIP cache.
   IPAddress preResolved;
-  if (!WiFi.hostByName(host, preResolved)) {
+  // hostByName returns 1 on success and the lwIP error code on failure, never 0
+  if (WiFi.hostByName(host, preResolved) != 1) {
     Serial.printf("doCloudPOST(%s): DNS lookup failed\n", endpointPath);
     queueConsoleMessageF("Cloud unreachable: DNS lookup for %s failed (check WiFi/router DNS)", host);
     return -2;
@@ -2550,14 +2494,10 @@ int doCloudPOST(const char *endpointPath, const char *payload,
   esp_task_wdt_reset();
 
   WiFiClientSecure client;
-  // Match executeUploadPayload (2_functions.ino) which uses setInsecure(). setCACert(server_root_ca)
-  // does NOT work here: that cert is our Let's Encrypt ISRG Root X1, but Supabase fronts behind
-  // Cloudflare and presents a different chain, so verification fails (mbedTLS -0x2700) and
-  // connect() returns false. Deliberate — marine threat model is trusted owner-WiFi.
+  // setInsecure, as in executeUploadPayload: setCACert(server_root_ca) fails (mbedTLS -0x2700) because Supabase sits
+  // behind Cloudflare's chain, not ISRG Root X1. Deliberate: the threat model is trusted owner WiFi.
   client.setInsecure();
-  // setTimeout omitted: Stream::setTimeout is ms (not seconds as some docs claim) and
-  // our read loops use available()+read() polling with explicit millis() deadlines,
-  // so the Stream-level timeout doesn't gate anything in this path.
+  // No setTimeout: the read loops poll available()/read() against explicit millis() deadlines.
   client.setHandshakeTimeout(HANDSHAKE_TIMEOUT / 1000);  // this API takes seconds
 
   uint32_t start = millis();
@@ -2568,14 +2508,10 @@ int doCloudPOST(const char *endpointPath, const char *payload,
     esp_task_wdt_reset();                     // the failed connect may have just eaten 14 s of the WDT window
     char errBuf[128] = {0};
     int lastErr = client.lastError(errBuf, sizeof(errBuf));
-    // Disambiguate the three distinct failure modes for the dashboard Console — a generic
-    // mbedTLS -1 can be any of them and they need very different fixes:
-    //   (a) DNS lookup fails        -> router/WiFi DNS problem
-    //   (b) DNS ok, raw TCP blocked -> firewall/router blocking outbound 443
-    //   (c) DNS ok, TCP ok, TLS bad -> secure handshake fails (TLS version/cipher, or MTU dropping
-    //                                  the large Cloudflare cert) even though a browser works
+    // A generic mbedTLS -1 can be DNS, blocked TCP 443, or a failed TLS handshake (version/cipher, MTU dropping the large
+    // Cloudflare cert); each needs a different fix, so probe and name which.
     IPAddress resolved;
-    bool dnsOk = WiFi.hostByName(host, resolved);
+    bool dnsOk = (WiFi.hostByName(host, resolved) == 1);
     bool tcpOk = false;
     if (dnsOk) {
       WiFiClient probe;  // plain TCP, no TLS — tests whether port 443 is reachable at all
@@ -2588,10 +2524,8 @@ int doCloudPOST(const char *endpointPath, const char *payload,
       queueConsoleMessageF("Cloud unreachable: %s resolves to %s but port 443 is blocked (firewall/router/client isolation)",
                            host, resolved.toString().c_str());
     } else {
-      // TCP works but the TLS handshake failed. The usual cause on this device is NOT the network
-      // but scarce CONTIGUOUS internal RAM — mbedTLS needs ~32-40KB in one block, and field-on
-      // workload (control loop, SSE, logging) fragments it. Report the largest free block so a
-      // low number (and a fast fail, not a ~5s timeout) points at RAM, not the network.
+      // Usually not the network: mbedTLS needs ~32-40 KB CONTIGUOUS internal RAM and field-on work fragments it. A low
+      // largest-block figure with a fast fail points at RAM.
       queueConsoleMessageF("Cloud unreachable: TCP reached %s:443 but TLS handshake failed in %u ms; largest free internal block %u B (mbedTLS needs ~32-40KB contiguous — if low, it's RAM not network; try with field OFF)",
                            resolved.toString().c_str(), (unsigned)connElapsed, (unsigned)ESP.getMaxAllocHeap());
     }
@@ -2609,11 +2543,8 @@ int doCloudPOST(const char *endpointPath, const char *payload,
   }
 
   size_t payloadLen = strlen(payload);
-  // HTTP/1.0 deliberately: Cloudflare (which fronts Supabase) sends
-  // `Transfer-Encoding: chunked` to HTTP/1.1 clients, and our simple read-until-EOF
-  // body loop below has no chunked-decoder. HTTP/1.0 forces Cloudflare to send a
-  // plain body + `Connection: close`, which the loop handles correctly. We don't
-  // need keep-alive here (each handler does at most one POST).
+  // HTTP/1.0 deliberately: Cloudflare sends chunked encoding to HTTP/1.1 clients and the body loop below has no chunked
+  // decoder. 1.0 forces a plain body + Connection: close.
   int headerBytes = client.printf(
     "POST %s HTTP/1.0\r\n"
     "Host: %s\r\n"
@@ -2630,15 +2561,12 @@ int doCloudPOST(const char *endpointPath, const char *payload,
     return -4;
   }
 
-  size_t sent = client.write((const uint8_t *)payload, payloadLen);
-  if (sent != payloadLen) {
-    Serial.printf("doCloudPOST(%s): payload write SHORT sent=%u expected=%u\n",
-                  endpointPath, (unsigned)sent, (unsigned)payloadLen);
+  if (!cloudWriteBody(client, payload, payloadLen, start)) {
+    Serial.printf("doCloudPOST(%s): payload write FAIL (%u bytes)\n", endpointPath, (unsigned)payloadLen);
     client.stop();
     return -4;
   }
 
-  // Read status line into local buffer
   int httpCode = 0;
   uint32_t readStart = millis();
   char statusBuf[64];
@@ -2672,7 +2600,6 @@ int doCloudPOST(const char *endpointPath, const char *payload,
     return -5;
   }
 
-  // Drain headers until \r\n\r\n, then read body into responseBuf
   enum { ST_HDR, ST_BODY } state = ST_HDR;
   int crlfRun = 0;
   size_t bodyLen = 0;
@@ -2703,8 +2630,7 @@ int doCloudPOST(const char *endpointPath, const char *payload,
   return httpCode;
 }
 
-// Plain-English reason for a doCloudPOST() negative return code, for the dashboard Console
-// (saves a trip to the Serial Monitor). Mirrors the sentinels returned above.
+// Plain-English reason for a doCloudPOST() negative return code, for the dashboard Console.
 const char *cloudFailReason(int code) {
   switch (code) {
     case -1: return "internal memory too low for secure connection";
@@ -2716,12 +2642,9 @@ const char *cloudFailReason(int code) {
   }
 }
 
-// ── Async cloud-op slot: /checkRegistration /registerProfile /updateProfile /deleteAllData stage
-// here and answer 202 immediately; the httpsTask worker runs doCloudPOST + the old handler's
-// post-processing (executeCloudOp below); /cloudOpState serves the finished (code, body) to the
-// polling client. One op in flight at a time — these are single-user dashboard actions. Plain
-// globals (no slot struct) because Arduino's auto-prototype generator can't parse sketch-defined
-// types in free-function signatures.
+// ── Async cloud-op slot: the four profile endpoints stage here and answer 202; the httpsTask worker runs executeCloudOp
+// and /cloudOpState serves the finished (code, body). One op in flight at a time. Plain globals, no struct: Arduino's
+// auto-prototype generator can't parse sketch-defined types in free-function signatures.
 #define CLOUDOP_CHECK_REG      1
 #define CLOUDOP_REGISTER       2
 #define CLOUDOP_UPDATE_PROFILE 3
@@ -2731,7 +2654,7 @@ const char *cloudFailReason(int code) {
 #define CLOUDOP_BODY_CAP    2304   // resp + envelope headroom, so pass-through can never truncate
 static volatile uint8_t cloudOpState = 0;   // 0 idle, 1 pending, 2 done
 static volatile uint8_t cloudOpKind = 0;
-static volatile int cloudOpCode = 0;        // HTTP status the old synchronous handler would have sent
+static volatile int cloudOpCode = 0;        // HTTP status returned to the poll
 static uint32_t cloudOpSeq = 0;
 static char *cloudOpPayload = nullptr;      // PSRAM, lazy — staged request JSON
 static char *cloudOpResp = nullptr;         // PSRAM, lazy — raw cloud response scratch (worker only)
@@ -2781,8 +2704,7 @@ static void cloudOpStageAndReply(AsyncWebServerRequest *request, uint8_t kind, c
   request->send(202, "application/json", buf);
 }
 
-// Runs on the httpsTask worker (HTTPS_CLOUD_OP). Mirrors the old synchronous handlers' response
-// handling exactly — token save/clear, post-registration version/forced checks, snapshot request.
+// Runs on the httpsTask worker (HTTPS_CLOUD_OP).
 void executeCloudOp() {
   if (cloudOpState != 1 || !cloudOpBuffersReady()) { cloudOpState = 0; return; }
   char *resp = cloudOpResp;
@@ -2806,20 +2728,21 @@ void executeCloudOp() {
           cloudOpSetBodyJson(resp);   // token valid and matches — full profile data through
         }
       } else if (httpCode == 401) {
-        queueConsoleMessage("Cloud: ready to register");
         DynamicJsonDocument doc(1024);
         DeserializationError error = deserializeJson(doc, resp);
-        String errorMsg = (!error && doc.containsKey("error")) ? doc["error"].as<String>() : String("");
-        // Only clear credentials if the token genuinely doesn't exist in the database
-        if (errorMsg == "Invalid token" || errorMsg == "Token not found") {
+        // Clear credentials only on code token_not_found (absent row): a bare 401 (gateway or lookup fault) must not
+        // erase a token the device cannot get back.
+        String code = (!error && doc.containsKey("code")) ? doc["code"].as<String>() : String("");
+        if (code == "token_not_found") {
           Serial.println("Clearing invalid credentials - device ready for re-registration");
+          queueConsoleMessage("Cloud: ready to register");
           clearAuthToken();
         }
         snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"registered\":false,\"error\":\"validation_failed\"}");
       } else {
         snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"registered\":false,\"error\":\"network_error\"}");
       }
-      outCode = 200;   // the old handler answered 200 on every one of these paths
+      outCode = 200;   // 200 on every path; the body carries the verdict
       break;
     }
     case CLOUDOP_REGISTER: {
@@ -2840,13 +2763,21 @@ void executeCloudOp() {
           if (!error && responseDoc.containsKey("token")) {
             String newToken = responseDoc["token"].as<String>();
             if (newToken.length() > 0) {
-              saveAuthToken(newToken);
+              esp_err_t saveErr = saveAuthToken(newToken);
+              if (saveErr != ESP_OK) {
+                queueConsoleMessageF("Registration failed: token could not be saved on the device (NVS error %d)", (int)saveErr);
+                snprintf(cloudOpBody, CLOUDOP_BODY_CAP,
+                         "{\"error\":\"Registration failed: token could not be saved on the device\",\"code\":%d}", (int)saveErr);
+                outCode = 500;
+                break;
+              }
               Serial.println("Token saved to NVS");
-              // The boot checks latched otaCheckDone while this device was still unregistered, so
-              // nothing would report our version or see a forced update until the next reboot.
-              // Version first: the cloud clears a forced flag once the reported version reaches it.
-              // Factory partition excluded for the same reasons as the boot check in Xregulator.ino.
-              if (currentPartitionType != 0) {
+              // A new record (not a nonce recovery) holds none of this unit's curves; owe them to it.
+              if (responseDoc["message"].as<String>() == "Registration successful") recSeedAfterNewRegistration();
+              // The boot one-shot in loop() sends this pair once isRegistered; only a re-registration after it ran
+              // (otaCheckDone) queues it here. Version first: the cloud clears a forced flag once the version reaches
+              // it. Factory partition excluded as in the boot check (Xregulator.ino).
+              if (otaCheckDone && currentPartitionType != 0) {
                 HttpsRequest verReq = { .type = HTTPS_UPDATE_FW_VERSION };
                 HttpsRequest forcedReq = { .type = HTTPS_CHECK_FORCED_UPDATE };
                 bool verSent = (xQueueSend(httpsQueue, &verReq, 0) == pdTRUE);
@@ -2890,7 +2821,7 @@ void executeCloudOp() {
                  "{\"success\":false,\"error\":\"Connection to cloud failed\",\"code\":%d}", httpCode);
         outCode = 503;
       } else {
-        if (httpCode == 200) {
+        if (httpCode == 200 && strstr(resp, "\"success\":true")) {   // a portal's 200 must not erase a token the cloud still honors
           clearAuthToken();
           Serial.println("Auth token cleared from NVS");
         }
@@ -2908,16 +2839,70 @@ void executeCloudOp() {
   cloudOpState = 2;   // last: the poll reads code/body only after seeing state done
 }
 
-// Accumulator for the /perfUploadFront POST body (Load CSV) — filled across body chunks, then
-// ingested once the request completes. LAN-only single-client dashboard, so one global is fine.
-static String perfUploadBuf;
-static String altUploadBuf;   // same, for /altUploadFront (alternator-health Load CSV)
+// The field-on queue flush (AdjustFieldLearnMode) dropped the staged op before the worker ran it.
+void cloudOpFailDropped() {
+  if (cloudOpState != 1) return;
+  snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"error\":\"cloud request dropped when charging started, try again\"}");
+  cloudOpCode = 503;
+  cloudOpState = 2;
+}
+
+// Body of a /perfUploadFront or /altUploadFront POST (Load CSV): one PSRAM copy on request->_tempObject, filled
+// across body chunks, ingested once the request completes, and free()d by the web server when the request ends or
+// aborts. Not the 512 KB sync cap (PERF_UPLOAD_BUF_SIZE): runtime free PSRAM cannot spare a block that size. Over the cap, nothing is buffered.
+#define FRONT_UPLOAD_CAP 131072u
+#define FU_OK      0
+#define FU_TOO_BIG 1   // answered 413 with the real size
+#define FU_NO_MEM  2   // answered 503
+struct FrontUpload { uint32_t total; uint8_t state; char text[1]; };
 static String importConfigBuf;   // body accumulator for POST /importConfig (config sharing)
+
+static void frontUploadBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  FrontUpload *u = (FrontUpload *)request->_tempObject;
+  if (index == 0 && !u && total > 0) {
+    uint8_t st = (total > FRONT_UPLOAD_CAP) ? FU_TOO_BIG : FU_OK;
+    if (st == FU_OK) u = (FrontUpload *)ps_malloc(sizeof(FrontUpload) + total);
+    if (!u) {
+      if (st == FU_OK) st = FU_NO_MEM;
+      u = (FrontUpload *)ps_malloc(sizeof(FrontUpload));
+      if (!u) u = (FrontUpload *)malloc(sizeof(FrontUpload));   // header only, so the reply can still say why
+      if (!u) return;
+    }
+    u->total = (uint32_t)total; u->state = st; u->text[0] = '\0';
+    request->_tempObject = u;
+  }
+  if (!u || u->state != FU_OK || index + len > u->total) return;
+  memcpy(u->text + index, data, len);
+  u->text[index + len] = '\0';
+}
+
+// The received CSV text (the caller may mutate it), or nullptr once the request has been answered with why not.
+static char *frontUploadText(AsyncWebServerRequest *request) {
+  FrontUpload *u = (FrontUpload *)request->_tempObject;
+  char msg[112];
+  if (u && u->state == FU_TOO_BIG) {
+    snprintf(msg, sizeof(msg), "The curve data is %u KB; the regulator accepts up to %u KB.",
+             (unsigned)((u->total + 1023u) / 1024u), (unsigned)(FRONT_UPLOAD_CAP / 1024u));
+    request->send(413, "text/plain", msg);
+    return nullptr;
+  }
+  if (u && u->state == FU_NO_MEM) {
+    snprintf(msg, sizeof(msg), "Not enough free memory on the regulator to receive this %u KB file.",
+             (unsigned)((u->total + 1023u) / 1024u));
+    request->send(503, "text/plain", msg);
+    return nullptr;
+  }
+  if (!u || strlen(u->text) < 8 || !strstr(u->text, "BEFRONT1")) {
+    request->send(400, "text/plain", "No BEFRONT1 data in upload");
+    return nullptr;
+  }
+  return u->text;
+}
 
 // Editing the DVCC source dialect or the instance filter points the follower at a different
 // authority, so everything decoded from the old one has to go and the new one must settle fresh.
 static void dvccResetAuthority() {
-  dvccRxCvl = dvccRxCcl = NAN;  // clear the old dialect's values; a new authority must settle fresh
+  dvccRxCvl = dvccRxCcl = NAN;
   dvccRxLastMs = 0;
   dvccRxSrcAddr = 255;
   dvccCvlV = dvccCclA = NAN;
@@ -2934,13 +2919,9 @@ static uint32_t webRunTok(AsyncWebServerRequest *request) {
   return (uint32_t)strtoul(request->getParam("run")->value().c_str(), nullptr, 10);
 }
 
-// Sender fingerprint for a client write that changes what the field is allowed to do (master switch,
-// field control). The OFF direction has carried one since the unexplained OnOff=0 arrivals of 2026-08;
-// ON carried none, so a field that came back on could not be traced to a client at all — the 2026-09-15
-// bench session found MANUAL 50% live with the header switch reading OFF and nothing in the log naming
-// who re-enabled it. Same shape for every line so an OFF and the ON that followed it pair up in the
-// console. The query string carries the dashboard's src/n tag (see clientWriteTrack), so a line with
-// the same src and n twice is one request delivered twice, and a different src is another tab.
+// Sender fingerprint for a client write that changes what the field may do (master switch, field control), both
+// directions, same shape so an OFF and the ON after it pair up in the console. The query carries the dashboard's src/n
+// tag (clientWriteTrack): same src and n twice = one request delivered twice; a different src = another tab.
 static void logClientWrite(AsyncWebServerRequest *request, const char *what) {
   String qs;
   bool anyParam = false;
@@ -2960,16 +2941,10 @@ static void logClientWrite(AsyncWebServerRequest *request, const char *what) {
                        request->client()->remoteIP().toString().c_str(), qs.c_str(), ua.c_str());
 }
 
-// Per-tab ordering guard for the writes above. The dashboard tags them with src (its page-load nonce)
-// and n (its press counter, increasing across every tagged write from that tab). A write carrying the
-// same src and an n at or below the last one applied is a duplicate delivery or a request the link held
-// back until after a later press — not a press. Bench 2026-09-15: an OnOff=1 landed 32 ms after the
-// user's OnOff=0 and re-energized the field. Returns true when the write is out of order; an in-order
-// tagged write advances the slot. Untagged writes (curl, older bundles) are never gated and never
-// advance it. The caller decides whether an out-of-order write is dropped — an OFF never is.
-// CW_SLOTS recent tabs are remembered per gated parameter (round-robin), so a stale write from one
-// tab is still caught after another tab has pressed. Built-in types only: the Arduino prototype
-// generator emits this function's prototype above any struct declared in a tab.
+// Per-tab ordering guard. The dashboard tags writes with src (page-load nonce) and n (press counter); same src with n at
+// or below the last applied is a duplicate or held-back delivery, not a press. Returns true when out of order; untagged
+// writes are never gated and never advance it; the caller decides whether to drop (an OFF never is). CW_SLOTS recent
+// tabs per parameter, round-robin. Built-in types only: the Arduino prototype generator emits this above any tab's structs.
 #define CW_SLOTS 4
 static char g_onOffWriteSrc[CW_SLOTS * 17] = { 0 };
 static uint32_t g_onOffWriteN[CW_SLOTS] = { 0 };
@@ -2977,12 +2952,8 @@ static uint8_t g_onOffWriteNext = 0;
 static char g_manualWriteSrc[CW_SLOTS * 17] = { 0 };
 static uint32_t g_manualWriteN[CW_SLOTS] = { 0 };
 static uint8_t g_manualWriteNext = 0;
-// isRepeat (out): why the write is being refused, which is NOT always "a later press replaced it". Since
-// 2026-09-16 the dashboard deliberately sends a SECOND copy of a control write ~500 ms after the first
-// when the first has not answered, so on a lossy link the ordinary case is now the same n arriving twice.
-// n == the last applied n is that hedge copy; n BELOW it is a genuinely superseded press. Both are
-// refused identically — only the console wording differs, and a log line that invents a press the user
-// never made is the kind of thing that costs an hour when the field misbehaves.
+// isRepeat (out): n == last applied is the dashboard's ~500 ms hedge copy of an unanswered write; n below it is a
+// superseded press. Both are refused; only the console wording differs, so the log never invents a press.
 static bool clientWriteTrack(AsyncWebServerRequest *request, char *srcTab, uint32_t *nTab, uint8_t *nextSlot, bool *isRepeat) {
   if (isRepeat) *isRepeat = false;
   if (!request->hasParam("src") || !request->hasParam("n")) return false;
@@ -3007,6 +2978,409 @@ static bool clientWriteTrack(AsyncWebServerRequest *request, char *srcTab, uint3
   return false;
 }
 
+static bool addressedElsewhere(AsyncWebServerRequest *request) {
+  if (!request->hasParam("uid")) return false;
+  const String &want = request->getParam("uid")->value();
+  return want.length() && !want.equalsIgnoreCase(device_id_hex);
+}
+// Not logClientWrite: it echoes params, and /setPassword's are the password.
+static bool refuseMisaddressed(AsyncWebServerRequest *request) {
+  if (!addressedElsewhere(request)) return false;
+  queueConsoleMessageF("WRITE REJECTED: %s addressed to another regulator [from %s]",
+                       request->url().c_str(), request->client()->remoteIP().toString().c_str());
+  request->send(409, "text/plain", device_id_hex);
+  return true;
+}
+
+// ── NMEA 2000 bus health / raw capture / history endpoints (NMEA2K_TRANSMIT_SPEC.md §16). Observe-only, so unarmed.
+// All formatting runs here on the web task; Core 1 only ever wrote the data.
+
+// Quoted JSON string from an untrusted bus string: dvccCopyPlainText first (printable ASCII only), then escaping.
+static size_t n2kJsonStr(char *dst, size_t cap, const char *src) {
+  char clean[48];
+  dvccCopyPlainText(clean, sizeof(clean), src);
+  size_t n = 0;
+  if (cap < 3) return 0;
+  dst[n++] = '"';
+  for (const char *p = clean; *p && n + 4 <= cap; p++) {
+    if (*p == '"' || *p == '\\') dst[n++] = '\\';
+    dst[n++] = *p;
+  }
+  dst[n++] = '"';
+  dst[n] = 0;
+  return n;
+}
+
+// Roster copy for formatting: taken under dvccCapMux one node at a time, formatted outside it. The receive path takes
+// the same spinlock on Core 1 inside ParseMessages() for every identity frame, so the lock is never held for the whole
+// 1.9 KB roster; slots are only appended or rewritten in place (dvccNodeSlot), never compacted, so a per-slot copy is
+// consistent. Returns a PSRAM DvccNode array the caller frees (void*: a DvccNode in the signature breaks the
+// Arduino-generated prototype, see dvccNodeSlot).
+static void *n2kRosterCopy(uint8_t *count) {
+  *count = 0;
+  if (!dvccNodes) return nullptr;
+  DvccNode *ns = (DvccNode *)ps_malloc(sizeof(DvccNode) * DVCC_NODE_N);
+  if (!ns) return nullptr;
+  uint8_t nc = 0;
+  for (uint8_t i = 0; i < DVCC_NODE_N; i++) {
+    portENTER_CRITICAL(&dvccCapMux);
+    if (i >= dvccNodeCount) {
+      portEXIT_CRITICAL(&dvccCapMux);
+      break;
+    }
+    ns[i] = dvccNodes[i];
+    portEXIT_CRITICAL(&dvccCapMux);
+    nc = i + 1;
+  }
+  *count = nc;
+  return ns;
+}
+
+static void sendPsramText(AsyncWebServerRequest *request, const char *type, char *buf, size_t n) {
+  std::shared_ptr<char> sp(buf, free);
+  AsyncWebServerResponse *response = request->beginResponse(type, n,
+    [sp, n](uint8_t *out, size_t maxLen, size_t index) -> size_t {
+      if (index >= n) return 0;
+      size_t tw = n - index;
+      if (tw > maxLen) tw = maxLen;
+      memcpy(out, sp.get() + index, tw);
+      return tw;
+    });
+  response->addHeader("Cache-Control", "no-cache");
+  request->send(response);
+}
+
+// GET /n2kNodes: addresses heard within N2K_HEARD_MS, sorted by address, with roster identity where it is known.
+static void handleN2kNodes(AsyncWebServerRequest *request) {
+  int self = (n2kSrcAddrLive >= 0 && n2kSrcAddrLive <= 251) ? n2kSrcAddrLive : -1;
+  uint32_t now = millis();
+  uint16_t heard = 0;
+  if (n2kLastSeenMs)
+    for (int a = 0; a < 255; a++)
+      if (n2kLastSeenMs[a] && a != self && (uint32_t)(now - n2kLastSeenMs[a]) <= N2K_HEARD_MS) heard++;
+  const size_t PER = 240;  // worst-case entry with every string escaped
+  size_t cap = 48 + (size_t)heard * PER;
+  char *out = (char *)ps_malloc(cap);
+  if (!out) {
+    request->send(503, "application/json", "{\"err\":\"out of memory\"}");
+    return;
+  }
+  uint8_t nc = 0;
+  DvccNode *ns = (DvccNode *)n2kRosterCopy(&nc);
+  size_t n = (size_t)snprintf(out, cap, "{\"self\":%d,\"nodes\":[", self);
+  bool first = true;
+  for (int a = 0; a < 255 && n2kLastSeenMs && n + PER < cap; a++) {
+    uint32_t t = n2kLastSeenMs[a];
+    if (!t || a == self || (uint32_t)(now - t) > N2K_HEARD_MS) continue;
+    const DvccNode *nd = nullptr;
+    for (uint8_t i = 0; ns && i < nc; i++)
+      if (ns[i].addr == a) nd = &ns[i];
+    n += (size_t)snprintf(out + n, cap - n, "%s{\"addr\":%d,\"ageS\":%lu,\"mfg\":%u,\"func\":%u,\"cls\":%u,\"model\":",
+                          first ? "" : ",", a, (unsigned long)((now - t) / 1000UL),
+                          (nd && nd->haveName) ? (unsigned)nd->mfg : 0u, (nd && nd->haveName) ? (unsigned)nd->func : 0u,
+                          (nd && nd->haveName) ? (unsigned)nd->cls : 0u);
+    bool prod = nd && nd->haveProd;
+    n += n2kJsonStr(out + n, cap - n, prod ? nd->model : "");
+    n += (size_t)snprintf(out + n, cap - n, ",\"sw\":");
+    n += n2kJsonStr(out + n, cap - n, prod ? nd->sw : "");
+    n += (size_t)snprintf(out + n, cap - n, ",\"serial\":");
+    n += n2kJsonStr(out + n, cap - n, prod ? nd->serial : "");
+    if (n + 2 < cap) out[n++] = '}';
+    first = false;
+  }
+  if (ns) free(ns);
+  n += (size_t)snprintf(out + n, cap - n, "]}");
+  sendPsramText(request, "application/json", out, n);
+}
+
+// Live state of one /canCapture download. Releasing the download hold lets the ring be freed again; the destructor
+// covers an aborted transfer (the request deletes its response, and with it this state).
+struct CanCapDl {
+  char *hdr = nullptr;
+  size_t hdrLen = 0, hdrPos = 0;
+  uint32_t i = 0, n = 0;
+  char line[64];
+  uint8_t lineLen = 0, linePos = 0;
+  bool released = false;
+  void release() {
+    if (released) return;
+    released = true;
+    portENTER_CRITICAL(&canCapMux);
+    if (canCap.dlRefs) canCap.dlRefs--;
+    portEXIT_CRITICAL(&canCapMux);
+  }
+  ~CanCapDl() {
+    if (hdr) free(hdr);
+    release();
+  }
+};
+
+static void canCapErr(AsyncWebServerRequest *request, int code, const char *err) {
+  char out[160];
+  snprintf(out, sizeof(out), "{\"ok\":0,\"err\":\"%s\"}", err);
+  request->send(code, "application/json", out);
+}
+
+// Takes the ring out of service and frees it, unless a recording or a download holds it. Web task.
+static const char *canCapRelease() {
+  CanCapEntry *old = nullptr;
+  const char *err = nullptr;
+  portENTER_CRITICAL(&canCapMux);
+  if (canCap.state == 1) err = "a recording is running";
+  else if (canCap.dlRefs) err = "a download is in progress";
+  else {
+    old = canCap.ring;
+    canCap.ring = nullptr;
+    canCap.cap = 0;
+    canCap.count = 0;
+    canCap.state = 0;
+  }
+  portEXIT_CRITICAL(&canCapMux);
+  if (old) free(old);
+  return err;
+}
+
+static void canCapStart(AsyncWebServerRequest *request) {
+  int s = 10;
+  if (paramOk(request, "s")) s = constrain((int)request->getParam("s")->value().toInt(), 1, 60);
+  if (!n2kBusRunning()) {
+    canCapErr(request, 409, "NMEA 2000 is not running");
+    return;
+  }
+  const char *err = canCapRelease();
+  if (err) {
+    canCapErr(request, 409, strcmp(err, "a recording is running") == 0 ? "already recording" : err);
+    return;
+  }
+  // §16.6: min(8192, (free - 256 KB) / entry), refused below 1024. A fragmented heap is met by stepping the size down an
+  // eighth per failed try: a failing TLSF malloc is constant-time, where asking for the largest block walks the whole heap.
+  size_t freeB = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t n = (freeB > CANCAP_PSRAM_RESERVE) ? (freeB - CANCAP_PSRAM_RESERVE) / sizeof(CanCapEntry) : 0;
+  if (n > CANCAP_MAX_N) n = CANCAP_MAX_N;
+  CanCapEntry *ring = nullptr;
+  while (n >= CANCAP_MIN_N) {
+    ring = (CanCapEntry *)ps_malloc(n * sizeof(CanCapEntry));
+    if (ring || n == CANCAP_MIN_N) break;
+    n -= n / 8;
+    if (n < CANCAP_MIN_N) n = CANCAP_MIN_N;
+  }
+  if (!ring) {
+    canCapErr(request, 503, "not enough free PSRAM for a recording");
+    return;
+  }
+  const tNMEA2000_esp32::tBusStats &bs = tNMEA2000_esp32::BusStats;
+  canCap.ring = ring;
+  canCap.cap = (uint32_t)n;
+  canCap.count = 0;
+  canCap.txN = 0;
+  canCap.why = 0;
+  canCap.reqS = (uint8_t)s;
+  canCap.durUs = (uint32_t)s * 1000000UL;
+  canCap.elapsedUs = 0;
+  canCap.selfAddr = (n2kSrcAddrLive >= 0 && n2kSrcAddrLive <= 251) ? n2kSrcAddrLive : -1;
+  canCap.tec0 = bs.tec;
+  canCap.rec0 = bs.rec;
+  canCap.missed0 = bs.rxMissed;
+  canCap.overrun0 = bs.rxOverrun;
+  canCap.busOff0 = bs.busOffCount;
+  canCap.startEpochMs = n2kClockTrusted() ? (uint64_t)timeBase * 1000ULL + (uint32_t)(millis() - timeBaseMillis) : 0;
+  canCap.startMs = millis();
+  canCap.startUptimeUs = (uint64_t)esp_timer_get_time();
+  canCap.startUs = (uint32_t)canCap.startUptimeUs;  // micros() is the low word of the same clock
+  portENTER_CRITICAL(&canCapMux);
+  canCap.state = 1;
+  canCap.active = true;
+  portEXIT_CRITICAL(&canCapMux);
+  char out[64];
+  snprintf(out, sizeof(out), "{\"ok\":1,\"id\":%lu,\"cap\":%lu,\"s\":%d}", (unsigned long)canCap.startMs, (unsigned long)n, s);
+  request->send(200, "application/json", out);
+}
+
+static void canCapDownload(AsyncWebServerRequest *request) {
+  portENTER_CRITICAL(&canCapMux);
+  bool ok = (canCap.state == 2 && canCap.ring != nullptr);
+  if (ok) canCap.dlRefs++;
+  portEXIT_CRITICAL(&canCapMux);
+  if (!ok) {
+    request->send(404, "text/plain", "No finished recording.");
+    return;
+  }
+  std::shared_ptr<CanCapDl> st(new CanCapDl());
+  st->n = canCap.count;
+  // Header, formatted once into PSRAM. candump readers skip # lines.
+  uint8_t nc = 0;
+  DvccNode *ns = (DvccNode *)n2kRosterCopy(&nc);
+  size_t cap = 2048 + (size_t)nc * 112;
+  st->hdr = (char *)ps_malloc(cap);
+  if (!st->hdr) {
+    if (ns) free(ns);
+    request->send(503, "text/plain", "out of memory");
+    return;  // st's destructor releases the download hold
+  }
+  char addrTxt[12], startTxt[64], nameTs[32];
+  if (canCap.selfAddr >= 0) snprintf(addrTxt, sizeof(addrTxt), "%d", canCap.selfAddr);
+  else snprintf(addrTxt, sizeof(addrTxt), "none");
+  uint32_t upMs = canCap.startMs;
+  if (canCap.startEpochMs) {
+    time_t es = (time_t)(canCap.startEpochMs / 1000ULL);
+    struct tm tmv;
+    gmtime_r(&es, &tmv);
+    snprintf(startTxt, sizeof(startTxt), "%04d-%02d-%02d %02d:%02d:%02d UTC (epoch %lu)", tmv.tm_year + 1900, tmv.tm_mon + 1,
+             tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (unsigned long)es);
+    snprintf(nameTs, sizeof(nameTs), "%04d%02d%02d-%02d%02d%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+  } else {
+    snprintf(startTxt, sizeof(startTxt), "clock not synced");
+    snprintf(nameTs, sizeof(nameTs), "uptime-%lus", (unsigned long)(upMs / 1000UL));
+  }
+  char whyTxt[40];
+  if (canCap.why == 2) snprintf(whyTxt, sizeof(whyTxt), "full (%lu frames)", (unsigned long)canCap.cap);
+  else snprintf(whyTxt, sizeof(whyTxt), "%s", canCap.why == 3 ? "NMEA 2000 stopped" : "time");
+  uint32_t missed = canCap.missed1 - canCap.missed0, overrun = canCap.overrun1 - canCap.overrun0;
+  size_t h = (size_t)snprintf(st->hdr, cap,
+    "# XREG-010 NMEA 2000 bus recording (candump log)\n"
+    "# fw %s, serial %s, our address %s\n"
+    "# start %s, uptime %lu.%03lu s; timestamps in %s\n"
+    "# requested %u s, recorded %lu.%03lu s, stopped: %s\n"
+    "# frames %lu: %lu received, %lu ours (recorded when queued; TEC and bus-offs say if they reached the bus)\n"
+    "# received frames lost %lu (queue full %lu, overrun %lu): missing here, not silence\n"
+    "# bus-offs %lu (%lu since boot); TEC %lu -> %lu, REC %lu -> %lu\n"
+    "# nodes heard (60928 NAME / 126996): addr mfg func class model | sw | serial\n",
+    FIRMWARE_VERSION, device_id_hex, addrTxt, startTxt, (unsigned long)(upMs / 1000UL), (unsigned long)(upMs % 1000UL),
+    canCap.startEpochMs ? "Unix epoch seconds" : "seconds since boot",
+    (unsigned)canCap.reqS, (unsigned long)(canCap.elapsedUs / 1000000UL), (unsigned long)((canCap.elapsedUs / 1000UL) % 1000UL), whyTxt,
+    (unsigned long)st->n, (unsigned long)(st->n - canCap.txN), (unsigned long)canCap.txN,
+    (unsigned long)(missed + overrun), (unsigned long)missed, (unsigned long)overrun,
+    (unsigned long)(canCap.busOff1 - canCap.busOff0), (unsigned long)canCap.busOff1,
+    (unsigned long)canCap.tec0, (unsigned long)canCap.tec1, (unsigned long)canCap.rec0, (unsigned long)canCap.rec1);
+  for (uint8_t i = 0; i < nc && h + 112 < cap; i++) {
+    char m[24], sw[16], sn[16];
+    dvccCopyPlainText(m, sizeof(m), ns[i].haveProd ? ns[i].model : "");
+    dvccCopyPlainText(sw, sizeof(sw), ns[i].haveProd ? ns[i].sw : "");
+    dvccCopyPlainText(sn, sizeof(sn), ns[i].haveProd ? ns[i].serial : "");
+    h += (size_t)snprintf(st->hdr + h, cap - h, "# %4u %4u %4u %5u  %s | %s | %s\n", (unsigned)ns[i].addr,
+                          (unsigned)ns[i].mfg, (unsigned)ns[i].func, (unsigned)ns[i].cls, m, sw, sn);
+  }
+  if (nc == 0 && h + 40 < cap) h += (size_t)snprintf(st->hdr + h, cap - h, "# (no identity frames heard)\n");
+  if (ns) free(ns);
+  st->hdrLen = (h < cap) ? h : cap - 1;
+  // The ring is frozen (state 2, held by dlRefs), so frames format straight from it.
+  const CanCapEntry *ring = canCap.ring;
+  uint64_t base = canCap.startEpochMs ? canCap.startEpochMs * 1000ULL : canCap.startUptimeUs;
+  AsyncWebServerResponse *response = request->beginChunkedResponse("text/plain",
+    [st, ring, base](uint8_t *buf, size_t maxLen, size_t) -> size_t {
+      size_t w = 0;
+      while (w < maxLen) {
+        if (st->hdrPos < st->hdrLen) {
+          size_t c = min(maxLen - w, st->hdrLen - st->hdrPos);
+          memcpy(buf + w, st->hdr + st->hdrPos, c);
+          w += c;
+          st->hdrPos += c;
+          continue;
+        }
+        if (st->linePos >= st->lineLen) {
+          if (st->i >= st->n) {
+            st->release();
+            return w;
+          }
+          const CanCapEntry &e = ring[st->i++];
+          uint64_t ts = base + e.us;
+          const bool sff = (e.id & tNMEA2000_esp32::RawSffFlag) != 0;
+          int k = snprintf(st->line, sizeof(st->line), sff ? "(%lu.%06lu) can0 %03lX#%s" : "(%lu.%06lu) can0 %08lX#%s",
+                           (unsigned long)(ts / 1000000ULL), (unsigned long)(ts % 1000000ULL),
+                           (unsigned long)(e.id & (sff ? 0x7FFUL : 0x1FFFFFFFUL)),
+                           (e.id & tNMEA2000_esp32::RawRtrFlag) ? "R" : "");
+          static const char hx[] = "0123456789ABCDEF";
+          for (uint8_t b = 0; b < e.len && b < 8; b++) {
+            st->line[k++] = hx[e.data[b] >> 4];
+            st->line[k++] = hx[e.data[b] & 0x0F];
+          }
+          st->line[k++] = '\n';
+          st->lineLen = (uint8_t)k;
+          st->linePos = 0;
+        }
+        size_t c = min(maxLen - w, (size_t)(st->lineLen - st->linePos));
+        memcpy(buf + w, st->line + st->linePos, c);
+        w += c;
+        st->linePos += (uint8_t)c;
+      }
+      return w;
+    });
+  char cd[96];
+  snprintf(cd, sizeof(cd), "attachment; filename=\"xreg-can-%s-%s.log\"", device_id_hex, nameTs);
+  response->addHeader("Content-Disposition", cd);
+  response->addHeader("Access-Control-Expose-Headers", "Content-Disposition");
+  response->addHeader("Cache-Control", "no-cache");
+  request->send(response);
+}
+
+// GET /canCapture: start=1&s=N | status=1 | free=1 | (none) = download the finished recording. Start and free change
+// state, so they refuse a request addressed to another regulator, like the other state-changing GETs; reads do not.
+static void handleCanCapture(AsyncWebServerRequest *request) {
+  if (request->hasParam("start")) {
+    if (refuseMisaddressed(request)) return;
+    canCapStart(request);
+  } else if (request->hasParam("status")) {
+    uint8_t st = canCap.state;
+    uint32_t el = 0;
+    if (st == 1) el = min((uint32_t)(micros() - canCap.startUs), canCap.durUs) / 1000UL;
+    else if (st == 2) el = canCap.elapsedUs / 1000UL;
+    char out[128];
+    // id = the recording's start millis: lets a log pull tell its own recording from one the owner started after it.
+    snprintf(out, sizeof(out), "{\"state\":\"%s\",\"id\":%lu,\"frames\":%lu,\"cap\":%lu,\"elapsedMs\":%lu,\"s\":%u}",
+             st == 1 ? "recording" : (st == 2 ? "ready" : "idle"), st ? (unsigned long)canCap.startMs : 0UL,
+             (unsigned long)canCap.count, (unsigned long)canCap.cap, (unsigned long)el, st ? (unsigned)canCap.reqS : 0u);
+    request->send(200, "application/json", out);
+  } else if (request->hasParam("free")) {
+    if (refuseMisaddressed(request)) return;
+    const char *err = canCapRelease();
+    if (err) canCapErr(request, 409, err);
+    else request->send(200, "application/json", "{\"ok\":1}");
+  } else {
+    canCapDownload(request);
+  }
+}
+
+// GET /n2kbuslog.csv: the per-minute bus history, oldest first, formatted straight from the ring. The writer's sequence
+// count is checked around the pass, so a row landing mid-format (once a minute) forces a retry, never a torn line.
+static void handleN2kBusLog(AsyncWebServerRequest *request) {
+  if (!n2kBusLog || n2kBusLogCount == 0) {
+    request->send(200, "text/plain", "No NMEA 2000 bus history yet.");
+    return;
+  }
+  const size_t LINE = 64;  // worst-case row
+  size_t cap = 128 + (size_t)N2K_BUSLOG_N * LINE;
+  char *out = (char *)ps_malloc(cap);
+  if (!out) {
+    request->send(503, "text/plain", "bus history unavailable - out of memory");
+    return;
+  }
+  size_t n = 0;
+  for (uint8_t tries = 0; tries < 4; tries++) {
+    uint32_t q = n2kBusLogSeq;
+    if (q & 1) continue;
+    __sync_synchronize();
+    uint16_t cnt = n2kBusLogCount, oldest = (uint16_t)((n2kBusLogHead + N2K_BUSLOG_N - cnt) % N2K_BUSLOG_N);
+    n = (size_t)snprintf(out, cap, "time,time_kind,worst_verdict,tec_max,rec_max,nodes_max,bus_offs,rx_frames,tx_frames,rx_lost,bus_errors\n");
+    for (uint16_t k = 0; k < cnt && n + LINE < cap; k++) {
+      const N2kBusRow &r = n2kBusLog[(oldest + k) % N2K_BUSLOG_N];
+      n += (size_t)snprintf(out + n, cap - n, "%lu,%s,%u,%u,%u,%u,%u,%lu,%u,%u,%u\n", (unsigned long)r.stamp,
+                            (r.flags & 1) ? "uptime_s" : "epoch", (unsigned)r.worst, (unsigned)r.tecMax, (unsigned)r.recMax,
+                            (unsigned)r.nodesMax, (unsigned)r.busOffs, (unsigned long)r.rxFrames, (unsigned)r.txFrames,
+                            (unsigned)r.rxLost, (unsigned)r.busErrors);
+    }
+    __sync_synchronize();
+    if (n2kBusLogSeq == q) break;
+    n = 0;
+  }
+  if (n == 0) {
+    free(out);
+    request->send(503, "text/plain", "bus history busy - retry");
+    return;
+  }
+  sendPsramText(request, "text/csv", out, n);
+}
+
 void setupServer() {
 
   static bool serverInitialized = false;
@@ -3026,6 +3400,7 @@ void setupServer() {
 
 
   server.on("/factoryReset", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -3065,14 +3440,12 @@ void setupServer() {
         while (written < maxLen) {
           if (state.linePos >= state.lineLen) {
             // Rows: 0=header, 1=constants, data at idx=oldest+row-2 → last data row is count+1.
-            // `> count` stopped one early and always dropped the newest entry (.bin emits it).
             if (state.row > state.count + 1) {
               thermalLogPaused = false;
               state.done = true;
               return written;
             }
             if (state.row == 0) {
-              // Header row
               state.lineLen = snprintf(
                 state.line, sizeof(state.line),
                 "ts_ms,tempFilt_F,tempProj_F,nominalTarget_A,"
@@ -3082,10 +3455,8 @@ void setupServer() {
                 "outerP,outerI,lookahead,impliedPenalty,antiWindupFired,thermalSlope_F_sec,"
                 "freezeWhy,penaltyRaw_A,iCeil_A\n");
             } else if (state.row == 1) {
-              // Constants row — written once, Python detects via "CONST" in ts_ms field.
-              // limit/warn/crit let the plotter draw the limit + warning-trip (limit+warn) +
-              // critical-trip (limit+crit) reference lines. nominalTarget column carries the
-              // live regulation setpoint in °F.
+              // Constants row; the plotter detects it by "CONST" in ts_ms and draws limit, limit+warn and limit+crit
+              // lines. nominalTarget carries the live regulation setpoint in °F.
               state.lineLen = snprintf(
                 state.line, sizeof(state.line),
                 "CONST,kp=%.6g,ki=%.6g,lookahead=%.1f,limit=%.1f,warn=%.1f,crit=%.1f,kidownfrac=%.3g,slopewin=%.1f\n",
@@ -3254,7 +3625,6 @@ void setupServer() {
 
         while (written < maxLen) {
 
-          // Refill line buffer when previous line is exhausted
           if (state.linePos >= state.lineLen) {
 
             // ── Row 0: comment block ──────────────────────────────────────
@@ -3408,7 +3778,6 @@ void setupServer() {
             state.row++;
           }
 
-          // Copy as much of the current line into the output buffer as fits
           size_t canSend = min(maxLen - written,
                                (size_t)(state.lineLen - state.linePos));
           memcpy(buf + written, state.line + state.linePos, canSend);
@@ -3425,14 +3794,14 @@ void setupServer() {
   });
 
   // ── Hunt-governor episode ledger (Hunt_Governor_Spec.md): one CSV line per damping episode ──
-  // Serves what is on flash PLUS the episodes still queued in RAM — queued rows only reach flash
-  // once the field gate has been cut ~30 s (huntLedgerService), and a Refresh must not have to wait
-  // for that to show a fresh episode. Read-only by design: this handler never writes flash. Runs on
-  // the async web-server task, so the ~6 KB read costs the control loop nothing.
+  // Serves flash PLUS episodes still queued in RAM (they reach flash only ~30 s after the field gate is cut,
+  // huntLedgerService). Read-only by design: never writes flash.
   server.on("/huntledger", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Queue counted and rendered under the FS lock too: huntLedgerService moves it to the file and
+    // zeroes it under this same lock, so a flush between the two reads would drop those rows from both.
+    fsTakeLock();
     uint8_t pendN = hgLedgerPendingCount();
     size_t pendCap = (size_t)pendN * 96 + 96;
-    fsTakeLock();
     File f = LittleFS.open("/huntledger.csv", "r");
     size_t fsz = f ? f.size() : 0;
     if (fsz == 0 && pendN == 0) {
@@ -3441,11 +3810,14 @@ void setupServer() {
       request->send(200, "text/plain", "no hunt episodes recorded");
       return;
     }
-    char *buf = (char *)ps_malloc(fsz + pendCap + 1);  // file is hard-capped at HG_LEDGER_MAX_BYTES
+    const size_t bufCap = fsz + pendCap + 1;
+    char *buf = (char *)ps_malloc(bufCap);  // file is hard-capped at HG_LEDGER_MAX_BYTES
     size_t n = 0;
     if (buf) {
       if (fsz) n = f.read((uint8_t *)buf, fsz);
       else n = (size_t)snprintf(buf, pendCap, "%s\n", "epoch,rpm,cv,freqHz,a0_pct,aEnd_pct,steps,verdict,derateExit");
+      if (n && buf[n - 1] != '\n') buf[n++] = '\n';
+      n += hgLedgerPendingCsv(buf + n, bufCap - n);
     }
     if (f) f.close();
     fsReleaseLock();
@@ -3453,8 +3825,6 @@ void setupServer() {
       request->send(503, "text/plain", "hunt ledger unavailable — out of memory");
       return;
     }
-    if (n && buf[n - 1] != '\n') buf[n++] = '\n';
-    n += hgLedgerPendingCsv(buf + n, pendCap);
     // Streamed straight out of PSRAM — passing a char* to send() would copy the whole ledger into
     // an Arduino String on the internal heap. The shared_ptr deleter frees on any completion path.
     std::shared_ptr<char> sp(buf, free);
@@ -3483,6 +3853,7 @@ void setupServer() {
   // Clear System for the oscillation damper: learned pockets + episode ledger + any test in
   // flight, together. The web UI fronts this with an explicit confirm.
   server.on("/huntclear", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -3491,23 +3862,16 @@ void setupServer() {
     request->send(200, "text/plain", "OK");
   });
 
-  // ── DVCC raw-frame capture (spec §8a): candidate CAN frames as hex text, for charge-limit
-  // decoder ground-truth validation from any browser/relay path. Observe-only by construction —
-  // the ring fills from the receive tap; reading it never touches control. Line format:
-  // "ms id_hex len data_hex", oldest first.
+  // ── DVCC raw-frame capture (spec §8a): candidate CAN frames as hex, for charge-limit decoder ground truth.
+  // Observe-only; reading never touches control. Line format: "ms id_hex len data_hex", oldest first.
   server.on("/dvccCapture", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!dvccCapRing || dvccCapCount == 0) {
       request->send(200, "text/plain", "no candidate frames captured yet (needs NMEA2K receive or DVCC follow enabled, and bus traffic)");
       return;
     }
-    // Pause the tap while copying out: the oldest entries — serialized first — are exactly the
-    // slots a concurrent write overwrites next, and a torn line (one frame's id, another's data)
-    // would corrupt the decode ground truth this endpoint exists to provide. The tap drops
-    // frames only for the raw memcpy below, not for the ~4600 snprintf calls that format it —
-    // those run with the tap live, off a private copy.
-    // Setting the pause and reading the head/count pair under dvccCapMux is what closes the
-    // handshake: the tap takes the same lock around its whole slot write, so once this critical
-    // section exits with the pause set, no write can be in flight and the ring is frozen.
+    // Pause the tap while copying: the oldest slots are the next ones a concurrent write overwrites, and a torn line would
+    // corrupt the ground truth. Setting the pause and reading head/count under dvccCapMux (the tap holds it for its whole
+    // slot write) guarantees no write is in flight; formatting then runs with the tap live, off the private copy.
     portENTER_CRITICAL(&dvccCapMux);
     dvccCapPause = true;
     uint16_t cnt = dvccCapCount;
@@ -3532,9 +3896,8 @@ void setupServer() {
       return;
     }
     size_t n = 0;
-    // Header first. Hex frames alone are an anecdote: what makes them generalisable is who
-    // published them and under which firmware. The roster is copied out of PSRAM under the lock
-    // and formatted unlocked — snprintf must never run inside the critical section.
+    // Header first: who published the frames and under which firmware. The roster is copied under the lock and
+    // formatted unlocked; snprintf must never run inside the critical section.
     char authTxt[24];
     if (dvccRxSrcAddr == 255) snprintf(authTxt, sizeof(authTxt), "none heard yet");
     else snprintf(authTxt, sizeof(authTxt), "addr %u", (unsigned)dvccRxSrcAddr);
@@ -3564,10 +3927,8 @@ void setupServer() {
     }
     if (nodeCnt == 0) n += (size_t)snprintf(buf + n, cap - n, "# (no identity frames heard)\n");
     if (nsnap) free(nsnap);
-    // The battery behind a GX is on the GX's other CAN port and never reaches our bus, so the one
-    // fact that makes these numbers generalisable is the owner's own record of what battery this
-    // is. Stamped from Vessel Info rather than asked for in the covering email, which is the half
-    // that gets forgotten. Sanitised on the way out: the stored strings pre-date any input filter.
+    // The battery behind a GX never reaches our bus, so stamp the owner's Vessel Info battery record. Sanitised on the
+    // way out: the stored strings pre-date any input filter.
     char battTxt[80], battChem[24];
     dvccCopyPlainText(battTxt, sizeof(battTxt), BATTERY_MAKE_MODEL);
     dvccCopyPlainText(battChem, sizeof(battChem), BATTERY_TYPE);
@@ -3590,8 +3951,7 @@ void setupServer() {
       if (n < cap - 1) buf[n++] = '\n';
     }
     free(snap);  // both buffers are PSRAM; hand the ~10 KB copy back before the response holds the text
-    // Streamed straight out of PSRAM, same pattern as /huntledger — a char* send() would copy
-    // the whole dump into an internal-heap String. shared_ptr deleter frees on any completion path.
+    // Streamed out of PSRAM, same pattern as /huntledger.
     std::shared_ptr<char> sp(buf, free);
     AsyncWebServerResponse *response = request->beginResponse("text/plain", n,
       [sp, n](uint8_t *out, size_t maxLen, size_t index) -> size_t {
@@ -3605,11 +3965,13 @@ void setupServer() {
     request->send(response);
   });
 
+  server.on("/n2kNodes", HTTP_GET, handleN2kNodes);
+  server.on("/canCapture", HTTP_GET, handleCanCapture);
+  server.on("/n2kbuslog.csv", HTTP_GET, handleN2kBusLog);
+
   // ── Console history: device-side source of truth for the Download Logs console file ──
-  // Tab-separated lines: epoch \t millis \t message. Client formats timestamps (pre-2020 epoch =
-  // clock unsynced at queue time → shows relative uptime instead). Entries memcpy'd under
-  // consoleMux so a concurrent append can't tear a line; no pause flag — the ring has no
-  // tick-driven writer to freeze.
+  // Lines: epoch \t millis \t message (pre-2020 epoch = clock unsynced, client shows uptime). Entries are memcpy'd under
+  // consoleMux so an append can't tear a line; no pause flag, the ring has no tick-driven writer.
   server.on("/consolehist.txt", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!consoleHist || consoleHistCount == 0) {
       request->send(200, "text/plain", "");
@@ -3655,9 +4017,8 @@ void setupServer() {
         return written;
       });
     response->addHeader("Cache-Control", "no-cache");
-    // Device uptime at send: the browser places ring lines on its own clock by age (millis is monotonic),
-    // so the splice after a stream outage needs no time source — the epoch column is only as good as the
-    // device's clock, and an AP-mode browser user has none. Exposed for the app's cross-origin fetch.
+    // Device uptime at send: the browser places ring lines by age on its own clock, so the post-outage splice needs no
+    // time source (AP-mode users have none). Exposed for the app's cross-origin fetch.
     char nowBuf[16];
     snprintf(nowBuf, sizeof(nowBuf), "%lu", (unsigned long)millis());
     response->addHeader("X-Device-Millis", nowBuf);
@@ -3666,9 +4027,8 @@ void setupServer() {
   });
 
   // ── Fast alternator-current channel: live scope dump ──
-  // 500 ms raw ring (20 kSPS, calibrated mV) + 16 B header — see faScopeSnapshot for layout.
-  // Snapshot is copied into a PSRAM buffer up front (spinlock vs the loop() drain), then
-  // streamed; the shared_ptr deleter frees it on any completion path including client abort.
+  // 500 ms raw ring (20 kSPS, calibrated mV) + 24 B header — see faScopeSnapshot for layout.
+  // Snapshot copied into PSRAM up front (spinlock vs the loop() drain), then streamed.
   server.on("/fastscope.bin", HTTP_GET, [](AsyncWebServerRequest *request) {
     const size_t cap = 24 + (size_t)FA_RAW_RING_N * 2;  // header (24 B) + full scope ring
     uint8_t *buf = (uint8_t *)ps_malloc(cap);
@@ -3697,7 +4057,7 @@ void setupServer() {
 
   // ── Fast alternator-current channel: reference flipbook dump ──
   // Header (8 B LE): u32 magic 'FFLP', u8 refSlots, u8 anomSlots, u16 sampleRate/10.
-  // Then (refSlots+anomSlots) × FaFlipPage verbatim (2020 B each, layout pinned by
+  // Then (refSlots+anomSlots) × FaFlipPage verbatim (8020 B each, layout pinned by
   // static_assert in 2_functions.ino). Pages freeze once captured, so no lock is needed;
   // `used` is set last on capture so a mid-capture read just sees an empty slot.
   server.on("/faflip.bin", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -3777,11 +4137,9 @@ void setupServer() {
   });
 
   // ── Measured filtered ripple per RPM bin (RPM_RIPPLE_TABLE_SPEC) ──
-  // Reads the game-scoped 1-D ripTab: one row per 50-RPM bin with any state, IExcessTau-filtered pk-pk
-  // (== detector mExcessEma pk-pk) captured at the game's fixed commanded current. First three columns
-  // keep the legacy layout (parsers read [0..2] after a length ≥ 3 check); altSt/battSt appended:
-  // 0 = none, 1 = pending (value = the unconfirmed candidate), 2 = committed. The wizard pick and the
-  // game's kill/coverage logic use committed only; the game strip may draw pending dimmed.
+  // One row per 50-RPM ripTab bin with any state: IExcessTau-filtered pk-pk at the game's fixed commanded current.
+  // Columns [0..2] are a fixed layout (parsers check length >= 3); altSt/battSt: 0 none, 1 pending (value = candidate),
+  // 2 committed. The wizard pick and the game's kill/coverage logic use committed only.
   server.on("/filtripple.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
     String out = "rpmLo,altFiltPkA,battFiltPkA,altSt,battSt\n";
     for (int r = 0; r < RIPTAB_BINS; r++) {
@@ -3823,11 +4181,9 @@ void setupServer() {
     request->send(response);
   });
 
-  // ── Filtered-ripple fold forensics (diagnostic) ──
-  // One row per ripTab fold event, oldest→newest — the "why won't this bin settle" trace. event:
-  // P = pending set, D = disagree (otherA = the pending it replaced), C = commit (otherA = the pair
-  // partner; the committed value is their average). pkpkA is always the window's own value.
-  // crossings ~2 = one-shot transient; many = sustained oscillation.
+  // ── Filtered-ripple fold forensics (diagnostic): one row per ripTab fold event, oldest first ──
+  // event: P pending set, D disagree (otherA = the pending it replaced), C commit (otherA = pair partner; committed =
+  // their average). crossings ~2 = one-shot transient, many = sustained oscillation.
   server.on("/ripforensic.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
     String out = "detector,rpm,ampLo,meanA,pkpkA,meanShiftA,cmdTravelA,crossings,event,otherA\n";
     uint16_t n = ripForensicCount < RIP_FORENSIC_CAP ? ripForensicCount : RIP_FORENSIC_CAP;
@@ -3869,10 +4225,9 @@ void setupServer() {
     request->send(response);
   });
 
-  // ── Measured ripple projection (§3.3/§4) — the stored per-detector fit for the Protections plot ──
-  // ripple(I)=a0+a1·I plus the 3 measured (I, pk-pk) points and the RPM the test ran at. n=0 → no test
-  // yet (plot shows the threshold line only). Read on the Protections tab and by the Step-6 review.
-  // "slp" = the same record shape for the CV D-term deadband: worst-positive voltage slope (V/s) vs I.
+  // ── Measured ripple projection (§3.3/§4): stored per-detector fit ripple(I)=a0+a1·I, its 3 measured (I, pk-pk) points
+  // and test RPM; n=0 = no test yet. Read by the Protections tab and the Step-6 review. "slp" = same shape for the CV
+  // D-term deadband (worst positive voltage slope, V/s, vs I).
   server.on("/ripfit", HTTP_GET, [](AsyncWebServerRequest *request) {
     auto j = [](const RipFit &r) {
       String s = "{\"a0\":" + String(r.a0, 4) + ",\"a1\":" + String(r.a1, 5)
@@ -3940,7 +4295,13 @@ void setupServer() {
   });
   // Battery Health: DCIR test status + result table + capacity-vs-cycles trend.
   server.on("/batteryHealth", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "application/json", bhBuildStatusJson());
+    size_t n = 0;
+    char *body = bhBuildStatusJson(&n);   // PSRAM, owned by the streamer below
+    if (!body) {
+      request->send(503, "application/json", "{\"err\":\"out of memory\"}");
+      return;
+    }
+    sendPsramText(request, "application/json", body, n);
   });
   // Zero-drift characterization log: small status JSON for the dashboard panel (enable, fill, span).
   server.on("/zerologstate", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -3970,11 +4331,12 @@ void setupServer() {
     j += ",\"applied\":";       j += (AutoAltCurrentZero ? 1 : 0);
     j += ",\"epoch\":";         j += String((unsigned)zfLastEpoch);
     j += ",\"histCount\":";     j += String((unsigned)zeroFitHistCount);
-    // Commissioned zero capture (engine running, field at 0%) — held until the operator applies it.
+    // Commissioned zero capture (field at 0%, engine running or stopped) — held until the operator applies it.
     j += ",\"capHeld\":";       j += (altZeroCapHeld ? 1 : 0);
     j += ",\"capEpoch\":";      j += String((unsigned)altZeroCapEpoch);
     j += ",\"capA\":";          j += String(altZeroCapA, 3);
     j += ",\"capRpm\":";        j += String((int)altZeroCapRpm);
+    j += ",\"capEngOff\":";     j += (altZeroCapEngineOff ? 1 : 0);
     j += ",\"capN\":";          j += String((unsigned)altZeroCapN);
     j += ",\"capP2P\":";        j += String(altZeroCapP2P, 3);
     j += ",\"capAltF\":";       j += (isnan(altZeroCapTempF)  ? String("null") : String(altZeroCapTempF, 1));
@@ -3989,10 +4351,8 @@ void setupServer() {
     j += "}";
     request->send(200, "application/json", j);
   });
-  // Multi-drop 1-Wire probe registry for Setup > Temperature (BATTERY_TEMP_SENSORS_SPEC.md §8). The registry
-  // is copied under owMux first and the JSON built from that copy on the stack, so TempTask never waits on
-  // the network and the handler never allocates. "role" comes from the stored role addresses, so a probe
-  // that dropped off the bus still reports its role with present:0.
+  // Multi-drop 1-Wire probe registry for Setup > Temperature (BATTERY_TEMP_SENSORS_SPEC.md §8). Copied under owMux and
+  // built from the stack copy, so TempTask never waits on the network. "role" is from stored role addresses (present:0 kept).
   server.on("/tempSensors", HTTP_GET, [](AsyncWebServerRequest *request) {
     OwProbe snap[OW_MAX_PROBES];
     DeviceAddress roleAddr[TR_COUNT];
@@ -4265,26 +4625,19 @@ void setupServer() {
   server.on("/solarledger.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
     solarLedgerCsvSend(request);
   });
-  // Gate-tuning capture dump: 164 B header + 17 B rows, streamed binary, decoded to CSV in the
-  // browser (parseAltLogBin in script.js) and handed over with deliverFile(). Refuses while
-  // recording. Clearing is a separate press (/get?altLogClear=1) so the file is safely in hand
-  // before the buffer is freed.
+  // Gate-tuning capture dump: 164 B header + 17 B rows, decoded in the browser (parseAltLogBin in script.js). Refuses
+  // while recording; clearing is a separate press (/get?altLogClear=1) so the file is in hand before the buffer is freed.
   server.on("/altlog.bin", HTTP_GET, [](AsyncWebServerRequest *request) {
     altLogBinSend(request);
   });
-  // Performance-vs-engine-hours trend (header + points, chunked). This is the headline. Decimated to
-  // <= TR_MAXOUT output points for readability + payload (full hourly history stays on the device):
-  // each output point is one bucket of source hours — the low line = min of the source hours' P10s
-  // (preserve the early-warning envelope), overall = mean. stride==1 (<= TR_MAXOUT total) streams
-  // every hour, as before.
+  // Performance-vs-engine-hours trend, decimated to <= TR_MAXOUT points (full hourly history stays on the device): each
+  // point is one bucket of source hours, low line = min of their P10s (keeps the early-warning envelope), overall = mean.
   extern float altTrendBucketSec;   // defined in 7_functions.ino (concatenated later) — needed to convert bucket index → engine-hours
   server.on("/alttrend.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!altTrend) { request->send(200, "text/plain", "engHours,worstPct,overallPct\n"); return; }
     const int TR_MAXOUT = 200;
-    // Optional ?hours=N window: decimate WITHIN the last N engine-hours so the dashboard's
-    // 10h/100h shortcuts aren't starved. A single global 200-pt stride over a multi-thousand-hour
-    // history lands ~0 points inside a recent 10h slice; windowing the base index first fixes that.
-    // hours<=0 or absent = full history (the "All" shortcut).
+    // Optional ?hours=N: decimate WITHIN the last N engine-hours, or a global 200-pt stride over a long history leaves
+    // ~0 points in a 10 h slice. hours<=0 or absent = full history.
     int base = 0;
     if (request->hasParam("hours")) {
       int winHours = request->getParam("hours")->value().toInt();
@@ -4322,8 +4675,7 @@ void setupServer() {
                 if (w < worst) worst = w;
                 sum += altTrend[i].overallPct / 10.0f; n++;
               }
-              // Stored engHour is a BUCKET INDEX. Convert to true engine-hours so the X axis is correct at
-              // any bucket size (index × bucketSec/3600): at 3600 s index==hours; at 600 s six buckets = 1 h.
+              // Stored engHour is a BUCKET INDEX; convert to engine-hours (index × bucketSec/3600).
               float ehHours = (float)altTrend[end - 1].engHour * (altTrendBucketSec / 3600.0f);
               st.len = snprintf(st.line, sizeof(st.line), "%.3f,%.1f,%.1f\n", ehHours, worst, n ? sum / n : 0.0f);
               st.outIdx++;
@@ -4356,61 +4708,35 @@ void setupServer() {
     perfRecordsCsvSend(request);
   });
 
-  // Load CSV (import a shared/saved polar): POST the BEFRONT1 sail+motor pair as the raw body to
-  // /perfUploadFront. The body handler accumulates chunks into perfUploadBuf; the
-  // request handler (runs once the body is complete) arm-gates, then perfUploadFrontCsv()
-  // replaces both fronts and applies the user's chosen mode (?fixed=1 freeze / 0 learn) + persists.
-  // Same ingest path as cloud-sync/Load-saved.
+  // Load CSV (import a polar): POST the BEFRONT1 sail+motor pair as the raw body; frontUploadBody buffers it on the
+  // request, then perfUploadFrontCsv() replaces both fronts (?fixed=1 freeze / 0 learn). Same ingest as cloud-sync.
   server.on("/perfUploadFront", HTTP_POST,
     [](AsyncWebServerRequest *request) {
-      if (!settingsArmActive(request)) {
-        perfUploadBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
-      }
-      if (perfUploadBuf.length() < 8 || perfUploadBuf.indexOf("BEFRONT1") < 0) {
-        perfUploadBuf = ""; request->send(400, "text/plain", "No BEFRONT1 data in upload"); return;
-      }
-      char *bodyc = strdup(perfUploadBuf.c_str());
-      perfUploadBuf = "";
-      if (!bodyc) { request->send(500, "text/plain", "Out of memory"); return; }
+      if (refuseMisaddressed(request)) return;
+      if (!settingsArmActive(request)) { request->send(403, "text/plain", "Settings not armed"); return; }
+      char *body = frontUploadText(request);
+      if (!body) return;
       // fixed=1 → FIXED+paused (freeze), fixed=0 → LEARNED+resumed (learn). Default freeze if absent.
       bool fixed = (!request->hasParam("fixed")) || (request->getParam("fixed")->value().toInt() != 0);
-      bool ok = perfUploadFrontCsv(bodyc, fixed);
-      free(bodyc);
+      bool ok = perfUploadFrontCsv(body, fixed);
       request->send(ok ? 200 : 400, "text/plain", ok ? "OK" : "Parse failed");
     },
-    NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-      if (total > 131072) return;  // a real BEFRONT1 is a few KB — a mispicked 30 MB log would OOM the accumulator
-      if (index == 0) { perfUploadBuf = ""; perfUploadBuf.reserve(total + 1); }
-      perfUploadBuf.concat((const char *)data, len);
-    });
+    NULL, frontUploadBody);
 
-  // Load CSV (alternator health): POST the BEFRONT1 front as the raw body to /altUploadFront.
-  // Mirrors /perfUploadFront. ?fixed=1 freeze (local only) / 0 learn (adopt to cloud, tagged). The
-  // request handler arm-gates once the body is complete, then altUploadFrontCsv() applies it.
+  // Load CSV (alternator health): mirrors /perfUploadFront. Loads into the Uploaded surface (My History kept); ?fixed=1
+  // pauses My History learning, 0 keeps it learning.
   server.on("/altUploadFront", HTTP_POST,
     [](AsyncWebServerRequest *request) {
-      if (!settingsArmActive(request)) {
-        altUploadBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
-      }
-      if (altUploadBuf.length() < 8 || altUploadBuf.indexOf("BEFRONT1") < 0) {
-        altUploadBuf = ""; request->send(400, "text/plain", "No BEFRONT1 data in upload"); return;
-      }
-      char *bodyc = strdup(altUploadBuf.c_str());
-      altUploadBuf = "";
-      if (!bodyc) { request->send(500, "text/plain", "Out of memory"); return; }
-      // fixed=1 → FIXED+paused (freeze), fixed=0 → LEARNED+resumed+adopt (learn). Default freeze if absent.
+      if (refuseMisaddressed(request)) return;
+      if (!settingsArmActive(request)) { request->send(403, "text/plain", "Settings not armed"); return; }
+      char *body = frontUploadText(request);
+      if (!body) return;
+      // fixed=1 → Pause ON (grade against the upload only), fixed=0 → My History keeps learning. Default Pause ON if absent.
       bool fixed = (!request->hasParam("fixed")) || (request->getParam("fixed")->value().toInt() != 0);
-      bool ok = altUploadFrontCsv(bodyc, fixed);
-      free(bodyc);
+      bool ok = altUploadFrontCsv(body, fixed);
       request->send(ok ? 200 : 400, "text/plain", ok ? "OK" : "Parse failed");
     },
-    NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-      if (total > 131072) return;  // same cap rationale as /perfUploadFront above
-      if (index == 0) { altUploadBuf = ""; altUploadBuf.reserve(total + 1); }
-      altUploadBuf.concat((const char *)data, len);
-    });
+    NULL, frontUploadBody);
 
   // Config Sharing — export the cloneable settings set as one JSON blob (for download
   // or cloud submission). Arm-gated like the upload endpoints.
@@ -4421,11 +4747,9 @@ void setupServer() {
     request->send(200, "application/json", exportConfigJson());
   });
 
-  // App-usage analytics delta from the web UI / Capacitor app (page dwell, button counts).
-  // Deliberately NOT arm-gated: pure counter increments, no settings touched, works in AP
-  // and Client mode. sendBeacon posts land here too (text/plain — content type is ignored).
-  // Body rides request->_tempObject (freed by the request destructor, aborted requests included) so
-  // two clients posting at once can't interleave into one shared accumulator.
+  // App-usage analytics delta (page dwell, button counts). NOT arm-gated: counter increments only, AP and Client mode;
+  // sendBeacon posts land here too (content type ignored). Body rides request->_tempObject (freed by the request
+  // destructor) so two concurrent posters can't interleave.
   server.on("/track", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       char *body = (char *)request->_tempObject;
@@ -4451,12 +4775,62 @@ void setupServer() {
     request->send(200, "application/json", usageStatsJson());
   });
 
-  // Config Sharing — apply an imported config blob (POST the /exportConfig JSON as the body).
-  // Only allowlisted manifest keys are written; everything else in the body is ignored.
-  // Reboots after applying so InitSystemSettings re-reads the whole set consistently
-  // (suppress with ?noReboot=1). Mirrors /perfUploadFront's body-accumulator pattern.
+  // Equipment records (8_functions.ino): the boat's history files, their NVS keys and the lifetime namespace, saved
+  // in the same file as the config by the dashboard. ?summary=1 = sizes and content hashes only, for the preview.
+  // Streamed from PSRAM — hundreds of KB of base64 must never become an internal-heap String.
+  server.on("/exportRecords", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!settingsArmActive(request)) {
+      request->send(403, "text/plain", "Settings not armed"); return;
+    }
+    size_t n = 0;
+    void *rec = recordsExportJson(paramOk(request, "summary") && request->getParam("summary")->value().toInt() != 0, &n);
+    if (!rec) { request->send(503, "text/plain", "records unavailable (out of memory, or a record file could not be read)"); return; }
+    std::shared_ptr<void> sp(rec, recordsExportFree);
+    AsyncWebServerResponse *response = request->beginResponse("application/json", n,
+      [sp](uint8_t *out, size_t maxLen, size_t index) -> size_t {
+        return recordsExportRead(sp.get(), out, maxLen, index);
+      });
+    response->addHeader("Cache-Control", "no-cache");
+    request->send(response);
+  });
+
+  // Apply the records groups the preview picked (body {"records":{...}}). Files are staged for the next boot, so
+  // the regulator always reboots after this: soon when nothing else follows, or within 30 s when the dashboard is
+  // about to post the config import too (?then=config), whose own reboot normally comes first.
+  server.on("/importRecords", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      if (refuseMisaddressed(request)) return;
+      if (!settingsArmActive(request)) { request->send(403, "text/plain", "Settings not armed"); return; }
+      const char *body = (const char *)request->_tempObject;
+      if (!body || strlen(body) < 2) { request->send(400, "text/plain", "Empty body"); return; }
+      int n = recordsImport(body);
+      if (n == -2) { request->send(500, "text/plain", "The records could not be staged (out of memory or flash space); nothing was changed"); return; }
+      if (n < 0) { request->send(400, "text/plain", "No records object in body"); return; }
+      const bool thenConfig = request->hasParam("then") && request->getParam("then")->value() == "config";
+      if (thenConfig) importRebootDeadlineMs = millis() + 30000UL;
+      else { rebootRequestedAt = millis(); rebootRequested = true; }
+      String resp = "{\"applied\":";
+      resp += n; resp += ",\"reboot\":1}";
+      request->send(200, "application/json", resp);
+    },
+    NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (total > 4194304) return;   // bound: a full set of records is well under 1 MB of base64
+      if (index == 0 && !request->_tempObject) {
+        request->_tempObject = ps_malloc(total + 1);
+        if (request->_tempObject) ((char *)request->_tempObject)[0] = '\0';
+      }
+      char *body = (char *)request->_tempObject;
+      if (!body || index + len > total) return;
+      memcpy(body + index, data, len);
+      body[index + len] = '\0';
+    });
+
+  // Config Sharing import (POST the /exportConfig JSON). Only allowlisted manifest keys are written. Reboots afterwards
+  // so InitSystemSettings re-reads the set consistently (?noReboot=1 suppresses).
   server.on("/importConfig", HTTP_POST,
     [](AsyncWebServerRequest *request) {
+      if (refuseMisaddressed(request)) { importConfigBuf = ""; return; }
       if (!settingsArmActive(request)) {
         importConfigBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
       }
@@ -4468,21 +4842,19 @@ void setupServer() {
       if (!bodyc) { request->send(500, "text/plain", "Out of memory"); return; }
       String preClassV = settingRead(NK_BatteryVoltage);
       String preWindV = settingRead(NK_FieldWindingV) + "/" + settingRead(NK_fieldWindApplied);
-      // Recorded BEFORE the write burst, because the burst itself is what may stall the loop and the
-      // console line is the only trace afterwards. The UI warns pre-Apply; this covers every other
-      // caller (bench noReboot, curl) and leaves the stutter explained in the log.
+      // Logged BEFORE the write burst, which is what may stall the loop; the console line is the only trace afterwards
+      // for callers the UI's pre-Apply warning doesn't cover.
       bool fieldWasLive = (fieldActiveStatus > 0);
       if (fieldWasLive) queueConsoleMessage("Config import starting with the field driving - each setting saved to NVS can briefly pause the control loop; prefer importing with charging off");
-      int n = applyImportConfig(bodyc);
+      int n = applyImportConfig(bodyc, false);
       free(bodyc);
       if (n < 0) { request->send(400, "text/plain", "No config object in body"); return; }
-      // noReboot is a bench affordance (no UI path uses it) and it leaves RAM stale against the NVS the
-      // manifest loop just wrote. Harmless for ordinary keys; NOT harmless for a class change, where the
-      // conversion mutates RAM while the loop's overwrites land only in NVS. Force the reboot there.
+      // noReboot (bench only) leaves RAM stale against the NVS just written; harmless for ordinary keys, but a class
+      // change mutates RAM while the overwrites land only in NVS, so force the reboot there.
       bool classMoved = (settingRead(NK_BatteryVoltage) != preClassV)
                         || (settingRead(NK_FieldWindingV) + "/" + settingRead(NK_fieldWindApplied) != preWindV);   // a winding move converts the same way
       bool reboot = classMoved || !request->hasParam("noReboot") || request->getParam("noReboot")->value().toInt() == 0;
-      if (reboot) { rebootRequested = true; rebootRequestedAt = millis(); }
+      if (reboot) { rebootRequestedAt = millis(); rebootRequested = true; }
       String resp = "{\"applied\":";
       resp += n; resp += ",\"reboot\":"; resp += (reboot ? 1 : 0); resp += "}";
       request->send(200, "application/json", resp);
@@ -4505,12 +4877,12 @@ void setupServer() {
 
     uint32_t cnt = (uint32_t)cvLogCount;
     uint32_t entrySize = (uint32_t)sizeof(CvLogEntry);
-    float kp = (float)VoltageKp_active;  // gains ACTUALLY in effect (Manual or Measured α/K, 12V-block normalized) — not the raw manual VoltageKp, which the loop ignores under Measured / on 24-48V
+    float kp = (float)VoltageKp_active;  // gains in effect (Manual or Measured α/K, 12V-block normalized), not raw VoltageKp
     float ki = (float)VoltageKi_active;
     uint32_t interval = (uint32_t)VoltageLoopInterval;
 
     float kdDeadband = CvKdDeadbandVps;
-    float kdActiveGain = VoltageKd_active;  // the gain the trim law multiplies (Measured Td·Kp or Manual, ×vNorm×derate) — the typed VoltageKd here once mislabeled every Measured-source log
+    float kdActiveGain = VoltageKd_active;  // the gain the trim law multiplies (Measured Td·Kp or Manual, ×vNorm×derate), not the typed VoltageKd
     float kdArmV     = CvKdArmV;
     float kdOneSided = (float)(CvKdOneSided ? 1 : 0);
     float kdVoltFiltTC = CvKdVoltFiltTC;
@@ -4595,13 +4967,8 @@ void setupServer() {
   });
 
 
-  // Barometric pressure 14-day history dump. 8-byte header + 4032 little-endian uint16
-  // samples (mbar × 10; 0 = no sample). Dashboard fetches once on Other-tab activation
-  // and every 5 min thereafter.
-  // Header layout (little-endian):
-  //   [0..1]  uint16 headIdx  — next write slot (samples[headIdx-1] is newest)
-  //   [2..5]  uint32 epoch    — wall-clock seconds of newest sample (0 if never synced)
-  //   [6..7]  uint16 count    — BARO_HISTORY_SIZE, for client-side sanity check
+  // Barometric pressure 14-day history: 8-byte LE header + 4032 LE uint16 samples (mbar × 10; 0 = no sample).
+  //   [0..1] u16 headIdx = next write slot  [2..5] u32 epoch of newest sample (0 = never synced)  [6..7] u16 count
   server.on("/baroHistory.bin", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!baroPressureHistory) {
       request->send(503, "application/octet-stream", "");
@@ -4610,7 +4977,7 @@ void setupServer() {
     struct BaroDLState {
       uint8_t  header[8];
       int      headerPos;
-      uint16_t samplePos;
+      uint32_t bytePos;  // bytes, not samples: maxLen can be odd, and a sample cursor re-sent the split byte
       bool     done;
     };
     BaroDLState state;
@@ -4635,17 +5002,15 @@ void setupServer() {
             state.headerPos += (int)canSend;
             continue;
           }
-          if (state.samplePos >= BARO_HISTORY_SIZE) {
+          if (state.bytePos >= BARO_HISTORY_SIZE * sizeof(uint16_t)) {
             state.done = true;
             return written;
           }
-          size_t bytesLeft = (BARO_HISTORY_SIZE - state.samplePos) * sizeof(uint16_t);
+          size_t bytesLeft = BARO_HISTORY_SIZE * sizeof(uint16_t) - state.bytePos;
           size_t canSend = min(maxLen - written, bytesLeft);
-          memcpy(buf + written,
-                 ((uint8_t *)baroPressureHistory) + state.samplePos * sizeof(uint16_t),
-                 canSend);
+          memcpy(buf + written, ((uint8_t *)baroPressureHistory) + state.bytePos, canSend);
           written += canSend;
-          state.samplePos += canSend / sizeof(uint16_t);
+          state.bytePos += canSend;
         }
         return written;
       });
@@ -4653,9 +5018,7 @@ void setupServer() {
     request->send(response);
   });
 
-  // Long Term Plots history download — header (16 B LE) + raw ring array. Lazy:
-  // dashboard fetches once on tab open. JS walks records in chrono order via head +
-  // count; record time = lastEpoch − (count−1−i) × intervalSec (no per-record stamp).
+  // Long Term Plots history: 16 B LE header + records; record time = lastEpoch − (count−1−i) × intervalSec.
   //   [0..1] u16 head  [2..3] u16 count  [4..5] u16 capacity  [6..7] u16 recordSize
   //   [8..11] u32 lastEpoch  [12..15] u32 intervalSec
   server.on("/longTermPlots.bin", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -4684,10 +5047,8 @@ void setupServer() {
     memcpy(state.header + 8,  &epochLE,    4);
     memcpy(state.header + 12, &intervalLE, 4);
 
-    // Body = `count` records in CHRONOLOGICAL order (oldest first), NOT the full ring.
-    // Sending the whole 4320-slot ring (~540 KB) made the async server truncate the
-    // chunked transfer (ERR_INCOMPLETE_CHUNKED_ENCODING); count×recSize stays small until
-    // the ring is genuinely full. JS reads records linearly (base = 16 + i*recSize).
+    // Body = `count` records oldest first, NOT the full ring: the whole 4320-slot ring (~540 KB) made the async server
+    // truncate the chunked transfer. JS reads records linearly (base = 16 + i*recSize).
     AsyncWebServerResponse *response = request->beginChunkedResponse(
       "application/octet-stream",
       [state, countLE, tail, capLE, recLE](uint8_t *buf, size_t maxLen, size_t) mutable -> size_t {
@@ -4717,6 +5078,7 @@ void setupServer() {
   });
 
   server.on("/resetlogs", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     thermalLogHead = 0;
     thermalLogCount = 0;
     thermalLogPaused = false;
@@ -4730,20 +5092,20 @@ void setupServer() {
   });
 
   server.on("/stoplogs", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     loggingActive = false;
     request->send(200, "text/plain", "Logging stopped");
   });
 
   server.on("/startlogs", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     loggingActive = true;
     request->send(200, "text/plain", "Logging started");
   });
 
 
-  // Derived view of the Vessel Info NVS record — no longer a file. Deliberately ungated
-  // (unlike /exportConfig): the dashboard form and the Download Logs bundle both need it
-  // without arming settings. 404 until the form has been saved, which is what the client
-  // reads as "vessel info incomplete".
+  // Derived view of the Vessel Info NVS record. Deliberately ungated: the form and the Download Logs bundle need it
+  // unarmed. 404 until the form has been saved (the client reads that as "vessel info incomplete").
   server.on("/vessel_info.json", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (settingExists(NK_vesselSaved)) {
       request->send(200, "application/json", vesselInfoJson());
@@ -4763,6 +5125,7 @@ void setupServer() {
   // settings are normally still locked, and a 403 there would silently un-silence it every session.
   // These two flags carry no control authority — the worst a caller can do is mute a maintenance nag.
   server.on("/recommissionAck", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (request->hasParam("commissionAgeAck")) {
       commissionAgeAck = true;
       settingWrite(NK_cmAgeAck, "1");
@@ -4773,10 +5136,8 @@ void setupServer() {
     }
     request->send(200, "application/json", "{\"ok\":true}");
   });
-  // Admin config push detail + ack. The CSV2 counts tell the dashboard THAT something is queued
-  // or landed; this hands over the text the popup needs. ?ack=1 clears the applied receipt (the
-  // pending notice is not ackable — it clears itself when the cloud flag goes away or the push
-  // lands). Not arm-gated: it neither changes a setting nor reveals anything a CSV2 frame doesn't.
+  // Admin config push detail + ack: the text the popup needs. ?ack=1 clears the applied receipt (pending clears itself).
+  // Not arm-gated: it changes no setting and reveals nothing a CSV2 frame doesn't.
   server.on("/configPush", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("ack")) {
       cfgPushAppliedCount = 0;
@@ -4790,11 +5151,11 @@ void setupServer() {
     request->send(200, "application/json", out);
   });
   server.on("/saveVesselInfo", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (!settingsArmActive(request)) {
       request->send(401, "application/json", "{\"success\":false,\"error\":\"Settings not armed\"}");
       return;
     }
-    // Get JSON data
     if (!request->hasParam("vesselData", true)) {
       request->send(400, "application/json", "{\"success\":false,\"error\":\"No vessel data\"}");
       return;
@@ -4806,7 +5167,6 @@ void setupServer() {
       request->send(400, "application/json", "{\"success\":false,\"error\":\"Invalid JSON\"}");
       return;
     }
-    // Update RAM variables
     BOAT_LENGTH_FT = doc["boat_length_ft"];
     BOAT_DISPLACEMENT_LBS = doc["boat_displacement_lbs"];
     vesselSetText(BOAT_TYPE, sizeof(BOAT_TYPE), doc["boat_type"] | "");
@@ -4841,10 +5201,9 @@ void setupServer() {
     BatteryCapacity_Ah = constrain((int)(doc["battery_capacity_ah"] | BatteryCapacity_Ah), 1, 100000);
     PeukertRatedCurrent_A = BatteryCapacity_Ah / 20.0f;  // /get derives this on write; import must too
     vesselSetText(BATTERY_TYPE, sizeof(BATTERY_TYPE), doc["battery_type"] | "");
-    // Chemistry no longer moves the INA228 limit — VoltageHardwareLimit is a persisted user
-    // setting; the chemistry-specific value arrives via the battery-defaults proposal.
-    // Voltage/capacity/chemistry all move the CV plant gain the commissioning fit measured, so the stored
-    // tune no longer describes this bank. Only nag once a pass has actually been finished (epoch stamped).
+    // Chemistry does not move VoltageHardwareLimit (a user setting; chemistry values come via the battery-defaults
+    // proposal). Voltage/capacity/chemistry all move the CV plant gain the commissioning fit measured, so nag, but only
+    // once a pass has finished (epoch stamped).
     if (CommissionEpoch > 0 && (newBatteryVoltage != oldBatteryVoltage
                                 || BatteryCapacity_Ah != oldCapacityAh
                                 || strcmp(BATTERY_TYPE, oldBatteryType) != 0)) {
@@ -4878,17 +5237,12 @@ void setupServer() {
                   String("{\"success\":true,\"firstSave\":") + (firstSave ? "true" : "false") + "}");
   });
   server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Addressed write: the dashboard names the unit whose data it is showing (uid=). One naming
-    // another unit reached this board through an address both answer to (alternator.local with two
-    // regulators, 2026-09-15) and is refused whole - OnOff=0 included, because the board the user is
-    // looking at is the other one and this one would go dark with nothing on screen to explain it.
-    if (request->hasParam("uid")) {
-      const String &want = request->getParam("uid")->value();
-      if (want.length() && !want.equalsIgnoreCase(device_id_hex)) {
-        logClientWrite(request, "WRITE REJECTED: addressed to another regulator");
-        request->send(409, "text/plain", device_id_hex);
-        return;
-      }
+    // Addressed write: the dashboard names the unit it is showing (uid=). One naming another unit came through a shared
+    // address (alternator.local) and is refused whole, OnOff=0 included: the user is looking at the other board.
+    if (addressedElsewhere(request)) {
+      logClientWrite(request, "WRITE REJECTED: addressed to another regulator");
+      request->send(409, "text/plain", device_id_hex);
+      return;
     }
     bool foundParameter = false;
     bool heartbeat = false;       // commissionHeartbeat= seen: answered, never counted as a setting write (see the CSV3 echo at the end)
@@ -4903,14 +5257,10 @@ void setupServer() {
         OnOff = 0;
         settingWrite(NK_OnOff, "0");
         stateRevision++;
-        // This path returns before the foundParameter block that normally raises settingsDirty, so
-        // without this an OFF never pushed a CSV3 echo — a second browser or the cloud config snapshot
-        // kept the old value until the 60 s fallback.
+        // This path returns before the foundParameter block, so raise settingsDirty here for the CSV3 echo.
         settingsDirty = true;
-        // Sender fingerprint: unexplained OnOff=0 arrivals were seen on the bench (2026-08).
-        // The dashboard sends OnOff plus its src/n/uid tags and nothing else, so any other param = a
-        // different sender, and IP+UA tell laptop from phone from a stale client replaying the request.
-        // Tracked so a later out-of-order ON from the same tab is recognized; never dropped itself.
+        // Sender fingerprint: the dashboard sends only OnOff + src/n/uid, so any other param is a different sender.
+        // Tracked so a later out-of-order ON from the same tab is recognized; an OFF itself is never dropped.
         bool offIsRepeat = false;
         clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext, &offIsRepeat);
         logClientWrite(request, offIsRepeat ? "FIELD OFF: duplicate copy of a press already applied (field was already off)"
@@ -5050,8 +5400,8 @@ void setupServer() {
         Serial.flush();
         // Deferred like every other reboot path: the 200 above is only written once this handler
         // returns, so restarting inline discarded it and left the caller waiting on a dead socket.
-        rebootRequested = true;
         rebootRequestedAt = millis();
+        rebootRequested = true;
         return;
       }
     }
@@ -5062,7 +5412,7 @@ void setupServer() {
       settingWrite(NK_SystemIDStepAmplitude, inputMessage.c_str());
       SystemIDStepAmplitude = inputMessage.toFloat();
     }
-    if (request->hasParam("systemIDTestType")) {
+    if (paramOk(request, "systemIDTestType")) {
       foundParameter = true;
       inputMessage = request->getParam("systemIDTestType")->value();
       settingWrite(NK_systemIDTestType, inputMessage.c_str());
@@ -5080,7 +5430,7 @@ void setupServer() {
       settingWrite(NK_systemIDSineFreqEnd, inputMessage.c_str());
       systemIDSineFreqEnd = inputMessage.toFloat();
     }
-    if (request->hasParam("systemIDPlantTauMs")) {
+    if (paramOk(request, "systemIDPlantTauMs")) {
       // Fitted plant tau from the dashboard Plant Delay sweep. Persisted with no field-off gate
       // (cheap compare-first scalar) so the actionable-disturbance readout survives reboots.
       foundParameter = true;
@@ -5088,11 +5438,10 @@ void setupServer() {
       systemIDPlantTauMs = (uint16_t)inputMessage.toInt();
       settingWrite(NK_sysidPlantTau, String(systemIDPlantTauMs).c_str());
     }
-    if (request->hasParam("fieldDecayTauMs")) {
-      // Commissioned field drain time (ms) — worst-case value used when RPM is unknown and by the 3×
-      // post-protection backstops. Writing it FLATTENS the drain-vs-RPM line (endpoints cleared), so a
-      // manual override applies at every speed; the wizard Apply sends the endpoint params in the SAME
-      // request (handled below, after this flatten) to commission a line. Clamped to a sane physical band.
+    if (paramOk(request, "fieldDecayTauMs")) {
+      // Commissioned field drain time (ms): worst case when RPM is unknown and for the 3× post-protection backstops.
+      // Writing it FLATTENS the drain-vs-RPM line so a manual override applies at every speed; the wizard Apply sends
+      // the endpoint params in the SAME request (handled after this flatten) to commission a line.
       foundParameter = true;
       inputMessage = request->getParam("fieldDecayTauMs")->value();
       int v = inputMessage.toInt();
@@ -5103,31 +5452,31 @@ void setupServer() {
       settingWrite(NK_fdDrainLoMs, "0"); settingWrite(NK_fdDrainHiMs, "0");
       settingWrite(NK_fdDrainRpmLo, "0"); settingWrite(NK_fdDrainRpmHi, "0");
     }
-    if (request->hasParam("fdDrainLoMs")) {
+    if (paramOk(request, "fdDrainLoMs")) {
       foundParameter = true;
       int v = request->getParam("fdDrainLoMs")->value().toInt();
       fdDrainLoMs = (uint16_t)constrain(v, 0, 900);
       settingWrite(NK_fdDrainLoMs, String(fdDrainLoMs).c_str());
     }
-    if (request->hasParam("fdDrainHiMs")) {
+    if (paramOk(request, "fdDrainHiMs")) {
       foundParameter = true;
       int v = request->getParam("fdDrainHiMs")->value().toInt();
       fdDrainHiMs = (uint16_t)constrain(v, 0, 900);
       settingWrite(NK_fdDrainHiMs, String(fdDrainHiMs).c_str());
     }
-    if (request->hasParam("fdDrainRpmLo")) {
+    if (paramOk(request, "fdDrainRpmLo")) {
       foundParameter = true;
       int v = request->getParam("fdDrainRpmLo")->value().toInt();
       fdDrainRpmLo = (uint16_t)constrain(v, 0, 10000);
       settingWrite(NK_fdDrainRpmLo, String(fdDrainRpmLo).c_str());
     }
-    if (request->hasParam("fdDrainRpmHi")) {
+    if (paramOk(request, "fdDrainRpmHi")) {
       foundParameter = true;
       int v = request->getParam("fdDrainRpmHi")->value().toInt();
       fdDrainRpmHi = (uint16_t)constrain(v, 0, 10000);
       settingWrite(NK_fdDrainRpmHi, String(fdDrainRpmHi).c_str());
     }
-    if (request->hasParam("systemIDSineCycles")) {
+    if (paramOk(request, "systemIDSineCycles")) {
       foundParameter = true;
       inputMessage = request->getParam("systemIDSineCycles")->value();
       settingWrite(NK_systemIDSineCycles, inputMessage.c_str());
@@ -5233,6 +5582,8 @@ void setupServer() {
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
         queueConsoleMessage("Field curve: start blocked — only allowed while charging in Auto mode");
+      } else if (const char *rr = rpmTestRefuseReason()) {
+        queueConsoleMessageF("Field curve: start blocked — %s", rr);
       } else if (busy != nullptr) {
         queueConsoleMessageF("Field curve: start blocked — %s is active", busy);
       } else if ((millis() - fieldCurveLastEndMs) > 2000UL) {
@@ -5271,6 +5622,8 @@ void setupServer() {
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
         queueConsoleMessage("Field cut: start blocked — only allowed while charging in Auto mode");
+      } else if (const char *rr = rpmTestRefuseReason()) {
+        queueConsoleMessageF("Field cut: start blocked — %s", rr);
       } else if (busy != nullptr) {
         queueConsoleMessageF("Field cut: start blocked — %s is active", busy);
       } else if ((millis() - fieldCutLastEndMs) > 2000UL) {
@@ -5292,7 +5645,7 @@ void setupServer() {
 
     // ── Charge health system calibration (stage 9): one clock-scheduled run of four throttle cycles ──
     // The engine's maximum working RPM, entered on the setup screen. The test top is CHC_TOP_FRAC of it.
-    if (request->hasParam("maxWorkingRpm")) {
+    if (paramOk(request, "maxWorkingRpm")) {
       foundParameter = true;
       maxWorkingRpm = (int)constrain(request->getParam("maxWorkingRpm")->value().toInt(), 800L, 8000L);
       settingWrite(NK_maxWorkingRpm, String(maxWorkingRpm).c_str());
@@ -5312,10 +5665,9 @@ void setupServer() {
                          : cvStressActive ? "CV stress test"
                          : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
                          : (chcActive != 0) ? "Charge health calibration" : nullptr;
-      // A refusal has to be latched as a failed result, not just said on the console: the wizard
-      // consumes a not-ok ready result immediately, so without this it polls for the full run
-      // timeout waiting for a run that was never armed. Not when chc itself is the blocker — that
-      // would abort the run in progress from the wizard's point of view.
+      // A refusal is latched as a failed result, not just a console line: the wizard consumes a not-ok ready result at
+      // once, otherwise it polls the full run timeout for a run never armed. Not when chc itself is the blocker (that
+      // would abort the run in progress from the wizard's view).
       if (sysMode != SYS_MODE_AUTO) {
         queueConsoleMessage("Charge health calibration: start blocked — only allowed while charging in Auto mode");
         if (chcActive == 0) {
@@ -5324,6 +5676,12 @@ void setupServer() {
         }
       } else if (chcRequested) {
         queueConsoleMessage("Charge health calibration: start ignored (already requested)");
+      } else if (const char *rr = rpmTestRefuseReason()) {
+        queueConsoleMessageF("Charge health calibration: start blocked — %s", rr);
+        if (chcActive == 0) {
+          chcOk = false; chcResultsReady = true;
+          snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — %s", rr);
+        }
       } else if (maxWorkingRpm <= 0 && chcActive == 0) {
         queueConsoleMessage("Charge health calibration: start blocked — enter the maximum working RPM first");
         chcOk = false; chcResultsReady = true;
@@ -5335,7 +5693,7 @@ void setupServer() {
           snprintf(chcAbortMsg, sizeof(chcAbortMsg), "start blocked — %s is active", busy);
         }
       } else if ((millis() - chcLastEndMs) > 2000UL) {
-        if (request->hasParam("chcPct"))
+        if (paramOk(request, "chcPct"))
           chcTestPct = (uint8_t)constrain(request->getParam("chcPct")->value().toInt(), 20, 80);
         // NVS reads belong here, on the web task — never in the control tick that consumes them.
         chcLoadCapColumn(false, chcLoTable);
@@ -5362,17 +5720,17 @@ void setupServer() {
     // ── Protection Actuation Tests (Settings → Emergency & Troubleshooting) ──
     //   Value setters (Set buttons): store into the globals; Fire uses the stored values. Independent
     //   ifs so each Set form (which carries only its own param) is handled on its own.
-    if (request->hasParam("protTestCutMs")) {
+    if (paramOk(request, "protTestCutMs")) {
       protTestCutMs = (uint16_t)constrain(request->getParam("protTestCutMs")->value().toInt(), 20, 10000);
       foundParameter = true;
       queueConsoleMessageF("Protection test: cut duration = %u ms", protTestCutMs);
     }
-    if (request->hasParam("protTestGapMs")) {
+    if (paramOk(request, "protTestGapMs")) {
       protTestGapMs = (uint16_t)constrain(request->getParam("protTestGapMs")->value().toInt(), 100, 20000);
       foundParameter = true;
       queueConsoleMessageF("Protection test: gap = %u ms", protTestGapMs);
     }
-    if (request->hasParam("protTestReps")) {
+    if (paramOk(request, "protTestReps")) {
       protTestReps = (uint8_t)constrain(request->getParam("protTestReps")->value().toInt(), 1, 20);
       foundParameter = true;
       queueConsoleMessageF("Protection test: repeats = %u", protTestReps);
@@ -5386,7 +5744,7 @@ void setupServer() {
     }
     //   Fire buttons: trigger a run using the stored values. mode 1=instant cut, 2=load-dump,
     //   3=graceful ramp, 4=ladder walk (all AUTO + live-field gated), 5=manual bench cut (Manual Field).
-    if (request->hasParam("protTestStart")) {
+    if (paramOk(request, "protTestStart")) {
       foundParameter = true;
       int mode = request->getParam("protTestStart")->value().toInt();
       const char *busy = (systemIDActive != 0) ? "Plant Delay test"
@@ -5428,6 +5786,8 @@ void setupServer() {
         queueConsoleMessage("Protection test: start blocked — engine-running tests need charging in Auto mode (in Manual mode, use Bench Testing instead)");
       } else if (!chargingEnabled) {
         queueConsoleMessage("Protection test: start blocked — charging must be enabled (engine running, On/Off on)");
+      } else if (const char *rr = rpmTestRefuseReason()) {
+        queueConsoleMessageF("Protection test: start blocked — %s", rr);
       } else if (RPM < (float)MinRPMForField) {
         queueConsoleMessageF("Protection test: start blocked — RPM %d below Min RPM For Field (%d); raise engine speed",
                              (int)RPM, MinRPMForField);
@@ -5448,10 +5808,8 @@ void setupServer() {
     }
 
     // ── Min% onset-knee sweep (commissioning stage 7) ───────────────────────
-    // Reuses the field-curve ramp in onset-stop mode (stops at first current). Each completed
-    // sweep is committed as an anchor; applyKneeCurve fits the Min% column across the anchors.
-    // Deliberately NOT gated on kneeLearnEnable: the floor table it fills is always live (max
-    // with the scalar MinDuty) — the learning toggle gates only the background learner.
+    // Field-curve ramp in onset-stop mode; each completed sweep is an anchor, applyKneeCurve fits the Min% column. NOT
+    // gated on kneeLearnEnable: the floor table is always live (max with MinDuty); the toggle gates only the learner.
     if (request->hasParam("startKneeSweep")) {
       foundParameter = true;
       const char *busy = (systemIDActive != 0) ? "Plant Delay test"
@@ -5468,6 +5826,8 @@ void setupServer() {
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode != SYS_MODE_AUTO) {
         queueConsoleMessage("Keep-alive onset: start blocked — only allowed while charging in Auto mode");
+      } else if (const char *rr = rpmTestRefuseReason()) {
+        queueConsoleMessageF("Keep-alive onset: start blocked — %s", rr);
       } else if (busy != nullptr) {
         queueConsoleMessageF("Keep-alive onset: start blocked — %s is active", busy);
       } else if ((millis() - fieldCurveLastEndMs) > 2000UL) {
@@ -5490,12 +5850,8 @@ void setupServer() {
     }
 
     // ── Gate-tuning capture: session logger + field sweeper (ALT_GATE_TUNING_CAPTURE_SPEC.md) ──
-    // Buttons, not URL parameters typed by hand: this is operated while also managing a throttle.
-    // The browser confirms the discard before pressing Record over an un-dumped session.
-    // Each of these only RAISES a flag: the 192 KB is allocated, freed and state-changed on the
-    // control loop (altLogService), so a press can never free the buffer while a row is being
-    // written. Refusals and confirmations come back on the console a few ms later, exactly as the
-    // field curve reports its own start.
+    // Each press only RAISES a flag: the 192 KB buffer is allocated, freed and state-changed on the control loop
+    // (altLogService), so a press can never free it mid-row. Replies come back on the console.
     if (request->hasParam("altLogRecord")) {
       foundParameter = true;
       altLogStartReq = true;
@@ -5512,18 +5868,6 @@ void setupServer() {
     }
     if (request->hasParam("altSweepStart")) {
       foundParameter = true;
-      if (paramOk(request, "rate")) altSweepRatePctS = request->getParam("rate")->value().toFloat();
-      if (paramOk(request, "from")) altSweepFromPct  = request->getParam("from")->value().toFloat();
-      if (paramOk(request, "to"))   altSweepToPct    = request->getParam("to")->value().toFloat();
-      // Turnaround margins. 0 is legal and means "turn around on the limit itself" — the ramp then
-      // relies on the hard-cut layer alone, which is the behaviour the margins exist to avoid, so it
-      // is allowed but never the default. Upper clamps keep a fat-fingered entry from making the
-      // span shorter than the 1% minimum and refusing every sweep.
-      if (paramOk(request, "marginA"))
-        altSweepMarginA = constrain(request->getParam("marginA")->value().toFloat(), 0.0f, 100.0f);
-      if (paramOk(request, "marginV"))
-        altSweepMarginV = constrain(request->getParam("marginV")->value().toFloat(),
-                                    0.0f, 2.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
       const char *busy = (systemIDActive != 0) ? "Plant Delay test"
                          : TuningMode ? "Current tuning"
                          : CVTuningMode ? "Voltage tuning"
@@ -5546,11 +5890,20 @@ void setupServer() {
       } else if (busy != nullptr) {
         queueConsoleMessageF("Field sweep: start blocked — %s is active", busy);
       } else if ((millis() - altSweepLastEndMs) > 2000UL) {
-        // Deliberately does NOT clear altSweepAbortRequested: after an external teardown
-        // (protection cut / leaving AUTO) the tick's static phase is still mid-ramp, and only the
-        // latch makes the next normal tick reset it. Clearing it here would let a Start pressed
-        // before that tick resume the stale ramp as an instant field step. altSweep_tick consumes
-        // a stale latch itself: the abort gate resets phase first, then phase 0 starts this request.
+        // Do NOT clear altSweepAbortRequested: after an external teardown the tick's static phase is still mid-ramp and
+        // only the latch makes the next tick reset it; clearing it would let this Start resume the stale ramp as an
+        // instant field step (altSweep_tick consumes a stale latch itself). Parameters are taken only here because
+        // altSweepLimitNow() reads the margins live, so a refused press must not rewrite the running sweep's turnaround.
+        if (paramOk(request, "rate")) altSweepRatePctS = request->getParam("rate")->value().toFloat();
+        if (paramOk(request, "from")) altSweepFromPct  = request->getParam("from")->value().toFloat();
+        if (paramOk(request, "to"))   altSweepToPct    = request->getParam("to")->value().toFloat();
+        // Margin 0 is legal ("turn around on the limit", relying on the hard-cut layer alone) but never the default.
+        // Upper clamps keep a fat-fingered entry from shrinking the span under the 1% minimum and refusing every sweep.
+        if (paramOk(request, "marginA"))
+          altSweepMarginA = constrain(request->getParam("marginA")->value().toFloat(), 0.0f, 100.0f);
+        if (paramOk(request, "marginV"))
+          altSweepMarginV = constrain(request->getParam("marginV")->value().toFloat(),
+                                      0.0f, 2.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));
         altSweepReqMs = millis();
         altSweepRequested = true;
       } else {
@@ -5569,12 +5922,11 @@ void setupServer() {
       if (altSweepActive == 1) altSweepReverseReq = true;
       else queueConsoleMessage("Field sweep: Reverse now ignored — no ramp is on its way up");
     }
-    if (request->hasParam("addKneeAnchor")) {
+    if (paramOk(request, "addKneeAnchor")) {
       foundParameter = true;
-      // Keyed to the run that produced the result, and commits it exactly once: a sweep's completion
-      // frame reaches every poll still in flight and each one asks to commit (one held speed was filed
-      // as four anchors). The token rejects another run's result, the consume below a repeat of this
-      // one. ok gates as well as duty — the "no onset found" exit stores the ceiling duty, which is > 0.
+      // Keyed to the run that produced the result and committed exactly once: a sweep's completion frame reaches every
+      // in-flight poll and each asks to commit. The token rejects another run's result, the consume below a repeat. ok
+      // gates as well as duty: the "no onset found" exit stores the ceiling duty, which is > 0.
       const uint32_t tok = (uint32_t)strtoul(request->getParam("addKneeAnchor")->value().c_str(), nullptr, 10);
       if (tok != fieldCurveRunTok) {
         queueConsoleMessage("Keep-alive onset: commit ignored — it names a different sweep than the one that just ran");
@@ -5613,7 +5965,7 @@ void setupServer() {
     }
 
     // ── Auto-commissioning: Phase-2 relaxed matrix gate ─────────────────────
-    if (request->hasParam("faCommissionGate")) {
+    if (paramOk(request, "faCommissionGate")) {
       foundParameter = true;
       faCommissionGate = (request->getParam("faCommissionGate")->value().toInt() != 0);
       queueConsoleMessageF("Commissioning matrix gate %s", faCommissionGate ? "RELAXED (Phase 2)" : "strict");
@@ -5622,31 +5974,38 @@ void setupServer() {
     // ── RPM ripple table game-fill window (RPM_RIPPLE_TABLE_SPEC §2.2) ──
     // Arm = wipe + stamp + open the fold (deferred to Core 1); disarm = freeze + persist. The browser
     // sends ripGameIdleRpm and the resTest level BEFORE arming — the wipe stamps both into the session.
-    if (request->hasParam("ripGameFill")) {
+    if (paramOk(request, "ripGameFill")) {
       foundParameter = true;
       bool on = (request->getParam("ripGameFill")->value().toInt() != 0);
-      if (on) {
+      const char *rr = on ? rpmTestRefuseReason() : nullptr;   // an arm would wipe the map with nothing to refill it
+      if (rr) {
+        queueConsoleMessageF("RPM ripple sweep: start blocked — %s", rr);
+      } else if (on) {
         ripTabPendingWipe = true;
       } else {
         ripGameFill = false;
         ripTabPendingWipe = false;  // cancel an arm that never executed
         ripTabPendingSave = true;
       }
-      queueConsoleMessageF("RPM ripple sweep %s", on ? "started (table wiped)" : "ended (table frozen + saved)");
+      if (!rr) queueConsoleMessageF("RPM ripple sweep %s", on ? "started (table wiped)" : "ended (table frozen + saved)");
     }
-    if (request->hasParam("ripGameIdleRpm")) {
+    if (paramOk(request, "ripGameIdleRpm")) {
       foundParameter = true;
       long v = request->getParam("ripGameIdleRpm")->value().toInt();
       ripIdleRpmStage = (uint16_t)((v < 0) ? 0 : (v > 4000) ? 4000 : v);
     }
 
     // ── Active 3-current resonance test (COMMISSIONING_SPEC §3.2): arm = clear the ring + collect ──
-    if (request->hasParam("bcurRtest")) {
+    if (paramOk(request, "bcurRtest")) {
       foundParameter = true;
       bool on = (request->getParam("bcurRtest")->value().toInt() != 0);
-      if (on) bcurRtestCount = 0;  // arm clears; windows append only when the §10 steadiness gates pass (both sensors)
-      bcurRtestActive = on;
-      queueConsoleMessageF("Resonance current test %s", on ? "ARMED (vary charge current)" : "stopped");
+      if (const char *rr = on ? rpmTestRefuseReason() : nullptr) {
+        queueConsoleMessageF("Resonance current test: start blocked — %s", rr);
+      } else {
+        if (on) bcurRtestCount = 0;  // arm clears; windows append only when the §10 steadiness gates pass (both sensors)
+        bcurRtestActive = on;
+        queueConsoleMessageF("Resonance current test %s", on ? "ARMED (vary charge current)" : "stopped");
+      }
     }
 
     // ── Auto-commissioning: state machine ───────────────────────────────────
@@ -5655,31 +6014,26 @@ void setupServer() {
       // Repeat click while a Start is already staging (double-click / second tab): first staging
       // wins — the wizard's /cxStartState poll resolves either way.
       if (cxStartPersistStep == 0) {
-        // Resuming a live run (IN_PROGRESS with its origin snapshot still present — e.g. reopening the
-        // wizard after a page reload or a mid-wizard reboot) must NOT re-baseline: the origin snapshot and
-        // the protection-flag backup keep their values from the original Start, so a later Abort still
-        // reverts to the true pre-commissioning tune. Any other Start (fresh, restart after abort/done,
-        // re-run on a demoted state==1 device that has no snapshot) captures the current tune as origin.
+        // Resuming a live run (IN_PROGRESS with its origin snapshot present) must NOT re-baseline: the snapshot and the
+        // protection-flag backup keep their original values so a later Abort reverts to the true pre-commissioning tune.
+        // Any other Start captures the current tune as origin.
         bool resumingRun = (commissionState == 1 && settingExists(NK_commissionSnap));
         if (!resumingRun) commissionProtBackup = testProtectionsEnabled;
         // Force protections ON for the run so the tuning-tab Protections sliders can't leak a stray "off"
         // into commissioning. Restored to the backup on done/abort.
         testProtectionsEnabled = true;
-        // RAM-only staging of the origin snapshot + step baseline + state keys; the loop worker
-        // retires the NVS writes one commit per pass so this handler never stalls the network task
-        // (the old in-handler burst froze the SSE stream ~2 s). The wizard polls /cxStartState and
-        // advances only when the worker reports IDLE — the HTTP 200 alone means accepted, not saved.
+        // RAM-only staging; the loop worker retires the NVS writes one commit per pass so this handler never stalls the
+        // network task. The wizard polls /cxStartState: HTTP 200 alone means accepted, not saved.
         cxStartPersistBegin(resumingRun);
-        // Wipe the live onset-knee FIT SCRATCH so the Min% floor step (stage 7) starts its
-        // sweeps clean. (This is only the in-session anchor/fit state — NOT the applied rpmMinDutyTable
-        // floors, which are left intact. cxStartPersistBegin above already captured kneeFitA for the backup.)
+        // Wipe the in-session onset-knee anchor/fit scratch so stage 7 starts clean; the applied rpmMinDutyTable floors
+        // stay (cxStartPersistBegin already captured kneeFitA for the backup).
         kneeAnchorN = 0;
         kneeFitResidPct = -1.0f; kneeFitWorstIdx = -1; kneeFitA = 0.0f; kneeFitC = 0.0f;
       }
     }
     // Mark one wizard stage complete (i = 0=Prep…8=Stress test). Sets its done bit and clears
     // any downstream stage it feeds (coupling: see commissionDependentsMask). Drives the ✓ marks.
-    if (request->hasParam("commissionStageDone")) {
+    if (paramOk(request, "commissionStageDone")) {
       foundParameter = true;
       int s = request->getParam("commissionStageDone")->value().toInt();
       commissionMarkStage(s);
@@ -5688,7 +6042,7 @@ void setupServer() {
     }
     // Skip a step "for now": leave it outstanding (badge keeps nagging) but flag it hand-touched so the
     // Finish summary lists it for manual setup. Does not advance phase — the wizard moves on client-side.
-    if (request->hasParam("commissionStageSkip")) {
+    if (paramOk(request, "commissionStageSkip")) {
       foundParameter = true;
       int s = request->getParam("commissionStageSkip")->value().toInt();
       commissionSkipStage(s);
@@ -5696,7 +6050,7 @@ void setupServer() {
       queueConsoleMessageF("Commissioning: step %d skipped (set manually later)", s + 1);
     }
     // Mark a step done BY HAND (unmeasured): counts toward COMMISSIONED so the nag can stop, flagged manual.
-    if (request->hasParam("commissionStageManual")) {
+    if (paramOk(request, "commissionStageManual")) {
       foundParameter = true;
       int s = request->getParam("commissionStageManual")->value().toInt();
       commissionManualStage(s);
@@ -5715,24 +6069,20 @@ void setupServer() {
       // worker before the cancel lands. Resume/none fall through: a resume's cancel only stops the
       // bookkeeping writes, the original snapshot is intact for the teardown below.
       if (cxStartPersistCancel() == CX_CANCEL_FRESH) {
-        // A fresh Start still staging (state=1 not yet committed) never began: cancel back to the
-        // exact pre-click state. The live-run teardown below would wrongly demote a previously-
-        // commissioned device whose re-run never actually started.
+        // A fresh Start still staging never began: cancel back to the exact pre-click state. The live-run teardown
+        // below would wrongly demote a previously-commissioned device.
         settingsDirty = true;
         queueConsoleMessage("Commissioning: start cancelled before the restore point was saved — nothing changed");
       } else if (commissionState != 1 && !settingExists(NK_commissionSnap)) {
-        // No run in flight: a finished pass (commissionDone) drops BOTH the origin snapshot and the
-        // pre-run record, so the teardown below would find neither, fall through to the legacy zeroing
-        // and silently demote a COMMISSIONED device to NOT_COMMISSIONED — wiping every done/manual
-        // mark — while reporting "settings left as they are". Abort is a no-op here. State 1 with no
-        // snapshot still takes the teardown: that IS the legacy/older-firmware run the zeroing is for.
+        // No run in flight: a finished pass drops both the origin snapshot and the pre-run record, so the teardown below
+        // would fall through to the zeroing and silently demote a COMMISSIONED device. Abort is a no-op here. State 1
+        // with no snapshot still takes the teardown (older-firmware runs, which the zeroing is for).
         queueConsoleMessage("Commissioning: nothing to abort — no run is in progress, the committed tune and its record are untouched");
       } else {
         testProtectionsEnabled = commissionProtBackup;  // restore the user's manual-tuning protection setting
         bool reverted = commissionRestore();  // revert every setting to the Phase-0 snapshot
-        // Bookkeeping goes back to the pre-run record (a device that was COMMISSIONED before a targeted
-        // redo is commissioned again — its tune just came back). No record (runs started on older
-        // firmware, or Clear-and-restart on a committed device) → everything clears, as before.
+        // Bookkeeping goes back to the pre-run record (a COMMISSIONED device redoing a step is commissioned again). No
+        // record (older-firmware run, or Clear-and-restart on a committed device) -> everything clears.
         if (!commissionRestorePreRun()) {
           commissionSetState(0);                // NOT_COMMISSIONED
           commissionSetPhase(0);                // clear checklist progress
@@ -5789,7 +6139,7 @@ void setupServer() {
       commissionSetPhase(COMMISSION_STAGE_COUNT);  // wizard pass finished (= one past the last step)
       // Browser wall clock, not the device soft clock (which can be unset at sea). A garbage stamp is
       // rejected rather than written, because a far-future epoch would silence the age prompt forever.
-      if (request->hasParam("cmEpoch")) {
+      if (paramOk(request, "cmEpoch")) {
         long long e = strtoll(request->getParam("cmEpoch")->value().c_str(), nullptr, 10);
         if (e > 1735689600LL) {   // 2025-01-01
           CommissionEpoch = (time_t)e;
@@ -5807,10 +6157,9 @@ void setupServer() {
                            : commissionRequiredComplete()            ? "device COMMISSIONED (stress test skipped — it's an optional reference check)"
                                                                      : "partial — some steps still pending");
     }
-    // Wizard heartbeat: persist the current wizard phase so the tab checklist survives
-    // a page reload / a different client. Clamped 0..COMMISSION_STAGE_COUNT (last value = finished).
-    // Does not change commissionState.
-    if (request->hasParam("commissionPhase")) {
+    // Wizard heartbeat: persist the phase so the tab checklist survives a reload / another client (last value =
+    // finished). Does not change commissionState.
+    if (paramOk(request, "commissionPhase")) {
       foundParameter = true;
       int p = request->getParam("commissionPhase")->value().toInt();
       if (p < 0) p = 0; if (p > COMMISSION_STAGE_COUNT) p = COMMISSION_STAGE_COUNT;
@@ -5829,20 +6178,20 @@ void setupServer() {
     // Commissioning idle-rest heartbeat. The open wizard pings =1 every ~2 s to keep the field "rested"
     // at a low duty between steps; on a clean close it pings =0 to drop the hold and resume charging
     // immediately. A missing ping (crash / Wi-Fi drop) goes stale on its own after the firmware timeout.
-    if (request->hasParam("commissionHeartbeat")) {
+    if (paramOk(request, "commissionHeartbeat")) {
       heartbeat = true;
       lastCommissionHeartbeatMs = (request->getParam("commissionHeartbeat")->value().toInt() != 0)
                                   ? millis() : 0;   // 0 = explicit exit → stale now → charging resumes
     }
 
-    if (request->hasParam("TemperatureLimitF")) {
+    if (paramOk(request, "TemperatureLimitF")) {
       foundParameter = true;
       inputMessage = request->getParam("TemperatureLimitF")->value();
       settingWrite(NK_TemperatureLimitF, inputMessage.c_str());
       TemperatureLimitF = inputMessage.toInt();
     }
     // Cold-charge lockout (lithium protection) — master on/off. Turning it OFF is the user "override".
-    if (request->hasParam("coldChargeLockoutEnable")) {
+    if (paramOk(request, "coldChargeLockoutEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("coldChargeLockoutEnable")->value();
       coldChargeLockoutEnable = inputMessage.toInt() != 0;
@@ -5858,27 +6207,27 @@ void setupServer() {
     }
     // Battery + extra temperature probes, battery-temperature source chain, hot-charge lockout
     // (BATTERY_TEMP_SENSORS_SPEC.md §6). Temperatures arrive in °F (the UI converts).
-    if (request->hasParam("battTempProbeEnable")) {
+    if (paramOk(request, "battTempProbeEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("battTempProbeEnable")->value();
       battTempProbeEnable = (inputMessage.toInt() != 0) ? 1 : 0;
       settingWrite(NK_battTempProbeEnable, String(battTempProbeEnable).c_str());
     }
-    if (request->hasParam("extraTempProbeEnable")) {
+    if (paramOk(request, "extraTempProbeEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("extraTempProbeEnable")->value();
       extraTempProbeEnable = (inputMessage.toInt() != 0) ? 1 : 0;
       settingWrite(NK_extraTempProbeEnable, String(extraTempProbeEnable).c_str());
     }
-    if (request->hasParam("battTempSource")) {
+    if (paramOk(request, "battTempSource")) {
       foundParameter = true;
       inputMessage = request->getParam("battTempSource")->value();
       battTempSource = constrain(inputMessage.toInt(), 0, 6);  // 0 Auto, 1..4 pinned sources, 6 None
-      if (battTempSource == 5) battTempSource = 0;               // 5 (board) retired 2026-09-18 — falls back to Auto
+      if (battTempSource == 5) battTempSource = 0;               // 5 (board) is retired: falls back to Auto
       settingWrite(NK_battTempSource, String(battTempSource).c_str());
     }
     // Hot-charge lockout — mirror of the cold one; acts only on a measured battery temperature (source 1..4).
-    if (request->hasParam("hotChargeLockoutEnable")) {
+    if (paramOk(request, "hotChargeLockoutEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("hotChargeLockoutEnable")->value();
       hotChargeLockoutEnable = (inputMessage.toInt() != 0) ? 1 : 0;
@@ -5891,7 +6240,7 @@ void setupServer() {
       MaxChargeTempF = constrain(inputMessage.toFloat(), 32.0f, 200.0f);   // the form's range; stored raw, a bad value (0 from a non-number) would lock charging out
       settingWrite(NK_MaxChargeTempF, String(MaxChargeTempF, 1).c_str());
     }
-    if (request->hasParam("extraTempAlarmHiEnable")) {
+    if (paramOk(request, "extraTempAlarmHiEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("extraTempAlarmHiEnable")->value();
       extraTempAlarmHiEnable = (inputMessage.toInt() != 0) ? 1 : 0;
@@ -5903,7 +6252,7 @@ void setupServer() {
       extraTempAlarmHiF = constrain(inputMessage.toFloat(), -40.0f, 300.0f);
       settingWrite(NK_extraTempAlarmHiF, String(extraTempAlarmHiF, 1).c_str());
     }
-    if (request->hasParam("extraTempAlarmLoEnable")) {
+    if (paramOk(request, "extraTempAlarmLoEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("extraTempAlarmLoEnable")->value();
       extraTempAlarmLoEnable = (inputMessage.toInt() != 0) ? 1 : 0;
@@ -6004,17 +6353,17 @@ void setupServer() {
     }
     // Fast alt-current diagnostic knobs (Pattern B). Globals are updated live so faDrain()
     // and the steady-state gate react immediately; no reboot needed (faEnabled toggles the driver).
-    if (request->hasParam("faEnabled")) {
+    if (paramOk(request, "faEnabled")) {
       foundParameter = true;
       faEnabled = (request->getParam("faEnabled")->value().toInt() != 0);
       settingWrite(NK_faEnabled, faEnabled ? "1" : "0");
     }
-    if (request->hasParam("faAlarmEnable")) {
+    if (paramOk(request, "faAlarmEnable")) {
       foundParameter = true;
       faAlarmEnable = (request->getParam("faAlarmEnable")->value().toInt() != 0);
       settingWrite(NK_faAlarmEnable, faAlarmEnable ? "1" : "0");
     }
-    if (request->hasParam("faAnomPause")) {
+    if (paramOk(request, "faAnomPause")) {
       foundParameter = true;
       faAnomPause = (request->getParam("faAnomPause")->value().toInt() != 0);
       settingWrite(NK_faAnomPause, faAnomPause ? "1" : "0");
@@ -6072,7 +6421,7 @@ void setupServer() {
       settingWrite(NK_faPeakMinA, String(faPeakMinA, 2).c_str());
     }
     // ---- Auto Min% learning ("knee tracker") knobs ----
-    if (request->hasParam("kneeLearnEnable")) {
+    if (paramOk(request, "kneeLearnEnable")) {
       foundParameter = true;
       kneeLearnEnable = (request->getParam("kneeLearnEnable")->value().toInt() != 0);
       settingWrite(NK_kneeLearnEnable, kneeLearnEnable ? "1" : "0");
@@ -6107,7 +6456,7 @@ void setupServer() {
       kneeStepPct = request->getParam("kneeStepPct")->value().toFloat();
       settingWrite(NK_kneeStepPct, String(kneeStepPct, 2).c_str());
     }
-    if (request->hasParam("kneeTempComp")) {
+    if (paramOk(request, "kneeTempComp")) {
       foundParameter = true;
       kneeTempComp = (request->getParam("kneeTempComp")->value().toInt() != 0);
       settingWrite(NK_kneeTempComp, kneeTempComp ? "1" : "0");
@@ -6142,7 +6491,7 @@ void setupServer() {
       kneeLearnResetDefaults();
     }
     // ---- Zero-drift characterization log (diagnostic) ----
-    if (request->hasParam("ZeroLogEnable")) {
+    if (paramOk(request, "ZeroLogEnable")) {
       foundParameter = true;
       ZeroLogEnable = (request->getParam("ZeroLogEnable")->value().toInt() != 0);
       settingWrite(NK_ZeroLogEnable, ZeroLogEnable ? "1" : "0");
@@ -6151,7 +6500,7 @@ void setupServer() {
       foundParameter = true;
       zeroLogResetAll();
     }
-    if (request->hasParam("wifiNapEnabled")) {
+    if (paramOk(request, "wifiNapEnabled")) {
       foundParameter = true;
       wifiNapEnabled = (request->getParam("wifiNapEnabled")->value().toInt() != 0);
       settingWrite(NK_wifiNapEnabled, wifiNapEnabled ? "1" : "0");
@@ -6185,7 +6534,7 @@ void setupServer() {
       ManualDutyTarget = constrain(inputMessage.toFloat(), 0.0f, 100.0f);
       settingWrite(NK_ManualDutyTarget, String(ManualDutyTarget, 2).c_str());
     }
-    if (request->hasParam("socInfoAvailable")) {
+    if (paramOk(request, "socInfoAvailable")) {
       foundParameter = true;
       inputMessage = request->getParam("socInfoAvailable")->value();
       settingWrite(NK_socInfoAvailable, inputMessage.c_str());
@@ -6203,7 +6552,7 @@ void setupServer() {
       settingWrite(NK_RebulkVoltage, inputMessage.c_str());
       RebulkVoltage = inputMessage.toFloat();
     }
-    if (request->hasParam("rebulkDebounceTime")) {
+    if (paramOk(request, "rebulkDebounceTime")) {
       foundParameter = true;
       inputMessage = request->getParam("rebulkDebounceTime")->value();
       rebulkDebounceTime = (uint32_t)inputMessage.toInt() * 1000UL;  // sec → ms
@@ -6211,19 +6560,19 @@ void setupServer() {
       settingWrite(NK_rebulkDebounceTime, String(rebulkDebounceTime).c_str());
     }
 
-    if (request->hasParam("MinFloatTime")) {
+    if (paramOk(request, "MinFloatTime")) {
       foundParameter = true;
       inputMessage = request->getParam("MinFloatTime")->value();
       MinFloatTime = (uint32_t)inputMessage.toInt() * 60000UL;  // min → ms
       settingWrite(NK_MinFloatTime, String(MinFloatTime).c_str());
     }
-    if (request->hasParam("SOC_BlockRebulk_percent")) {
+    if (paramOk(request, "SOC_BlockRebulk_percent")) {
       foundParameter = true;
       inputMessage = request->getParam("SOC_BlockRebulk_percent")->value();
       settingWrite(NK_SOC_BlockRebulk_percent, inputMessage.c_str());
       SOC_BlockRebulk_percent = inputMessage.toInt();
     }
-    if (request->hasParam("SOC_AllowRebulk_percent")) {
+    if (paramOk(request, "SOC_AllowRebulk_percent")) {
       foundParameter = true;
       inputMessage = request->getParam("SOC_AllowRebulk_percent")->value();
       settingWrite(NK_SOC_AllowRebulk_percent, inputMessage.c_str());
@@ -6235,17 +6584,15 @@ void setupServer() {
       settingWrite(NK_BulkVoltage, inputMessage.c_str());
       BulkVoltage = inputMessage.toFloat();
     }
-    // NOTE: system voltage (12/24/36/48V) is NOT a /get setting — it lives in Vessel Info and the whole
-    // class-change rescale (charge profile, hard-shutdown, INA228 OV, normalized CV/CC gains) runs in
-    // the /saveVesselInfo handler via applyNominalVoltageChange(). SYSTEM_VOLTAGE_CLASS is the sole source.
-    if (request->hasParam("wavePeriod")) {
+    // System voltage class is not a /get setting: /saveVesselInfo sets it via applyNominalVoltageChange().
+    if (paramOk(request, "wavePeriod")) {
       foundParameter = true;
       inputMessage = request->getParam("wavePeriod")->value();
       settingWrite(NK_wavePeriod, inputMessage.c_str());
       wavePeriod = inputMessage.toInt();
       if (TuningMode) tuningParamChanged = true;
     }
-    if (request->hasParam("tuningWaveform")) {
+    if (paramOk(request, "tuningWaveform")) {
       foundParameter = true;
       inputMessage = request->getParam("tuningWaveform")->value();
       settingWrite(NK_tuningWaveform, inputMessage.c_str());
@@ -6270,7 +6617,7 @@ void setupServer() {
       settingWrite(NK_tuningSweepEnd, inputMessage.c_str());
       tuningSweepEnd = inputMessage.toFloat();
     }
-    if (request->hasParam("tuningSweepCycles")) {
+    if (paramOk(request, "tuningSweepCycles")) {
       foundParameter = true;
       inputMessage = request->getParam("tuningSweepCycles")->value();
       settingWrite(NK_tuningSweepCycles, inputMessage.c_str());
@@ -6285,11 +6632,10 @@ void setupServer() {
         tuningSweepRequested = true;   // momentary — the TuningMode sine block consumes it
       }
     }
-    if (request->hasParam("SwitchingFrequency")) {
+    if (paramOk(request, "SwitchingFrequency")) {
       foundParameter = true;
       inputMessage = request->getParam("SwitchingFrequency")->value();
-      // LEDC 12-bit ceiling is 19455Hz (clock divider must exceed 1.0) — higher values are rejected
-      // by the driver and, once in NVS, kill the boot-time PWM attach (bench-confirmed 2026-08-16).
+      // LEDC 12-bit ceiling is 19455 Hz (clock divider must exceed 1.0); a higher value in NVS kills the boot-time PWM attach.
       int requestedFreq = constrain(inputMessage.toInt(), 100, 19455);
       settingWrite(NK_SwitchingFrequency, String(requestedFreq).c_str());
       SwitchingFrequency = requestedFreq;
@@ -6301,13 +6647,13 @@ void setupServer() {
       settingWrite(NK_FloatVoltage, inputMessage.c_str());
       FloatVoltage = inputMessage.toFloat();
     }
-    if (request->hasParam("yyMin")) {
+    if (paramOk(request, "yyMin")) {
       foundParameter = true;
       inputMessage = request->getParam("yyMin")->value();
       settingWrite(NK_yyMin, inputMessage.c_str());
       yyMin = inputMessage.toInt();
     }
-    if (request->hasParam("ManualFieldToggle")) {
+    if (paramOk(request, "ManualFieldToggle")) {
       foundParameter = true;
       bool manualIsRepeat = false;
       if (clientWriteTrack(request, g_manualWriteSrc, g_manualWriteN, &g_manualWriteNext, &manualIsRepeat)) {
@@ -6317,27 +6663,24 @@ void setupServer() {
         inputMessage = request->getParam("ManualFieldToggle")->value();
         settingWrite(NK_ManualFieldToggle, inputMessage.c_str());
         ManualFieldToggle = inputMessage.toInt();
-        // Same fingerprint as the master switch: this is the one write that removes the protections, and
-        // it left no trace at all — the 2026-09-15 bench cut (RPM_TOO_LOW in what the user knew as
-        // Manual mode) could only be attributed to "some client".
+        // Fingerprinted like the master switch: this is the write that bypasses the protections.
         logClientWrite(request, (ManualFieldToggle == 1) ? "FIELD CONTROL: MANUAL (protections bypassed)"
                                                          : "FIELD CONTROL: AUTO");
       }
     }
-    if (request->hasParam("capLimitMode")) {
+    if (paramOk(request, "capLimitMode")) {
       foundParameter = true;
       inputMessage = request->getParam("capLimitMode")->value();
       settingWrite(NK_capLimitMode, inputMessage.c_str());
       capLimitMode = constrain(inputMessage.toInt(), 0, 1);
     }
-    if (request->hasParam("PhysicalPanelOverride")) {
+    if (paramOk(request, "PhysicalPanelOverride")) {
       foundParameter = true;
       inputMessage = request->getParam("PhysicalPanelOverride")->value();
       PhysicalPanelOverride = (inputMessage.toInt() == 1) ? 1 : 0;  // clamped: the resolvers test == 0 and the app gates on === 1, so any other value would split them
       settingWrite(NK_PhysicalPanelOverride, String(PhysicalPanelOverride).c_str());
-      // Ownership of both modes just moved. Re-resolve here rather than waiting for the loop pass, so
-      // the CSV3 echo this request triggers already carries the modes the new owner asks for — turning
-      // the override off has to put the app's stored choice back on screen in the same round trip.
+      // Re-resolve now so the CSV3 echo of this request already carries the new owner's modes (turning the
+      // override off must put the app's stored choice back on screen in the same round trip).
       if (applyChargeRateMode(resolveChargeRateMode())) {
         queueConsoleMessageF("Charge rate mode: switched to %s", HiLow == 1 ? "Normal" : "Low");
       }
@@ -6353,16 +6696,15 @@ void setupServer() {
         queueConsoleMessage("Your stored Force Maintain Mode choice stays off: Target Voltage mode is on and the two are mutually exclusive. Turn Target Voltage mode off to get Maintain Mode back.");
       }
     }
-    if (request->hasParam("MaintainMode")) {
+    if (paramOk(request, "MaintainMode")) {
       foundParameter = true;
       inputMessage = request->getParam("MaintainMode")->value();
       MaintainModeUserSel = inputMessage.toInt();  // the app's stored choice; inert while PhysicalPanelOverride is on, but still recorded so turning the override back off restores it
       if (!BatteryShuntPresent) MaintainModeUserSel = 0;  // no battery-current sensor at all → 0-net-amps hold impossible
       settingWrite(NK_MaintainMode, String(MaintainModeUserSel).c_str());
       if (MaintainModeUserSel && PhysicalPanelOverride == 0) {
-        // MaintainMode and TargetVoltageMode are mutually exclusive — clear the other. Only while the app
-        // owns the mode: with the panel override on this choice is inert, so clearing Target Voltage for
-        // it would cost the user that mode for nothing.
+        // Mutually exclusive with TargetVoltageMode. Cleared only while the app owns the mode: under the panel
+        // override this choice is inert, so clearing Target Voltage would cost the user that mode for nothing.
         TargetVoltageMode = 0;
         settingWrite(NK_TargetVoltageMode, "0");
       }
@@ -6370,7 +6712,7 @@ void setupServer() {
       if (PhysicalPanelOverride) queueConsoleMessageF("MaintainMode choice stored (%s) - the Cable 3 Force Float switch decides while Physical Panel Override is on", MaintainModeUserSel ? "on" : "off");
       else queueConsoleMessageF("MaintainMode mode %s", MaintainMode ? "enabled" : "disabled");
     }
-    if (request->hasParam("TargetVoltageMode")) {
+    if (paramOk(request, "TargetVoltageMode")) {
       foundParameter = true;
       inputMessage = request->getParam("TargetVoltageMode")->value();
       TargetVoltageMode = inputMessage.toInt();
@@ -6387,17 +6729,13 @@ void setupServer() {
       }
       queueConsoleMessageF("TargetVoltageMode %s", TargetVoltageMode ? "enabled" : "disabled");
     }
-    if (request->hasParam("OnOff")) {
-      // NOTE: OnOff==0 already caused an early return above, so this
-      // branch only runs for OnOff==1 (or any non-zero value) after
-      // the arm check has passed.
+    if (paramOk(request, "OnOff")) {
+      // OnOff==0 returned early above; only non-zero values past the arm check reach here.
       foundParameter = true;
       bool onIsRepeat = false;
       if (clientWriteTrack(request, g_onOffWriteSrc, g_onOffWriteN, &g_onOffWriteNext, &onIsRepeat)) {
-        // A press the user has since superseded (an OFF or a later ON from the same tab was already
-        // applied). Applying it would re-energize a field the user just switched off.
-        // Or — the common case since the dashboard began hedging — simply the second copy of a press
-        // that already landed. Nothing superseded it, and the log must not say otherwise.
+        // Either a superseded press (applying it would re-energize a field the user just switched off) or the
+        // hedged second copy of a press that already landed; the log must tell the two apart.
         logClientWrite(request, onIsRepeat ? "OnOff=1 IGNORED: duplicate copy of a press already applied"
                                            : "OnOff=1 IGNORED: out of order for its tab (an OFF or later ON already applied)");
       } else {
@@ -6407,34 +6745,31 @@ void setupServer() {
         OnOff = inputMessage.toInt();
         stateRevision++;
         logClientWrite(request, "ALTERNATOR ENABLED: master switch ON");
-        // Off→on is the operator asking for a charge, so a pack resting in IDLE (charge cycle finished,
-        // UseFloat=0) restarts from BULK instead of leaving the switch dead until a voltage-sag rebulk.
-        // Consumed by updateChargingStage() on the control task.
+        // Off->on restarts a pack resting in IDLE from BULK, else the switch stays dead until a voltage-sag
+        // rebulk. Consumed by updateChargingStage() on the control task.
         if (wasOff && inIdleStage) restartChargeCycleRequested = true;
       }
     }
-    if (request->hasParam("HiLow")) {
+    if (paramOk(request, "HiLow")) {
       foundParameter = true;
       inputMessage = request->getParam("HiLow")->value();
       HiLowUserSel = inputMessage.toInt();  // the app's stored choice; inert while PhysicalPanelOverride is on, but still recorded so turning the override back off restores it
       settingWrite(NK_HiLow, inputMessage.c_str());
-      // Applied here as well as in servicePanelSwitchInputs() so the mode is live before this request
-      // returns; the loop-side call then finds nothing left to do. applyChargeRateMode() (6_functions.ino)
-      // carries the table swap, the thermal-loop note and the Hi->Lo ceiling glide. With the override on
-      // this resolves back to the panel's mode and the request changes nothing but the stored choice.
+      // Applied here as well as in servicePanelSwitchInputs() so the mode is live before this request returns.
+      // With the override on this resolves back to the panel's mode and only the stored choice changes.
       if (applyChargeRateMode(resolveChargeRateMode())) {
         queueConsoleMessageF("Charge rate mode: switched to %s", HiLow == 1 ? "Normal" : "Low");
       } else if (PhysicalPanelOverride) {
         queueConsoleMessageF("Charge rate choice stored (%s) - the Cable 3 switch decides while Physical Panel Override is on", HiLowUserSel == 0 ? "Low" : "Normal");
       }
     }
-    if (request->hasParam("InvertAltAmps")) {
+    if (paramOk(request, "InvertAltAmps")) {
       foundParameter = true;
       inputMessage = request->getParam("InvertAltAmps")->value();
       settingWrite(NK_InvertAltAmps, inputMessage.c_str());
       InvertAltAmps = inputMessage.toInt();
     }
-    if (request->hasParam("InvertBattAmps")) {
+    if (paramOk(request, "InvertBattAmps")) {
       foundParameter = true;
       inputMessage = request->getParam("InvertBattAmps")->value();
       settingWrite(NK_InvertBattAmps, inputMessage.c_str());
@@ -6451,16 +6786,14 @@ void setupServer() {
         queueConsoleMessageF("WRITE REJECTED: ShuntLead=%d - negative lead (1) or positive lead (2) only", lead);
       }
     }
-    if (request->hasParam("BatteryShuntPresent")) {
+    if (paramOk(request, "BatteryShuntPresent")) {
       foundParameter = true;
       inputMessage = request->getParam("BatteryShuntPresent")->value();
       settingWrite(NK_BatteryShuntPresent, inputMessage.c_str());
       BatteryShuntPresent = inputMessage.toInt();
-      // Only the two battery-CURRENT control laws go with the sticky statement "no shunt": zero-current float
-      // is demoted to voltage float and Maintain is cleared. Voltage float stays — absorption ends on its
-      // time limit and CV holds FloatVoltage, no current needed. A shunt declared present but with no
-      // resistance entered is a recoverable calibration gap: every Bcur consumer already gates on
-      // HAS_BATT_SHUNT, so suppress at runtime and leave the user's Float/Maintain choice in NVS.
+      // "No shunt" drops only the battery-current laws: zero-current float demotes to voltage float, Maintain clears.
+      // Shunt present but resistance unset is a recoverable gap: Bcur consumers gate on HAS_BATT_SHUNT, so the
+      // user's Float/Maintain choice stays in NVS.
       if (!BatteryShuntPresent) {
         if (UseFloat == 2)     { UseFloat = 1;     settingWrite(NK_UseFloat, "1"); }
         if (MaintainMode != 0 || MaintainModeUserSel != 0) { MaintainMode = 0; MaintainModeUserSel = 0; settingWrite(NK_MaintainMode, "0"); }
@@ -6471,25 +6804,23 @@ void setupServer() {
         queueConsoleMessage("Enter the shunt resistance to enable them. Your float setting is kept.");
       }
     }
-    if (request->hasParam("MaxDuty")) {
+    if (paramOk(request, "MaxDuty")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxDuty")->value();
       settingWrite(NK_MaxDuty, inputMessage.c_str());
       MaxDuty = inputMessage.toInt();
       if (pidInitialized) {
-        applyCcOutputLimits();  // one owner for the ceiling expression — a raw SetOutputLimits here silently diverges the moment ccDutyCeiling() stops being plain MaxDuty
+        applyCcOutputLimits();  // single owner of the ceiling expression; never a raw SetOutputLimits here
       }
-      queueConsoleMessageF("Max Duty updated to: %d%%", MaxDuty);
+      queueConsoleMessageF("Max Duty updated to: %d%%", (int)MaxDuty);
     }
     if (paramOk(request, "MaxFieldVolts")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxFieldVolts")->value();
-      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as the boot-time sanity check in InitSystemSettings, which rewrites anything outside it to 1.25 x the winding rating; 60 V covers a 48 V winding
+      MaxFieldVolts = constrain(inputMessage.toFloat(), 0.5f, 60.0f);  // same window as InitSystemSettings' boot sanity check; 60 V covers a 48 V winding
       settingWrite(NK_MaxFieldVolts, String(MaxFieldVolts, 1).c_str());
-      // Force an immediate re-solve rather than waiting for the tick filter to drift the derived
-      // ceiling past its 0.5-point deadband: a large dtSec collapses the bus filter onto the present
-      // reading, so the new cap is enforced on the next duty write, not up to 2s later.
-      updateFieldVoltCeiling(getBatteryVoltage(), 999.0f);
+      // Re-solve now: the tick filter would take up to 2 s to move the ceiling past its 0.5-point deadband.
+      updateFieldVoltCeilingNow();
       queueConsoleMessageF("Max Field Volts updated to: %.1fV (field ceiling now %.1f%%)", MaxFieldVolts, ccDutyCeiling());
     }
     // Field winding rating outside a Vessel Info save: the dashboard's answer "use a 12 V winding" to the resistance check.
@@ -6502,7 +6833,7 @@ void setupServer() {
         return;
       }
       fieldWindingSet(request->getParam("FieldWindingV")->value().toInt(), nullptr);
-      updateFieldVoltCeiling(getBatteryVoltage(), 999.0f);
+      updateFieldVoltCeilingNow();
     }
     // The owner's "keep this winding" answer to the resistance check, carrying the "W:R" pairing it was asked about.
     if (request->hasParam("FieldWindingAck")) {
@@ -6513,7 +6844,7 @@ void setupServer() {
       }
       fieldWindingConfirm();
       fieldWindingReconcile("owner confirmed the winding");
-      updateFieldVoltCeiling(getBatteryVoltage(), 999.0f);
+      updateFieldVoltCeilingNow();
     }
     if (paramOk(request, "MinDuty")) {
       foundParameter = true;
@@ -6525,26 +6856,26 @@ void setupServer() {
       }
       queueConsoleMessageF("Min Field (tachometer keep-alive) updated to: %.2f%%", MinDuty);
     }
-    if (request->hasParam("LimpHome")) {
+    if (paramOk(request, "LimpHome")) {
       foundParameter = true;
       inputMessage = request->getParam("LimpHome")->value();
       settingWrite(NK_LimpHome, inputMessage.c_str());
       LimpHome = inputMessage.toInt();
     }
-    if (request->hasParam("VeData")) {
+    if (paramOk(request, "VeData")) {
       foundParameter = true;
       inputMessage = request->getParam("VeData")->value();
       settingWrite(NK_VeData, inputMessage.c_str());
       VeData = inputMessage.toInt();
     }
-    if (request->hasParam("NMEA0183Data")) {
+    if (paramOk(request, "NMEA0183Data")) {
       foundParameter = true;
       inputMessage = request->getParam("NMEA0183Data")->value();
       settingWrite(NK_NMEA0183Data, inputMessage.c_str());
       NMEA0183Data = inputMessage.toInt();
       if (NMEA0183Data != 1) n183ClearHeading();  // receiver stopped: nothing will ever age this value out again
     }
-    if (request->hasParam("NMEA0183Baud")) {
+    if (paramOk(request, "NMEA0183Baud")) {
       foundParameter = true;
       inputMessage = request->getParam("NMEA0183Baud")->value();
       int b = inputMessage.toInt();
@@ -6557,7 +6888,7 @@ void setupServer() {
         queueConsoleMessageF("NMEA 0183 baud must be 4800/9600/19200/38400 - %d rejected, keeping %d", b, NMEA0183Baud);
       }
     }
-    if (request->hasParam("NMEA0183Invert")) {
+    if (paramOk(request, "NMEA0183Invert")) {
       foundParameter = true;
       inputMessage = request->getParam("NMEA0183Invert")->value();
       NMEA0183Invert = (inputMessage.toInt() == 1) ? 1 : 0;
@@ -6565,142 +6896,147 @@ void setupServer() {
       n183ReconfigPending = true;  // Core 1 applies it; see the flag's declaration
       queueConsoleMessageF("NMEA 0183 polarity set to %s", NMEA0183Invert ? "inverted (TTL talker)" : "normal (RS-232 talker)");
     }
-    if (request->hasParam("NMEA2KData")) {
+    if (paramOk(request, "NMEA2KData")) {
       foundParameter = true;
       inputMessage = request->getParam("NMEA2KData")->value();
       settingWrite(NK_NMEA2KData, inputMessage.c_str());
       NMEA2KData = inputMessage.toInt();
     }
-    if (request->hasParam("n2kTxEnable")) {
+    if (paramOk(request, "n2kTxEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kTxEnable")->value();
       settingWrite(NK_n2kTxEn, inputMessage.c_str());
-      int newVal = inputMessage.toInt();
-      if (newVal != n2kTxEnable) queueConsoleMessage("NMEA2000 transmit: bus mode is set at boot — reboot to apply");
-      n2kTxEnable = newVal;  // per-PGN toggles/instances below apply live; only the node/listen mode itself is boot-time
+      n2kTxEnable = inputMessage.toInt();
+      n2kNodeReconfigPending = true;  // Core 1 joins or leaves the bus; see the flag's declaration
     }
-    if (request->hasParam("n2kDeviceInstance")) {
+    if (paramOk(request, "n2kDeviceInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kDeviceInstance")->value();
       n2kDeviceInstance = constrain(inputMessage.toInt(), 0, 252);
       settingWrite(NK_n2kDevInst, String(n2kDeviceInstance).c_str());
-      queueConsoleMessage("NMEA2000 device instance: applied at boot — reboot to take effect on the bus");
+      n2kNodeReconfigPending = true;  // Core 1 applies it; a live node re-announces itself with the new instance
     }
-    if (request->hasParam("n2kBattEnable")) {
+    if (paramOk(request, "n2kBattEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kBattEnable")->value();
       settingWrite(NK_n2kBattEn, inputMessage.c_str());
       n2kBattEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kBattInstance")) {
+    if (paramOk(request, "n2kBattInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kBattInstance")->value();
       n2kBattInstance = constrain(inputMessage.toInt(), 0, 252);
       settingWrite(NK_n2kBattInst, String(n2kBattInstance).c_str());
     }
-    if (request->hasParam("n2kBattCfgEnable")) {
+    if (paramOk(request, "n2kBattCfgEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kBattCfgEnable")->value();
       settingWrite(NK_n2kBattCfgEn, inputMessage.c_str());
       n2kBattCfgEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kAltEnable")) {
+    if (paramOk(request, "n2kAltEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kAltEnable")->value();
       settingWrite(NK_n2kAltEn, inputMessage.c_str());
       n2kAltEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kAltInstance")) {
+    if (paramOk(request, "n2kAltInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kAltInstance")->value();
       n2kAltInstance = constrain(inputMessage.toInt(), 0, 252);
       settingWrite(NK_n2kAltInst, String(n2kAltInstance).c_str());
     }
-    if (request->hasParam("n2kAltTempEnable")) {
+    if (paramOk(request, "n2kAltTempEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kAltTempEnable")->value();
       settingWrite(NK_n2kAltTempEn, inputMessage.c_str());
       n2kAltTempEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kTempInstance")) {
+    if (paramOk(request, "n2kTempInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kTempInstance")->value();
       n2kTempInstance = constrain(inputMessage.toInt(), 0, 252);
       settingWrite(NK_n2kTempInst, String(n2kTempInstance).c_str());
     }
-    if (request->hasParam("n2kTempSource")) {
+    if (paramOk(request, "n2kTempSource")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kTempSource")->value();
       n2kTempSource = constrain(inputMessage.toInt(), 0, 15);  // tN2kTempSource 4-bit field
       settingWrite(NK_n2kTempSrc, String(n2kTempSource).c_str());
     }
-    if (request->hasParam("n2kExtraTempEnable")) {
+    if (paramOk(request, "n2kExtraTempEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kExtraTempEnable")->value();
       settingWrite(NK_n2kExtraTempEnable, inputMessage.c_str());
       n2kExtraTempEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kExtraTempInstance")) {
+    if (paramOk(request, "n2kExtraTempInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kExtraTempInstance")->value();
       n2kExtraTempInstance = constrain(inputMessage.toInt(), 0, 252);
       settingWrite(NK_n2kExtraTempInstance, String(n2kExtraTempInstance).c_str());
     }
-    if (request->hasParam("n2kExtraTempSource")) {
+    if (paramOk(request, "n2kExtraTempSource")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kExtraTempSource")->value();
       n2kExtraTempSource = constrain(inputMessage.toInt(), 0, 15);  // tN2kTempSource 4-bit field
       settingWrite(NK_n2kExtraTempSource, String(n2kExtraTempSource).c_str());
     }
-    if (request->hasParam("n2kChgrEnable")) {
+    if (paramOk(request, "n2kChgrEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kChgrEnable")->value();
       settingWrite(NK_n2kChgrEn, inputMessage.c_str());
       n2kChgrEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kChgrInstance")) {
+    if (paramOk(request, "n2kChgrInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kChgrInstance")->value();
       n2kChgrInstance = constrain(inputMessage.toInt(), 0, 252);
       settingWrite(NK_n2kChgrInst, String(n2kChgrInstance).c_str());
     }
-    if (request->hasParam("n2kChgrCfgEnable")) {
+    if (paramOk(request, "n2kChgrCfgEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kChgrCfgEnable")->value();
       settingWrite(NK_n2kChgrCfgEn, inputMessage.c_str());
       n2kChgrCfgEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kChgrMode")) {
+    if (paramOk(request, "n2kChgrMode")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kChgrMode")->value();
       n2kChgrMode = constrain(inputMessage.toInt(), 0, 2);  // tN2kChargerMode: Standalone/Primary/Secondary
       settingWrite(NK_n2kChgrMode, String(n2kChgrMode).c_str());
     }
-    if (request->hasParam("n2kEngRpmEnable")) {
+    if (paramOk(request, "n2kEngRpmEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kEngRpmEnable")->value();
       settingWrite(NK_n2kEngRpmEn, inputMessage.c_str());
       n2kEngRpmEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kEngInstance")) {
+    if (paramOk(request, "n2kEngInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kEngInstance")->value();
       n2kEngInstance = constrain(inputMessage.toInt(), 0, 252);
       settingWrite(NK_n2kEngInst, String(n2kEngInstance).c_str());
     }
-    if (request->hasParam("n2kEngDynEnable")) {
+    if (paramOk(request, "n2kEngDynEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kEngDynEnable")->value();
       settingWrite(NK_n2kEngDynEn, inputMessage.c_str());
       n2kEngDynEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kEngBitsEnable")) {
+    if (paramOk(request, "n2kEngBitsEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kEngBitsEnable")->value();
       settingWrite(NK_n2kEngBitsEn, inputMessage.c_str());
       n2kEngBitsEnable = inputMessage.toInt();
     }
-    if (request->hasParam("n2kRxBattInstance")) {
+    if (paramOk(request, "n2kConvStatEnable")) {
+      foundParameter = true;
+      inputMessage = request->getParam("n2kConvStatEnable")->value();
+      settingWrite(NK_n2kConvStatEn, inputMessage.c_str());
+      n2kConvStatEnable = inputMessage.toInt();
+    }
+    if (paramOk(request, "n2kRxBattInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("n2kRxBattInstance")->value();
       n2kRxBattInstance = constrain(inputMessage.toInt(), 0, 252);
@@ -6710,53 +7046,50 @@ void setupServer() {
       dataTimestamps[IDX_N2K_BATT] = 0;
       dataTimestamps[IDX_N2K_SOC] = 0;
     }
-    if (request->hasParam("rvcTxEnable")) {
+    if (paramOk(request, "rvcTxEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("rvcTxEnable")->value();
-      int newVal = inputMessage.toInt();
       settingWrite(NK_rvcTxEn, inputMessage.c_str());
-      // Same boot-time constraint as n2kTxEnable: becoming a bus node (address claim) happens once
-      // in initializeHardware. The per-DGN toggles and instances below apply live.
-      if (newVal != rvcTxEnable && n2kTxEnable != 1) queueConsoleMessage("RV-C transmit: bus mode is set at boot — reboot to apply");
-      rvcTxEnable = newVal;
+      rvcTxEnable = inputMessage.toInt();
+      n2kNodeReconfigPending = true;  // same node as NMEA2000 transmit; Core 1 joins or leaves the bus
     }
-    if (request->hasParam("rvcChgrEnable")) {
+    if (paramOk(request, "rvcChgrEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("rvcChgrEnable")->value();
       settingWrite(NK_rvcChgrEn, inputMessage.c_str());
       rvcChgrEnable = inputMessage.toInt();
     }
-    if (request->hasParam("rvcDcEnable")) {
+    if (paramOk(request, "rvcDcEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("rvcDcEnable")->value();
       settingWrite(NK_rvcDcEn, inputMessage.c_str());
       rvcDcEnable = inputMessage.toInt();
     }
-    if (request->hasParam("rvcFaultEnable")) {
+    if (paramOk(request, "rvcFaultEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("rvcFaultEnable")->value();
       settingWrite(NK_rvcFaultEn, inputMessage.c_str());
       rvcFaultEnable = inputMessage.toInt();
     }
-    if (request->hasParam("rvcChgrInstance")) {
+    if (paramOk(request, "rvcChgrInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("rvcChgrInstance")->value();
       rvcChgrInstance = constrain(inputMessage.toInt(), 1, 250);  // spec 6.20.8b: 0 is invalid
       settingWrite(NK_rvcChgrInst, String(rvcChgrInstance).c_str());
     }
-    if (request->hasParam("rvcDcInstance")) {
+    if (paramOk(request, "rvcDcInstance")) {
       foundParameter = true;
       inputMessage = request->getParam("rvcDcInstance")->value();
       rvcDcInstance = constrain(inputMessage.toInt(), 1, 250);  // spec 6.5.2b: 0 is invalid
       settingWrite(NK_rvcDcInst, String(rvcDcInstance).c_str());
     }
-    if (request->hasParam("rvcDevPriority")) {
+    if (paramOk(request, "rvcDevPriority")) {
       foundParameter = true;
       inputMessage = request->getParam("rvcDevPriority")->value();
       rvcDevPriority = constrain(inputMessage.toInt(), 0, 250);
       settingWrite(NK_rvcDevPri, String(rvcDevPriority).c_str());
     }
-    if (request->hasParam("dvccEn")) {
+    if (paramOk(request, "dvccEn")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccEn")->value();
       settingWrite(NK_dvccEn, inputMessage.c_str());
@@ -6775,31 +7108,37 @@ void setupServer() {
         queueConsoleMessage("Charge-limit follow enabled: authority must settle before limits apply. Verify the shown CVL/CCL match what the sender itself displays before relying on it.");
       }
     }
-    if (request->hasParam("dvccSrcType")) {
+    if (paramOk(request, "dvccSrcType")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccSrcType")->value();
       dvccSrcType = constrain(inputMessage.toInt(), 0, 1);
       settingWrite(NK_dvccSrcType, String(dvccSrcType).c_str());
       dvccResetAuthority();
     }
-    if (request->hasParam("dvccInst")) {
+    if (paramOk(request, "dvccInst")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccInst")->value();
       dvccInst = constrain(inputMessage.toInt(), 0, 250);  // RV-C DC instance range; 0 = any
       settingWrite(NK_dvccInst, String(dvccInst).c_str());
       dvccResetAuthority();
     }
-    if (request->hasParam("dvccSilenceS")) {
+    if (paramOk(request, "dvccSilenceS")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccSilenceS")->value();
       dvccSilenceS = constrain(inputMessage.toInt(), 5, 600);
       settingWrite(NK_dvccSilenceS, String(dvccSilenceS).c_str());
     }
-    if (request->hasParam("dvccSettleS")) {
+    if (paramOk(request, "dvccSettleS")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccSettleS")->value();
       dvccSettleS = constrain(inputMessage.toInt(), 5, 600);
       settingWrite(NK_dvccSettleS, String(dvccSettleS).c_str());
+    }
+    if (paramOk(request, "dvccVicCutHold")) {
+      foundParameter = true;
+      inputMessage = request->getParam("dvccVicCutHold")->value();
+      dvccVicCutHold = constrain(inputMessage.toInt(), 0, 1);
+      settingWrite(NK_dvccVicCutHold, String(dvccVicCutHold).c_str());
     }
     if (paramOk(request, "dvccCvlMin")) {
       foundParameter = true;
@@ -6829,14 +7168,14 @@ void setupServer() {
       foundParameter = true;
       dvccResetReq = true;  // consumed by dvccTick(); momentary action, no NVS
     }
-    if (request->hasParam("waveAmplitude")) {
+    if (paramOk(request, "waveAmplitude")) {
       foundParameter = true;
       inputMessage = request->getParam("waveAmplitude")->value();
       settingWrite(NK_waveAmplitude, inputMessage.c_str());
       waveAmplitude = inputMessage.toInt();
       if (TuningMode) tuningParamChanged = true;
     }
-    if (request->hasParam("tuningWaveFloor")) {
+    if (paramOk(request, "tuningWaveFloor")) {
       foundParameter = true;
       inputMessage = request->getParam("tuningWaveFloor")->value();
       settingWrite(NK_tuningWaveFloor, inputMessage.c_str());
@@ -6873,35 +7212,35 @@ void setupServer() {
       settingWrite(NK_TailCurrent, inputMessage.c_str());
       TailCurrent = inputMessage.toFloat();
     }
-    if (request->hasParam("ChargedDetectionTime")) {
+    if (paramOk(request, "ChargedDetectionTime")) {
       foundParameter = true;
       inputMessage = request->getParam("ChargedDetectionTime")->value();
       settingWrite(NK_ChargedDetectionTime, inputMessage.c_str());
       ChargedDetectionTime = inputMessage.toInt();
     }
-    if (request->hasParam("IgnoreTemperature")) {
+    if (paramOk(request, "IgnoreTemperature")) {
       foundParameter = true;
       inputMessage = request->getParam("IgnoreTemperature")->value();
       settingWrite(NK_IgnoreTemperature, inputMessage.c_str());
       IgnoreTemperature = inputMessage.toInt();
     }
-    if (request->hasParam("IgnoreRPM")) {
+    if (paramOk(request, "IgnoreRPM")) {
       foundParameter = true;
       inputMessage = request->getParam("IgnoreRPM")->value();
       settingWrite(NK_IgnoreRPM, inputMessage.c_str());
       IgnoreRPM = inputMessage.toInt();
     }
-    if (request->hasParam("IgnoreAltCurrent")) {
+    if (paramOk(request, "IgnoreAltCurrent")) {
       foundParameter = true;
       IgnoreAltCurrent = request->getParam("IgnoreAltCurrent")->value().toInt() ? 1 : 0;
       settingWrite(NK_IgnoreAltCurrent, String(IgnoreAltCurrent).c_str());
     }
-    if (request->hasParam("IgnoreBattVMain")) {
+    if (paramOk(request, "IgnoreBattVMain")) {
       foundParameter = true;
       IgnoreBattVMain = request->getParam("IgnoreBattVMain")->value().toInt() ? 1 : 0;
       settingWrite(NK_IgnoreBattVMain, String(IgnoreBattVMain).c_str());
     }
-    if (request->hasParam("IgnoreBattV2")) {
+    if (paramOk(request, "IgnoreBattV2")) {
       foundParameter = true;
       IgnoreBattV2 = request->getParam("IgnoreBattV2")->value().toInt() ? 1 : 0;
       settingWrite(NK_IgnoreBattV2, String(IgnoreBattV2).c_str());
@@ -6916,38 +7255,38 @@ void setupServer() {
       NoRpmCurrentA = fmaxf(0.0f, request->getParam("NoRpmCurrentA")->value().toFloat());
       settingWrite(NK_NoRpmCurrentA, String(NoRpmCurrentA, 1).c_str());
     }
-    if (request->hasParam("MinRPMForField")) {
+    if (paramOk(request, "MinRPMForField")) {
       foundParameter = true;
       inputMessage = request->getParam("MinRPMForField")->value();
       MinRPMForField = inputMessage.toInt();
       if (MinRPMForField < 0) MinRPMForField = 0;
       settingWrite(NK_MinRPMForField, String(MinRPMForField).c_str());
     }
-    if (request->hasParam("bmsLogic")) {
+    if (paramOk(request, "bmsLogic")) {
       foundParameter = true;
       inputMessage = request->getParam("bmsLogic")->value();
       settingWrite(NK_bmsLogic, inputMessage.c_str());
       bmsLogic = inputMessage.toInt();
     }
-    if (request->hasParam("bmsLogicLevelOff")) {
+    if (paramOk(request, "bmsLogicLevelOff")) {
       foundParameter = true;
       inputMessage = request->getParam("bmsLogicLevelOff")->value();
       settingWrite(NK_bmsLogicLevelOff, inputMessage.c_str());
       bmsLogicLevelOff = inputMessage.toInt();
     }
-    if (request->hasParam("AlarmActivate")) {
+    if (paramOk(request, "AlarmActivate")) {
       foundParameter = true;
       inputMessage = request->getParam("AlarmActivate")->value();
       settingWrite(NK_AlarmActivate, inputMessage.c_str());
       AlarmActivate = inputMessage.toInt();
     }
-    if (request->hasParam("TempAlarm")) {
+    if (paramOk(request, "TempAlarm")) {
       foundParameter = true;
       inputMessage = request->getParam("TempAlarm")->value();
       settingWrite(NK_TempAlarm, inputMessage.c_str());
       TempAlarm = inputMessage.toInt();
     }
-    if (request->hasParam("TempAlarmLow")) {
+    if (paramOk(request, "TempAlarmLow")) {
       foundParameter = true;
       inputMessage = request->getParam("TempAlarmLow")->value();
       settingWrite(NK_TempAlarmLow, inputMessage.c_str());
@@ -6965,19 +7304,19 @@ void setupServer() {
       settingWrite(NK_VoltageAlarmLow, inputMessage.c_str());
       VoltageAlarmLow = inputMessage.toFloat();
     }
-    if (request->hasParam("SocAlarmLow")) {
+    if (paramOk(request, "SocAlarmLow")) {
       foundParameter = true;
       inputMessage = request->getParam("SocAlarmLow")->value();
       SocAlarmLow = constrain(inputMessage.toInt(), 0, 100);
       settingWrite(NK_SocAlarmLow, String(SocAlarmLow).c_str());
     }
-    if (request->hasParam("CurrentAlarmHigh")) {
+    if (paramOk(request, "CurrentAlarmHigh")) {
       foundParameter = true;
       inputMessage = request->getParam("CurrentAlarmHigh")->value();
       settingWrite(NK_CurrentAlarmHigh, inputMessage.c_str());
       CurrentAlarmHigh = inputMessage.toInt();
     }
-    if (request->hasParam("RPMScalingFactor")) {
+    if (paramOk(request, "RPMScalingFactor")) {
       foundParameter = true;
       inputMessage = request->getParam("RPMScalingFactor")->value();
       int newScale = inputMessage.toInt();
@@ -7033,12 +7372,12 @@ void setupServer() {
       foundParameter = true;
       inputMessage = request->getParam("AlternatorCOffset")->value();
       settingWrite(NK_AlternatorCOffset, inputMessage.c_str());
+      const float offBefore = AlternatorCOffset;
       AlternatorCOffset = inputMessage.toFloat();
+      if (AutoAltCurrentZero != 1) zeroCorrFollowOffset(offBefore - AlternatorCOffset);   // typed against the uncorrected reading
     }
-    // Commissioned alternator-zero capture. Both momentary, neither is a stored setting:
-    // AltZeroCaptureNow requests one measurement (the control tick holds the field at 0% for it),
-    // altZeroApply folds the held capture into AlternatorCOffset above. A new request discards a
-    // capture still held from an earlier one: Zero Now means a fresh number, not the old one again.
+    // Alternator-zero capture, both momentary: AltZeroCaptureNow requests one measurement (control tick holds
+    // the field at 0%); altZeroApply folds the held capture into AlternatorCOffset. A new request discards it.
     if (request->hasParam("AltZeroCaptureNow")) {
       foundParameter = true;
       altZeroCapHeld    = 0;
@@ -7056,7 +7395,7 @@ void setupServer() {
       settingWrite(NK_BatteryCOffset, inputMessage.c_str());
       BatteryCOffset = inputMessage.toFloat();
     }
-    if (request->hasParam("AmpSensorRange")) {
+    if (paramOk(request, "AmpSensorRange")) {
       foundParameter = true;
       inputMessage = request->getParam("AmpSensorRange")->value();
       settingWrite(NK_AmpSensorRange, inputMessage.c_str());
@@ -7081,25 +7420,25 @@ void setupServer() {
       settingWrite(NK_T0_C, inputMessage.c_str());
       T0_C = inputMessage.toFloat();
     }
-    if (request->hasParam("TempSource")) {
+    if (paramOk(request, "TempSource")) {
       foundParameter = true;
       inputMessage = request->getParam("TempSource")->value();
       settingWrite(NK_TempSource, inputMessage.c_str());
       TempSource = inputMessage.toInt();
     }
-    if (request->hasParam("IgnitionOverride")) {
+    if (paramOk(request, "IgnitionOverride")) {
       foundParameter = true;
       inputMessage = request->getParam("IgnitionOverride")->value();
       settingWrite(NK_IgnitionOverride, inputMessage.c_str());
       IgnitionOverride = inputMessage.toInt();
     }
-    if (request->hasParam("AlarmLatchEnabled")) {
+    if (paramOk(request, "AlarmLatchEnabled")) {
       foundParameter = true;
       inputMessage = request->getParam("AlarmLatchEnabled")->value();
       settingWrite(NK_AlarmLatchEnabled, inputMessage.c_str());
       AlarmLatchEnabled = inputMessage.toInt();
     }
-    if (request->hasParam("GeneralFaultAlarm")) {
+    if (paramOk(request, "GeneralFaultAlarm")) {
       foundParameter = true;
       inputMessage = request->getParam("GeneralFaultAlarm")->value();
       GeneralFaultAlarm = inputMessage.toInt() ? 1 : 0;
@@ -7126,7 +7465,7 @@ void setupServer() {
       } else {
         // Adopt the form's selected mount orientation (RAM only — persisted by the Vessel Info
         // save), so calibrating BEFORE the first save still captures offsets in the right frame.
-        if (request->hasParam("imuOrient")) {
+        if (paramOk(request, "imuOrient")) {
           int o = request->getParam("imuOrient")->value().toInt();
           if (o >= 0 && o < IMU_ORIENT_COUNT) imuMountOrientation = (uint8_t)o;
         }
@@ -7155,12 +7494,12 @@ void setupServer() {
 
     if (request->hasParam("RebootRegulator")) {
       foundParameter = true;
-      rebootRequested = true;          // deferred — loop() does the actual restart after response flushes
       rebootRequestedAt = millis();
+      rebootRequested = true;          // deferred — loop() does the actual restart after response flushes
       queueConsoleMessage("REBOOT: requested from /get endpoint");
       inputMessage = "1";
     }
-    if (request->hasParam("absorptionCompleteTime")) {
+    if (paramOk(request, "absorptionCompleteTime")) {
       foundParameter = true;
       inputMessage = request->getParam("absorptionCompleteTime")->value();
       uint32_t seconds = (uint32_t)inputMessage.toInt();
@@ -7175,14 +7514,12 @@ void setupServer() {
       FLOAT_DURATION = seconds;
       settingWrite(NK_FLOAT_DURATION, String(seconds).c_str());
     }
-    if (request->hasParam("UseFloat")) {
+    if (paramOk(request, "UseFloat")) {
       foundParameter = true;
       inputMessage = request->getParam("UseFloat")->value();
       UseFloat = constrain(inputMessage.toInt(), 0, 2);  // 0=idle, 1=voltage float, 2=zero-current float
-      // Voltage float needs no battery current: without a shunt absorption ends on AbsorptionTimeoutMs and
-      // CV then holds FloatVoltage, the way a solar controller floats with no shunt. Zero-current float IS a
-      // battery-current control law, so with the shunt declared absent it is stored as voltage float (the
-      // runtime EFFECTIVE_USE_FLOAT map does the same for a shunt present but unset).
+      // Zero-current float is a battery-current law, so with the shunt declared absent it is stored as voltage
+      // float (EFFECTIVE_USE_FLOAT does the same at runtime for a shunt present but unset).
       if (!BatteryShuntPresent && UseFloat == 2) UseFloat = 1;
       settingWrite(NK_UseFloat, String(UseFloat).c_str());
     }
@@ -7199,7 +7536,7 @@ void setupServer() {
       settingWrite(NK_VMGTargetBearing, String(VMGTargetBearing).c_str());
     }
     // No VMGUseTrueWind param — both VMGs (manual + upwind) are always computed.
-    if (request->hasParam("timeSourceMode")) {
+    if (paramOk(request, "timeSourceMode")) {
       foundParameter = true;
       inputMessage = request->getParam("timeSourceMode")->value();
       uint8_t m = (uint8_t)inputMessage.toInt();
@@ -7212,7 +7549,7 @@ void setupServer() {
                                          : "NTP time only";
       queueConsoleMessageF("Time source set to %s", lbl);
     }
-    if (request->hasParam("gpsPositionSource")) {
+    if (paramOk(request, "gpsPositionSource")) {
       foundParameter = true;
       inputMessage = request->getParam("gpsPositionSource")->value();
       uint8_t m = (uint8_t)inputMessage.toInt();
@@ -7224,7 +7561,7 @@ void setupServer() {
                          : (m == GPS_SRC_NMEA)  ? "NMEA only"
                                                 : "phone only");
     }
-    if (request->hasParam("speedSourceMode")) {
+    if (paramOk(request, "speedSourceMode")) {
       foundParameter = true;
       inputMessage = request->getParam("speedSourceMode")->value();
       uint8_t m = (uint8_t)inputMessage.toInt();
@@ -7237,21 +7574,25 @@ void setupServer() {
     if (request->hasParam("ResetThermTemp")) {
       foundParameter = true;
       MaxTemperatureThermistor = 0;
+      nvsPersistNow = true;
       queueConsoleMessage("Max Thermistor Temp: Reset requested from web interface");
     }
     if (request->hasParam("ResetTemp")) {
       foundParameter = true;
       MaxAlternatorTemperatureF = 0;
+      nvsPersistNow = true;
       queueConsoleMessage("Max Alternator Temp: Reset requested from web interface");
     }
     if (request->hasParam("ResetVoltage")) {
       foundParameter = true;
       IBVMax = 0;
+      nvsPersistNow = true;
       queueConsoleMessage("Max Voltage: Reset requested from web interface");
     }
     if (request->hasParam("ResetCurrent")) {
       foundParameter = true;
       MeasuredAmpsMax = 0;
+      nvsPersistNow = true;
       queueConsoleMessage("Max Battery Current: Reset requested from web interface");
     }
     if (request->hasParam("ResetEngineRunTime")) {
@@ -7316,6 +7657,7 @@ void setupServer() {
     if (request->hasParam("ResetRPMMax")) {
       foundParameter = true;
       RPMMax = 0;
+      nvsPersistNow = true;
       queueConsoleMessage("Max Engine Speed: Reset requested from web interface");
     }
     if (request->hasParam("ResetSolarEnergy")) {
@@ -7326,6 +7668,7 @@ void setupServer() {
     }
     if (request->hasParam("ResetChargeCycles")) {
       foundParameter = true;
+      ChargeCycleEnergy = 0;   // ChargeCycles is recomputed from this every SoC pass
       ChargeCycles = 0;
       nvsPersistNow = true;
       queueConsoleMessage("Charge Cycles: Reset requested from web interface");
@@ -7333,6 +7676,7 @@ void setupServer() {
     if (request->hasParam("ResetMinVoltage")) {
       foundParameter = true;
       MinVoltage = 999.0;
+      nvsPersistNow = true;
       queueConsoleMessage("Min Voltage: Reset requested from web interface");
     }
     if (request->hasParam("ResetTotalDistance")) {
@@ -7344,6 +7688,7 @@ void setupServer() {
     if (request->hasParam("ResetAvgSpeed")) {
       foundParameter = true;
       AvgSpeed = 0;
+      avgSpeedResetRequested = true;
       nvsPersistNow = true;
       queueConsoleMessage("Average Speed: Reset requested from web interface");
     }
@@ -7353,9 +7698,8 @@ void setupServer() {
       nvsPersistNow = true;
       queueConsoleMessage("Sustained Speed: Reset requested from web interface");
     }
-    // Lifetime nav/sailing records — individual resets (moved off the diagnostics "Reset Peak
-    // Values" button). prev_* shadows are intentionally NOT touched so saveNVSDataFull() sees the
-    // change and actually persists the cleared value.
+    // Lifetime nav/sailing record resets. prev_* shadows are deliberately left alone so saveNVSDataFull()
+    // sees the change and persists the cleared value.
     if (request->hasParam("ResetLongestTrip")) {
       foundParameter = true;
       LongestSingleTrip_Nm_AllTime = 0.0f;   // in-progress trip (currentTripDistanceNm) intentionally preserved
@@ -7410,7 +7754,7 @@ void setupServer() {
       fcRun = false;                                    // break any in-progress steady run
       queueConsoleMessage("Fuel Economy Curve: Reset requested from web interface");
     }
-    if (request->hasParam("MaximumAllowedBatteryAmps")) {
+    if (paramOk(request, "MaximumAllowedBatteryAmps")) {
       foundParameter = true;
       inputMessage = request->getParam("MaximumAllowedBatteryAmps")->value();
       settingWrite(NK_MaximumAllowedBatteryAmps, inputMessage.c_str());
@@ -7434,19 +7778,19 @@ void setupServer() {
       LoadDumpDtThresh3 = inputMessage.toFloat();
       settingWrite(NK_LoadDumpDtThresh3, String(LoadDumpDtThresh3).c_str());
     }
-    if (request->hasParam("LoadDumpN1")) {
+    if (paramOk(request, "LoadDumpN1")) {
       foundParameter = true;
       inputMessage = request->getParam("LoadDumpN1")->value();
       LoadDumpN1 = constrain(inputMessage.toInt(), 1, 10);
       settingWrite(NK_LoadDumpN1, String(LoadDumpN1).c_str());
     }
-    if (request->hasParam("LoadDumpN2")) {
+    if (paramOk(request, "LoadDumpN2")) {
       foundParameter = true;
       inputMessage = request->getParam("LoadDumpN2")->value();
       LoadDumpN2 = constrain(inputMessage.toInt(), 1, 10);
       settingWrite(NK_LoadDumpN2, String(LoadDumpN2).c_str());
     }
-    if (request->hasParam("LoadDumpN3")) {
+    if (paramOk(request, "LoadDumpN3")) {
       foundParameter = true;
       inputMessage = request->getParam("LoadDumpN3")->value();
       LoadDumpN3 = constrain(inputMessage.toInt(), 1, 10);
@@ -7464,11 +7808,10 @@ void setupServer() {
       ManualSOCPoint = inputMessage.toFloat();
       SOC_percent = (int)roundf(ManualSOCPoint * 100.0f);   // SOC_percent is percent x100; round so decimals seed exactly
       CoulombCount_Ah_scaled = (ManualSOCPoint * BatteryCapacity_Ah);
-      shadowCoulombX100 = CoulombCount_Ah_scaled;  // external seed re-anchors the shadow twin
-      nvsPersistNow = true;  // persist SoC + coulomb count NOW (single save at end of handler). NVS otherwise only saves at the field-off edge, so a reboot before then (e.g. a forced OTA) would revert the manual seed and the loop would re-derive SoC from the stale/zero coulomb count.
+      nvsPersistNow = true;  // NVS otherwise saves only at the field-off edge; a reboot before then would revert the seed
       queueConsoleMessageF("SoC manually set to: %.2f%%", ManualSOCPoint);
     }
-    if (request->hasParam("BatteryCapacity_Ah")) {
+    if (paramOk(request, "BatteryCapacity_Ah")) {
       foundParameter = true;
       inputMessage = request->getParam("BatteryCapacity_Ah")->value();
       BatteryCapacity_Ah = constrain(inputMessage.toInt(), 1L, 100000L);  // reject 0 Ah — it divides-by-zero into SOC
@@ -7476,7 +7819,7 @@ void setupServer() {
       PeukertRatedCurrent_A = BatteryCapacity_Ah / 20.0f;
       queueConsoleMessageF("Battery capacity set to: %d Ah", BatteryCapacity_Ah);
     }
-    if (request->hasParam("ShuntResistanceMicroOhm")) {
+    if (paramOk(request, "ShuntResistanceMicroOhm")) {
       foundParameter = true;
       inputMessage = request->getParam("ShuntResistanceMicroOhm")->value();
       long r = inputMessage.toInt();   // a blank number input submits as "" → 0, which disables every Bcur feature
@@ -7499,19 +7842,19 @@ void setupServer() {
       if (CVTuningMode) cvTuningParamChanged = true;
     }
 
-    if (request->hasParam("maxPoints")) {
+    if (paramOk(request, "maxPoints")) {
       foundParameter = true;
       inputMessage = request->getParam("maxPoints")->value();
       settingWrite(NK_maxPoints, inputMessage.c_str());
       maxPoints = inputMessage.toInt();
     }
-    if (request->hasParam("Ymin1")) {
+    if (paramOk(request, "Ymin1")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymin1")->value();
       settingWrite(NK_Ymin1, inputMessage.c_str());
       Ymin1 = inputMessage.toInt();
     }
-    if (request->hasParam("Ymax1")) {
+    if (paramOk(request, "Ymax1")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymax1")->value();
       settingWrite(NK_Ymax1, inputMessage.c_str());
@@ -7529,47 +7872,35 @@ void setupServer() {
       settingWrite(NK_Ymax2, inputMessage.c_str());
       Ymax2 = inputMessage.toFloat();
     }
-    if (request->hasParam("Ymin3")) {
+    if (paramOk(request, "Ymin3")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymin3")->value();
       settingWrite(NK_Ymin3, inputMessage.c_str());
       Ymin3 = inputMessage.toInt();
     }
-    if (request->hasParam("Ymax3")) {
+    if (paramOk(request, "Ymax3")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymax3")->value();
       settingWrite(NK_Ymax3, inputMessage.c_str());
       Ymax3 = inputMessage.toInt();
     }
-    if (request->hasParam("Ymin4")) {
+    if (paramOk(request, "Ymin4")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymin4")->value();
       settingWrite(NK_Ymin4, inputMessage.c_str());
       Ymin4 = inputMessage.toInt();
     }
-    if (request->hasParam("Ymax4")) {
+    if (paramOk(request, "Ymax4")) {
       foundParameter = true;
       inputMessage = request->getParam("Ymax4")->value();
       settingWrite(NK_Ymax4, inputMessage.c_str());
       Ymax4 = inputMessage.toInt();
     }
-    if (request->hasParam("AutoShuntGainCorrection")) {
-      foundParameter = true;
-      inputMessage = request->getParam("AutoShuntGainCorrection")->value();
-      settingWrite(NK_AutoShuntGainCorrection, inputMessage.c_str());
-      AutoShuntGainCorrection = inputMessage.toInt();
-    }
-    if (request->hasParam("AutoAltCurrentZero")) {
+    if (paramOk(request, "AutoAltCurrentZero")) {
       foundParameter = true;
       inputMessage = request->getParam("AutoAltCurrentZero")->value();
       settingWrite(NK_AutoAltCurrentZero, inputMessage.c_str());
       AutoAltCurrentZero = inputMessage.toInt();
-    }
-    if (request->hasParam("ResetDynamicShuntGain")) {
-      foundParameter = true;
-      ResetDynamicShuntGain = 1;  // Set the flag - don't save to file as it's momentary
-      queueConsoleMessage("SOC Gain: Reset requested from web interface");
-      inputMessage = "1";
     }
     if (request->hasParam("ResetDynamicAltZero")) {
       foundParameter = true;
@@ -7583,13 +7914,13 @@ void setupServer() {
       settingWrite(NK_WindingTempOffset, inputMessage.c_str());
       WindingTempOffset = inputMessage.toFloat();
     }
-    if (request->hasParam("displayTempUnit")) {
+    if (paramOk(request, "displayTempUnit")) {
       foundParameter = true;
       inputMessage = request->getParam("displayTempUnit")->value();
       settingWrite(NK_displayTempUnit, inputMessage.c_str());
       displayTempUnit = (uint8_t)inputMessage.toInt();
     }
-    if (request->hasParam("displayVolUnit")) {
+    if (paramOk(request, "displayVolUnit")) {
       foundParameter = true;
       inputMessage = request->getParam("displayVolUnit")->value();
       settingWrite(NK_displayVolUnit, inputMessage.c_str());
@@ -7601,7 +7932,7 @@ void setupServer() {
       settingWrite(NK_PulleyRatio, inputMessage.c_str());
       PulleyRatio = inputMessage.toFloat();
     }
-    if (request->hasParam("ManualLifePercentage")) {
+    if (paramOk(request, "ManualLifePercentage")) {
       foundParameter = true;
       inputMessage = request->getParam("ManualLifePercentage")->value();
       settingWrite(NK_ManualLifePercentage, inputMessage.c_str());
@@ -7610,10 +7941,10 @@ void setupServer() {
       CumulativeInsulationDamage = 1.0 - life_fraction;
       CumulativeGreaseDamage = 1.0 - life_fraction;
       CumulativeBrushDamage = 1.0 - life_fraction;
-      nvsPersistNow = true;   // commit InsulDamage/GreaseDamage/BrushDamage now (single save at end of handler) instead of waiting for the next field-off edge.
+      nvsPersistNow = true;   // commit the damage values now, not at the next field-off edge
       queueConsoleMessageF("Alternator life manually set to %d%%", ManualLifePercentage);
     }
-    if (request->hasParam("webgaugesinterval")) {
+    if (paramOk(request, "webgaugesinterval")) {
       foundParameter = true;
       inputMessage = request->getParam("webgaugesinterval")->value();
       int newInterval = inputMessage.toInt();
@@ -7622,14 +7953,14 @@ void setupServer() {
       webgaugesinterval = newInterval;
       queueConsoleMessageF("Update interval set to: %dms", newInterval);
     }
-    if (request->hasParam("battMaxMode")) {
+    if (paramOk(request, "battMaxMode")) {
       foundParameter = true;
       inputMessage = request->getParam("battMaxMode")->value();
       battMaxMode = (inputMessage.toInt() != 0);
       settingWrite(NK_battMaxMode, battMaxMode ? "1" : "0");
       queueConsoleMessageF("Battery V/I plot sampling: %s", battMaxMode ? "Max" : "Average");
     }
-    if (request->hasParam("BattMonSrc")) {
+    if (paramOk(request, "BattMonSrc")) {
       foundParameter = true;
       const int src = request->getParam("BattMonSrc")->value().toInt();
       if (src == 0 || src == 1 || src == 3) {
@@ -7640,7 +7971,7 @@ void setupServer() {
         queueConsoleMessageF("WRITE REJECTED: BattMonSrc=%d - 0 (none), 1 (NMEA 2000) or 3 (VE.Direct) only", src);
       }
     }
-    if (request->hasParam("BatteryVoltageSource")) {
+    if (paramOk(request, "BatteryVoltageSource")) {
       foundParameter = true;
       inputMessage = request->getParam("BatteryVoltageSource")->value();
       int vsrc = inputMessage.toInt();
@@ -7650,21 +7981,21 @@ void setupServer() {
       queueConsoleMessageF("Battery voltage source for charge decisions: %s",
                            BatteryVoltageSource == 1 ? "NMEA 2000" : BatteryVoltageSource == 3 ? "Victron VE.Direct" : "onboard INA228");
     }
-    if (request->hasParam("totalPowerCycles")) {
+    if (paramOk(request, "totalPowerCycles")) {
       foundParameter = true;
       inputMessage = request->getParam("totalPowerCycles")->value();
       settingWrite(NK_totalPowerCycles, inputMessage.c_str());
       totalPowerCycles = inputMessage.toInt();
       nvsPersistNow = true;   // also commit the storage-namespace "PowerCycles" (what loadNVSData reads at boot) now, not at the field-off edge.
     }
-    if (request->hasParam("timeAxisModeChanging")) {
+    if (paramOk(request, "timeAxisModeChanging")) {
       foundParameter = true;
       inputMessage = request->getParam("timeAxisModeChanging")->value();
       settingWrite(NK_timeAxisModeChanging, inputMessage.c_str());
       timeAxisModeChanging = inputMessage.toInt();
       queueConsoleMessageF("Time axis mode changed to: %s", timeAxisModeChanging ? "UNIX timestamps" : "relative time");
     }
-    if (request->hasParam("plotTimeWindow")) {
+    if (paramOk(request, "plotTimeWindow")) {
       foundParameter = true;
       inputMessage = request->getParam("plotTimeWindow")->value();
       settingWrite(NK_plotTimeWindow, inputMessage.c_str());
@@ -7672,9 +8003,8 @@ void setupServer() {
     }
     if (paramOk(request, "LatitudeNMEA") && paramOk(request, "LongitudeNMEA")) {
       foundParameter = true;
-      // Engage the sticky manual override: these coords now beat boat NMEA and
-      // phone GPS until the user clears it (clearGpsManual). resolveSources()
-      // reasserts them every tick, so the auto-sources can't clobber them.
+      // Sticky manual override: beats boat NMEA and phone GPS until clearGpsManual; resolveSources()
+      // reasserts it every tick.
       LatitudeManual  = request->getParam("LatitudeNMEA")->value().toDouble();
       LongitudeManual = request->getParam("LongitudeNMEA")->value().toDouble();
       gpsManualActive = true;
@@ -7693,7 +8023,7 @@ void setupServer() {
       queueConsoleMessage("GPS: Manual override cleared — back to automatic (NMEA/phone)");
       nextWeatherUpdate = millis();  // refresh weather with whatever the auto chain now resolves
     }
-    if (request->hasParam("weatherModeEnabled")) {
+    if (paramOk(request, "weatherModeEnabled")) {
       foundParameter = true;
       inputMessage = request->getParam("weatherModeEnabled")->value();
       settingWrite(NK_weatherModeEnabled, inputMessage.c_str());
@@ -7706,7 +8036,7 @@ void setupServer() {
       settingWrite(NK_UVThresholdHigh, inputMessage.c_str());
       UVThresholdHigh = inputMessage.toFloat();
     }
-    if (request->hasParam("SolarWatts")) {
+    if (paramOk(request, "SolarWatts")) {
       foundParameter = true;
       inputMessage = request->getParam("SolarWatts")->value();
       settingWrite(NK_SolarWatts, inputMessage.c_str());
@@ -7721,13 +8051,13 @@ void setupServer() {
       sledRatioDirty = false;   // the typed value is now the stored value — a pending learned write must not overwrite it
       weatherRecomputePredicted();
     }
-    if (request->hasParam("solarLearnEnable")) {
+    if (paramOk(request, "solarLearnEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("solarLearnEnable")->value();
       settingWrite(NK_solarLearnEnable, inputMessage.c_str());
       solarLearnEnable = inputMessage.toInt();
     }
-    if (request->hasParam("solarUseConsEnable")) {
+    if (paramOk(request, "solarUseConsEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("solarUseConsEnable")->value();
       settingWrite(NK_solarUseConsEnable, inputMessage.c_str());
@@ -7752,10 +8082,8 @@ void setupServer() {
     }
     if (request->hasParam("TriggerWeatherUpdate")) {
       foundParameter = true;
-      // Every rejection path must give user feedback — a silent fall-through (e.g. no GPS) reads as
-      // "nothing happened". Check each precondition separately so the message names the actual reason.
-      // Deliberately NOT gated on field state: the scheduled fetch waits for fieldCutSettled (field
-      // gate cut 75 s), but a user pressing the button has asked for it now and owns the consequences.
+      // Every rejection names its reason; a silent fall-through reads as "nothing happened". Not gated on
+      // field state: the scheduled fetch waits for fieldCutSettled, but a button press asks for it now.
       if (LatitudeNMEA == 0.0 && LongitudeNMEA == 0.0) {
         queueConsoleMessage("Weather update failed: no GPS position yet — wait for a fix or set a manual lat/lon");
         inputMessage = "no_gps";
@@ -7774,6 +8102,8 @@ void setupServer() {
     if (request->hasParam("ResetLearningTable")) {
       foundParameter = true;
       resetLearningTableToDefaults();
+      kneeLearnResetDefaults();   // the learner's floors would otherwise rebuild the old column at the next boot
+      commissionClearStage(7);    // the commissioned Keep-Alive column is gone
       queueConsoleMessage("Learning table reset from web - refresh to see defaults");
       inputMessage = "1";
     }
@@ -7800,38 +8130,37 @@ void setupServer() {
       settingWrite(NK_SLAM_THRESHOLD_G, inputMessage.c_str());
       SLAM_THRESHOLD_G = inputMessage.toFloat();
     }
-    if (request->hasParam("IgnoreLearningDuringPenalty")) {
+    if (paramOk(request, "IgnoreLearningDuringPenalty")) {
       foundParameter = true;
       inputMessage = request->getParam("IgnoreLearningDuringPenalty")->value();
       settingWrite(NK_IgnoreLearningDuringPenalty, inputMessage.c_str());
       IgnoreLearningDuringPenalty = inputMessage.toInt();
     }
-    if (request->hasParam("CloudFeatures")) {
+    if (paramOk(request, "CloudFeatures")) {
       foundParameter = true;
       inputMessage = request->getParam("CloudFeatures")->value();
       settingWrite(NK_CloudFeatures, inputMessage.c_str());
       CloudFeatures = inputMessage.toInt();
     }
-    if (request->hasParam("RemoteDiagnostics")) {
+    if (paramOk(request, "RemoteDiagnostics")) {
       foundParameter = true;
       inputMessage = request->getParam("RemoteDiagnostics")->value();
       settingWrite(NK_RemoteDiagnostics, inputMessage.c_str());
       RemoteDiagnostics = inputMessage.toInt();
     }
-    if (request->hasParam("testProtectionsEnabled")) {
+    if (paramOk(request, "testProtectionsEnabled")) {
       foundParameter = true;
       inputMessage = request->getParam("testProtectionsEnabled")->value();
       testProtectionsEnabled = (inputMessage.toInt() != 0);
-      // NOT persisted to LittleFS — resets TRUE (enabled) on every boot by design.
-      // foundParameter=true above bumps settingsDirty so CSV3 echoes the change immediately,
-      // which fires the dashboard banner show/hide and syncs the per-page toggle states.
+      // Not persisted: resets to enabled on every boot by design. The CSV3 echo drives the dashboard banner
+      // and the per-page toggles.
       if (testProtectionsEnabled) {
         queueConsoleMessage("PROTECTIONS ENABLED — all protection layers restored");
       } else {
         queueConsoleMessage("PROTECTIONS DISABLED for tuning — G1/G2 over-voltage, timed OV cut tiers + G3 iExcess over-current bypassed; fast-OV hard-cut (AlternatorHardShutdownV), G4 load-dump/battery-current limit, INA228, and hardware OC remain active");
       }
     }
-    if (request->hasParam("TuningMode")) {
+    if (paramOk(request, "TuningMode")) {
       foundParameter = true;
       inputMessage = request->getParam("TuningMode")->value();
       int requested = inputMessage.toInt();
@@ -7852,7 +8181,7 @@ void setupServer() {
         TuningMode = requested;
       }
     }
-    if (request->hasParam("tuningSquareAbrupt")) {
+    if (paramOk(request, "tuningSquareAbrupt")) {
       foundParameter = true;   // transient (NOT persisted): CV plant fit asks for abrupt square edges
       tuningSquareAbrupt = (request->getParam("tuningSquareAbrupt")->value().toInt() != 0);
     }
@@ -7889,7 +8218,7 @@ void setupServer() {
         settingWrite(NK_bhDwellMs, String(bhDwellMs).c_str());
       }
     }
-    if (request->hasParam("bhDwellMs")) {   // stored unit — the CONFIG_MANIFEST key, so the fleet
+    if (paramOk(request, "bhDwellMs")) {   // stored unit — the CONFIG_MANIFEST key, so the fleet
       foundParameter = true;                // snapshot names what it holds. bhDwellSec is the UI alias.
       bhDwellMs = (uint32_t)request->getParam("bhDwellMs")->value().toInt();
       if (bhDwellMs < bhMinDwellMs()) bhDwellMs = bhMinDwellMs();
@@ -7901,7 +8230,7 @@ void setupServer() {
       if (bhDwellMs < bhMinDwellMs()) bhDwellMs = bhMinDwellMs();
       settingWrite(NK_bhDwellMs, String(bhDwellMs).c_str());
     }
-    if (request->hasParam("bhNumEdges")) {
+    if (paramOk(request, "bhNumEdges")) {
       foundParameter = true;
       int e = request->getParam("bhNumEdges")->value().toInt();
       if (e < 3) e = 3;
@@ -7911,6 +8240,8 @@ void setupServer() {
     }
     if (request->hasParam("bhStartOver")) {
       foundParameter = true;   // battery replaced: re-baseline + wipe history
+      // bhAbort is the only path that clears batteryHealthTestActive
+      if (bhTestState == 1) bhAbort("history reset (battery replaced) during the test");
       bhBaselineCapacityAh = 0.0f;
       bhResultCount = 0; bhResultHead = 0; bhResultsDirty = false;
       bhCapCount = 0; bhCapHead = 0; bhCapDirty = false;
@@ -7933,13 +8264,13 @@ void setupServer() {
     }
     // ── Capacity tracker config + OCV table ──
     if (paramOk(request, "capRestFrac"))   { foundParameter = true; capRestCurrentFrac = request->getParam("capRestFrac")->value().toFloat();   settingWrite(NK_capRestFrac, String(capRestCurrentFrac, 4).c_str()); }
-    if (request->hasParam("capRestFloor"))  { foundParameter = true; capRestFloorMin    = (uint16_t)request->getParam("capRestFloor")->value().toInt(); settingWrite(NK_capRestFloor, String(capRestFloorMin).c_str()); }
+    if (paramOk(request, "capRestFloor"))  { foundParameter = true; capRestFloorMin    = (uint16_t)request->getParam("capRestFloor")->value().toInt(); settingWrite(NK_capRestFloor, String(capRestFloorMin).c_str()); }
     if (paramOk(request, "capSettleRate")) { foundParameter = true; capSettleRateMv10  = request->getParam("capSettleRate")->value().toFloat(); settingWrite(NK_capSettleRate, String(capSettleRateMv10, 2).c_str()); }
     if (paramOk(request, "capSocLowMax"))  { foundParameter = true; capSocLowMax       = request->getParam("capSocLowMax")->value().toFloat();  settingWrite(NK_capSocLowMax, String(capSocLowMax, 1).c_str()); }
     if (paramOk(request, "capMinSpan"))    { foundParameter = true; capMinSpan         = request->getParam("capMinSpan")->value().toFloat();    settingWrite(NK_capMinSpan, String(capMinSpan, 1).c_str()); }
     if (paramOk(request, "capFullSoc"))    { foundParameter = true; capFullSoc         = request->getParam("capFullSoc")->value().toFloat();    settingWrite(NK_capFullSoc, String(capFullSoc, 1).c_str()); }
-    if (request->hasParam("capRefMode"))    { foundParameter = true; capRefMode         = (uint8_t)request->getParam("capRefMode")->value().toInt(); settingWrite(NK_capRefMode, String(capRefMode).c_str()); }
-    if (request->hasParam("capTempNorm"))   { foundParameter = true; capTempNormEnable  = (uint8_t)request->getParam("capTempNorm")->value().toInt(); settingWrite(NK_capTempNorm, String(capTempNormEnable).c_str()); }
+    if (paramOk(request, "capRefMode"))    { foundParameter = true; capRefMode         = (uint8_t)request->getParam("capRefMode")->value().toInt(); settingWrite(NK_capRefMode, String(capRefMode).c_str()); }
+    if (paramOk(request, "capTempNorm"))   { foundParameter = true; capTempNormEnable  = (uint8_t)request->getParam("capTempNorm")->value().toInt(); settingWrite(NK_capTempNorm, String(capTempNormEnable).c_str()); }
     if (paramOk(request, "capTempCoeff"))  { foundParameter = true; capTempCoeffPctC   = request->getParam("capTempCoeff")->value().toFloat();  settingWrite(NK_capTempCoeff, String(capTempCoeffPctC, 3).c_str()); }
     if (paramOk(request, "capTempRef"))    { foundParameter = true; capTempRefC        = request->getParam("capTempRef")->value().toFloat();   settingWrite(NK_capTempRef, String(capTempRefC, 1).c_str()); }
     if (request->hasParam("capOcv")) {
@@ -7958,13 +8289,13 @@ void setupServer() {
       settingWrite(NK_bhBaseline, "0");
       queueConsoleMessage("BATT CAP: capacity trend + baseline cleared");
     }
-    if (request->hasParam("LogAllLearningEvents")) {
+    if (paramOk(request, "LogAllLearningEvents")) {
       foundParameter = true;
       inputMessage = request->getParam("LogAllLearningEvents")->value();
       settingWrite(NK_LogAllLearningEvents, inputMessage.c_str());
       LogAllLearningEvents = inputMessage.toInt();
     }
-    if (request->hasParam("hardwarePresent")) {
+    if (paramOk(request, "hardwarePresent")) {
       foundParameter = true;
       inputMessage = request->getParam("hardwarePresent")->value();
       settingWrite(NK_hardwarePresent, inputMessage.c_str());
@@ -7974,11 +8305,14 @@ void setupServer() {
 
     // RPM breakpoint and current table handlers
     bool tableChangedThisRequest = false;
+    int prevRPMPoints[RPM_TABLE_SIZE];
+    memcpy(prevRPMPoints, rpmTableRPMPoints, sizeof(prevRPMPoints));
+    const bool capBothReq = paramOk(request, "capBothSave");   // its handler below owns this request's rpmTableRPMPoints*
     for (int i = 0; i < 10; i++) {
       char paramName[32];
 
       snprintf(paramName, sizeof(paramName), "rpmTableRPMPoints%d", i);
-      if (paramOk(request, paramName)) {
+      if (!capBothReq && paramOk(request, paramName)) {
         foundParameter = true;
         rpmTableRPMPoints[i] = request->getParam(paramName)->value().toInt();
         tableChangedThisRequest = true;
@@ -8007,61 +8341,17 @@ void setupServer() {
     }
 
     if (tableChangedThisRequest) {
-      // Track which RPM breakpoints changed
       learningTableUpdated = true;  // ← update the global so buildConfigPayload() sees it
-
-      static int previousRPMPoints[RPM_TABLE_SIZE] = { 0 };
-      static bool firstRun = true;
-
-      if (firstRun) {
-        for (int i = 0; i < RPM_TABLE_SIZE; i++) {
-          previousRPMPoints[i] = rpmTableRPMPoints[i];
-        }
-        firstRun = false;
-      }
-
-      bool rpmPointChanged = false;
-      for (int i = 0; i < RPM_TABLE_SIZE; i++) {
-        if (rpmTableRPMPoints[i] != previousRPMPoints[i]) {
-          rpmPointChanged = true;
-          overheatCount[i] = 0;
-          lastOverheatTime[i] = 0;
-          cumulativeNoOverheatTime[i] = 0;
-          learningUpCount[i] = 0;
-
-          if (i > 0) {
-            overheatCount[i - 1] = 0;
-            lastOverheatTime[i - 1] = 0;
-            cumulativeNoOverheatTime[i - 1] = 0;
-            learningUpCount[i - 1] = 0;
-          }
-
-          queueConsoleMessageF("Learning: RPM bin %d changed - cleared affected history", i);
-          previousRPMPoints[i] = rpmTableRPMPoints[i];
-        }
-      }
-
-      // An RPM breakpoint moved → every learned Min% floor is now keyed to the wrong RPM
-      // (the per-RPM onset-knee fit spans all bins). Wipe the knee tracker entirely so the floors are
-      // re-measured at the new breakpoints instead of silently re-applied at shifted RPMs.
-      if (rpmPointChanged) {
-        kneeLearnResetDefaults();   // clear floors/knees, unfreeze, column back to the flat baseline
-        commissionClearStage(7);    // Keep-alive floor + Field decay stage now stale (demotes a commissioned device to in-progress)
-        queueConsoleMessage("Learning: RPM breakpoints changed — keep-alive floors cleared, re-run the Keep-Alive Floor step");
-      }
-
+      rpmBreakpointsMoved(prevRPMPoints);
       pendingSaveUserTableEdits = true;  // deferred to Core 1 to avoid SSE gap
       queueConsoleMessage("Learning: Table saved to NVS");
     }
 
-    // Pre-commissioning "Charge Rate Limits" screen: seed BOTH the Low and High cap tables in one
-    // request, independent of the live HiLow mode. Only the active mode's live ceiling is refreshed
-    // here (so the running alternator honors the edit immediately); the mode switch itself rides a
-    // separate HiLow request so its ceiling glide runs. Both blobs are written on Core 1.
+    // Pre-commissioning "Charge Rate Limits" screen: seeds BOTH Low and High cap tables in one request,
+    // independent of the live HiLow mode. Both blobs are written on Core 1.
     if (paramOk(request, "capBothSave")) {
       foundParameter = true;
       char pn[32];
-      bool ptsChanged = false;
       float hiA[RPM_TABLE_SIZE], loA[RPM_TABLE_SIZE], hiW[RPM_TABLE_SIZE], loW[RPM_TABLE_SIZE];
       for (int i = 0; i < RPM_TABLE_SIZE; i++) {
         hiA[i] = rpmCapCurrentTable[i]; loA[i] = rpmCapCurrentTable[i];
@@ -8072,21 +8362,14 @@ void setupServer() {
         snprintf(pn, sizeof(pn), "rpmCapPwrLo%d", i); if (paramOk(request, pn)) loW[i] = request->getParam(pn)->value().toFloat() * 1000.0f;
 
         snprintf(pn, sizeof(pn), "rpmTableRPMPoints%d", i);
-        if (paramOk(request, pn)) {
-          int v = request->getParam(pn)->value().toInt();
-          if (v != rpmTableRPMPoints[i]) { ptsChanged = true; rpmTableRPMPoints[i] = v; }
-        }
+        if (paramOk(request, pn)) rpmTableRPMPoints[i] = request->getParam(pn)->value().toInt();
         // Refresh only the ACTIVE mode's live ceiling (so a running alternator honors the edit now);
         // the mode switch itself rides a separate HiLow request so its ceiling glide runs.
         rpmCapCurrentTable[i] = (HiLow == 1) ? hiA[i] : loA[i];
         rpmCapPowerTable[i]   = (HiLow == 1) ? hiW[i] : loW[i];
       }
-      if (ptsChanged) {
-        kneeLearnResetDefaults();
-        commissionClearStage(7);
-        queueConsoleMessage("Learning: RPM breakpoints changed — keep-alive floors cleared, re-run the Keep-Alive Floor step");
-      }
-      capBothStageBegin(hiA, hiW, loA, loW);   // 6_functions.ino: the loop writes the blobs one per pass; "saved" is announced from there and /capSaveState reports it
+      rpmBreakpointsMoved(prevRPMPoints);
+      capBothStageBegin(hiA, hiW, loA, loW);   // the loop writes one blob per pass and announces "saved"; /capSaveState reports it
       learningTableUpdated = true;
       stateRevision++;
     }
@@ -8121,7 +8404,7 @@ void setupServer() {
     }
 
 
-    if (request->hasParam("AlternatorNominalAmps")) {
+    if (paramOk(request, "AlternatorNominalAmps")) {
       foundParameter = true;
       inputMessage = request->getParam("AlternatorNominalAmps")->value();
       settingWrite(NK_AlternatorNominalAmps, inputMessage.c_str());
@@ -8145,7 +8428,7 @@ void setupServer() {
       settingWrite(NK_xTime, inputMessage.c_str());
       xTime = inputMessage.toFloat();
     }
-    if (request->hasParam("MinLearningInterval")) {
+    if (paramOk(request, "MinLearningInterval")) {
       foundParameter = true;
       inputMessage = request->getParam("MinLearningInterval")->value();
       int temp = inputMessage.toInt() * 1000;  // from seconds (entry into html) to ms
@@ -8206,10 +8489,10 @@ void setupServer() {
       float temp = inputMessage.toFloat();
       settingWrite(NK_PIDTrackingGain, String(temp).c_str());
       PIDTrackingGain = temp;
-      if (pidInitialized) currentPID.SetTrackingGain(PIDTrackingGain);  // enter_sys_auto() is the only other caller, so without this a live edit did nothing until the next AUTO entry
+      if (pidInitialized) currentPID.SetTrackingGain(PIDTrackingGain);  // else a live edit waits for the next enter_sys_auto()
       if (TuningMode) tuningParamChanged = true;
     }
-    if (request->hasParam("SafeOperationThreshold")) {
+    if (paramOk(request, "SafeOperationThreshold")) {
       foundParameter = true;
       inputMessage = request->getParam("SafeOperationThreshold")->value();
       int temp = inputMessage.toInt() * 1000;  // from seconds (entry into html) to ms
@@ -8240,7 +8523,7 @@ void setupServer() {
       settingWrite(NK_TargetVoltageSetpoint, inputMessage.c_str());
     }
 
-    if (request->hasParam("AbsorptionTimeoutMs")) {
+    if (paramOk(request, "AbsorptionTimeoutMs")) {
       foundParameter = true;
       inputMessage = request->getParam("AbsorptionTimeoutMs")->value();
       uint32_t minutes = (uint32_t)inputMessage.toInt();
@@ -8266,8 +8549,8 @@ void setupServer() {
     if (request->hasParam("cvGainMode")) {
       foundParameter = true;
       inputMessage = request->getParam("cvGainMode")->value();
-      // Strict "0"/"1" only: toInt("") decodes as 0 = Manual, silently swapping the fitted gains for the
-      // typed fallbacks (07-24 unexplained flip). Client IP makes any future flip attributable.
+      // Strict "0"/"1" only: toInt("") decodes as 0 = Manual, silently swapping in the typed fallback gains.
+      // Client IP makes any flip attributable.
       if (inputMessage == "0" || inputMessage == "1") {
         cvGainMode = (uint8_t)(inputMessage == "1" ? 1 : 0);
         settingWrite(NK_cvGainMode, String((int)cvGainMode).c_str());
@@ -8311,7 +8594,7 @@ void setupServer() {
       recomputeCvGains();
       queueConsoleMessageF("CV PI zero (Ki/Kp ratio): %.2f", cvPiZero);
     }
-    if (request->hasParam("battTempDerateEnable")) {  // master on/off for the battery-temp gain derate
+    if (paramOk(request, "battTempDerateEnable")) {  // master on/off for the battery-temp gain derate
       foundParameter = true;
       battTempDerateEnable = (request->getParam("battTempDerateEnable")->value().toInt() != 0);
       settingWrite(NK_battTempDerateEn, String((int)battTempDerateEnable).c_str());
@@ -8325,69 +8608,69 @@ void setupServer() {
       recomputeCvGains();
       queueConsoleMessageF("Battery-temp resistance coeff: %.3f /°C", battTempCoeff);
     }
-    if (request->hasParam("vTgtRampEnable")) {  // master switch for the voltage-target slew (1=on, 0=instant)
+    if (paramOk(request, "vTgtRampEnable")) {  // master switch for the voltage-target slew (1=on, 0=instant)
       foundParameter = true;
       vTgtRampEnable = (uint8_t)(request->getParam("vTgtRampEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_vTgtRampEnable, String((int)vTgtRampEnable).c_str());
       queueConsoleMessageF("CV target ramp limiter: %s", vTgtRampEnable ? "ON" : "OFF (instant)");
     }
-    if (request->hasParam("setpointSlewEnable")) {  // master switch for inner-loop current setpoint slew (1=on, 0=instant)
+    if (paramOk(request, "setpointSlewEnable")) {  // master switch for inner-loop current setpoint slew (1=on, 0=instant)
       foundParameter = true;
       setpointSlewEnable = (uint8_t)(request->getParam("setpointSlewEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_setpointSlewEnable, String((int)setpointSlewEnable).c_str());
       queueConsoleMessageF("Current setpoint slew limiter: %s", setpointSlewEnable ? "ON" : "OFF (instant)");
     }
-    if (request->hasParam("cvRiseGovEnable")) {  // master switch for CV rise governor / anti-windup clamp (1=on, 0=off)
+    if (paramOk(request, "cvRiseGovEnable")) {  // master switch for CV rise governor / anti-windup clamp (1=on, 0=off)
       foundParameter = true;
       cvRiseGovEnable = (uint8_t)(request->getParam("cvRiseGovEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_cvRiseGovEnable, String((int)cvRiseGovEnable).c_str());
       queueConsoleMessageF("CV rise governor (anti-windup): %s", cvRiseGovEnable ? "ON" : "OFF — OV-trip risk on up-steps");
     }
-    if (request->hasParam("cvRecovEnable")) {  // master switch for the post-protection integrator refill (1=on, 0=plain PI)
+    if (paramOk(request, "cvRecovEnable")) {  // master switch for the post-protection integrator refill (1=on, 0=plain PI)
       foundParameter = true;
       cvRecovEnable = (uint8_t)(request->getParam("cvRecovEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_cvRecovEnable, String((int)cvRecovEnable).c_str());
       queueConsoleMessageF("CV recovery refill: %s", cvRecovEnable ? "ON" : "OFF — recovery pace scales with post-cut error");
     }
-    if (request->hasParam("loadServeBoostEnable")) {  // load-serve Ki boost toward the measured house loads (shunt-gated)
+    if (paramOk(request, "loadServeBoostEnable")) {  // load-serve Ki boost toward the measured house loads (shunt-gated)
       foundParameter = true;
       loadServeBoostEnable = (uint8_t)(request->getParam("loadServeBoostEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_loadServeBoostEnable, String((int)loadServeBoostEnable).c_str());
       queueConsoleMessageF("Load pickup boost: %s", loadServeBoostEnable ? "ON" : "OFF — load pickup pace scales with voltage error only");
     }
-    if (request->hasParam("reseedCorrEnable")) {  // demand-corrected reseed: measured load-drop subtraction + rapid-refire ratchet escalation
+    if (paramOk(request, "reseedCorrEnable")) {  // demand-corrected reseed: measured load-drop subtraction + rapid-refire ratchet escalation
       foundParameter = true;
       reseedCorrEnable = (uint8_t)(request->getParam("reseedCorrEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_reseedCorrEnable, String((int)reseedCorrEnable).c_str());
       queueConsoleMessageF("Smart reseed: %s", reseedCorrEnable ? "ON" : "OFF — every release restores the plain seed fraction");
     }
-    if (request->hasParam("HuntGovEnable")) {  // oscillation damper: hunt detector + verified inner-Ki derate
+    if (paramOk(request, "HuntGovEnable")) {  // oscillation damper: hunt detector + verified inner-Ki derate
       foundParameter = true;
       HuntGovEnable = (uint8_t)(request->getParam("HuntGovEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_HuntGovEnable, String((int)HuntGovEnable).c_str());
       queueConsoleMessageF("Oscillation damper: %s", HuntGovEnable ? "ON" : "OFF — hunting persists at full gain");
     }
-    if (request->hasParam("HuntCutPct")) {
+    if (paramOk(request, "HuntCutPct")) {
       foundParameter = true;
       HuntCutPct = (uint8_t)constrain(request->getParam("HuntCutPct")->value().toInt(), HUNT_CUT_PCT_MIN, HUNT_CUT_PCT_MAX);
       settingWrite(NK_HuntCutPct, String((int)HuntCutPct).c_str());
     }
-    if (request->hasParam("HuntVerifyPct")) {
+    if (paramOk(request, "HuntVerifyPct")) {
       foundParameter = true;
       HuntVerifyPct = (uint8_t)constrain(request->getParam("HuntVerifyPct")->value().toInt(), HUNT_VERIFY_PCT_MIN, HUNT_VERIFY_PCT_MAX);
       settingWrite(NK_HuntVerifyPct, String((int)HuntVerifyPct).c_str());
     }
-    if (request->hasParam("HuntWingPct")) {
+    if (paramOk(request, "HuntWingPct")) {
       foundParameter = true;
       HuntWingPct = (uint8_t)constrain(request->getParam("HuntWingPct")->value().toInt(), HUNT_WING_PCT_MIN, HUNT_WING_PCT_MAX);
       settingWrite(NK_HuntWingPct, String((int)HuntWingPct).c_str());
     }
-    if (request->hasParam("HuntCooldownMin")) {
+    if (paramOk(request, "HuntCooldownMin")) {
       foundParameter = true;
       HuntCooldownMin = (uint8_t)constrain(request->getParam("HuntCooldownMin")->value().toInt(), HUNT_COOLDOWN_MIN_MIN, HUNT_COOLDOWN_MIN_MAX);
       settingWrite(NK_HuntCooldownMin, String((int)HuntCooldownMin).c_str());
     }
-    if (request->hasParam("HuntQualifyScans")) {
+    if (paramOk(request, "HuntQualifyScans")) {
       foundParameter = true;
       HuntQualifyScans = (uint8_t)constrain(request->getParam("HuntQualifyScans")->value().toInt(), HUNT_QUALIFY_SCANS_MIN, HUNT_QUALIFY_SCANS_MAX);
       settingWrite(NK_HuntQualifyScans, String((int)HuntQualifyScans).c_str());
@@ -8397,18 +8680,18 @@ void setupServer() {
       HuntTrigPct = fmaxf(request->getParam("HuntTrigPct")->value().toFloat(), HUNT_TRIG_PCT_MIN);
       settingWrite(NK_HuntTrigPct, String(HuntTrigPct, 3).c_str());
     }
-    if (request->hasParam("HuntSteadyPct")) {
+    if (paramOk(request, "HuntSteadyPct")) {
       foundParameter = true;
       HuntSteadyPct = (uint8_t)constrain(request->getParam("HuntSteadyPct")->value().toInt(), HUNT_STEADY_PCT_MIN, HUNT_STEADY_PCT_MAX);
       settingWrite(NK_HuntSteadyPct, String((int)HuntSteadyPct).c_str());
     }
-    if (paramOk(request, "cvRecovSec")) {  // retired timed-window knob — writes the inert global (UI field removed)
+    if (paramOk(request, "cvRecovSec")) {  // retired knob: writes an inert global
       foundParameter = true;
       cvRecovSec = clamp_f(request->getParam("cvRecovSec")->value().toFloat(), 0.5f, 30.0f);
       settingWrite(NK_cvRecovSec, String(cvRecovSec, 2).c_str());
       queueConsoleMessageF("CV recovery time: %.1f s", cvRecovSec);
     }
-    if (paramOk(request, "cvRecovEmaxV")) {  // retired timed-window knob — writes the inert global (UI field removed)
+    if (paramOk(request, "cvRecovEmaxV")) {  // retired knob: writes an inert global
       foundParameter = true;
       cvRecovEmaxV = clamp_f(request->getParam("cvRecovEmaxV")->value().toFloat(), 0.05f, 2.0f);
       settingWrite(NK_cvRecovEmaxV, String(cvRecovEmaxV, 3).c_str());
@@ -8420,7 +8703,7 @@ void setupServer() {
       settingWrite(NK_cvRecovKiMax, String(cvRecovKiMax, 2).c_str());
       queueConsoleMessageF("CV recovery refill max rate: %.1fx", cvRecovKiMax);
     }
-    if (request->hasParam("cvRecovBoostEnable")) {  // master switch for the post-protection recovery P-boost (1=on, 0=off)
+    if (paramOk(request, "cvRecovBoostEnable")) {  // master switch for the post-protection recovery P-boost (1=on, 0=off)
       foundParameter = true;
       cvRecovBoostEnable = (uint8_t)(request->getParam("cvRecovBoostEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_cvRecovBoostEnable, String((int)cvRecovBoostEnable).c_str());
@@ -8468,13 +8751,13 @@ void setupServer() {
       settingWrite(NK_cvRecovFlareFrac, String(cvRecovFlareFrac, 2).c_str());
       queueConsoleMessageF("CV recovery arrival flare floor: %.2f of goal", cvRecovFlareFrac);
     }
-    if (request->hasParam("dutySlewEnable")) {  // master switch for field duty slew (1=on, 0=instant)
+    if (paramOk(request, "dutySlewEnable")) {  // master switch for field duty slew (1=on, 0=instant)
       foundParameter = true;
       dutySlewEnable = (uint8_t)(request->getParam("dutySlewEnable")->value().toInt() ? 1 : 0);
       settingWrite(NK_dutySlewEnable, String((int)dutySlewEnable).c_str());
       queueConsoleMessageF("Field duty slew limiter: %s", dutySlewEnable ? "ON" : "OFF (instant)");
     }
-    if (request->hasParam("testSlewMode")) {  // manual CC test slew: 0=off/instant, 1=default rates, 2=custom
+    if (paramOk(request, "testSlewMode")) {  // manual CC test slew: 0=off/instant, 1=default rates, 2=custom
       foundParameter = true;
       int m = request->getParam("testSlewMode")->value().toInt();
       testSlewMode = (uint8_t)(m < 0 ? 0 : (m > 2 ? 2 : m));
@@ -8482,7 +8765,7 @@ void setupServer() {
       queueConsoleMessageF("Manual test slew mode: %s",
                            testSlewMode == 0 ? "Off (instant)" : testSlewMode == 1 ? "Default rates" : "Custom rates");
     }
-    if (request->hasParam("cvTestSlewMode")) {  // manual CV test slew: 0=off/instant target, 1=default rate, 2=custom
+    if (paramOk(request, "cvTestSlewMode")) {  // manual CV test slew: 0=off/instant target, 1=default rate, 2=custom
       foundParameter = true;
       int m = request->getParam("cvTestSlewMode")->value().toInt();
       cvTestSlewMode = (uint8_t)(m < 0 ? 0 : (m > 2 ? 2 : m));
@@ -8502,7 +8785,7 @@ void setupServer() {
       settingWrite(NK_vTgtRampDn, String(vTgtRampDn, 3).c_str());
       queueConsoleMessageF("CV target ramp down: %.3f V/s", vTgtRampDn);
     }
-    if (request->hasParam("cvWindDownEnable")) {  // commanded-target wind-down governor master switch
+    if (paramOk(request, "cvWindDownEnable")) {  // commanded-target wind-down governor master switch
       foundParameter = true;
       cvWindDownEnable = (uint8_t)(request->getParam("cvWindDownEnable")->value().toInt() != 0);
       settingWrite(NK_cvWindDownEn, String((int)cvWindDownEnable).c_str());
@@ -8520,8 +8803,7 @@ void setupServer() {
       settingWrite(NK_cvWindDownStopV, String(cvWindDownStopV, 3).c_str());
       queueConsoleMessageF("CV wind-down stop margin: %.3f V", cvWindDownStopV);
     }
-    // Plant curve K(t) = Ka + Kb·√t. The fit step writes both; a bench hand-entry may send cvPlantK alone,
-    // which means "flat curve" (Kb = 0) — the old single-point behaviour.
+    // Plant curve K(t) = Ka + Kb·√t; the fit writes both, a bench hand-entry may send cvPlantK alone.
     if (paramOk(request, "cvPlantK")) {   // alias: flat curve at the given gain
       foundParameter = true;
       cvPlantKa = request->getParam("cvPlantK")->value().toFloat();
@@ -8534,9 +8816,8 @@ void setupServer() {
       foundParameter = true;
       cvPlantKa = request->getParam("cvPlantKa")->value().toFloat();
       settingWrite(NK_cvPlantKa, String(cvPlantKa, 5).c_str());
-      // Stamp the measured battery temperature and its source at the moment the curve was measured — the
-      // reference for the battery-temp gain derate. No qualifying source → leave the prior stamp rather than
-      // inventing a reference; computeCvTempScale then keeps the derate inert until a fit runs with one.
+      // Stamp battery temp + source at measurement time as the battery-temp derate reference. No qualifying
+      // source keeps the prior stamp; computeCvTempScale stays inert until a fit runs with one.
       if (isfinite(battTempActiveF) && battTempActiveSrc >= 1 && battTempActiveSrc <= 4) {
         CommissionTempF = battTempActiveF;
         CommissionTempSrc = (int)battTempActiveSrc;
@@ -8551,9 +8832,8 @@ void setupServer() {
       settingWrite(NK_cvPlantKb, String(cvPlantKb, 5).c_str());
       recomputeCvGains();
     }
-    // Measured ripple projection (§3.3): the browser fits ripple(I)=a0+a1·I from the 3-level current-check
-    // points and POSTs the whole record as a CSV string. Reference data for the Protections
-    // ripple-vs-threshold plot ONLY — never touches the over-current floor.
+    // Measured ripple projection (§3.3): browser-fitted ripple(I)=a0+a1·I record as CSV. Reference for the
+    // Protections ripple-vs-threshold plot ONLY — never touches the over-current floor.
     if (request->hasParam("ripFitAlt")) {
       foundParameter = true;
       ripFitDecode(request->getParam("ripFitAlt")->value(), ripFitAlt);
@@ -8568,19 +8848,22 @@ void setupServer() {
     }
     // Resonance current-check (§3.2): arm/disarm field-commanding, and set the commanded level. Disarm
     // also zeroes the target so the loop slews back toward the normal AUTO setpoint gently.
-    if (request->hasParam("resTest")) {
+    if (paramOk(request, "resTest")) {
       foundParameter = true;
       bool arm = (request->getParam("resTest")->value().toInt() != 0);
+      const char *rr = arm ? rpmTestRefuseReason() : nullptr;
       if (arm && (cvStressActive || protTestActive != 0)) {
         queueConsoleMessageF("Resonance current-check: start blocked — %s is active",
                              cvStressActive ? "CV stress test" : "Protection test");
+      } else if (rr) {
+        queueConsoleMessageF("Resonance current-check: start blocked — %s", rr);
       } else if (arm) { resTestActive = true; resTestReleasing = false; }
       // Release = DEFERRED: keep the field under test-control (OV still suppressed) and let the loop wind the
       // current down to ~0 first; it drops resTestActive itself once the field is down (6_functions.ino), so
       // CV re-enters at low voltage and slews up from below rather than slamming G2 on the transition edge.
       else if (resTestActive) { resTestReleasing = true; resTestTargetA = 0.0f; }
       resTestLastCmdMs = millis();
-      queueConsoleMessageF("Resonance current-check %s", arm ? "ARMED (wizard commands current)" : "winding down");
+      if (!rr) queueConsoleMessageF("Resonance current-check %s", arm ? "ARMED (wizard commands current)" : "winding down");
     }
     // The `else` is load-bearing: a batched resTest=0&resTestTargetA=N would otherwise zero the target in the
     // disarm above and then command N amps back into a field that was asked to wind down. Arm/disarm wins.
@@ -8617,14 +8900,14 @@ void setupServer() {
       settingWrite(NK_CvKdDbCeil, String(CvKdDbCeil, 3).c_str());
       queueConsoleMessageF("CV D-term deadband ceiling: %.3f V/s", CvKdDbCeil);
     }
-    if (request->hasParam("CvKdOneSided")) {
+    if (paramOk(request, "CvKdOneSided")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdOneSided")->value();
       CvKdOneSided = inputMessage.toInt() != 0;
       settingWrite(NK_CvKdOneSided, String((int)CvKdOneSided).c_str());
       queueConsoleMessageF("CV D-term mode: %s", CvKdOneSided ? "ONE-SIDED (removes current only)" : "SYMMETRIC (adds on falling bus)");
     }
-    if (request->hasParam("CvKdExcessMode")) {
+    if (paramOk(request, "CvKdExcessMode")) {
       foundParameter = true;
       inputMessage = request->getParam("CvKdExcessMode")->value();
       CvKdExcessMode = inputMessage.toInt() != 0;
@@ -8650,7 +8933,7 @@ void setupServer() {
       // measured quantity exactly as IExcessTau does for the ripple fit. The pk-pk fit is untouched by it.
       if (fabsf(CvKdVoltFiltTC - kdFiltPrev) > 0.5f) ripFitForget(false, true, "CV D-term voltage filter TC changed");
     }
-    if (request->hasParam("cvHelpersEnabled")) {
+    if (paramOk(request, "cvHelpersEnabled")) {
       foundParameter = true;
       inputMessage = request->getParam("cvHelpersEnabled")->value();
       cvHelpersEnabled = inputMessage.toInt() != 0;
@@ -8691,7 +8974,6 @@ void setupServer() {
       inputMessage = request->getParam("TempPIDKp")->value();
       settingWrite(NK_TempPIDKp, inputMessage.c_str());
       TempPIDKp = inputMessage.toFloat();
-      // Velocity form reads TempPIDKp directly each tick — no library object to retune.
       queueConsoleMessageF("Temp PID Kp updated to: %.6f", TempPIDKp);
     }
     if (paramOk(request, "TempPIDKi")) {
@@ -8699,7 +8981,6 @@ void setupServer() {
       inputMessage = request->getParam("TempPIDKi")->value();
       settingWrite(NK_TempPIDKi, inputMessage.c_str());
       TempPIDKi = inputMessage.toFloat();
-      // Velocity form reads TempPIDKi directly each tick — no library object to retune.
       queueConsoleMessageF("Temp PID Ki updated to: %.6f", TempPIDKi);
     }
     if (paramOk(request, "TempPIDKiDownFrac")) {
@@ -8722,7 +9003,7 @@ void setupServer() {
       settingWrite(NK_ThermalSlopeWindowSec, String(ThermalSlopeWindowSec, 1).c_str());
       queueConsoleMessageF("ThermalSlopeWindowSec set to: %.1f s", ThermalSlopeWindowSec);
     }
-    if (request->hasParam("TempPIDIntervalMs")) {
+    if (paramOk(request, "TempPIDIntervalMs")) {
       foundParameter = true;
       inputMessage = request->getParam("TempPIDIntervalMs")->value();
       long tpi = strtol(inputMessage.c_str(), nullptr, 10);   // signed: the global is uint32_t, so "-5" must clamp before assignment
@@ -8758,27 +9039,27 @@ void setupServer() {
       if (TuningMode) tuningParamChanged = true;
       queueConsoleMessageF("PID Kd updated to: %.6f", PidKd);
     }
-    if (request->hasParam("PidSampleDivisor")) {
+    if (paramOk(request, "PidSampleDivisor")) {
       foundParameter = true;
       inputMessage = request->getParam("PidSampleDivisor")->value();
       settingWrite(NK_PidSampleDivisor, inputMessage.c_str());
       PidSampleDivisor = inputMessage.toInt();
       if (TuningMode) tuningParamChanged = true;
     }
-    if (request->hasParam("LearningSettlingPeriod")) {
+    if (paramOk(request, "LearningSettlingPeriod")) {
       foundParameter = true;
       inputMessage = request->getParam("LearningSettlingPeriod")->value();
       int temp = inputMessage.toInt() * 1000;  // Convert seconds to ms
       settingWrite(NK_LearningSettlingPeriod, String(temp).c_str());
       LearningSettlingPeriod = temp;
     }
-    if (request->hasParam("LearningRPMChangeThreshold")) {
+    if (paramOk(request, "LearningRPMChangeThreshold")) {
       foundParameter = true;
       inputMessage = request->getParam("LearningRPMChangeThreshold")->value();
       settingWrite(NK_LearningRPMChangeThreshold, inputMessage.c_str());
       LearningRPMChangeThreshold = inputMessage.toInt();
     }
-    if (request->hasParam("LearningTempHysteresis")) {
+    if (paramOk(request, "LearningTempHysteresis")) {
       foundParameter = true;
       inputMessage = request->getParam("LearningTempHysteresis")->value();
       settingWrite(NK_LearningTempHysteresis, inputMessage.c_str());
@@ -8790,7 +9071,7 @@ void setupServer() {
       inputMessage = request->getParam("MaxTableValue")->value();
       settingWrite(NK_MaxTableValue, inputMessage.c_str());
       MaxTableValue = inputMessage.toFloat();
-      HardOCTripAmps = MaxTableValue + 10.0f;  // always 10A above current limit
+      HardOCTripAmps = MaxTableValue + 10.0f;
       queueConsoleMessageF("Alternator current limit set to %.1fA — OC trip threshold: %.1fA", MaxTableValue, HardOCTripAmps);
     }
     if (paramOk(request, "MaxPenaltyPercent")) {
@@ -8799,7 +9080,7 @@ void setupServer() {
       settingWrite(NK_MaxPenaltyPercent, inputMessage.c_str());
       MaxPenaltyPercent = inputMessage.toFloat();
     }
-    if (request->hasParam("MaxPenaltyDuration")) {
+    if (paramOk(request, "MaxPenaltyDuration")) {
       foundParameter = true;
       inputMessage = request->getParam("MaxPenaltyDuration")->value();
       int temp = inputMessage.toInt() * 1000;
@@ -8812,13 +9093,13 @@ void setupServer() {
       settingWrite(NK_NeighborLearningFactor, inputMessage.c_str());
       NeighborLearningFactor = inputMessage.toFloat();
     }
-    if (request->hasParam("yyMax")) {
+    if (paramOk(request, "yyMax")) {
       foundParameter = true;
       inputMessage = request->getParam("yyMax")->value();
       settingWrite(NK_yyMax, inputMessage.c_str());
       yyMax = inputMessage.toInt();
     }
-    if (request->hasParam("LearningMemoryDuration")) {
+    if (paramOk(request, "LearningMemoryDuration")) {
       foundParameter = true;
       inputMessage = request->getParam("LearningMemoryDuration")->value();
       settingWrite(NK_LearningMemoryDuration, inputMessage.c_str());
@@ -8827,17 +9108,27 @@ void setupServer() {
     if (paramOk(request, "DutyRampRate")) {
       foundParameter = true;
       inputMessage = request->getParam("DutyRampRate")->value();
-      settingWrite(NK_DutyRampRate, inputMessage.c_str());
-      DutyRampRate = inputMessage.toFloat();
-      if (TuningMode) tuningParamChanged = true;
-      queueConsoleMessageF("Duty ramp rate set to: %.1f %%/sec", DutyRampRate);
+      const float rampMin = DUTY_RAMP_MIN_12V * fieldScale();
+      if (inputMessage.toFloat() < rampMin) {
+        queueConsoleMessageF("Duty ramp rate must be at least %.2f %%/sec - rejected, keeping %.2f", rampMin, DutyRampRate);
+      } else {
+        settingWrite(NK_DutyRampRate, inputMessage.c_str());
+        DutyRampRate = inputMessage.toFloat();
+        if (TuningMode) tuningParamChanged = true;
+        queueConsoleMessageF("Duty ramp rate set to: %.1f %%/sec", DutyRampRate);
+      }
     }
     if (paramOk(request, "DutySlowRampRate")) {
       foundParameter = true;
       inputMessage = request->getParam("DutySlowRampRate")->value();
-      settingWrite(NK_DutySlowRampRate, inputMessage.c_str());
-      DutySlowRampRate = inputMessage.toFloat();
-      queueConsoleMessageF("Shutdown final ramp rate set to: %.2f %%/s", DutySlowRampRate);
+      const float rampMin = DUTY_RAMP_MIN_12V * fieldScale();
+      if (inputMessage.toFloat() < rampMin) {
+        queueConsoleMessageF("Shutdown final ramp rate must be at least %.2f %%/s - rejected, keeping %.2f", rampMin, DutySlowRampRate);
+      } else {
+        settingWrite(NK_DutySlowRampRate, inputMessage.c_str());
+        DutySlowRampRate = inputMessage.toFloat();
+        queueConsoleMessageF("Shutdown final ramp rate set to: %.2f %%/s", DutySlowRampRate);
+      }
     }
     if (paramOk(request, "ShutdownRampTauS")) {
       foundParameter = true;
@@ -8851,7 +9142,7 @@ void setupServer() {
       settingWrite(NK_NoOutputAmps, String(NoOutputAmps, 2).c_str());
       queueConsoleMessageF("No-output current set to: %.2f A", NoOutputAmps);
     }
-    if (request->hasParam("ShutdownPhase2HoldMs")) {
+    if (paramOk(request, "ShutdownPhase2HoldMs")) {
       foundParameter = true;
       inputMessage = request->getParam("ShutdownPhase2HoldMs")->value();
       uint32_t ms = (uint32_t)inputMessage.toInt();
@@ -8859,7 +9150,7 @@ void setupServer() {
       ShutdownPhase2HoldMs = ms;
       queueConsoleMessageF("Shutdown phase 2 hold set to: %u ms", ShutdownPhase2HoldMs);
     }
-    if (request->hasParam("SettleTimeBeforeCut")) {
+    if (paramOk(request, "SettleTimeBeforeCut")) {
       foundParameter = true;
       inputMessage = request->getParam("SettleTimeBeforeCut")->value();
       settingWrite(NK_SettleTimeBeforeCut, inputMessage.c_str());
@@ -8888,11 +9179,9 @@ void setupServer() {
       TempSustainedTimeout = temp;
       queueConsoleMessageF("Temp sustained timeout set to: %d seconds", inputMessage.toInt());
     }
-    // Both OV-ladder rungs can arrive in ONE request (battery-defaults proposal, Other-chemistry
-    // prep), so read both first and enforce the ladder order ONCE — clamping one at a time
-    // against the value being replaced would corrupt a joint move in either direction. The
-    // hardware rung is the anchor; the software cut must sit strictly below it (0.05 x class/12
-    // guard band) so software always gets first shot.
+    // Both OV-ladder rungs can arrive in ONE request, so enforce the ladder order once on the joint values;
+    // clamping one at a time against the value being replaced corrupts a joint move. The software cut sits
+    // strictly below the hardware rung (0.05 x class/12 guard band) so software always gets first shot.
     bool swRungPresent = paramOk(request, "AlternatorHardShutdownV");
     bool hwRungPresent = paramOk(request, "VoltageHardwareLimit");
     if (swRungPresent || hwRungPresent) {
@@ -8908,7 +9197,7 @@ void setupServer() {
       settingWrite(NK_AlternatorHardShutdownV, String(AlternatorHardShutdownV, 2).c_str());
       if (hwRungPresent) {
         settingWrite(NK_VoltageHardwareLimit, String(VoltageHardwareLimit, 2).c_str());
-        updateINA228OvervoltageThreshold();  // reprogram the comparator immediately — never leave it stale
+        inaOvReprogramPending = true;  // loop() reprograms the comparator on its next pass — never leave it stale, never touch I2C from this task
         queueConsoleMessageF("Hardware shutdown voltage set to: %.2fV (INA228 ALERT, absolute)", VoltageHardwareLimit);
       }
       if (swClamped)
@@ -8917,7 +9206,7 @@ void setupServer() {
         queueConsoleMessageF("Alternator hard-shutdown voltage set to: %.2fV (absolute)", AlternatorHardShutdownV);
     }
     // "Group 0" in UI = hardware overcurrent trip (no protection-group integration yet)
-    if (request->hasParam("HardOCDebounceMs")) {
+    if (paramOk(request, "HardOCDebounceMs")) {
       foundParameter = true;
       inputMessage = request->getParam("HardOCDebounceMs")->value();
       settingWrite(NK_HardOCDebounceMs, inputMessage.c_str());
@@ -8995,9 +9284,8 @@ void setupServer() {
       IExcessTau = constrain(inputMessage.toFloat(), 20.0f, 300.0f);
       settingWrite(NK_IExcessTau, String(IExcessTau, 1).c_str());
       queueConsoleMessageF("IExcess averaging TC set to: %.0f ms", IExcessTau);
-      // The a0+a1·I fit is the pk-pk of THIS low-pass, so a tau change invalidates it. The slope fit
-      // is not measured through this filter and survives; the Resonance & Ripple Map never was
-      // (raw stream, own fixed window) — see ripFitForget.
+      // The a0+a1·I fit is the pk-pk of THIS low-pass, so a tau change invalidates it; the slope fit and the
+      // Ripple Map are not measured through it (see ripFitForget).
       if (fabsf(IExcessTau - iexTauPrev) > 0.05f) ripFitForget(true, false, "IExcess averaging TC changed");
       if (CVTuningMode) cvTuningParamChanged = true;
     }
@@ -9040,7 +9328,7 @@ void setupServer() {
       settingWrite(NK_FastSetpointRiseRate, String(FastSetpointRiseRate, 1).c_str());
       queueConsoleMessageF("Fast setpoint rise rate set to: %.1fx", FastSetpointRiseRate);
     }
-    if (request->hasParam("FastSetpointRiseWindowMs")) {
+    if (paramOk(request, "FastSetpointRiseWindowMs")) {
       foundParameter = true;
       inputMessage = request->getParam("FastSetpointRiseWindowMs")->value();
       FastSetpointRiseWindowMs = (uint32_t)constrain(inputMessage.toInt(), 500, 30000);
@@ -9054,7 +9342,7 @@ void setupServer() {
       settingWrite(NK_FastSetpointRiseHeadroomV, String(FastSetpointRiseHeadroomV, 2).c_str());
       queueConsoleMessageF("Fast rise headroom set to: %.2fV", FastSetpointRiseHeadroomV);
     }
-    if (request->hasParam("AwSeedProtectMs")) {
+    if (paramOk(request, "AwSeedProtectMs")) {
       foundParameter = true;
       inputMessage = request->getParam("AwSeedProtectMs")->value();
       AwSeedProtectMs = (uint16_t)constrain(inputMessage.toInt(), 0, 2000);
@@ -9070,56 +9358,56 @@ void setupServer() {
       queueConsoleMessageF("KHard set to: %.1f A/V", KHard);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("OvGroup1Enable")) {
+    if (paramOk(request, "OvGroup1Enable")) {
       foundParameter = true;
       inputMessage = request->getParam("OvGroup1Enable")->value();
       OvGroup1Enable = inputMessage.toInt() != 0;
       settingWrite(NK_OvGroup1Enable, String((int)OvGroup1Enable).c_str());
       queueConsoleMessageF("OV Group 1 (prediction-based cap): %s", OvGroup1Enable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("OvGroup2Enable")) {
+    if (paramOk(request, "OvGroup2Enable")) {
       foundParameter = true;
       inputMessage = request->getParam("OvGroup2Enable")->value();
       OvGroup2Enable = inputMessage.toInt() != 0;
       settingWrite(NK_OvGroup2Enable, String((int)OvGroup2Enable).c_str());
       queueConsoleMessageF("OV Group 2 (measured-voltage threshold): %s", OvGroup2Enable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("TachLieEnable")) {
+    if (paramOk(request, "TachLieEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("TachLieEnable")->value();
       TachLieEnable = inputMessage.toInt() != 0;
       settingWrite(NK_TachLieEnable, String((int)TachLieEnable).c_str());
       queueConsoleMessageF("Tach plausibility cut (commanded current, zero output): %s", TachLieEnable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("HardOCEnable")) {
+    if (paramOk(request, "HardOCEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("HardOCEnable")->value();
       HardOCEnable = inputMessage.toInt() != 0;
       settingWrite(NK_HardOCEnable, String((int)HardOCEnable).c_str());
       queueConsoleMessageF("Group 0 (hard over-current trip): %s", HardOCEnable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("IExcessEnable")) {
+    if (paramOk(request, "IExcessEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("IExcessEnable")->value();
       IExcessEnable = inputMessage.toInt() != 0;
       settingWrite(NK_IExcessEnable, String((int)IExcessEnable).c_str());
       queueConsoleMessageF("Group 3 (alternator iExcess detectors): %s", IExcessEnable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("BattLimitEnable")) {
+    if (paramOk(request, "BattLimitEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("BattLimitEnable")->value();
       BattLimitEnable = inputMessage.toInt() != 0;
       settingWrite(NK_BattLimitEnable, String((int)BattLimitEnable).c_str());
       queueConsoleMessageF("Group 4 (battery charge current limit): %s", BattLimitEnable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("LoadDumpEnable")) {
+    if (paramOk(request, "LoadDumpEnable")) {
       foundParameter = true;
       inputMessage = request->getParam("LoadDumpEnable")->value();
       LoadDumpEnable = inputMessage.toInt() != 0;
       settingWrite(NK_LoadDumpEnable, String((int)LoadDumpEnable).c_str());
       queueConsoleMessageF("Group 5 (load dump): %s", LoadDumpEnable ? "ENABLED" : "DISABLED");
     }
-    if (request->hasParam("OutputPIDSigSrc")) {
+    if (paramOk(request, "OutputPIDSigSrc")) {
       foundParameter = true;
       inputMessage = request->getParam("OutputPIDSigSrc")->value();
       OutputPIDSigSrc = constrain(inputMessage.toInt(), 0, 2);
@@ -9127,7 +9415,7 @@ void setupServer() {
       const char* sigNames[] = { "EMA(TC)", "MA(N)", "Raw" };
       queueConsoleMessageF("Output PID signal source: %s", sigNames[OutputPIDSigSrc]);
     }
-    if (request->hasParam("OutputPIDMA_N")) {
+    if (paramOk(request, "OutputPIDMA_N")) {
       foundParameter = true;
       inputMessage = request->getParam("OutputPIDMA_N")->value();
       OutputPIDMA_N = constrain(inputMessage.toInt(), 1, I_RING_SIZE);
@@ -9158,7 +9446,7 @@ void setupServer() {
     if (paramOk(request, "OvMeasMarginV")) {
       foundParameter = true;
       inputMessage = request->getParam("OvMeasMarginV")->value();
-      OvMeasMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));  // ceiling matches OvTierLoMarginV: the LOW tier rides this line, so a tighter cap here made the lead/AGM 0.50 recommendation unraisable
+      OvMeasMarginV = constrain(inputMessage.toFloat(), 0.020f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f), 2.000f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f));  // ceiling must match OvTierLoMarginV's: the LOW tier rides this line
       settingWrite(NK_OvMeasMarginV, String(OvMeasMarginV, 3).c_str());
       queueConsoleMessageF("Group 2 measured-voltage trigger margin set to: %.0f mV", OvMeasMarginV * 1000.0f);
     }
@@ -9176,7 +9464,7 @@ void setupServer() {
       settingWrite(NK_OvTierLoMarginV, String(OvTierLoMarginV, 3).c_str());
       queueConsoleMessageF("Timed OV cut LOW-tier margin set to: %.0f mV above target", OvTierLoMarginV * 1000.0f);
     }
-    if (request->hasParam("OvTierLoDwellMs")) {
+    if (paramOk(request, "OvTierLoDwellMs")) {
       foundParameter = true;
       inputMessage = request->getParam("OvTierLoDwellMs")->value();
       OvTierLoDwellMs = (uint32_t)constrain(inputMessage.toInt(), 0, 5000);
@@ -9191,7 +9479,7 @@ void setupServer() {
       settingWrite(NK_OvTierMidMarginV, String(OvTierMidMarginV, 3).c_str());
       queueConsoleMessageF("Timed OV cut MID-tier margin set to: %.0f mV above target", OvTierMidMarginV * 1000.0f);
     }
-    if (request->hasParam("OvTierMidDwellMs")) {
+    if (paramOk(request, "OvTierMidDwellMs")) {
       foundParameter = true;
       inputMessage = request->getParam("OvTierMidDwellMs")->value();
       OvTierMidDwellMs = (uint32_t)constrain(inputMessage.toInt(), 0, 5000);
@@ -9209,7 +9497,7 @@ void setupServer() {
     if (paramOk(request, "ReseedFrac")) {
       foundParameter = true;
       inputMessage = request->getParam("ReseedFrac")->value();
-      ReseedFrac = clamp_f(inputMessage.toFloat(), 0.2f, 1.0f);  // at exactly 1.0 the first-fire de-escalation on a persistent cause is dead — UI max stays 0.95, 1.0 is deliberate-raw-URL territory
+      ReseedFrac = clamp_f(inputMessage.toFloat(), 0.2f, 1.0f);  // at 1.0 first-fire de-escalation on a persistent cause is dead; UI max is 0.95
       settingWrite(NK_ReseedFrac, String(ReseedFrac, 2).c_str());
       queueConsoleMessageF("Recovery seed fraction set to: %.2f", ReseedFrac);
       if (CVTuningMode) cvTuningParamChanged = true;
@@ -9230,7 +9518,7 @@ void setupServer() {
       queueConsoleMessageF("Recovery climb rate set to: %.2f of max/s (%.0f A/s here)", CvRecovClimbRate, CvRecovClimbRate * (float)MaxTableValue);
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("CVTuningMode")) {
+    if (paramOk(request, "CVTuningMode")) {
       foundParameter = true;
       inputMessage = request->getParam("CVTuningMode")->value();
       int requested = inputMessage.toInt();
@@ -9273,7 +9561,7 @@ void setupServer() {
       settingWrite(NK_cvWaveAmplitudeV, String(cvWaveAmplitudeV, 2).c_str());
       if (CVTuningMode) cvTuningParamChanged = true;
     }
-    if (request->hasParam("cvWavePeriodSec")) {
+    if (paramOk(request, "cvWavePeriodSec")) {
       foundParameter = true;
       inputMessage = request->getParam("cvWavePeriodSec")->value();
       cvWavePeriodSec = inputMessage.toInt();
@@ -9286,7 +9574,7 @@ void setupServer() {
       cvKOvershoot = inputMessage.toFloat();
       settingWrite(NK_cvKOvershoot, String(cvKOvershoot, 1).c_str());
     }
-    if (request->hasParam("cvConsecutiveReads")) {
+    if (paramOk(request, "cvConsecutiveReads")) {
       foundParameter = true;
       inputMessage = request->getParam("cvConsecutiveReads")->value();
       cvConsecutiveReads = (uint8_t)constrain(inputMessage.toInt(), 1, 20);
@@ -9299,7 +9587,7 @@ void setupServer() {
       VoltageDisagreeThreshold = inputMessage.toFloat();
       queueConsoleMessageF("Voltage disagreement threshold set to: %.2fV", VoltageDisagreeThreshold);
     }
-    if (request->hasParam("VoltageDisagreeTimeout")) {
+    if (paramOk(request, "VoltageDisagreeTimeout")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageDisagreeTimeout")->value();
       int temp = inputMessage.toInt() * 1000;  // user enters seconds
@@ -9307,13 +9595,13 @@ void setupServer() {
       VoltageDisagreeTimeout = temp;
       queueConsoleMessageF("Voltage disagreement timeout set to: %d seconds", inputMessage.toInt());
     }
-    if (request->hasParam("VoltageLoopInterval")) {
+    if (paramOk(request, "VoltageLoopInterval")) {
       foundParameter = true;
       inputMessage = request->getParam("VoltageLoopInterval")->value();
       settingWrite(NK_VoltageLoopInterval, inputMessage.c_str());
       VoltageLoopInterval = inputMessage.toInt();
     }
-    if (request->hasParam("FIELD_COLLAPSE_DELAY")) {
+    if (paramOk(request, "FIELD_COLLAPSE_DELAY")) {
       foundParameter = true;
       inputMessage = request->getParam("FIELD_COLLAPSE_DELAY")->value();
       int temp = inputMessage.toInt() * 1000;
@@ -9322,9 +9610,7 @@ void setupServer() {
     }
     if (request->hasParam("ResetPerfCounters")) {
       foundParameter = true;
-      // Function timing — session worsts (full list mirrors the periodic
-      // worstWindow reset block in loop() so every timer on the dashboard
-      // actually clears on button press).
+      // Function timing session worsts; mirrors the worstWindow reset block in loop(), keep the two in sync.
       ft_ReadAnalogInputs.worstSession = 0;
       ft_AdjustFieldLearnMode.worstSession = 0;
       ft_logDashboardValues.worstSession = 0;
@@ -9344,9 +9630,8 @@ void setupServer() {
       ft_solarLedger.worstSession = 0;
       ft_bhFlushCapNVS.worstSession = 0;
       ft_kneeLearnService.worstSession = 0;
-      // Deliberately NOT cleared here: the ripple analyzer's per-session worsts (faSesPkpkWorstA /
-      // faSesPeakWorstA / faSesPeakWorstHz) persist across reboot and are cleared only by the
-      // ripple panel's own reset (ResetRipplePeaks handler).
+      // Not cleared here: the ripple analyzer's session worsts (faSes*) persist across reboot and are
+      // cleared only by ResetRipplePeaks.
       ft_uploadBufferedRecords.worstSession = 0;
       ft_buildConfigPayload.worstSession = 0;
       ft_UpdateBatterySOC.worstSession = 0;
@@ -9368,6 +9653,7 @@ void setupServer() {
       ft_n2kParse.worstSession = 0;
       n2kTxCount = 0;
       n2kTxDropCount = 0;
+      n2kRxFramesBase = tNMEA2000_esp32::BusStats.rxFrames;
       n183SentenceCount = 0;
       n183ChecksumErrCount = 0;
       ft_huntGov.worstSession = 0;
@@ -9430,8 +9716,7 @@ void setupServer() {
       pfBkt1sCurrent = { 0, 0, 0, 0 };
       pfBkt1sStart = millis();
       pfHasPrev = false;
-      // INA228 interval stats — must clear all windows AND all-time accumulators,
-      // else stale ina_worst_at/ina_worst_2m spikes survive the reset.
+      // INA228 interval stats: all windows AND all-time accumulators, else stale worst spikes survive.
       resetINA228AllStats();
       // CV voltage-loop firing-interval ladder — clears all windows AND all-time accumulators
       vlAtWorst = 0;
@@ -9455,9 +9740,8 @@ void setupServer() {
       vlBkt1sCurrent = { 0, 0, 0, 0 };
       vlBkt1sStart = millis();
       vlHasPrev = false;
-      // Deliberately NOT cleared here: the lifetime nav/sailing records reset individually from
-      // the Lifetime Statistics panel (ResetLongestTrip / ResetMax24hrDist / ResetDeepestAnchor /
-      // ResetBestUpwindVMG / ResetLongestGale) — "Reset Peak Values" must never nuke leaderboard records.
+      // Not cleared here: lifetime nav/sailing records have their own resets; "Reset Peak Values" must never
+      // nuke leaderboard records.
       // 80MHz low-power loop instrumentation — clear session worst + near-miss counters
       loopWorst80Ses = 0;
       loopOver80ImuLimitCount = 0;
@@ -9493,15 +9777,12 @@ void setupServer() {
       // Core-0 HTTPS task cloud-op time — clear last + worst-since-reset
       httpsUploadWorstMs = 0;
       httpsUploadLastMs = 0;
-      // NVS full-save diagnostics — clear the worst-duration watermark and the call
-      // counter so "Worst Save Duration" and "Save Count" track since-reset, not since-boot.
-      // "Last Save Duration" is zeroed too (it just shows 0 until the next field-off save).
+      // NVS full-save diagnostics: worst/count/last track since-reset, not since-boot.
       nvsFullSaveWorstMs = 0;
       nvsFullSaveCount = 0;
       nvsFullSaveLastMs = 0;
-      // Reset to the "never saved this boot" sentinel so "Time Since Last Save" reads 0
-      // and STAYS 0 until the next field-off save fires — turns the field into a live
-      // "is the save actually firing?" indicator after a reset.
+      // "Never saved this boot" sentinel: "Time Since Last Save" stays 0 until the next field-off save,
+      // a live is-the-save-firing indicator.
       lastNVSSaveTime = 0;
       // Dashboard-stream backpressure witnesses (/debug line + stall console lines)
       sseQueuePeak = 0;
@@ -9519,12 +9800,11 @@ void setupServer() {
 
     if (request->hasParam("forceCloudFlush")) {
       foundParameter = true;
-      // "Upload Cloud Now" button — bypasses fieldCutSettled and the 13-sec
-      // interval throttle. The cloud-feature block in loop() reads this flag,
-      // drains the PSRAM ring through the HTTPS queue, and clears the flag
-      // once the ring is empty.
+      // "Upload Cloud Now": shortens the field-off settle to fieldCutSettled's 20 s floor and bypasses the
+      // 13 s throttle; loop()'s cloud block drains the PSRAM ring and clears the flag once it is empty.
       forceCloudFlushPending = true;
-      queueConsoleMessage("Cloud sync: forced flush requested");
+      queueConsoleMessage(gpio4IsLow ? "Cloud sync: forced flush requested"
+                                     : "Cloud sync: forced flush requested - it starts 20 s after the field turns off");
     }
 
     if (request->hasParam("ResetAccelSession")) {
@@ -9562,14 +9842,11 @@ void setupServer() {
       queueConsoleMessage("Accel lifetime stats reset from web interface");
     }
 
-    if (nvsPersistNow) saveNVSDataFull();   // commit storage-namespace resets/sets now (at most one save per request); otherwise they'd wait for the field-off edge and a reboot/power-cut before then would revert them
-    // The commissioning wizard's 2 s keep-alive ping changes nothing, so it must not fire the settings
-    // echo. It was pushing the whole CSV3 block every 2 s for the length of a wizard session — on the
-    // busiest link of the session — in place of the 60 s idle cadence, for bytes no client acts on.
-    // The ping never sets foundParameter, so a heartbeat riding along with a real setting still echoes
-    // and one riding with only the uid=/tok= every dashboard request carries does not.
+    if (nvsPersistNow) saveNVSDataFull();   // one save per request; else a reboot before the field-off edge reverts these
+    // The wizard's 2 s keep-alive ping never sets foundParameter, so it does not fire the CSV3 echo; a
+    // heartbeat riding along with a real setting still echoes.
     if (foundParameter) {
-      stateRevision++;      // Increment whenever any setting changed
+      stateRevision++;
       settingsDirty = true; // trigger immediate CSV3 settings echo
     }
     if (!foundParameter) {
@@ -9578,14 +9855,10 @@ void setupServer() {
     request->send(200, "text/plain", inputMessage);
   });
 
-  // Settings arm gate (replaced /setPassword + /checkPassword). ?arm=1 opens the write window,
-  // ?arm=0 closes it, no param just reports state — the dashboard polls this to keep its unlocked
-  // UI honest, so a reload while armed comes back unlocked and a lock from another client relocks
-  // every tab within a poll. Nothing times out; see settingsArmActive() in 5_functions.ino.
-  // With the settings password on (pwRequired): arm=1 is a POST whose body carries pw (never a URL a
-  // log or a proxy could keep, the same rule as /setPassword) and answers with tok=, which the
-  // dashboard then puts on every mutating request; arm=0 needs a live tok; and "armed" in the reply
-  // is THIS client's standing, not the global flag, so a page without the password stays locked.
+  // Settings arm gate: ?arm=1 opens the write window, ?arm=0 closes it, no param reports state (the dashboard
+  // polls it so every tab stays honest). Nothing times out; see settingsArmActive(). With pwRequired, arm=1 is
+  // a POST carrying pw in the body (never a URL) and answers tok= for every mutating request; arm=0 needs a
+  // live tok; "armed" in the reply is THIS client's standing, not the global flag.
   server.on("/armSettings", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request) {
     int code = 200;
     const char *issued = nullptr;
@@ -9651,10 +9924,10 @@ void setupServer() {
     request->send(code, "application/json", out);
   });
 
-  // Settings password (Setup > System). Arm-gated like every other mutation, and a change or a
-  // turn-off also needs the current password, so a page left unlocked cannot silently change it.
+  // Settings password: arm-gated, and a change or turn-off also needs the current password.
   // POST body only: the password never rides in a URL a log or a proxy could keep.
   server.on("/setPassword", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (!settingsArmActive(request)) {
       request->send(403, "application/json", "{\"ok\":0,\"err\":\"armed\"}");
       return;
@@ -9719,12 +9992,9 @@ void setupServer() {
     request->send(200, "application/json", out);
   });
 
-  // Explicit routes for all static web assets — served directly, never hit onNotFound
-  // PSRAM-preload-failed fallback still has to carry no-cache, or the flash path reintroduces the
-  // stale-dashboard-off-an-unreachable-device problem serveCachedAsset() closes.
-  // The other four assets carry it for the matched-set reason instead: this path has no ETag and
-  // no Last-Modified (AsyncFileResponse sets neither, unlike serveStatic), so a browser has no
-  // validator to revalidate with and refetches anyway — the header only makes that explicit.
+  // Explicit routes for static assets, never via onNotFound. The flash fallback carries no-cache: for index.html
+  // so a stale dashboard can't outlive an unreachable device, for the rest because this path has no ETag or
+  // Last-Modified validator, so browsers refetch anyway.
   auto sendAssetFromFlash = [](AsyncWebServerRequest *request, const char *path, const char *type) {
     AsyncWebServerResponse *resp = request->beginResponse(webFS, path, type);
     resp->addHeader("Cache-Control", "no-cache");
@@ -9784,19 +10054,15 @@ void setupServer() {
       Serial.printf("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
     }
     settingsDirty = true;  // send CSV3 immediately so new client gets current settings
-    // AsyncTCP's 5 s ack timeout is wired straight to close() for an event-source client
-    // (AsyncEventSourceClient::_onTimeout), and the countdown starts at the last write that got out —
-    // so once the send window fills, a radio stall well under 5 s does not degrade the dashboard
-    // stream, it destroys it, and everything the regulator says while it is gone is discarded.
-    // 20 s rides out the stalls a phone hotspot actually produces. Cost: a client that vanishes
-    // without a FIN holds its slot 20 s before events.count() reads 0.
+    // AsyncTCP's ack timeout closes an event-source client outright (AsyncEventSourceClient::_onTimeout),
+    // counted from the last write that got out, so at the 5 s default a radio stall destroys the stream.
+    // 20 s rides out phone-hotspot stalls; a client that vanishes without a FIN holds its slot 20 s.
     if (client->client()) client->client()->setAckTimeout(20000);
     client->send("hello!", NULL, millis(), 10000);
   });
   // MUST precede "/debug": a plain-string URI matches exact-or-prefix-with-slash and the server
   // dispatches in registration order, so "/debug" registered first swallows both of these.
-  // Bench-only data-growth ceiling test: fill every ring to cap + measure the worst-case
-  // scans (handlers defined at the tail of 8_functions.ino where the ring symbols are in scope).
+  // Bench-only data-growth ceiling test; handlers live at the tail of 8_functions.ino.
   { void debugFillMax(AsyncWebServerRequest *); void debugClearMax(AsyncWebServerRequest *);
     server.on("/debug/fillmax",  HTTP_GET, debugFillMax);
     server.on("/debug/clearmax", HTTP_GET, debugClearMax); }
@@ -9815,29 +10081,30 @@ void setupServer() {
     const char *spdSrcName  = (currentSpeedSource == GPS_NMEA)  ? "NMEA"
                             : (currentSpeedSource == GPS_PHONE) ? "Phone" : "none";
     unsigned long now = millis();
-    // Ground truth for the Core-1 preemption investigation: where the network tasks
-    // actually landed. async_tcp must read 0 if the Core-0 pin made it into THIS image
-    // (the pin is a compile-time default — a stale factory/IDE flash won't have it).
-    // 2147483647 = tskNO_AFFINITY (floating), -99 = task not found by name.
-    TaskHandle_t hAsyncTcp = xTaskGetHandle("async_tcp");
-    TaskHandle_t hLwip = xTaskGetHandle("tiT");
-    int asyncTcpCore = hAsyncTcp ? (int)xTaskGetCoreID(hAsyncTcp) : -99;
-    int lwipCore = hLwip ? (int)xTaskGetCoreID(hLwip) : -99;
+    // Heap walks and the task census are cpuLoadTask's field-cut cache: a live largest-block walk holds a heap lock, and
+    // uxTaskGetSystemState / xTaskGetHandle hold the kernel lock, which stalls Core 1. Stamps can postdate `now`.
+    auto ageS = [now](uint32_t at) -> unsigned long {
+      return ((int32_t)((uint32_t)now - at) > 0) ? ((uint32_t)now - at) / 1000UL : 0UL;
+    };
+    const TaskCensus *cen = (taskCensus && taskCensusAtMs) ? &taskCensus[taskCensusPub] : nullptr;
+    taskCensusWanted = true;   // the next field-cut window takes a fresh one; reload /debug to see it
+    // Where the network tasks landed: async_tcp reads 0 only if this image has the Core-0 pin (compile-time
+    // default; a stale flash won't). 2147483647 = tskNO_AFFINITY (floating), -99 = not found.
+    int asyncTcpCore = -99, lwipCore = -99;
+    for (uint16_t i = 0; cen && i < cen->n; i++) {
+      if (strcmp(cen->row[i].name, "async_tcp") == 0) asyncTcpCore = (int)cen->row[i].core;
+      else if (strcmp(cen->row[i].name, "tiT") == 0) lwipCore = (int)cen->row[i].core;
+    }
     const char *faStateName = (faChanState == 1) ? "live" : (faChanState == 2) ? "RAILED-dormant (jumper open?)" : "off";
-    // mbedTLS allocator self-test: do a TLS-sized alloc through mbedtls_calloc and see which heap it
-    // lands in. Proves the setup() mbedtls_platform_set_calloc_free(->PSRAM) override is live, without
-    // relying on catching the early boot serial line. "PSRAM" = TLS no longer needs contiguous internal.
-    size_t tlsPsBefore = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    void *tlsTest = mbedtls_calloc(1, 16384);
-    size_t tlsPsAfter = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const char *tlsMem = !tlsTest ? "ALLOC-FAILED" : ((tlsPsBefore - tlsPsAfter) >= 16000 ? "PSRAM" : "INTERNAL");
-    if (tlsTest) mbedtls_free(tlsTest);
-    char out[2944];
+    // "PSRAM" = setup()'s mbedTLS calloc override is registered; the counts show where real TLS allocations landed.
+    const char *tlsMem = mbedtlsPsramHooked ? "PSRAM" : "INTERNAL (override not registered)";
+    char out[3600];
     int dpos = snprintf(out, sizeof(out),
              "Partition: %s\nVersion: %s\nFree heap: %lu\n"
              "Web FS %s: %d/%d KB used (%d%%) - boot seed, -1 = unread\n"
-             "TLS buffers -> %s (largest internal block %u B, free PSRAM %u B)\n"
-             "Net task cores (0/1=pinned, 2147483647=floating, -99=not found): async_tcp=%d lwIP=%d\n"
+             "TLS buffers -> %s (mbedTLS allocations since boot: PSRAM %lu, internal fallback %lu, failed %lu)\n"
+             "Heap walks (Core 0, field cut only): largest internal block %u KB %lus ago, largest PSRAM block %u KB %lus ago; free PSRAM %u B\n"
+             "Net task cores (0/1=pinned, 2147483647=floating, -99=not found or no census yet): async_tcp=%d lwIP=%d\n"
              "Dashboard stream: clients=%u queue=%u peak=%u/%u stalls=%lu longest=%.1fs dropped=%lu csv3=%uB peak=%uB of %uB\n"
              "AdjustField worst full pass (ms): total=%.1f | thermal=%.1f snapshot=%.1f fastov=%.1f modes=%.1f control=%.1f duty=%.1f tail=%.1f\n"
              "Field derate worst pass: %lu us (budget 500 us; part of snapshot above)\n"
@@ -9851,8 +10118,9 @@ void setupServer() {
              (unsigned long)ESP.getFreeHeap(),
              WebFsPartLabel, WebFsUsedKb, WebFsTotalKb,
              (WebFsTotalKb > 0) ? (100 * WebFsUsedKb / WebFsTotalKb) : -1,
-             tlsMem,
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             tlsMem, (unsigned long)tlsAllocPsram, (unsigned long)tlsAllocInternal, (unsigned long)tlsAllocFailed,
+             (unsigned)LargestInternalBlock, ageS(largestInternalAtMs),
+             (unsigned)LargestPSRAMBlock, ageS(largestPsramAtMs),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              asyncTcpCore, lwipCore,
              (unsigned)events.count(), (unsigned)sseQueueDepth, (unsigned)sseQueuePeak, (unsigned)SSE_MAX_QUEUED_MESSAGES,
@@ -9876,36 +10144,59 @@ void setupServer() {
              faStateName, faAttenIs12 ? "12" : "6",
              (unsigned long)faWindowsAccepted, (unsigned long)faWindowsDiscarded,
              (unsigned)faCellsUsed, faSesPkpkWorstA, faSesPeakWorstA, faSesPeakWorstHz);
-    // Floating-task census for the Core-1 preemption hunt: any task with core=FLOAT
-    // (tskNO_AFFINITY) can land on Core 1 and stall the priority-1 loop task. The loop runs
-    // at priority 1 — read the core column, then suspect any FLOAT task above it.
-    if (dpos > 0 && dpos < (int)sizeof(out)) {
-      const UBaseType_t maxTasks = 32;   // uxTaskGetSystemState returns 0 if this is too small
-      TaskStatus_t st[maxTasks];
-      UBaseType_t nTasks = uxTaskGetSystemState(st, maxTasks, nullptr);
-      dpos += snprintf(out + dpos, sizeof(out) - dpos, "Tasks (name prio core stackHWM):");
-      for (UBaseType_t i = 0; i < nTasks && dpos < (int)sizeof(out) - 64; i++) {
-        int core = (int)xTaskGetCoreID(st[i].xHandle);
-        dpos += snprintf(out + dpos, sizeof(out) - dpos, " [%s p%u c%s hwm%u]",
-                         st[i].pcTaskName,
-                         (unsigned)st[i].uxCurrentPriority,
-                         core == 2147483647 ? "FLOAT" : (core == 0 ? "0" : "1"),
-                         (unsigned)st[i].usStackHighWaterMark);
+    // Floating-task census: a core=FLOAT (tskNO_AFFINITY) task above the priority-1 loop task can land on
+    // Core 1 and stall it.
+    if (dpos > 0 && dpos < (int)sizeof(out) - 64) {
+      if (!cen) {
+        dpos += snprintf(out + dpos, sizeof(out) - dpos, "Tasks: no census yet (taken once the field has been cut 20 s)\n");
+      } else {
+        // Per-task CPU share = run-time counter delta against the previous census (the other slot) over the wall time
+        // between the two. That slot is intact here: the writer only fills it during the next census, which runs with
+        // Core 0's scheduler suspended, so this handler (async_tcp, Core 0) never reads a half-written one. The 32-bit
+        // counters wrap at 71.6 min, so shares are shown only for a shorter interval.
+        const TaskCensus *prev = &taskCensus[taskCensusPub ^ 1];
+        const bool haveShares = prev->atUs != 0 && prev->n > 0 && cen->atUs > prev->atUs
+                                && (cen->atUs - prev->atUs) < 4000000000LL;
+        const double spanUs = haveShares ? (double)(cen->atUs - prev->atUs) : 0.0;
+        if (haveShares)
+          dpos += snprintf(out + dpos, sizeof(out) - dpos,
+                           "Tasks (name prio core stackHWM cpu%% of its core over the %lus before the census), census %lus ago with the field cut, next one at the next field-cut window%s:",
+                           (unsigned long)(spanUs / 1e6), ageS(cen->atMs), cen->n ? "" : " - none listed, more than MAX_TASKS tasks?");
+        else
+          dpos += snprintf(out + dpos, sizeof(out) - dpos,
+                           "Tasks (name prio core stackHWM; cpu%% appears from the second census on), census %lus ago with the field cut, next one at the next field-cut window%s:",
+                           ageS(cen->atMs), cen->n ? "" : " - none listed, more than MAX_TASKS tasks?");
+        for (uint16_t i = 0; i < cen->n && dpos < (int)sizeof(out) - 64; i++) {
+          const TaskCensusRow &r = cen->row[i];
+          int core = (int)r.core;
+          char cpuS[14] = "";
+          if (haveShares) {
+            for (uint16_t k = 0; k < prev->n; k++) {
+              const TaskCensusRow &p = prev->row[k];
+              if (p.handle != r.handle || strcmp(p.name, r.name) != 0) continue;
+              double pct = 100.0 * (double)(uint32_t)(r.runUs - p.runUs) / spanUs;
+              if (pct > 100.0) strncpy(cpuS, " cpu?", sizeof(cpuS));   // same handle and name, fresh counter: the task was recreated
+              else snprintf(cpuS, sizeof(cpuS), " cpu%.1f%%", pct);
+              break;
+            }
+          }
+          dpos += snprintf(out + dpos, sizeof(out) - dpos, " [%s p%u c%s hwm%u%s]",
+                           r.name,
+                           (unsigned)r.prio,
+                           core == 2147483647 ? "FLOAT" : (core == 0 ? "0" : "1"),
+                           (unsigned)r.hwm, cpuS);
+        }
+        if (dpos < (int)sizeof(out)) snprintf(out + dpos, sizeof(out) - dpos, "\n");
       }
-      snprintf(out + dpos, sizeof(out) - dpos, "\n");
     }
     request->send(200, "text/plain", out);
   });
 
-  // Phone-sourced GPS + time backup. Browser + Capacitor app both POST here
-  // periodically (every ~30-60s) when they have a location fix. The priority
-  // chain (NMEA → Phone → NTP) consumes these via the *Phone globals and the
-  // lastPhone*Ms freshness timestamps. Partial submissions are OK — send only
-  // the fields you have.
+  // Phone GPS + time backup: browser and Capacitor app GET this every ~30-60 s with a fix; partial submissions
+  // are OK. Feeds the NMEA -> Phone -> NTP chain via the *Phone globals and lastPhone*Ms stamps.
   server.on("/set_phone_data", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Deliberately NOT arm-gated: this is background telemetry (clients push every ~30-60s
-    // whether or not settings are armed), and phone GPS/speed/time are backup sources a LAN
-    // client is trusted to provide. NMEA always outranks phone data, and range checks reject garbage.
+    // Deliberately NOT arm-gated: background telemetry from a trusted LAN client, pushed whether or not
+    // settings are armed. NMEA always outranks phone data, and range checks reject garbage.
     bool acceptedGps = false, acceptedTime = false;
     if (paramOk(request, "lat") && paramOk(request, "lon")) {
       // Use strtod + endptr (not String::toDouble — that silently returns 0.0
@@ -9928,8 +10219,7 @@ void setupServer() {
       }
     }
     if (request->hasParam("epochMs")) {
-      // JS Date.now() is millis since 1970. We store seconds for parity with
-      // the GPS/NTP path. Reject anything before Jan 1, 2020 (sanity).
+      // Date.now() ms -> seconds like the GPS/NTP path; reject anything before 2020-01-01.
       uint64_t ms = (uint64_t)strtoull(request->getParam("epochMs")->value().c_str(), nullptr, 10);
       time_t sec = (time_t)(ms / 1000ULL);
       if (sec > 1577836800) {
@@ -9938,9 +10228,8 @@ void setupServer() {
         acceptedTime = true;
       }
     }
-    // Phone GNSS doppler speed (m/s, Geolocation coords.speed) and course over
-    // ground (degrees, coords.heading). Sent independently of lat/lon — heading
-    // is null on a stationary phone, so each gets its own freshness stamp.
+    // Phone GNSS speed (m/s, coords.speed) and course (deg, coords.heading), independent of lat/lon:
+    // heading is null on a stationary phone, so each gets its own freshness stamp.
     bool acceptedSpd = false, acceptedHdg = false;
     if (paramOk(request, "spd")) {
       const char *spdStr = request->getParam("spd")->value().c_str();
@@ -9963,9 +10252,8 @@ void setupServer() {
         acceptedHdg = true;
       }
     }
-    // Promote phone data into the effective globals. GPS/time are no-ops when
-    // NMEA is fresh (NMEA wins); speed/course apply only when the user has
-    // selected phone as the speed source (never an automatic fallback).
+    // GPS/time are no-ops while NMEA is fresh; speed/course apply only when the user selected phone as
+    // the speed source (never an automatic fallback).
     if (acceptedGps)  consumePhoneGps();
     applyPhoneSpeed(acceptedSpd, acceptedHdg);
     if (acceptedTime) syncTimeFromPhone(PhoneTimeEpoch);
@@ -9988,9 +10276,8 @@ void setupServer() {
       return;
     }
 
-    // Validate token with Supabase (send only token, not device_uid) — staged onto the httpsTask
-    // worker; a synchronous doCloudPOST here starved every other endpoint for up to ~45 s on a
-    // dead uplink. Response handling lives in executeCloudOp; the client polls /cloudOpState.
+    // Token-only validation, staged onto the httpsTask worker: a synchronous doCloudPOST here starves every
+    // endpoint for up to ~45 s on a dead uplink. Reply handling is in executeCloudOp; the client polls /cloudOpState.
     DynamicJsonDocument payloadDoc(256);
     payloadDoc["token"] = authToken;
     String payload;
@@ -9998,9 +10285,8 @@ void setupServer() {
     cloudOpStageAndReply(request, CLOUDOP_CHECK_REG, payload.c_str());
   });
 
-  // Result poll for the staged cloud ops (/checkRegistration /registerProfile /updateProfile
-  // /deleteAllData). "code" is the HTTP status the old synchronous handler would have sent;
-  // "body" is its exact JSON reply.
+  // Result poll for the staged cloud ops (/checkRegistration /registerProfile /updateProfile /deleteAllData):
+  // "code" is the op's HTTP status, "body" its exact JSON reply.
   server.on("/cloudOpState", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
@@ -10024,15 +10310,10 @@ void setupServer() {
     request->send(200, "application/json", out);
   });
 
-  // Tiny always-answers identity endpoint for app-side subnet discovery: when mDNS fails
-  // across a phone hotspot, the Capacitor app sweeps 172.20.10.2-14 and latches onto this
-  // reply. No password, no side effects; CORS header because the app's origin is not us.
-  // The discovery floor, and the only thing that can tell two regulators apart before a client
-  // commits to one: uid is what the app pins to, name is what it shows the user, host is the
-  // per-unit mDNS name, ap is this unit's access-point SSID (per-unit now, so the app's Join
-  // button cannot offer a name that belongs to another board). pwreq says whether Unlock Controls
-  // will ask for a password, paired is this boat's other regulators, peers is every other regulator
-  // this unit currently hears on the network — the dashboard's picker is built from those two.
+  // Always-answers identity endpoint for app-side subnet discovery (mDNS fails across a phone hotspot, so the
+  // app sweeps 172.20.10.2-14). No password, no side effects; CORS because the app's origin is not us. uid is
+  // what the app pins to, name what it shows, host the per-unit mDNS name, ap this unit's own SSID; pwreq =
+  // Unlock Controls asks for a password; paired + peers (regulators heard on the LAN) build the dashboard picker.
   server.on("/identify", HTTP_GET, [](AsyncWebServerRequest *request) {
     String idBuf = "{\"device\":\"xreg-010\",\"uid\":\"";
     idBuf += device_id_hex;
@@ -10075,6 +10356,7 @@ void setupServer() {
   });
   // Cloud Features
   server.on("/registerProfile", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -10086,10 +10368,12 @@ void setupServer() {
     }
     // Identity only — the vessel record reaches user_profiles via the config snapshot
     // (update-config-snapshot projects the settings jsonb), never via registration.
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(768);
     doc["device_uid"] = deviceUID;
     doc["username"] = request->getParam("username", true)->value();
     doc["email"] = request->getParam("email", true)->value();
+    String nonce = regNonce();
+    if (nonce.length()) doc["reg_nonce"] = nonce;
     String payload;
     serializeJson(doc, payload);
     Serial.println("=== REGISTRATION REQUEST ===");
@@ -10099,6 +10383,7 @@ void setupServer() {
   });
 
   server.on("/updateProfile", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -10133,6 +10418,7 @@ void setupServer() {
   });
 
   server.on("/deleteAllData", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -10158,27 +10444,29 @@ void setupServer() {
   });
 
   server.on("/resetThermalPID", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     tempPIDResetRequested = true;
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/resetInnerPID", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     innerPIDResetRequested = true;
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/tuninglog", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // PSRAM-backed buffer; shared_ptr deleter frees on response destruction
-    // (normal completion OR abort). Chunked send keeps only ~1.5 KB on the internal heap.
-    // 16 KB (was 10 KB): the per-record Notes field widened each row.
+    // PSRAM buffer freed by the shared_ptr deleter on completion OR abort; chunked send keeps ~1.5 KB on the
+    // internal heap. 16 KB fits the per-record Notes field.
     std::shared_ptr<char> bufPtr((char *)ps_malloc(16384), [](char *p) { if (p) free(p); });
     if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
     char *buf = bufPtr.get();
 
     // Build sorted index (insertion sort — 50 entries max)
+    const int count = tuningLogCount;   // read once: a record committed mid-handler would index an unset sortIdx slot
     uint8_t sortIdx[50];
-    for (int i = 0; i < tuningLogCount; i++) sortIdx[i] = i;
-    for (int i = 1; i < tuningLogCount; i++) {
+    for (int i = 0; i < count; i++) sortIdx[i] = i;
+    for (int i = 1; i < count; i++) {
       uint8_t key = sortIdx[i];
       float keyScore = tuningLog[key].score;
       int j = i - 1;
@@ -10191,7 +10479,7 @@ void setupServer() {
 
     int pos = 0;
     pos += snprintf(buf + pos, 16384 - pos, "{\"rec\":[");
-    for (int i = 0; i < tuningLogCount && pos < 15900; i++) {
+    for (int i = 0; i < count && pos < 15900; i++) {
       TuningRecord &r = tuningLog[sortIdx[i]];
       char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, 16384 - pos,
@@ -10210,9 +10498,8 @@ void setupServer() {
     bool testActive = (TuningMode && tuningScore.toggleCount > 0);
     float ts = (tuningScore.activeTimeSec > 0.0f)
                  ? (tuningScore.errorAccum / tuningScore.activeTimeSec) : 0.0f;
-    // "live" carries the since-reset Control Accuracy v4 numbers for this loop:
-    // [Tracking % (in-band while active), worst over-current (A), 0, 0]. (4-slot
-    // shape kept for the tuning UI parser.)
+    // "live" = since-reset Control Accuracy v4: [Tracking % in-band while active, worst over-current A, 0, 0];
+    // the 4-slot shape is what the tuning UI parser expects.
     pos += snprintf(buf + pos, 16384 - pos,
       "],\"live\":[%.2f,%.2f,%.2f,%.2f],"
       "\"ts\":%.2f,\"tt\":%d,\"ta\":%d}",
@@ -10296,18 +10583,15 @@ void setupServer() {
     char *buf = bufPtr.get();
     int pos = 0;
     pos += snprintf(buf + pos, FCJ_BUF - pos, "{\"pts\":[");
-    // Points are display-only and the poller reads them once, off the FINISHED run. Shipping them on
-    // the in-run polls put ~1.7 kB on the wire every 1.5 s for the whole ramp, contending with the
-    // 10 Hz SSE telemetry on the same TCP stack, for bytes the client discards.
+    // Points are display-only and read once off the FINISHED run; on in-run polls ~1.7 kB every 1.5 s would
+    // contend with the 10 Hz SSE telemetry for bytes the client discards.
     const bool fcvDone = (fieldCurveActive == 0) && fieldCurveResultsReady;
     for (int i = 0; fcvDone && i < fieldCurveCount && pos < FCJ_BUF - 640; i++) {
       pos += snprintf(buf + pos, FCJ_BUF - pos, "%s{\"d\":%.1f,\"a\":%.2f}",
                       i > 0 ? "," : "", fieldCurveBuf[i].duty, fieldCurveBuf[i].amps);
     }
-    // "aborted" is the protection-abort latch (fieldCurveAbortRequested). It is reported INDEPENDENTLY
-    // of "active" because a protection cut latches the abort but leaves fieldCurveActive set until
-    // fieldCurve_tick next runs — and that tick is gated out during the fault lockout, so "active"
-    // can stay 1 indefinitely. The poller checks "aborted" so it never hangs waiting for !active.
+    // "aborted" (fieldCurveAbortRequested) is reported independently of "active": a protection cut leaves
+    // fieldCurveActive set and fieldCurve_tick is gated out during the lockout, so the poller checks "aborted".
     pos += snprintf(buf + pos, FCJ_BUF - pos,
                     "],\"active\":%d,\"ready\":%d,\"ok\":%d,\"tok\":%u,\"kneeDuty\":%.1f,\"kneeAmps\":%.2f,"
                     "\"targetA\":%.1f,\"propStabA\":%.1f,\"propStepPct\":%.2f,\"ceilLimited\":%d,\"ceilBind\":%d,\"aborted\":%d,\"abort\":\"%s\","
@@ -10324,12 +10608,12 @@ void setupServer() {
     request->send(200, "application/json", buf);
   });
 
-  // Field resistance test (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1). Every request is the app's heartbeat: a run ends
-  // 3 s after the last one. start=1&method=1|2 (shunt|meter), reading=<amps>, again=1, save=1, skip=1 and abort=1 act; with
-  // none it is a status read. abort works locked, like OnOff=0; the others need the settings arm. save=1 writes a finished
-  // result and skip=1 the 12 V no-shunt default (B1.14): the owner's Next, Save or Use 2 ohm, so an explicit action may write
-  // flash here. The firmware does the math for both methods, so the formula lives once, beside the estimate it calibrates.
+  // Field resistance test (BATTERY_WIRING_AND_SHUNT_SPEC.md Addendum B1). Every request is the app's heartbeat: a run
+  // ends FRT_HB_MS after the last one. start=1&method=1|2 (shunt|meter), reading=<amps>, again=1, save=1, skip=1 and
+  // abort=1 act; none = status read. abort works locked, like OnOff=0; the others need the arm. save=1 / skip=1 (the
+  // 12 V no-shunt default, B1.14) are explicit owner actions, so they may write flash here.
   server.on("/fieldResTest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     const uint32_t nowMs = millis();
     if (frt.state == FRT_RUNNING) {
       const uint32_t gap = nowMs - frt.lastPollMs;
@@ -10444,20 +10728,17 @@ void setupServer() {
     request->send(200, "application/json", buf);
   });
 
-  // Field de-energize test (runs per speed inside commissioning stage 7): filtered decay trace +
-  // fitted τ / 90→10 fall time + the hold-averaged RPM and pre-cut amps this run's drain point is
-  // reported at. pts.t is ms relative to the detected cut edge (small negative lead-in shows the
-  // plateau). The wizard polls this once per Min%-floor speed and fits drain-vs-RPM across the runs.
-  // "aborted" reported independently of "active" (same rationale as /fieldcurve.json).
+  // Field de-energize test (commissioning stage 7, once per Min%-floor speed): decay trace, fitted τ / 90→10 fall
+  // time, hold-averaged RPM and pre-cut amps. pts.t is ms relative to the detected cut edge (negative lead-in shows
+  // the plateau). "aborted" is reported independently of "active" (see /fieldcurve.json).
   server.on("/fieldcut.json", HTTP_GET, [](AsyncWebServerRequest *request) {
     std::shared_ptr<char> bufPtr((char *)ps_malloc(8192), [](char *p) { if (p) free(p); });
     if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
     char *buf = bufPtr.get();
     int pos = 0;
     pos += snprintf(buf + pos, 8192 - pos, "{\"pts\":[");
-    // Same as /fieldcurve.json: display-only, read once off the finished run. fieldCutProcess fills
-    // these at cut+4 s but `active` stays set through the 1.5 s ease-out, so the in-run polls were
-    // pushing ~5 kB apiece across exactly the window where the field re-engages.
+    // Same as /fieldcurve.json: display-only, read once off the finished run (`active` stays set through the
+    // 1.5 s ease-out, exactly when the field re-engages).
     const bool fcDone = (fieldCutActive == 0) && fieldCutResultsReady;
     for (int i = 0; fcDone && i < fcPlotN && pos < 7400; i++) {
       pos += snprintf(buf + pos, 8192 - pos, "%s{\"t\":%.1f,\"a\":%.2f}",
@@ -10475,10 +10756,9 @@ void setupServer() {
     request->send(200, "application/json", buf);
   });
 
-  // Charge health calibration status (commissioning stage 9 polls this). One small object — the
-  // captured swing never leaves the device, only the fits do. runMs/rampMs/idleRpm/top are the
-  // schedule the browser draws its chart against, so the screen and the firmware share one clock.
-  // topCapA is valid BEFORE a run: the charge-rate limit at the would-be test top, for the setup screen.
+  // Charge health calibration status (commissioning stage 9). Only the fits leave the device. runMs/rampMs/idleRpm/top
+  // are the schedule the browser charts against, so screen and firmware share one clock. topCapA is valid BEFORE a
+  // run: the charge-rate limit at the would-be test top, for the setup screen.
   server.on("/chc.json", HTTP_GET, [](AsyncWebServerRequest *request) {
     char buf[768];
     snprintf(buf, sizeof(buf),
@@ -10613,9 +10893,10 @@ void setupServer() {
     if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
     char *buf = bufPtr.get();
     // Sort by bandwidth; never-tracks (<0) sinks to end.
+    const int count = tuningSweepLogCount;   // read once: a record committed mid-handler would index an unset sortIdx slot
     uint8_t sortIdx[50];
-    for (int i = 0; i < tuningSweepLogCount; i++) sortIdx[i] = i;
-    for (int i = 1; i < tuningSweepLogCount; i++) {
+    for (int i = 0; i < count; i++) sortIdx[i] = i;
+    for (int i = 1; i < count; i++) {
       uint8_t key = sortIdx[i];
       float kb = tuningSweepLog[key].bandwidthHz; if (kb < 0.0f) kb = -1e9f;
       int j = i - 1;
@@ -10628,7 +10909,7 @@ void setupServer() {
     }
     int pos = 0;
     pos += snprintf(buf + pos, CAP - pos, "{\"rec\":[");
-    for (int i = 0; i < tuningSweepLogCount && pos < CAP - 600; i++) {
+    for (int i = 0; i < count && pos < CAP - 600; i++) {
       TuningSweepRecord &r = tuningSweepLog[sortIdx[i]];
       char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, CAP - pos,
@@ -10669,9 +10950,10 @@ void setupServer() {
     if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
     char *buf = bufPtr.get();
     // Sort by roll-off; <0 sinks to end.
+    const int count = sysidSweepLogCount;   // read once: a record committed mid-handler would index an unset sortIdx slot
     uint8_t sortIdx[50];
-    for (int i = 0; i < sysidSweepLogCount; i++) sortIdx[i] = i;
-    for (int i = 1; i < sysidSweepLogCount; i++) {
+    for (int i = 0; i < count; i++) sortIdx[i] = i;
+    for (int i = 1; i < count; i++) {
       uint8_t key = sortIdx[i];
       float kb = sysidSweepLog[key].rolloffHz; if (kb < 0.0f) kb = -1e9f;
       int j = i - 1;
@@ -10684,7 +10966,7 @@ void setupServer() {
     }
     int pos = 0;
     pos += snprintf(buf + pos, CAP - pos, "{\"rec\":[");
-    for (int i = 0; i < sysidSweepLogCount && pos < CAP - 600; i++) {
+    for (int i = 0; i < count && pos < CAP - 600; i++) {
       SysIDSweepRecord &r = sysidSweepLog[sortIdx[i]];
       char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, CAP - pos,
@@ -10716,15 +10998,16 @@ void setupServer() {
   });
 
   server.on("/systemidlog", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // PSRAM-backed buffer (50 records × ~200 bytes ≈ 10 KB).
-    std::shared_ptr<char> bufPtr((char *)ps_malloc(10240), [](char *p) { if (p) free(p); });
+    // PSRAM-backed buffer (50 records × ~215 bytes ≈ 11 KB, so 16 KB like /tuninglog).
+    std::shared_ptr<char> bufPtr((char *)ps_malloc(16384), [](char *p) { if (p) free(p); });
     if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
     char *buf = bufPtr.get();
 
     // Sort by score (lower = faster plant = better). Aborted runs (-1) sink to end.
+    const int count = systemIDLogCount;   // read once: a record committed mid-handler would index an unset sortIdx slot
     uint8_t sortIdx[50];
-    for (int i = 0; i < systemIDLogCount; i++) sortIdx[i] = i;
-    for (int i = 1; i < systemIDLogCount; i++) {
+    for (int i = 0; i < count; i++) sortIdx[i] = i;
+    for (int i = 1; i < count; i++) {
       uint8_t key = sortIdx[i];
       float keyScore = systemIDLog[key].score;
       if (keyScore < 0.0f) keyScore = 1e9f;  // aborted → sort last
@@ -10740,11 +11023,11 @@ void setupServer() {
     }
 
     int pos = 0;
-    pos += snprintf(buf + pos, 10240 - pos, "{\"rec\":[");
-    for (int i = 0; i < systemIDLogCount && pos < 9800; i++) {
+    pos += snprintf(buf + pos, 16384 - pos, "{\"rec\":[");
+    for (int i = 0; i < count && pos < 15900; i++) {
       SystemIDRecord &r = systemIDLog[sortIdx[i]];
       char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
-      pos += snprintf(buf + pos, 10240 - pos,
+      pos += snprintf(buf + pos, 16384 - pos,
         "%s{\"n\":%u,\"s\":%.1f,"
         "\"rd\":[%.0f,%.0f,%.0f],\"fd\":[%.0f,%.0f,%.0f],"
         "\"ra\":%.1f,\"fa\":%.1f,"
@@ -10761,7 +11044,7 @@ void setupServer() {
         (unsigned)r.abortReason, (unsigned)r.abortPhase, r.setupStepAmplitude,
         r.avgRPM, jsonNum1(tbuf, sizeof(tbuf), r.avgAltTempF), r.battV, (int)r.chargeStage, (unsigned)r.epoch);
     }
-    pos += snprintf(buf + pos, 10240 - pos,
+    pos += snprintf(buf + pos, 16384 - pos,
       "],\"active\":%d,\"ready\":%d}",
       (int)systemIDActive, systemIDResultsReady ? 1 : 0);
 
@@ -10778,17 +11061,16 @@ void setupServer() {
   });
 
   server.on("/cvtuninglog", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // PSRAM-backed buffer (50 records × ~420 bytes ≈ 21 KB). shared_ptr deleter runs
-    // when the chunked-response lambda is destroyed (normal completion OR abort), so
-    // no manual free is needed and aborted requests can't leak.
+    // PSRAM buffer (50 records × ~420 B ≈ 21 KB); the shared_ptr deleter frees it on completion OR abort.
     std::shared_ptr<char> bufPtr((char *)ps_malloc(32768), [](char *p) { if (p) free(p); });
     if (!bufPtr) { request->send(500, "text/plain", "OOM"); return; }
     char *buf = bufPtr.get();
 
     // Build sorted index (insertion sort, best score first)
+    const int count = cvTuningLogCount;   // read once: a record committed mid-handler would index an unset sortIdx slot
     uint8_t sortIdx[50];
-    for (int i = 0; i < cvTuningLogCount; i++) sortIdx[i] = i;
-    for (int i = 1; i < cvTuningLogCount; i++) {
+    for (int i = 0; i < count; i++) sortIdx[i] = i;
+    for (int i = 1; i < count; i++) {
       uint8_t key = sortIdx[i];
       float keyScore = cvTuningLog[key].score;
       int j = i - 1;
@@ -10801,7 +11083,7 @@ void setupServer() {
 
     int pos = 0;
     pos += snprintf(buf + pos, (pos >= 32768 ? 0 : 32768 - pos), "{\"rec\":[");
-    for (int i = 0; i < cvTuningLogCount && pos < 32000; i++) {
+    for (int i = 0; i < count && pos < 32000; i++) {
       CVTuningRecord &r = cvTuningLog[sortIdx[i]];
       char tbuf[12];   // avgAltTempF is NAN when no probe read during the run -> JSON null
       pos += snprintf(buf + pos, (pos >= 32768 ? 0 : 32768 - pos),
@@ -10841,9 +11123,8 @@ void setupServer() {
                         + cvTuningScore.totalLowUndershootVs)
              / cvTuningScore.activeTimeSec;
     }
-    // "live" carries the since-reset Control Accuracy v4 numbers for the CV loop:
-    // [Tracking % (in-band while active), worst over-voltage (mV 12V-equiv), 0, 0]. (4-slot
-    // shape kept for the tuning UI parser.)
+    // "live" = since-reset Control Accuracy v4 for the CV loop: [Tracking % in-band while active, worst
+    // over-voltage mV 12V-equiv, 0, 0]; the 4-slot shape is what the tuning UI parser expects.
     pos += snprintf(buf + pos, (pos >= 32768 ? 0 : 32768 - pos),
       "],\"live\":[%.2f,%.0f,%.0f,%.0f],"
       "\"ts\":%.2f,\"tc\":%d,\"ta\":%d}",
@@ -10851,9 +11132,7 @@ void setupServer() {
       accVolt4.worstOver * 1000.0f, 0.0f, 0.0f,  // mV
       cvts, (int)cvTuningScore.scoredHighCount, cvTestActive ? 1 : 0);
 
-    // Chunked send: only ~1.5 KB per chunk lands on the internal heap. bufPtr is
-    // captured by value (ref-count) so the PSRAM buffer lives for the duration of
-    // the response and is freed automatically when the lambda is destroyed.
+    // Chunked send: ~1.5 KB per chunk on the internal heap; the captured bufPtr keeps the PSRAM buffer alive.
     size_t total = (size_t)pos;
     AsyncWebServerResponse *response = request->beginChunkedResponse(
       "application/json",
@@ -10867,6 +11146,7 @@ void setupServer() {
   });
 
   server.on("/resetcvtuninglog", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     cvTuningLogCount     = 0;
     cvTuningLogHead      = 0;
     cvTuningRunCounter   = 0;
@@ -10880,6 +11160,7 @@ void setupServer() {
   });
 
   server.on("/resettuninglog", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     tuningLogCount    = 0;
     tuningLogHead     = 0;
     tuningRunCounter  = 0;
@@ -10892,10 +11173,10 @@ void setupServer() {
     request->send(200, "text/plain", "OK");
   });
 
-  // Manual "Reset" button under the Control Accuracy panel. Clears all accumulators AND the live
-  // excursion stopwatches. (The daily post-snapshot auto-reset passes false so an in-progress
-  // excursion carries whole into the new window.)
+  // Manual Control Accuracy "Reset": clears accumulators AND the live excursion stopwatches (the daily
+  // auto-reset passes false so an in-progress excursion carries whole into the new window).
   server.on("/resetAccuracyScores", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     resetAccuracyScores(true);
     request->send(200, "text/plain", "OK");
   });
@@ -10930,11 +11211,13 @@ void setupServer() {
   });
 
   server.on("/resetsystemidlog", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     systemIDLogClearAll();  // persist deferred to Core 1 — avoids blocking Core 0 SSE
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/resettuningsweeplog", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     tuningSweepLogCount   = 0;
     tuningSweepLogHead    = 0;
     tuningSweepRunCounter = 0;
@@ -10944,6 +11227,7 @@ void setupServer() {
   });
 
   server.on("/resetsysidsweeplog", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     sysidSweepLogCount   = 0;
     sysidSweepLogHead    = 0;
     sysidSweepRunCounter = 0;
@@ -10953,11 +11237,13 @@ void setupServer() {
   });
 
   server.on("/resetVoltageLoop", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     cvLoopResetRequested = true;
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/resetVoltageProtectionCounters", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     g_fastOvClampCount = 0;
     g_fastOvHardCount = 0;
     g_iExcessCount = 0;
@@ -10981,6 +11267,7 @@ void setupServer() {
   // Deliberately SEPARATE from the session-counter reset above: routine bench resets must not
   // destroy the lifetime OV record. The web UI fronts this with an explicit confirm.
   server.on("/resetOvTelemetryLifetime", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     memset(&g_ovTel, 0, sizeof(g_ovTel));
     g_ovTel.magic = OVTEL_MAGIC;
     request->send(200, "text/plain", "OK");
@@ -11020,6 +11307,7 @@ void setupServer() {
   });
 
   server.on("/resetThermalProtectionCounters", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     g_tempCritCount = 0;
     g_tempSustainedCount = 0;
     g_tempStaleCount = 0;
@@ -11027,6 +11315,7 @@ void setupServer() {
   });
 
   server.on("/resetTempTaskCounters", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
     tempReadFailCount = 0;
     tempCrcFailCount = 0;
     tempCrcRecoveredCount = 0;
@@ -11108,23 +11397,15 @@ void dnsHandleRequest() {  // process dns request for captive portals
     }
   }
 }
-// Engine-off standby power drop. Normally powers WiFi fully off and slows the CPU to 80MHz. With
-// WiFi Napping enabled in Client mode it instead keeps WiFi associated in modem-sleep so the
-// dashboard stays reachable with no button press — indefinitely while the regulator stays on the
-// router. Nap costs only ~1mA over full-off (measured), so there is no idle timeout. While napping
-// the CPU bumps to 240MHz whenever a dashboard is connected (snappy UI) and drops to 80MHz when
-// idle. The temp task is NO LONGER suspended here — the DS18B20/OneWire path reads fine at 80MHz
-// (all its timing is wall-clock, not CPU-cycle, based), and the task self-throttles while the
-// engine is off (60 s unwatched, 5 s with a dashboard connected; see TempTask), which keeps alt
-// temperature fresh for the zero-drift log at negligible standby power. Modem-sleep stays on, so
-// there's still ~100-300ms beacon latency on the first packet, which is fine. Ordering matters: do
-// the WiFi op, then set the clock.
+// Engine-off standby. Normally WiFi fully off + 80 MHz. With WiFi Napping in Client mode WiFi stays associated
+// in modem-sleep so the dashboard stays reachable (~1 mA over full-off, measured, so no idle timeout); CPU runs
+// 240 MHz while a dashboard is connected, else 80 MHz. The temp task is not suspended: its OneWire timing is
+// wall-clock and it self-throttles engine-off (see TempTask). Ordering matters: WiFi op first, then the clock.
 void enterLowPowerStandby() {
   if (wifiNapEnabled && currentMode == MODE_CLIENT) {
     if (!wifiNapActive) {
-      // Napping can be switched on after a previous standby already took the WIFI_OFF branch below.
-      // Declaring the nap without raising STA first strands checkWiFiConnection() on its WIFI_OFF
-      // early-out while the call-site gate believes WiFi is up — dead until ignition-on or GPIO5.
+      // Napping can be enabled after a standby already took the WIFI_OFF branch below; declaring the nap without
+      // raising STA strands checkWiFiConnection() on its WIFI_OFF early-out until ignition-on or GPIO5.
       if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);  // seek engine does the join, non-blocking
       WiFi.setSleep(true);           // modem sleep — WiFi naps between DTIM beacons
       wifiNapActive = true;
@@ -11134,9 +11415,7 @@ void enterLowPowerStandby() {
     WiFi.mode(WIFI_OFF);             // THIS MUST BE DONE FIRST
     wifiNapActive = false;           // napping disabled (or AP mode) — clear stale nap state
   }
-  // Temp task intentionally NOT suspended (reads fine at 80MHz; self-throttles engine-off: 60 s unwatched, 5 s watched).
-  // While napping, run 240MHz when a dashboard is actually connected (snappy UI), else 80MHz.
-  // WiFi-off standby always stays 80MHz. Guarded so the PLL isn't reconfigured every loop pass.
+  // 240 MHz only while napping with a dashboard connected; guarded so the PLL isn't reconfigured every pass.
   uint32_t targetMhz = (wifiNapActive && events.count() > 0) ? 240 : 80;
   if (getCpuFrequencyMhz() != targetMhz) {
     setCpuFrequencyMhz(targetMhz);   // THIS MUST BE DONE AFTER THE WIFI OP
@@ -11144,7 +11423,7 @@ void enterLowPowerStandby() {
 }
 void checkWiFiConnection() {
   // Non-blocking reconnect engine — never waits on the radio in loop() (Core 1). Presence scans
-  // run async+passive on the Core-0 WiFi task; joins are fire-and-poll across loop passes. No
+  // run async on the Core-0 WiFi task; joins are fire-and-poll across loop passes. No
   // backoff, no give-up: a phone hotspot can appear at any moment, and holding the association
   // once joined is what keeps the iPhone's ~90 s no-client hotspot auto-off at bay.
   if (currentMode != MODE_CLIENT) return;
@@ -11255,7 +11534,6 @@ void sseSend(const char *msg, const char *evt) {
 // costs nothing because they carry current state, not history.
 bool sseBacklogged() { return sseQueueDepth >= SSE_BACKLOG_DEPTH; }
 void SendWifiData() {
-  // Don't send WiFi data during HTTPS operations
   unsigned long start66 = micros();
   // === THROTTLED WIFI CHECKS (every 2 seconds) ===
   static int cachedWiFiMode = WIFI_OFF;
@@ -11265,11 +11543,9 @@ void SendWifiData() {
 
   unsigned long now = millis();
 
-  // Dashboard-stream census, ahead of the WiFi gate so a radio-down window is counted too.
-  // events.send() with no listener discards silently and trySendConsoleSSE drains the queue the same
-  // way, so an outage costs every console line produced while it lasted with nothing to mark it.
-  // Report the gap on the way back: it lands in the /consolehist.txt ring, which survives outages the
-  // browser does not. 2 s floor keeps a page reload or tab swap out of the log.
+  // Dashboard-stream census, ahead of the WiFi gate so a radio-down window counts too. With no listener,
+  // events.send() and trySendConsoleSSE discard silently, so the gap is reported on reconnect into the
+  // /consolehist.txt ring. The 2 s floor keeps a page reload or tab swap out of the log.
   static uint8_t  sseLastClients = 0;
   static uint32_t sseDownSinceMs = 0;
   static uint16_t sseDropCount = 0;
@@ -11285,10 +11561,8 @@ void SendWifiData() {
   }
   sseLastClients = sseClients;
 
-  // Backpressure witness, 10 Hz: a stall is logged when the queue empties again, sized from first
-  // backlog to full drain (the browser's own gap is a little shorter - it runs from the last frame
-  // that got through to the first of the burst). Console lines queued during the stall reach the
-  // browser after the drain, because trySendConsoleSSE is one of the gated channels.
+  // Backpressure witness, 10 Hz: a stall is logged when the queue empties again, sized from first backlog to
+  // full drain. Console lines queued during it arrive after the drain (trySendConsoleSSE is a gated channel).
   static uint32_t sseDepthPollMs = 0, sseStallStartMs = 0, sseStallDropsAtStart = 0;
   static uint16_t sseStallPeak = 0;
   if (now - sseDepthPollMs >= 100) {
@@ -11341,9 +11615,8 @@ void SendWifiData() {
 
   bool sentSomething = false;
 
-  // One-shot boot announcement. Emitted only once a browser is connected, so it
-  // survives the 10-slot console queue churning during boot and lands right after
-  // the SSE auto-reconnect that follows a reboot — exactly the remote-debug case.
+  // One-shot boot announcement, sent only once a browser is connected so it survives boot-time console
+  // queue churn and lands right after the post-reboot SSE auto-reconnect.
   static bool bootLineSent = false;
   if (!bootLineSent && events.count() > 0) {
     bootLineSent = true;
@@ -11370,7 +11643,7 @@ void SendWifiData() {
     static char *payload1 = nullptr;
     static const size_t PAYLOAD1_SIZE = 1400;
     if (!payload1) {
-      payload1 = (char *)ps_malloc(PAYLOAD1_SIZE);  // bumped from 500, allocated to PSRAM
+      payload1 = (char *)ps_malloc(PAYLOAD1_SIZE);  // allocated to PSRAM
       if (!payload1) {
         Serial.println("FATAL: payload1 ps_malloc failed");
         return;
@@ -11401,11 +11674,11 @@ void SendWifiData() {
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"  // +2: mExcessEmaPeak, iExcessThreshMin; +1: fieldEventReason; +4: cvPTerm, cvIterm, cvKdTrim, cvKdFiltV; +1: huntDerate; +2: huntFreqHz, huntState; +1: rpmCeilingAmps; +1: OnOff
+                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%u,%u",  // +2: sessionId, sendMs
 
                                CSV1_FIELD_COUNT,
-                               !isfinite(AlternatorTemperatureF) ? ROLL_EMPTY : SafeInt(AlternatorTemperatureF, 100),  // no probe bound to the alt role -> "not available"; SafeInt's -1 rendered as a real -0.0F
+                               !isfinite(AlternatorTemperatureF) ? ROLL_EMPTY : SafeInt(AlternatorTemperatureF, 100),  // no alt-role probe -> "not available" (SafeInt's -1 would render as -0.0F)
 
                                SafeInt(dutyCycle, 100),
                                SafeInt(battVOut, 100),
@@ -11483,16 +11756,12 @@ void SendWifiData() {
     lastEventSourceSend = now;
     sentSomething = true;
   }
-  // PRIORITY 2: CSVData4 / NavStream — live nav/wind/solar/fuel at 2 Hz (500 ms).
-  // High priority (right after CSV1) so these gauges aren't starved by the slower CSV2/CSV3/TS
-  // channels. These fields used to ride the 5 s CSV2 cadence and looked frozen on the dial/helm.
+  // PRIORITY 2: CSVData4 / NavStream — live nav/wind/solar/fuel at 2 Hz, right after CSV1 so the slower
+  // CSV2/CSV3/TS channels can't starve these gauges.
   if (!sentSomething && now - lastpayload4send >= 500UL && events.count() > 0 && !sseBacklogged()) {
     static char *payload4 = nullptr;
-    static const size_t PAYLOAD4_SIZE = 512;  // ~7 B/field, plus the two 10-digit stamp fields; rounded up with headroom
-                                              // Was 256: SafeInt's sentinel widened from -1 to -2000000000, and 19 SafeInt
-                                              // fields at 11 chars each puts the arithmetic worst case at 253 of 256 bytes.
-                                              // snprintf truncates and the length guard below drops the frame, so an
-                                              // overrun would silently stop NavStream rather than corrupt memory.
+    static const size_t PAYLOAD4_SIZE = 512;  // ~7 B/field (SafeInt sentinel is 11 chars) plus two 10-digit stamps, with headroom;
+                                              // an overrun drops the frame at the length guard below, silently stopping NavStream.
     if (!payload4) {
       payload4 = (char *)ps_malloc(PAYLOAD4_SIZE);  // allocated to PSRAM
       if (!payload4) {
@@ -11514,8 +11783,7 @@ void SendWifiData() {
                                !isfinite(STWNMEA) ? ROLL_EMPTY : SafeInt(STWNMEA, 100),                                  // CSV4_STWNMEA (knots ×100)
                                SafeInt(ApparentWindSpeedNMEA, 100),      // CSV4_ApparentWindSpeedNMEA
                                SafeInt(ApparentWindAngleNMEA),           // CSV4_ApparentWindAngleNMEA
-                               // No wind instrument / no target bearing / no boat speed leaves these NAN. SafeInt's -1
-                               // rendered as real readings (-0.0 kt, -1 deg) and banked a flat line in the trend rings.
+                               // NAN (no wind instrument / target bearing / boat speed) -> ROLL_EMPTY; SafeInt's -1 would read as real.
                                !isfinite(TrueWindSpeedNMEA) ? ROLL_EMPTY : SafeInt(TrueWindSpeedNMEA, 100),                // CSV4_TrueWindSpeedNMEA
                                !isfinite(TrueWindAngleNMEA) ? ROLL_EMPTY : SafeInt(TrueWindAngleNMEA),                     // CSV4_TrueWindAngleNMEA
                                !isfinite(LeewayNMEA) ? ROLL_EMPTY : SafeInt(LeewayNMEA),                                   // CSV4_LeewayNMEA
@@ -11549,10 +11817,8 @@ void SendWifiData() {
   }
   // PRIORITY 3: Console
   trySendConsoleSSE(sentSomething, now);
-  // PRIORITY 4: CSVData2 (status/settings data).
-  // During a plant delay test, bypass the sentSomething gate and send every 500 ms so the
-  // UI phase-progress display stays within one poll tick of the actual firmware state.
-  // Normal operation: every 5 s, gated behind CSV1 to avoid double-sending per tick.
+  // PRIORITY 4: CSVData2. Every 5 s gated behind CSV1; during a plant delay test every 500 ms, bypassing the
+  // gate, so the UI phase-progress display stays within one poll tick of the firmware.
   const bool sysIDRunning = (systemIDActive != 0);
   if ((sysIDRunning || !sentSomething) && now - lastpayload2send >= (sysIDRunning ? 500UL : 5000UL) && events.count() > 0 && !sseBacklogged()) {
     static char *payload2 = nullptr;
@@ -11561,6 +11827,9 @@ void SendWifiData() {
     static const size_t PAYLOAD2_SIZE = 8192;
     static int payload2Len = 0;       // persists between the build pass and the send pass
     static uint8_t csv2Phase = 0;     // 0 = build this due pass, 1 = send the built payload next pass
+    static unsigned long csv2BuiltMs = 0;
+    // The send pass's gate can fail for hours (last client gone, queue backed up): a frame that old is rebuilt, never sent.
+    if (csv2Phase == 1 && now - csv2BuiltMs > 1000UL) csv2Phase = 0;
     if (!payload2) {
       payload2 = (char *)ps_malloc(PAYLOAD2_SIZE);  // allocated to PSRAM
       if (!payload2) {
@@ -11581,8 +11850,8 @@ void SendWifiData() {
                                "%d,"  // CSV2_FIELD_COUNT
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%d,"
+                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
@@ -11638,6 +11907,8 @@ void SendWifiData() {
                                "%d,%d,%d,"      // +3 sensor-fault field-event counters: voltage stale, voltage2 stale, battery temp lost
                                "%d,%d,%d,%d,%d,%d,"   // +6 sensor faults: fault mask, battery-temperature state, limp tier, steady mask, required-fault count, battery-current state
                                "%d,%d,%d,%d,%lu,%lu,%lu,%lu,%d,"   // +9 board field ceilings: current, heat, binding term, corrected R, lifetime/session seconds at each, die-temp-lost count
+                               "%d,%d,%d,%d,%d,%d,%d,"   // +7 NMEA 2000 bus health: verdict, TEC, REC, frames received, bus-offs, lost frames, nodes heard
+                               "%d,"            // +1 largest free PSRAM block (KB)
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -11673,7 +11944,6 @@ void SendWifiData() {
                                SafeInt(weatherDataValid),
                                SafeInt(alarmLatch ? 1 : 0),
                                SafeInt(ResetAlarmLatch),
-                               SafeInt(DynamicShuntGainFactor, 1000),
                                SafeInt(DynamicAltCurrentZero, 1000),
                                SafeInt(InsulationLifePercent, 100),
                                SafeInt(GreaseLifePercent, 100),
@@ -11781,8 +12051,8 @@ void SendWifiData() {
                                SafeInt(imu_fifo_overrun_count),
                                SafeInt(imu_i2c_error_count),
                                SafeInt(imu_unknown_tag_count),
-                               SafeInt(imuRingBuffer->accel_dropped),
-                               SafeInt(imuRingBuffer->gyro_dropped),
+                               SafeInt(imuRingBuffer ? imuRingBuffer->accel_dropped : 0),
+                               SafeInt(imuRingBuffer ? imuRingBuffer->gyro_dropped : 0),
                                SafeInt(imu_total_samples_accel),
                                SafeInt(imu_total_samples_gyro),
                                SafeInt(IMUReadTime2),
@@ -12275,6 +12545,14 @@ void SendWifiData() {
                                (unsigned long)g_fieldHeatLimSesS,                        // CSV2_fieldHeatLimSesS
                                (unsigned long)g_fieldCurLimSesS,                         // CSV2_fieldCurLimSesS
                                SafeInt(g_dieTempLostCount),                              // CSV2_dieTempLostCount
+                               (int)n2kBusVerdictCode,                                   // CSV2_n2kBusVerdict
+                               (int)tNMEA2000_esp32::BusStats.tec,                       // CSV2_n2kTec
+                               (int)tNMEA2000_esp32::BusStats.rec,                       // CSV2_n2kRec
+                               (int)((tNMEA2000_esp32::BusStats.rxFrames - n2kRxFramesBase) & 0x7FFFFFFF),  // CSV2_n2kRxFrames
+                               (int)(tNMEA2000_esp32::BusStats.busOffCount & 0x7FFFFFFF),                   // CSV2_n2kBusOffCount
+                               (int)(n2kRxLostRun & 0x7FFFFFFF),                         // CSV2_n2kRxLost
+                               (int)n2kNodesHeard,                                       // CSV2_n2kNodesHeard
+                               SafeInt(LargestPSRAMBlock),                               // CSV2_LargestPSRAMBlock
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost
@@ -12287,6 +12565,7 @@ void SendWifiData() {
       return;
     }
     csv2Phase = 1;          // built OK — send it on the next pass
+    csv2BuiltMs = now;
     sentSomething = true;   // claim this pass (the heavy build ran)
     } else {
       // PASS 2 — send the payload built last pass (cheap ~1.3 ms; kept off the build pass).
@@ -12304,9 +12583,8 @@ void SendWifiData() {
   // PRIORITY 5: CSVData3 — sent immediately when settingsDirty (event-driven), or every 60s fallback
   if (!sentSomething && (settingsDirty || now - lastpayload3send >= 60000) && events.count() > 0 && !sseBacklogged()) {
     static char *payload3 = nullptr;
-    // Overflow is caught below rather than truncating, but the catch returns early from SendWifiData,
-    // which stops CSV3 for good and skips TS on any pass CSV3 is due. The frame's live and peak
-    // lengths ride the /debug line (csv3LastLen / csv3PeakLen) so the margin is measured, not guessed.
+    // Overflow is caught below, but the catch returns early from SendWifiData, stopping CSV3 for good and
+    // skipping TS when CSV3 is due; csv3LastLen / csv3PeakLen on /debug measure the margin.
     if (!payload3) {
       payload3 = (char *)ps_malloc(PAYLOAD3_SIZE);  // allocated to PSRAM
       if (!payload3) {
@@ -12317,23 +12595,9 @@ void SendWifiData() {
     /// ALL THIS SAFEINT STUFF MAY BE UNNECESSAREY BAD ADVICE, COULD HAVE JUST SENT ROUNDED FLOATS FOR 1 Byte (or bit?) xtra
     //WifiSendTime was 834uS before increasing csv3 payload size from 1100 to 1400     No change after.  Again, this separation into groups and worry about wifi packet size seems like AI nonsense.
 
-    /* Retained rationale from the previous hand-maintained format string. It recorded how
-       specifiers were grouped so hand-edited fields stayed type-aligned with their arguments.
-       CSV3_LIST now pairs each field's format with its own expression, so that alignment is
-       structural and these groupings are history, kept for the units and orderings they name:
-         +1 CvKdVoltFiltTC (int) — pairs the arg inserted after VoltageFilterTC; sits in the all-integer run before IExcessArmMarginV so every field stays type-aligned
-         damper detection bar (x100) + 2 NMEA 0183: baud, polarity
-         displayVolUnit
-         gpsPositionSource
-         MaxFieldVolts (x10)
-         timed OV tiers: LOW margin (V), LOW dwell (ms), MID margin (V), MID dwell (ms)
-         VoltageHardwareLimit (x100)
-         load-dump consecutive-sample counts N1/N2/N3
-         solar ledger toggles + margins: learn, use consumption, margin % (x100), learn rate % (x100)
-         RV-C: tx master, charger DGNs, DC source DGNs, DM_RV, charger instance, DC instance, device priority
-         +13 battery/extra temperature settings (§6 order, CommissionTempSrc last)
-         +2: sessionId, sendMs
-    */
+    // Cleared BEFORE the build: a /get on core 0 landing mid-build re-arms it for the next pass
+    // instead of being wiped after a frame that already read the old value.
+    settingsDirty = false;
     int     payload3Len = snprintf(payload3, PAYLOAD3_SIZE,
                                "%d" CSV3_LIST(CSV3_FMT_X) "\n",
                                CSV3_FIELD_COUNT CSV3_LIST(CSV3_ARG_X));
@@ -12345,7 +12609,6 @@ void SendWifiData() {
     if (csv3LastLen > csv3PeakLen) csv3PeakLen = csv3LastLen;
 
     sseSend(payload3, "CSVData3");
-    settingsDirty = false;
     lastpayload3send = now;
     lastEventSourceSend = now;
     sentSomething = true;
@@ -12363,55 +12626,60 @@ void SendWifiData() {
         return;
       }
     }
+    // An age past 0xFFFF0000 is a wrap, not 49.7 days: TempTask and httpsTask on core 0 can stamp after `now` was sampled.
+    auto tsAge = [now](unsigned long ts) -> unsigned long {
+      if (ts == 0) return 999999;
+      const unsigned long age = now - ts;
+      return (age > 0xFFFF0000UL) ? 0 : age;
+    };
     int timestampPayloadLen = snprintf(timestampPayload, TIMESTAMP_PAYLOAD_SIZE,
                                        "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                                        "%lu,%lu,%lu,%lu,"  // +4 battery/extra temperature: BATT probe, EXTRA probe, VE.Direct T, RV-C T
                                        "%lu,"      // +1 INA228 die temperature
                                        "%lu,%lu",  // +2: sessionId, sendMs
                                        (unsigned long)TS_FIELD_COUNT,
-                                       (dataTimestamps[IDX_HEADING_NMEA] == 0) ? 999999 : (now - dataTimestamps[IDX_HEADING_NMEA]),
-                                       (dataTimestamps[IDX_LATITUDE_NMEA] == 0) ? 999999 : (now - dataTimestamps[IDX_LATITUDE_NMEA]),
-                                       (dataTimestamps[IDX_LONGITUDE_NMEA] == 0) ? 999999 : (now - dataTimestamps[IDX_LONGITUDE_NMEA]),
-                                       (dataTimestamps[IDX_SATELLITE_COUNT] == 0) ? 999999 : (now - dataTimestamps[IDX_SATELLITE_COUNT]),
-                                       (dataTimestamps[IDX_VICTRON_VOLTAGE] == 0) ? 999999 : (now - dataTimestamps[IDX_VICTRON_VOLTAGE]),
-                                       (dataTimestamps[IDX_VICTRON_CURRENT] == 0) ? 999999 : (now - dataTimestamps[IDX_VICTRON_CURRENT]),
-                                       (dataTimestamps[IDX_ALTERNATOR_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_ALTERNATOR_TEMP]),
-                                       (dataTimestamps[IDX_THERMISTOR_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_THERMISTOR_TEMP]),
-                                       (dataTimestamps[IDX_RPM] == 0) ? 999999 : (now - dataTimestamps[IDX_RPM]),
-                                       (dataTimestamps[IDX_MEASURED_AMPS] == 0) ? 999999 : (now - dataTimestamps[IDX_MEASURED_AMPS]),
-                                       (dataTimestamps[IDX_BATTERY_V] == 0) ? 999999 : (now - dataTimestamps[IDX_BATTERY_V]),
-                                       (dataTimestamps[IDX_IBV] == 0) ? 999999 : (now - dataTimestamps[IDX_IBV]),
-                                       (dataTimestamps[IDX_BCUR] == 0) ? 999999 : (now - dataTimestamps[IDX_BCUR]),
-                                       (dataTimestamps[IDX_CHANNEL3V] == 0) ? 999999 : (now - dataTimestamps[IDX_CHANNEL3V]),
-                                       (dataTimestamps[IDX_DUTY_CYCLE] == 0) ? 999999 : (now - dataTimestamps[IDX_DUTY_CYCLE]),
-                                       (dataTimestamps[IDX_FIELD_VOLTS] == 0) ? 999999 : (now - dataTimestamps[IDX_FIELD_VOLTS]),
-                                       (dataTimestamps[IDX_FIELD_AMPS] == 0) ? 999999 : (now - dataTimestamps[IDX_FIELD_AMPS]),
-                                       (dataTimestamps[IDX_COG_NMEA] == 0) ? 999999 : (now - dataTimestamps[IDX_COG_NMEA]),
-                                       (dataTimestamps[IDX_SOG_NMEA] == 0) ? 999999 : (now - dataTimestamps[IDX_SOG_NMEA]),
-                                       (dataTimestamps[IDX_APPARENT_WIND_SPEED] == 0) ? 999999 : (now - dataTimestamps[IDX_APPARENT_WIND_SPEED]),
-                                       (dataTimestamps[IDX_APPARENT_WIND_ANGLE] == 0) ? 999999 : (now - dataTimestamps[IDX_APPARENT_WIND_ANGLE]),
-                                       (dataTimestamps[IDX_TRUE_WIND_SPEED] == 0) ? 999999 : (now - dataTimestamps[IDX_TRUE_WIND_SPEED]),
-                                       (dataTimestamps[IDX_TRUE_WIND_ANGLE] == 0) ? 999999 : (now - dataTimestamps[IDX_TRUE_WIND_ANGLE]),
-                                       (dataTimestamps[IDX_LEEWAY] == 0) ? 999999 : (now - dataTimestamps[IDX_LEEWAY]),
-                                       (dataTimestamps[IDX_VMG] == 0) ? 999999 : (now - dataTimestamps[IDX_VMG]),
-                                       (dataTimestamps[IDX_BARO_PRESSURE] == 0) ? 999999 : (now - dataTimestamps[IDX_BARO_PRESSURE]),
-                                       (dataTimestamps[IDX_AMBIENT_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_AMBIENT_TEMP]),
-                                       (dataTimestamps[IDX_IMU] == 0) ? 999999 : (now - dataTimestamps[IDX_IMU]),
-                                       (dataTimestamps[IDX_VICTRON_SOLAR] == 0) ? 999999 : (now - dataTimestamps[IDX_VICTRON_SOLAR]),
-                                       (dataTimestamps[IDX_STW_NMEA] == 0) ? 999999 : (now - dataTimestamps[IDX_STW_NMEA]),
-                                       (dataTimestamps[IDX_N2K_BATT] == 0) ? 999999 : (now - dataTimestamps[IDX_N2K_BATT]),
-                                       (dataTimestamps[IDX_N2K_SOC] == 0) ? 999999 : (now - dataTimestamps[IDX_N2K_SOC]),
-                                       (dataTimestamps[IDX_DVCC] == 0) ? 999999 : (now - dataTimestamps[IDX_DVCC]),
-                                       // Own "never" sentinel: a forecast age of 999999 ms is only
-                                       // 17 min, well inside the normal 6-hour refresh interval, so
-                                       // the shared sensor sentinel would read as a real age here.
-                                       (weatherLastUpdate == 0) ? 4294967295UL : (unsigned long)(now - weatherLastUpdate),
-                                       (dataTimestamps[IDX_N183] == 0) ? 999999 : (now - dataTimestamps[IDX_N183]),
-                                       (dataTimestamps[IDX_BATT_TEMP_PROBE] == 0) ? 999999 : (now - dataTimestamps[IDX_BATT_TEMP_PROBE]),
-                                       (dataTimestamps[IDX_EXTRA_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_EXTRA_TEMP]),
-                                       (dataTimestamps[IDX_VE_BATT_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_VE_BATT_TEMP]),
-                                       (dataTimestamps[IDX_RVC_BATT_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_RVC_BATT_TEMP]),
-                                       (dataTimestamps[IDX_INA_DIE_TEMP] == 0) ? 999999 : (now - dataTimestamps[IDX_INA_DIE_TEMP]),
+                                       tsAge(dataTimestamps[IDX_HEADING_NMEA]),
+                                       tsAge(dataTimestamps[IDX_LATITUDE_NMEA]),
+                                       tsAge(dataTimestamps[IDX_LONGITUDE_NMEA]),
+                                       tsAge(dataTimestamps[IDX_SATELLITE_COUNT]),
+                                       tsAge(dataTimestamps[IDX_VICTRON_VOLTAGE]),
+                                       tsAge(dataTimestamps[IDX_VICTRON_CURRENT]),
+                                       tsAge(dataTimestamps[IDX_ALTERNATOR_TEMP]),
+                                       tsAge(dataTimestamps[IDX_THERMISTOR_TEMP]),
+                                       tsAge(dataTimestamps[IDX_RPM]),
+                                       tsAge(dataTimestamps[IDX_MEASURED_AMPS]),
+                                       tsAge(dataTimestamps[IDX_BATTERY_V]),
+                                       tsAge(dataTimestamps[IDX_IBV]),
+                                       tsAge(dataTimestamps[IDX_BCUR]),
+                                       tsAge(dataTimestamps[IDX_CHANNEL3V]),
+                                       tsAge(dataTimestamps[IDX_DUTY_CYCLE]),
+                                       tsAge(dataTimestamps[IDX_FIELD_VOLTS]),
+                                       tsAge(dataTimestamps[IDX_FIELD_AMPS]),
+                                       tsAge(dataTimestamps[IDX_COG_NMEA]),
+                                       tsAge(dataTimestamps[IDX_SOG_NMEA]),
+                                       tsAge(dataTimestamps[IDX_APPARENT_WIND_SPEED]),
+                                       tsAge(dataTimestamps[IDX_APPARENT_WIND_ANGLE]),
+                                       tsAge(dataTimestamps[IDX_TRUE_WIND_SPEED]),
+                                       tsAge(dataTimestamps[IDX_TRUE_WIND_ANGLE]),
+                                       tsAge(dataTimestamps[IDX_LEEWAY]),
+                                       tsAge(dataTimestamps[IDX_VMG]),
+                                       tsAge(dataTimestamps[IDX_BARO_PRESSURE]),
+                                       tsAge(dataTimestamps[IDX_AMBIENT_TEMP]),
+                                       tsAge(dataTimestamps[IDX_IMU]),
+                                       tsAge(dataTimestamps[IDX_VICTRON_SOLAR]),
+                                       tsAge(dataTimestamps[IDX_STW_NMEA]),
+                                       tsAge(dataTimestamps[IDX_N2K_BATT]),
+                                       tsAge(dataTimestamps[IDX_N2K_SOC]),
+                                       tsAge(dataTimestamps[IDX_DVCC]),
+                                       // Own "never" sentinel: 999999 ms is only 17 min, inside the 6 h forecast
+                                       // refresh, so the shared sensor sentinel would read as a real age.
+                                       (weatherLastUpdate == 0) ? 4294967295UL : tsAge(weatherLastUpdate),
+                                       tsAge(dataTimestamps[IDX_N183]),
+                                       tsAge(dataTimestamps[IDX_BATT_TEMP_PROBE]),
+                                       tsAge(dataTimestamps[IDX_EXTRA_TEMP]),
+                                       tsAge(dataTimestamps[IDX_VE_BATT_TEMP]),
+                                       tsAge(dataTimestamps[IDX_RVC_BATT_TEMP]),
+                                       tsAge(dataTimestamps[IDX_INA_DIE_TEMP]),
                                        (unsigned long)g_sessionId,   // TS_sessionId
                                        (unsigned long)now            // TS_sendMs (`now` is this dispatch tick's millis())
     );
@@ -12464,20 +12732,24 @@ String loadAuthToken() {
 
   return authToken;
 }
-void saveAuthToken(String token) {
+esp_err_t saveAuthToken(String token) {
   nvs_handle_t handle;
   esp_err_t err = nvs_open("cloud", NVS_READWRITE, &handle);
   if (err != ESP_OK) {
     Serial.printf("ERROR opening NVS for write: %d\n", err);
-    return;
+    return err;
   }
 
   err = nvs_set_str(handle, "authToken", token.c_str());
   if (err != ESP_OK) {
     Serial.printf("ERROR writing token: %d\n", err);
+  } else {
+    err = nvs_commit(handle);
+    if (err != ESP_OK) Serial.printf("ERROR committing token: %d\n", err);
   }
-  nvs_commit(handle);
   nvs_close(handle);
+  // Not registered on a failed write: running registered would end, unannounced, at the next reboot.
+  if (err != ESP_OK) return err;
 
   authToken = token;
   isRegistered = true;
@@ -12490,7 +12762,26 @@ void saveAuthToken(String token) {
   Serial.println("Copy token above and add to Vercel URL:");
   Serial.printf("?token=%s\n", token.c_str());
   Serial.println("========================================\n");
+  return ESP_OK;
 }
+// Random per-board registration nonce, saved in NVS before it is ever sent and reused on every
+// attempt. The cloud stores its hash with the device row, so a retry after a lost registration reply
+// gets the existing token back instead of "already registered". Empty if NVS can't hold it.
+String regNonce() {
+  char buf[33] = { 0 };
+  nvs_handle_t h;
+  if (nvs_open("cloud", NVS_READWRITE, &h) != ESP_OK) return String();
+  size_t len = sizeof(buf);
+  if (nvs_get_str(h, "regNonce", buf, &len) != ESP_OK || strlen(buf) != 32) {
+    for (int i = 0; i < 4; i++) snprintf(buf + i * 8, 9, "%08lx", (unsigned long)esp_random());
+    esp_err_t e = nvs_set_str(h, "regNonce", buf);
+    if (e == ESP_OK) e = nvs_commit(h);
+    if (e != ESP_OK) { nvs_close(h); return String(); }
+  }
+  nvs_close(h);
+  return String(buf);
+}
+
 void clearAuthToken() {
   nvs_handle_t handle;
   esp_err_t err = nvs_open("cloud", NVS_READWRITE, &handle);
@@ -12504,19 +12795,6 @@ void clearAuthToken() {
   authToken = "";
   isRegistered = false;
   Serial.println("Auth token cleared");
-}
-
-void debugStackBeforeHTTPS(const char *functionName) {
-  UBaseType_t loopStackBytes = uxTaskGetStackHighWaterMark(NULL);  // Already in bytes
-
-  Serial.printf("=== BEFORE %s ===\n", functionName);
-  Serial.printf("Loop stack free: %d bytes\n", loopStackBytes);
-  Serial.printf("Free heap: %u KB\n", ESP.getFreeHeap() / 1024);
-  Serial.printf("Largest heap block: %u bytes\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-#ifdef BOARD_HAS_PSRAM
-  Serial.printf("Free PSRAM: %u KB\n", ESP.getFreePsram() / 1024);
-#endif
-  Serial.println("==================");
 }
 
 
