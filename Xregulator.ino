@@ -16,7 +16,7 @@
 
 // Must be strict semver ^\d+\.\d+\.\d+$ — no suffixes, no leading v. Compared as an integer
 // major*10000 + minor*100 + patch, so the ceiling is 999.99.99 (minor/patch cannot exceed 99).
-const char *FIRMWARE_VERSION = "0.0.7";
+const char *FIRMWARE_VERSION = "0.0.8";
 
 // Stable proxy domain in front of the Supabase "ota" bucket, so hosting can move without a re-flash.
 // Download uses setInsecure; integrity is the on-device RSA-4096 signature check (performOTAUpdate).

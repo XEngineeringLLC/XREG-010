@@ -24258,6 +24258,16 @@ let thermalLogPlots = [null, null, null, null];
 let thermalLogResizeObservers = [null, null, null, null];
 let thermalWindowMin = 30;
 
+// Fresh objects per plot (uPlot writes onto them). x: min/max seed the window; the range fn passes setScale through.
+// A fixed [min, max] array is frozen at build and silently overrides every later setScale, which killed drag-zoom,
+// the zoom sync and Reset. dblclick resets like Reset instead of uPlot's default auto-scale to the whole ring.
+function thermalXScale() {
+    return { time: false, auto: false, min: -thermalWindowMin, max: 0, range: (u, mn, mx) => [mn, mx] };
+}
+function thermalCursor() {
+    return { drag: { x: true, y: false, setScale: true }, bind: { dblclick: () => () => resetThermalZoom() } };
+}
+
 // Per-plot Y manual ranges; null = auto-fit (default). Each plot has its own corner auto checkbox + on-plot edit boxes.
 let thermalY = { p0: { temp: null, amps: null }, p2: { amps: null } };
 
@@ -24532,7 +24542,7 @@ function renderThermalPlot1(data, tMin) {
     const H = 300;
     const opts = {
         width: plotFitWidth(el, 800), height: H,
-        cursor: { drag: { x: true, y: false, setScale: true } },
+        cursor: thermalCursor(),
         select: { show: true },
         series: [
             { label: null },
@@ -24569,7 +24579,7 @@ function renderThermalPlot1(data, tMin) {
             }
         ],
         scales: {
-            x: { time: false, auto: false, range: [-thermalWindowMin, 0] },
+            x: thermalXScale(),
             // null manual range = auto-fit (default); a typed range pins the axis
             temp: { range: (u, mn, mx) => thermalY.p0.temp || stableAutoRange(mn, mx, 0.1) },
             amps: { range: (u, mn, mx) => thermalY.p0.amps || stableAutoRange(mn, mx, 0.1) }
@@ -24627,7 +24637,7 @@ function renderThermalPlot2(data, tMin) {
     const H = 300;
     const opts = {
         width: plotFitWidth(el, 800), height: H,
-        cursor: { drag: { x: true, y: false, setScale: true } },
+        cursor: thermalCursor(),
         select: { show: true },
         series: [
             { label: null },
@@ -24638,7 +24648,7 @@ function renderThermalPlot2(data, tMin) {
             { label: 'Integrator (I)', stroke: '#ff7f0e', width: 1.5, scale: 'amps' }
         ],
         scales: {
-            x: { time: false, auto: false, range: [-thermalWindowMin, 0] },
+            x: thermalXScale(),
             // null manual range = auto-fit (default); a typed range pins the axis
             amps: { range: (u, mn, mx) => thermalY.p2.amps || stableAutoRange(mn, mx, 0.1) }
         },
@@ -24697,14 +24707,14 @@ function renderThermalPlotState(data, tMin, flagsArr, antiWindupArr, stageArr, t
     const opts = {
         width: plotFitWidth(el, 800),
         height: H,
-        cursor: { drag: { x: true, y: false, setScale: true } },
+        cursor: thermalCursor(),
         select: { show: true },
         series: [
             { label: null },
             { label: null, stroke: 'transparent', width: 0, points: { show: false } }
         ],
         scales: {
-            x: { time: false, auto: false, range: [-thermalWindowMin, 0] },
+            x: thermalXScale(),
             y: { auto: false, range: [0, 1] }
         },
         axes: [
@@ -25051,8 +25061,7 @@ function windTrendRender() {
     for (let i = 0; i < n; i++) t[i] = -(now - r.ts[i]) / 60000;   // minutes ago (oldest first)
     const data = [t, _windDirArr().slice(), _windSpdArr().slice()];
     if (windTrendPlot) {
-        windTrendPlot.setData(data);
-        windTrendPlot.setScale('x', { min: -windWindowMin, max: 0 });
+        windTrendPlot.setData(data);   // auto:false keeps the current x range, so a drag-zoom survives the refresh
         updateWindLegend(null);
         return;
     }
@@ -25065,7 +25074,7 @@ function windTrendRender() {
     const H = 300;
     const opts = {
         width: _windPlotW(el), height: H,
-        cursor: { drag: { x: true, y: false, setScale: true } },
+        cursor: { drag: { x: true, y: false, setScale: true }, bind: { dblclick: () => () => windResetZoom() } },   // dblclick = back to the window, not uPlot's whole-ring auto-scale
         select: { show: true },
         series: [
             { label: null },
@@ -25073,7 +25082,7 @@ function windTrendRender() {
             { label: 'Speed', stroke: '#00a19a', width: 2, scale: 'spd', points: { show: false } }
         ],
         scales: {
-            x: { time: false, auto: false, range: [-windWindowMin, 0] },
+            x: { time: false, auto: false, min: -windWindowMin, max: 0, range: (u, mn, mx) => [mn, mx] },   // pass-through fn, not a fixed array (see thermalXScale): the array overrode setScale and killed drag-zoom
             // null manual range = auto-fit (default); a typed/locked range pins the axis
             dir: { range: (u, mn, mx) => windY.dir || stableAutoRange(mn, mx, 0.18) },
             spd: { range: (u, mn, mx) => windY.spd || (mn == null ? [0, 5] : stableAutoRange(Math.min(0, mn), mx, 0.15)) }
@@ -25137,6 +25146,9 @@ function highlightWindWindowBtn(minutes) {
         const btn = document.getElementById('ww-' + v);
         if (btn) btn.classList.toggle('on', v === minutes);
     });
+}
+function windResetZoom() {
+    if (windTrendPlot) windTrendPlot.setScale('x', { min: -windWindowMin, max: 0 });
 }
 function setWindWindow(minutes) {
     windWindowMin = minutes;
@@ -33366,7 +33378,8 @@ window.addEventListener('load', function () {
         { label: 'Pressure (mbar)', stroke: accent, width: 2, fill: hexAlpha(accent, 0.12) }
       ],
       scales: {
-        x: { time: false, auto: false, range: [slice.xAxis[0], slice.xAxis[slice.xAxis.length - 1] || 0] },
+        // fn, not array: a fixed array is frozen at build and overrides setScale, so the range pills never moved the axis
+        x: { time: false, auto: false, range: () => baroXRange() },
         y: { auto: false, range: () => computeYRange() }
       },
       axes: [
@@ -33399,14 +33412,20 @@ window.addEventListener('load', function () {
 
   function refreshPlot() {
     const slice = computePlotSlice();
-    baroPlot.setData([slice.xAxis, slice.values]);
-    baroPlot.setScale('x', { min: slice.xAxis[0], max: slice.xAxis[slice.xAxis.length - 1] || 0 });
+    baroPlot.setData([slice.xAxis, slice.values]);   // the x range fn re-reads currentRangeHours on this redraw
+  }
+
+  function baroSliceStart() {
+    return Math.max(0, BARO_HISTORY_SIZE - currentRangeHours * 60 / SAMPLE_INTERVAL_MIN);
+  }
+
+  function baroXRange() {
+    return [-(BARO_HISTORY_SIZE - 1 - baroSliceStart()) * SAMPLE_INTERVAL_MIN * 60, 0];
   }
 
   function computePlotSlice() {
     // X axis = seconds ago (negative). Newest sample is at x=0.
-    const samples = currentRangeHours * 60 / SAMPLE_INTERVAL_MIN;
-    const startIdx = Math.max(0, BARO_HISTORY_SIZE - samples);
+    const startIdx = baroSliceStart();
     const xAxis = new Array(BARO_HISTORY_SIZE - startIdx);
     const values = new Array(BARO_HISTORY_SIZE - startIdx);
     for (let i = startIdx; i < BARO_HISTORY_SIZE; i++) {
@@ -33964,7 +33983,8 @@ window.addEventListener('load', function () {
     const scales = { x: { time: true } };
     const axes = [ { grid: { show: true } } ];
     spec.scales.forEach(sc => {
-      scales[sc.name] = sc.range ? { auto: false, range: sc.range } : { auto: true };
+      // fn, not array: a fixed array overrides setScale, so a typed Y override on a fixed-range scale (SOC / Duty %) never applied
+      scales[sc.name] = sc.range ? { auto: false, range: () => (ltYOverride[id] && ltYOverride[id][sc.name]) || sc.range } : { auto: true };
       axes.push({ scale: sc.name, label: sc.label, side: sc.side, grid: { show: sc.side === 3 },
                   splits: edgeLabeledSplits(() => !!(ltYOverride[id] && ltYOverride[id][sc.name])),
                   values: sc.fmt ? (u, ticks) => ticks.map(sc.fmt) : undefined });
