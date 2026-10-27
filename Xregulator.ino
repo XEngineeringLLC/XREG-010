@@ -16,7 +16,7 @@
 
 // Must be strict semver ^\d+\.\d+\.\d+$ — no suffixes, no leading v. Compared as an integer
 // major*10000 + minor*100 + patch, so the ceiling is 999.99.99 (minor/patch cannot exceed 99).
-const char *FIRMWARE_VERSION = "0.0.8";
+const char *FIRMWARE_VERSION = "0.0.9";
 
 // Stable proxy domain in front of the Supabase "ota" bucket, so hosting can move without a re-flash.
 // Download uses setInsecure; integrity is the on-device RSA-4096 signature check (performOTAUpdate).
@@ -1583,7 +1583,7 @@ int ManualFieldToggle = 0;           // 0 = Auto — fresh-flash default. Set to
 int PhysicalPanelOverride = 0;       // 0 (default) = the app owns HiLow and MaintainMode and the Cable 3 panel wires only report; 1 = the panel wires own both modes and the app toggles go inert
 int MaintainMode = 0;                // Set to 1 to target 0 amps at battery
 int TargetVoltageMode = 0;
-float TargetVoltageSetpoint = 14.0f;
+float TargetVoltageSetpoint = 13.5f;
 int OnOff = 0;             // 0 is charger off, 1 is charger On (corresponds to Alternator Enable in Basic Settings)
 int Ignition = 0;          // Digital Input      NEED THIS TO HAVE WIFI ON , FOR NOW
 int IgnitionOverride = 2;  // Auto (any value != 1) = follow real GPIO1 ignition wire (default); 1 = force ON. Cannot force off.
@@ -5784,9 +5784,14 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   "<span class=\"opt-title\">Use the regulator as a Hotspot (Access Point)</span>"
   "<span class=\"opt-note\">You may use the regulator as a Hotspot (aka Access Point). The regulator controller will broadcast its own WiFi network which you can connect to from any device (phone, ipad, laptop, etc.).  Mostly the same functionality will exist at alternator.local, but with no internet, you won't be able to use weather mode, get software updates, see Community features, etc.  To enter this mode on a reboot, connect pin 12 in RJ3 (the rightmost ethernet connector, Blue wire) to Ground.  For permanent Access Point mode, leave this hardwired.</span>"
   "<label>New Alt. Reg. Hotspot Name (SSID):</label>"
-  "<input type=\"text\" name=\"hotspot_ssid\" placeholder=\"Leave blank for default: ALTERNATOR_WIFI-&lt;unit id&gt;\">"
+  "<input type=\"text\" name=\"hotspot_ssid\" placeholder=\"Leave blank to keep the current name\">"
   "<label>New Alt. Reg. Hotspot Password:</label>"
-  "<input type=\"password\" name=\"ap_password\" placeholder=\"Leave blank for default: alternator123\">"
+  "<input type=\"password\" name=\"ap_password\" placeholder=\"Leave blank to keep the current password\">"
+  "<label style=\"display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer\">"
+  "<input type=\"checkbox\" name=\"reset_ap\" style=\"width:auto;margin:0\">"
+  "Reset hotspot to defaults"
+  "</label>"
+  "<span class=\"opt-note\">Leave the two fields above blank and check this box to return the hotspot to its defaults: ALTERNATOR_WIFI-&lt;unit id&gt; and password alternator123.</span>"
   "</div>"
 
   "<div class=\"info-box\">"

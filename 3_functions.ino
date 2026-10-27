@@ -2382,16 +2382,11 @@ void setupWiFiConfigServer() {
       static const char ERR[] PROGMEM =
         "<!DOCTYPE html><html><head><title>Configuration Error</title></head><body>"
         "<h1>Configuration Error</h1>"
-        "<p><strong>AP password must be at least 8 characters or left blank for default.</strong></p>"
+        "<p><strong>Hotspot password must be at least 8 characters, or left blank to keep the current one.</strong></p>"
         "<p><a href='javascript:history.back()'>Go Back and Try Again</a></p>"
         "</body></html>";
       request->send_P(400, "text/html", ERR);
       return;
-    }
-
-    if (ap_password[0] == '\0') {
-      strncpy(ap_password, "alternator123", sizeof(ap_password) - 1);
-      ap_password[sizeof(ap_password) - 1] = '\0';
     }
 
     Serial.println("=== SAVING CONFIGURATION ===");
@@ -2399,18 +2394,28 @@ void setupWiFiConfigServer() {
     Serial.printf("Password: '%s' (length: %u)\n", password, (unsigned)strlen(password));
 
     // Credentials persist in NVS (settings namespace) — no LittleFS dependency here
-    if (!settingWrite(NK_appass, ap_password)) {
-      Serial.println("CRITICAL: NVS write failed");
-      request->send(500, "text/plain", "Storage error - cannot save configuration");
-      return;
+    static const char STORAGE_ERR[] = "Storage error - cannot save configuration";
+
+    // Blank hotspot field = keep the stored value: the form never pre-fills these, so writing the default on blank reset a
+    // custom name/password on every save. reset_ap returns each blank field to its default (absent key = default at load).
+    bool resetAp = request->hasParam("reset_ap", true);
+    if (ap_password[0] != '\0') {
+      if (!settingWrite(NK_appass, ap_password)) {
+        Serial.println("CRITICAL: NVS write failed");
+        request->send(500, "text/plain", STORAGE_ERR);
+        return;
+      }
+      esp32_ap_password = ap_password;
+    } else if (resetAp) {
+      settingRemove(NK_appass);
+      esp32_ap_password = "alternator123";
     }
-    esp32_ap_password = ap_password;
 
     if (hotspot_ssid[0] != '\0') {
       settingWrite(NK_apssid, hotspot_ssid);
       esp32_ap_ssid = hotspot_ssid;
-    } else {
-      settingRemove(NK_apssid);  // cleared custom AP SSID -> back to default
+    } else if (resetAp) {
+      settingRemove(NK_apssid);
       esp32_ap_ssid = defaultApSsid();
     }
 
@@ -2418,7 +2423,11 @@ void setupWiFiConfigServer() {
     // wiped working WiFi). Deliberate erase goes through the forget_client checkbox.
     bool forgetClient = (ssid[0] == '\0' && request->hasParam("forget_client", true));
     if (ssid[0] != '\0') {
-      settingWrite(NK_ssid, ssid);
+      if (!settingWrite(NK_ssid, ssid)) {
+        Serial.println("CRITICAL: NVS write failed");
+        request->send(500, "text/plain", STORAGE_ERR);
+        return;
+      }
       settingWrite(NK_pass, password);
 
       strncpy(cached_wifi_ssid, ssid, sizeof(cached_wifi_ssid) - 1);

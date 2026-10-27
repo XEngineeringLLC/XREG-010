@@ -4937,6 +4937,10 @@ body.readings-stale .reading-value {
 /* Lets a form-row span the full card width instead of the default 480px cap */
 .form-row-wide { max-width: none; }
 
+/* The decoded charge-limit line is long; inside the 480px cap it squeezed its label to a word per line. Not
+   .form-row-wide, which would keep the row inline on phones instead of stacking it. */
+#dvccStatus_row { max-width: none; }
+
 /* auto-fit + minmax keeps each cell at least as wide as the widest nowrap button ("Start Fresh
    Log" ~165px), dropping 3→2→1 columns as the card narrows, so labels never overlap. */
 .log-row { align-items: center; }

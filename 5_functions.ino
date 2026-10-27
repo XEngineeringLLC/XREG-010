@@ -741,7 +741,8 @@ static void dvccAuthIdentityRefresh() {
     for (uint8_t i = 0; i < dvccNodeCount; i++) {
       if (dvccNodes[i].addr != dvccRxSrcAddr) continue;
       mfg = dvccNodes[i].mfg;
-      prod = dvccNodes[i].prodCode ? dvccNodes[i].prodCode : dvccNodes[i].vicProdId;
+      // 0xFFFF is 126996's "not available" (an Ekrano GX sends it), so it falls through to the VREG product id.
+      prod = (dvccNodes[i].prodCode && dvccNodes[i].prodCode != 0xFFFF) ? dvccNodes[i].prodCode : dvccNodes[i].vicProdId;
       break;
     }
     portEXIT_CRITICAL(&dvccCapMux);
@@ -1064,7 +1065,7 @@ static struct {
 // One line per verdict, indexed by code - 1; every format takes (number, TEC, REC).
 static const char *const N2K_BUS_SAY[5] = {
   "NMEA2000: bus OK, %lu other devices heard (TEC %lu, REC %lu)",
-  "NMEA2000: nothing heard on the bus (%lu frames in 30 s, TEC %lu, REC %lu)",
+  "NMEA2000: nothing heard on the bus for %lu s (TEC %lu, REC %lu)",
   "NMEA2000: errors receiving from the bus (%lu bus errors in the last minute, TEC %lu, REC %lu) - check both terminators and the connectors",
   "NMEA2000: no other device is acknowledging our messages (%lu frames in 10 s, TEC %lu, REC %lu) - check bus power on connector pins 2-3",
   "NMEA2000: bus-off, the CAN controller restarted (%lu times since boot, TEC %lu, REC %lu) - check the cable and the bus power",
@@ -1218,7 +1219,7 @@ void n2kBusTick() {
   }
   if (cand != said && (uint32_t)(now - candMs) >= 10000UL) {
     said = cand;
-    uint32_t num = (cand == 1) ? nodes : (cand == 3) ? berrPerMin : (cand == 5) ? boNow : 0;
+    uint32_t num = (cand == 1) ? nodes : (cand == 2) ? N2K_HEARD_MS / 1000UL : (cand == 3) ? berrPerMin : (cand == 5) ? boNow : 0;
     queueConsoleMessageF(N2K_BUS_SAY[cand - 1], (unsigned long)num, (unsigned long)tec, (unsigned long)rec);
   }
 
