@@ -85,7 +85,7 @@ const char *frtRefuseReason(uint8_t method) {
   static char busyMsg[96];
   const uint32_t now = millis();
   if (frt.state == FRT_RUNNING || frt.reqStart) return "A field resistance test is already running.";
-  if (hardwarePresent != 1) return "The regulator is running on simulated sensor data, so there is no field to measure.";
+  if (hardwarePresent != 1 || demoSeal) return "Not available in demo mode. Set Hardware Present to Yes to use it.";
   const char *busy = (systemIDActive != 0) ? "The Plant Delay test"
                      : TuningMode ? "Current tuning"
                      : CVTuningMode ? "Voltage tuning"
@@ -807,7 +807,7 @@ enum Csv2Index {
   CSV2_dvccState,         // DVCC follow state: 0 off, 1 waiting, 2 settling, 3 following, 4 stale, 5 untrusted
   CSV2_dvccRxCvl,         // last decoded charge-voltage limit (V ×100; -2000000000 = none)
   CSV2_dvccRxCcl,         // last decoded charge-current limit (A ×10; -2000000000 = none)
-  CSV2_dvccRxSrcAddr,     // authority bus address (255 = none yet)
+  CSV2_dvccRxSrcAddr,     // authority bus address (255 = none yet, 254 = only the Victron WiFi carrier is fresh)
   CSV2_dvccUntrustReason, // 0 none, 1 CVL out of window, 2 CCL implausible, 3 flapping
   CSV2_ft_dvcc_win,       // DVCC brain tick worst µs (window)
   CSV2_ft_dvcc_ses,       // DVCC brain tick worst µs (session)
@@ -883,6 +883,11 @@ enum Csv2Index {
   CSV2_n2kRxLost,           // received frames lost (driver queue full + controller FIFO overrun) while NMEA 2000 runs, since boot
   CSV2_n2kNodesHeard,       // distinct source addresses heard within N2K_HEARD_MS (75 s), ours excluded
   CSV2_LargestPSRAMBlock,   // largest contiguous free PSRAM block, KB (cpuLoadTask walk every 20 s, field cut only; held while charging)
+  // DVCC Victron source, per carrier (dvccRxCvl/Ccl above is their merge); ages in TS_DvccVeCan / TS_DvccWifi
+  CSV2_dvccRxCanCvl,        // VE.Can carrier CVL as last merged (V x100; -2000000000 = none)
+  CSV2_dvccRxCanCcl,        // VE.Can carrier CCL as last merged, 0 under a stop-charging command (A x10; -2000000000 = none)
+  CSV2_dvccRxWifiCvl,       // WiFi carrier (/gxLimits) last CVL (V x100; -2000000000 = not sent)
+  CSV2_dvccRxWifiCcl,       // WiFi carrier last CCL (A x10; -2000000000 = not sent)
 
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
@@ -917,9 +922,10 @@ enum Csv4Index {
   CSV4_panelHiRateInput,        // switch panel HIGH/LOW opto input (Cable 3 pin 5, GPIO39): 1 = wire energized = switch ON = asking for High. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
   CSV4_panelForceFloatInput,    // switch panel FORCEFLOAT opto input (Cable 3 pin 7, GPIO40): 1 = wire energized = switch ON = asking for Maintain. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
   CSV4_VictronSoc,              // VE.Direct battery monitor's own state of charge (% ×10; ROLL_EMPTY when stale, unsynced or not a battery monitor)
+  CSV4_gxStreams,               // connected Victron GX streams (/gxevents clients)
   CSV4_sessionId,               // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV4_sendMs,                  // millis() when this payload was built
-  CSV4_FIELD_COUNT  // = 27
+  CSV4_FIELD_COUNT  // = 28
 };
 
 // CSV3 wire contract, declared ONCE: expanded into the Csv3Index enum, the snprintf format and argument list, and the
@@ -1310,7 +1316,7 @@ enum Csv4Index {
   X(n2kConvStatEnable, "%d", SafeInt(n2kConvStatEnable))                                                          /* 127750 converter status (0/1) */ \
   X(n2kRxBattInstance, "%d", SafeInt(n2kRxBattInstance))                                                          /* battery instance to ingest (127508/127506 receive) */ \
   X(dvccEn, "%d", SafeInt(dvccEn))                                                                                /* DVCC follow master (0/1) */ \
-  X(dvccSrcType, "%d", SafeInt(dvccSrcType))                                                                      /* authority dialect: 0 Victron VE.Can (VREG), 1 RV-C */ \
+  X(dvccSrcType, "%d", SafeInt(dvccSrcType))                                                                      /* limit source: 0 Victron GX (VE.Can and WiFi carriers), 1 RV-C */ \
   X(dvccInst, "%d", SafeInt(dvccInst))                                                                            /* RV-C DC instance filter (0 = any) */ \
   X(dvccSilenceS, "%d", SafeInt(dvccSilenceS))                                                                    /* silence timeout (s) */ \
   X(dvccSettleS, "%d", SafeInt(dvccSettleS))                                                                      /* settling time (s) */ \
@@ -1440,11 +1446,13 @@ enum TsIndex {
   TS_VeBattTemp,    // VE.Direct "T" battery temperature staleness (IDX_VE_BATT_TEMP)
   TS_RvcBattTemp,   // RV-C DC_SOURCE_STATUS_2 battery temperature staleness (IDX_RVC_BATT_TEMP)
   TS_DieTemp,       // INA228 die temperature: age of the last valid sample (IDX_INA_DIE_TEMP), the field-drive heat ceiling's input
+  TS_DvccVeCan,     // DVCC Victron source, VE.Can carrier: age of the last accepted limit register (IDX_DVCC_VECAN)
+  TS_DvccWifi,      // DVCC Victron source, WiFi carrier: age of the last /gxLimits post (IDX_DVCC_WIFI)
 
   TS_sessionId,     // boot identity — matches CSV1_sessionId while this cached block is from the live run
   TS_sendMs,        // millis() when built; every other TS field is an AGE, so this is what exposes a frozen block
 
-  TS_FIELD_COUNT  // = 42
+  TS_FIELD_COUNT  // = 44
 };
 
 float getCapCurrentForRPM(float rpm);
@@ -1902,6 +1910,280 @@ void pairListAppendJson(String &out) {
     out += '}';
   }
   out += ']';
+}
+
+// Victron GX writes: a request carrying gx=1 comes from the GX bridge. Its /get writes skip Unlock Controls (anyone at
+// the GX screen may change settings) and never read or write settingsArmed or an armTok.
+bool gxFlagged(AsyncWebServerRequest *request) {
+  const AsyncWebParameter *p = request->hasParam("gx", true) ? request->getParam("gx", true) : request->getParam("gx");
+  return p && p->value().toInt() == 1;
+}
+
+// What a GX may not do: commissioning (out of scope on the GX), firmware updates, and the Vessel Info field
+// winding (FieldWindingV / FieldWindingAck answer its resistance check). /saveVesselInfo and /fieldResTest refuse a GX
+// request through settingsArmActive. Stop and cancel stay allowed, so a GX can always end anything; the flagged
+// entries refuse only a nonzero (start) value.
+bool gxParamDenied(AsyncWebServerRequest *request) {
+  static const char *const DENY[] = {
+    "UpdateToVersion", "FieldWindingV", "FieldWindingAck",
+    "commissionStart", "commissionPhase", "commissionStageDone", "commissionStageManual", "commissionStageSkip",
+    "commissionDone", "commissionHeartbeat",
+    "startSystemID", "startTuningSweep", "restartCVTest",
+    "startFieldCurve", "startKneeSweep", "applyKneeCurve", "addKneeAnchor", "clearKneeAnchors",
+    "chcStart", "cvPlantFitStart", "fieldCutStart", "cvStressStart", "ripFitAlt", "slpFitAlt", "capBothSave",
+  };
+  static const char *const DENY_NONZERO[] = { "faCommissionGate", "TuningMode", "CVTuningMode",
+                                              "resTest", "bcurRtest", "ripGameFill" };
+  for (size_t i = 0; i < sizeof(DENY) / sizeof(DENY[0]); i++)
+    if (request->hasParam(DENY[i])) return true;
+  for (size_t i = 0; i < sizeof(DENY_NONZERO) / sizeof(DENY_NONZERO[0]); i++)
+    if (request->hasParam(DENY_NONZERO[i]) && request->getParam(DENY_NONZERO[i])->value().toInt() != 0) return true;
+  return false;
+}
+
+#define GX_STREAM_MAX 4
+struct GxStreamRec { const void *client; char ip[16]; uint32_t atMs; };
+// Written by gxEvents' connect/disconnect callbacks and read by GET /gxStatus, all on async_tcp.
+static GxStreamRec *gxStreamRecs = nullptr;
+
+static void gxStreamAdd(const void *client, const char *ip) {
+  if (!gxStreamRecs) gxStreamRecs = (GxStreamRec *)ps_calloc(GX_STREAM_MAX, sizeof(GxStreamRec));
+  if (!gxStreamRecs) return;
+  for (int i = 0; i < GX_STREAM_MAX; i++) {
+    if (!gxStreamRecs[i].client) {
+      gxStreamRecs[i].client = client;
+      snprintf(gxStreamRecs[i].ip, sizeof(gxStreamRecs[i].ip), "%s", ip ? ip : "");
+      gxStreamRecs[i].atMs = millis();
+      return;
+    }
+  }
+}
+
+// By pointer value only: the library hands the disconnecting client "for reference purposes".
+static void gxStreamRemove(const void *client) {
+  if (!gxStreamRecs) return;
+  for (int i = 0; i < GX_STREAM_MAX; i++)
+    if (gxStreamRecs[i].client == client) memset(&gxStreamRecs[i], 0, sizeof(GxStreamRec));
+}
+
+static void gxStatusAppendJson(String &out, uint32_t now) {
+  out += "{\"streams\":[";
+  bool first = true;
+  for (int i = 0; gxStreamRecs && i < GX_STREAM_MAX; i++) {
+    const GxStreamRec &s = gxStreamRecs[i];
+    if (!s.client) continue;
+    if (!first) out += ',';
+    first = false;
+    out += "{\"ip\":\"";
+    out += s.ip;
+    out += "\",\"upS\":";
+    out += String((now - s.atMs) / 1000UL);
+    out += '}';
+  }
+  out += "]}";
+}
+
+// ── Victron GX stream (/gxevents) ───────────────────────────────────────────────────────────────
+// The GX gets the phone's five frames, byte for byte, thinned to its own schedule. Core 1 brackets each frame build with a
+// sequence bump (odd = writing) and offers finished frames; the Core-0 sender copies one out, re-checks the sequence and
+// sends it, so loop() never waits on lwIP for the GX. Latest frame wins: nothing queues behind a slow GX.
+// 0-4 are SendWifiData's channels; 5-9 are the schema-zipped side streams built in 7_functions.ino (gxSideOffer).
+#define GX_CH_COUNT 10
+#define GX_CH_ALTLIVE 5
+#define GX_CH_PERFLIVE 6
+#define GX_CH_MOTORLIVE 7
+#define GX_CH_ALTSET 8
+#define GX_CH_PERFSET 9
+static const char *const GX_EVT[GX_CH_COUNT] = { "CSVData", "CSVData4", "CSVData2", "CSVData3", "TimestampData",
+                                                 "AltLive", "PerfLive", "MotorLive", "AltSettings", "PerfSettings" };
+// Rows: 0 engine running (or a GX page asked for live data), 1 ignition on with the engine stopped, 2 ignition-off WiFi nap.
+// The side streams are built at 1 Hz (live) and every 5 s (settings) whatever the schedule; a row only thins them.
+static const uint32_t GX_IV[3][GX_CH_COUNT] = { { 500, 1000, 10000, 60000, 6000, 1000, 1000, 1000, 5000, 5000 },
+                                                { 5000, 10000, 30000, 120000, 30000, 10000, 10000, 10000, 30000, 30000 },
+                                                { 10000, 30000, 60000, 300000, 60000, 30000, 30000, 30000, 60000, 60000 } };
+#define GX_SIDE_SIZE 512          // >= the largest side-stream buffer (AltLive, 512)
+// The side-stream builders tick on their own clocks, so a frame can land a little short of an interval equal to its
+// build period; without this slack the GX would get every other one.
+#define GX_SIDE_SLACK_MS 250UL
+static const char *const GX_TIER_NAME[3] = { "run", "stopped", "nap" };
+#define GX_RUN_HOLD_MS 30000UL    // the running schedule holds this long after the engine and field stop
+#define GX_FAST_HOLD_MS 60000UL   // GET /gxrate?fast=1 holds the running schedule this long
+#define GX_STAGE_SIZE 8192        // >= PAYLOAD2_SIZE and PAYLOAD3_SIZE, the largest frames
+// Unacked frames on the GX link at which the sender waits (the frame stays owed); a connect sends a burst of every
+// channel, so the floor sits above a healthy burst.
+static const uint16_t GX_BACKLOG_DEPTH = 8;
+static uint32_t gxSeq[GX_CH_COUNT];
+static const char *gxBuf[GX_CH_COUNT];
+static int gxLen[GX_CH_COUNT];          // -1 = the last build failed its length guard
+static uint8_t gxWant[GX_CH_COUNT];     // 1 = the sender owes the GX this channel's current frame
+static uint32_t gxLastOfferMs[GX_CH_COUNT];
+static bool gxKick[GX_CH_COUNT];        // Core 1 only: offer this channel at once (a GX just connected)
+static volatile bool gxKickPending = false;
+// Kept by gxEvents' connect/disconnect callbacks (async_tcp). Core 1 reads this, never gxEvents.count(): the Core-0
+// sender holds that lock across its blocking lwIP send, at priority 1 where anything on Core 0 can preempt it.
+static volatile uint8_t gxStreamCount = 0;
+static volatile uint8_t gxTier = 1;
+static volatile uint32_t gxFastUntilMs = 0;   // 0 = no fast hold
+static uint32_t gxRunSeenMs = 0;
+static TaskHandle_t gxSendTaskHandle = nullptr;
+static char *gxStage = nullptr;
+static char *gxSide = nullptr;          // PSRAM copies of the side streams (built in stack buffers), GX_SIDE_SIZE each
+static bool gxLiveNow = false;          // Core 1: a GX stream is up and the sender runs (refreshed every SendWifiData pass)
+
+static bool gxFastActive(uint32_t now) {
+  const uint32_t until = gxFastUntilMs;
+  return until && (int32_t)(until - now) > 0;
+}
+
+static uint8_t gxTierEffective(uint32_t now) { return gxFastActive(now) ? 0 : gxTier; }
+
+#define GX_RATE_JSON_SIZE 320
+void gxRateJson(char *out, size_t n) {
+  const uint32_t now = millis();
+  const uint8_t t = gxTierEffective(now);
+  const uint32_t *iv = GX_IV[t];
+  snprintf(out, n, "{\"tier\":\"%s\",\"fast\":%d,\"csv1\":%lu,\"csv4\":%lu,\"csv2\":%lu,\"csv3\":%lu,\"ts\":%lu,"
+                   "\"altLive\":%lu,\"perfLive\":%lu,\"motorLive\":%lu,\"altSettings\":%lu,\"perfSettings\":%lu}",
+           GX_TIER_NAME[t], gxFastActive(now) ? 1 : 0, (unsigned long)iv[0], (unsigned long)iv[1], (unsigned long)iv[2],
+           (unsigned long)iv[3], (unsigned long)iv[4], (unsigned long)iv[5], (unsigned long)iv[6], (unsigned long)iv[7],
+           (unsigned long)iv[8], (unsigned long)iv[9]);
+}
+
+static void gxFastHold(bool on) {
+  gxFastUntilMs = on ? ((millis() + GX_FAST_HOLD_MS) | 1UL) : 0;
+  if (gxSendTaskHandle) xTaskNotifyGive(gxSendTaskHandle);   // a changed schedule goes out as GxRate
+}
+
+// Core 1, every SendWifiData pass.
+static void gxTierUpdate(uint32_t now) {
+  if (g_engineSpinningNow || fieldActiveStatus != 0) gxRunSeenMs = now | 1UL;
+  const uint8_t t = (gxRunSeenMs && now - gxRunSeenMs < GX_RUN_HOLD_MS) ? 0 : (wifiNapActive ? 2 : 1);
+  if (t != gxTier) {
+    gxTier = t;
+    if (gxSendTaskHandle) xTaskNotifyGive(gxSendTaskHandle);
+  }
+}
+
+static inline void gxBeginWrite(uint8_t ch) {
+  __atomic_add_fetch(&gxSeq[ch], 1, __ATOMIC_SEQ_CST);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+// Called right after the build, before its length guard can return, so the sequence is always left even.
+static inline void gxEndWrite(uint8_t ch, const char *buf, int len, size_t cap) {
+  __atomic_store_n(&gxBuf[ch], buf, __ATOMIC_RELAXED);
+  __atomic_store_n(&gxLen[ch], (len > 0 && (size_t)len < cap && len < GX_STAGE_SIZE) ? len : -1, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&gxSeq[ch], 1, __ATOMIC_RELEASE);
+}
+
+// GX-only frame gate: the GX's own interval, or at once after a connect.
+static inline bool gxDue(uint8_t ch, uint32_t now, uint32_t last, bool gxLive) {
+  return gxLive && (gxKick[ch] || now - last >= GX_IV[gxTierEffective(now)][ch]);
+}
+
+// force: the frame was built for the GX (no phone) or carries a settings change; otherwise a phone-paced frame is
+// passed on only at the GX's interval.
+static void gxOffer(uint8_t ch, uint32_t now, bool gxLive, bool force) {
+  if (!gxLive || !gxSendTaskHandle) return;
+  if (!force && !gxKick[ch] && now - gxLastOfferMs[ch] < GX_IV[gxTierEffective(now)][ch]) return;
+  gxLastOfferMs[ch] = now;
+  gxKick[ch] = false;
+  __atomic_store_n(&gxWant[ch], 1, __ATOMIC_RELEASE);
+  xTaskNotifyGive(gxSendTaskHandle);
+}
+
+// Side streams (AltLive, PerfLive, MotorLive, AltSettings, PerfSettings): the builder's stack buffer is copied into the
+// channel's PSRAM slot under the sequence. Core 1 only, so each channel keeps one writer (a /get handler on Core 0 also
+// sends the settings echoes; those reach the phone only, and the GX gets the next periodic one).
+void gxSideOffer(uint8_t ch, const char *buf, int len) {
+  if (!gxLiveNow || !gxSide || ch < GX_CH_ALTLIVE || ch >= GX_CH_COUNT || xPortGetCoreID() != 1) return;
+  if (len <= 0 || len >= GX_SIDE_SIZE) return;
+  const uint32_t now = millis();
+  if (!gxKick[ch] && now - gxLastOfferMs[ch] + GX_SIDE_SLACK_MS < GX_IV[gxTierEffective(now)][ch]) return;
+  char *slot = gxSide + (size_t)(ch - GX_CH_ALTLIVE) * GX_SIDE_SIZE;
+  gxBeginWrite(ch);
+  memcpy(slot, buf, (size_t)len);
+  gxEndWrite(ch, slot, len, GX_SIDE_SIZE);
+  gxOffer(ch, now, true, true);
+}
+
+#define GX_COPY_OK 0
+#define GX_COPY_NONE 1   // no usable frame (never built, or the last build failed its guard)
+#define GX_COPY_BUSY 2   // Core 1 kept rebuilding it; the newer frame is offered on the next try
+static uint8_t gxCopyFrame(uint8_t ch) {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    const uint32_t s1 = __atomic_load_n(&gxSeq[ch], __ATOMIC_ACQUIRE);
+    if (s1 & 1u) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+    const char *buf = __atomic_load_n(&gxBuf[ch], __ATOMIC_RELAXED);
+    const int len = __atomic_load_n(&gxLen[ch], __ATOMIC_RELAXED);
+    if (!buf || len <= 0 || len >= GX_STAGE_SIZE) return GX_COPY_NONE;
+    memcpy(gxStage, buf, (size_t)len);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&gxSeq[ch], __ATOMIC_RELAXED) == s1) {
+      gxStage[len] = '\0';
+      return GX_COPY_OK;
+    }
+    gxFramesTorn++;
+  }
+  return GX_COPY_BUSY;
+}
+
+static void gxSendTask(void *) {
+  uint8_t sentTier = 0xFF, sentFast = 0xFF;
+  for (;;) {
+    bool owed = false;
+    for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) owed |= __atomic_load_n(&gxWant[ch], __ATOMIC_ACQUIRE) != 0;
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(owed ? 100 : 1000));
+    if (otaInProgress) continue;
+    if (gxEvents.count() == 0) {
+      // A connecting client is counted (onConnect) before the library lists it: its kick burst stays owed.
+      if (gxStreamCount == 0)
+        for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) __atomic_store_n(&gxWant[ch], 0, __ATOMIC_RELEASE);
+      continue;
+    }
+    const uint32_t now = millis();
+    const uint8_t tier = gxTierEffective(now), fast = gxFastActive(now) ? 1 : 0;
+    if (tier != sentTier || fast != sentFast) {
+      char rate[GX_RATE_JSON_SIZE];
+      gxRateJson(rate, sizeof(rate));
+      if (gxEvents.send(rate, "GxRate") != AsyncEventSource::ENQUEUED) gxFramesDropped++;
+      sentTier = tier;
+      sentFast = fast;
+    }
+    for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) {
+      if (!__atomic_load_n(&gxWant[ch], __ATOMIC_ACQUIRE)) continue;
+      if (gxEvents.avgPacketsWaiting() >= GX_BACKLOG_DEPTH) {
+        gxFramesHeld++;
+        break;
+      }
+      // Cleared before the copy, so an offer that lands during it is not lost.
+      __atomic_store_n(&gxWant[ch], 0, __ATOMIC_RELEASE);
+      const uint8_t got = gxCopyFrame(ch);
+      if (got == GX_COPY_BUSY) __atomic_store_n(&gxWant[ch], 1, __ATOMIC_RELEASE);
+      if (got != GX_COPY_OK) continue;
+      if (gxEvents.send(gxStage, GX_EVT[ch]) == AsyncEventSource::ENQUEUED) gxFramesSent++;
+      else gxFramesDropped++;
+    }
+  }
+}
+
+void startGxSendTask() {
+  if (gxSendTaskHandle) return;
+  if (!gxStage) gxStage = (char *)ps_malloc(GX_STAGE_SIZE);
+  if (!gxSide) gxSide = (char *)ps_malloc((size_t)(GX_CH_COUNT - GX_CH_ALTLIVE) * GX_SIDE_SIZE);
+  if (!gxStage || !gxSide) {
+    Serial.println("GX stream: staging buffer allocation failed, /gxevents carries no frames this boot");
+    return;
+  }
+  // Priority 1 like TempTask and HTTPS; never retires (idles through an OTA), so it is not in ensureCore0Tasks().
+  if (xTaskCreatePinnedToCoreWithCaps(gxSendTask, "gxSend", 6144, NULL, 1, &gxSendTaskHandle, 0, MALLOC_CAP_SPIRAM) != pdPASS) {
+    gxSendTaskHandle = nullptr;
+    Serial.println("GX stream: sender task create failed, /gxevents carries no frames this boot");
+    return;
+  }
+  Serial.println("GX stream sender task created on Core 0 (prio 1, PSRAM stack)");
 }
 
 void accessInit() {
@@ -2482,6 +2764,7 @@ void setupWiFiConfigServer() {
 int doCloudPOST(const char *endpointPath, const char *payload,
                 char *responseBuf, size_t responseBufSize) {
   if (responseBuf && responseBufSize > 0) responseBuf[0] = '\0';
+  if (demoSeal) return -6;   // demo mode: nothing reaches the cloud
 
   // Hard floor only (setInsecure TLS needs ~5-10 KB). Do not raise it: 40 KB tripped right after sensor uploads before
   // heap was reclaimed; a real OOM fails client.connect() -> -2.
@@ -2647,6 +2930,7 @@ const char *cloudFailReason(int code) {
     case -3: return "timed out after connecting";
     case -4: return "lost connection while sending";
     case -5: return "no response from cloud server";
+    case -6: return "demo mode is on";
     default: return "unknown error";
   }
 }
@@ -2684,6 +2968,12 @@ static void cloudOpSetBodyJson(const char *resp) {
 }
 
 static void cloudOpStageAndReply(AsyncWebServerRequest *request, uint8_t kind, const char *payload) {
+  if (demoSeal) {
+    char b[160];
+    snprintf(b, sizeof(b), "{\"success\":false,\"error\":\"%s\"}", DEMO_REFUSAL);
+    request->send(423, "application/json", b);
+    return;
+  }
   if (!cloudOpBuffersReady()) {
     request->send(500, "application/json", "{\"error\":\"alloc failed\"}");
     return;
@@ -2918,6 +3208,7 @@ static void dvccResetAuthority() {
   if (dvccState != 5) dvccState = (dvccEn == 1) ? 1 : 0;  // preserve an UNTRUSTED latch across source edits
   dvccCfgChanged = true;  // dvccTick also clears its decode-side state (sender lock, flap history)
   dataTimestamps[IDX_DVCC] = 0;
+  dataTimestamps[IDX_DVCC_VECAN] = 0;
 }
 
 // Reads the caller's run token (run=) off a test-start request. Absent = 0, which is what a caller
@@ -2946,8 +3237,9 @@ static void logClientWrite(AsyncWebServerRequest *request, const char *what) {
   const AsyncWebHeader *uaH = request->getHeader("User-Agent");
   String ua = uaH ? uaH->value() : String("-");
   if (ua.length() > 80) ua = ua.substring(0, 80);
-  queueConsoleMessageF("%s [from %s | %s | UA %s]", what,
-                       request->client()->remoteIP().toString().c_str(), qs.c_str(), ua.c_str());
+  String from = request->client()->remoteIP().toString();
+  if (gxFlagged(request)) from += " Victron GX";
+  queueConsoleMessageF("%s [from %s | %s | UA %s]", what, from.c_str(), qs.c_str(), ua.c_str());
 }
 
 // Per-tab ordering guard. The dashboard tags writes with src (page-load nonce) and n (press counter); same src with n at
@@ -2998,6 +3290,18 @@ static bool refuseMisaddressed(AsyncWebServerRequest *request) {
   queueConsoleMessageF("WRITE REJECTED: %s addressed to another regulator [from %s]",
                        request->url().c_str(), request->client()->remoteIP().toString().c_str());
   request->send(409, "text/plain", device_id_hex);
+  return true;
+}
+
+// One /gxLimits value. Absent = not available (NAN). Present = the whole string must be a finite number, else false.
+static bool gxLimitParam(AsyncWebServerRequest *request, const char *name, float &out) {
+  out = NAN;
+  if (!request->hasParam(name)) return true;
+  const char *s = request->getParam(name)->value().c_str();
+  char *end = nullptr;
+  float v = strtof(s, &end);
+  if (end == s || *end != 0 || !isfinite(v)) return false;
+  out = v;
   return true;
 }
 
@@ -3410,6 +3714,7 @@ void setupServer() {
 
   server.on("/factoryReset", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -3806,6 +4111,7 @@ void setupServer() {
   // Serves flash PLUS episodes still queued in RAM (they reach flash only ~30 s after the field gate is cut,
   // huntLedgerService). Read-only by design: never writes flash.
   server.on("/huntledger", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/huntledger")) return;   // demo mode: made-up history (9_demo.ino)
     // Queue counted and rendered under the FS lock too: huntLedgerService moves it to the file and
     // zeroes it under this same lock, so a flush between the two reads would drop those rows from both.
     fsTakeLock();
@@ -3852,6 +4158,7 @@ void setupServer() {
   // Live damper speed-pocket map for the Diag plot: cut/wing/pockets in one JSON so the client
   // renders exactly the profile the firmware applies. Tiny (≤4 pockets) — no PSRAM streaming.
   server.on("/huntmap", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/huntmap")) return;   // demo mode: made-up history (9_demo.ino)
     char buf[384];
     size_t n = huntMapJson(buf, sizeof(buf));
     AsyncWebServerResponse *response = request->beginResponse(200, "application/json", String(buf, n));
@@ -3863,7 +4170,8 @@ void setupServer() {
   // flight, together. The web UI fronts this with an explicit confirm.
   server.on("/huntclear", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
-    if (!settingsArmActive(request)) {
+    if (demoSeal) { demoRefuse(request); return; }
+    if (!gxFlagged(request) && !settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
     }
@@ -3897,7 +4205,7 @@ void setupServer() {
     memcpy(snap, dvccCapRing + start, (size_t)run * sizeof(DvccCapEntry));
     if (run < cnt) memcpy(snap + run, dvccCapRing, (size_t)(cnt - run) * sizeof(DvccCapEntry));
     dvccCapPause = false;
-    size_t cap = (size_t)cnt * 44 + 4352;  // + header: run stamp, authority, node roster, battery record, the not-the-battery's-number note
+    size_t cap = (size_t)cnt * 44 + 4480;  // + header: run stamp, authority, WiFi carrier, node roster, battery record, the not-the-battery's-number note
     char *buf = (char *)ps_malloc(cap);
     if (!buf) {
       free(snap);
@@ -3909,16 +4217,20 @@ void setupServer() {
     // formatted unlocked; snprintf must never run inside the critical section.
     char authTxt[24];
     if (dvccRxSrcAddr == 255) snprintf(authTxt, sizeof(authTxt), "none heard yet");
+    else if (dvccRxSrcAddr == DVCC_ADDR_WIFI) snprintf(authTxt, sizeof(authTxt), "WiFi only");
     else snprintf(authTxt, sizeof(authTxt), "addr %u", (unsigned)dvccRxSrcAddr);
+    const unsigned long wifiTs = dataTimestamps[IDX_DVCC_WIFI];
     n += (size_t)snprintf(buf + n, cap - n,
                           "# XREG-010 DVCC capture - fw %s - uptime %lu ms - %u frames\n"
                           "# dialect %s - RV-C instance filter %d - follow state %u - authority %s\n"
+                          "# WiFi carrier (/gxLimits): CVL %.2f V, CCL %.1f A (nan = not sent), last post %ld ms ago (-1 = never)\n"
                           "# nodes heard passively (PGN 60928 NAME / 126996 product info). Hearing nothing is\n"
                           "# normal with transmit off: neither PGN can be requested, so this is only what the\n"
                           "# bus volunteered while we were listening.\n"
                           "# addr  mfg func class   unique  prod vprod  model | sw | serial\n",
                           FIRMWARE_VERSION, (unsigned long)millis(), (unsigned)cnt,
-                          dvccSrcType == 1 ? "RV-C" : "Victron VE.Can", dvccInst, (unsigned)dvccState, authTxt);
+                          dvccSrcType == 1 ? "RV-C" : "Victron GX", dvccInst, (unsigned)dvccState, authTxt,
+                          (double)dvccRxWifiCvl, (double)dvccRxWifiCcl, wifiTs ? (long)(millis() - wifiTs) : -1L);
     DvccNode *nsnap = (DvccNode *)ps_malloc(sizeof(DvccNode) * DVCC_NODE_N);
     uint8_t nodeCnt = 0;
     if (nsnap && dvccNodes) {
@@ -4278,6 +4590,7 @@ void setupServer() {
   });
   // Auto Min% learning ("knee tracker") state: knobs + live status + per-bin learned floors.
   server.on("/kneeLearnState", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/kneeLearnState")) return;   // demo mode: made-up history (9_demo.ino)
     request->send(200, "application/json", kneeLearnStateJson());
   });
   // Deferred commissioning-start persist status: PENDING while the loop worker retires the Start's
@@ -4304,6 +4617,7 @@ void setupServer() {
   });
   // Battery Health: DCIR test status + result table + capacity-vs-cycles trend.
   server.on("/batteryHealth", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/batteryHealth")) return;   // demo mode: made-up history (9_demo.ino)
     size_t n = 0;
     char *body = bhBuildStatusJson(&n);   // PSRAM, owned by the streamer below
     if (!body) {
@@ -4314,6 +4628,7 @@ void setupServer() {
   });
   // Zero-drift characterization log: small status JSON for the dashboard panel (enable, fill, span).
   server.on("/zerologstate", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/zerologstate")) return;   // demo mode: made-up history (9_demo.ino)
     uint32_t oldest = 0, newest = 0;
     if (zeroLogRing && zeroLogCount > 0) {
       uint16_t oi = (zeroLogCount < ZEROLOG_RING_SIZE) ? 0 : zeroLogHead;
@@ -4331,6 +4646,7 @@ void setupServer() {
   });
   // Temp-comp zero correction: live learned-equation state for the dashboard panel.
   server.on("/zerofitstate", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/zerofitstate")) return;   // demo mode: made-up history (9_demo.ino)
     String j = "{\"valid\":";   j += zfValid;
     j += ",\"sensor\":\"";      j += (zfSensor == ZF_ALT ? "alt" : "board"); j += "\"";
     j += ",\"c\":";             j += String(zfC, 4);
@@ -4363,6 +4679,7 @@ void setupServer() {
   // Multi-drop 1-Wire probe registry for Setup > Temperature (BATTERY_TEMP_SENSORS_SPEC.md §8). Copied under owMux and
   // built from the stack copy, so TempTask never waits on the network. "role" is from stored role addresses (present:0 kept).
   server.on("/tempSensors", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/tempSensors")) return;   // demo mode: made-up history (9_demo.ino)
     OwProbe snap[OW_MAX_PROBES];
     DeviceAddress roleAddr[TR_COUNT];
     int8_t roleSlot[TR_COUNT];
@@ -4419,6 +4736,7 @@ void setupServer() {
   });
   // Temp-comp zero correction: daily-fit history (≤90 rows) for the trend view. Small enough to build inline.
   server.on("/zerofit.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/zerofit.csv")) return;   // demo mode: made-up history (9_demo.ino)
     String out = "epoch,sensor,c,b,r2,n\n";
     if (zeroFitHist && zeroFitHistCount > 0) {
       for (uint16_t i = 0; i < zeroFitHistCount; i++) {
@@ -4437,6 +4755,7 @@ void setupServer() {
   // Zero-drift log → CSV, streamed oldest-first (constant RAM). Reads the live PSRAM ring, so the
   // download is always complete regardless of the last flash flush.
   server.on("/zerolog.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/zerolog.csv")) return;   // demo mode: made-up history (9_demo.ino)
     if (!zeroLogRing || zeroLogCount == 0) {
       request->send(200, "text/csv", "epoch,rpm,battV,altTempF,boardTempF,amps,p2pAmps\n");
       return;
@@ -4632,6 +4951,7 @@ void setupServer() {
   });
   // Solar ledger: predicted vs actual harvest and consumption per local day, plus the day in progress.
   server.on("/solarledger.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/solarledger.csv")) return;   // demo mode: made-up history (9_demo.ino)
     solarLedgerCsvSend(request);
   });
   // Gate-tuning capture dump: 164 B header + 17 B rows, decoded in the browser (parseAltLogBin in script.js). Refuses
@@ -4722,6 +5042,7 @@ void setupServer() {
   server.on("/perfUploadFront", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       if (refuseMisaddressed(request)) return;
+      if (demoSeal) { demoRefuse(request); return; }
       if (!settingsArmActive(request)) { request->send(403, "text/plain", "Settings not armed"); return; }
       char *body = frontUploadText(request);
       if (!body) return;
@@ -4737,6 +5058,7 @@ void setupServer() {
   server.on("/altUploadFront", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       if (refuseMisaddressed(request)) return;
+      if (demoSeal) { demoRefuse(request); return; }
       if (!settingsArmActive(request)) { request->send(403, "text/plain", "Settings not armed"); return; }
       char *body = frontUploadText(request);
       if (!body) return;
@@ -4753,6 +5075,8 @@ void setupServer() {
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed"); return;
     }
+    // demo mode: no config file (download=1 is the Export button); the app's own reads of the current settings still answer
+    if (demoSeal && paramOk(request, "download") && request->getParam("download")->value().toInt() != 0) { demoRefuse(request); return; }
     request->send(200, "application/json", exportConfigJson());
   });
 
@@ -4791,6 +5115,7 @@ void setupServer() {
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed"); return;
     }
+    if (demoSeal) { demoRefuse(request); return; }   // demo mode: the stores in RAM are the demo's
     size_t n = 0;
     void *rec = recordsExportJson(paramOk(request, "summary") && request->getParam("summary")->value().toInt() != 0, &n);
     if (!rec) { request->send(503, "text/plain", "records unavailable (out of memory, or a record file could not be read)"); return; }
@@ -4809,6 +5134,7 @@ void setupServer() {
   server.on("/importRecords", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       if (refuseMisaddressed(request)) return;
+      if (demoSeal) { demoRefuse(request); return; }
       if (!settingsArmActive(request)) { request->send(403, "text/plain", "Settings not armed"); return; }
       const char *body = (const char *)request->_tempObject;
       if (!body || strlen(body) < 2) { request->send(400, "text/plain", "Empty body"); return; }
@@ -4840,6 +5166,7 @@ void setupServer() {
   server.on("/importConfig", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       if (refuseMisaddressed(request)) { importConfigBuf = ""; return; }
+      if (demoSeal) { importConfigBuf = ""; demoRefuse(request); return; }
       if (!settingsArmActive(request)) {
         importConfigBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
       }
@@ -5031,6 +5358,7 @@ void setupServer() {
   //   [0..1] u16 head  [2..3] u16 count  [4..5] u16 capacity  [6..7] u16 recordSize
   //   [8..11] u32 lastEpoch  [12..15] u32 intervalSec
   server.on("/longTermPlots.bin", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoServe(request, "/longTermPlots.bin")) return;   // demo mode: made-up history (9_demo.ino)
     if (!longTermRing) {
       request->send(503, "application/octet-stream", "");
       return;
@@ -5264,7 +5592,8 @@ void setupServer() {
       if (requestedState == 0) {
         // Turning OFF is ALWAYS allowed — safety critical
         OnOff = 0;
-        settingWrite(NK_OnOff, "0");
+        if (demoSeal) demoWriteThrough(NK_OnOff, "0");   // a safety OFF outlives demo mode: never back on at exit
+        else settingWrite(NK_OnOff, "0");
         stateRevision++;
         // This path returns before the foundParameter block, so raise settingsDirty here for the CSV3 echo.
         settingsDirty = true;
@@ -5289,10 +5618,24 @@ void setupServer() {
       return;
     }
 
-    if (!settingsArmActive(request)) {
+    // A Victron GX write (gx=1) skips Unlock Controls, password or not, and never reads or changes the phones' unlock.
+    const bool fromGx = gxFlagged(request);
+    if (!fromGx && !settingsArmActive(request)) {
       // Console line so a rejected write is visible — a stale/replayed URL lands here silently.
       queueConsoleMessage("Settings write REJECTED: not armed (press Unlock Controls first)");
       request->send(403, "text/plain", "Settings not armed");
+      return;
+    }
+    if (fromGx && gxParamDenied(request)) {
+      request->send(403, "text/plain", "Not available from a Victron GX");
+      return;
+    }
+    if (demoPhase == DEMO_EXITING) {   // the real settings are reloading; a write now would be lost
+      request->send(503, "text/plain", "Leaving demo mode, try again in a moment.");
+      return;
+    }
+    if (demoSeal && demoParamDenied(request)) {
+      demoRefuse(request);
       return;
     }
 
@@ -5403,6 +5746,7 @@ void setupServer() {
         Serial.printf("Active tasks: %u\n", uxTaskGetNumberOfTasks());
         Serial.println("Closing event connections...");
         events.close();
+        gxEvents.close();
         Serial.println("========================================");
         Serial.println("NOTE: Task termination backtrace next is expected and harmless");
         Serial.println("========================================");
@@ -6514,10 +6858,6 @@ void setupServer() {
       wifiNapEnabled = (request->getParam("wifiNapEnabled")->value().toInt() != 0);
       settingWrite(NK_wifiNapEnabled, wifiNapEnabled ? "1" : "0");
     }
-    if (paramOk(request, "altSimMode")) {
-      foundParameter = true;
-      altSimMode = request->getParam("altSimMode")->value().toFloat();  // bench simulator (not persisted)
-    }
     // Alternator-health steady-state / window / record settings (registry-driven)
     if (altSettingsHandle(request)) {
       foundParameter = true;
@@ -6526,10 +6866,6 @@ void setupServer() {
     if (request->hasParam("ResetBoatPerformance")) {
       foundParameter = true;
       pendingResetBoatPerformance = true;  // deferred to Core 1 to avoid SSE gap (Clear all data)
-    }
-    if (paramOk(request, "perfSimMode")) {
-      foundParameter = true;
-      perfSimMode = request->getParam("perfSimMode")->value().toFloat();  // bench NMEA simulator (not persisted)
     }
     // Boat-performance polar settings (registry-driven, incl. sticky Pause + speed-source selector)
     if (perfSettingsHandle(request)) {
@@ -8304,12 +8640,14 @@ void setupServer() {
       settingWrite(NK_LogAllLearningEvents, inputMessage.c_str());
       LogAllLearningEvents = inputMessage.toInt();
     }
-    if (paramOk(request, "hardwarePresent")) {
+    if (paramOk(request, "hardwarePresent")) {   // demo mode switch: RAM only, entry and exit run on the loop (9_demo.ino)
       foundParameter = true;
-      inputMessage = request->getParam("hardwarePresent")->value();
-      settingWrite(NK_hardwarePresent, inputMessage.c_str());
-      hardwarePresent = inputMessage.toInt();
-      queueConsoleMessageF("hardwarePresent mode %s", hardwarePresent ? "enabled" : "disabled");
+      const char *why = demoSwitchRequest(request->getParam("hardwarePresent")->value().toInt() != 0 ? 1 : 0);
+      if (why) {
+        queueConsoleMessage(why);
+        request->send(503, "text/plain", why);
+        return;
+      }
     }
 
     // RPM breakpoint and current table handlers
@@ -9799,6 +10137,11 @@ void setupServer() {
       sseStallLongestMs = 0;
       sseFramesDropped = 0;
       csv3PeakLen = 0;
+      gxFramesSent = 0;
+      gxFramesHeld = 0;
+      gxFramesTorn = 0;
+      gxFramesDropped = 0;
+      gxStreamDrops = 0;
       // INA228 die-temperature session max — same "since last reset" semantics as the rest of this block.
       inaDieTempMaxF = NAN;
       // Stamp the reset moment. Dashboard reads CSV1 slot 28 = (millis()-this)/1000
@@ -9873,6 +10216,11 @@ void setupServer() {
     const char *issued = nullptr;
     uint32_t waitS = 0;
     const bool armInBody = request->hasParam("arm", true);
+    // A GX must never arm or lock the phones' shared unlock.
+    if (gxFlagged(request)) {
+      request->send(400, "application/json", "{\"err\":\"gx\"}");
+      return;
+    }
     if (armInBody || request->hasParam("arm")) {
       bool arm = (armInBody ? request->getParam("arm", true) : request->getParam("arm"))->value().toInt() != 0;
       if (arm && !pwRequired) {
@@ -10001,6 +10349,51 @@ void setupServer() {
     request->send(200, "application/json", out);
   });
 
+  // GX schedule: fast=1 holds the engine-running schedule for 60 s whatever the engine does (the GX repeats it while a
+  // page shows live data), fast=0 releases it. Cadence only; the GX still never counts as a watching dashboard.
+  server.on("/gxrate", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
+    const String fast = request->hasParam("fast") ? request->getParam("fast")->value() : String();
+    if (fast.length()) gxFastHold(fast.toInt() != 0);
+    char rate[GX_RATE_JSON_SIZE];
+    gxRateJson(rate, sizeof(rate));
+    request->send(200, "application/json", rate);
+  });
+
+  // Setup > System > Victron GX: the GX streams connected now (address, seconds up). Read-only.
+  server.on("/gxStatus", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
+    String out;
+    gxStatusAppendJson(out, millis());
+    request->send(200, "application/json", out);
+  });
+
+  // DVCC over WiFi: the GX bridge forwards what systemcalc writes to its alternator service, every ~3 s. Contract:
+  // claude_docs/firmware-internals.md, "Victron GX stream". Not a settings write: no NVS, no console line, no CSV3 echo.
+  server.on("/gxLimits", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
+    if (!gxFlagged(request)) {
+      request->send(400, "text/plain", "gx=1 required");
+      return;
+    }
+    float cvl, ccl;
+    if (!gxLimitParam(request, "cvl", cvl) || !gxLimitParam(request, "ccl", ccl)) {
+      request->send(400, "text/plain", "cvl and ccl must be numbers");
+      return;
+    }
+    if (!demoSeal) {   // demo mode follows its own made-up GX limit (9_demo.ino); a real GX post is answered, not taken
+      portENTER_CRITICAL(&dvccWifiMux);
+      dvccWifiBoxCvl = cvl;
+      dvccWifiBoxCcl = ccl;
+      dvccWifiBoxSeq = dvccWifiBoxSeq + 1;
+      portEXIT_CRITICAL(&dvccWifiMux);
+    }
+    char out[64];
+    snprintf(out, sizeof(out), "{\"ok\":1,\"follow\":%d,\"source\":%d,\"state\":%u}", dvccEn, dvccSrcType,
+             (unsigned)dvccState);
+    request->send(200, "application/json", out);
+  });
+
   // Explicit routes for static assets, never via onNotFound. The flash fallback carries no-cache: for index.html
   // so a stale dashboard can't outlive an unreachable device, for the rest because this path has no ETag or
   // Last-Modified validator, so browsers refetch anyway.
@@ -10069,12 +10462,30 @@ void setupServer() {
     if (client->client()) client->client()->setAckTimeout(20000);
     client->send("hello!", NULL, millis(), 10000);
   });
+  // Victron GX stream: same frames on the GX schedule (gxSendTask). Its own source, so a connected GX never counts
+  // as a phone watching (TempTask cadence, the nap clock, the maintenance-reboot window, the phone backlog witness).
+  gxEvents.onConnect([](AsyncEventSourceClient *client) {
+    settingsDirty = true;   // CSV3 at once: the GX needs every settings echo before its first write
+    if (client->client()) client->client()->setAckTimeout(20000);
+    client->send("hello!", NULL, millis(), 10000);
+    char rate[GX_RATE_JSON_SIZE];
+    gxRateJson(rate, sizeof(rate));
+    client->send(rate, "GxRate");
+    gxKickPending = true;
+    gxStreamAdd(client, client->client() ? client->client()->remoteIP().toString().c_str() : "");
+    gxStreamCount = (uint8_t)(gxStreamCount + 1);
+  });
+  gxEvents.onDisconnect([](AsyncEventSourceClient *client) {
+    gxStreamRemove(client);
+    if (gxStreamCount) gxStreamCount = (uint8_t)(gxStreamCount - 1);
+    gxStreamDrops++;
+  });
   // MUST precede "/debug": a plain-string URI matches exact-or-prefix-with-slash and the server
   // dispatches in registration order, so "/debug" registered first swallows both of these.
   // Bench-only data-growth ceiling test; handlers live at the tail of 8_functions.ino.
   { void debugFillMax(AsyncWebServerRequest *); void debugClearMax(AsyncWebServerRequest *);
-    server.on("/debug/fillmax",  HTTP_GET, debugFillMax);
-    server.on("/debug/clearmax", HTTP_GET, debugClearMax); }
+    server.on("/debug/fillmax",  HTTP_GET, [](AsyncWebServerRequest *r) { if (demoSeal) demoRefuse(r); else debugFillMax(r); });
+    server.on("/debug/clearmax", HTTP_GET, [](AsyncWebServerRequest *r) { if (demoSeal) demoRefuse(r); else debugClearMax(r); }); }
 
   // Diagnostic endpoint to check partition and version
   server.on("/debug", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -10115,6 +10526,7 @@ void setupServer() {
              "Heap walks (Core 0, field cut only): largest internal block %u KB %lus ago, largest PSRAM block %u KB %lus ago; free PSRAM %u B\n"
              "Net task cores (0/1=pinned, 2147483647=floating, -99=not found or no census yet): async_tcp=%d lwIP=%d\n"
              "Dashboard stream: clients=%u queue=%u peak=%u/%u stalls=%lu longest=%.1fs dropped=%lu csv3=%uB peak=%uB of %uB\n"
+             "GX stream: clients=%u queue=%u schedule=%s%s sender=%s sent=%lu held=%lu torn=%lu dropped=%lu disconnects=%lu\n"
              "AdjustField worst full pass (ms): total=%.1f | thermal=%.1f snapshot=%.1f fastov=%.1f modes=%.1f control=%.1f duty=%.1f tail=%.1f\n"
              "Field derate worst pass: %lu us (budget 500 us; part of snapshot above)\n"
              "Time source: %s (NMEA last sync: %lus ago, Phone last: %lus ago)\n"
@@ -10135,6 +10547,10 @@ void setupServer() {
              (unsigned)events.count(), (unsigned)sseQueueDepth, (unsigned)sseQueuePeak, (unsigned)SSE_MAX_QUEUED_MESSAGES,
              (unsigned long)sseStallCount, sseStallLongestMs / 1000.0f, (unsigned long)sseFramesDropped,
              (unsigned)csv3LastLen, (unsigned)csv3PeakLen, (unsigned)PAYLOAD3_SIZE,
+             (unsigned)gxEvents.count(), (unsigned)gxEvents.avgPacketsWaiting(), GX_TIER_NAME[gxTierEffective(now)],
+             gxFastActive(now) ? " (fast hold)" : "", gxSendTaskHandle ? "running" : "NOT RUNNING",
+             (unsigned long)gxFramesSent, (unsigned long)gxFramesHeld, (unsigned long)gxFramesTorn,
+             (unsigned long)gxFramesDropped, (unsigned long)gxStreamDrops,
              aflWorstTotalUs / 1000.0f,
              aflWorstSecUs[0] / 1000.0f, aflWorstSecUs[1] / 1000.0f, aflWorstSecUs[2] / 1000.0f,
              aflWorstSecUs[3] / 1000.0f, aflWorstSecUs[4] / 1000.0f, aflWorstSecUs[5] / 1000.0f,
@@ -10207,7 +10623,7 @@ void setupServer() {
     // Deliberately NOT arm-gated: background telemetry from a trusted LAN client, pushed whether or not
     // settings are armed. NMEA always outranks phone data, and range checks reject garbage.
     bool acceptedGps = false, acceptedTime = false;
-    if (paramOk(request, "lat") && paramOk(request, "lon")) {
+    if (!demoSeal && paramOk(request, "lat") && paramOk(request, "lon")) {   // demo: the simulated boat is the only position, speed and course
       // Use strtod + endptr (not String::toDouble — that silently returns 0.0
       // for unparseable input, so "lat=NaN&lon=42" would pass as (0.0, 42)).
       const char *latStr = request->getParam("lat")->value().c_str();
@@ -10240,7 +10656,7 @@ void setupServer() {
     // Phone GNSS speed (m/s, coords.speed) and course (deg, coords.heading), independent of lat/lon:
     // heading is null on a stationary phone, so each gets its own freshness stamp.
     bool acceptedSpd = false, acceptedHdg = false;
-    if (paramOk(request, "spd")) {
+    if (!demoSeal && paramOk(request, "spd")) {
       const char *spdStr = request->getParam("spd")->value().c_str();
       char *spdEnd = nullptr;
       double spd = strtod(spdStr, &spdEnd);
@@ -10251,7 +10667,7 @@ void setupServer() {
         acceptedSpd = true;
       }
     }
-    if (paramOk(request, "hdg")) {
+    if (!demoSeal && paramOk(request, "hdg")) {
       const char *hdgStr = request->getParam("hdg")->value().c_str();
       char *hdgEnd = nullptr;
       double hdg = strtod(hdgStr, &hdgEnd);
@@ -10343,6 +10759,9 @@ void setupServer() {
     pairListAppendJson(idBuf);
     idBuf += ",\"peers\":";
     peerListAppendJson(idBuf);
+    idBuf += ",\"gx\":3";   // Victron GX link version: 2 = /gxevents, /gxrate, /gxStatus and gx=1 writes; 3 adds /gxLimits
+    idBuf += ",\"demo\":";  // 1 = demo mode (simulated boat): a GX must not log or forward these values
+    idBuf += demoSeal ? "1" : "0";
     idBuf += "}";
     AsyncWebServerResponse *r = request->beginResponse(200, "application/json", idBuf);
     r->addHeader("Access-Control-Allow-Origin", "*");
@@ -11156,6 +11575,7 @@ void setupServer() {
 
   server.on("/resetcvtuninglog", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }
     cvTuningLogCount     = 0;
     cvTuningLogHead      = 0;
     cvTuningRunCounter   = 0;
@@ -11170,6 +11590,7 @@ void setupServer() {
 
   server.on("/resettuninglog", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }
     tuningLogCount    = 0;
     tuningLogHead     = 0;
     tuningRunCounter  = 0;
@@ -11221,12 +11642,14 @@ void setupServer() {
 
   server.on("/resetsystemidlog", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }
     systemIDLogClearAll();  // persist deferred to Core 1 — avoids blocking Core 0 SSE
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/resettuningsweeplog", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }
     tuningSweepLogCount   = 0;
     tuningSweepLogHead    = 0;
     tuningSweepRunCounter = 0;
@@ -11237,6 +11660,7 @@ void setupServer() {
 
   server.on("/resetsysidsweeplog", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }
     sysidSweepLogCount   = 0;
     sysidSweepLogHead    = 0;
     sysidSweepRunCounter = 0;
@@ -11277,14 +11701,16 @@ void setupServer() {
   // destroy the lifetime OV record. The web UI fronts this with an explicit confirm.
   server.on("/resetOvTelemetryLifetime", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
-    memset(&g_ovTel, 0, sizeof(g_ovTel));
-    g_ovTel.magic = OVTEL_MAGIC;
+    OvTelemetry &ov = ovTel();   // the demo copy while in demo
+    memset(&ov, 0, sizeof(ov));
+    ov.magic = OVTEL_MAGIC;
     request->send(200, "text/plain", "OK");
   });
 
   // Lifetime OV telemetry for the Diagnostics panel. Not in CSV2 (avoids field-count churn) —
   // polled on demand. time_ms as decimal strings: uint64 dwell is beyond JS's 53-bit integers.
   server.on("/getOvTelemetry", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const OvTelemetry &ov = ovTel();
     const size_t cap = 2048;  // worst-case body ~1.2 KB (31 bins × two arrays + metadata)
     char *buf = (char *)ps_malloc(cap);
     if (!buf) {
@@ -11297,14 +11723,14 @@ void setupServer() {
                        "\"soft\":%lu,\"sw_hard\":%lu,\"ina\":%lu,\"kd\":%lu,"
                        "\"tier_low\":%lu,\"tier_mid\":%lu,\"events\":[",
                        BulkVoltage, (float)SYSTEM_VOLTAGE_CLASS / 12.0f, OV_HIST_FINE_BINS, OV_HIST_COARSE_BINS,
-                       (unsigned long)g_ovTel.softExceedCount, (unsigned long)g_ovTel.swHardCutCount,
-                       (unsigned long)g_ovTel.inaCutCount, (unsigned long)g_ovTel.kdEventCount,
-                       (unsigned long)g_ovTel.tierLowCutCount, (unsigned long)g_ovTel.tierMidCutCount);
+                       (unsigned long)ov.softExceedCount, (unsigned long)ov.swHardCutCount,
+                       (unsigned long)ov.inaCutCount, (unsigned long)ov.kdEventCount,
+                       (unsigned long)ov.tierLowCutCount, (unsigned long)ov.tierMidCutCount);
     for (int i = 0; i < OV_HIST_BINS && off > 0 && off < (int)cap; i++)
-      off += snprintf(buf + off, cap - off, "%s%lu", i ? "," : "", (unsigned long)g_ovTel.events[i]);
+      off += snprintf(buf + off, cap - off, "%s%lu", i ? "," : "", (unsigned long)ov.events[i]);
     if (off > 0 && off < (int)cap) off += snprintf(buf + off, cap - off, "],\"time_ms\":[");
     for (int i = 0; i < OV_HIST_BINS && off > 0 && off < (int)cap; i++)
-      off += snprintf(buf + off, cap - off, "%s\"%llu\"", i ? "," : "", (unsigned long long)g_ovTel.timeMs[i]);
+      off += snprintf(buf + off, cap - off, "%s\"%llu\"", i ? "," : "", (unsigned long long)ov.timeMs[i]);
     if (off > 0 && off < (int)cap) off += snprintf(buf + off, cap - off, "]}");
     if (off <= 0 || off >= (int)cap) {
       free(buf);
@@ -11390,7 +11816,9 @@ void setupServer() {
     request->send(200, "text/plain", out);
   });
 
+  demoRegisterRoutes();   // GET /demoBackfill (9_demo.ino)
   server.addHandler(&events);
+  server.addHandler(&gxEvents);
   server.begin();
   Serial.println("=== MAIN SERVER STARTED ===");
   Serial.println("=== MAIN SERVER SETUP COMPLETE ===");
@@ -11559,6 +11987,16 @@ void SendWifiData() {
   static uint32_t sseDownSinceMs = 0;
   static uint16_t sseDropCount = 0;
   uint8_t sseClients = (uint8_t)events.count();
+  // phoneLive keeps every phone gate exactly as it was; with no phone, a connected GX gets frames built on its schedule.
+  const bool phoneLive = sseClients > 0;
+  const uint8_t gxStreamsNow = gxStreamCount;
+  const bool gxLive = gxStreamsNow > 0 && gxSendTaskHandle != nullptr;
+  gxLiveNow = gxLive;
+  gxTierUpdate(now);
+  if (gxKickPending) {
+    gxKickPending = false;
+    for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) gxKick[ch] = true;
+  }
   if (sseLastClients > 0 && sseClients == 0) {
     sseDownSinceMs = now;
     sseDropCount++;
@@ -11640,13 +12078,15 @@ void SendWifiData() {
                            g_blackBoxPrev.duty, (int)g_blackBoxPrev.rpm, g_blackBoxPrev.measAmps,
                            bbTemp, g_blackBoxPrev.sysMode, g_blackBoxPrev.chargeStage,
                            g_blackBoxPrev.maxLoopUs / 1000.0f, (long)g_blackBoxPrev.minHeapKB);
+    } else if (g_blackBoxPrev.magic == BLACKBOX_DEMO_MAGIC) {
+      queueConsoleMessage("BLACKBOX: the last session ended in demo mode (simulated readings) - not recorded");
     } else {
       queueConsoleMessage("BLACKBOX: RTC RAM lost - true power interruption preceded this boot");
     }
   }
 
   // PRIORITY 1: CSVData
-  if (!sentSomething && now - prev_millis5 >= webgaugesinterval && events.count() > 0) {
+  if (!sentSomething && (phoneLive ? (now - prev_millis5 >= webgaugesinterval) : gxDue(0, now, prev_millis5, gxLive))) {
     WifiHeartBeat = WifiHeartBeat + 1;
 
     static char *payload1 = nullptr;
@@ -11678,6 +12118,7 @@ void SendWifiData() {
     float rpmOut   = aggRpm.value(false, RPM);
     float ch3Out   = aggCh3.value(false, Channel3V);
 
+    gxBeginWrite(0);
     int payload1Len = snprintf(payload1, PAYLOAD1_SIZE,
                                "%d,"  // CSV1_FIELD_COUNT
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
@@ -11743,6 +12184,7 @@ void SendWifiData() {
                                (unsigned)g_sessionId,          // CSV1_sessionId
                                (unsigned)millis()              // CSV1_sendMs — the reference clock every other channel is aged against
     );
+    gxEndWrite(0, payload1, payload1Len, PAYLOAD1_SIZE);
     // Reset the per-frame iExcess sparkline aggregates now that they've been captured.
     g_mExcessEmaPeak = 0.0f;
     g_iExcessThreshWinMin = 0.0f;
@@ -11760,6 +12202,7 @@ void SendWifiData() {
     }
 
     sseSend(payload1, "CSVData");
+    gxOffer(0, now, gxLive, !phoneLive);
     SendWifiTime = micros() - start66;
     prev_millis5 = now;
     lastEventSourceSend = now;
@@ -11767,7 +12210,7 @@ void SendWifiData() {
   }
   // PRIORITY 2: CSVData4 / NavStream — live nav/wind/solar/fuel at 2 Hz, right after CSV1 so the slower
   // CSV2/CSV3/TS channels can't starve these gauges.
-  if (!sentSomething && now - lastpayload4send >= 500UL && events.count() > 0 && !sseBacklogged()) {
+  if (!sentSomething && (phoneLive ? (now - lastpayload4send >= 500UL) : gxDue(1, now, lastpayload4send, gxLive)) && !sseBacklogged()) {
     static char *payload4 = nullptr;
     static const size_t PAYLOAD4_SIZE = 512;  // ~7 B/field (SafeInt sentinel is 11 chars) plus two 10-digit stamps, with headroom;
                                               // an overrun drops the frame at the length guard below, silently stopping NavStream.
@@ -11778,11 +12221,12 @@ void SendWifiData() {
         return;
       }
     }
+    gxBeginWrite(1);
     int payload4Len = snprintf(payload4, PAYLOAD4_SIZE,
                                "%d,"  // CSV4_FIELD_COUNT
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                               "%d,%d,%d,"
+                               "%d,%d,%d,%d,"
                                "%u,%u",  // +2: sessionId, sendMs
 
                                CSV4_FIELD_COUNT,
@@ -11812,14 +12256,17 @@ void SendWifiData() {
                                (int)panelHiRateInput,                    // CSV4_panelHiRateInput
                                (int)panelForceFloatInput,                // CSV4_panelForceFloatInput
                                SafeInt(veSocFresh() ? VictronSoc : NAN, 10),  // CSV4_VictronSoc
+                               (int)gxStreamsNow,                        // CSV4_gxStreams
                                (unsigned)g_sessionId,                    // CSV4_sessionId
                                (unsigned)millis()                        // CSV4_sendMs
     );
+    gxEndWrite(1, payload4, payload4Len, PAYLOAD4_SIZE);
     if (payload4Len < 0 || payload4Len >= PAYLOAD4_SIZE) {
       Serial.printf("payload4 truncated or format error: %d\n", payload4Len);
       return;
     }
     sseSend(payload4, "CSVData4");
+    gxOffer(1, now, gxLive, !phoneLive);
     lastpayload4send = now;
     lastEventSourceSend = now;
     sentSomething = true;
@@ -11829,7 +12276,9 @@ void SendWifiData() {
   // PRIORITY 4: CSVData2. Every 5 s gated behind CSV1; during a plant delay test every 500 ms, bypassing the
   // gate, so the UI phase-progress display stays within one poll tick of the firmware.
   const bool sysIDRunning = (systemIDActive != 0);
-  if ((sysIDRunning || !sentSomething) && now - lastpayload2send >= (sysIDRunning ? 500UL : 5000UL) && events.count() > 0 && !sseBacklogged()) {
+  if ((sysIDRunning || !sentSomething)
+      && (phoneLive ? (now - lastpayload2send >= (sysIDRunning ? 500UL : 5000UL)) : gxDue(2, now, lastpayload2send, gxLive))
+      && !sseBacklogged()) {
     static char *payload2 = nullptr;
     // Sized by the ~7 B/field rule rather than the observed frame, because an overflow returns early
     // from SendWifiData and kills CSV2 + CSV3 + TS until reboot. PSRAM.
@@ -11854,6 +12303,7 @@ void SendWifiData() {
     pidFire_compute_stats();
     voltLoop_compute_stats();
     // Format string:
+    gxBeginWrite(2);
     uint32_t _csv2b0 = micros();   // CSV2 build-cost timer (snprintf)
         payload2Len = snprintf(payload2, PAYLOAD2_SIZE,
                                "%d,"  // CSV2_FIELD_COUNT
@@ -11918,6 +12368,7 @@ void SendWifiData() {
                                "%d,%d,%d,%d,%lu,%lu,%lu,%lu,%d,"   // +9 board field ceilings: current, heat, binding term, corrected R, lifetime/session seconds at each, die-temp-lost count
                                "%d,%d,%d,%d,%d,%d,%d,"   // +7 NMEA 2000 bus health: verdict, TEC, REC, frames received, bus-offs, lost frames, nodes heard
                                "%d,"            // +1 largest free PSRAM block (KB)
+                               "%d,%d,%d,%d,"   // +4 DVCC Victron carriers: VE.Can CVL/CCL, WiFi CVL/CCL
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -12510,14 +12961,15 @@ void SendWifiData() {
                                (int)dvccAuthProd,
                                SafeInt(g_ovTierLowCount),   // CSV2_ovTierLowCount
                                SafeInt(g_ovTierMidCount),   // CSV2_ovTierMidCount
-                               sledTele(sledLive.dayIdx ? sledLive.predHarvKwh : NAN),   // CSV2_sledPredHarvToday
-                               sledTele(sledLiveActHarvKwh()),                           // CSV2_sledActHarvToday
-                               sledTele(sledLive.dayIdx ? sledLive.predConsKwh : NAN),   // CSV2_sledPredConsToday
-                               sledTele(sledLiveActConsKwh()),                           // CSV2_sledActConsToday
-                               SafeInt(sledNeedKwh, 100),                                // CSV2_sledNeedKwh
-                               SafeInt(sledNeedSource),                                  // CSV2_sledNeedSource
-                               SafeInt(sledCompleteDays()),                              // CSV2_sledDaysValid
-                               SafeInt(sledLive.dayIdx ? sledLive.coverageMin : 0),      // CSV2_sledCoverageMin
+                               // demo mode: today's row of the made-up ledger (9_demo.ino), the real ledger is frozen
+                               sledTele(demoSeal ? 3.60f : (sledLive.dayIdx ? sledLive.predHarvKwh : NAN)),   // CSV2_sledPredHarvToday
+                               sledTele(demoSeal ? VictronYieldToday_kWh : sledLiveActHarvKwh()),             // CSV2_sledActHarvToday
+                               sledTele(demoSeal ? 2.85f : (sledLive.dayIdx ? sledLive.predConsKwh : NAN)),   // CSV2_sledPredConsToday
+                               sledTele(demoSeal ? 1.18f : sledLiveActConsKwh()),                             // CSV2_sledActConsToday
+                               SafeInt(demoSeal ? 3.56f : sledNeedKwh, 100),                                  // CSV2_sledNeedKwh
+                               SafeInt(demoSeal ? 1 : sledNeedSource),                                        // CSV2_sledNeedSource
+                               SafeInt(demoSeal ? 45 : sledCompleteDays()),                                   // CSV2_sledDaysValid
+                               SafeInt(demoSeal ? demoMinutesToday() : (sledLive.dayIdx ? sledLive.coverageMin : 0)),   // CSV2_sledCoverageMin
                                SafeInt(ft_solarLedger.worstWindow),                      // CSV2_ft_solarLedger_win
                                SafeInt(ft_solarLedger.worstSession),                     // CSV2_ft_solarLedger_ses
                                isfinite(BatteryTempProbeF) ? (int)lroundf(BatteryTempProbeF * 10.0f) : ROLL_EMPTY,  // CSV2_BatteryTempProbeF
@@ -12562,10 +13014,15 @@ void SendWifiData() {
                                (int)(n2kRxLostRun & 0x7FFFFFFF),                         // CSV2_n2kRxLost
                                (int)n2kNodesHeard,                                       // CSV2_n2kNodesHeard
                                SafeInt(LargestPSRAMBlock),                               // CSV2_LargestPSRAMBlock
+                               SafeInt(dvccRxCanCvl, 100),                               // CSV2_dvccRxCanCvl
+                               SafeInt(dvccRxCanCcl, 10),                                // CSV2_dvccRxCanCcl
+                               SafeInt(dvccRxWifiCvl, 100),                              // CSV2_dvccRxWifiCvl
+                               SafeInt(dvccRxWifiCcl, 10),                               // CSV2_dvccRxWifiCcl
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost
     if (csv2BuildLastUs > csv2BuildWorstUs) csv2BuildWorstUs = csv2BuildLastUs;
+    gxEndWrite(2, payload2, payload2Len, PAYLOAD2_SIZE);
     // Clear the anti-windup latch now that this CSV2 frame has captured it (set in tempPID_tick on each CV-bleed event)
     thermalAntiWindupLatch = false;
     if (payload2Len < 0 || payload2Len >= (int)PAYLOAD2_SIZE) {
@@ -12582,6 +13039,7 @@ void SendWifiData() {
       sseSend(payload2, "CSVData2");
       csv2SendLastUs = micros() - _csv2s0;
       if (csv2SendLastUs > csv2SendWorstUs) csv2SendWorstUs = csv2SendLastUs;
+      gxOffer(2, now, gxLive, !phoneLive);
       lastpayload2send = now;
       lastEventSourceSend = now;
       csv2Phase = 0;
@@ -12590,7 +13048,9 @@ void SendWifiData() {
   }
 
   // PRIORITY 5: CSVData3 — sent immediately when settingsDirty (event-driven), or every 60s fallback
-  if (!sentSomething && (settingsDirty || now - lastpayload3send >= 60000) && events.count() > 0 && !sseBacklogged()) {
+  if (!sentSomething
+      && (phoneLive ? (settingsDirty || now - lastpayload3send >= 60000) : (gxLive && (settingsDirty || gxDue(3, now, lastpayload3send, gxLive))))
+      && !sseBacklogged()) {
     static char *payload3 = nullptr;
     // Overflow is caught below, but the catch returns early from SendWifiData, stopping CSV3 for good and
     // skipping TS when CSV3 is due; csv3LastLen / csv3PeakLen on /debug measure the margin.
@@ -12606,10 +13066,13 @@ void SendWifiData() {
 
     // Cleared BEFORE the build: a /get on core 0 landing mid-build re-arms it for the next pass
     // instead of being wiped after a frame that already read the old value.
+    const bool csv3Dirty = settingsDirty;
     settingsDirty = false;
+    gxBeginWrite(3);
     int     payload3Len = snprintf(payload3, PAYLOAD3_SIZE,
                                "%d" CSV3_LIST(CSV3_FMT_X) "\n",
                                CSV3_FIELD_COUNT CSV3_LIST(CSV3_ARG_X));
+    gxEndWrite(3, payload3, payload3Len, PAYLOAD3_SIZE);
     if (payload3Len < 0 || payload3Len >= PAYLOAD3_SIZE) {
       Serial.printf("payload3 truncated or format error: %d\n", payload3Len);
       return;
@@ -12618,13 +13081,14 @@ void SendWifiData() {
     if (csv3LastLen > csv3PeakLen) csv3PeakLen = csv3LastLen;
 
     sseSend(payload3, "CSVData3");
+    gxOffer(3, now, gxLive, !phoneLive || csv3Dirty);   // a settings change reaches the GX at once
     lastpayload3send = now;
     lastEventSourceSend = now;
     sentSomething = true;
   }
 
   // PRIORITY 6: TimestampData (staleness data - every 3 seconds)
-  if (!sentSomething && now - lastTimestampSend >= 3000 && events.count() > 0 && !sseBacklogged()) {
+  if (!sentSomething && (phoneLive ? (now - lastTimestampSend >= 3000) : gxDue(4, now, lastTimestampSend, gxLive)) && !sseBacklogged()) {
 
     static char *timestampPayload = nullptr;
     static const size_t TIMESTAMP_PAYLOAD_SIZE = 512;  // every field is an age and the weather one can be 10 digits; an overflow kills TS until reboot
@@ -12641,10 +13105,12 @@ void SendWifiData() {
       const unsigned long age = now - ts;
       return (age > 0xFFFF0000UL) ? 0 : age;
     };
+    gxBeginWrite(4);
     int timestampPayloadLen = snprintf(timestampPayload, TIMESTAMP_PAYLOAD_SIZE,
                                        "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                                        "%lu,%lu,%lu,%lu,"  // +4 battery/extra temperature: BATT probe, EXTRA probe, VE.Direct T, RV-C T
                                        "%lu,"      // +1 INA228 die temperature
+                                       "%lu,%lu,"  // +2 DVCC Victron carriers: VE.Can, WiFi
                                        "%lu,%lu",  // +2: sessionId, sendMs
                                        (unsigned long)TS_FIELD_COUNT,
                                        tsAge(dataTimestamps[IDX_HEADING_NMEA]),
@@ -12689,15 +13155,19 @@ void SendWifiData() {
                                        tsAge(dataTimestamps[IDX_VE_BATT_TEMP]),
                                        tsAge(dataTimestamps[IDX_RVC_BATT_TEMP]),
                                        tsAge(dataTimestamps[IDX_INA_DIE_TEMP]),
+                                       tsAge(dataTimestamps[IDX_DVCC_VECAN]),
+                                       tsAge(dataTimestamps[IDX_DVCC_WIFI]),
                                        (unsigned long)g_sessionId,   // TS_sessionId
                                        (unsigned long)now            // TS_sendMs (`now` is this dispatch tick's millis())
     );
+    gxEndWrite(4, timestampPayload, timestampPayloadLen, TIMESTAMP_PAYLOAD_SIZE);
     if (timestampPayloadLen < 0 || timestampPayloadLen >= TIMESTAMP_PAYLOAD_SIZE) {
       Serial.printf("timestampPayload truncated or format error: %d\n", timestampPayloadLen);
       return;
     }
 
     sseSend(timestampPayload, "TimestampData");
+    gxOffer(4, now, gxLive, !phoneLive);
     lastTimestampSend = now;
     lastEventSourceSend = now;
     sentSomething = true;

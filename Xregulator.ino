@@ -80,6 +80,8 @@ bool usingFactoryWebFiles = false;       // Track which web partition is mounted
 #include "esp_adc/adc_continuous.h"   // fast alternator-current channel (GPIO3/ADC1_CH2) — hardware-timed DMA sampling
 #include "esp_adc/adc_cali.h"         // eFuse factory gain correction for the fast channel (nominal scaling, NOT user calibration)
 #include "esp_adc/adc_cali_scheme.h"
+
+
 // rom/rtc.h can't be included here (its SLEEP_MODE enum collides with BMP388_DEV.h), so declare
 // the ROM function directly; it returns the RESET_REASON enum, ABI-compatible with int.
 extern "C" int rtc_get_reset_reason(int cpu_no);
@@ -103,13 +105,61 @@ struct FadResult;       // forward-declared for their auto-prototypes
 struct ZFitResult;      // zeroFitRegress() return type (full def near ZeroFitRecord) — same reason
 struct SolarLedgerLive; // the sled*() hour helpers (4_functions.ino) take it by reference (full def near sledRing) — same reason
 struct RipFit;          // forward-declared for the ripFitEncode/ripFitDecode auto-prototypes
+struct LongTermRecord;  // buildLongTermRecord() takes it by reference (full def near longTermRing)
 // Defined here so the cxStartPersistCancel() auto-prototype (2_functions.ino) can't precede the type.
 enum CxStartCancel : uint8_t { CX_CANCEL_NONE = 0, CX_CANCEL_FRESH = 1, CX_CANCEL_RESUME = 2 };
 // Auto-prototype generator fails on default-argument functions defined in later .ino files.
 bool fieldCutSettled(uint32_t extraMs = 0);
 
+// ===== DEMO MODE SEAL (9_demo.ino) — must stay below every #include and the forward declarations above =====
+// While demoSeal is up nothing in the sketch can change NVS or the userdata filesystem: every NVS read-write open is
+// downgraded to read-only (nvs_set/commit then fail), and every mutating LittleFS call is refused. Library code is
+// untouched. Settings writes go to a RAM overlay instead (settingWrite, 2_functions.ino).
+#define DEMO_OFF 0
+#define DEMO_ENTERING 1
+#define DEMO_ON 2
+#define DEMO_EXITING 3
+volatile bool demoSeal = false;
+volatile uint8_t demoPhase = DEMO_OFF;
+const char *DEMO_REFUSAL = "Not available in demo mode. Set Hardware Present to Yes to use it.";
+esp_err_t demoNvsOpen(const char *ns, nvs_open_mode_t mode, nvs_handle_t *h) {
+  return (nvs_open)(ns, (demoSeal && mode == NVS_READWRITE) ? NVS_READONLY : mode, h);
+}
+esp_err_t demoNvsFlashErase() { return demoSeal ? ESP_ERR_NOT_ALLOWED : (nvs_flash_erase)(); }
+#define nvs_open(ns, mode, h) demoNvsOpen((ns), (mode), (h))
+#define nvs_flash_erase() demoNvsFlashErase()
+static fs::LittleFSFS &realLittleFS = LittleFS;
+class DemoSealFS {
+ public:
+  bool begin(bool formatOnFail = false, const char *basePath = "/littlefs", uint8_t maxOpenFiles = 10, const char *label = "spiffs") {
+    return realLittleFS.begin(formatOnFail, basePath, maxOpenFiles, label);
+  }
+  void end() { realLittleFS.end(); }
+  bool format() { return demoSeal ? false : realLittleFS.format(); }
+  size_t totalBytes() { return realLittleFS.totalBytes(); }
+  size_t usedBytes() { return realLittleFS.usedBytes(); }
+  File open(const char *p, const char *m = FILE_READ, const bool create = false) {
+    if (demoSeal && (create || !m || m[0] != 'r' || strchr(m, '+'))) return File();
+    return realLittleFS.open(p, m, create);
+  }
+  File open(const String &p, const char *m = FILE_READ, const bool create = false) { return open(p.c_str(), m, create); }
+  bool exists(const char *p) { return realLittleFS.exists(p); }
+  bool exists(const String &p) { return realLittleFS.exists(p); }
+  bool remove(const char *p) { return demoSeal ? false : realLittleFS.remove(p); }
+  bool remove(const String &p) { return remove(p.c_str()); }
+  bool rename(const char *a, const char *b) { return demoSeal ? false : realLittleFS.rename(a, b); }
+  bool rename(const String &a, const String &b) { return rename(a.c_str(), b.c_str()); }
+  bool mkdir(const char *p) { return demoSeal ? false : realLittleFS.mkdir(p); }
+  bool mkdir(const String &p) { return mkdir(p.c_str()); }
+  bool rmdir(const char *p) { return demoSeal ? false : realLittleFS.rmdir(p); }
+  bool rmdir(const String &p) { return rmdir(p.c_str()); }
+  operator fs::FS &() { return realLittleFS; }   // read-side APIs (beginResponse, readFile); writeFile() checks demoSeal itself
+};
+DemoSealFS littleFsSeal;
+#define LittleFS littleFsSeal
+
 SET_LOOP_TASK_STACK_SIZE(20 * 1024);  // 20KB stack necessary for SSL/TLS operations
-int hardwarePresent = 1;              // usage varies
+int hardwarePresent = 1;              // RAM only, boots 1, never saved or exported. 0 = demo mode: simulated boat, field drive stays real (9_demo.ino)
 // Parse JSON update response - this struct definition cannot move down in file, leave it here.
 struct UpdateInfo {
   bool hasUpdate;
@@ -252,7 +302,7 @@ float altMinDuty = 5.0f;
 // Mode:
 float altPaused       = 0.0f;    // 1 = halt LEARNING into My History (sticky); independent of altRefSource.
                                  // Selecting Uploaded defaults this ON; live display + trend still update.
-float altSimMode      = 0.0f;    // 1 = inject synthetic operating points for bench testing (not persisted)
+float altSimMode      = 0.0f;    // 1 only in demo mode (9_demo.ino sets and clears it): alt health grades the simulated boat, points stay local
 
 // BOAT PERFORMANCE — sailing polar bins. Full design: BOAT_PERFORMANCE_MATRIX_PLAN.md.
 #define PERF_WS_BINS    16         // wind-speed bands 0..40 kt
@@ -291,7 +341,7 @@ float perfRpmFloor     = 50.0f;     // RPM ≤ this = engine off = sailing; abov
 float perfSpeedSrc     = 1.0f;      // 1 = STW, 2 = SOG (switching source = Clear-All)
 float perfFoldSymmetric = 1.0f;     // 1 = fold |AWA| at eval/display (default); 0 = keep both tacks
 float perfPaused       = 0.0f;      // 1 = halt learning/persist (sticky across reboot); live display still updates
-float perfSimMode      = 0.0f;      // 1 = inject synthetic wind/speed/RPM/pitch for bench testing; NOT persisted
+float perfSimMode      = 0.0f;      // 1 only in demo mode (9_demo.ino sets and clears it): boat performance reads the simulated boat, points stay local
 
 // Supabase configuration......similar stuff is locally defined in a few functions that upload sensor data, config snapshots to cloud
 const char *SUPABASE_URL = "https://qnbekuaoweuteylitzvo.supabase.co";
@@ -872,6 +922,7 @@ typedef struct {
 } BlackBoxSnap;
 // sizeof folded into the magic so a layout change invalidates old snapshots.
 #define BLACKBOX_MAGIC (0xB1ACB0C5UL ^ (uint32_t)sizeof(BlackBoxSnap))
+#define BLACKBOX_DEMO_MAGIC (BLACKBOX_MAGIC ^ 0x00DE0000UL)
 // Soft-clock origin (CLOCK_REAL_TAG, clockIsReal() below). Defined first so the linker places it LAST in RTC noinit:
 // ahead of g_ovTel/g_blackBox it moved both, and a soft reset into the new layout fails their magic.
 RTC_NOINIT_ATTR uint32_t clockRealTag;
@@ -899,6 +950,9 @@ typedef struct {
 // Size + bin count in the magic: a layout change self-invalidates (no migration; old histograms aren't comparable).
 #define OVTEL_MAGIC (0x0E7E1E77UL ^ (uint32_t)sizeof(OvTelemetry) ^ ((uint32_t)OV_HIST_BINS << 8))
 RTC_NOINIT_ATTR OvTelemetry g_ovTel;
+// Writers and /getOvTelemetry go through ovTel(): in demo it is a PSRAM copy, so RTC never carries demo data into a later boot.
+OvTelemetry *demoOvTelPtr = nullptr;
+#define ovTel() (demoOvTelPtr ? *demoOvTelPtr : g_ovTel)
 // ovHistBin() + updateOvHistogram() live in 5_functions.ino (need BulkVoltage, declared below).
 
 // These are health variables for the TempTask (digital temperature measurement)
@@ -1570,7 +1624,7 @@ int   extraTempAlarmHiEnable = 0;   // EXTRA-probe high alarm on/off
 float extraTempAlarmHiF = 150.0f;   // EXTRA-probe high alarm threshold (°F)
 int   extraTempAlarmLoEnable = 0;   // EXTRA-probe low alarm on/off
 float extraTempAlarmLoF = 32.0f;    // EXTRA-probe low alarm threshold (°F)
-float BatteryTempProbeF = NAN;      // BATT-role probe (°F); written by TempTask (and ReadAnalogInputs_Fake in sim), NAN until the first good read
+float BatteryTempProbeF = NAN;      // BATT-role probe (°F); written by TempTask (and demoReadSensors in demo mode), NAN until the first good read
 float ExtraTempF = NAN;             // EXTRA-role probe (°F); written by TempTask only
 float batteryTempF(uint8_t *srcOut);   // 6_functions.ino — callers earlier in the concatenation order (the SoC seed) need this
 float battTempActiveF = NAN;        // batteryTempF() result of the current tick (°F); NAN = no source qualifies
@@ -3239,6 +3293,12 @@ uint16_t sseQueuePeak = 0;         // deepest since reset
 uint32_t sseStallCount = 0;        // stalls >= 1 s since reset
 uint32_t sseStallLongestMs = 0;
 uint32_t sseFramesDropped = 0;     // events.send() calls not fully enqueued since reset
+// Victron GX stream (/gxevents) witnesses, on /debug, cleared by Reset Peak Values.
+uint32_t gxFramesSent = 0;         // frames the Core-0 GX sender handed to gxEvents
+uint32_t gxFramesHeld = 0;         // sender passes that found the GX link backlogged (owed frames wait for the next try)
+uint32_t gxFramesTorn = 0;         // copies Core 1 rebuilt mid-read (retried with the newer frame)
+uint32_t gxFramesDropped = 0;      // gxEvents.send() calls not fully enqueued
+uint32_t gxStreamDrops = 0;        // GX stream disconnects since reset
 static const size_t PAYLOAD3_SIZE = 8192;   // settings echo (CSV3) frame buffer, PSRAM; ~7 B/field
 uint16_t csv3LastLen = 0;          // last CSV3 frame length; peak since reset. The margin against PAYLOAD3_SIZE, on /debug
 uint16_t csv3PeakLen = 0;
@@ -4504,6 +4564,9 @@ String defaultApSsid();
 void mdnsPublishIdentity();
 // Access control + multi-regulator (3_functions.ino unless noted)
 bool settingsArmActive(AsyncWebServerRequest *request);   // 5_functions.ino
+bool gxFlagged(AsyncWebServerRequest *request);
+bool gxParamDenied(AsyncWebServerRequest *request);
+void startGxSendTask();
 bool armTokenValid(AsyncWebServerRequest *request);
 const char *armTokenIssue();
 void armTokensClear();
@@ -5211,8 +5274,10 @@ enum DataIndex {
   IDX_RVC_BATT_TEMP,             // 45 - RV-C DC_SOURCE_STATUS_2 battery temperature (rvcRxBattTempF)
   IDX_INA_DIE_TEMP,              // 46 - INA228 die temperature: stamped only by a sample past the warm-up discard and inside the bad-read window
   IDX_VE_SOC,                    // 47 - VE.Direct "SOC" field seen: only battery monitors send it, so it also proves the port is not an MPPT
+  IDX_DVCC_VECAN,                // 48 - DVCC Victron source, VE.Can carrier: an accepted VREG limit register
+  IDX_DVCC_WIFI,                 // 49 - DVCC Victron source, WiFi carrier: a /gxLimits post taken by dvccTick
   // Keep this last and increment when new added
-  MAX_DATA_INDICES = 48
+  MAX_DATA_INDICES = 50
 };
 
 unsigned long dataTimestamps[MAX_DATA_INDICES];  // Uses the enum size automatically
@@ -5349,6 +5414,7 @@ bool wifiNapActive = false;           // true while modem-sleep nap is active
 
 AsyncWebServer server(80);                  // Create AsyncWebServer object on port 80
 AsyncEventSource events("/events");
+AsyncEventSource gxEvents("/gxevents");    // Victron GX link: its own source, so events.count() stays "a phone is watching"
 unsigned long webgaugesinterval = 100;      // delay in ms between sensor updates on webpage
 // Per-CSV1-window aggregation for analog channels sampled faster than the ~100ms send interval,
 // so a plotted point is the window mean (anti-aliased) or peak instead of one aliased snapshot.
@@ -5503,7 +5569,7 @@ int n2kRxSoh = -1;           // received state of health % (127506); -1 = not av
 // protection outranks it. Sources: RV-C DC_SOURCE_STATUS_4 / BATTERY_STATUS_4 (raw-RX tap) and Victron VE.Can VREG 0x351 (0xEF00 +
 // 126720). The Victron layout is PROVISIONAL until validated against a real GX capture (spec §8a); the trust machine gates it.
 int dvccEn = 0;             // master follow switch; decoded limits clamp targets only when 1
-int dvccSrcType = 0;        // authority dialect: 0 = Victron VE.Can (VREG), 1 = RV-C
+int dvccSrcType = 0;        // limit source: 0 = Victron GX (VE.Can VREG and WiFi /gxLimits carriers), 1 = RV-C
 int dvccInst = 1;           // RV-C DC instance filter (RV-C is 1-oriented; 0 = accept any). Victron path locks to the first sending bus address instead
 int dvccSilenceS = 30;      // no valid limit frame for this long → drop the clamp, revert to local targets
 int dvccVicCutHold = 1;     // 1 = a Victron do-not-charge stays held after it stops arriving; 0 = it ages out like the voltage/current limits
@@ -5515,15 +5581,32 @@ float dvccRxCvl = NAN;      // last decoded charge-voltage limit (displayed even
 float dvccRxCcl = NAN;      // last decoded charge-current limit (NAN = dialect sent not-available)
 uint32_t dvccRxLastMs = 0;  // millis() of last decoded limit frame
 uint32_t dvccRxCount = 0;   // decoded limit frames since boot (dvccTick uses it as a new-frame edge)
-uint8_t dvccRxSrcAddr = 255;    // sender bus address (255 = none yet)
+uint8_t dvccRxSrcAddr = 255;    // sender bus address (255 = none yet, DVCC_ADDR_WIFI = only the Victron WiFi carrier is fresh)
 uint8_t dvccRxPriority = 0;     // RV-C device priority of the sender (BMS = 120)
 uint8_t dvccRxChgState = 0;     // RV-C desired charge state — value 1 (do not charge) forces effective CCL 0; other values displayed only
 uint8_t dvccState = 0;          // 0 off, 1 waiting, 2 settling, 3 following, 4 stale, 5 untrusted
 uint8_t dvccUntrustReason = 0;  // 0 none, 1 CVL out of window, 2 CCL implausible, 3 flapping
 float dvccCvlV = NAN;       // ACTIVE clamps consumed by the control path — non-NAN only while FOLLOWING
 float dvccCclA = NAN;
+// CCL basis: true = an alternator-current ceiling (the WiFi CCL, dvcc.py's per-alternator share, which already has solar
+// subtracted and measured DC loads added); false = battery current (VE.Can / RV-C), converted with loadOffsetFilt on a live shunt
+bool dvccRxCclAltBasis = false;  // of dvccRxCcl, set by each ingest
+bool dvccCclAltBasis = false;    // of dvccCclA, copied with it in dvccTick
+float loadOffsetFilt = 0.0f;     // EMA of MeasuredAmps − Bcur (A; negative = other sources exceed loads), control loop (6_functions.ino)
 bool dvccResetReq = false;    // momentary UNTRUSTED-latch reset request from the web UI; consumed by dvccTick()
 bool dvccCfgChanged = false;  // source/instance edited: dvccTick clears decode/settle state (an UNTRUSTED latch is preserved)
+// The Victron source has two carriers, VE.Can and WiFi (GET /gxLimits from the GX bridge); dvccRxCvl/Ccl is their merge.
+// /gxLimits runs on async_tcp and only fills this mailbox under dvccWifiMux; dvccTick (loop) takes it on the next pass.
+float dvccWifiBoxCvl = NAN;
+float dvccWifiBoxCcl = NAN;
+volatile uint32_t dvccWifiBoxSeq = 0;  // bumped per post; read unlocked as the "anything new" test
+static portMUX_TYPE dvccWifiMux = portMUX_INITIALIZER_UNLOCKED;
+float dvccRxWifiCvl = NAN;  // WiFi carrier, loop side: last values taken (NAN = not sent) and when
+float dvccRxWifiCcl = NAN;
+uint32_t dvccRxWifiMs = 0;
+float dvccRxCanCvl = NAN;   // VE.Can carrier as it entered the last merge: held registers, CCL 0 under a stop-charging command
+float dvccRxCanCcl = NAN;
+#define DVCC_ADDR_WIFI 254  // dvccRxSrcAddr while only the WiFi carrier is fresh (254 is never a J1939 sender of data)
 // Raw-frame capture ring (spec §8a), PSRAM, filled from the raw-RX tap (5_functions), served as hex by /dvccCapture (3_functions)
 // so a customer boat can validate the decode with no tooling. Declared here so both files see it.
 struct DvccCapEntry {
@@ -6238,6 +6321,7 @@ void setup() {
   // sleeping between runs so it never starves the idle task / watchdog. 4KB PSRAM stack (TLS-floor reason).
   xTaskCreatePinnedToCoreWithCaps(cpuLoadTask, "cpuLoad", 4096, NULL, 0, &cpuLoadTaskHandle, 0, MALLOC_CAP_SPIRAM);
   Serial.println("CPU-load task created on Core 0 (prio 0, PSRAM stack)");
+  startGxSendTask();          // Victron GX stream sender (Core 0): loop() only marks finished frames, never waits on lwIP for the GX
 
   if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED) {
     Serial.println("Starting NTP sync...");
@@ -6367,7 +6451,7 @@ void loop() {
   g_blackBox.minHeapKB = MinFreeHeap;
   g_blackBox.sysMode = (uint8_t)sysMode;
   g_blackBox.chargeStage = chargeStageDisplay;  // global kept fresh by the control loop — no function call here
-  g_blackBox.magic = BLACKBOX_MAGIC;
+  g_blackBox.magic = demoSeal ? BLACKBOX_DEMO_MAGIC : BLACKBOX_MAGIC;   // a reset in demo must not read as a real last-alive snapshot
 
   gHeavyRanThisPass = false;  // reset the one-heavy-per-pass scheduler gate for this loop pass
 
@@ -6482,7 +6566,7 @@ void loop() {
   // === OTA UPDATE: simple one-shot FORCED UPDATE check ===
   static bool otaVerSent = false, otaForcedSent = false;
   static uint32_t otaWeakRetryMs = 0;   // a weak-signal skip waits 30 s before the next try
-  if (!otaCheckDone && millis() > 3000 && (otaWeakRetryMs == 0 || millis() - otaWeakRetryMs >= 30000UL)) {  // 3 seconds after boot
+  if (!otaCheckDone && !demoSeal && millis() > 3000 && (otaWeakRetryMs == 0 || millis() - otaWeakRetryMs >= 30000UL)) {  // 3 seconds after boot
     if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && currentPartitionType != 0) {
       // Only proceed if no uploads in progress
       if (!core0Busy && fieldCutSettled(0)) {
@@ -6530,7 +6614,7 @@ void loop() {
   // CANCELLED push would keep the cached modal stuck. Install stays user-triggered (only raises/clears hasForcedUpdate). Version FIRST:
   // the cloud auto-clears a satisfied forced flag on the version report. Queue-full: retry in 60 s (a duplicate report is harmless).
   static unsigned long lastForcedRecheck = 0;
-  if (otaCheckDone && millis() - lastForcedRecheck >= FORCED_RECHECK_INTERVAL_MS
+  if (otaCheckDone && !demoSeal && millis() - lastForcedRecheck >= FORCED_RECHECK_INTERVAL_MS
       && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered
       && currentPartitionType != 0 && !core0Busy && !otaInProgress
       && fieldCutSettled(60000) && WiFi.RSSI() >= -80) {
@@ -6548,7 +6632,7 @@ void loop() {
   // Cloud half of the tach-rescale wipe. Retried until it returns 200; front sync stays suppressed
   // meanwhile, so a device rescaled offline can never have its old-scaled front shipped back to it.
   static unsigned long lastRpmAxisWipeTry = 0;
-  if (rpmAxisWipePending && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED
+  if (rpmAxisWipePending && !demoSeal && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED
       && isRegistered && !core0Busy && fieldCutSettled(60000) && WiFi.RSSI() >= -80
       && (lastRpmAxisWipeTry == 0 || millis() - lastRpmAxisWipeTry > 60000)) {
     lastRpmAxisWipeTry = millis();
@@ -6559,7 +6643,7 @@ void loop() {
   // Cloud half of the alt-health Start Over — same contract: the cloud rebuilds the front from every raw
   // point it holds, so until the device's rows are gone a sync-back would hand the cleared record book back.
   static unsigned long lastAltWipeTry = 0;
-  if (altCloudWipePending && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED
+  if (altCloudWipePending && !demoSeal && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED
       && isRegistered && !core0Busy && fieldCutSettled(60000) && WiFi.RSSI() >= -80
       && (lastAltWipeTry == 0 || millis() - lastAltWipeTry > 60000)) {
     lastAltWipeTry = millis();
@@ -6569,7 +6653,7 @@ void loop() {
 
   // Cloud half of a boat-performance Clear All or records import: same contract as the alt-health wipe above.
   static unsigned long lastPerfWipeTry = 0;
-  if (perfCloudWipePending && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED
+  if (perfCloudWipePending && !demoSeal && currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED
       && isRegistered && !core0Busy && fieldCutSettled(60000) && WiFi.RSSI() >= -80
       && (lastPerfWipeTry == 0 || millis() - lastPerfWipeTry > 60000)) {
     lastPerfWipeTry = millis();
@@ -6580,7 +6664,7 @@ void loop() {
   // === ADMIN CONFIG PUSH: one-shot pending-config check after the OTA checks ===
   // Boot-only, like the forced-update check. Fires once after otaCheckDone so it doesn't
   // compete with the depth-2 httpsQueue; retries next loop if the queue is momentarily full.
-  if (!pendingConfigCheckDone && otaCheckDone && millis() > 6000) {
+  if (!pendingConfigCheckDone && otaCheckDone && !demoSeal && millis() > 6000) {
     if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && !core0Busy && fieldCutSettled(0) && WiFi.RSSI() >= -80) {
       HttpsRequest req = { .type = HTTPS_GET_PENDING_CONFIG };
       if (xQueueSend(httpsQueue, &req, 0) == pdTRUE) pendingConfigCheckDone = true;
@@ -6595,8 +6679,8 @@ void loop() {
   bhServiceCompletion();  // Battery Health: runs the DCIR fit once a test finishes / aborts on timeout
   cvpfServiceCompletion();  // CV plant fit: runs the gain fit once the step sequence finishes / aborts on timeout
 
-  // SOC and runtime update every 2 seconds (runs regardless of hardwarePresent)
-  if (currentTime - lastSOCUpdateTime >= SOCUpdateInterval) {
+  // SOC and runtime update every 2 seconds (runs regardless of hardwarePresent); held while demo exit reloads these totals on core 0
+  if (currentTime - lastSOCUpdateTime >= SOCUpdateInterval && !demoStoresBusy()) {
     CurrentSessionDuration = (millis() - sessionStartTime) / 1000;  // seconds
     elapsedMillis = currentTime - lastSOCUpdateTime;
     lastSOCUpdateTime = currentTime;
@@ -6608,13 +6692,14 @@ void loop() {
     handleAltZeroReset();   // do the dynamic udpates
     // fieldCutSettled (hardware gate), never the duty-based fieldOffSettled: that reads "off" during a live duty-0 CV hold and let
     // NVS/LittleFS commits land on live control passes.
-    TIMED_CALL(ft_kneeLearnService, kneeLearnService(fieldCutSettled(2000)));  // Auto Min% learning: NVS flush of learned floors
-    if (fieldCutSettled(2000)) TIMED_CALL(ft_bhFlushCapNVS, bhFlushCapNVS());  // Battery Health persist
-    if (fieldCutSettled(2000)) overheatHistFlush();  // overheat-history NVS persist — dirty-flagged at overheat entry
+    TIMED_CALL(ft_kneeLearnService, kneeLearnService(fieldCutSettled(2000) && !demoSeal));  // Auto Min% learning: NVS flush of learned floors
+    if (fieldCutSettled(2000) && !demoSeal) TIMED_CALL(ft_bhFlushCapNVS, bhFlushCapNVS());  // Battery Health persist
+    if (fieldCutSettled(2000) && !demoSeal) overheatHistFlush();  // overheat-history NVS persist — dirty-flagged at overheat entry
 
     // Baro history sampler, 10-min cadence; skipped while BMP388 is NAN. Epoch stamped only if timeIsSynced, so after a cold boot the
     // loaded NVS epoch lets the JS detect the power-off gap and grey out those slots.
-    if (hardwarePresent == 1 && baroPressureHistory && (currentTime - lastBaroSampleMs >= BARO_SAMPLE_INTERVAL_MS)) {   // sim mode: no fake baro history
+    // In demo the ring is the demo copy (9_demo.ino), so the made-up week continues with the simulated barometer.
+    if ((hardwarePresent == 1 || demoPhase == DEMO_ON) && baroPressureHistory && (currentTime - lastBaroSampleMs >= BARO_SAMPLE_INTERVAL_MS)) {
       lastBaroSampleMs = currentTime;
       if (!isnan(baroPressure)) {
         baroPressureHistory[baroHistoryHead] = (uint16_t)(baroPressure * 10.0f + 0.5f);
@@ -6898,6 +6983,7 @@ void loop() {
       // Full sensor/data functionality (also runs for MODE_AP due to fall-through above)
 
       // ========== HARDWARE-DEPENDENT SECTION ==========
+      demoService();  // demo-mode entry / exit (9_demo.ino), ahead of the read so the switch lands on a whole pass
       // Ahead of the hardwarePresent branch: sim mode still drives the real field, so the comparator edit must land there too
       if (inaOvReprogramPending) { inaOvReprogramPending = false; updateINA228OvervoltageThreshold(); }
       // Read sensors: Real hardware or fake data depending on hardwarePresent flag
@@ -6906,18 +6992,7 @@ void loop() {
 
         TIMED_CALL(ft_ReadAnalogInputs, ReadAnalogInputs());
       } else {
-        imuEnabled = true;        //hack but it works for now
-        ReadAnalogInputs_Fake();  // Fake sensor readings for development
-        delay(1);                 // yield to asyncTCP callbacks — I2C wait states do this naturally in real mode
-        // Notify user every 60 seconds that we're in fake mode
-        static unsigned long lastFakeWarning = 0;
-        if (millis() - lastFakeWarning > 60000) {
-          Serial.println("hardwarePresent=0: Using fake sensor data");
-          if (WiFi.getMode() != WIFI_OFF) {
-            events.send("hardwarePresent flag is 0 - using fake sensor data", "console", millis());
-          }
-          lastFakeWarning = millis();
-        }
+        TIMED_CALL(ft_ReadAnalogInputs, demoReadSensors());  // simulated boat at the real sensor cadences; no I2C, no delay
       }
 
       // ========== END HARDWARE-DEPENDENT SECTION ==========
@@ -6947,9 +7022,9 @@ void loop() {
       // timeout still reverts the clamps instead of the control loop obeying a frozen CVL/CCL forever.
       TIMED_CALL(ft_dvcc, dvccTick());
       TIMED_CALL(ft_CheckAlarms, CheckAlarms());  // Process alarms (runs with fake or real data)
-      calculateThermalStress();                   // alternator lifetime modeling (runs with fake or real data)
+      if (!demoStoresBusy()) calculateThermalStress();  // alternator lifetime modeling; paused while demo exit reloads the wear totals
       //UpdateDisplay();
-      zeroFitService();  // Temp-comp zero correction: daily fit (engine+field off) + live correction (must be before AdjustField)
+      if (!demoSeal) zeroFitService();  // Temp-comp zero correction: daily fit (engine+field off) + live correction (must be before AdjustField)
 
       // Runs in every mode: the stale-forecast release must fire with no internet, or a solar pause holds the field off forever.
       // The fetch itself is gated on client mode + WiFi inside the call.
@@ -7007,14 +7082,14 @@ void loop() {
         lastFieldStateForFlush = fieldNowActive ? 1 : 0;
 
         // Gate 1 (+20 s — 2x the fast-OV lockout cap): drain storage namespace to NVS
-        if (!fieldOffFlushDone && !pendingShutdownFlush && !fieldNowActive
+        if (!fieldOffFlushDone && !pendingShutdownFlush && !fieldNowActive && !demoSeal
             && fieldOffEdgeMs > 0 && (millis() - fieldOffEdgeMs) >= 20000UL) {
           saveNVSDataFull();
           fieldOffFlushDone = true;
         }
         // Gate 2 (+28 s): write performance matrix to LittleFS — staggered so
         // the ~150 ms file write doesn't land on the NVS commit's relocation tail
-        if (!fieldOffMatrixFlushDone && !pendingShutdownFlush && !fieldNowActive
+        if (!fieldOffMatrixFlushDone && !pendingShutdownFlush && !fieldNowActive && !demoSeal
             && fieldOffEdgeMs > 0 && (millis() - fieldOffEdgeMs) >= 28000UL) {
           altHealthSave();
           boatPerfSave();
@@ -7031,7 +7106,7 @@ void loop() {
         } else if (engineStoppedAtMs == 0) {
           engineStoppedAtMs = millis() ? millis() : 1;
         }
-        if (!restSaveDone && Ignition == 1 && engineStoppedAtMs != 0
+        if (!restSaveDone && Ignition == 1 && engineStoppedAtMs != 0 && !demoSeal
             && (uint32_t)(millis() - engineStoppedAtMs) >= 3600000UL) {
           if (!ringIsEmpty()) dumpSensorRingToLittleFS();
           dumpUsageAccum();
@@ -7081,7 +7156,7 @@ void loop() {
         
         // Configuration Snapshot, field cut 70 s; sim mode (HardwarePresent=0) skips — never push fake data. Fires on the 24 h
         // backstop or configSnapshotRequested, at most once per minute so a failing gate can't spin, and behind configSnapshotRetryMs.
-        if (hardwarePresent == 1 && fieldCutSettled(50000)
+        if (hardwarePresent == 1 && !demoSeal && fieldCutSettled(50000)
             && (millis() - lastConfigSnapshotTime >= CONFIG_SNAPSHOT_INTERVAL
                 || (configSnapshotRequested
                     && millis() - lastConfigSnapshotTime >= max(configSnapshotRetryMs, 60000UL)))) {
@@ -7118,7 +7193,7 @@ void loop() {
         // overwrite the local wipe or import with the points the cloud still holds. Stay silent until the wipe lands.
         // One PSRAM block per upload carries the batch out and the cloud's front back, freed once Core 1 applies it. Boat and alt
         // take turns (frontSyncTurnFree), so the peak is the larger block, not the sum; a turn not taken leaves the timer due.
-        if (hardwarePresent == 1 && !rpmAxisWipePending && !perfCloudWipePending && fieldCutSettled(50000) && millis() - lastBoatPerfUploadTime >= BOATPERF_UPLOAD_INTERVAL
+        if (hardwarePresent == 1 && !demoSeal && !rpmAxisWipePending && !perfCloudWipePending && fieldCutSettled(50000) && millis() - lastBoatPerfUploadTime >= BOATPERF_UPLOAD_INTERVAL
             && frontSyncTurnFree()) {
           lastBoatPerfUploadTime = millis();
           if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && WiFi.RSSI() >= -80) {
@@ -7143,7 +7218,7 @@ void loop() {
 
         // Alternator-health records → cloud (field-off gated; sim never uploads): learned with the field ON, banked, flushed at the
         // next field-off. altSyncBufBytes() is 0 when nothing new was banked, so that interval allocates nothing.
-        if (hardwarePresent == 1 && !rpmAxisWipePending && !altCloudWipePending && fieldCutSettled(50000) && millis() - lastAltHealthUploadTime >= ALTHEALTH_UPLOAD_INTERVAL
+        if (hardwarePresent == 1 && !demoSeal && !rpmAxisWipePending && !altCloudWipePending && fieldCutSettled(50000) && millis() - lastAltHealthUploadTime >= ALTHEALTH_UPLOAD_INTERVAL
             && frontSyncTurnFree()) {
           lastAltHealthUploadTime = millis();
           size_t need = (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered && WiFi.RSSI() >= -80) ? altSyncBufBytes() : 0;
@@ -7168,7 +7243,7 @@ void loop() {
         // retried at most once a minute; an empty period just rolls. Reset at queue time, so a later send failure loses that day
         // (lossy by design); UsageDays_AllTime counts DELIVERED uploads. fieldCutSettled, NOT fieldOffSettled: the roll writes
         // /usage.bin, so charging across midnight defers it to the first field-off minute.
-        if (hardwarePresent == 1 && fieldCutSettled(10000)
+        if (hardwarePresent == 1 && !demoSeal && fieldCutSettled(10000)
             && millis() - lastUsageUploadAttempt >= 60000) {
           time_t usageNowEp = time(NULL);
           if (usageNowEp > 1700000000LL && usagePeriodStartEpoch > 0
@@ -7200,12 +7275,12 @@ void loop() {
         // Commissioning-ledger drain (COMMISSIONING_LEDGER_SPEC.md) → log-commissioning-event. Never during commissioning: rows wait on
         // flash until idle. Network gates live inside the service, flash-safety gates here (the post-send trim is a flash write).
         // fieldCutSettled, NOT the duty-based fieldOffSettled.
-        if (hardwarePresent == 1 && fieldCutSettled(10000)) {
+        if (hardwarePresent == 1 && !demoSeal && fieldCutSettled(10000)) {
           cxLedgerDrainService();
         }
       }
       // Local field-cut flash pass: outside the Cloud Features block, which AP mode forces off. OTA skips it as the cloud block does.
-      if (!otaInProgress && hardwarePresent == 1 && fieldCutSettled(10000)) {
+      if (!otaInProgress && hardwarePresent == 1 && !demoSeal && fieldCutSettled(10000)) {
         huntLedgerService();  // hunt-episode records queued in RAM by the control path → flash, here only
         huntMapService();     // damper pocket map — same rule: flash only here, never in the control path
         owRoleService();      // 1-Wire role auto-binds queued by TempTask (Core 0 never writes NVS) → flash, here only

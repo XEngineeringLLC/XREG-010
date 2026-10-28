@@ -1,0 +1,2492 @@
+{
+ "version": 1,
+ "generatedFrom": "web_src/index.html:e4bd0df41c7d web_src/script.js:03ebe746253d gx_app/settings_keys.txt:a6023ecffa7b",
+ "endpoints": {
+  "zerofitstate": {
+   "path": "/zerofitstate",
+   "pollS": 5.0
+  },
+  "kneeLearnState": {
+   "path": "/kneeLearnState",
+   "pollS": 4.0
+  },
+  "tempSensors": {
+   "path": "/tempSensors",
+   "pollS": 5
+  }
+ },
+ "sections": [
+  {
+   "id": "alternator",
+   "title": "Alternator",
+   "items": [
+    {
+     "key": "ManualFieldToggle",
+     "label": "Field Control",
+     "type": "select",
+     "group": "Output Control",
+     "options": [
+      {
+       "value": 0,
+       "label": "Auto"
+      },
+      {
+       "value": 1,
+       "label": "Manual"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "ManualFieldToggle",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "tagged": true,
+     "confirm": "Manual mode drives the field straight from the Manual Field PWM box. It is a bench and diagnostic mode: while it is on, the regulator stops protecting the alternator and the battery.\n\nNo longer enforced:\n• Alternator temperature — no cut-back, no over-temperature shutdown, and no cut when the temperature sensor stops reporting. The alternator can cook.\n• Min Field % and the per-speed Keep-Alive floor — a PWM of 0 really means zero field, so a tachometer driven off the stator will stop reading.\n• Engine speed — no low-RPM cut, no engine-stopped cut, no implausible-tachometer cut. The field stays energized with the engine stopped.\n• Battery too cold and too hot to charge.\n• Battery voltage plausibility and the two-sensor disagreement checks.\n• The timed over-voltage steps and any protection lockout already running.\n• The whole current-control loop: no charge current target, no battery current limit, no externally sent limits, no charge stages.\n\nStill enforced: the master On/Off switch, the hardware over-voltage shutdown (Alternator Hard Shutdown V), and the Max Field % / Max Field Volts ceiling. If the INA228 battery monitor is not reading, Manual has no over-voltage protection at all: the hardware shutdown is that chip.",
+     "confirmWhen": 1,
+     "help": "Auto runs the charge stages and every protection. Manual drives the field straight from the Manual Field PWM box below and turns the protections off: no temperature cut-back or over-temperature shutdown, no Min Field or per-speed tachometer keep-alive floor (a PWM of 0 really means zero field), no engine-speed or tachometer-plausibility cut, no battery temperature or voltage checks, and no current control at all. The master On/Off switch, the hardware over-voltage shutdown and the field ceiling (Max Field % and Max Field Volts, whichever is lower) still apply. If the INA228 battery monitor is not reading, Manual has no over-voltage protection at all: the hardware shutdown is that chip. Switching to Manual asks for confirmation and lists the full set."
+    },
+    {
+     "key": "ManualDutyTarget",
+     "label": "Manual Field PWM",
+     "type": "number",
+     "group": "Output Control",
+     "min": 0,
+     "max": 100,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "%",
+     "echo": {
+      "stream": "CSV3",
+      "field": "ManualDutyTarget",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Direct PWM duty cycle applied to the field winding when Manual mode is active, 0–100% in steps of 0.01, delivered as typed — Min Field and the per-speed keep-alive floor do not raise it, so 0 is a genuinely dead field. Only the field ceiling, Max Field % or Max Field Volts, whichever is lower, still caps it. Has no effect in Auto mode. Use with caution — Manual mode bypasses the thermal, engine-speed, battery and current protections."
+    },
+    {
+     "key": "SwitchingFrequency",
+     "label": "Field Switching Freq",
+     "type": "number",
+     "group": "Output Control",
+     "min": 100,
+     "max": 19455,
+     "step": 1,
+     "decimals": 0,
+     "unit": "Hz",
+     "echo": {
+      "stream": "CSV3",
+      "field": "SwitchingFrequency",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "100 to 2000 Hz is a good range — may want to avoid human hearing frequencies depending on installation location and noise."
+    },
+    {
+     "key": "TemperatureLimitF",
+     "label": "Alternator Temp Limit",
+     "type": "number",
+     "group": "Temperature Settings",
+     "min": 0,
+     "max": 350,
+     "step": 1,
+     "decimals": 0,
+     "unit": "°F",
+     "temp": "abs",
+     "echo": {
+      "stream": "CSV3",
+      "field": "TemperatureLimitF",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Maximum safe temperature at the sensor location. The temperature PID begins reducing current as temperature approaches this value — intervention starts at (Limit − Temp PID Margin). Hard warning and critical shutdowns trigger above it. Sensors often read 20–30°F cooler than true winding temperature; account for this offset when setting this value."
+    },
+    {
+     "key": "InvertAltAmps",
+     "label": "Invert Alternator Amps",
+     "type": "toggle",
+     "group": "Current Sensing",
+     "options": [
+      {
+       "value": 0,
+       "label": "No"
+      },
+      {
+       "value": 1,
+       "label": "Yes"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "InvertAltAmps",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Reverses the sign of the raw alternator current reading. Enable if your hall-effect sensor is mounted with reversed polarity and reports negative amps during normal charging."
+    },
+    {
+     "key": "AlternatorCOffset",
+     "label": "Alternator Current Offset",
+     "type": "number",
+     "group": "Current Sensing",
+     "min": -100,
+     "max": 100,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "A",
+     "echo": {
+      "stream": "CSV3",
+      "field": "AlternatorCOffset",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Amps subtracted from every alternator current reading to cancel the sensor's zero error. Measured Zero below sets it for you, or you can enter a known value here. With Alternator Zero Correction off, a change here moves the learned correction by the same amount, so switching the correction on later is right from the first reading instead of spending several days re-learning. With the correction on, a change here leaves the learned correction alone, because the reading you corrected from already had it taken out."
+    },
+    {
+     "key": "AltZeroCaptureNow",
+     "label": "Measured Zero",
+     "type": "action",
+     "group": "Current Sensing",
+     "arm": true,
+     "buttonText": "Zero Now",
+     "help": "With the field at 0%, the alternator makes no current, so the current sensor should read exactly zero. Whatever it reads instead is its zero error on this installation. Zero Now works with the engine running or stopped: it turns the field off if it is on, waits for the reading to settle, averages it for ten seconds, and reports what it found. Apply folds that number into the Alternator Current Offset above, where it is stored permanently. If Alternator Zero Correction was off while it measured, Apply moves the learned correction by the same amount so the two stay in step. If it was on, the measurement already had the learned correction taken out, so that correction stays as it is. The sensor's zero moves a little with temperature, so measure while the engine compartment is warm, such as right after a run. The commissioning wizard offers the same measurement at the finish. With the engine running, charging pauses for under a minute. A reading that is too large or too noisy is refused rather than applied."
+    },
+    {
+     "key": "altZeroApply",
+     "label": "Measured Zero",
+     "type": "action",
+     "group": "Current Sensing",
+     "arm": true,
+     "buttonText": "Apply",
+     "enabledWhen": {
+      "endpoint": "zerofitstate",
+      "field": "capHeld",
+      "value": 1
+     },
+     "help": "With the field at 0%, the alternator makes no current, so the current sensor should read exactly zero. Whatever it reads instead is its zero error on this installation. Zero Now works with the engine running or stopped: it turns the field off if it is on, waits for the reading to settle, averages it for ten seconds, and reports what it found. Apply folds that number into the Alternator Current Offset above, where it is stored permanently. If Alternator Zero Correction was off while it measured, Apply moves the learned correction by the same amount so the two stay in step. If it was on, the measurement already had the learned correction taken out, so that correction stays as it is. The sensor's zero moves a little with temperature, so measure while the engine compartment is warm, such as right after a run. The commissioning wizard offers the same measurement at the finish. With the engine running, charging pauses for under a minute. A reading that is too large or too noisy is refused rather than applied."
+    },
+    {
+     "key": "@zeroStatus",
+     "label": "",
+     "type": "info",
+     "group": "Current Sensing",
+     "arm": true,
+     "widget": "zeroStatus",
+     "source": "zerofitstate",
+     "strings": {
+      "ALTZERO_REJ_TEXT": [
+       "",
+       "too noisy to be a zero",
+       "reading too large, check which cable the sensor is on",
+       "engine speed moved mid-measurement",
+       "the field came back on before it finished",
+       "the engine is not running (it needs 400 RPM)",
+       "a test is running on the alternator, finish it first",
+       "the field could not be brought to 0%"
+      ],
+      "ALTZERO_PHASE_TEXT": [
+       "",
+       "Checking whether the engine is running",
+       "Turning the field off",
+       "Waiting for the rotor to drain",
+       "Averaging the reading"
+      ]
+     },
+     "help": ""
+    },
+    {
+     "key": "ManualLifePercentage",
+     "label": "Set Alternator Life Manually",
+     "type": "number",
+     "group": "Alternator Health",
+     "min": 0,
+     "max": 100,
+     "step": 1,
+     "decimals": 0,
+     "unit": "%",
+     "echo": {
+      "stream": "CSV3",
+      "field": "ManualLifePercentage",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "This will adjust life for brushes, bearings, insulation all together, meant for zeroing all together."
+    }
+   ]
+  },
+  {
+   "id": "rpm_table",
+   "title": "RPM Table",
+   "items": [
+    {
+     "key": "PhysicalPanelOverride",
+     "label": "Physical Panel Override",
+     "type": "toggle",
+     "group": "Security & Maintenance",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "PhysicalPanelOverride",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "hidden": true,
+     "help": "Chooses who sets the charge rate and Force \"Maintain Mode\": this app, or the two switch-panel wires on data Cable 3 (Charge Rate on pin 5, Force Float on pin 7). Off — this app decides both modes. The wires are still read and reported below, but they change nothing. On — the panel decides both modes, and the matching controls in this app grey out and stop having any effect. Charge Rate: switch on = High, switch off = Low. Force Float: switch on = Force \"Maintain Mode\", which still needs a battery shunt and still yields to Target Voltage mode."
+    },
+    {
+     "key": "HiLow",
+     "label": "Charge Rate",
+     "type": "select",
+     "options": [
+      {
+       "value": 0,
+       "label": "Low"
+      },
+      {
+       "value": 1,
+       "label": "High"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "HiLow",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "disabledWhen": {
+      "key": "PhysicalPanelOverride",
+      "value": 1,
+      "note": "Physical Panel Override is on, so the charge rate is set by the switch on data Cable 3 pin 5 — switch on is High, switch off is Low — and these buttons only show which mode that switch has chosen. Turn the override off under Setup → System → Security & Maintenance to set the rate from here."
+     },
+     "help": ""
+    },
+    {
+     "key": "capLimitMode",
+     "label": "Limit by",
+     "type": "select",
+     "options": [
+      {
+       "value": 0,
+       "label": "Amps"
+      },
+      {
+       "value": 1,
+       "label": "kW"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "capLimitMode",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "rpmTable",
+     "label": "RPM Table",
+     "type": "table",
+     "arm": true,
+     "buttonText": "Save Table",
+     "tableId": "rpmTable",
+     "rows": 10,
+     "columns": [
+      {
+       "label": "RPM",
+       "type": "number",
+       "min": 0,
+       "max": 10000,
+       "step": 1,
+       "decimals": 0,
+       "echo": {
+        "stream": "CSV3",
+        "field": "rpmTableRPMPoints{i}",
+        "scale": 1
+       },
+       "send": {
+        "scale": 1,
+        "integer": true
+       },
+       "help": "Engine RPM breakpoint for this bucket. Row 0 covers all RPM below its value; row 9 covers all RPM above its value.",
+       "keyPattern": "rpmTableRPMPoints{i}"
+      },
+      {
+       "label": "Limit",
+       "type": "number",
+       "min": 0,
+       "max": 99999,
+       "step": 1,
+       "decimals": 0,
+       "unit": "A",
+       "echo": {
+        "stream": "CSV3",
+        "field": "rpmCapCurrentTable{i}",
+        "scale": 100
+       },
+       "send": {
+        "scale": 1,
+        "integer": false
+       },
+       "help": "Hard current ceiling (A) for this RPM range. In Amps mode, enter your limit here — the kW column is calculated from this value and the present battery voltage. In kW mode, this is derived from your kW limit and live battery voltage each control tick.",
+       "keyPattern": "rpmCapCurrentTable{i}",
+       "capCol": "amps"
+      },
+      {
+       "label": "Limit",
+       "type": "number",
+       "min": 0,
+       "max": 9999,
+       "step": 0.01,
+       "decimals": 2,
+       "unit": "kW",
+       "echo": {
+        "stream": "CSV3",
+        "field": "rpmCapPowerTable{i}",
+        "scale": 1000
+       },
+       "send": {
+        "scale": 1,
+        "integer": false
+       },
+       "help": "Power limit for this RPM range. This is electrical power, assuming 100% alternator efficiency. If you want to convert to engine power, you can mentally multiply table values by 2 to account for mechanical and electrical losses. In kW mode, enter your limit here — the firmware divides by live battery voltage each control tick to derive the amp ceiling, so the load stays constant regardless of voltage sag or rise. In Amps mode, this is calculated for reference only.",
+       "keyPattern": "rpmCapKW{i}",
+       "capCol": "kw"
+      },
+      {
+       "label": "Keep-Alive",
+       "type": "number",
+       "min": 0,
+       "max": 100,
+       "step": 0.05,
+       "decimals": 2,
+       "unit": "%",
+       "echo": {
+        "stream": "CSV3",
+        "field": "rpmMinDutyTable{i}",
+        "scale": 100
+       },
+       "send": {
+        "scale": 1,
+        "integer": false
+       },
+       "help": "Tachometer keep-alive floor: the lowest field duty cycle (%) the regulator will hold at this engine speed, even when the controls otherwise want less. The RPM signal reads normally with the field off; only a rapid field drop blinds it. This floor sits a small margin below where output current begins, to keep the field from dropping fast from a working level to zero. Edit these cells by hand only while Automatic Learning (card below) is off.",
+       "keyPattern": "rpmMinDutyTable{i}",
+       "readOnlyWhen": {
+        "key": "kneeLearnEnable",
+        "value": 1,
+        "omit": true
+       }
+      }
+     ],
+     "include": [
+      "capLimitMode"
+     ],
+     "capMode": {
+      "key": "capLimitMode",
+      "kw": 1
+     },
+     "confirmIfChanged": {
+      "keyPattern": "rpmTableRPMPoints{i}",
+      "text": "You changed an RPM breakpoint.\n\nThe learned keep-alive floors were measured at the old RPMs, so they will be CLEARED — re-run the Keep-Alive Floor calibration from the Tachometer Keep-Alive card.\n\nSave this change?"
+     },
+     "validate": {
+      "rule": "ascending",
+      "keyPattern": "rpmTableRPMPoints{i}"
+     },
+     "help": ""
+    },
+    {
+     "key": "ClearOverheatHistory",
+     "label": "Clear Overheats / Safe Hours",
+     "type": "action",
+     "arm": true,
+     "buttonText": "Clear Overheats / Safe Hours",
+     "confirm": "CLEAR OVERHEAT HISTORY\n\nThis will reset all overheat counters, timestamps, and accumulated safe time to zero.\n\n",
+     "help": ""
+    },
+    {
+     "key": "ResetLearningTable",
+     "label": "Reset Table",
+     "type": "action",
+     "arm": true,
+     "buttonText": "Reset Table",
+     "confirm": "RESET LEARNING TABLE\n\nThis will reset all learned and user-entered values to defaults.\nAre you sure you want to continue?",
+     "help": ""
+    },
+    {
+     "key": "kneeLearnEnable",
+     "label": "Automatic Learning",
+     "type": "toggle",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "enable",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Master switch. On = the regulator owns and auto-fills the Keep-Alive (%) column. Off = the column is yours to edit and is left alone."
+    },
+    {
+     "key": "kneeMarginPct",
+     "label": "Margin Below Onset",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0,
+     "max": 50,
+     "step": 0.1,
+     "decimals": 1,
+     "unit": "%",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "marginPct",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How far below the current-onset point to park the floor. Larger = safer (never forces unwanted current), smaller = field stays more primed. The value it starts at is already scaled for the Nominal Battery Voltage and Field Winding Voltage in Vessel Info."
+    },
+    {
+     "key": "kneeOnsetA",
+     "label": "Onset Delta",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0.1,
+     "max": 20,
+     "step": 0.1,
+     "decimals": 2,
+     "unit": "A",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "onsetA",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How far output current must rise above the freshly measured zero, while probing, to count as \"the alternator just started making current\" (the onset). Keep it a few times the current sensor noise — under one amp is typical."
+    },
+    {
+     "key": "kneeReArmA",
+     "label": "Re-arm Current",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0.1,
+     "max": 100,
+     "step": 0.1,
+     "decimals": 1,
+     "unit": "A",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "reArmA",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Once a range is locked, if this much current ever appears at its floor the onset has dropped, so the floor is lowered one margin step. Set above the worst current-sensor zero drift (a couple of amps) so noise never re-triggers it."
+    },
+    {
+     "key": "kneeDwellSec",
+     "label": "Step Dwell",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0.5,
+     "max": 60,
+     "step": 0.5,
+     "decimals": 1,
+     "unit": "s",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "dwellSec",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Settle and hold time at each probe step: RPM, temperature and field must stay steady this long before the floor is stepped again. A few seconds is plenty; longer = stricter."
+    },
+    {
+     "key": "kneeStepPct",
+     "label": "Probe Step",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0.05,
+     "max": 5,
+     "step": 0.05,
+     "decimals": 2,
+     "unit": "%",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "stepPct",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How many field-duty points the floor climbs at each step while hunting the onset. Smaller = finer knee resolution but slower; this is the staircase increment, taken once per Step Dwell."
+    },
+    {
+     "key": "kneeTempComp",
+     "label": "Temperature Compensation",
+     "type": "toggle",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "tempComp",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "When on, the applied floor is corrected for alternator case temperature — the field-onset point rises with winding resistance, so a colder alternator gets a lower floor. Turn off to apply the learned floors as-is (useful for bench comparison)."
+    },
+    {
+     "key": "kneeTempRefF",
+     "label": "Reference Temperature",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": -40,
+     "max": 300,
+     "step": 1,
+     "decimals": 1,
+     "unit": "°F",
+     "temp": "abs",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "tempRefF",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "The alternator case temperature the learned floors are referenced to (learning happens hot, so ~180 °F / ~82 °C is typical). The temperature correction lowers the floor below this and raises it above."
+    },
+    {
+     "key": "kneeMaxFloorPct",
+     "label": "Maximum Floor",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0,
+     "max": 50,
+     "step": 0.5,
+     "decimals": 1,
+     "unit": "%",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "maxFloorPct",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Safety cap — no learned floor will ever exceed this, even while probing. Bounds how much field can be held during light load."
+    },
+    {
+     "key": "kneeRpmTolPct",
+     "label": "Steady Band — RPM",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0.5,
+     "max": 50,
+     "step": 0.5,
+     "decimals": 1,
+     "unit": "%",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "rpmTolPct",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How much RPM may wander and still count as steady. Tighter = stricter."
+    },
+    {
+     "key": "kneeTempTolF",
+     "label": "Steady Band — Temperature",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0.5,
+     "max": 50,
+     "step": 0.5,
+     "decimals": 1,
+     "unit": "°F",
+     "temp": "delta",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "tempTolF",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How much temperature may wander and still count as steady."
+    },
+    {
+     "key": "kneeDutyTolPct",
+     "label": "Steady Band — Field",
+     "type": "number",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "min": 0.1,
+     "max": 20,
+     "step": 0.1,
+     "decimals": 1,
+     "unit": "%",
+     "echo": {
+      "stream": "HTTP",
+      "endpoint": "kneeLearnState",
+      "field": "dutyTolPct",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How much the applied field may wander and still count as steady."
+    },
+    {
+     "key": "@kneeStatus",
+     "label": "Per-RPM Learning Status",
+     "type": "info",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "arm": true,
+     "widget": "kneeStatus",
+     "source": "kneeLearnState",
+     "headings": [
+      "RPM",
+      "Floor (%)",
+      "Onset (%)",
+      "Locked",
+      "Learn °F",
+      "Last seen"
+     ],
+     "help": "Live view per RPM range: the floor in use, the learned current-onset point, how confident the learning is (0–100%), and how long since that range was last confirmed. \"Active\" marks the range being observed right now."
+    },
+    {
+     "key": "ResetKneeLearn",
+     "label": "Reset Learned Floors",
+     "type": "action",
+     "group": "Tachometer Keep-Alive — Automatic Learning",
+     "arm": true,
+     "buttonText": "Reset Learned Floors",
+     "confirm": "Reset all learned tachometer keep-alive floors to factory defaults?",
+     "help": ""
+    }
+   ]
+  },
+  {
+   "id": "cv_mode",
+   "title": "CV Mode",
+   "items": [
+    {
+     "key": "TargetVoltageMode",
+     "label": "CV Mode On/Off",
+     "type": "toggle",
+     "options": [
+      {
+       "value": 0,
+       "label": "OFF"
+      },
+      {
+       "value": 1,
+       "label": "ON"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "TargetVoltageMode",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Not safe for Lithium batteries. This mode bypasses the normal charge algorithm — use only with flooded or AGM batteries, or in consultation with your battery manufacturer. Overrides normal charging with fixed voltage control — mainly useful for tuning voltage loop parameters or simulating an old-school automotive alternator voltage regulator."
+    },
+    {
+     "key": "TargetVoltageSetpoint",
+     "label": "Target Voltage Setpoint",
+     "type": "number",
+     "min": 1,
+     "max": 100,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "V",
+     "echo": {
+      "stream": "CSV3",
+      "field": "TargetVoltageSetpoint",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Voltage target when mode is enabled."
+    }
+   ]
+  },
+  {
+   "id": "engine",
+   "title": "Engine",
+   "items": [
+    {
+     "key": "RPMScalingFactor",
+     "label": "RPM Scaling Factor",
+     "type": "number",
+     "group": "Engine & Alternator Parameters",
+     "min": 1,
+     "max": 1000000,
+     "step": 1,
+     "decimals": 0,
+     "echo": {
+      "stream": "CSV3",
+      "field": "RPMScalingFactor",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "confirm": "Rescaling the engine-RPM axis discards everything measured against the old one:\n\n• Tachometer keep-alive floor table and its learning\n• Overheat history\n• Resonance and ripple maps, and the reference waveforms\n• Alternator health matrix and its engine-hour trend\n• Motoring speed curve (your sailing data is kept)\n• Step-test log\n• Commissioning steps 2 to 8 (Field curve through Keep-Alive Floor & Field Decay), which have to be run again\n\nThe same data is deleted from the cloud, including your all-time alternator records. This cannot be undone.\n\nYour fuel curve, current-limit tables, and alternator wear hours are kept. The alternator must be off.",
+     "help": "Scales the tachometer signal into engine RPM. Adjust until the RPM shown here matches your engine's tachometer. Changing it erases every table and record measured against the old RPM axis, on the device and in the cloud, and requires re-commissioning. The alternator must be off."
+    },
+    {
+     "key": "PulleyRatio",
+     "label": "Pulley Ratio, Alt to Engine",
+     "type": "number",
+     "group": "Engine & Alternator Parameters",
+     "min": 1.0,
+     "max": 10.0,
+     "step": 0.01,
+     "decimals": 2,
+     "echo": {
+      "stream": "CSV3",
+      "field": "PulleyRatio",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "*** Only used for Alternator Lifetime Calcs *** Alternator RPM = Engine RPM × this ratio. Common: 2.0-3.0"
+    },
+    {
+     "key": "IgnitionOverride",
+     "label": "Ignition Override",
+     "type": "toggle",
+     "group": "Engine & Alternator Parameters",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "IgnitionOverride",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Off: the regulator counts the ignition as on only while the key is on, and charges only then. On: it counts the ignition as on all the time, so charging no longer waits for the key; the alternator switch turns it on and off. Use On when no ignition wire is connected. With it on, the regulator also stays fully awake with the engine off, so it draws more power while the boat sits."
+    }
+   ]
+  },
+  {
+   "id": "battery",
+   "title": "Battery",
+   "items": [
+    {
+     "key": "BatteryShuntPresent",
+     "label": "Battery Shunt Present",
+     "type": "toggle",
+     "group": "Measurement Sources",
+     "options": [
+      {
+       "value": 0,
+       "label": "No"
+      },
+      {
+       "value": 1,
+       "label": "Yes"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "BatteryShuntPresent",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "hidden": true,
+     "help": "Turn off if this device has no battery shunt (battery-current sensor). Battery current, State of Charge, battery health, the battery charge-current limit, load-dump detection and float charging all become unavailable — the alternator current limit is then the only thing bounding charge current. Their settings stay on their pages, greyed, and each card says why; only the live readouts that would sit at a dash are hidden. If your shunt is in the battery negative lead and its current reaches the regulator only over NMEA 2000 or VE.Direct, the regulator's own battery voltage reading runs high while charging, by charging current × shunt resistance (10 mV per 100 A on a 500 A / 50 mV shunt). Wiring Cable 2 pins 9 and 10 to the shunt removes it."
+    },
+    {
+     "key": "BattMonSrc",
+     "label": "Use as Battery Monitor",
+     "type": "number",
+     "group": "NMEA 2000",
+     "decimals": 0,
+     "echo": {
+      "stream": "CSV3",
+      "field": "BattMonSrc",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "hidden": true,
+     "help": "Uses the battery instance above as the regulator's battery monitor. Its own state of charge (PGN 127506) becomes the one shown and used. With no shunt wired to the regulator, its current (PGN 127508) also ends absorption on taper current and triggers the current rebulk. Same setting as Use as Battery Monitor in the VE.Direct card, so only one can be on."
+    },
+    {
+     "key": "BulkVoltage",
+     "label": "Bulk Voltage",
+     "type": "number",
+     "group": "Bulk Phase",
+     "min": 1,
+     "max": 99,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "V",
+     "echo": {
+      "stream": "CSV3",
+      "field": "BulkVoltage",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "14.4V typical."
+    },
+    {
+     "key": "bulkVoltageHoldMs",
+     "label": "Bulk Voltage Debounce Time",
+     "type": "number",
+     "group": "Bulk Phase",
+     "min": 0,
+     "max": 999999,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "sec",
+     "echo": {
+      "stream": "CSV3",
+      "field": "bulkVoltageHoldMs",
+      "scale": 1000
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How long battery voltage must remain continuously within 50 mV below Bulk voltage (or higher) before Absorption begins. The 50 mV arming band is hard-coded — it lets the timer start as the battery approaches Bulk, rather than waiting for the exact crossing. Prevents transient voltage spikes from triggering an early Absorption entry. 0.25s typical. Note that there isn't any controls difference between Bulk and Absorb other than the limiting voltage, if those are set differently, so this is more a question of display nomenclature."
+    },
+    {
+     "key": "AbsorptionVoltage",
+     "label": "Absorption Voltage",
+     "type": "number",
+     "group": "Absorption Phase",
+     "min": 1,
+     "max": 100,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "V",
+     "echo": {
+      "stream": "CSV3",
+      "field": "AbsorptionVoltage",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Voltage held during Absorption. Typically 0.1 to 0.2 below Bulk Voltage for an AC charger/ solar or 0.3 to 0.4 below for an alternator controller. It's wise to leave some margin for transients during rapid engine speed changes. The battery dictates how much current it accepts — current tapers naturally as the battery fills."
+    },
+    {
+     "key": "TailCurrent_A",
+     "label": "Tail Current",
+     "type": "number",
+     "group": "Absorption Phase",
+     "min": 0,
+     "max": 999,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "A",
+     "echo": {
+      "stream": "CSV3",
+      "field": "TailCurrent_A",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-soc-src",
+       "when": {
+        "all": [
+         {
+          "any": [
+           {
+            "key": "BatteryShuntPresent",
+            "eq": 0
+           },
+           {
+            "key": "ShuntResistanceMicroOhm",
+            "le": 0
+           }
+          ]
+         },
+         {
+          "key": "BattMonSrc",
+          "eq": 0
+         }
+        ]
+       },
+       "note": "Tail Current and the Rebulk Current Threshold are greyed too, because no battery monitor is set up under Setup → Integrations either. Absorption ends on time alone, and float (if enabled) then holds the float voltage."
+      }
+     ],
+     "help": "Absorption ends when charging current tapers to or below this value continuously for the Absorption Completion Time. Confirms the battery is genuinely full. 5 amps per 100Ah of bank is typical. Two things must both be true before this counts: current at or below your number, AND the battery still sitting up at the Absorption Voltage. A big load coming on, or the engine dropping to idle, can pull charging current down to almost nothing while the battery is only part full — on its own that looks exactly like a finished battery. Requiring the voltage to still be up there tells the two apart. If another charge source (solar, shore power) is holding the battery even higher, that still counts."
+    },
+    {
+     "key": "absorptionCompleteTime",
+     "label": "Absorption Completion Time",
+     "type": "number",
+     "group": "Absorption Phase",
+     "min": 1,
+     "max": 999999,
+     "step": 1,
+     "decimals": 0,
+     "unit": "sec",
+     "echo": {
+      "stream": "CSV3",
+      "field": "absorptionCompleteTime",
+      "scale": 1000
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "How long current must remain at or below Tail Current before Absorption ends. Prevents a momentary current dip from triggering a premature exit. 10-60s typical."
+    },
+    {
+     "key": "AbsorptionTimeoutMs",
+     "label": "Absorption Timeout",
+     "type": "number",
+     "group": "Absorption Phase",
+     "min": 1,
+     "max": 999,
+     "step": 1,
+     "decimals": 0,
+     "unit": "min",
+     "echo": {
+      "stream": "CSV3",
+      "field": "AbsorptionTimeoutMs",
+      "scale": 60000
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Maximum time in Absorption before forcing a transition regardless of current. Safety fallback in case Tail Current is never reached. Typical starting point: 30m per 100Ah of battery bank. This clock only runs while the battery is actually held up at the Absorption Voltage. If the voltage sags — engine at idle, a heavy load, or any limit holding the alternator back — the clock pauses and picks up where it left off, so time spent not really absorbing doesn't count against you. As a backstop the phase always ends at twice this figure of real elapsed time, even if the battery never got up to voltage."
+    },
+    {
+     "key": "UseFloat",
+     "label": "Float Mode",
+     "type": "select",
+     "group": "Float Phase",
+     "options": [
+      {
+       "value": 0,
+       "label": "No Float (idle)"
+      },
+      {
+       "value": 1,
+       "label": "Voltage Float"
+      },
+      {
+       "value": 2,
+       "label": "Zero-Current Float",
+       "gates": [
+        {
+         "name": "no-batt-current",
+         "when": {
+          "any": [
+           {
+            "key": "BatteryShuntPresent",
+            "eq": 0
+           },
+           {
+            "key": "ShuntResistanceMicroOhm",
+            "le": 0
+           }
+          ]
+         },
+         "note": "No battery shunt is wired to the regulator, so zero-current float and Force \"Maintain Mode\" are greyed below. Both need the regulator's own shunt, set up under Setup → Battery → Measurement Sources."
+        }
+       ]
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "UseFloat",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "No Float (idle) — after Absorption the field turns off. The battery carries the house loads, and charging restarts when the rebulk criteria (next section) are met. Voltage Float — the classic third stage: holds the battery at Float Voltage to maintain near-full charge, and returns to Bulk when the rebulk criteria are met or Float Duration runs out. Zero-Current Float — the alternator carries exactly the house loads and the battery rests at 0 A, at whatever voltage it naturally sits. The battery is neither charged nor discharged while the engine runs. Needs the INA228 battery shunt. The rebulk criteria stay armed — unlike the manual Force Maintain Mode override below, which suspends the charge-stage machine entirely."
+    },
+    {
+     "key": "FloatVoltage",
+     "label": "Float Voltage",
+     "type": "number",
+     "group": "Float Phase",
+     "min": 1,
+     "max": 99,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "V",
+     "echo": {
+      "stream": "CSV3",
+      "field": "FloatVoltage",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "float-gated-fields",
+       "when": {
+        "key": "UseFloat",
+        "ne": 1
+       },
+       "note": "Float Voltage and Float Duration only apply to the Voltage Float mode selected above. Pick Voltage Float to set them."
+      }
+     ],
+     "help": "Holding voltage used only when Use Float is ON. Typical: ~13.4V"
+    },
+    {
+     "key": "FLOAT_DURATION",
+     "label": "Float Duration",
+     "type": "number",
+     "group": "Float Phase",
+     "min": 0,
+     "max": 999,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "hrs",
+     "echo": {
+      "stream": "CSV3",
+      "field": "FLOAT_DURATION",
+      "scale": 3600
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "float-gated-fields",
+       "when": {
+        "key": "UseFloat",
+        "ne": 1
+       },
+       "note": "Float Voltage and Float Duration only apply to the Voltage Float mode selected above. Pick Voltage Float to set them."
+      }
+     ],
+     "help": "Maximum time in Float before returning to Bulk."
+    },
+    {
+     "key": "MinFloatTime",
+     "label": "Minimum Float Time",
+     "type": "number",
+     "group": "Float Phase",
+     "min": 0,
+     "max": 9999999,
+     "step": 0.01,
+     "decimals": 0,
+     "unit": "min",
+     "echo": {
+      "stream": "CSV3",
+      "field": "MinFloatTime",
+      "scale": 60000
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Delay after Absorption completes before any rebulk is allowed. Applies in all three Float Modes (idle, voltage float, zero-current float)."
+    },
+    {
+     "key": "MaintainMode",
+     "label": "Force \"Maintain Mode\"",
+     "type": "toggle",
+     "group": "Float Phase",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "MaintainMode",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "disabledWhen": {
+      "key": "PhysicalPanelOverride",
+      "value": 1,
+      "note": "Physical Panel Override is on, so Force \"Maintain Mode\" is set by the switch on data Cable 3 pin 7, and this toggle only shows what that switch has chosen. Turn the override off under Setup → System → Security & Maintenance to set it from here."
+     },
+     "gates": [
+      {
+       "name": "no-batt-current",
+       "when": {
+        "any": [
+         {
+          "key": "BatteryShuntPresent",
+          "eq": 0
+         },
+         {
+          "key": "ShuntResistanceMicroOhm",
+          "le": 0
+         }
+        ]
+       },
+       "note": "No battery shunt is wired to the regulator, so zero-current float and Force \"Maintain Mode\" are greyed below. Both need the regulator's own shunt, set up under Setup → Battery → Measurement Sources."
+      }
+     ],
+     "help": "Targets 0A net battery current- this is not a recommended mode, as errors may build up over time."
+    },
+    {
+     "key": "RebulkVoltage",
+     "label": "Rebulk Voltage",
+     "type": "number",
+     "group": "Charge Start / Rebulk Criteria",
+     "min": 1,
+     "max": 99,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "V",
+     "echo": {
+      "stream": "CSV3",
+      "field": "RebulkVoltage",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "If battery voltage drops below this threshold during Float or Idle, and stays there for Rebulk Debounce Time, the system returns to Bulk. 13V typical."
+    },
+    {
+     "key": "RebulkCurrent_A",
+     "label": "Rebulk Current Threshold",
+     "type": "number",
+     "group": "Charge Start / Rebulk Criteria",
+     "min": 0,
+     "max": 999,
+     "step": 0.1,
+     "decimals": 2,
+     "unit": "A",
+     "echo": {
+      "stream": "CSV3",
+      "field": "RebulkCurrent_A",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-soc-src",
+       "when": {
+        "all": [
+         {
+          "any": [
+           {
+            "key": "BatteryShuntPresent",
+            "eq": 0
+           },
+           {
+            "key": "ShuntResistanceMicroOhm",
+            "le": 0
+           }
+          ]
+         },
+         {
+          "key": "BattMonSrc",
+          "eq": 0
+         }
+        ]
+       },
+       "note": "Tail Current and the Rebulk Current Threshold are greyed too, because no battery monitor is set up under Setup → Integrations either. Absorption ends on time alone, and float (if enabled) then holds the float voltage."
+      }
+     ],
+     "help": "If net battery current is more negative than this value (i.e. the battery is discharging at this rate or faster), the system returns to Bulk. Provides more reliable rebulk detection than voltage alone under load. Typical ~0.02–0.05C discharge 2 to 5 amps per 100Ah of battery bank."
+    },
+    {
+     "key": "rebulkDebounceTime",
+     "label": "Rebulk Debounce Time",
+     "type": "number",
+     "group": "Charge Start / Rebulk Criteria",
+     "min": 0,
+     "max": 9999999,
+     "step": 1,
+     "decimals": 0,
+     "unit": "sec",
+     "echo": {
+      "stream": "CSV3",
+      "field": "rebulkDebounceTime",
+      "scale": 1000
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "How long the rebulk condition (voltage sag or discharge current) must persist continuously before a return to Bulk is triggered. Prevents nuisance rebulk from transient loads. 10-60s typical."
+    },
+    {
+     "key": "InvertBattAmps",
+     "label": "Invert Battery Amps",
+     "type": "toggle",
+     "group": "Measurement Sources",
+     "options": [
+      {
+       "value": 0,
+       "label": "No"
+      },
+      {
+       "value": 1,
+       "label": "Yes"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "InvertBattAmps",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-batt-current",
+       "when": {
+        "any": [
+         {
+          "key": "BatteryShuntPresent",
+          "eq": 0
+         },
+         {
+          "key": "ShuntResistanceMicroOhm",
+          "le": 0
+         }
+        ]
+       },
+       "note": "Battery Shunt Present is Off, so the four rows that set up the shunt — Invert Battery Amps, Battery Current Offset, Shunt Resistance and Shunt Location — are greyed. Switch it to Yes to set them up."
+      }
+     ],
+     "help": ""
+    },
+    {
+     "key": "BatteryCOffset",
+     "label": "Battery Current Offset",
+     "type": "number",
+     "group": "Measurement Sources",
+     "min": -10000,
+     "max": 10000,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "A",
+     "echo": {
+      "stream": "CSV3",
+      "field": "BatteryCOffset",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-batt-current",
+       "when": {
+        "any": [
+         {
+          "key": "BatteryShuntPresent",
+          "eq": 0
+         },
+         {
+          "key": "ShuntResistanceMicroOhm",
+          "le": 0
+         }
+        ]
+       },
+       "note": "Battery Shunt Present is Off, so the four rows that set up the shunt — Invert Battery Amps, Battery Current Offset, Shunt Resistance and Shunt Location — are greyed. Switch it to Yes to set them up."
+      }
+     ],
+     "help": ""
+    },
+    {
+     "key": "ShuntResistanceMicroOhm",
+     "label": "Shunt Resistance uOhms (micro)",
+     "type": "number",
+     "group": "Measurement Sources",
+     "min": 1,
+     "max": 5000,
+     "step": 1,
+     "decimals": 0,
+     "echo": {
+      "stream": "CSV3",
+      "field": "ShuntResistanceMicroOhm",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-batt-current",
+       "when": {
+        "any": [
+         {
+          "key": "BatteryShuntPresent",
+          "eq": 0
+         },
+         {
+          "key": "ShuntResistanceMicroOhm",
+          "le": 0
+         }
+        ]
+       },
+       "note": "Battery Shunt Present is Off, so the four rows that set up the shunt — Invert Battery Amps, Battery Current Offset, Shunt Resistance and Shunt Location — are greyed. Switch it to Yes to set them up."
+      }
+     ],
+     "help": "Resistance of your current shunt in micro-ohms (µΩ). The current sensor converts the shunt's measured voltage drop to amps using this value — a wrong value scales all current and SoC readings proportionally. Shunts are rated by a full-scale millivolt drop at a rated current, and the resistance follows: µΩ = mV ÷ amps × 1000. Victron SmartShunt / BMV are the 50 mV family (500 A = 100 µΩ, 1000 A = 50 µΩ, 2000 A = 25 µΩ). Check your shunt's datasheet for the exact rating. RatedµΩmΩ 50 mV — Victron / marine 100 A5000.5 200 A2500.25 300 A1670.167 400 A1250.125 500 A — BMV-7121000.1 1000 A500.05 2000 A250.025 75 mV — industrial / analog meter 50 A15001.5 100 A7500.75 150 A5000.5 200 A3750.375 300 A2500.25 400 A1880.188 500 A1500.15 600 A1250.125 100 mV 100 A10001.0 200 A5000.5 300 A3330.333 500 A2000.2 1000 A1000.1"
+    },
+    {
+     "key": "ShuntLead",
+     "label": "Shunt Location",
+     "type": "select",
+     "group": "Measurement Sources",
+     "options": [
+      {
+       "value": 0,
+       "label": "Not set",
+       "disabled": true
+      },
+      {
+       "value": 1,
+       "label": "Negative lead"
+      },
+      {
+       "value": 2,
+       "label": "Positive lead"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "ShuntLead",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-batt-current",
+       "when": {
+        "any": [
+         {
+          "key": "BatteryShuntPresent",
+          "eq": 0
+         },
+         {
+          "key": "ShuntResistanceMicroOhm",
+          "le": 0
+         }
+        ]
+       },
+       "note": "Battery Shunt Present is Off, so the four rows that set up the shunt — Invert Battery Amps, Battery Current Offset, Shunt Resistance and Shunt Location — are greyed. Switch it to Yes to set them up."
+      }
+     ],
+     "help": "Which battery cable your shunt sits in. Negative lead: the Regulator Ground Wire lands on the shunt's load side, and the regulator removes the shunt's own voltage drop from its battery voltage reading. Positive lead: the Regulator Power Wire lands on the shunt's load side, and no correction is needed."
+    }
+   ]
+  },
+  {
+   "id": "charge_limit_follow",
+   "title": "Charge-Limit Follow",
+   "items": [
+    {
+     "key": "dvccEn",
+     "label": "Follow External Charge Limits",
+     "type": "toggle",
+     "group": "Charge-Limit Follow",
+     "options": [
+      {
+       "value": 0,
+       "label": "Disabled"
+      },
+      {
+       "value": 1,
+       "label": "Enabled"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "dvccEn",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Obey the charge voltage and current limits (CVL/CCL) a battery management system or gateway publishes on the NMEA 2000 port, or a Victron GX sends over WiFi (the coordination Victron calls DVCC). Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge. A new authority must send steady, plausible values for the settling time before its limits apply. If no limits ever arrive, or the sender goes silent, this regulator falls back to its own targets and a warning strip appears at the top of the dashboard. Charging is never left ungoverned, but the sender is not the backstop it would be while following. A current limit of 0 A is obeyed as \"stop charging,\" the battery's strongest command. While a lower external voltage limit is in control, the internal bulk/absorption/float progression pauses and resumes when the limit releases. Leave this off to watch the decoded limits below and confirm they match what your BMS or GX displays."
+    },
+    {
+     "key": "dvccSilenceS",
+     "label": "Silence Timeout",
+     "type": "number",
+     "group": "Charge-Limit Follow",
+     "min": 5,
+     "max": 600,
+     "step": 1,
+     "decimals": 0,
+     "unit": "s",
+     "echo": {
+      "stream": "CSV3",
+      "field": "dvccSilenceS",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On. With a Victron GX, VE.Can and WiFi each time out on their own, and follow stops only when both are silent."
+    }
+   ]
+  },
+  {
+   "id": "temperature",
+   "title": "Temperature",
+   "items": [
+    {
+     "key": "@probes",
+     "label": "",
+     "type": "info",
+     "group": "Temperature Sensors",
+     "arm": true,
+     "widget": "probes",
+     "source": "tempSensors",
+     "headings": [
+      "Serial",
+      "Temp",
+      "Age",
+      "Role"
+     ],
+     "strings": {
+      "OW_ROLE_NAMES": [
+       "Alternator",
+       "Battery",
+       "Extra"
+      ],
+      "OW_ASSIGN_PARAM": [
+       "owAssignAlt",
+       "owAssignBatt",
+       "owAssignExtra"
+      ]
+     },
+     "help": "Warm one probe by hand to identify it; its reading rises within a few seconds."
+    },
+    {
+     "key": "owScan",
+     "label": "Scan",
+     "type": "action",
+     "group": "Temperature Sensors",
+     "arm": true,
+     "buttonText": "Scan",
+     "help": ""
+    },
+    {
+     "key": "battTempProbeEnable",
+     "label": "Battery temperature probe",
+     "type": "toggle",
+     "group": "Temperature Sensors",
+     "options": [
+      {
+       "value": 0,
+       "label": "OFF"
+      },
+      {
+       "value": 1,
+       "label": "ON"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "battTempProbeEnable",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "On: the probe assigned the Battery role supplies the battery temperature used by the cold-charge and hot-charge lockouts, the voltage-loop gain derate and the NMEA 2000 battery status message. Off: the Battery probe is still read for the table above but is not used as a battery temperature source."
+    },
+    {
+     "key": "extraTempProbeEnable",
+     "label": "Extra temperature probe",
+     "type": "toggle",
+     "group": "Temperature Sensors",
+     "options": [
+      {
+       "value": 0,
+       "label": "OFF"
+      },
+      {
+       "value": 1,
+       "label": "ON"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "extraTempProbeEnable",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "On: the probe assigned the Extra role is shown as Extra Temperature on Live Data, can raise the high and low alarms under Setup → Alarms → Temperature Alarms, and can be transmitted on NMEA 2000. Off: the Extra probe is still read for the table above but is not reported anywhere else."
+    }
+   ]
+  },
+  {
+   "id": "solar",
+   "title": "Solar",
+   "items": [
+    {
+     "key": "weatherModeEnabled",
+     "label": "Defer to Solar",
+     "type": "toggle",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "weatherModeEnabled",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Saves fuel, emissions, and alternator wear when solar forecast is optimistic for at least 2 of the next 3 days in your GPS location. Useful for solar-dominant systems."
+    },
+    {
+     "key": "gpsManual",
+     "label": "Override manually",
+     "type": "table",
+     "group": "GPS Location",
+     "arm": true,
+     "buttonText": "Set Manual",
+     "tableId": "gpsManual",
+     "rows": 1,
+     "columns": [
+      {
+       "label": "Latitude",
+       "type": "number",
+       "min": -90,
+       "max": 90,
+       "step": 1e-06,
+       "decimals": 6,
+       "echo": {
+        "stream": "CSV2",
+        "field": "LatitudeNMEA",
+        "scale": 1000000
+       },
+       "send": {
+        "scale": 1,
+        "integer": false
+       },
+       "help": "",
+       "keyPattern": "LatitudeNMEA"
+      },
+      {
+       "label": "Longitude",
+       "type": "number",
+       "min": -180,
+       "max": 180,
+       "step": 1e-06,
+       "decimals": 6,
+       "echo": {
+        "stream": "CSV2",
+        "field": "LongitudeNMEA",
+        "scale": 1000000
+       },
+       "send": {
+        "scale": 1,
+        "integer": false
+       },
+       "help": "",
+       "keyPattern": "LongitudeNMEA"
+      }
+     ],
+     "include": [],
+     "help": ""
+    },
+    {
+     "key": "clearGpsManual",
+     "label": "Use automatic GPS",
+     "type": "action",
+     "group": "GPS Location",
+     "arm": true,
+     "buttonText": "Use automatic GPS",
+     "help": ""
+    },
+    {
+     "key": "TriggerWeatherUpdate",
+     "label": "Update Weather Now",
+     "type": "action",
+     "group": "Solar Forecast",
+     "arm": true,
+     "buttonText": "Update Weather Now",
+     "help": ""
+    },
+    {
+     "key": "SolarWatts",
+     "label": "Nominal Solar Array Power",
+     "type": "number",
+     "group": "Configuration",
+     "min": 0,
+     "max": 999999999,
+     "step": 1,
+     "decimals": 0,
+     "unit": "W",
+     "echo": {
+      "stream": "CSV3",
+      "field": "SolarWatts",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "System-rated solar capacity, e.g. 600 for two 300W panels"
+    },
+    {
+     "key": "performanceRatio",
+     "label": "Solar Performance Ratio",
+     "type": "number",
+     "group": "Configuration",
+     "min": 0,
+     "max": 99,
+     "step": 0.01,
+     "decimals": 2,
+     "echo": {
+      "stream": "CSV3",
+      "field": "performanceRatio",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Fraction of nameplate output the array really delivers after tilt, shading, temperature and charger losses. Learned from the ledger automatically while Learn Performance Ratio is on; a value typed here restarts the learning from that point."
+    },
+    {
+     "key": "UVThresholdHigh",
+     "label": "High Solar Threshold",
+     "type": "number",
+     "group": "Configuration",
+     "min": 0,
+     "max": 9999,
+     "step": 0.01,
+     "decimals": 2,
+     "unit": "kWh",
+     "echo": {
+      "stream": "CSV3",
+      "field": "UVThresholdHigh",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Forecast harvest a day must exceed to count as sunny; at least 2 of the next 3 days must clear it to pause the alternator. Decides alone when Size Threshold from Consumption is off, and stands in until the ledger has consumption history."
+    },
+    {
+     "key": "solarUseConsEnable",
+     "label": "Size Threshold from Consumption",
+     "type": "toggle",
+     "group": "Configuration",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "solarUseConsEnable",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "On: a day counts as sunny enough when its forecast harvest covers the consumption predicted from the ledger plus the margin below; until that history exists the High Solar Threshold stands in. Off: the High Solar Threshold alone decides."
+    },
+    {
+     "key": "solarConsMarginPct",
+     "label": "Consumption Margin",
+     "type": "number",
+     "group": "Configuration",
+     "min": 0,
+     "max": 500,
+     "step": 1,
+     "decimals": 0,
+     "unit": "%",
+     "echo": {
+      "stream": "CSV3",
+      "field": "solarConsMarginPct",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "Headroom added to the predicted consumption before a day counts as covered by solar. Larger values pause the alternator less readily."
+    },
+    {
+     "key": "solarLearnEnable",
+     "label": "Learn Performance Ratio",
+     "type": "toggle",
+     "group": "Configuration",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "solarLearnEnable",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "On: each complete day with a forecast and a VE.Direct link nudges the performance ratio toward what the panels actually delivered, so the forecast fits this array. Off: the ratio stays at the value entered above."
+    },
+    {
+     "key": "solarLearnRatePct",
+     "label": "Learning Rate",
+     "type": "number",
+     "group": "Configuration",
+     "min": 0,
+     "max": 50,
+     "step": 1,
+     "decimals": 0,
+     "unit": "% per day",
+     "echo": {
+      "stream": "CSV3",
+      "field": "solarLearnRatePct",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": "How far one day's result moves the performance ratio. Small values ride out a single cloudy day; large values track a real change, such as new shade or a cleaned array, within a few days."
+    }
+   ]
+  },
+  {
+   "id": "alarms",
+   "title": "Alarms",
+   "items": [
+    {
+     "key": "AlarmActivate",
+     "label": "Alarm Enable",
+     "type": "toggle",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "AlarmActivate",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "GeneralFaultAlarm",
+     "label": "Alarm on General Fault Condition",
+     "type": "toggle",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "GeneralFaultAlarm",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "Sounds the alarm for faults that have no threshold of their own: a required sensor that stops reading (alternator temperature, engine speed, alternator current, either battery voltage, battery temperature), a battery current shunt or VE.Direct feed that goes quiet, a lost ADS1115 or INA228 chip, a stalled temperature task, and the INA228 hardware over-voltage trip. Off limits the alarm to the thresholds set on this page and to the cold and hot charge lockouts. The header line names the fault either way, and Silence mutes the buzzer for the fault that is sounding."
+    },
+    {
+     "key": "TempAlarm",
+     "label": "High Temp Alarm",
+     "type": "number",
+     "group": "Temperature Alarms",
+     "min": 0,
+     "max": 350,
+     "step": 1,
+     "decimals": 0,
+     "unit": "°F",
+     "temp": "abs",
+     "zeroOff": "Off",
+     "echo": {
+      "stream": "CSV3",
+      "field": "TempAlarm",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "TempAlarmLow",
+     "label": "Low Temp Alarm",
+     "type": "number",
+     "group": "Temperature Alarms",
+     "min": 0,
+     "max": 350,
+     "step": 1,
+     "decimals": 0,
+     "unit": "°F",
+     "temp": "abs",
+     "zeroOff": "Off",
+     "echo": {
+      "stream": "CSV3",
+      "field": "TempAlarmLow",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "extraTempAlarmHiEnable",
+     "label": "High Alarm",
+     "type": "toggle",
+     "group": "Temperature Alarms",
+     "options": [
+      {
+       "value": 0,
+       "label": "OFF"
+      },
+      {
+       "value": 1,
+       "label": "ON"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "extraTempAlarmHiEnable",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-extra-temp",
+       "when": {
+        "key": "extraTempProbeEnable",
+        "eq": 0
+       },
+       "note": "The Extra temperature probe is off, so these alarms cannot fire. Turn it on under Setup → Temperature → Temperature Sensors, and assign a probe the Extra role."
+      }
+     ],
+     "help": "On: the alarm sounds whenever the Extra probe reads above the High Alarm threshold below, provided alarms are enabled. Off: no high-temperature alarm from the Extra probe."
+    },
+    {
+     "key": "extraTempAlarmHiF",
+     "label": "High Alarm Threshold",
+     "type": "number",
+     "group": "Temperature Alarms",
+     "min": -40,
+     "max": 300,
+     "step": 1,
+     "decimals": 0,
+     "unit": "°F",
+     "temp": "abs",
+     "echo": {
+      "stream": "CSV3",
+      "field": "extraTempAlarmHiF",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-extra-temp",
+       "when": {
+        "key": "extraTempProbeEnable",
+        "eq": 0
+       },
+       "note": "The Extra temperature probe is off, so these alarms cannot fire. Turn it on under Setup → Temperature → Temperature Sensors, and assign a probe the Extra role."
+      }
+     ],
+     "help": "Extra-probe temperature above which the High Alarm sounds. Has no effect unless the High Alarm is On."
+    },
+    {
+     "key": "extraTempAlarmLoEnable",
+     "label": "Low Alarm",
+     "type": "toggle",
+     "group": "Temperature Alarms",
+     "options": [
+      {
+       "value": 0,
+       "label": "OFF"
+      },
+      {
+       "value": 1,
+       "label": "ON"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "extraTempAlarmLoEnable",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-extra-temp",
+       "when": {
+        "key": "extraTempProbeEnable",
+        "eq": 0
+       },
+       "note": "The Extra temperature probe is off, so these alarms cannot fire. Turn it on under Setup → Temperature → Temperature Sensors, and assign a probe the Extra role."
+      }
+     ],
+     "help": "On: the alarm sounds whenever the Extra probe reads below the Low Alarm threshold below, provided alarms are enabled. Off: no low-temperature alarm from the Extra probe."
+    },
+    {
+     "key": "extraTempAlarmLoF",
+     "label": "Low Alarm Threshold",
+     "type": "number",
+     "group": "Temperature Alarms",
+     "min": -40,
+     "max": 300,
+     "step": 1,
+     "decimals": 0,
+     "unit": "°F",
+     "temp": "abs",
+     "echo": {
+      "stream": "CSV3",
+      "field": "extraTempAlarmLoF",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-extra-temp",
+       "when": {
+        "key": "extraTempProbeEnable",
+        "eq": 0
+       },
+       "note": "The Extra temperature probe is off, so these alarms cannot fire. Turn it on under Setup → Temperature → Temperature Sensors, and assign a probe the Extra role."
+      }
+     ],
+     "help": "Extra-probe temperature below which the Low Alarm sounds. Has no effect unless the Low Alarm is On."
+    },
+    {
+     "key": "VoltageAlarmHigh",
+     "label": "High Voltage Alarm",
+     "type": "number",
+     "group": "Voltage & Charge Alarms",
+     "min": 0,
+     "max": 70,
+     "step": 0.01,
+     "decimals": 2,
+     "echo": {
+      "stream": "CSV3",
+      "field": "VoltageAlarmHigh",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "VoltageAlarmLow",
+     "label": "Low Voltage Alarm",
+     "type": "number",
+     "group": "Voltage & Charge Alarms",
+     "min": 0,
+     "max": 70,
+     "step": 0.01,
+     "decimals": 2,
+     "echo": {
+      "stream": "CSV3",
+      "field": "VoltageAlarmLow",
+      "scale": 100
+     },
+     "send": {
+      "scale": 1,
+      "integer": false
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "SocAlarmLow",
+     "label": "Low State of Charge Alarm",
+     "type": "number",
+     "group": "Voltage & Charge Alarms",
+     "min": 0,
+     "max": 100,
+     "step": 1,
+     "decimals": 0,
+     "unit": "%",
+     "echo": {
+      "stream": "CSV3",
+      "field": "SocAlarmLow",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-soc-src",
+       "when": {
+        "all": [
+         {
+          "any": [
+           {
+            "key": "BatteryShuntPresent",
+            "eq": 0
+           },
+           {
+            "key": "ShuntResistanceMicroOhm",
+            "le": 0
+           }
+          ]
+         },
+         {
+          "key": "BattMonSrc",
+          "eq": 0
+         }
+        ]
+       },
+       "note": "The Low State of Charge Alarm is greyed: state of charge needs a battery shunt wired to the regulator or a battery monitor set up under Setup → Integrations, and neither is present. The voltage alarms are unaffected."
+      }
+     ],
+     "help": "Sounds the alarm when the battery's state of charge falls below this percentage. Only active when the battery monitor's state of charge information is available. 0 disables."
+    },
+    {
+     "key": "CurrentAlarmHigh",
+     "label": "High Current Alarm (Alternator)",
+     "type": "number",
+     "group": "Current Alarms",
+     "min": 0,
+     "max": 1000,
+     "step": 1,
+     "decimals": 0,
+     "unit": "A",
+     "echo": {
+      "stream": "CSV3",
+      "field": "CurrentAlarmHigh",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "MaximumAllowedBatteryAmps",
+     "label": "High Current Alarm (Battery)",
+     "type": "number",
+     "group": "Current Alarms",
+     "min": 0,
+     "max": 1000,
+     "step": 1,
+     "decimals": 0,
+     "unit": "A",
+     "echo": {
+      "stream": "CSV3",
+      "field": "MaximumAllowedBatteryAmps",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "gates": [
+      {
+       "name": "no-batt-current",
+       "when": {
+        "any": [
+         {
+          "key": "BatteryShuntPresent",
+          "eq": 0
+         },
+         {
+          "key": "ShuntResistanceMicroOhm",
+          "le": 0
+         }
+        ]
+       },
+       "note": "The High Current Alarm (Battery) is greyed: no battery shunt is installed, so battery current is not measured. The alternator current alarm is unaffected. Setup → Battery → Measurement Sources → Battery Shunt Present."
+      }
+     ],
+     "help": "Alarm only — never reduces the field. Fires when battery current magnitude exceeds this value in either direction, so it catches heavy discharge as well as over-charge. Separate from the Group 4 Battery Charge Current Limit (which actively caps the command); set this alarm above that limit so a correctly limited charge doesn't alarm. 0 disables."
+    },
+    {
+     "key": "AlarmLatchEnabled",
+     "label": "Alarm Latch Mode",
+     "type": "select",
+     "group": "Alarm Controls",
+     "options": [
+      {
+       "value": 0,
+       "label": "Momentary"
+      },
+      {
+       "value": 1,
+       "label": "Latched"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "AlarmLatchEnabled",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": ""
+    },
+    {
+     "key": "AlarmTest",
+     "label": "Alarm Test",
+     "type": "action",
+     "group": "Alarm Controls",
+     "options": [
+      {
+       "value": 0,
+       "label": "---"
+      },
+      {
+       "value": 1,
+       "label": "Active"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "AlarmTest",
+      "scale": 1
+     },
+     "arm": true,
+     "buttonText": "Test Buzzer (2s)",
+     "help": ""
+    },
+    {
+     "key": "ResetAlarmLatch",
+     "label": "Reset Alarm Latch",
+     "type": "action",
+     "group": "Alarm Controls",
+     "arm": true,
+     "buttonText": "Reset Latch",
+     "help": ""
+    },
+    {
+     "key": "SilenceAlarm",
+     "label": "Silence Alarm",
+     "type": "action",
+     "group": "Alarm Controls",
+     "arm": false,
+     "buttonText": "Silence",
+     "help": ""
+    }
+   ]
+  },
+  {
+   "id": "bench_and_development",
+   "title": "Bench and Development",
+   "items": [
+    {
+     "key": "hardwarePresent",
+     "label": "Hardware Present?",
+     "type": "toggle",
+     "group": "Bench and Development",
+     "options": [
+      {
+       "value": 0,
+       "label": "No"
+      },
+      {
+       "value": 1,
+       "label": "Yes"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "hardwarePresent",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "No starts demo mode and switches the field off. A simulated boat drives every reading, and once you switch the field on, its output follows those readings. Nothing is saved or uploaded, and any setting you change lasts only until you switch back to Yes, which brings back the real readings, records, and settings. The field then stays off until you switch it on."
+    }
+   ]
+  }
+ ]
+}

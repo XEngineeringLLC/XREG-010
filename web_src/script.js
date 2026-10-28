@@ -338,6 +338,126 @@ window.vesselInfo = null; // Cache for vessel data
 let DEMO_MODE = false;
 let demoInterval = null;
 
+// ===== Regulator demo mode: CSV3 hardwarePresent 0 (9_demo.ino) =====
+// Unrelated to DEMO_MODE above (the app with no regulator at all): here a real regulator simulates the boat and refuses
+// the owner actions listed below with HTTP 423.
+let g_regDemo = false;
+let g_regDemoBackfilled = false;
+const REG_DEMO_TEXT = 'Not available in demo mode. Set Hardware Present to Yes to use it.';
+// The native-form subset of demoParamDenied (9_demo.ino): those posts land in an iframe the app cannot read back. fetch() paths need no list (423 below)
+const REG_DEMO_REFUSED = new Set(['UpdateToVersion', 'commissionStart', 'startSystemID', 'startTuningSweep', 'restartCVTest',
+    'startFieldCurve', 'startKneeSweep', 'chcStart', 'cvPlantFitStart', 'fieldCutStart', 'cvStressStart', 'ResetAlternatorHealth',
+    'ResetBoatPerformance', 'RPMScalingFactor', 'AltZeroCaptureNow', 'altZeroApply', 'ResetDynamicAltZero', 'LatitudeNMEA',
+    'LongitudeNMEA', 'clearGpsManual', 'BatteryHealthTest', 'bhStartOver', 'bhClearHistory', 'capClearPoints', 'ZeroIMU',
+    'ClearIMUZero', 'FastAltClearMatrix', 'FastAltRebaseline', 'ResetRipplePeaks', 'ResetKneeLearn', 'ResetZeroLog',
+    'ClearOverheatHistory', 'ResetLearningTable', 'RebootRegulator', 'forceCloudFlush', 'protTestStart', 'CVTuningMode', 'TuningMode',
+    'ResetSolarLedger', 'ClearBuffer', 'testProtectionsEnabled']);
+// True when a form would post a refused parameter: stop values (0) of the test switches and re-enabling protections pass
+function regDemoFormRefused(f) {
+    if (!g_regDemo || !f || !f.elements) return false;
+    for (const el of f.elements) {
+        if (!el.name || !REG_DEMO_REFUSED.has(el.name)) continue;
+        if ((el.name === 'CVTuningMode' || el.name === 'TuningMode' || el.name === 'protTestStart') && Number(el.value) === 0) continue;
+        if (el.name === 'testProtectionsEnabled' && Number(el.value) !== 0) continue;
+        return true;
+    }
+    return false;
+}
+function regDemoOnCsv3(data) {
+    const on = Number(data.hardwarePresent) === 0;
+    if (on && !g_regDemo) g_regDemoBackfilled = false;
+    g_regDemo = on;
+    const exp = document.getElementById('exportConfigBtn');   // Export Config: refused in demo (the settings in RAM are the demo's)
+    if (exp) exp.disabled = on;
+    if (on && !g_regDemoBackfilled) { g_regDemoBackfilled = true; setTrackedTimeout(regDemoBackfill, 1500); }
+}
+// One notice per refusal however many layers saw it (fetch wrapper, cxGet, the optimistic writers)
+let _regDemoNoticeMs = 0;
+function regDemoNotice(text) {
+    if (Date.now() - _regDemoNoticeMs < 2000) return;
+    _regDemoNoticeMs = Date.now();
+    xAlert(text || REG_DEMO_TEXT);
+}
+function regDemoRefusal(e) { return !!(e && String(e.message || e).indexOf('423') !== -1); }
+(function () {
+    const realFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        return realFetch(input, init).then(r => {
+            if (r.status === 423) r.clone().text().then(t => regDemoNotice(t)).catch(() => regDemoNotice());
+            return r;
+        });
+    };
+    // Native <form target="hidden-form"> posts land in an iframe the app never reads, so stop the refused ones here.
+    // form.submit() fires no submit event, so it is checked separately.
+    window.addEventListener('submit', function (e) {
+        if (!regDemoFormRefused(e.target)) return;
+        e.preventDefault(); e.stopImmediatePropagation();
+        regDemoNotice();
+    }, true);
+    const realFormSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function () {
+        if (regDemoFormRefused(this)) { regDemoNotice(); return; }
+        return realFormSubmit.call(this);
+    };
+})();
+// Fills the Short Term plots and the wind trend with the regulator's last 5 min / 60 min, so a page opened mid-demo is
+// not empty. /demoBackfill answers only in demo mode (contract: claude_docs/firmware-internals.md, "Demo mode").
+async function regDemoBackfill() {
+    if (!g_regDemo) return;
+    let j;
+    try {
+        const r = await fetchWithTimeout(buildURL('/demoBackfill'), {}, 8000);
+        if (!r.ok) { g_regDemoBackfilled = false; return; }
+        j = await r.json();
+    } catch (e) { g_regDemoBackfilled = false; return; }
+    try { regDemoFillShort(j.short); } catch (e) { console.warn('demo backfill (short term):', e); }
+    try { regDemoFillWind(j.wind); } catch (e) { console.warn('demo backfill (wind):', e); }
+}
+function regDemoFillShort(sh) {
+    if (!sh || !Array.isArray(sh.rows) || !currentTempData || !currentTempData[1]) return;
+    const col = {}; sh.cols.forEach((c, i) => { col[c] = i; });
+    const L = currentTempData[1].length;
+    const intervalSec = (window._lastKnownInterval || 200) / 1000;
+    const nowS = Date.now() / 1000;
+    const rows = sh.rows, t0 = sh.t0, dt = sh.dt || 1;
+    // Fill only slots that never received a live frame (still null), oldest-first, so live data is never overwritten
+    for (let i = 0; i < L; i++) {
+        if (currentTempData[2][i] !== null) continue;
+        const tSlot = nowS - (L - 1 - i) * intervalSec;
+        const k = Math.floor((tSlot - t0) / dt);
+        if (k < 0 || k >= rows.length) continue;
+        const r = rows[k], g = n => (col[n] === undefined ? null : r[col[n]]);
+        const pct = g('dutyCycle');
+        currentTempData[1][i] = g('Bcur'); currentTempData[2][i] = g('MeasuredAmps'); currentTempData[3][i] = g('iiout');
+        currentTempData[4][i] = pct; currentTempData[5][i] = g('pidAltPV');
+        voltageData[1][i] = g('BatteryV'); voltageData[2][i] = g('IBV'); voltageData[3][i] = pct;
+        rpmData[1][i] = g('RPM'); rpmData[2][i] = pct;
+        const tf = g('AlternatorTemperatureF');
+        temperatureData[1][i] = (tf === null) ? null : toDisplayTemp(tf); temperatureData[2][i] = pct;
+        if (protEventData.length === L) protEventData[i] = g('protEventMask') || 0;
+        if (modeStripData.length === L) modeStripData[i] = g('chargeStage') || 0;
+        if (useTimestamps) {
+            currentTempData[0][i] = voltageData[0][i] = rpmData[0][i] = temperatureData[0][i] = Math.floor(tSlot);
+        }
+    }
+    recomputeAutoScales(true);
+    ['current', 'voltage', 'rpm', 'temperature'].forEach(n => queuePlotUpdate(n));
+}
+function regDemoFillWind(w) {
+    if (!w || !Array.isArray(w.rows) || _windRing.ts.length > 12) return;   // a page that has banked a minute keeps its own
+    const col = {}; w.cols.forEach((c, i) => { col[c] = i; });
+    const dt = w.dt || 10;
+    _windRing = { ts: [], tDir: [], tSpd: [], aDir: [], aSpd: [] };
+    w.rows.forEach((r, k) => {
+        _windRing.ts.push((w.t0 + k * dt) * 1000);
+        _windRing.tSpd.push(r[col.TrueWindSpeedNMEA]); _windRing.tDir.push(r[col.TrueWindAngleNMEA]);
+        _windRing.aSpd.push(r[col.ApparentWindSpeedNMEA]); _windRing.aDir.push(r[col.ApparentWindAngleNMEA]);
+    });
+    _windLastSampleMs = Date.now();
+    const el = document.getElementById('windtrend-plot');
+    if (el && el.offsetParent !== null) windTrendRender();
+}
+
 //prevent EventSource Infinite Reconnection
 let sseReconnectAttempts = 0;
 const MAX_SSE_RECONNECTS = 10;
@@ -1000,7 +1120,7 @@ const CSV2_FIELDS = [
     "dvccState",                      // DVCC follow state: 0 off, 1 waiting, 2 settling, 3 following, 4 stale, 5 untrusted
     "dvccRxCvl",                      // last decoded charge-voltage limit (V ×100; -2000000000 = none)
     "dvccRxCcl",                      // last decoded charge-current limit (A ×10; -2000000000 = none)
-    "dvccRxSrcAddr",                  // authority bus address (255 = none yet)
+    "dvccRxSrcAddr",                  // authority bus address (255 = none yet, 254 = only the Victron WiFi carrier is fresh)
     "dvccUntrustReason",              // 0 none, 1 CVL out of window, 2 CCL implausible, 3 flapping
     "ft_dvcc_win", "ft_dvcc_ses",     // DVCC brain tick worst µs
     "ft_n2kParse_win", "ft_n2kParse_ses",  // NMEA2000.ParseMessages worst µs — RX drain, scales with bus traffic
@@ -1064,6 +1184,10 @@ const CSV2_FIELDS = [
     "n2kRxLost",               // frames our receive queue / FIFO lost since boot (load on us, never wiring; diagnostics only)
     "n2kNodesHeard",           // other nodes heard in the last 60 s
     "LargestPSRAMBlock",       // largest contiguous free PSRAM block, KB (sampled every 20 s with the field cut, held while charging)
+    "dvccRxCanCvl",            // Victron source, VE.Can carrier CVL (V x100); ts_DvccVeCan is its age
+    "dvccRxCanCcl",            // VE.Can carrier CCL (A x10), 0 under a stop-charging command
+    "dvccRxWifiCvl",           // WiFi carrier (/gxLimits from the GX app) CVL (V x100); ts_DvccWifi is its age
+    "dvccRxWifiCcl",           // WiFi carrier CCL (A x10)
     "sessionId",               // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
@@ -1131,6 +1255,7 @@ const CSV4_FIELDS = [
     "panelHiRateInput",           // switch panel HIGH/LOW opto input (Cable 3 pin 5): 1 = wire energized = switch on = asking for High. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything
     "panelForceFloatInput",       // switch panel FORCEFLOAT opto input (Cable 3 pin 7): 1 = wire energized = switch on = asking for Maintain. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything
     "VictronSoc",                 // VE.Direct battery monitor's own state of charge (% ×10; NaN when stale, unsynced or not a battery monitor)
+    "gxStreams",                  // connected Victron GX streams (/gxevents clients)
     "sessionId",                  // device boot identity, same in every channel this boot
     "sendMs",                     // device millis() when this payload was built
 ];
@@ -1622,7 +1747,6 @@ function updateAltHealth() {
   if (modeWrap && modeLbl) modeWrap.style.display = modeLbl.textContent ? '' : 'none';
   setSegEcho('altSource', ['alt-src-hist','alt-src-file'], altLive.source>=1?1:0);
   setSegEcho('altPaused', ['alt-learn-on','alt-learn-off'], altLive.paused>=1?1:0);
-  setSegEcho('altSimMode', ['alt-sim-off','alt-sim-on'], altLive.sim>=1?1:0);   // simulator segmented toggle in Setup (mirrors Vessel Performance)
 }
 
 // Write path for echo-only controls on Charging System Health + Vessel Performance: paint optimistically;
@@ -1634,10 +1758,10 @@ function optimisticEchoWrite(key, desired, query, what, paint, repaint){
   paint(desired);
   fetchWithTimeout(buildURL('/get?'+query),{},5000)
     .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); })
-    .catch(()=>{
+    .catch(e=>{
       pendingToggles.delete(key);
       repaint();
-      xAlert('Could not reach the regulator — ' + what + ' was NOT changed.');
+      if (!regDemoRefusal(e)) xAlert('Could not reach the regulator — ' + what + ' was NOT changed.');
     });
 }
 // Echo-side gate: returns the echoed value to paint, or null while a stale (pre-confirmation)
@@ -1659,13 +1783,7 @@ function echoSettingWrite(query, what){
   if(DEMO_MODE){ xAlert('Demo mode — no regulator is connected, so ' + what + ' cannot be changed.'); return; }
   fetchWithTimeout(buildURL('/get?'+query),{},5000)
     .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); })
-    .catch(()=>{ xAlert('Could not reach the regulator — ' + what + ' was NOT changed.'); });
-}
-// Simulator Off(0)/On(1) — segmented toggle in Setup, parallels Vessel Performance's perfSimMode.
-function altSetSim(v){
-  if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
-  optimisticEchoWrite('altSimMode', v?1:0, 'altSimMode='+(v?1:0), 'the simulator',
-                      i=>setSeg(['alt-sim-off','alt-sim-on'],i), updateAltHealth);
+    .catch(e=>{ if (!regDemoRefusal(e)) xAlert('Could not reach the regulator — ' + what + ' was NOT changed.'); });
 }
 // Reference Source: My History (0) | Uploaded File (1). INDEPENDENT of Pause. Selecting Uploaded
 // defaults Pause = ON firmware-side (spec §4.3); the user can flip Continue afterward. Only the
@@ -2258,8 +2376,9 @@ function downloadRippleBundle(){
 // Export (/exportConfig), import (/importConfig, reboots), submit to the cloud library (submit-config).
 // Every path carries the FULL config; the import diff checkboxes are the only place anything is held back.
 function exportConfigDownload(){
+  if(g_regDemo){ regDemoNotice(); return; }
   if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
-  fetchWithTimeout(buildURL('/exportConfig'),{},10000)
+  fetchWithTimeout(buildURL('/exportConfig?download=1'),{},10000)
     .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
     .then(async txt=>{
       // The equipment records (firmware /exportRecords) ride in the same file as a "records" section.
@@ -3213,13 +3332,12 @@ let _perfPlotPending = false, _perfModelLastFetch = 0;
 function fetchPerfSchema(){ return fetch(buildURL('/perfschema')).then(r=>r.json()).then(j=>{ perfSchema=j; }).catch(()=>{}); }
 
 // Names for the failure message; a key with no entry falls back to a generic phrase.
-const PERF_SET_LABEL = { perfFoldSymmetric:'polar symmetry', perfSimMode:'the simulator',
+const PERF_SET_LABEL = { perfFoldSymmetric:'polar symmetry',
                          perfSpeedSrc:'the speed source', perfSource:'the reference source',
                          perfPaused:'learning' };
 // Optimistic-paint config per control. idx maps the written value onto the SAME 0/1 the echo
 // painter computes — the two must stay in lockstep or echoReconcile never confirms.
 const PERF_OPTIMISTIC = {
-  perfSimMode:      { idx:v=>v?1:0,      paint:i=>setSeg(['perf-sim-off','perf-sim-on'],i), repaint:renderPerf },
   perfSource:       { idx:v=>v>=1?1:0,   paint:i=>setSeg(['perf-ref-0','perf-ref-1'],i),    repaint:renderPerf },
   perfSpeedSrc:     { idx:v=>v>=1.5?1:0, paint:i=>setSeg(['perf-src-1','perf-src-2'],i),    repaint:updatePerfControls },
   perfFoldSymmetric:{ idx:v=>v>=0.5?0:1, paint:i=>setSeg(['perf-sym-1','perf-sym-0'],i),    repaint:updatePerfControls },
@@ -3347,7 +3465,6 @@ function renderPerf(){
   // in-flight optimistic click isn't reverted by a stale echo.
   const pv = echoReconcile('perfPaused', perfLive.paused===1?1:0);
   if (pv !== null) paintPerfLearnSwitch(pv);
-  setSegEcho('perfSimMode', ['perf-sim-off','perf-sim-on'], perfLive.sim===1?1:0);
   setSegEcho('perfSource', ['perf-ref-0','perf-ref-1'], (L.source>=1)?1:0);
 }
 // Learning switch + label painter, shared by the echo path and the optimistic write path (0/1, 1 = paused).
@@ -3967,7 +4084,7 @@ const CSV3_FIELDS = [
     "n2kConvStatEnable",
     "n2kRxBattInstance",  // battery instance to ingest (127508/127506 receive)
     "dvccEn",  // DVCC follow master (0/1)
-    "dvccSrcType",  // authority dialect: 0 Victron VE.Can (VREG), 1 RV-C
+    "dvccSrcType",  // limit source: 0 Victron GX (VE.Can and WiFi carriers), 1 RV-C
     "dvccInst",  // RV-C DC instance filter (0 = any)
     "dvccSilenceS",  // silence timeout (s)
     "dvccSettleS",  // settling time (s)
@@ -4079,6 +4196,8 @@ const TS_FIELDS = [
     "ts_VeBattTemp",
     "ts_RvcBattTemp",
     "ts_DieTemp",     // age of the last valid INA228 die-temperature sample (999999 = never)
+    "ts_DvccVeCan",   // Victron charge limits, VE.Can carrier (999999 = never)
+    "ts_DvccWifi",    // Victron charge limits, WiFi carrier (999999 = never)
     "ts_sessionId",   // device boot identity, same in every channel this boot
     "ts_sendMs",      // device millis() when this payload was built — every other TS field is an age measured at that instant
 ];
@@ -4428,6 +4547,7 @@ function applyConnectedIdentity(hit) {
     if (typeof hit.pwreq === 'boolean') g_pwRequired = hit.pwreq;
     renderBoatCard();
     renderAccessCard();
+    renderGxCard();
     syncWriteUidInputs();
 }
 
@@ -6945,6 +7065,7 @@ function displayAvailableVersions() {
 }
 
 function confirmUpdate(form, version) {
+    if (g_regDemo) { xAlert(REG_DEMO_TEXT); return; }
     xConfirm(`ALTERNATOR WILL BE AUTOMATICALLY DISABLED FOR SAFETY\n\nUpdate process takes 2-3 minutes. Do not interfere with auto-reboots. When finished, the web interface will be accessible in the usual way, but you must HARD-REFRESH your browser (Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows/Linux) to load the new web files — otherwise your browser will keep showing the old cached UI. The Software Update sub-tab in Cloud Features will then confirm the new version.\n\nIf process fails, you may try again with better internet. If the whole thing bricks, you may always start fresh with the factory golden image (connect FactoryReset wire, pin 9 in RJ3, Orange/White to GND), which will never force updates.\n\nWhether the update completes or fails, Alternator Enable returns to the setting it had before the update.`).then(confirmed => {
         if (!confirmed) return;
         // UpdateToVersion is arm-gated in firmware (a replayed URL must never reboot the device); the
@@ -7485,6 +7606,7 @@ function enableAllInputs() {
 }
 
 async function triggerForcedUpdate(versionStr) {
+    if (g_regDemo) { xAlert(REG_DEMO_TEXT); return; }
     const confirmed = await xConfirm('The update begins about 7 seconds after you press OK and takes 2-3 minutes, including automatic reboots. Do not power-cycle the device or leave this page while it runs. When it finishes, hard-refresh this page (Cmd+Shift+R, or Ctrl+Shift+R on Windows) or it will keep showing the old cached interface. If it fails, retry on a stronger connection.', { title: 'Update firmware to ' + versionStr + '?', okText: 'OK', cancelText: 'Cancel' });
     if (confirmed) {
         // UpdateToVersion is arm-gated in firmware; the OK click above is the acknowledgment,
@@ -8626,7 +8748,7 @@ function updateAllEchosOptimized(data) {
         { key: 'VeData', id: 'integStateVe', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'NMEA0183Data', id: 'integStateN183', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'dvccEn', id: 'dvccEn_echo', transform: v => v == 1 ? 'Enabled' : 'Disabled' },
-        { key: 'dvccSrcType', id: 'dvccSrcType_echo', transform: v => v == 1 ? 'RV-C' : 'Victron VE.Can' },
+        { key: 'dvccSrcType', id: 'dvccSrcType_echo', transform: v => v == 1 ? 'RV-C' : 'Victron GX' },
         { key: 'dvccSrcType', id: 'vicSel_echo', transform: v => v == 0 ? 'in use' : 'not in use' },
         { key: 'dvccSrcType', id: 'rvcSel_echo', transform: v => v == 1 ? 'in use' : 'not in use' },
         { key: 'dvccInst', id: 'dvccInst_echo', transform: v => v == 0 ? 'Any' : v },
@@ -14188,7 +14310,7 @@ function broadcastThemeToCloudIframes() {
 // ============================================
 // CLOUD FEATURES - Leaderboards
 async function loadLeaderboardsInIframe() {
-    if (DEMO_MODE) { demoFillCloudPanes(); return; }   // static mockup; iframe needs a device token
+    if (DEMO_MODE || g_regDemo) { demoFillCloudPanes(); return; }   // static mockup; iframe needs a device token (regulator demo mode: no cloud)
     const statusEl = document.getElementById('leaderboards-status');
     const iframe = document.getElementById('leaderboards-iframe');
 
@@ -14222,7 +14344,7 @@ async function loadLeaderboardsInIframe() {
 // ===== CLOUD FEATURES - Fleet Stats =====
 
 async function loadFleetStatsInIframe() {
-    if (DEMO_MODE) { demoFillCloudPanes(); return; }
+    if (DEMO_MODE || g_regDemo) { demoFillCloudPanes(); return; }
     const statusEl = document.getElementById('fleetstats-status');
     const iframe = document.getElementById('fleetstats-iframe');
 
@@ -14247,7 +14369,7 @@ async function loadFleetStatsInIframe() {
 // CLOUD FEATURES - Config Sharing
 // The device token lets the page offer "load onto my regulator" (relayed by _configShareHandleMessage).
 async function loadConfigSharingInIframe() {
-    if (DEMO_MODE) { demoFillCloudPanes(); return; }
+    if (DEMO_MODE || g_regDemo) { demoFillCloudPanes(); return; }
     const statusEl = document.getElementById('configsharing-status');
     const iframe = document.getElementById('configsharing-iframe');
     if (statusEl) statusEl.textContent = 'Loading shared configurations...';
@@ -16207,6 +16329,57 @@ async function passwordOff() {
     } else {
         xAlert('The regulator did not turn the password off' + (r ? ' (HTTP ' + r.status + ')' : ': no answer') + '.', 'Settings password');
     }
+}
+
+// ── Victron GX (Setup > System) ──────────────────────────────────────────────────────
+// GET /gxStatus: the GX streams connected now. A GX write carries gx=1 and skips Unlock Controls, so it neither needs
+// nor changes this page's unlock.
+let g_gxState = null;
+let g_gxLastStreams = null;
+let g_gxFetch = null;
+
+function gxSpanText(s) {
+    if (s < 90) return Math.round(s) + ' s';
+    if (s < 5400) return Math.round(s / 60) + ' min';
+    if (s < 172800) return (s / 3600).toFixed(1) + ' h';
+    return Math.round(s / 86400) + ' days';
+}
+
+async function gxFetchState() {
+    if (DEMO_MODE) return null;
+    if (!g_gxFetch) {
+        g_gxFetch = (async () => {
+            try {
+                const r = await fetchWithTimeout(buildURL('/gxStatus'), {}, 6000);
+                if (!r.ok) return null;
+                const j = await r.json();
+                return (j && Array.isArray(j.streams)) ? j : null;
+            } catch (e) { return null; }
+        })().finally(() => { g_gxFetch = null; });
+    }
+    const st = await g_gxFetch;
+    if (st) g_gxState = st;
+    return st;
+}
+
+async function renderGxCard() {
+    if (!document.getElementById('gxCard')) return;
+    await gxFetchState();
+    const linkOut = document.getElementById('gxLinkOut');
+    if (!linkOut) return;
+    const streams = g_gxState ? g_gxState.streams : null;
+    if (!streams) { linkOut.textContent = '—'; return; }
+    linkOut.textContent = streams.length
+        ? 'Connected ' + streams.map(x => 'from ' + x.ip + ' for ' + gxSpanText(Number(x.upS) || 0)).join('; ')
+        : 'Not connected';
+}
+
+// CSV4 at 2 Hz: a change in the GX stream count refreshes the card.
+function gxOnCsv4(streams) {
+    if (!Number.isFinite(streams) || DEMO_MODE) return;
+    const changed = streams !== g_gxLastStreams;
+    g_gxLastStreams = streams;
+    if (changed) renderGxCard();
 }
 
 // ── Regulators on this boat (Setup > System) ──────────────────────────────────────────
@@ -19580,15 +19753,24 @@ window.addEventListener("load", function () {
                 set2('dvccCvl_ID', num(data.dvccRxCvl, 100, 2, ' V'));
                 set2('dvccCcl_ID', num(data.dvccRxCcl, 10, 1, ' A'));
                 const src = Number(data.dvccRxSrcAddr);
+                const ages = window.sensorAges || {};
+                const age = Number(ages.dvcc ?? 999999);
+                const canAge = Number(ages.dvccVeCan ?? 999999);
+                const wifiAge = Number(ages.dvccWifi ?? 999999);
+                const wifiFresh = wifiAge <= 20000;
+                // Read the firmware echo, not the <select> (may be mid-edit); '' until the echo arrives.
+                const srcTxt = (document.getElementById('dvccSrcType_echo') || {}).textContent || '';
+                const isRvc = srcTxt.indexOf('RV-C') >= 0;
                 // Identity of the publisher, collected passively from PGN 60928 / 126996. Often
                 // absent (nothing can be requested with transmit off), so every part is optional.
                 const authMfg = Number(data.dvccAuthMfg || 0);
                 const authProd = Number(data.dvccAuthProd || 0);
                 const authWho = authMfg === 358 ? 'Victron' : authMfg === 2046 ? 'open mfr code' : authMfg > 0 ? 'mfr ' + authMfg : '';
                 const authTxt = 'addr ' + src + (authWho ? ' \u00b7 ' + authWho : '') + (authProd ? ' \u00b7 product ' + authProd : '');
-                set2('dvccSrc_ID', (src === 255 || !isFinite(src)) ? '—' : authTxt);
-                const ages = window.sensorAges || {};
-                const age = Number(ages.dvcc ?? 999999);
+                // 254 = only the Victron WiFi carrier is fresh; with both fresh the VE.Can sender is named and WiFi appended.
+                set2('dvccSrc_ID', (src === 255 || !isFinite(src)) ? '—'
+                    : src === 254 ? 'Victron GX over WiFi'
+                    : authTxt + (!isRvc && wifiFresh ? ' + WiFi' : ''));
                 const op = (age > 20000) ? '0.5' : '';
                 if (row) row.style.opacity = op;
                 if (card) card.style.opacity = op;
@@ -19596,44 +19778,79 @@ window.addEventListener("load", function () {
                 const rst = document.getElementById('dvccReset_row');
                 if (rst) rst.classList.toggle('is-gated', st !== 5);
 
-                // Per-dialect cards: only the selected dialect is decoded. Read the firmware echo, not the <select>
-                // (may be mid-edit); leave both cards untouched until the echo arrives.
-                const srcTxt = (document.getElementById('dvccSrcType_echo') || {}).textContent || '';
+                // Per-source cards: only the selected source is followed. Leave both cards untouched until the echo arrives.
                 if (!/RV-C|Victron/.test(srcTxt)) return;
-                const isRvc = srcTxt.indexOf('RV-C') >= 0;
-                setText('li_dvccDialect_ID', isRvc ? 'RV-C' : 'Victron VE.Can');
-                // Nothing is decoded unless ParseMessages runs: receive toggle OR the follow master
+                setText('li_dvccDialect_ID', isRvc ? 'RV-C' : 'Victron GX');
+                // Nothing is decoded off CAN unless ParseMessages runs: receive toggle OR the follow master. WiFi needs neither.
                 const portOn = ((document.getElementById('NMEA2KData_echo') || {}).textContent === 'Enabled') ||
                                ((document.getElementById('dvccEn_echo') || {}).textContent === 'Enabled');
+                const canOffWord = 'CAN receive off';
+                const canOffDetail = 'turn on Receive NMEA2K Data (NMEA 2000 card) or Follow External Charge Limits below';
+                const secsOf = a => Math.round(a / 1000);
+                const vTxt = v => Number.isFinite(Number(v)) ? (Number(v) / 100).toFixed(2) + ' V' : '';
+                const aTxt = v => Number.isFinite(Number(v)) ? (Number(v) / 10).toFixed(1) + ' A' : '';
+                const limTxt = (v, a) => [vTxt(v), aTxt(a)].filter(Boolean).join(' \u00b7 ') || 'no limits sent';
+                // RV-C: one carrier, judged on the merged stream.
                 const everHeard = isFinite(src) && src !== 255;
                 const fresh = everHeard && age <= 20000;
-                const secs = Math.round(age / 1000);
                 let hWord, hDetail;
                 if (!portOn) {
-                    hWord = 'CAN receive off';
-                    hDetail = 'turn on Receive NMEA2K Data (NMEA 2000 card) or Follow External Charge Limits below';
+                    hWord = canOffWord;
+                    hDetail = canOffDetail;
                 } else if (!everHeard) {
                     hWord = 'none heard';
                     hDetail = 'nothing decoded yet';
                 } else if (!fresh) {
                     hWord = 'silent';
-                    hDetail = 'last decoded ' + secs + ' s ago, from addr ' + src;
+                    hDetail = 'last decoded ' + secsOf(age) + ' s ago, from addr ' + src;
                 } else {
                     hWord = 'heard';
-                    hDetail = 'addr ' + src + ' \u00b7 ' + secs + ' s ago';
+                    hDetail = 'addr ' + src + ' \u00b7 ' + secsOf(age) + ' s ago';
                 }
-                const chip = !portOn ? 'source \u00b7 receive off' : (fresh ? 'source \u00b7 heard' : 'source \u00b7 no data');
-                const idleDetail = 'not decoded \u2014 ' + (isRvc ? 'RV-C' : 'Victron VE.Can') + ' is the selected source';
-                setText('integStateVic', isRvc ? 'not selected' : chip);
-                setText('integStateRvc', isRvc ? chip : 'not selected');
-                setText('vicHeardWord_ID', isRvc ? 'idle' : hWord);
+                // Victron: each carrier on its own age (999999 = never). The values are each carrier's own, before the merge.
+                let cWord, cDetail;
+                if (!portOn) {
+                    cWord = canOffWord;
+                    cDetail = canOffDetail;
+                } else if (canAge === 999999) {
+                    cWord = 'none heard';
+                    cDetail = 'nothing received yet';
+                } else if (canAge > 20000) {
+                    cWord = 'silent';
+                    cDetail = 'last received ' + secsOf(canAge) + ' s ago';
+                } else {
+                    cWord = 'heard';
+                    const at = (isFinite(src) && src < 254) ? ' \u00b7 addr ' + src : '';
+                    cDetail = limTxt(data.dvccRxCanCvl, data.dvccRxCanCcl) + at + ' \u00b7 ' + secsOf(canAge) + ' s ago';
+                }
+                let wWord, wDetail;
+                if (wifiAge === 999999) {
+                    wWord = 'none heard';
+                    wDetail = 'nothing received yet';
+                } else if (!wifiFresh) {
+                    wWord = 'silent';
+                    wDetail = 'last received ' + secsOf(wifiAge) + ' s ago';
+                } else {
+                    wWord = 'heard';
+                    wDetail = limTxt(data.dvccRxWifiCvl, data.dvccRxWifiCcl) + ' \u00b7 ' + secsOf(wifiAge) + ' s ago';
+                }
+                const vicFresh = (portOn && canAge <= 20000) || wifiFresh;
+                const vicChip = vicFresh ? 'source \u00b7 heard'
+                    : (!portOn && wifiAge === 999999) ? 'source \u00b7 receive off' : 'source \u00b7 no data';
+                const rvcChip = !portOn ? 'source \u00b7 receive off' : (fresh ? 'source \u00b7 heard' : 'source \u00b7 no data');
+                const idleDetail = (isRvc ? 'RV-C' : 'Victron GX') + ' is the selected source';
+                setText('integStateVic', isRvc ? 'not selected' : vicChip);
+                setText('integStateRvc', isRvc ? rvcChip : 'not selected');
+                setText('vicCanWord_ID', isRvc ? 'idle' : cWord);
+                setText('vicCanDetail_ID', isRvc ? idleDetail : cDetail);
+                setText('vicWifiWord_ID', isRvc ? 'idle' : wWord);
+                setText('vicWifiDetail_ID', isRvc ? idleDetail : wDetail);
                 setText('rvcHeardWord_ID', isRvc ? hWord : 'idle');
-                setText('vicHeardDetail_ID', isRvc ? idleDetail : hDetail);
                 setText('rvcHeardDetail_ID', isRvc ? hDetail : idleDetail);
                 // Re-clicking the source already in use would needlessly restart settling
                 const btnVic = document.getElementById('vicUseBtn');
                 const btnRvc = document.getElementById('rvcUseBtn');
-                if (btnVic) { btnVic.disabled = !isRvc; setText('vicUseBtn', isRvc ? 'Use Victron VE.Can' : 'In use'); }
+                if (btnVic) { btnVic.disabled = !isRvc; setText('vicUseBtn', isRvc ? 'Use Victron GX' : 'In use'); }
                 if (btnRvc) { btnRvc.disabled = isRvc; setText('rvcUseBtn', isRvc ? 'In use' : 'Use RV-C'); }
             })();
 
@@ -19866,6 +20083,9 @@ window.addEventListener("load", function () {
             if (data.panelHiRateInput !== undefined) {
                 renderPanelSwitchRows(Number(data.panelHiRateInput) === 1, Number(data.panelForceFloatInput) === 1);
             }
+            if (data.gxStreams !== undefined) {
+                try { gxOnCsv4(Number(data.gxStreams)); } catch (err) { }
+            }
 
             // Cache raw nav values for cross-listener consumers (baro Zambretti forecast on CSV2).
             Object.assign(window._navLast, data);
@@ -19954,6 +20174,7 @@ window.addEventListener("load", function () {
             battNaToNaN(data);
             g_lastCsv3 = data;  // cache for cvBinToCsv header
             noteStreamRx('csv3');
+            regDemoOnCsv3(data);
 
             // Phone GNSS speed watch follows the speedSourceMode echo; wrapped so a geolocation failure can't kill this.
             try {
@@ -20396,7 +20617,9 @@ window.addEventListener("load", function () {
                 extraTemp: data.ts_ExtraTemp,
                 veBattTemp: data.ts_VeBattTemp,
                 rvcBattTemp: data.ts_RvcBattTemp,
-                dieTemp: data.ts_DieTemp
+                dieTemp: data.ts_DieTemp,
+                dvccVeCan: data.ts_DvccVeCan,
+                dvccWifi: data.ts_DvccWifi
             };
 
             updateWeatherForecastAge(data.ts_WeatherFetch);
@@ -21090,8 +21313,11 @@ function updateDvccNotice(st, srcAddr) {
                   + "regulator's own targets are in control."
                 : ((srcAddr === 255 || !isFinite(srcAddr))
                     ? '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; follow is on but nothing is arriving. This '
-                      + "regulator's own targets are in control. Check the CAN wiring, the bus "
-                      + 'termination, and the selected dialect.'
+                      + "regulator's own targets are in control. Check the selected source, the CAN wiring "
+                      + 'and bus termination, and for a Victron GX the XREG-010 app on the GX.'
+                    : (srcAddr === 254)
+                    ? '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; the Victron GX is connected over WiFi but is not '
+                      + "sending limits (CVL/CCL). This regulator's own targets are in control."
                     : '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; the sender is on the bus but is not '
                       + "publishing limits (CVL/CCL). This regulator's own targets are in control.");
         }
@@ -23773,6 +23999,7 @@ async function pollLogRequest() {
         // Inside the try so the finally still reschedules: the chain has to keep ticking while the
         // switch is off, or turning it on would need a page reload to resume polling.
         if (g_remoteDiagnostics !== 1) return;
+        if (g_regDemo) return;   // regulator demo mode: nothing it serves is real, so nothing is relayed
         const token = await ensureCloudToken();
         if (!token) return;
 
@@ -28043,6 +28270,7 @@ function cxGet(params) {
         if (r.ok) return r;
         const why = r.status === 403 ? 'controls are locked'
                   : r.status === 409 ? 'a different regulator answered'
+                  : r.status === 423 ? 'it is not available in demo mode'
                   : 'the regulator refused it (HTTP ' + r.status + ')';
         const e = new Error(why); e.toString = () => why;
         throw e;
@@ -34411,6 +34639,7 @@ window.addEventListener('load', function () {
   let ltCloud = { avail: undefined, fetching: false, oldest: null, probeFrom: null, exhausted: false };
 
   function ltCloudEnabled() {
+    if (g_regDemo) return false;   // regulator demo mode: the plots are its made-up month, never stitched to real cloud history
     // Read the checkbox: updateCheckbox keeps .checked current but never writes the hidden #CloudFeatures
     // input's .value (it stays "0").
     const cb = document.getElementById('CloudFeatures_checkbox');
@@ -36892,7 +37121,7 @@ function solarLedgerClearConfirm() {
     xConfirm('Clear the solar ledger? Every day on record is erased and the consumption prediction starts over. The learned performance ratio is kept.').then(ok => {
         if (!ok) return;
         fetchWithTimeout(buildURL('/get?ResetSolarLedger=1'), {}, 8000)
-            .then(() => { sledRows = []; sledLastFetchMs = 0; setTimeout(solarLedgerFetch, 1500); })
+            .then(r => { if (!r.ok) return; sledRows = []; sledLastFetchMs = 0; setTimeout(solarLedgerFetch, 1500); })
             .catch(err => diagError('Solar ledger clear failed:', err));
     });
 }
@@ -36951,15 +37180,21 @@ function _whyOwnVoltageSetting() {
 function _whyLimitAuthority(c2) {
     const src = Number(c2.dvccRxSrcAddr);
     const mfg = Number(c2.dvccAuthMfg || 0);
+    if (src === 254) {
+        return 'Sent by the Victron GX over WiFi, not set here. DVCC on the GX computes it from the battery\'s limit '
+             + 'or from the GX\'s Limit charge current setting.';
+    }
     const at = (isFinite(src) && src !== 255) ? ' at address ' + src : '';
     const dialect = (((document.getElementById('dvccSrcType_echo') || {}).textContent || '').indexOf('RV-C') >= 0)
         ? 'RV-C' : 'VE.Can';
+    // A Victron GX can carry the same limits over WiFi too; the regulator follows the lower of the two.
+    const over = dialect + ((dialect === 'VE.Can' && Number((window.sensorAges || {}).dvccWifi ?? 999999) <= 20000) ? ' and WiFi' : '');
     if (mfg === 358) {
-        return 'Published by a Victron device' + at + ' over ' + dialect + ', not set here. On a Victron system '
+        return 'Published by a Victron device' + at + ' over ' + over + ', not set here. On a Victron system '
              + 'this is usually the Cerbo GX passing on DVCC rather than the battery itself.';
     }
     if (at) {
-        return 'Published by the device' + at + ' over ' + dialect + ', not set here — a battery BMS, or a '
+        return 'Published by the device' + at + ' over ' + over + ', not set here — a battery BMS, or a '
              + 'gateway passing on its charge limits.';
     }
     return 'Sent by an external charge authority, not set here — a battery BMS, or a gateway passing on its charge limits.';

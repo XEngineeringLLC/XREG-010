@@ -6355,19 +6355,6 @@
                     </div>
                   </div>
                 </div>
-                <hr>
-                <div class="form-row">
-                  <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
-                    <span>Simulator</span>
-                    <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Injects synthetic operating points for bench testing without a running engine, so the curve fills and the health trend visibly declines. Leave off for real use; simulated data is not saved.</span></span>
-                  </div>
-                  <div class="form-input">
-                    <div class="cap-mode-toggle">
-                      <button type="button" id="alt-sim-off" class="cap-mode-btn" onclick="altSetSim(0)">Off</button>
-                      <button type="button" id="alt-sim-on" class="cap-mode-btn" onclick="altSetSim(1)">On</button>
-                    </div>
-                  </div>
-                </div>
               </details>
               <details class="tuning-section" open>
                 <summary class="tuning-section-title">Steady-State Detection</summary>
@@ -6644,7 +6631,7 @@
                 </div>
                 <div class="form-input">
                   <input type="button" value="Reset / Start Over" class="btn-danger"
-                    onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Clear My History, the whole % vs Engine-Hours trend (including the current partial hour) and the session stats, restart the engine-hour axis at 0, and revert the source to My History? Tuning settings are kept. Do this after replacing the alternator, regulator, or belt. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetAlternatorHealth=1'),{},5000).then(()=>{altTrend=[];drawAltTrend();}).catch(()=>{});}})" />
+                    onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Clear My History, the whole % vs Engine-Hours trend (including the current partial hour) and the session stats, restart the engine-hour axis at 0, and revert the source to My History? Tuning settings are kept. Do this after replacing the alternator, regulator, or belt. This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetAlternatorHealth=1'),{},5000).then(r=>{if(r.ok){altTrend=[];drawAltTrend();}}).catch(()=>{});}})" />
                 </div>
               </div>
             </div>
@@ -8694,7 +8681,7 @@
                 </details>
               </div>
 
-              <p class="integ-copy">Nav, engine and battery data in and out over the 250 kbps CAN backbone. That one port is shared: the Victron VE.Can and RV-C charge limits under Battery Charge Limits over CAN below arrive on the same wire, and they are decoded whenever the receive switch here is on or the follow switch there is.</p>
+              <p class="integ-copy">Nav, engine, and battery data in and out over the 250 kbps CAN backbone. That one port is shared: the Victron VE.Can and RV-C charge limits under Battery Charge Limits below arrive on the same wire, and they are decoded whenever the receive switch here is on or the follow switch there is.</p>
 
               <div class="form-row">
                 <div class="form-label">Receive NMEA2K Data (<span id="NMEA2KData_echo">?</span>):
@@ -9308,40 +9295,54 @@
             <!-- The three cards below are one feature: two dialect cards (dialect-only settings) plus the shared vet/apply card.
                  The .integ-group rail is the only cue tying them together, so a shared setting must never go in a dialect card. -->
             <div class="integ-group">
-              <div class="integ-group-title">Battery Charge Limits over CAN</div>
-              <p class="integ-group-copy">Obeying the charge limits a managed battery, BMS or Victron GX publishes takes two parts. Pick the dialect your battery authority speaks &mdash; <strong>Victron VE.Can</strong> or <strong>RV-C</strong> &mdash; in its own card; a dialect card holds only what belongs to that dialect. Everything else is <strong>shared</strong> and lives in the Charge-Limit Follow card at the bottom of this group. Only one dialect is decoded and followed at a time.</p>
+              <div class="integ-group-title">Battery Charge Limits</div>
+              <p class="integ-group-copy">Obeying the charge limits a managed battery, BMS, or Victron GX publishes takes two parts. Pick the source in its own card, <strong>Victron GX</strong> or <strong>RV-C</strong>; a source card holds only what belongs to that source. Everything else is <strong>shared</strong> and is in the Charge-Limit Follow card at the bottom of this group. Only one source is followed at a time.</p>
 
             <details class="integ-section">
-              <summary class="integ-section-title">Victron CAN (DVCC)<span class="integ-state"><span id="integStateVic">?</span></span></summary>
+              <summary class="integ-section-title">Victron GX (DVCC)<span class="integ-state"><span id="integStateVic">?</span></span></summary>
 
-              <p class="integ-copy">Listens for the charge voltage and current limits (CVL/CCL) Victron equipment exchanges over its proprietary VE.Can messages &mdash; the coordination Victron calls DVCC. The GX device or managed battery must share this regulator's 250 kbps NMEA2000/VE.Can port, and that port has to be listening: turn on Receive NMEA2K Data in the NMEA 2000 card above, or the follow switch below. There is no bank filter here &mdash; the first device heard becomes the authority, and its address shows in the status row below.</p>
+              <p class="integ-copy">Follows the charge voltage and current limits (CVL/CCL) a Victron GX sets with DVCC. Over VE.Can, the GX broadcasts the voltage limit on the 250 kbps NMEA 2000/VE.Can backbone this regulator shares, and that port has to be listening: turn on Receive NMEA2K Data in the NMEA 2000 card above, or the follow switch below. VE.Can has no bank filter, so the first device heard becomes the authority and its address shows in the status row below.</p>
+
+              <p class="integ-copy">Over WiFi, the XREG-010 app on the GX sends the voltage and current limits DVCC sets for this alternator, with no CAN connection needed.</p>
 
               <div class="form-row">
                 <div class="form-label">Use as Limit Source (<span id="vicSel_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Makes Victron VE.Can the dialect this regulator decodes and follows. Same setting as Limit Source in the shared Charge-Limit Follow card &mdash; changing it here changes it there. Only one dialect is decoded at a time, and switching starts a fresh settling period.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Makes the Victron GX the source this regulator follows, over VE.Can and WiFi. Same setting as Limit Source in the shared Charge-Limit Follow card, so changing it here changes it there. Only one source is followed at a time, and switching starts a fresh settling period.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
                     <input type="hidden" name="dvccSrcType" value="0">
-                    <button type="submit" id="vicUseBtn" class="btn-primary" onclick="submitMessage()">Use Victron VE.Can</button>
+                    <button type="submit" id="vicUseBtn" class="btn-primary" onclick="submitMessage()">Use Victron GX</button>
                   </form>
                 </div>
               </div>
 
               <hr />
               <div class="form-row">
-                <div class="form-label">Victron Messages (<span id="vicHeardWord_ID">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether Victron limit messages are actually arriving. heard = decoded within the last 20 seconds; silent = decoded earlier but nothing recently; none heard = nothing has ever decoded, so check the GX is on this same CAN backbone and that DVCC is enabled there. Only the selected dialect is decoded, so this reads "idle" while RV-C is the chosen source. The decoded numbers themselves are in the shared status row below.</span></span>
+                <div class="form-label">Over VE.Can (<span id="vicCanWord_ID">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether the GX's voltage limit is arriving on the VE.Can backbone, and its value. heard = received within the last 20 seconds; silent = received earlier but nothing recently; none heard = nothing received yet, so check that the GX is on this same backbone and that DVCC is on there. A GX sends only the voltage limit on VE.Can. A Victron battery on the same backbone can add a stop-charging command, which shows here as 0.0 A. This reads "idle" while RV-C is the chosen source.</span></span>
                 </div>
                 <div class="form-input">
-                  <span class="integ-live" id="vicHeardDetail_ID">&mdash;</span>
+                  <span class="integ-live" id="vicCanDetail_ID">&mdash;</span>
                 </div>
               </div>
 
               <hr />
               <div class="form-row">
+                <div class="form-label">Over WiFi (<span id="vicWifiWord_ID">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether the XREG-010 app on the GX is sending limits over the network, and their values. heard = received within the last 20 seconds; silent = received earlier but nothing recently; none heard = nothing received yet. The app sends a voltage limit only while a managed battery is connected to the GX. It sends a current limit whenever DVCC limits charge current, from the battery or from the GX's Limit charge current setting, and that limit is this alternator's share after what the solar chargers are making. This reads "idle" while RV-C is the chosen source.</span></span>
+                </div>
+                <div class="form-input">
+                  <span class="integ-live" id="vicWifiDetail_ID">&mdash;</span>
+                </div>
+              </div>
+
+              <p class="integ-note">VE.Can and WiFi carry limits from the same GX, and the regulator follows the lower of the two. The current limit arrives only over WiFi.</p>
+
+              <hr />
+              <div class="form-row">
                 <div class="form-label">Hold Stop-Charging Command (<span id="dvccVicCutHold_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">What to do when a Victron battery sends stop charging and then stops repeating it while its other limit messages keep arriving. Off: the command expires once it has not been heard for 60 seconds or the Silence Timeout, whichever is longer, the same as the voltage and current limits. On: charging stays stopped until the battery sends allowed to charge, the sender goes silent altogether, another sender takes over after this one has been silent for 10 seconds, follow is switched off, the Limit Source or RV-C Battery Instance is changed, the trust latch is reset, or the regulator restarts.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">What to do when a Victron battery sends stop charging and then stops repeating it while its other limit messages keep arriving. Off: the command expires once it has not been heard for 60 seconds or the Silence Timeout, whichever is longer, the same as the voltage and current limits. On: charging stays stopped until the battery sends allowed to charge, VE.Can goes silent for the Silence Timeout, another sender takes over after this one has been silent for 10 seconds, follow is switched off, the Limit Source or RV-C Battery Instance is changed, the trust latch is reset, or the regulator restarts.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9357,7 +9358,7 @@
                 </div>
               </div>
 
-              <p class="integ-note">Everything else this dialect uses is shared with RV-C and lives in the Charge-Limit Follow card below: the follow switch, decoded CVL/CCL and follow state, settling and silence times, the plausibility window, trust reset and raw frame capture.</p>
+              <p class="integ-note">Everything else this source uses is shared with RV-C and is in the Charge-Limit Follow card below: the follow switch, the CVL/CCL being followed and the follow state, settling and silence times, the plausibility window, trust reset, and raw frame capture.</p>
 
             </details>
 
@@ -9394,7 +9395,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">RV-C Messages (<span id="rvcHeardWord_ID">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether RV-C limit messages are actually arriving. heard = decoded within the last 20 seconds; silent = decoded earlier but nothing recently; none heard = nothing has ever decoded, so check the sender is on this CAN backbone and that the battery instance above matches the bank it broadcasts. Only the selected dialect is decoded, so this reads "idle" while Victron VE.Can is the chosen source. The decoded numbers themselves are in the shared status row below.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether RV-C limit messages are arriving. heard = decoded within the last 20 seconds; silent = decoded earlier but nothing recently; none heard = nothing has ever decoded, so check the sender is on this CAN backbone and that the battery instance above matches the bank it broadcasts. Only the selected dialect is decoded, so this reads "idle" while Victron GX is the chosen source. The decoded numbers themselves are in the shared status row below.</span></span>
                 </div>
                 <div class="form-input">
                   <span class="integ-live" id="rvcHeardDetail_ID">&mdash;</span>
@@ -9516,7 +9517,7 @@
                 </div>
               </div>
 
-              <p class="integ-note">Everything else this dialect uses is shared with Victron VE.Can and lives in the Charge-Limit Follow card below: the follow switch, decoded CVL/CCL and follow state, settling and silence times, the plausibility window, trust reset and raw frame capture.</p>
+              <p class="integ-note">Everything else this dialect uses is shared with the Victron GX source and is in the Charge-Limit Follow card below: the follow switch, decoded CVL/CCL and follow state, settling and silence times, the plausibility window, trust reset, and raw frame capture.</p>
 
             </details>
 
@@ -9524,11 +9525,11 @@
             <details class="integ-section" id="dvccFollowSection">
               <summary class="integ-section-title">Charge-Limit Follow<span class="integ-badge">shared</span><span class="integ-state"><span id="integStateFollow">off</span></span></summary>
 
-              <p class="integ-copy">Everything here applies to whichever dialect is selected above — Victron VE.Can or RV-C — and the status row shows what that dialect has decoded. Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge.</p>
+              <p class="integ-copy">Everything here applies to whichever source is selected above, Victron GX or RV-C, and the status row shows what that source has sent (for a Victron GX, the lower of its VE.Can and WiFi values). Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge.</p>
 
               <div class="form-row">
                 <div class="form-label">Follow External Charge Limits (<span id="dvccEn_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Obey the charge voltage and current limits (CVL/CCL) a battery management system or gateway publishes on the NMEA2000 port — the coordination Victron calls DVCC. Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge. A new authority must send steady, plausible values for the settling time before its limits apply. If no limits ever arrive, or the sender goes silent, this regulator falls back to its own targets and a warning strip appears at the top of the dashboard &mdash; charging is never left ungoverned, but the sender is not the backstop it would be while following. A current limit of 0 A is obeyed as "stop charging" — that is the battery's strongest command. While a lower external voltage limit is in control, the internal bulk/absorption/float progression pauses and resumes when the limit releases. Leave this off to simply watch the decoded limits below and confirm they match what your BMS or GX displays.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Obey the charge voltage and current limits (CVL/CCL) a battery management system or gateway publishes on the NMEA 2000 port, or a Victron GX sends over WiFi (the coordination Victron calls DVCC). Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge. A new authority must send steady, plausible values for the settling time before its limits apply. If no limits ever arrive, or the sender goes silent, this regulator falls back to its own targets and a warning strip appears at the top of the dashboard. Charging is never left ungoverned, but the sender is not the backstop it would be while following. A current limit of 0 A is obeyed as "stop charging," the battery's strongest command. While a lower external voltage limit is in control, the internal bulk/absorption/float progression pauses and resumes when the limit releases. Leave this off to watch the decoded limits below and confirm they match what your BMS or GX displays.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9576,12 +9577,12 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Limit Source (<span id="dvccSrcType_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which dialect the battery authority speaks. Victron VE.Can listens for the charge limits Victron equipment exchanges over its proprietary messages — the GX device or managed battery must share this same 250 kbps backbone, and the decode should be verified against your system (watch the status row above) before follow is enabled. RV-C listens for the DC Source Status messages an RV-C battery management system broadcasts. One authority is followed at a time; there is no automatic scanning across dialects.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which source this regulator follows. Victron GX follows the limits a GX sets with DVCC: the voltage limit on this same 250 kbps backbone, and the voltage and current limits over WiFi from the XREG-010 app on the GX. Check them against the GX (watch the status row above) before follow is enabled. RV-C listens for the DC Source Status messages an RV-C battery management system broadcasts. One authority is followed at a time, and there is no automatic scanning across sources.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
                     <select name="dvccSrcType">
-                        <option value="0">Victron VE.Can</option>
+                        <option value="0">Victron GX</option>
                         <option value="1">RV-C</option>
                     </select>
                     <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
@@ -9592,7 +9593,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Silence Timeout (s) (<span id="dvccSilenceS_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On. With a Victron GX, VE.Can and WiFi each time out on their own, and follow stops only when both are silent.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9664,7 +9665,7 @@
 
               <p class="integ-copy">One wire from a battery management system (BMS) that says charge, or don't &mdash; any BMS with a spare relay or a charge-enable output can drive it. The BMS applies 5 to 62 V to the BMS on/off wire (Cable 2, pin 16) and the regulator takes that as permission to charge.</p>
 
-              <p class="integ-copy">If your BMS or Victron GX also publishes charge limits on the CAN backbone, use Battery Charge Limits over CAN above as well: those limits taper the charge, this wire is a full stop. Both can be connected at once, and the stop wins.</p>
+              <p class="integ-copy">If your BMS or Victron GX also publishes charge limits, use Battery Charge Limits above as well: those limits taper the charge, and this wire stops it. Both can be connected at once, and the stop takes priority.</p>
 
               <div class="form-row">
                 <div class="form-label">Use BMS On/Off Signal (<span id="bmsLogic_echo">?</span>):</div>
@@ -9927,6 +9928,29 @@
               </div>
             </details>
 
+            <!-- Victron GX: GET /gxStatus (the GX streams connected now), rendered by renderGxCard(); refreshed on a change
+                 in CSV4 gxStreams and with every /identify pass. Read-only. -->
+            <details id="gxCard" open style="margin-top: 20px;">
+              <summary
+                style="cursor: pointer; font-weight: bold; font-size: 16px; padding: 10px 0; border-bottom: 2px solid var(--accent); margin-bottom: 10px;">
+                Victron GX</summary>
+
+              <div class="form-row">
+                <div class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                  <span>Live Link:</span>
+                  <span class="tooltip">
+                    &#8505;&#65039;
+                    <span class="tooltip-box">A Victron GX reading this regulator's live data right now, the
+                      address it reads from, and how long it has been connected. Settings changes made on the GX
+                      screen need neither Unlock Controls nor the settings password. The GX cannot run commissioning
+                      or update the firmware. A GX on the link does not count as an open app, so the automatic
+                      maintenance restart does not wait for it.</span>
+                  </span>
+                </div>
+                <div class="form-input"><span id="gxLinkOut">&mdash;</span></div>
+              </div>
+            </details>
+
             <!-- iOS app only: joining a named network needs NEHotspotConfiguration; initRegulatorApUi() unhides this card. Values
                  are stored on this phone; the AP credentials live in the regulator's NVS and are never echoed. -->
             <details id="regApCard" open style="margin-top: 20px; display: none;">
@@ -10134,8 +10158,10 @@
                     <span>Hardware Present? (<span id="HardwarePresent_echo">?</span>):</span>
                     <span class="tooltip">
                       &#8505;&#65039;
-                      <span class="tooltip-box">When lacking wiring harnesses, this mode will fake data inputs to allow
-                        interface testing.</span>
+                      <span class="tooltip-box">No starts demo mode and switches the field off. A simulated boat drives
+                        every reading, and once you switch the field on, its output follows those readings. Nothing is saved
+                        or uploaded, and any setting you change lasts only until you switch back to Yes, which brings back
+                        the real readings, records, and settings. The field then stays off until you switch it on.</span>
                     </span>
                   </div>
                   <div class="form-input">
@@ -10437,7 +10463,7 @@
 
               <div class="form-row">
                 <div class="form-input">
-                  <input type="button" value="Export Config from Regulator" class="btn-primary"
+                  <input type="button" id="exportConfigBtn" value="Export Config from Regulator" class="btn-primary"
                     onclick="exportConfigDownload()" />
                 </div>
               </div>
@@ -10587,21 +10613,6 @@
             </div>
             <hr />
 
-            <!-- simulator -->
-            <div class="form-row">
-              <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
-                <span>Simulator</span>
-                <span class="tooltip">ℹ️<span class="tooltip-box">Injects synthetic sailing/motoring data for bench testing without a boat. Leave off on the water.</span></span>
-              </div>
-              <div class="form-input">
-                <div class="cap-mode-toggle">
-                  <button type="button" id="perf-sim-off" class="cap-mode-btn" onclick="perfSet('perfSimMode',0)">Off</button>
-                  <button type="button" id="perf-sim-on" class="cap-mode-btn" onclick="perfSet('perfSimMode',1)">On</button>
-                </div>
-              </div>
-            </div>
-            <hr />
-
             <!-- clear all (danger action) -->
             <div class="form-row">
               <div class="form-label" style="display:flex;align-items:center;justify-content:space-between;">
@@ -10609,7 +10620,7 @@
                 <span class="tooltip">ℹ️<span class="tooltip-box">Clear All erases every learned point in both the sailing and motoring maps and zeroes the best surface points and hours counters. Use after a major rig, sail, or propeller change. Cannot be undone.</span></span>
               </div>
               <div class="form-input">
-                <input type="button" value="Clear All" class="btn-danger-ghost" onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Wipe ALL learned boat-performance data? This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetBoatPerformance=1'),{},5000).then(()=>{perfCells=[];motorCells=[];drawPerfPlot();drawMotorPlot();}).catch(()=>{});}})" />
+                <input type="button" value="Clear All" class="btn-danger-ghost" onclick="if(!settingsUnlocked){xAlert('Please unlock controls first');return;} xConfirm('Wipe ALL learned boat-performance data? This cannot be undone.').then(ok=>{if(ok){fetchWithTimeout(buildURL('/get?ResetBoatPerformance=1'),{},5000).then(r=>{if(r.ok){perfCells=[];motorCells=[];drawPerfPlot();drawMotorPlot();}}).catch(()=>{});}})" />
               </div>
             </div>
             <hr />
@@ -11762,11 +11773,11 @@
               <span class="metric-value"><span id="li_dvccCcl_ID">&mdash;</span></span>
             </div>
             <div class="metric-row">
-              <span class="metric-label">Source Dialect</span>
+              <span class="metric-label">Limit Source</span>
               <span class="metric-value"><span id="li_dvccDialect_ID">&mdash;</span></span>
             </div>
             <div class="metric-row">
-              <span class="metric-label">Sender Address</span>
+              <span class="metric-label">Sender</span>
               <span class="metric-value"><span id="li_dvccSrc_ID">&mdash;</span></span>
             </div>
           </div>

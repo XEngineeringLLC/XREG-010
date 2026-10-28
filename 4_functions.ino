@@ -695,6 +695,7 @@ static void sledHoldSnap() {
 // fieldOffSettled, which reads "off" during a live duty-0 CV hold). Every other pass is one compare.
 void solarLedgerService() {
   static uint32_t lastTickMs = 0, lastMinuteMs = 0, lastLiveFlushMs = 0;
+  if (demoSeal) return;   // demo mode: the real ledger and its live day stay as they were; /solarledger.csv is served from 9_demo.ino
   uint32_t now = millis();
   if (now - lastTickMs < 1000) return;
   lastTickMs = now;
@@ -1319,6 +1320,8 @@ if (!BMP388Disconnected) {
   dataTimestamps[IDX_INA_DIE_TEMP] = 0;   // stamped only by a real sample past the warm-up discard: the heat ceiling's freshness
   dataTimestamps[IDX_VE_SOC] = 0;         // a boot stamp would pass an unseen VE.Direct port off as a battery monitor
   dataTimestamps[IDX_VICTRON_SOLAR] = 0;  // and as an MPPT (the solar ledger would log a measured 0 harvest)
+  dataTimestamps[IDX_DVCC_VECAN] = 0;     // the Victron carrier rows read 0 as "none heard"
+  dataTimestamps[IDX_DVCC_WIFI] = 0;
 
   // if (setupDisplay()) {
   //   Serial.println("Display ready for use");
@@ -1693,11 +1696,6 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
     settingWrite(NK_IgnitionOverride, String(IgnitionOverride).c_str());
   } else {
     IgnitionOverride = settingRead(NK_IgnitionOverride).toInt();
-  }
-  if (!settingExists(NK_hardwarePresent)) {
-    settingWrite(NK_hardwarePresent, String(hardwarePresent).c_str());
-  } else {
-    hardwarePresent = settingRead(NK_hardwarePresent).toInt();
   }
   if (!settingExists(NK_timeSourceMode)) {
     settingWrite(NK_timeSourceMode, String(timeSourceMode).c_str());
@@ -4620,6 +4618,7 @@ bool prepareForOTA() {
   // Close EventSource FIRST (before any heap measurements)
   Serial.println("Closing EventSource connections...");
   events.close();
+  gxEvents.close();
   delay(100);
 
   Serial.println("🧹 Preparing system for OTA - freeing memory...");
@@ -5048,6 +5047,7 @@ cleanup:
   }
 }
 void performOTAUpdate(const UpdateInfo &updateInfo) {
+  if (demoSeal) { queueConsoleMessage(DEMO_REFUSAL); return; }   // demo mode: no software update (web assets are outside the LittleFS seal)
   //Purpose: Handles the partition switching and signature download
   //Action:
   //1) Downloads signature from server
@@ -5316,6 +5316,7 @@ void detachOta0ForInstall() {
   if (factory && esp_ota_get_boot_partition() != factory) esp_ota_set_boot_partition(factory);
 }
 void performOTAUpdateToVersion(const char *targetVersion) {
+  if (demoSeal) { queueConsoleMessage(DEMO_REFUSAL); return; }   // demo mode: no software update (web assets are outside the LittleFS seal)
   //This performs an OTA update to specific version
   // Called by: The /get handler when UpdateToVersion parameter is received
   //Purpose: Initiates a targeted version update

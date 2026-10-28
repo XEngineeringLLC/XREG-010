@@ -949,42 +949,19 @@ static void altRestoreTrendBucket() {    // boot restore — resume the partial 
   }
 }
 
-// ---- NMEA-style bench simulator (no engine) ----
-// Sweeps RPM × excitation points, synthesizes amps from a near-deterministic model × a slow
-// degradation ramp + noise so the curve fills and the trend declines. Writes only alt sim vars.
+// ---- Demo-mode feed (altSimMode follows Hardware Present = No, 9_demo.ino) ----
+// The record book grades the simulated boat through its own sensors, so the live dot, the session plot and the
+// header chips all describe one alternator. Writes only the altSim* vars the fold reads in sim mode.
 static float altSimRpm = 0, altSimExc = 0, altSimT = 80, altSimV = 13.6f, altSimAmps = 0;
-static float altSimDuty = 50.0f;   // synthetic field duty % consistent with altSimExc (spreads the front's excitation axis)
-static int   altSimIdx = 0, altSimLoops = 0;
-static uint32_t altSimPtStartMs = 0;
-static float altSimDeg = 1.0f;
-#define ALT_SIM_NRPM 8
-#define ALT_SIM_NEXC 5
-#define ALT_SIM_NPTS (ALT_SIM_NRPM * ALT_SIM_NEXC)
-#define ALT_SIM_HOLD_MS 40000u    // floor on the per-point hold; altSimTick extends it to altThermSec+30 s
+static float altSimDuty = 50.0f;
 static void altSimTick(uint32_t nowMs) {
-  // Hold each point longer than the temperature dwell (+margin) so the sliding-window temp band
-  // clears the inter-point temp jump (tF varies per point below) and the run can qualify + emit.
-  uint32_t hold = (uint32_t)(altThermSec * 1000.0f) + 30000u;
-  if (hold < ALT_SIM_HOLD_MS) hold = ALT_SIM_HOLD_MS;
-  if (altSimPtStartMs == 0) altSimPtStartMs = nowMs;
-  if (nowMs - altSimPtStartMs >= hold) {
-    altSimPtStartMs = nowMs;
-    if (++altSimIdx >= ALT_SIM_NPTS) { altSimIdx = 0; altSimLoops++; }
-  }
-  int ri = altSimIdx / ALT_SIM_NEXC, ei = altSimIdx % ALT_SIM_NEXC;
-  float rpm = 800.0f + ri * 400.0f;             // 800..3600
-  float exc = 3.0f + ei * 2.5f;                 // 3..13
-  float tF = 80.0f + 0.02f * rpm;               // hotter at higher RPM
-  float vbus = 13.6f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
-  float a = 1.4f * exc * (1.0f - expf(-rpm / 1200.0f));   // rises with rpm knee + excitation
-  a *= 1.0f - 0.0008f * (tF - 77.0f);                     // derate with temp
-  if (altSimLoops >= 2) altSimDeg -= 0.0006f * (EP_FEED_DT_MS / 1000.0f);   // after 2 full sweeps, degrade 0.0006/s (called every EP_FEED_DT_MS)
-  if (altSimDeg < 0.80f) altSimDeg = 0.80f;
-  a *= altSimDeg;
-  a *= 1.0f + (float)random(-20, 21) / 1000.0f;          // ±2% noise
-  if (a < 0.5f) a = 0.5f;
-  altSimRpm = rpm; altSimExc = exc; altSimT = tF; altSimV = vbus; altSimAmps = a;
-  altSimDuty = exc * 100.0f / vbus;             // invert excitation → duty so the duty axis tracks exc
+  (void)nowMs;
+  altSimRpm = RPM;
+  altSimT = TempToUse;
+  altSimV = getBatteryVoltage();
+  altSimAmps = isnan(MeasuredAmps) ? 0.0f : MeasuredAmps;
+  altSimDuty = gpio4IsLow ? 0.0f : dutyCycle;
+  altSimExc = altExcitation(altSimDuty, altSimV, altSimT);
 }
 
 // Per-axis limits from the knobs, resynced every fold so live edits apply immediately. Axis MODES are set once
@@ -1590,7 +1567,8 @@ static float alf_logSecLeft(){ return altLogSecLeft; }                    // cap
 static float alf_logCap()    { return (float)ALTLOG_CAP_ROWS; }
 static float alf_sweepState(){ return (float)altSweepActive; }            // 0 idle, 1 ramp up, 2 ramp down, 3 easing out
 static float alf_sweepRev()  { return (float)altSweepRevWhy; }            // 0 ceiling, 1 a control limit, 2 Reverse now
-static float alf_syncAgo()   { if (lastAltHealthSyncEpoch <= 0 || !timeIsSynced) return -1.0f;
+static float alf_syncAgo()   { if (demoSeal) return demoSyncAgoS(420.0f);   // demo mode: a believable sync age, nothing is uploaded
+                               if (lastAltHealthSyncEpoch <= 0 || !timeIsSynced) return -1.0f;
                                time_t n = time(NULL); return (n > (time_t)lastAltHealthSyncEpoch) ? (float)(n - (time_t)lastAltHealthSyncEpoch) : 0.0f; }
 // fold timing lives in the Function Timing table (ft_altHealth / ft_altFold rows) — not in this live stream
 static AltLiveField ALT_LIVE[] = {
@@ -1613,7 +1591,9 @@ static AltLiveField ALT_LIVE[] = {
 };
 static const size_t ALT_LIVE_COUNT = sizeof(ALT_LIVE) / sizeof(ALT_LIVE[0]);
 static void altSendLive() {
-  if (sseBacklogged()) return;   // periodic; the next tick resends current state
+  // periodic; the next tick resends current state. A backlogged phone link skips only the phone copy.
+  const bool phoneOk = !sseBacklogged();
+  if (!phoneOk && !gxLiveNow) return;
   char buf[512];   // truncates rather than overruns (see the break below); sized well past the field list
   int off = 0;
   for (size_t i = 0; i < ALT_LIVE_COUNT; i++) {
@@ -1621,7 +1601,8 @@ static void altSendLive() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  sseSend(buf, "AltLive");
+  if (phoneOk) sseSend(buf, "AltLive");
+  gxSideOffer(GX_CH_ALTLIVE, buf, off);
 }
 
 // ---- coverage / status helpers (CSV2 + dashboard) ----
@@ -2046,7 +2027,7 @@ static void altTrendLoad() {
 void altHealthSave() {
   if (dbgRingsSynthetic) return;   // fillmax/clearmax: RAM rings are synthetic/empty — keep the real flash blobs
   if (importRebootPending) return; // a records import just wrote this record's keys; the reboot loads them
-  if (!altFrontBuf || hardwarePresent != 1) return;
+  if (!altFrontBuf || hardwarePresent != 1 || demoSeal) return;   // demo mode: the stores in RAM are the demo copies
   uint32_t uw = ((uint32_t)altFront2.source << 8) | (uint32_t)ALT_NAXIS;   // stash source + naxis
   writePsramBlob("/altfront.bin", ALT_FRONT_MAGIC, ALT_VER, uw, altFrontBuf, sizeof(FrontPoint<ALT_NAXIS>), ALT_FRONT_CAP, 0, altFront2.count);
   // Unsynced points too: else a reboot loses them and the next sync-back erases them from My History.
@@ -2212,6 +2193,7 @@ void altHealthWindingInit() {
 // Loop-side, so every move of fieldWindApplied is caught: a winding or resistance change, the owner's answer to the
 // resistance check, the class clamp, and an import (at the next boot).
 void altHealthWindingCheck() {
+  if (demoSeal) return;   // demo mode: a winding changed in demo reverts at exit, so the record must not be cleared for it
   if (altHealthWindV == 0 || altHealthWindV == fieldWindApplied) return;
   if (importRebootPending) return;   // a records import just wrote the record's keys; the boot after it judges the winding
   char why[48];
@@ -2308,15 +2290,15 @@ static void altSessSeriesPush(uint32_t nowMs, bool graded) {
 //      advances the simulator and folds at EP_FEED_DT_MS; live, the fold runs in the ~75 Hz pidLog hook. ----
 void altHealth_tick(uint32_t nowMs) {
   static uint32_t lastMs = 0;
-  if (!altFrontBuf) return;
+  if (!altFrontBuf || demoStoresBusy()) return;   // demo mode switching: the stores are mid-swap
   // A finished cloud sync (heavy: front parse + re-adds + flash write) — one heavy op per pass, and only with
   // the field physically cut (gpio4, not the duty-derived fieldActiveStatus, which reads off in a duty-0 CV hold).
-  if (altSyncHandoff && !gHeavyRanThisPass && fieldCutSettled()) {
+  if (altSyncHandoff && !demoSeal && !gHeavyRanThisPass && fieldCutSettled()) {   // demo: held, the front in RAM is the demo copy
     gHeavyRanThisPass = true;
     altApplySync();
     return;
   }
-  if ((regSeedRequest & 4) && !gHeavyRanThisPass && fieldCutSettled()) {
+  if ((regSeedRequest & 4) && !demoSeal && !gHeavyRanThisPass && fieldCutSettled()) {
     gHeavyRanThisPass = true;
     __atomic_fetch_and(&regSeedRequest, (uint8_t)~4, __ATOMIC_ACQ_REL);
     if (altPending && altFront2.count > 0) {
@@ -2480,6 +2462,7 @@ void sendAltSettings() {
     off += n;
   }
   sseSend(buf, "AltSettings");
+  gxSideOffer(GX_CH_ALTSET, buf, off);
 }
 
 // Self-describing schema (served at /altschema). The dashboard fetches this ONCE and zips these
@@ -2657,12 +2640,9 @@ static void perfEpisodeSyncCfg() {
 // Feeds the SAIL or MOTOR Episode (the other gets an ineligible break so a run can't span a sail<->motor change).
 // Wind axes are APPARENT; AWA is stored RAW (both-sided) to pending/cloud, folded to |AWA| only for eval + the
 // device front when perfFoldSymmetric.
-// Bench simulator state (perfSim* — written ONLY by perfSimTick, never the real NMEA/IMU globals).
+// Demo-mode feed (perfSim* — written ONLY by perfSimTick, never the real NMEA/IMU globals).
 static float perfSimTws = 0, perfSimTwa = 0, perfSimStw = 0, perfSimSog = 0;
-static float perfSimHdg = 90, perfSimPitch = 0, perfSimRpm = 0;
-static int   perfSimLoops = 0;
-static uint32_t perfSimPtStartMs = 0;
-static float perfSimFoul = 1.0f;
+static float perfSimPitch = 0, perfSimRpm = 0;
 
 void perfFold_tick(uint32_t nowMs) {
   if (!sailFrontBuf || !motorFrontBuf) return;
@@ -2770,70 +2750,12 @@ void perfFold_tick(uint32_t nowMs) {
                    : (motoring ? motorEpisode.settleRemainSec(nowMs) : sailEpisode.settleRemainSec(nowMs));
   }
 }
-// ---- NMEA SIMULATOR (bench testing, no boat) ----
-// Writes ONLY perfSim* vars (declared above the fold), never the real NMEA/RPM/IMU globals. Each leg draws a
-// weighted random operating point and holds it long enough to bank one record, so the front fills organically.
-#define PERF_SIM_HOLD_MS 14000u    // hold each leg > max steady time so one run forms + emits
-
-// Normalized best-speed fraction vs TWA (0..180, 10° steps): zero in the no-go zone, peak on the
-// reach (~100-110°), still ~0.72 of peak dead downwind — matches the dashboard's render shape.
-static float perfSimShape(float pa) {
-  static const float S[19] = {0,0,0,0.42f,0.60f,0.74f,0.84f,0.90f,0.95f,0.98f,1.00f,1.00f,0.98f,0.94f,0.89f,0.85f,0.81f,0.78f,0.72f};
-  if (pa < 0) pa = -pa; if (pa > 180) pa = 360 - pa; if (pa < 0) pa = 0;
-  float f = pa / 10.0f; int i = (int)f; if (i > 17) i = 17; float t = f - i;
-  return S[i] * (1.0f - t) + S[i + 1] * t;
-}
+// ---- Demo-mode feed (perfSimMode follows Hardware Present = No, 9_demo.ino) ----
+// Copies the simulated boat's own wind, speed, engine and pitch, so the polar dot agrees with the dashboards.
+// perfSimTws / perfSimTwa carry APPARENT wind: the sail front's wind axes are apparent.
 static void perfSimTick(uint32_t nowMs) {
-  const float HULL = 7.6f;                  // typical ~35-40 ft sailboat hull speed (kt)
-  // Current leg's target — persists across ticks until the hold expires, then a new one is drawn.
-  static float legTws = 12, legTwa = 95, legRpm = 0, legSea = 1.0f;
-  static uint8_t legMotor = 0; static bool legInit = false;
-  if (perfSimPtStartMs == 0) perfSimPtStartMs = nowMs;
-  if (!legInit || nowMs - perfSimPtStartMs >= PERF_SIM_HOLD_MS) {
-    legInit = true; perfSimPtStartMs = nowMs; perfSimLoops++;          // count legs (drives fouling)
-    legMotor = (random(0, 100) < 20) ? 1 : 0;                          // ~20% of legs under engine
-    if (legMotor) {
-      legRpm = 1000.0f + (float)random(0, 2401);                       // 1000..3400 RPM
-      legTws = (float)random(0, 121) / 10.0f;                          // 0..12 kt ambient wind
-      legTwa = (float)random(0, 181);
-      legSea = 0.3f + (float)random(0, 151) / 100.0f;                  // 0.3..1.8
-    } else {
-      // wind speed: triangular (avg of two uniforms) → peaks ~13 kt, spans ~4..23
-      legTws = 4.0f + (float)(random(0, 191) + random(0, 191)) / 20.0f;
-      // wind angle: triangular → peaks ~105°, spans ~30..176 (full range incl. downwind)
-      legTwa = 30.0f + (float)(random(0, 1461) + random(0, 1461)) / 20.0f;
-      legSea = 0.3f + legTws * 0.12f + (float)random(-30, 31) / 100.0f;// chop grows with wind
-      if (legSea < 0) legSea = 0; if (legSea > 5) legSea = 5;
-      legRpm = 0;
-    }
-  }
-  // Small in-band jitter so the run looks "live" but stays steady within the episode tolerances.
-  uint8_t motor = legMotor;
-  float tws = legTws + (float)random(-20, 21) / 100.0f;               // ±0.2 kt
-  float twa = legTwa + (float)random(-10, 11) / 10.0f;               // ±1.0°
-  float rpm = legMotor ? (legRpm + (float)random(-15, 16)) : 0.0f;    // ±15 RPM
-  float sea = legSea;
-  float v;
-  if (motor) {
-    v = HULL * (1.0f - expf(-(rpm - 600.0f) / 1300.0f));              // idle ~2kt, cruise ~6.5, → hull
-    if (v < 0) v = 0;
-    float hw = tws * cosf(twa * (float)PI / 180.0f);                  // ambient headwind while motoring
-    v -= 0.015f * (hw > 0 ? hw : 0);
-  } else {
-    float resp = 1.0f - expf(-tws / 8.0f);                           // wind response: ~.63@8 .86@16 .94@22
-    v = HULL * resp * perfSimShape(twa);                              // × normalized polar shape
-  }
-  float seaStd = sea / 1.414f;
-  v *= (1.0f - 0.025f * seaStd);                                      // rougher seas → slower
-  if (perfSimLoops >= 40) perfSimFoul -= 0.0002f;                     // gentle fouling after ~40 legs (~9 min)
-  if (perfSimFoul < 0.85f) perfSimFoul = 0.85f;
-  v *= perfSimFoul;
-  v *= 1.0f + (float)random(-25, 26) / 1000.0f;                      // ±2.5% measurement noise
-  if (v < 0.2f) v = 0.2f;
-  perfSimPitch = sea * sinf(2.0f * (float)PI * (float)(nowMs % 4000) / 4000.0f);  // wave-like pitch
-  perfSimTws = tws; perfSimTwa = twa; perfSimHdg = 90.0f;
-  perfSimRpm = motor ? rpm : 0.0f;
-  perfSimStw = v; perfSimSog = v;                            // no current; SOG == STW
+  (void)nowMs;
+  demoPerfSimFeed(perfSimTws, perfSimTwa, perfSimStw, perfSimSog, perfSimRpm, perfSimPitch);
 }
 
 // ---- live telemetry registry (single source for the PerfLive payload + /perfschema) ----
@@ -2853,7 +2775,8 @@ static float plf_source()   { return (float)sailFront.source; }    // 0 LEARNED,
 static float plf_paused()   { return (perfPaused >= 0.5f) ? 1.0f : 0.0f; }
 // fold timing lives in the Function Timing table (ft_boatPerf row) — not in this live stream
 static float plf_sim()      { return (perfSimMode >= 0.5f) ? 1.0f : 0.0f; }
-static float plf_syncAgo()  { if (lastBoatPerfSyncEpoch <= 0 || !timeIsSynced) return -1.0f;
+static float plf_syncAgo()  { if (demoSeal) return demoSyncAgoS(1260.0f);
+                              if (lastBoatPerfSyncEpoch <= 0 || !timeIsSynced) return -1.0f;
                               time_t n = time(NULL); return (n > (time_t)lastBoatPerfSyncEpoch) ? (float)(n - (time_t)lastBoatPerfSyncEpoch) : 0.0f; }
 static float plf_sailHours(){ return (float)(perfSailSeconds / 3600.0); }   // data-maturity hours
 static float plf_steady()   { return (float)perfSteady; }                   // in a steady-run right now
@@ -2871,7 +2794,9 @@ static PerfLiveField PERF_LIVE[] = {
 static const size_t PERF_LIVE_COUNT = sizeof(PERF_LIVE) / sizeof(PERF_LIVE[0]);
 
 static void perfSendLive() {
-  if (sseBacklogged()) return;   // periodic; the next tick resends current state
+  // periodic; the next tick resends current state. A backlogged phone link skips only the phone copy.
+  const bool phoneOk = !sseBacklogged();
+  if (!phoneOk && !gxLiveNow) return;
   char buf[256];
   int off = 0;
   for (size_t i = 0; i < PERF_LIVE_COUNT; i++) {
@@ -2879,7 +2804,8 @@ static void perfSendLive() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  sseSend(buf, "PerfLive");
+  if (phoneOk) sseSend(buf, "PerfLive");
+  gxSideOffer(GX_CH_PERFLIVE, buf, off);
 }
 
 // Motoring live registry (same {name,getter} pattern; schema served alongside under "motorLive").
@@ -2909,7 +2835,9 @@ static PerfLiveField PERF_MOTOR_LIVE[] = {
 };
 static const size_t PERF_MOTOR_LIVE_COUNT = sizeof(PERF_MOTOR_LIVE) / sizeof(PERF_MOTOR_LIVE[0]);
 static void perfSendMotorLive() {
-  if (sseBacklogged()) return;   // periodic; the next tick resends current state
+  // periodic; the next tick resends current state. A backlogged phone link skips only the phone copy.
+  const bool phoneOk = !sseBacklogged();
+  if (!phoneOk && !gxLiveNow) return;
   char buf[256];
   int off = 0;
   for (size_t i = 0; i < PERF_MOTOR_LIVE_COUNT; i++) {
@@ -2917,13 +2845,14 @@ static void perfSendMotorLive() {
     if (n < 0 || off + n >= (int)sizeof(buf)) break;   // truncated echo beats stack overrun (snprintf returns would-be length)
     off += n;
   }
-  sseSend(buf, "MotorLive");
+  if (phoneOk) sseSend(buf, "MotorLive");
+  gxSideOffer(GX_CH_MOTORLIVE, buf, off);
 }
 
 // ---- persistence (field-off-gated by caller) ----
 void boatPerfSave() {
   if (dbgRingsSynthetic) return;   // fillmax/clearmax: RAM rings are synthetic/empty — keep the real flash blobs
-  if (!sailFrontBuf || hardwarePresent != 1) return;
+  if (!sailFrontBuf || hardwarePresent != 1 || demoSeal) return;
   uint32_t suw = ((uint32_t)sailFront.source  << 8) | (uint32_t)PERF_NAXIS;
   uint32_t muw = ((uint32_t)motorFront.source << 8) | (uint32_t)PERF_NAXIS;
   writePsramBlob("/sailfront.bin",  PERF_SAILF_MAGIC, PERF_VER, suw, sailFrontBuf,  sizeof(FrontPoint<PERF_NAXIS>), PERF_FRONT_CAP, 0, sailFront.count);
@@ -3270,6 +3199,7 @@ static void perfApplySync() {
 }
 
 void boatPerf_tick(uint32_t nowMs) {
+  if (demoStoresBusy()) return;   // demo mode switching: the stores are mid-swap
   static uint32_t lastFold = 0, lastSse = 0;
   static uint8_t  perfSseStep = 0;   // 0 = idle; 1..4 = the 1 Hz SSE burst, SPREAD one step per loop pass
   static uint8_t  sc = 0;            // sendPerfSettings cadence: every 5th SSE cycle
@@ -3277,7 +3207,8 @@ void boatPerf_tick(uint32_t nowMs) {
   if (!sailFrontBuf) return;
   // Heavy one-offs, one per pass and only with the field physically cut (gpio4, not duty-derived fieldActiveStatus):
   // a finished cloud sync, and a 15 min save of new learning (sailing engine-off has no field-off edge to persist on).
-  if (!gHeavyRanThisPass && fieldCutSettled()) {
+  // Held in demo mode: the fronts in RAM are the demo copies.
+  if (!gHeavyRanThisPass && !demoSeal && fieldCutSettled()) {
     if (perfSyncHandoff) {
       gHeavyRanThisPass = true;
       perfApplySync();
@@ -3314,7 +3245,7 @@ void boatPerf_tick(uint32_t nowMs) {
     if (perfSimMode >= 0.5f) perfSimTick(nowMs);        // keep the sim feed alive on idle passes
     return;
   }
-  if (perfSimMode >= 0.5f) perfSimTick(nowMs);          // bench simulator feeds the sim vars first
+  if (perfSimMode >= 0.5f) perfSimTick(nowMs);          // demo feed first
   if (sseStart && perfSseStep == 0) { lastSse = nowMs; perfSseStep = 1; }   // arm the 1 Hz burst
   // Do exactly ONE heavy sub-op per pass: advance the SSE burst if one is pending, else run the fold.
   // (Prioritising the burst defers the 10 Hz fold by at most a few passes — jitter, not loss.)
@@ -3419,6 +3350,7 @@ void sendPerfSettings() {
     off += n;
   }
   sseSend(buf, "PerfSettings");
+  gxSideOffer(GX_CH_PERFSET, buf, off);
 }
 
 // Self-describing schema (/perfschema): the dashboard fetches it ONCE and zips these names against the
@@ -5753,8 +5685,12 @@ static const char *altSweepLimitNow() {
                                                         : interpolateRPMTable(RPM, rpmCapCurrentTable);
   capA = fminf(capA, (float)MaxTableValue);
   if (capA > 0.5f && amps >= capA - altSweepAmpMargin(capA))               return "current limit at this engine speed";
-  if (dvccFollowing && !isnan(dvccCclA) && dvccCclA > 0.5f && amps >= dvccCclA - altSweepAmpMargin(dvccCclA))
-                                                                           return "external current limit";
+  // Measured on the basis the min-select chain applies the CCL: battery current on a live shunt, unless it is the WiFi
+  // carrier's alternator ceiling (dvccCclAltBasis) or there is no live shunt (then it caps alternator amps directly).
+  if (dvccFollowing && !isnan(dvccCclA) && dvccCclA > 0.5f) {
+    float cclMeas = (!dvccCclAltBasis && HAS_BATT_SHUNT && bcurFresh() && !isnan(Bcur)) ? Bcur : amps;
+    if (cclMeas >= dvccCclA - altSweepAmpMargin(dvccCclA))                return "external current limit";
+  }
   // Same enable gate the battery-limit ceiling uses in the min-select chain (BattLimitEnable +
   // a configured INA228 shunt), so a disabled limit cannot cut the sweep short.
   if (BattLimitEnable && HAS_BATT_SHUNT && BattCurrentLimitA > 0.5f

@@ -1,0 +1,138 @@
+# The settings the Victron GX shows (Mark's list, 2026-10-27), as web-app keys.
+# gx_app/gen_settings.py reads labels, types, ranges, options, tooltips and echoes from
+# web_src/index.html and web_src/script.js, and writes gx_app/xregulator/bridge/settings_schema.json.
+#
+# One key per line, in screen order, under a "# section: Title" header.
+#   "# group: Title"            sub-heading for the keys that follow (must be a heading in index.html);
+#                               without it the key's enclosing <details> summary is used.
+#   KEY hidden                  published for gating only, not drawn.
+#   KEY disabledWhen=K:V        greyed while key K echoes V.
+#                               A key inside one of the app's gate containers (.gate-batt-current, .gate-soc-src,
+#                               .gate-extra-temp, #float-gated-fields) is greyed the same way without an option
+#                               (GATES in gen_settings.py); every key such a gate reads must be listed, hidden if not shown.
+#   KEY enabledWhen=EP.F:V      usable only while field F of polled endpoint EP is V.
+#   KEY confirm=fn:NAME[@V]     ask first, with the string a script.js function returns (only when writing V);
+#                               confirm=const:NAME takes a script.js string constant.
+#   KEY buttons=ID,ID           a select drawn by buttons outside a form (values traced from their handlers).
+#   table ID KEY ...            the whole form holding KEY, saved in one request like the app's Save button.
+#                               confirmIfChanged=PREFIX  the form's submit-listener warning, when a PREFIX<n> cell moved
+#                               readOnlyWhen=PREFIX:K:V  that column is locked and left out of the save while K is V
+#                               validate=ascending:PREFIX  the app's validateLearningTable rule on that column
+#                               capMode=K                Amps/kW columns (data-cap-col) follow select K, one derived
+#   @widget source=/endpoint    a GX-drawn panel fed by a JSON endpoint the app polls; anchor=ID (its place in
+#                               index.html: help text, table headings), strings=NAME,... (script.js string arrays).
+# The GX-only Connection section (regulator link and address, Regulators list) is drawn by XregCfgConnection.qml.
+
+# section: Alternator
+ManualFieldToggle confirm=fn:manualFieldBypassText@1
+ManualDutyTarget
+SwitchingFrequency
+TemperatureLimitF
+InvertAltAmps
+AlternatorCOffset
+AltZeroCaptureNow
+altZeroApply enabledWhen=zerofitstate.capHeld:1
+@zeroStatus source=/zerofitstate anchor=altzero-status strings=ALTZERO_REJ_TEXT,ALTZERO_PHASE_TEXT
+ManualLifePercentage
+
+# section: RPM Table
+PhysicalPanelOverride hidden
+HiLow buttons=chargeRateLowBtn,chargeRateHighBtn disabledWhen=PhysicalPanelOverride:1
+capLimitMode buttons=capModeAmpsBtn,capModeKWBtn
+table rpmTable rpmTableRPMPoints0 confirmIfChanged=rpmTableRPMPoints readOnlyWhen=rpmMinDutyTable:kneeLearnEnable:1 validate=ascending:rpmTableRPMPoints capMode=capLimitMode
+ClearOverheatHistory
+ResetLearningTable
+# group: Tachometer Keep-Alive — Automatic Learning
+kneeLearnEnable
+kneeMarginPct
+kneeOnsetA
+kneeReArmA
+kneeDwellSec
+kneeStepPct
+kneeTempComp
+kneeTempRefF
+kneeMaxFloorPct
+kneeRpmTolPct
+kneeTempTolF
+kneeDutyTolPct
+@kneeStatus source=/kneeLearnState anchor=knee-status-table
+ResetKneeLearn
+
+# section: CV Mode
+TargetVoltageMode
+TargetVoltageSetpoint
+
+# section: Engine
+RPMScalingFactor confirm=const:RPM_SCALE_WIPE_MSG
+PulleyRatio
+IgnitionOverride
+
+# section: Battery
+BatteryShuntPresent hidden
+BattMonSrc hidden
+BulkVoltage
+bulkVoltageHoldMs
+AbsorptionVoltage
+TailCurrent_A
+absorptionCompleteTime
+AbsorptionTimeoutMs
+UseFloat
+FloatVoltage
+FLOAT_DURATION
+MinFloatTime
+MaintainMode disabledWhen=PhysicalPanelOverride:1
+RebulkVoltage
+RebulkCurrent_A
+rebulkDebounceTime
+InvertBattAmps
+BatteryCOffset
+ShuntResistanceMicroOhm
+ShuntLead
+
+# section: Charge-Limit Follow
+dvccEn
+dvccSilenceS
+
+# section: Temperature
+@probes source=/tempSensors anchor=owProbeTable strings=OW_ROLE_NAMES,OW_ASSIGN_PARAM
+owScan
+battTempProbeEnable
+extraTempProbeEnable
+
+# section: Solar
+weatherModeEnabled
+# group: GPS Location
+table gpsManual LatitudeNMEA
+clearGpsManual
+# group: Solar Forecast
+TriggerWeatherUpdate
+# group: Configuration
+SolarWatts
+performanceRatio
+UVThresholdHigh
+solarUseConsEnable
+solarConsMarginPct
+solarLearnEnable
+solarLearnRatePct
+
+# section: Alarms
+AlarmActivate
+GeneralFaultAlarm
+TempAlarm
+TempAlarmLow
+extraTempAlarmHiEnable
+extraTempAlarmHiF
+extraTempAlarmLoEnable
+extraTempAlarmLoF
+VoltageAlarmHigh
+VoltageAlarmLow
+SocAlarmLow
+CurrentAlarmHigh
+MaximumAllowedBatteryAmps
+AlarmLatchEnabled
+AlarmTest
+ResetAlarmLatch
+SilenceAlarm
+
+# section: Bench and Development
+hardwarePresent

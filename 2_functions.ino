@@ -65,6 +65,7 @@ String readFile(fs::FS &fs, const char *path) {
 }
 
 bool writeFile(fs::FS &fs, const char *path, const char *message) {
+  if (demoSeal) return false;   // takes fs::FS directly, so the LittleFS seal cannot see it
   if (!littleFSMounted && !ensureLittleFS()) {
     return false;
   }
@@ -482,7 +483,7 @@ bool fsRemove(const char *path) {
 #define NK_timeSourceMode "gpsTimeSourceMd"   // legacy key string from before the position/time split
 #define NK_gpsPositionSource "gpsPosSource"
 #define NK_speedSourceMode "speedSourceMode"
-#define NK_hardwarePresent "hardwarePresent"
+// #define NK_hardwarePresent "hardwarePresent"   // RETIRED 2026-10-27: Hardware Present is RAM-only (demo mode) — key reserved, never reuse
 #define NK_maxPoints "maxPoints"
 #define NK_perfPaused "perfPaused"
 #define NK_performanceRatio "performanceRati"
@@ -542,6 +543,7 @@ bool fsRemove(const char *path) {
 #define NK_pwSalt "pwSalt"
 #define NK_pwHash "pwHash"
 #define NK_pairList "pairList"
+// #define NK_gxPairs "gxPairs"   // RETIRED 2026-10-27 with Victron GX pairing (a GX write now carries gx=1) — key reserved, never reuse
 #define NK_first_config_done "firstconfigdone"
 #define NK_imu_zero "imu_zero"
 #define NK_imu_mnt_state "imu_mnt_state"
@@ -664,6 +666,7 @@ bool fsRemove(const char *path) {
 #define SETTINGS_NVS_NAMESPACE "settings"
 
 bool settingExists(const char *key) {
+  if (demoSeal) { int r = demoOvRead(key, nullptr); if (r >= 0) return r == 1; }   // demo-mode overlay (9_demo.ino)
   nvs_handle_t h;
   if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
   size_t len = 0;
@@ -673,6 +676,7 @@ bool settingExists(const char *key) {
 }
 
 String settingRead(const char *key) {
+  if (demoSeal) { String v; int r = demoOvRead(key, &v); if (r >= 0) return v; }
   nvs_handle_t h;
   if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return String();
   String out;
@@ -690,6 +694,7 @@ String settingRead(const char *key) {
 
 bool settingWrite(const char *key, const char *value) {
   if (!key || !value) return false;
+  if (demoSeal) return demoOvWrite(key, value);   // demo: applies in RAM only, gone at exit
   nvs_handle_t h;
   if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
   // compare-first: unchanged value -> no flash write (wear + entry churn)
@@ -706,6 +711,7 @@ bool settingWrite(const char *key, const char *value) {
 }
 
 bool settingRemove(const char *key) {
+  if (demoSeal) return demoOvWrite(key, nullptr);
   nvs_handle_t h;
   if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
   esp_err_t e = nvs_erase_key(h, key);
@@ -2149,6 +2155,11 @@ void httpsTask(void *param) {
 
     HttpsRequest request;
     if (xQueueReceive(httpsQueue, &request, pdMS_TO_TICKS(1000))) {
+      // Demo mode: only the weather forecast fetch leaves the boat; every upload and cloud operation is dropped here.
+      if (demoSeal && request.type != HTTPS_FETCH_WEATHER) {
+        if (request.payload) free(request.payload);
+        continue;
+      }
 
       if (request.type == HTTPS_UPLOAD_PAYLOAD || request.type == HTTPS_UPLOAD_CONFIG || request.type == HTTPS_UPLOAD_BOATPERF || request.type == HTTPS_UPLOAD_ALTHEALTH || request.type == HTTPS_UPLOAD_CX_LEDGER || request.type == HTTPS_UPLOAD_USAGE) {
         size_t payloadLen = request.payload ? strlen(request.payload) : 0;
@@ -3177,7 +3188,7 @@ bool sensorUploadsHeldForClock() {
 
 void uploadBufferedRecords() {
   if (otaInProgress) return;
-  if (hardwarePresent != 1) return;   // sim mode (HardwarePresent=0): never upload fake data to the cloud
+  if (hardwarePresent != 1 || demoSeal) return;   // demo mode: nothing reaches the cloud
   if (ringIsEmpty()) return;
   if (!isRegistered || authToken.isEmpty()) {
     Serial.println("uploadBufferedRecords: skipping — not registered");
@@ -3521,7 +3532,7 @@ inline bool ringIsEmpty() { return sensorRingCount == 0; }
 
 // Drops the oldest if full, unless that slot is mid-upload on Core 0 — then the new sample is dropped.
 void pushSensorSnapshot(time_t collectionTime) {
-  if (!sensorRing) return;
+  if (!sensorRing || demoSeal) return;   // demo mode: a restart or shutdown must not file the simulated window
   // Index RMWs under sensorRingMux (Core 0 pops concurrently). The big struct
   // copy below stays OUTSIDE the lock — the head slot is invisible to Core 0
   // until the count++ publish at the end.
@@ -3782,9 +3793,9 @@ static inline int16_t ltScale(int32_t v100, int32_t divisor) {
     rec.dst[2] = ltScale(_a, divisor); \
     rec.validMask |= (1u << (bit)); \
   } } while (0)
-void pushLongTermRecord() {
-  if (!longTermRing) return;
-  LongTermRecord rec = {};  // zero-init: absent fields stay 0 with validMask bit clear
+// Builds the record from the closing window; pushLongTermRecord() files it in the real ring, demo mode in its own (9_demo.ino).
+void buildLongTermRecord(LongTermRecord &rec) {
+  rec = {};  // zero-init: absent fields stay 0 with validMask bit clear
 
   // Real epoch of THIS record (0 if unsynced) — drives the legit time axis + gap detection.
   uint32_t nowEpoch = (timeIsSynced && timeBase > 0)
@@ -3840,6 +3851,12 @@ void pushLongTermRecord() {
     rec.onAvg[4] = ltScale((int32_t)(currentWindow->dutyCycle_on_area_v_us / on_us), 1);
   }
 
+}
+void pushLongTermRecord() {
+  if (!longTermRing) return;
+  LongTermRecord rec;
+  buildLongTermRecord(rec);
+  uint32_t nowEpoch = rec.timestamp;
   longTermRing[longTermHead] = rec;
   longTermHead = (longTermHead + 1) % LONGTERM_RING_SIZE;
   if (longTermCount < LONGTERM_RING_SIZE) longTermCount++;
@@ -3854,9 +3871,10 @@ void pushLongTermRecord() {
 void uploadSensorHistory() {
   if (otaInProgress) return;
 
-  // Sim mode (HardwarePresent=0): live display only — no long-term ring, no cloud
-  // buffering. Still roll the window so it doesn't accumulate fake data unbounded.
-  if (hardwarePresent != 1) {
+  // Demo mode: the record goes to the demo ring only (9_demo.ino), never the real ring or the cloud buffer. The window still rolls
+  // so the restart snapshot can never carry simulated data.
+  if (hardwarePresent != 1 || demoSeal) {
+    demoPushLongTermLive();
     resetSensorWindow();
     resetAccelWindow();
     return;
@@ -3951,7 +3969,7 @@ static float zeroBasisFromWord(uint32_t w) {
 // Flush the PSRAM ring so a reboot keeps the session. Field-off only (caller gates). Same append/compact
 // scheme as dumpLongTermRing.
 void dumpZeroLog() {
-  if (dbgRingsSynthetic) return;   // fillmax/clearmax: RAM ring is synthetic/empty — keep the real flash blob
+  if (dbgRingsSynthetic || demoSeal) return;   // fillmax/clearmax: RAM ring is synthetic/empty — keep the real flash blob
   if (!zeroLogRing || zeroLogCount == 0) return;
   uint32_t delta = zeroLogPushSeq - zeroLogFlushedSeq;   // samples new since last flush (unsigned wrap-safe)
   if (delta == 0 && zeroLogFileRecords > 0) return;      // file already holds every sample — nothing to persist
@@ -4015,6 +4033,7 @@ void zeroLogResetAll() {
 // (RAM only), and flushes to flash field-off only (60s-settled, every 30 min, new-data-gated — same
 // flash discipline as dumpLongTermRing). The flush is the only flash write; sampling is trivial.
 void zeroLogService() {
+  if (demoSeal) return;   // demo mode: no samples, no fit, no flash; an offset changed in demo reverts before this runs again
   // An AlternatorCOffset change from any path lands here, on the core that appends to and fits from these rings.
   static uint32_t basisMovedMs = 0;
   const float off = AlternatorCOffset;
@@ -4103,6 +4122,7 @@ static void altZeroEnd(uint8_t rej) {
 // field the average IS the sensor's zero error. Writes nothing (operator applies it). Live RPM is NOT a gate
 // once the hold is on: at 0% field the LM2907 may read low/zero on a running engine, so RPM is latched first.
 void altZeroCaptureService() {
+  if (demoSeal) return;   // Measured Zero is refused in demo; one already running waits for real readings
   uint32_t now = millis();
   static uint32_t fieldOnMs    = 0;   // last pass the field was on: the drain is counted from here, not from the request
   if (fieldActiveStatus > 0) fieldOnMs = now;
@@ -5298,6 +5318,7 @@ static void usageAdd(const char *key, uint32_t n, uint32_t ms) {
 // Merge one /track delta POST: {"o":1,"a":1,"p":{"<page>":{"n":1,"ms":1234}},"b":{"<btn>":2}}
 // Runs on the async_tcp task — pure counter increments under the mutex, no I/O.
 bool usageMergeDelta(const char *body) {
+  if (demoSeal) return true;   // demo mode: app use is not counted (accepted so the app drops its deltas)
   if (!usageSlots || !usageMutex) return false;
   DynamicJsonDocument doc(6144);
   if (deserializeJson(doc, body)) return false;
@@ -5551,7 +5572,7 @@ struct UsageFileHdr {
 #define USAGE_FILE_PATH "/usage.bin"
 
 void dumpUsageAccum() {
-  if (!usageSlots || !usageDirty) return;
+  if (!usageSlots || !usageDirty || demoSeal) return;
   if (!usageMutex || xSemaphoreTake(usageMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
   fsTakeLock();
   File f = LittleFS.open(USAGE_FILE_PATH, "w");
@@ -7014,6 +7035,7 @@ void faFlipFlush() {
 // long-term ring: matrix + flipbook bank during charging, flush on the field-off settled
 // rising edge and every 15 min thereafter while new data has merged.
 void faMatrixMaybeFlush() {
+  if (demoSeal) return;   // demo mode: ripple map, table and peaks stay as they were
   // RPM ripple table service (deferred from /get so wipe/save run on Core 1, same core as the
   // faFiltRippleUpdate folds — no locking needed). Wipe = game start: zero + stamp the session,
   // THEN open the fold window. Save = game teardown: persist the frozen table.

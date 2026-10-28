@@ -1061,7 +1061,6 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "TuningMode", NK_TuningMode, 1 },       // both tuning modes are cleared at every boot, so an import of either is inert
   { "CVTuningMode", NK_CVTuningMode, 1 },
   { "battMaxMode", NK_battMaxMode, 1 },
-  { "hardwarePresent", NK_hardwarePresent, 1 },
   { "socInfoAvailable", NK_socInfoAvailable, 1 },
   { "totalPowerCycles", NK_totalPowerCycles, 1 },
   { "weatherDataValid", NK_weatherDataValid, 1 },
@@ -4047,7 +4046,7 @@ static void capAppendPoint(uint32_t epoch, float capAh, float socLow, float temp
 // Per battery-update tick. Rest detection (dV/dt-settled + time floor) on the FILTERED voltage,
 // low-OCV anchor capture, and an independent unclamped Ah bridge from the anchor.
 void capTrackTick(float I_batt, float V_filt, float tempC, float dtSec) {
-  if (!bhCapRing || dtSec <= 0.0f) return;
+  if (!bhCapRing || dtSec <= 0.0f || demoSeal) return;   // demo mode: the simulated battery never feeds the capacity record
   uint32_t nowMs = millis();
   float restThresh = capRestCurrentFrac * (float)BatteryCapacity_Ah;
   if (restThresh < 0.2f) restThresh = 0.2f;
@@ -4091,7 +4090,7 @@ void capTrackTick(float I_batt, float V_filt, float tempC, float dtSec) {
 
 // At the full-charge anchor. Emits a dated capacity point if the span is deep enough.
 void capTrackOnFull(uint32_t epoch, float tempC) {
-  if (!capLowAnchorValid) return;                 // no independent low anchor → can't measure
+  if (!capLowAnchorValid || demoSeal) return;                 // no independent low anchor → can't measure
   float span = capFullSoc - capLowAnchorSoC;
   if (span < capMinSpan || capBridgeAh <= 0.0f) { capLowAnchorValid = false; return; }
 
@@ -5039,6 +5038,7 @@ void cxLedgerFlush() {
 // flash write). Network gates live here. One batch in flight at a time; sent bytes trim off
 // the file head only after the cloud confirms.
 void cxLedgerDrainService() {
+  if (demoSeal) return;   // commissioning is refused in demo; anything queued before entry waits
   static uint32_t trimRetryAtMs = 0;   // 0 = no trim waiting on PSRAM
   static bool noMemNoted = false;      // one console line per run of failed buffer allocations
   if (cxLedgerUpState == 1) return;                            // batch in flight

@@ -628,8 +628,9 @@ static bool dvccVicCut = false;  // 0x2108 said do-not-charge → effective CCL 
 // Last decode time of each held register. Silence is judged on the authority as a whole
 // (dvccRxLastMs), so without these a register that stops arriving while others keep flowing holds forever.
 static uint32_t dvccVicCvlMs = 0, dvccVicCclMs = 0, dvccVicCutMs = 0;
+static uint32_t dvccVicCanMs = 0;  // last accepted register from the locked sender: the VE.Can carrier's own silence clock (0 = silent)
 
-// A stale sender lock or flap history must never carry into judging a fresh authority.
+// A stale sender lock, flap history or held carrier value must never carry into judging a fresh authority.
 static void dvccClearDecodeState() {
   dvccFlapLastCvl = NAN;
   dvccFlapWindowStartMs = 0;
@@ -638,6 +639,10 @@ static void dvccClearDecodeState() {
   dvccVicLockAddr = 255;
   dvccVicCvl = dvccVicCcl = NAN;
   dvccVicCut = false;
+  dvccVicCanMs = 0;
+  dvccRxCanCvl = dvccRxCanCcl = NAN;
+  dvccRxWifiCvl = dvccRxWifiCcl = NAN;
+  dvccRxWifiMs = 0;
 }
 
 void initDvccCapture() {
@@ -736,7 +741,7 @@ void dvccNoteProductInfo(const tN2kMsg &N2kMsg) {
 // CSV2 identity of the current limit sender; refreshed even with follow off (observe-before-enable).
 static void dvccAuthIdentityRefresh() {
   uint16_t mfg = 0, prod = 0;
-  if (dvccNodes && dvccRxSrcAddr != 255) {
+  if (dvccNodes && dvccRxSrcAddr != 255 && dvccRxSrcAddr != DVCC_ADDR_WIFI) {
     portENTER_CRITICAL(&dvccCapMux);
     for (uint8_t i = 0; i < dvccNodeCount; i++) {
       if (dvccNodes[i].addr != dvccRxSrcAddr) continue;
@@ -815,6 +820,7 @@ static void dvccIngest(float cvl, float ccl, uint8_t srcAddr, uint8_t priority, 
   }
   dvccRxCvl = cvl;
   dvccRxCcl = ccl;
+  dvccRxCclAltBasis = false;   // battery basis; the Victron merge marks a WiFi winner after this call
   dvccRxSrcAddr = srcAddr;
   dvccRxPriority = priority;
   dvccRxChgState = chgState;
@@ -832,12 +838,13 @@ static bool dvccRvcAcceptSender(uint8_t srcAddr, uint8_t priority) {
 }
 
 // Victron: no instance field on the VREG carrier — lock to the first sending bus address.
+// Handoff is timed on the VE.Can carrier alone: WiFi posts keep dvccRxLastMs fresh and would block it forever.
 static bool dvccVicAcceptSender(uint8_t srcAddr) {
   if (dvccVicLockAddr == 255 || srcAddr == dvccVicLockAddr) {
     dvccVicLockAddr = srcAddr;
     return true;
   }
-  if ((uint32_t)(millis() - dvccRxLastMs) > DVCC_HANDOFF_SILENCE_MS) {
+  if ((uint32_t)(millis() - dvccVicCanMs) > DVCC_HANDOFF_SILENCE_MS) {
     dvccVicLockAddr = srcAddr;
     dvccVicCvl = dvccVicCcl = NAN;  // never combine a new authority's first field with the old authority's held values
     dvccVicCut = false;
@@ -856,6 +863,50 @@ static bool dvccDecodeVreg351(const unsigned char *p, int len, float &cvl, float
   cvl = rawV * 0.1f;
   ccl = (rawA == (int16_t)0x7FFF) ? NAN : rawA * 0.1f;
   return true;
+}
+
+static inline float dvccLower(float a, float b) {
+  if (isnan(a)) return b;
+  if (isnan(b)) return a;
+  return (b < a) ? b : a;
+}
+
+// The Victron source is one authority on two carriers: VE.Can (the held registers) and WiFi (/gxLimits). A carrier counts
+// only while heard within Silence Timeout, and the lower of the fresh values wins. Runs on every accepted VE.Can register
+// and every taken WiFi post, so the trust machine still sees each update.
+static void dvccVicIngestMerged() {
+  uint32_t now = millis();
+  uint32_t silenceMs = (uint32_t)dvccSilenceS * 1000UL;
+  if (dvccVicCanMs != 0 && (uint32_t)(now - dvccVicCanMs) > silenceMs) {
+    // VE.Can alone went silent while WiFi kept the authority alive: the same clear a whole-authority silence does.
+    dvccVicLockAddr = 255;
+    dvccVicCvl = dvccVicCcl = NAN;
+    dvccVicCut = false;
+    dvccVicCanMs = 0;
+  }
+  // Held registers older than max(Silence Timeout, 60 s) drop: Victron's contract repeats limits more than once a minute.
+  // dvccVicCutHold = owner choice to keep a stale do-not-charge until cleared or until VE.Can goes silent.
+  uint32_t maxAgeMs = (uint32_t)max(dvccSilenceS, 60) * 1000UL;
+  if ((uint32_t)(now - dvccVicCvlMs) > maxAgeMs) dvccVicCvl = NAN;
+  if ((uint32_t)(now - dvccVicCclMs) > maxAgeMs) dvccVicCcl = NAN;
+  if (dvccVicCutHold != 1 && (uint32_t)(now - dvccVicCutMs) > maxAgeMs) dvccVicCut = false;
+  bool canFresh = (dvccVicCanMs != 0);
+  bool wifiFresh = (dvccRxWifiMs != 0) && (uint32_t)(now - dvccRxWifiMs) <= silenceMs;
+  dvccRxCanCvl = canFresh ? dvccVicCvl : NAN;
+  dvccRxCanCcl = canFresh ? (dvccVicCut ? 0.0f : dvccVicCcl) : NAN;  // do-not-charge = CCL 0 (obey-zero)
+  float cvl = dvccRxCanCvl, ccl = dvccRxCanCcl;
+  bool cclAlt = false;
+  if (wifiFresh) {
+    cvl = dvccLower(cvl, dvccRxWifiCvl);
+    // CCLs compared as alternator amps: the WiFi one is this alternator's share already, the VE.Can one is battery current
+    // and gets the house-load offset the control loop would add (live shunt only). The winner keeps its own basis.
+    if (!isnan(dvccRxWifiCcl)) {
+      float canAsAlt = (!isnan(ccl) && HAS_BATT_SHUNT && bcurFresh()) ? fmaxf(0.0f, ccl + loadOffsetFilt) : ccl;
+      if (isnan(canAsAlt) || dvccRxWifiCcl < canAsAlt) { ccl = dvccRxWifiCcl; cclAlt = true; }
+    }
+  }
+  dvccIngest(cvl, ccl, canFresh ? dvccVicLockAddr : (uint8_t)DVCC_ADDR_WIFI, 0, 0);
+  dvccRxCclAltBasis = cclAlt;
 }
 
 // One Victron VREG register; p = the register value (the bytes after the vreg id, on both carriers). 0x2001 (what a GX sends, per Victron, spec §17)
@@ -910,15 +961,10 @@ static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uin
   } else {
     return false;
   }
-  // Re-ingest the held set so the trust machine sees the combined view; do-not-charge = CCL 0 (obey-zero).
-  // Held registers older than max(Silence Timeout, 60 s) drop: Victron's contract repeats limits more than
-  // once a minute. dvccVicCutHold = owner choice to keep a stale do-not-charge until cleared or full silence.
-  uint32_t now = millis();
-  uint32_t maxAgeMs = (uint32_t)max(dvccSilenceS, 60) * 1000UL;
-  if ((uint32_t)(now - dvccVicCvlMs) > maxAgeMs) dvccVicCvl = NAN;
-  if ((uint32_t)(now - dvccVicCclMs) > maxAgeMs) dvccVicCcl = NAN;
-  if (dvccVicCutHold != 1 && (uint32_t)(now - dvccVicCutMs) > maxAgeMs) dvccVicCut = false;
-  dvccIngest(dvccVicCvl, dvccVicCut ? 0.0f : dvccVicCcl, src, 0, 0);
+  // Re-ingest the held set, merged with WiFi, so the trust machine sees the combined view.
+  dvccVicCanMs = millis();
+  MARK_FRESH(IDX_DVCC_VECAN);
+  dvccVicIngestMerged();
   return true;
 }
 
@@ -1273,9 +1319,26 @@ void n2kBusDailyRefresh() {
   n2kDayNodesMax = nodes;
 }
 
+// Loop side of /gxLimits. Called every pass, ahead of dvccTick's 1 Hz gate, so each post is ingested on its own: flap
+// detection needs every update, and a 1 Hz sample can alias a fast flap to steady. Taken even with follow off (observe mode).
+static void dvccWifiTake() {
+  static uint32_t seenSeq = 0;
+  if (dvccWifiBoxSeq == seenSeq) return;
+  portENTER_CRITICAL(&dvccWifiMux);
+  float cvl = dvccWifiBoxCvl, ccl = dvccWifiBoxCcl;
+  seenSeq = dvccWifiBoxSeq;
+  portEXIT_CRITICAL(&dvccWifiMux);
+  dvccRxWifiCvl = cvl;
+  dvccRxWifiCcl = ccl;
+  dvccRxWifiMs = millis();
+  MARK_FRESH(IDX_DVCC_WIFI);
+  if (dvccSrcType == 0) dvccVicIngestMerged();
+}
+
 // Trust state machine (spec §3), 1 Hz. The clamps are also gated on dvccEn at the application sites, so
 // a mid-session disable takes effect before the next tick.
 void dvccTick() {
+  dvccWifiTake();
   static uint32_t lastTickMs = 0;
   uint32_t now = millis();
   if ((uint32_t)(now - lastTickMs) < 1000UL) return;
@@ -1388,13 +1451,17 @@ void dvccTick() {
     dvccState = DVCC_SETTLING;
     if ((uint32_t)(now - settleStartMs) >= (uint32_t)dvccSettleS * 1000UL && settleFrames >= DVCC_SETTLE_MIN_FRAMES) {
       dvccState = DVCC_FOLLOWING;
-      queueConsoleMessageF("DVCC: following authority (addr %u) CVL=%.2fV CCL=%.1fA (-1 = not sent)",
-                           (unsigned)dvccRxSrcAddr, isnan(dvccRxCvl) ? -1.0f : dvccRxCvl, isnan(dvccRxCcl) ? -1.0f : dvccRxCcl);
+      char who[12];
+      if (dvccRxSrcAddr == DVCC_ADDR_WIFI) snprintf(who, sizeof(who), "WiFi");
+      else snprintf(who, sizeof(who), "addr %u", (unsigned)dvccRxSrcAddr);
+      queueConsoleMessageF("DVCC: following authority (%s) CVL=%.2fV CCL=%.1fA (-1 = not sent)",
+                           who, isnan(dvccRxCvl) ? -1.0f : dvccRxCvl, isnan(dvccRxCcl) ? -1.0f : dvccRxCcl);
     }
   }
   if (dvccState == DVCC_FOLLOWING) {
     dvccCvlV = dvccRxCvl;
     dvccCclA = dvccRxCcl;
+    dvccCclAltBasis = dvccRxCclAltBasis;
   } else {
     dvccCvlV = dvccCclA = NAN;
   }
@@ -2262,6 +2329,7 @@ void ReadNMEA0183Data() {
 // Maintenance reboot engine. Tier constants + full ladder description live with
 // REBOOT_OPPORTUNISTIC_MS in Xregulator.ino. Runs every loop pass.
 void checkAndRestart() {
+  if (demoSeal) return;   // a maintenance restart waits for demo exit: it would drop the unsaved real state the demo is holding aside
   unsigned long up = millis();  // device boots at millis()=0, so uptime IS millis(); the 72 h cap keeps us far from the 49.7-day wrap
 
   // Health requester: LargestInternalBlock (KB, cpuLoadTask's 20 s walk, field cut only) below the
@@ -2442,6 +2510,7 @@ void checkAndRestart() {
       events.send("Performing maintenance restart", "console");
       delay(500);             // Give events time to actually send
       events.close();         // Close all SSE connections
+      gxEvents.close();
       delay(100);             // Let close complete
       WiFi.disconnect(true);
       delay(100);
@@ -2517,6 +2586,7 @@ void captureResetReason() {
   // invalidate so a reset before the first loop pass can't replay this session's copy.
   memcpy(&g_blackBoxPrev, &g_blackBox, sizeof(g_blackBoxPrev));
   g_blackBoxPrevValid = (g_blackBoxPrev.magic == BLACKBOX_MAGIC);
+  const bool bbWasDemo = (g_blackBoxPrev.magic == BLACKBOX_DEMO_MAGIC);   // reset during demo mode: simulated values, not a record
   g_blackBox.magic = 0;
 
   // Lifetime OV telemetry: bad magic = true power-down or a firmware layout change — start clean
@@ -2537,6 +2607,8 @@ void captureResetReason() {
                   g_blackBoxPrev.duty, (int)g_blackBoxPrev.rpm, g_blackBoxPrev.measAmps,
                   bbTemp, g_blackBoxPrev.sysMode, g_blackBoxPrev.chargeStage,
                   g_blackBoxPrev.maxLoopUs / 1000.0f, (long)g_blackBoxPrev.minHeapKB);
+  } else if (bbWasDemo) {
+    Serial.println("BLACKBOX: the last session ended in demo mode (simulated readings) - not recorded");
   } else {
     Serial.println("BLACKBOX: RTC RAM lost - true power interruption preceded this boot");
   }
@@ -4472,8 +4544,8 @@ void updateOvHistogram(float rawV, bool vTrusted, uint32_t nowMs) {
     lastBin = -1;
     return;
   }
-  g_ovTel.timeMs[bin] += dt;
-  if (bin != lastBin) g_ovTel.events[bin]++;
+  ovTel().timeMs[bin] += dt;
+  if (bin != lastBin) ovTel().events[bin]++;
   lastBin = bin;
 }
 
@@ -5452,319 +5524,6 @@ void drainIMUFifo() {
              }()));
 }
 
-void ReadAnalogInputs_Fake() {
-  static unsigned long lastINARead_local2 = 0;
-
-  if (millis() - lastINARead_local2 >= INA_SLOW_INTERVAL_MS) {  // could go down to 600 here, but this logic belongs in Loop anyway
-    lastINARead_local2 = millis();
-
-    static unsigned long lastFakeUpdate = 0;
-    static float fakeVoltage = 13.2;
-    static float fakeCurrent = -85.0;
-    static float fakeRPM = 1000;
-    static float fakeTemp = 45.0;
-
-    // GPS motion simulation
-    static float fakeLat = 0.0;     // Equator
-    static float fakeLon = -140.0;  // Open Pacific
-    static float fakeHeading = random(0, 360);
-    static float fakeCOG = fakeHeading + random(-30, 30);
-    static float fakeSOG = 3.0 + (random(-150, 150) / 100.0);  // 1.5–4.5 kt initial band
-    static float fakeApparentWindSpeed = 12.0;
-    static float fakeApparentWindAngle = 45.0;
-    fakeLon += 0.000375f;
-    if (fakeLon > 180.0f) fakeLon -= 360.0f;
-    // small lat oscillation near equator
-    // 0.1 deg amplitude, period controlled by time
-    // this uses fakeLon as the "time" driver, no new vars
-    fakeLat = 0.1f * sin(fakeLon * 0.1f);
-
-    LatitudeNMEA = fakeLat;
-    LongitudeNMEA = fakeLon;
-    SatelliteCountNMEA = 6 + random(0, 10);  // 6–15 sats
-    MARK_FRESH(IDX_LATITUDE_NMEA);
-    MARK_FRESH(IDX_LONGITUDE_NMEA);
-    MARK_FRESH(IDX_SATELLITE_COUNT);
-
-    fakeSOG += (random(-80, 80) / 100.0);  // ±0.8 kt per update
-    if (fakeSOG < 0.5) fakeSOG = 0.5;
-    if (fakeSOG > 12.0) fakeSOG = 12.0;
-    SOGNMEA = fakeSOG;
-    MARK_FRESH(IDX_SOG_NMEA);
-
-    updateSustainedSpeed(fakeSOG);
-
-
-    fakeCOG += (random(-40, 40) / 10.0);  // ±4° per update
-    if (fakeCOG < 0) fakeCOG += 360;
-    if (fakeCOG >= 360) fakeCOG -= 360;
-    COGNMEA = fakeCOG;
-    MARK_FRESH(IDX_COG_NMEA);
-
-    fakeHeading += (random(-60, 60) / 10.0);  // ±6° per update
-    if (fakeHeading < 0) fakeHeading += 360;
-    if (fakeHeading >= 360) fakeHeading -= 360;
-    HeadingNMEA = fakeHeading;
-    MARK_FRESH(IDX_HEADING_NMEA);
-
-    fakeApparentWindSpeed += (random(-40, 40) / 10.0);  // ±4 kt per update
-    if (fakeApparentWindSpeed < 0.0) fakeApparentWindSpeed = 0.0;
-    if (fakeApparentWindSpeed > 35.0) fakeApparentWindSpeed = 35.0;
-    ApparentWindSpeedNMEA = fakeApparentWindSpeed;
-    MARK_FRESH(IDX_APPARENT_WIND_SPEED);
-
-    fakeApparentWindAngle += (random(-120, 120) / 10.0);  // ±12° per update
-    if (fakeApparentWindAngle < 0.0) fakeApparentWindAngle += 360.0;
-    if (fakeApparentWindAngle >= 360.0) fakeApparentWindAngle -= 360.0;
-    ApparentWindAngleNMEA = fakeApparentWindAngle;
-    MARK_FRESH(IDX_APPARENT_WIND_ANGLE);
-
-    // Fake battery voltage, 11.5–15.0V per-cell-scaled by class (unscaled 12V numbers would
-    // fail isVoltageSensorPlausible and trip the disagreement fault on a 24/36/48V-configured unit)
-    float simK = (float)SYSTEM_VOLTAGE_CLASS / 12.0f;
-    fakeVoltage += (random(-80, 80) / 100.0) * simK;  // ±0.8 V per update at 12V
-    if (fakeVoltage < 11.5 * simK) fakeVoltage = 11.5 * simK;
-    if (fakeVoltage > 15.0 * simK) fakeVoltage = 15.0 * simK;
-    BatteryV = fakeVoltage;
-    IBV = fakeVoltage + (random(-30, 30) / 100.0) * simK;             // ±0.30 V at 12V
-    VictronVoltage = fakeVoltage + (random(-50, 50) / 100.0) * simK;  // ±0.50 V at 12V
-    MARK_FRESH(IDX_BATTERY_V);
-    MARK_FRESH(IDX_IBV);
-    MARK_FRESH(IDX_VICTRON_VOLTAGE);
-
-
-    if (IBV > PeakVoltage_AllTime) { PeakVoltage_AllTime = IBV; }
-    if (IBV > IBVMax)              { IBVMax              = IBV; }
-    if (IBV < MinVoltage)          { MinVoltage          = IBV; }
-    if (MinVoltage_AllTime == 0.0 || IBV < MinVoltage_AllTime) { MinVoltage_AllTime = IBV; }
-
-
-    // Fake alternator current
-    //fakeCurrent += (random(-50, 50) / 100.0);  // ±0.5 A per update
-    //if (fakeCurrent < -140.0) fakeCurrent = -140.0;
-    // if (fakeCurrent > 150.0) fakeCurrent = 150.0;
-    fakeCurrent = 10;
-    MeasuredAmps = fakeCurrent * (InvertAltAmps ? -1 : 1);
-    ch1FreshFlag = true;                                    // Signal PID that fresh current data is available
-    MARK_FRESH(IDX_MEASURED_AMPS);
-
-    if (MeasuredAmps > MeasuredAmpsMax)         { MeasuredAmpsMax         = MeasuredAmps; }
-    if (MeasuredAmps > MeasuredAmpsMax_AllTime) { MeasuredAmpsMax_AllTime = MeasuredAmps; }
-
-
-    static float fakeBattCurrent = 0;
-    if (SOC_percent > 99) {
-      fakeBattCurrent = -100.0;
-    }
-    if (SOC_percent < 99) {
-      fakeBattCurrent = 100.0;
-    }
-    //fakeBattCurrent += (random(-80, 80) / 10.0);  // ±8 A per update
-    //if (fakeBattCurrent < -180.0) fakeBattCurrent = -180.0;
-    //if (fakeBattCurrent > 180.0) fakeBattCurrent = 180.0;
-    fakeBattCurrent = 100;
-    Bcur = fakeBattCurrent * (InvertBattAmps ? -1 : 1);
-    BatteryCurrent_scaled = Bcur * 100;
-    VictronCurrent = Bcur + (random(-80, 80) / 10.0);  // ±8 A offset
-    MARK_FRESH(IDX_BCUR);
-    MARK_FRESH(IDX_VICTRON_CURRENT);
-
-    // Fake RPM
-    //fakeRPM += (random(-3, 3));  // ±3 rpm per update
-    // if (fakeRPM < 800) fakeRPM = 800;
-    // if (fakeRPM > 3200) fakeRPM = 3200;
-    fakeRPM = 1000;
-    RPM = fakeRPM;
-    MARK_FRESH(IDX_RPM);
-    rpmUnheldReadMs = (uint32_t)dataTimestamps[IDX_RPM];
-
-    if (RPM > RPMMax)         { RPMMax         = RPM; }
-    if (RPM > RPMMax_AllTime) { RPMMax_AllTime = RPM; }
-
-    // fakeTemp walks in °C (10–110), converted to °F at storage to match the °F-native globals.
-    fakeTemp += (random(-30, 30) / 10.0);
-    if (fakeTemp < 10) fakeTemp = 10;
-    if (fakeTemp > 110) fakeTemp = 110;
-    temperatureThermistor = (int)(fakeTemp * 1.8f + 32.0f);
-    ambientTemp = (fakeTemp - (5 + random(-20, 20) / 10.0)) * 1.8f + 32.0f;
-    // Floored at 60 °F only so the board-temp readout looks plausible; no lockout reads board temp.
-    // Without the MARK_FRESH the board-temp and baro readouts stay grayed forever.
-    if (ambientTemp < 60.0f) ambientTemp = 60.0f;
-
-    // Battery temperature as source 1 (probe): without it the default Automatic source reports
-    // BATT_TEMP_LOST and stops charging 90 s after boot. Held at 20-30°C so neither lockout trips.
-    static float fakeBattTempC = 25.0f;
-    fakeBattTempC += (random(-5, 6) / 10.0f);
-    if (fakeBattTempC < 20.0f) fakeBattTempC = 20.0f;
-    if (fakeBattTempC > 30.0f) fakeBattTempC = 30.0f;
-    BatteryTempProbeF = fakeBattTempC * 1.8f + 32.0f;
-    MARK_FRESH(IDX_BATT_TEMP_PROBE);
-
-    // Drive temperature (INA228 die): without it REASON_DIE_TEMP_LOST stops the field 15 s after boot. Tracks the walk, 30-75 C.
-    inaDieTempF = (30.0f + 0.45f * (fakeTemp - 10.0f)) * 1.8f + 32.0f;
-    g_fdDieTempF = inaDieTempF;
-    MARK_FRESH(IDX_INA_DIE_TEMP);
-
-    float tempC = fakeTemp + 10 + random(-20, 20) / 10.0;
-    AlternatorTemperatureF = tempC * 9.0 / 5.0 + 32.0;
-    MARK_FRESH(IDX_THERMISTOR_TEMP);
-    MARK_FRESH(IDX_ALTERNATOR_TEMP);
-    MARK_FRESH(IDX_AMBIENT_TEMP);
-
-    if (temperatureThermistor > MaxTemperatureThermistor)             MaxTemperatureThermistor             = temperatureThermistor;
-    if (temperatureThermistor > MaxTemperatureThermistor_AllTime)     MaxTemperatureThermistor_AllTime     = temperatureThermistor;
-    if (AlternatorTemperatureF > MaxAlternatorTemperatureF)           MaxAlternatorTemperatureF            = AlternatorTemperatureF;
-    if (AlternatorTemperatureF > MaxAlternatorTemperatureF_AllTime)   MaxAlternatorTemperatureF_AllTime    = AlternatorTemperatureF;
-
-
-    // Solar energy simulation (fake Victron data)
-    static unsigned long lastSolarUpdate = 0;
-    if (millis() - lastSolarUpdate >= 2000) {  // Update every 2 seconds like real VE.Direct
-      lastSolarUpdate = millis();
-
-      // Solar power 100–800W band
-      static float fakeSolarPower = 300.0;
-      fakeSolarPower += (random(-300, 300));  // ±300 W per update
-      if (fakeSolarPower < 100) fakeSolarPower = 100;
-      if (fakeSolarPower > 800) fakeSolarPower = 800;
-
-      float elapsedSeconds = 2.0;  // matches the 2s update gate above
-      float solarEnergyDelta_Wh = (fakeSolarPower * elapsedSeconds) / 3600.0f;
-
-      // Mirror the fake solar onto the live dashboard fields + leaderboard watermark
-      VictronSolarPower_W = fakeSolarPower;
-      VictronSolarVoltage_V = 18.0f + (random(-200, 200) / 100.0f);
-      VictronSolarCurrent_A = (VictronSolarVoltage_V > 1.0f) ? (VictronSolarPower_W / VictronSolarVoltage_V) : 0.0f;
-      VictronChargeState = 3; VictronMPPTMode = 2; VictronError = 0;   // Bulk / Active MPPT / OK
-      VictronYieldToday_kWh += solarEnergyDelta_Wh / 1000.0f;
-      if (fakeSolarPower > VictronMaxPowerToday_W) VictronMaxPowerToday_W = fakeSolarPower;
-      MARK_FRESH(IDX_VICTRON_SOLAR);
-      if (VictronSolarPower_W > solar_power_max_alltime_w) solar_power_max_alltime_w = VictronSolarPower_W;
-
-      static float solarEnergyAccumulator = 0.0f;
-      static float solarEnergyAccumulator_AllTime = 0.0f;
-
-      solarEnergyAccumulator += solarEnergyDelta_Wh;
-      solarEnergyAccumulator_AllTime += solarEnergyDelta_Wh;
-
-      if (solarEnergyAccumulator >= 1.0f) {
-        SolarChargedEnergy += (int)solarEnergyAccumulator;
-        solarEnergyAccumulator -= (int)solarEnergyAccumulator;
-      }
-
-      if (solarEnergyAccumulator_AllTime >= 1.0f) {
-        SolarChargedEnergy_AllTime += (int)solarEnergyAccumulator_AllTime;
-        solarEnergyAccumulator_AllTime -= (int)solarEnergyAccumulator_AllTime;
-      }
-    }
-
-    // Fake barometric pressure (wide, stormy)
-    baroPressure = 1013 + (random(-200, 200) / 10.0);  // ±20 hPa
-    MARK_FRESH(IDX_BARO_PRESSURE);
-
-    // Fake other channels
-    Channel0V = BatteryV;
-    Channel1V = 2.5 + (MeasuredAmps / 50.0);
-    Channel2V = RPM / RPMScalingFactor;
-    Channel3V = 50 + (random(-60, 60));  //  -10–110 range
-    MARK_FRESH(IDX_CHANNEL3V);
-  }
-
-  // ===== IMU FAKE DATA GENERATION =====
-  if (imuEnabled) {
-    static float fakeHeelAngle = 0;
-    static float fakePitchAngle = 0;
-    static float fakeHeelRate = 0;
-    static float fakePitchRate = 0;
-    static unsigned long lastIMUFake = 0;
-
-    unsigned long now = millis();
-    float dt = (now - lastIMUFake) / 1000.0f;
-    if (lastIMUFake == 0) dt = 0.1f;  // First call
-    lastIMUFake = now;
-
-    // Advance motion phases every call so heel/pitch track real time even when pushes are throttled
-    static float rollPhase = 0;
-    rollPhase += dt * 0.5f;                                              // ~0.5 rad/s = ~12s period
-    fakeHeelAngle = 8.0f * sin(rollPhase) + (random(-30, 30) / 10.0f);  // ±8° ±3° noise
-    fakeHeelRate = 8.0f * 0.5f * cos(rollPhase);                        // Derivative
-
-    static float pitchPhase = 0;
-    pitchPhase += dt * 0.3f;                                               // ~0.3 rad/s = ~20s period
-    fakePitchAngle = 4.0f * sin(pitchPhase) + (random(-20, 20) / 10.0f);  // ±4° ±2° noise
-    fakePitchRate = 4.0f * 0.3f * cos(pitchPhase);                        // Derivative
-
-    // Rate-limit sample push to ~10 Hz — avoids flooding ring buffer at fast main loop rates
-    static unsigned long lastIMUPush = 0;
-    if (now - lastIMUPush < 100) return;
-    lastIMUPush = now;
-
-    // Slam event (~2% per push call at 10 Hz = ~1 per 5 seconds, rough conditions)
-    // Amplitude kept within ±2g sensor range to avoid int16_t overflow
-    static float slamDecay = 0;
-    if (random(0, 100) < 2 && slamDecay == 0) {
-      slamDecay = 0.6f + (random(0, 30) / 100.0f);  // 0.6–0.9g spike
-    }
-    if (slamDecay > 0) {
-      slamDecay -= dt * 8.0f;
-      if (slamDecay < 0) slamDecay = 0;
-    }
-
-    // Convert angles to accelerations (sensor frame)
-    // When boat heels, gravity vector rotates
-    float heel_rad = fakeHeelAngle * PI / 180.0f;
-    float pitch_rad = fakePitchAngle * PI / 180.0f;
-
-    // Gravity components in sensor frame (simplified, no yaw)
-    float ax_g = -sin(pitch_rad);                 // Forward/aft tilt
-    float ay_g = sin(heel_rad) * cos(pitch_rad);  // Port/starboard tilt
-    float az_g = cos(heel_rad) * cos(pitch_rad);  // Vertical (1g when level)
-
-    az_g += slamDecay;
-
-    // Add wave-induced vertical motion (~0.3g peak, ~8s period)
-    static float wavePhase = 0;
-    wavePhase += dt * 0.8f;
-    az_g += 0.3f * sin(wavePhase) + (random(-20, 20) / 100.0f);
-
-    // Convert to raw sensor counts — constrain prevents int16_t overflow on spikes
-    // ACCEL_SCALE = 0.000061 g/LSB → 1g = 16393 LSB, full range ±32767 = ±2.0g
-    int16_t raw_ax = (int16_t)constrain((int32_t)(ax_g / ACCEL_SCALE), -32767, 32767);
-    int16_t raw_ay = (int16_t)constrain((int32_t)(ay_g / ACCEL_SCALE), -32767, 32767);
-    int16_t raw_az = (int16_t)constrain((int32_t)(az_g / ACCEL_SCALE), -32767, 32767);
-
-    // Gyro rates (already in dps)
-    // GYRO_SCALE = 0.070 dps/LSB → 1 dps = 14.3 LSB
-    float gx_dps = fakePitchRate + (random(-50, 50) / 100.0f);  // ±0.5 dps noise
-    float gy_dps = fakeHeelRate + (random(-50, 50) / 100.0f);
-    float gz_dps = (random(-30, 30) / 100.0f);  // Small yaw rate noise
-
-    int16_t raw_gx = (int16_t)(gx_dps / GYRO_SCALE);
-    int16_t raw_gy = (int16_t)(gy_dps / GYRO_SCALE);
-    int16_t raw_gz = (int16_t)(gz_dps / GYRO_SCALE);
-
-    // Engine + sea-state vibration noise scaled with RPM
-    // At 1500 RPM: ±2500 LSB ≈ ±150 mg per axis (≈90 mg RMS)
-    // At idle/stopped: minimum 200 LSB keeps background sea-state noise present
-    int engineNoise = (int)constrain(RPM / 0.6f, 200.0f, 6000.0f);
-
-    // Push samples to ring buffers — simulates a batch from the real 104 Hz FIFO
-    uint32_t timestamp_us = micros();
-
-    // 5 accel samples at ~9.6ms spacing = 104Hz claimed rate
-    for (int i = 0; i < 5; i++) {
-      int16_t jitter_ax = (int16_t)constrain((int32_t)raw_ax + random(-engineNoise, engineNoise), -32767, 32767);
-      int16_t jitter_ay = (int16_t)constrain((int32_t)raw_ay + random(-engineNoise, engineNoise), -32767, 32767);
-      int16_t jitter_az = (int16_t)constrain((int32_t)raw_az + random(-engineNoise, engineNoise), -32767, 32767);
-      pushAccelSample(jitter_ax, jitter_ay, jitter_az, timestamp_us + i * 9615);
-    }
-
-    // Gyro at 52 Hz (one sample per ~20ms)
-    pushGyroSample(raw_gx, raw_gy, raw_gz, timestamp_us + 19000);
-  }
-}
-
-
 bool validateWebFile(const char *filename) {
   esp_task_wdt_reset();  // Feed watchdog before file operations
 
@@ -6220,6 +5979,8 @@ void ensurePreferredBootPartition() {
 // Settings arm gate for every mutating endpoint. Nothing expires it: only an explicit lock or a reboot clears it.
 // With the settings password on, the arm belongs to /armSettings token holders, so the request itself is checked.
 bool settingsArmActive(AsyncWebServerRequest *request) {
+  // A Victron GX request (gx=1) is never lent a phone's unlock.
+  if (request && gxFlagged(request)) return false;
   if (!settingsArmed) return false;
   if (!pwRequired) return true;
   return armTokenValid(request);
@@ -6327,7 +6088,7 @@ void initializeNVS() {
 // Not safe to call from loop() — blocks for up to 200ms.
 void saveNVSDataFull() {
   if (importRebootPending) return;   // a records import just wrote these keys; the reboot loads them
-  if (hardwarePresent != 1) return;   // sim mode (HardwarePresent=0): don't persist fake accumulators/extrema
+  if (hardwarePresent != 1 || demoSeal) return;   // demo mode: the accumulators in RAM are the demo's (exit reloads the real ones)
   uint32_t _nvsT0 = millis();
   nvs_handle_t h;
   esp_err_t err = nvs_open("storage", NVS_READWRITE, &h);

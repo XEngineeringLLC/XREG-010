@@ -162,7 +162,7 @@ bool tempProbeFresh(uint8_t idx) {
 // and never emitted; the remaining codes keep their values so stored settings and CSV2 stay valid.
 float batteryTempF(uint8_t *srcOut) {
   // Every gate is evaluated each call so tempProbeFresh's idle tracker keeps running whatever the selection.
-  // Fake hardware simulates a probe reading whether or not the probe is enabled (ReadAnalogInputs_Fake).
+  // Demo mode simulates a probe reading whether or not the probe is enabled (demoReadSensors, 9_demo.ino).
   bool okProbe = tempProbeFresh(IDX_BATT_TEMP_PROBE) && (battTempProbeEnable == 1 || hardwarePresent == 0) && isfinite(BatteryTempProbeF);
   bool okVe    = tempProbeFresh(IDX_VE_BATT_TEMP) && isfinite(VictronBattTempF);
   bool okRvc   = tempProbeFresh(IDX_RVC_BATT_TEMP) && isfinite(rvcRxBattTempF);
@@ -349,7 +349,7 @@ static uint8_t hgQueueN = 0;
 static uint16_t hgQueueDropped = 0;
 
 static void hgLedgerQueue(const char *verdict, float freqHz, float a0, float aEnd, uint8_t steps) {
-  if (IgnoreRPM || LimpHome) return;   // the record's speed would be an ignored reading
+  if (IgnoreRPM || LimpHome || demoSeal) return;   // the record's speed would be an ignored reading; demo episodes are not records
   if (hgQueueN >= HG_LEDGER_QUEUE_N) {
     hgQueueDropped++;
     return;
@@ -499,6 +499,7 @@ float huntMapGainD(float rpm) {
 // Fold a verified speed into the map: widen the same-lever pocket that covers it, else add one (evicting the
 // least-recently-confirmed at the cap), then merge overlapping same-lever pockets. Depth never changes.
 static void huntMapAdd(float rpm, uint8_t lever) {
+  if (demoSeal) return;   // demo mode: the pocket map is not learned from the simulated boat
   float wing = (float)HuntWingPct / 100.0f;
   uint32_t now = (uint32_t)time(nullptr);
   int hit = -1;
@@ -569,7 +570,7 @@ void huntMapLoad() {
 
 // The ONLY code that writes the map to flash. Main loop, same field-off-settled call site as huntLedgerService.
 void huntMapService() {
-  if (!hgMapDirty) return;
+  if (!hgMapDirty || demoSeal) return;
   fsTakeLock();
   File f = LittleFS.open("/huntpockets.csv", "w");
   if (f) {
@@ -3916,7 +3917,7 @@ void AdjustFieldLearnMode() {
       // which counts all protections), so the count means "the soft current-cap actually engaged."
       bool g2SoftNow = (testProtectionsEnabled && !TuningMode && !batteryHealthTestActive && !altZeroOutput && tick.limpTier != 2 && OvGroup2Enable && ibvFilt > ChargingVoltageTarget + OvMeasMarginV);
       static bool g2SoftPrev = false;
-      if (g2SoftNow && !g2SoftPrev) g_ovTel.softExceedCount++;
+      if (g2SoftNow && !g2SoftPrev) ovTel().softExceedCount++;
       g2SoftPrev = g2SoftNow;
 
       // Group 2 measured-OV: armed ONLY while the filtered bus is above target + OvMeasMarginV AND still rising (filtered dvdt
@@ -4859,7 +4860,6 @@ void AdjustFieldLearnMode() {
         // to the battery charge limit it gives an alternator-amp ceiling valid however many sources are on the bus, min-selected in
         // bulk AND CV. Deliberately NOT clamped ≥0: a second source out-producing the loads makes it negative, and clamping let the
         // alternator overshoot the battery limit by that source's share. Only the ceiling is floored. Needs the INA228 shunt.
-        static float loadOffsetFilt = 0.0f;  // EMA of MeasuredAmps − Bcur (A; negative = other sources exceed loads)
         const bool bcurLive = bcurFresh();   // a held shunt reading (§10.6) must not feed the offset or the shunt-basis ceilings
         if (bcurLive) {
           const float ldoTC = 0.25f;  // s
@@ -4899,12 +4899,13 @@ void AdjustFieldLearnMode() {
         }
 
         // ── DVCC follow: external charge-current limit (CCL) ceiling ─────────────────────────
-        // Same min-select as the battery limit. With a shunt the CCL is a BATTERY-current limit, converted by the house-load
-        // offset; without one it caps alternator amps directly (conservative). CCL 0 is a legitimate command (cold/full/cell-high):
+        // Same min-select as the battery limit. A battery-basis CCL (VE.Can, RV-C) with a shunt is a BATTERY-current limit,
+        // converted by the house-load offset; without one it caps alternator amps directly (conservative). The WiFi CCL is
+        // already this alternator's ceiling (dvccCclAltBasis): applied as is. CCL 0 is a legitimate command (cold/full/cell-high):
         // ceiling 0, recovery rides the existing rate-governed ramp.
         bool dvccCclBinding = false;
         if (dvccEn == 1 && dvccState == 3 /*FOLLOWING*/ && !cxOwnsBatteryNow() && !isnan(dvccCclA)) {
-          bool shuntBasis = (HAS_BATT_SHUNT && bcurLive);
+          bool shuntBasis = (!dvccCclAltBasis && HAS_BATT_SHUNT && bcurLive);
           float dvccCeil = shuntBasis ? fmaxf(0.0f, dvccCclA + loadOffsetFilt) : fmaxf(0.0f, dvccCclA);
           if (dvccCeil < uTargetAmps) {
             uTargetAmps = dvccCeil;
@@ -5658,7 +5659,7 @@ void AdjustFieldLearnMode() {
               static uint32_t lastKdTrimMs = 0;
               if (currentMillis - lastKdTrimMs > 1000) {
                 g_cvKdCount++;
-                g_ovTel.kdEventCount++;
+                ovTel().kdEventCount++;
               }
               lastKdTrimMs = currentMillis;
               g_kdTrimThisTick = kdTrim;         // captured for cvLog; cleared by cvLog_tick after logging
@@ -7377,20 +7378,20 @@ void updateProtectionCounters(FieldEventReason reason) {
     switch (reason) {
       case REASON_INA_OVERVOLTAGE:
         g_inaOVCount++;
-        g_ovTel.inaCutCount++;  // lifetime twin (RTC) of the session counter
+        ovTel().inaCutCount++;  // lifetime twin (RTC) of the session counter
         break;
       case REASON_HARD_OVERCURRENT: g_hardOCCount++; break;
       case REASON_FAST_OVERVOLTAGE:
         g_voltSpikeCount++;  // reuses the OV-spike counter (REASON_VOLTAGE_SPIKE retired)
-        g_ovTel.swHardCutCount++;  // lifetime twin (RTC) of the session counter
+        ovTel().swHardCutCount++;  // lifetime twin (RTC) of the session counter
         break;
       case REASON_OV_TIER_LOW:
         g_ovTierLowCount++;
-        g_ovTel.tierLowCutCount++;  // lifetime twin (RTC) of the session counter
+        ovTel().tierLowCutCount++;  // lifetime twin (RTC) of the session counter
         break;
       case REASON_OV_TIER_MID:
         g_ovTierMidCount++;
-        g_ovTel.tierMidCutCount++;  // lifetime twin (RTC) of the session counter
+        ovTel().tierMidCutCount++;  // lifetime twin (RTC) of the session counter
         break;
       case REASON_VOLTAGE_SPIKE: g_voltSpikeCount++; break;
       case REASON_VOLTAGE_DISAGREE_CRITICAL: g_voltDisagreeCritCount++; break;
@@ -8718,6 +8719,7 @@ void overheatSafeTimeFlush() {
 
 void updateRPMBucketHistory(uint32_t nowMs) {
   static uint32_t lastHistoryMs = 0;
+  if (demoSeal) { lastHistoryMs = 0; return; }   // demo mode: the overheat table shown is the demo's (9_demo.ino)
   uint32_t dtMs = (lastHistoryMs == 0) ? 0 : (uint32_t)(nowMs - lastHistoryMs);
   if (dtMs > 500) dtMs = 500;
   lastHistoryMs = nowMs;
