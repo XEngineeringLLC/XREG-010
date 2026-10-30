@@ -1,13 +1,18 @@
 import QtQuick
 import Victron.VenusOS
 
-// One regulator's link. The bridge finds it by its ID wherever it is on the network; the address is only where it was
-// last seen. When it is nowhere and a different XREG-010 answers at that address, "Use this regulator" puts that one
-// in its place.
+// One regulator's link, a GX-only page: its row sits where the app shows the GX link (settings_keys.txt @connection,
+// the app's "Victron GX" card). The bridge finds the regulator by its ID wherever it is on the network; the address is
+// only where it was last seen. When it is nowhere and a different XREG-010 answers at that address, "Use this
+// regulator" puts that one in its place. "Power flow devices" opens the GX devices the power flow remembers
+// (XregFlowDevices), to forget one or to say how one is wired (a DC-DC charger drawing from the house bank, a device
+// wired through the DC system meter).
 Page {
 	id: page
 
 	property string svc
+	property Item home                // the home page this was opened from (XregHome), for its header
+	property string setupId           // the Setup sub-tab it sits under, lit in the header
 	readonly property bool linkUp: connectedItem.valid && connectedItem.value === 1
 	readonly property string uid: serialItem.valid ? String(serialItem.value) : ""
 	readonly property string label: regs.labelOf(page.uid, nameItem.valid ? nameItem.value : "")
@@ -16,6 +21,15 @@ Page {
 	readonly property bool otherOnGx: regs.units.some(u => u.uid === page.otherUid)
 	readonly property int boatToAdd: regs.found.filter(f => f.boat && !f.unit).length
 	readonly property int limitsState: limitsStateItem.valid ? limitsStateItem.value : 0
+	readonly property var flowDevices: regs.parse(flowDevicesItem)
+
+	// figure spaces (a digit's width) in front, so the amps after the volts hold still as the limits change
+	function figPad(text, chars) {
+		let t = String(text)
+		while (t.length < chars)
+			t = "\u2007" + t
+		return t
+	}
 
 	VeQuickItem { id: connectedItem; uid: page.svc + "/Connected" }
 	VeQuickItem { id: statusItem; uid: page.svc + "/Link/Status" }
@@ -31,6 +45,7 @@ Page {
 	VeQuickItem { id: limitsCvlItem; uid: page.svc + "/Link/GxLimits/Cvl" }
 	VeQuickItem { id: limitsCclItem; uid: page.svc + "/Link/GxLimits/Ccl" }
 	VeQuickItem { id: removeItem; uid: regs.mgr + "/Remove" }
+	VeQuickItem { id: flowDevicesItem; uid: regs.mgr + "/GxDevices" }
 
 	XregUnits { id: regs }
 
@@ -39,8 +54,21 @@ Page {
 		XregCfgDialog {}
 	}
 
+	Loader {
+		id: header
+		width: page.width
+		active: !!page.home
+		sourceComponent: XregHeader {
+			svc: page.svc
+			home: page.home
+			pushed: true
+			setupRow: true
+			setupId: page.setupId
+		}
+	}
+
 	GradientListView {
-		anchors.fill: parent
+		anchors { top: header.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
 		model: VisibleItemModel {
 			ListText {
 				text: "Regulator link"
@@ -76,13 +104,25 @@ Page {
 				text: "Charge limits from this GX"
 				secondaryText: ["", "Not sending", "Sending", "Handled by the GX", "Refused"][page.limitsState] || ""
 				caption: page.limitsState === 1 ? "DVCC on this GX has no limit for this alternator"
-						: page.limitsState === 2 ? [limitsCvlItem.valid ? limitsCvlItem.value.toFixed(2) + " V" : "",
-													limitsCclItem.valid ? limitsCclItem.value.toFixed(1) + " A" : ""]
+						: page.limitsState === 2 ? [limitsCvlItem.valid ? page.figPad(limitsCvlItem.value.toFixed(2), 5) + " V" : "",
+													limitsCclItem.valid ? page.figPad(limitsCclItem.value.toFixed(1), 6) + " A" : ""]
 												   .filter(t => t.length).join(", ")
 						: page.limitsState === 3 ? "Another service on this GX controls this alternator directly"
 						: page.limitsState === 4 ? "The regulator refused the last post. Sending resumes after it reconnects."
 						: ""
 				preferredVisible: page.limitsState > 0
+			}
+			ListNavigation {
+				// the GX devices the power flow remembers at 0.0 A while they are off the GX, forgetting one, which side of
+				// the house bank a DC-DC charger is on, and what is wired through a DC system meter
+				text: "Power flow devices"
+				secondaryText: {
+					const gone = page.flowDevices.filter(d => !d.on).length
+					return gone ? gone + " not on this GX now" : ""
+				}
+				preferredVisible: page.flowDevices.length > 0
+				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregFlowDevices.qml",
+						{ title: text, svc: page.svc, home: page.home, setupId: page.setupId })
 			}
 			ListButton {
 				text: "Use this regulator"
@@ -103,7 +143,8 @@ Page {
 			ListNavigation {
 				text: "Regulators"
 				secondaryText: page.boatToAdd > 0 ? page.boatToAdd + " more on this boat" : ""
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregRegulators.qml", { title: text })
+				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregRegulators.qml",
+						{ title: text, svc: page.svc, home: page.home, setupId: page.setupId })
 			}
 			ListButton {
 				text: "Remove from this GX"

@@ -344,7 +344,7 @@ struct HgLedgerRec {
 #define HG_LEDGER_QUEUE_N 12       // episodes that can wait in RAM for the engine to stop; past this the oldest are counted and dropped
 #define HG_LEDGER_MAX_BYTES 6144   // hard file cap (~100 rows); the oldest half is dropped at the cap
 static const char *HG_LEDGER_HDR = "epoch,rpm,cv,freqHz,a0_pct,aEnd_pct,steps,verdict,derateExit";
-static HgLedgerRec hgQueue[HG_LEDGER_QUEUE_N];
+static HgLedgerRec (&hgQueue)[HG_LEDGER_QUEUE_N] = PsramPlace::make<HgLedgerRec[HG_LEDGER_QUEUE_N]>();
 static uint8_t hgQueueN = 0;
 static uint16_t hgQueueDropped = 0;
 
@@ -7717,7 +7717,8 @@ TickSnapshot buildTickSnapshot(uint32_t currentMillis, uint32_t dt_ms) {
   // Weather mode: rest the alternator when the solar forecast is strong. Applied LAST so the flag
   // means "a sunny forecast is the ONLY thing holding charging off" — the banner must not blame
   // the forecast when the key, the on/off switch, the BMS, or a full battery is the real cause.
-  tick.solarForecastPause = chargingEnabledLocal && weatherModeEnabled == 1 && currentWeatherMode == 1 && !tick.fieldResTest;
+  // Demo mode: the forecast is the real boat's, not the simulated one's.
+  tick.solarForecastPause = chargingEnabledLocal && weatherModeEnabled == 1 && currentWeatherMode == 1 && !tick.fieldResTest && !demoSeal;
   if (tick.solarForecastPause) chargingEnabledLocal = false;
 
   tick.chargingEnabled = chargingEnabledLocal;
@@ -8284,12 +8285,13 @@ void resetLearningTableToDefaults() {
     }
     nvs_handle_t nvs_h;
     if (nvs_open("learning", NVS_READWRITE, &nvs_h) == ESP_OK) {
-      nvs_set_blob(nvs_h, "rpmPoints", rpmTableRPMPoints, sizeof(rpmTableRPMPoints));
+      // From the defaults, not the live tables: the /get reset runs on the web task while the learner writes Min% on Core 1
+      nvs_set_blob(nvs_h, "rpmPoints", defaultRPMValues, sizeof(defaultRPMValues));
       nvs_set_blob(nvs_h, "capTable", defaultCapCurrentValues, sizeof(defaultCapCurrentValues));   // Normal/High
       nvs_set_blob(nvs_h, "capPowerTable", hiDefaultsPwr, sizeof(hiDefaultsPwr));                  // Normal/High
       nvs_set_blob(nvs_h, "capTableLo", loDefaults, sizeof(loDefaults));                            // Low
       nvs_set_blob(nvs_h, "capPowerTableLo", loDefaultsPwr, sizeof(loDefaultsPwr));                 // Low
-      nvs_set_blob(nvs_h, "minDutyTable", rpmMinDutyTable, sizeof(rpmMinDutyTable));
+      nvs_set_blob(nvs_h, "minDutyTable", defaultMinDutyValues, sizeof(defaultMinDutyValues));
       nvs_commit(nvs_h);
       nvs_close(nvs_h);
     }
@@ -8564,6 +8566,8 @@ void servicePanelSwitchInputs() {
 
 // Immediate save of all user-editable columns (Save / Reset buttons)
 void saveUserTableEdits() {
+  const bool announce = tableSaveAnnounce;
+  tableSaveAnnounce = false;
   nvs_handle_t nvs_handle;
   esp_err_t err = nvs_open("learning", NVS_READWRITE, &nvs_handle);
   if (err != ESP_OK) {
@@ -8573,15 +8577,22 @@ void saveUserTableEdits() {
 
   bool success = true;
 
-  err = nvs_set_blob(nvs_handle, "rpmPoints", rpmTableRPMPoints, sizeof(rpmTableRPMPoints));
+  // From copies: a /get table edit on the web task can land while this loop-side save writes (see saveHistoricalDataImmediate)
+  int pts[RPM_TABLE_SIZE];
+  float capA[RPM_TABLE_SIZE], capW[RPM_TABLE_SIZE];
+  memcpy(pts, rpmTableRPMPoints, sizeof(pts));
+  memcpy(capA, rpmCapCurrentTable, sizeof(capA));
+  memcpy(capW, rpmCapPowerTable, sizeof(capW));
+
+  err = nvs_set_blob(nvs_handle, "rpmPoints", pts, sizeof(pts));
   if (err != ESP_OK) success = false;
 
   {
     const char *capKey = (HiLow == 1) ? "capTable" : "capTableLo";
     const char *capPwrKey = (HiLow == 1) ? "capPowerTable" : "capPowerTableLo";
-    err = nvs_set_blob(nvs_handle, capKey, rpmCapCurrentTable, sizeof(rpmCapCurrentTable));
+    err = nvs_set_blob(nvs_handle, capKey, capA, sizeof(capA));
     if (err != ESP_OK) success = false;
-    err = nvs_set_blob(nvs_handle, capPwrKey, rpmCapPowerTable, sizeof(rpmCapPowerTable));
+    err = nvs_set_blob(nvs_handle, capPwrKey, capW, sizeof(capW));
     if (err != ESP_OK) success = false;
   }
 
@@ -8597,6 +8608,8 @@ void saveUserTableEdits() {
 
   if (!success) {
     queueConsoleMessage("Learning: Save completed with errors");
+  } else if (announce) {
+    queueConsoleMessage("Learning: Table saved to NVS");
   }
 }
 
@@ -8672,13 +8685,23 @@ void saveHistoricalDataImmediate() {
 
   bool success = true;
 
-  err = nvs_set_blob(nvs_handle, "overheatCount", overheatCount, sizeof(overheatCount));
+  // NVS checksums a blob from the source buffer, then reads that buffer again to write it. This save also runs on Core 0
+  // (demo entry, /get, import) while the control loop adds safe time every pass, and a value changed in between was stored
+  // with a bad checksum that the next read deletes (cumulativeTime lost, bench 2026-10-28). The blobs go out from copies.
+  int oc[RPM_TABLE_SIZE];
+  unsigned long lo[RPM_TABLE_SIZE], ct[RPM_TABLE_SIZE];
+  memcpy(oc, overheatCount, sizeof(oc));
+  memcpy(lo, lastOverheatTime, sizeof(lo));
+  memcpy(ct, cumulativeNoOverheatTime, sizeof(ct));
+  const uint64_t safeMs = totalSafeMs;
+
+  err = nvs_set_blob(nvs_handle, "overheatCount", oc, sizeof(oc));
   if (err != ESP_OK) success = false;
 
-  err = nvs_set_blob(nvs_handle, "lastOverheat", lastOverheatTime, sizeof(lastOverheatTime));
+  err = nvs_set_blob(nvs_handle, "lastOverheat", lo, sizeof(lo));
   if (err != ESP_OK) success = false;
 
-  err = nvs_set_blob(nvs_handle, "cumulativeTime", cumulativeNoOverheatTime, sizeof(cumulativeNoOverheatTime));
+  err = nvs_set_blob(nvs_handle, "cumulativeTime", ct, sizeof(ct));
   if (err != ESP_OK) success = false;
 
   err = nvs_set_u32(nvs_handle, "totalEvents", (uint32_t)totalLearningEvents);
@@ -8687,7 +8710,7 @@ void saveHistoricalDataImmediate() {
   err = nvs_set_u32(nvs_handle, "totalOverheats", (uint32_t)totalOverheats);
   if (err != ESP_OK) success = false;
 
-  err = nvs_set_blob(nvs_handle, "totalSafeMs", &totalSafeMs, sizeof(totalSafeMs));
+  err = nvs_set_blob(nvs_handle, "totalSafeMs", &safeMs, sizeof(safeMs));
   if (err != ESP_OK) success = false;
 
   err = nvs_commit(nvs_handle);
@@ -8700,7 +8723,7 @@ void saveHistoricalDataImmediate() {
   if (!success) {
     queueConsoleMessage("Learning: Historical save completed with errors");
   } else {
-    overheatSavedSafeMs = totalSafeMs;
+    overheatSavedSafeMs = safeMs;
   }
 }
 
@@ -9103,12 +9126,20 @@ bool cxStepMinPctRestore() {
 // Stage the per-bin knee state AND the Keep-Alive column on an open "learning" handle. Every save writes both:
 // kneeLearnInit rebuilds the column from kneeFloor at boot, so a column saved without its knee state is lost on reboot.
 static bool kneePutStateBlobs(nvs_handle_t h) {
+  // From copies: web-task callers race the learner on Core 1 (bad-checksum blobs, see saveHistoricalDataImmediate)
+  float flr[RPM_TABLE_SIZE], kn[RPM_TABLE_SIZE], minDuty[RPM_TABLE_SIZE];
+  bool frz[RPM_TABLE_SIZE];
+  memcpy(flr, kneeFloor, sizeof(flr));
+  memcpy(kn, kneeKnee, sizeof(kn));
+  memcpy(frz, kneeFrozen, sizeof(frz));
+  memcpy(minDuty, rpmMinDutyTable, sizeof(minDuty));
+  const float fitA = kneeFitA;
   bool ok = true;
-  ok &= (nvs_set_blob(h, "kneeFloor", kneeFloor, sizeof(kneeFloor)) == ESP_OK);
-  ok &= (nvs_set_blob(h, "kneeKnee", kneeKnee, sizeof(kneeKnee)) == ESP_OK);
-  ok &= (nvs_set_blob(h, "kneeFrozen", kneeFrozen, sizeof(kneeFrozen)) == ESP_OK);
-  ok &= (nvs_set_blob(h, "kneeFitA", &kneeFitA, sizeof(kneeFitA)) == ESP_OK);  // temp-neutral threshold for the live temp correction
-  ok &= (nvs_set_blob(h, "minDutyTable", rpmMinDutyTable, sizeof(rpmMinDutyTable)) == ESP_OK);
+  ok &= (nvs_set_blob(h, "kneeFloor", flr, sizeof(flr)) == ESP_OK);
+  ok &= (nvs_set_blob(h, "kneeKnee", kn, sizeof(kn)) == ESP_OK);
+  ok &= (nvs_set_blob(h, "kneeFrozen", frz, sizeof(frz)) == ESP_OK);
+  ok &= (nvs_set_blob(h, "kneeFitA", &fitA, sizeof(fitA)) == ESP_OK);  // temp-neutral threshold for the live temp correction
+  ok &= (nvs_set_blob(h, "minDutyTable", minDuty, sizeof(minDuty)) == ESP_OK);
   kneeStateDirty = false;
   return ok;
 }
@@ -9188,15 +9219,15 @@ bool commissionRestoreMinPct() {
     memcpy(kneeFloor, fFlr, sizeof(fFlr));
     memcpy(kneeKnee, fKn, sizeof(fKn));
     memcpy(kneeFrozen, fFrz, sizeof(fFrz));
-    nvs_set_blob(h, "minDutyTable", rpmMinDutyTable, sizeof(rpmMinDutyTable));
-    nvs_set_blob(h, "kneeFloor", kneeFloor, sizeof(kneeFloor));
-    nvs_set_blob(h, "kneeKnee", kneeKnee, sizeof(kneeKnee));
-    nvs_set_blob(h, "kneeFrozen", kneeFrozen, sizeof(kneeFrozen));
+    nvs_set_blob(h, "minDutyTable", fMin, sizeof(fMin));   // the locals, not the live tables the learner writes
+    nvs_set_blob(h, "kneeFloor", fFlr, sizeof(fFlr));
+    nvs_set_blob(h, "kneeKnee", fKn, sizeof(fKn));
+    nvs_set_blob(h, "kneeFrozen", fFrz, sizeof(fFrz));
     // Restore the live-correction threshold. Optional (old backups lack it) → 0 = whole-knee fallback.
     float fFitA = 0.0f; size_t szA = sizeof(fFitA);
     if (nvs_get_blob(h, "bk_kneeFitA", &fFitA, &szA) != ESP_OK || szA != sizeof(fFitA)) fFitA = 0.0f;
     kneeFitA = fFitA;
-    nvs_set_blob(h, "kneeFitA", &kneeFitA, sizeof(kneeFitA));
+    nvs_set_blob(h, "kneeFitA", &fFitA, sizeof(fFitA));
   }
   nvs_erase_key(h, "bk_minDuty"); nvs_erase_key(h, "bk_kneeFlr");
   nvs_erase_key(h, "bk_kneeKn");  nvs_erase_key(h, "bk_kneeFrz");
@@ -10030,7 +10061,7 @@ void thermalLog_tick(uint32_t nowMs) {
   e.flags = 0;
   if (tempPIDActive) e.flags |= (1 << 0);
   if (sysMode == SYS_MODE_AUTO) e.flags |= (1 << 4);
-  if (shutdownPhase != SHUTDOWN_PHASE_NONE) e.flags |= (1 << 5);
+  if (shutdownRampActive()) e.flags |= (1 << 5);
 
   e.antiWindupFired = outerAntiWindupFired ? 1 : 0;
   e.chargeStageDisplay = thermalLogGetStageCode();

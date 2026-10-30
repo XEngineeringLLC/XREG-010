@@ -1,9 +1,10 @@
 import QtQuick
 import Victron.VenusOS
 
-// Plots page, pushed from the home page: Short Term and Long Term as in the web app, alternator Health, and Wind.
-// Each tab is loaded only while shown, so only its data is requested from the bridge (/Ui/Want/*).
-Page {
+// Plots, the home page's second page (XregHome): Short Term and Long Term as in the web app, alternator Health, and
+// Wind (opening on apparent wind). Each tab is loaded only while shown, so only its data is requested from the bridge
+// (/Ui/Want/*).
+Item {
 	id: page
 
 	property string svc
@@ -17,25 +18,21 @@ Page {
 	// Window choices survive switching tabs while the page is open
 	property int shortWindow: 30
 	property int windWindow: 30
-	property bool windTrue: true
+	property bool windTrue: false
 	property int healthWindow: 0
-
-	title: "Plots"
 
 	Loader {
 		anchors.fill: parent
 		sourceComponent: [shortTab, longTab, healthTab, windTab][page.tab]
 	}
 
-	TabBar {
+	XregTabs {
 		x: page.m
 		y: 8
 		width: page.barW
-		height: 40
-		fontPixelSize: page.width < 900 ? Theme.font_size_caption : Theme.font_button_size
-		model: [{ value: "Short Term" }, { value: "Long Term" }, { value: "Health" }, { value: "Wind" }]
+		model: ["Short Term", "Long Term", "Health", "Wind"]
 		currentIndex: page.tab
-		onButtonClicked: function(buttonIndex) { page.tab = buttonIndex }
+		onPicked: function(index) { page.tab = index }
 	}
 
 	Component {

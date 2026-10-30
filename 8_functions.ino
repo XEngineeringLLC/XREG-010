@@ -1630,7 +1630,7 @@ static bool cfgCsvToInt(const String &s, int *out, int n) {
 
 // What this import wrote into each table, by CFG_TABLE_NAMES index — the "after" side of the commissioning step
 // comparison for tables whose live value only reloads at the next boot (staged files, "storage" keys).
-static String cfgImpTblVal[sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0])];
+static String (&cfgImpTblVal)[sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0])] = PsramPlace::make<String[sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0])]>();
 static bool cfgImpTblSet[sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0])];
 static void cfgImpNoteTable(const char *name, const String &v) {
   for (size_t k = 0; k < sizeof(CFG_TABLE_NAMES) / sizeof(CFG_TABLE_NAMES[0]); k++)
@@ -1702,7 +1702,7 @@ static const char *const CFG_OWNER_TABLES[] = {
   "rpmPoints", "capTable", "capPowerTable", "capTableLo", "capPowerTableLo", "minDutyTable", "fuelRPM", "fuelGPH",
 };
 static const size_t CFG_OWNER_TABLE_COUNT = sizeof(CFG_OWNER_TABLES) / sizeof(CFG_OWNER_TABLES[0]);
-static String cfgOwnerTblPre[CFG_OWNER_TABLE_COUNT];
+static String (&cfgOwnerTblPre)[CFG_OWNER_TABLE_COUNT] = PsramPlace::make<String[CFG_OWNER_TABLE_COUNT]>();
 static bool cfgOwnerTblPreOk[CFG_OWNER_TABLE_COUNT];
 
 // Before anything in the import writes (the class conversion resets the Keep-Alive column). Only while collecting.
@@ -1903,7 +1903,7 @@ static const struct { const char *now; const char *legacy; } CFG_PARAM_ALIASES[]
 };
 
 
-static String cxImpPre[CX_IMPORT_KEY_COUNT];
+static String (&cxImpPre)[CX_IMPORT_KEY_COUNT] = PsramPlace::make<String[CX_IMPORT_KEY_COUNT]>();
 static String cxImpPreAxis[sizeof(CFG_AXIS_BASIS_TABLES) / sizeof(CFG_AXIS_BASIS_TABLES[0])];
 static uint16_t cxImpPreDone, cxImpPreMan;
 static uint8_t cxImpPreState;
@@ -3224,7 +3224,7 @@ static float    cvpfHoldAmps = 0.0f;    // settled output at HOLD exit (crest le
 // ends, so their difference is pure engine drift with the test's own load sag cancelled out.
 static double   cvpfSeg0RpmSum = 0.0, cvpfSeg6RpmSum = 0.0;
 static uint32_t cvpfSeg0RpmN = 0, cvpfSeg6RpmN = 0;
-static char     cvpfDiagBuf[256];       // composed diagnostic aborts (cvpfAbortMsg points here); longest message + UTF-8 dashes reaches ~231 bytes
+static char     (&cvpfDiagBuf)[256] = PsramPlace::make<char[256]>();       // composed diagnostic aborts (cvpfAbortMsg points here); longest message + UTF-8 dashes reaches ~231 bytes
 
 // Called every control tick from the duty-override block in AdjustField (like fieldCut_tick). Returns
 // true only while PULSES/RELEASE own duty; CC phases return false. Ends by clearing cvPlantFitActive.
@@ -4386,6 +4386,7 @@ void debugFillMax(AsyncWebServerRequest *request) {
   dbgRingsSynthetic = !persist;                     // default: freeze ALL field-off persistence until reboot (flash stays real)
   dbgLcg = 0x1234567u;                              // reseed
   String out;
+  frontWriteBegin();
 
   // 4-D alternator best-ever front → cap, dispersed across the real operating box (axisScale set at init)
   if (altFrontBuf) {
@@ -4417,6 +4418,7 @@ void debugFillMax(AsyncWebServerRequest *request) {
     }
     motorFront.count = PERF_FRONT_CAP; motorFront.source = 0;
   }
+  frontWriteEnd();
 
   // Alt-health engine-hour trend → cap (drives the /alttrend.csv scan + ~52 KB /alttrend.bin)
   if (altTrend) {
@@ -4530,8 +4532,10 @@ void debugClearMax(AsyncWebServerRequest *request) {
     return;
   }
   dbgRingsSynthetic = true;                         // RAM empty ≠ real → keep every field-off persister frozen until reboot
+  frontWriteBegin();
   if (altFront2.source == 0) altFront2.count = 0;   // only clear a LEARNED surface, never an uploaded one
   sailFront.count = 0; motorFront.count = 0;
+  frontWriteEnd();
   altTrendCount = 0; altTrendFlushed = 0; altTrendRewrite = true;
   longTermCount = 0; longTermHead = 0;
   zeroLogCount = 0; zeroLogHead = 0;
@@ -4539,6 +4543,156 @@ void debugClearMax(AsyncWebServerRequest *request) {
   request->send(200, "text/plain",
     "CLEARMAX done — in-RAM rings zeroed; persistence frozen. REBOOT to reload from flash\n"
     "(real data — unless a fillmax?persist=yes wrote synthetic there; then Erase All Flash).\n");
+}
+
+// /debug/frontcheck (bench only): proves the record-book lookup engine (FrontQuery) returns what the inline reads
+// (classify, eval, evalLWLR, hasLocalSupport, cellOf, nearestNormDist, pushesHybrid) return, bit for bit, on this
+// board's own fronts, and times both. Runs on async_tcp; field cut only, so no alternator runs are emitted meanwhile.
+//   ?confirm=yes[&n=16]   per front: n stored records exactly, n moved 0.3 cell (in-cell), n moved 0.6 cell
+//                         (estimate path), n random points in the records' bounding box; then a second's work, inline
+//                         vs engine, min of 5 (async_tcp is preempted by WiFi/lwIP, so single samples run long)
+//   ?drive=S[&mode=old]   for S s (1-300) with the field cut, a two-run second's lookups each second through the live
+//                         Core 1 path, results unused (mode=old: the inline reads, all in the 1 Hz pass); read the
+//                         Record-book engine line on /debug. ?drive=0 stops.
+struct FrontCheck {
+  static uint32_t bits(float v) { uint32_t u; memcpy(&u, &v, 4); return u; }
+  template <int N>
+  static void run(FrontStore<N> &fs, const char *name, int nPer, float idwP, float ridge, float radius, float risk,
+                  float margin, String &out) {
+    char line[200];
+    if (fs.count <= 0) { out += String(name) + ": empty, skipped\n"; return; }
+    const uint32_t g0 = frontGenNow();
+    const int c0 = fs.count;
+    float lo[N], hi[N];
+    for (int a = 0; a < N; a++) { lo[a] = 1e30f; hi[a] = -1e30f; }
+    for (int i = 0; i < fs.count; i++)
+      for (int a = 0; a < N; a++) { if (fs.pts[i].x[a] < lo[a]) lo[a] = fs.pts[i].x[a]; if (fs.pts[i].x[a] > hi[a]) hi[a] = fs.pts[i].x[a]; }
+    FrontQuery<N> q;
+    int tested = 0, matched = 0, byState[4] = { 0, 0, 0, 0 }, shown = 0;
+    uint32_t lcg = 0x9E3779B9u;
+    for (int set = 0; set < 4; set++) {
+      for (int k = 0; k < nPer; k++) {
+        float x[N], yTest;
+        if (set == 0) {
+          const FrontPoint<N> &p = fs.pts[((uint32_t)k * 7919u) % (uint32_t)fs.count];
+          for (int a = 0; a < N; a++) x[a] = p.x[a];
+          yTest = p.y;
+        } else if (set < 3) {
+          FrontQuery<N>::probe(fs, (uint32_t)k + 101u * set, set == 1 ? 0.3f : 0.6f, x);
+          yTest = fs.pts[(((uint32_t)k + 101u * set) * 7919u) % (uint32_t)fs.count].y;
+        } else {
+          for (int a = 0; a < N; a++) {
+            lcg = lcg * 1664525u + 1013904223u;
+            float span = hi[a] - lo[a];
+            x[a] = lo[a] - 0.1f * span + 1.2f * span * ((float)(lcg >> 8) / 16777216.0f);
+          }
+          yTest = fs.pts[k % fs.count].y;
+        }
+        float oPred = 0, oBar = 0, oLp = 0;
+        int oSt = fs.classify(x, radius, idwP, ridge, risk, &oPred, &oBar);
+        float oNear = fs.nearestNormDist(x);
+        int oCell = fs.cellOf(x);
+        bool oLocal = fs.hasLocalSupport(x);
+        float oIdw = fs.eval(x, idwP);
+        bool oOk = fs.evalLWLR(x, ridge, &oLp, nullptr);
+        bool oPush = fs.pushesHybrid(x, yTest, margin, idwP, ridge);
+        q.begin(fs, x, idwP, ridge, radius, risk, frontGenNow());
+        while (!q.step(INT64_MAX)) {}
+        bool nPush = (fs.count <= 0) ? true : (yTest > q.bar - margin);
+        bool ok = q.phase == FrontQuery<N>::DONE && oSt == q.state && bits(oPred) == bits(q.pred)
+                  && bits(oBar) == bits(q.bar) && bits(oNear) == bits(q.nearest) && oCell == q.cell
+                  && oLocal == (q.cell >= 0) && bits(oIdw) == bits(q.idw) && oOk == q.lwlrOk
+                  && (!oOk || bits(oLp) == bits(q.lp)) && oPush == nPush;
+        tested++;
+        if (ok) matched++;
+        if (q.state >= 0 && q.state < 4) byState[q.state]++;
+        if (!ok && shown < 3) {
+          shown++;
+          snprintf(line, sizeof(line), "  MISMATCH set %d #%d: state %d/%d pred %08lx/%08lx bar %08lx/%08lx near %08lx/%08lx cell %d/%d lwlr %d/%d\n",
+                   set, k, oSt, q.state, (unsigned long)bits(oPred), (unsigned long)bits(q.pred),
+                   (unsigned long)bits(oBar), (unsigned long)bits(q.bar), (unsigned long)bits(oNear),
+                   (unsigned long)bits(q.nearest), oCell, q.cell, (int)oOk, (int)q.lwlrOk);
+          out += line;
+        }
+      }
+    }
+    // A second's work at this count, near stored records on the estimate path (the inline reads' most passes).
+    uint32_t oldLive = UINT32_MAX, oldRun = UINT32_MAX, eng = UINT32_MAX;
+    volatile float sink = 0;
+    for (int r = 0; r < 5; r++) {
+      float x[N], pr = 0, br = 0;
+      FrontQuery<N>::probe(fs, 7u + (uint32_t)r, 0.6f, x);
+      uint32_t t0 = micros();
+      if (N == ALT_NAXIS) sink = sink + fs.nearestNormDist(x);           // the alt live grade's extra read
+      sink = sink + (float)fs.classify(x, radius, idwP, ridge, risk, &pr);
+      uint32_t t1 = micros();
+      if (N == ALT_NAXIS) {                                               // altProcessEmits, My History active
+        sink = sink + (float)fs.classify(x, radius, idwP, ridge, risk, &pr);
+        sink = sink + (float)fs.classify(x, radius, idwP, ridge, risk, &pr, &br);
+      } else {                                                            // the inline perf fold
+        sink = sink + (fs.pushesHybrid(x, 0.0f, margin, idwP, ridge) ? 1.0f : 0.0f);
+      }
+      sink = sink + (fs.hasLocalSupport(x) ? 1.0f : 0.0f) + (float)fs.cellOf(x);
+      uint32_t t2 = micros();
+      q.begin(fs, x, idwP, ridge, radius, risk, frontGenNow());
+      while (!q.step(INT64_MAX)) {}
+      uint32_t t3 = micros();
+      sink = sink + q.pred;
+      if (t1 - t0 < oldLive) oldLive = t1 - t0;
+      if (t2 - t1 < oldRun) oldRun = t2 - t1;
+      if (t3 - t2 < eng) eng = t3 - t2;
+    }
+    const bool moved = !frontGenSame(g0) || fs.count != c0;
+    snprintf(line, sizeof(line), "%s (%d pts): %d/%d identical%s; engine states measured %d, estimated %d, learning %d, no reference %d\n",
+             name, c0, matched, tested, moved ? " (FRONT CHANGED DURING THE CHECK: rerun)" : "",
+             byState[0], byState[1], byState[2], byState[3]);
+    out += line;
+    snprintf(line, sizeof(line), "  one second's work, inline vs engine (us, min of 5): live grade %lu vs %lu; with %s %lu vs %lu\n",
+             (unsigned long)oldLive, (unsigned long)eng, N == ALT_NAXIS ? "two runs" : "one run",
+             (unsigned long)(N == ALT_NAXIS ? oldLive + 2 * oldRun : oldLive + oldRun),
+             (unsigned long)(N == ALT_NAXIS ? 3 * eng : 2 * eng));
+    out += line;
+  }
+};
+
+void debugFrontCheck(AsyncWebServerRequest *request) {
+  if (request->hasParam("drive")) {
+    long sec = request->getParam("drive")->value().toInt();
+    if (sec <= 0) { frontDriveUntilMs = 0; request->send(200, "text/plain", "frontcheck drive off\n"); return; }
+    if (!gpio4IsLow) { request->send(200, "text/plain", "REFUSED: the field is on. Drive runs only with the field cut.\n"); return; }
+    if (sec > 300) sec = 300;
+    frontDriveOld = request->hasParam("mode") && request->getParam("mode")->value() == "old";
+    uint32_t until = millis() + (uint32_t)sec * 1000u;
+    frontDriveUntilMs = until ? until : 1;
+    String m = "frontcheck drive " + String(frontDriveOld ? "OLD (inline reads, one pass per second)" : "NEW (lookup engine)")
+             + " for " + String(sec) + " s, field cut only (stops when the field turns on).\n"
+             + "Reset Peak Values first, then read the Record-book engine line and ft_altHealth / ft_boatPerf on /debug.\n";
+    request->send(200, "text/plain", m);
+    return;
+  }
+  if (!request->hasParam("confirm") || request->getParam("confirm")->value() != "yes") {
+    request->send(200, "text/plain",
+      "REFUSED. /debug/frontcheck?confirm=yes[&n=16] compares the lookup engine with the inline reads on every front\n"
+      "and times both (blocks the web server for seconds at 4096 points). Field cut only. Bench units only.\n"
+      "/debug/frontcheck?drive=60[&mode=old] runs a two-run second's lookups each second on Core 1; drive=0 stops.\n");
+    return;
+  }
+  if (!gpio4IsLow) { request->send(200, "text/plain", "REFUSED: the field is on. Cut the field and wait for it to settle.\n"); return; }
+  if (frontDriveUntilMs) { request->send(200, "text/plain", "REFUSED: a drive is running; /debug/frontcheck?drive=0 first.\n"); return; }
+  int nPer = request->hasParam("n") ? request->getParam("n")->value().toInt() : 16;
+  if (nPer < 1) nPer = 1;
+  if (nPer > 256) nPer = 256;
+  String out = "FRONTCHECK: lookup engine vs inline reads, bit for bit (state, pred, bar, idw, lwlr, cell, nearest, admit)\n";
+  if (altFrontBuf) {
+    FrontCheck::run(altFront2, "alt My History", nPer, altIdwPower, altRidgeFrac, altRefRadius, altRiskThresh, altSafetyMargin, out);
+    if (altHaveUpload) FrontCheck::run(altFrontUp, "alt Uploaded", nPer, altIdwPower, altRidgeFrac, altRefRadius, altRiskThresh, altSafetyMargin, out);
+  }
+  if (sailFrontBuf) {
+    FrontCheck::run(sailFront, "sail", nPer, perfIdwPower, perfRidgeFrac, perfRefRadius, perfRiskThresh, perfSafetyMargin, out);
+    FrontCheck::run(motorFront, "motor", nPer, perfIdwPower, perfRidgeFrac, perfRefRadius, perfRiskThresh, perfSafetyMargin, out);
+  }
+  out += "Engine work per loop pass is capped at " + String(FRONT_STEP_US) + " us per engine; live per-pass and per-second figures are on /debug.\n";
+  request->send(200, "text/plain", out);
 }
 
 // ════════════════ Commissioning Ledger (COMMISSIONING_LEDGER_SPEC.md) ════════════════
@@ -5086,7 +5240,7 @@ void cxLedgerDrainService() {
     if (trimmed) fsFreeDirty = true;
     fsReleaseLock();
     if (!trimmed) {
-      trimRetryAtMs = millis() | 1u;
+      trimRetryAtMs = millis() ? millis() : 1;
       return;
     }
     trimRetryAtMs = 0;

@@ -2,13 +2,21 @@ import QtQuick
 import QtQuick.Layouts
 import Victron.VenusOS
 
-// One settings section, drawn from /Settings/Schema (gx_app/xregulator/bridge/settings_schema.json).
+// One page of the settings outline (/Settings/Schema "outline", built by gx_app/gen_settings.py into
+// gx_app/xregulator/bridge/settings_schema.json): the app's Setup sub-tab, panel or nested <details> named by nodeId,
+// its rows in the app's order. A row is a setting, a group heading, a deeper page (pushed), the GX-only Connection
+// page, or a table drawn in place (XregCfgTable) with the app's buttons that sit above it (Charge Rate, Limit by).
+// Embedded in the home page's Settings page it is the list alone; pushed, it carries the home page's header and
+// sub-tab row (XregHeader). A short page (the schema's "short") always shows its descriptions; a longer one has a
+// "Show descriptions" switch when anything on it has one.
 // Values are in the schema's units (temperatures in °F, as on the wire); shown in °C when the GX is set so.
 Page {
 	id: page
 
 	property string svc
-	property string sectionId
+	property string nodeId
+	property Item home                // the home page this belongs to (XregHome); none when opened on its own
+	property bool embedded            // inside the home page's Settings page, under its sub-tab row
 	property bool showHelp
 	property bool wroteSinceOpen
 	property int lastSeq: -1
@@ -16,31 +24,62 @@ Page {
 
 	readonly property bool useC: Global.systemSettings.temperatureUnit === VenusOS.Units_Temperature_Celsius
 	readonly property bool linkUp: connectedItem.valid && connectedItem.value === 1
-	readonly property var sectionCfg: {
+	readonly property var outline: {
 		if (!schemaItem.valid || !schemaItem.value)
-			return null
+			return []
 		try {
-			const s = JSON.parse(schemaItem.value)
-			return s.sections.find(x => x.id === page.sectionId) || null
+			return JSON.parse(schemaItem.value).outline || []
 		} catch (e) {
-			return null
+			return []
 		}
 	}
+	function findNode(nodes, id) {
+		for (const n of nodes) {
+			if (!n.children)
+				continue
+			if (n.id === id)
+				return n
+			if (id.indexOf(n.id + "/") === 0)
+				return findNode(n.children, id)
+		}
+		return null
+	}
+	readonly property var node: page.nodeId ? findNode(page.outline, page.nodeId) : null
+	readonly property var items: node ? node.children.filter(c => !c.children) : []
+	readonly property bool shortPage: !!node && !!node.short
+	readonly property bool helpOn: shortPage || showHelp
+	// Charge Rate and Limit by: drawn by the table they set, never as rows of their own
+	readonly property var tableControls: {
+		const out = []
+		for (const it of items)
+			if (it.type === "table")
+				out.push(...(it.controls || []))
+		return out
+	}
+	readonly property bool anyHelp: items.some(it => !it.hidden
+			&& (!!it.help || (it.type === "table" && it.columns.some(c => !!c.help))))
 	readonly property var rowModel: {
 		const out = []
-		if (!sectionCfg)
+		if (!node)
 			return out
 		let g = null
-		for (const it of sectionCfg.items) {
-			if (it.hidden)
+		for (const c of node.children) {
+			if (c.children) {
+				if (!c.hidden)
+					out.push({ kind: "page", cfg: c })
+				g = null
 				continue
-			if (it.group && it.group !== g)
-				out.push({ kind: "header", label: it.group })
-			g = it.group || null
-			out.push({ kind: it.type === "info" ? it.widget : it.type, cfg: it })
+			}
+			if (c.hidden || tableControls.indexOf(c.key) >= 0)
+				continue
+			if (c.group && c.group !== g)
+				out.push({ kind: "header", label: c.group })
+			g = c.group || null
+			out.push({ kind: c.type === "info" ? c.widget : c.type, cfg: c })
 		}
 		return out
 	}
+	onNodeIdChanged: list.contentY = 0
 
 	// Every key a gate on this page reads: disabledWhen, and gates[].when on an item or a select option.
 	readonly property var gateKeys: {
@@ -51,7 +90,7 @@ Page {
 			else if (out.indexOf(c.key) < 0)
 				out.push(c.key)
 		}
-		for (const it of (sectionCfg ? sectionCfg.items : [])) {
+		for (const it of page.items) {
 			if (it.disabledWhen)
 				add(it.disabledWhen)
 			for (const g of (it.gates || []))
@@ -65,10 +104,10 @@ Page {
 	property var gateValues: ({})
 	property int gateRev
 
-	// Result keys this page answers for; a table's result belongs to its editor page.
+	// Result keys this page answers for, Charge Rate and Limit by included; a table's own result is its editor's.
 	readonly property var ownKeys: {
 		const out = []
-		for (const it of (sectionCfg ? sectionCfg.items : [])) {
+		for (const it of page.items) {
 			if (it.type === "info" && it.widget === "probes")
 				out.push("ProbeRole")
 			else if (it.type !== "table" && it.type !== "info")
@@ -94,6 +133,15 @@ Page {
 		return Math.round((cfg.temp === "delta" ? v * 9 / 5 : v * 9 / 5 + 32) * 10) / 10
 	}
 	function tempF(t) { return useC ? (t - 32) * 5 / 9 : t }
+	// A number with a true minus (a digit's width), left-padded with figure spaces (also a digit's width) to `chars`, so
+	// what follows it in the same line stays put as the value changes
+	function signNum(v, dec) { const t = Math.abs(v).toFixed(dec); return (v < 0 && Number(t) !== 0 ? "\u2212" : "") + t }
+	function figPad(text, chars) {
+		let t = String(text)
+		while (t.length < chars)
+			t = "\u2007" + t
+		return t
+	}
 	function tempUnit() { return useC ? "°C" : "°F" }
 	function unitOf(cfg) { return cfg && cfg.temp && useC ? "°C" : (cfg && cfg.unit ? cfg.unit : "") }
 	function stepDecimals(st) {
@@ -150,7 +198,7 @@ Page {
 	function captionOf(cfg, gatedNote) {
 		if (gatedNote)
 			return gatedNote
-		return showHelp && cfg && cfg.help ? cfg.help : ""
+		return helpOn && cfg && cfg.help ? cfg.help : ""
 	}
 
 	function confirmThen(cfg, fn) {
@@ -256,44 +304,75 @@ Page {
 		}
 	}
 
-	GradientListView {
+	Loader {
+		id: header
+		width: page.width
+		active: !!page.home && !page.embedded
+		sourceComponent: XregHeader {
+			svc: page.svc
+			home: page.home
+			pushed: true
+			setupRow: true
+			setupId: page.nodeId.split("/")[0]
+		}
+	}
+
+	// A Column, not a ListView: rows are never destroyed while scrolled away, so a table's unsaved edits stay
+	Flickable {
 		id: list
-		anchors.fill: parent
-		model: page.rowModel
-		header: Column {
+		anchors { top: header.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
+		contentHeight: rows.height
+		bottomMargin: Theme.geometry_gradientList_bottomMargin
+		boundsBehavior: Flickable.StopAtBounds
+		clip: true
+		ScrollBar.vertical: ScrollBar {}
+
+		Column {
+			id: rows
 			width: list.width
 			ListText {
 				text: !schemaItem.valid ? "Settings are not available from the bridge"
 						: !page.linkUp ? "No data from regulator" : ""
 				preferredVisible: text.length > 0
 			}
-			ListSwitch {
+			XregListSwitch {
 				text: "Show descriptions"
-				checkable: true
-				checked: page.showHelp
+				value: page.showHelp
 				writeAccessLevel: VenusOS.User_AccessType_User
-				onCheckedChanged: page.showHelp = checked
+				preferredVisible: !page.shortPage && page.anyHelp
+				onCommanded: function(on) { page.showHelp = on }
 			}
-		}
-		delegate: Loader {
-			id: rowLoader
-			width: list.width
-			sourceComponent: {
-				switch (modelData.kind) {
-				case "header": return headerRow
-				case "toggle": return toggleRow
-				case "select": return selectRow
-				case "number": return numberRow
-				case "action": return actionRow
-				case "table": return tableRow
-				case "zeroStatus": return zeroStatusRow
-				case "kneeStatus": return kneeStatusRow
-				case "probes": return probesRow
-				default: return null
+			// A row's caption is " " until its row arrives (onLoaded, after the row is created): gui-v2's CaptionLabel
+			// reports a binding loop on its height the first time a caption created empty gets text, never on one
+			// created with some.
+			Repeater {
+				model: page.rowModel
+				delegate: Loader {
+					width: rows.width
+					sourceComponent: {
+						switch (modelData.kind) {
+						case "header": return headerRow
+						case "page": return pageRow
+						case "toggle": return toggleRow
+						case "select": return selectRow
+						case "number": return numberRow
+						case "action": return actionRow
+						case "table": return tableRow
+						case "zeroStatus": return zeroStatusRow
+						case "kneeStatus": return kneeStatusRow
+						case "probes": return probesRow
+						case "connection": return connectionRow
+						default: return null
+						}
+					}
+					onLoaded: item.row = Qt.binding(() => modelData)
 				}
 			}
-			onLoaded: item.row = Qt.binding(() => modelData)
 		}
+	}
+	ViewGradient {
+		anchors.bottom: list.bottom
+		width: list.width
 	}
 
 	component GateWatch: QtObject {
@@ -314,25 +393,29 @@ Page {
 
 	Component {
 		id: toggleRow
-		ListSwitch {
+		XregListSwitch {
 			id: sw
 			property var row
 			readonly property var cfg: row ? row.cfg : null
 			GateWatch { id: gate; cfg: sw.cfg }
 			text: cfg ? cfg.label : ""
-			caption: page.captionOf(cfg, gate.note)
+			caption: row ? page.captionOf(cfg, gate.note) : " "
 			writeAccessLevel: VenusOS.User_AccessType_User
 			dataItem.uid: cfg ? page.valueUid(cfg.key) : ""
 			valueFalse: cfg && cfg.options ? cfg.options[0].value : 0
 			valueTrue: cfg && cfg.options ? cfg.options[cfg.options.length - 1].value : 1
+			value: dataItem.value === valueTrue
 			interactive: dataItem.valid && page.linkUp && !gate.gated
-			updateDataOnClick: false
-			onClicked: {
-				const v = checked ? valueFalse : valueTrue
-				if (cfg.confirm && (cfg.confirmWhen === undefined || cfg.confirmWhen === v))
-					page.confirmThen(cfg, () => page.writeValue(dataItem, v))
-				else
+			onCommanded: function(on) {
+				const v = on ? valueTrue : valueFalse
+				const write = () => {
 					page.writeValue(dataItem, v)
+					sw.expect(on)
+				}
+				if (cfg.confirm && (cfg.confirmWhen === undefined || cfg.confirmWhen === v))
+					page.confirmThen(cfg, write)
+				else
+					write()
 			}
 		}
 	}
@@ -346,7 +429,7 @@ Page {
 			readonly property bool asks: !!cfg && !!cfg.confirm
 			GateWatch { id: gate; cfg: sel.cfg }
 			text: cfg ? cfg.label : ""
-			caption: page.captionOf(cfg, gate.note)
+			caption: row ? page.captionOf(cfg, gate.note) : " "
 			writeAccessLevel: VenusOS.User_AccessType_User
 			dataItem.uid: cfg ? page.valueUid(cfg.key) : ""
 			// A gated option stays listed but cannot be picked, like the app's disabled <option>; readOnly would hide it.
@@ -377,7 +460,7 @@ Page {
 			readonly property var cfg: row ? row.cfg : null
 			GateWatch { id: gate; cfg: nr.cfg }
 			text: cfg ? cfg.label : ""
-			caption: page.captionOf(cfg, gate.note)
+			caption: row ? page.captionOf(cfg, gate.note) : " "
 			writeAccessLevel: VenusOS.User_AccessType_User
 			secondaryText: cfg ? page.fmt(cfg, valueItem.valid, valueItem.value) : "--"
 			interactive: page.linkUp && !gate.gated
@@ -405,7 +488,11 @@ Page {
 			GateWatch { id: gate; cfg: ar.cfg }
 			text: cfg ? cfg.label : ""
 			caption: {
-				const st = cfg && cfg.options && echoItem.valid ? page.optionLabel(cfg, echoItem.value) : ""
+				if (!row)
+					return " "
+				// a state's placeholder label ("---" for Alarm Test idle, as the app's echo shows it) reads as nothing here
+				const lbl = cfg && cfg.options && echoItem.valid ? page.optionLabel(cfg, echoItem.value) : ""
+				const st = /^[-\u2013\u2014\s]*$/.test(lbl) ? "" : lbl
 				const h = page.captionOf(cfg, gate.note)
 				return st && h ? st + "\n" + h : (st || h)
 			}
@@ -429,14 +516,39 @@ Page {
 	}
 
 	Component {
-		id: tableRow
+		id: pageRow
 		ListNavigation {
 			property var row
 			readonly property var cfg: row ? row.cfg : null
-			text: cfg ? cfg.label : ""
-			caption: page.captionOf(cfg, "")
-			onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregCfgTable.qml",
-					{ title: cfg.label, tableCfg: cfg, svc: page.svc })
+			text: cfg ? cfg.title : ""
+			onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregCfgSection.qml",
+					{ title: cfg.title, nodeId: cfg.id, svc: page.svc, home: page.home })
+		}
+	}
+
+	Component {
+		id: connectionRow
+		ListNavigation {
+			property var row
+			text: "Connection"
+			secondaryText: !connectedItem.valid ? "Bridge not running" : page.linkUp ? "Connected" : "No data from regulator"
+			onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregCfgConnection.qml",
+					{ title: text, svc: page.svc, home: page.home, setupId: page.nodeId.split("/")[0] })
+		}
+	}
+
+	Component {
+		id: tableRow
+		XregCfgTable {
+			property var row
+			readonly property var cfg: row ? row.cfg : null
+			svc: page.svc
+			tableCfg: cfg
+			controls: cfg ? (cfg.controls || []).map(k => page.items.find(x => x.key === k)).filter(x => !!x) : []
+			linkUp: page.linkUp
+			showHelp: page.helpOn
+			showLabel: !!cfg && !!page.node && cfg.label !== page.node.title
+			onWrote: page.wroteSinceOpen = true
 		}
 	}
 
@@ -524,7 +636,7 @@ Page {
 				}
 				Label {
 					width: parent.width
-					text: page.showHelp && ks.cfg ? ks.cfg.help : ""
+					text: page.helpOn && ks.cfg ? ks.cfg.help : ""
 					visible: text.length > 0
 					wrapMode: Text.Wrap
 					color: Theme.color_font_secondary
@@ -542,6 +654,7 @@ Page {
 							color: Theme.color_font_secondary
 							font.pixelSize: Theme.font_size_caption
 							Layout.fillWidth: true
+							Layout.preferredWidth: 1   // equal columns, so a changing cell never resizes the table
 						}
 					}
 					Repeater {
@@ -562,7 +675,9 @@ Page {
 							}
 							font.pixelSize: Theme.font_size_caption
 							font.bold: !!ks.j && Number(ks.j.activeBin) === bi
+							font.features: { "tnum": 1 }
 							Layout.fillWidth: true
+							Layout.preferredWidth: 1
 						}
 					}
 				}
@@ -607,10 +722,10 @@ Page {
 				if (s === null || s === undefined || !isFinite(n))
 					return "—"
 				if (n < 120)
-					return n + " s"
+					return page.figPad(n, 3) + " s"
 				if (n < 7200)
-					return Math.round(n / 60) + " min"
-				return (n / 3600).toFixed(1) + " h"
+					return page.figPad(Math.round(n / 60), 3) + " min"
+				return page.figPad((n / 3600).toFixed(1), 5) + " h"
 			}
 			function statusText() {
 				if (!j)
@@ -645,7 +760,7 @@ Page {
 			ListText {
 				text: pr.cfg && pr.cfg.headings ? pr.cfg.headings.join(" · ") : ""
 				secondaryText: pr.statusText()
-				caption: page.showHelp && pr.cfg ? pr.cfg.help : ""
+				caption: !pr.row ? " " : page.helpOn && pr.cfg ? pr.cfg.help : ""
 			}
 			ListText {
 				text: "No temperature probes found on the bus. Check the probe wiring, then press Scan."
@@ -654,14 +769,16 @@ Page {
 			Repeater {
 				model: pr.rowIds
 				delegate: ListRadioButtonGroup {
+					property bool primed     // " " caption until created, as for the page's rows
+					Component.onCompleted: primed = true
 					readonly property string pid: modelData
 					readonly property var probe: pr.probeOf(pid)
 					readonly property int probeRole: probe ? Number(probe.role) : -1
 					readonly property real tF: !probe || probe.tempF === null || probe.tempF === undefined ? NaN : Number(probe.tempF)
 					text: pid.slice(-6).toUpperCase() + "   "
-							+ (isFinite(tF) ? page.tempF(tF).toFixed(1) + " " + page.tempUnit() : "—")
+							+ (isFinite(tF) ? page.figPad(page.signNum(page.tempF(tF), 1), 6) + " " + page.tempUnit() : "—")
 							+ "   " + pr.fmtAge(probe ? probe.ageS : null)
-					caption: probe && probe.present ? "" : "not on bus"
+					caption: !primed ? " " : probe && probe.present ? "" : "not on bus"
 					writeAccessLevel: VenusOS.User_AccessType_User
 					optionModel: pr.roleOptions
 					currentIndex: Math.max(0, pr.roleOptions.findIndex(o => o.value === probeRole))

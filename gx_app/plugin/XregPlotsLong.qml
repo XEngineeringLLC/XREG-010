@@ -4,7 +4,9 @@ import Victron.VenusOS
 // Plots > Long Term: the web app's seven long-term charts (same groups, series and min/max bands) over 1 h to 30 d,
 // from the regulator's on-device ring as the bridge bins it (/Plot/Long/*, at most 300 points, fetched while this
 // tab asks for it). Where the bridge also sends an engine-on average (<name>OnAvg) it is the solid line and the
-// all-hours average is the faint dashed one, as in the app; otherwise the all-hours average is the line.
+// all-hours average is the faint dashed one, as in the app; otherwise the all-hours average is the line. The
+// temperature chart adds Battery (v5 records; empty on an older ring) and starts with Thermistor and Board hidden
+// (Mark, 2026-10-28); a tap on their legend entry shows them.
 Item {
 	id: tab
 
@@ -19,7 +21,7 @@ Item {
 	readonly property string range: rangeItem.valid && ranges.indexOf(String(rangeItem.value)) >= 0 ? String(rangeItem.value) : "24h"
 	readonly property bool oneColumn: width < 760
 	readonly property var envelope: ["battVolt", "battCurr", "altCurr", "victronCurr", "rpm", "duty", "altTemp", "tempTherm",
-		"sog", "tws", "vmg", "aws", "awa", "twa", "heel", "pitch", "soc"]
+		"sog", "tws", "vmg", "aws", "awa", "twa", "heel", "pitch", "soc", "battTemp"]
 	// the app keeps Victron/Solar on the all-hours average: it charges with the engine off
 	readonly property var engineOn: ["battVolt", "battCurr", "altCurr", "duty"]
 	readonly property var fields: fieldsItem.valid && String(fieldsItem.value).length ? String(fieldsItem.value).split(",") : []
@@ -36,6 +38,8 @@ Item {
 	VeQuickItem { id: stepItem; uid: tab.svc + "/Plot/Long/StepS"; onValueChanged: tab.dirty = true }
 	VeQuickItem { id: echoItem; uid: tab.svc + "/Plot/Long/Range"; onValueChanged: tab.dirty = true }
 	VeQuickItem { id: stageItem; uid: tab.svc + "/Plot/Long/chargeStage"; onValueChanged: tab.dirty = true }
+	// each field's newest recorded value in the whole ring: the legend's value when its window has none
+	VeQuickItem { id: lastItem; uid: tab.svc + "/Plot/Long/Last"; onValueChanged: tab.dirty = true }
 	Timer {
 		interval: 15000
 		repeat: true
@@ -89,8 +93,9 @@ Item {
 			{ key: "soc", label: "SOC", unit: "%", dec: 0, color: Theme.color_blue, right: true }] },
 		{ k: "temp", title: "Temperatures & Barometric Pressure", unit: Global.systemSettings.temperatureUnitSuffix, rightUnit: "mbar", series: [
 			{ key: "altTemp", label: "Alternator", temp: true, color: Theme.color_red },
-			{ key: "tempTherm", label: "Thermistor", temp: true, color: Theme.color_orange },
-			{ key: "ambTemp", label: "Board", temp: true, color: Theme.color_blue },
+			{ key: "battTemp", label: "Battery", temp: true, color: Theme.color_green },
+			{ key: "tempTherm", label: "Thermistor", temp: true, color: Theme.color_orange, off: true },
+			{ key: "ambTemp", label: "Board", temp: true, color: Theme.color_blue, off: true },
 			{ key: "baro", label: "Baro", unit: "mbar", dec: 1, color: Theme.color_blackWater, right: true }] },
 		{ k: "rpm", title: "Engine RPM & Alternator Duty", unit: "", zero: true, rightFixed: [0, 100], rightUnit: "%", series: [
 			{ key: "rpm", label: "RPM", unit: "", dec: 0, color: Theme.color_blackWater },
@@ -132,6 +137,12 @@ Item {
 		out.xHi = start + Math.max(1, n) * stepS
 		out.xs = xs
 		const tempSuffix = Global.systemSettings.temperatureUnitSuffix
+		let lastMap = {}
+		try {
+			lastMap = lastItem.valid && lastItem.value ? JSON.parse(lastItem.value) : {}
+		} catch (e) {
+			lastMap = {}
+		}
 		for (const sp of specs) {
 			let lines = []
 			for (const s of sp.series) {
@@ -146,8 +157,10 @@ Item {
 					lo = lo ? lo.map(toUserTemp) : null
 					hi = hi ? hi.map(toUserTemp) : null
 				}
+				const lastV = lastMap[s.key]
 				const base = { unit: s.temp ? tempSuffix : s.unit, dec: s.dec !== undefined ? s.dec : 1, color: s.color,
-					right: !!s.right, wrap: !!s.wrap, x: xs }
+					right: !!s.right, wrap: !!s.wrap, off: !!s.off, x: xs,
+					last: typeof lastV === "number" ? (s.temp ? toUserTemp(lastV) : lastV) : NaN }
 				if (on) {
 					lines.push(Object.assign({}, base, { key: s.key, label: s.label, v: on, lo: lo, hi: hi }))
 					lines.push(Object.assign({}, base, { key: s.key + "W", v: v, dash: true, w: 1, noLegend: true }))
@@ -207,8 +220,17 @@ Item {
 		height: 40
 		fontPixelSize: Theme.font_size_body1
 		model: [{ value: "1h" }, { value: "6h" }, { value: "24h" }, { value: "7d" }, { value: "30d" }]
-		currentIndex: tab.ranges.indexOf(tab.range)
-		onButtonClicked: function(buttonIndex) { rangeItem.setValue(tab.ranges[buttonIndex]) }
+		currentIndex: tab.ranges.indexOf(rangeSync.shown)
+		onButtonClicked: function(buttonIndex) {
+			rangeItem.setValue(tab.ranges[buttonIndex])
+			rangeSync.expect(tab.ranges[buttonIndex])
+			// the click sets currentIndex itself; follow the range again, which every screen on this GX shares
+			Qt.callLater(() => rangeRow.currentIndex = Qt.binding(() => tab.ranges.indexOf(rangeSync.shown)))
+		}
+	}
+	XregSync {
+		id: rangeSync
+		value: tab.range
 	}
 	Label {
 		anchors { left: rangeRow.right; leftMargin: 14; right: parent.right; rightMargin: tab.m; verticalCenter: rangeRow.verticalCenter }

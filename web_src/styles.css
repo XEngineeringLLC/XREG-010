@@ -4232,6 +4232,33 @@ body.readings-stale .reading-value {
   border-bottom-color: #444444;
 }
 
+/* Live Data > Integrations > Victron GX: one row per GX device, its name over its kind and product, amps over age */
+.gxdev-row .metric-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 10em;
+}
+.gxdev-name {
+  font-size: 13px;
+  color: var(--text-dark);
+  overflow-wrap: anywhere;
+}
+.gxdev-sub,
+.gxdev-age {
+  font-size: 11px;
+  font-weight: normal;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.gxdev-row .metric-value {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
 /* Two-signal interval comparison tables (Timing & Diagnostics):
    one metric-label column + two right-aligned value columns. */
 .interval-row {
@@ -6393,3 +6420,31 @@ body.dark-mode .baro-tendency-delta { color: #aaa; }
 .dark-mode .onoff-switch.is-on  .onoff-half[data-v="1"] { background: #0f8f88; border-color: #0f8f88; color: #ffffff; }
 .dark-mode .onoff-half.onoff-pending { box-shadow: inset 0 0 0 2px #7fe9df; }
 .dark-mode .onoff-half:focus-visible { outline-color: #7fe9df; }
+
+/* Until the regulator has reported a setting, its control shows no position, the way the master switch fills neither
+   half before its first frame: no knob, no lit segment, no option text, at the same size so nothing moves as it fills.
+   body.awaiting-echo is in the markup and comes off after the first settings echo (CSV3); .echo-pending marks a control
+   another source fills (CSV2, a JSON poll, PerfSettings / PerfLive) and comes off when that source arrives. */
+body.awaiting-echo form[target="hidden-form"] label.switch .slider,
+label.switch.echo-pending .slider { background-color: #dddddd; }
+body.dark-mode.awaiting-echo form[target="hidden-form"] label.switch .slider,
+.dark-mode label.switch.echo-pending .slider { background-color: #333333; }
+body.awaiting-echo form[target="hidden-form"] label.switch .slider:before,
+label.switch.echo-pending .slider:before { visibility: hidden; }
+body.awaiting-echo form[target="hidden-form"] .cap-mode-btn.cap-mode-active,
+body.awaiting-echo #chargeRateHighBtn.cap-mode-active, body.awaiting-echo #chargeRateLowBtn.cap-mode-active,
+body.awaiting-echo #capModeAmpsBtn.cap-mode-active, body.awaiting-echo #capModeKWBtn.cap-mode-active,
+body.awaiting-echo [id^="outputPIDSigSrc_"].cap-mode-active,
+.echo-pending > .cap-mode-btn.cap-mode-active,
+body.awaiting-echo form[target="hidden-form"] .seg > button.on,
+body.awaiting-echo [id^="systemIDTestType_btn"].on, body.awaiting-echo [id^="tuningWaveform_btn"].on {
+  background: transparent;
+  color: var(--text-muted, #888);
+  box-shadow: none;
+}
+body.awaiting-echo select[name="AmpSensorRange"], body.awaiting-echo select[name="timeSourceMode"],
+body.awaiting-echo select[name="gpsPositionSource"], body.awaiting-echo select[name="speedSourceMode"],
+body.awaiting-echo select[name="UseFloat"], body.awaiting-echo select[name="n2kTempSource"],
+body.awaiting-echo select[name="n2kExtraTempSource"], body.awaiting-echo select[name="battTempSource"],
+body.awaiting-echo select[name="n2kChgrMode"], body.awaiting-echo select[name="dvccSrcType"],
+body.awaiting-echo select[name="FieldWiring"], body.awaiting-echo select[name="ShuntLead"] { color: transparent; }

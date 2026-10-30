@@ -2,12 +2,14 @@ import QtQuick
 import QtQuick.Shapes
 import Victron.VenusOS
 
-// Home page for one regulator (svc: its service uid), shared by the Integrations page and the alternator's
-// Device List page.
-// Top: the web app's header banner (wordmark, status words, off-reason strip, chips, Alternator Enable).
-// Below: alternator gauge, the app's boat speed-performance view (XregChartPerf), wind for the last hour and barometer
-// for 24 hours over the two days before, then the Plots and Settings buttons.
-// Under 600 px wide (remote console on a phone held upright) the same pieces stack in one scrolling column.
+// Dashboard, the first page of the home page (XregHome, under its header with Alternator Enable), for one regulator
+// (svc: its service uid).
+// Top: the web app's header banner (wordmark, status words, off-reason strip, chips).
+// Below: power flow (XregFlow: the battery, then a row per source and load on one fixed scale), the app's boat
+// speed-performance view (XregChartPerf), apparent wind for the last hour and barometer for today, yesterday and the day
+// before on one midnight-to-midnight axis.
+// Under 600 px wide (remote console on a phone held upright) the same pieces stack in one scrolling column, the power
+// flow as tall as its rows.
 // Reads the bridge's /Live and /History paths; temperatures arrive in Celsius and show in the owner's unit.
 // Status, stage, limiter and off-reason words are the web app's own (script.js fieldOffReasonText etc.).
 Item {
@@ -16,34 +18,31 @@ Item {
 	property bool animationEnabled
 	property string svc
 	readonly property bool linkUp: connected.valid && connected.value === 1
-	readonly property real capMax: capMaxItem.valid && capMaxItem.value > 0 ? capMaxItem.value : 100
 	readonly property color brand: "#00a19a"    // web app --accent
 	readonly property real m: 14
 	readonly property real gap: 10
 	readonly property bool portrait: width < 600
 	readonly property real sc: portrait ? 0.85 : Math.min(1, width / 1024)    // 0.78 on an 800-wide GX Touch 50
-	readonly property real stripY: portrait ? 142 : 60
-	readonly property real chipsY: stripY + 36
-	readonly property real chipsH: 76
-	readonly property real chipW: portrait ? (width - 2 * m - gap) / 2 : (width - 2 * m - Math.round(250 * sc) - 5 * gap) / 5
-	readonly property real lowerY: chipsY + (portrait ? 3 * chipsH + 2 * gap : chipsH) + gap
-	readonly property real lowerH: portrait ? 0 : height - lowerY - m
-	// 5-inch GX Touch 50 (228 px below the chips): the page buttons move under the gauge so wind and barometer get
-	// the whole right column
-	readonly property bool tight: !portrait && lowerH < 300
-	readonly property real navH: 46
-	readonly property real colW: portrait ? width - 2 * m : Math.min(width * 0.27, tight ? width : lowerH / 0.82)
-	// 24: the gauge's 0 and full-scale labels hang below its 0.82 box
-	readonly property real heroW: portrait ? Math.min(width - 2 * m, 320)
-										   : tight ? Math.min(colW, (lowerH - navH - gap - 24) / 0.82) : colW
+	// 5-inch GX Touch 50 (372 px under the header): banner, strip and chips packed closer, so the tiles below keep 214 px
+	readonly property bool tight: !portrait && height < 420
+	readonly property real topY: tight ? 0 : 4
+	readonly property real bannerH: tight ? 40 : 46
+	readonly property real stripY: portrait ? 136 : topY + bannerH + 4
+	readonly property real chipsY: stripY + (tight ? 34 : 36)
+	readonly property real chipsH: tight ? 64 : 76
+	readonly property real chipW: portrait ? (width - 2 * m - gap) / 2 : (width - 2 * m - 4 * gap) / 5
+	readonly property real lowerY: chipsY + (portrait ? 3 * chipsH + 2 * gap : chipsH) + (tight ? 8 : gap)
+	readonly property real lowerH: portrait ? 0 : height - lowerY - (tight ? 8 : m)
+	readonly property real colW: portrait ? width - 2 * m : width * 0.27
+	readonly property real flowH: portrait ? flowTile.implicitHeight : lowerH
 	readonly property real perfX: portrait ? m : m + colW + gap
-	readonly property real perfY: portrait ? lowerY + heroW * 0.82 + 30 : lowerY
+	readonly property real perfY: portrait ? lowerY + flowH + gap : lowerY
 	readonly property real perfW: portrait ? width - 2 * m : Math.round(width * 0.42)
 	readonly property real perfH: portrait ? 340 : lowerH
 	readonly property real sideX: portrait ? m : perfX + perfW + gap
 	readonly property real sideY: portrait ? perfY + perfH + gap : lowerY
 	readonly property real sideW: portrait ? width - 2 * m : width - sideX - m
-	readonly property real sideH: portrait ? 2 * 160 + 46 + 2 * gap : lowerH
+	readonly property real sideH: portrait ? 2 * 160 + gap : lowerH
 
 	VeQuickItem { id: connected; uid: root.svc + "/Connected" }
 	VeQuickItem { id: altAmps; uid: root.svc + "/Live/AltAmps" }
@@ -60,8 +59,7 @@ Item {
 	VeQuickItem { id: soc; uid: root.svc + "/Live/Soc" }
 	VeQuickItem { id: health; uid: root.svc + "/Live/Health" }
 	VeQuickItem { id: baro; uid: root.svc + "/Live/Baro" }
-	VeQuickItem { id: trueWind; uid: root.svc + "/Live/TrueWind" }
-	VeQuickItem { id: capMaxItem; uid: root.svc + "/Live/AltCapMax" }
+	VeQuickItem { id: appWind; uid: root.svc + "/Live/AppWind" }
 	VeQuickItem { id: onOff; uid: root.svc + "/SwitchableOutput/0/State" }
 	VeQuickItem {
 		id: altTemp
@@ -75,8 +73,9 @@ Item {
 		sourceUnit: Units.unitToVeUnit(VenusOS.Units_Temperature_Celsius)
 		displayUnit: Units.unitToVeUnit(Global.systemSettings.temperatureUnit)
 	}
-	VeQuickItem { id: histWind; uid: root.svc + "/History/Wind" }
+	VeQuickItem { id: histWind; uid: root.svc + "/History/AppWind" }
 	VeQuickItem { id: histBaro; uid: root.svc + "/History/Baro" }
+	VeQuickItem { id: histBaroEnd; uid: root.svc + "/History/BaroEnd" }
 	VeQuickItem { id: dvccState; uid: root.svc + "/Live/DvccState" }
 	VeQuickItem { id: dvccUntrust; uid: root.svc + "/Live/DvccUntrust" }
 	VeQuickItem { id: dvccCvl; uid: root.svc + "/Live/DvccCvl" }
@@ -85,7 +84,19 @@ Item {
 	VeQuickItem { id: dvccWifiAge; uid: root.svc + "/Live/DvccWifiAge" }
 
 	function num(item) { return root.linkUp && item.valid ? item.value : NaN }
-	function fmt(v, decimals, unit) { return isNaN(v) ? "--" : v.toFixed(decimals) + (unit ? " " + unit : "") }
+	// Fixed decimals per quantity and a true minus sign (a digit's width; a hyphen is half that)
+	function fmt(v, decimals, unit) {
+		return isNaN(v) ? "--" : (v < 0 && Math.abs(v).toFixed(decimals) !== (0).toFixed(decimals) ? "\u2212" : "")
+			+ Math.abs(v).toFixed(decimals) + (unit ? " " + unit : "")
+	}
+	// A number padded with figure spaces (a digit's width) to `chars`, for numbers inside a sentence or a centred line,
+	// so the words after it stay put as the digit count changes
+	function pad(text, chars) {
+		let t = String(text)
+		while (t.length < chars)
+			t = "\u2007" + t
+		return t
+	}
 
 	readonly property var faultReasons: [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 19, 22, 23, 24, 27, 28, 29, 31, 32]
 	readonly property var idleReasons: [10, 20, 21, 25, 30]
@@ -154,8 +165,8 @@ Item {
 		if (dvccWifiAge.valid && dvccWifiAge.value <= 20000)
 			heard.push("WiFi")
 		const over = heard.length ? " over " + heard.join(" and ") : ""
-		const lim = [dvccCvl.valid ? dvccCvl.value.toFixed(2) + " V" : "", dvccCcl.valid ? dvccCcl.value.toFixed(1) + " A" : ""]
-				.filter(t => t.length).join(", ")
+		const lim = [dvccCvl.valid ? pad(dvccCvl.value.toFixed(2), 5) + " V" : "",
+					 dvccCcl.valid ? pad(dvccCcl.value.toFixed(1), 6) + " A" : ""].filter(t => t.length).join(", ")
 		switch (dvccState.value) {
 		case 0: return heard.length ? "Charge limits heard" + over + ", not followed" + (lim ? ": " + lim : "") : ""
 		case 1: return "Charge limits: waiting, none heard"
@@ -192,6 +203,34 @@ Item {
 	}
 	function validOf(v) { return v.filter(x => !isNaN(x)) }
 
+	// The GX clock and its offset from UTC. ClockTime follows the GX's time-zone setting; a JS Date follows the process
+	// (UTC on a GX) or the browser.
+	readonly property real nowS: typeof ClockTime !== "undefined" && ClockTime.clockTime > 0 ? ClockTime.clockTime : Date.now() / 1000
+	readonly property int tzS: {
+		if (typeof ClockTime === "undefined" || !(ClockTime.clockTime > 0))
+			return -new Date().getTimezoneOffset() * 60
+		const u = new Date(ClockTime.clockTime * 1000)
+		const d = ((ClockTime.hour * 60 + ClockTime.minute - u.getUTCHours() * 60 - u.getUTCMinutes()) % 1440 + 1440) % 1440
+		return (d > 840 ? d - 1440 : d) * 60
+	}
+	// Barometer samples (the regulator's 10 min apart, the newest at epoch end) that fall on local day `day`, as points
+	// on a midnight-to-midnight axis; NaN samples are skipped
+	function dayPoints(v, end, day, lo, hi, w, h) {
+		if (!(hi > lo))
+			return []
+		let pts = []
+		for (let i = 0; i < v.length; ++i) {
+			if (isNaN(v[i]))
+				continue
+			const t = end - (v.length - 1 - i) * 600 + tzS
+			if (Math.floor(t / 86400) !== day)
+				continue
+			const f = Math.max(lo, Math.min(hi, v[i]))
+			pts.push(Qt.point((t - day * 86400) / 86400 * w, h - (f - lo) / (hi - lo) * h))
+		}
+		return pts
+	}
+
 	component Chip: Rectangle {
 		property real sc: 1
 		property string label1
@@ -200,6 +239,8 @@ Item {
 		property string label2
 		property string value2
 		property color color2: Theme.color_font_primary
+		property string template1
+		property string template2
 		radius: Theme.geometry_overviewPage_widget_radius
 		color: Theme.color_background_secondary
 		Column {
@@ -217,8 +258,9 @@ Item {
 						color: Theme.color_font_secondary
 						font.pixelSize: Math.round(Theme.font_size_body1 * sc)
 					}
-					Label {
+					XregNum {
 						anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+						template: index === 0 ? template1 : template2
 						text: index === 0 ? value1 : value2
 						color: index === 0 ? color1 : color2
 						font.pixelSize: Math.round(Theme.font_size_body2 * sc)
@@ -263,7 +305,7 @@ Item {
 			color: Theme.color_font_secondary
 			font.pixelSize: Theme.font_size_caption
 		}
-		Label {
+		XregNum {
 			id: chartNote
 			anchors { right: parent.right; rightMargin: 14 }
 			y: parent.compact ? 8 : 6
@@ -293,8 +335,8 @@ Item {
 
 		// Banner row: connection dot + wordmark, status words on the right (their own line in portrait)
 		Row {
-			x: root.m; y: 10
-			height: 46
+			x: root.m; y: root.topY
+			height: root.bannerH
 			spacing: 10
 			Rectangle {
 				anchors.verticalCenter: parent.verticalCenter
@@ -318,19 +360,32 @@ Item {
 		}
 		Label {
 			id: statusLabel
-			x: root.portrait ? root.m : root.width - root.m - width
-			y: root.portrait ? 56 : 10
-			height: 46
+			x: root.portrait ? root.m : fieldPct.visible ? fieldPct.x - 14 - width : root.width - root.m - width
+			y: root.portrait ? 50 : root.topY
+			height: root.bannerH
 			verticalAlignment: Text.AlignVCenter
-			text: root.statusWord + (root.statusWord === "ACTIVE" && field.valid ? "  " + Math.round(field.value) + "%" : "")
+			text: root.statusWord
+			color: root.statusColor
+			font.pixelSize: Theme.font_size_h1
+			font.bold: true
+		}
+		XregNum {
+			id: fieldPct
+			visible: root.statusWord === "ACTIVE" && field.valid
+			x: root.portrait ? statusLabel.x + statusLabel.width + 14 : root.width - root.m - width
+			y: statusLabel.y
+			height: root.bannerH
+			verticalAlignment: Text.AlignVCenter
+			template: "100%"
+			text: Math.round(field.value) + "%"
 			color: root.statusColor
 			font.pixelSize: Theme.font_size_h1
 			font.bold: true
 		}
 		Row {
 			x: root.portrait ? root.m : statusLabel.x - 10 - width
-			y: root.portrait ? 102 : 10
-			height: root.portrait ? 36 : 46
+			y: root.portrait ? 96 : root.topY
+			height: root.portrait ? 36 : root.bannerH
 			spacing: 10
 			Pill { anchors.verticalCenter: parent.verticalCenter; text: root.limiterWord; tint: Theme.color_orange }
 			Pill { anchors.verticalCenter: parent.verticalCenter; text: root.stageWord; tint: Theme.color_ok }
@@ -356,38 +411,39 @@ Item {
 			}
 		}
 
-		// Chips, as in the app header, then Alternator Enable
+		// Chips, as in the app header (Alternator Enable is in the header above the page, XregHeader)
 		Grid {
 			id: chips
 			x: root.m; y: root.chipsY
-			columns: root.portrait ? 2 : 6
+			columns: root.portrait ? 2 : 5
 			spacing: root.gap
-			readonly property real enableW: root.portrait ? root.chipW : Math.round(250 * root.sc)
 			readonly property real chipW: root.chipW
 
 			Chip {
 				width: chips.chipW; height: root.chipsH
 				sc: root.sc
-				label1: "Batt"; value1: root.fmt(root.num(battV), 2, "V")
-				label2: "SOC"; value2: root.fmt(root.num(soc), 1, "%")
+				label1: "Batt"; value1: root.fmt(root.num(battV), 2, "V"); template1: "88.88 V"
+				label2: "SOC"; value2: root.fmt(root.num(soc), 1, "%"); template2: "100.0 %"
 			}
 			Chip {
 				width: chips.chipW; height: root.chipsH
 				sc: root.sc
-				label1: "Alt"; value1: root.fmt(root.num(altAmps), 1, "A")
-				label2: "Batt"; value2: root.fmt(root.num(battA), 1, "A")
+				label1: "Alt"; value1: root.fmt(root.num(altAmps), 1, "A"); template1: "\u2212888.8 A"
+				label2: "Batt"; value2: root.fmt(root.num(battA), 1, "A"); template2: "\u2212888.8 A"
 			}
 			Chip {
 				width: chips.chipW; height: root.chipsH
 				sc: root.sc
 				label1: "Alt"; value1: root.fmt(root.num(altTemp), 1, Global.systemSettings.temperatureUnitSuffix)
+				template1: "\u221288.8 " + Global.systemSettings.temperatureUnitSuffix
 				label2: isNaN(root.num(battTemp)) ? "" : "Batt"
 				value2: root.fmt(root.num(battTemp), 1, Global.systemSettings.temperatureUnitSuffix)
+				template2: template1
 			}
 			Chip {
 				width: chips.chipW; height: root.chipsH
 				sc: root.sc
-				label1: "RPM"; value1: root.fmt(root.num(rpm), 0, "")
+				label1: "RPM"; value1: root.fmt(root.num(rpm), 0, ""); template1: "8888"
 				label2: "IGN"
 				value2: !root.linkUp || !ignition.valid ? "--" : ignition.value === 1 ? "ON" : "OFF"
 				color2: ignition.value === 1 ? root.brand : Theme.color_font_primary
@@ -395,134 +451,24 @@ Item {
 			Chip {
 				width: chips.chipW; height: root.chipsH
 				sc: root.sc
-				label1: "Health"; value1: isNaN(root.num(health)) ? "- %" : Math.round(root.num(health)) + " %"
-			}
-			Rectangle {
-				width: chips.enableW; height: root.chipsH
-				radius: Theme.geometry_overviewPage_widget_radius
-				color: Theme.color_background_secondary
-				Label {
-					anchors { left: parent.left; leftMargin: 14; right: enableSwitch.left; rightMargin: 8; verticalCenter: parent.verticalCenter }
-					text: "Alternator Enable"
-					wrapMode: Text.WordWrap
-					font.pixelSize: Math.round(Theme.font_size_body2 * root.sc)
-					font.bold: true
-				}
-				Switch {
-					id: enableSwitch
-					anchors { right: parent.right; rightMargin: 14; verticalCenter: parent.verticalCenter }
-					enabled: root.linkUp
-					checkable: false
-					checked: onOff.valid && onOff.value === 1
-					onClicked: onOff.setValue(checked ? 0 : 1)
-				}
+				label1: "Health"; value1: isNaN(root.num(health)) ? "- %" : Math.round(root.num(health)) + " %"; template1: "100 %"
 			}
 		}
 
-		// Hero gauge: alternator current on the outer arc (full scale = largest RPM-table current cap), field % on the
-		// inner arc, target current as an orange tick
-		Item {
-			id: hero
-			x: root.portrait ? (root.width - width) / 2 : root.m + (root.colW - width) / 2
-			y: root.portrait || root.tight ? root.lowerY : root.lowerY + (root.lowerH - height) / 2
-			width: root.heroW
-			height: root.heroW * 0.82
-			readonly property real r: width / 2
-			readonly property real k: Math.min(1, width / 216)    // rings thin below the 800-wide size so the words fit
-			readonly property real inset: Math.round(34 * k)
-			readonly property real span: 260
-			readonly property real endDx: Math.sin(span / 2 * Math.PI / 180) * (r - 13)
-			readonly property real endY: r - Math.cos(span / 2 * Math.PI / 180) * (r - 13)
-
-			Item {
-				width: hero.width; height: hero.width
-				layer.enabled: !UiConfig.msaaEnabled
-				layer.textureSize: Qt.size(2 * width, 2 * height)
-				layer.smooth: true
-
-				ProgressArc {
-					id: ampArc
-					anchors.fill: parent
-					radius: hero.r
-					startAngle: -hero.span / 2
-					endAngle: hero.span / 2
-					strokeWidth: Math.round(24 * hero.k)
-					value: isNaN(root.num(altAmps)) ? 0 : 100 * root.num(altAmps) / root.capMax
-					progressColor: Theme.color_ok
-					remainderColor: Theme.color_darkOk
-					animationEnabled: root.animationEnabled
-				}
-				ProgressArc {
-					x: hero.inset; y: hero.inset
-					width: hero.width - 2 * hero.inset; height: width
-					radius: hero.r - hero.inset
-					startAngle: -hero.span / 2
-					endAngle: hero.span / 2
-					strokeWidth: Math.round(10 * hero.k)
-					value: isNaN(root.num(field)) ? 0 : root.num(field)
-					progressColor: Theme.color_green
-					remainderColor: Theme.color_darkGreen
-					animationEnabled: root.animationEnabled
-				}
-				Item {
-					x: hero.r; y: hero.r
-					rotation: ampArc.progressAnimatedEndAngle
-					Rectangle { x: -3; y: -hero.r - 2; width: 6; height: Math.round(28 * hero.k); radius: 3; color: Theme.color_font_primary }
-				}
-				Item {
-					visible: root.statusWord === "ACTIVE" && ampTarget.valid
-					x: hero.r; y: hero.r
-					rotation: -hero.span / 2 + hero.span * Math.max(0, Math.min(1, root.num(ampTarget) / root.capMax))
-					Rectangle { x: -2; y: -hero.r - 8; width: 4; height: 14; radius: 2; color: Theme.color_orange }
-				}
-			}
-			Column {
-				readonly property real cap: Math.max(12, Math.round(hero.width * 0.058))
-				anchors { horizontalCenter: parent.horizontalCenter; top: parent.top; topMargin: hero.r * 0.46 }
-				spacing: 2
-				QuantityLabel {
-					anchors.horizontalCenter: parent.horizontalCenter
-					value: root.num(altAmps)
-					unit: VenusOS.Units_Amp
-					decimals: 1
-					font.pixelSize: Math.round(hero.width * 0.2)
-				}
-				Label {
-					anchors.horizontalCenter: parent.horizontalCenter
-					text: "Alternator current"
-					color: Theme.color_font_secondary
-					font.pixelSize: parent.cap
-				}
-				Item { width: 1; height: 4 }
-				QuantityLabel {
-					anchors.horizontalCenter: parent.horizontalCenter
-					value: root.num(field)
-					unit: VenusOS.Units_Percentage
-					decimals: 0
-					valueColor: Theme.color_green
-					font.pixelSize: Math.round(hero.width * 0.123)
-				}
-				Label {
-					anchors.horizontalCenter: parent.horizontalCenter
-					text: "Field"
-					color: Theme.color_font_secondary
-					font.pixelSize: parent.cap
-				}
-			}
-			Label {
-				x: hero.r - hero.endDx - width / 2
-				y: hero.endY + 14
-				text: "0"
-				color: Theme.color_font_secondary
-				font.pixelSize: Theme.font_size_caption
-			}
-			Label {
-				x: hero.r + hero.endDx - width / 2
-				y: hero.endY + 14
-				text: Math.round(root.capMax) + " A"
-				color: Theme.color_font_secondary
-				font.pixelSize: Theme.font_size_caption
-			}
+		XregFlow {
+			id: flowTile
+			x: root.m
+			y: root.lowerY
+			width: root.colW
+			height: root.flowH
+			svc: root.svc
+			linkUp: root.linkUp
+			active: root.statusWord === "ACTIVE"
+			target: root.num(ampTarget)
+			compact: root.tight
+			grow: root.portrait
+			animationEnabled: root.animationEnabled
+			shown: root.visible && !ScreenBlanker.blanked
 		}
 
 		XregChartPerf {
@@ -535,28 +481,29 @@ Item {
 			active: root.visible && !ScreenBlanker.blanked
 		}
 
-		// Right column: wind, barometer, page buttons
+		// Right column: wind, barometer
 		Item {
 			id: side
 			x: root.sideX
 			y: root.sideY
 			width: root.sideW
 			height: root.sideH
-			readonly property real chartH: (height - root.gap - (root.tight ? 0 : root.navH + root.gap)) / 2
+			readonly property real chartH: (height - root.gap) / 2
 
 			ChartTile {
 				id: windTile
 				width: side.width; height: side.chartH
 				title: "Wind, last hour"
 				compactTitle: "Wind, 1 h"
-				note: isNaN(root.num(trueWind)) ? "" : root.num(trueWind).toFixed(1) + (compact ? " kn" : " kn true")
+				note: isNaN(root.num(appWind)) ? "" : root.num(appWind).toFixed(1) + (compact ? " kn" : " kn apparent")
 				empty: "No wind data"
 				readonly property var v: root.series(histWind.value)
 				readonly property var valid: root.validOf(v)
 				readonly property real yMax: Math.max(10, Math.ceil((valid.length ? Math.max.apply(null, valid) : 0) * 1.15))
 				hasData: valid.length > 1
-				Label {
+				XregNum {
 					anchors { left: parent.left; top: parent.top }
+					template: "88 kn"
 					text: Math.round(windTile.yMax) + " kn"
 					color: Theme.color_font_secondary
 					font.pixelSize: Theme.font_size_micro
@@ -594,80 +541,104 @@ Item {
 				title: "Barometer"
 				note: isNaN(root.num(baro)) ? "" : root.num(baro).toFixed(1) + " mbar"
 				empty: "No barometer data"
-				// 10-minute samples, newest last: today = last 144, then the 144 before each
+				// Three days of 10-minute samples, each day on the same midnight-to-midnight axis, so today's line ends at
+				// the latest sample
 				readonly property var v: root.series(histBaro.value)
-				readonly property var today: v.slice(Math.max(0, v.length - 144))
-				readonly property var day1: v.slice(Math.max(0, v.length - 288), Math.max(0, v.length - 144))
-				readonly property var day2: v.slice(Math.max(0, v.length - 432), Math.max(0, v.length - 288))
+				readonly property real end: histBaroEnd.valid && histBaroEnd.value > 0 ? histBaroEnd.value : root.nowS
+				readonly property int today: Math.floor((root.nowS + root.tzS) / 86400)
 				readonly property var valid: root.validOf(v)
 				readonly property real lo: valid.length ? Math.min(Math.min.apply(null, valid), Math.max.apply(null, valid) - 4) - 0.5 : 0
 				readonly property real hi: valid.length ? Math.max.apply(null, valid) + 0.5 : 1
-				hasData: root.validOf(today).length > 1
+				readonly property var days: [0, 1, 2].map(k => root.dayPoints(v, end, today - k, lo, hi, baroPlot.width, baroPlot.height))
+				readonly property var colors: [Theme.color_blue, Theme.color_orange, Theme.color_blackWater]
+				readonly property var nowPt: days[0].length ? days[0][days[0].length - 1] : null
+				readonly property real gutter: baroHi.width + 4   // lines start right of the scale; fixed, so the plot never shifts
+				hasData: valid.length > 1
 				footH: 18
 				Row {
 					anchors { left: parent.left; top: parent.bottom; topMargin: 4 }
-					spacing: 12
-					Label { text: "Today"; color: Theme.color_ok; font.pixelSize: Theme.font_size_micro }
-					Label { text: "Yesterday"; color: Theme.color_font_secondary; font.pixelSize: Theme.font_size_micro }
-					Label { text: "2 days ago"; color: Theme.color_font_disabled; font.pixelSize: Theme.font_size_micro }
+					spacing: 10
+					Repeater {
+						model: baroTile.compact ? ["Today", "-1 d", "-2 d"] : ["Today", "Yesterday", "2 days ago"]
+						delegate: Row {
+							required property int index
+							required property string modelData
+							spacing: 4
+							Rectangle {
+								anchors.verticalCenter: parent.verticalCenter
+								width: 10; height: 3; radius: 1.5
+								color: baroTile.colors[index]
+							}
+							Label { text: modelData; color: Theme.color_font_secondary; font.pixelSize: Theme.font_size_micro }
+						}
+					}
 				}
-				Label {
+				Repeater {
+					model: [6, 12, 18]
+					delegate: Rectangle {
+						required property int modelData
+						x: baroPlot.x + Math.round(baroPlot.width * modelData / 24)
+						width: 1; height: baroPlot.height
+						color: Theme.color_card_separator
+					}
+				}
+				XregNum {
+					id: baroHi
 					anchors { left: parent.left; top: parent.top }
+					template: "8888"
 					text: baroTile.hi.toFixed(0)
 					color: Theme.color_font_secondary
 					font.pixelSize: Theme.font_size_micro
 				}
-				Label {
+				XregNum {
+					id: baroLo
 					anchors { left: parent.left; bottom: parent.bottom }
+					template: "8888"
 					text: baroTile.lo.toFixed(0)
 					color: Theme.color_font_secondary
 					font.pixelSize: Theme.font_size_micro
 				}
 				Shape {
 					id: baroPlot
-					anchors.fill: parent
+					anchors { fill: parent; leftMargin: baroTile.gutter }
 					preferredRendererType: Shape.CurveRenderer
 					ShapePath {
-						strokeColor: Theme.color_font_disabled
-						strokeWidth: 1.5
+						strokeColor: baroTile.colors[2]
+						strokeWidth: 2
 						fillColor: "transparent"
-						PathPolyline { path: root.points(baroTile.day2, 144, baroTile.lo, baroTile.hi, baroPlot.width, baroPlot.height) }
+						PathPolyline { path: baroTile.days[2] }
 					}
 					ShapePath {
-						strokeColor: Theme.color_font_secondary
-						strokeWidth: 1.5
+						strokeColor: baroTile.colors[1]
+						strokeWidth: 2
 						fillColor: "transparent"
-						PathPolyline { path: root.points(baroTile.day1, 144, baroTile.lo, baroTile.hi, baroPlot.width, baroPlot.height) }
+						PathPolyline { path: baroTile.days[1] }
 					}
 					ShapePath {
-						strokeColor: Theme.color_ok
+						strokeColor: baroTile.colors[0]
 						strokeWidth: 3
 						fillColor: "transparent"
-						PathPolyline { path: root.points(baroTile.today, 144, baroTile.lo, baroTile.hi, baroPlot.width, baroPlot.height) }
+						PathPolyline { path: baroTile.days[0] }
 					}
 				}
-			}
-
-		}
-
-		Row {
-			id: nav
-			x: root.tight ? root.m : side.x
-			y: root.tight ? root.lowerY + root.lowerH - height : side.y + side.height - height
-			width: root.tight ? root.colW : side.width
-			height: root.navH
-			spacing: root.gap
-			Button {
-				width: (nav.width - root.gap) / 2; height: nav.height
-				flat: false
-				text: "Plots"
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregPlots.qml", { title: "Plots", svc: root.svc })
-			}
-			Button {
-				width: (nav.width - root.gap) / 2; height: nav.height
-				flat: false
-				text: "Settings"
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregSetup.qml", { title: "Settings", svc: root.svc })
+				// Where today stops: the latest sample and its time of day
+				Rectangle {
+					visible: !!baroTile.nowPt
+					x: baroPlot.x + (baroTile.nowPt ? baroTile.nowPt.x : 0) - width / 2
+					y: (baroTile.nowPt ? baroTile.nowPt.y : 0) - height / 2
+					width: 8; height: 8; radius: 4
+					color: baroTile.colors[0]
+				}
+				Label {
+					visible: !!baroTile.nowPt
+					readonly property int mins: baroTile.nowPt ? Math.round(baroTile.nowPt.x / baroPlot.width * 1440) % 1440 : 0
+					x: baroPlot.x + Math.max(0, Math.min(baroPlot.width - width, (baroTile.nowPt ? baroTile.nowPt.x : 0) - width / 2))
+					y: !baroTile.nowPt ? 0 : baroTile.nowPt.y - height - 6 >= 0 ? baroTile.nowPt.y - height - 6 : baroTile.nowPt.y + 6
+					text: ("0" + Math.floor(mins / 60)).slice(-2) + ":" + ("0" + mins % 60).slice(-2)
+					color: baroTile.colors[0]
+					font.pixelSize: Theme.font_size_micro
+					font.bold: true
+				}
 			}
 		}
 	}

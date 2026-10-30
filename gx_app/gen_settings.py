@@ -6,10 +6,14 @@ web_src/script.js (web_src/styles.css only to confirm what each gate greys and w
 the firmware .ino files are read only for what the web app does not show
 (the CSV3 wire scale of a field, whether a key is parsed as an integer, clamps, keyless keys,
 keys a GX may not send).
+Where each key goes on the GX is where the app's Setup tab has it: sub-tab, then the Alternator or Battery panel
+tab, then <details>. The schema's "outline" is that tree, in the app's order: a <details> holding another
+<details> with a listed key is a page of its own, the innermost <details> is a group heading.
 
   python3 gx_app/gen_settings.py           write the schema (refuses if anything is unresolved)
   python3 gx_app/gen_settings.py --check   resolve everything and compare with the schema on disk;
                                            exit 1 on an unresolved key or a stale schema
+  python3 gx_app/gen_settings.py --outline print the tree the GX draws (resolves, writes nothing)
 
 Standard library only, so it runs anywhere compress_web.sh runs.
 """
@@ -66,6 +70,24 @@ OPTION_GATES = [
     ('UseFloat', 2, 'no-batt-current', ("const zc = document.querySelector('select[name=\"UseFloat\"] option[value=\"2\"]');",
                                          "if (zc) zc.disabled = noShunt;")),
 ]
+# The Setup tab's tab buttons, by the handler each calls: (onclick pattern, id of the container it shows, the script.js
+# line that finds the container that way). A button with data-alt-panel names its container directly.
+TAB_RULES = [
+    (re.compile(r"^showSubTab\('settings',\s*'([\w-]+)'"), 'settings-{}',
+     "const contentEl = document.getElementById(`${parentTab}-${subTabName}`);"),
+    (re.compile(r"^showAltTab\('\w+',\s*'([\w-]+)'\)"), '{}', "const panel = document.getElementById(panelId);"),
+    (re.compile(r"^showBatteryPanel\('(\w+)'"), 'battery-panel-{}',
+     "const panel = document.getElementById('battery-panel-' + panelName);"),
+    (re.compile(r"^showTuningPanel\('([\w-]+)'"), 'tuning-{}', "const panel = document.getElementById('tuning-' + name);"),
+]
+ALT_PANEL_JS = 'const declared = t.dataset.altPanel;'
+# A short page shows every description, with no "Show descriptions" switch: its rows, descriptions included, fit one
+# Ekrano screen (1024x600) under the GX header. Estimated with gui-v2's SevenInch list geometry (a row 68 px, a group
+# heading 48 px, a description line 22 px at 80 characters, measured offline with Roboto); SHORT_MAX_H is the list height
+# on the Ekrano under the header and the sub-tab row (432 px on the home page's Settings page, 442 on a pushed page)
+# less the list's bottom margin. A widget adds its own lines (WIDGET_LINES).
+ROW_H, HEADING_H, LINE_H, LINE_CHARS, SHORT_MAX_H = 68, 48, 22, 80, 416
+WIDGET_LINES = {'connection': 0, 'zeroStatus': 1, 'probes': 5, 'kneeStatus': 14}
 VOID_TAGS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source',
              'track', 'wbr'}
 AUTO_CLOSE = {'p', 'li', 'option', 'tr', 'td', 'th', 'dt', 'dd'}
@@ -225,14 +247,23 @@ def label_parts(row, key):
     return t, unit, temp
 
 
+def details_title(d):
+    for c in d.elements():
+        if c.tag == 'summary':
+            # an Integrations summary carries a badge and a live state word after its title
+            return clean(c.text(lambda x: bool({'integ-badge', 'integ-state'} & set(x.classes()))))
+    return None
+
+
 def group_of(n):
     for a in n.ancestors():
         if a.tag == 'details':
-            for c in a.elements():
-                if c.tag == 'summary':
-                    # an Integrations summary carries a badge and a live state word after its title
-                    return clean(c.text(lambda x: bool({'integ-badge', 'integ-state'} & set(x.classes()))))
+            return details_title(a)
     return None
+
+
+def slug(title):
+    return re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')
 
 
 def num(s):
@@ -501,38 +532,35 @@ class Firmware:
 # ---------------------------------------------------------------- keys file
 
 def parse_keys(path):
-    sections, sec, group = [], None, None
+    lines, group = [], None
     with open(path, encoding='utf-8') as f:
         for ln, raw in enumerate(f, 1):
             line = raw.rstrip('\n')
             s = line.strip()
             if not s:
                 continue
-            m = re.match(r'^#\s*section:\s*(.+?)\s*$', s)
-            if m:
-                title = m.group(1)
-                sec = {'id': re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_'), 'title': title, 'lines': []}
-                sections.append(sec)
-                group = None
-                continue
+            if re.match(r'^#\s*section:', s):
+                raise CheckError('settings_keys.txt:%d: "# section:" headers are gone; a key\'s place on the GX is '
+                                 'its place in index.html' % ln)
             m = re.match(r'^#\s*group:\s*(.*?)\s*$', s)
             if m:
                 group = m.group(1) or None
                 continue
             if s.startswith('#'):
                 continue
-            if sec is None:
-                raise CheckError('settings_keys.txt:%d: key before any "# section:" header' % ln)
+            cm = re.search(r'\scaption=(.*)$', s)   # free text to the end of the line, spaces and all
+            if cm:
+                s = s[:cm.start()]
             toks = s.split()
-            opts = {}
+            opts = {'caption': cm.group(1).strip()} if cm and cm.group(1).strip() else {}
             for t in toks[1:]:
                 if '=' in t:
                     k, v = t.split('=', 1)
                     opts[k] = v
                 else:
                     opts[t] = True
-            sec['lines'].append({'head': toks[0], 'opts': opts, 'group': group, 'line': ln})
-    return sections
+            lines.append({'head': toks[0], 'opts': opts, 'group': group, 'line': ln})
+    return lines
 
 
 # ---------------------------------------------------------------- resolver
@@ -547,8 +575,11 @@ class Gen:
             self.css = f.read()
         self.endpoints = {}
         self.pending_checks = []
+        self.cap_tables = []
         self.built = {}
         self.gate_uses = {}
+        self.tabs = self.setup_tabs()
+        self.text_of = {}
 
     def err(self, ln, key, msg):
         self.errors.append('settings_keys.txt:%d %s: %s' % (ln, key, msg))
@@ -729,7 +760,7 @@ class Gen:
             item['zeroOff'] = info['zeroOff']
         return info
 
-    def build_item(self, ent, sec):
+    def build_item(self, ent):
         key, opts, ln = ent['head'], ent['opts'], ent['line']
         if key == 'table':
             return self.build_table(ent)
@@ -822,9 +853,7 @@ class Gen:
 
     def finish(self, item, ent, node):
         opts = ent['opts']
-        item['group'] = ent['group'] or (group_of(node) if node is not None else None)
-        if ent['group'] and ent['group'] not in self.html.plain_text:
-            self.err(ent['line'], item.get('key', ent['head']), 'group "%s" is not a heading in index.html' % ent['group'])
+        item['_anchor'], item['_ent'] = node, ent   # its place in the outline is worked out once every item is built
         if 'hidden' in opts:
             item['hidden'] = True
         if 'enabledWhen' in opts:
@@ -1024,6 +1053,7 @@ class Gen:
             self.err(ln, key, 'no /get handler for this key in the firmware')
         item['send'] = {'scale': 1, 'integer': True}
         item['arm'] = self.arm_for(key)
+        item['buttons'] = True   # the app's button pair, drawn as one on the GX
         item['help'] = ''
         self.finish(item, ent, first)
         return item
@@ -1131,14 +1161,7 @@ class Gen:
                 self.err(ln, tid, 'validateLearningTable in script.js no longer checks strictly increasing values')
             item['validate'] = {'rule': rule, 'keyPattern': pat + '{i}'}
         if 'capMode' in opts:
-            mode = self.built.get(opts['capMode'])
-            kw = next((o['value'] for o in (mode or {}).get('options', []) if o['label'] == 'kW'), None)
-            if kw is None:
-                self.err(ln, tid, 'capMode=%s: no earlier select with a "kW" option' % opts['capMode'])
-            elif not any(c.get('capCol') for c in item['columns']):
-                self.err(ln, tid, 'capMode given but no column carries data-cap-col')
-            else:
-                item['capMode'] = {'key': opts['capMode'], 'kw': kw}
+            self.cap_tables.append((ln, item, opts['capMode']))   # its select may be listed after the table
         item['arm'] = True
         item['help'] = tooltip_text(row)
         self.finish(item, ent, c)
@@ -1241,7 +1264,8 @@ class Gen:
             if anchor.tag == 'table':
                 item['headings'] = [clean(th.text(is_tooltip)) for th in anchor.walk() if th.tag == 'th']
             lab = ''
-            for a in anchor.ancestors():
+            # a widget anchored at a whole <details> (GX-only pages: Connection at "Victron GX") is that group's own row
+            for a in ([] if anchor.tag == 'details' else anchor.ancestors()):
                 if a.tag == 'details':
                     copy = next((x for x in a.walk() if 'integ-copy' in x.classes()), None)
                     if copy is not None and not item['help']:
@@ -1294,52 +1318,203 @@ class Gen:
                     self.err(ln, user, 'gate %s reads %s, which is not a setting with an echo' % (name, k))
 
     def run(self):
-        secs = parse_keys(KEYS_FILE)
-        out = []
+        ents = parse_keys(KEYS_FILE)
+        items = []
         keys_seen = set()
-        for s in secs:
-            items = []
-            grouped = False
-            for ent in s['lines']:
-                it = self.build_item(ent, s)
-                if it is None:
-                    continue
-                if it['key'] in keys_seen:
-                    self.err(ent['line'], it['key'], 'listed twice')
-                keys_seen.add(it['key'])
-                self.built[it['key']] = it
-                ew = it.get('enabledWhen')
-                if ew:
-                    ln = ew.pop('_line')
-                    self.pending_checks.append((ln, it['key'], ew))
-                if not it.get('hidden'):
-                    if it.get('group'):
-                        grouped = True
-                    elif grouped:
-                        self.err(ent['line'], it['key'], 'ungrouped after a grouped key; add a "# group:" line')
-                items.append(order(it))
-            out.append({'id': s['id'], 'title': s['title'], 'items': items})
+        for ent in ents:
+            it = self.build_item(ent)
+            if it is None:
+                continue
+            if ent['opts'].get('caption'):
+                it['caption'] = ent['opts']['caption']   # GX-only: the web app shows this item without one
+            if it['key'] in keys_seen:
+                self.err(ent['line'], it['key'], 'listed twice')
+            keys_seen.add(it['key'])
+            self.built[it['key']] = it
+            ew = it.get('enabledWhen')
+            if ew:
+                ln = ew.pop('_line')
+                self.pending_checks.append((ln, it['key'], ew))
+            items.append(it)
         for ln, key, ew in self.pending_checks:
             if ew['endpoint'] not in self.endpoints:
                 self.err(ln, key, 'enabledWhen endpoint %s is not polled by any item' % ew['endpoint'])
             if not re.search(r'\bj\.' + ew['field'] + r'\b', self.js.src):
                 self.err(ln, key, 'enabledWhen field %s is never read from a JSON reply in script.js' % ew['field'])
+        for ln, table, mk in self.cap_tables:
+            mode = self.built.get(mk)
+            kw = next((o['value'] for o in (mode or {}).get('options', []) if o['label'] == 'kW'), None)
+            if kw is None:
+                self.err(ln, table['key'], 'capMode=%s: no listed select with a "kW" option' % mk)
+            elif not any(c.get('capCol') for c in table['columns']):
+                self.err(ln, table['key'], 'capMode given but no column carries data-cap-col')
+            else:
+                table['capMode'] = {'key': mk, 'kw': kw}
         # The GX greys from /Settings/Value/<K>, which the bridge publishes only for listed keys with an echo.
-        for s in secs:
-            for ent in s['lines']:
-                for opt, pos in (('disabledWhen', 0), ('readOnlyWhen', 1)):
-                    dw = ent['opts'].get(opt)
-                    if isinstance(dw, str) and len(dw.split(':')) > pos:
-                        gk = dw.split(':')[pos]
-                        g = self.built.get(gk)
-                        if g is None or g.get('type') in ('action', 'table', 'info') or not g.get('echo'):
-                            self.err(ent['line'], ent['head'], '%s key %s is not a listed setting with an echo' % (opt, gk))
+        for ent in ents:
+            for opt, pos in (('disabledWhen', 0), ('readOnlyWhen', 1)):
+                dw = ent['opts'].get(opt)
+                if isinstance(dw, str) and len(dw.split(':')) > pos:
+                    gk = dw.split(':')[pos]
+                    g = self.built.get(gk)
+                    if g is None or g.get('type') in ('action', 'table', 'info') or not g.get('echo'):
+                        self.err(ent['line'], ent['head'], '%s key %s is not a listed setting with an echo' % (opt, gk))
         self.check_gates()
+        outline = self.build_outline(items)
         hashes = []
         for p in (INDEX_HTML, SCRIPT_JS, KEYS_FILE):
             with open(p, 'rb') as f:
                 hashes.append('%s:%s' % (os.path.relpath(p, REPO), hashlib.sha256(f.read()).hexdigest()[:12]))
-        return {'version': 1, 'generatedFrom': ' '.join(hashes), 'endpoints': self.endpoints, 'sections': out}
+        return {'version': 2, 'generatedFrom': ' '.join(hashes), 'endpoints': self.endpoints, 'outline': outline}
+
+    # -- outline ----------------------------------------------------------
+    def setup_tabs(self):
+        """Every container a Setup tab button shows: id -> (title, line of the button), in button order."""
+        root = self.html.by_id.get('settings')
+        if root is None:
+            raise CheckError('index.html: no #settings (the Setup tab)')
+        js = ' '.join(self.js.src.split())
+        for _, _, line in TAB_RULES:
+            if line not in js:
+                raise CheckError('script.js no longer finds a Setup tab container with: %s' % line)
+        if ALT_PANEL_JS not in js:
+            raise CheckError('script.js no longer finds an Alternator panel with: %s' % ALT_PANEL_JS)
+        tabs = {}
+        for b in root.walk():
+            if b.tag != 'button':
+                continue
+            target = b.get('data-alt-panel')
+            if not target:
+                oc = clean(b.get('onclick') or '')
+                for rx, fmt, _ in TAB_RULES:
+                    m = rx.match(oc)
+                    if m:
+                        target = fmt.format(m.group(1))
+                        break
+            if target and target not in tabs and target in self.html.by_id:
+                tabs[target] = (clean(b.text()), b.line)
+        return tabs
+
+    def container_text(self, el):
+        t = self.text_of.get(id(el))
+        if t is None:
+            t = self.text_of[id(el)] = clean(el.text())
+        return t
+
+    def place(self, it):
+        """-> (tab containers outermost first, <details> chain outermost first), or None with the error recorded."""
+        node, ent = it['_anchor'], it['_ent']
+        if node is None:
+            self.err(ent['line'], it['key'], 'no element in index.html to place it by')
+            return None
+        tabs, dets, setup = [], [], False
+        for a in [node] + list(node.ancestors()):
+            i = a.get('id')
+            if a.tag == 'details':
+                dets.append(a)
+            elif i in self.tabs:
+                tabs.append(a)
+            if i == 'settings':
+                setup = True
+        if not setup or not tabs:
+            self.err(ent['line'], it['key'], 'not under a sub-tab of the app\'s Setup tab in index.html')
+            return None
+        return tabs[::-1], dets[::-1]
+
+    def build_outline(self, items):
+        placed = [(it, self.place(it)) for it in items]
+        placed = [(it, p) for it, p in placed if p]
+        # A <details> holding another <details> with a shown key is a page; the innermost one is a heading
+        pages = {id(d) for it, (_, dets) in placed if not it.get('hidden') for d in dets[:-1]}
+        root = {'children': []}
+        nodes = {}
+        for it, (tabs, dets) in placed:
+            ent = it.pop('_ent')
+            anchor = it.pop('_anchor')
+            path = [(a, self.tabs[a.get('id')][0], self.tabs[a.get('id')][1]) for a in tabs]
+            path += [(d, details_title(d) or '', d.line) for d in dets if id(d) in pages]
+            inner = dets[-1] if dets and id(dets[-1]) not in pages else None
+            it['group'] = ent['group'] or (details_title(inner) if inner is not None else None)
+            if ent['group'] and ent['group'] not in self.container_text(path[-1][0]):
+                self.err(ent['line'], it['key'], 'group "%s" is not a heading on its page in index.html (%s)'
+                         % (ent['group'], ' > '.join(t for _, t, _ in path)))
+            parent = root
+            for el, title, line in path:
+                n = nodes.get(id(el))
+                if n is None:
+                    n = nodes[id(el)] = {'title': title, 'children': [], '_line': line}
+                    parent['children'].append(n)
+                parent = n
+            it['_line'] = anchor.line
+            it['_ln'] = ent['line']
+            parent['children'].append(it)
+        return [self.finish_node(n, '') for n in sorted(root['children'], key=lambda c: c['_line'])]
+
+    def finish_node(self, n, prefix):
+        n['id'] = prefix + slug(n['title'])
+        kids = sorted(n['children'], key=lambda c: c['_line'])
+        out, seen_ids, runs, prev = [], set(), [], None
+        for c in kids:
+            if 'children' in c:
+                c = self.finish_node(c, n['id'] + '/')
+                if c['id'] in seen_ids:
+                    self.errors.append('outline: two pages named "%s" under %s' % (c['title'], n['id']))
+                seen_ids.add(c['id'])
+                prev = None
+                out.append(c)
+                continue
+            ln = c.pop('_ln')
+            c.pop('_line')
+            if not c.get('hidden'):
+                g = c.get('group')
+                if g and (not runs or runs[-1] != g):
+                    if g in runs:
+                        self.err(ln, c['key'], 'group "%s" is split on page %s by another group or item' % (g, n['id']))
+                    runs.append(g)
+                elif not g and prev and prev.get('group'):
+                    self.err(ln, c['key'], 'ungrouped after a grouped key on page %s; add a "# group:" line' % n['id'])
+                elif not g:
+                    runs.append(None)
+                prev = c
+            out.append(order(c))
+        tables = [c for c in out if c.get('type') == 'table']
+        for t in tables:
+            # the app's buttons right above a table set what it shows (Charge Rate, Limit by): the table draws them
+            i, ctl = out.index(t) - 1, []
+            while i >= 0 and 'children' not in out[i] and (out[i].get('hidden') or out[i].get('buttons')):
+                if not out[i].get('hidden'):
+                    ctl.insert(0, out[i]['key'])
+                i -= 1
+            if ctl:
+                t['controls'] = ctl
+        shown = [c for c in out if not c.get('hidden')]
+        res = {'id': n['id'], 'title': n['title']}
+        if not shown:
+            res['hidden'] = True
+        elif self.page_height(shown) <= SHORT_MAX_H:
+            res['short'] = True
+        res['children'] = out
+        return res
+
+    @staticmethod
+    def page_height(rows):
+        """Estimated list height of a page with every description showing (see SHORT_MAX_H)."""
+        h, g = 0, None
+        for r in rows:
+            if 'children' in r:
+                h, g = h + ROW_H, None
+                continue
+            if r.get('group') and r['group'] != g:
+                h += HEADING_H
+            g = r.get('group')
+            text = ' '.join(t for t in (r.get('caption'), r.get('help')) if t)
+            lines = -(-len(text) // LINE_CHARS)
+            if r.get('type') == 'table':
+                lines += 3 * (r.get('rows') or 1) + 4 + 2 * len(r.get('controls') or [])
+            elif r.get('type') == 'info':
+                lines += WIDGET_LINES.get(r.get('widget'), 5)
+            h += ROW_H + lines * LINE_H
+        return h
 
 
 def cond_keys(c):
@@ -1348,10 +1523,10 @@ def cond_keys(c):
     return [c['key']]
 
 
-ORDER = ['key', 'label', 'type', 'group', 'options', 'min', 'max', 'step', 'decimals', 'unit', 'temp', 'zeroOff',
+ORDER = ['key', 'label', 'caption', 'type', 'group', 'options', 'min', 'max', 'step', 'decimals', 'unit', 'temp', 'zeroOff',
          'echo', 'send', 'arm', 'tagged', 'endpoint', 'method', 'buttonText', 'confirm', 'confirmWhen', 'disabledWhen',
-         'gates', 'enabledWhen', 'hidden', 'tableId', 'rows', 'columns', 'include', 'capMode', 'confirmIfChanged', 'validate',
-         'widget',
+         'gates', 'enabledWhen', 'hidden', 'buttons', 'tableId', 'rows', 'columns', 'include', 'capMode', 'controls',
+         'confirmIfChanged', 'validate', 'widget',
          'source', 'headings', 'strings', 'help']
 
 
@@ -1369,6 +1544,37 @@ def dump(schema):
     return json.dumps(schema, ensure_ascii=False, indent=1) + '\n'
 
 
+def walk(nodes):
+    for n in nodes:
+        if 'children' in n:
+            yield n
+            yield from walk(n['children'])
+
+
+def outline_text(nodes, depth=0):
+    """The tree the GX draws: pages (short ones marked), group headings and shown items; hidden items and empty pages left out."""
+    out = []
+    for n in nodes:
+        if n.get('hidden'):
+            continue
+        out.append('%s%s%s' % ('  ' * depth, n['title'], '  [short: descriptions shown, no switch]' if n.get('short') else ''))
+        g, kids = None, n['children']
+        for c in kids:
+            if 'children' in c:
+                out += outline_text([c], depth + 1)
+                g = None
+                continue
+            if c.get('hidden') or (c['key'] in sum((t.get('controls') or [] for t in kids), [])):
+                continue
+            if c.get('group') and c['group'] != g:
+                out.append('%s-- %s --' % ('  ' * (depth + 1), c['group']))
+            g = c.get('group')
+            lab = c.get('label') or c.get('widget') or c['key']
+            extra = ' (with %s)' % ', '.join(c['controls']) if c.get('controls') else ''
+            out.append('%s%s  [%s %s]%s' % ('  ' * (depth + 1 + (1 if g else 0)), lab, c['type'], c['key'], extra))
+    return out
+
+
 def main():
     check = '--check' in sys.argv[1:]
     try:
@@ -1382,8 +1588,13 @@ def main():
         for e in g.errors:
             print('  ' + e)
         return 1
+    if '--outline' in sys.argv[1:]:
+        print('\n'.join(outline_text(schema['outline'])))
+        return 0
     text = dump(schema)
-    n_items = sum(len(s['items']) for s in schema['sections'])
+    pages = list(walk(schema['outline']))
+    n_items = sum(1 for p in pages for c in p['children'] if 'children' not in c)
+    n_pages = sum(1 for p in pages if not p.get('hidden'))
     if check:
         try:
             with open(SCHEMA_FILE, encoding='utf-8') as f:
@@ -1398,12 +1609,12 @@ def main():
             print('gen_settings: FAIL: %s is stale or missing; run: python3 gx_app/gen_settings.py'
                   % os.path.relpath(SCHEMA_FILE, REPO))
             return 1
-        print('gen_settings: OK: %d sections, %d items, schema up to date' % (len(schema['sections']), n_items))
+        print('gen_settings: OK: %d pages, %d items, schema up to date' % (n_pages, n_items))
         return 0
     with open(SCHEMA_FILE, 'w', encoding='utf-8') as f:
         f.write(text)
-    print('gen_settings: wrote %s (%d sections, %d items, %d bytes)'
-          % (os.path.relpath(SCHEMA_FILE, REPO), len(schema['sections']), n_items, len(text.encode('utf-8'))))
+    print('gen_settings: wrote %s (%d pages, %d items, %d bytes)'
+          % (os.path.relpath(SCHEMA_FILE, REPO), n_pages, n_items, len(text.encode('utf-8'))))
     return 0
 
 

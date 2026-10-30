@@ -13,7 +13,7 @@ Item {
 	property real toolY
 	property real bodyY
 	property int windowMin: 30
-	property bool trueWind: true
+	property bool trueWind: false
 	signal windowPicked(int minutes)
 	signal framePicked(bool isTrue)
 
@@ -72,34 +72,48 @@ Item {
 		return t
 	}
 
-	Row {
+	// Frame and window buttons share the tool row at the body size where each label keeps 12 px a side (7-inch), at the
+	// caption size where only 10 px a side fits (5-inch); narrower still (a phone held upright) the window buttons take
+	// a row of their own under the frame buttons.
+	TextMetrics { id: apparentBody; font.family: Global.fontFamily; font.pixelSize: Theme.font_size_body1; text: "Apparent" }
+	TextMetrics { id: apparentCaption; font.family: Global.fontFamily; font.pixelSize: Theme.font_size_caption; text: "Apparent" }
+	TextMetrics { id: sixtyBody; font.family: Global.fontFamily; font.pixelSize: Theme.font_size_body1; text: "60m" }
+	TextMetrics { id: sixtyCaption; font.family: Global.fontFamily; font.pixelSize: Theme.font_size_caption; text: "60m" }
+	function frameW(tm, pad) { return Math.ceil(2 * (tm.advanceWidth + 2 * pad)) }
+	function windowsW(tm, pad) { return Math.ceil(4 * (tm.advanceWidth + 2 * pad)) }
+	readonly property real toolW: width - toolX - m
+	readonly property bool bodyRow: Math.max(200, frameW(apparentBody, 12)) + 12 + windowsW(sixtyBody, 12) <= toolW
+	readonly property bool captionRow: !bodyRow && frameW(apparentCaption, 10) + 12 + windowsW(sixtyCaption, 10) <= toolW
+	readonly property bool twoRows: !bodyRow && !captionRow
+	readonly property real chartY: bodyY + (twoRows ? 50 : 0)
+
+	SegmentedButtonRow {
+		id: frameBar
 		x: tab.toolX
 		y: tab.toolY
+		width: tab.captionRow ? tab.frameW(apparentCaption, 10) : 200
 		height: 40
-		spacing: 12
-		SegmentedButtonRow {
-			width: 200
-			height: 40
-			fontPixelSize: Theme.font_size_body1
-			model: [{ value: "True" }, { value: "Apparent" }]
-			currentIndex: tab.trueWind ? 0 : 1
-			onButtonClicked: function(buttonIndex) { tab.framePicked(buttonIndex === 0) }
-		}
-		SegmentedButtonRow {
-			width: Math.min(260, tab.width - tab.toolX - tab.m - 212)
-			height: 40
-			fontPixelSize: Theme.font_size_body1
-			model: [{ value: "5m" }, { value: "15m" }, { value: "30m" }, { value: "60m" }]
-			currentIndex: tab.windows.indexOf(tab.windowMin)
-			onButtonClicked: function(buttonIndex) { tab.windowPicked(tab.windows[buttonIndex]) }
-		}
+		fontPixelSize: tab.captionRow ? Theme.font_size_caption : Theme.font_size_body1
+		model: [{ value: "True" }, { value: "Apparent" }]
+		currentIndex: tab.trueWind ? 0 : 1
+		onButtonClicked: function(buttonIndex) { tab.framePicked(buttonIndex === 0) }
+	}
+	SegmentedButtonRow {
+		x: tab.twoRows ? tab.toolX : frameBar.x + frameBar.width + 12
+		y: tab.twoRows ? tab.toolY + 50 : tab.toolY
+		width: Math.min(260, tab.twoRows ? tab.toolW : tab.toolW - frameBar.width - 12)
+		height: 40
+		fontPixelSize: frameBar.fontPixelSize
+		model: [{ value: "5m" }, { value: "15m" }, { value: "30m" }, { value: "60m" }]
+		currentIndex: tab.windows.indexOf(tab.windowMin)
+		onButtonClicked: function(buttonIndex) { tab.windowPicked(tab.windows[buttonIndex]) }
 	}
 
 	Rectangle {
 		x: tab.m
-		y: tab.bodyY
+		y: tab.chartY
 		width: tab.width - 2 * tab.m
-		height: tab.height - tab.bodyY - tab.m
+		height: tab.height - tab.chartY - tab.m
 		radius: Theme.geometry_overviewPage_widget_radius
 		color: Theme.color_background_secondary
 		XregChart {
@@ -112,6 +126,7 @@ Item {
 			leftUnit: "°"
 			leftFixed: tab.trueWind ? [0, 360] : null
 			leftStep: tab.trueWind ? 90 : 0
+			leftCap: [0, 360, 90]
 			rightFromZero: true
 			rightUnit: "kn"
 			emptyText: "No wind data"

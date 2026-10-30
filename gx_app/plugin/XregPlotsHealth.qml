@@ -29,12 +29,13 @@ Item {
 		running: tab.visible && !ScreenBlanker.blanked
 		onTriggered: {
 			want.setValue(Math.floor(Date.now() / 1000))
-			hoursItem.setValue(tab.windowH)
+			trendWant.setValue(Math.floor(Date.now() / 1000))
 		}
 	}
-	// The regulator thins the trend to 200 points within this many engine-hours (0 = all)
-	VeQuickItem { id: hoursItem; uid: tab.svc + "/Ui/HealthHours" }
-	onWindowHChanged: hoursItem.setValue(windowH)
+	// The regulator thins the trend to 200 points within this many engine-hours (0 = all). The bridge keeps one trend
+	// per window, so each screen asks for its own window's and shows only that.
+	VeQuickItem { id: trendWant; uid: tab.svc + "/Ui/Want/HealthTrend/" + tab.windowH }
+	onWindowHChanged: Qt.callLater(() => trendWant.setValue(Math.floor(Date.now() / 1000)))
 
 	VeQuickItem { id: hValid; uid: tab.svc + "/Health/Live/valid" }
 	VeQuickItem { id: hPct; uid: tab.svc + "/Health/Live/pct" }
@@ -55,7 +56,7 @@ Item {
 	VeQuickItem { id: hAmps; uid: tab.svc + "/Health/Live/amps" }
 	VeQuickItem { id: hPred; uid: tab.svc + "/Health/Live/pred" }
 	VeQuickItem { id: hTSlope; uid: tab.svc + "/Health/Live/tSlope" }
-	VeQuickItem { id: trendCsv; uid: tab.svc + "/Health/TrendCsv" }
+	VeQuickItem { id: trendCsv; uid: tab.svc + "/Health/TrendCsv/" + tab.windowH }
 	VeQuickItem {
 		id: sessCsv
 		uid: tab.svc + "/Health/SessionCsv"
@@ -343,7 +344,8 @@ Item {
 					}
 					Row {
 						spacing: 12
-						Label {
+						XregNum {
+							template: "100%"
 							text: tab.graded ? Math.round(tab.num(hPct)) + "%" : "--"
 							color: tab.graded ? tab.stateColor(tab.st) : Theme.color_font_primary
 							font.pixelSize: Theme.font_size_h1

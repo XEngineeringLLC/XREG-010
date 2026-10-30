@@ -6,6 +6,9 @@ import Victron.VenusOS
 Page {
 	id: page
 
+	property string svc               // with home: the regulator whose home page this was opened from, for its header
+	property Item home
+	property string setupId
 	property int waitAfter: -1   // /ProbeResult seq when this page sent an address; -1 = not waiting
 	property string probeError
 	readonly property var others: regs.found.filter(f => !f.unit)
@@ -63,9 +66,22 @@ Page {
 		XregCfgDialog {}
 	}
 
+	Loader {
+		id: header
+		width: page.width
+		active: !!page.home
+		sourceComponent: XregHeader {
+			svc: page.svc
+			home: page.home
+			pushed: true
+			setupRow: true
+			setupId: page.setupId
+		}
+	}
+
 	GradientListView {
 		id: list
-		anchors.fill: parent
+		anchors { top: header.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
 		header: Column {
 			width: list.width
 			ListText {

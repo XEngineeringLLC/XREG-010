@@ -204,11 +204,15 @@ function updateAllTempUnitLabels() {
 }
 
 function setTempUnit(unit) {
+    const was = displayTempUnit;
     displayTempUnit = unit;
     updateAllTempUnitLabels();
     // buildURL is mandatory: a bare /get resolves to the app's own localhost origin under
     // Capacitor, so the write never lands and the next CSV3 echo snaps the pill back to °F.
-    fetch(buildURL(`/get?displayTempUnit=${unit}`)).catch(() => {});
+    controlWrite({ displayTempUnit: unit }, 'displayTempUnit=' + unit, () => {
+        displayTempUnit = 'displayTempUnit' in g_echoLast ? Number(g_echoLast.displayTempUnit) : was;
+        updateAllTempUnitLabels();
+    });
 }
 
 // Fuel volume unit preference — 0=US gallons (default), 1=litres. Echoed from CSV3.
@@ -263,10 +267,14 @@ function updateAllVolUnitLabels() {
 }
 
 function setVolUnit(unit) {
+    const was = displayVolUnit;
     displayVolUnit = unit;
     updateAllVolUnitLabels();
     // buildURL is mandatory under Capacitor — see setTempUnit.
-    fetch(buildURL(`/get?displayVolUnit=${unit}`)).catch(() => {});
+    controlWrite({ displayVolUnit: unit }, 'displayVolUnit=' + unit, () => {
+        displayVolUnit = 'displayVolUnit' in g_echoLast ? Number(g_echoLast.displayVolUnit) : was;
+        updateAllVolUnitLabels();
+    });
 }
 
 // The GPH cells hold display units but are submitted as gallons. _fuelGphShadow is the
@@ -366,6 +374,7 @@ function regDemoFormRefused(f) {
 function regDemoOnCsv3(data) {
     const on = Number(data.hardwarePresent) === 0;
     if (on && !g_regDemo) g_regDemoBackfilled = false;
+    if (!on && g_regDemo) demoCloudIframesOff();
     g_regDemo = on;
     const exp = document.getElementById('exportConfigBtn');   // Export Config: refused in demo (the settings in RAM are the demo's)
     if (exp) exp.disabled = on;
@@ -443,15 +452,23 @@ function regDemoFillShort(sh) {
     recomputeAutoScales(true);
     ['current', 'voltage', 'rpm', 'temperature'].forEach(n => queuePlotUpdate(n));
 }
+// The regulator's hour replaces whatever the page banked before it (the real boat's wind, or nothing); samples the page
+// took after the backfill's newest row are kept on the end.
 function regDemoFillWind(w) {
-    if (!w || !Array.isArray(w.rows) || _windRing.ts.length > 12) return;   // a page that has banked a minute keeps its own
+    if (!w || !Array.isArray(w.rows)) return;
     const col = {}; w.cols.forEach((c, i) => { col[c] = i; });
     const dt = w.dt || 10;
+    const old = _windRing;
     _windRing = { ts: [], tDir: [], tSpd: [], aDir: [], aSpd: [] };
     w.rows.forEach((r, k) => {
         _windRing.ts.push((w.t0 + k * dt) * 1000);
         _windRing.tSpd.push(r[col.TrueWindSpeedNMEA]); _windRing.tDir.push(r[col.TrueWindAngleNMEA]);
         _windRing.aSpd.push(r[col.ApparentWindSpeedNMEA]); _windRing.aDir.push(r[col.ApparentWindAngleNMEA]);
+    });
+    const lastMs = (w.t0 + (w.rows.length - 1) * dt) * 1000;
+    old.ts.forEach((t, i) => {
+        if (t <= lastMs) return;
+        for (const k in _windRing) _windRing[k].push(old[k][i]);
     });
     _windLastSampleMs = Date.now();
     const el = document.getElementById('windtrend-plot');
@@ -1256,6 +1273,15 @@ const CSV4_FIELDS = [
     "panelForceFloatInput",       // switch panel FORCEFLOAT opto input (Cable 3 pin 7): 1 = wire energized = switch on = asking for Maintain. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything
     "VictronSoc",                 // VE.Direct battery monitor's own state of charge (% ×10; NaN when stale, unsynced or not a battery monitor)
     "gxStreams",                  // connected Victron GX streams (/gxevents clients)
+    "flowBattA",                  // power flow, one instant: battery current (A ×100, + = charging; NaN = no battery reading)
+    "flowAltA",                   // power flow: alternator current (A ×100)
+    "flowSolarA",                 // power flow: battery-side solar current (A ×100; NaN = array fitted but not measured)
+    "flowSrc",                    // power flow: battery source ×10 + solar source (firmware powerFlowSample)
+    "flowSolarSer",               // power flow: hash of the VE.Direct MPPT's serial while it is the solar source, else 0 (the GX bridge's de-duplication)
+    "demoShoreA",                 // demo only: the simulated shore charger's output (A ×100; NaN outside demo), for the GX bridge's made-up GX
+    "demoFridgeA",                // demo only: the simulated fridge's draw (A ×100)
+    "demoOrionA",                 // demo only: the simulated Orion XS's draw from the house bank (A ×100)
+    "demoInverterA",              // demo only: the simulated inverter's draw, DC side (A ×100)
     "sessionId",                  // device boot identity, same in every channel this boot
     "sendMs",                     // device millis() when this payload was built
 ];
@@ -1479,7 +1505,20 @@ try { altTrendWindow = localStorage.getItem('altTrendWin') || '0'; } catch(e){}
 let altTrendYManual = null;
 try { altTrendYManual = JSON.parse(localStorage.getItem('altTrendY') || 'null'); } catch(e){}
 
-function fetchAltSchema(){ return fetch(buildURL('/altschema')).then(r=>r.json()).then(j=>{ altSchema=j; }).catch(()=>{}); }
+function fetchAltSchema(){ return (demoJson('/altschema') || fetch(buildURL('/altschema')).then(r=>r.json())).then(j=>{ altSchema=j; }).catch(()=>{}); }
+
+// Switches echoed by their own JSON poll, not the CSV stream (knee learning, zero-drift log). The write goes through
+// controlWrite and the poll re-runs on the answer. A poll sent before a write settled can land after it, so a poll paints
+// a switch only while no write to it is pending and none has settled since the poll was sent.
+let g_pollToggleEpoch = 0;
+function pollToggleMayPaint(key, epochAtSend) { return epochAtSend === g_pollToggleEpoch && !pendingToggles.has(key); }
+function pollToggleWrite(cb, key, poll) {
+    const on = cb.checked;
+    const settled = () => { g_pollToggleEpoch++; poll(); };
+    controlWrite({ [key]: on ? 1 : 0 }, key + '=' + (on ? 1 : 0),
+                 () => { pendingToggles.delete(key); cb.checked = !on; settled(); },
+                 () => { pendingToggles.delete(key); settled(); });
+}
 
 // ===== Tachometer Keep-Alive — Automatic Learning (firmware "knee tracker", knee*/kneeLearn* keys) =====
 // State comes from /kneeLearnState, not CSV.
@@ -1488,12 +1527,17 @@ function _kneeSetInput(id, val){
     // Intentional no-op: like every setting, the input stays blank; the value shows only in the _echo span.
 }
 function fetchKneeLearnState(){
-    return fetch(buildURL('/kneeLearnState')).then(r=>r.json()).then(j=>{
+    const ep = g_pollToggleEpoch;
+    return (demoJson('/kneeLearnState') || fetch(buildURL('/kneeLearnState')).then(r=>r.json())).then(j=>{
         if (!j) return;
         const on = (Number(j.enable) === 1);
         _kneeSetEcho('kneeLearnEnable_echo', on ? 'On' : 'Off');
         const cb = document.getElementById('kneeLearnEnable_checkbox');
-        if (cb) cb.checked = on;
+        if (cb && pollToggleMayPaint('kneeLearnEnable', ep)) cb.checked = on;
+        ['kneeLearnEnable_checkbox', 'kneeTempComp_checkbox'].forEach(id => {
+            const l = (document.getElementById(id) || { closest: () => null }).closest('label.switch');
+            if (l) l.classList.remove('echo-pending');
+        });
         // Lock the 10 cells while learning owns the Keep-Alive column so manual edits can't be silently stomped.
         const owns = on;
         for (let i = 0; i < 10; i++) {
@@ -1517,7 +1561,7 @@ function fetchKneeLearnState(){
         const tc = (Number(j.tempComp) === 1);
         _kneeSetEcho('kneeTempComp_echo', tc ? 'On' : 'Off');
         const tcCb = document.getElementById('kneeTempComp_checkbox');
-        if (tcCb) tcCb.checked = tc;
+        if (tcCb && pollToggleMayPaint('kneeTempComp', ep)) tcCb.checked = tc;
         _kneeSetEcho('kneeTempRefF_echo',    f1(toDisplayTemp(j.tempRefF)));    _kneeSetInput('kneeTempRefF_input',    f1(toDisplayTemp(j.tempRefF)));
         _kneeSetEcho('kneeMaxFloorPct_echo', f1(j.maxFloorPct)); _kneeSetInput('kneeMaxFloorPct_input', f1(j.maxFloorPct));
         _kneeSetEcho('kneeRpmTolPct_echo',   f1(j.rpmTolPct));   _kneeSetInput('kneeRpmTolPct_input',   f1(j.rpmTolPct));
@@ -1565,15 +1609,16 @@ async function resetKneeLearn(){
 }
 
 // ===== Zero-drift characterization log (diagnostic) =====
-let zeroLogToggledAt = 0; // ms timestamp of last user flip — guards the switch from poll snap-back
 function fetchZeroLogState(){
-    return fetch(buildURL('/zerologstate')).then(r=>r.json()).then(j=>{
+    const ep = g_pollToggleEpoch;
+    return (demoJson('/zerologstate') || fetch(buildURL('/zerologstate')).then(r=>r.json())).then(j=>{
         if (!j) return;
         const on = (Number(j.enable) === 1);
         const e = document.getElementById('ZeroLogEnable_echo'); if (e) e.textContent = on ? 'On' : 'Off';
         const cb = document.getElementById('ZeroLogEnable_checkbox');
-        // Don't fight a just-flipped switch during the GET round-trip (poll is ~1s).
-        if (cb && (Date.now() - zeroLogToggledAt) > 3000) cb.checked = on;
+        // Don't fight a just-flipped switch during the GET round-trip (poll is ~5s).
+        if (cb && pollToggleMayPaint('ZeroLogEnable', ep)) cb.checked = on;
+        if (cb && cb.closest('label.switch')) cb.closest('label.switch').classList.remove('echo-pending');
         const st = document.getElementById('zerolog-status');
         if (st) {
             const cap = Number(j.cap) || 0, cnt = Number(j.count) || 0;
@@ -3329,7 +3374,7 @@ let perfSettings = {};
 let perfCells = [];
 let _perfPlotPending = false, _perfModelLastFetch = 0;
 
-function fetchPerfSchema(){ return fetch(buildURL('/perfschema')).then(r=>r.json()).then(j=>{ perfSchema=j; }).catch(()=>{}); }
+function fetchPerfSchema(){ return (demoJson('/perfschema') || fetch(buildURL('/perfschema')).then(r=>r.json())).then(j=>{ perfSchema=j; }).catch(()=>{}); }
 
 // Names for the failure message; a key with no entry falls back to a generic phrase.
 const PERF_SET_LABEL = { perfFoldSymmetric:'polar symmetry',
@@ -3516,28 +3561,62 @@ async function perfUploadCsvFile(inp){
   rd.readAsText(f);
 }
 
-// ── Plots render the raw best-ever FRONT (BEFRONT1, /perfcurve.csv) with the SAME IDW eval the firmware
-// uses for live "% of best" (FrontStore::eval), so the line agrees with the gauge.
+// ── Plots render the raw best-ever FRONT (BEFRONT1, /perfcurve.csv) with the reference the firmware grades the live
+// "% of best" against (frontPred), so a 96 % dot sits 4 % under the line.
 // Each point: {x:[axis0, axis1, sea], y:speed, n:nSamp}.
 let sailFrontPts = [], motorFrontPts = [];
 let _perfCurveLastFetch = 0;
 // Per-axis distance normalization — MUST match the firmware axisScale[] (7_functions.ino).
 const SAIL_SCALE = [2.0, 12.0, 1.0];     // AWS, AWA, sea
-const MOTOR_SCALE = [100.0, 2.0, 1.0];   // RPM, headwind, sea
+const MOTOR_SCALE = [100.0, 4.0, 1.0];   // RPM, headwind, sea
+const FRONT_LWLR_KMAX = 48;              // = FRONT_LWLR_KMAX, 7_functions.ino
 function perfIdw(){ return (perfSettings.perfIdwPower != null && perfSettings.perfIdwPower > 0) ? perfSettings.perfIdwPower : 2.0; }
+function perfRidge(){ return (perfSettings.perfRidgeFrac != null && perfSettings.perfRidgeFrac >= 0) ? perfSettings.perfRidgeFrac : 0.10; }
 
-// IDW surface eval — mirrors FrontStore::eval: dᵢ=√Σ((x-pt)/scale)²; exact hit→y; else Σwᵢyᵢ/Σwᵢ, w=1/(dᵢ^p+eps).
-function frontEval(pts, q, scale){
-  if(!pts.length) return 0;
-  const p=perfIdw(); let wsum=0,num=0;
-  for(const pt of pts){
-    let d2=0;
-    for(let a=0;a<q.length;a++){ const sc=scale[a]>1e-9?scale[a]:1; const dx=(q[a]-pt.x[a])/sc; d2+=dx*dx; }
-    if(d2<1e-12) return pt.y;
-    const dp = (p===2) ? d2 : Math.pow(Math.sqrt(d2), p);
-    const w = 1/(dp+1e-9); wsum+=w; num+=w*pt.y;
+// The firmware's grading reference (FrontQuery's prediction, 7_functions.ino): a local linear fit through the nearest
+// FRONT_LWLR_KMAX records, weights 1/(d²+eps), a ridge on the slopes only, clamped to 0.1 .. 1.25 × the front's fastest;
+// the whole-front IDW (FrontStore::eval) only where the fit is singular. The IDW alone reads high at the ends of the front.
+function frontPred(pts, q, scale){
+  const n=pts.length, N=q.length, K=FRONT_LWLR_KMAX; if(!n) return 0;
+  const inv=scale.map(s=>s>1e-9?1/s:1), p=perfIdw(), ridgeFrac=perfRidge();
+  let wsum=0, num=0, exact=-1, maxY=0, nSel=0;
+  const selI=new Array(K), selD=new Array(K);
+  for(let i=0;i<n;i++){
+    const pt=pts[i]; let d2=0;
+    for(let a=0;a<N;a++){ const dx=(q[a]-pt.x[a])*inv[a]; d2+=dx*dx; }
+    if(exact<0){
+      if(d2<1e-12) exact=i;
+      else { const w=1/(((p===2)?d2:Math.pow(Math.sqrt(d2),p))+1e-9); wsum+=w; num+=w*pt.y; }
+    }
+    if(pt.y>maxY) maxY=pt.y;
+    if(nSel<K || d2<selD[K-1]){
+      let j=(nSel<K)?nSel++:K-1;
+      while(j>0 && selD[j-1]>d2){ selD[j]=selD[j-1]; selI[j]=selI[j-1]; j--; }
+      selD[j]=d2; selI[j]=i;
+    }
   }
-  return wsum>0 ? num/wsum : 0;
+  const idw = (exact>=0) ? pts[exact].y : (wsum>0 ? num/wsum : 0);
+  const M=N+1, A=[], b=new Array(M).fill(0);
+  for(let r=0;r<M;r++) A.push(new Array(M).fill(0));
+  for(let k=0;k<nSel;k++){
+    const pt=pts[selI[k]], phi=[1]; let d2=0;
+    for(let a=0;a<N;a++){ const dx=(pt.x[a]-q[a])*inv[a]; phi.push(dx); d2+=dx*dx; }
+    const w=1/(d2+1e-9);
+    for(let r=0;r<M;r++){ for(let c=r;c<M;c++) A[r][c]+=w*phi[r]*phi[c]; b[r]+=w*phi[r]*pt.y; }
+  }
+  let tr=0;
+  for(let r=1;r<M;r++){ for(let c=0;c<r;c++) A[r][c]=A[c][r]; tr+=A[r][r]; }
+  for(let a=1;a<M;a++) A[a][a]+=ridgeFrac*tr/N;
+  for(let col=0;col<M;col++){
+    let pv=col;
+    for(let r=col+1;r<M;r++) if(Math.abs(A[r][col])>Math.abs(A[pv][col])) pv=r;
+    if(Math.abs(A[pv][col])<1e-12) return idw;
+    if(pv!==col){ const t=A[col]; A[col]=A[pv]; A[pv]=t; const tb=b[col]; b[col]=b[pv]; b[pv]=tb; }
+    for(let r=col+1;r<M;r++){ const f=A[r][col]/A[col][col]; for(let c=col;c<M;c++) A[r][c]-=f*A[col][c]; b[r]-=f*b[col]; }
+  }
+  const sol=new Array(M);
+  for(let r=M-1;r>=0;r--){ let s=b[r]; for(let c=r+1;c<M;c++) s-=A[r][c]*sol[c]; sol[r]=s/A[r][r]; }
+  return Math.min(Math.max(sol[0],0.1), 1.25*maxY);
 }
 // Fold |AWA| to [0,180] when symmetric — mirrors perfFoldAwa (the front is stored folded only when symmetric).
 function foldAwaJS(a){
@@ -3606,7 +3685,7 @@ function drawPerfPlot(){
     let lo=999, hi=-999; sailFrontPts.forEach(p=>{ if(p.x[1]<lo)lo=p.x[1]; if(p.x[1]>hi)hi=p.x[1]; });
     const step=Math.max(1, (hi-lo)/90);
     for(let awa=lo; awa<=hi+1e-6; awa+=step){
-      const s=frontEval(sailFrontPts, [aws, foldAwaJS(awa), sea], SAIL_SCALE);
+      const s=frontPred(sailFrontPts, [aws, foldAwaJS(awa), sea], SAIL_SCALE);
       if(s<=0) continue;
       const ang = trueWind ? appToTrue(awa, s, aws).twa : awa;
       curve.push([ang, s]); if(s>maxS) maxS=s;
@@ -3669,7 +3748,7 @@ function drawMotorPlot(){
   if(haveData){
     loR=1e9; hiR=-1e9; motorFrontPts.forEach(p=>{ if(p.x[0]<loR)loR=p.x[0]; if(p.x[0]>hiR)hiR=p.x[0]; });
     const step=Math.max(20, (hiR-loR)/120);
-    for(let r=loR; r<=hiR+1e-6; r+=step){ const v=frontEval(motorFrontPts,[r,hw,sea],MOTOR_SCALE); if(v>0) line.push([r,v]); }
+    for(let r=loR; r<=hiR+1e-6; r+=step){ const v=frontPred(motorFrontPts,[r,hw,sea],MOTOR_SCALE); if(v>0) line.push([r,v]); }
   }
   let maxR=3600, maxS=4;
   line.forEach(p=>{ if(p[0]>maxR)maxR=p[0]; if(p[1]>maxS)maxS=p[1]; });
@@ -5367,7 +5446,8 @@ async function maybeAskLocationOnFirstConnect() {
 // DEVICE-global but the permission is THIS-client, so a browser must still submit (else a laptop could never select
 // Backup or Phone); the phone app raises its own prompt when it starts posting.
 async function gpsPositionSourceChanged(sel) {
-    const v = Number(sel.value);
+    const want = sel.value;
+    const v = Number(want);
     if ((v === 0 || v === 2) && IS_CAPACITOR) {
         const ok = await requestPhoneLocationPermission(
             v === 2
@@ -5376,10 +5456,20 @@ async function gpsPositionSourceChanged(sel) {
               : 'XREG-010 will use this phone as a backup position source when the boat\'s own ' +
                 'GPS is unavailable, so distance run, anchorages and the solar forecast keep working. ' +
                 'Position goes to your regulator on your local network.');
-        if (!ok) { sel.value = String(window.gpsPositionSource ?? 0); return; }
+        if (!ok) { selectRepaint(sel); return; }
     }
-    sel.form.submit();
-    submitMessage();
+    selectWrite(sel, want);
+}
+
+// A <select> that sends on change. want = the option chosen, captured before any dialog: an echo may have repainted
+// the select while the dialog was open. A write that does not land puts it back to the regulator's last report.
+function selectWrite(sel, want) {
+    if (want !== undefined) sel.value = want;
+    return controlWrite({ [sel.name]: String(sel.value) }, sel.name + '=' + encodeURIComponent(sel.value), () => selectRepaint(sel));
+}
+function selectRepaint(sel) {
+    pendingToggles.delete(sel.name);
+    if (sel.name in g_echoLast) sel.value = String(g_echoLast[sel.name]);
 }
 
 // Authorization state WITHOUT prompting. Capacitor's checkPermissions() reads the state;
@@ -5558,13 +5648,14 @@ async function updatePhoneSpeedPoster(mode) {
 }
 window.updatePhoneSpeedPoster = updatePhoneSpeedPoster;
 
-// Phone speed has real tradeoffs, so the select submits only after an explicit acknowledgment. Cancel reverts to NMEA
-// (binary setting; the CSV3 echo re-syncs it anyway).
+// Phone speed has real tradeoffs, so the select submits only after an explicit acknowledgment. Cancel puts back the
+// source the regulator last reported.
 async function speedSourceModeChanged(sel) {
-    if (Number(sel.value) === 1) {
+    const want = sel.value;
+    if (Number(want) === 1) {
         const ok = await xConfirm(phoneSpeedModeDialogText(),
             { title: 'Use phone GPS for speed?', okText: 'Use Phone GPS' });
-        if (!ok) { sel.value = '0'; return; }
+        if (!ok) { selectRepaint(sel); return; }
         markPhoneSpeedDisclosed();   // this dialog IS the disclosure — the poster must not raise a second copy
         // Ask when the feature is switched on (guideline 5.1.1(ii), HIG). Capacitor only: device-global setting, this-client
         // permission, so a browser must still submit (its own geolocation prompt fires when posting starts).
@@ -5572,11 +5663,10 @@ async function speedSourceModeChanged(sel) {
             const granted = await requestPhoneLocationPermission(
                 'XREG-010 needs this phone\'s location to use it as the vessel speed source. ' +
                 'Speed and course go to your regulator on your local network.');
-            if (!granted) { sel.value = '0'; return; }
+            if (!granted) { selectRepaint(sel); return; }
         }
     }
-    sel.form.submit();
-    submitMessage();
+    selectWrite(sel, want);
 }
 
 function startPhoneDataPoster() {
@@ -5974,7 +6064,7 @@ function initializeEventSource() {
         }, false);
 
         // \u2500\u2500 SSE: AltSettings \u2500 GUI-tunable values \u2192 echo spans (schema-driven) \u2500\u2500
-        source.addEventListener('AltSettings', function (e) {
+        source.addEventListener('AltSettings', window._altSettingsHandler = function (e) {   // ref stored for demo mode
             if (!altSchema || !altSchema.settings) { if (!altSchema) fetchAltSchema(); return; }
             const v = e.data.split(',').map(Number);
             const ALT_NOECHO = { altPaused: 1 };   // driven by the Pause/Continue + Reference Source buttons, no echo span
@@ -6000,9 +6090,11 @@ function initializeEventSource() {
             perfSchema.live.forEach((k, i) => { perfLive[k] = v[i]; });
             perfLive.valid = perfLive.valid === 1;
             updatePerf(); queuePerfPlotUpdate();
+            const pls = document.getElementById('perf-learn-switch');
+            if (pls && pls.closest('label.switch')) pls.closest('label.switch').classList.remove('echo-pending');
             updateCloudStatus();
         }, false);
-        source.addEventListener('PerfSettings', function (e) {
+        source.addEventListener('PerfSettings', window._perfSettingsHandler = function (e) {   // ref stored for demo mode
             if (!perfSchema || !perfSchema.settings) { if (!perfSchema) fetchPerfSchema(); return; }
             const v = e.data.split(',').map(Number);
             const PERF_NOECHO = { perfFoldSymmetric: 1, perfSpeedSrc: 1, perfPaused: 1 };  // segmented/switch controls, no echo span
@@ -6013,6 +6105,7 @@ function initializeEventSource() {
                 if (el) el.textContent = (Math.round(v[i] * 1000) / 1000);
             });
             updatePerfControls(); queuePerfPlotUpdate(); queueMotorPlotUpdate();
+            ['perf-src-1', 'perf-sym-1'].forEach(id => { const b = document.getElementById(id); if (b) b.parentElement.classList.remove('echo-pending'); });
         }, false);
         source.addEventListener('MotorLive', function (e) {
             if (!perfSchema || !perfSchema.motorLive) { if (!perfSchema) fetchPerfSchema(); return; }
@@ -6256,7 +6349,7 @@ function enableDemoMode() {
 }
 
 // Prominent disclosure pinned above the Cloud Features sub-tabs while demo is live.
-// The profile below it is simulated; the iframes (leaderboards etc.) are real public pages.
+// The profile below it is simulated; Leaderboards and Fleet Stats are the cloud pages' own demo mode (demoCloudIframe).
 function demoInjectCloudBanner() {
     if (document.getElementById('demo-cloud-banner')) return;
     const tab = document.getElementById('cloudfeatures');
@@ -6270,6 +6363,7 @@ function demoInjectCloudBanner() {
 
 // Demo-mode mockups for the Cloud Features sub-tabs: the real panes are iframes keyed to a
 // registered device token, so in demo these render into each pane's status element instead.
+// Leaderboards and Fleet Stats show them only when their demo page cannot load (demoCloudIframe).
 function demoFillCloudPanes() {
     const th = 'text-align:left;padding:6px 10px;border-bottom:1px solid rgba(128,128,128,0.35);';
     const td = 'padding:6px 10px;border-bottom:1px solid rgba(128,128,128,0.2);';
@@ -6279,18 +6373,20 @@ function demoFillCloudPanes() {
         const el = document.getElementById(id);
         if (el) { el.innerHTML = html; el.style.color = 'inherit'; el.style.display = 'block'; }
     };
+    // Figures as the demo pages show them from the GX demo dataset (Vercel demo-bundle.js): top 3 plus DemoBoat's own row
     set('leaderboards-status',
         '<strong>Deepest Anchorage</strong>'
-        + table('Depth', row3(1, 'Meridian', '142 ft') + row3(2, 'Blue Heron', '118 ft') + row3(3, 'DemoBoat', '96 ft'))
+        + table('Depth', row3(1, 'Moonshadow', '131 ft') + row3(2, 'Meridian', '112 ft') + row3(3, 'Northern Light', '104 ft') + row3(7, 'DemoBoat', '58 ft'))
         + '<strong>Longest Passage</strong>'
-        + table('Distance', row3(1, 'Wanderer', '1,240 nm') + row3(2, 'Meridian', '980 nm') + row3(3, 'DemoBoat', '610 nm')));
+        + table('Days offshore', row3(1, 'Meridian', '26 days') + row3(2, 'Moonshadow', '22 days') + row3(3, 'Northern Light', '9 days') + row3(6, 'DemoBoat', '5 days')));
     set('fleetstats-status',
         '<strong>Fleet Overview</strong>'
-        + '<div style="line-height:1.9;margin-top:6px;">Registered vessels: 47<br>'
-        + 'Combined engine hours: 12,840<br>'
-        + 'Average alternator output: 61 A<br>'
-        + 'Energy charged this month: 3.9 MWh<br>'
-        + 'Most common battery: LiFePO4 400 Ah</div>');
+        + '<div style="line-height:1.9;margin-top:6px;">Registered devices: 47<br>'
+        + 'Active last 7 days: 29<br>'
+        + 'Distance traveled: 198,403 nm<br>'
+        + 'Engine hours: 10,270 hrs<br>'
+        + 'Alternator energy: 6,796 kWh<br>'
+        + 'Solar energy: 16,271 kWh</div>');
     const cfgBtn = '<button class="btn-secondary" disabled style="opacity:0.5;">Load</button>';
     const cfgRow = (name, by) => `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 4px;border-bottom:1px solid rgba(128,128,128,0.2);"><span>${name}<br><small style="opacity:0.7;">shared by ${by}</small></span>${cfgBtn}</div>`;
     set('configsharing-status',
@@ -6299,6 +6395,40 @@ function demoFillCloudPanes() {
         + cfgRow('AGM 400 Ah / 12 V bluewater setup', 'Meridian')
         + cfgRow('LiFePO4 300 Ah / 24 V catamaran', 'Wanderer'));
     demoRenderSoftwareUpdate();
+}
+
+// Leaderboards / Fleet Stats in demo: the cloud page's ?demo=1 (the GX demo's invented boats, no Supabase call). The pane
+// stays blank while it loads; demoFillCloudPanes' short table shows if the page has not reported its height within 10 s (no internet).
+function demoCloudIframe(pane, page) {
+    const f = document.getElementById(pane + '-iframe'), st = document.getElementById(pane + '-status');
+    if (!f || !st) return;
+    if (f.dataset.demo) { if (f.dataset.demo !== 'failed') st.style.display = 'none'; return; }   // demoFillCloudPanes re-showed it
+    f.dataset.demo = 'loading';
+    st.style.display = 'none';
+    if (!f._demoListen) {
+        f._demoListen = true;
+        window.addEventListener('message', e => {
+            if (e.source !== f.contentWindow || !f.dataset.demo || !e.data || e.data.type !== 'IFRAME_HEIGHT') return;
+            f.dataset.demo = 'up';
+            st.style.display = 'none';
+        });
+    }
+    f.style.height = '0';
+    f.style.display = 'block';
+    f.src = `https://supabase-nine-ashy.vercel.app/${page}?demo=1&dark=${cloudDarkParam()}`;
+    setTrackedTimeout(() => { if (f.dataset.demo === 'loading') { f.dataset.demo = 'failed'; st.style.display = 'block'; } }, 10000);
+}
+// Regulator demo turned off: unload the demo pages so the real loaders start from the plain pane.
+function demoCloudIframesOff() {
+    ['leaderboards', 'fleetstats'].forEach(pane => {
+        const f = document.getElementById(pane + '-iframe'), st = document.getElementById(pane + '-status');
+        if (!f || !f.dataset.demo) return;
+        delete f.dataset.demo;
+        f.removeAttribute('src');
+        f.style.display = 'none';
+        f.style.height = '600px';
+        if (st) st.style.display = '';
+    });
 }
 
 function demoRenderSoftwareUpdate() {
@@ -6316,6 +6446,172 @@ function demoRenderSoftwareUpdate() {
     }
 }
 
+// App Store demo settings: the website demo's boat (demo-shim.js CSV3_DEFAULTS), wire-scaled as CSV3 carries them;
+// unnamed fields 0. webgaugesinterval is sendFakeCSVData's 200 ms; Remote Diagnostics off, it would poll the cloud for nothing.
+const DEMO_CSV3 = {
+    TemperatureLimitF: 175, BulkVoltage: 1390, wavePeriod: 10, FloatVoltage: 1360, SwitchingFrequency: 400,
+    yyMin: -5, ManualDutyTarget: 400, waveAmplitude: 10, CurrentThreshold: 1, PeukertExponent_scaled: 105,
+    ChargeEfficiency_scaled: 990, ChargedVoltage_Scaled: 1380, TailCurrent: 50, ChargedDetectionTime: 180,
+    RPMScalingFactor: 1330, MaximumAllowedBatteryAmps: 250, AlternatorNominalAmps: 100, LearningUpStep: 100,
+    LearningDownStep: 200, xTime: 30, MinLearningInterval: 30000, SafeOperationThreshold: 30000, PidKp: 500,
+    PidKi: 2000, PidSampleDivisor: 1, MaxTableValue: 15000, MaxPenaltyPercent: 1500, MaxPenaltyDuration: 60,
+    NeighborLearningFactor: 250, yyMax: 105, LearningMemoryDuration: 30, ShuntResistanceMicroOhm: 100, MaxDuty: 99,
+    MinDuty: 100, FieldResistance: 2000, maxPoints: 1500, AlternatorCOffset: -6, BatteryCapacity_Ah: 400,
+    AmpSensorRange: 1, R_fixed: 1000000, Beta: 338000, T0_C: 2500, IgnitionOverride: 2, FLOAT_DURATION: 28800,
+    PulleyRatio: 200, rpmTableRPMPoints0: 600, rpmTableRPMPoints1: 800, rpmTableRPMPoints2: 1000,
+    rpmTableRPMPoints3: 1200, rpmTableRPMPoints4: 1500, rpmTableRPMPoints5: 1800, rpmTableRPMPoints6: 2200,
+    rpmTableRPMPoints7: 2600, rpmTableRPMPoints8: 3000, rpmTableRPMPoints9: 3500, LearningSettlingPeriod: 30000,
+    LearningRPMChangeThreshold: 500, LearningTempHysteresis: 10, fuelTableRPM1: 500, fuelTableRPM2: 1000,
+    fuelTableRPM3: 1500, fuelTableRPM4: 2000, fuelTableRPM5: 2500, fuelTableRPM6: 3000, fuelTableRPM7: 3500,
+    fuelTableRPM8: 4000, fuelTableRPM9: 4500, fuelTableGPH1: 30, fuelTableGPH2: 50, fuelTableGPH3: 80,
+    fuelTableGPH4: 120, fuelTableGPH5: 180, fuelTableGPH6: 250, fuelTableGPH7: 350, fuelTableGPH8: 500,
+    fuelTableGPH9: 700, DutyRampRate: 4000, SettleTimeBeforeCut: 1000, TempWarnExcess: 200, TempCritExcess: 1000,
+    TempSustainedTimeout: 120, AlternatorHardShutdownV: 1420, VoltageDisagreeThreshold: 15,
+    VoltageDisagreeTimeout: 10, rpmMinDutyTable0: 500, rpmMinDutyTable1: 500, rpmMinDutyTable2: 800,
+    rpmMinDutyTable3: 1000, rpmMinDutyTable4: 1200, rpmMinDutyTable5: 1400, rpmMinDutyTable6: 1500,
+    rpmMinDutyTable7: 1500, rpmMinDutyTable8: 1500, rpmMinDutyTable9: 1500, rpmCapCurrentTable0: 3000,
+    rpmCapCurrentTable1: 5000, rpmCapCurrentTable2: 7000, rpmCapCurrentTable3: 8500, rpmCapCurrentTable4: 10000,
+    rpmCapCurrentTable5: 8800, rpmCapCurrentTable6: 9000, rpmCapCurrentTable7: 9000, rpmCapCurrentTable8: 8800,
+    rpmCapCurrentTable9: 8500, VoltageKp: 850, VoltageLoopInterval: 100, FIELD_COLLAPSE_DELAY: 30000,
+    SetpointRiseRate: 3000, SetpointFallRate: 5000, SetpointBigStepThresh: 1000, SetpointBigStepRiseRate: 1500,
+    PIDTrackingGain: 400, CAPSIZE_THRESHOLD_DEG: 120, PITCHPOLE_THRESHOLD_DEG: 70, SLAM_THRESHOLD_G: 25,
+    TailCurrent_A: 2000, RebulkVoltage: 1310, rebulkDebounceTime: 10000, MinFloatTime: 300000,
+    SOC_BlockRebulk_percent: 90, SOC_AllowRebulk_percent: 80, DutySlowRampRate: 50, ShutdownPhase2HoldMs: 500,
+    TempPIDKp: 3000, TempPIDKi: 100, ThermalLookaheadSec: 60, TempPIDIntervalMs: 5000, TempPIDFilterAlpha: 200,
+    VoltageKi: 600, SystemIDStepAmplitude: 60, HardOCTripAmps: 1600, HardOCDebounceMs: 40, IExcessFrac: 31,
+    IExcessFloorA: 50, MinRPMForField: 125, AwBleedRate: 20, KHard: 350, ReseedFrac: 95, AwSeedProtectMs: 150,
+    WarmupRampRate: 100, OvGroup2Enable: 1, IExcessCeilA: 200, IExcessTau: 75, TdPred: 0.045, OvMeasMarginV: 0.1,
+    OvPredMarginV: 0.15, OutputPIDMA_N: 2, OutputPIDFilterTC: 12, VoltageFilterTC: 35, CvKdVoltFiltTC: 40,
+    CvKdDeadbandVps: 40, VoltageKd: 50, DvdtTC: 580, CvKdArmV: 50, StartupRiseRate: 1000,
+    absorptionCompleteTime: 30000, OnOff: 1, HiLow: 1, AlarmActivate: 1, TempAlarm: 190, VoltageAlarmHigh: 1440,
+    VoltageAlarmLow: 1190, CurrentAlarmHigh: 100, AlarmLatchEnabled: 1, GeneralFaultAlarm: 1, ManualSOCPoint: 2500,
+    IgnoreLearningDuringPenalty: 1, CloudFeatures: 1, AutoAltCurrentZero: 1, WindingTempOffset: 50,
+    ManualLifePercentage: 100, UVThresholdHigh: 210, weatherModeEnabled: 1, imuEnabled: 1, AbsorptionVoltage: 1390,
+    AbsorptionTimeoutMs: 2700000, bulkVoltageHoldMs: 250, TargetVoltageSetpoint: 1350, RebulkCurrent_A: 2000,
+    IExcessFracBulk: 31, IExcessRelFrac: 500, systemIDPlantTauMs: 180, TempAlarmLow: 32, LoadDumpDtThresh: 5000,
+    LoadDumpDtThresh1: 7000, cvWaveAmplitudeV: 30, cvWavePeriodSec: 30, cvKOvershoot: 100, cvConsecutiveReads: 10,
+    webgaugesinterval: 200, plotTimeWindow: 30, Ymin1: -40, Ymax1: 120, Ymin2: 1100, Ymax2: 1500, Ymax3: 2500,
+    Ymin4: 80, Ymax4: 200, LoadDumpDtThresh3: 5000, hardwarePresent: 1, testProtectionsEnabled: 1,
+    IExcessArmMarginV: 0.1, FastSetpointRiseRate: 800, FastSetpointRiseWindowMs: 5000, FastSetpointRiseHeadroomV: 20,
+    SolarWatts: 600, performanceRatio: 75, VeData: 1, NMEA0183Data: 1, NMEA2KData: 1, faEnabled: 1,
+    faRpmEdgeMargin: 20, faAmpsDriftFloorA: 200, faAmpsDriftPct: 50, faAttenUpAmps: 1200, faAttenDownAmps: 900,
+    faPeakMinA: 50, wifiNapEnabled: 1, systemIDSineFreqStart: 5, systemIDSineFreqEnd: 200, systemIDSineCycles: 2,
+    tuningSineFreq: 20, tuningSweepStart: 2, tuningSweepEnd: 150, tuningSweepCycles: 2, SystemIDStabilizeAmps: 300,
+    tuningWaveFloor: 5, commissionState: 2, commissionDoneMask: 1023, cvHelpersEnabled: 1, MinChargeTempF: 40,
+    coldChargeLockoutEnable: 1, cvGainMode: 1, cvPlantK: 216, cvComputedKp: 463, cvComputedKi: 231, cvCrossover: 120,
+    cvPiZero: 50, vTgtRampUp: 150, vTgtRampDn: 150, vTgtRampEnable: 1, setpointSlewEnable: 1, cvRiseGovEnable: 1,
+    dutySlewEnable: 1, CommissionTempF: 770, battTempDerateEnable: 1, battTempCoeff: 240, TempPIDKiDownFrac: 330,
+    ThermalSlopeWindowSec: 25, BattCurrentLimitA: 2000, ripWinMs: 2000, ripDriftFloorA: 200, ripDriftPct: 50,
+    SocAlarmLow: 10, IExcessBaseA: 58, IExcessCcOffsetA: 40, BatteryShuntPresent: 1, cvRecovEnable: 1,
+    cvRecovSec: 25, cvRecovEmaxV: 250, testSlewMode: 2, cvTestSlewMode: 2, fieldDecayTauMs: 60, CvKdMaxTrimA: 5000,
+    cvAlpha: 100, CvKdSlopeCeil: 100, cvComputedKd: 194, CvKdDbSlope: 60, CvKdDbFloor: 10, CvKdDbCeil: 350,
+    cvRecovBoostEnable: 1, cvRecovBoostMax: 400, cvRecovBoostErrV: 600, HardOCEnable: 1, IExcessEnable: 1,
+    BattLimitEnable: 1, CvKdExcessMode: 1, CvStressDropV: 10, CvStressFailBandV: 25, CvBrakeFallRate: 20000,
+    cvRecovKiMax: 500, cvWindDownEnable: 1, cvWindDownRate: 50, cvWindDownStopV: 50, LoadDumpEnable: 1,
+    loadServeBoostEnable: 1, reseedCorrEnable: 1, ReseedFracNoShunt: 50, CvRecovClimbRate: 10, protTestCutMs: 500,
+    protTestGapMs: 1000, protTestReps: 1, cvRecovBoostFloorV: 200, cvRecovDeepBandV: 750, cvRecovDeepMult: 500,
+    cvRecovFlareBandV: 350, cvRecovFlareFrac: 85, TachLieEnable: 1, n2kTxEnable: 1, n2kBattEnable: 1,
+    n2kAltEnable: 1, n2kAltInstance: 1, n2kAltTempEnable: 1, n2kTempInstance: 4, n2kTempSource: 3, n2kChgrEnable: 1,
+    n2kChgrCfgEnable: 1, n2kEngBitsEnable: 1, dvccEn: 1, dvccInst: 1, dvccSilenceS: 30, dvccSettleS: 10,
+    dvccCvlMin: 900, dvccCvlMax: 1600, HuntCutPct: 50, HuntVerifyPct: 15, HuntWingPct: 15, HuntCooldownMin: 10,
+    HuntSteadyPct: 3, HuntQualifyScans: 3, HuntTrigPct: 50, NMEA0183Baud: 19200, MaxFieldVolts: 150,
+    OvTierLoMarginV: 0.1, OvTierLoDwellMs: 400, OvTierMidMarginV: 0.2, OvTierMidDwellMs: 150,
+    VoltageHardwareLimit: 1430, LoadDumpN1: 1, LoadDumpN2: 2, LoadDumpN3: 3, solarLearnEnable: 1,
+    solarUseConsEnable: 1, solarConsMarginPct: 2500, solarLearnRatePct: 1000, rvcChgrEnable: 1, rvcDcEnable: 1,
+    rvcFaultEnable: 1, rvcChgrInstance: 49, rvcDcInstance: 5, rvcDevPriority: 80, battTempProbeEnable: 1,
+    extraTempProbeEnable: 1, hotChargeLockoutEnable: 1, MaxChargeTempF: 113, extraTempAlarmHiF: 150,
+    extraTempAlarmLoF: 32, n2kExtraTempInstance: 5, n2kExtraTempSource: 3, CommissionTempSrc: 1, maxWorkingRpm: 3200,
+    LimpDutyPct: 300, ShutdownRampTauS: 400, NoOutputAmps: 200, FieldResTrefC: 220, FieldWiring: 1, ShuntLead: 1,
+    FieldWindingV: 12, fieldWindApplied: 12
+};
+let g_demoCsv3 = null;   // the demo's stand-in regulator settings: DEMO_CSV3 plus what was changed this session
+let g_demoOnOff = 1;     // its master switch
+// TS ages: fresh for what sendFakeCSVData simulates, never (999999) for the rest, so nothing unsimulated reads as live.
+const DEMO_TS_LIVE = new Set(['ts_AlternatorTemp', 'ts_ThermistorTemp', 'ts_RPM', 'ts_MeasuredAmps', 'ts_BatteryV', 'ts_IBV',
+    'ts_Bcur', 'ts_Channel3V', 'ts_DutyCycle', 'ts_FieldVolts', 'ts_FieldAmps', 'ts_VictronVoltage']);
+function demoSendCsv3() {
+    window._demoLastCsv3 = Date.now();
+    if (!window._csv3DataHandler || !g_demoCsv3) return;
+    const v3 = CSV3_FIELDS.map(k => g_demoCsv3[k] !== undefined ? g_demoCsv3[k] : 0);
+    window._csv3DataHandler({ data: v3.length + ',' + v3.join(',') });
+}
+function demoSendTs() {
+    window._demoLastTs = Date.now();
+    if (!window._tsDataHandler) return;
+    const vt = TS_FIELDS.map(k => DEMO_TS_LIVE.has(k) ? 50 : (k === 'ts_sessionId' || k === 'ts_sendMs') ? 0 : 999999);
+    window._tsDataHandler({ data: vt.length + ',' + vt.join(',') });
+}
+// App Store demo: what the stand-in regulator answers to the JSON reads behind some Setup cards, and its AltSettings /
+// PerfSettings echoes in schema order: the website demo's values (demo-shim.js), history dated back from now.
+const DEMO_JSON = {
+    '/altschema': {live: ['valid', 'rpm', 'exc', 'amps', 'pred', 'pct', 'worstPct', 'overallPct', 'status', 'steady',
+        'sessSteady', 'engHours', 'coverage', 'haveCurve', 'ptCount', 'source', 'haveUpload', 'paused', 'refOk',
+        'refDist', 'state', 'sessionMean', 'sessionP10', 'sessionN', 'hiFieldAlert', 'sim', 'syncAgoS', 'gAmps',
+        'tSlope', 'logState', 'logRows', 'logSecLeft', 'logCap', 'sweepState', 'sweepRev', 'latchPct'],
+        settings: ['altRpmLineRms', 'altRpmRateMax', 'altRpmSec', 'altDutyLineRms', 'altDutySlewMax', 'altDutySec',
+        'altVbusTol', 'altVbusSec', 'altThermDegF', 'altThermSec', 'altTrendBuckSec', 'altTrendFeedSec',
+        'altTrendMinSamp', 'altAmpsLinePct', 'altAmpsLineFlrA', 'altAmpsSlewPct', 'altAmpsSlewFlrA', 'altAmpsSec',
+        'altEmaSec', 'altLeadSec', 'altMinRunSec', 'altRefRadius', 'altMinAmps', 'altMinDuty', 'altSafetyMargin',
+        'altIdwPower', 'altPruneK', 'altRidgeFrac', 'altRiskThresh', 'altHiFieldPct', 'altLowOutAmps',
+        'altHiFieldSec', 'altPaused']},
+    '/perfschema': {live: ['valid', 'ws', 'wa', 'spd', 'best', 'pct', 'pitchStd', 'src', 'coverage', 'ptCount', 'source',
+        'paused', 'sim', 'syncAgoS', 'sailHours', 'steady', 'settleSec', 'state'], motorLive: ['valid', 'rpm',
+        'headwind', 'spd', 'best', 'pct', 'src', 'coverage', 'ptCount', 'source', 'paused', 'pitchStd', 'motorHours',
+        'steady', 'settleSec', 'state'], settings: ['perfWsTol', 'perfWsSec', 'perfWaTol', 'perfWaSec', 'perfSeaTol',
+        'perfSeaSec', 'perfSeaWinSec', 'perfRpmTol', 'perfRpmSec', 'perfHwTol', 'perfHwSec', 'perfMinBoatSpeed',
+        'perfMinWindSpeed', 'perfRpmFloor', 'perfSafetyMargin', 'perfIdwPower', 'perfPruneK', 'perfRefRadius',
+        'perfRidgeFrac', 'perfRiskThresh', 'perfSpeedSrc', 'perfFoldSymmetric', 'perfPaused']},
+    '/kneeLearnState': {enable: 1, marginPct: 2, onsetA: 4, reArmA: 8, stepPct: 0.5, dwellSec: 20, tempComp: 1, tempRefF: 77,
+        maxFloorPct: 25, rpmTolPct: 6, tempTolF: 15, dutyTolPct: 3, activeBin: -1, floorActive: 0, steady: 0,
+        bins: [{rpm: 500, floor: 15, knee: 0, frozen: 0, learnT: 0, ageS: -1}, {rpm: 900, floor: 13, knee: 11,
+        frozen: 1, learnT: 4, ageS: 172800}, {rpm: 1300, floor: 12, knee: 10, frozen: 1, learnT: 5, ageS: 259200},
+        {rpm: 1700, floor: 11, knee: 9, frozen: 1, learnT: 6, ageS: 345600}, {rpm: 2100, floor: 10, knee: 8,
+        frozen: 0, learnT: 7, ageS: 432000}, {rpm: 2500, floor: 9, knee: 7, frozen: 0, learnT: 8, ageS: 518400},
+        {rpm: 2900, floor: 8, knee: 6, frozen: 0, learnT: 9, ageS: 604800}, {rpm: 3300, floor: 15, knee: 0,
+        frozen: 0, learnT: 0, ageS: -1}, {rpm: 3700, floor: 15, knee: 0, frozen: 0, learnT: 0, ageS: -1}, {rpm: 4100,
+        floor: 15, knee: 0, frozen: 0, learnT: 0, ageS: -1}]},
+    '/zerologstate': () => { const now = Math.floor(Date.now() / 1000) - 600;
+        return { enable: 1, cap: 288, count: 203, oldest: now - 1119600, newest: now }; },
+    '/batteryHealth': () => { const now = Math.floor(Date.now() / 1000), day = 86400;
+        return {state: 0, reason: '', elapsedMs: 0, totalMs: 0, low: 20, delta: 60, dwellMs: 4000, edges: 6,
+            lastDcir: 6.21, results: [{epoch: now - 115 * day, dcir: 5.84, tF: 74, delta: 60, spread: 0.21, edges: 6,
+            dwell: 4000, soc: 71, v: 13.28, low: 20}, {epoch: now - 62 * day, dcir: 5.97, tF: 79, delta: 60,
+            spread: 0.26, edges: 6, dwell: 4000, soc: 66, v: 13.24, low: 20}, {epoch: now - 21 * day, dcir: 6.1,
+            tF: 83, delta: 60, spread: 0.33, edges: 5, dwell: 4000, soc: 74, v: 13.3, low: 20},
+            {epoch: now - 2 * day, dcir: 6.21, tF: 81, delta: 60, spread: 0.24, edges: 6, dwell: 4000, soc: 69,
+            v: 13.26, low: 20}], cap: [{epoch: now - 140 * day, pct: 99.2, ah: 397, conf: 1}, {epoch: now - 96 * day,
+            pct: 98.4, ah: 394, conf: 1}, {epoch: now - 55 * day, pct: 97.9, ah: 392, conf: 0},
+            {epoch: now - 18 * day, pct: 97.1, ah: 388, conf: 1}], capLastUpd: now - 18 * day, capAnchored: 0,
+            capAnchorSoC: 0, capRestMin: 42, capDvdt: 0.8, capCfg: {capacityAh: 400, refMode: 0, restFrac: 0.6,
+            restFloor: 30, settleRate: 2, socLowMax: 30, fullSoc: 99, minSpan: 40, chgEff: 0.99, tempNorm: 1,
+            tempCoeff: 0.5, tempRef: 25}, ocv: [13.6, 13.4, 13.3, 13.2, 13.1, 13, 12.9, 12.8, 12.5, 12, 10],
+            ocvSoc: [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0]}; }
+};
+const DEMO_ALT_SETTINGS = [48, 250, 3, 0.4, 1, 3, 0.2, 3, 4, 20, 3600, 10, 2, 0.5, 0.4, 1, 0.15, 3, 0.5, 0.4, 2, 2, 2, 5, 0, 2, 6, 0.1,
+    0.15, 80, 10, 30, 0];
+const DEMO_PERF_SETTINGS = [2, 3, 12, 3, 1, 5, 20, 100, 3, 2, 3, 0.5, 2, 50, 0, 2, 6, 2, 0.1, 0.15, 1, 1, 0];
+// In the App Store demo, the stand-in's answer to a JSON read (a promise); null otherwise, so the caller's own fetch runs.
+// The callers keep their fetch(buildURL('/path')) literal: gx_app/gen_settings.py finds HTTP echoes by it.
+function demoJson(path) {
+    const demo = DEMO_MODE && DEMO_JSON[path];
+    if (!demo) return null;
+    return Promise.resolve(typeof demo === 'function' ? demo() : JSON.parse(JSON.stringify(demo)));
+}
+// AltSettings / PerfSettings every 15 s (the website demo's cadence), once their schemas are in.
+function demoSendAltPerf() {
+    window._demoLastAltPerf = Date.now();
+    Promise.all([altSchema || fetchAltSchema(), perfSchema || fetchPerfSchema()]).then(() => {
+        if (window._altSettingsHandler) window._altSettingsHandler({ data: DEMO_ALT_SETTINGS.join(',') });
+        if (window._perfSettingsHandler) window._perfSettingsHandler({ data: DEMO_PERF_SETTINGS.join(',') });
+    });
+}
+// A settings write the stand-in regulator applies as the firmware would: an integer setting it echoes in CSV3 at once.
+function demoSettingWrite(query) {
+    if (!g_demoCsv3) return;
+    new URLSearchParams(query).forEach((v, k) => { if (CSV3_FIELDS.includes(k) && /^-?\d+$/.test(v)) g_demoCsv3[k] = Number(v); });
+    setTrackedTimeout(demoSendCsv3, 100);
+}
+
 function startDemoData() {
     sendFakeCSVData();
 
@@ -6326,6 +6622,11 @@ function startDemoData() {
 
 function sendFakeCSVData() {
     window.lastEventTime = Date.now();
+    // CSV3 at connect and every 60 s, TS every 3 s, as the firmware sends them: the Setup echoes and the sensor ages.
+    if (!g_demoCsv3) g_demoCsv3 = Object.assign({}, DEMO_CSV3);
+    if (!window._demoLastCsv3 || Date.now() - window._demoLastCsv3 >= 60000) demoSendCsv3();
+    if (!window._demoLastTs || Date.now() - window._demoLastTs >= 3000) demoSendTs();
+    if (!window._demoLastAltPerf || Date.now() - window._demoLastAltPerf >= 15000) demoSendAltPerf();
 
     if (window.sensorAges) {
         window.sensorAges.ibv = 0;
@@ -6344,12 +6645,13 @@ function sendFakeCSVData() {
     // mismatch, so build from the registry, never a positional array. Values are fixed-point as
     // firmware sends them (×100 unless noted); unnamed keys default to 0.
     const t = Date.now() / 1000;
+    const on = g_demoOnOff === 1;                             // master switch OFF: no field, no alternator current
     const rpm = 1900 + 300 * Math.sin(t / 19) + (Math.random() * 60 - 30);
-    const ampsClean = 55 + 9 * Math.sin(t / 13);              // filtered/PV traces ride this
+    const ampsClean = on ? 55 + 9 * Math.sin(t / 13) : 0;     // filtered/PV traces ride this
     const amps = ampsClean + (Math.random() * 2 - 1);         // raw sensor adds jitter
     const voltsClean = 13.9 + 0.25 * Math.sin(t / 37);
     const volts = voltsClean + (Math.random() * 0.02 - 0.01);
-    const duty = 40 + 7 * Math.sin(t / 13 + 0.6) + Math.random();
+    const duty = on ? 40 + 7 * Math.sin(t / 13 + 0.6) + Math.random() : 0;
     const spl = 59 + Math.sin(t / 97);                        // post-limit setpoint, just under the 60 A target
     const csv1 = {
         AlternatorTemperatureF: Math.round((168 + 8 * Math.sin(t / 53)) * 100),
@@ -6362,7 +6664,8 @@ function sendFakeCSVData() {
         Bcur: Math.round((amps - 22) * 100),   // house loads eat part of the output
         VictronVoltage: Math.round((volts - 0.03) * 100),
         FreeHeap: 148000,
-        fieldActiveStatus: 1,
+        OnOff: g_demoOnOff,
+        fieldActiveStatus: on ? 1 : 0,
         // CC current-PID group (PID tuning plot): PV = filtered amps chasing the limited setpoint
         setpointLimited: Math.round(spl * 100),
         uTargetAmps: 6000,
@@ -6378,7 +6681,7 @@ function sendFakeCSVData() {
         cvKdTrim: Math.max(0, Math.round(150 * Math.sin(t / 7) - 100)),   // occasional small D back-off
         cvKdFiltV: Math.round(voltsClean * 100),
         vvout: Math.round(duty / 100 * volts * 100),
-        iiout: Math.round((2.0 + duty / 25) * 100),
+        iiout: on ? Math.round((2.0 + duty / 25) * 100) : 0,
         Ignition: 1,
         // iExcess detector sparkline (A ×10): excess breathing well under its threshold
         mExcessEma: Math.round(6 + 4 * Math.sin(t / 17)),
@@ -6412,10 +6715,71 @@ function sendFakeCSVData() {
             fieldHeatDutyCeil: 9900,
             fieldCeilBind: 0,
             fieldRcOhm: 212,             // ohm x100: 2.00 ohm demo coil corrected to ~168 °F, less the 12 % margin
+            // Charge-limit follow off with no limit heard (firmware's none values); 0 would read 0.00 V from addr 0
+            dvccRxCvl: -2000000000,
+            dvccRxCcl: -2000000000,
+            dvccRxSrcAddr: 255,
         };
         const v2 = CSV2_FIELDS.map(k => csv2[k] !== undefined ? csv2[k] : 0);
         csv2Handler({ data: v2.length + ',' + v2.join(',') });
     }
+
+    // GxDevices on the firmware's 5 s cadence while a dashboard is connected
+    if (!window._demoLastGx || Date.now() - window._demoLastGx >= 5000) {
+        window._demoLastGx = Date.now();
+        demoGxPost(t, ampsClean);
+    }
+}
+
+// A Victron GX on the link and the device list its XREG-010 app posts: the website demo's devices (demo-shim.js
+// buildGxDevices, same names, products, kinds and signs) on this boat's numbers. The house loads are the 22 A in Bcur
+// plus what the solar carries, so the shunt reads Bcur; the inverter, fridge and Orion are part of those loads.
+const demoGx = { t0: 0, inv: { on: false, next: 30 + Math.random() * 60, draw: 0 },
+    fridge: { on: true, next: 40 + Math.random() * 120, draw: 3 + Math.random() * 2 }, orion: { on: false, next: 45 + Math.random() * 75, draw: 0 } };
+
+// Switches at the end of each on or off span (s); returns the draw (A) picked for this on span, 0 while off.
+function demoGxCycle(c, s, onS, offS, drawA) {
+    if (s >= c.next) {
+        c.on = !c.on;
+        const span = c.on ? onS : offS;
+        c.next = s + span[0] + Math.random() * (span[1] - span[0]);
+        c.draw = drawA[0] + Math.random() * (drawA[1] - drawA[0]);
+    }
+    return c.on ? c.draw : 0;
+}
+
+function demoGxPost(t, ampsClean) {
+    const now = performance.now() / 1000;
+    if (!demoGx.t0) demoGx.t0 = now;
+    const s = now - demoGx.t0;
+    const q = a => Math.round(a * 10) / 10;
+    const solar = q(22 + 2.4 * Math.sin(t / 50));
+    const bimini = q(solar * (0.58 + 0.1 * Math.sin(t / 300)));
+    let spare = 22 + solar - 4;   // 4 A of the house loads (lights, electronics) are on no meter
+    const take = a => { a = q(Math.max(0, Math.min(a, spare))); spare -= a; return a; };
+    const fridgeA = demoGxCycle(demoGx.fridge, s, [120, 300], [150, 360], [3, 5]);
+    const fridge = take(fridgeA ? fridgeA + (Math.random() - 0.5) * 0.3 : 0);
+    const orionA = demoGxCycle(demoGx.orion, s, [60, 240], [240, 720], [2.5, 6]);
+    const orion = take(orionA ? orionA + (Math.random() - 0.5) * 0.3 : 0);
+    const invA = demoGxCycle(demoGx.inv, s, [150, 480], [300, 900], [4, 9]);
+    const inv = take(invA ? invA + (Math.random() - 0.5) * 0.8 : 0);
+    // [kind, name, product ('' = the name), amps (+ into the batteries)]; the shore charger is remembered but off at sea
+    const d = [
+        ['battery', 'SmartShunt 500A/50mV', '', 1.004 * (ampsClean - 22) + 0.04 + (Math.random() - 0.5) * 0.06],
+        ['solar', 'Bimini array', 'SmartSolar MPPT 100/30', bimini],
+        ['solar', 'Deck array', 'SmartSolar MPPT 75/15', solar - bimini],
+        ['charger', 'Phoenix Smart IP43 Charger 12/30', '', 0],
+        ['inverter', 'Phoenix Inverter 12/800 Smart', '', -inv],
+        ['dcdc', 'Start battery charger', 'Orion XS 12/12-50A', -orion],
+        ['dcload', 'Fridge', 'SmartShunt 500A/50mV', -fridge]
+    ].map(([k, n, p, a]) => {
+        const off = k === 'charger';
+        return { k, n, p, a: q(a), age: off ? null : q(0.2 + Math.random() * 1.4), on: off ? 0 : 1 };
+    });
+    g_gxLastStreams = 1;
+    g_gxState = { streams: [{ ip: '192.168.1.36', upS: 9300 + s }] };
+    renderGxCard();
+    gxDevOnEvent(JSON.stringify({ v: 1, ageMs: Math.round(20 + Math.random() * 180), everyS: 5, d }));
 }
 
 
@@ -9113,9 +9477,9 @@ function updateAllEchosOptimized(data) {
     // matches, so a walked-away edit can't block sync forever.
     const selectSyncs = updateAllEchosOptimized._selectSyncs || (updateAllEchosOptimized._selectSyncs = [
         { key: 'AmpSensorRange',        name: 'AmpSensorRange' },
-        { key: 'timeSourceMode',        name: 'timeSourceMode' },
-        { key: 'gpsPositionSource',     name: 'gpsPositionSource' },
-        { key: 'speedSourceMode',       name: 'speedSourceMode' },
+        { key: 'timeSourceMode',        name: 'timeSourceMode',    sends: true },
+        { key: 'gpsPositionSource',     name: 'gpsPositionSource', sends: true },
+        { key: 'speedSourceMode',       name: 'speedSourceMode',   sends: true },
         { key: 'UseFloat',              name: 'UseFloat' },
         { key: 'n2kTempSource',         name: 'n2kTempSource' },
         { key: 'n2kExtraTempSource',    name: 'n2kExtraTempSource' },
@@ -9125,10 +9489,12 @@ function updateAllEchosOptimized(data) {
         { key: 'FieldWiring',           name: 'FieldWiring' },
         { key: 'ShuntLead',             name: 'ShuntLead' },
     ]);
-    selectSyncs.forEach(({ key, name }) => {
+    selectSyncs.forEach(({ key, name, sends }) => {
         if (key in data) {
             const sel = document.querySelector(`select[name="${name}"]`);
             if (!sel) return;
+            // A select that sends on change (selectWrite) has no unsent edit to protect, only a write in flight.
+            if (sends) { if (!echoHeld(key, String(data[key]), data.stateRevision)) sel.value = String(data[key]); return; }
             if (!sel.dataset.syncGuard) {
                 sel.dataset.syncGuard = '1';
                 sel.addEventListener('change', () => { sel.dataset.pendingEdit = '1'; });
@@ -9141,9 +9507,9 @@ function updateAllEchosOptimized(data) {
         }
     });
 
-    if ('BatteryVoltageSource' in data) syncSegmentedSelect('BatteryVoltageSource', data.BatteryVoltageSource);
-    if ('NMEA0183Baud' in data) syncSegmentedSelect('NMEA0183Baud', data.NMEA0183Baud);
-    if ('NMEA0183Invert' in data) syncSegmentedSelect('NMEA0183Invert', data.NMEA0183Invert);
+    if ('BatteryVoltageSource' in data) segSelectEcho('BatteryVoltageSource', data.BatteryVoltageSource, data.stateRevision);
+    if ('NMEA0183Baud' in data) segSelectEcho('NMEA0183Baud', data.NMEA0183Baud, data.stateRevision);
+    if ('NMEA0183Invert' in data) segSelectEcho('NMEA0183Invert', data.NMEA0183Invert, data.stateRevision);
 
     // Time-window buttons: the current setting is shown by highlighting its button
     if ('plotTimeWindow' in data) {
@@ -9192,8 +9558,116 @@ let lastValues = new Map(); // Cache for DOM updates
 // DOM update batching system
 let pendingDOMUpdates = new Map();
 let lastSeenRev = 0;
-let pendingToggles = new Map(); // {dataKey: {desiredValue, baseRev}}
+let pendingToggles = new Map(); // {dataKey: {desiredValue, baseRev, setAt}}
 let domUpdateScheduled = false;
+
+// Newest value of every field handed to updateTogglesFromData (CSV1/CSV2/CSV3), painted or held: the regulator's
+// last report, which a control goes back to when its write does not land.
+const g_echoLast = Object.create(null);
+// Past the device's 20 s stalled-client hold, a frame still carrying the press-time stamp is not one a write waits on.
+const ECHO_HOLD_MAX_MS = 30000;
+
+// True while an echo must not repaint a control whose write is in flight; clears the pending entry once the
+// regulator has answered. Every /get write bumps stateRevision before it replies (the HiLow reconciler relies on
+// this too), so a frame still stamped with the revision seen at the press was built before the write landed. Any
+// other stamp, newer or lower (reboot), is the regulator's answer, agreeing or not. Unstamped: 2.5 s from the first echo.
+function echoHeld(key, value, frameRev) {
+    const pending = pendingToggles.get(key);
+    if (!pending) return false;
+    if (value !== pending.desiredValue) {
+        const rev = Number(frameRev);
+        if (frameRev !== undefined && Number.isFinite(rev) && pending.setAt !== undefined) {
+            if (rev === pending.baseRev && Date.now() - pending.setAt < ECHO_HOLD_MAX_MS) return true;
+        } else {
+            if (pending.deadlineMs === undefined) pending.deadlineMs = Date.now() + 2500;
+            if (Date.now() <= pending.deadlineMs) return true;
+        }
+    }
+    pendingToggles.delete(key);
+    return false;
+}
+
+// The write path for every settings control that shows a state (switch, segment, radio, auto-sending select). A fetch,
+// not the hidden-iframe post, so the answer is read: a refusal or no answer puts the control back to the regulator's
+// last report (repaint) and says why. marks = {echo key: value the echo will carry once the write lands}.
+const CONTROL_WRITE_ANSWER_MS = 5000;
+let g_controlWriteSeq = 0;
+const g_controlWriteNewest = Object.create(null);   // echo key -> seq of its newest press; only that press reports
+function controlWrite(marks, query, repaint, onOk) {
+    if (DEMO_MODE) { demoSettingWrite(query); return true; }   // App Store demo: its stand-in regulator takes the write
+    if (!settingsUnlocked) { repaint(); xAlert('Please unlock controls first'); return false; }
+    const keys = Object.keys(marks);
+    const seq = ++g_controlWriteSeq;
+    const mine = {};
+    keys.forEach(k => {
+        mine[k] = { desiredValue: marks[k], baseRev: lastSeenRev, setAt: Date.now() };
+        pendingToggles.set(k, mine[k]);
+        g_controlWriteNewest[k] = seq;
+    });
+    const newest = () => keys.every(k => g_controlWriteNewest[k] === seq);
+    const fail = say => {
+        const ours = keys.filter(k => pendingToggles.get(k) === mine[k]);
+        ours.forEach(k => pendingToggles.delete(k));
+        if (ours.length) repaint();
+        if (newest()) say();
+    };
+    fetchWithTimeout(buildURL('/get?' + query), {}, CONTROL_WRITE_ANSWER_MS)
+        .then(r => {
+            if (r.ok) { if (onOk && newest()) onOk(r); return; }
+            fail(() => controlWriteRefusedSay(r));
+        })
+        .catch(() => fail(() => xAlert('The regulator did not answer, so the change most likely never reached it. '
+                                       + 'The control shows the setting the regulator last reported.', 'Setting: no answer')));
+    return true;
+}
+function controlWriteRefusedSay(r) {
+    if (r.status === 423) return;   // the fetch wrapper has already said why (regDemoNotice)
+    if (r.status === 403) {
+        syncArmState();   // settingsUnlocked only mirrors the device's window: a 403 means it is locked (reboot, another client)
+        xAlert('The regulator refused this: its controls are locked. Press Unlock Controls, then try again.', 'Setting NOT changed');
+    } else if (r.status === 409) {
+        xAlert('That command reached a different regulator than the one shown here, and it refused it. Open this regulator at its own address (Setup ▸ System ▸ This Regulator) and try again.',
+               'Wrong regulator');
+    } else {
+        const say = t => xAlert('The regulator refused this' + (t ? ': ' + t : ' (HTTP ' + r.status + ').'), 'Setting NOT changed');
+        if (r.status === 503) r.text().then(t => say(String(t || '').trim())).catch(() => say(''));
+        else say('');
+    }
+}
+
+// A settings switch. The browser has already flipped it, so checked IS the position chosen. A caller that waited on a
+// dialog asserts the position first (an echo may have repainted the switch while the dialog was open). Returns true
+// when the write went out. gx_app/gen_settings.py reads the handlers that call this to learn what each switch sends.
+function handleUserToggle(checkboxId, hiddenInputId, dataKey) {
+    const cb = document.getElementById(checkboxId);
+    const hidden = document.getElementById(hiddenInputId);
+    if (!cb || !hidden) return false;
+    const on = cb.checked;
+    hidden.value = on ? '1' : '0';
+    syncSegmented(checkboxId);
+    return controlWrite({ [dataKey]: on ? 1 : 0 }, hidden.name + '=' + hidden.value,
+                        () => toggleRepaint(dataKey, checkboxId, !on));
+}
+// Repaints a switch (and every mirror of it) from the regulator's last report through the echo painter itself, so the
+// painter's side effects follow; before any report, the position it had before the press.
+const TOGGLE_ECHO_FIELD = { BattMonVe: 'BattMonSrc', BattMonN2k: 'BattMonSrc' };
+function toggleRepaint(dataKey, checkboxId, fallbackOn) {
+    pendingToggles.delete(dataKey);
+    if ((TOGGLE_ECHO_FIELD[dataKey] || dataKey) in g_echoLast) echoReplay();
+    else {
+        const cb = document.getElementById(checkboxId);
+        if (cb) { cb.checked = !!fallbackOn; syncSegmented(checkboxId); }
+    }
+    syncCvDependentVis();
+}
+// Re-runs the settings painter on the last report. Whole, because some blocks read several fields at once (the no-shunt
+// gate, the CV gain card); minus the stamp and every field another write is still waiting on, so those stay held.
+function echoReplay() {
+    const f = Object.assign(Object.create(null), g_echoLast);
+    delete f.stateRevision;
+    pendingToggles.forEach((p, k) => { delete f[TOGGLE_ECHO_FIELD[k] || k]; });
+    updateTogglesFromData(f);
+}
 
 
 //feedback on button clicking
@@ -9252,11 +9726,15 @@ let g_onOffDevice = null;   // last OnOff the regulator reported (a CSV1 frame, 
 const g_clientTabId = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
 let g_clientWriteN = 0;
 function clientWriteTag() { return '&src=' + g_clientTabId + '&n=' + (++g_clientWriteN); }
+// One n sequence per tab (each firmware guard needs it rising), but "newer press" is per control: a Manual/Auto
+// press must not cancel an in-flight OFF's retries, nor an OFF strand a refused Manual/Auto press unrepainted.
+const g_controlNewestN = Object.create(null);   // 'OnOff' / 'ManualFieldToggle' -> n of that control's newest press
 
 // A write that never arrives looks like a refusal from here, and the link drops whole requests while
 // looking healthy, so silent failures are resent. Safe because (1) the URL and its n are built ONCE by
-// the caller, so the firmware's per-tab guard discards a repeat, and (2) a newer press (myN !== g_clientWriteN)
-// stops the retry. Only SILENT failures retry; any HTTP status is an answer and is never re-sent.
+// the caller, so the firmware's per-tab guard discards a repeat, and (2) a newer press of the same control
+// (myN !== g_controlNewestN[control]) stops the retry. Only SILENT failures retry; any HTTP status is an
+// answer and is never re-sent.
 const CONTROL_WRITE_TRIES = 3;
 const CONTROL_WRITE_TIMEOUT_MS = 1600;   // ~10x the worst observed reply; 3 tries stay under 5 s
 // Hedge: on the first attempt only, send a second copy of the same url after 500 ms unanswered. 500 ms
@@ -9265,7 +9743,8 @@ const CONTROL_WRITE_TIMEOUT_MS = 1600;   // ~10x the worst observed reply; 3 tri
 const CONTROL_WRITE_HEDGE_MS = 500;
 // onDeviceState (optional): called at most once with the 0/1 the regulator put in its reply body. Any
 // copy's answer serves — they carry the same command. See alternatorSet for why the reply is painted.
-function sendControlWrite(url, myN, onDeviceState) {
+function sendControlWrite(url, control, myN, onDeviceState) {
+    const superseded = () => myN !== g_controlNewestN[control];
     let attempt = 0;
     let reported = false;
     const readState = r => {
@@ -9290,13 +9769,13 @@ function sendControlWrite(url, myN, onDeviceState) {
             fetchWithTimeout(url, {}, CONTROL_WRITE_TIMEOUT_MS).then(onAnswer, onSilence);
             if (attempt === 1) {
                 setTrackedTimeout(() => {
-                    if (done || myN !== g_clientWriteN) return;   // answered, or a newer press owns the outcome
+                    if (done || superseded()) return;   // answered, or a newer press owns the outcome
                     inFlight++;
                     fetchWithTimeout(url, {}, CONTROL_WRITE_TIMEOUT_MS).then(onAnswer, onSilence);
                 }, CONTROL_WRITE_HEDGE_MS);
             }
         }).catch(err => {
-            if (myN !== g_clientWriteN) return { superseded: true };
+            if (superseded()) return { superseded: true };
             if (attempt >= CONTROL_WRITE_TRIES) throw err;
             return once();
         });
@@ -9323,7 +9802,7 @@ function paintOnOff(v, pendingV) {
 
 function alternatorSet(want) {
     want = want ? 1 : 0;
-    if (DEMO_MODE) { g_onOffDevice = want; paintOnOff(want); return; }
+    if (DEMO_MODE) { g_demoOnOff = want; g_onOffDevice = want; paintOnOff(want); return; }
     pendingToggles.set('OnOff', { desiredValue: want, baseRev: lastSeenRev });
     paintOnOff(g_onOffDevice, want);
     // Drop the pending mark and show the regulator's state as last reported. Used for every non-success:
@@ -9331,12 +9810,13 @@ function alternatorSet(want) {
     const settle = () => { pendingToggles.delete('OnOff'); paintOnOff(g_onOffDevice); };
     const url = buildURL('/get?OnOff=' + want + clientWriteTag());
     const myN = g_clientWriteN;   // the press counter clientWriteTag() just minted for THIS url
+    g_controlNewestN.OnOff = myN;
     // The write reply carries the regulator's OnOff after the handler ran (the /get handler in 3_functions.ino):
     // device truth on a fresh connection, while the stream can sit 1.5-4.5 s in an lwIP retransmit. So the reply
     // paints too, only for an exact 0/1 and only while this is the tab's newest press. pendingToggles stays set so
     // echoReconcile shields the paint from frames built before the write; the next agreeing frame settles it.
     const paintFromReply = v => {
-        if (myN !== g_clientWriteN) return;   // a newer press owns the paint
+        if (myN !== g_controlNewestN.OnOff) return;   // a newer press owns the paint
         const pending = pendingToggles.get('OnOff');
         if (!pending) return;                 // the stream already settled this press, and it is fresher than this reply
         // Order this paint against the stream on the REGULATOR's clock: frames stamped (sendMs) before device-now
@@ -9356,10 +9836,10 @@ function alternatorSet(want) {
         g_onOffDevice = v;
         paintOnOff(g_onOffDevice);
     };
-    sendControlWrite(url, myN, paintFromReply)
+    sendControlWrite(url, 'OnOff', myN, paintFromReply)
         .then(r => {
             if (r.superseded) return;   // a newer press is in flight and owns the outcome
-            if (myN !== g_clientWriteN) return;   // same, for an answer that DID arrive: it is the old press's outcome, not this one's
+            if (myN !== g_controlNewestN.OnOff) return;   // same, for an answer that DID arrive: it is the old press's outcome, not this one's
             if (r.ok) return;
             settle();
             if (r.status === 403) {
@@ -9517,7 +9997,12 @@ const resetReasonLookup = {
     13: "CPU lockup (double exception)",
     14: "USB reset",
     15: "JTAG reset",
-    16: "eFuse error"
+    16: "eFuse error",
+    17: "Restart to load an import",
+    18: "Restart after Wi-Fi setup",
+    19: "Restart after Wi-Fi set over USB",
+    20: "Restart to load a cloud settings push",
+    21: "Restart into the factory installer for an update"
 };
 
 
@@ -12650,8 +13135,6 @@ function huntGovToggle(el, checkboxId, hiddenId, mirrorId) {
     if (!handleUserToggle(checkboxId, hiddenId, 'HuntGovEnable')) return;
     const mirror = document.getElementById(mirrorId);
     if (mirror) mirror.checked = el.checked;
-    el.form.submit();
-    submitMessage();
 }
 
 function huntGovLiveOnCsv1(data) {
@@ -14310,7 +14793,7 @@ function broadcastThemeToCloudIframes() {
 // ============================================
 // CLOUD FEATURES - Leaderboards
 async function loadLeaderboardsInIframe() {
-    if (DEMO_MODE || g_regDemo) { demoFillCloudPanes(); return; }   // static mockup; iframe needs a device token (regulator demo mode: no cloud)
+    if (DEMO_MODE || g_regDemo) { demoFillCloudPanes(); demoCloudIframe('leaderboards', 'leaderboards.html'); return; }   // the page's demo mode; the real one needs a device token (regulator demo mode: no cloud)
     const statusEl = document.getElementById('leaderboards-status');
     const iframe = document.getElementById('leaderboards-iframe');
 
@@ -14344,7 +14827,7 @@ async function loadLeaderboardsInIframe() {
 // ===== CLOUD FEATURES - Fleet Stats =====
 
 async function loadFleetStatsInIframe() {
-    if (DEMO_MODE || g_regDemo) { demoFillCloudPanes(); return; }
+    if (DEMO_MODE || g_regDemo) { demoFillCloudPanes(); demoCloudIframe('fleetstats', 'fleet-stats.html'); return; }
     const statusEl = document.getElementById('fleetstats-status');
     const iframe = document.getElementById('fleetstats-iframe');
 
@@ -14573,7 +15056,13 @@ function resetParameter(parameterName) {
     }
 
     hiddenInput.value = '1';
-    button.closest('form').submit();
+    // Only the reset flag goes: Reset Zero shares its form with the Auto Zero switch, whose hidden value may not be
+    // the regulator's. submit() serializes synchronously, so the fields can come back on the next line.
+    const form = button.closest('form');
+    const others = Array.from(form.elements).filter(el => el.name && el !== hiddenInput && el.name !== 'uid' && el.name !== 'tok' && !el.disabled);
+    others.forEach(el => { el.disabled = true; });
+    form.submit();
+    others.forEach(el => { el.disabled = false; });
     submitMessage();
 }
 
@@ -16379,8 +16868,98 @@ function gxOnCsv4(streams) {
     if (!Number.isFinite(streams) || DEMO_MODE) return;
     const changed = streams !== g_gxLastStreams;
     g_gxLastStreams = streams;
-    if (changed) renderGxCard();
+    if (changed) { renderGxCard(); renderGxDevices(); }
 }
+
+// ── Victron GX devices (Live Data > Integrations) ─────────────────────────────────────
+// The GxDevices event: what the GX's XREG-010 app reads from the GX's devices (its POST /gxDevices, RAM only on the
+// regulator). {v:1, ageMs: ms since the GX posted (null: nothing since boot or a demo switch), everyS: the interval the
+// GX was asked for, d: [{k kind, n name, p product, a amps (+ into the batteries), age reading age s, on 1/0}]}. Sent
+// when the GX posts and on connect; ages run on from there on this page's clock.
+const GX_DEV_KIND = {
+    battery: 'Battery monitor', solar: 'Solar charger', charger: 'Shore charger', multi: 'Inverter/charger',
+    inverter: 'Inverter', dcgenset: 'DC generator', fuelcell: 'Fuel cell', altx: 'Alternator', dcdc: 'DC-DC charger',
+    wind: 'Wind generator', water: 'Water generator', shaft: 'Shaft generator', source: 'DC source', dcload: 'DC load',
+    dcsystem: 'DC system'
+};
+let g_gxDev = null;   // the last GxDevices event, with its receive time (performance.now())
+
+function gxDevOnEvent(text) {
+    let j = null;
+    try { j = JSON.parse(text); } catch (e) { return; }
+    if (!j || j.v !== 1 || !Array.isArray(j.d)) return;
+    g_gxDev = { ageMs: Number.isFinite(j.ageMs) ? j.ageMs : null, everyS: Number(j.everyS) || 30, d: j.d, at: performance.now() };
+    renderGxDevices();
+}
+
+function gxDevAgeText(s) {
+    if (!Number.isFinite(s)) return '\u2014';
+    return s < 10 ? s.toFixed(1) + '\u00A0s' : gxSpanText(s);
+}
+
+function renderGxDevices() {
+    const box = document.getElementById('li_gxDevRows');
+    if (!box) return;
+    const card = document.getElementById('li_gxDev_card');
+    const status = document.getElementById('li_gxDevStatus_ID');
+    const gx = g_gxDev;
+    const sinceS = gx && gx.ageMs !== null ? (gx.ageMs + performance.now() - gx.at) / 1000 : null;
+    const streams = Number.isFinite(g_gxLastStreams) ? g_gxLastStreams : 0;
+    let word, note = '';
+    if (sinceS === null) {
+        word = streams > 0 ? 'no readings' : 'no GX';
+        note = streams > 0 ? 'A Victron GX is connected, but its XREG-010 app sends no device readings. Update the app on the GX.'
+                           : 'No Victron GX connected';
+    } else {
+        word = sinceS > 3 * gx.everyS + 5 ? 'stale' : 'live';
+        if (!gx.d.length) note = 'The GX reports no device that charges the batteries or draws from them.';
+    }
+    if (status && status.textContent !== word) status.textContent = word;
+    if (card) card.style.opacity = (word === 'live') ? '' : '0.6';
+    const rows = note ? [] : gx.d;
+    // rebuilt only when the list's shape changes, so a reading that changes moves nothing else
+    const shape = note ? 'note:' + note : rows.map(r => [r.k, r.n, r.p].join('|')).join('\n');
+    if (box.dataset.shape !== shape) {
+        box.dataset.shape = shape;
+        box.textContent = '';
+        if (note) {
+            const row = document.createElement('div');
+            row.className = 'metric-row';
+            const lab = document.createElement('span');
+            lab.className = 'metric-label';
+            lab.textContent = note;
+            row.appendChild(lab);
+            box.appendChild(row);
+        }
+        rows.forEach(r => {
+            const row = document.createElement('div');
+            row.className = 'metric-row gxdev-row';
+            row.innerHTML = '<span class="metric-label"><span class="gxdev-name"></span><span class="gxdev-sub"></span></span>' +
+                '<span class="metric-value"><span class="gxdev-amps"></span><span class="gxdev-age"></span></span>';
+            row.querySelector('.gxdev-name').textContent = r.n || r.p || GX_DEV_KIND[r.k] || r.k;
+            row.querySelector('.gxdev-sub').textContent = [GX_DEV_KIND[r.k] || r.k, r.n ? r.p : ''].filter(Boolean).join(' \u00B7 ');
+            box.appendChild(row);
+        });
+    }
+    if (note) return;
+    box.querySelectorAll('.gxdev-row').forEach((row, i) => {
+        const r = rows[i];
+        const a = Number(r.a);
+        const amps = (r.a === null || !Number.isFinite(a)) ? '\u2014'
+            : (a <= -0.05 ? '\u2212' : '') + Math.abs(a).toFixed(1) + '\u00A0A';
+        const age = !r.on ? 'not on the GX now' : (r.age === null || !Number.isFinite(Number(r.age))) ? 'no reading'
+            : gxDevAgeText(Number(r.age) + sinceS) + ' old';
+        const ampsEl = row.querySelector('.gxdev-amps'), ageEl = row.querySelector('.gxdev-age');
+        if (ampsEl.textContent !== amps) ampsEl.textContent = amps;
+        if (ageEl.textContent !== age) ageEl.textContent = age;
+    });
+}
+
+// Ages count up between events while the card is on screen
+setTrackedInterval(function () {
+    const box = document.getElementById('li_gxDevRows');
+    if (box && box.offsetParent !== null) renderGxDevices();
+}, 1000);
 
 // ── Regulators on this boat (Setup > System) ──────────────────────────────────────────
 function renderBoatCard() {
@@ -16617,6 +17196,7 @@ function updateGPSDisplay(lat, lon) {
 async function submitCapLimitModeImmediately(desiredValue) {
     const params = new URLSearchParams();
     params.set('capLimitMode', String(desiredValue));
+    if (DEMO_MODE) { demoSettingWrite(params.toString()); return { ok: true, status: 200 }; }
 
     const r = await fetchWithTimeout(buildURL(`/get?${params.toString()}`), {
         method: 'GET',
@@ -16628,11 +17208,13 @@ async function submitCapLimitModeImmediately(desiredValue) {
 
 function handleCapModeToggle(mode) {
     const desiredValue = (mode === 'kw') ? 1 : 0;
+    const was = currentCapMode;
 
-    pendingToggles.set('capLimitMode', {
+    const pending = {
         desiredValue: desiredValue,
         baseRev: lastSeenRev
-    });
+    };
+    pendingToggles.set('capLimitMode', pending);
 
     const modeInput = document.getElementById('capLimitMode_input');
     if (modeInput) modeInput.value = String(desiredValue);
@@ -16640,10 +17222,17 @@ function handleCapModeToggle(mode) {
     setCapMode(mode); // optimistic UI immediately
 
     submitCapLimitModeImmediately(desiredValue).catch(err => {
-        if (!err || !err.deviceRejected) return;   // timeout proves nothing — let the echo reconcile (HiLow pattern)
+        if (pendingToggles.get('capLimitMode') !== pending) return;   // settled already (HiLow pattern)
         pendingToggles.delete('capLimitMode');
-        setCapMode(mode === 'kw' ? 'amps' : 'kw');   // undo the optimistic flip (HiLow pattern)
-        xAlert('Cap mode switch failed — the regulator refused the change. ' + err);
+        // The regulator's last report, not the inverse of the press (HiLow pattern).
+        setCapMode('capLimitMode' in g_echoLast ? (Number(g_echoLast.capLimitMode) === 1 ? 'kw' : 'amps') : was);
+        if (err && err.deviceRejected) {
+            if (/HTTP 403/.test(String(err))) syncArmState();
+            xAlert('Cap mode switch failed — the regulator refused the change. ' + err);
+        } else {
+            xAlert('The regulator did not answer, so the cap mode change most likely never reached it. '
+                   + 'The buttons show the mode the regulator last reported.', 'Cap mode: no answer');
+        }
     });
 }
 
@@ -16651,6 +17240,8 @@ function handleCapModeToggle(mode) {
 function updateTogglesFromData(data) {
     try {
         if (!data) return;
+        for (const k in data) g_echoLast[k] = data[k];
+        const frameRev = data.stateRevision;
 
         const now = Date.now();
         if (data.timeAxisModeChanging !== undefined) {
@@ -16672,26 +17263,12 @@ function updateTogglesFromData(data) {
             if (value === undefined) return;
 
             // Pending toggle handling (prevent bounce / double-toggle)
-            const pending = pendingToggles.get(dataKey);
-            if (pending) {
-                if (pending.deadlineMs === undefined) {
-                    pending.deadlineMs = Date.now() + 2500; // ms to wait for ESP32 echo
-                }
-
-                if (value !== pending.desiredValue) {
-                    // Still waiting → keep optimistic UI, do not overwrite
-                    if (Date.now() <= pending.deadlineMs) {
-                        return;
-                    }
-
-                    pendingToggles.delete(dataKey);
-                } else {
-                    pendingToggles.delete(dataKey);
-                }
-            }
+            if (echoHeld(dataKey, value, frameRev)) return;
 
             const checkbox = document.getElementById(id);
             if (!checkbox) return;
+            const sw = checkbox.closest('label.switch');
+            if (sw) sw.classList.remove('echo-pending');
 
             const shouldBeChecked = (value === 1);
             if (checkbox.checked !== shouldBeChecked) {
@@ -16773,9 +17350,9 @@ function updateTogglesFromData(data) {
             _cvHidden.value = String(data.CVTuningMode);
         }
         // Fast alt-current diagnostic toggles (Pattern B)
-        updateSegToggle("faEnabled", data.faEnabled);
-        updateSegToggle("faAlarmEnable", data.faAlarmEnable);
-        faUpdatePauseBtn(data.faAnomPause);
+        updateSegToggle("faEnabled", data.faEnabled, frameRev);
+        updateSegToggle("faAlarmEnable", data.faAlarmEnable, frameRev);
+        faUpdatePauseBtn(data.faAnomPause, frameRev);
         // Three checkboxes share the same firmware flag — all three reflect data.testProtectionsEnabled.
         updateCheckbox("testProtectionsEnabled_plant_checkbox",   data.testProtectionsEnabled, "testProtectionsEnabled");
         updateCheckbox("testProtectionsEnabled_current_checkbox", data.testProtectionsEnabled, "testProtectionsEnabled");
@@ -16798,7 +17375,7 @@ function updateTogglesFromData(data) {
         updateFloatVisibility();
 
 
-        updateTuningModeUI(data.TuningMode);  // unified Begin/Stop Test button
+        updateTuningModeUI(data.TuningMode, frameRev);  // unified Begin/Stop Test button
         updateCheckbox("socInfoAvailable_checkbox", data.socInfoAvailable, "socInfoAvailable");
         updateCheckbox("CloudFeatures_checkbox", data.CloudFeatures, "CloudFeatures");
         updateCheckbox("RemoteDiagnostics_checkbox", data.RemoteDiagnostics, "RemoteDiagnostics");
@@ -16808,15 +17385,13 @@ function updateTogglesFromData(data) {
         updateUploadNowButtonState();  // re-gray "Upload Now" if cloud just turned off/on
         updateCheckbox("wifiNapEnabled_checkbox", data.wifiNapEnabled, "wifiNapEnabled");
         // SystemID test-type selector (segmented): reflect saved value + show/hide sine params
-        // (skip while the user is actively clicking one of its buttons).
-        if (data.systemIDTestType !== undefined) {
-            const af = document.activeElement;
-            if (!(af && /^systemIDTestType_btn/.test(af.id || ''))) syncSysidTestTypeUI(data.systemIDTestType);
+        // (held while its own write is in flight).
+        if (data.systemIDTestType !== undefined && !echoHeld('systemIDTestType', Number(data.systemIDTestType), frameRev)) {
+            syncSysidTestTypeUI(data.systemIDTestType);
         }
         // Tuning waveform selector (segmented): reflect saved value + show/hide period/sine rows.
-        if (data.tuningWaveform !== undefined) {
-            const af = document.activeElement;
-            if (!(af && /^tuningWaveform_btn/.test(af.id || ''))) syncTuningWaveformUI(data.tuningWaveform);
+        if (data.tuningWaveform !== undefined && !echoHeld('tuningWaveform', Number(data.tuningWaveform), frameRev)) {
+            syncTuningWaveformUI(data.tuningWaveform);
         }
         // The cloud status labels read CloudFeatures_checkbox, echoed above.
         updateCloudStatus();
@@ -16844,15 +17419,13 @@ function updateTogglesFromData(data) {
         updateCheckbox("cvRiseGovEnable_checkbox", data.cvRiseGovEnable, "cvRiseGovEnable");
         updateCheckbox("cvRecovEnable_checkbox", data.cvRecovEnable, "cvRecovEnable");
         updateCheckbox("cvRecovBoostEnable_checkbox", data.cvRecovBoostEnable, "cvRecovBoostEnable");
-        // Pend window stops the echo flickering a just-clicked pill. Number.isFinite before | 0: NaN|0 is 0,
+        // echoHeld stops a pre-write echo flickering a just-clicked pill. Number.isFinite before | 0: NaN|0 is 0,
         // which would tick "Off" for a mode the device never sent.
-        if (Number.isFinite(data.testSlewMode) && Date.now() > _testSlewModePendMs) {
-            const _tsr = document.querySelector('.seg-pill input[name="testSlewMode"][value="' + (data.testSlewMode | 0) + '"]');
-            if (_tsr) _tsr.checked = true;
+        if (Number.isFinite(data.testSlewMode) && !echoHeld('testSlewMode', data.testSlewMode | 0, frameRev)) {
+            slewModePaint('testSlewMode', data.testSlewMode);
         }
-        if (Number.isFinite(data.cvTestSlewMode) && Date.now() > _cvTestSlewModePendMs) {
-            const _cvr = document.querySelector('.seg-pill input[name="cvTestSlewMode"][value="' + (data.cvTestSlewMode | 0) + '"]');
-            if (_cvr) _cvr.checked = true;
+        if (Number.isFinite(data.cvTestSlewMode) && !echoHeld('cvTestSlewMode', data.cvTestSlewMode | 0, frameRev)) {
+            slewModePaint('cvTestSlewMode', data.cvTestSlewMode);
         }
         updateCheckbox("dutySlewEnable_cv_checkbox", data.dutySlewEnable, "dutySlewEnable");
         updateCheckbox("battTempDerateEnable_checkbox", data.battTempDerateEnable, "battTempDerateEnable");
@@ -16864,7 +17437,9 @@ function updateTogglesFromData(data) {
         updateCheckbox("extraTempAlarmLoEnable_checkbox", data.extraTempAlarmLoEnable, "extraTempAlarmLoEnable");
         updateCheckbox("cvGainMode_checkbox", data.cvGainMode, "cvGainMode");
         updateCvGainModeUI(data);
-        if (data.OutputPIDSigSrc !== undefined)  updateTripleBtn('outputPIDSigSrc_', data.OutputPIDSigSrc);
+        if (data.OutputPIDSigSrc !== undefined && !echoHeld('OutputPIDSigSrc', Number(data.OutputPIDSigSrc), frameRev)) {
+            outputPIDSigSrcPaint(Number(data.OutputPIDSigSrc));
+        }
         // // Apply the ESP32 state to the plot system
         // if (data.timeAxisModeChanging !== undefined) {
         //     useTimestamps = (data.timeAxisModeChanging === 1);
@@ -16876,53 +17451,33 @@ function updateTogglesFromData(data) {
     }
 }
 //function to handle user toggle changes without double toggle
-// Manual CC-test slew-mode pill (Current Target Generator). Fetches /get like the other admin toggles; the pend
-// timestamp holds the telemetry echo from clobbering the just-clicked pill for a few seconds.
-let _testSlewModePendMs = 0;
-function setTestSlewMode(v) {
-    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
-    _testSlewModePendMs = Date.now() + 3000;
-    fetchWithTimeout(buildURL('/get?testSlewMode=' + encodeURIComponent(v)), {}, 5000).catch(() => {});
+// Manual CC-test slew-mode pill (Current Target Generator) and its CV twin. The browser has already ticked the pill;
+// echoHeld keeps a pre-write echo off it, and a write that does not land puts it back to the last report.
+function slewModePaint(name, v) {
+    if (!Number.isFinite(Number(v))) return;
+    const r = document.querySelector('.seg-pill input[name="' + name + '"][value="' + (Number(v) | 0) + '"]');
+    if (r) r.checked = true;
 }
-let _cvTestSlewModePendMs = 0;
-function setCvTestSlewMode(v) {
-    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
-    _cvTestSlewModePendMs = Date.now() + 3000;
-    fetchWithTimeout(buildURL('/get?cvTestSlewMode=' + encodeURIComponent(v)), {}, 5000).catch(() => {});
+function slewModeWrite(name, v) {
+    controlWrite({ [name]: v }, name + '=' + encodeURIComponent(v), () => slewModePaint(name, g_echoLast[name]));
 }
+function setTestSlewMode(v) { slewModeWrite('testSlewMode', v); }
+function setCvTestSlewMode(v) { slewModeWrite('cvTestSlewMode', v); }
 
 // "Use as Battery Monitor" is one setting (BattMonSrc) shown as a switch in both the VE.Direct and NMEA 2000 cards:
 // switching one on moves the monitor there, switching the active one off clears it.
 function battMonToggle(cb, src) {
-    const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : {};
-    const cur = Number(c3.BattMonSrc) || 0;
+    const cur = Number(g_echoLast.BattMonSrc) || 0;
+    const wasOn = !cb.checked;
     const val = cb.checked ? src : (cur === src ? 0 : cur);
     cb.form.querySelector('input[name="BattMonSrc"]').value = String(val);
-    pendingToggles.set('BattMonVe', { desiredValue: val === 3 ? 1 : 0, baseRev: lastSeenRev });
-    pendingToggles.set('BattMonN2k', { desiredValue: val === 1 ? 1 : 0, baseRev: lastSeenRev });
     const ve = document.getElementById('BattMonVe_checkbox'), nk = document.getElementById('BattMonN2k_checkbox');
     if (ve) ve.checked = val === 3;
     if (nk) nk.checked = val === 1;
-    cb.form.submit();
-    submitMessage();
-}
-
-function handleUserToggle(checkboxId, hiddenInputId, dataKey) {
-    const checkbox = document.getElementById(checkboxId);
-    const hiddenInput = document.getElementById(hiddenInputId);
-
-    if (checkbox && hiddenInput) {
-        const newValue = checkbox.checked ? '1' : '0';
-        hiddenInput.value = newValue;
-
-        pendingToggles.set(dataKey, {
-            desiredValue: parseInt(newValue),
-            baseRev: lastSeenRev
-        });
-
-        return true;
-    }
-    return false;
+    controlWrite({ BattMonVe: val === 3 ? 1 : 0, BattMonN2k: val === 1 ? 1 : 0 }, 'BattMonSrc=' + val, () => {
+        pendingToggles.delete('BattMonN2k');
+        toggleRepaint('BattMonVe', cb.id, wasOn);
+    });
 }
 
 // Deep-link to Setup > Alternator > RPM Table and flash the first-row Limit (A) box. The box shows the
@@ -17325,6 +17880,7 @@ let currentChargeRateMode = 'high'; // tracks active mode; updated by setChargeR
 async function submitChargeRateModeImmediately(desiredValue) {
     const params = new URLSearchParams();
     params.set('HiLow', String(desiredValue));
+    if (DEMO_MODE) { demoSettingWrite(params.toString()); return { ok: true, status: 200 }; }
     const r = await fetchWithTimeout(buildURL(`/get?${params.toString()}`), { method: 'GET', cache: 'no-store' }, 4000);
     // deviceRejected marks the ONLY case that proves the device did not act. A timeout/abort out of
     // fetchWithTimeout proves nothing — callers must not report it as a refusal.
@@ -17351,15 +17907,24 @@ function setChargeRateMode(mode) {
 
 function handleChargeRateModeToggle(mode) {
     const desiredValue = (mode === 'low') ? 0 : 1;
-    pendingToggles.set('HiLow', { desiredValue: desiredValue, baseRev: lastSeenRev });
+    const was = currentChargeRateMode;
+    const pending = { desiredValue: desiredValue, baseRev: lastSeenRev };
+    pendingToggles.set('HiLow', pending);
     setChargeRateMode(mode); // optimistic UI immediately
     submitChargeRateModeImmediately(desiredValue).catch(err => {
-        // Only a refusal (403) proves the mode did not move; a timeout usually still applies. Leave the
-        // pending entry for the CSVData3 HiLow reconciler (accepts the device value after 2.5 s).
-        if (!err || !err.deviceRejected) return;
+        // Settled already (the echo confirmed it, or a newer press owns it): nothing to undo.
+        if (pendingToggles.get('HiLow') !== pending) return;
         pendingToggles.delete('HiLow');
-        setChargeRateMode(mode === 'low' ? 'high' : 'low');   // undo the optimistic flip
-        xAlert('Charge rate switch failed — the regulator refused the change. ' + err);
+        // Show the mode the regulator last reported, never the inverse of the press: a press on the mode already
+        // active would otherwise paint the other one. A timeout that did land is repainted by its own CSV3 echo.
+        setChargeRateMode('HiLow' in g_echoLast ? (Number(g_echoLast.HiLow) === 0 ? 'low' : 'high') : was);
+        if (err && err.deviceRejected) {
+            if (/HTTP 403/.test(String(err))) syncArmState();
+            xAlert('Charge rate switch failed — the regulator refused the change. ' + err);
+        } else {
+            xAlert('The regulator did not answer, so the charge rate change most likely never reached it. '
+                   + 'The buttons show the charge rate the regulator last reported.', 'Charge rate: no answer');
+        }
     });
 }
 
@@ -17714,8 +18279,15 @@ function startImuZero() {
 }
 
 function setOutputPIDSigSrc(val) {
+    const active = document.querySelector('[id^="outputPIDSigSrc_"].cap-mode-active');
+    const was = active ? Number(active.id.replace(/\D/g, '')) : 0;
+    outputPIDSigSrcPaint(val);
+    controlWrite({ OutputPIDSigSrc: val }, 'OutputPIDSigSrc=' + val,
+                 () => outputPIDSigSrcPaint('OutputPIDSigSrc' in g_echoLast ? Number(g_echoLast.OutputPIDSigSrc) : was));
+}
+// The filter row for the chosen source shows; the other's hides. Painted from the echo too, not only on a press.
+function outputPIDSigSrcPaint(val) {
     updateTripleBtn('outputPIDSigSrc_', val);
-    submitSimpleParam('OutputPIDSigSrc', val);
     const nRow  = document.getElementById('outputPIDMA_N_row');
     const tcRow = document.getElementById('outputPIDFilterTC_row');
     if (nRow)  nRow.style.display  = (val === 1) ? '' : 'none';
@@ -17902,7 +18474,9 @@ window.addEventListener("load", function () {
     const originalGetElementById = document.getElementById;
     let warnedElements = new Set();
     // IDs absent by design (created on demand or only while a dialog is open): null is expected, don't flag.
-    const optionalElementIds = new Set(['recoveryDialog', 'lt-cloud-hint', 'faflip-pause-btn', 'xdlg-overlay', 'mode-strip-tip']);
+    const optionalElementIds = new Set(['recoveryDialog', 'lt-cloud-hint', 'faflip-pause-btn', 'xdlg-overlay', 'mode-strip-tip',
+        'cx-settle-hint', 'fu-off-btn', 'forced-update-banner', 'forced-update-overlay', 'cfgpush-overlay', 'stall-toast',
+        'demo-cloud-banner']);
     // Conditionally rendered subtrees. commprep-*: chemistry-gated inputs, probed check-then-use.
     const optionalElementPrefixes = ['commprep-'];
 
@@ -19734,125 +20308,7 @@ window.addEventListener("load", function () {
             })();
 
             // DVCC follow status: Setup row, li_ Live Data mirror and card-header word. Values CSV2, staleness TS.
-            (function () {
-                // Banner first: it is global, so it must not depend on the Integrations markup
-                // that the two early-returns below guard.
-                if (data.dvccState !== undefined) updateDvccNotice(Number(data.dvccState), Number(data.dvccRxSrcAddr));
-                const row = document.getElementById('dvccStatus_row');
-                const card = document.getElementById('li_dvccStatus_card');
-                if ((!row && !card) || data.dvccState === undefined) return;
-                const setText = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
-                const set2 = (id, txt) => { setText(id, txt); setText('li_' + id, txt); };
-                const st = Number(data.dvccState);
-                const words = ['off', 'waiting', 'settling', 'following', 'stale', 'UNTRUSTED'];
-                const reasons = ['', ' — voltage limit out of range', ' — current limit implausible', ' — values flapping'];
-                const word = (st === 5) ? (words[5] + (reasons[Number(data.dvccUntrustReason)] || '')) : (words[st] || String(st));
-                set2('dvccStateWord_ID', word);
-                setText('integStateFollow', words[st] || String(st));  // header state: word only, no reason suffix
-                const num = (v, div, fix, unit) => !Number.isFinite(Number(v)) ? '—' : (Number(v) / div).toFixed(fix) + unit;
-                set2('dvccCvl_ID', num(data.dvccRxCvl, 100, 2, ' V'));
-                set2('dvccCcl_ID', num(data.dvccRxCcl, 10, 1, ' A'));
-                const src = Number(data.dvccRxSrcAddr);
-                const ages = window.sensorAges || {};
-                const age = Number(ages.dvcc ?? 999999);
-                const canAge = Number(ages.dvccVeCan ?? 999999);
-                const wifiAge = Number(ages.dvccWifi ?? 999999);
-                const wifiFresh = wifiAge <= 20000;
-                // Read the firmware echo, not the <select> (may be mid-edit); '' until the echo arrives.
-                const srcTxt = (document.getElementById('dvccSrcType_echo') || {}).textContent || '';
-                const isRvc = srcTxt.indexOf('RV-C') >= 0;
-                // Identity of the publisher, collected passively from PGN 60928 / 126996. Often
-                // absent (nothing can be requested with transmit off), so every part is optional.
-                const authMfg = Number(data.dvccAuthMfg || 0);
-                const authProd = Number(data.dvccAuthProd || 0);
-                const authWho = authMfg === 358 ? 'Victron' : authMfg === 2046 ? 'open mfr code' : authMfg > 0 ? 'mfr ' + authMfg : '';
-                const authTxt = 'addr ' + src + (authWho ? ' \u00b7 ' + authWho : '') + (authProd ? ' \u00b7 product ' + authProd : '');
-                // 254 = only the Victron WiFi carrier is fresh; with both fresh the VE.Can sender is named and WiFi appended.
-                set2('dvccSrc_ID', (src === 255 || !isFinite(src)) ? '—'
-                    : src === 254 ? 'Victron GX over WiFi'
-                    : authTxt + (!isRvc && wifiFresh ? ' + WiFi' : ''));
-                const op = (age > 20000) ? '0.5' : '';
-                if (row) row.style.opacity = op;
-                if (card) card.style.opacity = op;
-                // Reset control is only meaningful while the untrusted latch is set
-                const rst = document.getElementById('dvccReset_row');
-                if (rst) rst.classList.toggle('is-gated', st !== 5);
-
-                // Per-source cards: only the selected source is followed. Leave both cards untouched until the echo arrives.
-                if (!/RV-C|Victron/.test(srcTxt)) return;
-                setText('li_dvccDialect_ID', isRvc ? 'RV-C' : 'Victron GX');
-                // Nothing is decoded off CAN unless ParseMessages runs: receive toggle OR the follow master. WiFi needs neither.
-                const portOn = ((document.getElementById('NMEA2KData_echo') || {}).textContent === 'Enabled') ||
-                               ((document.getElementById('dvccEn_echo') || {}).textContent === 'Enabled');
-                const canOffWord = 'CAN receive off';
-                const canOffDetail = 'turn on Receive NMEA2K Data (NMEA 2000 card) or Follow External Charge Limits below';
-                const secsOf = a => Math.round(a / 1000);
-                const vTxt = v => Number.isFinite(Number(v)) ? (Number(v) / 100).toFixed(2) + ' V' : '';
-                const aTxt = v => Number.isFinite(Number(v)) ? (Number(v) / 10).toFixed(1) + ' A' : '';
-                const limTxt = (v, a) => [vTxt(v), aTxt(a)].filter(Boolean).join(' \u00b7 ') || 'no limits sent';
-                // RV-C: one carrier, judged on the merged stream.
-                const everHeard = isFinite(src) && src !== 255;
-                const fresh = everHeard && age <= 20000;
-                let hWord, hDetail;
-                if (!portOn) {
-                    hWord = canOffWord;
-                    hDetail = canOffDetail;
-                } else if (!everHeard) {
-                    hWord = 'none heard';
-                    hDetail = 'nothing decoded yet';
-                } else if (!fresh) {
-                    hWord = 'silent';
-                    hDetail = 'last decoded ' + secsOf(age) + ' s ago, from addr ' + src;
-                } else {
-                    hWord = 'heard';
-                    hDetail = 'addr ' + src + ' \u00b7 ' + secsOf(age) + ' s ago';
-                }
-                // Victron: each carrier on its own age (999999 = never). The values are each carrier's own, before the merge.
-                let cWord, cDetail;
-                if (!portOn) {
-                    cWord = canOffWord;
-                    cDetail = canOffDetail;
-                } else if (canAge === 999999) {
-                    cWord = 'none heard';
-                    cDetail = 'nothing received yet';
-                } else if (canAge > 20000) {
-                    cWord = 'silent';
-                    cDetail = 'last received ' + secsOf(canAge) + ' s ago';
-                } else {
-                    cWord = 'heard';
-                    const at = (isFinite(src) && src < 254) ? ' \u00b7 addr ' + src : '';
-                    cDetail = limTxt(data.dvccRxCanCvl, data.dvccRxCanCcl) + at + ' \u00b7 ' + secsOf(canAge) + ' s ago';
-                }
-                let wWord, wDetail;
-                if (wifiAge === 999999) {
-                    wWord = 'none heard';
-                    wDetail = 'nothing received yet';
-                } else if (!wifiFresh) {
-                    wWord = 'silent';
-                    wDetail = 'last received ' + secsOf(wifiAge) + ' s ago';
-                } else {
-                    wWord = 'heard';
-                    wDetail = limTxt(data.dvccRxWifiCvl, data.dvccRxWifiCcl) + ' \u00b7 ' + secsOf(wifiAge) + ' s ago';
-                }
-                const vicFresh = (portOn && canAge <= 20000) || wifiFresh;
-                const vicChip = vicFresh ? 'source \u00b7 heard'
-                    : (!portOn && wifiAge === 999999) ? 'source \u00b7 receive off' : 'source \u00b7 no data';
-                const rvcChip = !portOn ? 'source \u00b7 receive off' : (fresh ? 'source \u00b7 heard' : 'source \u00b7 no data');
-                const idleDetail = (isRvc ? 'RV-C' : 'Victron GX') + ' is the selected source';
-                setText('integStateVic', isRvc ? 'not selected' : vicChip);
-                setText('integStateRvc', isRvc ? rvcChip : 'not selected');
-                setText('vicCanWord_ID', isRvc ? 'idle' : cWord);
-                setText('vicCanDetail_ID', isRvc ? idleDetail : cDetail);
-                setText('vicWifiWord_ID', isRvc ? 'idle' : wWord);
-                setText('vicWifiDetail_ID', isRvc ? idleDetail : wDetail);
-                setText('rvcHeardWord_ID', isRvc ? hWord : 'idle');
-                setText('rvcHeardDetail_ID', isRvc ? hDetail : idleDetail);
-                // Re-clicking the source already in use would needlessly restart settling
-                const btnVic = document.getElementById('vicUseBtn');
-                const btnRvc = document.getElementById('rvcUseBtn');
-                if (btnVic) { btnVic.disabled = !isRvc; setText('vicUseBtn', isRvc ? 'Use Victron GX' : 'In use'); }
-                if (btnRvc) { btnRvc.disabled = isRvc; setText('rvcUseBtn', isRvc ? 'In use' : 'Use RV-C'); }
-            })();
+            renderDvccCards(data);
 
             // Session fuel-economy curve (mpg vs RPM). try/catch so a chart bug can't break the dispatcher.
             try { if (typeof window.updateFuelCurve === 'function') window.updateFuelCurve(data); }
@@ -20020,6 +20476,10 @@ window.addEventListener("load", function () {
             updateDeviceId(data.deviceIdUpper, data.deviceIdLower);
         }, false);
 
+        source.addEventListener('GxDevices', function (e) {
+            try { gxDevOnEvent(e.data); } catch (err) { }
+        }, false);
+
         // CSVData4 / NavStream — live nav/wind/solar/fuel at 2 Hz (500 ms); updates the dial/compass/
         // speed/solar/fuel gauges. Order/scaling of CSV4_FIELDS must match the firmware Csv4Index enum.
         source.addEventListener('CSVData4', function (e) {
@@ -20146,7 +20606,7 @@ window.addEventListener("load", function () {
             } catch (err) { /* never let fuel readout break NavStream dispatch */ }
         }, false);
 
-        source.addEventListener('CSVData3', function (e) {
+        source.addEventListener('CSVData3', window._csv3DataHandler = function (e) {   // ref stored for demo mode
             const raw = e.data.split(',').map(Number);
 
             const declaredCount = raw[0];
@@ -20194,11 +20654,13 @@ window.addEventListener("load", function () {
             if (data.stateRevision !== undefined) {
                 lastSeenRev = data.stateRevision;
             }
-            if (data.displayTempUnit !== undefined && data.displayTempUnit !== displayTempUnit) {
+            if (data.displayTempUnit !== undefined && !echoHeld('displayTempUnit', data.displayTempUnit, data.stateRevision)
+                && data.displayTempUnit !== displayTempUnit) {
                 displayTempUnit = data.displayTempUnit;
                 updateAllTempUnitLabels();
             }
-            if (data.displayVolUnit !== undefined && data.displayVolUnit !== displayVolUnit) {
+            if (data.displayVolUnit !== undefined && !echoHeld('displayVolUnit', data.displayVolUnit, data.stateRevision)
+                && data.displayVolUnit !== displayVolUnit) {
                 displayVolUnit = data.displayVolUnit;
                 updateAllVolUnitLabels();
             }
@@ -20211,6 +20673,7 @@ window.addEventListener("load", function () {
             }
             updatePlotConfiguration(data);
             updateAllEchosOptimized(data);
+            if (g_lastCsv2) renderDvccCards(g_lastCsv2);   // reads the source and port echoes just painted
             updateTogglesFromData(data);
             // Auto-commissioning: refresh the badge + step checklist + clear button from the
             // persisted state (0/1/2), current phase (0..8), and done/manual masks.
@@ -20546,11 +21009,12 @@ window.addEventListener("load", function () {
             updateTogglesFromData(data);
 
             drawGlyphs();
+            document.body.classList.remove('awaiting-echo');   // the settings controls now show the regulator's state
 
 
         }, false);
 
-        source.addEventListener('TimestampData', function (e) {
+        source.addEventListener('TimestampData', window._tsDataHandler = function (e) {   // ref stored for demo mode
             const raw = e.data.split(',').map(Number);
 
             const declaredCount = raw[0];
@@ -20621,6 +21085,7 @@ window.addEventListener("load", function () {
                 dvccVeCan: data.ts_DvccVeCan,
                 dvccWifi: data.ts_DvccWifi
             };
+            if (g_lastCsv2) renderDvccCards(g_lastCsv2);
 
             updateWeatherForecastAge(data.ts_WeatherFetch);
         }, false);
@@ -21296,6 +21761,129 @@ function goToDiagSettings(ck) {
 const DVCC_NOTICE_GRACE_MS = 60000;   // a GX rebooting or booting after us must not raise a banner
 let dvccNoticeSince = 0;
 
+// DVCC follow status: Setup row, li_ Live Data mirror and card-header word. Values CSV2 (data), staleness TS,
+// source and port from the CSV3 echoes. Drawn on each of the three, from the last CSV2, so a (re)connect shows the
+// right state once its inputs are in, not at the next 5 s CSV2.
+function renderDvccCards(data) {
+    // Banner first: it is global, so it must not depend on the Integrations markup
+    // that the two early-returns below guard.
+    if (data.dvccState !== undefined) updateDvccNotice(Number(data.dvccState), Number(data.dvccRxSrcAddr));
+    const row = document.getElementById('dvccStatus_row');
+    const card = document.getElementById('li_dvccStatus_card');
+    if ((!row && !card) || data.dvccState === undefined) return;
+    const setText = (id, txt) => { const el = document.getElementById(id); if (el && el.textContent !== txt) el.textContent = txt; };
+    const set2 = (id, txt) => { setText(id, txt); setText('li_' + id, txt); };
+    const st = Number(data.dvccState);
+    const words = ['off', 'waiting', 'settling', 'following', 'stale', 'UNTRUSTED'];
+    const reasons = ['', ' — voltage limit out of range', ' — current limit implausible', ' — values flapping'];
+    const word = (st === 5) ? (words[5] + (reasons[Number(data.dvccUntrustReason)] || '')) : (words[st] || String(st));
+    set2('dvccStateWord_ID', word);
+    setText('integStateFollow', words[st] || String(st));  // header state: word only, no reason suffix
+    const num = (v, div, fix, unit) => !Number.isFinite(Number(v)) ? '—' : (Number(v) / div).toFixed(fix) + unit;
+    set2('dvccCvl_ID', num(data.dvccRxCvl, 100, 2, ' V'));
+    set2('dvccCcl_ID', num(data.dvccRxCcl, 10, 1, ' A'));
+    const src = Number(data.dvccRxSrcAddr);
+    const ages = window.sensorAges || {};
+    const age = Number(ages.dvcc ?? 999999);
+    const canAge = Number(ages.dvccVeCan ?? 999999);
+    const wifiAge = Number(ages.dvccWifi ?? 999999);
+    const wifiFresh = wifiAge <= 20000;
+    // Read the firmware echo, not the <select> (may be mid-edit); '' until the echo arrives.
+    const srcTxt = (document.getElementById('dvccSrcType_echo') || {}).textContent || '';
+    const isRvc = srcTxt.indexOf('RV-C') >= 0;
+    // Identity of the publisher, collected passively from PGN 60928 / 126996. Often
+    // absent (nothing can be requested with transmit off), so every part is optional.
+    const authMfg = Number(data.dvccAuthMfg || 0);
+    const authProd = Number(data.dvccAuthProd || 0);
+    const authWho = authMfg === 358 ? 'Victron' : authMfg === 2046 ? 'open mfr code' : authMfg > 0 ? 'mfr ' + authMfg : '';
+    const authTxt = 'addr ' + src + (authWho ? ' \u00b7 ' + authWho : '') + (authProd ? ' \u00b7 product ' + authProd : '');
+    // 254 = only the Victron WiFi carrier is fresh; with both fresh the VE.Can sender is named and WiFi appended.
+    set2('dvccSrc_ID', (src === 255 || !isFinite(src)) ? '—'
+        : src === 254 ? 'Victron GX over WiFi'
+        : authTxt + (!isRvc && wifiFresh ? ' + WiFi' : ''));
+    const op = (age > 20000) ? '0.5' : '';
+    if (row) row.style.opacity = op;
+    if (card) card.style.opacity = op;
+    // Reset control is only meaningful while the untrusted latch is set
+    const rst = document.getElementById('dvccReset_row');
+    if (rst) rst.classList.toggle('is-gated', st !== 5);
+
+    // Per-source cards: only the selected source is followed. Leave both cards untouched until the echo arrives.
+    if (!/RV-C|Victron/.test(srcTxt)) return;
+    setText('li_dvccDialect_ID', isRvc ? 'RV-C' : 'Victron GX');
+    // Nothing is decoded off CAN unless ParseMessages runs: receive toggle OR the follow master. WiFi needs neither.
+    const portOn = ((document.getElementById('NMEA2KData_echo') || {}).textContent === 'Enabled') ||
+                   ((document.getElementById('dvccEn_echo') || {}).textContent === 'Enabled');
+    const canOffWord = 'CAN receive off';
+    const canOffDetail = 'turn on Receive NMEA2K Data (NMEA 2000 card) or Follow External Charge Limits below';
+    const secsOf = a => Math.round(a / 1000);
+    const vTxt = v => Number.isFinite(Number(v)) ? (Number(v) / 100).toFixed(2) + ' V' : '';
+    const aTxt = v => Number.isFinite(Number(v)) ? (Number(v) / 10).toFixed(1) + ' A' : '';
+    const limTxt = (v, a) => [vTxt(v), aTxt(a)].filter(Boolean).join(' \u00b7 ') || 'no limits sent';
+    // RV-C: one carrier, judged on the merged stream.
+    const everHeard = isFinite(src) && src !== 255;
+    const fresh = everHeard && age <= 20000;
+    let hWord, hDetail;
+    if (!portOn) {
+        hWord = canOffWord;
+        hDetail = canOffDetail;
+    } else if (!everHeard) {
+        hWord = 'none heard';
+        hDetail = 'nothing decoded yet';
+    } else if (!fresh) {
+        hWord = 'silent';
+        hDetail = 'last decoded ' + secsOf(age) + ' s ago, from addr ' + src;
+    } else {
+        hWord = 'heard';
+        hDetail = 'addr ' + src + ' \u00b7 ' + secsOf(age) + ' s ago';
+    }
+    // Victron: each carrier on its own age (999999 = never). The values are each carrier's own, before the merge.
+    let cWord, cDetail;
+    if (!portOn) {
+        cWord = canOffWord;
+        cDetail = canOffDetail;
+    } else if (canAge === 999999) {
+        cWord = 'none heard';
+        cDetail = 'nothing received yet';
+    } else if (canAge > 20000) {
+        cWord = 'silent';
+        cDetail = 'last received ' + secsOf(canAge) + ' s ago';
+    } else {
+        cWord = 'heard';
+        const at = (isFinite(src) && src < 254) ? ' \u00b7 addr ' + src : '';
+        cDetail = limTxt(data.dvccRxCanCvl, data.dvccRxCanCcl) + at + ' \u00b7 ' + secsOf(canAge) + ' s ago';
+    }
+    let wWord, wDetail;
+    if (wifiAge === 999999) {
+        wWord = 'none heard';
+        wDetail = 'nothing received yet';
+    } else if (!wifiFresh) {
+        wWord = 'silent';
+        wDetail = 'last received ' + secsOf(wifiAge) + ' s ago';
+    } else {
+        wWord = 'heard';
+        wDetail = limTxt(data.dvccRxWifiCvl, data.dvccRxWifiCcl) + ' \u00b7 ' + secsOf(wifiAge) + ' s ago';
+    }
+    const vicFresh = (portOn && canAge <= 20000) || wifiFresh;
+    const vicChip = vicFresh ? 'source \u00b7 heard'
+        : (!portOn && wifiAge === 999999) ? 'source \u00b7 receive off' : 'source \u00b7 no data';
+    const rvcChip = !portOn ? 'source \u00b7 receive off' : (fresh ? 'source \u00b7 heard' : 'source \u00b7 no data');
+    const idleDetail = (isRvc ? 'RV-C' : 'Victron GX') + ' is the selected source';
+    setText('integStateVic', isRvc ? 'not selected' : vicChip);
+    setText('integStateRvc', isRvc ? rvcChip : 'not selected');
+    setText('vicCanWord_ID', isRvc ? 'idle' : cWord);
+    setText('vicCanDetail_ID', isRvc ? idleDetail : cDetail);
+    setText('vicWifiWord_ID', isRvc ? 'idle' : wWord);
+    setText('vicWifiDetail_ID', isRvc ? idleDetail : wDetail);
+    setText('rvcHeardWord_ID', isRvc ? hWord : 'idle');
+    setText('rvcHeardDetail_ID', isRvc ? hDetail : idleDetail);
+    // Re-clicking the source already in use would needlessly restart settling
+    const btnVic = document.getElementById('vicUseBtn');
+    const btnRvc = document.getElementById('rvcUseBtn');
+    if (btnVic) { btnVic.disabled = !isRvc; setText('vicUseBtn', isRvc ? 'Use Victron GX' : 'In use'); }
+    if (btnRvc) { btnRvc.disabled = isRvc; setText('rvcUseBtn', isRvc ? 'In use' : 'Use RV-C'); }
+}
+
 function updateDvccNotice(st, srcAddr) {
     const el = document.getElementById('dvcc-banner');
     if (!el) return;
@@ -21654,9 +22242,9 @@ function updateFuelTableHighlight(data) {
     }
     if (row === _fuelHighlightRow) return;
 
-    const prev = document.getElementById(`fuelRow${_fuelHighlightRow}`);
+    const prev = _fuelHighlightRow >= 0 ? document.getElementById(`fuelRow${_fuelHighlightRow}`) : null;
     if (prev) prev.classList.remove('fuel-table-row-active');
-    const next = document.getElementById(`fuelRow${row}`);
+    const next = row >= 0 ? document.getElementById(`fuelRow${row}`) : null;
     if (next) next.classList.add('fuel-table-row-active');
     _fuelHighlightRow = row;
 }
@@ -22561,12 +23149,14 @@ async function rwfsStopOne(key) {
 // Setup > Engine. With engine speed ignored the ignition is the only "engine running" signal, so forcing it on
 // needs the same acknowledgement the Run Without Failed Sensors screen asks for in the other order.
 async function ignitionOverrideToggle(cb) {
-    if (cb.checked && rwfsFlags.IgnoreRPM === 1) {
+    const want = cb.checked;   // read before the dialog: an echo can repaint the switch while it is open
+    if (want && rwfsFlags.IgnoreRPM === 1) {
         const ok = await xConfirm('Engine speed is ignored (Setup → System → Run Without Failed Sensors), so the ignition is the regulator\'s only sign that the engine is running. With Ignition Override on as well, nothing will tell it the engine has stopped: with the alternator switch on it keeps powering the field and drains the battery until you switch the alternator off.',
             { title: 'Ignition Override', okText: 'Turn on', cancelText: 'Cancel' });
-        if (!ok) { cb.checked = false; return; }
+        if (!ok) { toggleRepaint('IgnitionOverride', 'IgnitionOverride_checkbox', false); return; }
     }
-    if (handleUserToggle('IgnitionOverride_checkbox', 'IgnitionOverride', 'IgnitionOverride')) { cb.form.submit(); submitMessage(); }
+    cb.checked = want;
+    handleUserToggle('IgnitionOverride_checkbox', 'IgnitionOverride', 'IgnitionOverride');
 }
 // §6: the commissioning Prep gate. Returns '' when every sensor is in use and reading, else the reason.
 function rwfsCommissioningBlock() {
@@ -22609,7 +23199,7 @@ function manualFieldBypassText() {
 }
 
 // Entering manual REMOVES protections, so confirm first and restore the switch on no; leaving goes straight through.
-// The confirm runs before handleUserToggle, or a cancel leaves a pending desired value the next echo would fight.
+// The confirm runs before handleManualFieldToggle, or a cancel leaves a pending desired value the next echo would fight.
 function manualFieldToggleChanged(cb) {
     if (!cb) return;
     const wantManual = !cb.checked;                           // checked = Auto; the position just chosen
@@ -22620,8 +23210,8 @@ function manualFieldToggleChanged(cb) {
         cancelText: 'Stay on Auto'
     }).then(ok => {
         if (ok) { manualFieldToggleApply(cb, true); return; }
-        cb.checked = true;                             // back to Auto; nothing was ever sent
-        syncSegmented('ManualFieldToggle_checkbox');   // abSegClick already painted Manual; repaint Auto
+        // Nothing was sent: show the mode the regulator last reported (Auto unless another client changed it meanwhile).
+        toggleRepaint('ManualFieldToggle', 'ManualFieldToggle_checkbox', true);
     });
 }
 
@@ -22637,17 +23227,14 @@ function manualFieldToggleApply(cb, manual) {
     // next press, and its answer is invisible. src/n tag as for the master switch. A REFUSAL repaints from the last echo
     // and is never re-sent; only a silent failure is retried (sendControlWrite reuses this url, so n never changes).
     const v = manual ? 1 : 0;
-    const repaint = () => {
-        pendingToggles.delete('ManualFieldToggle');
-        const last = toggleStates['ManualFieldToggle'];          // last CSV3 echo, inverted domain (1 = Auto)
-        if (last !== undefined) { cb.checked = (last === 1); syncSegmented('ManualFieldToggle_checkbox'); }
-    };
+    const repaint = () => toggleRepaint('ManualFieldToggle', 'ManualFieldToggle_checkbox', manual);
     const url = buildURL('/get?ManualFieldToggle=' + v + clientWriteTag());
     const myN = g_clientWriteN;
-    sendControlWrite(url, myN)
+    g_controlNewestN.ManualFieldToggle = myN;
+    sendControlWrite(url, 'ManualFieldToggle', myN)
         .then(r => {
             if (r.superseded) return;
-            if (myN !== g_clientWriteN) return;   // an answer to a press a newer one has already replaced
+            if (myN !== g_controlNewestN.ManualFieldToggle) return;   // an answer to a press a newer one has already replaced
             if (r.ok) return;
             repaint();
             if (r.status === 403) {
@@ -22675,17 +23262,13 @@ function handleManualFieldToggle(checkboxId) {
     // So when checkbox is checked (Auto), we send 0; unchecked (Manual), we send 1
     const invertedVal = cb.checked ? '0' : '1';
 
-    const result = handleUserToggle(checkboxId, 'ManualFieldToggle', 'ManualFieldToggle');
-
-    const pending = pendingToggles.get('ManualFieldToggle');
-    if (pending) {
-        pending.desiredValue = cb.checked ? 1 : 0;  // checked=Auto=invertedManual=1
-    }
-
     const hiddenInput = document.getElementById('ManualFieldToggle');
-    if (hiddenInput) hiddenInput.value = invertedVal;
+    if (!hiddenInput) return false;
+    hiddenInput.value = invertedVal;
+    // checked=Auto=invertedManual=1; manualFieldToggleApply sends the write itself
+    pendingToggles.set('ManualFieldToggle', { desiredValue: cb.checked ? 1 : 0, baseRev: lastSeenRev, setAt: Date.now() });
 
-    return result;
+    return true;
 }
 
 // ===== Segmented A/B controls =====
@@ -22730,11 +23313,21 @@ function abSegSelectClick(btn) {
     const wrap = btn.closest('.ab-seg-select');
     if (!wrap) return;
     const name = wrap.dataset.segName;
+    const active = wrap.querySelector('.cap-mode-btn.cap-mode-active');
+    const was = active ? active.dataset.val : undefined;
     const hidden = document.getElementById(name + '_val');
     if (hidden) hidden.value = btn.dataset.val;
     syncSegmentedSelect(name, btn.dataset.val);
-    const form = btn.closest('form');
-    if (form) { form.submit(); }
+    controlWrite({ [name]: String(btn.dataset.val) }, name + '=' + encodeURIComponent(btn.dataset.val),
+                 () => syncSegmentedSelect(name, name in g_segSelectLast ? g_segSelectLast[name] : was));
+}
+// Echo side of the segmented selects (CSV3, or the battery-health poll with no frameRev): remembers the regulator's
+// value for a repaint, and holds a pre-write echo off a press in flight.
+const g_segSelectLast = Object.create(null);
+function segSelectEcho(name, val, frameRev) {
+    g_segSelectLast[name] = String(val);
+    if (echoHeld(name, String(val), frameRev)) return;
+    syncSegmentedSelect(name, val);
 }
 
 // ==================== PID TUNING PLOT (SEPARATE SYSTEM) ====================
@@ -23792,12 +24385,10 @@ function resetLogs() {
 
 // Stop/Start Logs — freeze or resume the thermal/PID/CV ring buffers on the device.
 function stopLogs() {
-    fetch(buildURL('/stoplogs'), { method: 'POST' })
-        .catch(() => { });
+    return fetchWithTimeout(buildURL('/stoplogs'), { method: 'POST' }, CONTROL_WRITE_ANSWER_MS);
 }
 function startLogs() {
-    fetch(buildURL('/startlogs'), { method: 'POST' })
-        .catch(() => { });
+    return fetchWithTimeout(buildURL('/startlogs'), { method: 'POST' }, CONTROL_WRITE_ANSWER_MS);
 }
 
 // Pure render of the pause/resume toggle (no reconciliation). The dot carries the state (pulsing green = recording,
@@ -23834,9 +24425,22 @@ function toggleLogs() {
     const toggle = document.getElementById('logToggleBtn');
     if (!toggle) return;
     const goRecording = toggle.dataset.recording !== '1';   // target = opposite of current
-    pendingToggles.set('loggingActive', { desiredValue: goRecording ? 1 : 0, baseRev: lastSeenRev });
+    const pending = { desiredValue: goRecording ? 1 : 0, baseRev: lastSeenRev };
+    pendingToggles.set('loggingActive', pending);
     renderLoggingToggle(goRecording);                       // instant feedback — no CSV2 wait
-    (goRecording ? startLogs : stopLogs)();                 // POST; CSV2 echo reaffirms via updateLoggingStatus
+    if (DEMO_MODE) return;                                  // no regulator: nothing to send
+    // POST; CSV2 echo reaffirms via updateLoggingStatus. One that does not land shows the last CSV2 state at once,
+    // rather than the pressed one until the 8 s grace runs out.
+    (goRecording ? startLogs : stopLogs)()
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); })
+        .catch(e => {
+            if (pendingToggles.get('loggingActive') !== pending) return;
+            pendingToggles.delete('loggingActive');
+            const last = (typeof g_lastCsv2 === 'object' && g_lastCsv2) ? g_lastCsv2.loggingActive : undefined;
+            renderLoggingToggle(last !== undefined ? Number(last) === 1 : !goRecording);
+            xAlert('The regulator did not take the ' + (goRecording ? 'resume' : 'pause') + ' (' + e.message
+                   + '). The button shows what it is doing.', 'Logs NOT ' + (goRecording ? 'resumed' : 'paused'));
+        });
 }
 
 // ── Silent cloud log relay ────────────────────────────────────────────────
@@ -25623,9 +26227,11 @@ async function validateAndSubmitBatteryToggle(checkbox, fieldName) {
 
     if (result.warning) {
         if (!(await xConfirm(result.warning + '\n\nProceed anyway?', xWarnExtra(result)))) {
-            checkbox.checked = !checkbox.checked;
+            // After the dialog: the switch may have been repainted by an echo, so never invert what it shows now.
+            toggleRepaint(fieldName, checkbox.id, !proposedValue);
             return false;
         }
+        checkbox.checked = !!proposedValue;   // the caller sends what the switch shows: the position agreed to
     }
 
     return true;
@@ -26690,8 +27296,11 @@ function syncSysidTestTypeUI(v) {
     sysidToggleSineParams(v);
 }
 function setSysidTestType(v) {
+    const sel = document.getElementById('systemIDTestType_sel');
+    const was = sel ? sel.value : '0';
     syncSysidTestTypeUI(v);
-    fetch(buildURL(`/get?systemIDTestType=${v}`)).catch(() => {});
+    controlWrite({ systemIDTestType: v }, 'systemIDTestType=' + v,
+                 () => syncSysidTestTypeUI('systemIDTestType' in g_echoLast ? g_echoLast.systemIDTestType : was));
 }
 
 function syncTuningWaveformUI(v) {
@@ -26705,8 +27314,11 @@ function syncTuningWaveformUI(v) {
     tuningToggleWaveformUI(v);
 }
 function setTuningWaveform(v) {
+    const sel = document.getElementById('tuningWaveform_sel');
+    const was = sel ? sel.value : '0';
     syncTuningWaveformUI(v);
-    fetch(buildURL(`/get?tuningWaveform=${v}`)).catch(() => {});
+    controlWrite({ tuningWaveform: v }, 'tuningWaveform=' + v,
+                 () => syncTuningWaveformUI('tuningWaveform' in g_echoLast ? g_echoLast.tuningWaveform : was));
 }
 
 // ── Tuning→Current closed-loop sine (Stage 2) ──
@@ -26722,12 +27334,16 @@ function tuningToggleWaveformUI(val) {
 
 let tuningBodePollTimer = null;
 
-// Register a pending toggle + set a hidden input without a checkbox (button-driven toggles). Mirrors
-// what handleUserToggle does, but the unified Begin/Stop Test button has no checkbox to read from.
-function setPendingToggleValue(hiddenInputId, dataKey, value) {
-    const hiddenInput = document.getElementById(hiddenInputId);
-    if (hiddenInput) hiddenInput.value = String(value);
-    pendingToggles.set(dataKey, { desiredValue: parseInt(value), baseRev: lastSeenRev });
+// TuningMode writes (Begin, Stop, the sweep's own disarm) go through controlWrite: one that does not land puts the
+// Begin/Stop button back to the regulator's last report and says why. The hidden input is what getField() reads.
+function tuningModeSend(v, onOk) {
+    const hidden = document.getElementById('TuningMode');
+    if (hidden) hidden.value = String(v);
+    controlWrite({ TuningMode: v }, 'TuningMode=' + v, () => {
+        updateTuningModeUI('TuningMode' in g_echoLast ? Number(g_echoLast.TuningMode) : 1 - v);
+        const statusEl = document.getElementById('tuning-sweep-status');
+        if (statusEl) statusEl.textContent = '';
+    }, onOk);
 }
 
 // Used for all three waveform types; a sine sweep also flips back when it self-completes.
@@ -26751,6 +27367,7 @@ function _setTestBtnRunning(running) {
 // fires the closed-loop frequency sweep. Pressing again while running disarms.
 function tuningToggleTest() {
     if (!settingsUnlocked) { xAlert("Please unlock controls first."); return; }
+    if (DEMO_MODE) { xAlert('Demo mode: no regulator is connected, so the test cannot run.'); return; }
     if (parseInt(getField("TuningMode") ?? 0) === 1) { tuningStopTest(); return; }
 
     const conflict = getActiveTestKey();
@@ -26764,18 +27381,14 @@ function tuningToggleTest() {
 
     // Optimistically reflect the armed state, register the pending toggle so the stream echo doesn't
     // bounce it back, then send the arm command (TuningMode=1 is all square/sine-manual need to run).
-    setPendingToggleValue('TuningMode', 'TuningMode', 1);
     _setTestBtnRunning(true);
 
     if (waveform === 2) {
         if (statusEl) statusEl.textContent = 'Arming…';
-        fetch(buildURL("/get?TuningMode=1"))
-            .then(() => _startTuningSweepNow())
-            .catch(err => { if (statusEl) statusEl.textContent = 'Arm failed: ' + err; _setTestBtnRunning(false); });
+        tuningModeSend(1, () => _startTuningSweepNow());
     } else {
         if (statusEl) statusEl.textContent = 'Running…';
-        fetch(buildURL("/get?TuningMode=1"))
-            .catch(err => { if (statusEl) statusEl.textContent = 'Start failed: ' + err; _setTestBtnRunning(false); });
+        tuningModeSend(1);
     }
 }
 
@@ -26800,8 +27413,7 @@ function _startTuningSweepNow() {
                         // done=1, so this must be checked first or the partial points get rendered).
                         if (data.aborted) {
                             clearInterval(tuningBodePollTimer); tuningBodePollTimer = null;
-                            setPendingToggleValue('TuningMode', 'TuningMode', 0);
-                            fetch(buildURL("/get?TuningMode=0")).catch(() => {});
+                            tuningModeSend(0);
                             _setTestBtnRunning(false);
                             if (statusEl) statusEl.textContent = 'Sweep aborted by ' +
                                 (cxCutCauseText(data.abortWhy | 0) || 'a protection') + ' — results discarded. See Live Data → Console.';
@@ -26813,8 +27425,7 @@ function _startTuningSweepNow() {
                         if (data.done && !data.active) {
                             clearInterval(tuningBodePollTimer); tuningBodePollTimer = null;
                             // A completed sweep is a finished test: disarm (square/sine-manual stay armed until Stop).
-                            setPendingToggleValue('TuningMode', 'TuningMode', 0);
-                            fetch(buildURL("/get?TuningMode=0")).catch(() => {});
+                            tuningModeSend(0);
                             _setTestBtnRunning(false);
                             renderTuningBode(data);
                         }
@@ -26822,8 +27433,7 @@ function _startTuningSweepNow() {
                     .catch(() => {});
                 if (waited > 180000) {
                     clearInterval(tuningBodePollTimer); tuningBodePollTimer = null;
-                    setPendingToggleValue('TuningMode', 'TuningMode', 0);
-                    fetch(buildURL("/get?TuningMode=0")).catch(() => {});
+                    tuningModeSend(0);
                     _setTestBtnRunning(false);
                     if (statusEl) statusEl.textContent = 'Timed out.';
                 }
@@ -26833,8 +27443,7 @@ function _startTuningSweepNow() {
 }
 
 function tuningStopTest() {
-    setPendingToggleValue('TuningMode', 'TuningMode', 0);
-    fetch(buildURL("/get?TuningMode=0")).catch(() => {});
+    tuningModeSend(0);
     if (tuningBodePollTimer) { clearInterval(tuningBodePollTimer); tuningBodePollTimer = null; }
     const statusEl = document.getElementById('tuning-sweep-status');
     if (statusEl) statusEl.textContent = 'Stopped.';
@@ -26844,18 +27453,9 @@ function tuningStopTest() {
 // Reflect firmware TuningMode state onto the unified Begin/Stop button + hidden input, honoring any
 // in-flight optimistic toggle so the stream echo doesn't bounce it (same pattern as updateCheckbox).
 // Catches reboot-with-generator-on and disarms triggered by another client.
-function updateTuningModeUI(value) {
+function updateTuningModeUI(value, frameRev) {
     if (value === undefined) return;
-    const pending = pendingToggles.get("TuningMode");
-    if (pending) {
-        if (pending.deadlineMs === undefined) pending.deadlineMs = Date.now() + 2500;
-        if (value !== pending.desiredValue) {
-            if (Date.now() <= pending.deadlineMs) return;   // keep optimistic UI
-            pendingToggles.delete("TuningMode");            // timed out → accept firmware state
-        } else {
-            pendingToggles.delete("TuningMode");            // confirmed
-        }
-    }
+    if (echoHeld('TuningMode', value, frameRev)) return;   // keep the optimistic button until the regulator answers
     const hidden = document.getElementById("TuningMode");
     if (hidden) hidden.value = String(value);
     toggleStates["TuningMode"] = value;
@@ -33829,13 +34429,17 @@ window.addEventListener('load', function () {
     return `rgba(${r},${g},${b},${a})`;
   }
 
-  // Envelope fields in struct order with the scale divisor to reach real units.
+  // Envelope fields in struct order with the scale divisor to reach real units. The first ENV_CORE_N sit in the envelope
+  // block (validMask bit = index); the rest are record-tail fields placed by ENV_TAIL.
   const ENV = [
     ['battVolt',100], ['battCurr',10], ['altCurr',10], ['victronCurr',10],
     ['rpm',1], ['duty',100], ['altTemp',10], ['tempTherm',10],
     ['sog',100], ['tws',100], ['vmg',100], ['aws',100],
-    ['awa',10], ['twa',10], ['heel',100], ['pitch',100], ['soc',10]
+    ['awa',10], ['twa',10], ['heel',100], ['pitch',100], ['soc',10],
+    ['battTemp',10]
   ];
+  const ENV_CORE_N = 17;
+  const ENV_TAIL = { battTemp: { bit: 24, off: 144, minRec: 152 } };   // v5 tail
   const AVG = [
     ['baro',10], ['ambTemp',10], ['cog',10], ['heading',10],
     ['leeway',10], ['altZero',100]
@@ -33884,9 +34488,9 @@ window.addEventListener('load', function () {
       ONAVG.forEach(([k]) => fields[k].onAvg.push(null));
     };
 
-    // Record layout (144 B): u32 timestamp @0, i32 lat @4, i32 lon @8, u32 validMask @12,
+    // Record layout (152 B): u32 timestamp @0, i32 lat @4, i32 lon @8, u32 validMask @12,
     // envelope [min,max,avg]×17 from @16, avg-only ×6 after, u8 chargeStage + pad @130,
-    // v4 tail: onAvg[5] i16 @132, activeFrac u8 @142 + pad.
+    // v4 tail: onAvg[5] i16 @132, activeFrac u8 @142 + pad; v5 tail: battTemp [min,max,avg] i16 @144 (bit 24) + pad.
     // Unsynced ring (no wall clock, e.g. AP mode): timestamps are 0 → anchor the newest to the browser
     // clock and space back by interval, else history collapses to 1970 and every view is blank.
     const anchorEpoch = lastEpoch || Math.floor(Date.now() / 1000);
@@ -33900,23 +34504,22 @@ window.addEventListener('load', function () {
       prevTs = ts;
 
       t.push(ts); isGap.push(false);
-      let off = base + 16;   // envelope block: [min,max,avg] int16 each
       ENV.forEach(([k, scale], fi) => {
-        const f = fields[k];
-        if (valid & (1 << fi)) {
+        const f = fields[k], tl = ENV_TAIL[k];
+        const off = tl ? base + tl.off : base + 16 + fi * 6;   // envelope block: [min,max,avg] int16 each
+        if ((!tl || recSize >= tl.minRec) && (valid & (1 << (tl ? tl.bit : fi)))) {
           f.min.push(ltNz(k, dv.getInt16(off, true) / scale));
           f.max.push(ltNz(k, dv.getInt16(off + 2, true) / scale));
           f.avg.push(ltNz(k, dv.getInt16(off + 4, true) / scale));
         } else { f.min.push(null); f.max.push(null); f.avg.push(null); }
-        off += 6;
       });
-      let ao = base + 16 + ENV.length * 6;   // avg-only block: one int16 each
+      let ao = base + 16 + ENV_CORE_N * 6;   // avg-only block: one int16 each
       AVG.forEach(([k, scale], ai) => {
-        fields[k].avg.push((valid & (1 << (ENV.length + ai))) ? ltNz(k, dv.getInt16(ao, true) / scale) : null);
+        fields[k].avg.push((valid & (1 << (ENV_CORE_N + ai))) ? ltNz(k, dv.getInt16(ao, true) / scale) : null);
         ao += 2;
       });
       // chargeStage u8 sits right after the avg-only block (display code 0-8).
-      stage.push(dv.getUint8(base + 16 + ENV.length * 6 + AVG.length * 2));
+      stage.push(dv.getUint8(base + 16 + ENV_CORE_N * 6 + AVG.length * 2));
       // cover = engine-on % (activeFrac/2); 0 → onAvg null. battVolt valid bit clear = unknown engine state →
       // cover null. Each onAvg also needs its OWN valid bit (activeFrac says the engine ran, not that the field
       // was measurable). Pre-v4 132 B records: cover null, onAvg = wall avg so the solid line survives.
@@ -34408,6 +35011,7 @@ window.addEventListener('load', function () {
                 { name:'mb', label:'mbar', side:1 } ],
       series: [ { key:'altTemp',   scale:'F',  color:'#F44336', label:'Alternator (' + tempUnitLabel() + ')', band:true, temp:true },
                 { key:'tempTherm', scale:'F',  color:'#FF9800', label:'Thermistor (' + tempUnitLabel() + ')', band:true, temp:true },
+                { key:'battTemp',  scale:'F',  color:'#4CAF50', label:'Battery (' + tempUnitLabel() + ')', band:true, temp:true },
                 { key:'ambTemp',   scale:'F',  color:'#2196F3', label:'Board (' + tempUnitLabel() + ')', temp:true },
                 { key:'baro',      scale:'mb', color:'#9C27B0', label:'Baro (mbar)' } ]
     });
@@ -34622,7 +35226,7 @@ window.addEventListener('load', function () {
   // JS field key → sensor_history column prefix (envelope: _min/_max/_avg; avg-only: _avg).
   const LT_CLOUD_COL = {
     battVolt:'batt_volt', battCurr:'batt_curr', altCurr:'alt_curr', victronCurr:'victron_curr',
-    rpm:'rpm', duty:'duty_cycle', altTemp:'alt_temp', tempTherm:'temp_therm',
+    rpm:'rpm', duty:'duty_cycle', altTemp:'alt_temp', tempTherm:'temp_therm', battTemp:'batt_temp',
     sog:'sog', tws:'tws', vmg:'vmg', aws:'aws', awa:'awa', twa:'twa',
     heel:'imu_heel', pitch:'imu_pitch',
     soc:'soc', baro:'baro', ambTemp:'amb_temp', cog:'cog', heading:'heading',
@@ -35287,41 +35891,33 @@ function downloadFaFlipPageCsv() {
 // ── Fast current channel (faEnabled/faAlarmEnable): segmented Off/On toggles + the chart Pause/Resume (faAnomPause) ──
 // updateSegToggle mirrors updateCheckbox's pending-toggle reconciliation so an in-flight
 // optimistic press isn't reverted by a stale echo before the regulator confirms.
-function updateSegToggle(key, value) {
+function updateSegToggle(key, value, frameRev) {
     if (value === undefined) return;
-    const pending = pendingToggles.get(key);
-    if (pending) {
-        if (pending.deadlineMs === undefined) pending.deadlineMs = Date.now() + 2500;
-        if (value !== pending.desiredValue) { if (Date.now() <= pending.deadlineMs) return; pendingToggles.delete(key); }
-        else pendingToggles.delete(key);
-    }
+    if (echoHeld(key, value, frameRev)) return;
+    faSegPaint(key, value | 0);
+}
+function faSegPaint(key, v) {
     const off = document.getElementById(key + '_off');
     const on = document.getElementById(key + '_on');
-    const v = value | 0;
     if (off) off.classList.toggle('cap-mode-active', v === 0);
     if (on) on.classList.toggle('cap-mode-active', v === 1);
 }
-function faSegSet(key, value, form) {
+function faSegSet(key, value) {
+    const onBtn = document.getElementById(key + '_on');
+    const was = onBtn && onBtn.classList.contains('cap-mode-active') ? 1 : 0;
     const inp = document.getElementById(key);
     if (inp) inp.value = value;
-    pendingToggles.set(key, { desiredValue: value, baseRev: lastSeenRev });
-    const off = document.getElementById(key + '_off');
-    const on = document.getElementById(key + '_on');
-    if (off) off.classList.toggle('cap-mode-active', value === 0);
-    if (on) on.classList.toggle('cap-mode-active', value === 1);
-    if (form) form.submit();
-    submitMessage();
+    faSegPaint(key, value);
+    controlWrite({ [key]: value }, key + '=' + value, () => faSegPaint(key, key in g_echoLast ? (g_echoLast[key] | 0) : was));
 }
 let _faAnomPause = 0;
-function faUpdatePauseBtn(value) {
+function faUpdatePauseBtn(value, frameRev) {
     if (value === undefined) return;
-    const pending = pendingToggles.get('faAnomPause');
-    if (pending) {
-        if (pending.deadlineMs === undefined) pending.deadlineMs = Date.now() + 2500;
-        if (value !== pending.desiredValue) { if (Date.now() <= pending.deadlineMs) return; pendingToggles.delete('faAnomPause'); }
-        else pendingToggles.delete('faAnomPause');
-    }
-    _faAnomPause = value | 0;
+    if (echoHeld('faAnomPause', value, frameRev)) return;
+    faPausePaint(value | 0);
+}
+function faPausePaint(v) {
+    _faAnomPause = v;
     const b = document.getElementById('faflip-pause-btn');
     if (b) {
         b.textContent = _faAnomPause ? 'Resume' : 'Pause';
@@ -35331,10 +35927,10 @@ function faUpdatePauseBtn(value) {
 }
 function faAnomPauseToggle() {
     if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
-    const next = _faAnomPause ? 0 : 1;
-    pendingToggles.set('faAnomPause', { desiredValue: next, baseRev: lastSeenRev });
-    faUpdatePauseBtn(next);
-    fetchWithTimeout(buildURL('/get?faAnomPause=' + next), {}, 5000).then(() => {}).catch(() => {});
+    const next = _faAnomPause ? 0 : 1;   // the label on the button is the command: "Pause" (0) sends 1
+    faPausePaint(next);
+    controlWrite({ faAnomPause: next }, 'faAnomPause=' + next,
+                 () => faPausePaint('faAnomPause' in g_echoLast ? (g_echoLast.faAnomPause | 0) : 1 - next));
 }
 function fastScopeViewToggle(which, btn) {
     if (which === 'raw') fastScopeShowRaw = !fastScopeShowRaw;
@@ -35872,7 +36468,7 @@ function bhwRenderDone(b) {
 
 function pollBatteryHealth() {
   if (!document.getElementById('bh_status')) return;
-  return fetch(buildURL('/batteryHealth')).then(r => r.json()).then(j => {
+  return (demoJson('/batteryHealth') || fetch(buildURL('/batteryHealth')).then(r => r.json())).then(j => {
     const states = { 0: 'Idle', 1: 'Running test…', 2: 'Done', 3: 'Aborted' };
     let s = states[j.state] || '—';
     if (j.state === 3 && j.reason) s += ' — ' + j.reason;
@@ -35945,7 +36541,7 @@ function pollBatteryHealth() {
     const cfg = j.capCfg || {};
     bhSet('capBankAh_echo', cfg.capacityAh + ' Ah');
     bhSet('capRefMode_echo', cfg.refMode == 1 ? 'First reading' : 'Rated');
-    syncSegmentedSelect('capRefMode', cfg.refMode == 1 ? 1 : 0);
+    segSelectEcho('capRefMode', cfg.refMode == 1 ? 1 : 0);
     bhSet('capRestFrac_echo', cfg.restFrac);
     bhSet('capRestFloor_echo', cfg.restFloor + ' min');
     bhSet('capSettleRate_echo', cfg.settleRate + ' mV/10min');
@@ -35954,7 +36550,7 @@ function pollBatteryHealth() {
     bhSet('capMinSpan_echo', cfg.minSpan + '%');
     bhSet('capChgEff_echo', (Number(cfg.chgEff) * 100).toFixed(1) + '%');
     bhSet('capTempNorm_echo', cfg.tempNorm == 1 ? 'On' : 'Off');
-    syncSegmentedSelect('capTempNorm', cfg.tempNorm == 1 ? 1 : 0);
+    segSelectEcho('capTempNorm', cfg.tempNorm == 1 ? 1 : 0);
     bhSet('capTempCoeff_echo', cfg.tempCoeff + ' %/°C');
     bhSet('capTempRef_echo', Math.round(toDisplayTempFromC(Number(cfg.tempRef))) + ' ' + tempUnitLabel());
     if (j.ocv && j.ocvSoc) renderCapOcvTable(j.ocv, j.ocvSoc, Number(cfg.socLowMax));

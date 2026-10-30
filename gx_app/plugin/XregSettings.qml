@@ -21,9 +21,10 @@ Page {
 	Loader {
 		anchors.fill: parent
 		active: !!page.unit
-		sourceComponent: XregDash {
+		sourceComponent: XregHome {
 			svc: regs.svcOf(page.unit)
 			animationEnabled: page.animationEnabled
+			hostPage: page
 		}
 	}
 

@@ -126,7 +126,9 @@ Item {
 			id: grid
 			readonly property real gap: 10
 			readonly property real tileW: tab.oneColumn ? parent.width : (parent.width - gap) / 2
-			readonly property real tileH: tab.oneColumn ? 260 : (tab.height - tab.bodyY - tab.m - gap) / 2
+			// two rows fill the page; on a 5-inch screen under the home page's header they would be 145 px, too low for the
+			// current chart's three legend lines, so the page scrolls instead
+			readonly property real tileH: tab.oneColumn ? 260 : Math.max(200, (tab.height - tab.bodyY - tab.m - gap) / 2)
 			columns: tab.oneColumn ? 1 : 2
 			spacing: gap
 

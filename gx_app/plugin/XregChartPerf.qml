@@ -5,8 +5,9 @@ import Victron.VenusOS
 // Home-page tile: the web app's boat speed-performance view (Live Data > Boat > Speed). Percent of the learned
 // best-ever speed, the sailing polar or motoring speed-vs-RPM curve evaluated at the present wind (or headwind) and
 // sea state, and the live point: green while a steady run is being recorded, orange while settling. Math follows
-// script.js (parseFrontCsv, frontEval, foldAwaJS, appToTrue, drawPerfPlot, drawMotorPlot, renderPerf); the bridge
-// passes PerfLive, MotorLive and /perfcurve.csv through unchanged as /Perf/*.
+// script.js (parseFrontCsv, frontPred, foldAwaJS, appToTrue, drawPerfPlot, drawMotorPlot, renderPerf); the bridge
+// passes PerfLive, MotorLive and /perfcurve.csv through unchanged as /Perf/*, and the regulator's perfRidgeFrac and
+// perfIdwPower settings as /Perf/RidgeFrac and /Perf/IdwPower.
 Rectangle {
 	id: perf
 
@@ -51,6 +52,7 @@ Rectangle {
 	VeQuickItem { id: mSettle; uid: perf.svc + "/Perf/Motor/settleSec" }
 	VeQuickItem { id: mState; uid: perf.svc + "/Perf/Motor/state" }
 	VeQuickItem { id: mHours; uid: perf.svc + "/Perf/Motor/motorHours" }
+	VeQuickItem { id: engRpm; uid: perf.svc + "/Live/Rpm" }
 	VeQuickItem {
 		id: curveCsv
 		uid: perf.svc + "/Perf/CurveCsv"
@@ -65,7 +67,9 @@ Rectangle {
 	readonly property bool sailBoat: num(sPts) > 0 || num(sHours) > 0 || num(sValid) >= 0.5
 	property int pinned: -1
 	property int autoView: num(sHours) > num(mHours) ? 0 : 1
-	readonly property int liveView: num(mValid) >= 0.5 ? 1 : num(sValid) >= 0.5 ? 0 : -1
+	// Demo mode grades both at once; then the engine says which one the boat is doing
+	readonly property int liveView: num(mValid) >= 0.5 && num(sValid) >= 0.5 ? (num(engRpm) > 0 ? 1 : 0)
+		: num(mValid) >= 0.5 ? 1 : num(sValid) >= 0.5 ? 0 : -1
 	onLiveViewChanged: if (liveView >= 0) autoView = liveView
 	readonly property int view: !sailBoat ? 1 : pinned >= 0 ? pinned : autoView
 	property bool trueFrame: false
@@ -91,9 +95,13 @@ Rectangle {
 	readonly property var stateLabels: ["MEASURED", "ESTIMATED", "Learning this operating region", "No reference here yet"]
 	function seaWord(s) { return s < 0.5 ? "calm" : s < 1.5 ? "slight" : s < 3 ? "choppy" : s < 5 ? "rough" : "very rough" }
 
-	// ---- best-ever fronts (BEFRONT1 sail + motor blocks), evaluated as script.js frontEval ----
-	readonly property var sailScale: [2.0, 12.0, 1.0]     // AWS, AWA, sea: firmware axisScale[]
-	readonly property var motorScale: [100.0, 2.0, 1.0]   // RPM, headwind, sea
+	// ---- best-ever fronts (BEFRONT1 sail + motor blocks), evaluated as script.js frontPred ----
+	readonly property var sailScale: [2.0, 12.0, 1.0]     // AWS, AWA, sea: firmware axisScale[] (7_functions.ino)
+	readonly property var motorScale: [100.0, 4.0, 1.0]   // RPM, headwind, sea
+	VeQuickItem { id: ridgeItem; uid: perf.svc + "/Perf/RidgeFrac" }
+	VeQuickItem { id: idwItem; uid: perf.svc + "/Perf/IdwPower" }
+	readonly property real ridgeFrac: num(ridgeItem) >= 0 ? num(ridgeItem) : 0.10
+	readonly property real idwPower: num(idwItem) > 0 ? num(idwItem) : 2.0
 	property var sailFront: []
 	property var motorFront: []
 	property bool folded: true
@@ -129,21 +137,104 @@ Rectangle {
 		curveRev++
 		refresh()
 	}
-	function frontEval(pts, q, sc) {
-		let wsum = 0, acc = 0
-		for (const pt of pts) {
+	// The speed the regulator grades against (FrontQuery's prediction, 7_functions.ino): a ridge-regularised local linear
+	// fit through the 48 nearest records, clamped to 0.1 .. 1.25 x the front's fastest; the whole-front inverse-distance
+	// average only where that fit is singular. So a 96 % dot sits 4 % under the curve.
+	function frontPred(pts, q, sc) {
+		const K = 48, N = q.length, n = pts.length
+		if (!n)
+			return 0
+		let inv = []
+		for (let a = 0; a < N; ++a)
+			inv.push(sc[a] > 1e-9 ? 1 / sc[a] : 1)
+		const p = idwPower
+		let wsum = 0, acc = 0, exact = -1, maxY = 0, nSel = 0
+		let selI = new Array(K), selD = new Array(K)
+		for (let i = 0; i < n; ++i) {
+			const pt = pts[i]
 			let d2 = 0
-			for (let a = 0; a < q.length; ++a) {
-				const dx = (q[a] - pt.x[a]) / (sc[a] > 1e-9 ? sc[a] : 1)
+			for (let a = 0; a < N; ++a) {
+				const dx = (q[a] - pt.x[a]) * inv[a]
 				d2 += dx * dx
 			}
-			if (d2 < 1e-12)
-				return pt.y
-			const w = 1 / (d2 + 1e-9)
-			wsum += w
-			acc += w * pt.y
+			if (exact < 0) {
+				if (d2 < 1e-12) {
+					exact = i
+				} else {
+					const w = 1 / ((p === 2 ? d2 : Math.pow(Math.sqrt(d2), p)) + 1e-9)
+					wsum += w
+					acc += w * pt.y
+				}
+			}
+			if (pt.y > maxY)
+				maxY = pt.y
+			if (nSel < K || d2 < selD[K - 1]) {
+				let j = nSel < K ? nSel++ : K - 1
+				while (j > 0 && selD[j - 1] > d2) {
+					selD[j] = selD[j - 1]
+					selI[j] = selI[j - 1]
+					--j
+				}
+				selD[j] = d2
+				selI[j] = i
+			}
 		}
-		return wsum > 0 ? acc / wsum : 0
+		const idw = exact >= 0 ? pts[exact].y : wsum > 0 ? acc / wsum : 0
+		const M = N + 1
+		let A = [], b = []
+		for (let r = 0; r < M; ++r) {
+			A.push(new Array(M).fill(0))
+			b.push(0)
+		}
+		for (let k = 0; k < nSel; ++k) {
+			const pt = pts[selI[k]]
+			let phi = [1], d2 = 0
+			for (let a = 0; a < N; ++a) {
+				const dx = (pt.x[a] - q[a]) * inv[a]
+				phi.push(dx)
+				d2 += dx * dx
+			}
+			const w = 1 / (d2 + 1e-9)
+			for (let r = 0; r < M; ++r) {
+				for (let c = r; c < M; ++c)
+					A[r][c] += w * phi[r] * phi[c]
+				b[r] += w * phi[r] * pt.y
+			}
+		}
+		let tr = 0
+		for (let r = 1; r < M; ++r) {
+			for (let c = 0; c < r; ++c)
+				A[r][c] = A[c][r]
+			tr += A[r][r]
+		}
+		for (let a = 1; a < M; ++a)
+			A[a][a] += ridgeFrac * tr / N
+		for (let col = 0; col < M; ++col) {
+			let pv = col
+			for (let r = col + 1; r < M; ++r)
+				if (Math.abs(A[r][col]) > Math.abs(A[pv][col]))
+					pv = r
+			if (Math.abs(A[pv][col]) < 1e-12)
+				return idw
+			if (pv !== col) {
+				const t = A[col]; A[col] = A[pv]; A[pv] = t
+				const tb = b[col]; b[col] = b[pv]; b[pv] = tb
+			}
+			for (let r = col + 1; r < M; ++r) {
+				const f = A[r][col] / A[col][col]
+				for (let c = col; c < M; ++c)
+					A[r][c] -= f * A[col][c]
+				b[r] -= f * b[col]
+			}
+		}
+		let sol = new Array(M)
+		for (let r = M - 1; r >= 0; --r) {
+			let s = b[r]
+			for (let c = r + 1; c < M; ++c)
+				s -= A[r][c] * sol[c]
+			sol[r] = s / A[r][r]
+		}
+		return Math.min(Math.max(sol[0], 0.1), 1.25 * maxY)
 	}
 	function foldAwa(a) {
 		if (!folded)
@@ -168,7 +259,7 @@ Rectangle {
 	property string curveKey
 	function refresh() {
 		const sea = Math.round((lSea || 0) * 10) / 10
-		const key = view + "|" + curveRev + "|" + trueFrame + "|" + sea + "|"
+		const key = view + "|" + curveRev + "|" + trueFrame + "|" + sea + "|" + ridgeFrac + "|" + idwPower + "|"
 			+ (view ? Math.round(num(mHw) * 2 || 0) : Math.round(num(sWs) * 2 || 0))
 		if (key === curveKey)
 			return
@@ -183,7 +274,7 @@ Rectangle {
 			}
 			const st = Math.max(1, (hi - lo) / 90)
 			for (let a = lo; a <= hi + 1e-6; a += st) {
-				const s = frontEval(sailFront, [aws, foldAwa(a), sea], sailScale)
+				const s = frontPred(sailFront, [aws, foldAwa(a), sea], sailScale)
 				if (s <= 0)
 					continue
 				pts.push([trueFrame ? appToTrue(a, s, aws) : a, s])
@@ -198,7 +289,7 @@ Rectangle {
 			}
 			const st = Math.max(20, (hi - lo) / 120)
 			for (let r = lo; r <= hi + 1e-6; r += st) {
-				const v = frontEval(motorFront, [r, hw, sea], motorScale)
+				const v = frontPred(motorFront, [r, hw, sea], motorScale)
 				if (v <= 0)
 					continue
 				pts.push([r, v])
@@ -290,9 +381,11 @@ Rectangle {
 			font.bold: true
 		}
 	}
+	TextMetrics { id: motoringTm; font.family: Global.fontFamily; font.pixelSize: Theme.font_size_tiny; text: "Motoring" }
 	SegmentedButtonRow {
 		anchors { right: parent.right; rightMargin: 8; top: parent.top; topMargin: 6 }
-		width: Math.round(190 * perf.k)
+		// never so narrow that "Motoring" loses its 12 px each side, as the 5-inch tile's 0.7 scale made it
+		width: Math.max(Math.round(190 * perf.k), 2 * Math.ceil(motoringTm.advanceWidth + 24))
 		height: 30
 		visible: perf.sailBoat
 		fontPixelSize: Theme.font_size_tiny
@@ -318,25 +411,30 @@ Rectangle {
 				color: Theme.color_font_secondary
 				font.pixelSize: perf.fs(14, 12)
 			}
-			Label {
+			XregNum {
+				template: perf.view ? "8888" : "88 kn"
 				text: !perf.lValid ? "--" : perf.view ? Math.round(perf.num(mRpm)) : Math.round(perf.num(sWs) || 0) + " kn"
 				font.pixelSize: perf.fs(26, 18)
 				font.bold: true
 			}
-			Label {
-				width: parent.width
-				wrapMode: Text.WordWrap
-				text: {
-					if (!perf.lValid)
-						return ""
-					if (perf.view) {
-						const hw = perf.num(mHw) || 0
-						return Math.round(Math.abs(hw)) + (hw < 0 ? " kn tailwind" : " kn headwind")
+			Row {
+				spacing: 4
+				XregNum {
+					template: perf.view ? "88 kn" : "888°"
+					text: {
+						if (!perf.lValid)
+							return ""
+						return perf.view ? Math.round(Math.abs(perf.num(mHw) || 0)) + " kn" : Math.round(perf.num(sWa) || 0) + "°"
 					}
-					return Math.round(perf.num(sWa) || 0) + "°"
+					color: Theme.color_font_secondary
+					font.pixelSize: perf.fs(14, 12)
 				}
-				color: Theme.color_font_secondary
-				font.pixelSize: perf.fs(14, 12)
+				Label {
+					visible: perf.view && perf.lValid
+					text: (perf.num(mHw) || 0) < 0 ? "tailwind" : "headwind"
+					color: Theme.color_font_secondary
+					font.pixelSize: perf.fs(14, 12)
+				}
 			}
 		}
 		// Top right: sea state
@@ -350,9 +448,9 @@ Rectangle {
 				color: Theme.color_font_secondary
 				font.pixelSize: perf.fs(14, 12)
 			}
-			Label {
-				width: parent.width
-				horizontalAlignment: Text.AlignRight
+			XregNum {
+				anchors.right: parent.right
+				template: "88.8°"
 				text: isFinite(perf.lSea) ? perf.lSea.toFixed(1) + "°" : "--"
 				font.pixelSize: perf.fs(26, 18)
 				font.bold: true
@@ -369,7 +467,8 @@ Rectangle {
 		Column {
 			anchors.bottom: parent.bottom
 			width: perf.side
-			Label {
+			XregNum {
+				template: "100%"
 				text: perf.graded ? Math.round(perf.lPct) + "%" : "--"
 				color: perf.graded ? perf.stateColor(perf.lState) : Theme.color_font_primary
 				font.pixelSize: perf.fs(34, 24)
@@ -392,9 +491,9 @@ Rectangle {
 		Column {
 			anchors { right: parent.right; bottom: parent.bottom }
 			width: perf.side
-			Label {
-				width: parent.width
-				horizontalAlignment: Text.AlignRight
+			XregNum {
+				anchors.right: parent.right
+				template: "88888"
 				text: isFinite(perf.num(perf.view ? mPts : sPts)) ? perf.num(perf.view ? mPts : sPts) | 0 : "--"
 				font.pixelSize: perf.fs(20, 16)
 				font.bold: true
@@ -407,10 +506,10 @@ Rectangle {
 				color: Theme.color_font_secondary
 				font.pixelSize: perf.fs(12, 11)
 			}
-			Label {
-				width: parent.width
-				horizontalAlignment: Text.AlignRight
-				text: !isFinite(perf.lHours) ? "--" : perf.lHours >= 10 ? Math.round(perf.lHours) : perf.lHours.toFixed(1)
+			XregNum {
+				anchors.right: parent.right
+				template: "8888.8"
+				text: !isFinite(perf.lHours) ? "--" : perf.lHours.toFixed(1)
 				font.pixelSize: perf.fs(20, 16)
 				font.bold: true
 			}
@@ -458,9 +557,10 @@ Rectangle {
 							border.width: 1
 							border.color: Theme.color_card_separator
 						}
-						Label {
+						XregNum {
 							x: polar.cx + 3
 							y: polar.cy - parent.r + 1
+							template: "88 kn"
 							text: Math.round(perf.maxS * (index + 1) / 4) + " kn"
 							color: Theme.color_font_disabled
 							font.pixelSize: 10
@@ -513,13 +613,20 @@ Rectangle {
 					color: Theme.color_font_secondary
 					font.pixelSize: 10
 				}
+				// Halfway down the lower half, but never over the speed readout, and inside the circle: on a small polar
+				// (5-inch) it drops to the readout's foot, shrinks and breaks onto two lines
 				Label {
-					anchors.centerIn: parent
-					anchors.verticalCenterOffset: polar.rr * 0.5
+					id: noSail
+					readonly property real maxW: polar.rr * 1.5
+					x: polar.cx - width / 2
+					y: Math.max(polar.cy + polarSpd.height / 2 + 2, (polar.height + polar.rr - height) / 2)
+					width: Math.min(implicitWidth, maxW)
 					visible: !perf.haveCurve
-					text: "No sailing data yet"
+					text: noSailTm.advanceWidth <= maxW ? noSailTm.text : "No sailing\ndata yet"
+					horizontalAlignment: Text.AlignHCenter
 					color: Theme.color_font_secondary
-					font.pixelSize: Theme.font_size_caption
+					font.pixelSize: perf.fs(Theme.font_size_caption, 11)
+					TextMetrics { id: noSailTm; font: noSail.font; text: "No sailing data yet" }
 				}
 				Rectangle {
 					readonly property point at: polar.pt(perf.trueFrame ? perf.appToTrue(perf.num(sWa) || 0, perf.lSpd || 0, perf.num(sWs) || 0)
@@ -533,10 +640,12 @@ Rectangle {
 					border.color: Theme.color_white
 				}
 				Column {
+					id: polarSpd
 					x: polar.cx - width / 2
 					y: polar.cy - height / 2
-					Label {
+					XregNum {
 						anchors.horizontalCenter: parent.horizontalCenter
+						template: "88.8"
 						text: perf.lValid && isFinite(perf.lSpd) ? perf.lSpd.toFixed(1) : "--"
 						color: perf.brand
 						font.pixelSize: perf.fs(38, 26)
@@ -561,10 +670,22 @@ Rectangle {
 				readonly property real padB: 16
 				readonly property real cw: width - padL - 4
 				readonly property real ch: height - padB - 4
-				readonly property real rStep: Math.max(500, Math.ceil(perf.maxR / 6 / 500) * 500)
+				// at most six RPM labels, and at least 30 px apart (four-digit labels touch on the 5-inch plot at 1000)
+				readonly property real rStep: [500, 1000, 2000, 5000, 10000].find(s => s >= perf.maxR / 6
+						&& s / perf.maxR * cw >= 30) || 10000
 				readonly property real sStep: Math.max(1, Math.ceil(perf.maxS / 5))
 				function mx(r) { return padL + r / perf.maxR * cw }
 				function my(s) { return 4 + ch - s / perf.maxS * ch }
+				// The speed readout sits top left, over the low-RPM end the curve rises from; on a small plot (5-inch) the
+				// curve and the dot reach that corner, and the readout moves to bottom right, under the high-RPM end
+				function clear(rx, ry, rw, rh) {
+					const hit = (x, y, pad) => x > rx - pad && x < rx + rw + pad && y > ry - pad && y < ry + rh + pad
+					if (perf.lValid && hit(mx(perf.num(mRpm) || 0), my(perf.lSpd || 0), 8))
+						return false
+					return !perf.haveCurve || !perf.curve.pts.some(q => hit(mx(q[0]), my(q[1]), 3))
+				}
+				readonly property bool lowRight: !clear(padL + 8, 8, spdCol.width, spdCol.height)
+					&& clear(padL + cw - 8 - spdCol.width, 4 + ch - 6 - spdCol.height, spdCol.width, spdCol.height)
 				Repeater {
 					model: Math.floor(perf.maxR / motor.rStep) + 1
 					delegate: Item {
@@ -619,12 +740,19 @@ Rectangle {
 						}
 					}
 				}
+				// Centred in the plot area, clear of the axis labels; on a small plot (5-inch) it shrinks and breaks onto two lines
 				Label {
-					anchors.centerIn: parent
+					id: noMotor
+					readonly property real maxW: motor.cw - 8
+					x: motor.padL + (motor.cw - width) / 2
+					y: 4 + (motor.ch - height) / 2
+					width: Math.min(implicitWidth, maxW)
 					visible: !perf.haveCurve
-					text: "No motoring data yet"
+					text: noMotorTm.advanceWidth <= maxW ? noMotorTm.text : "No motoring\ndata yet"
+					horizontalAlignment: Text.AlignHCenter
 					color: Theme.color_font_secondary
-					font.pixelSize: Theme.font_size_caption
+					font.pixelSize: perf.fs(Theme.font_size_caption, 11)
+					TextMetrics { id: noMotorTm; font: noMotor.font; text: "No motoring data yet" }
 				}
 				Rectangle {
 					visible: perf.view === 1 && perf.lValid
@@ -636,15 +764,19 @@ Rectangle {
 					border.color: Theme.color_white
 				}
 				Column {
-					x: motor.padL + 8
-					y: 8
-					Label {
+					id: spdCol
+					x: motor.lowRight ? motor.padL + motor.cw - 8 - width : motor.padL + 8
+					y: motor.lowRight ? 4 + motor.ch - 6 - height : 8
+					XregNum {
+						anchors.right: motor.lowRight ? parent.right : undefined
+						template: "88.8"
 						text: perf.lValid && isFinite(perf.lSpd) ? perf.lSpd.toFixed(1) : "--"
 						color: perf.brand
 						font.pixelSize: perf.fs(34, 24)
 						font.bold: true
 					}
 					Label {
+						anchors.right: motor.lowRight ? parent.right : undefined
 						text: perf.num(mSrc) >= 1.5 ? "KN · SOG" : "KN · STW"
 						color: Theme.color_font_secondary
 						font.pixelSize: 10

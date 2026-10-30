@@ -3,9 +3,10 @@ import QtQuick.Shapes
 import Victron.VenusOS
 
 // Line chart for the Plots page, drawn with Shapes. A line is
-// { key, label, unit, dec, x: [..], v: [..], lo: [..], hi: [..], color, w, dash, right, off, dots, wrap, noLegend }:
+// { key, label, unit, dec, x: [..], v: [..], lo: [..], hi: [..], color, w, dash, right, off, dots, wrap, noLegend, last }:
 // NaN in v breaks the line, lo/hi draw a min/max band, dots draws one round mark per sample, wrap breaks an angle line
-// where it crosses 0/360, off starts the line hidden, noLegend keeps it out of the legend. Tapping a legend entry hides
+// where it crosses 0/360, off starts the line hidden, noLegend keeps it out of the legend, last is the value the legend
+// shows when the window holds none. Tapping a legend entry hides
 // or shows its line; pressing on the plot reads every line at that point (scrubbed() lets a page move the cursor on
 // several charts at once).
 Item {
@@ -17,6 +18,7 @@ Item {
 	property real xHi: 1
 	property var xTicks: []                 // [{ x, t }]
 	property var leftFixed: null            // [lo, hi]; null fits the data in the window
+	property var leftCap: null              // [lo, hi, step]: a fitted left axis that would pass either end shows all of it
 	property var rightFixed: null
 	property real leftStep: 0               // tick spacing for a fixed left range; 0 picks one
 	property bool leftFromZero
@@ -50,7 +52,7 @@ Item {
 	readonly property var shownLines: lines.filter(l => !isHidden(l))
 	readonly property bool hasLeft: lines.some(l => !l.right && !l.noLegend)
 	readonly property bool hasRight: lines.some(l => !!l.right)
-	readonly property var lAx: axisFor(false, leftFixed, leftFromZero)
+	readonly property var lAx: axisFor(false, leftFixed, leftFromZero, leftCap)
 	readonly property var rAx: axisFor(true, rightFixed, rightFromZero)
 	readonly property bool hasData: shownLines.some(l => !l.noLegend && inWindow(l))
 
@@ -77,7 +79,7 @@ Item {
 			t.push(k * st)
 		return { lo: lo, hi: hi, ticks: t, st: st }
 	}
-	function axisFor(right, fixed, fromZero) {
+	function axisFor(right, fixed, fromZero, cap) {
 		if (fixed)
 			return mk(fixed[0], fixed[1], right ? 0 : leftStep)
 		let lo = Infinity, hi = -Infinity
@@ -103,11 +105,17 @@ Item {
 			hi = Math.max(hi, 0)
 		}
 		if (hi - lo < 1e-6) {
-			lo -= 1
+			// every reading equal: open the axis around it, but a zero-based axis (a speed, RPM) only upward from 0
+			if (!fromZero)
+				lo -= 1
 			hi += 1
 		}
 		const st = step(hi - lo)
-		return mk(Math.floor(lo / st + 1e-9) * st, Math.ceil(hi / st - 1e-9) * st)
+		lo = Math.floor(lo / st + 1e-9) * st
+		hi = Math.ceil(hi / st - 1e-9) * st
+		if (cap && (lo < cap[0] || hi > cap[1]))
+			return mk(cap[0], cap[1], cap[2])
+		return mk(lo, hi)
 	}
 	function tickText(v, st) {
 		return v.toFixed(Math.max(0, Math.ceil(-Math.log10(st) - 1e-9)))
@@ -179,12 +187,27 @@ Item {
 		}
 		return best
 	}
+	function numText(v, l) {
+		const u = l.unit || ""
+		const t = Math.abs(v).toFixed(l.dec !== undefined ? l.dec : 1)
+		return (v < 0 && Number(t) !== 0 ? "\u2212" : "") + t + (u === "" || u === "%" || u === "°" ? u : " " + u)
+	}
+	// the line's own `last` (its newest reading outside the window, where a page has one) before a dash
 	function valueText(l) {
 		const v = valueAt(l)
-		if (!isFinite(v))
-			return "--"
-		const u = l.unit || ""
-		return v.toFixed(l.dec !== undefined ? l.dec : 1) + (u === "" || u === "%" || u === "°" ? u : " " + u)
+		return isFinite(v) ? numText(v, l) : isFinite(l.last) ? numText(l.last, l) : "--"
+	}
+	// The widest value a legend entry can show on its axis, so the entries after it never move as the value changes
+	function valueTemplate(l) {
+		const ax = l.right ? rAx : lAx
+		const m = ax ? Math.max(Math.abs(ax.lo), Math.abs(ax.hi)) : 0
+		let lo = ax ? ax.lo : 0, mm = m
+		for (const v of (l.v || []).concat(isFinite(l.last) ? [l.last] : []))
+			if (isFinite(v)) {
+				lo = Math.min(lo, v)
+				mm = Math.max(mm, Math.abs(v))
+			}
+		return numText(lo < 0 ? -mm : mm, l)
 	}
 	function scrub(mx) {
 		lift.stop()
@@ -286,7 +309,8 @@ Item {
 						color: Theme.color_font_secondary
 						font.pixelSize: Theme.font_size_tiny
 					}
-					Label {
+					XregNum {
+						template: chart.valueTemplate(entry.ln)
 						text: chart.valueText(entry.ln)
 						font.pixelSize: Theme.font_size_tiny
 						font.bold: true
@@ -430,11 +454,30 @@ Item {
 			opacity: 0.6
 		}
 		MouseArea {
+			id: scrubArea
+			// The swipe host (XregHome) stops paging while a finger is on the plot, so a sideways drag moves the cursor
+			// and never the page; a vertical drag still scrolls a page of charts, which cancels the cursor.
+			property Item host: null
+			function hold(on) {
+				if (on && !host) {
+					for (let p = chart.parent; p; p = p.parent) {
+						if (p.swipeHolds !== undefined) {
+							host = p
+							host.swipeHolds++
+							break
+						}
+					}
+				} else if (!on && host) {
+					host.swipeHolds--
+					host = null
+				}
+			}
 			anchors.fill: parent
-			onPressed: (mouse) => chart.scrub(mouse.x)
+			onPressed: (mouse) => { hold(true); chart.scrub(mouse.x) }
 			onPositionChanged: (mouse) => chart.scrub(mouse.x)
-			onReleased: lift.restart()
-			onCanceled: lift.restart()
+			onReleased: { hold(false); lift.restart() }
+			onCanceled: { hold(false); lift.restart() }
+			Component.onDestruction: hold(false)
 		}
 	}
 

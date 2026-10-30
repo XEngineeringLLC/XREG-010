@@ -422,20 +422,27 @@ struct FrontStore {
   // Max-per-cell insert (cell = within half an axisScale on EVERY axis) keeps a true upper envelope.
   // Returns true only for a new cell or a >=0.5% record beat (bare compare churned the cloud upload queue;
   // BEST_EVER_FRONT_SPEC.md §5b); callers gate cloud upload on it.
-  bool add(const FrontPoint<NAXIS> &p) {
+  bool add(const FrontPoint<NAXIS> &p) { return addAt(p, cellOf(p.x)); }
+  // add() with its cell already found: cellOf(p.x), or a FrontQuery over this store with no write since.
+  bool addAt(const FrontPoint<NAXIS> &p, int cell) {
+    if (cell >= 0) {
+      if (p.y > pts[cell].y * 1.005f + 0.01f) { pts[cell] = p; return true; }   // meaningfully better at this cell
+      return false;                                                              // the existing record stands
+    }
+    if (count >= cap) return false;
+    pts[count++] = p; return true;
+  }
+  // First record in x's half-axisScale cell, or -1: the record add() would beat (hasLocalSupport() is cellOf() >= 0).
+  int cellOf(const float x[NAXIS]) const {
     for (int i = 0; i < count; i++) {
       bool sameCell = true;
       for (int a = 0; a < NAXIS; a++) {
         float sc = (axisScale[a] > 1e-9f) ? axisScale[a] : 1.0f;
-        if (fabsf(p.x[a] - pts[i].x[a]) > 0.5f * sc) { sameCell = false; break; }
+        if (fabsf(x[a] - pts[i].x[a]) > 0.5f * sc) { sameCell = false; break; }
       }
-      if (sameCell) {
-        if (p.y > pts[i].y * 1.005f + 0.01f) { pts[i] = p; return true; }   // meaningfully better at this cell
-        return false;                                                        // the existing record stands
-      }
+      if (sameCell) return i;
     }
-    if (count >= cap) return false;
-    pts[count++] = p; return true;
+    return -1;
   }
   // IDW evaluation, O(count). Reached only at 1 Hz via classify()/pushesHybrid(), never from the ~75 Hz
   // altFold_tick. A convex blend, so the result never leaves the support points' y-range.
@@ -640,6 +647,229 @@ struct FrontStore {
   }
 };
 
+// Front writes outside the lookup engine (reset, import, cloud sync, Uploaded load, class change, demo swap, fillmax)
+// bracket themselves with frontWriteBegin/End; a FrontQuery that sees either counter move drops its result. The
+// writer count covers async_tcp loading the Uploaded surface while Core 1 is mid-lookup.
+static volatile uint32_t frontGen = 0;
+static volatile int32_t  frontWriters = 0;
+static inline void frontWriteBegin() {
+  __atomic_add_fetch(&frontWriters, 1, __ATOMIC_SEQ_CST);
+  __atomic_add_fetch(&frontGen, 1, __ATOMIC_SEQ_CST);
+}
+static inline void frontWriteEnd() {
+  __atomic_add_fetch(&frontGen, 1, __ATOMIC_SEQ_CST);
+  __atomic_sub_fetch(&frontWriters, 1, __ATOMIC_SEQ_CST);
+}
+static inline uint32_t frontGenNow() { return __atomic_load_n(&frontGen, __ATOMIC_SEQ_CST); }
+static inline bool frontGenSame(uint32_t g) {
+  return __atomic_load_n(&frontWriters, __ATOMIC_SEQ_CST) == 0 && __atomic_load_n(&frontGen, __ATOMIC_SEQ_CST) == g;
+}
+
+#define FRONT_STEP_US 500   // lookup work per loop() pass for each engine (alt-health job, boat-perf queue)
+
+// One record-book lookup as ONE pass over the store, resumable across loop() passes so a pass pays at most
+// FRONT_STEP_US at any count. The pass gathers what classify(), cellOf() and nearestNormDist() otherwise read the
+// store five to seven times for, keeping each one's comparisons and summation order, so every result is bit-identical
+// to theirs (/debug/frontcheck compares them on the board). pts/count/axisScale are taken at begin(); a front write
+// since then (frontGen) ends the lookup DROPPED.
+template <int NAXIS>
+struct FrontQuery {
+  enum : uint8_t { IDLE = 0, SCAN = 1, SOLVE = 2, DONE = 3, DROPPED = 4 };
+  uint8_t phase;
+  const FrontPoint<NAXIS> *pts;
+  int   n, i, k;
+  uint32_t gen;
+  float x[NAXIS], invSc[NAXIS], half[NAXIS];
+  float idwPower, ridgeFrac, refRadius, riskThresh, r2;
+  float wsum, num, maxY, best;                         // eval() sums, evalLWLR() max y, nearest d²
+  int   exact, nSel;                                   // eval() exact hit, evalLWLR() neighbor count
+  int   selIdx[FRONT_LWLR_KMAX];
+  float selD2[FRONT_LWLR_KMAX];
+  float minPos[NAXIS], minNeg[NAXIS];                  // slopeGapAmps() per-axis side state
+  bool  hasPos[NAXIS], hasNeg[NAXIS], hasMid[NAXIS];
+  double A[NAXIS + 1][NAXIS + 1], b[NAXIS + 1];
+  float sl[NAXIS];
+  // Results, valid at DONE
+  int   state;                  // classify()
+  float pred, bar;              // classify() predOut / barOut (bar = pushesHybrid()'s bar)
+  float idw, lp;                // eval(); evalLWLR() prediction (0 unless lwlrOk)
+  bool  lwlrOk;
+  int   cell;                   // cellOf()
+  float nearest;                // nearestNormDist()
+
+  void begin(const FrontStore<NAXIS> &fs, const float q[NAXIS], float idwP, float ridge, float radius, float risk,
+             uint32_t g) {
+    pts = fs.pts; n = fs.count; i = 0; k = 0; gen = g;
+    for (int a = 0; a < NAXIS; a++) {
+      x[a] = q[a];
+      invSc[a] = (fs.axisScale[a] > 1e-9f) ? (1.0f / fs.axisScale[a]) : 1.0f;
+      float sc = (fs.axisScale[a] > 1e-9f) ? fs.axisScale[a] : 1.0f;
+      half[a] = 0.5f * sc;
+      minPos[a] = minNeg[a] = 1e30f; hasPos[a] = hasNeg[a] = hasMid[a] = false;
+    }
+    idwPower = idwP; ridgeFrac = ridge; refRadius = radius; riskThresh = risk; r2 = radius * radius;
+    wsum = 0; num = 0; maxY = 0; best = 1e30f; exact = -1; nSel = 0; cell = -1;
+    state = FRONT_NO_REFERENCE; pred = 0; bar = 0; idw = 0; lp = 0; lwlrOk = false; nearest = 1e9f;
+    phase = SCAN;
+  }
+
+  // Runs until the lookup ends (true: DONE or DROPPED) or untilUs passes (false: call again next pass).
+  bool step(int64_t untilUs) {
+    if (phase != SCAN && phase != SOLVE) return true;
+    if (!frontGenSame(gen)) { phase = DROPPED; return true; }
+    if (phase == SCAN) {
+      float ws = wsum, nm = num, my = maxY, bs = best;
+      int ex = exact, cl = cell;
+      while (i < n) {
+        int end = (n - i > 32) ? i + 32 : n;
+        for (; i < end; i++) {
+          const FrontPoint<NAXIS> &p = pts[i];
+          float d2 = 0;
+          bool inCell = true;
+          for (int a = 0; a < NAXIS; a++) {
+            float diff = x[a] - p.x[a];
+            float dx = diff * invSc[a];
+            d2 += dx * dx;
+            if (fabsf(diff) > half[a]) inCell = false;
+          }
+          if (ex < 0) {                                                // eval()
+            if (d2 < 1e-12f) ex = i;
+            else {
+              float dp = (idwPower == 2.0f) ? d2 : powf(sqrtf(d2), idwPower);
+              float w = 1.0f / (dp + 1e-9f);
+              ws += w; nm += w * p.y;
+            }
+          }
+          if (p.y > my) my = p.y;                                      // evalLWLR() selection
+          if (nSel < FRONT_LWLR_KMAX) {
+            int j = nSel++;
+            while (j > 0 && selD2[j - 1] > d2) { selD2[j] = selD2[j - 1]; selIdx[j] = selIdx[j - 1]; j--; }
+            selD2[j] = d2; selIdx[j] = i;
+          } else if (d2 < selD2[FRONT_LWLR_KMAX - 1]) {
+            int j = FRONT_LWLR_KMAX - 1;
+            while (j > 0 && selD2[j - 1] > d2) { selD2[j] = selD2[j - 1]; selIdx[j] = selIdx[j - 1]; j--; }
+            selD2[j] = d2; selIdx[j] = i;
+          }
+          if (d2 < bs) bs = d2;                                        // nearestNormDist()
+          if (cl < 0 && inCell) cl = i;                                // cellOf()
+          if (!(d2 > r2)) {                                            // slopeGapAmps(x, refRadius, 0.05f)
+            for (int a = 0; a < NAXIS; a++) {
+              float g = (p.x[a] - x[a]) * invSc[a];
+              if (g > 0.05f)       { hasPos[a] = true; if (g  < minPos[a]) minPos[a] = g; }
+              else if (g < -0.05f) { hasNeg[a] = true; if (-g < minNeg[a]) minNeg[a] = -g; }
+              else hasMid[a] = true;
+            }
+          }
+        }
+        if (i < n && esp_timer_get_time() >= untilUs) break;
+      }
+      wsum = ws; num = nm; maxY = my; best = bs; exact = ex; cell = cl;
+      if (i < n) return false;
+      if (n <= 0) { finish(); return true; }
+      idw = (exact >= 0) ? pts[exact].y : ((wsum > 0) ? (num / wsum) : 0.0f);
+      nearest = sqrtf(best);
+      for (int r = 0; r <= NAXIS; r++) { b[r] = 0; for (int c = 0; c <= NAXIS; c++) A[r][c] = 0; }
+      phase = SOLVE;
+      if (esp_timer_get_time() >= untilUs) return false;
+    }
+    while (k < nSel) {                                                 // evalLWLR() normal equations
+      const FrontPoint<NAXIS> &pt = pts[selIdx[k]];
+      const int M = NAXIS + 1;
+      double phi[NAXIS + 1];
+      phi[0] = 1.0;
+      double d2 = 0;
+      for (int a = 0; a < NAXIS; a++) {
+        double dx = (double)(pt.x[a] - x[a]) * invSc[a];
+        phi[a + 1] = dx;
+        d2 += dx * dx;
+      }
+      double w = 1.0 / (d2 + 1e-9);
+      for (int r = 0; r < M; r++) {
+        for (int c = r; c < M; c++) A[r][c] += w * phi[r] * phi[c];
+        b[r] += w * phi[r] * (double)pt.y;
+      }
+      k++;
+      if ((k & 3) == 0 && k < nSel && esp_timer_get_time() >= untilUs) return false;
+    }
+    finish();
+    if (!frontGenSame(gen)) phase = DROPPED;                           // an async_tcp write landed mid-lookup
+    return true;
+  }
+
+  // evalLWLR()'s solve, then classify()'s decision, as written there.
+  void finish() {
+    if (n > 0) {
+      const int M = NAXIS + 1;
+      for (int r = 1; r < M; r++)
+        for (int c = 0; c < r; c++) A[r][c] = A[c][r];
+      double tr = 0;
+      for (int a = 1; a < M; a++) tr += A[a][a];
+      double ridge = (double)ridgeFrac * tr / (double)NAXIS;
+      for (int a = 1; a < M; a++) A[a][a] += ridge;
+      bool ok = true;
+      for (int col = 0; ok && col < M; col++) {
+        int p = col;
+        for (int r = col + 1; r < M; r++)
+          if (fabs(A[r][col]) > fabs(A[p][col])) p = r;
+        if (fabs(A[p][col]) < 1e-12) { ok = false; break; }
+        if (p != col) {
+          for (int c = 0; c < M; c++) { double t = A[col][c]; A[col][c] = A[p][c]; A[p][c] = t; }
+          double t = b[col]; b[col] = b[p]; b[p] = t;
+        }
+        for (int r = col + 1; r < M; r++) {
+          double f = A[r][col] / A[col][col];
+          for (int c = col; c < M; c++) A[r][c] -= f * A[col][c];
+          b[r] -= f * b[col];
+        }
+      }
+      if (ok) {
+        double sol[NAXIS + 1];
+        for (int r = M - 1; r >= 0; r--) {
+          double s = b[r];
+          for (int c = r + 1; c < M; c++) s -= A[r][c] * sol[c];
+          sol[r] = s / A[r][r];
+        }
+        float pr = (float)sol[0];
+        float hi = 1.25f * maxY;
+        if (pr < 0.1f) pr = 0.1f;
+        if (pr > hi) pr = hi;
+        lp = pr;
+        for (int a = 0; a < NAXIS; a++) sl[a] = (float)sol[a + 1];
+        lwlrOk = true;
+      }
+    }
+    pred = 0; bar = 0;
+    if (n <= 0) state = FRONT_NO_REFERENCE;
+    else {
+      bar = (lwlrOk && lp < idw) ? lp : idw;
+      if (cell >= 0) { pred = lwlrOk ? lp : idw; state = FRONT_MEASURED; }
+      else if (nearest > refRadius) state = FRONT_NO_REFERENCE;
+      else if (!lwlrOk || lp <= 0.1f) state = FRONT_LEARNING_EDGE;
+      else {
+        float sum = 0;
+        for (int a = 0; a < NAXIS; a++) {
+          if (hasMid[a] || (hasPos[a] && hasNeg[a])) continue;
+          float gap = hasPos[a] ? minPos[a] : (hasNeg[a] ? minNeg[a] : 0.0f);
+          sum += fabsf(sl[a]) * gap;
+        }
+        float slopeGapRisk = sum / lp;
+        float curvRisk = fabsf(lp - idw) / lp;
+        float risk = (slopeGapRisk > curvRisk) ? slopeGapRisk : curvRisk;
+        if (risk > riskThresh) state = FRONT_LEARNING_EDGE;
+        else { pred = lp; state = FRONT_ESTIMATED; }
+      }
+    }
+    phase = DONE;
+  }
+
+  // Bench probe near a stored record (/debug/frontcheck): record (seq·7919 mod count), moved off * axisScale per axis.
+  static void probe(const FrontStore<NAXIS> &fs, uint32_t seq, float off, float out[NAXIS]) {
+    if (fs.count <= 0) { for (int a = 0; a < NAXIS; a++) out[a] = 0; return; }
+    const FrontPoint<NAXIS> &p = fs.pts[(seq * 7919u) % (uint32_t)fs.count];
+    for (int a = 0; a < NAXIS; a++) out[a] = p.x[a] + off * ((fs.axisScale[a] > 1e-9f) ? fs.axisScale[a] : 1.0f);
+  }
+};
+
 // ALTERNATOR HEALTH, Best-Ever Front (device side). Folds one sample per control tick (~75 Hz, pidLog hook)
 // into Episode; emitted steady-run averages push the output-amps front; the cloud prunes and keeps raw history.
 // Generic engine: top of this file; globals: Xregulator.ino. Spec: BEST_EVER_FRONT_SPEC.md / BEST_EVER_IMPLEMENTATION_PLAN.md.
@@ -731,6 +961,7 @@ struct __attribute__((packed)) AltSessPt {   // 21 B — packed + fixed-point; 2
 static_assert(sizeof(AltSessPt) == 21, "AltSessPt lost its packing — the PSRAM budget assumes 21 B");
 static AltSessPt *altSessRing      = nullptr;
 static uint32_t   altSessRingHead  = 0, altSessRingCount = 0, altSessRingLastMs = 0;
+static AltSessPt  altSessLastGraded = {};   // demo only: the row repeated while nothing is graded (9_demo.ino seeds it)
 static inline uint16_t altQU16(float v, float scale) {          // saturating, NaN→0
   if (!(v > 0.0f)) return 0;
   float q = v * scale;
@@ -896,8 +1127,8 @@ static void altCommitTrendBucket() {
   p.worstPct = (int16_t)lroundf(worst * 10.0f);
   p.overallPct = (int16_t)lroundf(overall * 10.0f);
 }
-static void altTrendAdd(float perfFrac) {
-  int eh = altTrendBucketIndex();
+// eh = altTrendBucketIndex() when the run was graded (the 1 Hz tick, which the job may apply a few passes later).
+static void altTrendAdd(float perfFrac, int eh) {
   if (altCurEngHour < 0) altCurEngHour = eh;
   if (eh != altCurEngHour) {             // engine-time bucket advanced → commit the prior bucket + reset
     altCommitTrendBucket();
@@ -993,6 +1224,35 @@ static void altEpisodeSyncCfg(float ampsFilt) {
 struct AltEmitPending { FrontPoint<ALT_NAXIS> sp; };
 static AltEmitPending altEmitQ[ALT_EMIT_QUEUE];
 static int altEmitQCount = 0;
+static uint32_t altLastTrendFeedMs = 0;   // altTrendFeedSec throttle, shared by altProcessEmits() and the 1 Hz job
+
+// ---- 1 Hz record-book job (live alternator; demo mode keeps altTickInline) ----
+// The tick takes what altTickInline() reads (up to two finished steady runs, the live point, the knobs, the active
+// surface, the trend clock); then FrontQuery lookups run in the inline order within FRONT_STEP_US per loop pass: each
+// run's grade (trend) and, only when Uploaded is the active surface, its admission lookup against My History (otherwise
+// one lookup serves both); then the live grade; then AltLive and the settings echo on passes of their own. Same grades
+// as the inline tick, landing a few passes after it. A front write after the tick drops the job's remaining lookups.
+enum : uint8_t { ALTJ_GRADE = 0, ALTJ_ADMIT = 1, ALTJ_LIVE = 2, ALTJ_DRY = 3 };
+#define ALTJ_ITEMS 10
+struct AltJobItem { uint8_t kind, emit, uploaded; float x[ALT_NAXIS]; };
+struct AltJob {
+  bool     active;
+  uint8_t  stage;                               // 0 lookups, 1 AltLive, 2 settings echo
+  uint8_t  gradeUp;                             // altGradeFront() at the tick: 1 = Uploaded
+  bool     learn, liveWanted, liveSessSteady, liveSteady;
+  uint32_t tickMs, gen, trendFeedMs, workUs;
+  int      trendEh;
+  float    refRadius, idwPower, ridgeFrac, riskThresh, safetyMargin;
+  float    liveSurf[ALT_NAXIS], liveGAmps;
+  float    liveIn[6];                           // altSessSeriesPush() inputs at the tick
+  FrontPoint<ALT_NAXIS> emit[2];
+  AltJobItem item[ALTJ_ITEMS];
+  uint8_t  nItem, iItem;
+  uint16_t passes, lookups;
+  FrontQuery<ALT_NAXIS> q;
+};
+static AltJob *altJob = nullptr;                // PSRAM (altFrontInit); null → altTickInline()
+
 static bool altCapWarned = false;   // once per boot OR per Start Over (cleared in resetAlternatorHealth)
 
 // ---- per-control-tick fold (THE canonical cadence) ----
@@ -1478,21 +1738,22 @@ static bool altLearnArmed() { return commissionState == 2 && (commissionDoneMask
 static void altProcessEmits() {
   if (!altLearnArmed()) { altEmitQCount = 0; return; }   // not armed: no record, no trend sample, no upload
   int n = (altEmitQCount < 2) ? altEmitQCount : 2;
-  bool learn = (altPaused < 0.5f);   // learning active → also admit into My History; else trend-only
+  bool learn = (altPaused < 0.5f) && altSimMode < 0.5f;   // learning active → also admit into My History; else trend-only
+                                                           // (demo: the record stays the seeded one, 9_demo.ino)
   for (int k = 0; k < n; k++) {
     FrontPoint<ALT_NAXIS> &sp = altEmitQ[k].sp;
 
     // (1) TREND FEED: the trend's ONLY source. FULL-steady MEASURED runs graded against the ACTIVE surface, one per
     // altTrendFeedSec; Estimated grades lean on interpolation and would blur it.
     {
-      static uint32_t lastTrendFeedMs = 0;
       float pred = 0;
-      int st = altGradeFront().classify(sp.x, altRefRadius, altIdwPower, altRidgeFrac, altRiskThresh, &pred);
+      int st = (altSimMode >= 0.5f) ? demoAltGrade(sp.x, sp.y, millis(), &pred)
+                                    : altGradeFront().classify(sp.x, altRefRadius, altIdwPower, altRidgeFrac, altRiskThresh, &pred);
       bool graded = (st == FRONT_MEASURED) && pred > 0.1f;
       uint32_t nowMs = millis();
-      if (graded && (lastTrendFeedMs == 0 || (uint32_t)(nowMs - lastTrendFeedMs) >= (uint32_t)(altTrendFeedSec * 1000.0f))) {
-        lastTrendFeedMs = nowMs;
-        altTrendAdd((sp.y / pred));   // output-% as a fraction; altTrendAdd scales ×100 + buckets it
+      if (graded && (altLastTrendFeedMs == 0 || (uint32_t)(nowMs - altLastTrendFeedMs) >= (uint32_t)(altTrendFeedSec * 1000.0f))) {
+        altLastTrendFeedMs = nowMs;
+        altTrendAdd((sp.y / pred), altTrendBucketIndex());   // output-% as a fraction; altTrendAdd scales ×100 + buckets it
       }
     }
 
@@ -1525,18 +1786,20 @@ static void altProcessEmits() {
 // One {name, getter} table builds BOTH the AltLive SSE payload AND the /altschema field list, so
 // the firmware↔dashboard contract can't desync. Adding a field = add ONE row. All values floats.
 struct AltLiveField { const char *name; float (*get)(); };
-static float alf_valid()     { return (float)altLiveValid; }
+// Demo mode never serves an ungraded tick (field off, engine stopped, between steady points): it serves the last grade
+static inline bool alfDemoHold() { return altSimMode >= 0.5f && !(altRefOk && altLive_pct > 0.0f); }
+static float alf_valid()     { return (altSimMode >= 0.5f) ? 1.0f : (float)altLiveValid; }
 static float alf_rpm()       { return altLive_rpm; }
 static float alf_exc()       { return altLive_exc; }
 static float alf_amps()      { return altLive_amps; }
 static float alf_pred()      { return altLive_pred; }
-static float alf_pct()       { return altLive_pct; }
+static float alf_pct()       { return alfDemoHold() ? altLatchPct : altLive_pct; }
 static float alf_latchPct()  { return altLatchPct; }                             // header Health chip (device-side latch)
 static float alf_worst()     { return altWorstPctLive; }
 static float alf_overall()   { return altOverallPctLive; }
 static float alf_status()    { return (float)altStatusCode; }
-static float alf_steady()    { return (float)altSteady; }                        // FULL steady run (temp held STEADY_TEMP_SEC) → orange ring
-static float alf_sessSteady(){ return (float)altSessSteady; }                    // SESSION steady (temp held SESSION_TEMP_SEC) → session-plot dot gate
+static float alf_steady()    { return (altSimMode >= 0.5f) ? 1.0f : (float)altSteady; }      // FULL steady run (temp held STEADY_TEMP_SEC) → orange ring
+static float alf_sessSteady(){ return (altSimMode >= 0.5f) ? 1.0f : (float)altSessSteady; }  // SESSION steady (temp held SESSION_TEMP_SEC) → session-plot dot gate
 static float alf_engHours()  { return altEngineHoursSinceBaseline(); }
 static float alf_coverage()  { return altFrontBuf ? (100.0f * (float)altGradeFront().count / (float)ALT_FRONT_CAP) : 0.0f; }
 static float alf_haveCurve() { return (float)(altGradeFront().count > 0 ? 1 : 0); }   // active surface has a usable front
@@ -1544,14 +1807,18 @@ static float alf_ptCount()   { return (float)altGradeFront().count; }           
 static float alf_source()    { return (float)altRefSource; }                    // 0 = My History, 1 = Uploaded File (active grading surface)
 static float alf_haveUpload(){ return altHaveUpload ? 1.0f : 0.0f; }            // an Uploaded surface is resident
 static float alf_paused()    { return (altPaused >= 0.5f) ? 1.0f : 0.0f; }
-static float alf_refOk()     { return altRefOk ? 1.0f : 0.0f; }          // state is MEASURED/ESTIMATED → % shown
+static float alf_refOk()     { return (altRefOk || altSimMode >= 0.5f) ? 1.0f : 0.0f; }   // state is MEASURED/ESTIMATED → % shown
 static float alf_refDist()   { return altRefDist; }                       // normalized distance to nearest support
-static float alf_state()     { return (float)altState; }                  // 0 MEASURED, 1 ESTIMATED, 2 LEARNING_EDGE, 3 NO_REFERENCE
+static float alf_state()     { return alfDemoHold() ? (float)FRONT_MEASURED : (float)altState; }   // 0 MEASURED, 1 ESTIMATED, 2 LEARNING_EDGE, 3 NO_REFERENCE
 static float alf_sessMean()  { return (altSessN > 0) ? (float)(altSessSum / (double)altSessN) : 0.0f; }
-static float alf_sessP10()   {                                            // P10 of the session histogram (≥10 samples)
-  if (altSessN < 10) return 0.0f;
+static float alf_sessP10()   {                                            // P10 of the session histogram (≥10 samples), interpolated
+  if (altSessN < 10) return 0.0f;                                          // inside its 2 % bin as altBucketP10 does
   uint32_t target = (altSessN + 9) / 10, cum = 0;
-  for (int i = 0; i < 60; i++) { cum += altSessHist[i]; if (cum >= target) return (float)(i * 2 + 1); }
+  for (int i = 0; i < 60; i++) {
+    if (altSessHist[i] == 0) continue;
+    if (cum + altSessHist[i] >= target) return (float)(i * 2) + 2.0f * ((float)(target - cum) / (float)altSessHist[i]);
+    cum += altSessHist[i];
+  }
   return 0.0f;
 }
 static float alf_sessN()     { return (float)altSessN; }
@@ -1945,6 +2212,7 @@ static bool altIngestFrontCsvInto(char *body, bool toUploaded) {
     t = strtok(NULL, ",");                              // source
     if (t) newSource = (uint8_t)atoi(t);
     *nl = saved; }
+  frontWriteBegin();
   int newCount = 0;
   char *line = nl + 1;
   while (line && *line && newCount < ALT_FRONT_CAP) {
@@ -1966,6 +2234,7 @@ static bool altIngestFrontCsvInto(char *body, bool toUploaded) {
     queueConsoleMessageF("WARN: alt front truncated at %d pts — raise ALT_FRONT_CAP", ALT_FRONT_CAP);
   fs.count = newCount;
   fs.source = newSource;
+  frontWriteEnd();
   return true;
 }
 // Back-compat: cloud sync-back replaces My History (the learned surface the cloud prunes).
@@ -2155,7 +2424,7 @@ void resetAlternatorHealth() {
 // The health record itself, local and cloud. The Uploaded surface stays: it was scaled by its own boat's winding.
 void altHealthRecordClear(const char *why) {
   if (!altFrontBuf) return;
-  altFront2.count = 0; altFront2.source = 0;
+  frontWriteBegin(); altFront2.count = 0; altFront2.source = 0; frontWriteEnd();
   altPendingCount = 0; altSentCount = 0; altFrontEmitCount = 0; altEmitQCount = 0; altCapWarned = false;
   altEpisode.clearRun(); altEpisode.ringHead = 0; altEpisode.ringCount = 0;
   altTrendCount = 0; altTrendFlushed = 0; altTrendRewrite = true;   // /alttrend.bin removed below → fresh log
@@ -2212,6 +2481,8 @@ void altFrontInit() {
   altSessRing = (AltSessPt *)ps_malloc((size_t)ALT_SESS_RING_N * sizeof(AltSessPt));   // session series (~30 KB)
   if (altSessRing) memset(altSessRing, 0, (size_t)ALT_SESS_RING_N * sizeof(AltSessPt));
   else queueConsoleMessage("AltHealth: session-series ps_malloc failed — /altsess.csv empty, plots stay browser-only");
+  altJob = (AltJob *)ps_malloc(sizeof(AltJob));   // null leaves the 1 Hz evaluator inline (altTickInline)
+  if (altJob) memset(altJob, 0, sizeof(AltJob));
   if (!altEpRing || !altFrontBuf || !altFrontUpBuf || !altPending) { queueConsoleMessage("ERROR: AltFront ps_malloc failed"); return; }
   memset(altEpRing,     0, (size_t)ALT_EP_RING_CAP * sizeof(RawSample<ALT_NAXIS>));
   memset(altFrontBuf,   0, (size_t)ALT_FRONT_CAP   * sizeof(FrontPoint<ALT_NAXIS>));
@@ -2259,71 +2530,73 @@ void altFrontInit() {
 // runs BEFORE InitSystemSettings loads SYSTEM_VOLTAGE_CLASS; also re-run on a live class change. Interpretation
 // only (stored points keep raw coords); the update-alt-health edge fn mirrors it via payload sysV.
 void altApplyClassScales() {
+  frontWriteBegin();   // callers include the web task
   altFront2.axisScale[2] = 0.1f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f);
   altFrontUp.axisScale[2] = altFront2.axisScale[2];
+  frontWriteEnd();
 }
 
 // One entry per ALT_SESS_DT_MS while the alternator is live, graded or not (state 2 = the dashboard's grey gap).
 // Nothing is pushed while the field is down, so an overnight stop is a time jump, not gap rows evicting real data.
 // Cost: one 21-byte PSRAM store every 5 s inside the existing 1 Hz evaluator — never in the fold.
-static void altSessSeriesPush(uint32_t nowMs, bool graded) {
+// in[] = the fold outputs at the grading tick {amps, rpm, duty, vbus, tF, tSlope}; steady = altSteady then.
+static void altSessSeriesPush(uint32_t nowMs, bool graded, const float *in, bool steady) {
   if (!altSessRing) return;
   if (altSessRingLastMs && (uint32_t)(nowMs - altSessRingLastMs) < ALT_SESS_DT_MS) return;
   altSessRingLastMs = nowMs;
   AltSessPt &p = altSessRing[altSessRingHead];
-  p.tMs    = nowMs;
-  p.flags  = graded ? (uint8_t)((altState == FRONT_ESTIMATED) ? 1 : 0) : 2;
-  if (graded && altSteady) p.flags |= 0x04;
-  p.gAmps  = altQU16(altLive_gAmps, 100.0f);
-  p.measA  = altQU16(altLive_amps,  100.0f);
-  p.pred   = altQU16(altLive_pred,  100.0f);
-  p.rpm    = altQU16(altLive_rpm,     1.0f);
-  p.duty   = altQU16(altLive_duty,  100.0f);
-  p.vbus   = altQU16(altLive_vbus,  100.0f);
-  p.tF     = altQI16(altLive_tF,     10.0f);
-  p.tSlope = altQI16(altTempSlopeFMin, 100.0f);
+  if (!graded && altSimMode >= 0.5f && altSessLastGraded.pred > 0) {
+    // Demo: the plot stays populated with no grade (field off, engine stopped): the last graded conditions at the held grade
+    float pct = constrain(altLatchPct + 0.25f * demoWander((float)nowMs / 30000.0f, 414), 97.65f, 99.35f);
+    bool est = demoHash01(nowMs / ALT_SESS_DT_MS) < 0.12f;
+    p = altSessLastGraded;
+    p.tMs = nowMs;
+    p.flags = est ? 1 : 0x04;
+    p.gAmps = altQU16(altSessLastGraded.pred / 100.0f * (est ? pct - 0.5f : pct), 1.0f);
+  } else {
+    p.tMs    = nowMs;
+    p.flags  = graded ? (uint8_t)((altState == FRONT_ESTIMATED) ? 1 : 0) : 2;
+    if (graded && (steady || (altSimMode >= 0.5f && altState == FRONT_MEASURED))) p.flags |= 0x04;
+    p.gAmps  = altQU16(altLive_gAmps, 100.0f);
+    p.measA  = altQU16(in[0], 100.0f);
+    p.pred   = altQU16(altLive_pred,  100.0f);
+    p.rpm    = altQU16(in[1],   1.0f);
+    p.duty   = altQU16(in[2], 100.0f);
+    p.vbus   = altQU16(in[3], 100.0f);
+    p.tF     = altQI16(in[4],  10.0f);
+    p.tSlope = altQI16(in[5], 100.0f);
+    if (graded) altSessLastGraded = p;
+  }
   altSessRingHead = (altSessRingHead + 1) % ALT_SESS_RING_N;
   if (altSessRingCount < ALT_SESS_RING_N) altSessRingCount++;
 }
 
-// ---- 1 Hz tick (NOT the fold): evaluator/classifier, live telemetry, settings echo. In bench-sim it also
-//      advances the simulator and folds at EP_FEED_DT_MS; live, the fold runs in the ~75 Hz pidLog hook. ----
-void altHealth_tick(uint32_t nowMs) {
-  static uint32_t lastMs = 0;
-  if (!altFrontBuf || demoStoresBusy()) return;   // demo mode switching: the stores are mid-swap
-  // A finished cloud sync (heavy: front parse + re-adds + flash write) — one heavy op per pass, and only with
-  // the field physically cut (gpio4, not the duty-derived fieldActiveStatus, which reads off in a duty-0 CV hold).
-  if (altSyncHandoff && !demoSeal && !gHeavyRanThisPass && fieldCutSettled()) {   // demo: held, the front in RAM is the demo copy
-    gHeavyRanThisPass = true;
-    altApplySync();
-    return;
-  }
-  if ((regSeedRequest & 4) && !demoSeal && !gHeavyRanThisPass && fieldCutSettled()) {
-    gHeavyRanThisPass = true;
-    __atomic_fetch_and(&regSeedRequest, (uint8_t)~4, __ATOMIC_ACQ_REL);
-    if (altPending && altFront2.count > 0) {
-      altPendingCount = 0;
-      for (int i = 0; i < altFront2.count && altPendingCount < ALT_PENDING_CAP; i++) altPending[altPendingCount++] = altFrontBuf[i];
-      altSentCount = 0;   // a batch already in flight carried none of these
-      altPendingSeededFrom = "reregister";
-    } else {
-      recSeedOwedSet(4, false);
-    }
-    return;
-  }
-  // Bench simulator: advance + fold at the Episode feed cadence (at 1 Hz every feed would trip the 5x feed-gap barrier).
-  if (altSimMode >= 0.5f) {
-    static uint32_t lastSimMs = 0;
-    if (nowMs - lastSimMs >= EP_FEED_DT_MS) {
-      lastSimMs = nowMs;
-      altSimTick(nowMs);
-      altFold_tick(nowMs);
+// High-field-low-output alert — independent of the record book (covers degradation pushed into
+// unlearned territory where the gauge says "learning"). Self-clears when either condition lifts.
+static void altHiFieldTick(uint32_t nowMs, bool foldFresh) {
+  static uint32_t hiFieldSinceMs = 0;
+  // altHiFieldPct is % of altFieldCeiling (lower of Max Field % and the Max Field Volts term), not absolute duty:
+  // 80% absolute is unreachable on 24/36/48V banks with a 12 V winding. Never ccDutyCeiling(): a hot regulator
+  // holding the field down must not read as a weak alternator.
+  bool cond = foldFresh && altLiveValid
+              && altLive_duty >= altHiFieldPct * (altFieldCeiling() / 100.0f) && altLive_amps <= altLowOutAmps;
+  if (!cond) {
+    hiFieldSinceMs = 0; altHiFieldAlert = false;
+  } else {
+    if (hiFieldSinceMs == 0) hiFieldSinceMs = nowMs;
+    if (!altHiFieldAlert && (uint32_t)(nowMs - hiFieldSinceMs) >= (uint32_t)(altHiFieldSec * 1000.0f)) {
+      altHiFieldAlert = true;
+      queueConsoleMessageF("ALERT: Low output despite high field drive (duty %.0f%%, only %.1f A for %.0f s) — check alternator, belt, wiring",
+                           altLive_duty, altLive_amps, altHiFieldSec);
     }
   }
-  if (nowMs - lastMs < 1000) return;
-  if (gHeavyRanThisPass) return;      // one-heavy-per-pass gate; defer (lastMs unchanged → still due next pass)
-  gHeavyRanThisPass = true;
-  lastMs = nowMs;
+}
+
+static uint8_t altSettCtr = 0;   // resend settings ~every 5s so reconnects get echoes
+
+// The whole 1 Hz evaluator in one pass: demo mode (its grades come from the simulated alternator, no record-book
+// lookups) and a unit whose job memory failed to allocate.
+static void altTickInline(uint32_t nowMs) {
   altProcessEmits();                  // grade + admit queued steady runs FIRST (front fresh for the live classify)
   altStatusCode = (IgnoreTemperature || IgnoreRPM) ? 3 : altLearnArmed() ? 0 : (commissionState == 2 ? ALT_STATUS_WAIT_CHC : ALT_STATUS_WAIT_CX);
   // 1 Hz evaluator + OUTPUT-BLIND state classifier. A stale fold (field off) → nothing to grade.
@@ -2344,51 +2617,297 @@ void altHealth_tick(uint32_t nowMs) {
     }
     // Grade against the ACTIVE reference surface (My History or Uploaded). The trend uses the same
     // surface (in altProcessEmits) — session % and trend are graded identically (spec §1/§4.2).
-    FrontStore<ALT_NAXIS> &gf = altGradeFront();
-    altRefDist = gf.nearestNormDist(surf);
-    if (altRefDist > 999.0f) altRefDist = 999.0f;
     float pred = 0;
-    altState = (uint8_t)gf.classify(surf, altRefRadius, altIdwPower, altRidgeFrac, altRiskThresh, &pred);
+    if (altSimMode >= 0.5f) {                 // demo: graded against the simulated alternator's own best (9_demo.ino)
+      altRefDist = 0;
+      altState = demoAltGrade(surf, altLive_gAmps, nowMs, &pred);
+    } else {
+      FrontStore<ALT_NAXIS> &gf = altGradeFront();
+      altRefDist = gf.nearestNormDist(surf);
+      if (altRefDist > 999.0f) altRefDist = 999.0f;
+      altState = (uint8_t)gf.classify(surf, altRefRadius, altIdwPower, altRidgeFrac, altRiskThresh, &pred);
+    }
     altLive_pred = pred;
     altRefOk = (altState == FRONT_MEASURED || altState == FRONT_ESTIMATED);
     altLive_pct = (altRefOk && pred > 0.1f) ? (altLive_gAmps / pred * 100.0f) : 0.0f;
     if (altRefOk && altLive_pct > 0.0f) altLatchPct = altLive_pct;   // same gate as the Diag headline; only this survives an ungraded tick
     // Session stats = the SESSION-PLOTTED points: session-steady (lighter gate) AND graded. The trend is
-    // NOT fed here — it is built purely from FULL-steady runs in altProcessEmits (spec §2).
-    if (altSessSteady && altRefOk && altLive_pct > 0.0f) {
+    // NOT fed here — it is built purely from FULL-steady runs in altProcessEmits (spec §2). Demo: every graded tick.
+    const bool sessGraded = (altSessSteady || altSimMode >= 0.5f) && altRefOk && altLive_pct > 0.0f;
+    if (sessGraded) {
       altSessSum += altLive_pct; altSessN++;
       int bin = (int)(altLive_pct * 0.5f);    // 2%-wide histogram bins, 0..120%
       if (bin < 0) bin = 0;
       if (bin > 59) bin = 59;
       if (altSessHist[bin] < 65535) altSessHist[bin]++;
     }
-    altSessSeriesPush(nowMs, altSessSteady && altRefOk && altLive_pct > 0.0f);
+    const float in[6] = { altLive_amps, altLive_rpm, altLive_duty, altLive_vbus, altLive_tF, altTempSlopeFMin };
+    altSessSeriesPush(nowMs, sessGraded, in, altSteady);
   } else {
     altRefOk = false; altLive_pct = 0;        // nothing running → no grade (state holds its last value)
-  }
-  // High-field-low-output alert — independent of the record book (covers degradation pushed into
-  // unlearned territory where the gauge says "learning"). Self-clears when either condition lifts.
-  {
-    static uint32_t hiFieldSinceMs = 0;
-    // altHiFieldPct is % of altFieldCeiling (lower of Max Field % and the Max Field Volts term), not absolute duty:
-    // 80% absolute is unreachable on 24/36/48V banks with a 12 V winding. Never ccDutyCeiling(): a hot regulator
-    // holding the field down must not read as a weak alternator.
-    bool cond = foldFresh && altLiveValid
-                && altLive_duty >= altHiFieldPct * (altFieldCeiling() / 100.0f) && altLive_amps <= altLowOutAmps;
-    if (!cond) {
-      hiFieldSinceMs = 0; altHiFieldAlert = false;
-    } else {
-      if (hiFieldSinceMs == 0) hiFieldSinceMs = nowMs;
-      if (!altHiFieldAlert && (uint32_t)(nowMs - hiFieldSinceMs) >= (uint32_t)(altHiFieldSec * 1000.0f)) {
-        altHiFieldAlert = true;
-        queueConsoleMessageF("ALERT: Low output despite high field drive (duty %.0f%%, only %.1f A for %.0f s) — check alternator, belt, wiring",
-                             altLive_duty, altLive_amps, altHiFieldSec);
-      }
+    if (altSimMode >= 0.5f) {                 // demo: the session plot keeps going (altSessSeriesPush)
+      static const float none[6] = { 0, 0, 0, 0, 0, 0 };
+      altSessSeriesPush(nowMs, false, none, false);
     }
   }
+  altHiFieldTick(nowMs, foldFresh);
   altSendLive();
-  static uint8_t settCtr = 0;          // resend settings ~every 5s so reconnects get echoes
-  if (++settCtr >= 5) { settCtr = 0; sendAltSettings(); }
+  if (++altSettCtr >= 5) { altSettCtr = 0; sendAltSettings(); }
+}
+
+static uint32_t frontDriveSeq = 0;              // /debug/frontcheck?drive= probe sequence
+
+// /debug/frontcheck?drive=: synthetic lookups each second while the field stays cut (bench timing only).
+static inline bool frontDriveOn() {
+  if (!frontDriveUntilMs) return false;
+  if (!gpio4IsLow || demoSeal || (int32_t)(millis() - frontDriveUntilMs) >= 0) { frontDriveUntilMs = 0; return false; }
+  return true;
+}
+
+static void altJobItemAdd(uint8_t kind, uint8_t e, uint8_t uploaded, const float *x) {
+  if (altJob->nItem >= ALTJ_ITEMS) return;
+  AltJobItem &it = altJob->item[altJob->nItem++];
+  it.kind = kind; it.emit = e; it.uploaded = uploaded;
+  for (int a = 0; a < ALT_NAXIS; a++) it.x[a] = x[a];
+}
+
+static void altJobBegin(uint32_t nowMs) {
+  AltJob &J = *altJob;
+  J.active = true; J.stage = 0; J.tickMs = nowMs; J.gen = frontGenNow();
+  J.workUs = 0; J.passes = 0; J.lookups = 0; J.nItem = 0; J.iItem = 0;
+  J.q.phase = FrontQuery<ALT_NAXIS>::IDLE;
+  J.trendEh = altTrendBucketIndex();
+  J.trendFeedMs = (uint32_t)(altTrendFeedSec * 1000.0f);
+  J.learn = (altPaused < 0.5f);
+  J.gradeUp = (altRefSource == 1 && altHaveUpload) ? 1 : 0;
+  J.refRadius = altRefRadius; J.idwPower = altIdwPower; J.ridgeFrac = altRidgeFrac;
+  J.riskThresh = altRiskThresh; J.safetyMargin = altSafetyMargin;
+  int nE = 0;                                   // altProcessEmits(): at most 2 per tick, none unless armed
+  if (!altLearnArmed()) altEmitQCount = 0;
+  else {
+    nE = (altEmitQCount < 2) ? altEmitQCount : 2;
+    for (int k = 0; k < nE; k++) J.emit[k] = altEmitQ[k].sp;
+    if (altEmitQCount > nE) memmove(altEmitQ, altEmitQ + nE, (size_t)(altEmitQCount - nE) * sizeof(AltEmitPending));
+    altEmitQCount -= nE;
+  }
+  altStatusCode = (IgnoreTemperature || IgnoreRPM) ? 3 : altLearnArmed() ? 0 : (commissionState == 2 ? ALT_STATUS_WAIT_CHC : ALT_STATUS_WAIT_CX);
+  bool foldFresh = (altLastFoldMs != 0) && ((uint32_t)(nowMs - altLastFoldMs) < 3000u);
+  if (!foldFresh) altLiveValid = false;
+  J.liveWanted = foldFresh && altLiveValid;
+  if (J.liveWanted) {                           // as altTickInline(): the boxcar averages, else the fast EMA point
+    float *surf = J.liveSurf;
+    surf[0] = altLive_rpm; surf[1] = altLive_exc; surf[2] = altLive_vbus; surf[3] = altLive_tF;
+    J.liveGAmps = altLive_amps;
+    if (altEpisode.ringCount > 0) {
+      double rc = (double)altEpisode.ringCount;
+      surf[0] = (float)(altEpisode.avgSumX[0] / rc);
+      surf[2] = (float)(altEpisode.avgSumX[2] / rc);
+      surf[3] = (float)(altEpisode.avgSumX[3] / rc);
+      surf[1] = altExcitation((float)(altEpisode.avgSumX[1] / rc), surf[2], surf[3]);
+      J.liveGAmps = (float)(altEpisode.avgSumOut / rc);
+    }
+    J.liveSessSteady = altSessSteady; J.liveSteady = altSteady;
+    J.liveIn[0] = altLive_amps; J.liveIn[1] = altLive_rpm; J.liveIn[2] = altLive_duty;
+    J.liveIn[3] = altLive_vbus; J.liveIn[4] = altLive_tF; J.liveIn[5] = altTempSlopeFMin;
+  }
+  altHiFieldTick(nowMs, foldFresh);
+  for (int k = 0; k < nE; k++) {
+    altJobItemAdd(ALTJ_GRADE, k, J.gradeUp, J.emit[k].x);
+    if (J.learn && J.gradeUp) altJobItemAdd(ALTJ_ADMIT, k, 0, J.emit[k].x);
+  }
+  if (J.liveWanted) altJobItemAdd(ALTJ_LIVE, 0, J.gradeUp, J.liveSurf);
+  if (frontDriveOn()) {                         // bench: a two-run second's lookups near stored records, results unused
+    FrontStore<ALT_NAXIS> &gf = J.gradeUp ? altFrontUp : altFront2;
+    float px[ALT_NAXIS];
+    if (frontDriveOld) {                        // the inline tick's reads for the same second, all in this pass
+      volatile float sink = 0;
+      for (int d = 0; d < 2; d++) {
+        FrontQuery<ALT_NAXIS>::probe(altFront2, frontDriveSeq++, 0.6f, px);
+        float pr = 0, yr = 0, br = 0;
+        sink = sink + (float)gf.classify(px, J.refRadius, J.idwPower, J.ridgeFrac, J.riskThresh, &pr) + pr;
+        sink = sink + (float)altFront2.classify(px, J.refRadius, J.idwPower, J.ridgeFrac, J.riskThresh, &yr, &br) + br;
+        sink = sink + (altFront2.hasLocalSupport(px) ? 1.0f : 0.0f) + (float)altFront2.cellOf(px);
+      }
+      FrontQuery<ALT_NAXIS>::probe(gf, frontDriveSeq++, 0.6f, px);
+      float pr = 0;
+      sink = sink + gf.nearestNormDist(px);
+      sink = sink + (float)gf.classify(px, J.refRadius, J.idwPower, J.ridgeFrac, J.riskThresh, &pr) + pr;
+      J.lookups += 10;                          // calls, each one or more passes over the store
+    } else {
+      for (int d = 0; d < 2; d++) {
+        FrontQuery<ALT_NAXIS>::probe(altFront2, frontDriveSeq++, 0.6f, px);
+        altJobItemAdd(ALTJ_DRY, 0, J.gradeUp, px);
+        if (J.gradeUp) altJobItemAdd(ALTJ_DRY, 0, 0, px);
+      }
+      FrontQuery<ALT_NAXIS>::probe(gf, frontDriveSeq++, 0.6f, px);
+      altJobItemAdd(ALTJ_DRY, 0, J.gradeUp, px);
+    }
+  }
+}
+
+// Admission into My History, as altProcessEmits(): cell-local gate against the lookup's bar, then add at its cell.
+static void altJobAdmit(uint8_t e) {
+  AltJob &J = *altJob;
+  const FrontQuery<ALT_NAXIS> &q = J.q;
+  const FrontPoint<ALT_NAXIS> &sp = J.emit[e];
+  bool localSup = (q.cell >= 0);
+  if (localSup && !(sp.y > q.bar - J.safetyMargin)) return;
+  if (!localSup && altFront2.count >= ALT_FRONT_CAP) {
+    if (!altCapWarned) {   // a genuinely NEW cell dropped at capacity (in-cell improvements still land)
+      altCapWarned = true;
+      queueConsoleMessage("WARN: alt front at capacity — new operating cells are no longer recorded");
+    }
+    return;
+  }
+  if (altFront2.addAt(sp, q.cell)) {
+    if (altPending && altPendingCount < ALT_PENDING_CAP) altPending[altPendingCount++] = sp;
+  }
+}
+
+// The live grade, as altTickInline() applies it.
+static void altJobLive() {
+  AltJob &J = *altJob;
+  const FrontQuery<ALT_NAXIS> &q = J.q;
+  altLive_gAmps = J.liveGAmps;
+  altRefDist = q.nearest;
+  if (altRefDist > 999.0f) altRefDist = 999.0f;
+  altState = (uint8_t)q.state;
+  float pred = q.pred;
+  altLive_pred = pred;
+  altRefOk = (altState == FRONT_MEASURED || altState == FRONT_ESTIMATED);
+  altLive_pct = (altRefOk && pred > 0.1f) ? (altLive_gAmps / pred * 100.0f) : 0.0f;
+  if (altRefOk && altLive_pct > 0.0f) altLatchPct = altLive_pct;
+  const bool sessGraded = J.liveSessSteady && altRefOk && altLive_pct > 0.0f;
+  if (sessGraded) {
+    altSessSum += altLive_pct; altSessN++;
+    int bin = (int)(altLive_pct * 0.5f);
+    if (bin < 0) bin = 0;
+    if (bin > 59) bin = 59;
+    if (altSessHist[bin] < 65535) altSessHist[bin]++;
+  }
+  altSessSeriesPush(J.tickMs, sessGraded, J.liveIn, J.liveSteady);
+}
+
+static void altJobApply(uint8_t kind, uint8_t e) {
+  AltJob &J = *altJob;
+  if (kind == ALTJ_GRADE) {                     // altProcessEmits() (1) TREND FEED
+    const FrontPoint<ALT_NAXIS> &sp = J.emit[e];
+    bool graded = (J.q.state == FRONT_MEASURED) && J.q.pred > 0.1f;
+    if (graded && (altLastTrendFeedMs == 0 || (uint32_t)(J.tickMs - altLastTrendFeedMs) >= J.trendFeedMs)) {
+      altLastTrendFeedMs = J.tickMs;
+      altTrendAdd((sp.y / J.q.pred), J.trendEh);
+    }
+    if (J.learn && !J.gradeUp) altJobAdmit(e);  // My History is the active surface: this lookup is the admission lookup too
+  } else if (kind == ALTJ_ADMIT) {
+    altJobAdmit(e);
+  } else if (kind == ALTJ_LIVE) {
+    altJobLive();
+  }
+}
+
+// One pass of the job; true when it has finished. Lookups first; AltLive and the settings echo each wait for a pass
+// with no lookup work and the heavy slot free.
+static bool altJobStep() {
+  AltJob &J = *altJob;
+  if (J.stage == 0) {
+    int64_t until = esp_timer_get_time() + FRONT_STEP_US;
+    while (J.iItem < J.nItem) {
+      const AltJobItem &it = J.item[J.iItem];
+      if (J.q.phase == FrontQuery<ALT_NAXIS>::IDLE) {
+        J.q.begin(it.uploaded ? altFrontUp : altFront2, it.x, J.idwPower, J.ridgeFrac, J.refRadius, J.riskThresh, J.gen);
+        J.lookups++;
+      }
+      if (!J.q.step(until)) return false;
+      bool dropped = (J.q.phase == FrontQuery<ALT_NAXIS>::DROPPED);
+      J.q.phase = FrontQuery<ALT_NAXIS>::IDLE;
+      if (dropped) { frontDropCount++; J.iItem = J.nItem; break; }
+      altJobApply(it.kind, it.emit);
+      J.iItem++;
+      if (esp_timer_get_time() >= until) return false;
+    }
+    if (!J.liveWanted) { altRefOk = false; altLive_pct = 0; }   // nothing running → no grade (state holds its last value)
+    J.stage = 1;
+    return false;
+  }
+  if (gHeavyRanThisPass) return false;
+  gHeavyRanThisPass = true;
+  if (J.stage == 1) {
+    altSendLive();
+    if (++altSettCtr >= 5) { J.stage = 2; return false; }
+    return true;
+  }
+  altSettCtr = 0;
+  sendAltSettings();
+  return true;
+}
+
+// Runs the job for this pass and books its time: ft_altEngine per pass, altJob* per finished job (/debug).
+static void altJobPass(uint32_t nowMs, bool begin) {
+  AltJob &J = *altJob;
+  uint32_t t0 = (uint32_t)esp_timer_get_time();
+  if (begin) altJobBegin(nowMs);
+  bool ended = altJobStep();
+  uint32_t dt = (uint32_t)esp_timer_get_time() - t0;
+  ft_altEngine.lastCall = dt;
+  ft_altEngine.passSeq = ftLoopPassSeq;
+  if (dt > ft_altEngine.worstWindow) ft_altEngine.worstWindow = dt;
+  if (dt > ft_altEngine.worstSession) ft_altEngine.worstSession = dt;
+  J.workUs += dt; J.passes++;
+  if (!ended) return;
+  J.active = false;
+  uint32_t span = millis() - J.tickMs;
+  altJobLastUs = J.workUs; altJobLastPasses = J.passes; altJobLastLookups = J.lookups; altJobLastSpanMs = span;
+  if (J.workUs > altJobWorstUs) { altJobWorstUs = J.workUs; altJobWorstLookups = J.lookups; }
+  if (span > altJobWorstSpanMs) altJobWorstSpanMs = span;
+}
+
+// ---- 1 Hz tick (NOT the fold): evaluator/classifier, live telemetry, settings echo. In bench-sim it also
+//      advances the simulator and folds at EP_FEED_DT_MS; live, the fold runs in the ~75 Hz pidLog hook. ----
+void altHealth_tick(uint32_t nowMs) {
+  static uint32_t lastMs = 0;
+  if (!altFrontBuf || demoStoresBusy()) return;   // demo mode switching: the stores are mid-swap
+  const bool jobIdle = !(altJob && altJob->active);   // the job's tick-time order holds until it finishes
+  // A finished cloud sync (heavy: front parse + re-adds + flash write) — one heavy op per pass, and only with
+  // the field physically cut (gpio4, not the duty-derived fieldActiveStatus, which reads off in a duty-0 CV hold).
+  if (jobIdle && altSyncHandoff && !demoSeal && !gHeavyRanThisPass && fieldCutSettled()) {   // demo: held, the front in RAM is the demo copy
+    gHeavyRanThisPass = true;
+    altApplySync();
+    return;
+  }
+  if (jobIdle && (regSeedRequest & 4) && !demoSeal && !gHeavyRanThisPass && fieldCutSettled()) {
+    gHeavyRanThisPass = true;
+    __atomic_fetch_and(&regSeedRequest, (uint8_t)~4, __ATOMIC_ACQ_REL);
+    if (altPending && altFront2.count > 0) {
+      altPendingCount = 0;
+      for (int i = 0; i < altFront2.count && altPendingCount < ALT_PENDING_CAP; i++) altPending[altPendingCount++] = altFrontBuf[i];
+      altSentCount = 0;   // a batch already in flight carried none of these
+      altPendingSeededFrom = "reregister";
+    } else {
+      recSeedOwedSet(4, false);
+    }
+    return;
+  }
+  // Bench simulator: advance + fold at the Episode feed cadence (at 1 Hz every feed would trip the 5x feed-gap barrier).
+  // Field gate open only, as the live fold runs only on a field-on control tick.
+  if (altSimMode >= 0.5f && !gpio4IsLow) {
+    static uint32_t lastSimMs = 0;
+    if (nowMs - lastSimMs >= EP_FEED_DT_MS) {
+      lastSimMs = nowMs;
+      altSimTick(nowMs);
+      altFold_tick(nowMs);
+    }
+  }
+  if (!jobIdle) { altJobPass(nowMs, false); return; }
+  if (nowMs - lastMs < 1000) return;
+  if (!altJob || altSimMode >= 0.5f) {
+    if (gHeavyRanThisPass) return;      // one-heavy-per-pass gate; defer (lastMs unchanged → still due next pass)
+    gHeavyRanThisPass = true;
+    lastMs = nowMs;
+    altTickInline(nowMs);
+    return;
+  }
+  lastMs = nowMs;
+  altJobPass(nowMs, true);
 }
 
 
@@ -2492,7 +3011,8 @@ String altSchemaJson() {
 #define PERF_PENDING_CAP 4096     // = front cap (PSRAM); covers weeks offline because non-admitted raw points are
                                   // per-cell throttled (PerfPendingQ::push) and admitted ones always get a slot
 
-static Episode<PERF_NAXIS>    sailEpisode,  motorEpisode;
+static Episode<PERF_NAXIS>    &sailEpisode  = PsramPlace::make<Episode<PERF_NAXIS>>();
+static Episode<PERF_NAXIS>    &motorEpisode = PsramPlace::make<Episode<PERF_NAXIS>>();
 static FrontStore<PERF_NAXIS> sailFront,    motorFront;
 static RawSample<PERF_NAXIS>  *sailRing = nullptr,     *motorRing = nullptr;
 static FrontPoint<PERF_NAXIS> *sailFrontBuf = nullptr, *motorFrontBuf = nullptr;
@@ -2591,6 +3111,141 @@ struct PerfPendingQ {
   }
 };
 
+// ---- boat-performance lookup queue ----
+// perfFold_tick() queues each finished steady run instead of admitting it inline; PerfEng::step() admits them in emit
+// order (FrontQuery within FRONT_STEP_US per loop pass), and the 1 Hz live grade (SSE step 1) takes its turn behind the
+// runs queued before it. Same admissions, pending-queue pushes and grades as the inline fold and step 1 made, from the
+// knobs as they were when each was queued; a front write since then drops it.
+#define PERF_EMIT_Q 8
+struct PerfEmit {
+  FrontPoint<PERF_NAXIS> sp, raw;   // sp: device-front coords (sail AWA folded); raw: as emitted, for the pending queue
+  uint32_t nowMs, gen;
+  float    idwPower, ridgeFrac, safetyMargin;
+  bool     sail, dry;               // dry: /debug/frontcheck?drive= lookup, result unused
+};
+static PerfEmit *perfEmitQ = nullptr;        // PSRAM, PERF_EMIT_Q (initBoatPerformance)
+static int       perfEmitN = 0;
+static uint32_t  perfEmitDropped = 0;        // queue full: the engine fell PERF_EMIT_Q runs behind
+static FrontQuery<PERF_NAXIS> *perfQ = nullptr;   // PSRAM
+static uint8_t   perfQKind = 0;              // 0 idle, 1 the head run, 2 the live grade
+static bool      perfLiveArmed = false, perfLiveReady = false, perfLiveMotor = false, perfLiveDry = false;
+static int       perfLiveBefore = 0;         // runs queued ahead of the live grade
+static float     perfLiveX[PERF_NAXIS], perfLiveSpd = 0, perfLiveK[4];   // point, speed, {radius, idw, ridge, risk}
+static uint32_t  perfLiveGen = 0;
+static uint32_t  perfEngAccUs = 0, perfEngWinMs = 0;
+
+// Members, not free functions: Arduino's auto-prototype generator breaks on template types in free-function signatures.
+struct PerfEng {
+  static bool idle() { return perfQKind == 0 && perfEmitN == 0 && !perfLiveArmed; }
+  static void push(bool sail, const FrontPoint<PERF_NAXIS> &sp, const FrontPoint<PERF_NAXIS> &raw, uint32_t nowMs, bool dry) {
+    if (!perfEmitQ) return;
+    if (perfEmitN >= PERF_EMIT_Q) { perfEmitDropped++; return; }
+    PerfEmit &e = perfEmitQ[perfEmitN++];
+    e.sp = sp; e.raw = raw; e.nowMs = nowMs; e.gen = frontGenNow();
+    e.idwPower = perfIdwPower; e.ridgeFrac = perfRidgeFrac; e.safetyMargin = perfSafetyMargin;
+    e.sail = sail; e.dry = dry;
+  }
+  // SSE step 1's live grade, as that step read it, queued behind the runs already waiting.
+  static void arm(bool motor, const float *x, float spd, bool dry) {
+    perfLiveArmed = true; perfLiveReady = false; perfLiveMotor = motor; perfLiveDry = dry;
+    for (int a = 0; a < PERF_NAXIS; a++) perfLiveX[a] = x[a];
+    perfLiveSpd = spd;
+    perfLiveK[0] = perfRefRadius; perfLiveK[1] = perfIdwPower; perfLiveK[2] = perfRidgeFrac; perfLiveK[3] = perfRiskThresh;
+    perfLiveGen = frontGenNow();
+    perfLiveBefore = perfEmitN;
+  }
+  static void pop() {
+    if (perfEmitN > 1) memmove(perfEmitQ, perfEmitQ + 1, (size_t)(perfEmitN - 1) * sizeof(PerfEmit));
+    perfEmitN--;
+    if (perfLiveArmed && !perfLiveReady && perfLiveBefore > 0) perfLiveBefore--;
+  }
+  // Admission, as the inline fold did it: cell-local gate (unvisited cell → unconditional; local support → beat the
+  // min(IDW, LWLR) bar − margin), then the pending queue with the admitted flag.
+  static void admit(const PerfEmit &e) {
+    const FrontQuery<PERF_NAXIS> &q = *perfQ;
+    FrontStore<PERF_NAXIS> &fs = e.sail ? sailFront : motorFront;
+    bool local = (q.cell >= 0);
+    bool admitted = false;
+    if (!local || e.sp.y > q.bar - e.safetyMargin) {
+      if (!local && fs.count >= PERF_FRONT_CAP) {
+        // a genuinely NEW conditions cell dropped at capacity (in-cell improvements still land)
+        bool &warned = e.sail ? sailCapWarned : motorCapWarned;
+        if (!warned) {
+          warned = true;
+          queueConsoleMessage(e.sail ? "WARN: sail front at capacity — new conditions are no longer recorded"
+                                     : "WARN: motor front at capacity — new conditions are no longer recorded");
+        }
+      } else admitted = fs.addAt(e.sp, q.cell);   // no console message on accept (counter on the dashboard)
+    }
+    if (perfSimMode < 0.5f) {
+      if (e.sail) PerfPendingQ::push(sailPending, sailPendingAdm, sailPendingCount, perfSentSail, e.raw, admitted, sailFront.axisScale, e.nowMs);
+      else        PerfPendingQ::push(motorPending, motorPendingAdm, motorPendingCount, perfSentMotor, e.raw, admitted, motorFront.axisScale, e.nowMs);
+      perfLearnSerial++;
+    }
+  }
+  static void applyLive() {
+    float pred = perfQ->pred;
+    if (perfLiveMotor) {
+      motorState = (uint8_t)perfQ->state;
+      motorLive_best = pred;
+      bool graded = (motorState == FRONT_MEASURED || motorState == FRONT_ESTIMATED);
+      motorLive_pct = (graded && pred > 0.1f) ? (perfLiveSpd / pred * 100.0f) : 0.0f;
+    } else {
+      perfState = (uint8_t)perfQ->state;
+      perfLive_best = pred;
+      bool graded = (perfState == FRONT_MEASURED || perfState == FRONT_ESTIMATED);
+      perfLive_pct = (graded && pred > 0.1f) ? (perfLiveSpd / pred * 100.0f) : 0.0f;
+    }
+  }
+  // ft_perfEngine per pass, plus the work per wall-clock second (/debug).
+  static void book(uint32_t dt) {
+    ft_perfEngine.lastCall = dt;
+    ft_perfEngine.passSeq = ftLoopPassSeq;
+    if (dt > ft_perfEngine.worstWindow) ft_perfEngine.worstWindow = dt;
+    if (dt > ft_perfEngine.worstSession) ft_perfEngine.worstSession = dt;
+    perfEngAccUs += dt;
+    uint32_t now = millis();
+    if (perfEngWinMs == 0) perfEngWinMs = now;
+    if ((uint32_t)(now - perfEngWinMs) >= 1000u) {
+      perfEngLastSecUs = perfEngAccUs;
+      if (perfEngAccUs > perfEngWorstSecUs) perfEngWorstSecUs = perfEngAccUs;
+      perfEngAccUs = 0; perfEngWinMs = now;
+    }
+  }
+  // Every boatPerf_tick pass: lookups within FRONT_STEP_US, in queue order with the live grade in its place.
+  static void step() {
+    if (!perfQ || !perfEmitQ) return;
+    uint32_t t0 = (uint32_t)esp_timer_get_time();
+    int64_t until = (int64_t)t0 + FRONT_STEP_US;
+    for (;;) {
+      if (perfQKind == 0) {
+        if (perfLiveArmed && !perfLiveReady && perfLiveBefore == 0) {
+          perfQ->begin(perfLiveMotor ? motorFront : sailFront, perfLiveX, perfLiveK[1], perfLiveK[2], perfLiveK[0], perfLiveK[3], perfLiveGen);
+          perfQKind = 2;
+        } else if (perfEmitN > 0) {
+          const PerfEmit &e = perfEmitQ[0];
+          perfQ->begin(e.sail ? sailFront : motorFront, e.sp.x, e.idwPower, e.ridgeFrac, perfRefRadius, perfRiskThresh, e.gen);
+          perfQKind = 1;
+        } else break;
+      }
+      if (!perfQ->step(until)) break;
+      bool dropped = (perfQ->phase == FrontQuery<PERF_NAXIS>::DROPPED);
+      perfQ->phase = FrontQuery<PERF_NAXIS>::IDLE;
+      if (dropped) frontDropCount++;
+      if (perfQKind == 2) {
+        if (!dropped && !perfLiveDry) applyLive();
+        perfLiveReady = true;
+      } else {
+        if (!dropped && !perfEmitQ[0].dry) admit(perfEmitQ[0]);
+        pop();
+      }
+      perfQKind = 0;
+      if (esp_timer_get_time() >= until) break;
+    }
+    book((uint32_t)esp_timer_get_time() - t0);
+  }
+};
+
 // Fold |AWA| to [0,180] when symmetric (eval/display only — raw AWA is stored to pending/cloud).
 static inline float perfFoldAwa(float a) {
   if (perfFoldSymmetric < 0.5f) return a;
@@ -2601,8 +3256,8 @@ static inline float perfFoldAwa(float a) {
 
 // ---- rolling sea-state: pitch standard deviation over the last perfSeaWinSec (default 20 s) ----
 #define PERF_PITCH_RING 256
-static float    perfPitchVal[PERF_PITCH_RING];
-static uint32_t perfPitchMs[PERF_PITCH_RING];
+static float    (&perfPitchVal)[PERF_PITCH_RING] = PsramPlace::make<float[PERF_PITCH_RING]>();
+static uint32_t (&perfPitchMs)[PERF_PITCH_RING] = PsramPlace::make<uint32_t[PERF_PITCH_RING]>();
 static int      perfPitchHead = 0, perfPitchCount = 0;
 static void perfPitchPush(float pitch, uint32_t nowMs) {
   perfPitchVal[perfPitchHead] = pitch; perfPitchMs[perfPitchHead] = nowMs;
@@ -2678,9 +3333,17 @@ void perfFold_tick(uint32_t nowMs) {
   if (motoring) {
     motorLive_rpm = rpm; motorLive_hw = headwind; motorLive_spd = spd; motorLive_pitch = sea;
     motorLiveSrc = src; motorLiveValid = haveSpd; perfLiveValid = false;
+    if (perfSimMode >= 0.5f && sailBoat) {   // demo: the sailing view keeps a point while the engine runs (9_demo.ino)
+      demoSailShadow(perfLive_ws, perfLive_wa, perfLive_spd);
+      perfLive_pitch = sea; perfLiveSrc = src; perfLiveValid = true;
+    }
   } else {
     perfLive_ws = aws; perfLive_wa = awa; perfLive_spd = spd; perfLive_pitch = sea;
     perfLiveSrc = src; perfLiveValid = (sailBoat && haveSpd && aws >= perfMinWindSpeed); motorLiveValid = false;
+    if (perfSimMode >= 0.5f) {               // demo: and the motoring view while the engine is stopped
+      demoMotorShadow(motorLive_rpm, motorLive_hw, motorLive_spd);
+      motorLive_pitch = sea; motorLiveSrc = src; motorLiveValid = true;
+    }
   }
 
   if (hardwarePresent != 1 && perfSimMode < 0.5f) { perfSteady = false; perfSettleSec = -1.0f; return; }   // display only
@@ -2696,50 +3359,21 @@ void perfFold_tick(uint32_t nowMs) {
   // ── feed both Episodes; the inactive one gets an ineligible break so runs don't span a mode change ──
   FrontPoint<PERF_NAXIS> ep;
 
-  bool sailLearn = sailBoat && (sailFront.source != 1);
+  bool sailLearn = sailBoat && (sailFront.source != 1) && perfSimMode < 0.5f;   // demo: the seeded record stays as seeded
   bool sailElig = sailLearn && !motoring && haveSpd && spd >= perfMinBoatSpeed && aws >= perfMinWindSpeed;
   RawSample<PERF_NAXIS> ss; ss.x[0] = aws; ss.x[1] = awa; ss.x[2] = sea; ss.out = spd; ss.tMs = nowMs;
   ss.ex[0] = 0; ss.ex[1] = 0;   // sail keeps raw AWS/AWA as surface axes x0/x1 already — no extras needed
   if (sailEpisode.feed(sailElig, ss, &ep)) {
     FrontPoint<PERF_NAXIS> raw = ep;                                  // raw both-sided AWA → cloud
     FrontPoint<PERF_NAXIS> sp = ep; sp.x[1] = perfFoldAwa(ep.x[1]);   // device front: folded AWA (gate operates on folded coords)
-    // Cell-local admit gate (alt pattern): unvisited cell → unconditional; local support → beat
-    // the min(IDW, LWLR) hybrid bar − margin.
-    bool sailLocal = sailFront.hasLocalSupport(sp.x);
-    bool sailAdmitted = false;
-    if (!sailLocal || sailFront.pushesHybrid(sp.x, sp.y, perfSafetyMargin, perfIdwPower, perfRidgeFrac)) {
-      if (!sailLocal && sailFront.count >= PERF_FRONT_CAP) {
-        // a genuinely NEW conditions cell dropped at capacity (in-cell improvements still land)
-        if (!sailCapWarned) {
-          sailCapWarned = true;
-          queueConsoleMessage("WARN: sail front at capacity — new conditions are no longer recorded");
-        }
-      } else sailAdmitted = sailFront.add(sp);   // no console message on accept (counter on the dashboard)
-    }
-    // Queue AFTER the admit gate so admitted points carry their never-drop flag (sim never uploads).
-    if (perfSimMode < 0.5f) { PerfPendingQ::push(sailPending, sailPendingAdm, sailPendingCount, perfSentSail, raw, sailAdmitted, sailFront.axisScale, nowMs); perfLearnSerial++; }
+    PerfEng::push(true, sp, raw, nowMs, false);   // admit gate + pending queue run in PerfEng::step(), in emit order
   }
 
-  bool motorLearn = (motorFront.source != 1);
+  bool motorLearn = (motorFront.source != 1) && perfSimMode < 0.5f;
   bool motorElig = motorLearn && motoring && haveSpd && spd >= perfMinBoatSpeed;
   RawSample<PERF_NAXIS> ms; ms.x[0] = rpm; ms.x[1] = headwind; ms.x[2] = sea; ms.out = spd; ms.tMs = nowMs;
   ms.ex[0] = aws; ms.ex[1] = awa;   // retain raw AWS/AWA (headwind is derived from them) for cloud diagnosis
-  if (motorEpisode.feed(motorElig, ms, &ep)) {
-    // Cell-local admit gate — same pattern as the sail site above.
-    bool motorLocal = motorFront.hasLocalSupport(ep.x);
-    bool motorAdmitted = false;
-    if (!motorLocal || motorFront.pushesHybrid(ep.x, ep.y, perfSafetyMargin, perfIdwPower, perfRidgeFrac)) {
-      if (!motorLocal && motorFront.count >= PERF_FRONT_CAP) {
-        // a genuinely NEW conditions cell dropped at capacity (in-cell improvements still land)
-        if (!motorCapWarned) {
-          motorCapWarned = true;
-          queueConsoleMessage("WARN: motor front at capacity — new conditions are no longer recorded");
-        }
-      } else motorAdmitted = motorFront.add(ep);   // no console message on accept (counter on the dashboard)
-    }
-    // Queue AFTER the admit gate so admitted points carry their never-drop flag (sim never uploads).
-    if (perfSimMode < 0.5f) { PerfPendingQ::push(motorPending, motorPendingAdm, motorPendingCount, perfSentMotor, ep, motorAdmitted, motorFront.axisScale, nowMs); perfLearnSerial++; }
-  }
+  if (motorEpisode.feed(motorElig, ms, &ep)) PerfEng::push(false, ep, ep, nowMs, false);   // same as the sail site
 
   // steady-run indicator: the active mode's Episode is currently accumulating eligible samples
   perfSteady = motoring ? (motorEpisode.count > 0) : (sailEpisode.count > 0);
@@ -2779,8 +3413,8 @@ static float plf_syncAgo()  { if (demoSeal) return demoSyncAgoS(1260.0f);
                               if (lastBoatPerfSyncEpoch <= 0 || !timeIsSynced) return -1.0f;
                               time_t n = time(NULL); return (n > (time_t)lastBoatPerfSyncEpoch) ? (float)(n - (time_t)lastBoatPerfSyncEpoch) : 0.0f; }
 static float plf_sailHours(){ return (float)(perfSailSeconds / 3600.0); }   // data-maturity hours
-static float plf_steady()   { return (float)perfSteady; }                   // in a steady-run right now
-static float plf_settleSec(){ return perfSettleSec; }                       // dwell s remaining; 0 settled, -1 idle
+static float plf_steady()   { return (perfSimMode >= 0.5f && perfLiveValid) ? 1.0f : (float)perfSteady; }   // in a steady-run right now
+static float plf_settleSec(){ return (perfSimMode >= 0.5f && perfLiveValid) ? 0.0f : perfSettleSec; }      // dwell s remaining; 0 settled, -1 idle
 static float plf_state()    { return (float)perfState; }    // 0 MEASURED, 1 ESTIMATED, 2 LEARNING_EDGE, 3 NO_REFERENCE
 static PerfLiveField PERF_LIVE[] = {
   {"valid", plf_valid}, {"ws", plf_ws}, {"wa", plf_wa}, {"spd", plf_spd},
@@ -2822,8 +3456,8 @@ static float pmlf_source()   { return (float)motorFront.source; }
 static float pmlf_paused()   { return (perfPaused >= 0.5f) ? 1.0f : 0.0f; }
 static float pmlf_pitchStd() { return motorLive_pitch; }
 static float pmlf_motorHours() { return (float)(perfMotorSeconds / 3600.0); }   // data-maturity hours
-static float pmlf_steady()     { return (float)perfSteady; }                    // in a steady-run right now
-static float pmlf_settleSec()  { return perfSettleSec; }                        // dwell s remaining; 0 settled, -1 idle
+static float pmlf_steady()     { return (perfSimMode >= 0.5f && motorLiveValid) ? 1.0f : (float)perfSteady; }   // in a steady-run right now
+static float pmlf_settleSec()  { return (perfSimMode >= 0.5f && motorLiveValid) ? 0.0f : perfSettleSec; }      // dwell s remaining; 0 settled, -1 idle
 static float pmlf_state()      { return (float)motorState; }   // 0 MEASURED, 1 ESTIMATED, 2 LEARNING_EDGE, 3 NO_REFERENCE
 static PerfLiveField PERF_MOTOR_LIVE[] = {
   {"valid", pmlf_valid}, {"rpm", pmlf_rpm}, {"headwind", pmlf_headwind}, {"spd", pmlf_spd},
@@ -2989,8 +3623,10 @@ static int perfIngestBlock(char *p, int target) {
 bool perfIngestFrontCsv(char *body) {
   char *sp = strstr(body, "BEFRONT1,SAIL");
   char *mp = strstr(body, "BEFRONT1,MOTOR");
+  frontWriteBegin();
   if (sp) perfIngestBlock(sp, 0);
   if (mp) perfIngestBlock(mp, 1);
+  frontWriteEnd();
   return (sp || mp);
 }
 
@@ -3088,10 +3724,13 @@ void initBoatPerformance() {
   motorPending  = (FrontPoint<PERF_NAXIS> *)ps_malloc((size_t)PERF_PENDING_CAP * sizeof(FrontPoint<PERF_NAXIS>));
   sailPendingAdm  = (uint8_t *)ps_malloc(PERF_PENDING_CAP);
   motorPendingAdm = (uint8_t *)ps_malloc(PERF_PENDING_CAP);
+  perfEmitQ = (PerfEmit *)ps_malloc((size_t)PERF_EMIT_Q * sizeof(PerfEmit));
+  perfQ     = (FrontQuery<PERF_NAXIS> *)ps_malloc(sizeof(FrontQuery<PERF_NAXIS>));
   if (!sailRing || !motorRing || !sailFrontBuf || !motorFrontBuf || !sailPending || !motorPending
-      || !sailPendingAdm || !motorPendingAdm) {
+      || !sailPendingAdm || !motorPendingAdm || !perfEmitQ || !perfQ) {
     queueConsoleMessage("ERROR: BoatPerf ps_malloc failed"); return;
   }
+  memset(perfQ, 0, sizeof(FrontQuery<PERF_NAXIS>));
   memset(sailFrontBuf,  0, (size_t)PERF_FRONT_CAP * sizeof(FrontPoint<PERF_NAXIS>));
   memset(motorFrontBuf, 0, (size_t)PERF_FRONT_CAP * sizeof(FrontPoint<PERF_NAXIS>));
   // Deque window caps {AWS|RPM, AWA|headwind, sea, output}: sea-state has the longest dwell (60 s headroom);
@@ -3122,7 +3761,7 @@ void initBoatPerformance() {
 }
 void resetBoatPerformance() {
   if (!sailFrontBuf) return;
-  sailFront.count = 0; sailFront.source = 0; motorFront.count = 0; motorFront.source = 0;
+  frontWriteBegin(); sailFront.count = 0; sailFront.source = 0; motorFront.count = 0; motorFront.source = 0; frontWriteEnd();
   sailPendingCount = motorPendingCount = 0; perfSentSail = perfSentMotor = 0; sailCapWarned = motorCapWarned = false;
   sailEpisode.clearRun();  sailEpisode.ringHead = 0;  sailEpisode.ringCount = 0;
   motorEpisode.clearRun(); motorEpisode.ringHead = 0; motorEpisode.ringCount = 0;
@@ -3146,7 +3785,7 @@ void resetBoatPerformance() {
 // tach rescale invalidates it; the sail front (AWS/AWA/sea-state) has no RPM axis and must survive.
 void resetMotorFrontOnly() {
   if (!sailFrontBuf) return;  // shared PSRAM arena backs both fronts
-  motorFront.count = 0; motorFront.source = 0;
+  frontWriteBegin(); motorFront.count = 0; motorFront.source = 0; frontWriteEnd();
   motorPendingCount = 0; perfSentMotor = 0; motorCapWarned = false;
   motorEpisode.clearRun(); motorEpisode.ringHead = 0; motorEpisode.ringCount = 0;
   perfMotorSeconds = 0.0;
@@ -3205,10 +3844,12 @@ void boatPerf_tick(uint32_t nowMs) {
   static uint8_t  sc = 0;            // sendPerfSettings cadence: every 5th SSE cycle
   static uint32_t lastPeriodicSave = 0, savedLearnSerial = 0;
   if (!sailFrontBuf) return;
+  PerfEng::step();   // queued runs and the live grade, within FRONT_STEP_US; no heavy slot
   // Heavy one-offs, one per pass and only with the field physically cut (gpio4, not duty-derived fieldActiveStatus):
   // a finished cloud sync, and a 15 min save of new learning (sailing engine-off has no field-off edge to persist on).
-  // Held in demo mode: the fronts in RAM are the demo copies.
-  if (!gHeavyRanThisPass && !demoSeal && fieldCutSettled()) {
+  // Held in demo mode: the fronts in RAM are the demo copies. All wait for the lookup queue to empty, so every run
+  // emitted before them is admitted first, as the inline fold did.
+  if (!gHeavyRanThisPass && !demoSeal && fieldCutSettled() && PerfEng::idle()) {
     if (perfSyncHandoff) {
       gHeavyRanThisPass = true;
       perfApplySync();
@@ -3238,7 +3879,9 @@ void boatPerf_tick(uint32_t nowMs) {
   // The 1 Hz SSE burst (~7 ms stacked) is split one step per pass so it never becomes the tallest loop pole.
   bool foldDue  = ((uint32_t)(nowMs - lastFold) >= 100);
   bool sseStart = ((uint32_t)(nowMs - lastSse) >= 1000);
-  if (foldDue || sseStart || perfSseStep) {
+  // Step 1 waiting on its queued lookup takes no slot, so the 10 Hz fold keeps its cadence meanwhile.
+  bool sseWait  = (perfSseStep == 1 && perfLiveArmed && !perfLiveReady);
+  if (foldDue || sseStart || (perfSseStep && !sseWait)) {
     if (gHeavyRanThisPass) return;
     gHeavyRanThisPass = true;
   } else {
@@ -3249,27 +3892,46 @@ void boatPerf_tick(uint32_t nowMs) {
   if (sseStart && perfSseStep == 0) { lastSse = nowMs; perfSseStep = 1; }   // arm the 1 Hz burst
   // Do exactly ONE heavy sub-op per pass: advance the SSE burst if one is pending, else run the fold.
   // (Prioritising the burst defers the 10 Hz fold by at most a few passes — jitter, not loss.)
-  if (perfSseStep) {
+  if (perfSseStep && !(perfSseStep == 1 && perfLiveArmed && !perfLiveReady)) {
     switch (perfSseStep) {
       case 1:
         // step 1: 1 Hz evaluator + OUTPUT-BLIND state classifier for the active mode (mirrors
-        // altHealth_tick). NO clamp on the % — it may exceed 100 vs a stale front.
-        if (motorLiveValid) {
-          float surf[PERF_NAXIS] = { motorLive_rpm, motorLive_hw, motorLive_pitch };
-          float pred = 0;
-          motorState = (uint8_t)motorFront.classify(surf, perfRefRadius, perfIdwPower, perfRidgeFrac, perfRiskThresh, &pred);
-          motorLive_best = pred;
-          bool graded = (motorState == FRONT_MEASURED || motorState == FRONT_ESTIMATED);
-          motorLive_pct = (graded && pred > 0.1f) ? (motorLive_spd / pred * 100.0f) : 0.0f;
-        } else if (perfLiveValid) {
-          float surf[PERF_NAXIS] = { perfLive_ws, perfFoldAwa(perfLive_wa), perfLive_pitch };
-          float pred = 0;
-          perfState = (uint8_t)sailFront.classify(surf, perfRefRadius, perfIdwPower, perfRidgeFrac, perfRiskThresh, &pred);
-          perfLive_best = pred;
-          bool graded = (perfState == FRONT_MEASURED || perfState == FRONT_ESTIMATED);
-          perfLive_pct = (graded && pred > 0.1f) ? (perfLive_spd / pred * 100.0f) : 0.0f;
+        // altHealth_tick). NO clamp on the % — it may exceed 100 vs a stale front. Demo: both views, from the model.
+        // Live: the point is read here and graded by PerfEng::step() on the passes after (PerfEng::applyLive).
+        if (perfLiveArmed) { perfLiveArmed = false; perfSseStep = 2; break; }   // graded and applied
+        if (perfSimMode >= 0.5f) { demoPerfGrade(); perfSseStep = 2; break; }
+        {
+          const bool drive = frontDriveOn();
+          float px[PERF_NAXIS];
+          if (drive && frontDriveOld) {   // bench: the inline reads for a second with one run, in this pass
+            uint32_t d0 = (uint32_t)esp_timer_get_time();
+            volatile float sink = 0;
+            float pr = 0;
+            FrontQuery<PERF_NAXIS>::probe(sailFront, frontDriveSeq++, 0.6f, px);
+            sink = sink + (float)sailFront.classify(px, perfRefRadius, perfIdwPower, perfRidgeFrac, perfRiskThresh, &pr) + pr;
+            FrontQuery<PERF_NAXIS>::probe(sailFront, frontDriveSeq++, 0.6f, px);
+            sink = sink + (sailFront.hasLocalSupport(px) ? 1.0f : 0.0f)
+                 + (sailFront.pushesHybrid(px, 0.0f, perfSafetyMargin, perfIdwPower, perfRidgeFrac) ? 1.0f : 0.0f)
+                 + (float)sailFront.cellOf(px);
+            PerfEng::book((uint32_t)esp_timer_get_time() - d0);
+          } else if (drive) {             // bench: the same second through the queue, results unused
+            FrontPoint<PERF_NAXIS> dp = {};
+            FrontQuery<PERF_NAXIS>::probe(sailFront, frontDriveSeq++, 0.6f, dp.x);
+            PerfEng::push(true, dp, dp, nowMs, true);
+          }
+          if (motorLiveValid) {
+            float surf[PERF_NAXIS] = { motorLive_rpm, motorLive_hw, motorLive_pitch };
+            PerfEng::arm(true, surf, motorLive_spd, false);
+          } else if (perfLiveValid) {
+            float surf[PERF_NAXIS] = { perfLive_ws, perfFoldAwa(perfLive_wa), perfLive_pitch };
+            PerfEng::arm(false, surf, perfLive_spd, false);
+          } else if (drive && !frontDriveOld) {
+            FrontQuery<PERF_NAXIS>::probe(sailFront, frontDriveSeq++, 0.6f, px);
+            PerfEng::arm(false, px, 0.0f, true);
+          } else {
+            perfSseStep = 2;
+          }
         }
-        perfSseStep = 2;
         break;
       case 2: perfSendLive();      perfSseStep = 3; break;                  // step 2: sailing live SSE
       case 3: perfSendMotorLive(); perfSseStep = (++sc >= 5) ? 4 : 0; break; // step 3: motoring live SSE
@@ -3278,6 +3940,27 @@ void boatPerf_tick(uint32_t nowMs) {
   } else if (foldDue) {
     lastFold = nowMs; perfFold_tick(nowMs);                                 // ~10 Hz fold
   }
+}
+
+// The /debug "Record-book engine" line (3_functions.ino cannot see this file's statics).
+int frontEngineDebugLine(char *buf, size_t cap) {
+  uint32_t now = millis();
+  int32_t left = frontDriveUntilMs ? (int32_t)(frontDriveUntilMs - now) : 0;
+  char drive[40];
+  if (left > 0) snprintf(drive, sizeof(drive), "%s, %lds left", frontDriveOld ? "OLD inline reads" : "NEW engine", (long)(left / 1000));
+  else snprintf(drive, sizeof(drive), "off");
+  return snprintf(buf, cap,
+    "Record-book engine (Core 1, <=%u us of lookups per loop pass each): alt pass last %.2f ms, worst %.2f (10 s) / %.2f ms;"
+    " 1 Hz job last %u lookups, %.2f ms work over %u passes in %lu ms, worst %.2f ms (%u lookups), longest %lu ms;"
+    " boat perf pass last %.2f ms, worst %.2f / %.2f ms, work last second %.2f ms, worst %.2f ms, queue %d, full-drops %lu;"
+    " fronts alt %d, uploaded %d, sail %d, motor %d; lookups dropped by a front write %lu; drive %s\n",
+    (unsigned)FRONT_STEP_US, ft_altEngine.lastCall / 1000.0f, ft_altEngine.worstWindow / 1000.0f, ft_altEngine.worstSession / 1000.0f,
+    (unsigned)altJobLastLookups, altJobLastUs / 1000.0f, (unsigned)altJobLastPasses, (unsigned long)altJobLastSpanMs,
+    altJobWorstUs / 1000.0f, (unsigned)altJobWorstLookups, (unsigned long)altJobWorstSpanMs,
+    ft_perfEngine.lastCall / 1000.0f, ft_perfEngine.worstWindow / 1000.0f, ft_perfEngine.worstSession / 1000.0f,
+    perfEngLastSecUs / 1000.0f, perfEngWorstSecUs / 1000.0f, perfEmitN, (unsigned long)perfEmitDropped,
+    altFront2.count, altHaveUpload ? altFrontUp.count : 0, sailFront.count, motorFront.count,
+    (unsigned long)frontDropCount, drive);
 }
 
 // ===== BOAT PERFORMANCE — GUI-adjustable settings (registry-driven, like AltSettings). =====
@@ -6099,8 +6782,10 @@ static float chcFitLead(int lo, int hi, float *gapBefore, float *gapAfter) {
   if (gapBefore) *gapBefore = -1.0f;
   if (gapAfter)  *gapAfter  = -1.0f;
   if (!chcBuf || lo < 0 || hi > chcCount || n < 40) return -1.0f;
-  static float sumUp[128], sumDn[128];
-  static uint16_t nUp[128], nDn[128];
+  static float (&sumUp)[128] = PsramPlace::make<float[128]>();
+  static float (&sumDn)[128] = PsramPlace::make<float[128]>();
+  static uint16_t (&nUp)[128] = PsramPlace::make<uint16_t[128]>();
+  static uint16_t (&nDn)[128] = PsramPlace::make<uint16_t[128]>();
   float cost[CHC_KMAX + 1];
   for (int k = 0; k <= CHC_KMAX; k++) {
     for (int b = 0; b < 128; b++) { sumUp[b] = sumDn[b] = 0.0f; nUp[b] = nDn[b] = 0; }

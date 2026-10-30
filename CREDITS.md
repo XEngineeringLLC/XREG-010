@@ -51,6 +51,21 @@ derived image asset is likewise made available under CC BY-SA 3.0.
   Bus-off is recovered with the IDF's documented `twai_initiate_recovery` path instead of the
   stock driver reinstall, which freed the driver object while the receive path could still be
   using it.
+  The error-monitor task's stack is allocated in PSRAM.
+
+### Async web server — `ESP_Async_WebServer_xeng`
+
+- **Origin:** ESP Async WebServer 3.11.0 by ESP32Async (Hristo Gochkov, Mathieu Carbou, Emil
+  Muratov, Will Miles)
+- **Source:** <https://github.com/ESP32Async/ESPAsyncWebServer>
+- **License:** LGPL-3.0-or-later. Notice kept in every source file and the library LICENSE file.
+- **Modifications:** server-sent event messages are held in PSRAM. Each message's text and its
+  reference count share one PSRAM block, and each client's queue is a ring of slots in PSRAM.
+  Stock kept the text, the reference count, and the queue node in internal RAM. A message that
+  finds no PSRAM is dropped. The
+  sender's task drives the socket only while a client's queue is under 4 messages, however deep
+  the queue may grow. Main header renamed `ESPAsyncWebServer_xeng.h`; class names and API
+  otherwise unchanged. Only `AsyncEventSource.h` and `AsyncEventSource.cpp` differ from upstream.
 
 ### LSM6DSOX IMU driver — `LSM6DSOX_xeng`
 

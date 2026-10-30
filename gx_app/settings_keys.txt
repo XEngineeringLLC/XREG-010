@@ -2,9 +2,12 @@
 # gx_app/gen_settings.py reads labels, types, ranges, options, tooltips and echoes from
 # web_src/index.html and web_src/script.js, and writes gx_app/xregulator/bridge/settings_schema.json.
 #
-# One key per line, in screen order, under a "# section: Title" header.
-#   "# group: Title"            sub-heading for the keys that follow (must be a heading in index.html);
-#                               without it the key's enclosing <details> summary is used.
+# One key per line. Where a key shows on the GX, and in what order, is where it is in the app's Setup tab
+# (sub-tab, Alternator or Battery panel tab, <details>); the order of lines here does not matter, and they are
+# kept in the GX's order so the file reads like the screens (python3 gx_app/gen_settings.py --outline prints them).
+#   "# group: Title"            sub-heading for the keys that follow, up to the next "# group:" line (an empty one
+#                               ends it); Title must be a heading on the key's page in index.html. Without it the
+#                               key's enclosing <details> summary is used.
 #   KEY hidden                  published for gating only, not drawn.
 #   KEY disabledWhen=K:V        greyed while key K echoes V.
 #                               A key inside one of the app's gate containers (.gate-batt-current, .gate-soc-src,
@@ -13,17 +16,19 @@
 #   KEY enabledWhen=EP.F:V      usable only while field F of polled endpoint EP is V.
 #   KEY confirm=fn:NAME[@V]     ask first, with the string a script.js function returns (only when writing V);
 #                               confirm=const:NAME takes a script.js string constant.
-#   KEY buttons=ID,ID           a select drawn by buttons outside a form (values traced from their handlers).
-#   table ID KEY ...            the whole form holding KEY, saved in one request like the app's Save button.
+#   KEY buttons=ID,ID           a select drawn by buttons outside a form (values traced from their handlers); right
+#                               above a table, it is drawn by that table (Charge Rate and Limit by on the RPM Table).
+#   table ID KEY ...            the whole form holding KEY, drawn in place and saved in one request like the app's Save.
 #                               confirmIfChanged=PREFIX  the form's submit-listener warning, when a PREFIX<n> cell moved
 #                               readOnlyWhen=PREFIX:K:V  that column is locked and left out of the save while K is V
 #                               validate=ascending:PREFIX  the app's validateLearningTable rule on that column
 #                               capMode=K                Amps/kW columns (data-cap-col) follow select K, one derived
+#   KEY ... caption=TEXT        a line under the item on the GX, always shown; TEXT runs to the end of the line
 #   @widget source=/endpoint    a GX-drawn panel fed by a JSON endpoint the app polls; anchor=ID (its place in
 #                               index.html: help text, table headings), strings=NAME,... (script.js string arrays).
-# The GX-only Connection section (regulator link and address, Regulators list) is drawn by XregCfgConnection.qml.
+#   @connection anchor=ID       the GX-only Connection page (regulator link and address, Regulators list;
+#                               XregCfgConnection.qml), placed at the app's element ID.
 
-# section: Alternator
 ManualFieldToggle confirm=fn:manualFieldBypassText@1
 ManualDutyTarget
 SwitchingFrequency
@@ -35,11 +40,10 @@ altZeroApply enabledWhen=zerofitstate.capHeld:1
 @zeroStatus source=/zerofitstate anchor=altzero-status strings=ALTZERO_REJ_TEXT,ALTZERO_PHASE_TEXT
 ManualLifePercentage
 
-# section: RPM Table
 PhysicalPanelOverride hidden
 HiLow buttons=chargeRateLowBtn,chargeRateHighBtn disabledWhen=PhysicalPanelOverride:1
 capLimitMode buttons=capModeAmpsBtn,capModeKWBtn
-table rpmTable rpmTableRPMPoints0 confirmIfChanged=rpmTableRPMPoints readOnlyWhen=rpmMinDutyTable:kneeLearnEnable:1 validate=ascending:rpmTableRPMPoints capMode=capLimitMode
+table rpmTable rpmTableRPMPoints0 confirmIfChanged=rpmTableRPMPoints readOnlyWhen=rpmMinDutyTable:kneeLearnEnable:1 validate=ascending:rpmTableRPMPoints capMode=capLimitMode caption=Amps or kW limit and keep-alive per engine speed
 ClearOverheatHistory
 ResetLearningTable
 # group: Tachometer Keep-Alive — Automatic Learning
@@ -57,17 +61,15 @@ kneeTempTolF
 kneeDutyTolPct
 @kneeStatus source=/kneeLearnState anchor=knee-status-table
 ResetKneeLearn
+# group:
 
-# section: CV Mode
 TargetVoltageMode
 TargetVoltageSetpoint
 
-# section: Engine
 RPMScalingFactor confirm=const:RPM_SCALE_WIPE_MSG
 PulleyRatio
 IgnitionOverride
 
-# section: Battery
 BatteryShuntPresent hidden
 BattMonSrc hidden
 BulkVoltage
@@ -89,17 +91,11 @@ BatteryCOffset
 ShuntResistanceMicroOhm
 ShuntLead
 
-# section: Charge-Limit Follow
-dvccEn
-dvccSilenceS
-
-# section: Temperature
 @probes source=/tempSensors anchor=owProbeTable strings=OW_ROLE_NAMES,OW_ASSIGN_PARAM
 owScan
 battTempProbeEnable
 extraTempProbeEnable
 
-# section: Solar
 weatherModeEnabled
 # group: GPS Location
 table gpsManual LatitudeNMEA
@@ -114,8 +110,8 @@ solarUseConsEnable
 solarConsMarginPct
 solarLearnEnable
 solarLearnRatePct
+# group:
 
-# section: Alarms
 AlarmActivate
 GeneralFaultAlarm
 TempAlarm
@@ -134,5 +130,8 @@ AlarmTest
 ResetAlarmLatch
 SilenceAlarm
 
-# section: Bench and Development
+dvccEn
+dvccSilenceS
+
+@connection anchor=gxCard
 hardwarePresent

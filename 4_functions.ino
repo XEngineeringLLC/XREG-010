@@ -181,6 +181,105 @@ struct PsramJsonAllocator : ArduinoJson::Allocator {
 };
 static PsramJsonAllocator psramJsonAllocator;
 
+// A GX device's name as a quoted JSON string, at most maxBytes of it: control bytes dropped, cut on a UTF-8 character
+// boundary, '"' and '\' escaped. The names are the owner's, typed on the GX, so they reach the web app only this way.
+static size_t gxDevJsonStr(char *dst, size_t cap, const char *src, size_t maxBytes) {
+  size_t n = 0, taken = 0;
+  if (cap < 3) return 0;
+  dst[n++] = '"';
+  for (const unsigned char *p = (const unsigned char *)(src ? src : ""); *p && n + 3 <= cap; p++) {
+    if (*p < 0x20 || *p == 0x7F) continue;
+    if (*p >= 0x80 && (*p & 0xC0) != 0x80) {   // a lead byte: its whole character fits, or none of it goes
+      const size_t len = (*p >= 0xF0) ? 4 : (*p >= 0xE0) ? 3 : 2;
+      size_t have = 1;
+      while (have < len && (p[have] & 0xC0) == 0x80) have++;
+      if (have < len || taken + len > maxBytes || n + len + 2 > cap) break;
+      memcpy(dst + n, p, len);
+      n += len;
+      taken += len;
+      p += len - 1;
+      continue;
+    }
+    if (*p >= 0x80) continue;                  // a stray continuation byte
+    if (taken + 1 > maxBytes) break;
+    if (*p == '"' || *p == '\\') {
+      if (n + 4 > cap) break;
+      dst[n++] = '\\';
+    }
+    dst[n++] = (char)*p;
+    taken++;
+  }
+  dst[n++] = '"';
+  dst[n] = '\0';
+  return n;
+}
+
+// POST /gxDevices (GX link 4): the GX bridge's device readings, for the web app's Live Data > Integrations. Contract:
+// claude_docs/firmware-internals.md, "Victron GX stream". async_tcp only; RAM only (no NVS, no console line, no CSV),
+// accepted in demo mode too. The list is re-serialized from the parsed values, so what reaches a browser is bounded
+// and well-formed whatever arrives.
+void gxDevicesHandle(AsyncWebServerRequest *request) {
+  if (refuseMisaddressed(request)) return;
+  if (!gxFlagged(request)) {
+    request->send(400, "text/plain", "gx=1 required");
+    return;
+  }
+  JsonDocument doc(&psramJsonAllocator);
+  if (!request->hasParam("j", true) || deserializeJson(doc, request->getParam("j", true)->value())
+      || doc["v"].as<int>() != 1 || !doc["d"].is<JsonArrayConst>()) {
+    request->send(400, "text/plain", "j must be {\"v\":1,\"d\":[...]}");
+    return;
+  }
+  static char *stage = nullptr;   // async_tcp is the only caller
+  if (!stage) stage = (char *)ps_malloc(GXDEV_TEXT_SIZE);
+  if (!gxDevText) gxDevText = (char *)ps_malloc(GXDEV_TEXT_SIZE);
+  if (!stage || !gxDevText) {
+    request->send(503, "text/plain", "No memory for the device list");
+    return;
+  }
+  size_t n = 0;
+  unsigned kept = 0;
+  stage[n++] = '[';
+  for (JsonVariantConst item : doc["d"].as<JsonArrayConst>()) {
+    if (kept >= GXDEV_MAX) break;
+    JsonArrayConst row = item.as<JsonArrayConst>();
+    // [kind, name, product, amps or null, reading age s or null, on D-Bus now 1/0]
+    const char *kind = row[0].as<const char *>();
+    size_t klen = kind ? strlen(kind) : 0;
+    bool kindOk = klen >= 1 && klen <= 11;
+    for (size_t i = 0; kindOk && i < klen; i++) kindOk = kind[i] >= 'a' && kind[i] <= 'z';
+    if (!kindOk) continue;
+    float amps = row[3].is<float>() ? row[3].as<float>() : NAN;
+    float age = row[4].is<float>() ? row[4].as<float>() : NAN;
+    if (!isfinite(amps) || fabsf(amps) > 5000.0f) amps = NAN;
+    if (!isfinite(age) || age < 0.0f || age > 86400.0f) age = NAN;
+    char name[2 * 32 + 3], prod[2 * 40 + 3], a[16], g[16];
+    gxDevJsonStr(name, sizeof(name), row[1].as<const char *>(), 32);
+    gxDevJsonStr(prod, sizeof(prod), row[2].as<const char *>(), 40);
+    if (isfinite(amps)) snprintf(a, sizeof(a), "%.2f", amps); else snprintf(a, sizeof(a), "null");
+    if (isfinite(age)) snprintf(g, sizeof(g), "%.1f", age); else snprintf(g, sizeof(g), "null");
+    const int w = snprintf(stage + n, GXDEV_TEXT_SIZE - n, "%s{\"k\":\"%s\",\"n\":%s,\"p\":%s,\"a\":%s,\"age\":%s,\"on\":%d}",
+                           kept ? "," : "", kind, name, prod, a, g, row[5].as<int>() == 1 ? 1 : 0);
+    if (w < 0 || n + (size_t)w + 2 >= GXDEV_TEXT_SIZE) break;   // the list ends at the last entry that fits
+    n += (size_t)w;
+    kept++;
+  }
+  stage[n++] = ']';
+  stage[n] = '\0';
+  const uint8_t every = phoneLiveNow ? GXDEV_EVERY_WATCHED_S : GXDEV_EVERY_IDLE_S;
+  const uint32_t now = millis();
+  __atomic_add_fetch(&gxDevSeq, 1, __ATOMIC_SEQ_CST);   // odd: Core 1 skips a copy taken now
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  memcpy(gxDevText, stage, n + 1);
+  __atomic_store_n(&gxDevLen, (uint16_t)n, __ATOMIC_RELAXED);
+  __atomic_store_n(&gxDevAtMs, now ? now : 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&gxDevEveryS, every, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&gxDevSeq, 1, __ATOMIC_RELEASE);
+  char out[64];
+  snprintf(out, sizeof(out), "{\"ok\":1,\"everyS\":%u,\"kept\":%u}", (unsigned)every, kept);
+  request->send(200, "application/json", out);
+}
+
 bool executeFetchWeatherData() {
   // Called by HTTPS task on Core 0
   Serial.println(">>> executeFetchWeatherData() ENTERED");
@@ -1266,6 +1365,9 @@ if (!BMP388Disconnected) {
   // Transmit mode (spec: Working Markdown Docs/NMEA2K_TRANSMIT_SPEC.md). Identity and the retry ring are set up in every
   // mode: the ring can only be sized before Open(), and transmit can be switched on live later. Off keeps the library's
   // listen-only default: no bus presence, no address claim. Relies on InitSystemSettings() running first.
+  // The library's device, product-info and frame buffers (~3.4 KB, allocated from here through Open()) go to PSRAM;
+  // the TWAI driver and its queues pass explicit caps and stay internal.
+  PsramPlace::mallocWindow(true);
   NMEA2000.SetN2kCANSendFrameBufSize(80);  // software retry ring for frames the non-blocking _xeng driver refuses (TWAI queue full / no bus)
   // TWAI RX queue 128 (driver default 40): a peer nobody acknowledged (us off the bus or unpowered) releases its whole
   // transmit backlog back-to-back the moment we ACK again, and a Victron GX holds up to 100 (its txqlen). ~1.8 KB internal.
@@ -1294,6 +1396,7 @@ if (!BMP388Disconnected) {
   NMEA2000.ExtendReceiveMessages(N2kReceiveMessages);
   n2kApplyNodeConfig(false);  // before Open(), which runs the address claim itself
   NMEA2000.Open();
+  PsramPlace::mallocWindow(false);
   Serial.println("NMEA2K Running...");
 
 
@@ -1319,6 +1422,7 @@ if (!BMP388Disconnected) {
   }
   dataTimestamps[IDX_INA_DIE_TEMP] = 0;   // stamped only by a real sample past the warm-up discard: the heat ceiling's freshness
   dataTimestamps[IDX_VE_SOC] = 0;         // a boot stamp would pass an unseen VE.Direct port off as a battery monitor
+  dataTimestamps[IDX_SOG_NMEA] = 0;       // and the 0 kn initializer as a speed reading: the lifetime average speed took it every boot
   dataTimestamps[IDX_VICTRON_SOLAR] = 0;  // and as an MPPT (the solar ledger would log a measured 0 harvest)
   dataTimestamps[IDX_DVCC_VECAN] = 0;     // the Victron carrier rows read 0 as "none heard"
   dataTimestamps[IDX_DVCC_WIFI] = 0;
@@ -3619,7 +3723,7 @@ struct RollingWindow {
   float pitch[ROLLING_WINDOW_SIZE];
   uint16_t index = 0;
   uint16_t count = 0;  // How many valid samples (0-60)
-} rolling60s;
+} &rolling60s = PsramPlace::make<RollingWindow>();
 
 // 120-second rolling window for anchor display (roll/pitch deviation + heading swing)
 // heading entries: actual degrees [0,360] when fresh, -1.0 when compass stale
@@ -3630,7 +3734,7 @@ struct RollingWindow120 {
   float heading[ROLLING_WINDOW_120];
   uint16_t index = 0;
   uint16_t count = 0;
-} rolling120s;
+} &rolling120s = PsramPlace::make<RollingWindow120>();
 
 // ===== IMU METRIC PROCESSING FUNCTIONS =====
 void resetAccelStats() {
@@ -5816,6 +5920,7 @@ void executeGetPendingConfig() {
 
   pendingConfigClearId = pid;
   executeClearPendingConfig();   // synchronous (same task) so it completes before the reboot
+  rebootRequestWhy = REBOOT_WHY_CFG_PUSH;
   rebootRequestedAt = millis();
   rebootRequested = true;
 }
@@ -6304,17 +6409,8 @@ void checkTimeSync() {
     return;
   }
 
-  // AUTO: NTP only when BOTH NMEA SystemTime and phone time are stale. NMEA/Phone-forced skip the call
-  // (syncTimeFromNTP would early-return anyway) to avoid the WiFi check + log noise.
-  if (timeSourceMode == TSRC_AUTO) {
-    bool nmeaTimeFresh  = (lastNmea2kSystemTimeMs > 0) &&
-                          (currentMillis - lastNmea2kSystemTimeMs < NMEA_TIME_FRESH_MS);
-    bool phoneTimeFresh = (lastPhoneTimeMs > 0) &&
-                          (currentMillis - lastPhoneTimeMs < PHONE_FRESH_MS);
-    if (!nmeaTimeFresh && !phoneTimeFresh) syncTimeFromNTP();
-  } else if (timeSourceMode == TSRC_NTP) {
-    syncTimeFromNTP();
-  }
+  // NMEA/Phone-forced skip the call (syncTimeFromNTP would early-return anyway) to avoid the WiFi check + log noise.
+  if (ntpTimeWanted()) syncTimeFromNTP();
 }
 // Format timestamp into static buffer - returns pointer to timestampBuffer
 const char *formatTimestamp(time_t timestamp) {
@@ -6482,6 +6578,7 @@ static void improvHandleRpc(const uint8_t *d, uint8_t dlen) {
       const char *s[1] = { "http://alternator.local" };  // the mDNS name client mode registers; the DHCP address is unknown until after the restart
       improvSendResult(IMPROV_CMD_WIFI, s, 1);
       Serial.printf("=== IMPROV: ship WiFi '%s' saved, restarting ===\n", ssid);
+      rebootRequestWhy = REBOOT_WHY_IMPROV;
       rebootRequestedAt = millis();
       rebootRequested = true;  // loop() restarts 2 s later, after these packets have left
       break;
@@ -6494,7 +6591,7 @@ static void improvHandleRpc(const uint8_t *d, uint8_t dlen) {
 // Called every loop() pass; returns immediately when nothing is buffered. Debug output shares
 // the port, so bytes are scanned for the header rather than trusting alignment.
 void improvSerialPoll() {
-  static uint8_t buf[9 + 255 + 1];
+  static uint8_t (&buf)[9 + 255 + 1] = PsramPlace::make<uint8_t[9 + 255 + 1]>();
   static uint16_t n = 0, need = 0;
   static const char HDR[6] = { 'I', 'M', 'P', 'R', 'O', 'V' };
   int guard = 0;

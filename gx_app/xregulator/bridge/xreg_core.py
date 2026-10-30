@@ -5,9 +5,11 @@
 # published path, and the settings model. xregulator_bridge.py maps the Manager and each Core onto their own D-Bus
 # services; the offline tests drive them with dicts in their place.
 
-import collections, concurrent.futures, gzip, http.client, ipaddress, json, logging, math, os, queue, re, secrets
-import socket, struct, subprocess, threading, time
+import collections, concurrent.futures, gzip, http.client, ipaddress, json, logging, math, os, queue, random, re
+import secrets, socket, struct, subprocess, threading, time
 import urllib.error, urllib.parse, urllib.request
+
+import xreg_cloud as cloud
 
 log = logging.getLogger('xregulator')
 
@@ -31,10 +33,10 @@ RATE_KEY = {'CSVData': 'csv1', 'CSVData4': 'csv4', 'CSVData2': 'csv2', 'CSVData3
 F_TO_C = lambda f: (f - 32.0) * 5.0 / 9.0
 # /Live/<name>: (event, field, wire scale, conversion). Temperatures in Celsius, the D-Bus convention.
 LIVE = (
-    ('AltAmps',     'CSVData',  'MeasuredAmps',           100, None),
+    ('AltAmps',     'CSVData',  'MeasuredAmps',           100, None),   # the tile's alternator instead while CSV4 has it
     ('Field',       'CSVData',  'dutyCycle',              100, None),
     ('BattV',       'CSVData',  'IBV',                    100, None),
-    ('BattA',       'CSVData',  'Bcur',                   100, None),
+    ('BattA',       'CSVData',  'Bcur',                   100, None),   # the tile's battery instead while CSV4 has it (_flow)
     ('Rpm',         'CSVData',  'RPM',                    1,   None),
     ('AltTemp',     'CSVData',  'AlternatorTemperatureF', 100, F_TO_C),
     ('FieldV',      'CSVData',  'vvout',                  100, None),
@@ -64,13 +66,20 @@ LIVE = (
     ('DvccCanAge',  'TimestampData', 'ts_DvccVeCan',      1,   None),
     ('DvccWifiAge', 'TimestampData', 'ts_DvccWifi',       1,   None),
 )
+LIVE_WIND = ('TrueWind', 'TrueWindAngle', 'AppWind')
+# Apparent wind's age on the TimestampData stream, ms at that frame (999999 never seen). Older than the firmware's own
+# DATA_TIMEOUT it is no reading: firmware before 2026-10-29 sends a never-seen apparent wind as 0, not the empty marker.
+WIND_TS = {'ApparentWindSpeedNMEA': 'ts_AppWindSpeed', 'ApparentWindAngleNMEA': 'ts_AppWindAngle'}
+WIND_STALE_MS = 10000
 HIST_EVERY_S = 2
 HIST_LEN = 150       # 5 minutes at 2 s
 HISTORY = (('AltAmps', 1), ('BattV', 2), ('Field', 0))   # /History/<name> = comma-separated samples, oldest first
 WIND_EVERY_S = 30
-WIND_LEN = 120       # /History/Wind: 1 hour of 30 s means of true wind speed
+WIND_LEN = 120       # /History/<name>: 1 hour of 30 s means of each wind speed below
+# (path name, /Live name, demo backfill field): Wind is true wind speed, AppWind apparent (the Dashboard's wind tile)
+WIND_HIST = (('Wind', 'TrueWind', 'TrueWindSpeedNMEA'), ('AppWind', 'AppWind', 'ApparentWindSpeedNMEA'))
 BARO_FETCH_S = 600   # the regulator stores one barometer sample every 10 minutes
-BARO_KEEP = 432      # /History/Baro: 3 days
+BARO_KEEP = 432      # /History/Baro: 3 days, newest last; /History/BaroEnd is the newest sample's epoch
 
 # /Plot/Short/<name>: (CSV1 field, wire scale, conversion, decimals); 1 s means, last 300
 SHORT = (
@@ -92,7 +101,7 @@ WIND_PLOT = (('Tws', 'TrueWindSpeedNMEA', 100, False), ('Twa', 'TrueWindAngleNME
 WIND_PLOT_S = 10
 WIND_PLOT_LEN = 360
 
-WANT_TOPICS = ('Short', 'Long', 'Health', 'Wind', 'Perf', 'Settings')
+WANT_TOPICS = ('Short', 'Long', 'Health', 'Wind', 'Perf', 'Settings', 'Flow', 'Cloud')
 WANT_HOLD_S = 45.0
 FAST_TOPICS = ('Short', 'Wind', 'Perf', 'Health')   # pages that hold the regulator's engine-running GX schedule
 PERF_FAST_KN = 1.0   # the home page always wants Perf; below this SOG and STW, it must not hold the fast schedule at anchor
@@ -102,9 +111,113 @@ LONG_POINTS = 300
 LONG_REFETCH_S = 600
 LONG_REUSE_S = 60    # a range change re-bins the cached ring when it is younger than this, then refetches
 HEALTH_REFETCH_S = 300
+# The plugin's Health window buttons, engine-hours (0 = the whole history). The regulator thins /alttrend.csv to 200
+# points within the window, so the bridge keeps a trend per window: two screens at different windows each get their own.
+HEALTH_WINDOWS = (10, 100, 0)
+DEMO_RETRY_S = 5     # /demoBackfill answers 404 until the regulator has finished entering demo
+DEMO_TRIES = 6       # fetches per entry or reconnect before the bridge gives up on it
 CURVE_REFETCH_S = 600
 SOURCE_POLL_S = 5    # an endpoint without its own pollS in the schema
-HOLD_S = 3.0         # after a GX write, show the written value this long before following the echo again
+# After a GX write the bridge shows the written value until the regulator's echo matches it. The write itself may take
+# WRITE_WAIT_S (a control write's three 1.7 s tries, a setting's 8 s timeout, writes queued ahead of it). Once the
+# regulator accepted it, the echo gets the interval of the channel carrying it plus CONFIRM_MARGIN_S, and the bridge
+# goes back to the echo only after that channel has delivered since the acceptance. Round 8 bench: OnOff came back up
+# to 4.6 s after a write, in a CSV1 sent every 5 s with the engine stopped.
+WRITE_WAIT_S = 20.0
+CONFIRM_MARGIN_S = 3.0
+
+# Home page power flow (/Flow/*), from the CSV4 group flowBattA / flowAltA / flowSolarA (A x100) and flowSrc, plus the
+# GX's own devices. Every value is amps at the battery bus: sources and loads >= 0, battery + charging; House is
+# sources - battery - measured loads, or, on a boat with a whole-DC-system meter (com.victronenergy.dcsystem), that
+# meter plus the sources and less the loads whose current passes through it (through_meter: the owner's word on the
+# Power flow devices page, else Victron's layout).
+# /Flow/Json, while the tile asks (/Ui/Want/Flow), else '':
+#   {"b": {"a": battery A or null, "st": 1 charging / 0 resting / -1 discharging, "from": Shunt | NMEA 2000 | VE.Direct
+#          | GX, "lim": the battery limit holding it or null},
+#    "rows": [{"id", "k": kind, "a": A or null (not measured), "c": caption, "in": 1 a row whose current passes through
+#          the DC system meter, only while House is metered}], sources in FLOW_SOURCE_KINDS order, then the loads; the
+#          tile adds House,
+#    "house": A or null, "hm": 1 House from the DC system meter, 0 calculated,
+#    "why": the footnote's reason: what keeps House unknown ('batt', the kind of the first row not measured), or an
+#          imbalance ('unmeasured': the battery and loads take more than the sources give; 'gap': with the meter, the
+#          sources give more than the battery, the loads and the meter take; either only once it has held
+#          FLOW_IMBALANCE_S), or '',
+#    "x": that imbalance, A (calculated House: the unmeasured source's least amps), "fs": full bar, A (the alternator's
+#          maximum) or null}
+# /Flow/Ok: 1 the regulator sends the flow group, 0 it does not (older firmware), None no stream.
+FLOW_SRC_MIN_A = 0.5    # a source or load under this shows 0 (Hall noise at zero)
+FLOW_FLIP_A = 0.3       # the battery word changes only past this, held for FLOW_FLIP_S
+FLOW_FLIP_S = 2.0
+FLOW_UNMEASURED_A = 1.0   # more into the battery than the sources give, past this: an unmeasured source (sensor offsets)
+# The DC system meter and the calculated House are two measurements of one thing; they may differ by this much before the
+# footnote names the difference: every sensor's offset, gain errors that grow with the current, and GX readings up to a
+# second apart from the regulator's
+FLOW_GAP_FRAC = 0.05    # of the sources' total, when that is more than FLOW_UNMEASURED_A
+# An imbalance ('unmeasured', 'gap') must hold this long before the footnote names it: two CSV4 frames at the tile's 2 s,
+# longer than the skew between inputs (a CSV4 frame against GX readings polled every 1 s, each up to 1 s old)
+FLOW_IMBALANCE_S = 4.0
+FLOW_HOLD_EVERY_S = 30  # /gxrate?flow=1 holds CSV4 at 2 s for 60 s; renewed this often while the tile is shown
+DVCC_HEARD_MS = 20000   # a Victron carrier counts as heard within this (the app's Victron card rule)
+# Row kinds in display order; the tile's table gives each its words and colour. 'alt' is this regulator, 'altx' any other
+# alternator (another regulator, an Orion XS in alternator mode, a Victron alternator), 'source' a generic DC meter;
+# 'dcdcload' a DC-DC charger that draws from the house bank, 'dcload' a DC meter on a load. 'dcsystem' (a whole-DC-system
+# meter) is no row: it gives House.
+FLOW_SOURCE_KINDS = ('alt', 'solar', 'charger', 'multi', 'dcgenset', 'fuelcell', 'altx', 'dcdc', 'wind', 'water',
+                     'shaft', 'source')
+FLOW_LOAD_KINDS = ('inverter', 'dcdcload', 'dcload')
+# D-Bus class -> kind. A Multi is a source row (charging) and a load row (inverting); an inverter and a DC load only a
+# load; an Orion DC-DC charger a source, or a load when the owner says it draws from the house bank (memory "h"); a DC
+# meter in DC-DC mode a source or a load by its sign.
+GX_CLASS_KIND = {'battery': 'battery', 'solarcharger': 'solar', 'charger': 'charger', 'vebus': 'multi',
+                 'multi': 'multi', 'inverter': 'inverter', 'dcgenset': 'dcgenset', 'fuelcell': 'fuelcell',
+                 'alternator': 'altx', 'dcdc': 'dcdc', 'dcload': 'dcload', 'dcsystem': 'dcsystem'}
+# com.victronenergy.dcsource /Settings/MonitorMode -> kind (gui-v2 enums.h MonitorMode_DcSource_*); -1 and any mode not
+# listed is a generic source
+DCSOURCE_KIND = {-2: 'charger', -3: 'dcdc', -4: 'water', -7: 'shaft', -8: 'wind'}
+# com.victronenergy.dcload /Settings/MonitorMode: 7 inverter and 6 DC system make their own kinds; the rest name the row
+# when the owner gave no name (gui-v2 1.3.22 enums.h MonitorMode_DcLoad_* and enums.cpp dcMeter_typeToText; 2 and 6
+# from the Venus OS wiki's D-Bus page, "dcload"). 1, a generic load, and any mode not listed: the product names it.
+DCLOAD_KIND = {6: 'dcsystem', 7: 'inverter'}
+DCLOAD_NAME = {2: 'Electric drive', 3: 'Fridge', 4: 'Water pump', 5: 'Bilge pump', 8: 'Water heater'}
+# What vecan-dbus names every NMEA 2000 alternator (ProductId 0xB091), this regulator's twin included
+ALT_N2K_PRODUCT = 'Alternator'
+# An alternator whose /Serial is still empty after this long asking is listed without one. A pinned regulator's twin
+# never is: vecan-dbus knows its NMEA 2000 unique number (n2k_unique) from address claim, before any serial.
+ALT_SERIAL_WAIT_S = 30.0
+# GX-side readings fill what the regulator does not measure (flow_model): battery from systemcalc /Dc/Battery/Current,
+# solar from /Dc/Pv/Current less the MPPT the regulator already reads over VE.Direct (flowSolarSer), and a row per GX
+# source and load. Read while the tile shows, and for /gxDevices.
+GX_FRESH_S = 5.0        # a GX reading older than this is not used
+GX_BATT_FROM = {1: 'Shunt', 2: 'NMEA 2000', 3: 'VE.Direct'}   # flowSrc battery source -> label
+# Devices seen (Manager store 'gx_devices'): a device that drops off D-Bus when unpowered stays listed at 0.0 A until the
+# owner forgets it (/GxForget). Key: D-Bus class and VRM instance. Value: {"k": kind, "n": name, "p": product, "r": roles,
+# 's' source row, 'l' load row, 'p' solar; "s": serial, there for an alternator unless it had none after
+# ALT_SERIAL_WAIT_S ("w": 1, with "u" its NMEA 2000 unique number when it has one); "h": 1 an Orion (class dcdc) that
+# draws from the house bank to charge another battery, which the GX cannot tell from one that feeds it, so the owner says
+# (/GxDrawsHouse); "m": 1 / 0 its current does or does not pass through the DC system meter, the owner's word over
+# through_meter()'s default (/GxMetered)}. Key "xreg:<uid>", {"k": "reg", "m"}: the same for a pinned regulator's own
+# alternator.
+GX_POLL_TILE_S = 1      # GxReader cadence while a tile shows
+GX_POLL_POST_S = 2      # while only /gxDevices posts need it (inside GX_FRESH_S)
+# /gxDevices (GX link 4): the GX's device readings to the regulator, for its web app's Live Data > Integrations. The
+# regulator answers the interval it wants (everyS: short while a phone watches, long otherwise).
+DEVPOST_EVERY_S = 5.0   # before the first answer
+DEVPOST_MAX = 16        # the firmware keeps this many
+
+# Cloud page (/Cloud/*): the get-leaderboard-bundle edge function, called by the bridge itself (xreg_cloud.py)
+CLOUD_OFF, CLOUD_UNREGISTERED, CLOUD_LOADING, CLOUD_READY, CLOUD_OFFLINE, CLOUD_ERROR, CLOUD_NO_LINK = range(7)
+CLOUD_REFRESH_S = 600   # a shown page refetches this often
+CLOUD_RETRY_S = 60      # after a failed fetch
+CLOUD_TIMEOUT_S = 15.0
+CLOUD_TEXT = {
+    CLOUD_OFF: 'Cloud Features is switched off, so leaderboards and fleet stats are unavailable. Turn it on in the '
+               'XREG-010 app under Setup → System → Cloud Features.',
+    CLOUD_UNREGISTERED: 'This regulator is not registered for cloud features. Register it in the XREG-010 app under '
+                        'Cloud Features.',
+    CLOUD_LOADING: 'Loading leaderboards',
+    CLOUD_OFFLINE: 'No internet connection on the GX',
+    CLOUD_NO_LINK: 'Regulator not connected',
+}
 
 MGR_SERVICE = 'com.victronenergy.xregulator'   # no ProductName, so gui-v2 never lists it as a device
 UNIT_SERVICE = 'com.victronenergy.switch.'
@@ -116,6 +229,15 @@ GXLIMITS_EVERY_S = 3.0
 # /Link/GxLimits/State
 LIMITS_NONE, LIMITS_IDLE, LIMITS_SENDING, LIMITS_NATIVE, LIMITS_REFUSED = 0, 1, 2, 3, 4
 INSTANCE = 100       # requested VRM instance of a new regulator; localsettings moves it to the next free one
+# Demo only: the simulated bank as a battery service, so the GX's own battery tile reads it. systemcalc then uses it as
+# the system battery, and from there it can reach real equipment: SOC onto every VE.Can port and to non-VE.Bus
+# inverter-chargers (socsync.py, always on, whatever is on the bus), and with DVCC on, voltage, current and temperature
+# to solar chargers, inverters, alternators and VE.Can (batterysense.py); a Multi takes it for ESS and SOC; Modbus TCP
+# serves it to whatever polls. So it is published only on a GX with no VE.Can or BMS-Can port (Mark 2026-10-28: "Block
+# if VE.Can present"), no other battery, none of these device classes, DVCC off and Modbus TCP off. It carries no
+# /Info/* limits, so it is never a BMS. A bench GX with its VE.Can port keeps the battery tile's dashes.
+BATT_SERVICE = 'com.victronenergy.battery.'
+BATT_BLOCKERS = ('vecan', 'battery', 'vebus', 'multi', 'acsystem', 'inverter', 'solarcharger', 'charger', 'dcdc')
 MDNS_TYPE = '_xreg._tcp.local.'
 UID_RE = re.compile(r'[0-9A-F]{16}$')
 HOST_RE = re.compile(r'[A-Za-z0-9.-]{1,64}(:[0-9]{1,5})?$')
@@ -143,6 +265,10 @@ def unit_ident(uid):
 
 def unit_service(uid):
     return UNIT_SERVICE + unit_ident(uid)
+
+
+def batt_service(uid):
+    return BATT_SERVICE + unit_ident(uid)
 
 
 def alt_service(uid):
@@ -262,12 +388,12 @@ def parse_backfill(b):
 
 
 def parse_baro(b):
-    # /baroHistory.bin: u16 head, u32 epoch, u16 count, then count u16 samples (mbar x10, 0 = empty) in a ring whose
-    # oldest slot is head
-    head, count = int.from_bytes(b[0:2], 'little'), int.from_bytes(b[6:8], 'little')
+    # /baroHistory.bin: u16 head, u32 epoch of the newest sample (0 = regulator clock not set), u16 count, then count
+    # u16 samples (mbar x10, 0 = empty) in a ring whose oldest slot is head. -> (last BARO_KEEP, oldest first; epoch)
+    head, epoch, count = struct.unpack_from('<HIH', b, 0)
     ring = [int.from_bytes(b[8 + 2 * i:10 + 2 * i], 'little') for i in range(count)]
     ordered = ring[head:] + ring[:head]
-    return [v / 10.0 if v else None for v in ordered[-BARO_KEEP:]]
+    return [v / 10.0 if v else None for v in ordered[-BARO_KEEP:]], epoch
 
 
 # ---- Long-term plots: /longTermPlots.bin decoded as script.js parseLT() does ----
@@ -281,12 +407,16 @@ LT_AVG = (('baro', 10, 1), ('ambTemp', 10, 1), ('cog', 10, 0), ('heading', 10, 0
           ('altZero', 100, 2))
 LT_ONAVG = (('battVolt', 100), ('battCurr', 10), ('altCurr', 10), ('victronCurr', 10), ('duty', 100))
 LT_ONAVG_BIT = tuple([n for n, _, _ in LT_ENV].index(k) for k, _ in LT_ONAVG)
-LT_TEMPS = ('altTemp', 'tempTherm', 'ambTemp')   # stored in F, published in C
+# v5 tail envelopes: (name, wire scale, published decimals, validMask bit, index of its min in the unpacked record)
+LT_TAIL_ENV = (('battTemp', 10, 1, 24, 70),)
+LT_TEMPS = ('altTemp', 'tempTherm', 'ambTemp', 'battTemp')   # stored in F, published in C
 LT_ANGLES = ('awa', 'twa', 'cog', 'heading')
 LT_NONZERO = ('battVolt', 'baro')                # a 0 here is a boot transient, never a reading
-LT_FIELDS = tuple(n for n, _, _ in LT_ENV) + tuple(n for n, _, _ in LT_AVG)
+LT_FIELDS = tuple(n for n, _, _ in LT_ENV) + tuple(n for n, _, _ in LT_AVG) + tuple(n for n, *_ in LT_TAIL_ENV)
+LT_REC5 = struct.Struct('<IiiI51h6hBB5hBB3hh')   # 152 B (v5: + battery temperature envelope)
 LT_REC4 = struct.Struct('<IiiI51h6hBB5hBB')      # 144 B (v4: engine-on averages + coverage)
 LT_REC3 = struct.Struct('<IiiI51h6hBB')          # 132 B
+LT_AF = 4 + 3 * len(LT_ENV) + len(LT_AVG) + 2 + len(LT_ONAVG)   # activeFrac's index in a v4/v5 record
 
 
 def parse_longterm(buf, wall=time.time):
@@ -296,7 +426,8 @@ def parse_longterm(buf, wall=time.time):
     interval = interval or 600
     if not rec_size or len(buf) < 16 + count * rec_size:
         return None
-    st = LT_REC4 if rec_size >= LT_REC4.size else LT_REC3 if rec_size >= LT_REC3.size else None
+    st = LT_REC5 if rec_size >= LT_REC5.size else LT_REC4 if rec_size >= LT_REC4.size \
+        else LT_REC3 if rec_size >= LT_REC3.size else None
     if st is None:
         return None
     # Unsynced records carry epoch 0: anchor the newest to the header epoch (or now) and space back by the interval
@@ -307,7 +438,7 @@ def parse_longterm(buf, wall=time.time):
         ts = v[0] or anchor - (count - 1 - i) * interval
         if ts not in recs:
             recs[ts] = v
-    return {'interval': interval, 'last_epoch': last_epoch, 'v4': st is LT_REC4,
+    return {'interval': interval, 'last_epoch': last_epoch, 'v4': st is not LT_REC3, 'v5': st is LT_REC5,
             'recs': sorted(recs.items())}
 
 
@@ -339,7 +470,7 @@ def bin_longterm(lt, range_s, max_points=LONG_POINTS):
         if i < n:
             buckets[i].append(v)
     series = {}
-    for name, _, _ in LT_ENV:
+    for name, *_ in LT_ENV + LT_TAIL_ENV:
         series[name], series[name + 'Min'], series[name + 'Max'] = [None] * n, [None] * n, [None] * n
     for name, _, _ in LT_AVG:
         series[name] = [None] * n
@@ -348,14 +479,16 @@ def bin_longterm(lt, range_s, max_points=LONG_POINTS):
     series['chargeStage'], series['cover'] = [None] * n, [None] * n
     n_env = len(LT_ENV)
     avg_base = 4 + 3 * n_env
+    envs = [(name, scale, fi, 4 + 3 * fi) for fi, (name, scale, _) in enumerate(LT_ENV)]
+    if lt and lt.get('v5'):
+        envs += [(name, scale, bit, o) for name, scale, _, bit, o in LT_TAIL_ENV]
     for bi, group in enumerate(buckets):
         if not group:
             continue
-        for fi, (name, scale, _) in enumerate(LT_ENV):
+        for name, scale, bit, o in envs:
             mins, maxs, avgs = [], [], []
             for v in group:
-                if v[3] & (1 << fi):
-                    o = 4 + 3 * fi
+                if v[3] & (1 << bit):
                     a = _lt_value(name, v[o + 2], scale)
                     if a is None:
                         continue
@@ -379,7 +512,7 @@ def bin_longterm(lt, range_s, max_points=LONG_POINTS):
         for v in group:
             stages[v[avg_base + len(LT_AVG)]] += 1
             if lt['v4']:
-                af = v[-2]
+                af = v[LT_AF]
                 cover = af / 2.0 if v[3] & 1 else None
                 for oi, (name, scale) in enumerate(LT_ONAVG):
                     if af > 0 and v[3] & (1 << LT_ONAVG_BIT[oi]):
@@ -408,6 +541,27 @@ def bin_longterm(lt, range_s, max_points=LONG_POINTS):
     return out
 
 
+def longterm_last(lt):
+    # Each field's newest recorded average anywhere in the ring: a legend whose window has no reading shows this rather
+    # than a dash (demo entry, before the first live record; a field only read now and then)
+    out = {}
+    if not lt or not lt['recs']:
+        return out
+    n_env = len(LT_ENV)
+    want = [(name, scale, fi, 4 + 3 * fi + 2) for fi, (name, scale, _) in enumerate(LT_ENV)]
+    want += [(name, scale, n_env + ai, 4 + 3 * n_env + ai) for ai, (name, scale, _) in enumerate(LT_AVG)]
+    if lt.get('v5'):
+        want += [(name, scale, bit, o + 2) for name, scale, _, bit, o in LT_TAIL_ENV]
+    for name, scale, bit, idx in want:
+        for _ts, v in reversed(lt['recs']):
+            if v[3] & (1 << bit):
+                x = _lt_value(name, v[idx], scale)
+                if x is not None:
+                    out[name] = round(x, lt_decimals(name))
+                    break
+    return out
+
+
 def _mean(name, vals):
     if name in LT_ANGLES:
         rad = [math.radians(x) for x in vals]
@@ -416,10 +570,32 @@ def _mean(name, vals):
 
 
 def lt_decimals(name):
-    for n, _, d in LT_ENV + LT_AVG:
+    for n, _, d, *_ in LT_ENV + LT_AVG + LT_TAIL_ENV:
         if name == n or name in (n + 'Min', n + 'Max', n + 'OnAvg'):
             return d
     return 1 if name == 'cover' else 0
+
+
+def wind_stale(frames, fresh, marker_ok=False):
+    # The CSV4 wind fields the latest fresh TimestampData calls never seen or stale (WIND_TS); with no fresh TS, none.
+    # marker_ok: this firmware sends the empty marker for apparent wind with no reading (seen on this stream), so a CSV4
+    # frame built after that TS frame speaks for itself: a wind instrument that has just come on shows at once. Without
+    # it (older firmware sends 0 for no instrument), the TS verdict stands until the next TS frame.
+    if 'TimestampData' not in fresh:
+        return set()
+    ts, c4 = frames.get('TimestampData') or {}, frames.get('CSVData4') or {}
+    if marker_ok and frame_after(c4, ts):
+        return set()
+    return {f for f, t in WIND_TS.items() if ts.get(t) is not None and ts[t] > WIND_STALE_MS}
+
+
+def frame_after(c4, ts):
+    # The CSV4 frame was built after the TimestampData frame: same boot, sendMs later (millis() wraps at 2^32)
+    a, b = c4.get('sendMs'), ts.get('ts_sendMs')
+    if a is None or b is None or c4.get('sessionId') != ts.get('ts_sessionId'):
+        return False
+    d = (int(a) - int(b)) & 0xFFFFFFFF
+    return 0 < d < 0x80000000
 
 
 # ---- Recorders (fed on the main tick) ----
@@ -465,10 +641,10 @@ class WindRecorder:
     def _reset(self):
         self.acc = {name: [0.0, 0.0, 0, False] for name, *_ in WIND_PLOT}   # sum (or sin sum), cos sum, count, any < 0
 
-    def sample(self, frame):
+    def sample(self, frame, stale=()):
         for name, field, scale, angle in WIND_PLOT:
             raw = frame.get(field)
-            if raw is None or raw <= EMPTY:
+            if raw is None or raw <= EMPTY or field in stale:
                 continue
             a = self.acc[name]
             v = raw / scale
@@ -525,9 +701,17 @@ class SettingsModel:
                 poll = ep.get('pollS')
                 self.endpoints[name] = (ep['path'], float(poll) if isinstance(poll, (int, float)) and poll > 0
                                         else SOURCE_POLL_S)
-        for section in (schema or {}).get('sections', []):
-            for item in section.get('items', []):
-                self._add(item)
+        self._walk((schema or {}).get('outline') or [])
+
+    def _walk(self, nodes):
+        # outline pages hold items and deeper pages ("children" marks a page); where an item sits does not matter here
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            if isinstance(n.get('children'), list):
+                self._walk(n['children'])
+            else:
+                self._add(n)
 
     @classmethod
     def from_text(cls, text):
@@ -1082,7 +1266,8 @@ class Link:
                     'host': self.host, 'other': self.other, 'gx': self.gx, 'mismatch': self.mismatch,
                     'schema': self.schema, 'perf_schema_text': self.perf_schema_text, 'ever_live': self.ever_live,
                     'rate': self.rate, 'generation': self.generation,
-                    'csv3_current': self.frame_at.get('CSVData3', -1e18) >= self.stream_at}
+                    'csv3_current': self.frame_at.get('CSVData3', -1e18) >= self.stream_at,
+                    'frame_at': dict(self.frame_at)}
             return dict(self.frames), fresh, info
 
     def take_short(self):
@@ -1356,16 +1541,345 @@ class Worker:
 
 # ---- Core ----
 
+def ser_hash(serial):
+    # The firmware's veSerHash (5_functions.ino): FNV-1a over the serial without spaces, 31 bits, never 0
+    h = 2166136261
+    for b in str(serial or '').encode('utf-8', 'replace'):
+        if b in (0x20, 0x0D, 0x0A):
+            continue
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    h &= 0x7FFFFFFF
+    return h or 1
+
+
+def _src(v):
+    return None if v is None else 0.0 if v < FLOW_SRC_MIN_A else v
+
+
+def _mode(dev):
+    try:
+        return int(dev.get('mode'))
+    except (TypeError, ValueError):
+        return None
+
+
+def gx_class(key):
+    # A device key's D-Bus class: 'dcdc:293' -> 'dcdc'; a key without a VRM instance is the service name
+    key = str(key or '')
+    if ':' in key:
+        return key.split(':')[0]
+    parts = key.split('.')
+    return parts[2] if len(parts) > 3 and key.startswith('com.victronenergy.') else ''
+
+
+def gx_kind(dev):
+    # A GX device's kind from its D-Bus class (and a DC meter's monitor mode); None: not one the power flow lists
+    cls = dev.get('cls')
+    if cls == 'dcsource':
+        return DCSOURCE_KIND.get(_mode(dev), 'source')
+    if cls == 'dcload':
+        return DCLOAD_KIND.get(_mode(dev), 'dcload')
+    return GX_CLASS_KIND.get(cls)
+
+
+def gx_roles(kind, pv=None):
+    # 's' a source row, 'l' a load row, 'p' counts as solar on the boat (an MPPT, or an inverter/charger with PV); a
+    # battery monitor and a DC system meter make no row
+    roles = {'multi': 'sl', 'inverter': 'l', 'dcload': 'l', 'solar': 'p', 'battery': '', 'dcsystem': ''}.get(kind, 's')
+    return roles + 'p' if pv is not None and kind in ('multi', 'inverter') else roles
+
+
+def draws_house(key, m):
+    # m: the device's memory entry. An Orion (class dcdc) the owner says draws from the house bank (memory "h"); the flag
+    # on anything else (an older bridge offered it for a DC meter in DC-DC mode too) does nothing.
+    return gx_class(key) == 'dcdc' and isinstance(m, dict) and m.get('h') == 1
+
+
+def through_meter(key, roles, m):
+    # Whether a device's current passes through the DC system meter: the owner's word (memory "m"), else Victron's layout
+    # (gui-v2 lists DC load meters and DC-DC chargers under the DC system total; systemcalc counts every source, inverter
+    # and Multi outside it): a DC load meter or an Orion drawing from the house bank inside, the rest outside
+    if isinstance(m, dict) and m.get('m') in (0, 1):
+        return m['m'] == 1
+    return roles == 'l' and gx_class(key) in ('dcload', 'dcdc')
+
+
+def n2k_unique(uid):
+    # A regulator's NMEA 2000 NAME unique number, the low 21 bits of its chip ID (4_functions.ino SetDeviceInformation):
+    # vecan-dbus has it from address claim, before the serial, as /N2kUniqueNumber and in the service name (_uc<n>)
+    try:
+        return int(uid, 16) & 0x1FFFFF
+    except (TypeError, ValueError):
+        return None
+
+
+def stored_twin(key, m):
+    # A remembered alternator with no serial under the twin's identity, not listed after the serial wait ("w"): how an
+    # older bridge stored this regulator's NMEA 2000 twin when it came back at a demo exit with its name read before its
+    # serial (bench round 7, 2026-10-28)
+    return gx_class(key) == 'alternator' and isinstance(m, dict) and m.get('k') == 'altx' and not m.get('s') \
+        and not m.get('w') and m.get('p') == ALT_N2K_PRODUCT
+
+
+def gx_devices(gx, memory=None, uid='', uids=(), peers=()):
+    # The GX's devices as the power flow and /gxDevices list them: each one on D-Bus now (gx['devices']), then each
+    # remembered one that is not on D-Bus now, at 0 A (on 0). Left out: this bridge's own services, every pinned
+    # regulator's NMEA 2000 twin (by its serial, or with none read yet by its NMEA 2000 unique number), and an alternator
+    # until its serial is read or the reader has asked for it ALT_SERIAL_WAIT_S ("since"): a twin coming back names
+    # itself before its /Serial reads, and a remembered device under its key stays listed as not on D-Bus meanwhile. The
+    # other pinned regulators come from their own links instead (peers: uid, name, amps or None, live), at 0 A while one
+    # is not streaming. A DC-DC charger that draws from the house bank is a load, its amps drawn from the battery bus
+    # (negative), as an inverter's: an Orion when the owner says so (memory "h"; FakeGx marks its own), a DC meter in
+    # DC-DC mode by its sign. A DC load meter with no name of its own is named by its monitor mode. meter: its current
+    # passes through the DC system meter (through_meter).
+    uids = list(uids) or [uid]
+    ours = {alt_service(u) for u in uids} | {batt_service(u) for u in uids}
+    twin = lambda serial: any(serial_matches(u, serial, uids) for u in uids)
+    uniques = {n2k_unique(u) for u in uids} - {None}
+    memory = memory or {}
+    out, seen = [], set()
+    for d in (gx or {}).get('devices') or []:
+        kind = gx_kind(d)
+        svc = str(d.get('service') or '')
+        key = str(d.get('key') or svc)
+        cls = str(d.get('cls') or '')
+        serial = str(d.get('serial') or '').strip()
+        n2k_twin = kind == 'altx' and not serial and d.get('n2k') in uniques
+        if kind == 'altx' and not serial and not n2k_twin and svc not in ours \
+                and (d.get('since') or 0.0) < ALT_SERIAL_WAIT_S:
+            continue
+        seen.add(key)
+        if kind is None or svc in ours or n2k_twin or (kind == 'altx' and twin(d.get('serial'))):
+            continue
+        roles, amps, age, m = gx_roles(kind, d.get('pv')), d.get('amps'), d.get('age'), memory.get(key)
+        if cls == 'dcdc' and (draws_house(key, m) or d.get('h') == 1):
+            # the house bank feeds its input: the input current where it reports one (the output current leaves out the
+            # conversion loss, and on a 12 to 24 V charger more than half the draw)
+            if d.get('in_amps') is not None:
+                amps, age = d['in_amps'], d.get('in_age')
+            roles = 'l'
+            amps = None if amps is None else -amps or 0.0   # never -0.0
+        elif cls == 'dcsource' and kind == 'dcdc':
+            # + into the house bank, as every Victron DC source reads; inside the deadband it stays where it was last seen
+            if amps is not None and abs(amps) >= FLOW_SRC_MIN_A:
+                roles = 'l' if amps < 0 else 's'
+            elif isinstance(m, dict) and m.get('r') in ('s', 'l'):
+                roles = m['r']
+        name = str(d.get('name') or '').strip() or (DCLOAD_NAME.get(_mode(d), '') if cls == 'dcload' else '')
+        out.append({'key': key, 'service': svc, 'cls': cls, 'kind': kind, 'roles': roles, 'name': name,
+                    'product': str(d.get('product') or '').strip(), 'serial': str(d.get('serial') or ''),
+                    'n2k': d.get('n2k'), 'amps': amps, 'pv': d.get('pv'), 'age': age, 'on': 1,
+                    'meter': through_meter(key, roles, m)})
+    # with no fresh GX reading at all, whether a remembered device is on is not known either
+    for key, m in sorted(memory.items()):
+        if key in seen or not isinstance(m, dict) or m.get('k') not in FLOW_SOURCE_KINDS + FLOW_LOAD_KINDS \
+                or twin(m.get('s')) or (not m.get('s') and m.get('u') in uniques) or stored_twin(key, m):
+            continue
+        roles = 'l' if draws_house(key, m) else str(m.get('r') or '')
+        out.append({'key': key, 'service': '', 'cls': gx_class(key), 'kind': m['k'], 'roles': roles,
+                    'name': str(m.get('n') or ''), 'product': str(m.get('p') or ''), 'serial': str(m.get('s') or ''),
+                    'n2k': m.get('u'), 'amps': 0.0 if gx else None, 'pv': None, 'age': None, 'on': 0,
+                    'meter': through_meter(key, roles, m)})
+    for p in peers:
+        if p['uid'] == uid:
+            continue
+        key = 'xreg:' + p['uid']
+        out.append({'key': key, 'service': '', 'cls': '', 'kind': 'altx', 'roles': 's',
+                    'name': p['name'], 'product': 'XREG-010', 'serial': p['uid'], 'n2k': None,
+                    'amps': p['amps'] if p['live'] else 0.0, 'pv': None, 'age': 0.0 if p['live'] else None,
+                    'on': int(bool(p['live'])), 'meter': through_meter(key, 's', memory.get(key))})
+    return out
+
+
+def flow_model(reg, gx, devs, uid='', uids=(), memory=None):
+    # The power-flow numbers: the regulator's own battery and solar readings where it has one, the GX's (GxReader or
+    # FakeGx shape) only where it has none, and a row per GX device (devs: gx_devices). reg: batt, alt, solar (A or None),
+    # src (flowSrc), ser (flowSolarSer, 0 = none). Sources and loads under FLOW_SRC_MIN_A read 0. memory: the remembered
+    # devices, for the owner's word on this regulator's own alternator and the DC system meter ("xreg:<uid>").
+    src = reg.get('src')
+    bsrc, ssrc = (int(src) // 10, int(src) % 10) if src is not None else (0, 3)
+    batt, solar = reg.get('batt'), reg.get('solar')
+    batt_from = GX_BATT_FROM.get(bsrc, '') if batt is not None else ''
+    solar_from = 'VE.Direct' if solar is not None and ssrc in (1, 2) else ''
+    gx = gx or {}
+    # systemcalc's battery current, only from a battery monitor: with none it estimates one from Multi and solar
+    # chargers alone, which leaves the alternators out
+    gb, gsvc = gx.get('batt'), str(gx.get('batt_service') or '')
+    if batt is None and gb is not None and gsvc.startswith(BATT_SERVICE) \
+            and gsvc not in [batt_service(u) for u in uids or [uid]]:
+        batt, batt_from = gb, 'GX'
+    pv = gx.get('pv')
+    mppts = [d for d in devs if d['kind'] == 'solar' and d['on']]
+    if pv is not None:
+        if ssrc in (1, 2) and solar is not None:
+            # A VE.Can MPPT can be wired to both: the one whose serial the regulator reports is already in its reading.
+            # Without that serial (older firmware) the GX's cannot be told from it, so the regulator's stands alone.
+            ser = reg.get('ser') or 0
+            if ser:
+                mine = sum(m['amps'] for m in mppts if m['amps'] is not None and ser_hash(m['serial']) == ser)
+                extra = pv - mine
+                if extra >= FLOW_SRC_MIN_A:
+                    solar, solar_from = solar + extra, 'VE.Direct + GX'
+        elif mppts or pv >= FLOW_SRC_MIN_A:
+            # no MPPT on the regulator's VE.Direct port: none configured (0 A), or an array it cannot see
+            solar, solar_from = max(0.0, pv), 'GX'
+    alt, solar = _src(reg.get('alt')), _src(solar)
+    # the boat has solar: an array set on the regulator (flowSrc solar code 0 = none), or an MPPT on the GX, now or
+    # remembered; the row then stays at 0.0 A through the night
+    has_solar = ssrc != 0 or any('p' in d['roles'] for d in devs) or (solar or 0.0) > 0.0
+    rows = [{'id': 'alt', 'k': 'alt', 'a': alt, 'c': ''}]
+    if has_solar:
+        rows.append({'id': 'solar', 'k': 'solar', 'a': solar, 'c': solar_from if solar is not None else ''})
+    order = {k: i for i, k in enumerate(FLOW_SOURCE_KINDS + FLOW_LOAD_KINDS)}
+    # the rows whose current passes through the DC system meter: sources it nets out, loads it already counts
+    srcs, loads, in_srcs, in_loads = [], [], [], []
+    if through_meter('xreg:' + uid, 's', (memory or {}).get('xreg:' + uid)):
+        in_srcs.append(rows[0])
+    for d in devs:
+        a, share = d['amps'], d['pv'] or 0.0   # an inverter/charger's own PV is in the GX's solar
+        cap = d['name'] or d['product']
+        if 's' in d['roles']:
+            srcs.append({'id': d['key'], 'k': d['kind'], 'a': None if a is None else _src(max(0.0, a - share)),
+                         'c': cap})
+            if d.get('meter'):
+                in_srcs.append(srcs[-1])
+        if 'l' in d['roles']:
+            loads.append({'id': d['key'] + ('/load' if 's' in d['roles'] else ''),
+                          'k': {'multi': 'inverter', 'dcdc': 'dcdcload'}.get(d['kind'], d['kind']),
+                          'a': None if a is None else _src(max(0.0, share - a)), 'c': cap})
+            if d.get('meter'):
+                in_loads.append(loads[-1])
+    ranked = lambda r: (order[r['k']], r['c'].lower(), r['id'])
+    rows += sorted(srcs, key=ranked) + sorted(loads, key=ranked)
+    house = None
+    x = 0.0
+    missing = next((r for r in rows if r['a'] is None), None)
+    sources = sum(r['a'] for r in rows if r['k'] in FLOW_SOURCE_KINDS and r['a'] is not None)
+    net = None if batt is None or missing is not None \
+        else sources - batt - sum(r['a'] for r in rows if r['k'] in FLOW_LOAD_KINDS)
+    meters = [d['amps'] for d in devs if d['kind'] == 'dcsystem' and d['on']]
+    inside = in_srcs + in_loads
+    metered = -sum(meters) + sum(r['a'] for r in in_srcs) - sum(r['a'] for r in in_loads) \
+        if meters and None not in meters and all(r['a'] is not None for r in inside) else None
+    if metered is not None:
+        for r in inside:
+            r['in'] = 1
+        why, house = '', max(0.0, metered)
+        # The meter measures House; past the sensors' tolerance the calculated rest disagrees because of something no
+        # meter sees: a load (a windlass or thruster wired to the battery, say) when the sources give more, a source when
+        # they give less
+        if net is not None and abs(net - metered) > max(FLOW_UNMEASURED_A, FLOW_GAP_FRAC * sources):
+            why, x = ('gap', net - metered) if net > metered else ('unmeasured', metered - net)
+    elif batt is None:
+        why = 'batt'
+    elif missing is not None:
+        why = missing['k']
+    elif net < -FLOW_UNMEASURED_A:
+        # more into the battery than the measured sources give: an unmeasured source, never a negative house load. Up to
+        # FLOW_UNMEASURED_A it is sensor offset, and House reads 0.
+        why, x = 'unmeasured', -net
+    else:
+        why, house = '', max(0.0, net)
+    return {'batt': batt, 'batt_from': batt_from, 'rows': rows, 'house': house, 'hm': int(metered is not None),
+            'why': why, 'x': x}
+
+
+def device_post(devs, gx):
+    # /gxDevices rows: [kind, name, product ('' when the name is the product), amps (the device's own DC current, +
+    # into the battery bus, - drawn from it: an inverter, a DC load, a DC-DC charger that draws from the house bank, the
+    # DC system), reading age s, on D-Bus now 1 / 0], the battery monitor systemcalc uses first
+    order = {k: i for i, k in enumerate(('battery',) + FLOW_SOURCE_KINDS + FLOW_LOAD_KINDS + ('dcsystem',))}
+    bsvc = str((gx or {}).get('batt_service') or '')
+    rows = []
+    for d in sorted(devs, key=lambda d: (order.get(d['kind'], 99), d['service'] != bsvc, not d['on'],
+                                          (d['name'] or d['product']).lower(), d['key'])):
+        name = d['name'] or d['product']
+        rows.append([d['kind'], name, d['product'] if d['product'] != name else '',
+                     None if d['amps'] is None else round(d['amps'], 2),
+                     None if d['age'] is None else round(max(0.0, d['age']), 1), d['on']])
+    return rows[:DEVPOST_MAX]
+
+
+class FakeGx:
+    # Demo only (Hardware Present? = No): the GX-side readings of a boat whose regulator measures only its alternator,
+    # made up around the regulator's simulated boat so the tile, its names and the regulator's GX device list show
+    # without the devices. A battery monitor, two named MPPTs, a shore charger, an inverter, an Orion XS charging the
+    # start battery from the house bank and a DC load meter on the fridge. Never published on D-Bus (a battery service
+    # on a real GX can steer DVCC): it only feeds the power flow and /gxDevices. The shore charger, the fridge and the
+    # Orion and the inverter are the regulator's simulation's own (CSV4 demoShoreA, demoFridgeA, demoOrionA,
+    # demoInverterA: the charger only alongside the town dock with the engine off, the Orion after an engine start, the
+    # inverter early in the sail leg), so the battery here and the simulated battery are one sum; firmware that sends
+    # none reads 0. The two arrays share the simulated sun (its clouds included), split by how the boat lies to it; the
+    # monitor reads the sources less the simulated loads, with its own offset and noise.
+    SUN_AZ = 200.0          # deg; the demo's sun is an afternoon sun whatever the clock
+    SERIALS = ('HQ2241DMO1A', 'HQ2241DMO2B')
+    # (service, class, key, name, product, monitor mode): the made-up devices, named the way an owner and Victron would
+    DEVICES = (('demo.battery', 'battery', 'battery:512', '', 'SmartShunt 500A/50mV', None),
+               ('demo.mppt1', 'solarcharger', 'solarcharger:278', 'Bimini array', 'SmartSolar MPPT 100/30', None),
+               ('demo.mppt2', 'solarcharger', 'solarcharger:279', 'Deck array', 'SmartSolar MPPT 75/15', None),
+               ('demo.charger', 'charger', 'charger:280', '', 'Phoenix Smart IP43 Charger 12/30', None),
+               ('demo.inverter', 'inverter', 'inverter:281', '', 'Phoenix Inverter 12/800 Smart', None),
+               ('demo.orion', 'dcdc', 'dcdc:282', 'Start battery charger', 'Orion XS 12/12-50A', None),
+               ('demo.fridge', 'dcload', 'dcload:283', 'Fridge', 'SmartShunt 500A/50mV', 3))
+    ORION_EFF = 0.95        # its output over its input current, 12 V to 12 V
+
+    def __init__(self, seed):
+        self.rng = random.Random(seed)
+        self.t = None
+        self.share_ou = 0.0
+        self.noise = 0.0
+
+    def _ou(self, x, tau, sigma, dt):
+        a = math.exp(-dt / tau)
+        return a * x + sigma * math.sqrt(1.0 - a * a) * self.rng.gauss(0.0, 1.0)
+
+    def step(self, now, reg, heading=None):
+        # reg: alt, solar, batt (flowAltA, flowSolarA, flowBattA) and shore, fridge, orion, inverter (demoShoreA,
+        # demoFridgeA, demoOrionA, demoInverterA), A or None
+        dt = 0.5 if self.t is None else min(max(now - self.t, 0.0), 5.0)
+        self.t = now
+        self.share_ou = self._ou(self.share_ou, 90.0, 0.03, dt)
+        self.noise = self._ou(self.noise, 1.5, 1.0, dt)
+        lie = math.sin(math.radians((heading if heading is not None else self.SUN_AZ) - self.SUN_AZ))
+        share = min(0.85, max(0.25, 0.58 + 0.12 * lie + self.share_ou))
+        alt, solar, batt = reg.get('alt'), reg.get('solar'), reg.get('batt')
+        charger, fridge, orion, inverter = (round(max(0.0, reg.get(k) or 0.0), 1)
+                                            for k in ('shore', 'fridge', 'orion', 'inverter'))
+        q = lambda v: None if v is None else round(v, 1)
+        s1 = s2 = pv = gb = None
+        if solar is not None:
+            s1 = q(max(0.0, solar) * share)
+            s2 = q(max(0.0, solar) - s1)
+            pv = round(s1 + s2, 1)
+        if alt is not None and solar is not None and batt is not None:
+            house = alt + solar + charger - batt   # the simulated loads, the fridge, the Orion and the inverter among them
+            gb = q(1.004 * (alt + pv + charger - house) + 0.04 + 0.03 * self.noise)
+        amps = {'demo.battery': gb, 'demo.mppt1': s1, 'demo.mppt2': s2, 'demo.charger': charger,
+                'demo.inverter': -inverter or 0.0, 'demo.orion': round(self.ORION_EFF * orion, 1),
+                'demo.fridge': -fridge or 0.0}
+        serial = {'demo.mppt1': self.SERIALS[0], 'demo.mppt2': self.SERIALS[1]}
+        devices = [{'service': svc, 'cls': cls, 'key': key, 'name': name, 'product': product,
+                    'serial': serial.get(svc, ''), 'mode': mode, 'amps': amps[svc], 'pv': None, 'age': 0.4}
+                   for svc, cls, key, name, product, mode in self.DEVICES]
+        for d in devices:
+            if d['cls'] == 'dcdc':
+                # draws from the house bank: FakeGx's own flag, never the owner's remembered one (no store sees FakeGx)
+                d.update(h=1, in_amps=orion, in_age=0.4)
+        return {'batt': gb, 'batt_service': BATT_SERVICE + 'demo', 'pv': pv, 'devices': devices, 'at': now}
+
+
 class Core:
     # One pinned regulator: its link, recorders and settings, published as its own D-Bus service
     def __init__(self, uid, store, schema_text='', discovery=None, cache_dir=CACHE_DIR, clock=time.monotonic,
-                 wall=time.time, instance=INSTANCE, alt_instance=INSTANCE, on_repin=None):
+                 wall=time.time, instance=INSTANCE, alt_instance=INSTANCE, batt_instance=INSTANCE, on_repin=None):
         self.clock, self.wall = clock, wall
         self.uid = norm_uid(uid)
         self.store = store   # 'host': where this regulator last answered
         self.host = (store.get('host') or '').strip()
         self.instance = instance
         self.alt_instance = alt_instance
+        self.batt_instance = batt_instance
+        self.batt_ok = False       # the Manager's say: this GX can take a demo battery service from this regulator
         self.on_repin = on_repin or (lambda old, new, host: False)
         self.schema_text = schema_text or ''
         self.model = SettingsModel.from_text(self.schema_text)
@@ -1373,11 +1887,14 @@ class Core:
         self.inbox = queue.Queue()
         self.writer = Worker('writer')     # writes and schedule requests: small and in order
         self.fetcher = Worker('fetcher')   # file downloads, so a 600 KB ring never delays a write
+        self.cloud_worker = Worker('cloud')   # internet calls, so a slow cloud never delays the regulator
         self.src = 'gx' + secrets.token_hex(4)
         self.n = 0
         self.hold = {}
         self.want_at = {}
         self.want_on = dict.fromkeys(WANT_TOPICS, False)
+        self.trend_want_at = {}   # Health window -> when a screen last asked for it
+        self.trend_on = dict.fromkeys(HEALTH_WINDOWS, False)
         self.long_range = '24h'
         self.long_dirty = False
         self.lt = None
@@ -1386,11 +1903,12 @@ class Core:
         self.short = ShortRecorder()
         self.wind_plot = WindRecorder()
         self.hist = {name: collections.deque(maxlen=HIST_LEN) for name, _ in HISTORY}
-        self.wind = collections.deque(maxlen=WIND_LEN)
-        self.wind_acc = []
+        self.wind = {name: collections.deque(maxlen=WIND_LEN) for name, _, _ in WIND_HIST}
+        self.wind_acc = {name: [] for name, _, _ in WIND_HIST}
         self.baro = []
-        self.health_csv = {'TrendCsv': '', 'SessionCsv': ''}
-        self.health_hours = 0   # 0 = the whole engine-hours history
+        self.baro_end = None       # epoch of the newest barometer sample
+        self.health_csv = {'SessionCsv': ''}
+        self.health_trend = dict.fromkeys(HEALTH_WINDOWS, '')
         self.curve_csv = ''
         self.sources = {}   # endpoint name -> (parsed JSON, raw text, fetched at)
         self.result_seq = 0
@@ -1412,18 +1930,48 @@ class Core:
         self.limits_sent = False   # the last /gxLimits post carried a value, so an empty one is owed when that stops
         self.limits_hold = -1      # link generation a refused post stopped posting for
         self.demo = False          # the regulator is in demo mode (Hardware Present? = No)
-        self.demo_gen = -1         # link generation /demoBackfill was fetched for
+        self.demo_gen = -1         # link generation /demoBackfill was fetched for in this demo spell
+        self.demo_tries = 0        # failed /demoBackfill fetches since the entry or reconnect
+        self.switch_frames = {}    # the frames on hand at the last demo switch: the other boat's, kept out of the history
+        self.wind_marker_gen = -1  # link generation whose CSV4 carried the empty marker for apparent wind (wind_stale)
         self.republish = False     # history rings were dropped or refilled: publish them on this tick
+        self.flow_state = None     # battery word: 1 charging, 0 resting, -1 discharging; None no reading
+        self.flow_flip_at = None   # when the battery started reading another way
+        self.flow_imb = None       # (the imbalance reason, 'unmeasured' or 'gap', when it began), until it holds
+        self.flow_held = False
+        self.flow_next = 0.0
+        self.flow_devs = None      # gx_devices() of the last tick with a GX reading, for /gxDevices
+        self.gx_side = None        # the GX's own readings for the power flow (set_gx_side), real mode only
+        self.gx_uids = []          # every pinned regulator, to tell this one's NMEA 2000 twin from another alternator
+        self.gx_memory = {}        # the Manager's remembered GX devices
+        self.gx_peers = []         # the other pinned regulators' alternators (Manager.set_gx_side)
+        self.fake_gx = None        # FakeGx while in demo
+        self.devpost_every = DEVPOST_EVERY_S   # what the regulator last asked for
+        self.devpost_rate = None   # s, this stream's GxRate "devPost" (None: firmware that sends none)
+        self.devpost_hold = -1     # link generation a refused /gxDevices post stopped posting for
+        self.devpost_keys = None   # the device set of the last post: a change posts at once
+        self.devpost_at = 0.0
+        self.cloud_state = CLOUD_LOADING
+        self.cloud_msg = ''
+        self.cloud_text = ''       # the page model (xreg_cloud.view) as JSON
+        self.cloud_as_of = None
+        self.cloud_at = None       # clock of the last good bundle
+        self.cloud_next = 0.0
+        self.cloud_busy = False
+        self.cloud_refresh = False
+        self.cloud_demo = False    # cloud_text is the canned demo bundle
 
     def start(self):
         self.link.start()
         self.writer.start()
         self.fetcher.start()
+        self.cloud_worker.start()
 
     def stop(self):
         self.link.close()
         self.writer.stop()
         self.fetcher.stop()
+        self.cloud_worker.stop()
 
     def summary(self):
         # This regulator's row in the Manager's /Units
@@ -1457,16 +2005,19 @@ class Core:
         p += [('/Live/' + name, None, None) for name, *_ in LIVE]
         p += [('/Live/AltCapMax', None, None)]
         p += [('/History/' + name, '', None) for name, _ in HISTORY]
-        p += [('/History/IntervalS', HIST_EVERY_S, None), ('/History/Wind', '', None), ('/History/Baro', '', None)]
+        p += [('/History/IntervalS', HIST_EVERY_S, None), ('/History/Baro', '', None), ('/History/BaroEnd', None, None)]
+        p += [('/History/' + name, '', None) for name, _, _ in WIND_HIST]
         p += [('/Ui/Want/' + t, None, 'core') for t in WANT_TOPICS]
-        p += [('/Ui/LongRange', self.long_range, 'core'), ('/Ui/HealthHours', self.health_hours, 'core')]
+        p += [('/Ui/LongRange', self.long_range, 'core')]
+        p += [('/Ui/Want/HealthTrend/%d' % h, None, 'core') for h in HEALTH_WINDOWS]
         p += [('/Plot/Short/' + name, '', None) for name, *_ in SHORT] + [('/Plot/Short/chargeStage', '', None)]
         p += [('/Plot/Long/Fields', '', None), ('/Plot/Long/StartEpoch', None, None), ('/Plot/Long/StepS', None, None),
-              ('/Plot/Long/Range', self.long_range, None)]
+              ('/Plot/Long/Range', self.long_range, None), ('/Plot/Long/Last', '', None)]
         p += [('/Plot/Long/' + name, '', None) for name in self._long_series_names()]
         p += [('/Plot/Wind/' + name, '', None) for name, *_ in WIND_PLOT]
-        p += [('/Health/TrendCsv', '', None), ('/Health/SessionCsv', '', None)]
-        p += [('/Perf/Schema', '', None), ('/Perf/CurveCsv', '', None)]
+        p += [('/Health/TrendCsv/%d' % h, '', None) for h in HEALTH_WINDOWS] + [('/Health/SessionCsv', '', None)]
+        p += [('/Perf/Schema', '', None), ('/Perf/CurveCsv', '', None), ('/Perf/RidgeFrac', None, None),
+              ('/Perf/IdwPower', None, None)]
         p += [('/Settings/Schema', self.schema_text, None), ('/Settings/Result', '', None)]
         p += [('/Settings/Http/' + name, '', None) for name in self.model.endpoints]
         if self.model.probe_roles:
@@ -1479,6 +2030,9 @@ class Core:
         p += [('/Link/Channel', '', None), ('/Link/Firmware', '', None), ('/Link/Status', '', None),
               ('/Link/Host', self.host, None), ('/Link/OtherUid', '', None), ('/Link/OtherName', '', None),
               ('/Link/AcceptRegulator', None, 'core')]
+        p += [('/Flow/Json', '', None), ('/Flow/Ok', None, None)]
+        p += [('/Cloud/State', None, None), ('/Cloud/Message', '', None), ('/Cloud/AsOf', None, None),
+              ('/Cloud/Json', '', None), ('/Cloud/Refresh', None, 'core')]
         p += [('/Link/GxLimits/State', LIMITS_NONE, None), ('/Link/GxLimits/Cvl', None, None),
               ('/Link/GxLimits/Ccl', None, None)]
         return p
@@ -1486,7 +2040,7 @@ class Core:
     @staticmethod
     def _long_series_names():
         names = []
-        for n, _, _ in LT_ENV:
+        for n, *_ in LT_ENV + LT_TAIL_ENV:
             names += [n, n + 'Min', n + 'Max']
         names += [n for n, _, _ in LT_AVG]
         names += [n + 'OnAvg' for n, _ in LT_ONAVG]
@@ -1505,24 +2059,31 @@ class Core:
 
     # -- writes from D-Bus (main thread) --
 
+    def trend_wanted(self, hours, now):
+        return now - self.trend_want_at.get(hours, -1e18) < WANT_HOLD_S
+
     def on_write(self, path, value):
         now = self.clock()
+        if path.startswith('/Ui/Want/HealthTrend/'):
+            # a screen showing the Health trend for this window, written every 15 s as the other /Ui/Want/ paths are
+            try:
+                hours = int(path[21:])
+            except ValueError:
+                return False
+            if hours not in HEALTH_WINDOWS:
+                return False
+            self.trend_want_at[hours] = now
+            return True
         if path.startswith('/Ui/Want/'):
             topic = path[9:]
             if topic not in WANT_TOPICS:
                 return False
             self.want_at[topic] = now
             return True
-        if path == '/Ui/HealthHours':
-            try:
-                v = int(value)
-            except (TypeError, ValueError):
-                return False
-            if not 0 <= v <= 100000:
-                return False
-            if v != self.health_hours:
-                self.health_hours = v
-                self.next['health'] = 0.0
+        if path == '/Cloud/Refresh':
+            self.cloud_refresh = True
+            self.cloud_next = 0.0
+            self.reset_paths.add(path)
             return True
         if path == '/Ui/LongRange':
             if value not in LONG_RANGES:
@@ -1540,8 +2101,8 @@ class Core:
                 return False
             if v not in (0, 1):
                 return False
-            self.hold[path] = (v, now + HOLD_S)
-            self._queue_write('OnOff', [('OnOff', str(v))], arm=(v == 1), control=True, hold=[path])
+            self.hold[path] = [v, now, None]
+            self._queue_write('OnOff', [('OnOff', str(v))], arm=(v == 1), control=True, hold=[(path, v)])
             return True
         if path.startswith('/Settings/Value/'):
             key = path[16:]
@@ -1553,8 +2114,8 @@ class Core:
             except ValueError as e:
                 self._post_result(key, False, str(e))
                 return False
-            self.hold[path] = (v, now + HOLD_S)
-            self._queue_write(key, [(key, self.model.wire(item, v))], arm=item.get('arm', True), hold=[path],
+            self.hold[path] = [v, now, None]
+            self._queue_write(key, [(key, self.model.wire(item, v))], arm=item.get('arm', True), hold=[(path, v)],
                               control=bool(item.get('tagged')) or key in ('OnOff', 'ManualFieldToggle'))
             return True
         if path.startswith('/Settings/Action/'):
@@ -1579,13 +2140,14 @@ class Core:
             except ValueError as e:
                 self._post_result(tid, False, str(e))
                 return False
-            hold = [path]
-            self.hold[path] = (value, now + HOLD_S)
+            hold = [(path, value)]
+            self.hold[path] = [value, now, None]
             sent = {k for k, _ in params}
             for k, v in edits.items():
                 if k in sent and k in self.model.values:
-                    self.hold['/Settings/Value/' + k] = (self.model.check(self.model.items[k], v), now + HOLD_S)
-                    hold.append('/Settings/Value/' + k)
+                    shown = self.model.check(self.model.items[k], v)
+                    self.hold['/Settings/Value/' + k] = [shown, now, None]
+                    hold.append(('/Settings/Value/' + k, shown))
             self._queue_write(tid, params, arm=self.model.tables[tid]['item'].get('arm', True), hold=hold)
             return True
         if path == '/Settings/ProbeRole':
@@ -1660,9 +2222,8 @@ class Core:
 
     def _write_job(self, key, params, arm, control, endpoint, method, n, hold):
         ok, msg = self._write(key, params, arm, control, endpoint, method, n)
-        if not ok:
-            for p in hold:
-                self.inbox.put(('unhold', p))
+        for p in hold:
+            self.inbox.put(('accepted' if ok else 'unhold', p))
         if ok:
             self.inbox.put(('sources_now', None))
         self._post_result(key, ok, msg)
@@ -1774,14 +2335,17 @@ class Core:
         self.able = self._can_charge(frames, fresh)
         self._dynamic(pub, info)
         self._identity(pub, info, live, frames)
-        self._demo(frames, info)
-        vals = self._live(pub, frames, fresh, live)
+        self._demo(now, frames, info)
+        vals = self._live(pub, frames, fresh, live, info)
         self._recorders(pub, now, frames, fresh, live, vals)
         self._wanted(pub, now, frames, fresh, info, live)
         if self.republish:
             self._republish(pub, now)
         self._settings(pub, now, frames, info)
         self._limits(pub, now, info)
+        self._flow(pub, now, frames, fresh)
+        self._devices(now, info)
+        self._cloud(pub, now, frames, info)
         for path in self.reset_paths:
             pub[path] = None
         self.reset_paths.clear()
@@ -1797,15 +2361,31 @@ class Core:
                 self.result_seq += 1
                 pub['/Settings/Result'] = json.dumps({'seq': self.result_seq, 'key': key, 'ok': ok,
                                                       'message': message}, separators=(',', ':'))
-            elif kind == 'unhold':
-                self.hold.pop(data, None)
+            elif kind in ('accepted', 'unhold'):
+                path, value = data
+                h = self.hold.get(path)
+                if h and h[0] == value:   # a later write to the same path has its own hold
+                    if kind == 'unhold':
+                        del self.hold[path]
+                    elif h[2] is None:
+                        h[2] = now
             elif kind == 'limits':
                 self._limits_answer(*data)
+            elif kind == 'devpost':
+                self._devices_answer(*data)
             elif kind == 'demo':
                 if self.demo:
                     self._backfill(data)
+            elif kind == 'demo_retry':
+                self.demo_tries += 1
+                if self.demo_gen == data and self.demo_tries < DEMO_TRIES:
+                    self.demo_gen = -1
+                    self.next['demo'] = now + DEMO_RETRY_S
             elif kind == 'baro':
-                self.baro = data
+                # an unset regulator clock: the newest sample is at most one interval older than the fetch
+                self.baro, self.baro_end = data[0], data[1] or int(self.wall())
+                pub['/History/Baro'] = ','.join('' if x is None else '%.1f' % x for x in self.baro)
+                pub['/History/BaroEnd'] = self.baro_end
             elif kind == 'long':
                 self.lt, self.lt_at = data, now
                 if self.want('Long', now):
@@ -1815,6 +2395,11 @@ class Core:
                 self.health_csv[name] = text
                 if self.want('Health', now):
                     pub['/Health/' + name] = text
+            elif kind == 'trend':
+                hours, text = data
+                self.health_trend[hours] = text
+                if self.trend_wanted(hours, now):
+                    pub['/Health/TrendCsv/%d' % hours] = text
             elif kind == 'curve':
                 self.curve_csv = data
                 if self.want('Perf', now):
@@ -1824,6 +2409,8 @@ class Core:
                 self.sources[name] = (parsed, text, now)
                 if self.want('Settings', now):
                     pub['/Settings/Http/' + name] = text
+            elif kind == 'cloud':
+                self._cloud_answer(now, *data)
             elif kind == 'sources_now':
                 for name in self.model.endpoints:
                     self.next['src:' + name] = 0.0
@@ -1871,10 +2458,10 @@ class Core:
 
     # -- demo mode --
 
-    def _demo(self, frames, info):
+    def _demo(self, now, frames, info):
         # Demo mode (Hardware Present? = No): CSV3 hardwarePresent 0 once this connection has sent CSV3, /identify
         # "demo" before that. The regulator swaps a simulated boat's stores in and out, so the bridge drops its own
-        # history at each switch; in demo /demoBackfill fills the rings again, once per connection.
+        # history at each switch; in demo /demoBackfill fills the rings again, once per entry and after each reconnect.
         c3 = frames.get('CSVData3') or {}
         if info['csv3_current'] and c3.get('hardwarePresent') is not None:
             demo = c3['hardwarePresent'] == 0
@@ -1882,21 +2469,27 @@ class Core:
             demo = info['ident'].get('demo') == 1
         if demo != self.demo:
             self.demo = demo
+            self.demo_gen, self.demo_tries = -1, 0   # a later entry on the same stream needs its own backfill
             log.info('%s %s demo mode', label(self.uid, self.last_name), 'in' if demo else 'out of')
             self._drop_history()
-        if demo and info['state'] == 'streaming' and info['generation'] != self.demo_gen:
+            self.switch_frames = dict(frames)
+        if demo and info['state'] == 'streaming' and info['generation'] != self.demo_gen and now >= self.next['demo']:
+            if self.demo_gen >= 0:
+                self.demo_tries = 0   # a reconnect: a fresh set of tries
             self.demo_gen = info['generation']
-            self._fetch('demo', '/demoBackfill', parse_backfill)
+            self._fetch('demo', '/demoBackfill', parse_backfill, failed=('demo_retry', self.demo_gen))
 
     def _drop_history(self):
         self.short, self.wind_plot = ShortRecorder(), WindRecorder()
         for q in self.hist.values():
             q.clear()
-        self.wind.clear()
-        self.wind_acc = []
-        self.baro, self.lt, self.lt_at, self.curve_csv, self.sources = [], None, None, '', {}
+        for name, _, _ in WIND_HIST:
+            self.wind[name].clear()
+            self.wind_acc[name] = []
+        self.baro, self.baro_end, self.lt, self.lt_at, self.curve_csv, self.sources = [], None, None, None, '', {}
         self.health_csv = dict.fromkeys(self.health_csv, '')
-        for k in ('baro', 'long', 'health', 'curve'):
+        self.health_trend = dict.fromkeys(HEALTH_WINDOWS, '')
+        for k in ('baro', 'long', 'health', 'curve') + tuple('trend%d' % h for h in HEALTH_WINDOWS):
             self.next[k] = 0.0
         for name in self.model.endpoints:
             self.next['src:' + name] = 0.0
@@ -1918,18 +2511,21 @@ class Core:
             self.wind_plot.fill(wind)
             rows = wind[-3 * WIND_LEN:]
             rows = rows[len(rows) % 3:]   # whole 30 s means, the last ending at the newest row
-            self.wind.clear()
-            for i in range(0, len(rows), 3):
-                v = [r['TrueWindSpeedNMEA'] for r in rows[i:i + 3] if r.get('TrueWindSpeedNMEA') is not None]
-                self.wind.append(sum(v) / len(v) if v else None)
+            for name, _, field in WIND_HIST:
+                q = self.wind[name]
+                q.clear()
+                for i in range(0, len(rows), 3):
+                    v = [r[field] for r in rows[i:i + 3] if r.get(field) is not None]
+                    q.append(sum(v) / len(v) if v else None)
         self.republish = True
 
     def _republish(self, pub, now):
         self.republish = False
         for name, decimals in HISTORY:
             pub['/History/' + name] = ','.join('%.*f' % (decimals, x) for x in self.hist[name])
-        pub['/History/Wind'] = ','.join('' if x is None else '%.1f' % x for x in self.wind)
+        self._publish_wind(pub)
         pub['/History/Baro'] = ','.join('' if x is None else '%.1f' % x for x in self.baro)
+        pub['/History/BaroEnd'] = self.baro_end
         if self.want('Short', now):
             for name, text in self.short.strings().items():
                 pub['/Plot/Short/' + name] = text
@@ -1941,20 +2537,27 @@ class Core:
         if self.want('Health', now):
             for name, text in self.health_csv.items():
                 pub['/Health/' + name] = text
+        for hours in HEALTH_WINDOWS:
+            if self.trend_wanted(hours, now):
+                pub['/Health/TrendCsv/%d' % hours] = self.health_trend[hours]
         if self.want('Perf', now):
             pub['/Perf/CurveCsv'] = self.curve_csv
 
-    def _live(self, pub, frames, fresh, live):
+    def _live(self, pub, frames, fresh, live, info):
         vals = {}
+        # the wind plots are cleared at a demo switch, so the header's wind waits for the new boat's first CSV4 too
+        wind_ok = self._since_switch(frames, fresh, 'CSVData4')
+        stale = self._wind_stale(frames, fresh)
         for name, ev, field, scale, conv in LIVE:
             raw = (frames.get(ev) or {}).get(field)
-            if ev not in fresh or raw is None or raw <= EMPTY:
+            if ev not in fresh or raw is None or raw <= EMPTY or (name in LIVE_WIND and not wind_ok) or field in stale:
                 vals[name] = None
                 continue
             v = raw / scale
             vals[name] = round(conv(v) if conv else v, 3)
         if not vals['Health']:
             vals['Health'] = None
+        vals['OnOff'] = self._onoff(frames, fresh, vals['OnOff'])
         # Gauge full scale: the largest current cap in the RPM table
         csv3 = frames.get('CSVData3') or {}
         caps = [csv3.get('rpmCapCurrentTable%d' % i) for i in range(10)]
@@ -1967,21 +2570,98 @@ class Core:
                 pub['/GenericInput/%d/Value' % i] = None
             return vals
         on = 1 if vals['OnOff'] else 0
-        self._set(pub, '/SwitchableOutput/0/State', on)
+        self._set(pub, '/SwitchableOutput/0/State', on, info)
         pub['/SwitchableOutput/0/Status'] = 0x09 if on else 0x00
         pub['/GenericInput/0/Value'] = None if vals['AltAmps'] is None else round(vals['AltAmps'], 1)
         pub['/GenericInput/1/Value'] = None if vals['BattV'] is None else round(vals['BattV'], 2)
         pub['/GenericInput/2/Value'] = None if vals['Field'] is None else round(vals['Field'])
         return vals
 
-    def _set(self, pub, path, value):
+    @staticmethod
+    def _onoff(frames, fresh, v1):
+        # OnOff rides CSV3 as well, which the regulator sends the moment a write changes a setting; whichever frame the
+        # regulator built last, by its own clock (sendMs, same boot), carries the current state
+        c1, c3 = frames.get('CSVData') or {}, frames.get('CSVData3') or {}
+        on3, s1, s3 = c3.get('OnOff'), c1.get('sendMs'), c3.get('sendMs')
+        if v1 is None or 'CSVData3' not in fresh or None in (on3, s1, s3) or on3 <= EMPTY:
+            return v1
+        if c1.get('sessionId') != c3.get('sessionId') or not 0 < (int(s3) - int(s1)) % 2 ** 32 < 2 ** 31:
+            return v1
+        return float(on3)
+
+    def _set(self, pub, path, value, info):
+        held = self._held(path, value, self.clock(), info)
+        pub[path] = value if held is None else held
+
+    def _shown(self, path, echo, now, info, connected):
+        if not connected:   # nothing to confirm a write against; the regulator's state is unknown
+            self.hold.pop(path, None)
+            return echo
+        held = self._held(path, echo, now, info)
+        return echo if held is None else held
+
+    def _held(self, path, echo, now, info):
+        # The value written to path while its write waits for the regulator's echo (see WRITE_WAIT_S), else None
         h = self.hold.get(path)
-        if h and self.clock() < h[1]:
-            return
-        self.hold.pop(path, None)
-        pub[path] = value
+        if not h:
+            return None
+        value, wrote_at, accepted_at = h
+        if self._echoes(path, value, echo):
+            del self.hold[path]
+            return None
+        if accepted_at is None:
+            if now - wrote_at < WRITE_WAIT_S:
+                return value
+        elif now - accepted_at < self._confirm_s(path, info) or self._echo_at(path, info) <= accepted_at:
+            return value
+        del self.hold[path]
+        return None
+
+    def _echoes(self, path, value, echo):
+        if path.startswith('/Settings/Table/'):
+            try:
+                want, got = json.loads(value), json.loads(echo) if echo else {}
+            except ValueError:
+                return False
+            return all(_same(v, got.get(k)) for k, v in want.items())
+        return _same(value, echo)
+
+    def _confirm_s(self, path, info):
+        # OnOff rides CSV1 at the GX schedule's interval (and CSV3 once a write makes it dirty); a setting's echo is sent
+        # at once, so its channel's own (slow) interval does not apply
+        if path == '/SwitchableOutput/0/State':
+            return float((info['rate'] or GX_NAP_RATE)['csv1']) / 1000.0 + CONFIRM_MARGIN_S
+        return CONFIRM_MARGIN_S
+
+    def _echo_at(self, path, info):
+        # when the channel carrying path's echo last delivered, on the bridge's clock
+        at = info.get('frame_at') or {}
+        if path == '/SwitchableOutput/0/State':
+            return max(at.get('CSVData', -1e18), at.get('CSVData3', -1e18))
+        item = self.model.items.get(path[16:]) if path.startswith('/Settings/Value/') else None
+        echo = (item or {}).get('echo') or {}
+        if echo.get('stream') == 'HTTP':
+            return self.sources.get(echo.get('endpoint'), (None, None, -1e18))[2]
+        return at.get(ECHO_EVENT.get(echo.get('stream'), 'CSVData3'), -1e18)
+
+    def _wind_stale(self, frames, fresh):
+        raw = (frames.get('CSVData4') or {}).get('ApparentWindSpeedNMEA')
+        gen = self.link.generation
+        if raw is not None and raw <= EMPTY:
+            self.wind_marker_gen = gen
+        return wind_stale(frames, fresh, self.wind_marker_gen == gen)
+
+    def _since_switch(self, frames, fresh, ev):
+        # A frame from before the last demo switch is still fresh for a while (CSV4 comes every 1-10 s) but belongs to
+        # the other boat: at the exit the demo's wind made one point after the plots were cleared
+        f = frames.get(ev)
+        if f is None or ev not in fresh or self.switch_frames.get(ev) is f:
+            return False
+        self.switch_frames.pop(ev, None)
+        return True
 
     def _recorders(self, pub, now, frames, fresh, live, vals):
+        wind_ok = self._since_switch(frames, fresh, 'CSVData4')
         if now >= self.next['short']:
             self.next['short'] = max(self.next['short'] + 1.0, now + 0.5) if self.next['short'] else now + 1.0
             means = self.link.take_short()
@@ -1989,8 +2669,8 @@ class Core:
             if 'CSVData' in fresh and (frames['CSVData'].get('shutdownPhase') or 0) > 0:
                 stage = 9   # the app's ribbon code for a shutdown in progress
             self.short.close(means, live, stage)
-        if 'CSVData4' in fresh:
-            self.wind_plot.sample(frames['CSVData4'])
+        if wind_ok:
+            self.wind_plot.sample(frames['CSVData4'], self._wind_stale(frames, fresh))
         if now >= self.next['wind_plot']:
             first = not self.next['wind_plot']
             self.next['wind_plot'] = now + WIND_PLOT_S
@@ -2008,16 +2688,25 @@ class Core:
                 v = vals[name]
                 q.append(v if v is not None else (q[-1] if q else 0.0))
                 pub['/History/' + name] = ','.join('%.*f' % (decimals, x) for x in q)
-        if vals['TrueWind'] is not None:
-            self.wind_acc.append(vals['TrueWind'])
+        for name, live_name, _ in WIND_HIST:
+            if vals[live_name] is not None and wind_ok:
+                self.wind_acc[name].append(vals[live_name])
         if now >= self.next['wind']:
             self.next['wind'] = now + WIND_EVERY_S
-            self.wind.append(sum(self.wind_acc) / len(self.wind_acc) if self.wind_acc else None)
-            self.wind_acc = []
-            pub['/History/Wind'] = ','.join('' if x is None else '%.1f' % x for x in self.wind)
+            for name, _, _ in WIND_HIST:
+                acc = self.wind_acc[name]
+                self.wind[name].append(sum(acc) / len(acc) if acc else None)
+                self.wind_acc[name] = []
+            self._publish_wind(pub)
             pub['/History/Baro'] = ','.join('' if x is None else '%.1f' % x for x in self.baro)
+            pub['/History/BaroEnd'] = self.baro_end
 
-    def _fetch(self, kind, path, parse, timeout=20.0):
+    def _publish_wind(self, pub):
+        for name, _, _ in WIND_HIST:
+            pub['/History/' + name] = ','.join('' if x is None else '%.1f' % x for x in self.wind[name])
+
+    def _fetch(self, kind, path, parse, timeout=20.0, failed=None):
+        # failed: an inbox message to post when the fetch or its parse fails
         http_ = self.link.http
 
         def job():
@@ -2025,6 +2714,8 @@ class Core:
                 self.inbox.put((kind, parse(http_.get_ok(path, timeout=timeout))))
             except Exception as e:
                 log.warning('%s: %s', path, fetch_error_text(e))
+                if failed:
+                    self.inbox.put(failed)
         self.fetcher.put(path, job, dedupe=True)
 
     def _wanted(self, pub, now, frames, fresh, info, live):
@@ -2067,27 +2758,34 @@ class Core:
             pub['/Plot/Long/Fields'] = ''
             pub['/Plot/Long/StartEpoch'] = None
             pub['/Plot/Long/StepS'] = None
+            pub['/Plot/Long/Last'] = ''
             for name in self._long_series_names():
                 pub['/Plot/Long/' + name] = ''
 
-        # Health: live fields always; the two files while wanted
+        # Health: live fields always; the session file while wanted, and each window's trend while a screen shows it
         hl = frames.get('AltLive') or {}
         alt_fresh = 'AltLive' in fresh
         for name in info['schema'].get('AltLive', []):
             v = hl.get(name) if alt_fresh else None
             pub['/Health/Live/' + name] = None if v is None else round(v, 3)
         if on['Health']:
-            if rose['Health']:
-                # Session rows are placed by arrival time, so a cached copy would sit early by its age; wait for fresh
-                pub['/Health/TrendCsv'] = self.health_csv['TrendCsv']
+            # Session rows are placed by arrival time, so a cached copy would sit early by its age; wait for fresh
             if connected and (rose['Health'] or now >= self.next['health']):
                 self.next['health'] = now + HEALTH_REFETCH_S
-                trend = '/alttrend.csv' + ('?hours=%d' % self.health_hours if self.health_hours > 0 else '')
-                self._fetch('health', trend, lambda b: ('TrendCsv', text(b)))
                 self._fetch('health', '/altsess.csv', lambda b: ('SessionCsv', text(b)))
         if fell['Health']:
-            pub['/Health/TrendCsv'] = ''
             pub['/Health/SessionCsv'] = ''
+        for hours in HEALTH_WINDOWS:
+            path, was = '/Health/TrendCsv/%d' % hours, self.trend_on[hours]
+            self.trend_on[hours] = is_on = self.trend_wanted(hours, now)
+            if is_on and not was:
+                pub[path] = self.health_trend[hours]
+            if is_on and connected and (not was or now >= self.next['trend%d' % hours]):
+                self.next['trend%d' % hours] = now + HEALTH_REFETCH_S
+                self._fetch('trend', '/alttrend.csv' + ('?hours=%d' % hours if hours else ''),
+                            lambda b, h=hours: (h, text(b)))
+            if was and not is_on:
+                pub[path] = ''
 
         # Speed performance
         pub['/Perf/Schema'] = info['perf_schema_text']
@@ -2098,6 +2796,12 @@ class Core:
                 for name in info['schema'].get(ev, []):
                     v = f.get(name) if ok else None
                     pub[prefix + name] = None if v is None else round(v, 3)
+        # The plugin's curve evaluator needs these two settings; they change only when the owner edits them, so an old
+        # frame still holds them
+        ps = frames.get('PerfSettings') or {}
+        for name, path in (('perfRidgeFrac', '/Perf/RidgeFrac'), ('perfIdwPower', '/Perf/IdwPower')):
+            v = ps.get(name)
+            pub[path] = round(v, 4) if v is not None and math.isfinite(v) else None
         if on['Perf']:
             if rose['Perf']:
                 pub['/Perf/CurveCsv'] = self.curve_csv
@@ -2134,28 +2838,348 @@ class Core:
         if info['generation'] != self.last_generation:
             self.last_generation = info['generation']
             self.fast_next, self.fast_held = 0.0, False
+            self.flow_next, self.flow_held = 0.0, False
         if fast and now >= self.fast_next:
             self.fast_next = now + FAST_EVERY_S
             self.fast_held = True
-            self._gxrate(1)
+            self._gxrate('fast', 1)
         elif not fast and self.fast_held:
             self.fast_held = False
             self.fast_next = 0.0
             if connected:
-                self._gxrate(0)
+                self._gxrate('fast', 0)
+        # The power-flow tile holds only CSV4 at 2 s (firmware without that hold ignores flow=)
+        flow = on['Flow'] and connected and info['channel'] == 'gxevents'
+        if flow and now >= self.flow_next:
+            self.flow_next = now + FLOW_HOLD_EVERY_S
+            self.flow_held = True
+            self._gxrate('flow', 1)
+        elif not flow and self.flow_held:
+            self.flow_held = False
+            self.flow_next = 0.0
+            if connected:
+                self._gxrate('flow', 0)
 
-    def _gxrate(self, fast):
+    def _gxrate(self, hold, value):
         http_ = self.link.http
-        q = [('fast', str(fast)), ('uid', self.uid)]
+        q = [(hold, str(value)), ('uid', self.uid)]
 
         def job():
             try:
                 http_.request('/gxrate', query=q, timeout=5)
             except Exception as e:
                 log.warning('/gxrate: %s', fetch_error_text(e))
-        self.writer.put('gxrate', job, dedupe=True)
+        self.writer.put('gxrate_' + hold, job, dedupe=True)
+
+    # -- home page power flow --
+
+    def wants_gx(self, now):
+        # The GxReader cadence this regulator needs, s (0: none): the tile while it shows, else /gxDevices on GX link 4.
+        # Never in demo (FakeGx instead).
+        if self.demo or not self.live:
+            return 0
+        if self.want('Flow', now):
+            return GX_POLL_TILE_S
+        info = self.link.snapshot()[2]
+        return GX_POLL_POST_S if gx_version(info['ident']) >= 4 and info['generation'] != self.devpost_hold else 0
+
+    def set_gx_side(self, snapshot, uids=(), memory=None, peers=None):
+        self.gx_side, self.gx_uids = snapshot, list(uids)
+        self.gx_memory = memory if memory is not None else self.gx_memory
+        self.gx_peers = peers if peers is not None else self.gx_peers
+
+    def alt_reading(self):
+        # This regulator's alternator amps for another pinned regulator's power flow (CSV4 flowAltA: None when it does
+        # not measure them), and whether it is streaming
+        frames, fresh, _ = self.link.snapshot()
+        raw = (frames.get('CSVData4') or {}).get('flowAltA') if 'CSVData4' in fresh else None
+        return (None if raw is None or not math.isfinite(raw) or raw <= EMPTY else raw / 100.0), self.live
+
+    def _flow(self, pub, now, frames, fresh):
+        c4 = frames.get('CSVData4') or {}
+        streaming = self.live and 'CSVData4' in fresh
+        pub['/Flow/Ok'] = (1 if 'flowBattA' in c4 else 0) if streaming else None
+        if not streaming or 'flowBattA' not in c4:
+            pub['/Flow/Json'] = ''
+            self.flow_state, self.flow_flip_at, self.flow_devs, self.flow_imb = None, None, None, None
+            return
+
+        def amps(f, ev='CSVData4', scale=100.0):
+            raw = (frames.get(ev) or {}).get(f) if ev == 'CSVData4' or ev in fresh else None
+            return None if raw is None or not math.isfinite(raw) or raw <= EMPTY else raw / scale
+
+        reg = {'batt': amps('flowBattA'), 'alt': amps('flowAltA'), 'solar': amps('flowSolarA'),
+               'src': c4.get('flowSrc'), 'ser': c4.get('flowSolarSer') or 0}   # firmware before flowSolarSer: none
+        if self.demo:
+            # the made-up GX of a boat whose regulator measures only its alternator: the GX fills the rest
+            if self.fake_gx is None:
+                self.fake_gx = FakeGx(hash((self.uid, int(self.wall()))) & 0xFFFFFFFF)
+            sim = dict(reg, shore=amps('demoShoreA'), fridge=amps('demoFridgeA'), orion=amps('demoOrionA'),
+                       inverter=amps('demoInverterA'))
+            gx = self.fake_gx.step(now, sim, heading=amps('HeadingNMEA', scale=1.0))
+            reg = {'alt': reg['alt'], 'batt': None, 'solar': None, 'src': 3, 'ser': 0}
+            devs = gx_devices(gx, None, self.uid, self.gx_uids)
+        else:
+            self.fake_gx = None
+            gx = self.gx_side if self.gx_side and now - self.gx_side.get('at', -1e18) <= GX_FRESH_S else None
+            devs = gx_devices(gx, self.gx_memory, self.uid, self.gx_uids, self.gx_peers)
+        self.flow_devs = (devs, gx) if gx is not None else None
+        m = flow_model(reg, gx, devs, self.uid, self.gx_uids, None if self.demo else self.gx_memory)
+        # An imbalance shows only once it has held FLOW_IMBALANCE_S: a step in one input reaches the bridge up to one
+        # update before the matching step in another (bench round 8: a fridge start, a charger unplug), and that skew
+        # passes within the hold. Meanwhile House reads what the meter, or the clamped sum, gives.
+        imb = m['why'] if m['why'] in ('unmeasured', 'gap') else ''
+        if not imb:
+            self.flow_imb = None
+        elif self.flow_imb is None or self.flow_imb[0] != imb:
+            self.flow_imb = (imb, now)
+        if imb and now - self.flow_imb[1] < FLOW_IMBALANCE_S:
+            m = dict(m, why='', x=0.0, house=m['house'] if m['hm'] else 0.0)
+        batt = m['batt']
+        # the Dashboard's Batt and Alt chips show these same battery and alternator readings, so a chip and the tile never
+        # disagree on one screen (bench round 8: the chips from CSV1, every 4-6 s, against CSV4 every 2 s, 30 A apart
+        # after a step)
+        pub['/Live/BattA'] = _r2(batt)
+        pub['/Live/AltAmps'] = _r2(m['rows'][0]['a'])
+        if batt is None:
+            self.flow_state, self.flow_flip_at = None, None
+        else:
+            st = 1 if batt > FLOW_FLIP_A else -1 if batt < -FLOW_FLIP_A else 0
+            if self.flow_state is None or st == self.flow_state:
+                self.flow_state, self.flow_flip_at = st, None
+            elif self.flow_flip_at is None:
+                self.flow_flip_at = now
+            elif now - self.flow_flip_at >= FLOW_FLIP_S:
+                self.flow_state, self.flow_flip_at = st, None
+        if not self.want('Flow', now):
+            pub['/Flow/Json'] = ''
+            return
+        # the limit holds the regulator's own battery reading; a GX monitor's is a different measurement
+        lim = self._flow_limit(frames, fresh) if m['batt_from'] not in ('', 'GX') else None
+        out = {'b': {'a': _r2(batt), 'st': self.flow_state, 'from': m['batt_from'], 'lim': lim},
+               'rows': [dict(r, a=_r2(r['a'])) for r in m['rows']], 'house': _r2(m['house']), 'hm': m['hm'],
+               'why': m['why'], 'x': _r2(m['x']), 'fs': self._charge_current_limit(frames)}
+        pub['/Flow/Json'] = json.dumps(out, separators=(',', ':'))
+
+    # -- the GX's devices to the regulator (/gxDevices), for its web app --
+
+    def _devices(self, now, info):
+        # Contract: claude_docs/firmware-internals.md, "Victron GX stream", "GX device readings over WiFi"
+        self._devices_pace(now, info)
+        if gx_version(info['ident']) < 4 or info['state'] != 'streaming' or info['generation'] == self.devpost_hold \
+                or self.flow_devs is None:
+            return
+        devs, gx = self.flow_devs
+        keys = frozenset(d['key'] for d in devs)
+        if now < self.next['devpost'] and (keys == self.devpost_keys or now < self.next['devpost_soon']):
+            return
+        self.devpost_keys = keys
+        self.devpost_at = now
+        self.next['devpost'] = now + self.devpost_every
+        self.next['devpost_soon'] = now + 1.0   # a device arriving or leaving posts at once, at most once a second
+        text = json.dumps({'v': 1, 'd': device_post(devs, gx)}, separators=(',', ':'))
+        http_, gen = self.link.http, info['generation']
+        q = [('gx', '1'), ('uid', self.uid)]
+
+        def job():
+            try:
+                st, _, body = http_.request('/gxDevices', query=q, body={'j': text}, timeout=5)
+            except Exception as e:
+                log.warning('/gxDevices: %s', fetch_error_text(e))
+                return
+            self.inbox.put(('devpost', (gen, st, body)))
+        self.writer.put('gxdevices', job, dedupe=True)
+
+    def _devices_pace(self, now, info):
+        # GxRate "devPost" (ms): the interval the regulator wants, sent the moment a dashboard connects or the last one
+        # leaves; a shorter one posts at once. Firmware that sends none: each post's answer (everyS) alone, so a page
+        # that opens waits up to one long interval.
+        rate = info.get('rate') if info['state'] == 'streaming' else None
+        try:
+            every = min(120.0, max(2.0, float(rate['devPost']) / 1000.0))
+        except (KeyError, TypeError, ValueError):
+            self.devpost_rate = None
+            return
+        if every == self.devpost_rate:
+            return
+        self.devpost_rate = every
+        self.next['devpost'] = now if every < self.devpost_every else self.devpost_at + every
+        self.devpost_every = every
+
+    def _devices_answer(self, gen, st, body):
+        # Only the JSON answer proves the route: older firmware in AP mode answers any path 200 with a page
+        try:
+            j = json.loads(body) if st == 200 else None
+        except ValueError:
+            j = None
+        if isinstance(j, dict) and j.get('ok') == 1:
+            if self.devpost_rate is not None:
+                return   # the stream paces the posts; this answer may predate its latest devPost
+            try:
+                self.devpost_every = min(120.0, max(2.0, float(j.get('everyS'))))
+            except (TypeError, ValueError):
+                return
+            # a phone just started watching: the shorter interval counts from this post, not the next
+            self.next['devpost'] = min(self.next['devpost'], self.devpost_at + self.devpost_every)
+            return
+        self.devpost_hold = gen
+        log.warning('%s: /gxDevices refused (HTTP %d %s); not posting until the link reconnects',
+                    label(self.uid, self.last_name), st, (body or b'')[:60].decode('utf-8', 'replace').strip())
+        if st == 409:
+            self.link.relocate()
+
+    @staticmethod
+    def _flow_limit(frames, fresh):
+        # The battery-current ceiling holding the battery block, when one binds on the battery's own basis: the
+        # regulator's Battery Charge Current Limit (limiter 4), or a Victron limit over VE.Can (limiter 8) that is the
+        # lower fresh one. A WiFi limit is the alternator's share (dvcc.py already took solar off), so no line for it.
+        c2, c3, c4 = (frames.get(e) or {} for e in ('CSVData2', 'CSVData3', 'CSVData4'))
+        if c3.get('BatteryShuntPresent') != 1:
+            return None
+        limiter = c4.get('ctrlLimiter')
+        if limiter == 4 and c3.get('BattLimitEnable') == 1 and (c3.get('BattCurrentLimitA') or 0) > 0:
+            return round(c3['BattCurrentLimitA'] / 10.0, 1)
+        if limiter != 8 or 'TimestampData' not in fresh or 'CSVData2' not in fresh:
+            return None
+        ts = frames.get('TimestampData') or {}
+
+        def heard(age_f, ccl_f):
+            age, ccl = ts.get(age_f), c2.get(ccl_f)
+            ok = age is not None and 0 <= age <= DVCC_HEARD_MS and ccl is not None and ccl > EMPTY and ccl >= 0
+            return ccl / 10.0 if ok else None
+        can, wifi = heard('ts_DvccVeCan', 'dvccRxCanCcl'), heard('ts_DvccWifi', 'dvccRxWifiCcl')
+        return round(can, 1) if can is not None and (wifi is None or can <= wifi) else None
+
+    # -- Cloud page --
+
+    def _cloud(self, pub, now, frames, info):
+        want = self.want('Cloud', now)
+        c3 = frames.get('CSVData3') or {}
+        if info['state'] != 'streaming':
+            self._cloud_set(CLOUD_NO_LINK)
+        elif c3.get('CloudFeatures') == 0:
+            # the app's gate: no cloud contact at all, and nothing from an earlier fetch stays on show
+            self._cloud_set(CLOUD_OFF)
+            self.cloud_text, self.cloud_as_of, self.cloud_at, self.cloud_demo = '', None, None, False
+        elif self.demo:
+            # regulator demo mode: no cloud, a canned bundle in the function's shape (the app's demoFillCloudPanes)
+            if not self.cloud_demo:
+                epoch = int(self.wall())
+                self.cloud_text = json.dumps(cloud.view(cloud.demo_bundle(epoch), epoch), separators=(',', ':'))
+                self.cloud_as_of, self.cloud_at, self.cloud_demo = epoch, None, True
+            self._cloud_set(CLOUD_READY)
+        elif c3.get('CloudFeatures') != 1:
+            self._cloud_set(CLOUD_LOADING)   # the setting not heard yet on this stream
+        else:
+            if self.cloud_demo:
+                self.cloud_text, self.cloud_as_of, self.cloud_demo = '', None, False
+                self._cloud_set(CLOUD_LOADING)
+            stale = self.cloud_at is None or now - self.cloud_at >= CLOUD_REFRESH_S
+            if (want or self.cloud_refresh) and not self.cloud_busy and now >= self.cloud_next \
+                    and (stale or self.cloud_refresh):
+                self.cloud_busy, self.cloud_refresh = True, False
+                http_ = self.link.http
+                self.cloud_worker.put('cloud', lambda: self._cloud_job(http_), dedupe=True)
+            if self.cloud_busy and not self.cloud_text:
+                self._cloud_set(CLOUD_LOADING)
+        pub['/Cloud/State'] = self.cloud_state
+        pub['/Cloud/Message'] = self.cloud_msg
+        pub['/Cloud/AsOf'] = self.cloud_as_of
+        pub['/Cloud/Json'] = self.cloud_text if want else ''
+
+    def _cloud_set(self, state, message=None):
+        self.cloud_state = state
+        self.cloud_msg = CLOUD_TEXT.get(state, '') if message is None else message
+
+    def _cloud_job(self, http_):
+        # cloud worker thread: the regulator's token, then one POST; the token lives only in this call
+        try:
+            st, _, b = http_.request('/getAuthToken', timeout=8)
+            j = json.loads(b) if st == 200 else None
+        except Exception as e:
+            log.warning('/getAuthToken: %s', fetch_error_text(e))
+            self.inbox.put(('cloud', (CLOUD_NO_LINK, None, None)))
+            return
+        if not isinstance(j, dict):
+            self.inbox.put(('cloud', (CLOUD_ERROR, 'The regulator did not give its cloud token', None)))
+            return
+        if not j.get('registered') or not j.get('token'):
+            self.inbox.put(('cloud', (CLOUD_UNREGISTERED, None, None)))
+            return
+        try:
+            v = cloud.view(cloud.fetch(str(j['token']), timeout=CLOUD_TIMEOUT_S), int(self.wall()))
+        except urllib.error.HTTPError as e:
+            code, msg = cloud.http_error_body(e)
+            if e.code == 401 and code == 'token_not_found':
+                self.inbox.put(('cloud', (CLOUD_UNREGISTERED, None, None)))
+            else:
+                log.warning('cloud: HTTP %d %s', e.code, msg)
+                self.inbox.put(('cloud', (CLOUD_ERROR, 'The cloud could not answer (%s)' % (msg or 'HTTP %d' % e.code),
+                                          None)))
+            return
+        except (urllib.error.URLError, OSError) as e:
+            log.warning('cloud: %s', fetch_error_text(e))
+            self.inbox.put(('cloud', (CLOUD_OFFLINE, None, None)))
+            return
+        except ValueError as e:
+            log.warning('cloud: %s', e)
+            self.inbox.put(('cloud', (CLOUD_ERROR, 'The cloud answered with something unreadable', None)))
+            return
+        self.inbox.put(('cloud', (CLOUD_READY, None, v)))
+
+    def _cloud_answer(self, now, state, message, v):
+        self.cloud_busy = False
+        if self.demo or self.cloud_demo:
+            return   # demo started while the call was out
+        self.cloud_next = now + (CLOUD_REFRESH_S if state == CLOUD_READY else CLOUD_RETRY_S)
+        if state == CLOUD_READY:
+            self.cloud_text = json.dumps(v, separators=(',', ':'))
+            self.cloud_as_of, self.cloud_at = v['asOf'], now
+        elif state == CLOUD_UNREGISTERED:
+            self.cloud_text, self.cloud_as_of, self.cloud_at = '', None, None
+        self._cloud_set(state, message)
 
     # -- DVCC over WiFi: the alternator service systemcalc controls, and /gxLimits --
+
+    # -- demo battery service --
+
+    def batt_mode(self, info=None):
+        info = info or self.link.snapshot()[2]
+        return 'shown' if self.demo and self.batt_ok and info['state'] == 'streaming' else None
+
+    def batt_static_paths(self, process_name='xregulator_bridge.py'):
+        return [('/Mgmt/ProcessName', process_name, None), ('/Mgmt/ProcessVersion', VERSION, None),
+                ('/Mgmt/Connection', 'WiFi', None), ('/DeviceInstance', self.batt_instance, None),
+                ('/ProductId', 0xFFFF, None), ('/ProductName', 'XREG-010 battery monitor', None),
+                ('/FirmwareVersion', '', None), ('/Serial', self.uid, None), ('/Connected', 0, None),
+                ('/Dc/0/Voltage', None, None), ('/Dc/0/Current', None, None), ('/Dc/0/Power', None, None),
+                ('/Dc/0/Temperature', None, None), ('/Soc', None, None), ('/TimeToGo', None, None),
+                ('/ConsumedAmphours', None, None), ('/Capacity', None, None)]
+
+    def batt_tick(self, pub):
+        frames, fresh, info = self.link.snapshot()
+        live = 'CSVData' in fresh
+
+        def val(ev, f, scale):
+            raw = (frames.get(ev) or {}).get(f)
+            return None if ev not in fresh or raw is None or not math.isfinite(raw) or raw <= EMPTY else raw / scale
+        v = next((x for x in (val('CSVData', 'IBV', 100), val('CSVData', 'BatteryV', 100)) if x), None)
+        a = val('CSVData4', 'flowBattA', 100)
+        a = val('CSVData', 'Bcur', 100) if a is None else a
+        soc = val('CSVData2', 'SOC_percent', 100)
+        t = val('CSVData2', 'battTempActiveF', 10)
+        cap = val('CSVData3', 'BatteryCapacity_Ah', 1)
+        pub['/Connected'] = int(live)
+        pub['/Dc/0/Voltage'] = None if v is None else round(v, 2)
+        pub['/Dc/0/Current'] = None if a is None else round(a, 1)
+        pub['/Dc/0/Power'] = None if v is None or a is None else round(v * a)
+        pub['/Dc/0/Temperature'] = None if t is None else round(F_TO_C(t), 1)
+        pub['/Soc'] = None if soc is None else round(soc, 1)
+        pub['/Capacity'] = cap
+        pub['/ConsumedAmphours'] = None if soc is None or not cap else round(-(100 - soc) / 100 * cap, 1)
+        # Victron's monitors give time to go only while discharging, in seconds
+        pub['/TimeToGo'] = round(soc / 100 * cap / -a * 3600) if soc is not None and cap and a is not None and a < -0.5 \
+            else None
 
     def alt_mode(self, info=None):
         # None: no alternator service. 'hidden': DVCC paths only, because an NMEA 2000 service already carries this
@@ -2163,7 +3187,9 @@ class Core:
         info = info or self.link.snapshot()[2]
         if self.alt_native or info['state'] == 'missing' or gx_version(info['ident']) < 3:
             return None
-        return 'hidden' if self.alt_twin else 'shown'
+        # demo mode turns NMEA 2000 off, so a twin still listed has stopped (its page shows dashes until VE.Can drops it):
+        # carry the WiFi readings from the moment demo starts
+        return 'hidden' if self.alt_twin and not self.demo else 'shown'
 
     def alt_static_paths(self, mode, process_name='xregulator_bridge.py'):
         # Write mode 'stamp': systemcalc writes it, and every write is stamped (alt_write), equal values included.
@@ -2297,26 +3323,31 @@ class Core:
         pub['/Plot/Long/StepS'] = b['step']
         for name in self._long_series_names():
             pub['/Plot/Long/' + name] = fmt_series(b['series'].get(name, []), lt_decimals(name))
+        pub['/Plot/Long/Last'] = json.dumps(longterm_last(self.lt), separators=(',', ':'))
 
     def _settings(self, pub, now, frames, info):
         connected = info['state'] == 'streaming'
         frames = self._echo_frames(now)
         for key in self.model.values:
             path = '/Settings/Value/' + key
-            h = self.hold.get(path)
-            if h and now < h[1]:
-                pub[path] = h[0]
-                continue
-            self.hold.pop(path, None)
-            pub[path] = self.model.display(self.model.items[key], frames) if connected else None
+            echo = self.model.display(self.model.items[key], frames) if connected else None
+            pub[path] = self._shown(path, echo, now, info, connected)
         for tid in self.model.tables:
             path = '/Settings/Table/' + tid
-            h = self.hold.get(path)
-            if h and now < h[1]:
-                pub[path] = h[0]
-                continue
-            self.hold.pop(path, None)
-            pub[path] = self.model.table_json(tid, frames) if connected else ''
+            echo = self.model.table_json(tid, frames) if connected else ''
+            pub[path] = self._shown(path, echo, now, info, connected)
+
+
+def _same(a, b):
+    # a written value against its echo: numbers equal to rounding, anything else exactly
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+    if num(a) and num(b):
+        return abs(a - b) <= 1e-6 * max(1.0, abs(a))
+    return a == b
+
+
+def _r2(v):
+    return None if v is None else round(v, 2)
 
 
 def _source_payload(name, b):
@@ -2358,14 +3389,25 @@ class Manager:
         self.probe_seq = 0
         self.reset_paths = {}
         self.alternators = []              # the GX's other alternator services, from set_alternators
+        self.batt_gate = False             # the GX can take a demo battery service (set_battery_gate)
+        self.gx_memory = {}                # the GX devices seen (GX_CLASS_KIND), store 'gx_devices'
+        self.gx_present = set()            # their keys on D-Bus at the last GX reading
+        self.gx_meter = False              # a DC system meter among them
 
     def start(self):
+        try:
+            mem = json.loads(self.store.get('gx_devices') or '{}')
+            self.gx_memory = {str(k): v for k, v in mem.items() if isinstance(v, dict)} if isinstance(mem, dict) else {}
+        except ValueError:
+            self.gx_memory = {}
         self.discovery.start()
         self.worker.start()
         for uid in dict.fromkeys(norm_uid(u) for u in (self.store.get('units') or '').split(',')):
             if uid:
                 self._add(uid)
                 self.order.append(uid)
+        if self._purge_memory(list(self.units)):
+            self._save_memory()
         if not self.order:
             self.discovery.request_sweep()   # nothing picked yet: have a list ready without mDNS too
 
@@ -2380,7 +3422,9 @@ class Manager:
         return [('/Mgmt/ProcessName', process_name, None), ('/Mgmt/ProcessVersion', VERSION, None),
                 ('/Mgmt/Connection', 'WiFi', None), ('/DeviceInstance', 0, None),
                 ('/Units', '[]', None), ('/Found', '[]', None), ('/Scanning', 0, None), ('/ProbeResult', '', None),
-                ('/Add', None, 'core'), ('/Remove', None, 'core'), ('/Scan', None, 'core'), ('/Probe', '', 'core')]
+                ('/Add', None, 'core'), ('/Remove', None, 'core'), ('/Scan', None, 'core'), ('/Probe', '', 'core'),
+                ('/GxDevices', '[]', None), ('/GxForget', '', 'core'), ('/GxDrawsHouse', '', 'core'),
+                ('/GxMetered', '', 'core')]
 
     # -- writes from D-Bus (main thread) --
 
@@ -2407,6 +3451,56 @@ class Manager:
             self.discovery.request_sweep(force=True)
             self.reset_paths[path] = None
             return True
+        if path == '/GxForget':
+            # a remembered GX device the owner says the boat no longer has: its power-flow row goes. One still on D-Bus
+            # comes straight back.
+            key = str(value or '')
+            if key not in self.gx_memory:
+                return False
+            del self.gx_memory[key]
+            self._save_memory()
+            self.reset_paths[path] = ''
+            return True
+        if path == '/GxDrawsHouse':
+            # {"key": a remembered Orion (class dcdc; a DC meter in DC-DC mode goes by its sign instead), "on": 1 it
+            # draws from the house bank to charge another battery (a Loads row), 0 it feeds the house bank (a source, the
+            # default)}
+            try:
+                req = json.loads(value)
+                key, on = str(req['key']), int(req['on'])
+            except (ValueError, KeyError, TypeError):
+                return False
+            m = self.gx_memory.get(key)
+            if not isinstance(m, dict) or gx_class(key) != 'dcdc' or on not in (0, 1):
+                return False
+            if on:
+                m['h'] = 1
+            else:
+                m.pop('h', None)
+            self._save_memory()
+            self.reset_paths[path] = ''
+            return True
+        if path == '/GxMetered':
+            # {"key": a remembered device that makes a row, or "xreg:<uid>" a pinned regulator's own alternator, "on": 1
+            # its current passes through the DC system meter, 0 it does not}: how it is wired, which the GX cannot see
+            try:
+                req = json.loads(value)
+                key, on = str(req['key']), int(req['on'])
+            except (ValueError, KeyError, TypeError):
+                return False
+            m = self.gx_memory.get(key)
+            if on not in (0, 1):
+                return False
+            if key.startswith('xreg:') and key[5:] in self.units:
+                self.gx_memory[key] = {'k': 'reg', 'm': on}
+            elif isinstance(m, dict) and m.get('k') in FLOW_SOURCE_KINDS + FLOW_LOAD_KINDS \
+                    and set(str(m.get('r') or '')) & set('sl'):
+                m['m'] = on
+            else:
+                return False
+            self._save_memory()
+            self.reset_paths[path] = ''
+            return True
         if path == '/Probe':
             host = str(value or '').strip()
             if not HOST_RE.match(host):
@@ -2426,6 +3520,97 @@ class Manager:
         if settled:
             for core in self.units.values():
                 core.alt_quiet = False
+
+    def set_battery_gate(self, ok):
+        # ok: the GX has no battery service, no device that takes a battery reading, and DVCC off (BATT_SERVICE). One
+        # demo battery at most: the first pinned regulator in demo gets it.
+        self.batt_gate = ok
+        self._match_batteries()
+
+    def _match_batteries(self):
+        first = next((u for u in self.order if u in self.units and self.units[u].demo), None) if self.batt_gate else None
+        for uid, core in self.units.items():
+            core.batt_ok = uid == first
+
+    def wants_gx(self):
+        # How often xregulator_bridge.py reads the GX's devices, s (0: not at all): a power-flow tile on screen outside
+        # demo, else a regulator taking /gxDevices
+        now = self.clock()
+        every = [e for e in (core.wants_gx(now) for core in self.units.values()) if e]
+        return min(every) if every else 0
+
+    def set_gx_side(self, snapshot):
+        # The GX's own readings for the power flow and /gxDevices (xregulator_bridge.py GxReader), the same for every
+        # regulator; each Core leaves out itself and the twins. A device seen with its identity read is remembered.
+        uids = list(self.units)
+        peers = []
+        for u, c in self.units.items():
+            amps, live = c.alt_reading()
+            peers.append({'uid': u, 'name': c.last_name or 'XREG-' + uid6(u), 'amps': amps, 'live': live})
+        self._remember(snapshot, uids)
+        for core in self.units.values():
+            core.set_gx_side(snapshot, uids, self.gx_memory, peers)
+
+    def _remember(self, snapshot, uids):
+        changed, present = False, set()
+        uniques = {n2k_unique(u) for u in uids} - {None}
+        # a key the GX now shows to be a pinned regulator's twin is never kept, whatever was stored under it
+        for d in (snapshot or {}).get('devices') or []:
+            serial = str(d.get('serial') or '').strip()
+            if gx_kind(d) == 'altx' and (any(serial_matches(u, serial, uids) for u in uids) if serial
+                                         else d.get('n2k') in uniques) \
+                    and self.gx_memory.pop(str(d.get('key') or d.get('service') or ''), None) is not None:
+                changed = True
+        # the memory goes in for the side a DC meter in DC-DC mode was last seen on
+        devs = gx_devices(snapshot, self.gx_memory, '', uids)
+        for d in devs:
+            if not d['on']:
+                continue
+            present.add(d['key'])
+            # once its D-Bus identity has been read (the key from the VRM instance, not the service name), and only
+            # what makes a row
+            if not (d['product'] or d['name']) or ':' not in d['key'] or not set(d['roles']) & set('slp'):
+                continue
+            # an Orion keeps its own side; the owner's flag ("h") makes it a load
+            roles = gx_roles(d['kind'], d['pv']) if d['cls'] == 'dcdc' else d['roles']
+            m = {'k': d['kind'], 'n': d['name'], 'p': d['product'], 'r': roles}
+            old = self.gx_memory.get(d['key'])
+            if d['serial']:
+                m['s'] = d['serial']
+            elif d['kind'] == 'altx':
+                m['w'] = 1   # listed without a serial after ALT_SERIAL_WAIT_S
+                if d['n2k'] is not None:
+                    m['u'] = d['n2k']
+            if draws_house(d['key'], old):
+                m['h'] = 1
+            if isinstance(old, dict) and old.get('m') in (0, 1):
+                m['m'] = old['m']
+            if old != m:
+                self.gx_memory[d['key']] = m
+                changed = True
+        self.gx_present = present
+        self.gx_meter = any(d['kind'] == 'dcsystem' and d['on'] for d in devs)
+        if self._purge_memory(uids) or changed:
+            self._save_memory()
+
+    def _purge_memory(self, uids):
+        # Drops what must never be a row: an alternator whose serial, or with none its NMEA 2000 unique number, is a
+        # pinned regulator's, and one stored without a serial under the twin's identity (stored_twin). Clears a "draws
+        # from the house bank" flag on anything but an Orion. True when something changed.
+        changed = False
+        uniques = {n2k_unique(u) for u in uids} - {None}
+        for key, m in list(self.gx_memory.items()):
+            if m.get('k') == 'altx' and (any(serial_matches(u, m.get('s'), uids) for u in uids) or stored_twin(key, m)
+                                         or (not m.get('s') and m.get('u') in uniques)):
+                del self.gx_memory[key]
+                changed = True
+            elif 'h' in m and gx_class(key) != 'dcdc':
+                del m['h']
+                changed = True
+        return changed
+
+    def _save_memory(self):
+        self.store.set('gx_devices', json.dumps(self.gx_memory, separators=(',', ':'), sort_keys=True))
 
     def alternator_appeared(self):
         # A new alternator service on the GX could be a regulator's NMEA 2000 twin coming back, which systemcalc counts
@@ -2474,7 +3659,8 @@ class Manager:
             st.set('host', host)
         core = Core(uid, st, self.schema_text, self.discovery, self.cache_dir, self.clock, self.wall,
                     instance=_instance(st.get('instance'), instance),
-                    alt_instance=_instance(st.get('alt_instance'), INSTANCE), on_repin=self._repin)
+                    alt_instance=_instance(st.get('alt_instance'), INSTANCE),
+                    batt_instance=_instance(st.get('batt_instance'), INSTANCE), on_repin=self._repin)
         self.units[uid] = core
         if self.listener:
             self.listener.unit_added(core)
@@ -2514,6 +3700,7 @@ class Manager:
     def tick(self, pub):
         self._apply()
         self._match_alternators()
+        self._match_batteries()
         while True:
             try:
                 r = self.inbox.get_nowait()
@@ -2527,6 +3714,28 @@ class Manager:
             if core.live and ident:
                 self.discovery.note_ident(core.host, ident, 'link')   # a streaming regulator stays on the found list
         pub['/Units'] = json.dumps([self.units[u].summary() for u in self.order], separators=(',', ':'))
+        order = {k: i for i, k in enumerate(FLOW_SOURCE_KINDS + FLOW_LOAD_KINDS)}
+        devices = []
+        # with a DC system meter on the GX: the pinned regulators' own alternators first ("reg"), for their "m" switch,
+        # and "m" on every device that makes a row (through_meter)
+        if self.gx_meter:
+            for u in self.order:
+                if u in self.units:
+                    key = 'xreg:' + u
+                    devices.append({'key': key, 'k': 'alt', 'n': self.units[u].last_name or 'XREG-' + uid6(u),
+                                    'p': 'XREG-010', 'on': 1, 'reg': 1,
+                                    'm': int(through_meter(key, 's', self.gx_memory.get(key)))})
+        for k, m in sorted(self.gx_memory.items(), key=lambda e: (order.get(e[1].get('k'), 99), e[0])):
+            if m.get('k') == 'reg':
+                continue
+            row = {'key': k, 'k': m['k'], 'n': m.get('n', ''), 'p': m.get('p', ''), 'on': int(k in self.gx_present)}
+            if gx_class(k) == 'dcdc':
+                row['h'] = int(draws_house(k, m))   # the page's switch: Orions only
+            roles = 'l' if draws_house(k, m) else str(m.get('r') or '')
+            if self.gx_meter and set(roles) & set('sl'):
+                row['m'] = int(through_meter(k, roles, m))
+            devices.append(row)
+        pub['/GxDevices'] = json.dumps(devices, separators=(',', ':'))
         pub['/Found'] = json.dumps(self._found(), separators=(',', ':'))
         pub['/Scanning'] = int(self.discovery.sweeping)
         for path, v in self.reset_paths.items():

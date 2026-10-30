@@ -42,7 +42,7 @@ tNMEA2000_esp32 NMEA2000(ESP32_CAN_TX_PIN, ESP32_CAN_RX_PIN);  // necessary for 
 #include <LittleFS.h>                    //
 fs::LittleFSFS webFS;                    // Separate filesystem for web files
 bool usingFactoryWebFiles = false;       // Track which web partition is mounted
-#include <ESPAsyncWebServer.h>           // for wifi stuff, important, don't ever update, use mathieucarbou github repository
+#include <ESPAsyncWebServer_xeng.h>      // for wifi stuff, important, don't ever update, use mathieucarbou github repository — my fork of 3.11.0: queued SSE messages live in PSRAM, never internal RAM (see its AsyncEventSource.h)
 #include <DNSServer.h>                   // For captive portal (Wifi Network Provisioning) functionality
 #include <ESPmDNS.h>                     // helps with wifi provisioning (to save users trouble of looking up ESP32's IP address)
 #include "esp_heap_caps.h"               // needed for tracking heap usage
@@ -85,6 +85,38 @@ bool usingFactoryWebFiles = false;       // Track which web partition is mounted
 // rom/rtc.h can't be included here (its SLEEP_MODE enum collides with BMP388_DEV.h), so declare
 // the ROM function directly; it returns the RESET_REASON enum, ABI-compatible with int.
 extern "C" int rtc_get_reset_reason(int cpu_no);
+
+// Cold globals in PSRAM: `T &name = PsramPlace::make<T>();` keeps every use site unchanged. Safe at static init: PSRAM
+// joins the heap in the IDF CORE init stage, before global constructors run. Zero-filled like .bss, then default-
+// constructed; falls back to internal RAM only when PSRAM is missing (counted, printed at boot). Not for anything
+// touched every control pass (claude_docs/firmware-internals.md, PSRAM move candidates).
+#include <new>
+#include <type_traits>
+struct PsramPlace {
+  static inline uint32_t psramBytes = 0;
+  static inline uint16_t internalFallbacks = 0;
+  template <typename T> static T &make() {
+    constexpr size_t al = alignof(T) < 4 ? 4 : alignof(T);
+    void *p = heap_caps_aligned_calloc(al, 1, sizeof(T), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p) {
+      psramBytes += sizeof(T);
+    } else {
+      p = heap_caps_aligned_calloc(al, 1, sizeof(T), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      internalFallbacks++;
+    }
+    using E = std::remove_all_extents_t<T>;
+    if constexpr (!std::is_trivially_default_constructible_v<E>) {
+      for (size_t i = 0; i < sizeof(T) / sizeof(E); i++) new (static_cast<E *>(p) + i) E();
+    }
+    return *static_cast<T *>(p);
+  }
+  // Plain malloc()/new go to PSRAM first while open; explicit-caps allocations (FreeRTOS objects, task stacks, drivers)
+  // are unaffected. Every task's plain malloc moves meanwhile, so open it only around one-time setup code.
+  static void mallocWindow(bool open) {
+    heap_caps_malloc_extmem_enable(open ? 0 : CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+  }
+};
+
 // FrontStore::classify confidence states (engine in 7_functions.ino); numeric order mirrored in script.js
 // labels. Defined here because globals below initialize from them.
 #define FRONT_MEASURED      0
@@ -254,7 +286,7 @@ volatile bool dbgRingsSynthetic = false;
 // Current-bucket accumulators (committed when the engine-hour bucket advances).
 static double altBucket_sum = 0, altBucket_n = 0;   // running average over the bucket
 static float  altBucket_worst = 0;                  // raw min output-% this bucket (debug CSV only; the committed low line is P10)
-static uint16_t altBucketHist[60] = {};             // bucket %-histogram (2% bins, 0..120) → committed P10
+static uint16_t (&altBucketHist)[60] = PsramPlace::make<uint16_t[60]>();             // bucket %-histogram (2% bins, 0..120) → committed P10
 static int    altCurEngHour = -1;
 double altTrendBaselineSec = 0.0;   // EngineRunTime_AllTime at last "Start Over" (trend X-axis origin)
 
@@ -278,7 +310,7 @@ static float   altWorstPctLive = 0;        // P10 output-% of the in-progress tr
 static float   altOverallPctLive = 0;      // current-bucket average output-%
 static uint8_t altStatusCode = 0;          // 0 normal, 3 disabled (Ignore Temperature), 4 waiting for commissioning, 5 waiting for Charge Health Calibration (stage 9)
 // Session statistics over the graded 1 Hz samples since boot/Start Over: mean + P10 histogram (60 × 2% bins).
-static uint16_t altSessHist[60] = {};
+static uint16_t (&altSessHist)[60] = PsramPlace::make<uint16_t[60]>();
 static uint32_t altSessN = 0;
 static double   altSessSum = 0;
 static bool    altHiFieldAlert = false;    // high-field-low-output alert (independent of the record book)
@@ -672,7 +704,7 @@ bool pendingConfigCheckDone = false;  // boot admin-config pull sent; the field-
 uint8_t cfgPushPendingCount = 0;   // settings staged in the cloud; 0 = nothing queued
 // Fixed storage, not String: written on the HTTPS task, read by /configPush on the webserver
 // task with no lock — a race on a char array can tear text, never the heap.
-char cfgPushPendingNote[84] = "";  // short admin description shown in the notice (firmware caps at 80)
+char (&cfgPushPendingNote)[84] = PsramPlace::make<char[84]>();  // short admin description shown in the notice (firmware caps at 80)
 uint16_t cfgPushAppliedCount = 0;  // settings the previous boot's push changed; 0 = nothing to report
 String  cfgPushAppliedKeys  = "";  // comma-separated param names it changed (capped, see CFGPUSH_KEYS_CAP)
 
@@ -829,9 +861,9 @@ bool settingsArmed = false;
 // (shared marina WiFi). Salt + hash only; tokens are RAM-only.
 bool pwRequired = false;
 char pwSaltHex[17] = "";
-char pwHashHex[65] = "";
+char (&pwHashHex)[65] = PsramPlace::make<char[65]>();
 #define ARM_TOKENS 4   // one per unlocked client; a fifth unlock retires the oldest
-char armTok[ARM_TOKENS][17] = { "", "", "", "" };
+char (&armTok)[ARM_TOKENS][17] = PsramPlace::make<char[ARM_TOKENS][17]>();
 uint8_t armTokNext = 0;
 uint8_t pwFailCount = 0;
 uint32_t pwLockUntilMs = 0;   // five wrong passwords buy a 60 s refusal of every attempt
@@ -923,6 +955,11 @@ typedef struct {
 // sizeof folded into the magic so a layout change invalidates old snapshots.
 #define BLACKBOX_MAGIC (0xB1ACB0C5UL ^ (uint32_t)sizeof(BlackBoxSnap))
 #define BLACKBOX_DEMO_MAGIC (BLACKBOX_MAGIC ^ 0x00DE0000UL)
+// Why a deferred reboot was asked for (REBOOT_INTENT_TAG | REBOOT_WHY_*), told to the next boot (captureResetReason): RTC
+// noinit, so the reboot path writes no flash. Defined ahead of clockRealTag, so the linker places it last and clockRealTag,
+// g_blackBox and g_ovTel keep their addresses.
+RTC_NOINIT_ATTR uint32_t g_rebootIntent;
+#define REBOOT_INTENT_TAG 0x1A904700UL
 // Soft-clock origin (CLOCK_REAL_TAG, clockIsReal() below). Defined first so the linker places it LAST in RTC noinit:
 // ahead of g_ovTel/g_blackBox it moved both, and a soft reset into the new layout fails their magic.
 RTC_NOINIT_ATTR uint32_t clockRealTag;
@@ -1058,7 +1095,7 @@ uint16_t systemIDPlantTauMs   = 112;   // ms — default from a commissioning pl
 #define SYSID_SINE_NPOINTS 10          // log-spaced sweep points
 #define SYSID_STEP_HOLD_MS 5000        // ms — fixed step-test per-phase dwell; sized to plant settling (several plant τ)
 struct SysIDBodePoint { float freqHz; float gainApPct; float phaseDeg; };  // gain = A output per %duty
-SysIDBodePoint systemIDBode[SYSID_SINE_NPOINTS] = {};
+SysIDBodePoint (&systemIDBode)[SYSID_SINE_NPOINTS] = PsramPlace::make<SysIDBodePoint[SYSID_SINE_NPOINTS]>();
 uint8_t systemIDBodeCount = 0;         // valid Bode points after a sine run (served by /sysidbode)
 float   systemIDFsHz      = 0.0f;      // CH1 sample rate at the last plant sweep's start; 0 = not measured
 // Engine speed across the last sweep's sine phase — advisory context served by /sysidbode
@@ -1199,7 +1236,7 @@ uint8_t fieldCurveCeilBind = 0;                 // g_fieldCeilBind latched when 
 // Field-curve / knee sweep abort reason (latched at the protection cut, cleared at each start; /fieldcurve.json & /kneesweep.json).
 // FIRST cause wins: a hard cut corrupts the tach ~4.6 s, so a phantom RPM_TOO_LOW cut during teardown must not overwrite it.
 volatile uint8_t fieldCurveAbortReason = 0;     // 0 = none / user-cancel; else FieldEventReason code
-char  fieldCurveAbortMsg[96] = {0};             // human reason text at the cut ("" = none); must fit the 49-byte battery-temperature-wait reason
+char (&fieldCurveAbortMsg)[96] = PsramPlace::make<char[96]>();             // human reason text at the cut ("" = none); must fit the 49-byte battery-temperature-wait reason
 volatile uint8_t fieldCurveAbortFollowOn = 0;   // 2nd distinct cut reason in the same teardown (0 = none)
 float fieldCurveAbortVolts = 0.0f;              // bus volts at the first cut
 float fieldCurveAbortDuty  = 0.0f;              // commanded field % at the first cut
@@ -1299,7 +1336,7 @@ int16_t *fcScratch = nullptr;                      // PSRAM — hold-end / tail-
 float *fcPlotMs = nullptr, *fcPlotA = nullptr;     // PSRAM — decimated decay served via /fieldcut.json (t relative to the cut command)
 int    fcPlotN = 0;
 uint32_t fieldCutLastEndMs = 0;                    // cooldown guard
-char  fieldCutAbortMsg[96] = {0};                  // human reason text on a failed/aborted run; 48 truncated four of the fit-failure messages
+char (&fieldCutAbortMsg)[96] = PsramPlace::make<char[96]>();                  // human reason text on a failed/aborted run; 48 truncated four of the fit-failure messages
 
 // ── Charge health system calibration (commissioning stage 9) ──────────────────────────────
 // Measures the alternator's speed lead (altLeadSec): with the field pinned, output answers where the engine is GOING, so up
@@ -1357,7 +1394,7 @@ float chcGapA[3] = {-1.0f, -1.0f, -1.0f};  // …and at the fitted delay
 // Throttle pace the operator delivered (|rate| >= CHC_RATE_MIN samples); reported for reference only.
 float chcRateMin = -1.0f, chcRateMax = -1.0f, chcRateAvg = -1.0f;
 bool  chcResultsReady = false, chcOk = false;
-char  chcAbortMsg[128] = {0};               // 64 truncated four of its own messages mid-word
+char (&chcAbortMsg)[128] = PsramPlace::make<char[128]>();               // 64 truncated four of its own messages mid-word
 uint32_t chcLastEndMs = 0;
 struct ChcSample { uint16_t rpm; int16_t amps10; };   // 4 B — amps ×10, so ±3200 A
 static_assert(sizeof(ChcSample) == 4, "ChcSample lost its packing — the PSRAM budget assumes 4 B");
@@ -1435,7 +1472,7 @@ float performanceRatio = .75;              // Real-world performance losses (typ
 
 unsigned long weatherLastUpdate = 0;
 int weatherDataValid = 0;  // 0=false, 1=true
-char weatherLastError[64];
+char (&weatherLastError)[64] = PsramPlace::make<char[64]>();
 
 int weatherModeEnabled = 0;            // 0=disabled, 1=enabled
 float UVThresholdHigh = 2.1;           // UV index above this = high solar expected (kWh)
@@ -1512,7 +1549,7 @@ struct SolarLedgerLive {  // the day in progress — persisted so a reboot resum
 SolarLedgerRec *sledRing = nullptr;   // ps_malloc'd in solarLedgerInit()
 uint16_t sledHead = 0;                // next write slot
 uint16_t sledCount = 0;               // 0..SLED_SIZE
-SolarLedgerLive sledLive = {};
+SolarLedgerLive &sledLive = PsramPlace::make<SolarLedgerLive>();
 bool sledDirty = false;               // ring changed (day closed / cleared) — flush at field-cut
 bool sledLiveDirty = false;           // live-day state changed — flush at field-cut, rate-limited
 bool sledRatioDirty = false;          // learned performanceRatio awaiting its NVS write (field-cut only)
@@ -1830,8 +1867,8 @@ float SOGNMEA = 0;                     // Speed Over Ground from NMEA2K (knots)
 float STWNMEA = NAN;                   // Speed Through Water (SOW) from NMEA2K PGN 128259 (knots); NAN = no log
 double LatitudeNMEA = 0;               // from own ship AIS FIX LATER
 double LongitudeNMEA = 0;              // from own ship AIS FIX LATER
-float ApparentWindSpeedNMEA = 0;       // Apparent wind speed from NMEA2K (knots)
-float ApparentWindAngleNMEA = 0;       // Apparent wind angle from NMEA2K (degrees)
+float ApparentWindSpeedNMEA = NAN;     // Apparent wind speed from NMEA2K (knots); NAN = no fresh reading (calculateDerivedMetrics)
+float ApparentWindAngleNMEA = NAN;     // Apparent wind angle from NMEA2K (degrees); NAN = no fresh reading
 int NMEA2KData = 0;                    //
 int NMEA2KVerbose = 0;                 // print stuff to serial monitor or not
 int SatelliteCountNMEA = 0;            // Number of satellites
@@ -1935,7 +1972,7 @@ uint32_t timeSinceLastValidGps = 0;              // ms accumulated with invalid 
 // Rolling 24-hour max distance (lb-max-24hr leaderboard). 24 hourly buckets; bucket[head] = in-progress hour.
 // Sum of all 24 ≈ last 24 hours of motion (~1 hr undercount worst case). Ring is session-only; watermark is NVS-persisted.
 float Max24hrDistance_AllTime = 0.0f;            // nm (lifetime max over any rolling 24-hr window)
-float distHourBuckets[24] = {0};                 // per-hour distance accumulators (nm)
+float (&distHourBuckets)[24] = PsramPlace::make<float[24]>();                 // per-hour distance accumulators (nm)
 uint8_t distHourHead = 0;                        // index of current in-progress hour bucket
 uint32_t distHourStartMs = 0;                    // millis() at start of current hour bucket (0 = uninitialized)
 // Water depth (NMEA2k PGN 128267). Stored in meters (NMEA native); displayed in feet (×3.28084).
@@ -2357,11 +2394,15 @@ struct LongTermRecord {                 // naturally aligned; see static_assert 
   int16_t onAvg[5];                     // battVolt ×100, battCurr ×10, altCurr ×10, victronCurr ×10, duty ×100
   uint8_t activeFrac;                   // engine-on % of observed window ×2 (0..200 = 0..100%); 0 ⇒ onAvg invalid
   uint8_t _pad2;
-};
-// 16 + 102 + 12 + 2 + 10 + 2 = 144, no tail padding; pinned so a layout edit can't silently desync the scaffold guard.
-static_assert(sizeof(LongTermRecord) == 144, "LongTermRecord layout changed — update the scaffold recordSize guard");
 
-const uint16_t LONGTERM_RING_SIZE = 4320;    // 30 d × 24 h × 6/h at 10-min cadence (~608 KB @ 144 B)
+  // v5 tail (append-only): battery temperature in use (batteryTempF), envelope, validMask bit 24
+  int16_t battTemp[3];                  // °F  ×10
+  int16_t _pad3;
+};
+// 16 + 102 + 12 + 2 + 10 + 2 + 8 = 152, no tail padding; pinned so a layout edit can't silently desync the scaffold guard.
+static_assert(sizeof(LongTermRecord) == 152, "LongTermRecord layout changed — update the scaffold recordSize guard");
+
+const uint16_t LONGTERM_RING_SIZE = 4320;    // 30 d × 24 h × 6/h at 10-min cadence (~641 KB @ 152 B)
 LongTermRecord *longTermRing      = nullptr; // ps_malloc'd in setup()
 volatile uint16_t longTermHead    = 0;       // next write slot (circular)
 volatile uint16_t longTermCount   = 0;       // 0..LONGTERM_RING_SIZE
@@ -2372,7 +2413,7 @@ uint32_t   longTermFlushedSeq     = 0;       // longTermPushSeq value at last su
 uint32_t   longTermFileRecords    = 0;       // records currently on disk (0 = none/invalid → compact next flush)
 #define LONGTERM_BACKUP_PATH  "/longterm_ring.bin"
 #define LONGTERM_BACKUP_MAGIC 0x4C54504Cu    // 'LTPL'
-#define LONGTERM_BACKUP_VER   4u    // v4: +onAvg[5]+activeFrac (132→144 B); old rings discarded
+#define LONGTERM_BACKUP_VER   5u    // v5: +battTemp[3] (144→152 B); old rings discarded
 // Periodic field-off re-dump (only when the ring changed): the rising-edge dump alone loses records on a bench where the field
 // never cycles. Appends only new records, so the cost is bytes, not a whole-file erase.
 const unsigned long LONGTERM_DUMP_INTERVAL_MS = 15UL * 60UL * 1000UL;  // 15 min
@@ -3179,6 +3220,18 @@ FuncTiming ft_ReadNMEA0183;  // NMEA 0183 drain — the number that proves the 0
 FuncTiming ft_altHealth;
 FuncTiming ft_altFold;     // per-control-tick (~75 Hz) alt fold (IDW eval cost) — distinct from ft_altHealth (SSE wrapper)
 FuncTiming ft_boatPerf;
+// Record-book lookup engine (FrontQuery, 7_functions.ino), shown on /debug. Per-pass timers are nested inside
+// ft_altHealth / ft_boatPerf, so they stay out of the blame registry.
+FuncTiming ft_altEngine;   // per loop pass: the 1 Hz alt-health job (begin, lookups, AltLive, settings echo)
+FuncTiming ft_perfEngine;  // per loop pass: the boat-performance lookup queue
+uint32_t altJobLastUs = 0, altJobWorstUs = 0;          // one 1 Hz alt job's total work, all passes
+uint32_t altJobLastSpanMs = 0, altJobWorstSpanMs = 0;  // tick to finish
+uint16_t altJobLastPasses = 0, altJobLastLookups = 0, altJobWorstLookups = 0;
+uint32_t perfEngLastSecUs = 0, perfEngWorstSecUs = 0;  // boat-perf lookup work per wall-clock second
+uint32_t frontDropCount = 0;   // lookups dropped by a front write (reset, import, Uploaded load, class change, demo swap)
+// /debug/frontcheck?drive=N: synthetic lookups each second until millis() reaches this, field cut only (0 = off).
+uint32_t frontDriveUntilMs = 0;
+bool frontDriveOld = false;    // drive the inline (pre-engine) reads instead of the engine
 FuncTiming ft_n2kTx;  // NMEA2000 transmit tick — proof the TX path stays out of the control loop's time budget
 FuncTiming ft_dvcc;   // DVCC follow brain (1 Hz trust state machine) — proof it stays out of the loop's time budget
 FuncTiming ft_n2kParse;  // NMEA2000.ParseMessages() — RX frame drain + fast-packet assembly; the only N2K cost that scales with bus traffic
@@ -3288,11 +3341,17 @@ uint32_t loopDiagWorstUs = 0;
 // A client's SSE queue drains only as its TCP acks, so it backs up during lwIP retransmit waits (1.5 s, doubling) that the
 // WiFi/stream-drop lines can't see. Depth polled in SendWifiData; the library drops the NEWEST message on a full queue (ESP warn
 // only), so sseSend() counts those. Cleared by Reset Peak Values; on /debug; each stall >= 1 s prints a console line.
-uint16_t sseQueueDepth = 0;        // last polled depth (messages, averaged over clients) - gates the secondary channels
+uint16_t sseQueueDepth = 0;        // last polled depth (messages, averaged over every client) - /debug only
+uint16_t sseGateDepth = 0;         // the same averaged over the clients still draining (a stalled one left out) - gates the secondary channels
 uint16_t sseQueuePeak = 0;         // deepest since reset
+uint16_t sseQueueDeepest = 0;      // last polled depth of the deepest client's queue (/debug only)
+uint16_t sseQueueDeepestPeak = 0;  // its deepest since reset
 uint32_t sseStallCount = 0;        // stalls >= 1 s since reset
 uint32_t sseStallLongestMs = 0;
 uint32_t sseFramesDropped = 0;     // events.send() calls not fully enqueued since reset
+// Every dashboard event (3_functions.ino). toStalled: history and settings echoes (CSV1, console, CSV3) queue for a stalled
+// client too; the periodic current-state channels skip it while another client drains.
+void sseSend(const char *msg, const char *evt, bool toStalled = false);
 // Victron GX stream (/gxevents) witnesses, on /debug, cleared by Reset Peak Values.
 uint32_t gxFramesSent = 0;         // frames the Core-0 GX sender handed to gxEvents
 uint32_t gxFramesHeld = 0;         // sender passes that found the GX link backlogged (owed frames wait for the next try)
@@ -3325,6 +3384,30 @@ bool systemShuttingDown = false;
 // Restart runs in loop() so the HTTP response flushes first, never inside the async TCP callback.
 volatile bool rebootRequested = false;
 volatile unsigned long rebootRequestedAt = 0;  // writers store this BEFORE the flag; both volatile so the order holds
+// Who asked, for the reboot's serial line and the next boot's reset reason; set with rebootRequestedAt. /get?RebootRegulator
+// leaves REBOOT_WHY_REMOTE.
+#define REBOOT_WHY_REMOTE 0
+#define REBOOT_WHY_IMPORT 1       // config or records import
+#define REBOOT_WHY_WIFI_SETUP 2   // the Wi-Fi setup page saved
+#define REBOOT_WHY_IMPROV 3       // Wi-Fi sent over USB (Improv)
+#define REBOOT_WHY_CFG_PUSH 4     // cloud settings push applied
+#define REBOOT_WHY_FACTORY 5      // switched to the factory installer for a firmware update
+#define REBOOT_WHY_COUNT 6
+volatile uint8_t rebootRequestWhy = REBOOT_WHY_REMOTE;
+// Per REBOOT_WHY_*: the reboot's serial line, the reset reason the next boot records (LastResetReason; script.js
+// resetReasonLookup), and that boot's "reset:" name
+const char *const REBOOT_WHY_LINE[REBOOT_WHY_COUNT] = {
+  "=== REMOTE REBOOT (/get?RebootRegulator) ===",
+  "=== IMPORT REBOOT (loading the imported settings) ===",
+  "=== WIFI SETUP REBOOT (joining with the saved Wi-Fi settings) ===",
+  "=== IMPROV WIFI REBOOT (joining the network sent over USB) ===",
+  "=== CLOUD SETTINGS PUSH REBOOT (loading the pushed settings) ===",
+  "=== FACTORY SWITCH REBOOT (the factory installer runs the update) ===" };
+const uint8_t REBOOT_WHY_RESET[REBOOT_WHY_COUNT] = { 1, 17, 18, 19, 20, 21 };
+const char *const REBOOT_WHY_NAME[REBOOT_WHY_COUNT] = { "software", "software, import restart",
+  "software, Wi-Fi setup restart", "software, Improv Wi-Fi restart", "software, cloud settings push restart",
+  "software, factory switch restart" };
+uint8_t g_bootRebootWhy = REBOOT_WHY_REMOTE;   // this boot's, from g_rebootIntent (captureResetReason)
 // Maintenance-reboot countdown for the dashboard banner (0 = none; CSV2). Only the relaxed/hard tiers count down; quiet-tier
 // reboots have no client by construction.
 uint32_t restartRemainingSec = 0;
@@ -3570,7 +3653,7 @@ float cvStressTargetV = 0.0f;               // achievable CV target the test com
 float CvStressDropV = 0.10f;                // V (12V-equiv, ×V/12 at use) — target headroom: CV target parks this far below the settled idle voltage; smaller = more standing current at the parked target = harsher snap (the settle-up gate keeps the level a true equilibrium so CV, not the current limit, stays in command)
 float CvStressFailBandV = 0.25f;            // V (12V-equiv, ×V/12 at use) — swing beyond this at a stabilization deadline = genuine instability, test cannot run; at or under it the phase proceeds with the swing reported as a marginal grade
 const char *cvStressAbortMsg = "";
-char cvsLastBlob[224] = "";                 // last persisted result CSV (NK_cvStressLast, ver-2), cached for /cvstress.json
+char (&cvsLastBlob)[224] = PsramPlace::make<char[224]>();                 // last persisted result CSV (NK_cvStressLast, ver-2), cached for /cvstress.json
 
 // Explicit prototypes: String-return / String& functions don't survive auto-prototype ordering.
 void   bhSample(uint32_t nowMs);
@@ -3617,7 +3700,7 @@ bool    tuningSweepDone     = false;   // sweep finished, tuningBode[] valid
 uint32_t tuningRunTok       = 0;       // run token, see fieldCurveRunTok
 #define TUNING_SWEEP_NPOINTS 10        // log-spaced sweep points
 struct TuningBodePoint { float freqHz; float gain; float phaseDeg; };  // gain = measured/reference (unitless)
-TuningBodePoint tuningBode[TUNING_SWEEP_NPOINTS] = {};
+TuningBodePoint (&tuningBode)[TUNING_SWEEP_NPOINTS] = PsramPlace::make<TuningBodePoint[TUNING_SWEEP_NPOINTS]>();
 uint8_t tuningBodeCount = 0;           // valid points (served by /tuningbode)
 
 // Sine-sweep run-condition trackers, reset at sweep start and snapshotted at commit: a sweep at wandering RPM or a railed
@@ -4135,6 +4218,7 @@ volatile bool altCloudWipePending = false; // NK_AltWipePend: alt-health Start O
 volatile bool perfCloudWipePending = false; // NK_PerfWipePend: a boat-performance Clear All's or records import's cloud half still owed; suppresses boat-perf upload + sync-back
 uint8_t altHealthWindV = 0;                // NK_altWindV: winding the alt-health record is on; 0 until altHealthWindingInit
 volatile bool pendingSaveUserTableEdits = false;
+volatile bool tableSaveAnnounce = false;  // a /get table edit: saveUserTableEdits() says "saved" only once NVS took it
 volatile bool pendingSaveVesselInfo = false;
 bool pendingShutdownFlush = false;     // set on ignition-off edge; cleared after full flush
 bool shutdownNVSFlushDone = false;     // true once NVS+sensor window saved this shutdown
@@ -4459,7 +4543,7 @@ struct CapBothStage {
   int   pts[RPM_TABLE_SIZE];
   float hiA[RPM_TABLE_SIZE], hiW[RPM_TABLE_SIZE], loA[RPM_TABLE_SIZE], loW[RPM_TABLE_SIZE];
 };
-CapBothStage capBothStage;
+CapBothStage &capBothStage = PsramPlace::make<CapBothStage>();
 portMUX_TYPE capBothMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t capBothPersistStep = 0;   // 0 idle; 1..5 = next blob (rpmPoints, capTable, capPowerTable, capTableLo, capPowerTableLo)
 volatile uint8_t capBothStageGen  = 0;     // bumped per staging; a re-stage mid-sequence restarts at blob 1 instead of advancing
@@ -4565,6 +4649,8 @@ void mdnsPublishIdentity();
 // Access control + multi-regulator (3_functions.ino unless noted)
 bool settingsArmActive(AsyncWebServerRequest *request);   // 5_functions.ino
 bool gxFlagged(AsyncWebServerRequest *request);
+void gxDevicesHandle(AsyncWebServerRequest *request);   // POST /gxDevices, 4_functions.ino
+void gxDevicesForget();                                 // 3_functions.ino, at a demo switch
 bool gxParamDenied(AsyncWebServerRequest *request);
 void startGxSendTask();
 bool armTokenValid(AsyncWebServerRequest *request);
@@ -4673,6 +4759,9 @@ enum ShutdownPhase {
 ShutdownPhase shutdownPhase = SHUTDOWN_PHASE_NONE;
 uint32_t shutdownPhaseEntryMs = 0;
 uint32_t shutdownPhase2EntryMs = 0;
+// What the displays call Shutdown: the ramp is under way and GPIO4 not yet cut. After the cut the machine parks at phase 4
+// until the next field-on, and that is Off (CSV1 shutdownPhase reads 0, flags bit 5 clear).
+inline bool shutdownRampActive() { return shutdownPhase != SHUTDOWN_PHASE_NONE && !gpio4IsLow; }
 // Tunable parameters (expose in web UI)
 float DutySlowRampRate = 0.5f;      // %/sec - Phase 3 tail: the slowest the proportional decay may go, so the ramp reaches 0
 float ShutdownRampTauS = 4.0f;      // s - Phase 3 proportional decay time constant; ~2x the LM2907 coupling re-centering (20uF x 104.7k = 2.1 s) so the input tracks the shrinking stator swing. 0 = tail rate only
@@ -5364,7 +5453,7 @@ struct OwProbe {
   uint16_t failCount;
   bool     present;       // seen on the last enumeration
 };
-OwProbe  owProbes[OW_MAX_PROBES];
+OwProbe (&owProbes)[OW_MAX_PROBES] = PsramPlace::make<OwProbe[OW_MAX_PROBES]>();
 uint8_t  owProbeCount = 0;
 DeviceAddress tempRoleAddr[TR_COUNT];   // all-zero = unassigned
 bool     tempRoleAssigned[TR_COUNT];
@@ -5398,7 +5487,7 @@ volatile uint32_t tempFailSnapConn = 0, tempFailSnapEnum = 0, tempFailSnapCrc = 
 
 
 //VictronEnergy
-VeDirectFrameHandler myve;
+VeDirectFrameHandler &myve = PsramPlace::make<VeDirectFrameHandler>();
 // WIFI STUFF
 // WiFi wake button functionality (GPIO5)
 int WiFiWakeButton = 0;                           // Current button state (1=pressed)
@@ -5450,7 +5539,7 @@ int plotTimeWindow = 30;                    // Plot time window in seconds
 // WiFi provisioning settings persist in NVS as NK_ssid / NK_pass
 // Cached WiFi client credentials (loaded once, reused for reconnects)
 char cached_wifi_ssid[33] = "";  // 32 + null
-char cached_wifi_pass[65] = "";  // 64 + null
+char (&cached_wifi_pass)[65] = PsramPlace::make<char[65]>();  // 64 + null
 // Main task subscribes to the TWDT late in setup(); before that, esp_task_wdt_reset() feeds
 // nothing and just logs "task not found". Boot-path reset sites gate on this to stay silent.
 bool wdtMainTaskSubscribed = false;
@@ -5960,6 +6049,8 @@ void setup() {
     mbedtlsPsramHooked = true;
     Serial.println("mbedTLS allocator -> PSRAM (TLS no longer needs contiguous internal RAM)");
   }
+  Serial.printf("PSRAM statics: %lu B in PSRAM, %u fell back to internal RAM\n", (unsigned long)PsramPlace::psramBytes,
+                (unsigned)PsramPlace::internalFallbacks);
 
   // Allocate buffers from PSRAM
   configPayloadBuffer = (char *)ps_malloc(CONFIG_PAYLOAD_SIZE);
@@ -6173,6 +6264,8 @@ void setup() {
   memset(&ft_altHealth, 0, sizeof(FuncTiming));
   memset(&ft_altFold, 0, sizeof(FuncTiming));
   memset(&ft_boatPerf, 0, sizeof(FuncTiming));
+  memset(&ft_altEngine, 0, sizeof(FuncTiming));
+  memset(&ft_perfEngine, 0, sizeof(FuncTiming));
   memset(&ft_n2kTx, 0, sizeof(FuncTiming));
   memset(&ft_dvcc, 0, sizeof(FuncTiming));
   memset(&ft_n2kParse, 0, sizeof(FuncTiming));
@@ -6324,9 +6417,7 @@ void setup() {
   startGxSendTask();          // Victron GX stream sender (Core 0): loop() only marks finished frames, never waits on lwIP for the GX
 
   if (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED) {
-    Serial.println("Starting NTP sync...");
-    syncTimeFromNTP();
-    Serial.printf("Time synced. Timestamp: %lld\n", (long long)getCurrentTimestamp());
+    syncTimeFromNTP();  // sends the request only; ntpPoll() in loop() adopts the answer
   } else {
     // WiFi not up within the boot connect window: first NTP try ~60 s out, not 12 h (checkTimeSync's
     // throttle starts from lastTimeSyncAttempt = 0). Same fast-retry arm syncTimeFromNTP uses.
@@ -6459,13 +6550,16 @@ void loop() {
   ensureCore0Tasks();  // bring TempTask / httpsTask back after an OTA attempt; retry + alarm if they can't
   improvSerialPoll();  // USB installer handshake (4_functions.ino); returns at once when nothing is buffered
 
-  // Deferred reboot from /get?RebootRegulator — wait 2s so the HTTP 200 reaches the caller
+  // Deferred reboot (rebootRequestWhy says who asked) — wait 2s so the HTTP 200 reaches the caller
   if (importRebootDeadlineMs && !rebootRequested && (int32_t)(millis() - importRebootDeadlineMs) >= 0) {
+    rebootRequestWhy = REBOOT_WHY_IMPORT;
     rebootRequestedAt = millis();
     rebootRequested = true;   // a records import whose config import never followed
   }
   if (rebootRequested && millis() - rebootRequestedAt > 2000) {
-    Serial.println("=== REMOTE REBOOT (/get?RebootRegulator) ===");
+    const uint8_t why = (rebootRequestWhy < REBOOT_WHY_COUNT) ? rebootRequestWhy : REBOOT_WHY_REMOTE;
+    Serial.println(REBOOT_WHY_LINE[why]);
+    g_rebootIntent = why ? (REBOOT_INTENT_TAG | why) : 0;
     // The maintenance restart's ring, plot and usage saves (setup() restores them); flash writes only with the field cut.
     // Not its NVS or curve saves: imports and the config push reboot through here, and altHealthSave would overwrite
     // the altbaseSec a records import just wrote.
@@ -6494,7 +6588,7 @@ void loop() {
       ignNext = (Ignition == 1 || ignFirstPass || (uint32_t)(millis() - ignOnSinceMs) >= 1000UL) ? 1 : 0;
     }
     ignFirstPass = false;
-    if (IgnitionOverride == 1) ignNext = 1;  // force ON (bench / no ignition wire) — override can ONLY force on, never off
+    if (ignitionForcedOn()) ignNext = 1;  // force ON (Ignition Override: bench / no ignition wire; demo mode) — can ONLY force on, never off
     Ignition = ignNext;
   }
   // IgnitionOverride != 1 (Auto, default): no override — honor the real GPIO1 reading above
@@ -6704,7 +6798,8 @@ void loop() {
       if (!isnan(baroPressure)) {
         baroPressureHistory[baroHistoryHead] = (uint16_t)(baroPressure * 10.0f + 0.5f);
         baroHistoryHead = (baroHistoryHead + 1) % BARO_HISTORY_SIZE;
-        if (timeIsSynced) baroHistoryLastEpoch = timeBase + (currentTime - timeBaseMillis) / 1000;
+        if (demoPhase == DEMO_ON) baroHistoryLastEpoch = demoNowEpoch();   // the demo's clock, synced or not (its seed ends at entry)
+        else if (timeIsSynced) baroHistoryLastEpoch = timeBase + (currentTime - timeBaseMillis) / 1000;
       }
     }
 
@@ -7127,6 +7222,7 @@ void loop() {
         }
       }
 
+      ntpPoll();  // outside the cloud and field-cut gates: no network or flash work, and the boot request needs it too
       if (CloudFeatures == 1) {
         if (otaInProgress) {
           return;  // Skip during OTA
@@ -7339,6 +7435,8 @@ void loop() {
     ft_altHealth.worstWindow = 0;
     ft_altFold.worstWindow = 0;
     ft_boatPerf.worstWindow = 0;
+    ft_altEngine.worstWindow = 0;
+    ft_perfEngine.worstWindow = 0;
     ft_n2kTx.worstWindow = 0;
     ft_dvcc.worstWindow = 0;
     ft_n2kParse.worstWindow = 0;

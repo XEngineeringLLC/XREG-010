@@ -82,7 +82,7 @@ void fieldResUseDefault() {
 
 // Why a field resistance test may not start now, or nullptr. Read on the web task; the control pass starts the run.
 const char *frtRefuseReason(uint8_t method) {
-  static char busyMsg[96];
+  static char (&busyMsg)[96] = PsramPlace::make<char[96]>();
   const uint32_t now = millis();
   if (frt.state == FRT_RUNNING || frt.reqStart) return "A field resistance test is already running.";
   if (hardwarePresent != 1 || demoSeal) return "Not available in demo mode. Set Hardware Present to Yes to use it.";
@@ -923,9 +923,21 @@ enum Csv4Index {
   CSV4_panelForceFloatInput,    // switch panel FORCEFLOAT opto input (Cable 3 pin 7, GPIO40): 1 = wire energized = switch ON = asking for Maintain. Debounced pin state, reported whether or not PhysicalPanelOverride lets it steer anything
   CSV4_VictronSoc,              // VE.Direct battery monitor's own state of charge (% ×10; ROLL_EMPTY when stale, unsynced or not a battery monitor)
   CSV4_gxStreams,               // connected Victron GX streams (/gxevents clients)
+  // Power flow, one instant (powerFlowSample): A ×100, + = into the battery for flowBattA; ROLL_EMPTY = not measured
+  CSV4_flowBattA,               // battery current the regulator trusts (shunt, else the selected network monitor)
+  CSV4_flowAltA,                // alternator output current
+  CSV4_flowSolarA,              // battery-side solar current (0 with no array fitted)
+  CSV4_flowSrc,                 // battery source ×10 + solar source (codes at powerFlowSample)
+  CSV4_flowSolarSer,            // hash of the VE.Direct MPPT's serial while it is the solar source, else 0 (GX de-duplication)
+  // Demo only, the same instant: made-up GX devices inside the simulated plant, A ×100, ROLL_EMPTY outside demo (the GX
+  // bridge's FakeGx shows them, so its battery and the simulated battery are one sum)
+  CSV4_demoShoreA,              // shore charger output, into the battery
+  CSV4_demoFridgeA,             // fridge draw (a DC load meter on the GX)
+  CSV4_demoOrionA,              // Orion XS draw from the house bank (charging the start battery)
+  CSV4_demoInverterA,           // inverter draw (DC side)
   CSV4_sessionId,               // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV4_sendMs,                  // millis() when this payload was built
-  CSV4_FIELD_COUNT  // = 28
+  CSV4_FIELD_COUNT  // = 37
 };
 
 // CSV3 wire contract, declared ONCE: expanded into the Csv3Index enum, the snprintf format and argument list, and the
@@ -1798,7 +1810,7 @@ void accessRecoveryClear() {
 // dashboard writes both units' lists, so neither firmware trusts a claim made by the other.
 #define PAIR_MAX 8
 struct PairedUnit { char uid[17]; char name[33]; };
-static PairedUnit pairList[PAIR_MAX];
+static PairedUnit (&pairList)[PAIR_MAX] = PsramPlace::make<PairedUnit[PAIR_MAX]>();
 static uint8_t pairCount = 0;
 static const char PAIR_RS = '\x1e', PAIR_US = '\x1f';
 
@@ -2008,6 +2020,8 @@ static const uint32_t GX_IV[3][GX_CH_COUNT] = { { 500, 1000, 10000, 60000, 6000,
 static const char *const GX_TIER_NAME[3] = { "run", "stopped", "nap" };
 #define GX_RUN_HOLD_MS 30000UL    // the running schedule holds this long after the engine and field stop
 #define GX_FAST_HOLD_MS 60000UL   // GET /gxrate?fast=1 holds the running schedule this long
+#define GX_FLOW_HOLD_MS 60000UL   // GET /gxrate?flow=1 holds CSV4 at GX_FLOW_CSV4_MS this long (the GX power-flow tile)
+#define GX_FLOW_CSV4_MS 2000UL
 #define GX_STAGE_SIZE 8192        // >= PAYLOAD2_SIZE and PAYLOAD3_SIZE, the largest frames
 // Unacked frames on the GX link at which the sender waits (the frame stays owed); a connect sends a burst of every
 // channel, so the floor sits above a healthy burst.
@@ -2024,11 +2038,40 @@ static volatile bool gxKickPending = false;
 static volatile uint8_t gxStreamCount = 0;
 static volatile uint8_t gxTier = 1;
 static volatile uint32_t gxFastUntilMs = 0;   // 0 = no fast hold
+static volatile uint32_t gxFlowUntilMs = 0;   // 0 = no flow hold
 static uint32_t gxRunSeenMs = 0;
 static TaskHandle_t gxSendTaskHandle = nullptr;
 static char *gxStage = nullptr;
 static char *gxSide = nullptr;          // PSRAM copies of the side streams (built in stack buffers), GX_SIDE_SIZE each
 static bool gxLiveNow = false;          // Core 1: a GX stream is up and the sender runs (refreshed every SendWifiData pass)
+
+// The GX's device readings (POST /gxDevices, GX link 4) for the web app's Live Data > Integrations. RAM only, never NVS.
+// The handler (gxDevicesHandle, 4_functions.ino, async_tcp) is the only writer: it re-serializes the bridge's list into
+// gxDevText between two gxDevSeq increments (odd = mid-write). SendWifiData copies it out on Core 1 and checks the
+// sequence again, so neither side ever waits on the other. A demo switch (Core 1) only raises gxDevClearSeq: data at or
+// below it belongs to the other boat and reads as none.
+#define GXDEV_TEXT_SIZE 4096
+#define GXDEV_MAX 16
+#define GXDEV_EVERY_WATCHED_S 5      // the post interval asked for while a dashboard is connected
+#define GXDEV_EVERY_IDLE_S 30        // with none
+static char *gxDevText = nullptr;       // PSRAM: the "d" array as JSON
+static uint16_t gxDevLen = 0;
+static uint32_t gxDevAtMs = 0;          // millis() of the post (never 0 once one arrived)
+static uint8_t gxDevEveryS = 0;         // the interval that post was told
+static uint32_t gxDevSeq = 0;
+static uint32_t gxDevClearSeq = 0;      // Core 1
+static volatile bool gxDevKick = false; // a dashboard connected: send GxDevices at once
+// A dashboard connected: its first CSV2 and TS go on the next free passes, not up to 5 s / 3 s later, so a card that needs
+// a CSV2 state and a TS age (Charge-Limit Follow) is right after a reload. Built as usual; the 5 s / 3 s clock restarts.
+static volatile bool csv2Kick = false;
+static volatile bool tsKick = false;
+static volatile bool phoneLiveNow = false;   // Core 1, every SendWifiData pass: a dashboard stream is connected
+
+// Core 1, at a demo switch: the readings on hand are the other boat's until the next post.
+void gxDevicesForget() {
+  gxDevClearSeq = __atomic_load_n(&gxDevSeq, __ATOMIC_ACQUIRE) | 1u;
+  gxDevKick = true;
+}
 
 static bool gxFastActive(uint32_t now) {
   const uint32_t until = gxFastUntilMs;
@@ -2037,26 +2080,45 @@ static bool gxFastActive(uint32_t now) {
 
 static uint8_t gxTierEffective(uint32_t now) { return gxFastActive(now) ? 0 : gxTier; }
 
+static bool gxFlowActive(uint32_t now) {
+  const uint32_t until = gxFlowUntilMs;
+  return until && (int32_t)(until - now) > 0;
+}
+
+// The channel's GX interval now: the tier's, with CSV4 no slower than GX_FLOW_CSV4_MS under a flow hold.
+static uint32_t gxIv(uint8_t ch, uint32_t now) {
+  const uint32_t iv = GX_IV[gxTierEffective(now)][ch];
+  return (ch == 1 && iv > GX_FLOW_CSV4_MS && gxFlowActive(now)) ? GX_FLOW_CSV4_MS : iv;
+}
+
 #define GX_RATE_JSON_SIZE 320
+// devPost: the POST /gxDevices interval wanted now, ms (the answer's everyS), so the bridge moves the moment a dashboard
+// connects or the last one leaves instead of at its next post's answer
 void gxRateJson(char *out, size_t n) {
   const uint32_t now = millis();
   const uint8_t t = gxTierEffective(now);
-  const uint32_t *iv = GX_IV[t];
-  snprintf(out, n, "{\"tier\":\"%s\",\"fast\":%d,\"csv1\":%lu,\"csv4\":%lu,\"csv2\":%lu,\"csv3\":%lu,\"ts\":%lu,"
-                   "\"altLive\":%lu,\"perfLive\":%lu,\"motorLive\":%lu,\"altSettings\":%lu,\"perfSettings\":%lu}",
-           GX_TIER_NAME[t], gxFastActive(now) ? 1 : 0, (unsigned long)iv[0], (unsigned long)iv[1], (unsigned long)iv[2],
-           (unsigned long)iv[3], (unsigned long)iv[4], (unsigned long)iv[5], (unsigned long)iv[6], (unsigned long)iv[7],
-           (unsigned long)iv[8], (unsigned long)iv[9]);
+  uint32_t iv[GX_CH_COUNT];
+  for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) iv[ch] = gxIv(ch, now);
+  snprintf(out, n, "{\"tier\":\"%s\",\"fast\":%d,\"flow\":%d,\"csv1\":%lu,\"csv4\":%lu,\"csv2\":%lu,\"csv3\":%lu,\"ts\":%lu,"
+                   "\"altLive\":%lu,\"perfLive\":%lu,\"motorLive\":%lu,\"altSettings\":%lu,\"perfSettings\":%lu,\"devPost\":%lu}",
+           GX_TIER_NAME[t], gxFastActive(now) ? 1 : 0, gxFlowActive(now) ? 1 : 0, (unsigned long)iv[0], (unsigned long)iv[1],
+           (unsigned long)iv[2], (unsigned long)iv[3], (unsigned long)iv[4], (unsigned long)iv[5], (unsigned long)iv[6],
+           (unsigned long)iv[7], (unsigned long)iv[8], (unsigned long)iv[9],
+           (unsigned long)(phoneLiveNow ? GXDEV_EVERY_WATCHED_S : GXDEV_EVERY_IDLE_S) * 1000UL);
 }
 
 static void gxFastHold(bool on) {
   gxFastUntilMs = on ? ((millis() + GX_FAST_HOLD_MS) | 1UL) : 0;
   if (gxSendTaskHandle) xTaskNotifyGive(gxSendTaskHandle);   // a changed schedule goes out as GxRate
 }
+static void gxFlowHold(bool on) {
+  gxFlowUntilMs = on ? ((millis() + GX_FLOW_HOLD_MS) | 1UL) : 0;
+  if (gxSendTaskHandle) xTaskNotifyGive(gxSendTaskHandle);
+}
 
 // Core 1, every SendWifiData pass.
 static void gxTierUpdate(uint32_t now) {
-  if (g_engineSpinningNow || fieldActiveStatus != 0) gxRunSeenMs = now | 1UL;
+  if (g_engineSpinningNow || fieldActiveStatus != 0) gxRunSeenMs = now ? now : 1;
   const uint8_t t = (gxRunSeenMs && now - gxRunSeenMs < GX_RUN_HOLD_MS) ? 0 : (wifiNapActive ? 2 : 1);
   if (t != gxTier) {
     gxTier = t;
@@ -2077,14 +2139,14 @@ static inline void gxEndWrite(uint8_t ch, const char *buf, int len, size_t cap) 
 
 // GX-only frame gate: the GX's own interval, or at once after a connect.
 static inline bool gxDue(uint8_t ch, uint32_t now, uint32_t last, bool gxLive) {
-  return gxLive && (gxKick[ch] || now - last >= GX_IV[gxTierEffective(now)][ch]);
+  return gxLive && (gxKick[ch] || now - last >= gxIv(ch, now));
 }
 
 // force: the frame was built for the GX (no phone) or carries a settings change; otherwise a phone-paced frame is
 // passed on only at the GX's interval.
 static void gxOffer(uint8_t ch, uint32_t now, bool gxLive, bool force) {
   if (!gxLive || !gxSendTaskHandle) return;
-  if (!force && !gxKick[ch] && now - gxLastOfferMs[ch] < GX_IV[gxTierEffective(now)][ch]) return;
+  if (!force && !gxKick[ch] && now - gxLastOfferMs[ch] < gxIv(ch, now)) return;
   gxLastOfferMs[ch] = now;
   gxKick[ch] = false;
   __atomic_store_n(&gxWant[ch], 1, __ATOMIC_RELEASE);
@@ -2098,7 +2160,7 @@ void gxSideOffer(uint8_t ch, const char *buf, int len) {
   if (!gxLiveNow || !gxSide || ch < GX_CH_ALTLIVE || ch >= GX_CH_COUNT || xPortGetCoreID() != 1) return;
   if (len <= 0 || len >= GX_SIDE_SIZE) return;
   const uint32_t now = millis();
-  if (!gxKick[ch] && now - gxLastOfferMs[ch] + GX_SIDE_SLACK_MS < GX_IV[gxTierEffective(now)][ch]) return;
+  if (!gxKick[ch] && now - gxLastOfferMs[ch] + GX_SIDE_SLACK_MS < gxIv(ch, now)) return;
   char *slot = gxSide + (size_t)(ch - GX_CH_ALTLIVE) * GX_SIDE_SIZE;
   gxBeginWrite(ch);
   memcpy(slot, buf, (size_t)len);
@@ -2131,7 +2193,7 @@ static uint8_t gxCopyFrame(uint8_t ch) {
 }
 
 static void gxSendTask(void *) {
-  uint8_t sentTier = 0xFF, sentFast = 0xFF;
+  uint8_t sentTier = 0xFF, sentFast = 0xFF, sentFlow = 0xFF, sentPhone = 0xFF;
   for (;;) {
     bool owed = false;
     for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) owed |= __atomic_load_n(&gxWant[ch], __ATOMIC_ACQUIRE) != 0;
@@ -2144,13 +2206,16 @@ static void gxSendTask(void *) {
       continue;
     }
     const uint32_t now = millis();
-    const uint8_t tier = gxTierEffective(now), fast = gxFastActive(now) ? 1 : 0;
-    if (tier != sentTier || fast != sentFast) {
+    const uint8_t tier = gxTierEffective(now), fast = gxFastActive(now) ? 1 : 0, flow = gxFlowActive(now) ? 1 : 0;
+    const uint8_t phone = phoneLiveNow ? 1 : 0;
+    if (tier != sentTier || fast != sentFast || flow != sentFlow || phone != sentPhone) {
       char rate[GX_RATE_JSON_SIZE];
       gxRateJson(rate, sizeof(rate));
       if (gxEvents.send(rate, "GxRate") != AsyncEventSource::ENQUEUED) gxFramesDropped++;
       sentTier = tier;
       sentFast = fast;
+      sentFlow = flow;
+      sentPhone = phone;
     }
     for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) {
       if (!__atomic_load_n(&gxWant[ch], __ATOMIC_ACQUIRE)) continue;
@@ -2291,7 +2356,8 @@ void startPeerBrowseTask() {
   }
   strcpy(peersJson, "[]");
   peerMux = xSemaphoreCreateMutex();
-  if (xTaskCreatePinnedToCore(peerBrowseTask, "PeerBrowse", 5120, NULL, 1, &peerTaskHandle, 0) != pdPASS)
+  // PSRAM stack: this task must never reach flash (an NVS read or a file op asserts on a PSRAM stack).
+  if (xTaskCreatePinnedToCoreWithCaps(peerBrowseTask, "PeerBrowse", 5120, NULL, 1, &peerTaskHandle, 0, MALLOC_CAP_SPIRAM) != pdPASS)
     Serial.println("PEERS: task create failed");
 }
 
@@ -2740,6 +2806,7 @@ void setupWiFiConfigServer() {
     settingWrite(NK_first_config_done, "1");
     // ESPAsyncWebServer 3.x sends the response only after the handler returns, so an in-handler ESP.restart() drops the
     // 200 and leaves the portal stuck on "Saving..." (a chip reset sends no FIN/RST).
+    rebootRequestWhy = REBOOT_WHY_WIFI_SETUP;
     rebootRequestedAt = millis();
     rebootRequested = true;
   });
@@ -3247,10 +3314,10 @@ static void logClientWrite(AsyncWebServerRequest *request, const char *what) {
 // writes are never gated and never advance it; the caller decides whether to drop (an OFF never is). CW_SLOTS recent
 // tabs per parameter, round-robin. Built-in types only: the Arduino prototype generator emits this above any tab's structs.
 #define CW_SLOTS 4
-static char g_onOffWriteSrc[CW_SLOTS * 17] = { 0 };
+static char (&g_onOffWriteSrc)[CW_SLOTS * 17] = PsramPlace::make<char[CW_SLOTS * 17]>();
 static uint32_t g_onOffWriteN[CW_SLOTS] = { 0 };
 static uint8_t g_onOffWriteNext = 0;
-static char g_manualWriteSrc[CW_SLOTS * 17] = { 0 };
+static char (&g_manualWriteSrc)[CW_SLOTS * 17] = PsramPlace::make<char[CW_SLOTS * 17]>();
 static uint32_t g_manualWriteN[CW_SLOTS] = { 0 };
 static uint8_t g_manualWriteNext = 0;
 // isRepeat (out): n == last applied is the dashboard's ~500 ms hedge copy of an unanswered write; n below it is a
@@ -3705,6 +3772,9 @@ void setupServer() {
   Serial.println("=== SETTING UP MAIN SERVER ===");
 
   ensureWebFS();  // Mount appropriate web partition (prod_fs with factory_fs fallback)
+  // Route objects (~130 handlers, their URI Strings and list nodes, ~22 KB) are permanent and only touched by
+  // async_tcp, so they go to PSRAM. Opened after the web FS mount, closed before the listener starts.
+  PsramPlace::mallocWindow(true);
 
   server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request) {  // just get rid of annoying chrome Console error messages
     static const uint8_t blank[] = { 0 };
@@ -5143,7 +5213,7 @@ void setupServer() {
       if (n < 0) { request->send(400, "text/plain", "No records object in body"); return; }
       const bool thenConfig = request->hasParam("then") && request->getParam("then")->value() == "config";
       if (thenConfig) importRebootDeadlineMs = millis() + 30000UL;
-      else { rebootRequestedAt = millis(); rebootRequested = true; }
+      else { rebootRequestWhy = REBOOT_WHY_IMPORT; rebootRequestedAt = millis(); rebootRequested = true; }
       String resp = "{\"applied\":";
       resp += n; resp += ",\"reboot\":1}";
       request->send(200, "application/json", resp);
@@ -5190,7 +5260,7 @@ void setupServer() {
       bool classMoved = (settingRead(NK_BatteryVoltage) != preClassV)
                         || (settingRead(NK_FieldWindingV) + "/" + settingRead(NK_fieldWindApplied) != preWindV);   // a winding move converts the same way
       bool reboot = classMoved || !request->hasParam("noReboot") || request->getParam("noReboot")->value().toInt() == 0;
-      if (reboot) { rebootRequestedAt = millis(); rebootRequested = true; }
+      if (reboot) { rebootRequestWhy = REBOOT_WHY_IMPORT; rebootRequestedAt = millis(); rebootRequested = true; }
       String resp = "{\"applied\":";
       resp += n; resp += ",\"reboot\":"; resp += (reboot ? 1 : 0); resp += "}";
       request->send(200, "application/json", resp);
@@ -5634,6 +5704,10 @@ void setupServer() {
       request->send(503, "text/plain", "Leaving demo mode, try again in a moment.");
       return;
     }
+    if (demoExitCutWaiting() && request->hasParam("OnOff") && request->getParam("OnOff")->value().toInt() != 0) {
+      request->send(503, "text/plain", "Leaving demo mode, try again in a moment.");
+      return;
+    }
     if (demoSeal && demoParamDenied(request)) {
       demoRefuse(request);
       return;
@@ -5753,6 +5827,7 @@ void setupServer() {
         Serial.flush();
         // Deferred like every other reboot path: the 200 above is only written once this handler
         // returns, so restarting inline discarded it and left the caller waiting on a dead socket.
+        rebootRequestWhy = REBOOT_WHY_FACTORY;
         rebootRequestedAt = millis();
         rebootRequested = true;
         return;
@@ -8249,9 +8324,12 @@ void setupServer() {
     }
     if (request->hasParam("ResetDynamicAltZero")) {
       foundParameter = true;
-      ResetDynamicAltZero = 1;  // Set the flag - don't save to file as it's momentary
-      queueConsoleMessage("Alt Zero: Reset requested from web interface");
-      inputMessage = "1";
+      inputMessage = request->getParam("ResetDynamicAltZero")->value();
+      // the Auto Zero form also carries this field at 0 (older web apps send it on every Auto Zero toggle)
+      if (inputMessage.toInt() == 1) {
+        ResetDynamicAltZero = 1;  // Set the flag - don't save to file as it's momentary
+        queueConsoleMessage("Alt Zero: Reset requested from web interface");
+      }
     }
     if (paramOk(request, "WindingTempOffset")) {
       foundParameter = true;
@@ -8690,8 +8768,8 @@ void setupServer() {
     if (tableChangedThisRequest) {
       learningTableUpdated = true;  // ← update the global so buildConfigPayload() sees it
       rpmBreakpointsMoved(prevRPMPoints);
+      tableSaveAnnounce = true;
       pendingSaveUserTableEdits = true;  // deferred to Core 1 to avoid SSE gap
-      queueConsoleMessage("Learning: Table saved to NVS");
     }
 
     // Pre-commissioning "Charge Rate Limits" screen: seeds BOTH Low and High cap tables in one request,
@@ -9995,6 +10073,9 @@ void setupServer() {
       ft_altHealth.worstSession = 0;
       ft_altFold.worstSession = 0;
       ft_boatPerf.worstSession = 0;
+      ft_altEngine.worstSession = 0;
+      ft_perfEngine.worstSession = 0;
+      altJobWorstUs = 0; altJobWorstSpanMs = 0; altJobWorstLookups = 0; perfEngWorstSecUs = 0;
       ft_n2kTx.worstSession = 0;
       ft_dvcc.worstSession = 0;
       ft_n2kParse.worstSession = 0;
@@ -10133,6 +10214,7 @@ void setupServer() {
       lastNVSSaveTime = 0;
       // Dashboard-stream backpressure witnesses (/debug line + stall console lines)
       sseQueuePeak = 0;
+      sseQueueDeepestPeak = 0;
       sseStallCount = 0;
       sseStallLongestMs = 0;
       sseFramesDropped = 0;
@@ -10350,11 +10432,14 @@ void setupServer() {
   });
 
   // GX schedule: fast=1 holds the engine-running schedule for 60 s whatever the engine does (the GX repeats it while a
-  // page shows live data), fast=0 releases it. Cadence only; the GX still never counts as a watching dashboard.
+  // page shows live data), fast=0 releases it; flow=1 / flow=0 the same for CSV4 alone at 2 s (the power-flow tile).
+  // Cadence only; the GX still never counts as a watching dashboard.
   server.on("/gxrate", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
     const String fast = request->hasParam("fast") ? request->getParam("fast")->value() : String();
     if (fast.length()) gxFastHold(fast.toInt() != 0);
+    const String flow = request->hasParam("flow") ? request->getParam("flow")->value() : String();
+    if (flow.length()) gxFlowHold(flow.toInt() != 0);
     char rate[GX_RATE_JSON_SIZE];
     gxRateJson(rate, sizeof(rate));
     request->send(200, "application/json", rate);
@@ -10393,6 +10478,10 @@ void setupServer() {
              (unsigned)dvccState);
     request->send(200, "application/json", out);
   });
+
+  // The GX's device readings for the web app's Live Data > Integrations, posted by the GX bridge (GX link 4). Contract:
+  // claude_docs/firmware-internals.md, "Victron GX stream". RAM only, demo mode included; never the control loop.
+  server.on("/gxDevices", HTTP_POST, [](AsyncWebServerRequest *request) { gxDevicesHandle(request); });
 
   // Explicit routes for static assets, never via onNotFound. The flash fallback carries no-cache: for index.html
   // so a stale dashboard can't outlive an unreachable device, for the rest because this path has no ETag or
@@ -10456,9 +10545,13 @@ void setupServer() {
       Serial.printf("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
     }
     settingsDirty = true;  // send CSV3 immediately so new client gets current settings
+    gxDevKick = true;      // and the GX's device readings, which otherwise go out only when the GX posts
+    csv2Kick = true;       // and the live state (CSV2) and sensor ages (TS), not on their 5 s / 3 s schedule
+    tsKick = true;
     // AsyncTCP's ack timeout closes an event-source client outright (AsyncEventSourceClient::_onTimeout),
     // counted from the last write that got out, so at the 5 s default a radio stall destroys the stream.
     // 20 s rides out phone-hotspot stalls; a client that vanishes without a FIN holds its slot 20 s.
+    // The _xeng fork closes a client that acks but stops reading (zero window) on the same limit (_onPoll).
     if (client->client()) client->client()->setAckTimeout(20000);
     client->send("hello!", NULL, millis(), 10000);
   });
@@ -10481,11 +10574,13 @@ void setupServer() {
     gxStreamDrops++;
   });
   // MUST precede "/debug": a plain-string URI matches exact-or-prefix-with-slash and the server
-  // dispatches in registration order, so "/debug" registered first swallows both of these.
+  // dispatches in registration order, so "/debug" registered first swallows all of these.
   // Bench-only data-growth ceiling test; handlers live at the tail of 8_functions.ino.
   { void debugFillMax(AsyncWebServerRequest *); void debugClearMax(AsyncWebServerRequest *);
+    void debugFrontCheck(AsyncWebServerRequest *);
     server.on("/debug/fillmax",  HTTP_GET, [](AsyncWebServerRequest *r) { if (demoSeal) demoRefuse(r); else debugFillMax(r); });
-    server.on("/debug/clearmax", HTTP_GET, [](AsyncWebServerRequest *r) { if (demoSeal) demoRefuse(r); else debugClearMax(r); }); }
+    server.on("/debug/clearmax", HTTP_GET, [](AsyncWebServerRequest *r) { if (demoSeal) demoRefuse(r); else debugClearMax(r); });
+    server.on("/debug/frontcheck", HTTP_GET, [](AsyncWebServerRequest *r) { if (demoSeal) demoRefuse(r); else debugFrontCheck(r); }); }
 
   // Diagnostic endpoint to check partition and version
   server.on("/debug", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -10518,14 +10613,14 @@ void setupServer() {
     const char *faStateName = (faChanState == 1) ? "live" : (faChanState == 2) ? "RAILED-dormant (jumper open?)" : "off";
     // "PSRAM" = setup()'s mbedTLS calloc override is registered; the counts show where real TLS allocations landed.
     const char *tlsMem = mbedtlsPsramHooked ? "PSRAM" : "INTERNAL (override not registered)";
-    char out[3600];
+    char out[4200];
     int dpos = snprintf(out, sizeof(out),
              "Partition: %s\nVersion: %s\nFree heap: %lu\n"
              "Web FS %s: %d/%d KB used (%d%%) - boot seed, -1 = unread\n"
              "TLS buffers -> %s (mbedTLS allocations since boot: PSRAM %lu, internal fallback %lu, failed %lu)\n"
              "Heap walks (Core 0, field cut only): largest internal block %u KB %lus ago, largest PSRAM block %u KB %lus ago; free PSRAM %u B\n"
              "Net task cores (0/1=pinned, 2147483647=floating, -99=not found or no census yet): async_tcp=%d lwIP=%d\n"
-             "Dashboard stream: clients=%u queue=%u peak=%u/%u stalls=%lu longest=%.1fs dropped=%lu csv3=%uB peak=%uB of %uB\n"
+             "Dashboard stream: clients=%u queue avg=%u deepest=%u peak avg=%u deepest=%u cap=%u stalls=%lu longest=%.1fs dropped=%lu csv3=%uB peak=%uB of %uB\n"
              "GX stream: clients=%u queue=%u schedule=%s%s sender=%s sent=%lu held=%lu torn=%lu dropped=%lu disconnects=%lu\n"
              "AdjustField worst full pass (ms): total=%.1f | thermal=%.1f snapshot=%.1f fastov=%.1f modes=%.1f control=%.1f duty=%.1f tail=%.1f\n"
              "Field derate worst pass: %lu us (budget 500 us; part of snapshot above)\n"
@@ -10544,7 +10639,8 @@ void setupServer() {
              (unsigned)LargestPSRAMBlock, ageS(largestPsramAtMs),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              asyncTcpCore, lwipCore,
-             (unsigned)events.count(), (unsigned)sseQueueDepth, (unsigned)sseQueuePeak, (unsigned)SSE_MAX_QUEUED_MESSAGES,
+             (unsigned)events.count(), (unsigned)sseQueueDepth, (unsigned)sseQueueDeepest,
+             (unsigned)sseQueuePeak, (unsigned)sseQueueDeepestPeak, (unsigned)SSE_MAX_QUEUED_MESSAGES,
              (unsigned long)sseStallCount, sseStallLongestMs / 1000.0f, (unsigned long)sseFramesDropped,
              (unsigned)csv3LastLen, (unsigned)csv3PeakLen, (unsigned)PAYLOAD3_SIZE,
              (unsigned)gxEvents.count(), (unsigned)gxEvents.avgPacketsWaiting(), GX_TIER_NAME[gxTierEffective(now)],
@@ -10569,6 +10665,11 @@ void setupServer() {
              faStateName, faAttenIs12 ? "12" : "6",
              (unsigned long)faWindowsAccepted, (unsigned long)faWindowsDiscarded,
              (unsigned)faCellsUsed, faSesPkpkWorstA, faSesPeakWorstA, faSesPeakWorstHz);
+    if (dpos > 0 && dpos < (int)sizeof(out) - 64) {
+      int n = frontEngineDebugLine(out + dpos, sizeof(out) - dpos);
+      if (n > 0) dpos += n;
+      if (dpos > (int)sizeof(out) - 1) dpos = (int)sizeof(out) - 1;
+    }
     // Floating-task census: a core=FLOAT (tskNO_AFFINITY) task above the priority-1 loop task can land on
     // Core 1 and stall it.
     if (dpos > 0 && dpos < (int)sizeof(out) - 64) {
@@ -10759,7 +10860,7 @@ void setupServer() {
     pairListAppendJson(idBuf);
     idBuf += ",\"peers\":";
     peerListAppendJson(idBuf);
-    idBuf += ",\"gx\":3";   // Victron GX link version: 2 = /gxevents, /gxrate, /gxStatus and gx=1 writes; 3 adds /gxLimits
+    idBuf += ",\"gx\":4";   // Victron GX link version: 2 = /gxevents, /gxrate, /gxStatus and gx=1 writes; 3 adds /gxLimits; 4 adds /gxDevices
     idBuf += ",\"demo\":";  // 1 = demo mode (simulated boat): a GX must not log or forward these values
     idBuf += demoSeal ? "1" : "0";
     idBuf += "}";
@@ -11819,6 +11920,7 @@ void setupServer() {
   demoRegisterRoutes();   // GET /demoBackfill (9_demo.ino)
   server.addHandler(&events);
   server.addHandler(&gxEvents);
+  PsramPlace::mallocWindow(false);
   server.begin();
   Serial.println("=== MAIN SERVER STARTED ===");
   Serial.println("=== MAIN SERVER SETUP COMPLETE ===");
@@ -11961,15 +12063,21 @@ void checkWiFiConnection() {
 // Queue depth at which a client's link counts as stalled. A healthy link holds 0-1 messages (the
 // frame in flight until its ack); 4 means no ack for several frames.
 static const uint16_t SSE_BACKLOG_DEPTH = 4;
+// A client whose queue has held messages this long with no ack has stopped draining (a stopped tab, a link in a retransmit
+// wait): the backlog gate and the current-state channels leave it out while another client drains, so it holds back no one.
+static const uint32_t SSE_STALLED_MS = 1000;
+static volatile bool sseLeaveStalledOut = false;   // last 10 Hz census: a client stalled while another drains
 // Every dashboard event goes out through here so a full client queue is counted instead of silent.
-void sseSend(const char *msg, const char *evt) {
+void sseSend(const char *msg, const char *evt, bool toStalled) {
   if (events.count() == 0) return;
-  if (events.send(msg, evt) != AsyncEventSource::ENQUEUED) sseFramesDropped++;
+  const AsyncEventSource::SendStatus st = (toStalled || !sseLeaveStalledOut) ? events.send(msg, evt)
+                                                                           : events.sendSkipStalled(msg, evt, SSE_STALLED_MS);
+  if (st != AsyncEventSource::ENQUEUED) sseFramesDropped++;
 }
-// True while a client's queue is backed up (TCP not draining). CSV1 keeps sending so the queue budget
+// True while the draining clients' queues are backed up (TCP not draining). CSV1 keeps sending so the queue budget
 // is spent on plot frames; the periodic channels wait it out and resend on their next tick, which
 // costs nothing because they carry current state, not history.
-bool sseBacklogged() { return sseQueueDepth >= SSE_BACKLOG_DEPTH; }
+bool sseBacklogged() { return sseGateDepth >= SSE_BACKLOG_DEPTH; }
 void SendWifiData() {
   unsigned long start66 = micros();
   // === THROTTLED WIFI CHECKS (every 2 seconds) ===
@@ -11989,6 +12097,10 @@ void SendWifiData() {
   uint8_t sseClients = (uint8_t)events.count();
   // phoneLive keeps every phone gate exactly as it was; with no phone, a connected GX gets frames built on its schedule.
   const bool phoneLive = sseClients > 0;
+  if (phoneLive != phoneLiveNow) {
+    phoneLiveNow = phoneLive;
+    if (gxSendTaskHandle) xTaskNotifyGive(gxSendTaskHandle);   // GxRate devPost: the bridge's post interval follows at once
+  }
   const uint8_t gxStreamsNow = gxStreamCount;
   const bool gxLive = gxStreamsNow > 0 && gxSendTaskHandle != nullptr;
   gxLiveNow = gxLive;
@@ -12006,20 +12118,35 @@ void SendWifiData() {
                            (now - sseDownSinceMs) / 1000.0f, (unsigned)sseDropCount);
     sseDownSinceMs = 0;
   }
+  // onConnect sets its kicks before the library lists the client (AsyncEventSource::_addClient), and a pass in that gap
+  // spends them on the GX or the pages already open: a newly listed dashboard arms them again.
+  if (sseClients > sseLastClients) {
+    settingsDirty = true;
+    gxDevKick = true;
+    csv2Kick = true;
+    tsKick = true;
+  }
   sseLastClients = sseClients;
 
-  // Backpressure witness, 10 Hz: a stall is logged when the queue empties again, sized from first backlog to
-  // full drain. Console lines queued during it arrive after the drain (trySendConsoleSSE is a gated channel).
+  // Backpressure witness, 10 Hz: a stall is logged when every queue is empty again, sized from the first client's backlog
+  // to full drain, with that client's own depth. Console lines wait while the draining clients are backed up
+  // (trySendConsoleSSE is a gated channel) and queue behind a stalled client's backlog.
   static uint32_t sseDepthPollMs = 0, sseStallStartMs = 0, sseStallDropsAtStart = 0;
   static uint16_t sseStallPeak = 0;
   if (now - sseDepthPollMs >= 100) {
     sseDepthPollMs = now;
-    sseQueueDepth = sseClients ? (uint16_t)events.avgPacketsWaiting() : 0;
+    const AsyncEventSource::QueueCensus q = events.queueCensus(SSE_STALLED_MS);
+    sseQueueDepth = sseClients ? (uint16_t)q.avg : 0;
+    sseQueueDeepest = (uint16_t)q.deepest;
+    // with every client stalled there is no one to leave out: the gate is the plain average, as with one client
+    sseLeaveStalledOut = q.stalled && q.stalled < q.clients;
+    sseGateDepth = sseClients ? (uint16_t)(sseLeaveStalledOut ? q.drainingAvg : q.avg) : 0;
     if (sseQueueDepth > sseQueuePeak) sseQueuePeak = sseQueueDepth;
-    if (sseQueueDepth >= SSE_BACKLOG_DEPTH) {
+    if (sseQueueDeepest > sseQueueDeepestPeak) sseQueueDeepestPeak = sseQueueDeepest;
+    if (sseQueueDeepest >= SSE_BACKLOG_DEPTH) {
       if (!sseStallStartMs) { sseStallStartMs = now; sseStallPeak = 0; sseStallDropsAtStart = sseFramesDropped; }
-      if (sseQueueDepth > sseStallPeak) sseStallPeak = sseQueueDepth;
-    } else if (sseStallStartMs && sseQueueDepth == 0) {
+      if (sseQueueDeepest > sseStallPeak) sseStallPeak = sseQueueDeepest;
+    } else if (sseStallStartMs && sseQueueDeepest == 0) {
       uint32_t stallMs = now - sseStallStartMs;
       sseStallStartMs = 0;
       if (stallMs >= 1000) {
@@ -12158,7 +12285,7 @@ void SendWifiData() {
                                SafeInt(imu_yaw_rate_dps, 100),
                                SafeInt(imu_total_accel_g, 1000),
                                SafeInt((int32_t)((millis() - perfCountersResetMs) / 1000UL)),  // seconds since perf-counters reset (0 = boot)
-                               SafeInt(shutdownPhase),
+                               SafeInt(shutdownRampActive() ? (int)shutdownPhase : 0),
                                SafeInt(BatteryV, 100),                  // raw ADS1115
                                SafeInt(pidAltPV, 100),  // CSV1_pidAltPV
                                SafeInt(ChargingVoltageTarget * 100),
@@ -12201,7 +12328,7 @@ void SendWifiData() {
       return;
     }
 
-    sseSend(payload1, "CSVData");
+    sseSend(payload1, "CSVData", true);
     gxOffer(0, now, gxLive, !phoneLive);
     SendWifiTime = micros() - start66;
     prev_millis5 = now;
@@ -12221,11 +12348,19 @@ void SendWifiData() {
         return;
       }
     }
+    float flowBattA, flowAltA, flowSolarA;
+    int flowSrc;
+    uint32_t flowSolarSer;
+    powerFlowSample(flowBattA, flowAltA, flowSolarA, flowSrc, flowSolarSer);
+    float demoShoreA, demoFridgeA, demoOrionA, demoInverterA;
+    demoGxDeviceAmps(demoShoreA, demoFridgeA, demoOrionA, demoInverterA);
     gxBeginWrite(1);
     int payload4Len = snprintf(payload4, PAYLOAD4_SIZE,
                                "%d,"  // CSV4_FIELD_COUNT
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+                               "%d,%d,%d,%d,"
+                               "%d,%d,%d,%d,%d,"
                                "%d,%d,%d,%d,"
                                "%u,%u",  // +2: sessionId, sendMs
 
@@ -12236,7 +12371,7 @@ void SendWifiData() {
                                !isfinite(STWNMEA) ? ROLL_EMPTY : SafeInt(STWNMEA, 100),                                  // CSV4_STWNMEA (knots ×100)
                                SafeInt(ApparentWindSpeedNMEA, 100),      // CSV4_ApparentWindSpeedNMEA
                                SafeInt(ApparentWindAngleNMEA),           // CSV4_ApparentWindAngleNMEA
-                               // NAN (no wind instrument / target bearing / boat speed) -> ROLL_EMPTY; SafeInt's -1 would read as real.
+                               // NAN (no wind instrument / target bearing / boat speed) -> ROLL_EMPTY; SafeInt maps NaN the same way, so the test is redundant.
                                !isfinite(TrueWindSpeedNMEA) ? ROLL_EMPTY : SafeInt(TrueWindSpeedNMEA, 100),                // CSV4_TrueWindSpeedNMEA
                                !isfinite(TrueWindAngleNMEA) ? ROLL_EMPTY : SafeInt(TrueWindAngleNMEA),                     // CSV4_TrueWindAngleNMEA
                                !isfinite(LeewayNMEA) ? ROLL_EMPTY : SafeInt(LeewayNMEA),                                   // CSV4_LeewayNMEA
@@ -12257,6 +12392,15 @@ void SendWifiData() {
                                (int)panelForceFloatInput,                // CSV4_panelForceFloatInput
                                SafeInt(veSocFresh() ? VictronSoc : NAN, 10),  // CSV4_VictronSoc
                                (int)gxStreamsNow,                        // CSV4_gxStreams
+                               SafeInt(flowBattA, 100),                  // CSV4_flowBattA
+                               SafeInt(flowAltA, 100),                   // CSV4_flowAltA
+                               SafeInt(flowSolarA, 100),                 // CSV4_flowSolarA
+                               flowSrc,                                  // CSV4_flowSrc
+                               (int)flowSolarSer,                        // CSV4_flowSolarSer (31 bits, never negative)
+                               SafeInt(demoShoreA, 100),                 // CSV4_demoShoreA
+                               SafeInt(demoFridgeA, 100),                // CSV4_demoFridgeA
+                               SafeInt(demoOrionA, 100),                 // CSV4_demoOrionA
+                               SafeInt(demoInverterA, 100),              // CSV4_demoInverterA
                                (unsigned)g_sessionId,                    // CSV4_sessionId
                                (unsigned)millis()                        // CSV4_sendMs
     );
@@ -12277,7 +12421,7 @@ void SendWifiData() {
   // gate, so the UI phase-progress display stays within one poll tick of the firmware.
   const bool sysIDRunning = (systemIDActive != 0);
   if ((sysIDRunning || !sentSomething)
-      && (phoneLive ? (now - lastpayload2send >= (sysIDRunning ? 500UL : 5000UL)) : gxDue(2, now, lastpayload2send, gxLive))
+      && (phoneLive ? (csv2Kick || now - lastpayload2send >= (sysIDRunning ? 500UL : 5000UL)) : gxDue(2, now, lastpayload2send, gxLive))
       && !sseBacklogged()) {
     static char *payload2 = nullptr;
     // Sized by the ~7 B/field rule rather than the observed frame, because an overflow returns early
@@ -12826,7 +12970,7 @@ void SendWifiData() {
                                SafeInt(loopFieldOnSes / 1000),
                                !isfinite(tempFiltered) ? ROLL_EMPTY : SafeInt(tempFiltered, 100),   // NAN until the first sane read -> "—", never a real -0.01F in the thermal plot
                                SafeInt(outerImpliedPenalty, 100),
-                               SafeInt((tempPIDActive ? (1 << 0) : 0) | (sysMode == SYS_MODE_AUTO ? (1 << 4) : 0) | (shutdownPhase != SHUTDOWN_PHASE_NONE ? (1 << 5) : 0)),
+                               SafeInt((tempPIDActive ? (1 << 0) : 0) | (sysMode == SYS_MODE_AUTO ? (1 << 4) : 0) | (shutdownRampActive() ? (1 << 5) : 0)),
                                SafeInt(thermalAntiWindupLatch ? 1 : 0),
                                SafeInt(pf_last_ms),
                                SafeInt(pf_avg_10s, 100),
@@ -13036,6 +13180,7 @@ void SendWifiData() {
     } else {
       // PASS 2 — send the payload built last pass (cheap ~1.3 ms; kept off the build pass).
       uint32_t _csv2s0 = micros();   // CSV2 send-cost timer (events.send → AsyncTCP)
+      csv2Kick = false;              // before the send: a dashboard connecting after this line gets the next frame
       sseSend(payload2, "CSVData2");
       csv2SendLastUs = micros() - _csv2s0;
       if (csv2SendLastUs > csv2SendWorstUs) csv2SendWorstUs = csv2SendLastUs;
@@ -13080,7 +13225,7 @@ void SendWifiData() {
     csv3LastLen = (uint16_t)payload3Len;
     if (csv3LastLen > csv3PeakLen) csv3PeakLen = csv3LastLen;
 
-    sseSend(payload3, "CSVData3");
+    sseSend(payload3, "CSVData3", true);
     gxOffer(3, now, gxLive, !phoneLive || csv3Dirty);   // a settings change reaches the GX at once
     lastpayload3send = now;
     lastEventSourceSend = now;
@@ -13088,7 +13233,7 @@ void SendWifiData() {
   }
 
   // PRIORITY 6: TimestampData (staleness data - every 3 seconds)
-  if (!sentSomething && (phoneLive ? (now - lastTimestampSend >= 3000) : gxDue(4, now, lastTimestampSend, gxLive)) && !sseBacklogged()) {
+  if (!sentSomething && (phoneLive ? (tsKick || now - lastTimestampSend >= 3000) : gxDue(4, now, lastTimestampSend, gxLive)) && !sseBacklogged()) {
 
     static char *timestampPayload = nullptr;
     static const size_t TIMESTAMP_PAYLOAD_SIZE = 512;  // every field is an age and the weather one can be 10 digits; an overflow kills TS until reboot
@@ -13166,11 +13311,48 @@ void SendWifiData() {
       return;
     }
 
+    tsKick = false;   // before the send, as csv2Kick
     sseSend(timestampPayload, "TimestampData");
     gxOffer(4, now, gxLive, !phoneLive);
     lastTimestampSend = now;
     lastEventSourceSend = now;
     sentSomething = true;
+  }
+
+  // PRIORITY 7: GxDevices, the GX's device readings (POST /gxDevices), JSON: {"v":1,"ageMs":ms since the post or null
+  // (none since boot or the last demo switch),"everyS":the interval that post was told,"d":[{"k","n","p","a","age","on"}]}.
+  // Sent when a post lands and at once to a dashboard that connects; the page ages it from there. Dashboards only: the
+  // GX has these readings already.
+  static uint32_t gxDevSentSeq = 0;
+  if (!sentSomething && phoneLive && (gxDevKick || __atomic_load_n(&gxDevSeq, __ATOMIC_ACQUIRE) != gxDevSentSeq)
+      && !sseBacklogged()) {
+    static char *gxDevCopy = nullptr, *gxDevOut = nullptr;
+    if (!gxDevCopy) gxDevCopy = (char *)ps_malloc(GXDEV_TEXT_SIZE);
+    if (!gxDevOut) gxDevOut = (char *)ps_malloc(GXDEV_TEXT_SIZE + 96);
+    const uint32_t s1 = __atomic_load_n(&gxDevSeq, __ATOMIC_ACQUIRE);
+    if (gxDevCopy && gxDevOut && !(s1 & 1u)) {
+      const char *src = __atomic_load_n(&gxDevText, __ATOMIC_RELAXED);
+      const uint16_t len = __atomic_load_n(&gxDevLen, __ATOMIC_RELAXED);
+      const uint32_t at = __atomic_load_n(&gxDevAtMs, __ATOMIC_RELAXED);
+      const uint8_t every = __atomic_load_n(&gxDevEveryS, __ATOMIC_RELAXED);
+      const bool have = src && len > 1 && len < GXDEV_TEXT_SIZE && at && s1 > gxDevClearSeq;
+      if (have) memcpy(gxDevCopy, src, len);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&gxDevSeq, __ATOMIC_RELAXED) == s1) {   // else the handler wrote meanwhile: next pass
+        gxDevCopy[have ? len : 0] = '\0';
+        char age[16];
+        // a post stamped on Core 0 after this pass sampled `now` is 0 ms old, not 49 days
+        if (have) snprintf(age, sizeof(age), "%lu", (unsigned long)((int32_t)(now - at) > 0 ? now - at : 0));
+        else snprintf(age, sizeof(age), "null");
+        const int n = snprintf(gxDevOut, GXDEV_TEXT_SIZE + 96, "{\"v\":1,\"ageMs\":%s,\"everyS\":%u,\"d\":%s}", age,
+                               (unsigned)every, have ? gxDevCopy : "[]");
+        gxDevKick = false;
+        gxDevSentSeq = s1;
+        if (n > 0 && n < GXDEV_TEXT_SIZE + 96) sseSend(gxDevOut, "GxDevices");
+        lastEventSourceSend = now;
+        sentSomething = true;
+      }
+    }
   }
 }
 // CLOUD FEATURES STUFF BELOW

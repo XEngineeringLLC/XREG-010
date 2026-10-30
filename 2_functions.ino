@@ -1051,7 +1051,7 @@ void commissionClearRpmDependents() {
 // network task); cxStartPersistService() retires ONE commit per loop() pass. commissionState=1 is committed
 // LAST, so a persisted state byte proves the whole restore point is on flash. The wizard advances only on
 // /cxStartState IDLE — HTTP 200 means accepted, not saved.
-static char  cxStartTuneCsv[320];   // scalar tune at the click — origin snapshot AND step baseline
+static char (&cxStartTuneCsv)[320] = PsramPlace::make<char[320]>();   // scalar tune at the click — origin snapshot AND step baseline
 static float cxStartMinDuty[RPM_TABLE_SIZE], cxStartKneeFloor[RPM_TABLE_SIZE], cxStartKneeKnee[RPM_TABLE_SIZE];
 static bool  cxStartKneeFrozen[RPM_TABLE_SIZE];
 static float cxStartKneeFitA;
@@ -3833,6 +3833,7 @@ void buildLongTermRecord(LongTermRecord &rec) {
     rec.lon_avg = (int32_t)(currentWindow->lon_current * 100000.0);
     rec.validMask |= (1u << 23);
   }
+  LT_ENV(battTemp,    battTemp,    10, 24);   // v5 tail
   rec.chargeStage = getChargeStageDisplayCode();
 
   // Coverage = active/observed in 0.5% steps, ROUNDED: <0.25% engine time rounds to 0 = "engine never ran"
@@ -4042,7 +4043,7 @@ void zeroLogService() {
     zeroLogShiftAmps(d);
     zeroFitShiftAmps(d);
     zeroBasisA = off;
-    basisMovedMs = millis() | 1u;
+    basisMovedMs = millis() ? millis() : 1;
   }
   if (!zeroLogRing || !ZeroLogEnable) return;
   uint32_t now = millis();
@@ -5631,6 +5632,23 @@ void loadUsageAccum() {
   fsReleaseLock();
 }
 
+// lwIP sends the first SNTP request after a random 0-5 s startup delay (CONFIG_LWIP_SNTP_MAXIMUM_STARTUP_DELAY in the core's
+// sdkconfig) and re-sends a lost one to the next server 15 s later (SNTP_RECV_TIMEOUT), then keeps taking the servers in
+// turn every 15 s, so loop() polls for the answer and nothing waits on it: Core 1 runs the control loop.
+const uint32_t NTP_ANSWER_WINDOW_MS = 25000UL;
+uint32_t ntpRequestSentMs = 0;  // 0 = no request out
+bool ntpMissLogged = false;     // the window ran out; lwIP is still asking, so a later answer is adopted until the retry
+
+// AUTO: NTP only when BOTH NMEA SystemTime and phone time are stale; NTP-forced always; NMEA/Phone-forced never.
+bool ntpTimeWanted() {
+  if (timeSourceMode == TSRC_NTP) return true;
+  if (timeSourceMode != TSRC_AUTO) return false;
+  unsigned long now = millis();
+  bool nmeaTimeFresh  = (lastNmea2kSystemTimeMs > 0) && (now - lastNmea2kSystemTimeMs < NMEA_TIME_FRESH_MS);
+  bool phoneTimeFresh = (lastPhoneTimeMs > 0) && (now - lastPhoneTimeMs < PHONE_FRESH_MS);
+  return !nmeaTimeFresh && !phoneTimeFresh;
+}
+
 void syncTimeFromNTP() {
   if (otaInProgress) {
     return;  // Skip during OTA — don't arm fast retry; OTA path is brief.
@@ -5645,47 +5663,39 @@ void syncTimeFromNTP() {
   }
 
   Serial.println("Starting NTP sync...");
-  // Hold core0Busy so RunAlternator will not enable the field while we block
-  // on the SNTP wait. Cleared on all exit paths below.
-  core0Busy = true;
-  esp_task_wdt_reset();
-
-  // Reset sync status BEFORE configTime(): sntp_init() fires a request immediately, and resetting after could
+  // Reset sync status BEFORE configTime(): the startup delay can be 0, and resetting after could
   // wipe a COMPLETED that already landed. Not getLocalTime(): it only tests tm_year > 2016, so the stale soft
   // clock restoreSoftClock() puts up on a cold boot passes instantly — stamping a days-old epoch TIME_NTP, which
   // also blocks syncTimeFromPhone() (it bypasses its 24 h skew guard only for a clock that is not real, clockIsReal()).
   sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  ntpRequestSentMs = millis() | 1;
+  ntpMissLogged = false;
+  lastTimeSyncAttempt = millis();  // holds checkTimeSync() off while the request is out; ntpPoll() arms the retry on a miss
+}
 
-  // Single-shot 3 s wait, no retry loop: checkTimeSync() retries on its TIME_SYNC_INTERVAL cadence, and a loop
-  // would block Core 1 for seconds if NTP is down. sntp_get_sync_status() self-clears on the read that returns
-  // COMPLETED, so read it once.
-  bool sntpAnswered = false;
-  uint32_t sntpWaitStart = millis();
-  while (millis() - sntpWaitStart < 3000) {
-    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) { sntpAnswered = true; break; }
-    delay(10);
-  }
-  esp_task_wdt_reset();
-
-  if (sntpAnswered) {
+// Every loop() pass, no wait. sntp_get_sync_status() self-clears on the read that returns COMPLETED, so read it once.
+void ntpPoll() {
+  if (ntpRequestSentMs == 0) return;
+  if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+    ntpRequestSentMs = 0;
+    lastTimeSyncAttempt = millis();
+    if (!ntpTimeWanted()) return;  // NMEA or phone time arrived, or the source setting changed, while the request was out
     timeBase = time(nullptr);
     timeBaseMillis = millis();
     timeIsSynced = true;
     currentTimeSource = TIME_NTP;
     clockRealTag = CLOCK_REAL_TAG;
-    lastTimeSyncAttempt = millis();
 
     queueConsoleMessage("Time synced from NTP");
     Serial.printf("NTP synced: epoch=%lld\n", (long long)timeBase);
-    core0Busy = false;
     return;
   }
-
+  if (ntpMissLogged || millis() - ntpRequestSentMs < NTP_ANSWER_WINDOW_MS) return;
+  ntpMissLogged = true;
   Serial.println("NTP sync attempt failed");
   // Arm fast retry — only successful syncs get the full 12h throttle.
   lastTimeSyncAttempt = millis() - (TIME_SYNC_INTERVAL - 60000UL);
-  core0Busy = false;
 }
 
 bool canUploadNow() {
@@ -5913,7 +5923,7 @@ static void filtRippleWinReset(float rpm, uint32_t now) {
 // slopeVpsX1000: worst positive slope of g_cvKdFiltV over the window (V/s, min-of-halves) — the CV
 // D-term deadband measurement. 0 = slope ring hadn't spanned a full diff window yet (browser skips).
 struct BcurRtestPt { uint16_t rpm; uint16_t iX100; uint16_t pkpkX100; uint16_t iAltX100; uint16_t altPkpkX100; uint16_t slopeVpsX1000; };
-BcurRtestPt bcurRtest[BCUR_RTEST_CAP];
+BcurRtestPt (&bcurRtest)[BCUR_RTEST_CAP] = PsramPlace::make<BcurRtestPt[BCUR_RTEST_CAP]>();
 volatile bool bcurRtestActive = false;
 volatile uint16_t bcurRtestCount = 0;  // appends stop at CAP; browser stops well before
 // Wizard-commanded current levels for the resonance test (§3.2): when active, the control loop drives the
@@ -5937,7 +5947,7 @@ volatile bool ripScoreArmed = false;
 // (otherX100 = averaged partner). Overwrites oldest; a torn row is a harmless stale read.
 #define RIP_FORENSIC_CAP 32
 struct RipForensicPt { uint16_t rpm, ampLo, meanX100, pkpkX100, shiftX100, cmdTravelX100, crossings, otherX100; uint8_t detector; char event; };
-RipForensicPt ripForensic[RIP_FORENSIC_CAP];
+RipForensicPt (&ripForensic)[RIP_FORENSIC_CAP] = PsramPlace::make<RipForensicPt[RIP_FORENSIC_CAP]>();
 volatile uint16_t ripForensicHead = 0;    // next write slot (wraps)
 volatile uint16_t ripForensicCount = 0;   // total fold events recorded (saturates)
 static void ripForensicPush(uint8_t det, uint16_t rpm, int ampLo, float meanA, uint16_t pkpkX100,

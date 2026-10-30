@@ -128,7 +128,7 @@
 
 </head>
 
-<body><iframe name="hidden-form" style="display:none"></iframe>
+<body class="awaiting-echo"><iframe name="hidden-form" style="display:none"></iframe>
 
   <!-- Boat loading splash: visible by default and themed by the inline script below so a Capacitor cold launch
        paints with no flash; hidden on the first CSVData packet (hideWaitingForRegulator) or demo start.
@@ -1211,9 +1211,9 @@
                         <div class="form-input">
                           <form action="/get" method="GET" target="hidden-form">
                             <span class="toggle-label">Off</span>
-                            <label class="switch">
+                            <label class="switch echo-pending">
                               <input id="kneeLearnEnable_checkbox" type="checkbox"
-                                onchange="document.getElementById('kneeLearnEnable').value = this.checked ? '1' : '0'; this.form.submit(); submitMessage();" />
+                                onchange="document.getElementById('kneeLearnEnable').value = this.checked ? '1' : '0'; pollToggleWrite(this, 'kneeLearnEnable', fetchKneeLearnState); submitMessage();" />
                               <span class="slider round"></span>
                             </label>
                             <span class="toggle-label">On</span>
@@ -1324,9 +1324,9 @@
                         <div class="form-input">
                           <form action="/get" method="GET" target="hidden-form">
                             <span class="toggle-label">Off</span>
-                            <label class="switch">
+                            <label class="switch echo-pending">
                               <input id="kneeTempComp_checkbox" type="checkbox"
-                                onchange="document.getElementById('kneeTempComp').value = this.checked ? '1' : '0'; this.form.submit(); submitMessage();" />
+                                onchange="document.getElementById('kneeTempComp').value = this.checked ? '1' : '0'; pollToggleWrite(this, 'kneeTempComp', fetchKneeLearnState); submitMessage();" />
                               <span class="slider round"></span>
                             </label>
                             <span class="toggle-label">On</span>
@@ -1785,7 +1785,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="setpointSlewEnable_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('setpointSlewEnable_checkbox', 'setpointSlewEnable', 'setpointSlewEnable')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('setpointSlewEnable_checkbox', 'setpointSlewEnable', 'setpointSlewEnable')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -2057,7 +2057,7 @@
                         <button type="button" class="cap-mode-btn" data-checked="1" onclick="abSegClick(this)">Thermistor</button>
                       </div>
                       <input id="TempSource_checkbox" type="checkbox" style="display:none;"
-                        onchange="if(handleUserToggle('TempSource_checkbox', 'TempSource', 'TempSource')) { this.form.submit(); submitMessage(); }">
+                        onchange="if(handleUserToggle('TempSource_checkbox', 'TempSource', 'TempSource')) { submitMessage(); }">
                       <input id="TempSource" name="TempSource" type="number" value="" style="display:none;" />
                     </form>
                   </div>
@@ -2164,7 +2164,7 @@
                       <span class="toggle-label">No</span>
                       <label class="switch">
                         <input id="InvertAltAmps_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('InvertAltAmps_checkbox', 'InvertAltAmps', 'InvertAltAmps')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('InvertAltAmps_checkbox', 'InvertAltAmps', 'InvertAltAmps')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">Yes</span>
@@ -2232,7 +2232,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="AutoAltCurrentZero_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('AutoAltCurrentZero_checkbox', 'AutoAltCurrentZero', 'AutoAltCurrentZero')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('AutoAltCurrentZero_checkbox', 'AutoAltCurrentZero', 'AutoAltCurrentZero')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -2297,9 +2297,9 @@
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
                       <span class="toggle-label">Off</span>
-                      <label class="switch">
+                      <label class="switch echo-pending">
                         <input id="ZeroLogEnable_checkbox" type="checkbox"
-                          onchange="document.getElementById('ZeroLogEnable').value = this.checked ? '1' : '0'; zeroLogToggledAt = Date.now(); this.form.submit(); submitMessage();" />
+                          onchange="document.getElementById('ZeroLogEnable').value = this.checked ? '1' : '0'; pollToggleWrite(this, 'ZeroLogEnable', fetchZeroLogState); submitMessage();" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -2364,7 +2364,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="TargetVoltageMode_checkbox" type="checkbox"
-                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'TargetVoltageMode').then(ok => { if (ok && handleUserToggle('TargetVoltageMode_checkbox', 'TargetVoltageMode', 'TargetVoltageMode')) { cb.form.submit(); submitMessage(); } });" />
+                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'TargetVoltageMode').then(ok => { if (ok && handleUserToggle('TargetVoltageMode_checkbox', 'TargetVoltageMode', 'TargetVoltageMode')) { submitMessage(); } });" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -2462,7 +2462,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="HardOCEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('HardOCEnable_checkbox', 'HardOCEnable', 'HardOCEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('HardOCEnable_checkbox', 'HardOCEnable', 'HardOCEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -2482,7 +2482,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="OvGroup1Enable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('OvGroup1Enable_checkbox', 'OvGroup1Enable', 'OvGroup1Enable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('OvGroup1Enable_checkbox', 'OvGroup1Enable', 'OvGroup1Enable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -2502,7 +2502,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="OvGroup2Enable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('OvGroup2Enable_checkbox', 'OvGroup2Enable', 'OvGroup2Enable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('OvGroup2Enable_checkbox', 'OvGroup2Enable', 'OvGroup2Enable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -2522,7 +2522,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="IExcessEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('IExcessEnable_checkbox', 'IExcessEnable', 'IExcessEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('IExcessEnable_checkbox', 'IExcessEnable', 'IExcessEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -2542,7 +2542,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="BattLimitEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('BattLimitEnable_checkbox', 'BattLimitEnable', 'BattLimitEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('BattLimitEnable_checkbox', 'BattLimitEnable', 'BattLimitEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -2562,7 +2562,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="LoadDumpEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('LoadDumpEnable_checkbox', 'LoadDumpEnable', 'LoadDumpEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('LoadDumpEnable_checkbox', 'LoadDumpEnable', 'LoadDumpEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -2582,7 +2582,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="TachLieEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('TachLieEnable_checkbox', 'TachLieEnable', 'TachLieEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('TachLieEnable_checkbox', 'TachLieEnable', 'TachLieEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -3173,7 +3173,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="cvRecovEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('cvRecovEnable_checkbox', 'cvRecovEnable', 'cvRecovEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('cvRecovEnable_checkbox', 'cvRecovEnable', 'cvRecovEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -3209,7 +3209,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="loadServeBoostEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('loadServeBoostEnable_checkbox', 'loadServeBoostEnable', 'loadServeBoostEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('loadServeBoostEnable_checkbox', 'loadServeBoostEnable', 'loadServeBoostEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -3274,7 +3274,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="reseedCorrEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('reseedCorrEnable_checkbox', 'reseedCorrEnable', 'reseedCorrEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('reseedCorrEnable_checkbox', 'reseedCorrEnable', 'reseedCorrEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -3294,7 +3294,7 @@
                         <span class="toggle-label">Off</span>
                         <label class="switch">
                           <input id="cvRecovBoostEnable_checkbox" type="checkbox"
-                            onchange="if(handleUserToggle('cvRecovBoostEnable_checkbox', 'cvRecovBoostEnable', 'cvRecovBoostEnable')) { this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('cvRecovBoostEnable_checkbox', 'cvRecovBoostEnable', 'cvRecovBoostEnable')) { submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">On</span>
@@ -3537,7 +3537,7 @@
                 <span class="toggle-label">Disabled</span>
                 <label class="switch">
                   <input id="testProtectionsEnabled_plant_checkbox" type="checkbox" checked
-                    onchange="if(handleUserToggle('testProtectionsEnabled_plant_checkbox', 'testProtectionsEnabled_plant', 'testProtectionsEnabled')) { mirrorTestProtectionsToggle('testProtectionsEnabled_plant_checkbox'); this.form.submit(); submitMessage(); }" />
+                    onchange="if(handleUserToggle('testProtectionsEnabled_plant_checkbox', 'testProtectionsEnabled_plant', 'testProtectionsEnabled')) { mirrorTestProtectionsToggle('testProtectionsEnabled_plant_checkbox'); submitMessage(); }" />
                   <span class="slider round"></span>
                 </label>
                 <span class="toggle-label">Enabled</span>
@@ -3985,7 +3985,7 @@
                         <span class="toggle-label">Disabled</span>
                         <label class="switch">
                           <input id="testProtectionsEnabled_current_checkbox" type="checkbox" checked
-                            onchange="if(handleUserToggle('testProtectionsEnabled_current_checkbox', 'testProtectionsEnabled_current', 'testProtectionsEnabled')) { mirrorTestProtectionsToggle('testProtectionsEnabled_current_checkbox'); this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('testProtectionsEnabled_current_checkbox', 'testProtectionsEnabled_current', 'testProtectionsEnabled')) { mirrorTestProtectionsToggle('testProtectionsEnabled_current_checkbox'); submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">Enabled</span>
@@ -4723,7 +4723,7 @@
                         <span class="toggle-label">Disabled</span>
                         <label class="switch">
                           <input id="testProtectionsEnabled_voltage_checkbox" type="checkbox" checked
-                            onchange="if(handleUserToggle('testProtectionsEnabled_voltage_checkbox', 'testProtectionsEnabled_voltage', 'testProtectionsEnabled')) { mirrorTestProtectionsToggle('testProtectionsEnabled_voltage_checkbox'); this.form.submit(); submitMessage(); }" />
+                            onchange="if(handleUserToggle('testProtectionsEnabled_voltage_checkbox', 'testProtectionsEnabled_voltage', 'testProtectionsEnabled')) { mirrorTestProtectionsToggle('testProtectionsEnabled_voltage_checkbox'); submitMessage(); }" />
                           <span class="slider round"></span>
                         </label>
                         <span class="toggle-label">Enabled</span>
@@ -4746,7 +4746,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="CVTuningMode_checkbox" type="checkbox"
-                          onchange="if(checkCVTestGate(this) && handleUserToggle('CVTuningMode_checkbox', 'CVTuningMode', 'CVTuningMode')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(checkCVTestGate(this) && handleUserToggle('CVTuningMode_checkbox', 'CVTuningMode', 'CVTuningMode')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5000,7 +5000,7 @@
                       <span class="toggle-label">Manual</span>
                       <label class="switch">
                         <input id="cvGainMode_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('cvGainMode_checkbox', 'cvGainMode', 'cvGainMode')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('cvGainMode_checkbox', 'cvGainMode', 'cvGainMode')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">Measured</span>
@@ -5260,7 +5260,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="CvKdOneSided_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('CvKdOneSided_checkbox', 'CvKdOneSided', 'CvKdOneSided')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('CvKdOneSided_checkbox', 'CvKdOneSided', 'CvKdOneSided')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5282,7 +5282,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="CvKdExcessMode_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('CvKdExcessMode_checkbox', 'CvKdExcessMode', 'CvKdExcessMode')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('CvKdExcessMode_checkbox', 'CvKdExcessMode', 'CvKdExcessMode')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5348,7 +5348,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="battTempDerateEnable_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('battTempDerateEnable_checkbox', 'battTempDerateEnable', 'battTempDerateEnable')) { this.form.submit(); submitMessage(); } syncCvDependentVis();" />
+                          onchange="if(handleUserToggle('battTempDerateEnable_checkbox', 'battTempDerateEnable', 'battTempDerateEnable')) { submitMessage(); } syncCvDependentVis();" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5429,7 +5429,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="vTgtRampEnable_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('vTgtRampEnable_checkbox', 'vTgtRampEnable', 'vTgtRampEnable')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('vTgtRampEnable_checkbox', 'vTgtRampEnable', 'vTgtRampEnable')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5453,7 +5453,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="cvWindDownEnable_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('cvWindDownEnable_checkbox', 'cvWindDownEnable', 'cvWindDownEnable')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('cvWindDownEnable_checkbox', 'cvWindDownEnable', 'cvWindDownEnable')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5505,7 +5505,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="cvRiseGovEnable_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('cvRiseGovEnable_checkbox', 'cvRiseGovEnable', 'cvRiseGovEnable')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('cvRiseGovEnable_checkbox', 'cvRiseGovEnable', 'cvRiseGovEnable')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5527,7 +5527,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="dutySlewEnable_cv_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('dutySlewEnable_cv_checkbox', 'dutySlewEnable_cv', 'dutySlewEnable')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('dutySlewEnable_cv_checkbox', 'dutySlewEnable_cv', 'dutySlewEnable')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -5577,7 +5577,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="cvHelpersEnabled_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('cvHelpersEnabled_checkbox', 'cvHelpersEnabled', 'cvHelpersEnabled')) { this.form.submit(); submitMessage(); } syncCvDependentVis();" />
+                          onchange="if(handleUserToggle('cvHelpersEnabled_checkbox', 'cvHelpersEnabled', 'cvHelpersEnabled')) { submitMessage(); } syncCvDependentVis();" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -6172,8 +6172,8 @@
             <form action="/get" method="GET" target="hidden-form">
               <input id="faEnabled" name="faEnabled" type="number" value="" style="display:none;" />
               <div class="cap-mode-toggle">
-                <button type="button" id="faEnabled_off" class="cap-mode-btn" onclick="faSegSet('faEnabled',0,this.closest('form'))">Off</button>
-                <button type="button" id="faEnabled_on" class="cap-mode-btn" onclick="faSegSet('faEnabled',1,this.closest('form'))">On</button>
+                <button type="button" id="faEnabled_off" class="cap-mode-btn" onclick="faSegSet('faEnabled',0)">Off</button>
+                <button type="button" id="faEnabled_on" class="cap-mode-btn" onclick="faSegSet('faEnabled',1)">On</button>
               </div>
             </form>
           </div>
@@ -6266,8 +6266,8 @@
             <form action="/get" method="GET" target="hidden-form">
               <input id="faAlarmEnable" name="faAlarmEnable" type="number" value="" style="display:none;" />
               <div class="cap-mode-toggle">
-                <button type="button" id="faAlarmEnable_off" class="cap-mode-btn" onclick="faSegSet('faAlarmEnable',0,this.closest('form'))">Off</button>
-                <button type="button" id="faAlarmEnable_on" class="cap-mode-btn" onclick="faSegSet('faAlarmEnable',1,this.closest('form'))">On</button>
+                <button type="button" id="faAlarmEnable_off" class="cap-mode-btn" onclick="faSegSet('faAlarmEnable',0)">Off</button>
+                <button type="button" id="faAlarmEnable_on" class="cap-mode-btn" onclick="faSegSet('faAlarmEnable',1)">On</button>
               </div>
             </form>
           </div>
@@ -7148,7 +7148,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="MaintainMode_checkbox" type="checkbox"
-                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'MaintainMode').then(ok => { if (ok && handleUserToggle('MaintainMode_checkbox', 'MaintainMode', 'MaintainMode')) { cb.form.submit(); submitMessage(); } });" />
+                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'MaintainMode').then(ok => { if (ok && handleUserToggle('MaintainMode_checkbox', 'MaintainMode', 'MaintainMode')) { submitMessage(); } });" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -7378,7 +7378,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="coldChargeLockoutEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('coldChargeLockoutEnable_checkbox', 'coldChargeLockoutEnable', 'coldChargeLockoutEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('coldChargeLockoutEnable_checkbox', 'coldChargeLockoutEnable', 'coldChargeLockoutEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -7418,7 +7418,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="hotChargeLockoutEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('hotChargeLockoutEnable_checkbox', 'hotChargeLockoutEnable', 'hotChargeLockoutEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('hotChargeLockoutEnable_checkbox', 'hotChargeLockoutEnable', 'hotChargeLockoutEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -7468,9 +7468,9 @@
                   <div class="form-input">
                     <form action="/get" method="GET" target="hidden-form">
                       <span class="toggle-label">No</span>
-                      <label class="switch">
+                      <label class="switch echo-pending">
                         <input id="socInfoAvailable_checkbox" type="checkbox"
-                          onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'socInfoAvailable').then(ok => { if (ok && handleUserToggle('socInfoAvailable_checkbox', 'socInfoAvailable', 'socInfoAvailable')) { cb.form.submit(); submitMessage(); } });" />
+                          onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'socInfoAvailable').then(ok => { if (ok && handleUserToggle('socInfoAvailable_checkbox', 'socInfoAvailable', 'socInfoAvailable')) { submitMessage(); } });" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">Yes</span>
@@ -7548,7 +7548,7 @@
                     <span class="toggle-label">No</span>
                     <label class="switch">
                       <input id="BatteryShuntPresent_checkbox" type="checkbox"
-                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'BatteryShuntPresent').then(ok => { if (ok && handleUserToggle('BatteryShuntPresent_checkbox', 'BatteryShuntPresent', 'BatteryShuntPresent')) { cb.form.submit(); submitMessage(); } });" />
+                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'BatteryShuntPresent').then(ok => { if (ok && handleUserToggle('BatteryShuntPresent_checkbox', 'BatteryShuntPresent', 'BatteryShuntPresent')) { submitMessage(); } });" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">Yes</span>
@@ -7565,7 +7565,7 @@
                     <span class="toggle-label">No</span>
                     <label class="switch">
                       <input id="InvertBattAmps_checkbox" type="checkbox"
-                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'InvertBattAmps').then(ok => { if (ok && handleUserToggle('InvertBattAmps_checkbox', 'InvertBattAmps', 'InvertBattAmps')) { cb.form.submit(); submitMessage(); } });" />
+                        onchange="const cb=this; validateAndSubmitBatteryToggle(cb, 'InvertBattAmps').then(ok => { if (ok && handleUserToggle('InvertBattAmps_checkbox', 'InvertBattAmps', 'InvertBattAmps')) { submitMessage(); } });" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">Yes</span>
@@ -7888,7 +7888,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="battTempProbeEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('battTempProbeEnable_checkbox', 'battTempProbeEnable', 'battTempProbeEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('battTempProbeEnable_checkbox', 'battTempProbeEnable', 'battTempProbeEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -7908,7 +7908,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="extraTempProbeEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('extraTempProbeEnable_checkbox', 'extraTempProbeEnable', 'extraTempProbeEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('extraTempProbeEnable_checkbox', 'extraTempProbeEnable', 'extraTempProbeEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -7959,7 +7959,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="weatherModeEnabled_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('weatherModeEnabled_checkbox', 'weatherModeEnabled', 'weatherModeEnabled')) { this.form.submit(); submitMessage(); weatherModeToggled(this.checked); }" />
+                        onchange="if(handleUserToggle('weatherModeEnabled_checkbox', 'weatherModeEnabled', 'weatherModeEnabled')) { submitMessage(); weatherModeToggled(this.checked); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8204,7 +8204,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="solarUseConsEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('solarUseConsEnable_checkbox', 'solarUseConsEnable', 'solarUseConsEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('solarUseConsEnable_checkbox', 'solarUseConsEnable', 'solarUseConsEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8256,7 +8256,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="solarLearnEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('solarLearnEnable_checkbox', 'solarLearnEnable', 'solarLearnEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('solarLearnEnable_checkbox', 'solarLearnEnable', 'solarLearnEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8362,7 +8362,7 @@
                   <span class="toggle-label">Off</span>
                   <label class="switch">
                     <input id="AlarmActivate_checkbox" type="checkbox"
-                      onchange="if(handleUserToggle('AlarmActivate_checkbox', 'AlarmActivate', 'AlarmActivate')) { this.form.submit(); submitMessage(); }" />
+                      onchange="if(handleUserToggle('AlarmActivate_checkbox', 'AlarmActivate', 'AlarmActivate')) { submitMessage(); }" />
                     <span class="slider round"></span>
                   </label>
                   <span class="toggle-label">Armed</span>
@@ -8404,7 +8404,7 @@
                   <span class="toggle-label">Off</span>
                   <label class="switch">
                     <input id="GeneralFaultAlarm_checkbox" type="checkbox"
-                      onchange="if(handleUserToggle('GeneralFaultAlarm_checkbox', 'GeneralFaultAlarm', 'GeneralFaultAlarm')) { this.form.submit(); submitMessage(); }" />
+                      onchange="if(handleUserToggle('GeneralFaultAlarm_checkbox', 'GeneralFaultAlarm', 'GeneralFaultAlarm')) { submitMessage(); }" />
                     <span class="slider round"></span>
                   </label>
                   <span class="toggle-label">On</span>
@@ -8457,7 +8457,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="extraTempAlarmHiEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('extraTempAlarmHiEnable_checkbox', 'extraTempAlarmHiEnable', 'extraTempAlarmHiEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('extraTempAlarmHiEnable_checkbox', 'extraTempAlarmHiEnable', 'extraTempAlarmHiEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8491,7 +8491,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="extraTempAlarmLoEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('extraTempAlarmLoEnable_checkbox', 'extraTempAlarmLoEnable', 'extraTempAlarmLoEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('extraTempAlarmLoEnable_checkbox', 'extraTempAlarmLoEnable', 'extraTempAlarmLoEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8606,7 +8606,7 @@
                       <button type="button" class="cap-mode-btn" data-checked="1" onclick="abSegClick(this)">Latched</button>
                     </div>
                     <input id="AlarmLatchEnabled_checkbox" type="checkbox" style="display:none;"
-                      onchange="if(handleUserToggle('AlarmLatchEnabled_checkbox', 'AlarmLatchEnabled', 'AlarmLatchEnabled')) { this.form.submit(); submitMessage(); }" />
+                      onchange="if(handleUserToggle('AlarmLatchEnabled_checkbox', 'AlarmLatchEnabled', 'AlarmLatchEnabled')) { submitMessage(); }" />
                     <input id="AlarmLatchEnabled" name="AlarmLatchEnabled" type="number" value=""
                       style="display:none;" />
                   </form>
@@ -8692,7 +8692,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="NMEA2KData_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('NMEA2KData_checkbox', 'NMEA2KData', 'NMEA2KData')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('NMEA2KData_checkbox', 'NMEA2KData', 'NMEA2KData')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8752,7 +8752,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kTxEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kTxEnable_checkbox', 'n2kTxEnable', 'n2kTxEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kTxEnable_checkbox', 'n2kTxEnable', 'n2kTxEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8817,7 +8817,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kBattEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kBattEnable_checkbox', 'n2kBattEnable', 'n2kBattEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kBattEnable_checkbox', 'n2kBattEnable', 'n2kBattEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8849,7 +8849,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kBattCfgEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kBattCfgEnable_checkbox', 'n2kBattCfgEnable', 'n2kBattCfgEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kBattCfgEnable_checkbox', 'n2kBattCfgEnable', 'n2kBattCfgEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8874,7 +8874,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kAltEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kAltEnable_checkbox', 'n2kAltEnable', 'n2kAltEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kAltEnable_checkbox', 'n2kAltEnable', 'n2kAltEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8906,7 +8906,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kAltTempEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kAltTempEnable_checkbox', 'n2kAltTempEnable', 'n2kAltTempEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kAltTempEnable_checkbox', 'n2kAltTempEnable', 'n2kAltTempEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -8968,7 +8968,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kExtraTempEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kExtraTempEnable_checkbox', 'n2kExtraTempEnable', 'n2kExtraTempEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kExtraTempEnable_checkbox', 'n2kExtraTempEnable', 'n2kExtraTempEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9036,7 +9036,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kChgrEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kChgrEnable_checkbox', 'n2kChgrEnable', 'n2kChgrEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kChgrEnable_checkbox', 'n2kChgrEnable', 'n2kChgrEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9055,7 +9055,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kConvStatEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kConvStatEnable_checkbox', 'n2kConvStatEnable', 'n2kConvStatEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kConvStatEnable_checkbox', 'n2kConvStatEnable', 'n2kConvStatEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9074,7 +9074,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kChgrCfgEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kChgrCfgEnable_checkbox', 'n2kChgrCfgEnable', 'n2kChgrCfgEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kChgrCfgEnable_checkbox', 'n2kChgrCfgEnable', 'n2kChgrCfgEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9129,7 +9129,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kEngRpmEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kEngRpmEnable_checkbox', 'n2kEngRpmEnable', 'n2kEngRpmEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kEngRpmEnable_checkbox', 'n2kEngRpmEnable', 'n2kEngRpmEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9161,7 +9161,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kEngDynEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kEngDynEnable_checkbox', 'n2kEngDynEnable', 'n2kEngDynEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kEngDynEnable_checkbox', 'n2kEngDynEnable', 'n2kEngDynEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9180,7 +9180,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="n2kEngBitsEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('n2kEngBitsEnable_checkbox', 'n2kEngBitsEnable', 'n2kEngBitsEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('n2kEngBitsEnable_checkbox', 'n2kEngBitsEnable', 'n2kEngBitsEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9206,7 +9206,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="NMEA0183Data_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('NMEA0183Data_checkbox', 'NMEA0183Data', 'NMEA0183Data')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('NMEA0183Data_checkbox', 'NMEA0183Data', 'NMEA0183Data')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9263,7 +9263,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="VeData_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('VeData_checkbox', 'VeData', 'VeData')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('VeData_checkbox', 'VeData', 'VeData')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9349,7 +9349,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="dvccVicCutHold_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('dvccVicCutHold_checkbox', 'dvccVicCutHold', 'dvccVicCutHold')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('dvccVicCutHold_checkbox', 'dvccVicCutHold', 'dvccVicCutHold')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9412,7 +9412,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="rvcTxEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('rvcTxEnable_checkbox', 'rvcTxEnable', 'rvcTxEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('rvcTxEnable_checkbox', 'rvcTxEnable', 'rvcTxEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9431,7 +9431,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="rvcChgrEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('rvcChgrEnable_checkbox', 'rvcChgrEnable', 'rvcChgrEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('rvcChgrEnable_checkbox', 'rvcChgrEnable', 'rvcChgrEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9450,7 +9450,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="rvcDcEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('rvcDcEnable_checkbox', 'rvcDcEnable', 'rvcDcEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('rvcDcEnable_checkbox', 'rvcDcEnable', 'rvcDcEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9469,7 +9469,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="rvcFaultEnable_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('rvcFaultEnable_checkbox', 'rvcFaultEnable', 'rvcFaultEnable')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('rvcFaultEnable_checkbox', 'rvcFaultEnable', 'rvcFaultEnable')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9536,7 +9536,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="dvccEn_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('dvccEn_checkbox', 'dvccEn', 'dvccEn')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('dvccEn_checkbox', 'dvccEn', 'dvccEn')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9674,7 +9674,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="bmsLogic_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('bmsLogic_checkbox', 'bmsLogic', 'bmsLogic')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('bmsLogic_checkbox', 'bmsLogic', 'bmsLogic')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9695,7 +9695,7 @@
                       <button type="button" class="cap-mode-btn" data-checked="1" onclick="abSegClick(this)">Absent</button>
                     </div>
                     <input id="bmsLogicLevelOff_checkbox" type="checkbox" style="display:none;"
-                      onchange="if(handleUserToggle('bmsLogicLevelOff_checkbox', 'bmsLogicLevelOff', 'bmsLogicLevelOff')) { this.form.submit(); submitMessage(); }" />
+                      onchange="if(handleUserToggle('bmsLogicLevelOff_checkbox', 'bmsLogicLevelOff', 'bmsLogicLevelOff')) { submitMessage(); }" />
                     <input id="bmsLogicLevelOff" name="bmsLogicLevelOff" type="number" value="" style="display:none;" />
                   </form>
                 </div>
@@ -9742,7 +9742,7 @@
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
                     <select id="timeSourceMode" name="timeSourceMode"
-                      onchange="this.form.submit(); submitMessage();">
+                      onchange="selectWrite(this); submitMessage();">
                       <option value="0">Auto (recommended)</option>
                       <option value="1">NMEA only</option>
                       <option value="2">This device only</option>
@@ -9763,7 +9763,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="CloudFeatures_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('CloudFeatures_checkbox','CloudFeatures','CloudFeatures')){ this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('CloudFeatures_checkbox','CloudFeatures','CloudFeatures')){ submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9782,7 +9782,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="RemoteDiagnostics_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('RemoteDiagnostics_checkbox','RemoteDiagnostics','RemoteDiagnostics')){ this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('RemoteDiagnostics_checkbox','RemoteDiagnostics','RemoteDiagnostics')){ submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -9807,7 +9807,7 @@
                       <span class="toggle-label">Off</span>
                       <label class="switch">
                         <input id="wifiNapEnabled_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('wifiNapEnabled_checkbox', 'wifiNapEnabled', 'wifiNapEnabled')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('wifiNapEnabled_checkbox', 'wifiNapEnabled', 'wifiNapEnabled')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">On</span>
@@ -10169,7 +10169,7 @@
                       <span class="toggle-label">No</span>
                       <label class="switch">
                         <input id="HardwarePresent_checkbox" type="checkbox"
-                          onchange="if(handleUserToggle('HardwarePresent_checkbox', 'hardwarePresent', 'hardwarePresent')) { this.form.submit(); submitMessage(); }" />
+                          onchange="if(handleUserToggle('HardwarePresent_checkbox', 'hardwarePresent', 'hardwarePresent')) { submitMessage(); }" />
                         <span class="slider round"></span>
                       </label>
                       <span class="toggle-label">Yes</span>
@@ -10372,7 +10372,7 @@
                     <span class="toggle-label">Off</span>
                     <label class="switch">
                       <input id="PhysicalPanelOverride_checkbox" type="checkbox"
-                        onchange="if(handleUserToggle('PhysicalPanelOverride_checkbox', 'PhysicalPanelOverride', 'PhysicalPanelOverride')) { this.form.submit(); submitMessage(); }" />
+                        onchange="if(handleUserToggle('PhysicalPanelOverride_checkbox', 'PhysicalPanelOverride', 'PhysicalPanelOverride')) { submitMessage(); }" />
                       <span class="slider round"></span>
                     </label>
                     <span class="toggle-label">On</span>
@@ -10575,7 +10575,7 @@
                 <span class="tooltip">ℹ️<span class="tooltip-box">Which boat-speed to learn from. Water (STW, from a paddlewheel/log) removes current. GPS (SOG) is always available but a current makes you read fast or slow. Switching source wipes all learned data (same as Clear All).</span></span>
               </div>
               <div class="form-input">
-                <div class="cap-mode-toggle">
+                <div class="cap-mode-toggle echo-pending">
                   <button type="button" id="perf-src-1" class="cap-mode-btn cap-mode-active" onclick="perfSetSpeedSrc(1)">Water (STW)</button>
                   <button type="button" id="perf-src-2" class="cap-mode-btn" onclick="perfSetSpeedSrc(2)">GPS (SOG)</button>
                 </div>
@@ -10590,7 +10590,7 @@
                 <span class="tooltip">ℹ️<span class="tooltip-box">Symmetric folds port and starboard together (|wind angle|) at display + scoring time — fills the polar twice as fast and assumes the boat sails the same on both tacks. Both tacks keeps them separate (for a lopsided rig or instrument offset). Raw both-sided data is always stored either way.</span></span>
               </div>
               <div class="form-input">
-                <div class="cap-mode-toggle">
+                <div class="cap-mode-toggle echo-pending">
                   <button type="button" id="perf-sym-1" class="cap-mode-btn cap-mode-active" onclick="perfSet('perfFoldSymmetric',1)">Symmetric</button>
                   <button type="button" id="perf-sym-0" class="cap-mode-btn" onclick="perfSet('perfFoldSymmetric',0)">Both tacks</button>
                 </div>
@@ -11758,6 +11758,18 @@
           </div>
         </div>
 
+        <div class="section-title" style="margin-top:16px;">Victron GX</div>
+        <div class="grid">
+          <div class="card-group" id="li_gxDev_card">
+            <p class="card-group-title"><span>Devices on the GX (<span id="li_gxDevStatus_ID">no GX</span>)</span>
+              <span class="tooltip">ℹ️<span class="tooltip-box">What the XREG-010 app on a Victron GX reads from the devices on that GX, the same readings its power flow shows: battery monitors, solar chargers, shore chargers, inverter/chargers, inverters, other alternators, DC-DC chargers, DC generators, fuel cells, wind generators, water generators, shaft generators, other DC sources, DC loads, and DC system meters. Amps are positive into the batteries and negative drawn from them. Negative: an inverter while it runs, a DC load, a DC-DC charger set on the GX to draw from the house bank, and the DC system meter (listed as DC system), which measures the boat's whole DC load. A DC meter in DC-DC mode follows its reading: positive while it charges the house bank, negative while it draws from it. Age is how old each reading is. A device the GX has seen that is off now (a charger with shore power unplugged) stays listed at 0.0 A until it is forgotten on the GX screen, under Settings, System, Connection, Power flow devices. "stale" means the GX has sent nothing for a while.</span></span>
+            </p>
+            <div id="li_gxDevRows">
+              <div class="metric-row"><span class="metric-label">No Victron GX connected</span></div>
+            </div>
+          </div>
+        </div>
+
         <div class="section-title" style="margin-top:16px;">Charge-Limit Follow</div>
         <div class="grid">
           <div class="card-group" id="li_dvccStatus_card">
@@ -11945,7 +11957,7 @@
             <span class="tooltip">ℹ️<span class="tooltip-box">Turn off to stop learning while under tow, or in strong current with no water-speed log, so bad data can't poison the map. Stays off across reboots.</span></span>
           </div>
           <div class="form-input" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-            <label class="switch"><input id="perf-learn-switch" type="checkbox" onchange="perfSet('perfPaused', this.checked?0:1)" /><span class="slider"></span></label>
+            <label class="switch echo-pending"><input id="perf-learn-switch" type="checkbox" onchange="perfSet('perfPaused', this.checked?0:1)" /><span class="slider"></span></label>
             <input type="button" id="perf-dl-btn" value="Download CSV" class="btn-secondary" onclick="downloadCsv('/perfcurve.csv','Boat Performance Data')" title="Save the complete best-ever front (BEFRONT1 sail + motor pair) to your Downloads as a dated file — the full, re-importable dataset to reproduce or share this boat's polar, then re-load with Load CSV." />
             <input type="button" id="perf-load-btn" value="Load CSV" class="btn-secondary" onclick="perfLoadCsv()" title="Import a boat polar CSV (BEFRONT1 sail + motor pair) shared from another boat or a backup. Replaces the live reference and switches to FIXED (learning paused)." />
             <input type="file" id="perf-load-file" accept=".csv,text/csv,text/plain" style="display:none;" onchange="perfUploadCsvFile(this)" />
@@ -15973,7 +15985,7 @@
                 <button type="button" class="cap-mode-btn" data-checked="1" onclick="abSegClick(this)">UNIX</button>
               </div>
               <input id="timeAxisModeChanging_checkbox" type="checkbox" style="display:none;"
-                onchange="if(handleUserToggle('timeAxisModeChanging_checkbox', 'timeAxisModeChanging', 'timeAxisModeChanging')) { this.form.submit(); submitMessage(); }" />
+                onchange="if(handleUserToggle('timeAxisModeChanging_checkbox', 'timeAxisModeChanging', 'timeAxisModeChanging')) { submitMessage(); }" />
               <input id="timeAxisModeChanging" name="timeAxisModeChanging" type="number" value=""
                 style="display:none;" />
             </form>
