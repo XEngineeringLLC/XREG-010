@@ -111,8 +111,10 @@ Item {
 		echoes[k] = valid ? v : undefined
 		if (k in pending && valid && Math.abs(Number(v) - Number(pending[k].value)) < 0.011)
 			delete pending[k]
-		rev++
+		// every cell echoes on its own (twice each as the page opens): one redraw of the cells for all of a turn's echoes
+		Qt.callLater(bump)
 	}
+	function bump() { rev++ }
 	function isCapControl(c) { return !!tableCfg && !!tableCfg.capMode && c.key === tableCfg.capMode.key }
 	function controlIndex(c) { return rev >= 0 ? (c.options || []).findIndex(o => o.value === aux[c.key]) : -1 }
 	function controlGated(c) { return rev >= 0 && !!c.disabledWhen && aux[c.disabledWhen.key] === c.disabledWhen.value }

@@ -610,7 +610,6 @@ void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
 #define DVCC_UNTRUSTED 5
 
 static float dvccUntrustVal = 0.0f;    // the offending value, for the UI message
-static uint8_t dvccVicLockAddr = 255;  // Victron path: bus address locked as the authority (255 = none)
 
 // Flap detection runs at ingest (per decoded update): a 1 Hz tick would alias fast flapping to steady.
 // Ingest and tick both run on the loop task, so no locking.
@@ -620,27 +619,57 @@ static uint8_t dvccFlapCount = 0;
 static bool dvccFlapLatch = false;  // set by ingest, converted to UNTRUSTED by dvccTick
 static float dvccFlapVal = 0.0f;
 
-// Victron VREG registers arrive ONE FIELD PER FRAME (0x2001 voltage, 0x2015 current, 0x2108
-// allowed-to-charge), so the last-seen value of each is held here and re-ingested together.
-static float dvccVicCvl = NAN;
-static float dvccVicCcl = NAN;
-static bool dvccVicCut = false;  // 0x2108 said do-not-charge → effective CCL forced to 0
-// Last decode time of each held register. Silence is judged on the authority as a whole
-// (dvccRxLastMs), so without these a register that stops arriving while others keep flowing holds forever.
-static uint32_t dvccVicCvlMs = 0, dvccVicCclMs = 0, dvccVicCutMs = 0;
-static uint32_t dvccVicCanMs = 0;  // last accepted register from the locked sender: the VE.Can carrier's own silence clock (0 = silent)
+// Victron VREG registers arrive ONE FIELD PER FRAME (0x2001 voltage, 0x2015 current, 0x2108 allowed-to-charge), so the
+// last-seen value of each is held per sending address and re-ingested together. A GX and a Lynx Smart BMS can both send
+// them, and the GX's value is never above the battery's, so the lowest fresh value of each register is followed.
+#define DVCC_VIC_SND_N 4
+struct DvccVicSnd {
+  bool used;
+  uint8_t addr;
+  float cvl, ccl;  // ccl = a broadcast 0x2015, battery current
+  bool cut;        // 0x2108 said do-not-charge → effective CCL forced to 0
+  // Last decode time of each held register: a register that stops arriving while others keep flowing must not hold forever.
+  uint32_t cvlMs, cclMs, cutMs, lastMs;
+};
+static DvccVicSnd dvccVicSnd[DVCC_VIC_SND_N];
+static uint32_t dvccVicCanMs = 0;      // last accepted register from any sender: the VE.Can carrier's own silence clock (0 = silent)
+static uint8_t dvccVicLastAddr = 255;  // sender of that register, named as the authority when no value picks one
+// 0x2015 addressed to this node: the GX's current share for this alternator (alternator basis) in the DVCC current handshake
+// (spec §20). It lapses 60 s after the last one, and the broadcast limits rule again.
+#define DVCC_VIC_SHARE_MS 60000UL
+static float dvccVicShare = NAN;
+static uint32_t dvccVicShareMs = 0;
 
-// A stale sender lock, flap history or held carrier value must never carry into judging a fresh authority.
+// VREG frames owed to the bus (spec §20): queued by the receive tap, sent by nmea2kTransmitTick one per pass.
+struct DvccVicNack {
+  uint8_t dest;
+  uint16_t reg, code;
+};
+static DvccVicNack dvccVicNackQ[4];
+static uint8_t dvccVicNackN = 0;
+static bool dvccVicCapDue = false;     // 0xEDF0 capacity broadcast owed: a request, or a change after one
+static bool dvccVicAsked = false;      // a GX has asked for the capacity since boot, so a change is broadcast unasked
+static uint16_t dvccVicCapSent = 0;    // raw value of the last 0xEDF0 sent
+static bool dvccVicEchoDue = false;    // 0x2015 echo owed: the share received, broadcast back as the value regulated to
+static uint8_t dvccVicEchoVal[4];
+static bool dvccVicShareGone = false;  // 0x2015 = 0xFFFF owed: the share lapsed or is no longer followed
+
+static void dvccVicClearSenders() {
+  for (uint8_t i = 0; i < DVCC_VIC_SND_N; i++) dvccVicSnd[i].used = false;
+}
+
+// A stale sender, flap history or held carrier value must never carry into judging a fresh authority.
 static void dvccClearDecodeState() {
   dvccFlapLastCvl = NAN;
   dvccFlapWindowStartMs = 0;
   dvccFlapCount = 0;
   dvccFlapLatch = false;
-  dvccVicLockAddr = 255;
-  dvccVicCvl = dvccVicCcl = NAN;
-  dvccVicCut = false;
+  dvccVicClearSenders();
+  dvccVicLastAddr = 255;
   dvccVicCanMs = 0;
-  dvccRxCanCvl = dvccRxCanCcl = NAN;
+  if (!isnan(dvccVicShare)) dvccVicShareGone = true;
+  dvccVicShare = NAN;
+  dvccRxCanCvl = dvccRxCanCcl = dvccRxCanShare = NAN;
   dvccRxWifiCvl = dvccRxWifiCcl = NAN;
   dvccRxWifiMs = 0;
 }
@@ -837,20 +866,39 @@ static bool dvccRvcAcceptSender(uint8_t srcAddr, uint8_t priority) {
   return (uint32_t)(millis() - dvccRxLastMs) > DVCC_HANDOFF_SILENCE_MS;
 }
 
-// Victron: no instance field on the VREG carrier — lock to the first sending bus address.
-// Handoff is timed on the VE.Can carrier alone: WiFi posts keep dvccRxLastMs fresh and would block it forever.
-static bool dvccVicAcceptSender(uint8_t srcAddr) {
-  if (dvccVicLockAddr == 255 || srcAddr == dvccVicLockAddr) {
-    dvccVicLockAddr = srcAddr;
-    return true;
+// A node whose address claim names another maker is repeating a Victron register, not setting a limit: every alternator
+// that follows DVCC broadcasts back the 0x2015 it was sent. A node not yet identified is accepted.
+static bool dvccVicForeign(uint8_t src) {
+  if (!dvccNodes) return false;
+  bool foreign = false;
+  portENTER_CRITICAL(&dvccCapMux);
+  for (uint8_t i = 0; i < dvccNodeCount; i++) {
+    if (dvccNodes[i].addr != src) continue;
+    foreign = dvccNodes[i].haveName && dvccNodes[i].mfg != 358;
+    break;
   }
-  if ((uint32_t)(millis() - dvccVicCanMs) > DVCC_HANDOFF_SILENCE_MS) {
-    dvccVicLockAddr = srcAddr;
-    dvccVicCvl = dvccVicCcl = NAN;  // never combine a new authority's first field with the old authority's held values
-    dvccVicCut = false;
-    return true;
+  portEXIT_CRITICAL(&dvccCapMux);
+  return foreign;
+}
+
+// Victron: no instance field on the VREG carrier, so each sending address keeps its own slot (-1 = not accepted). Four
+// senders fill the table; a fifth is ignored until one has been silent for the Silence Timeout and the merge frees it.
+static int dvccVicSender(uint8_t src) {
+  if (dvccVicForeign(src)) return -1;
+  int freeSlot = -1;
+  for (uint8_t i = 0; i < DVCC_VIC_SND_N; i++) {
+    if (dvccVicSnd[i].used && dvccVicSnd[i].addr == src) return (int)i;
+    if (!dvccVicSnd[i].used && freeSlot < 0) freeSlot = (int)i;
   }
-  return false;
+  if (freeSlot < 0) return -1;
+  DvccVicSnd &s = dvccVicSnd[freeSlot];
+  s.used = true;
+  s.addr = src;
+  s.cvl = s.ccl = NAN;
+  s.cut = false;
+  s.cvlMs = s.cclMs = s.cutMs = 0;
+  s.lastMs = millis();
+  return freeSlot;
 }
 
 // Victron VREG 0x351 payload (PROVISIONAL until §8a capture validation): mirrors the de-facto
@@ -879,70 +927,101 @@ static void dvccVicIngestMerged() {
   uint32_t silenceMs = (uint32_t)dvccSilenceS * 1000UL;
   if (dvccVicCanMs != 0 && (uint32_t)(now - dvccVicCanMs) > silenceMs) {
     // VE.Can alone went silent while WiFi kept the authority alive: the same clear a whole-authority silence does.
-    dvccVicLockAddr = 255;
-    dvccVicCvl = dvccVicCcl = NAN;
-    dvccVicCut = false;
+    dvccVicClearSenders();
     dvccVicCanMs = 0;
   }
+  if (!isnan(dvccVicShare) && (dvccVicCanMs == 0 || (uint32_t)(now - dvccVicShareMs) > DVCC_VIC_SHARE_MS)) {
+    dvccVicShare = NAN;
+    dvccVicShareGone = true;
+  }
   // Held registers older than max(Silence Timeout, 60 s) drop: Victron's contract repeats limits more than once a minute.
-  // dvccVicCutHold = owner choice to keep a stale do-not-charge until cleared or until VE.Can goes silent.
+  // dvccVicCutHold = owner choice to keep a stale do-not-charge until cleared or until its sender goes silent.
   uint32_t maxAgeMs = (uint32_t)max(dvccSilenceS, 60) * 1000UL;
-  if ((uint32_t)(now - dvccVicCvlMs) > maxAgeMs) dvccVicCvl = NAN;
-  if ((uint32_t)(now - dvccVicCclMs) > maxAgeMs) dvccVicCcl = NAN;
-  if (dvccVicCutHold != 1 && (uint32_t)(now - dvccVicCutMs) > maxAgeMs) dvccVicCut = false;
+  float canCvl = NAN, canCcl = NAN;
+  bool canCut = false;
+  uint8_t cvlAddr = 255, cclAddr = 255;
+  for (uint8_t i = 0; i < DVCC_VIC_SND_N; i++) {
+    DvccVicSnd &s = dvccVicSnd[i];
+    if (!s.used) continue;
+    if ((uint32_t)(now - s.lastMs) > silenceMs) {  // this sender went silent: everything it held goes, a held cut included
+      s.used = false;
+      continue;
+    }
+    if ((uint32_t)(now - s.cvlMs) > maxAgeMs) s.cvl = NAN;
+    if ((uint32_t)(now - s.cclMs) > maxAgeMs) s.ccl = NAN;
+    if (dvccVicCutHold != 1 && (uint32_t)(now - s.cutMs) > maxAgeMs) s.cut = false;
+    if (!isnan(s.cvl) && (isnan(canCvl) || s.cvl < canCvl)) { canCvl = s.cvl; cvlAddr = s.addr; }
+    if (s.cut) { canCut = true; cclAddr = s.addr; }
+    else if (!canCut && !isnan(s.ccl) && (isnan(canCcl) || s.ccl < canCcl)) { canCcl = s.ccl; cclAddr = s.addr; }
+  }
   bool canFresh = (dvccVicCanMs != 0);
   bool wifiFresh = (dvccRxWifiMs != 0) && (uint32_t)(now - dvccRxWifiMs) <= silenceMs;
-  dvccRxCanCvl = canFresh ? dvccVicCvl : NAN;
-  dvccRxCanCcl = canFresh ? (dvccVicCut ? 0.0f : dvccVicCcl) : NAN;  // do-not-charge = CCL 0 (obey-zero)
+  dvccRxCanCvl = canFresh ? canCvl : NAN;
+  dvccRxCanCcl = canFresh ? (canCut ? 0.0f : canCcl) : NAN;  // do-not-charge = CCL 0 (obey-zero)
+  dvccRxCanShare = canFresh ? dvccVicShare : NAN;
   float cvl = dvccRxCanCvl, ccl = dvccRxCanCcl;
   bool cclAlt = false;
-  if (wifiFresh) {
-    cvl = dvccLower(cvl, dvccRxWifiCvl);
-    // CCLs compared as alternator amps: the WiFi one is this alternator's share already, the VE.Can one is battery current
-    // and gets the house-load offset the control loop would add (live shunt only). The winner keeps its own basis.
-    if (!isnan(dvccRxWifiCcl)) {
-      float canAsAlt = (!isnan(ccl) && HAS_BATT_SHUNT && bcurFresh()) ? fmaxf(0.0f, ccl + loadOffsetFilt) : ccl;
-      if (isnan(canAsAlt) || dvccRxWifiCcl < canAsAlt) { ccl = dvccRxWifiCcl; cclAlt = true; }
-    }
+  if (wifiFresh) cvl = dvccLower(cvl, dvccRxWifiCvl);
+  // CCLs compared as alternator amps: the shares (VE.Can addressed 0x2015, WiFi) are this alternator's already, the battery
+  // CCL gets the house-load offset the control loop would add (live shunt only). The winner keeps its own basis.
+  const float shares[2] = { dvccRxCanShare, wifiFresh ? dvccRxWifiCcl : NAN };
+  for (uint8_t i = 0; i < 2; i++) {
+    if (isnan(shares[i])) continue;
+    float curAsAlt = (!cclAlt && !isnan(ccl) && HAS_BATT_SHUNT && bcurFresh()) ? fmaxf(0.0f, ccl + loadOffsetFilt) : ccl;
+    if (isnan(curAsAlt) || shares[i] < curAsAlt) { ccl = shares[i]; cclAlt = true; }
   }
-  dvccIngest(cvl, ccl, canFresh ? dvccVicLockAddr : (uint8_t)DVCC_ADDR_WIFI, 0, 0);
+  uint8_t who = (cvlAddr != 255) ? cvlAddr : (cclAddr != 255) ? cclAddr : dvccVicLastAddr;
+  dvccIngest(cvl, ccl, canFresh ? who : (uint8_t)DVCC_ADDR_WIFI, 0, 0);
   dvccRxCclAltBasis = cclAlt;
 }
 
 // One Victron VREG register; p = the register value (the bytes after the vreg id, on both carriers). 0x2001 (what a GX sends, per Victron, spec §17)
 // and 0x2016: un16 0.01 V; 0x2015: un16 0.1 A; 0xFFFF = not available. 0x2108 layout is from Victron's
 // Lynx Smart BMS decoder (spec §14); its id and the 0x351 guess are capture-pending. Fail-safe if wrong:
-// CVL only clamps down, CCL only lowers a min-selected ceiling. True = id recognized, even if lock-rejected.
-static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uint8_t src) {
-  if (vreg == 0x0351) {
+// CVL only clamps down, CCL only lowers a min-selected ceiling. True = id recognized, even if the sender was refused.
+// toUs = the frame was addressed to this node, which turns 0x2015 into the GX's share for this alternator.
+static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uint8_t src, bool toUs) {
+  uint32_t now = millis();
+  int k = -1;
+  if (vreg == 0x2015 && toUs) {  // the GX's current share for this alternator (spec §20), never the battery's limit
+    if (len < 2) return false;
+    if (dvccVicForeign(src)) return true;
+    uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    dvccVicShare = (raw == 0xFFFF) ? NAN : raw * 0.1f;
+    dvccVicShareMs = now;
+    if (raw != 0xFFFF) {  // accepted: broadcast back as the value regulated to, byte for byte (Revatek's shipped reply)
+      for (uint8_t i = 0; i < 4; i++) dvccVicEchoVal[i] = (i < len) ? p[i] : 0;
+      dvccVicEchoDue = true;
+    }
+  } else if (vreg == 0x0351) {
     float cvl = NAN, ccl = NAN;
     if (!dvccDecodeVreg351(p, len, cvl, ccl)) return false;
-    if (!dvccVicAcceptSender(src)) return true;
-    dvccVicCvl = cvl;
-    dvccVicCcl = ccl;
-    dvccVicCvlMs = dvccVicCclMs = millis();
+    if ((k = dvccVicSender(src)) < 0) return true;
+    dvccVicSnd[k].cvl = cvl;
+    dvccVicSnd[k].ccl = ccl;
+    dvccVicSnd[k].cvlMs = dvccVicSnd[k].cclMs = now;
   } else if (vreg == 0x2001 || vreg == 0x2016) {  // target voltage → CVL (0x2001 is the one a GX broadcasts)
     if (len < 2) return false;
     uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-    if (!dvccVicAcceptSender(src)) return true;
+    if ((k = dvccVicSender(src)) < 0) return true;
     // 0xFFFF is a withdrawal, not a value: the GX can drop the limit while frames keep flowing. Clearing
     // lets dvccTick fall to WAITING within 1 s instead of holding the last clamp until silence timeout.
-    dvccVicCvl = (raw == 0xFFFF) ? NAN : raw * 0.01f;
-    dvccVicCvlMs = millis();
-  } else if (vreg == 0x2015) {  // current limit → CCL (un16; 0xFFFF clears the held limit, it is NOT a value)
+    dvccVicSnd[k].cvl = (raw == 0xFFFF) ? NAN : raw * 0.01f;
+    dvccVicSnd[k].cvlMs = now;
+  } else if (vreg == 0x2015) {  // broadcast current limit → battery CCL (un16; 0xFFFF clears the held limit, it is NOT a value)
     if (len < 2) return false;
     uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-    if (!dvccVicAcceptSender(src)) return true;
-    dvccVicCcl = (raw == 0xFFFF) ? NAN : raw * 0.1f;
-    dvccVicCclMs = millis();
+    if ((k = dvccVicSender(src)) < 0) return true;
+    dvccVicSnd[k].ccl = (raw == 0xFFFF) ? NAN : raw * 0.1f;
+    dvccVicSnd[k].cclMs = now;
   } else if (vreg == 0x2108) {  // VE_REG_BMS_IO: 2-bit fields, allowed-to-charge at bits 2-3
     // (0 unknown, 1 allowed, 2/3 not; dbus-ble-sensors/src/victron-lsbms.c). Revatek's whole-byte ==2
     // reading is ORed in until a capture decides: a spurious cut is the safe error. 0xFF = NA, never a cut.
     if (len < 1 || p[0] == 0xFF) return false;
-    if (!dvccVicAcceptSender(src)) return true;
+    if ((k = dvccVicSender(src)) < 0) return true;
     uint8_t atc = (uint8_t)((p[0] >> 2) & 0x03);
-    dvccVicCut = (atc >= 2) || (p[0] == 2);
-    dvccVicCutMs = millis();
+    dvccVicSnd[k].cut = (atc >= 2) || (p[0] == 2);
+    dvccVicSnd[k].cutMs = now;
   } else if (vreg == 0x0100) {  // VE_REG_PRODUCT_ID — identity only, never a limit
     // Returns false on purpose: the caller then retries the other VREG framing, so identity never
     // costs a limit decode on a frame that only coincidentally reads 0x0100.
@@ -962,10 +1041,109 @@ static bool dvccVicHandleReg(uint16_t vreg, const unsigned char *p, int len, uin
     return false;
   }
   // Re-ingest the held set, merged with WiFi, so the trust machine sees the combined view.
-  dvccVicCanMs = millis();
+  if (k >= 0) dvccVicSnd[k].lastMs = now;
+  dvccVicLastAddr = src;
+  dvccVicCanMs = now;
   MARK_FRESH(IDX_DVCC_VECAN);
   dvccVicIngestMerged();
   return true;
+}
+
+static void dvccVicQueueNack(uint8_t dest, uint16_t reg, uint16_t code) {
+  if (dvccVicNackN >= sizeof(dvccVicNackQ) / sizeof(dvccVicNackQ[0])) return;
+  dvccVicNackQ[dvccVicNackN].dest = dest;
+  dvccVicNackQ[dvccVicNackN].reg = reg;
+  dvccVicNackQ[dvccVicNackN].code = code;
+  dvccVicNackN++;
+}
+
+// The DVCC current handshake, this node's side (spec §20): a GX asks for the capacity with a read request (VREG 0x0001,
+// the register wanted in bytes 4-5), then sends its share as 0x2015 to this address. While follow is off, set to RV-C,
+// or latched untrusted, both are refused with 0x8100, and any other register asked for gets 0x8000 (unknown).
+// Runs ahead of the receive gate, since a request needs an answer whenever this node is on the bus. True = handled here.
+static bool dvccVicServiceAddressed(uint8_t src, uint8_t dest, const unsigned char *buf, unsigned char len) {
+  if (!n2kNodeActive || n2kTxEnable != 1 || len < 6) return false;
+  uint8_t self = NMEA2000.GetN2kSource();
+  if (self > 251 || (dest != self && dest != 0xFF)) return false;
+  if ((((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) & 0x07FF) != 358) return false;
+  uint16_t vreg = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+  bool following = (dvccEn == 1 && dvccSrcType == 0 && dvccState != DVCC_UNTRUSTED);
+  if (vreg == 0x0001) {
+    uint16_t want = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
+    if (want == 0xEDF0 && following) {
+      dvccVicAsked = true;
+      dvccVicCapDue = true;
+    } else if (dest == self) {
+      dvccVicQueueNack(src, want, (want == 0xEDF0) ? 0x8100 : 0x8000);
+    }
+    return true;
+  }
+  if (vreg == 0x2015 && dest == self && !following) {
+    dvccVicQueueNack(src, 0x2015, 0x8100);
+    return true;
+  }
+  return false;
+}
+
+// Capacity advertised in 0xEDF0 (un16, 0.1 A): the Command Limit within the largest Charge Rate Limits entry, the most
+// this alternator is ever asked for. The same figure the GX app gives dvcc.py (xreg_core.py _charge_current_limit).
+static uint16_t dvccVicCapacityRaw() {
+  float top = 0.0f;
+  for (int i = 0; i < RPM_TABLE_SIZE; i++)
+    if (rpmCapCurrentTable[i] > top) top = rpmCapCurrentTable[i];
+  float cap = MaxTableValue;
+  if (top > 0.0f && (!(cap > 0.0f) || top < cap)) cap = top;
+  if (!(cap > 0.0f)) return 0xFFFF;
+  return (uint16_t)constrain(lroundf(cap * 10.0f), 0L, 0xFFFEL);
+}
+
+// One owed VREG frame on PGN 0xEF00 (spec §20), refusals first; false = nothing owed. Header 66 99 is the GX's own:
+// manufacturer 358, reserved bits set, industry group 4. Unused value bytes are 0, as in the GX's 0x2001.
+static bool dvccVicTxCompose(tN2kMsg &m) {
+  uint8_t dest = 0xFF;
+  uint16_t vreg;
+  uint8_t v[4] = { 0, 0, 0, 0 };
+  if (dvccVicNackN > 0) {
+    DvccVicNack n = dvccVicNackQ[0];
+    for (uint8_t i = 1; i < dvccVicNackN; i++) dvccVicNackQ[i - 1] = dvccVicNackQ[i];
+    dvccVicNackN--;
+    dest = n.dest;  // a refusal goes back to the asker: 0x0002, then the register, then the code
+    vreg = 0x0002;
+    v[0] = (uint8_t)(n.reg & 0xFF);
+    v[1] = (uint8_t)(n.reg >> 8);
+    v[2] = (uint8_t)(n.code & 0xFF);
+    v[3] = (uint8_t)(n.code >> 8);
+  } else if (dvccVicCapDue) {
+    dvccVicCapDue = false;
+    dvccVicCapSent = dvccVicCapacityRaw();
+    vreg = 0xEDF0;
+    v[0] = (uint8_t)(dvccVicCapSent & 0xFF);
+    v[1] = (uint8_t)(dvccVicCapSent >> 8);
+  } else if (dvccVicEchoDue) {
+    dvccVicEchoDue = false;
+    vreg = 0x2015;
+    memcpy(v, dvccVicEchoVal, sizeof(v));
+  } else if (dvccVicShareGone) {
+    dvccVicShareGone = false;
+    vreg = 0x2015;
+    v[0] = v[1] = 0xFF;
+  } else {
+    return false;
+  }
+  m.SetPGN(61184UL);
+  m.Priority = 7;
+  m.Destination = dest;
+  m.AddByte(0x66);
+  m.AddByte(0x99);
+  m.Add2ByteUInt(vreg);
+  for (uint8_t i = 0; i < 4; i++) m.AddByte(v[i]);
+  return true;
+}
+
+// Owner setting Stop Charging Without Limits: with follow on and nothing being followed, charge nothing. Applied in the
+// control loop the same way as a battery's stop-charging command.
+bool dvccStopForNoLimits() {
+  return dvccEn == 1 && dvccLostStop == 1 && dvccState != DVCC_FOLLOWING;
 }
 
 // Victron proprietary fast-packet (126720): 2-byte proprietary header (manufacturer code 358 +
@@ -979,11 +1157,12 @@ void VictronVreg126720(const tN2kMsg &N2kMsg) {
   if (N2kMsg.Destination != 0xFF && N2kMsg.Destination != NMEA2000.GetN2kSource()) return;
   uint16_t mfr = ((uint16_t)N2kMsg.Data[0] | ((uint16_t)N2kMsg.Data[1] << 8)) & 0x07FF;
   if (mfr != 358) return;  // Victron manufacturer code
+  bool toUs = (N2kMsg.Destination == NMEA2000.GetN2kSource());
   uint16_t reg23 = (uint16_t)N2kMsg.Data[2] | ((uint16_t)N2kMsg.Data[3] << 8);
-  bool got = dvccVicHandleReg(reg23, &N2kMsg.Data[4], N2kMsg.DataLen - 4, N2kMsg.Source);
+  bool got = dvccVicHandleReg(reg23, &N2kMsg.Data[4], N2kMsg.DataLen - 4, N2kMsg.Source, toUs);
   if (!got && N2kMsg.DataLen >= 7) {
     uint16_t reg34 = (uint16_t)N2kMsg.Data[3] | ((uint16_t)N2kMsg.Data[4] << 8);
-    dvccVicHandleReg(reg34, &N2kMsg.Data[5], N2kMsg.DataLen - 5, N2kMsg.Source);
+    dvccVicHandleReg(reg34, &N2kMsg.Data[5], N2kMsg.DataLen - 5, N2kMsg.Source, toUs);
   }
 }
 
@@ -1045,7 +1224,6 @@ void dvccRawFrameTap(unsigned long id, unsigned char len, const unsigned char *b
   if (canCap.active) canCapPush(id, len, buf, 0);
   if (id & (tNMEA2000_esp32::RawSffFlag | tNMEA2000_esp32::RawRtrFlag)) return;  // recorded only: no source address, no PGN
   if (n2kLastSeenMs) n2kLastSeenMs[id & 0xFF] = n2kPassMs;
-  if (NMEA2KData != 1 && dvccEn != 1) return;
   uint32_t pgn = (uint32_t)((id >> 8) & 0x1FFFFUL);
   uint8_t pf = (uint8_t)((id >> 16) & 0xFF);
   uint8_t dest = 0xFF;  // PDU2 frames are inherently broadcast
@@ -1054,10 +1232,13 @@ void dvccRawFrameTap(unsigned long id, unsigned char len, const unsigned char *b
     pgn &= 0x1FF00UL;  // PDU1 (destination-addressed): low byte is the destination, not part of the PGN
   }
   uint8_t src = (uint8_t)(id & 0xFF);
+  bool vicAnswered = (pgn == 61184UL) && dvccVicServiceAddressed(src, dest, buf, len);
+  if (NMEA2KData != 1 && dvccEn != 1) return;
   bool candidate = (pgn == 126720UL) || (pgn == 61184UL) || (pgn >= 130560UL && pgn <= 131071UL)  // RV-C DC/battery families + N2K proprietary fast-packet range
                    || (pgn >= 65280UL && pgn <= 65535UL);                                         // single-frame proprietary range
   if (!candidate) return;
   dvccCaptureFrame(id, len, buf);
+  if (vicAnswered) return;
   if (dvccSrcType == 1) {
     // RV-C battery authority: DC_SOURCE_STATUS_4 (1FEC9h) / BATTERY_STATUS_4 (1FE92h), single frame
     if ((pgn == 0x1FEC9UL || pgn == 0x1FE92UL) && len >= 7) {
@@ -1095,7 +1276,7 @@ void dvccRawFrameTap(unsigned long id, unsigned char len, const unsigned char *b
       uint16_t mfr = ((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) & 0x07FF;
       if (mfr != 358) return;
       uint16_t vreg = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-      dvccVicHandleReg(vreg, &buf[4], (int)len - 4, src);
+      dvccVicHandleReg(vreg, &buf[4], (int)len - 4, src, dest != 0xFF);
     }
   }
 }
@@ -1344,6 +1525,8 @@ void dvccTick() {
   if ((uint32_t)(now - lastTickMs) < 1000UL) return;
   lastTickMs = now;
   dvccAuthIdentityRefresh();
+  // A GX that asked for the capacity is told again when it changes: Command Limit, Charge Rate Limits, or the table mode
+  if (dvccVicAsked && dvccEn == 1 && dvccSrcType == 0 && dvccVicCapacityRaw() != dvccVicCapSent) dvccVicCapDue = true;
 
   static uint32_t lastSeenCount = 0;
   static uint32_t settleStartMs = 0;
@@ -1728,6 +1911,15 @@ void nmea2kTransmitTick() {
   if (n2kAddrPending != 255 && fieldCutSettled(2000)) {   // settled like the other field-off writers, not the raw cut flag
     settingWrite(NK_n2kSrcAddr, String((int)n2kAddrPending).c_str());
     n2kAddrPending = 255;
+  }
+  // Answers to a GX's DVCC handshake (spec §20) go ahead of the scheduled PGNs, still one frame per pass
+  if (n2kTxEnable == 1 && n2kNodeActive && NMEA2000.GetN2kSource() <= 251) {
+    tN2kMsg vregMsg;
+    if (dvccVicTxCompose(vregMsg)) {
+      if (NMEA2000.SendMsg(vregMsg)) n2kTxCount++;
+      else n2kTxDropCount++;
+      return;
+    }
   }
 
   enum : uint8_t { SLOT_BATT = 0,
@@ -2399,10 +2591,9 @@ void checkAndRestart() {
   bool engineOff = !engineSpinning() && !g_engineSpinningNow;   // g_engineSpinningNow follows ignition when engine speed is ignored, where engineSpinning() is always false
   bool fieldOff = (fieldActiveStatus == 0);
   bool noClient = (events.count() == 0);
-  bool cloudReachable = (currentMode == MODE_CLIENT && WiFi.status() == WL_CONNECTED && isRegistered);
-  // Offline, or every record waiting on a real clock, there is nothing to wait for — the flush below dumps the
-  // un-uploaded ring to flash.
-  bool cloudIdle = !core0Busy && (bufferedRecordCount == 0 || !cloudReachable || sensorUploadsHeldForClock());
+  // Unless the ring can drain (offline, WiFi with no internet, uploads off or blocked, every record waiting on a real
+  // clock), there is nothing to wait for: the flush below dumps the un-uploaded ring to flash.
+  bool cloudIdle = !core0Busy && (bufferedRecordCount == 0 || !sensorRingCanDrain());
   bool socOk = (!socInfoAvailable || !socShownOk() || socShownX100() >= REBOOT_SOC_FLOOR_X100);
   bool vQuietOk = (!vValid || vBatt >= REBOOT_VBAT_FLOOR_V * vScale);
   bool vBrownOk = (!vValid || vBatt >= REBOOT_VBAT_BROWNOUT_V * vScale);
@@ -2503,7 +2694,7 @@ void checkAndRestart() {
       resetSensorWindow();
     }
 
-    // Un-uploaded telemetry (offline/AP: cloudIdle waives the drain): dump the PSRAM ring to flash as
+    // Un-uploaded telemetry (offline, AP, WiFi with no internet: cloudIdle waives the drain): dump the PSRAM ring to flash as
     // shutdown Phase 4 does; setup() restores it on next boot.
     if (!ringIsEmpty()) {
       Serial.printf("Maintenance restart: ring still has %u records - dumping to LittleFS\n",

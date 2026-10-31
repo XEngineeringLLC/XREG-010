@@ -46,6 +46,7 @@ Page {
 	VeQuickItem { id: limitsCclItem; uid: page.svc + "/Link/GxLimits/Ccl" }
 	VeQuickItem { id: removeItem; uid: regs.mgr + "/Remove" }
 	VeQuickItem { id: flowDevicesItem; uid: regs.mgr + "/GxDevices" }
+	VeQuickItem { id: appVersionItem; uid: regs.mgr + "/Update/Installed" }
 
 	XregUnits { id: regs }
 
@@ -144,6 +145,12 @@ Page {
 				text: "Regulators"
 				secondaryText: page.boatToAdd > 0 ? page.boatToAdd + " more on this boat" : ""
 				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregRegulators.qml",
+						{ title: text, svc: page.svc, home: page.home, setupId: page.setupId })
+			}
+			ListNavigation {
+				text: "GX app"
+				secondaryText: appVersionItem.valid ? "Version " + appVersionItem.value : ""
+				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregGxApp.qml",
 						{ title: text, svc: page.svc, home: page.home, setupId: page.setupId })
 			}
 			ListButton {

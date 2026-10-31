@@ -132,6 +132,7 @@ SilenceAlarm
 
 dvccEn
 dvccSilenceS
+dvccLostStop
 
 @connection anchor=gxCard
 hardwarePresent

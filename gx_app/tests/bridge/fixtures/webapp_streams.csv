@@ -1,0 +1,1219 @@
+stream,index,field,wire_scale,fw_expression,comment
+CSV1,0,AlternatorTemperatureF,100,"!isfinite(AlternatorTemperatureF) ? ROLL_EMPTY : SafeInt(AlternatorTemperatureF, 100)","no alt-role probe -> ""not available"" (SafeInt's -1 would render as -0.0F)"
+CSV1,1,dutyCycle,100,"SafeInt(dutyCycle, 100)",
+CSV1,2,BatteryV,100,"SafeInt(battVOut, 100)",
+CSV1,3,MeasuredAmps,100,"SafeInt(altOut, 100)",
+CSV1,4,RPM,1,SafeInt(rpmOut),
+CSV1,5,Channel3V,100,"SafeInt(ch3Out, 100)",
+CSV1,6,IBV,100,"SafeInt(ibvOut, 100)",
+CSV1,7,Bcur,100,"HAS_BATT_SHUNT ? SafeInt(bcurOut, 100) : ROLL_EMPTY","no shunt -> ""not available"", never INA input noise"
+CSV1,8,VictronVoltage,100,"SafeInt(VictronVoltage, 100)",
+CSV1,9,LoopTime,1,SafeInt(LoopTime),
+CSV1,10,WifiHeartBeat,1,SafeInt(WifiHeartBeat),
+CSV1,11,vvout,100,"SafeInt(vvout, 100)",
+CSV1,12,iiout,100,"SafeInt(iiout, 100)",
+CSV1,13,FreeHeap,1,SafeInt(FreeHeap),
+CSV1,14,Alarm_Status,1,SafeInt(Alarm_Status),
+CSV1,15,fieldActiveStatus,1,SafeInt(fieldActiveStatus),
+CSV1,16,currentMode,1,SafeInt((int)currentMode),
+CSV1,17,stateRevision,1,SafeInt(stateRevision),
+CSV1,18,setpointLimited,100,"SafeInt(setpointLimited, 100)",
+CSV1,19,uTargetAmps,100,"SafeInt(uTargetAmps, 100)",
+CSV1,20,pidInput,100,"SafeInt(pidInput, 100)",
+CSV1,21,pidOutput,100,"SafeInt(pidOutput, 100)",
+CSV1,22,pidError,100,"SafeInt(pidError, 100)",
+CSV1,23,imu_heel_deg,100,"SafeInt(imu_heel_deg, 100)",
+CSV1,24,imu_pitch_deg,100,"SafeInt(imu_pitch_deg, 100)",
+CSV1,25,imu_vertical_accel_g,1000,"SafeInt(imu_vertical_accel_g, 1000)",
+CSV1,26,imu_yaw_rate_dps,100,"SafeInt(imu_yaw_rate_dps, 100)",
+CSV1,27,imu_total_accel_g,1000,"SafeInt(imu_total_accel_g, 1000)",
+CSV1,28,perfCountersResetElapsedS,1,SafeInt((int32_t)((millis() - perfCountersResetMs) / 1000UL)),seconds since perf-counters reset (0 = boot)
+CSV1,29,shutdownPhase,1,SafeInt(shutdownPhase),
+CSV1,30,BatteryV_raw,100,"SafeInt(BatteryV, 100)",raw ADS1115
+CSV1,31,pidAltPV,100,"SafeInt(pidAltPV, 100)",CC current-PID PV (OutputPIDSigSrc-selected)
+CSV1,32,voltageTarget,100,SafeInt(ChargingVoltageTarget * 100),
+CSV1,33,Icv,100,SafeInt(Icv * 100),
+CSV1,34,WaterDepth_ft,10,"SafeInt(IS_STALE(IDX_WATER_DEPTH) ? 0 : (WaterDepth_m * 3.28084f), 10)",
+CSV1,35,Ignition,1,SafeInt(Ignition),effective ignition (override applied at top of loop)
+CSV1,36,OnOff,1,SafeInt(OnOff),"master Alternator Enable — same frame as fieldActiveStatus, so the header switch can never disagree with the field-status word"
+CSV1,37,mExcessEma,10,"SafeInt(g_mExcessEma, 10)",iExcess detector: averaged current excess over command (A ×10) — tuning trace
+CSV1,38,iExcessThreshold,10,"SafeInt(g_iExcessThreshold, 10)",iExcess detector: fire threshold E (A ×10) — tuning trace
+CSV1,39,mExcessEmaPeak,10,"SafeInt(g_iExcessArmedWin ? g_mExcessEmaPeak : g_mExcessEma, 10)",iExcess: per-frame peak averaged excess (A ×10) — live sparkline
+CSV1,40,iExcessThreshMin,10,"SafeInt(g_iExcessArmedWin ? g_iExcessThreshWinMin : g_iExcessThreshold, 10)",iExcess: per-frame min fire threshold E (A ×10) — live sparkline
+CSV1,41,protEventMask,1,SafeInt(protMask),"event bitmask this frame (1=OV 2=iExcess 4=LoadDump — vertical markers; 8=CV D term — Voltage-plot shading, NOT a protection)"
+CSV1,42,fieldEventReason,1,SafeInt(g_fieldEventReason),FieldEventReason enum code — plain-English cause shown next to the banner OFF word
+CSV1,43,cvPTerm,100,"SafeInt(g_cvPTerm, 100)",CV loop P contribution to Icv (A ×100) — P/I/D tuning plot
+CSV1,44,cvIterm,100,"SafeInt(cv_I, 100)","CV loop I contribution to Icv (A ×100) — cv_I integrator, live"
+CSV1,45,cvKdTrim,100,"SafeInt(g_cvKdTrimLive, 100)",CV loop D back-off at the Icv output (A ×100) — plotted negated
+CSV1,46,cvKdFiltV,100,"SafeInt(g_cvKdFiltV, 100)","IBV smoothed by CvKdVoltFiltTC (V ×100) — ""Voltage for D term"" trace"
+CSV1,47,huntDerate,100,"SafeInt(g_huntDerate, 100)",hunt-governor live Ki derate (×100; 100 = full gain)
+CSV1,48,huntFreqHz,100,"SafeInt(g_huntFreqHz, 100)",hunt-governor last confirmed wobble frequency (Hz ×100; 0 = none this session)
+CSV1,49,huntState,1,(int)g_huntState,"0 watching, 1 testing a Ki cut, 3 cooldown, 4 testing with the D term paused (2 unused)"
+CSV1,50,rpmCeilingAmps,100,"SafeInt(g_I_cap, 100)",RPM-table current ceiling this tick (A ×100) — header Limit panel
+CSV1,51,sessionId,1,(unsigned)g_sessionId,"device boot identity, same in every channel this boot"
+CSV1,52,sendMs,1,(unsigned)millis(),device millis() when this payload was built — the reference clock the other channels are aged against
+CSV4,0,HeadingNMEA,1,SafeInt(HeadingNMEA),"heading (deg, int)"
+CSV4,1,SOGNMEA,100,"SafeInt(SOGNMEA, 100)",speed over ground (knots ×100)
+CSV4,2,COGNMEA,1,SafeInt(COGNMEA),"course over ground (deg, int)"
+CSV4,3,STWNMEA,100,"!isfinite(STWNMEA) ? ROLL_EMPTY : SafeInt(STWNMEA, 100)","speed through water (SOW, knots ×100); -1/0 = NAN/no log"
+CSV4,4,ApparentWindSpeedNMEA,100,"SafeInt(ApparentWindSpeedNMEA, 100)",AWS (knots ×100)
+CSV4,5,ApparentWindAngleNMEA,1,SafeInt(ApparentWindAngleNMEA),"AWA (deg, int)"
+CSV4,6,TrueWindSpeedNMEA,100,"!isfinite(TrueWindSpeedNMEA) ? ROLL_EMPTY : SafeInt(TrueWindSpeedNMEA, 100)",TWS (knots ×100)
+CSV4,7,TrueWindAngleNMEA,1,!isfinite(TrueWindAngleNMEA) ? ROLL_EMPTY : SafeInt(TrueWindAngleNMEA),"TWA (deg, int)"
+CSV4,8,LeewayNMEA,1,!isfinite(LeewayNMEA) ? ROLL_EMPTY : SafeInt(LeewayNMEA),"leeway (deg, int)"
+CSV4,9,VMGNMEA,100,"!isfinite(VMGNMEA) ? ROLL_EMPTY : SafeInt(VMGNMEA, 100)",VMG (knots ×100)
+CSV4,10,VMGUpwind,100,"!isfinite(VMGUpwind) ? ROLL_EMPTY : SafeInt(VMGUpwind, 100)","VMG to windward, knots ×100"
+CSV4,11,VictronSolarPower_W,1,SafeInt(VictronSolarPower_W),PPV panel power (W ×1)
+CSV4,12,VictronSolarVoltage_V,100,"SafeInt(VictronSolarVoltage_V, 100)",VPV panel voltage (V ×100)
+CSV4,13,VictronSolarCurrent_A,100,"SafeInt(VictronSolarCurrent_A, 100)",derived panel current (A ×100)
+CSV4,14,VictronCurrent,100,"SafeInt(VictronCurrent, 100)",Victron battery current (A ×100)
+CSV4,15,currentFuelGPH,100,"SafeInt(currentFuelGPH, 100)",live fuel flow (gal/hr ×100)
+CSV4,16,currentNMPG,100,"SafeInt(currentNMPG, 100)",live fuel economy (naut mi/gal ×100)
+CSV4,17,ctrlLimiter,1,(int)ctrlLimiter,"banner limiter code: 0 none, 1 alt current cap, 2 thermal derate, 3 CV voltage loop, 4 battery current limit, 5 field at max duty, 6 protection (cap binding or recovery window), 7 battery above target"
+CSV4,18,chargeStage,1,SafeInt(chargeStageDisplay),CHARGE_STAGE_* code — feeds gLastChargeStage at 2 Hz for the mode ribbon
+CSV4,19,n183Heading,10,"SafeInt(n183HeadingDeg, 10)","NMEA 0183 decoded heading (deg ×10; negative = nothing decoded). Distinct from HeadingNMEA, which is the NMEA2000 source."
+CSV4,20,n183HdgRef,1,(int)n183HdgRef,"reference frame of the above: 0 none, 1 magnetic, 2 true"
+CSV4,21,bmsSignalActive,1,(int)bmsSignalActive,"live BMS on/off opto input: 1 = 5-62 V present at the wire, 0 = dead/open. Raw pin, before the Present/Absent polarity choice"
+CSV4,22,panelHiRateInput,1,(int)panelHiRateInput,"switch panel HIGH/LOW opto input (Cable 3 pin 5): 1 = wire energized = switch on = asking for High. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything"
+CSV4,23,panelForceFloatInput,1,(int)panelForceFloatInput,"switch panel FORCEFLOAT opto input (Cable 3 pin 7): 1 = wire energized = switch on = asking for Maintain. Debounced pin state, sent whether or not Physical Panel Override lets it steer anything"
+CSV4,24,VictronSoc,10,"SafeInt(veSocFresh() ? VictronSoc : NAN, 10)","VE.Direct battery monitor's own state of charge (% ×10; NaN when stale, unsynced or not a battery monitor)"
+CSV4,25,sessionId,1,(unsigned)g_sessionId,"device boot identity, same in every channel this boot"
+CSV4,26,sendMs,1,(unsigned)millis(),device millis() when this payload was built
+CSV2,0,IBVMax,100,"SafeInt(IBVMax, 100)",
+CSV2,1,MeasuredAmpsMax,100,"SafeInt(MeasuredAmpsMax, 100)",
+CSV2,2,RPMMax,1,SafeInt(RPMMax),
+CSV2,3,SOC_percent,100,socShownOk() ? SafeInt(socShownX100()) : ROLL_EMPTY,no shunt and no network monitor -> SOC_percent is a frozen NVS leftover
+CSV2,4,EngineRunTime,1,"SafeInt((double)EngineRunTime * 100.0 / 3600.0, 1)","double: int math overflows (UB) at 5,965 engine-hours"
+CSV2,5,AlternatorOnTime,1,"SafeInt((double)AlternatorOnTime * 100.0 / 3600.0, 1)",
+CSV2,6,AlternatorFuelUsed,100,"SafeInt(AlternatorFuelUsed, 100)",
+CSV2,7,ChargedEnergy,1,SafeInt(ChargedEnergy),
+CSV2,8,DischargedEnergy,1,SafeInt(DischargedEnergy),
+CSV2,9,AlternatorChargedEnergy,1,SafeInt(AlternatorChargedEnergy),
+CSV2,10,MaxAlternatorTemperatureF,1,SafeInt(MaxAlternatorTemperatureF),
+CSV2,11,temperatureThermistor,1,SafeInt(temperatureThermistor),
+CSV2,12,MaxTemperatureThermistor,1,SafeInt(MaxTemperatureThermistor),
+CSV2,13,timeToFullChargeMin,1,SafeInt(timeToFullChargeMin),
+CSV2,14,timeToFullDischargeMin,1,SafeInt(timeToFullDischargeMin),
+CSV2,15,LatitudeNMEA,1000000,SafeInt(LatitudeNMEA * 1000000),
+CSV2,16,LongitudeNMEA,1000000,SafeInt(LongitudeNMEA * 1000000),
+CSV2,17,SatelliteCountNMEA,1,SafeInt(SatelliteCountNMEA),
+CSV2,18,LastSessionDuration,1,SafeInt(LastSessionDuration),
+CSV2,19,LastSessionMaxLoopTime,1,SafeInt(LastSessionMaxLoopTime),
+CSV2,20,lastSessionMinHeap,1,SafeInt(lastSessionMinHeap),
+CSV2,21,wifiReconnectsTotal,1,SafeInt(wifiReconnectsTotal),
+CSV2,22,LastResetReason,1,SafeInt(LastResetReason),
+CSV2,23,ancientResetReason,1,SafeInt(ancientResetReason),
+CSV2,24,totalPowerCycles,1,SafeInt(totalPowerCycles),
+CSV2,25,MinFreeHeap,1,SafeInt(MinFreeHeap),
+CSV2,26,currentWeatherMode,1,SafeInt(currentWeatherMode),
+CSV2,27,UVToday,100,"SafeInt(UVToday, 100)",
+CSV2,28,UVTomorrow,100,"SafeInt(UVTomorrow, 100)",
+CSV2,29,UVDay2,100,"SafeInt(UVDay2, 100)",
+CSV2,30,weatherDataValid,1,SafeInt(weatherDataValid),
+CSV2,31,AlarmLatchState,1,SafeInt(alarmLatch ? 1 : 0),
+CSV2,32,ResetAlarmLatch,1,SafeInt(ResetAlarmLatch),
+CSV2,33,DynamicAltCurrentZero,1000,"SafeInt(DynamicAltCurrentZero, 1000)",
+CSV2,34,InsulationLifePercent,100,"SafeInt(InsulationLifePercent, 100)",
+CSV2,35,GreaseLifePercent,100,"SafeInt(GreaseLifePercent, 100)",
+CSV2,36,BrushLifePercent,100,"SafeInt(BrushLifePercent, 100)",
+CSV2,37,PredictedLifeHours,1,SafeInt(PredictedLifeHours),
+CSV2,38,LifeIndicatorColor,1,SafeInt(LifeIndicatorColor),
+CSV2,39,pKwHrToday,100,"SafeInt(pKwHrToday, 100)",
+CSV2,40,pKwHrTomorrow,100,"SafeInt(pKwHrTomorrow, 100)",
+CSV2,41,pKwHr2days,100,"SafeInt(pKwHr2days, 100)",
+CSV2,42,ambientTemp,1,!isfinite(ambientTemp) ? ROLL_EMPTY : SafeInt(ambientTemp),"no BMP388 -> ""—"""
+CSV2,43,baroPressure,10,"SafeInt(baroPressure, 10)",
+CSV2,44,firmwareVersionInt,1,SafeInt(firmwareVersionInt),
+CSV2,45,deviceIdUpper,1,deviceIdUpper,
+CSV2,46,deviceIdLower,1,deviceIdLower,
+CSV2,47,ChargedEnergy_AllTime,1,SafeInt(ChargedEnergy_AllTime),
+CSV2,48,AlternatorFuelUsed_AllTime,100,"SafeInt(AlternatorFuelUsed_AllTime, 100)",
+CSV2,49,PeakVoltage_AllTime,100,"SafeInt(PeakVoltage_AllTime, 100)",
+CSV2,50,EngineRunTime_AllTime,1,"SafeInt(EngineRunTime_AllTime * 100 / 3600, 1)",
+CSV2,51,MinVoltage,100,"SafeInt(MinVoltage, 100)",
+CSV2,52,MinVoltage_AllTime,100,"SafeInt(MinVoltage_AllTime, 100)",
+CSV2,53,ChargeCycles,100,"SafeInt(ChargeCycles, 100)",
+CSV2,54,ChargeCycles_AllTime,100,"SafeInt(ChargeCycles_AllTime, 100)",
+CSV2,55,EngineFuelUsed,100,"SafeInt(EngineFuelUsed, 100)",
+CSV2,56,EngineFuelUsed_AllTime,100,"SafeInt(EngineFuelUsed_AllTime, 100)",
+CSV2,57,TotalDistance,10,"SafeInt(TotalDistance, 10)",
+CSV2,58,TotalDistance_AllTime,10,"SafeInt(TotalDistance_AllTime, 10)",
+CSV2,59,MaxSpeed,100,"SafeInt(MaxSpeed, 100)",
+CSV2,60,MaxSpeed_AllTime,100,"SafeInt(MaxSpeed_AllTime, 100)",
+CSV2,61,SolarChargedEnergy,1,SafeInt(SolarChargedEnergy),
+CSV2,62,SolarChargedEnergy_AllTime,1,SafeInt(SolarChargedEnergy_AllTime),
+CSV2,63,AlternatorChargedEnergy_AllTime,1,SafeInt(AlternatorChargedEnergy_AllTime),
+CSV2,64,DischargedEnergy_AllTime,1,SafeInt(DischargedEnergy_AllTime),
+CSV2,65,AvgSOC_AllTime,100,"SafeInt(AvgSOC_AllTime, 100)",
+CSV2,66,AvgSpeed_AllTime,100,"SafeInt(AvgSpeed_AllTime, 100)",
+CSV2,67,AvgSpeed,100,"SafeInt(AvgSpeed, 100)",
+CSV2,68,AlternatorOnTime_AllTime,1,"SafeInt(AlternatorOnTime_AllTime * 100 / 3600, 1)",
+CSV2,69,EngineCycles_AllTime,1,SafeInt(EngineCycles_AllTime),
+CSV2,70,MaxAlternatorTemperatureF_AllTime,1,SafeInt(MaxAlternatorTemperatureF_AllTime),
+CSV2,71,MaxTemperatureThermistor_AllTime,1,SafeInt(MaxTemperatureThermistor_AllTime),
+CSV2,72,MeasuredAmpsMax_AllTime,100,"SafeInt(MeasuredAmpsMax_AllTime, 100)",
+CSV2,73,RPMMax_AllTime,1,SafeInt(RPMMax_AllTime),
+CSV2,74,BulkStage,1,SafeInt(inBulkStage ? 1 : 0),
+CSV2,75,WifiWakeSecondsRemaining,1,SafeInt( (wifiWakeStart > 0 && (millis() - wifiWakeStart) < WIFI_WAKE_DURATION) ? (WIFI_WAKE_DURATION - (millis() - wifiWakeStart)) / 1000 : (pendingShutdownFlush && shutdownCloudDeadlineMs > millis(),
+CSV2,76,BufferedRecordCount,1,SafeInt(bufferedRecordCount),
+CSV2,77,BufferedRecordPercent,1,SafeInt((bufferedRecordCount * 100) / SENSOR_RING_SIZE),
+CSV2,78,BufferedRecordCap,1,SafeInt(SENSOR_RING_SIZE),
+CSV2,79,VMGTargetBearing,1,SafeInt(VMGTargetBearing),
+CSV2,80,cpuLoadCore0,1,SafeInt(cpuLoadCore0),
+CSV2,81,cpuLoadCore0Max,1,SafeInt(cpuLoadCore0Max),
+CSV2,82,cpuLoadCore1,1,SafeInt(cpuLoadCore1),
+CSV2,83,cpuLoadCore1Max,1,SafeInt(cpuLoadCore1Max),
+CSV2,84,hasForcedUpdate,1,SafeInt(hasForcedUpdate ? 1 : 0),
+CSV2,85,forcedFwVersionInt,1,SafeInt(forcedFwVersionInt),
+CSV2,86,forcedUpdateDeadline,1,(forcedUpdateDeadline),
+CSV2,87,stateRevision,1,SafeInt(stateRevision),
+CSV2,88,imu_accel_x_raw,1000,"SafeInt(imu_accel_x_raw, 1000)",
+CSV2,89,imu_accel_y_raw,1000,"SafeInt(imu_accel_y_raw, 1000)",
+CSV2,90,imu_accel_z_raw,1000,"SafeInt(imu_accel_z_raw, 1000)",
+CSV2,91,imu_gyro_x_raw,100,"SafeInt(imu_gyro_x_raw, 100)",
+CSV2,92,imu_gyro_y_raw,100,"SafeInt(imu_gyro_y_raw, 100)",
+CSV2,93,imu_gyro_z_raw,100,"SafeInt(imu_gyro_z_raw, 100)",
+CSV2,94,accel_x_min,1,SafeInt(imuWindow->accel_x_min),
+CSV2,95,accel_x_max,1,SafeInt(imuWindow->accel_x_max),
+CSV2,96,accel_x_avg,1,SafeInt(imuWindow->accel_x_valid_us > 0 ? (int)((int64_t)imuWindow->accel_x_area_v_us / (int64_t)imuWindow->accel_x_valid_us) : 0),
+CSV2,97,accel_y_min,1,SafeInt(imuWindow->accel_y_min),
+CSV2,98,accel_y_max,1,SafeInt(imuWindow->accel_y_max),
+CSV2,99,accel_y_avg,1,SafeInt(imuWindow->accel_y_valid_us > 0 ? (int)((int64_t)imuWindow->accel_y_area_v_us / (int64_t)imuWindow->accel_y_valid_us) : 0),
+CSV2,100,accel_z_min,1,SafeInt(imuWindow->accel_z_min),
+CSV2,101,accel_z_max,1,SafeInt(imuWindow->accel_z_max),
+CSV2,102,accel_z_avg,1,SafeInt(imuWindow->accel_z_valid_us > 0 ? (int)((int64_t)imuWindow->accel_z_area_v_us / (int64_t)imuWindow->accel_z_valid_us) : 0),
+CSV2,103,gyro_x_min,1,SafeInt(imuWindow->gyro_x_min),
+CSV2,104,gyro_x_max,1,SafeInt(imuWindow->gyro_x_max),
+CSV2,105,gyro_x_avg,1,SafeInt(imuWindow->gyro_x_valid_us > 0 ? (int)((int64_t)imuWindow->gyro_x_area_v_us / (int64_t)imuWindow->gyro_x_valid_us) : 0),
+CSV2,106,gyro_y_min,1,SafeInt(imuWindow->gyro_y_min),
+CSV2,107,gyro_y_max,1,SafeInt(imuWindow->gyro_y_max),
+CSV2,108,gyro_y_avg,1,SafeInt(imuWindow->gyro_y_valid_us > 0 ? (int)((int64_t)imuWindow->gyro_y_area_v_us / (int64_t)imuWindow->gyro_y_valid_us) : 0),
+CSV2,109,gyro_z_min,1,SafeInt(imuWindow->gyro_z_min),
+CSV2,110,gyro_z_max,1,SafeInt(imuWindow->gyro_z_max),
+CSV2,111,gyro_z_avg,1,SafeInt(imuWindow->gyro_z_valid_us > 0 ? (int)((int64_t)imuWindow->gyro_z_area_v_us / (int64_t)imuWindow->gyro_z_valid_us) : 0),
+CSV2,112,heel_min,1,SafeInt(imuWindow->heel_min),
+CSV2,113,heel_max,1,SafeInt(imuWindow->heel_max),
+CSV2,114,heel_avg,1,SafeInt(imuWindow->heel_valid_us > 0 ? (int)((int64_t)imuWindow->heel_area_v_us / (int64_t)imuWindow->heel_valid_us) : 0),
+CSV2,115,pitch_min,1,SafeInt(imuWindow->pitch_min),
+CSV2,116,pitch_max,1,SafeInt(imuWindow->pitch_max),
+CSV2,117,pitch_avg,1,SafeInt(imuWindow->pitch_valid_us > 0 ? (int)((int64_t)imuWindow->pitch_area_v_us / (int64_t)imuWindow->pitch_valid_us) : 0),
+CSV2,118,vertical_accel_min,1,SafeInt(imuWindow->vertical_accel_min),
+CSV2,119,vertical_accel_max,1,SafeInt(imuWindow->vertical_accel_max),
+CSV2,120,vertical_accel_avg,1,SafeInt(imuWindow->vertical_accel_valid_us > 0 ? (int)((int64_t)imuWindow->vertical_accel_area_v_us / (int64_t)imuWindow->vertical_accel_valid_us) : 0),
+CSV2,121,total_accel_min,1,SafeInt(imuWindow->total_accel_min),
+CSV2,122,total_accel_max,1,SafeInt(imuWindow->total_accel_max),
+CSV2,123,total_accel_avg,1,SafeInt(imuWindow->total_accel_valid_us > 0 ? (int)((int64_t)imuWindow->total_accel_area_v_us / (int64_t)imuWindow->total_accel_valid_us) : 0),
+CSV2,124,imu_slam_count,1,SafeInt(imuWindow->slam_count),
+CSV2,125,imu_slam_peak_max,1,SafeInt(imuWindow->slam_peak_max),
+CSV2,126,imu_slam_count_lifetime,1,SafeInt(imu_slam_count_lifetime),
+CSV2,127,imu_capsize_count,1,SafeInt(imu_capsize_count),
+CSV2,128,imu_pitchpole_count,1,SafeInt(imu_pitchpole_count),
+CSV2,129,imu_heel_change_60s,1,SafeInt(imuWindow->heel_change_60s),
+CSV2,130,imu_heel_deviation_60s,1,SafeInt(imuWindow->heel_deviation_60s),
+CSV2,131,imu_pitch_change_60s,1,SafeInt(imuWindow->pitch_change_60s),
+CSV2,132,imu_pitch_deviation_60s,1,SafeInt(imuWindow->pitch_deviation_60s),
+CSV2,133,imu_wave_period_sec,1,SafeInt(imuWindow->wave_period),
+CSV2,134,imu_heel_max_lifetime,100,"SafeInt(imu_heel_max_lifetime, 100)",
+CSV2,135,imu_pitch_max_lifetime,100,"SafeInt(imu_pitch_max_lifetime, 100)",
+CSV2,136,imu_slam_peak_lifetime,1000,"SafeInt(imu_slam_peak_lifetime, 1000)",
+CSV2,137,imu_fifo_overrun_count,1,SafeInt(imu_fifo_overrun_count),
+CSV2,138,imu_i2c_error_count,1,SafeInt(imu_i2c_error_count),
+CSV2,139,imu_unknown_tag_count,1,SafeInt(imu_unknown_tag_count),
+CSV2,140,imu_accel_dropped,1,SafeInt(imuRingBuffer ? imuRingBuffer->accel_dropped : 0),
+CSV2,141,imu_gyro_dropped,1,SafeInt(imuRingBuffer ? imuRingBuffer->gyro_dropped : 0),
+CSV2,142,imu_total_samples_accel,1,SafeInt(imu_total_samples_accel),
+CSV2,143,imu_total_samples_gyro,1,SafeInt(imu_total_samples_gyro),
+CSV2,144,IMUReadTime2,1,SafeInt(IMUReadTime2),
+CSV2,145,IMUReadTime,1,SafeInt(IMUReadTime),
+CSV2,146,adsI2CErrorCount,1,SafeInt(adsI2CErrorCount),
+CSV2,147,tempPIDActive,1,SafeInt(tempPIDActive ? 1 : 0),
+CSV2,148,tempPIDInput_d,100,"SafeInt(tempPIDInput_d, 100)",
+CSV2,149,tempPIDSetpoint_d,100,"SafeInt(tempPIDSetpoint_d, 100)",
+CSV2,150,thermalPenaltyAmps,100,"SafeInt(thermalPenaltyAmps, 100)",
+CSV2,151,innerTermP,100,"SafeInt(innerTermP, 100)",
+CSV2,152,innerTermI,100,"SafeInt(innerTermI, 100)",
+CSV2,153,innerTermD,100,"SafeInt(innerTermD, 100)",
+CSV2,154,outerTermP,100,"SafeInt(outerTermP, 100)",
+CSV2,155,outerTermI,100,"SafeInt(outerTermI, 100)",
+CSV2,156,outerTermLookahead,100,"SafeInt(outerTermLookahead, 100)",
+CSV2,157,thermalSlopeFPerSec,1000,"SafeInt(thermalSlopeFPerSec, 1000)",
+CSV2,158,chargeStageDisplay,1,SafeInt(chargeStageDisplay),
+CSV2,159,voltageControlActive,1,SafeInt(voltageControlActive),
+CSV2,160,voltageError,100,SafeInt((ChargingVoltageTarget - getBatteryVoltage()) * 100),
+CSV2,161,cv_I,100,SafeInt(cv_I * 100),
+CSV2,162,inIdleStage,1,SafeInt(inIdleStage),
+CSV2,163,altBaselineFrozen,1,altHaveFront(),
+CSV2,164,ft_rai_total_win,1,SafeInt(ft_rai_total.worstWindow),
+CSV2,165,ft_rai_total_ses,1,SafeInt(ft_rai_total.worstSession),
+CSV2,166,ft_rai_ina228_win,1,SafeInt(ft_rai_ina228.worstWindow),
+CSV2,167,ft_rai_ina228_ses,1,SafeInt(ft_rai_ina228.worstSession),
+CSV2,168,ft_rai_ads_state_win,1,SafeInt(ft_rai_ads_state.worstWindow),
+CSV2,169,ft_rai_ads_state_ses,1,SafeInt(ft_rai_ads_state.worstSession),
+CSV2,170,ft_rai_bmp_state_win,1,SafeInt(ft_rai_bmp_state.worstWindow),
+CSV2,171,ft_rai_bmp_state_ses,1,SafeInt(ft_rai_bmp_state.worstSession),
+CSV2,172,ft_rai_imu_win,1,SafeInt(ft_rai_imu.worstWindow),
+CSV2,173,ft_rai_imu_ses,1,SafeInt(ft_rai_imu.worstSession),
+CSV2,174,tempReadFailCount,1,SafeInt(tempReadFailCount),
+CSV2,175,tempCrcFailCount,1,SafeInt(tempCrcFailCount),
+CSV2,176,tempCrcRecoveredCount,1,SafeInt(tempCrcRecoveredCount),
+CSV2,177,tempAllFFCount,1,SafeInt(tempAllFFCount),
+CSV2,178,tempPowerOn85Count,1,SafeInt(tempPowerOn85Count),
+CSV2,179,tempOutOfRangeCount,1,SafeInt(tempOutOfRangeCount),
+CSV2,180,tempRequestFailCount,1,SafeInt(tempRequestFailCount),
+CSV2,181,tempConnectedFailCount,1,SafeInt(tempConnectedFailCount),
+CSV2,182,tempResolutionFixCount,1,SafeInt(tempResolutionFixCount),
+CSV2,183,tempRereadFailCount,1,SafeInt(tempRereadFailCount),
+CSV2,184,tempResolutionFixCrcFailCount,1,SafeInt(tempResolutionFixCrcFailCount),
+CSV2,185,tempEnumerateFailCount,1,SafeInt(tempEnumerateFailCount),
+CSV2,186,warmupCeiling,1,SafeInt(warmupCeiling),
+CSV2,187,imu_min_moving_gentle,1,SafeInt(imu_min_moving_gentle),
+CSV2,188,imu_min_moving_moderate,1,SafeInt(imu_min_moving_moderate),
+CSV2,189,imu_min_moving_rough,1,SafeInt(imu_min_moving_rough),
+CSV2,190,imu_min_moving_extreme,1,SafeInt(imu_min_moving_extreme),
+CSV2,191,imu_min_stat_gentle,1,SafeInt(imu_min_stat_gentle),
+CSV2,192,imu_min_stat_moderate,1,SafeInt(imu_min_stat_moderate),
+CSV2,193,imu_min_stat_rough,1,SafeInt(imu_min_stat_rough),
+CSV2,194,imu_min_stat_extreme,1,SafeInt(imu_min_stat_extreme),
+CSV2,195,imu_heel_deviation_120s,100,"SafeInt(imu_heel_deviation_120s, 100)",
+CSV2,196,imu_pitch_deviation_120s,100,"SafeInt(imu_pitch_deviation_120s, 100)",
+CSV2,197,imu_heading_swing_120s,10,"SafeInt(imu_heading_swing_120s, 10)",
+CSV2,198,dBcur_dt,10,"HAS_BATT_SHUNT ? SafeInt(g_dBcur_dt, 10) : ROLL_EMPTY",
+CSV2,199,loadDumpActive,1,(int)g_loadDumpActive,
+CSV2,200,ft_updateAccelMetrics_win,1,SafeInt(ft_updateAccelMetrics.worstWindow),
+CSV2,201,ft_updateAccelMetrics_ses,1,SafeInt(ft_updateAccelMetrics.worstSession),
+CSV2,202,WifiStrength,1,SafeInt(WifiStrength),
+CSV2,203,SendWifiTime,1,SafeInt(SendWifiTime),
+CSV2,204,AnalogReadTime,1,SafeInt(AnalogReadTime),
+CSV2,205,VeTime,1,SafeInt(VeTime),
+CSV2,206,MaximumLoopTime,1,SafeInt(MaximumLoopTime),
+CSV2,207,EngineCycles,1,SafeInt(EngineCycles),
+CSV2,208,CurrentSessionDuration,1,SafeInt(CurrentSessionDuration),
+CSV2,209,currentPartitionType,1,SafeInt(currentPartitionType),
+CSV2,210,fastOvCurrentCap,100,"SafeInt(g_fastOvCurrentCap, 100)",
+CSV2,211,fastOvClampCount,1,SafeInt(g_fastOvClampCount),
+CSV2,212,fastOvHardCount,1,SafeInt(g_fastOvHardCount),240
+CSV2,213,ch1_last_ms,1,SafeInt(ch1_last_ms),
+CSV2,214,ch1_avg_10s,100,"SafeInt(ch1_avg_10s, 100)",
+CSV2,215,ch1_worst_10s,1,SafeInt(ch1_worst_10s),
+CSV2,216,ch1_over2x_10s,1,SafeInt(ch1_over2x_10s),
+CSV2,217,ch1_n_10s,1,SafeInt(ch1_n_10s),
+CSV2,218,ch1_avg_2m,100,"SafeInt(ch1_avg_2m, 100)",
+CSV2,219,ch1_worst_2m,1,SafeInt(ch1_worst_2m),
+CSV2,220,ch1_over2x_2m,1,SafeInt(ch1_over2x_2m),
+CSV2,221,ch1_n_2m,1,SafeInt(ch1_n_2m),
+CSV2,222,ch1_avg_at,100,"SafeInt(ch1_avg_at, 100)",
+CSV2,223,ch1_worst_at,1,SafeInt(ch1_worst_at),
+CSV2,224,ch1_over2x_at,1,SafeInt(ch1_over2x_at),
+CSV2,225,ch1_n_at,1,SafeInt(ch1_n_at),
+CSV2,226,iExcessCount,1,SafeInt(g_iExcessCount),
+CSV2,227,inaOVCount,1,SafeInt(g_inaOVCount),
+CSV2,228,hardOCCount,1,SafeInt(g_hardOCCount),
+CSV2,229,voltSpikeCount,1,SafeInt(g_voltSpikeCount),
+CSV2,230,voltDisagreeCritCount,1,SafeInt(g_voltDisagreeCritCount),
+CSV2,231,voltDisagreeWarnCount,1,SafeInt(g_voltDisagreeWarnCount),
+CSV2,232,voltImplausibleCount,1,SafeInt(g_voltImplausibleCount),
+CSV2,233,tempCritCount,1,SafeInt(g_tempCritCount),
+CSV2,234,tempSustainedCount,1,SafeInt(g_tempSustainedCount),
+CSV2,235,tempStaleCount,1,SafeInt(g_tempStaleCount),
+CSV2,236,currentStaleCount,1,SafeInt(g_currentStaleCount),
+CSV2,237,imu_msi_score,100,"SafeInt(imu_msi_score, 100)",
+CSV2,238,imu_vomit_pct,100,"SafeInt(imu_vomit_pct, 100)",
+CSV2,239,imu_anchorage_comfort,100,"SafeInt(imu_anchorage_comfort, 100)",
+CSV2,240,ina_last_ms,1,SafeInt(ina_last_ms),
+CSV2,241,ina_avg_10s,100,"SafeInt(ina_avg_10s, 100)",
+CSV2,242,ina_worst_10s,1,SafeInt(ina_worst_10s),
+CSV2,243,ina_over2x_10s,1,SafeInt(ina_over2x_10s),
+CSV2,244,ina_avg_2m,100,"SafeInt(ina_avg_2m, 100)",
+CSV2,245,ina_worst_2m,1,SafeInt(ina_worst_2m),
+CSV2,246,ina_over2x_2m,1,SafeInt(ina_over2x_2m),
+CSV2,247,ina_avg_at,100,"SafeInt(ina_avg_at, 100)",
+CSV2,248,ina_worst_at,1,SafeInt(ina_worst_at),
+CSV2,249,ina_over2x_at,1,SafeInt(ina_over2x_at),
+CSV2,250,loopTime5sWindow_ms,1,SafeInt(loopTime5sWindow / 1000),
+CSV2,251,MaximumLoopTime_ms,1,SafeInt(MaximumLoopTime / 1000),
+CSV2,252,ft_SendWifiData_win,1,SafeInt(ft_SendWifiData.worstWindow),
+CSV2,253,ft_SendWifiData_ses,1,SafeInt(ft_SendWifiData.worstSession),
+CSV2,254,ft_CheckAlarms_win,1,SafeInt(ft_CheckAlarms.worstWindow),
+CSV2,255,ft_CheckAlarms_ses,1,SafeInt(ft_CheckAlarms.worstSession),
+CSV2,256,ft_calculateDerivedMetrics_win,1,SafeInt(ft_calculateDerivedMetrics.worstWindow),
+CSV2,257,ft_calculateDerivedMetrics_ses,1,SafeInt(ft_calculateDerivedMetrics.worstSession),
+CSV2,258,ft_logDashboardValues_win,1,SafeInt(ft_logDashboardValues.worstWindow),
+CSV2,259,ft_logDashboardValues_ses,1,SafeInt(ft_logDashboardValues.worstSession),
+CSV2,260,ft_updateSystemHealthStats_win,1,SafeInt(ft_updateSystemHealthStats.worstWindow),
+CSV2,261,ft_updateSystemHealthStats_ses,1,SafeInt(ft_updateSystemHealthStats.worstSession),
+CSV2,262,ft_checkWiFiConnection_win,1,SafeInt(ft_checkWiFiConnection.worstWindow),
+CSV2,263,ft_checkWiFiConnection_ses,1,SafeInt(ft_checkWiFiConnection.worstSession),
+CSV2,264,ft_ch1_compute_stats_win,1,SafeInt(ft_ch1_compute_stats.worstWindow),
+CSV2,265,ft_ch1_compute_stats_ses,1,SafeInt(ft_ch1_compute_stats.worstSession),
+CSV2,266,ft_UpdateBatterySOC_win,1,SafeInt(ft_UpdateBatterySOC.worstWindow),
+CSV2,267,ft_UpdateBatterySOC_ses,1,SafeInt(ft_UpdateBatterySOC.worstSession),
+CSV2,268,ft_updateSensorWindow_win,1,SafeInt(ft_updateSensorWindow.worstWindow),
+CSV2,269,ft_updateSensorWindow_ses,1,SafeInt(ft_updateSensorWindow.worstSession),
+CSV2,270,ft_checkTimeSync_win,1,SafeInt(ft_checkTimeSync.worstWindow),
+CSV2,271,ft_checkTimeSync_ses,1,SafeInt(ft_checkTimeSync.worstSession),
+CSV2,272,ft_zeroLogService_win,1,SafeInt(ft_zeroLogService.worstWindow),
+CSV2,273,ft_zeroLogService_ses,1,SafeInt(ft_zeroLogService.worstSession),
+CSV2,274,ft_bhFlushCapNVS_win,1,SafeInt(ft_bhFlushCapNVS.worstWindow),
+CSV2,275,ft_bhFlushCapNVS_ses,1,SafeInt(ft_bhFlushCapNVS.worstSession),
+CSV2,276,ft_kneeLearnService_win,1,SafeInt(ft_kneeLearnService.worstWindow),
+CSV2,277,ft_kneeLearnService_ses,1,SafeInt(ft_kneeLearnService.worstSession),
+CSV2,278,currentRPMTableIndex,1,SafeInt(currentRPMTableIndex),
+CSV2,279,pidInitialized,1,SafeInt(pidInitialized ? 1 : 0),
+CSV2,280,pidSetpoint,100,"SafeInt(pidSetpoint, 100)",
+CSV2,281,TempToUse,1,!isfinite(TempToUse) ? ROLL_EMPTY : SafeInt(TempToUse),"no probe on either source -> ""—"""
+CSV2,282,learningTargetFromRPM,100,"SafeInt(learningTargetFromRPM, 100)",
+CSV2,283,finalLearningTarget,100,"SafeInt(finalLearningTarget, 100)",
+CSV2,284,overheatingPenaltyTimer,1,SafeInt(overheatingPenaltyTimer / 1000),
+CSV2,285,overheatingPenaltyAmps,100,"SafeInt(overheatingPenaltyAmps, 100)",
+CSV2,286,timeSinceLastOverheat,1,SafeInt(timeSinceLastOverheat / 1000),
+CSV2,287,socInfoAvailable,1,SafeInt(socInfoAvailable),
+CSV2,288,overheatCount0,1,SafeInt(overheatCount[0]),
+CSV2,289,overheatCount1,1,SafeInt(overheatCount[1]),
+CSV2,290,overheatCount2,1,SafeInt(overheatCount[2]),
+CSV2,291,overheatCount3,1,SafeInt(overheatCount[3]),
+CSV2,292,overheatCount4,1,SafeInt(overheatCount[4]),
+CSV2,293,overheatCount5,1,SafeInt(overheatCount[5]),
+CSV2,294,overheatCount6,1,SafeInt(overheatCount[6]),
+CSV2,295,overheatCount7,1,SafeInt(overheatCount[7]),
+CSV2,296,overheatCount8,1,SafeInt(overheatCount[8]),
+CSV2,297,overheatCount9,1,SafeInt(overheatCount[9]),
+CSV2,298,cumulativeNoOverheatTime0,1,SafeInt(cumulativeNoOverheatTime[0] / 1000),
+CSV2,299,cumulativeNoOverheatTime1,1,SafeInt(cumulativeNoOverheatTime[1] / 1000),
+CSV2,300,cumulativeNoOverheatTime2,1,SafeInt(cumulativeNoOverheatTime[2] / 1000),
+CSV2,301,cumulativeNoOverheatTime3,1,SafeInt(cumulativeNoOverheatTime[3] / 1000),
+CSV2,302,cumulativeNoOverheatTime4,1,SafeInt(cumulativeNoOverheatTime[4] / 1000),
+CSV2,303,cumulativeNoOverheatTime5,1,SafeInt(cumulativeNoOverheatTime[5] / 1000),
+CSV2,304,cumulativeNoOverheatTime6,1,SafeInt(cumulativeNoOverheatTime[6] / 1000),
+CSV2,305,cumulativeNoOverheatTime7,1,SafeInt(cumulativeNoOverheatTime[7] / 1000),
+CSV2,306,cumulativeNoOverheatTime8,1,SafeInt(cumulativeNoOverheatTime[8] / 1000),
+CSV2,307,cumulativeNoOverheatTime9,1,SafeInt(cumulativeNoOverheatTime[9] / 1000),
+CSV2,308,learningUpCount0,1,SafeInt(learningUpCount[0]),
+CSV2,309,learningUpCount1,1,SafeInt(learningUpCount[1]),
+CSV2,310,learningUpCount2,1,SafeInt(learningUpCount[2]),
+CSV2,311,learningUpCount3,1,SafeInt(learningUpCount[3]),
+CSV2,312,learningUpCount4,1,SafeInt(learningUpCount[4]),
+CSV2,313,learningUpCount5,1,SafeInt(learningUpCount[5]),
+CSV2,314,learningUpCount6,1,SafeInt(learningUpCount[6]),
+CSV2,315,learningUpCount7,1,SafeInt(learningUpCount[7]),
+CSV2,316,learningUpCount8,1,SafeInt(learningUpCount[8]),
+CSV2,317,learningUpCount9,1,SafeInt(learningUpCount[9]),
+CSV2,318,totalLearningEvents,1,SafeInt(totalLearningEvents),
+CSV2,319,totalOverheats,1,SafeInt(totalOverheats),
+CSV2,320,totalSafeHours,1,SafeInt(totalSafeHours),
+CSV2,321,FreeInternalRam,1,SafeInt(FreeInternalRam),
+CSV2,322,TotalInternalRam,1,SafeInt(TotalInternalRam),
+CSV2,323,LargestInternalBlock,1,SafeInt(LargestInternalBlock),
+CSV2,324,FreePSRAM,1,SafeInt(FreePSRAM),
+CSV2,325,TotalPSRAM,1,SafeInt(TotalPSRAM),
+CSV2,326,Heapfrag,1,SafeInt(Heapfrag),
+CSV2,327,ft_ReadAnalogInputs_win,1,SafeInt(ft_ReadAnalogInputs.worstWindow),
+CSV2,328,ft_ReadAnalogInputs_ses,1,SafeInt(ft_ReadAnalogInputs.worstSession),
+CSV2,329,ft_AdjustFieldLearnMode_win,1,SafeInt(ft_AdjustFieldLearnMode.worstWindow),
+CSV2,330,ft_AdjustFieldLearnMode_ses,1,SafeInt(ft_AdjustFieldLearnMode.worstSession),
+CSV2,331,ft_uploadSensorHistory_win,1,SafeInt(ft_uploadSensorHistory.worstWindow),
+CSV2,332,ft_uploadSensorHistory_ses,1,SafeInt(ft_uploadSensorHistory.worstSession),
+CSV2,333,ft_uploadBufferedRecords_win,1,SafeInt(ft_uploadBufferedRecords.worstWindow),
+CSV2,334,ft_uploadBufferedRecords_ses,1,SafeInt(ft_uploadBufferedRecords.worstSession),
+CSV2,335,ft_buildConfigPayload_win,1,SafeInt(ft_buildConfigPayload.worstWindow),
+CSV2,336,ft_buildConfigPayload_ses,1,SafeInt(ft_buildConfigPayload.worstSession),
+CSV2,337,VeTime2,1,SafeInt(VeTime2),
+CSV2,338,systemIDRiseDelay_0,1,(int)systemIDRiseDelay_ms[0],
+CSV2,339,systemIDRiseDelay_1,1,(int)systemIDRiseDelay_ms[1],
+CSV2,340,systemIDRiseDelay_2,1,(int)systemIDRiseDelay_ms[2],
+CSV2,341,systemIDFallDelay_0,1,(int)systemIDFallDelay_ms[0],
+CSV2,342,systemIDFallDelay_1,1,(int)systemIDFallDelay_ms[1],
+CSV2,343,systemIDFallDelay_2,1,(int)systemIDFallDelay_ms[2],
+CSV2,344,systemIDRiseAvg,1,(int)systemIDRiseAvg_ms,
+CSV2,345,systemIDFallAvg,1,(int)systemIDFallAvg_ms,
+CSV2,346,ft_altHealth_win,1,SafeInt(ft_altHealth.worstWindow),
+CSV2,347,ft_altHealth_ses,1,SafeInt(ft_altHealth.worstSession),
+CSV2,348,ft_altFold_win,1,SafeInt(ft_altFold.worstWindow),
+CSV2,349,ft_altFold_ses,1,SafeInt(ft_altFold.worstSession),
+CSV2,350,ft_boatPerf_win,1,SafeInt(ft_boatPerf.worstWindow),
+CSV2,351,ft_boatPerf_ses,1,SafeInt(ft_boatPerf.worstSession),
+CSV2,352,ft_huntGov_win,1,SafeInt(ft_huntGov.worstWindow),
+CSV2,353,ft_huntGov_ses,1,SafeInt(ft_huntGov.worstSession),
+CSV2,354,systemIDActive,1,(int)systemIDActive,
+CSV2,355,systemIDResultsReady,1,(int)systemIDResultsReady,
+CSV2,356,systemIDStepAmp_0,10,(int)(systemIDStepAmp_A[0] * 10),
+CSV2,357,systemIDStepAmp_1,10,(int)(systemIDStepAmp_A[1] * 10),
+CSV2,358,systemIDStepAmp_2,10,(int)(systemIDStepAmp_A[2] * 10),
+CSV2,359,systemIDQuietPP_0,10,(int)(systemIDQuietPP_A[0] * 10),
+CSV2,360,systemIDQuietPP_1,10,(int)(systemIDQuietPP_A[1] * 10),
+CSV2,361,systemIDQuietPP_2,10,(int)(systemIDQuietPP_A[2] * 10),
+CSV2,362,systemIDAbortReason,1,(int)systemIDAbortReason,FieldEventReason code if protection aborted last test; 0=no abort
+CSV2,363,systemIDAbortPhase,1,(int)systemIDAbortPhase,phase 1-9 at moment of protection abort; 0=no abort
+CSV2,364,vl_last_ms,1,SafeInt(vl_last_ms),CV voltage-loop firing-interval ladder (CH1/pf-style)
+CSV2,365,vl_avg_10s,100,"SafeInt(vl_avg_10s, 100)",
+CSV2,366,vl_worst_10s,1,SafeInt(vl_worst_10s),
+CSV2,367,vl_over2x_10s,1,SafeInt(vl_over2x_10s),
+CSV2,368,vl_avg_2m,100,"SafeInt(vl_avg_2m, 100)",
+CSV2,369,vl_worst_2m,1,SafeInt(vl_worst_2m),
+CSV2,370,vl_over2x_2m,1,SafeInt(vl_over2x_2m),
+CSV2,371,vl_avg_at,100,"SafeInt(vl_avg_at, 100)",
+CSV2,372,vl_worst_at,1,SafeInt(vl_worst_at),
+CSV2,373,vl_over2x_at,1,SafeInt(vl_over2x_at),
+CSV2,374,nvsSecsSinceLastSave,1,(int)((lastNVSSaveTime == 0) ? 0 : ((millis() - lastNVSSaveTime) / 1000UL)),seconds since last successful saveNVSDataFull() (0 = never)
+CSV2,375,nvsFullSaveLastMs,1,SafeInt(nvsFullSaveLastMs),wall-clock duration of most recent saveNVSDataFull() (ms)
+CSV2,376,nvsFullSaveWorstMs,1,SafeInt(nvsFullSaveWorstMs),worst saveNVSDataFull() duration since boot (ms)
+CSV2,377,nvsFullSaveCount,1,SafeInt(nvsFullSaveCount),total saveNVSDataFull() calls since boot
+CSV2,378,wmIgn_amps_lo,1,"wmIgnCsv(wmIgn_amps.lo, 1)","MeasuredAmps (A, int)"
+CSV2,379,wmIgn_amps_hi,1,"wmIgnCsv(wmIgn_amps.hi, 1)","MeasuredAmps (A, int)"
+CSV2,380,wmIgn_altTempF_lo,1,"wmIgnCsv(wmIgn_altTempF.lo, 1)","AlternatorTemperatureF (°F, int)"
+CSV2,381,wmIgn_altTempF_hi,1,"wmIgnCsv(wmIgn_altTempF.hi, 1)","AlternatorTemperatureF (°F, int)"
+CSV2,382,wmIgn_IBV_lo,1,"wmIgnCsv(wmIgn_IBV.lo, 10)","INA228 battery V (×10, 1 decimal)"
+CSV2,383,wmIgn_IBV_hi,1,"wmIgnCsv(wmIgn_IBV.hi, 10)","INA228 battery V (×10, 1 decimal)"
+CSV2,384,wmIgn_Bcur_lo,1,"wmIgnCsv(wmIgn_Bcur.lo, 1)",INA228 battery A (int)
+CSV2,385,wmIgn_Bcur_hi,1,"wmIgnCsv(wmIgn_Bcur.hi, 1)",INA228 battery A (int)
+CSV2,386,wmIgn_SOC_lo,1,"wmIgnCsv(wmIgn_SOC.lo, 1)","SOC percent (0..100, int)"
+CSV2,387,wmIgn_SOC_hi,1,"wmIgnCsv(wmIgn_SOC.hi, 1)","SOC percent (0..100, int)"
+CSV2,388,wmIgn_RPM_lo,1,"wmIgnCsv(wmIgn_RPM.lo, 1)",Engine RPM (int)
+CSV2,389,wmIgn_RPM_hi,1,"wmIgnCsv(wmIgn_RPM.hi, 1)",Engine RPM (int)
+CSV2,390,wmIgn_SOG_lo,1,"wmIgnCsv(wmIgn_SOG.lo, 1)",SOGNMEA knots (int)
+CSV2,391,wmIgn_SOG_hi,1,"wmIgnCsv(wmIgn_SOG.hi, 1)",SOGNMEA knots (int)
+CSV2,392,wmIgn_AWS_lo,1,"wmIgnCsv(wmIgn_AWS.lo, 1)",ApparentWindSpeedNMEA knots (int)
+CSV2,393,wmIgn_AWS_hi,1,"wmIgnCsv(wmIgn_AWS.hi, 1)",ApparentWindSpeedNMEA knots (int)
+CSV2,394,wmIgn_TWS_lo,1,"wmIgnCsv(wmIgn_TWS.lo, 1)",TrueWindSpeedNMEA knots (int)
+CSV2,395,wmIgn_TWS_hi,1,"wmIgnCsv(wmIgn_TWS.hi, 1)",TrueWindSpeedNMEA knots (int)
+CSV2,396,wmIgn_heel_lo,1,"wmIgnCsv(wmIgn_heel.lo, 1)",imu_heel_deg (int)
+CSV2,397,wmIgn_heel_hi,1,"wmIgnCsv(wmIgn_heel.hi, 1)",imu_heel_deg (int)
+CSV2,398,wmIgn_pitch_lo,1,"wmIgnCsv(wmIgn_pitch.lo, 1)",imu_pitch_deg (int)
+CSV2,399,wmIgn_pitch_hi,1,"wmIgnCsv(wmIgn_pitch.hi, 1)",imu_pitch_deg (int)
+CSV2,400,wmIgn_vacc_lo,1,"wmIgnCsv(wmIgn_vacc.lo, 10)","imu_vertical_accel_g (×10, 1 decimal)"
+CSV2,401,wmIgn_vacc_hi,1,"wmIgnCsv(wmIgn_vacc.hi, 10)","imu_vertical_accel_g (×10, 1 decimal)"
+CSV2,402,wmIgn_baro_lo,1,"wmIgnCsv(wmIgn_baro.lo, 1)",baroPressure mbar (int)
+CSV2,403,wmIgn_baro_hi,1,"wmIgnCsv(wmIgn_baro.hi, 1)",baroPressure mbar (int)
+CSV2,404,wmIgn_ambient_lo,1,"wmIgnCsv(wmIgn_ambient.lo, 1)",ambientTemp °F (int)
+CSV2,405,wmIgn_ambient_hi,1,"wmIgnCsv(wmIgn_ambient.hi, 1)",ambientTemp °F (int)
+CSV2,406,restartRemainingSec,1,(int)restartRemainingSec,seconds until scheduled reboot (0 = banner hidden)
+CSV2,407,currentGpsSource,1,(int)currentGpsSource,"0=none, 1=NMEA, 2=Phone, 3=Manual"
+CSV2,408,currentTimeSource,1,(int)currentTimeSource,"0=none, 1=GPS, 2=Phone, 3=NTP, 4=drifting, 5=estimated"
+CSV2,409,currentSpeedSource,1,(int)currentSpeedSource,"0=none, 1=NMEA, 2=Phone (speed/course can differ from position source)"
+CSV2,410,loggingActive,1,(int)loggingActive,"439 — 1=logging active, 0=stopped (Stop/Start Logs)"
+CSV2,411,sustainedTWS,10,"SafeInt(sustainedTWS, 10)","2-min sustained true wind, knots ×10 (Beaufort + gale basis)"
+CSV2,412,currentGaleMinutes,1,"SafeInt(currentGaleMinutes, 1)","live minutes continuously in a gale (sustained ≥34kt), int"
+CSV2,413,wmIgn_VMGman_lo,1,"wmIgnCsv(wmIgn_VMGman.lo, 10)",VMG manual session min/max (knots ×10)
+CSV2,414,wmIgn_VMGman_hi,1,"wmIgnCsv(wmIgn_VMGman.hi, 10)",VMG manual session min/max (knots ×10)
+CSV2,415,wmIgn_VMGup_lo,1,"wmIgnCsv(wmIgn_VMGup.lo, 10)",VMG upwind session min/max (knots ×10)
+CSV2,416,wmIgn_VMGup_hi,1,"wmIgnCsv(wmIgn_VMGup.hi, 10)",VMG upwind session min/max (knots ×10)
+CSV2,417,altHealthPct,10,"SafeInt(altWorstPct(), 10)",health % ×10
+CSV2,418,altHealthStatus,1,altStatus(),"0 learn,1 healthy,2 drift-hi,3 drift-lo,4 low-coverage"
+CSV2,419,altCoveragePct,10,"SafeInt(altCoveragePct(), 10)",frozen/with-data % ×10
+CSV2,420,altObsCount,1,altFrontCount(),scored observations since freeze
+CSV2,421,VictronChargeState,1,SafeInt(VictronChargeState),CS code (×1)
+CSV2,422,VictronMPPTMode,1,SafeInt(VictronMPPTMode),MPPT tracker code (×1)
+CSV2,423,VictronError,1,SafeInt(VictronError),ERR code (×1)
+CSV2,424,VictronYieldToday_kWh,100,"SafeInt(VictronYieldToday_kWh, 100)",H20 yield today (kWh ×100)
+CSV2,425,VictronMaxPowerToday_W,1,SafeInt(VictronMaxPowerToday_W),H21 max power today (W ×1)
+CSV2,426,VictronYieldYesterday_kWh,100,"SafeInt(VictronYieldYesterday_kWh, 100)",H22 yield yesterday (kWh ×100)
+CSV2,427,VictronMaxPowerYesterday_W,1,SafeInt(VictronMaxPowerYesterday_W),H23 max power yesterday (W ×1)
+CSV2,428,fuelCurveNMPG_0,100,"SafeInt(fuelCurveNMPG[0], 100)",
+CSV2,429,fuelCurveNMPG_1,100,"SafeInt(fuelCurveNMPG[1], 100)",
+CSV2,430,fuelCurveNMPG_2,100,"SafeInt(fuelCurveNMPG[2], 100)",
+CSV2,431,fuelCurveNMPG_3,100,"SafeInt(fuelCurveNMPG[3], 100)",
+CSV2,432,fuelCurveNMPG_4,100,"SafeInt(fuelCurveNMPG[4], 100)",
+CSV2,433,fuelCurveNMPG_5,100,"SafeInt(fuelCurveNMPG[5], 100)",
+CSV2,434,fuelCurveNMPG_6,100,"SafeInt(fuelCurveNMPG[6], 100)",
+CSV2,435,fuelCurveNMPG_7,100,"SafeInt(fuelCurveNMPG[7], 100)",
+CSV2,436,fuelCurveNMPG_8,100,"SafeInt(fuelCurveNMPG[8], 100)",
+CSV2,437,fuelCurveNMPG_9,100,"SafeInt(fuelCurveNMPG[9], 100)",
+CSV2,438,fuelCurveNMPG_10,100,"SafeInt(fuelCurveNMPG[10], 100)",
+CSV2,439,fuelCurveNMPG_11,100,"SafeInt(fuelCurveNMPG[11], 100)",
+CSV2,440,fuelCurveNMPG_12,100,"SafeInt(fuelCurveNMPG[12], 100)",
+CSV2,441,fuelCurveNMPG_13,100,"SafeInt(fuelCurveNMPG[13], 100)",
+CSV2,442,fuelCurveNMPG_14,100,"SafeInt(fuelCurveNMPG[14], 100)",
+CSV2,443,fuelCurveNMPG_15,100,"SafeInt(fuelCurveNMPG[15], 100)",
+CSV2,444,fuelCurveNMPG_16,100,"SafeInt(fuelCurveNMPG[16], 100)",
+CSV2,445,fuelCurveNMPG_17,100,"SafeInt(fuelCurveNMPG[17], 100)",
+CSV2,446,fuelCurveTopRPM,1,SafeInt(currentFuelTopRPM),top configured fuel-table RPM -> chart x-axis scale (×1)
+CSV2,447,loopWorst80Win_ms,1,SafeInt(loopWorst80Win / 1000),"worst 80MHz loop pass, rolling 5s (ms)"
+CSV2,448,loopWorst80Ses_ms,1,SafeInt(loopWorst80Ses / 1000),worst 80MHz loop pass since Reset Peak Values (ms)
+CSV2,449,loopOver80ImuLimitCount,1,SafeInt(loopOver80ImuLimitCount),# 80MHz passes over ~38ms accel-drain limit since reset
+CSV2,450,loop80IterCount,1,SafeInt(loop80IterCount),total 80MHz passes since reset
+CSV2,451,loopFieldOnWin_ms,1,SafeInt(loopFieldOnWin / 1000),"worst field-ON loop pass, rolling 5s (ms)"
+CSV2,452,loopFieldOnSes_ms,1,SafeInt(loopFieldOnSes / 1000),worst field-ON loop pass since Reset Peak Values (ms)
+CSV2,453,tempFiltered,100,"!isfinite(tempFiltered) ? ROLL_EMPTY : SafeInt(tempFiltered, 100)","NAN until the first sane read -> ""—"", never a real -0.01F in the thermal plot"
+CSV2,454,outerImpliedPenalty,100,"SafeInt(outerImpliedPenalty, 100)","voltage cap as downstream amps penalty (A ×100); streamed, not plotted"
+CSV2,455,thermalFlags,1,SafeInt((tempPIDActive ? (1 << 0) : 0) | (sysMode == SYS_MODE_AUTO ? (1 << 4) : 0) | (shutdownPhase != SHUTDOWN_PHASE_NONE ? (1 << 5) : 0)),"state-strip bitfield: bit0 tempPIDActive, bit4 AUTO, bit5 shutdown"
+CSV2,456,outerAntiWindupFired,1,SafeInt(thermalAntiWindupLatch ? 1 : 0),1 = CV-bleed anti-windup fired since last frame (red ticks)
+CSV2,457,pf_last_ms,1,SafeInt(pf_last_ms),
+CSV2,458,pf_avg_10s,100,"SafeInt(pf_avg_10s, 100)",
+CSV2,459,pf_worst_10s,1,SafeInt(pf_worst_10s),
+CSV2,460,pf_over2x_10s,1,SafeInt(pf_over2x_10s),
+CSV2,461,pf_avg_2m,100,"SafeInt(pf_avg_2m, 100)",
+CSV2,462,pf_worst_2m,1,SafeInt(pf_worst_2m),
+CSV2,463,pf_over2x_2m,1,SafeInt(pf_over2x_2m),
+CSV2,464,pf_avg_at,100,"SafeInt(pf_avg_at, 100)",
+CSV2,465,pf_worst_at,1,SafeInt(pf_worst_at),
+CSV2,466,pf_over2x_at,1,SafeInt(pf_over2x_at),
+CSV2,467,inaBusReadWorstUs,1,SafeInt(inaBusReadWorstUs),
+CSV2,468,inaBusSlowCount,1,SafeInt(inaBusSlowCount),
+CSV2,469,ina228ErrorCount,1,SafeInt(ina228ErrorCount),
+CSV2,470,imuFifoFetchWorstUs,1,SafeInt(imuFifoFetchWorstUs),
+CSV2,471,imuFifoWorstSamples,1,SafeInt(imuFifoWorstSamples),
+CSV2,472,ft_dumpLongTermRing_win,1,SafeInt(ft_dumpLongTermRing.worstWindow),
+CSV2,473,ft_dumpLongTermRing_ses,1,SafeInt(ft_dumpLongTermRing.worstSession),
+CSV2,474,ft_fastAltDrain_win,1,SafeInt(ft_fastAltDrain.worstWindow),"bounded DMA drain worst, rolling 5s (µs, displayed ms)"
+CSV2,475,ft_fastAltDrain_ses,1,SafeInt(ft_fastAltDrain.worstSession),...since Reset Peak Values
+CSV2,476,ft_faMatrixFlush_win,1,SafeInt(ft_faMatrixFlush.worstWindow),"disturbance-matrix/flipbook flash flush worst, rolling 5s"
+CSV2,477,ft_faMatrixFlush_ses,1,SafeInt(ft_faMatrixFlush.worstSession),...since Reset Peak Values
+CSV2,478,ft_faDetector_win,1,SafeInt(faDetLastComputeUs),detector whole-analysis compute (Core 0): LAST run (kept ft_ name so the /1000 ms format applies)
+CSV2,479,ft_faDetector_ses,1,SafeInt(faDetWorstComputeUs),detector whole-analysis compute: WORST since Reset Peak Values
+CSV2,480,ft_faWindowFinalize_win,1,SafeInt(ft_faWindowFinalize.worstWindow),"per-2s-window finalize worst, rolling 5s"
+CSV2,481,ft_faWindowFinalize_ses,1,SafeInt(ft_faWindowFinalize.worstSession),...since Reset Peak Values
+CSV2,482,faChanState,1,SafeInt(faChanState),"0 = off, 1 = sampling, 2 = railed/dormant"
+CSV2,483,faCellsUsed,1,SafeInt(faCellsUsed),matrix cells with ≥1 qualified window
+CSV2,484,faDetectK,1,SafeInt(faDetectLastK),"detector fault class of last FAULT verdict, 0 = quiet"
+CSV2,485,faSesPkpkWorst,100,"SafeInt(faSesPkpkWorstA, 100)","session-worst broadband pk-pk, A ×100"
+CSV2,486,faSesPeakWorst,100,"SafeInt(faSesPeakWorstA, 100)","session-worst spectral peak, A ×100"
+CSV2,487,faSesPeakWorstHz,10,"SafeInt(faSesPeakWorstHz, 10)","...its frequency, Hz ×10"
+CSV2,488,faAnomalyCount,1,SafeInt(faAnomalyCount),lifetime detector FAULT-verdict count
+CSV2,489,faDomFreqHz,1,SafeInt(faDomFreqHzX10),"Highest Tone in Map: frequency, Hz ×10"
+CSV2,490,faDomAmp,1,SafeInt(faDomAmpAX100),"...pk-pk amplitude (2× sine amp), A ×100"
+CSV2,491,faDomRpm,1,SafeInt(faDomRpm),...RPM where it occurs
+CSV2,492,faDomAmps,10,"SafeInt(faDomAmpsA, 10)","...window-mean output current there, A ×10"
+CSV2,493,faDomTempF,10,"SafeInt(faDomTempF, 10)","...alternator temp there, °F ×10 (-1 = no probe)"
+CSV2,494,faDomEpoch,1,SafeInt((double)faDomEpoch),...wall-clock epoch when set (0 = clock not synced)
+CSV2,495,faSesPkpkRpm,1,SafeInt(faSesPkpkRpm),Session Worst Pk-Pk: RPM where it occurred
+CSV2,496,faSesPkpkAmps,10,"SafeInt(faSesPkpkAmpsA, 10)","...window-mean output current there, A ×10"
+CSV2,497,faSesPkpkTempF,10,"SafeInt(faSesPkpkTempF, 10)","...alternator temp there, °F ×10 (-1 = no probe)"
+CSV2,498,faSesPkpkEpoch,1,SafeInt((double)faSesPkpkEpoch),...wall-clock epoch when set (0 = clock not synced)
+CSV2,499,faRpmEdge10sMin,1,"rollCsv(ROLL_RPMEDGE, 10)","RPM edge margin, 10s trough (RPM ×10)"
+CSV2,500,faAmpsDrift10sMax,1,"rollCsv(ROLL_AMPSDRIFT, 100)","amps-drift EMA spread, 10s peak (A ×100)"
+CSV2,501,faAmpsDriftExc10sMax,1,"rollCsv(ROLL_AMPSDRIFTEXC, 100)","drift spread minus its effective gate limit, 10s peak (A ×100); <=0 = passing"
+CSV2,502,faTonePk10sMax,1,"rollCsv(ROLL_TONEPK, 100)","largest spectral peak, 10s peak (A ×100)"
+CSV2,503,ldSlew10sMax,1,"rollCsv(ROLL_LDSLEW, 10)","current slew, 10s peak (A/s ×10)"
+CSV2,504,cvSlope10sMax,1,"rollCsv(ROLL_CVSLOPE, 10000)","voltage rise, 10s peak (V/s ×10000)"
+CSV2,505,ripCmdExc10sMax,1,"rollCsv(ROLL_RIPCMDEXC, 100)",setpoint (command) travel over the capture window − amplitude limit (A ×100)
+CSV2,506,ripAltExc10sMax,1,"rollCsv(ROLL_RIPALTEXC, 100)",alternator half-window mean-shift − stationarity limit (A ×100)
+CSV2,507,ripBattExc10sMax,1,"rollCsv(ROLL_RIPBATTEXC, 100)",battery half-window mean-shift − stationarity limit (A ×100)
+CSV2,508,ripRpmShift10sMax,1,"rollCsv(ROLL_RIPRPMSHIFT, 10)",RPM half-window mean-shift − stationarity limit (RPM ×10); <=0 = passing
+CSV2,509,ripAltAdmitCount,1,(int)(g_ripAltAdmitCount & 0x7FFFFFFF),windows that passed all alt-fold gates (lifetime counter)
+CSV2,510,ripBattAdmitCount,1,(int)(g_ripBattAdmitCount & 0x7FFFFFFF),same for the battery detector
+CSV2,511,LongestTripAT,10,"SafeInt(LongestSingleTrip_Nm_AllTime, 10)","longest single trip, nm ×10"
+CSV2,512,Max24hrDistAT,10,"SafeInt(Max24hrDistance_AllTime, 10)","max 24-hour distance, nm ×10"
+CSV2,513,DeepestAnchorAT,10,"SafeInt(DeepestAnchorage_Ft_AllTime, 10)","deepest anchorage, ft ×10"
+CSV2,514,BestUpwindVmgAT,100,"SafeInt(best_upwind_vmg_alltime, 100)","best upwind VMG, kts ×100"
+CSV2,515,LongestGaleAT,100,"SafeInt(longest_gale_duration_hours_alltime, 100)","longest gale duration, hours ×100"
+CSV2,516,cpuFreqMhz,1,SafeInt(getCpuFrequencyMhz()),live CPU clock (80 or 240 MHz)
+CSV2,517,ch0GapLast,1,SafeInt(ch0GapLastMs),"CH0 battV read gap, most recent (ms)"
+CSV2,518,ch0GapWorst,1,SafeInt(ch0GapWorstMs),"CH0 battV read gap, worst since reset (ms)"
+CSV2,519,ch2GapLast,1,SafeInt(ch2GapLastMs),"CH2 RPM read gap, most recent (ms)"
+CSV2,520,ch2GapWorst,1,SafeInt(ch2GapWorstMs),"CH2 RPM read gap, worst since reset (ms)"
+CSV2,521,csv2BuildLast,1,SafeInt(csv2BuildLastUs),"CSV2 build (snprintf) time, previous cycle (µs)"
+CSV2,522,csv2BuildWorst,1,SafeInt(csv2BuildWorstUs),"CSV2 build time, worst since reset (µs)"
+CSV2,523,csv2SendLast,1,SafeInt(csv2SendLastUs),"CSV2 send (events.send) time, previous cycle (µs)"
+CSV2,524,csv2SendWorst,1,SafeInt(csv2SendWorstUs),"CSV2 send time, worst since reset (µs)"
+CSV2,525,httpsUpload_win,1,SafeInt(httpsUploadLastMs),"Core-0 HTTPS task cloud op time, LAST (ms — plain ms, NOT ft_ so no /1000)"
+CSV2,526,httpsUpload_ses,1,SafeInt(httpsUploadWorstMs),"Core-0 HTTPS task cloud op time, WORST since reset (ms)"
+CSV2,527,cvTempDerateScale,1000,"SafeInt(cvTempDerateScale, 1000)",live battery-temp CV gain derate multiplier; ×1000
+CSV2,528,accCurValidS,1,(int)accCur4.validSec,current loop: seconds in authority
+CSV2,529,accCurActiveS,1,(int)accCur4.activeSec,challenged seconds (tracking denominator)
+CSV2,530,accCurInbandS,1,(int)accCur4.inbandActiveSec,in-band seconds while active (tracking numerator)
+CSV2,531,accCurConstS,1,(int)accCur4.constrainedSec,seconds output railed / protection clamp
+CSV2,532,accCurExc,1,(int)accCur4.excursions,excursions (band exits) since reset
+CSV2,533,accCurRecovS10,10.0,(int)(accCur4.recovSecSum * 10.0),out-of-band seconds summed across excursions (s ×10)
+CSV2,534,accCurOverExp,100,"SafeInt((float)accCur4.overExpSum, 100)",damaging exposure (A·s ×100)
+CSV2,535,accCurWorst,100,"SafeInt(accCur4.worstOver, 100)",worst over-current vs command (A ×100)
+CSV2,536,accVoltValidS,1,(int)accVolt4.validSec,voltage loop: seconds CV engaged
+CSV2,537,accVoltActiveS,1,(int)accVolt4.activeSec,
+CSV2,538,accVoltInbandS,1,(int)accVolt4.inbandActiveSec,
+CSV2,539,accVoltConstS,1,(int)accVolt4.constrainedSec,seconds Icv pinned / protection / aw-recovery
+CSV2,540,accVoltExc,1,(int)accVolt4.excursions,
+CSV2,541,accVoltRecovS10,10.0,(int)(accVolt4.recovSecSum * 10.0),
+CSV2,542,accVoltOverExp,100,"SafeInt((float)accVolt4.overExpSum, 100)",V·s 12V-equiv ×100
+CSV2,543,accVoltWorst,1000,"SafeInt(accVolt4.worstOver, 1000)",worst over-voltage (mV 12V-equiv)
+CSV2,544,accThermBindS,1,(int)accThermBindingSec,thermal: binding-and-settled seconds
+CSV2,545,accThermInbandS,1,(int)accThermInbandSec,"of those, within ±3°F of the regulation setpoint"
+CSV2,546,accThermSess,1,(int)accThermSessions,containment sessions since reset
+CSV2,547,accThermWorst,100,"SafeInt(accThermWorstOverF, 100)",worst over-temp vs limit (°F ×100) — unconditional
+CSV2,548,imuInstallCode,1,(int)imuInstallCode(),0=OK 1=never zeroed 2=mount not vertical 3=zeroed pre-mount-check 4=no IMU
+CSV2,549,cvKdCount,1,SafeInt(g_cvKdCount),CV D-term engagement episodes this session
+CSV2,550,LittleFsFreeKb,1,LittleFsFreeKb,"free space on the userdata LittleFS partition, kB (refreshed ~60s firmware-side)"
+CSV2,551,cloudUpAgeS,1,(lastCloudUploadOkMs == 0) ? -1 : (int)((millis() - lastCloudUploadOkMs) / 1000UL),seconds since last ack-confirmed cloud payload upload; -1 = never this boot
+CSV2,552,deviceEpoch,1,(int)getCurrentTimestamp(),"regulator wall clock, UTC epoch seconds; 0 = clock never set this boot"
+CSV2,553,cfgPushPending,1,(int)cfgPushPendingCount,admin config push staged in the cloud: settings it will change; 0 = none queued
+CSV2,554,cfgPushApplied,1,(int)cfgPushAppliedCount,admin config push applied on the previous boot: settings it changed; 0 = nothing to report
+CSV2,555,ch1FieldOnWorst,1,SafeInt(ch1_worst_fieldon),"worst CH1 read interval with field gate open, ms — control-relevant split"
+CSV2,556,ch0GapFieldOnWorst,1,SafeInt(ch0GapFieldOnWorstMs),"ADS battV read-gap worst with field gate open, ms"
+CSV2,557,ch2GapFieldOnWorst,1,SafeInt(ch2GapFieldOnWorstMs),"ADS RPM read-gap worst with field gate open, ms"
+CSV2,558,blameIdx1,1,(int)loopBlameIdx[0],"worst field-on pass blame: top 3 timed consumers (idx into FT_BLAME_NAMES, 255 = empty; µs)"
+CSV2,559,blameUs1,1,(int)loopBlameUs[0],"worst field-on pass blame: top 3 timed consumers (idx into FT_BLAME_NAMES, 255 = empty; µs)"
+CSV2,560,blameIdx2,1,(int)loopBlameIdx[1],
+CSV2,561,blameUs2,1,(int)loopBlameUs[1],
+CSV2,562,blameIdx3,1,(int)loopBlameIdx[2],
+CSV2,563,blameUs3,1,(int)loopBlameUs[2],
+CSV2,564,ft_n2kTx_win,1,SafeInt(ft_n2kTx.worstWindow),NMEA2000 transmit tick worst µs
+CSV2,565,ft_n2kTx_ses,1,SafeInt(ft_n2kTx.worstSession),NMEA2000 transmit tick worst µs
+CSV2,566,n2kTxCount,1,SafeInt(n2kTxCount),N2K messages accepted / dropped since Reset Peak Values
+CSV2,567,n2kTxDrops,1,SafeInt(n2kTxDropCount),N2K messages accepted / dropped since Reset Peak Values
+CSV2,568,n2kSrcAddr,1,n2kSrcAddrLive,claimed N2K source address (-1 = listen-only)
+CSV2,569,n2kRxBattV,100,isnan(n2kRxBattV) ? ROLL_EMPTY : (int)lroundf(n2kRxBattV * 100.0f),NAN -> sentinel: SafeInt's -1 collides with real small negative currents
+CSV2,570,n2kRxBattA,100,isnan(n2kRxBattA) ? ROLL_EMPTY : (int)lroundf(n2kRxBattA * 100.0f),"received 127508 battery current (A ×100, signed; -2000000000 = NA)"
+CSV2,571,n2kRxBattTempF,10,isnan(n2kRxBattTempF) ? ROLL_EMPTY : (int)lroundf(n2kRxBattTempF * 10.0f),received 127508 battery temperature (F ×10; -2000000000 = NA)
+CSV2,572,n2kRxSoc,1,n2kRxSoc,received 127506 state of charge (%; -1 = NA)
+CSV2,573,n2kRxSoh,1,n2kRxSoh,received 127506 state of health (%; -1 = NA)
+CSV2,574,dvccState,1,(int)dvccState,"DVCC follow state: 0 off, 1 waiting, 2 settling, 3 following, 4 stale, 5 untrusted"
+CSV2,575,dvccRxCvl,100,isnan(dvccRxCvl) ? ROLL_EMPTY : (int)lroundf(dvccRxCvl * 100.0f),"NAN -> sentinel, same convention as n2kRx"
+CSV2,576,dvccRxCcl,10,isnan(dvccRxCcl) ? ROLL_EMPTY : (int)lroundf(dvccRxCcl * 10.0f),last decoded charge-current limit (A ×10; -2000000000 = none)
+CSV2,577,dvccRxSrcAddr,1,(int)dvccRxSrcAddr,authority bus address (255 = none yet)
+CSV2,578,dvccUntrustReason,1,(int)dvccUntrustReason,"0 none, 1 CVL out of window, 2 CCL implausible, 3 flapping"
+CSV2,579,ft_dvcc_win,1,SafeInt(ft_dvcc.worstWindow),DVCC brain tick worst µs
+CSV2,580,ft_dvcc_ses,1,SafeInt(ft_dvcc.worstSession),DVCC brain tick worst µs
+CSV2,581,ft_n2kParse_win,1,SafeInt(ft_n2kParse.worstWindow),"NMEA2000.ParseMessages worst µs — RX drain, scales with bus traffic"
+CSV2,582,ft_n2kParse_ses,1,SafeInt(ft_n2kParse.worstSession),"NMEA2000.ParseMessages worst µs — RX drain, scales with bus traffic"
+CSV2,583,huntKdScale,100,(int)lroundf(g_huntKdScale * 100.0f),"damper D-lever multiplier ×100 (100 = D-term running, 0 = paused for a test / mapped off at this speed)"
+CSV2,584,n183Sentences,1,(int)n183SentenceCount,NMEA 0183 checksum-valid sentences since boot (any type)
+CSV2,585,n183ChecksumErrs,1,(int)n183ChecksumErrCount,NMEA 0183 sentences that failed checksum
+CSV2,586,ft_ReadNMEA0183_win,1,SafeInt(ft_ReadNMEA0183.worstWindow),NMEA 0183 drain worst µs (window)
+CSV2,587,ft_ReadNMEA0183_ses,1,SafeInt(ft_ReadNMEA0183.worstSession),NMEA 0183 drain worst µs (session)
+CSV2,588,fieldDutyCeil,100,"SafeInt(ccDutyCeiling(), 100)","enforced field-duty ceiling x100: lowest of Max Field %, the Max Field Volts term, the 10 A field-current ceiling and the field-drive heat ceiling (fieldCeilBind names it)"
+CSV2,589,dvccAuthMfg,1,(int)dvccAuthMfg,NAME manufacturer code of the node publishing the charge limits (358 = Victron; 0 = never heard)
+CSV2,590,dvccAuthProd,1,(int)dvccAuthProd,"its product code (126996), else its Victron VREG product id, else 0"
+CSV2,591,ovTierLowCount,1,SafeInt(g_ovTierLowCount),"timed OV cut, LOW tier — session rising-edge counter"
+CSV2,592,ovTierMidCount,1,SafeInt(g_ovTierMidCount),"timed OV cut, MID tier — session rising-edge counter"
+CSV2,593,sledPredHarvToday,1,sledTele(sledLive.dayIdx ? sledLive.predHarvKwh : NAN),"solar ledger: harvest the forecast promised for today (kWh x100, -1 = unknown)"
+CSV2,594,sledActHarvToday,1,sledTele(sledLiveActHarvKwh()),"panel-power integral so far today (kWh x100, -1 = no VE.Direct)"
+CSV2,595,sledPredConsToday,1,sledTele(sledLive.dayIdx ? sledLive.predConsKwh : NAN),"consumption predicted for today (kWh x100, -1 = no history)"
+CSV2,596,sledActConsToday,1,sledTele(sledLiveActConsKwh()),"house-load energy so far today (kWh x100, -1 = not measurable)"
+CSV2,597,sledNeedKwh,100,"SafeInt(sledNeedKwh, 100)",the bar the 2-of-3 rule is using (kWh x100)
+CSV2,598,sledNeedSource,1,SafeInt(sledNeedSource),"0 = High Solar Threshold setting, 1 = predicted consumption + margin"
+CSV2,599,sledDaysValid,1,SafeInt(sledCompleteDays()),complete days on the ledger
+CSV2,600,sledCoverageMin,1,SafeInt(sledLive.dayIdx ? sledLive.coverageMin : 0),minutes of today the device has been awake
+CSV2,601,ft_solarLedger_win,1,SafeInt(ft_solarLedger.worstWindow),
+CSV2,602,ft_solarLedger_ses,1,SafeInt(ft_solarLedger.worstSession),
+CSV2,603,BatteryTempProbeF,10,isfinite(BatteryTempProbeF) ? (int)lroundf(BatteryTempProbeF * 10.0f) : ROLL_EMPTY,BATT-role DS18B20 (°F x10; ROLL_EMPTY = no reading)
+CSV2,604,ExtraTempF,10,isfinite(ExtraTempF) ? (int)lroundf(ExtraTempF * 10.0f) : ROLL_EMPTY,EXTRA-role DS18B20 (°F x10; ROLL_EMPTY = no reading)
+CSV2,605,battTempActiveF,10,isfinite(battTempActiveF) ? (int)lroundf(battTempActiveF * 10.0f) : ROLL_EMPTY,battery temperature in use this tick (°F x10; ROLL_EMPTY = none)
+CSV2,606,battTempActiveSrc,1,(int)battTempActiveSrc,"0 none, 1 probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C (5 retired, never emitted)"
+CSV2,607,owProbeCount,1,(int)owProbeCount,1-Wire probes present on the last enumeration
+CSV2,608,owUnassignedCount,1,(int)owUnassignedCount(),present probes with no role
+CSV2,609,VictronBattTempF,10,isfinite(VictronBattTempF) ? (int)lroundf(VictronBattTempF * 10.0f) : ROLL_EMPTY,VE.Direct T field (°F x10; ROLL_EMPTY = none)
+CSV2,610,rvcRxBattTempF,10,isfinite(rvcRxBattTempF) ? (int)lroundf(rvcRxBattTempF * 10.0f) : ROLL_EMPTY,RV-C DC_SOURCE_STATUS_2 (°F x10; ROLL_EMPTY = none)
+CSV2,611,cvTempDerateInert,1,(int)cvTempDerateInert,1 = battery-temp source class changed since commissioning; derate holds 1.0
+CSV2,612,wmIgn_battTempF_lo,1,"wmIgnCsv(wmIgn_battTempF.lo, 1)","BatteryTempProbeF (°F, int)"
+CSV2,613,wmIgn_battTempF_hi,1,"wmIgnCsv(wmIgn_battTempF.hi, 1)","BatteryTempProbeF (°F, int)"
+CSV2,614,wmIgn_extraTempF_lo,1,"wmIgnCsv(wmIgn_extraTempF.lo, 1)","ExtraTempF (°F, int)"
+CSV2,615,wmIgn_extraTempF_hi,1,"wmIgnCsv(wmIgn_extraTempF.hi, 1)","ExtraTempF (°F, int)"
+CSV2,616,fieldDutyFloor,100,"SafeInt(g_fieldDutyFloor, 100)","enforced field-duty floor x100: max of Min Field % and this speed's Keep-Alive %; 0 = floor bypassed (shutdown, sysID, protection clamp, MANUAL)"
+CSV2,617,inaDieTempF,10,"SafeInt(inaDieTempF, 10)",INA228 internal die temperature °F x10 (ROLL_EMPTY = no reading)
+CSV2,618,inaDieTempMaxF,10,"SafeInt(inaDieTempMaxF, 10)",session max of the above °F x10 (ROLL_EMPTY = nothing has passed the warm-up + corroboration gate); this is what uploads daily
+CSV2,619,voltStaleCount,1,SafeInt(g_voltStaleCount),"session count of VOLTAGE_STALE field events (main battery voltage, INA228)"
+CSV2,620,volt2StaleCount,1,SafeInt(g_volt2StaleCount),"session count of VOLTAGE2_STALE field events (second battery voltage, ADS1115)"
+CSV2,621,battTempLostCount,1,SafeInt(g_battTempLostCount),session count of BATT_TEMP_LOST field events
+CSV2,622,sensorFaultMask,1,(int)g_sensorFaultMask,"bit0 alt temp, 1 engine speed, 2 alt current, 3 main V, 4 second V, 5 V disagree, 6 batt temp, 7 ADS1115, 8 INA228, 9 regulator drive temperature (INA228 die) — real status, overrides or not"
+CSV2,623,battTempState,1,(int)g_battTempState,"0 not expected (Not fitted), 1 reading, 2 lost (charging stopped), 3 waiting for the first reading (field held off)"
+CSV2,624,limpTier,1,(int)g_limpTier,"0 normal, 1 closed-loop minus dependent reasons, 2 voltage-only, 3 fixed duty + second-voltage cap, 4 fixed duty"
+CSV2,625,sensorSteadyMask,1,(int)g_sensorSteadyMask,"same bits as sensorFaultMask, set once that fault has been clear for 10 min (the ""reading again"" prompt)"
+CSV2,626,reqFaultCount,1,(int)g_reqFaultCount,§11: required sensors faulted right now (chip loss counts its readings; owner overrides and Not fitted excluded); 2+ = charging stopped
+CSV2,627,battCurState,1,(int)g_battCurState,"§11.6 battery current (regulator shunt, or with none fitted the network battery monitor): 0 not declared, 1 reading, 2 lost (alarm + header line; charging continues on voltage)"
+CSV2,628,fieldCurDutyCeil,100,"SafeInt(g_fieldCurDutyCeil, 100)",the board's 10 A field-current ceiling as duty x100 (solved on the temperature-corrected resistance)
+CSV2,629,fieldHeatDutyCeil,100,"SafeInt(g_fieldHeatDutyCeil, 100)",field-drive heat ceiling as duty x100 (99 = not limiting)
+CSV2,630,fieldCeilBind,1,(int)g_fieldCeilBind,"which term sets the enforced field ceiling: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the field connector, 4 heat at the D5 spreader"
+CSV2,631,fieldRcOhm,100,"SafeInt(g_fieldRcOhm, 100)","field resistance both board ceilings and Field Amps use, corrected for alternator temperature, less the 12 % margin (ohm x100)"
+CSV2,632,fieldHeatLimS,1,(unsigned long)g_fieldHeatLimS,lifetime seconds held at the heat ceiling (raw seconds)
+CSV2,633,fieldCurLimS,1,(unsigned long)g_fieldCurLimS,lifetime seconds held at the 10 A ceiling (raw seconds)
+CSV2,634,fieldHeatLimSesS,1,(unsigned long)g_fieldHeatLimSesS,session seconds held at the heat ceiling (raw seconds; Reset on Live Data)
+CSV2,635,fieldCurLimSesS,1,(unsigned long)g_fieldCurLimSesS,session seconds held at the 10 A ceiling (raw seconds; Reset on Live Data)
+CSV2,636,dieTempLostCount,1,SafeInt(g_dieTempLostCount),session count of DIE_TEMP_LOST field events (INA228 die temperature)
+CSV2,637,n2kBusVerdict,1,(int)n2kBusVerdictCode,"CAN bus health, by severity: 0 off, 1 OK, 2 nothing heard, 3 receive errors, 4 nobody answering, 5 bus-off"
+CSV2,638,n2kTec,1,(int)tNMEA2000_esp32::BusStats.tec,TWAI transmit error counter (128+ = error-passive)
+CSV2,639,n2kRec,1,(int)tNMEA2000_esp32::BusStats.rec,TWAI receive error counter
+CSV2,640,n2kRxFrames,1,(int)((tNMEA2000_esp32::BusStats.rxFrames - n2kRxFramesBase) & 0x7FFFFFFF),CAN frames received since boot
+CSV2,641,n2kBusOffCount,1,(int)(tNMEA2000_esp32::BusStats.busOffCount & 0x7FFFFFFF),bus-off recoveries since boot
+CSV2,642,n2kRxLost,1,(int)(n2kRxLostRun & 0x7FFFFFFF),"frames our receive queue / FIFO lost since boot (load on us, never wiring; diagnostics only)"
+CSV2,643,n2kNodesHeard,1,(int)n2kNodesHeard,other nodes heard in the last 60 s
+CSV2,644,LargestPSRAMBlock,1,SafeInt(LargestPSRAMBlock),"largest contiguous free PSRAM block, KB (sampled every 20 s with the field cut, held while charging)"
+CSV2,645,sessionId,1,(unsigned)g_sessionId,"device boot identity, same in every channel this boot"
+CSV2,646,sendMs,1,(unsigned)millis(),device millis() when this payload was BUILT (CSV2 sends one pass later)
+CSV3,0,TemperatureLimitF,1,SafeInt(TemperatureLimitF),
+CSV3,1,BulkVoltage,100,"SafeInt(BulkVoltage, 100)",
+CSV3,2,wavePeriod,1,SafeInt(wavePeriod),
+CSV3,3,FloatVoltage,100,"SafeInt(FloatVoltage, 100)",
+CSV3,4,SwitchingFrequency,1,SafeInt(SwitchingFrequency),
+CSV3,5,yyMin,1,SafeInt(yyMin),
+CSV3,6,retired1,1,0,"dead slot, sends 0; kept so CSV3 indices never renumber"
+CSV3,7,ManualDutyTarget,100,"SafeInt(ManualDutyTarget, 100)",
+CSV3,8,PhysicalPanelOverride,1,SafeInt(PhysicalPanelOverride),
+CSV3,9,waveAmplitude,1,SafeInt(waveAmplitude),
+CSV3,10,CurrentThreshold,100,"SafeInt(CurrentThreshold, 100)",
+CSV3,11,PeukertExponent_scaled,1,SafeInt(PeukertExponent_scaled),
+CSV3,12,ChargeEfficiency_scaled,1,SafeInt(ChargeEfficiency_scaled),
+CSV3,13,ChargedVoltage_Scaled,1,SafeInt(ChargedVoltage_Scaled),
+CSV3,14,TailCurrent,10,"SafeInt(TailCurrent, 10)",
+CSV3,15,ChargedDetectionTime,1,SafeInt(ChargedDetectionTime),
+CSV3,16,IgnoreTemperature,1,SafeInt(IgnoreTemperature),
+CSV3,17,bmsLogic,1,SafeInt(bmsLogic),
+CSV3,18,bmsLogicLevelOff,1,SafeInt(bmsLogicLevelOff),
+CSV3,19,RPMScalingFactor,1,SafeInt(RPMScalingFactor),
+CSV3,20,MaximumAllowedBatteryAmps,1,SafeInt(MaximumAllowedBatteryAmps),
+CSV3,21,AlternatorNominalAmps,1,SafeInt(AlternatorNominalAmps),
+CSV3,22,LearningUpStep,100,"SafeInt(LearningUpStep, 100)",
+CSV3,23,LearningDownStep,100,"SafeInt(LearningDownStep, 100)",
+CSV3,24,xTime,1,SafeInt(xTime),
+CSV3,25,MinLearningInterval,1,SafeInt(MinLearningInterval),
+CSV3,26,SafeOperationThreshold,1,SafeInt(SafeOperationThreshold),
+CSV3,27,PidKp,1000,"SafeInt(PidKp, 1000)",
+CSV3,28,PidKi,1000,"SafeInt(PidKi, 1000)",
+CSV3,29,PidKd,1000,"SafeInt(PidKd, 1000)",
+CSV3,30,PidSampleDivisor,1,SafeInt(PidSampleDivisor),
+CSV3,31,MaxTableValue,100,"SafeInt(MaxTableValue, 100)",
+CSV3,32,MaxPenaltyPercent,100,"SafeInt(MaxPenaltyPercent, 100)",
+CSV3,33,MaxPenaltyDuration,1,SafeInt(MaxPenaltyDuration / 1000),
+CSV3,34,NeighborLearningFactor,1000,"SafeInt(NeighborLearningFactor, 1000)",
+CSV3,35,yyMax,1,SafeInt(yyMax),
+CSV3,36,LearningMemoryDuration,1,SafeInt(LearningMemoryDuration / 86400000),
+CSV3,37,TuningMode,1,SafeInt(TuningMode),
+CSV3,38,ShuntResistanceMicroOhm,1,SafeInt(ShuntResistanceMicroOhm),
+CSV3,39,InvertAltAmps,1,SafeInt(InvertAltAmps),
+CSV3,40,InvertBattAmps,1,SafeInt(InvertBattAmps),
+CSV3,41,MaxDuty,1,SafeInt(MaxDuty),
+CSV3,42,MinDuty,100,"SafeInt(MinDuty, 100)",
+CSV3,43,FieldResistance,1000,"SafeInt(FieldResistance, 1000)",
+CSV3,44,maxPoints,1,SafeInt(maxPoints),
+CSV3,45,AlternatorCOffset,100,"SafeInt(AlternatorCOffset, 100)",
+CSV3,46,BatteryCOffset,100,"SafeInt(BatteryCOffset, 100)",
+CSV3,47,BatteryCapacity_Ah,1,SafeInt(BatteryCapacity_Ah),
+CSV3,48,AmpSensorRange,1,SafeInt(AmpSensorRange),
+CSV3,49,R_fixed,100,"SafeInt(R_fixed, 100)",
+CSV3,50,Beta,100,"SafeInt(Beta, 100)",
+CSV3,51,T0_C,100,"SafeInt(T0_C, 100)",
+CSV3,52,TempSource,1,SafeInt(TempSource),
+CSV3,53,IgnitionOverride,1,SafeInt(IgnitionOverride),
+CSV3,54,FLOAT_DURATION,1,SafeInt(FLOAT_DURATION),
+CSV3,55,PulleyRatio,100,"SafeInt(PulleyRatio, 100)",
+CSV3,56,BattMonSrc,1,SafeInt(BattMonSrc),
+CSV3,57,rpmTableRPMPoints0,1,SafeInt(rpmTableRPMPoints[0]),
+CSV3,58,rpmTableRPMPoints1,1,SafeInt(rpmTableRPMPoints[1]),
+CSV3,59,rpmTableRPMPoints2,1,SafeInt(rpmTableRPMPoints[2]),
+CSV3,60,rpmTableRPMPoints3,1,SafeInt(rpmTableRPMPoints[3]),
+CSV3,61,rpmTableRPMPoints4,1,SafeInt(rpmTableRPMPoints[4]),
+CSV3,62,rpmTableRPMPoints5,1,SafeInt(rpmTableRPMPoints[5]),
+CSV3,63,rpmTableRPMPoints6,1,SafeInt(rpmTableRPMPoints[6]),
+CSV3,64,rpmTableRPMPoints7,1,SafeInt(rpmTableRPMPoints[7]),
+CSV3,65,rpmTableRPMPoints8,1,SafeInt(rpmTableRPMPoints[8]),
+CSV3,66,rpmTableRPMPoints9,1,SafeInt(rpmTableRPMPoints[9]),
+CSV3,67,LearningSettlingPeriod,1,SafeInt(LearningSettlingPeriod),
+CSV3,68,LearningRPMChangeThreshold,1,SafeInt(LearningRPMChangeThreshold),
+CSV3,69,LearningTempHysteresis,1,SafeInt(LearningTempHysteresis),
+CSV3,70,fuelTableRPM0,1,SafeInt(fuelTableRPM[0]),
+CSV3,71,fuelTableRPM1,1,SafeInt(fuelTableRPM[1]),
+CSV3,72,fuelTableRPM2,1,SafeInt(fuelTableRPM[2]),
+CSV3,73,fuelTableRPM3,1,SafeInt(fuelTableRPM[3]),
+CSV3,74,fuelTableRPM4,1,SafeInt(fuelTableRPM[4]),
+CSV3,75,fuelTableRPM5,1,SafeInt(fuelTableRPM[5]),
+CSV3,76,fuelTableRPM6,1,SafeInt(fuelTableRPM[6]),
+CSV3,77,fuelTableRPM7,1,SafeInt(fuelTableRPM[7]),
+CSV3,78,fuelTableRPM8,1,SafeInt(fuelTableRPM[8]),
+CSV3,79,fuelTableRPM9,1,SafeInt(fuelTableRPM[9]),
+CSV3,80,fuelTableGPH0,100,"SafeInt(fuelTableGPH[0], 100)",
+CSV3,81,fuelTableGPH1,100,"SafeInt(fuelTableGPH[1], 100)",
+CSV3,82,fuelTableGPH2,100,"SafeInt(fuelTableGPH[2], 100)",
+CSV3,83,fuelTableGPH3,100,"SafeInt(fuelTableGPH[3], 100)",
+CSV3,84,fuelTableGPH4,100,"SafeInt(fuelTableGPH[4], 100)",
+CSV3,85,fuelTableGPH5,100,"SafeInt(fuelTableGPH[5], 100)",
+CSV3,86,fuelTableGPH6,100,"SafeInt(fuelTableGPH[6], 100)",
+CSV3,87,fuelTableGPH7,100,"SafeInt(fuelTableGPH[7], 100)",
+CSV3,88,fuelTableGPH8,100,"SafeInt(fuelTableGPH[8], 100)",
+CSV3,89,fuelTableGPH9,100,"SafeInt(fuelTableGPH[9], 100)",
+CSV3,90,stateRevision,1,SafeInt(stateRevision),
+CSV3,91,DutyRampRate,100,"SafeInt(DutyRampRate, 100)",
+CSV3,92,SettleTimeBeforeCut,1,SafeInt(SettleTimeBeforeCut),
+CSV3,93,TempWarnExcess,100,"SafeInt(TempWarnExcess, 100)",
+CSV3,94,TempCritExcess,100,"SafeInt(TempCritExcess, 100)",
+CSV3,95,TempSustainedTimeout,1,SafeInt(TempSustainedTimeout / 1000),
+CSV3,96,AlternatorHardShutdownV,100,"SafeInt(AlternatorHardShutdownV, 100)",
+CSV3,97,VoltageDisagreeThreshold,100,"SafeInt(VoltageDisagreeThreshold, 100)",
+CSV3,98,VoltageDisagreeTimeout,1,SafeInt(VoltageDisagreeTimeout / 1000),
+CSV3,99,rpmMinDutyTable0,100,"SafeInt(rpmMinDutyTable[0], 100)",
+CSV3,100,rpmMinDutyTable1,100,"SafeInt(rpmMinDutyTable[1], 100)",
+CSV3,101,rpmMinDutyTable2,100,"SafeInt(rpmMinDutyTable[2], 100)",
+CSV3,102,rpmMinDutyTable3,100,"SafeInt(rpmMinDutyTable[3], 100)",
+CSV3,103,rpmMinDutyTable4,100,"SafeInt(rpmMinDutyTable[4], 100)",
+CSV3,104,rpmMinDutyTable5,100,"SafeInt(rpmMinDutyTable[5], 100)",
+CSV3,105,rpmMinDutyTable6,100,"SafeInt(rpmMinDutyTable[6], 100)",
+CSV3,106,rpmMinDutyTable7,100,"SafeInt(rpmMinDutyTable[7], 100)",
+CSV3,107,rpmMinDutyTable8,100,"SafeInt(rpmMinDutyTable[8], 100)",
+CSV3,108,rpmMinDutyTable9,100,"SafeInt(rpmMinDutyTable[9], 100)",
+CSV3,109,rpmCapCurrentTable0,100,"SafeInt(rpmCapCurrentTable[0], 100)",
+CSV3,110,rpmCapCurrentTable1,100,"SafeInt(rpmCapCurrentTable[1], 100)",
+CSV3,111,rpmCapCurrentTable2,100,"SafeInt(rpmCapCurrentTable[2], 100)",
+CSV3,112,rpmCapCurrentTable3,100,"SafeInt(rpmCapCurrentTable[3], 100)",
+CSV3,113,rpmCapCurrentTable4,100,"SafeInt(rpmCapCurrentTable[4], 100)",
+CSV3,114,rpmCapCurrentTable5,100,"SafeInt(rpmCapCurrentTable[5], 100)",
+CSV3,115,rpmCapCurrentTable6,100,"SafeInt(rpmCapCurrentTable[6], 100)",
+CSV3,116,rpmCapCurrentTable7,100,"SafeInt(rpmCapCurrentTable[7], 100)",
+CSV3,117,rpmCapCurrentTable8,100,"SafeInt(rpmCapCurrentTable[8], 100)",
+CSV3,118,rpmCapCurrentTable9,100,"SafeInt(rpmCapCurrentTable[9], 100)",
+CSV3,119,VoltageKp,100,"SafeInt(VoltageKp, 100)",
+CSV3,120,VoltageLoopInterval,1,SafeInt(VoltageLoopInterval),
+CSV3,121,FIELD_COLLAPSE_DELAY,1,SafeInt(FIELD_COLLAPSE_DELAY),
+CSV3,122,SetpointRiseRate,100,"SafeInt(SetpointRiseRate, 100)",
+CSV3,123,SetpointFallRate,100,"SafeInt(SetpointFallRate, 100)",
+CSV3,124,SetpointBigStepThresh,100,"SafeInt(SetpointBigStepThresh, 100)",
+CSV3,125,SetpointBigStepRiseRate,100,"SafeInt(SetpointBigStepRiseRate, 100)",
+CSV3,126,PIDTrackingGain,100,"SafeInt(PIDTrackingGain, 100)",
+CSV3,127,CAPSIZE_THRESHOLD_DEG,1,SafeInt(CAPSIZE_THRESHOLD_DEG),
+CSV3,128,PITCHPOLE_THRESHOLD_DEG,1,SafeInt(PITCHPOLE_THRESHOLD_DEG),
+CSV3,129,SLAM_THRESHOLD_G,10,"SafeInt(SLAM_THRESHOLD_G, 10)",
+CSV3,130,imuMountOrientation,1,SafeInt(imuMountOrientation),
+CSV3,131,TailCurrent_A,100,"SafeInt(TailCurrent_A, 100)",
+CSV3,132,RebulkVoltage,100,"SafeInt(RebulkVoltage, 100)",
+CSV3,133,rebulkDebounceTime,1,SafeInt(rebulkDebounceTime),
+CSV3,134,MinFloatTime,1,SafeInt(MinFloatTime),
+CSV3,135,SOC_BlockRebulk_percent,1,SafeInt(SOC_BlockRebulk_percent),
+CSV3,136,SOC_AllowRebulk_percent,1,SafeInt(SOC_AllowRebulk_percent),
+CSV3,137,DutySlowRampRate,100,"SafeInt(DutySlowRampRate, 100)",
+CSV3,138,ShutdownPhase2HoldMs,1,SafeInt(ShutdownPhase2HoldMs),
+CSV3,139,TempPIDKp,1000,"SafeInt(TempPIDKp, 1000)",
+CSV3,140,TempPIDKi,1000,"SafeInt(TempPIDKi, 1000)",
+CSV3,141,ThermalLookaheadSec,1,SafeInt(ThermalLookaheadSec),
+CSV3,142,TempPIDIntervalMs,1,SafeInt(TempPIDIntervalMs),
+CSV3,143,TempPIDFilterAlpha,1000,"SafeInt(TempPIDFilterAlpha, 1000)",
+CSV3,144,VoltageKi,100,"SafeInt(VoltageKi, 100)",
+CSV3,145,rpmCapPowerTable0,1,(int)rpmCapPowerTable[0],
+CSV3,146,rpmCapPowerTable1,1,(int)rpmCapPowerTable[1],
+CSV3,147,rpmCapPowerTable2,1,(int)rpmCapPowerTable[2],
+CSV3,148,rpmCapPowerTable3,1,(int)rpmCapPowerTable[3],
+CSV3,149,rpmCapPowerTable4,1,(int)rpmCapPowerTable[4],
+CSV3,150,rpmCapPowerTable5,1,(int)rpmCapPowerTable[5],
+CSV3,151,rpmCapPowerTable6,1,(int)rpmCapPowerTable[6],
+CSV3,152,rpmCapPowerTable7,1,(int)rpmCapPowerTable[7],
+CSV3,153,rpmCapPowerTable8,1,(int)rpmCapPowerTable[8],
+CSV3,154,rpmCapPowerTable9,1,(int)rpmCapPowerTable[9],
+CSV3,155,SystemIDStepAmplitude,10,"SafeInt(SystemIDStepAmplitude, 10)",
+CSV3,156,HardOCTripAmps,10,"SafeInt(HardOCTripAmps, 10)",
+CSV3,157,HardOCDebounceMs,1,SafeInt(HardOCDebounceMs),
+CSV3,158,IExcessFrac,1000,"SafeInt(IExcessFrac, 1000)",CV threshold fraction (×1000)
+CSV3,159,IExcessFloorA,10,"SafeInt(IExcessFloorA, 10)",threshold floor (A ×10)
+CSV3,160,IExcessKBleed,100,"SafeInt(IExcessKBleed, 100)",
+CSV3,161,IgnoreRPM,1,SafeInt(IgnoreRPM),
+CSV3,162,MinRPMForField,1,SafeInt(MinRPMForField),
+CSV3,163,AwBleedRate,10,"SafeInt(AwBleedRate, 10)",
+CSV3,164,KHard,10,"SafeInt(KHard, 10)",
+CSV3,165,ReseedFrac,100,"SafeInt(ReseedFrac, 100)",
+CSV3,166,AwSeedProtectMs,1,(int)AwSeedProtectMs,
+CSV3,167,displayTempUnit,1,SafeInt(displayTempUnit),
+CSV3,168,WarmupRampRate,10,"SafeInt(WarmupRampRate, 10)",
+CSV3,169,OvGroup1Enable,1,(int)OvGroup1Enable,
+CSV3,170,OvGroup2Enable,1,(int)OvGroup2Enable,
+CSV3,171,IExcessCeilA,10,"SafeInt(IExcessCeilA, 10)",threshold ceiling (A ×10)
+CSV3,172,IExcessTau,1,SafeInt(IExcessTau),"EMA time constant (ms, raw int)"
+CSV3,173,OutputPIDSigSrc,1,OutputPIDSigSrc,
+CSV3,174,TdPred,1,TdPred,
+CSV3,175,OvMeasMarginV,1,OvMeasMarginV,
+CSV3,176,OvPredMarginV,1,OvPredMarginV,
+CSV3,177,OutputPIDMA_N,1,OutputPIDMA_N,
+CSV3,178,OutputPIDFilterTC,1,(int)OutputPIDFilterTC,
+CSV3,179,VoltageFilterTC,1,(int)VoltageFilterTC,
+CSV3,180,CvKdVoltFiltTC,1,(int)CvKdVoltFiltTC,
+CSV3,181,CvKdDeadbandVps,100,"SafeInt(CvKdDeadbandVps, 100)",
+CSV3,182,VoltageKd,10,"SafeInt(VoltageKd, 10)",
+CSV3,183,DvdtTC,10,"SafeInt(DvdtTC, 10)",
+CSV3,184,CvKdArmV,100,"SafeInt(CvKdArmV, 100)",
+CSV3,185,StartupRiseRate,100,"SafeInt(StartupRiseRate, 100)",
+CSV3,186,absorptionCompleteTime,1,SafeInt(absorptionCompleteTime),
+CSV3,187,OnOff,1,SafeInt(OnOff),
+CSV3,188,ManualFieldToggle,1,SafeInt(ManualFieldToggle),
+CSV3,189,HiLow,1,SafeInt(HiLow),
+CSV3,190,LimpHome,1,SafeInt(LimpHome),
+CSV3,191,AlarmActivate,1,SafeInt(AlarmActivate),
+CSV3,192,TempAlarm,1,SafeInt(TempAlarm),
+CSV3,193,VoltageAlarmHigh,100,"SafeInt(VoltageAlarmHigh, 100)",
+CSV3,194,VoltageAlarmLow,100,"SafeInt(VoltageAlarmLow, 100)",
+CSV3,195,CurrentAlarmHigh,1,SafeInt(CurrentAlarmHigh),
+CSV3,196,AlarmTest,1,SafeInt(AlarmTest),
+CSV3,197,AlarmLatchEnabled,1,SafeInt(AlarmLatchEnabled),
+CSV3,198,GeneralFaultAlarm,1,SafeInt(GeneralFaultAlarm),
+CSV3,199,MaintainMode,1,SafeInt(MaintainMode),
+CSV3,200,ManualSOCPoint,100,"SafeInt(ManualSOCPoint, 100)",
+CSV3,201,IgnoreLearningDuringPenalty,1,SafeInt(IgnoreLearningDuringPenalty),
+CSV3,202,LogAllLearningEvents,1,SafeInt(LogAllLearningEvents),
+CSV3,203,CloudFeatures,1,SafeInt(CloudFeatures),
+CSV3,204,AutoAltCurrentZero,1,SafeInt(AutoAltCurrentZero),
+CSV3,205,WindingTempOffset,1,SafeInt(WindingTempOffset),
+CSV3,206,ManualLifePercentage,1,SafeInt(ManualLifePercentage),
+CSV3,207,UVThresholdHigh,100,"SafeInt(UVThresholdHigh, 100)",
+CSV3,208,weatherModeEnabled,1,SafeInt(weatherModeEnabled),
+CSV3,209,imuEnabled,1,SafeInt(imuEnabled ? 1 : 0),
+CSV3,210,AbsorptionVoltage,100,SafeInt(AbsorptionVoltage * 100),
+CSV3,211,AbsorptionTimeoutMs,1,SafeInt(AbsorptionTimeoutMs),
+CSV3,212,bulkVoltageHoldMs,1,SafeInt(bulkVoltageHoldMs),
+CSV3,213,capLimitMode,1,SafeInt(capLimitMode),
+CSV3,214,TargetVoltageMode,1,SafeInt(TargetVoltageMode),
+CSV3,215,TargetVoltageSetpoint,100,"SafeInt(TargetVoltageSetpoint, 100)",
+CSV3,216,RebulkCurrent_A,100,"SafeInt(RebulkCurrent_A, 100)",
+CSV3,217,UseFloat,1,SafeInt(UseFloat),
+CSV3,218,IExcessFracBulk,1000,"SafeInt(IExcessFracBulk, 1000)",BULK threshold fraction (×1000)
+CSV3,219,IExcessRelFrac,1000,"SafeInt(IExcessRelFrac, 1000)",release hysteresis fraction (×1000)
+CSV3,220,systemIDPlantTauMs,1,SafeInt(systemIDPlantTauMs),"fitted plant time constant (ms), persisted"
+CSV3,221,TempAlarmLow,1,SafeInt(TempAlarmLow),
+CSV3,222,LoadDumpDtThresh,1,SafeInt(LoadDumpDtThresh),
+CSV3,223,LoadDumpDtThresh1,1,SafeInt(LoadDumpDtThresh1),
+CSV3,224,CVTuningMode,1,(int)CVTuningMode,
+CSV3,225,cvWaveAmplitudeV,100,"SafeInt(cvWaveAmplitudeV, 100)",
+CSV3,226,cvWavePeriodSec,1,(int)cvWavePeriodSec,
+CSV3,227,cvKOvershoot,10,"SafeInt(cvKOvershoot, 10)",
+CSV3,228,cvConsecutiveReads,1,(int)cvConsecutiveReads,
+CSV3,229,webgaugesinterval,1,SafeInt(webgaugesinterval),
+CSV3,230,plotTimeWindow,1,SafeInt(plotTimeWindow),
+CSV3,231,Ymin1,1,SafeInt(Ymin1),
+CSV3,232,Ymax1,1,SafeInt(Ymax1),
+CSV3,233,Ymin2,100,"SafeInt(Ymin2, 100)",
+CSV3,234,Ymax2,100,"SafeInt(Ymax2, 100)",
+CSV3,235,Ymin3,1,SafeInt(Ymin3),
+CSV3,236,Ymax3,1,SafeInt(Ymax3),
+CSV3,237,Ymin4,1,SafeInt(Ymin4),
+CSV3,238,Ymax4,1,SafeInt(Ymax4),
+CSV3,239,LoadDumpDtThresh3,1,SafeInt(LoadDumpDtThresh3),
+CSV3,240,hardwarePresent,1,SafeInt(hardwarePresent),
+CSV3,241,testProtectionsEnabled,1,(int)testProtectionsEnabled,"runtime flag — not persisted, resets true (enabled) on boot"
+CSV3,242,IExcessArmMarginV,1,IExcessArmMarginV,"%.3f — iExcess voltage gate, independent of OvMeasMarginV"
+CSV3,243,FastSetpointRiseRate,100,"SafeInt(FastSetpointRiseRate, 100)","×100, 1 decimal — multiplier on setpoint rise slew during post-protection recovery"
+CSV3,244,FastSetpointRiseWindowMs,1,(int)FastSetpointRiseWindowMs,raw ms — hard upper bound on fast-rise window
+CSV3,245,FastSetpointRiseHeadroomV,100,"SafeInt(FastSetpointRiseHeadroomV, 100)","×100, 2 decimal — V below target at which fast-rise gate stays open"
+CSV3,246,SolarWatts,1,SafeInt(SolarWatts),
+CSV3,247,performanceRatio,100,"SafeInt(performanceRatio, 100)","×100, 2 decimal"
+CSV3,248,VeData,1,SafeInt(VeData),0/1
+CSV3,249,NMEA0183Data,1,SafeInt(NMEA0183Data),0/1
+CSV3,250,NMEA2KData,1,SafeInt(NMEA2KData),0/1
+CSV3,251,timeAxisModeChanging,1,SafeInt(timeAxisModeChanging),0/1
+CSV3,252,timeSourceMode,1,(int)timeSourceMode,"0=auto, 1=NMEA-forced, 2=Phone-forced, 3=NTP-time-forced"
+CSV3,253,speedSourceMode,1,(int)speedSourceMode,"0=NMEA 2000, 1=phone GPS (speed/course owner — selectable, never auto)"
+CSV3,254,faEnabled,1,(int)faEnabled,0/1 — global ON/OFF
+CSV3,255,faAlarmEnable,1,(int)faAlarmEnable,0/1 — FAULT drives audible alarm
+CSV3,256,faAnomPause,1,(int)faAnomPause,0/1 — freeze anomaly flipbook slots
+CSV3,257,faRpmEdgeMargin,10,"SafeInt(faRpmEdgeMargin, 10)",RPM ×10
+CSV3,258,faAmpsDriftFloorA,100,"SafeInt(faAmpsDriftFloorA, 100)",A ×100
+CSV3,259,faAmpsDriftPct,10,"SafeInt(faAmpsDriftPct, 10)",percent ×10
+CSV3,260,faAttenUpAmps,10,"SafeInt(faAttenUpAmps, 10)",A ×10
+CSV3,261,faAttenDownAmps,10,"SafeInt(faAttenDownAmps, 10)",A ×10
+CSV3,262,faPeakMinA,100,"SafeInt(faPeakMinA, 100)",A ×100
+CSV3,263,wifiNapEnabled,1,(int)wifiNapEnabled,0/1 — WiFi Napping standby toggle (Client only)
+CSV3,264,imuHeelOffset,100,"SafeInt(imuHeelOffsetDeg, 100)",captured rest heel offset (deg ×100); on CSV3 so the Level Zero echo is fast
+CSV3,265,imuPitchOffset,100,"SafeInt(imuPitchOffsetDeg, 100)",captured rest pitch offset (deg ×100)
+CSV3,266,systemIDTestType,1,SafeInt(systemIDTestType),"0=step, 1=sine sweep (Plant Delay test type)"
+CSV3,267,systemIDSineFreqStart,10,"SafeInt(systemIDSineFreqStart, 10)",Hz ×10
+CSV3,268,systemIDSineFreqEnd,10,"SafeInt(systemIDSineFreqEnd, 10)",Hz ×10
+CSV3,269,systemIDSineCycles,1,SafeInt(systemIDSineCycles),analysed cycles per sweep frequency
+CSV3,270,tuningWaveform,1,SafeInt(tuningWaveform),"0=square, 1=sine manual, 2=sine auto-sweep"
+CSV3,271,tuningSineFreq,10,"SafeInt(tuningSineFreq, 10)",Hz ×10 (manual sine frequency)
+CSV3,272,tuningSweepStart,10,"SafeInt(tuningSweepStart, 10)",Hz ×10
+CSV3,273,tuningSweepEnd,10,"SafeInt(tuningSweepEnd, 10)",Hz ×10
+CSV3,274,tuningSweepCycles,1,SafeInt(tuningSweepCycles),analysed cycles per sweep frequency
+CSV3,275,SystemIDStabilizeAmps,10,"SafeInt(SystemIDStabilizeAmps, 10)",A ×10 — plant-delay baseline/trough current
+CSV3,276,tuningWaveFloor,1,SafeInt(tuningWaveFloor),"A — Current Target Generator wave floor (trough), shared square + sine"
+CSV3,277,commissionState,1,(int)commissionState,"auto-commissioning state: 0=not, 1=in-progress, 2=commissioned"
+CSV3,278,commissionPhase,1,(int)commissionPhase,"current wizard phase: 0=Prep…9=Charge health calibration, 10=finished"
+CSV3,279,commissionDoneMask,1,(int)commissionDoneMask,per-stage completion bitmask (bit i = stage i done)
+CSV3,280,cvHelpersEnabled,1,(int)cvHelpersEnabled,master switch: asymmetric KiDown unwind + CV D term (1=on)
+CSV3,281,MinChargeTempF,1,SafeInt(MinChargeTempF),cold-charge lockout board-temp floor (°F)
+CSV3,282,coldChargeLockoutEnable,1,(int)coldChargeLockoutEnable,cold-charge lockout master on/off (1=on)
+CSV3,283,cvGainMode,1,(int)cvGainMode,"CV Gain Source: 0=Manual, 1=Measured (α/K anchored)"
+CSV3,284,cvPlantK,10000,"SafeInt(cvPlantK, 10000)",measured plant gain K (V/A); ×10000
+CSV3,285,cvComputedKp,100,"SafeInt(cvComputedKp, 100)","Plant-fit Kp, run under CV Gain Source = Measured (12V-equiv); ×100"
+CSV3,286,cvComputedKi,100,"SafeInt(cvComputedKi, 100)","Plant-fit Ki, run under CV Gain Source = Measured (12V-equiv); ×100"
+CSV3,287,cvCrossover,100,"SafeInt(cvCrossover, 100)",CV crossover ω_c (rad/s); ×100
+CSV3,288,cvPiZero,100,"SafeInt(cvPiZero, 100)",CV PI integral zero ρ (rad/s); ×100
+CSV3,289,vTgtRampUp,1000,"SafeInt(vTgtRampUp, 1000)",CV voltage-target ramp UP rate (V/s); ×1000
+CSV3,290,vTgtRampDn,1000,"SafeInt(vTgtRampDn, 1000)",CV voltage-target ramp DOWN rate (V/s); ×1000
+CSV3,291,vTgtRampEnable,1,(int)vTgtRampEnable,CV voltage-target slew master switch (0/1)
+CSV3,292,setpointSlewEnable,1,(int)setpointSlewEnable,inner-loop current setpoint slew master switch (0/1)
+CSV3,293,cvRiseGovEnable,1,(int)cvRiseGovEnable,CV rise governor / anti-windup master switch (0/1)
+CSV3,294,dutySlewEnable,1,(int)dutySlewEnable,field duty slew master switch (0/1)
+CSV3,295,CommissionTempF,10,isnan(CommissionTempF) ? ROLL_EMPTY : (int)lroundf(CommissionTempF * 10.0f),measured battery temp when CV fit applied — derate reference (°F ×10; ROLL_EMPTY = unset/NaN)
+CSV3,296,battTempDerateEnable,1,(int)battTempDerateEnable,battery-temp gain derate master on/off (0/1)
+CSV3,297,battTempCoeff,10000,"SafeInt(battTempCoeff, 10000)",battery fractional resistance change per °C; ×10000
+CSV3,298,TempPIDKiDownFrac,1000,"SafeInt(TempPIDKiDownFrac, 1000)",thermal velocity-form below-setpoint integral bleed ratio (×Ki); ×1000
+CSV3,299,ThermalSlopeWindowSec,1,SafeInt(ThermalSlopeWindowSec),thermal slope backward-difference window (s); integer
+CSV3,300,BattCurrentLimitA,10,"SafeInt(BattCurrentLimitA, 10)","max battery charge current (A ×10, G4); 0 = disabled — ceiling on the alternator command = limit + house-load offset"
+CSV3,301,ripWinMs,1,SafeInt(ripWinMs),"pk-pk capture window (ms, integer)"
+CSV3,302,ripDriftFloorA,100,"SafeInt(ripDriftFloorA, 100)",shared floor: command-travel gate + stationarity mean-shift tolerance (A ×100)
+CSV3,303,ripDriftPct,10,"SafeInt(ripDriftPct, 10)","command-travel gate slope (% of mean, ×10) — command gate only since §11"
+CSV3,304,SocAlarmLow,1,SafeInt(SocAlarmLow),"low-SoC alarm threshold (%, integer); 0 = disabled"
+CSV3,305,battMaxMode,1,SafeInt(battMaxMode),"battery V/I plot sampling: 0 = window mean, 1 = max-magnitude"
+CSV3,306,IExcessBaseA,10,"SafeInt(IExcessBaseA, 10)",over-current trip-line intercept / CV base (A ×10)
+CSV3,307,IExcessCcOffsetA,10,"SafeInt(IExcessCcOffsetA, 10)",CC trip line offset above CV (A ×10)
+CSV3,308,BatteryShuntPresent,1,SafeInt(BatteryShuntPresent),1 = INA228 battery shunt fitted; 0 = no battery-current sensor
+CSV3,309,cvRecovEnable,1,(int)cvRecovEnable,post-protection integrator-refill master switch (0/1)
+CSV3,310,cvRecovSec,10,"SafeInt(cvRecovSec, 10)",retired timed-window knob; slot kept (never repurpose); ×10
+CSV3,311,cvRecovEmaxV,1000,"SafeInt(cvRecovEmaxV, 1000)",retired timed-window knob; slot kept (never repurpose); ×1000
+CSV3,312,testSlewMode,1,(int)testSlewMode,"manual CC square-wave test slew mode (0=off, 1=default rates, 2=custom)"
+CSV3,313,cvTestSlewMode,1,(int)cvTestSlewMode,"manual CV square-wave test slew mode (0=off, 1=default rates, 2=custom)"
+CSV3,314,CvKdOneSided,1,(int)CvKdOneSided,"CV D-term mode: 1=one-sided (removes current only), 0=symmetric"
+CSV3,315,fieldDecayTauMs,1,SafeInt(fieldDecayTauMs),"commissioned field drain time, command→10% of output (ms); worst-case (longest) endpoint of the drain-vs-RPM line, or the flat value"
+CSV3,316,commissionManualMask,1,(int)commissionManualMask,per-stage set-by-hand bitmask (skip / mark-done-manually); pairs with commissionDoneMask
+CSV3,317,CvKdMaxTrimA,10,"SafeInt(CvKdMaxTrimA, 10)",CV D-term back-off ceiling (A ×10); caps kdTrim so a fast rise saturates instead of flooring the field
+CSV3,318,cvAlpha,1000,"SafeInt(cvAlpha, 1000)",CV auto-gain aggressiveness α (fraction of the deadbeat-ohmic gain); ×1000
+CSV3,319,CvKdSlopeCeil,10,"SafeInt(CvKdSlopeCeil, 10)",CV D-term slope ceiling (V/s real per-bus ×10) — max slope the D acts on
+CSV3,320,cvComputedKd,100,"SafeInt(cvComputedKd, 100)",Plant-fit D gain Kd = CvKdTd·cvComputedKp (12V-equiv); ×100
+CSV3,321,CvKdDbSlope,10000,"SafeInt(CvKdDbSlope, 10000)",CV D-term deadband line slope (V/s per A ×10000)
+CSV3,322,CvKdDbFloor,100,"SafeInt(CvKdDbFloor, 100)",CV D-term deadband line floor (V/s ×100)
+CSV3,323,CvKdDbCeil,100,"SafeInt(CvKdDbCeil, 100)",CV D-term deadband line ceiling (V/s ×100)
+CSV3,324,cvRecovBoostEnable,1,(int)cvRecovBoostEnable,post-protection recovery P-boost master switch (0/1)
+CSV3,325,cvRecovBoostMax,100,"SafeInt(cvRecovBoostMax, 100)",recovery P-boost max multiplier at full shortfall; ×100
+CSV3,326,cvRecovBoostErrV,1000,"SafeInt(cvRecovBoostErrV, 1000)",recovery P-boost full-boost shortfall (V per 12V block); ×1000
+CSV3,327,fdDrainLoMs,1,SafeInt(fdDrainLoMs),drain-vs-RPM line: drain (ms) at fdDrainRpmLo; 0 = no line (flat fieldDecayTauMs)
+CSV3,328,fdDrainHiMs,1,SafeInt(fdDrainHiMs),drain-vs-RPM line: drain (ms) at fdDrainRpmHi
+CSV3,329,fdDrainRpmLo,1,SafeInt(fdDrainRpmLo),drain-vs-RPM line: lowest tested RPM (lookup clamps here)
+CSV3,330,fdDrainRpmHi,1,SafeInt(fdDrainRpmHi),drain-vs-RPM line: highest tested RPM (lookup clamps here)
+CSV3,331,HardOCEnable,1,(int)HardOCEnable,Group 0 hard over-current trip enable (0/1)
+CSV3,332,IExcessEnable,1,(int)IExcessEnable,"Group 3 iExcess detectors enable (0/1, gates CV + bulk)"
+CSV3,333,BattLimitEnable,1,(int)BattLimitEnable,Group 4 battery charge-current ceiling enable (0/1)
+CSV3,334,CvKdExcessMode,1,(int)CvKdExcessMode,"CV D-term response shape (1 = slope excess over the tolerance line, 0 = legacy full-slope latch)"
+CSV3,335,CvStressDropV,100,"SafeInt(CvStressDropV, 100)","stress-test target headroom below settled idle (V 12V-equiv ×100, class-scaled at use)"
+CSV3,336,CvStressFailBandV,100,"SafeInt(CvStressFailBandV, 100)","stress-test stability fail band (V 12V-equiv ×100, class-scaled at use)"
+CSV3,337,CvBrakeFallRate,100,"SafeInt(CvBrakeFallRate, 100)",brake-tier setpoint fall rate while CV D-term removes current (A/s ×100)
+CSV3,338,cvRecovKiMax,100,"SafeInt(cvRecovKiMax, 100)","refill Ki multiplier at release, tapering to 1x as the deficit heals; ×100"
+CSV3,339,cvWindDownEnable,1,(int)cvWindDownEnable,commanded-target wind-down governor master switch (0/1)
+CSV3,340,cvWindDownRate,1000,"SafeInt(cvWindDownRate, 1000)",wind-down shed rate (fraction of MaxTableValue per second); ×1000
+CSV3,341,cvWindDownStopV,1000,"SafeInt(cvWindDownStopV, 1000)","wind-down stop margin above commanded target (V real per-bus, class-scaled at store); ×1000"
+CSV3,342,LoadDumpEnable,1,(int)LoadDumpEnable,Group 5 load dump enable (0/1)
+CSV3,343,loadServeBoostEnable,1,(int)loadServeBoostEnable,"load-serve Ki boost toward measured house loads (0/1, shunt-gated)"
+CSV3,344,reseedCorrEnable,1,(int)reseedCorrEnable,demand-corrected reseed: load-drop subtraction + rapid-refire ratchet (0/1)
+CSV3,345,HuntGovEnable,1,(int)HuntGovEnable,hunt-governor (oscillation damper) master switch (0/1)
+CSV3,346,ReseedFracNoShunt,100,"SafeInt(ReseedFracNoShunt, 100)",no-shunt recovery seed fraction (×100)
+CSV3,347,CvRecovClimbRate,100,"SafeInt(CvRecovClimbRate, 100)","recovery climb floor rate, fraction of MaxTableValue/s (×100)"
+CSV3,348,protTestCutMs,1,SafeInt(protTestCutMs),protection-test manual hard-cut hold (ms)
+CSV3,349,protTestGapMs,1,SafeInt(protTestGapMs),protection-test gap between repeated cuts (ms)
+CSV3,350,protTestReps,1,SafeInt(protTestReps),protection-test repeat count
+CSV3,351,protTestAmps,1,SafeInt(protTestCmdA),protection-test energize target current (A); 0 = auto-seed at fire
+CSV3,352,cvRecovBoostFloorV,1000,"SafeInt(cvRecovBoostFloorV, 1000)",recovery P-boost dead area below target (V per 12V block); ×1000
+CSV3,353,cvRecovDeepBandV,1000,"SafeInt(cvRecovDeepBandV, 1000)",deep-recovery band (V per 12V block); ×1000
+CSV3,354,cvRecovDeepMult,100,"SafeInt(cvRecovDeepMult, 100)",starve-walk rate multiplier at full depth; ×100
+CSV3,355,cvRecovFlareBandV,1000,"SafeInt(cvRecovFlareBandV, 1000)",arrival flare band (V per 12V block); ×1000
+CSV3,356,cvRecovFlareFrac,100,"SafeInt(cvRecovFlareFrac, 100)","arrival flare ceiling floor, fraction of recovery goal; ×100"
+CSV3,357,TachLieEnable,1,(int)TachLieEnable,tach-lie plausibility cut enable (0/1)
+CSV3,358,n2kTxEnable,1,SafeInt(n2kTxEnable),NMEA2000 transmit master (0/1)
+CSV3,359,n2kDeviceInstance,1,SafeInt(n2kDeviceInstance),N2K device instance
+CSV3,360,n2kBattEnable,1,SafeInt(n2kBattEnable),battery 127508+127506 pair (0/1)
+CSV3,361,n2kBattInstance,1,SafeInt(n2kBattInstance),
+CSV3,362,n2kBattCfgEnable,1,SafeInt(n2kBattCfgEnable),127513 battery configuration (0/1)
+CSV3,363,n2kAltEnable,1,SafeInt(n2kAltEnable),alternator 127508+127506 DCType=Alternator pair (0/1)
+CSV3,364,n2kAltInstance,1,SafeInt(n2kAltInstance),
+CSV3,365,n2kAltTempEnable,1,SafeInt(n2kAltTempEnable),130312 alternator temperature (0/1)
+CSV3,366,n2kTempInstance,1,SafeInt(n2kTempInstance),
+CSV3,367,n2kTempSource,1,SafeInt(n2kTempSource),tN2kTempSource code (3 = Engine Room)
+CSV3,368,n2kChgrEnable,1,SafeInt(n2kChgrEnable),127507 charger status (0/1)
+CSV3,369,n2kChgrInstance,1,SafeInt(n2kChgrInstance),
+CSV3,370,n2kChgrCfgEnable,1,SafeInt(n2kChgrCfgEnable),"127510 charger configuration, carries field drive % (0/1)"
+CSV3,371,n2kChgrMode,1,SafeInt(n2kChgrMode),"tN2kChargerMode label: 0 Standalone, 1 Primary, 2 Secondary"
+CSV3,372,n2kEngRpmEnable,1,SafeInt(n2kEngRpmEnable),127488 engine RPM (0/1)
+CSV3,373,n2kEngInstance,1,SafeInt(n2kEngInstance),
+CSV3,374,n2kEngDynEnable,1,SafeInt(n2kEngDynEnable),127489 engine dynamic (0/1)
+CSV3,375,n2kEngBitsEnable,1,SafeInt(n2kEngBitsEnable),discrete warning bits inside 127489 (0/1)
+CSV3,376,n2kConvStatEnable,1,SafeInt(n2kConvStatEnable),127750 converter status (0/1)
+CSV3,377,n2kRxBattInstance,1,SafeInt(n2kRxBattInstance),battery instance to ingest (127508/127506 receive)
+CSV3,378,dvccEn,1,SafeInt(dvccEn),DVCC follow master (0/1)
+CSV3,379,dvccSrcType,1,SafeInt(dvccSrcType),"authority dialect: 0 Victron VE.Can (VREG), 1 RV-C"
+CSV3,380,dvccInst,1,SafeInt(dvccInst),RV-C DC instance filter (0 = any)
+CSV3,381,dvccSilenceS,1,SafeInt(dvccSilenceS),silence timeout (s)
+CSV3,382,dvccSettleS,1,SafeInt(dvccSettleS),settling time (s)
+CSV3,383,dvccCvlMin,100,"SafeInt(dvccCvlMin, 100)",plausible-CVL window low (V ×100)
+CSV3,384,dvccCvlMax,100,"SafeInt(dvccCvlMax, 100)",plausible-CVL window high (V ×100)
+CSV3,385,dvccVicCutHold,1,SafeInt(dvccVicCutHold),Victron do-not-charge held after it stops arriving (0/1)
+CSV3,386,HuntCutPct,1,(int)HuntCutPct,"damper test/pocket gain, % of user Ki"
+CSV3,387,HuntVerifyPct,1,(int)HuntVerifyPct,"damper verify bar, % ripple reduction required"
+CSV3,388,HuntWingPct,1,(int)HuntWingPct,"damper pocket taper width, % of speed per side"
+CSV3,389,HuntCooldownMin,1,(int)HuntCooldownMin,damper retest cooldown after a failed test (min)
+CSV3,390,HuntSteadyPct,1,(int)HuntSteadyPct,damper engine-speed steadiness tolerance (%)
+CSV3,391,HuntQualifyScans,1,(int)HuntQualifyScans,damper wobble-confirm scan count (1.6 s each)
+CSV3,392,HuntTrigPct,1000,"SafeInt(HuntTrigPct, 1000)",damper detection bar: peak-bin duty swing % (x1000)
+CSV3,393,NMEA0183Baud,1,(int)NMEA0183Baud,NMEA 0183 serial baud (4800 / 9600 / 19200 / 38400)
+CSV3,394,NMEA0183Invert,1,(int)NMEA0183Invert,"NMEA 0183 UART polarity: 0 RS-232-level talker, 1 TTL-level talker"
+CSV3,395,displayVolUnit,1,SafeInt(displayVolUnit),"fuel volume display preference: 0 US gallons, 1 litres"
+CSV3,396,gpsPositionSource,1,(int)gpsPositionSource,"0=auto, 1=NMEA-forced, 2=phone-forced (position only; the clock is CSV3_timeSourceMode)"
+CSV3,397,MaxFieldVolts,10,"SafeInt(MaxFieldVolts, 10)",field-volt cap (x10); the enforced ceiling is CSV2_fieldDutyCeil
+CSV3,398,OvTierLoMarginV,1,OvTierLoMarginV,"timed OV cut LOW-tier margin above target (V, %.3f)"
+CSV3,399,OvTierLoDwellMs,1,SafeInt(OvTierLoDwellMs),timed OV cut LOW-tier continuous dwell (ms; 0 = tier off)
+CSV3,400,OvTierMidMarginV,1,OvTierMidMarginV,"timed OV cut MID-tier margin above target (V, %.3f)"
+CSV3,401,OvTierMidDwellMs,1,SafeInt(OvTierMidDwellMs),timed OV cut MID-tier continuous dwell (ms; 0 = tier off)
+CSV3,402,VoltageHardwareLimit,100,"SafeInt(VoltageHardwareLimit, 100)","INA228 hardware shutdown voltage (x100) — top OV-ladder rung, user setting"
+CSV3,403,LoadDumpN1,1,SafeInt(LoadDumpN1),load-dump tier 1 consecutive-reading count (time to act = N INA228 readings ~6 ms each + next control tick ~13 ms)
+CSV3,404,LoadDumpN2,1,SafeInt(LoadDumpN2),load-dump tier 2 consecutive-sample count
+CSV3,405,LoadDumpN3,1,SafeInt(LoadDumpN3),load-dump tier 3 consecutive-sample count
+CSV3,406,solarLearnEnable,1,SafeInt(solarLearnEnable),0/1 — learn performanceRatio from each complete day's actual/forecast harvest
+CSV3,407,solarUseConsEnable,1,SafeInt(solarUseConsEnable),0/1 — size the solar-pause bar from predicted consumption
+CSV3,408,solarConsMarginPct,100,"SafeInt(solarConsMarginPct, 100)",x100 — headroom over predicted consumption (%)
+CSV3,409,solarLearnRatePct,100,"SafeInt(solarLearnRatePct, 100)",x100 — per-day blend weight into performanceRatio (%)
+CSV3,410,rvcTxEnable,1,SafeInt(rvcTxEnable),RV-C transmit master (0/1)
+CSV3,411,rvcChgrEnable,1,SafeInt(rvcChgrEnable),RV-C CHARGER_STATUS / _2 / _3 / CONFIGURATION_STATUS (0/1)
+CSV3,412,rvcDcEnable,1,SafeInt(rvcDcEnable),RV-C DC_SOURCE_STATUS_1/2/3 at the alternator instance (0/1)
+CSV3,413,rvcFaultEnable,1,SafeInt(rvcFaultEnable),RV-C DM_RV diagnostic message (0/1)
+CSV3,414,rvcChgrInstance,1,SafeInt(rvcChgrInstance),RV-C charger instance (49 = alternator type nibble + instance 1)
+CSV3,415,rvcDcInstance,1,SafeInt(rvcDcInstance),RV-C DC source instance for the alternator
+CSV3,416,rvcDevPriority,1,SafeInt(rvcDevPriority),"RV-C device priority (80 = Charger, below a BMS 120)"
+CSV3,417,battTempProbeEnable,1,SafeInt(battTempProbeEnable),BATT-role probe feeds the battery-temperature source chain (0/1)
+CSV3,418,extraTempProbeEnable,1,SafeInt(extraTempProbeEnable),EXTRA-role probe live (0/1)
+CSV3,419,battTempSource,1,SafeInt(battTempSource),"0 Auto, 1 Probe, 2 NMEA 2000, 3 VE.Direct, 4 RV-C, 6 None (5 retired)"
+CSV3,420,hotChargeLockoutEnable,1,SafeInt(hotChargeLockoutEnable),hot-charge lockout master on/off (0/1)
+CSV3,421,MaxChargeTempF,1,SafeInt(MaxChargeTempF),hot-charge lockout ceiling (°F)
+CSV3,422,extraTempAlarmHiEnable,1,SafeInt(extraTempAlarmHiEnable),EXTRA-probe high alarm (0/1)
+CSV3,423,extraTempAlarmHiF,1,SafeInt(extraTempAlarmHiF),EXTRA-probe high alarm threshold (°F)
+CSV3,424,extraTempAlarmLoEnable,1,SafeInt(extraTempAlarmLoEnable),EXTRA-probe low alarm (0/1)
+CSV3,425,extraTempAlarmLoF,1,SafeInt(extraTempAlarmLoF),EXTRA-probe low alarm threshold (°F)
+CSV3,426,n2kExtraTempEnable,1,SafeInt(n2kExtraTempEnable),130312 for the EXTRA probe (0/1)
+CSV3,427,n2kExtraTempInstance,1,SafeInt(n2kExtraTempInstance),
+CSV3,428,n2kExtraTempSource,1,SafeInt(n2kExtraTempSource),tN2kTempSource code for the EXTRA probe
+CSV3,429,CommissionTempSrc,1,SafeInt(CommissionTempSrc),"battTempActiveSrc when CommissionTempF was stamped (0 = legacy/unknown, 5 = retired board stamp)"
+CSV3,430,maxWorkingRpm,1,SafeInt(maxWorkingRpm),stage-9 setup screen; 0 = never entered
+CSV3,431,RemoteDiagnostics,1,SafeInt(RemoteDiagnostics),owner switch for the dashboard's support log-relay poll (0/1)
+CSV3,432,retired2,1,0,"dead slot, sends 0; kept so CSV3 indices never renumber"
+CSV3,433,BatteryVoltageSource,1,SafeInt(BatteryVoltageSource),"charge-decision battery volts: 0 INA228, 1 NMEA 2000, 3 Victron"
+CSV3,434,IgnoreAltCurrent,1,SafeInt(IgnoreAltCurrent),run without alternator current (0/1) — voltage-only regulation
+CSV3,435,IgnoreBattVMain,1,SafeInt(IgnoreBattVMain),run without the INA228 bus voltage (0/1) — fixed duty
+CSV3,436,IgnoreBattV2,1,SafeInt(IgnoreBattV2),run without the ADS1115 battery voltage (0/1)
+CSV3,437,LimpDutyPct,10,"SafeInt(LimpDutyPct, 10)","field duty cap / fixed duty for the reduced-sensor tiers, % x10"
+CSV3,438,NoRpmCurrentA,10,"SafeInt(NoRpmCurrentA, 10)","alternator current limit while engine speed is ignored, A x10"
+CSV3,439,ShutdownRampTauS,100,"SafeInt(ShutdownRampTauS, 100)","shutdown ramp proportional decay time constant, s x100"
+CSV3,440,NoOutputAmps,100,"SafeInt(NoOutputAmps, 100)","alternator amps at or below this = no output, A x100"
+CSV3,441,FieldResTrefC,10,"SafeInt(FieldResTrefC, 10)","alternator temperature recorded with FieldResistance, C x10; ROLL_EMPTY = never recorded (Prerequisites gate)"
+CSV3,442,FieldResDefault,1,fieldResDefaultInUse() ? 1 : 0,"1 = the skipped-test 2 ohm default is in use (12 V, nothing measured); the stored flag is NK_FieldResDefault"
+CSV3,443,FieldWiring,1,SafeInt(FieldWiring),"field wiring for the drive-heat limit: 0 not set, 1 P-type, 2 N-type"
+CSV3,444,ShuntLead,1,SafeInt(ShuntLead),"shunt location: 0 not set, 1 negative lead (IBV corrected), 2 positive lead"
+CSV3,445,FieldWindingV,1,(int)FieldWindingV,"field winding rated voltage from Vessel Info, V"
+CSV3,446,fieldWindApplied,1,(int)fieldWindApplied,winding the field-side knobs are scaled for; below FieldWindingV = held on 12 V values until the owner confirms
+CSV3,447,sessionId,1,(unsigned)g_sessionId,boot identity — matches CSV1_sessionId while this cached block is from the live run
+CSV3,448,sendMs,1,(unsigned)millis(),"millis() when built; CSV3 resends at least every 60 s,"
+TS,0,ts_HeadingNMEA,1,tsAge(dataTimestamps[IDX_HEADING_NMEA]),
+TS,1,ts_LatitudeNMEA,1,tsAge(dataTimestamps[IDX_LATITUDE_NMEA]),
+TS,2,ts_LongitudeNMEA,1,tsAge(dataTimestamps[IDX_LONGITUDE_NMEA]),
+TS,3,ts_SatelliteCount,1,tsAge(dataTimestamps[IDX_SATELLITE_COUNT]),
+TS,4,ts_VictronVoltage,1,tsAge(dataTimestamps[IDX_VICTRON_VOLTAGE]),
+TS,5,ts_VictronCurrent,1,tsAge(dataTimestamps[IDX_VICTRON_CURRENT]),
+TS,6,ts_AlternatorTemp,1,tsAge(dataTimestamps[IDX_ALTERNATOR_TEMP]),
+TS,7,ts_ThermistorTemp,1,tsAge(dataTimestamps[IDX_THERMISTOR_TEMP]),
+TS,8,ts_RPM,1,tsAge(dataTimestamps[IDX_RPM]),
+TS,9,ts_MeasuredAmps,1,tsAge(dataTimestamps[IDX_MEASURED_AMPS]),
+TS,10,ts_BatteryV,1,tsAge(dataTimestamps[IDX_BATTERY_V]),
+TS,11,ts_IBV,1,tsAge(dataTimestamps[IDX_IBV]),
+TS,12,ts_Bcur,1,tsAge(dataTimestamps[IDX_BCUR]),
+TS,13,ts_Channel3V,1,tsAge(dataTimestamps[IDX_CHANNEL3V]),
+TS,14,ts_DutyCycle,1,tsAge(dataTimestamps[IDX_DUTY_CYCLE]),
+TS,15,ts_FieldVolts,1,tsAge(dataTimestamps[IDX_FIELD_VOLTS]),
+TS,16,ts_FieldAmps,1,tsAge(dataTimestamps[IDX_FIELD_AMPS]),
+TS,17,ts_CogNMEA,1,tsAge(dataTimestamps[IDX_COG_NMEA]),
+TS,18,ts_SogNMEA,1,tsAge(dataTimestamps[IDX_SOG_NMEA]),
+TS,19,ts_AppWindSpeed,1,tsAge(dataTimestamps[IDX_APPARENT_WIND_SPEED]),
+TS,20,ts_AppWindAngle,1,tsAge(dataTimestamps[IDX_APPARENT_WIND_ANGLE]),
+TS,21,ts_TrueWindSpeed,1,tsAge(dataTimestamps[IDX_TRUE_WIND_SPEED]),
+TS,22,ts_TrueWindAngle,1,tsAge(dataTimestamps[IDX_TRUE_WIND_ANGLE]),
+TS,23,ts_Leeway,1,tsAge(dataTimestamps[IDX_LEEWAY]),
+TS,24,ts_VMG,1,tsAge(dataTimestamps[IDX_VMG]),
+TS,25,ts_BaroPressure,1,tsAge(dataTimestamps[IDX_BARO_PRESSURE]),
+TS,26,ts_AmbientTemp,1,tsAge(dataTimestamps[IDX_AMBIENT_TEMP]),
+TS,27,ts_IMU,1,tsAge(dataTimestamps[IDX_IMU]),
+TS,28,ts_VictronSolar,1,tsAge(dataTimestamps[IDX_VICTRON_SOLAR]),
+TS,29,ts_StwNMEA,1,tsAge(dataTimestamps[IDX_STW_NMEA]),
+TS,30,ts_N2kBatt,1,tsAge(dataTimestamps[IDX_N2K_BATT]),
+TS,31,ts_N2kSoc,1,tsAge(dataTimestamps[IDX_N2K_SOC]),
+TS,32,ts_Dvcc,1,tsAge(dataTimestamps[IDX_DVCC]),
+TS,33,ts_WeatherFetch,1,(weatherLastUpdate == 0) ? 4294967295UL : tsAge(weatherLastUpdate),
+TS,34,ts_N183,1,tsAge(dataTimestamps[IDX_N183]),
+TS,35,ts_BattTempProbe,1,tsAge(dataTimestamps[IDX_BATT_TEMP_PROBE]),
+TS,36,ts_ExtraTemp,1,tsAge(dataTimestamps[IDX_EXTRA_TEMP]),
+TS,37,ts_VeBattTemp,1,tsAge(dataTimestamps[IDX_VE_BATT_TEMP]),
+TS,38,ts_RvcBattTemp,1,tsAge(dataTimestamps[IDX_RVC_BATT_TEMP]),
+TS,39,ts_DieTemp,1,tsAge(dataTimestamps[IDX_INA_DIE_TEMP]),age of the last valid INA228 die-temperature sample (999999 = never)
+TS,40,ts_sessionId,1,(unsigned long)g_sessionId,TS_sessionId
+TS,41,ts_sendMs,1,(unsigned long)now,device millis() when this payload was built — every other TS field is an age measured at that instant

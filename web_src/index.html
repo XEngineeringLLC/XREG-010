@@ -9320,7 +9320,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Over VE.Can (<span id="vicCanWord_ID">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether the GX's voltage limit is arriving on the VE.Can backbone, and its value. heard = received within the last 20 seconds; silent = received earlier but nothing recently; none heard = nothing received yet, so check that the GX is on this same backbone and that DVCC is on there. A GX sends only the voltage limit on VE.Can. A Victron battery on the same backbone can add a stop-charging command, which shows here as 0.0 A. This reads "idle" while RV-C is the chosen source.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether the GX's voltage limit is arriving on the VE.Can backbone, and its value. heard = received within the last 20 seconds; silent = received earlier but nothing recently; none heard = nothing received yet, so check that the GX is on this same backbone and that DVCC is on there. A GX sends its voltage limit on VE.Can to every charger, and a current share only to the alternators it controls; a share sent to this regulator shows as share. A Victron battery on the same backbone can add a stop-charging command, which shows here as 0.0 A. This reads "idle" while RV-C is the chosen source.</span></span>
                 </div>
                 <div class="form-input">
                   <span class="integ-live" id="vicCanDetail_ID">&mdash;</span>
@@ -9342,7 +9342,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Hold Stop-Charging Command (<span id="dvccVicCutHold_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">What to do when a Victron battery sends stop charging and then stops repeating it while its other limit messages keep arriving. Off: the command expires once it has not been heard for 60 seconds or the Silence Timeout, whichever is longer, the same as the voltage and current limits. On: charging stays stopped until the battery sends allowed to charge, VE.Can goes silent for the Silence Timeout, another sender takes over after this one has been silent for 10 seconds, follow is switched off, the Limit Source or RV-C Battery Instance is changed, the trust latch is reset, or the regulator restarts.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">What to do when a Victron battery sends stop charging and then stops repeating it while its other limit messages keep arriving. Off: the command expires once it has not been heard for 60 seconds or the Silence Timeout, whichever is longer, the same as the voltage and current limits. On: charging stays stopped until the battery sends allowed to charge, the battery has sent nothing for the Silence Timeout, follow is switched off, the Limit Source or RV-C Battery Instance is changed, the trust latch is reset, or the regulator restarts.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9577,7 +9577,7 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Limit Source (<span id="dvccSrcType_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which source this regulator follows. Victron GX follows the limits a GX sets with DVCC: the voltage limit on this same 250 kbps backbone, and the voltage and current limits over WiFi from the XREG-010 app on the GX. Check them against the GX (watch the status row above) before follow is enabled. RV-C listens for the DC Source Status messages an RV-C battery management system broadcasts. One authority is followed at a time, and there is no automatic scanning across sources.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Which source this regulator follows. Victron GX follows the limits a GX sets with DVCC: the voltage limit on this same 250 kbps backbone, and the voltage and current limits over WiFi from the XREG-010 app on the GX. Check them against the GX (watch the status row above) before follow is enabled. RV-C listens for the DC Source Status messages an RV-C battery management system broadcasts. Only the selected source is followed, with no automatic scanning across sources. When more than one Victron device sends limits, such as a GX and a Lynx Smart BMS, the lowest value of each limit is followed.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
@@ -9593,12 +9593,31 @@
               <hr />
               <div class="form-row">
                 <div class="form-label">Silence Timeout (s) (<span id="dvccSilenceS_echo">?</span>):
-                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On. With a Victron GX, VE.Can and WiFi each time out on their own, and follow stops only when both are silent.</span></span>
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. With Stop Charging Without Limits On, it stops charging instead. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On. With a Victron GX, VE.Can and WiFi each time out on their own, and follow stops only when both are silent.</span></span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form">
                     <input name="dvccSilenceS" type="number" step="1" min="5" max="600" />
                     <input onclick="submitMessage()" type="submit" value="Set" class="btn-primary" />
+                  </form>
+                </div>
+              </div>
+
+              <hr />
+              <div class="form-row">
+                <div class="form-label">Stop Charging Without Limits (<span id="dvccLostStop_echo">?</span>):
+                  <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">What this regulator does while follow is on and no limits are being followed: before the first message arrives, while settling, after the Silence Timeout, and while the trust latch is set. Off: it charges to the targets set on this regulator. On: it charges nothing, the same as a battery's stop-charging command. With a battery shunt it keeps supplying the measured loads at zero battery current; without one, alternator current is held at zero. Charging resumes once limits are followed again. Commissioning is not affected.</span></span>
+                </div>
+                <div class="form-input">
+                  <form action="/get" method="GET" target="hidden-form">
+                    <span class="toggle-label">Off</span>
+                    <label class="switch">
+                      <input id="dvccLostStop_checkbox" type="checkbox"
+                        onchange="if(handleUserToggle('dvccLostStop_checkbox', 'dvccLostStop', 'dvccLostStop')) { submitMessage(); }" />
+                      <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">On</span>
+                    <input id="dvccLostStop" name="dvccLostStop" type="number" value="" style="display:none;" />
                   </form>
                 </div>
               </div>

@@ -14,6 +14,7 @@ Rectangle {
 	property string svc
 	property bool linkUp
 	property bool active
+	property QtObject timing           // XregHome's bench timing log
 	readonly property color brand: "#00a19a"    // web app --accent, the app's speed number
 
 	radius: Theme.geometry_overviewPage_widget_radius
@@ -134,20 +135,21 @@ Rectangle {
 		motorFront = motor
 		// the firmware stores the sailing front folded to 0..180 only when the polar is symmetric
 		folded = !sail.some(p => p.x[1] < 0 || p.x[1] > 180)
+		swept = {}
+		sweptKeys = []
 		curveRev++
 		refresh()
 	}
 	// The speed the regulator grades against (FrontQuery's prediction, 7_functions.ino): a ridge-regularised local linear
 	// fit through the 48 nearest records, clamped to 0.1 .. 1.25 x the front's fastest; the whole-front inverse-distance
 	// average only where that fit is singular. So a 96 % dot sits 4 % under the curve.
-	function frontPred(pts, q, sc) {
+	function frontPred(pts, q, sc, p, ridge) {
 		const K = 48, N = q.length, n = pts.length
 		if (!n)
 			return 0
 		let inv = []
 		for (let a = 0; a < N; ++a)
 			inv.push(sc[a] > 1e-9 ? 1 / sc[a] : 1)
-		const p = idwPower
 		let wsum = 0, acc = 0, exact = -1, maxY = 0, nSel = 0
 		let selI = new Array(K), selD = new Array(K)
 		for (let i = 0; i < n; ++i) {
@@ -208,7 +210,7 @@ Rectangle {
 			tr += A[r][r]
 		}
 		for (let a = 1; a < M; ++a)
-			A[a][a] += ridgeFrac * tr / N
+			A[a][a] += ridge * tr / N
 		for (let col = 0; col < M; ++col) {
 			let pv = col
 			for (let r = col + 1; r < M; ++r)
@@ -236,13 +238,18 @@ Rectangle {
 		}
 		return Math.min(Math.max(sol[0], 0.1), 1.25 * maxY)
 	}
-	function foldAwa(a) {
+	function foldAwa(a, folded) {
 		if (!folded)
 			return a
 		let pa = a
 		while (pa < 0) pa += 360
 		while (pa >= 360) pa -= 360
 		return pa > 180 ? 360 - pa : pa
+	}
+	// A sailing curve in the other wind frame: its sweep's speeds at its apparent angles, turned to true or not
+	function inFrame(c, tf) {
+		return { view: 0, folded: c.folded, pts: c.raw.map(q => [tf ? appToTrue(q[0], q[1], c.wind) : q[0], q[1]]), maxS: c.maxS,
+			maxR: c.maxR, raw: c.raw, wind: c.wind }
 	}
 	function appToTrue(awa, bs, aws) {
 		const r = Math.PI / 180, ca = Math.cos(Math.abs(awa) * r)
@@ -254,50 +261,146 @@ Rectangle {
 	}
 
 	// The curve sweep costs (sweep steps x front points): redo it only when its inputs move noticeably, checked every
-	// 2 s and at once on a view, frame or curve change
-	property var curve: ({ pts: [], maxS: 4, maxR: 3600 })
+	// 2 s and at once on a view, frame, curve, ridge or power change; a wind (headwind) or sea-state change alone starts
+	// one at most 15 s after the last one started (hold), so the curve may lag it by up to 15 s (Mark, 2026-10-30). It
+	// runs in slices of about 3 ms (at least one step), one per event-loop turn, so taps are handled in between; its
+	// inputs are taken when it starts, and the chart keeps the last complete curve until it ends. A new input starts a
+	// new sweep in place of the running one.
+	property var curve: ({ view: -1, folded: true, pts: [], maxS: 4, maxR: 3600 })
 	property string curveKey
+	property real sweptAt: -Infinity
+	property var job: null
+	property bool slicePending
+	readonly property bool sweeping: job !== null
+	// The last 8 curves swept, by key, so a Sailing/Motoring or Apparent/True tap back shows one at once; a sailing curve
+	// keeps its apparent angles (raw) and wind, from which the other wind frame is the same speeds at other angles
+	property var swept: ({})
+	property var sweptKeys: []
+	function keep(key, c) {
+		if (!swept[key])
+			sweptKeys.push(key)
+		swept[key] = c
+		while (sweptKeys.length > 8)
+			delete swept[sweptKeys.shift()]
+	}
 	function refresh() {
-		const sea = Math.round((lSea || 0) * 10) / 10
-		const key = view + "|" + curveRev + "|" + trueFrame + "|" + sea + "|" + ridgeFrac + "|" + idwPower + "|"
-			+ (view ? Math.round(num(mHw) * 2 || 0) : Math.round(num(sWs) * 2 || 0))
+		// not lSea: inside onViewChanged it may still hold the other view's sea state
+		const sea = Math.round((num(view ? mSea : sSea) || 0) * 10) / 10
+		const soft = sea + "|" + (view ? Math.round(num(mHw) * 2 || 0) : Math.round(num(sWs) * 2 || 0))
+		// the wind frame only moves the sailing curve
+		const fixedOf = tf => view + "|" + curveRev + "|" + (view === 0 && tf) + "|" + ridgeFrac + "|" + idwPower + "|"
+		const fixed = fixedOf(trueFrame)
+		const key = fixed + soft
 		if (key === curveKey)
 			return
+		const other = swept[fixedOf(!trueFrame) + soft]
+		const ready = swept[key] || (view === 0 && other && other.raw ? inFrame(other, trueFrame) : null)
+		if (ready) {
+			hold.stop()
+			job = null
+			curveKey = key
+			keep(key, ready)
+			curve = ready
+			return
+		}
+		const wait = sweptAt + 15000 - Date.now()
+		if (curveKey.indexOf(fixed) === 0 && wait > 0) {
+			if (!hold.running) {
+				hold.interval = wait
+				hold.start()
+			}
+			return
+		}
+		hold.stop()
 		curveKey = key
-		let pts = [], maxS = 4, maxR = 3600
+		sweptAt = Date.now()
+		const j = { key: key, view: view, folded: folded, sea: sea, trueFrame: trueFrame, p: idwPower, ridge: ridgeFrac, pts: [],
+			raw: [], maxS: 4, maxR: 3600, started: Date.now(), work: 0 }
 		if (view === 0 && sailFront.length >= 2) {
-			const aws = num(sWs) || 0
+			j.front = sailFront
+			j.sc = sailScale
+			j.wind = num(sWs) || 0
 			let lo = 999, hi = -999
 			for (const p of sailFront) {
 				lo = Math.min(lo, p.x[1])
 				hi = Math.max(hi, p.x[1])
 			}
-			const st = Math.max(1, (hi - lo) / 90)
-			for (let a = lo; a <= hi + 1e-6; a += st) {
-				const s = frontPred(sailFront, [aws, foldAwa(a), sea], sailScale)
-				if (s <= 0)
-					continue
-				pts.push([trueFrame ? appToTrue(a, s, aws) : a, s])
-				maxS = Math.max(maxS, s)
-			}
+			j.x = lo
+			j.st = Math.max(1, (hi - lo) / 90)
+			j.end = hi + 1e-6
 		} else if (view === 1 && motorFront.length >= 2) {
-			const hw = num(mHw) || 0
+			j.front = motorFront
+			j.sc = motorScale
+			j.wind = num(mHw) || 0
 			let lo = 1e9, hi = -1e9
 			for (const p of motorFront) {
 				lo = Math.min(lo, p.x[0])
 				hi = Math.max(hi, p.x[0])
 			}
-			const st = Math.max(20, (hi - lo) / 120)
-			for (let r = lo; r <= hi + 1e-6; r += st) {
-				const v = frontPred(motorFront, [r, hw, sea], motorScale)
-				if (v <= 0)
-					continue
-				pts.push([r, v])
-				maxS = Math.max(maxS, v)
-				maxR = Math.max(maxR, r)
+			j.x = lo
+			j.st = Math.max(20, (hi - lo) / 120)
+			j.end = hi + 1e-6
+		} else {
+			job = null
+			curve = { view: view, folded: folded, pts: [], maxS: 4, maxR: 3600 }
+			return
+		}
+		job = j
+		if (!slicePending) {
+			slicePending = true
+			Qt.callLater(sweepSlice)
+		}
+	}
+	// One sweep step: the point at angle (sailing) or RPM (motoring) x
+	function sweepStep(j) {
+		const x = j.x
+		j.x += j.st
+		if (j.view === 0) {
+			const s = frontPred(j.front, [j.wind, foldAwa(x, j.folded), j.sea], j.sc, j.p, j.ridge)
+			if (s <= 0)
+				return
+			j.pts.push([j.trueFrame ? appToTrue(x, s, j.wind) : x, s])
+			j.raw.push([x, s])
+			j.maxS = Math.max(j.maxS, s)
+		} else {
+			const v = frontPred(j.front, [x, j.wind, j.sea], j.sc, j.p, j.ridge)
+			if (v <= 0)
+				return
+			j.pts.push([x, v])
+			j.maxS = Math.max(j.maxS, v)
+			j.maxR = Math.max(j.maxR, x)
+		}
+	}
+	function sweepSlice() {
+		slicePending = false
+		const j = job
+		if (!j)
+			return
+		const t0 = Date.now()
+		while (j.x <= j.end) {
+			sweepStep(j)
+			if (Date.now() - t0 >= 3)
+				break
+		}
+		const done = !(j.x <= j.end)
+		if (done) {
+			job = null
+			curve = { view: j.view, folded: j.folded, pts: j.pts, maxS: j.maxS, maxR: j.maxR,
+				raw: j.view === 0 ? j.raw : null, wind: j.wind }
+			keep(j.key, curve)
+		} else {
+			slicePending = true
+			Qt.callLater(sweepSlice)
+		}
+		const ms = Date.now() - t0
+		j.work += ms
+		if (timing) {
+			timing.add("perfSlice", ms)
+			if (done) {
+				timing.add("perf", j.work)
+				timing.add("perfWall", Date.now() - j.started)
 			}
 		}
-		curve = { pts: pts, maxS: maxS, maxR: maxR }
 	}
 	onViewChanged: refresh()
 	onTrueFrameChanged: refresh()
@@ -308,9 +411,15 @@ Rectangle {
 		running: perf.visible
 		onTriggered: perf.refresh()
 	}
-	readonly property bool haveCurve: curve.pts.length > 1
-	readonly property real maxS: Math.ceil(Math.max(curve.maxS, lValid && lSpd > 0 ? lSpd : 0))
-	readonly property real maxR: Math.ceil(Math.max(curve.maxR, view === 1 && lValid ? num(mRpm) || 0 : 0) / 500) * 500
+	Timer {
+		id: hold
+		onTriggered: if (perf.visible) perf.refresh()
+	}
+	// a curve swept for the other view is not drawn while this view's sweep runs
+	readonly property var shown: curve.view === view ? curve : ({ view: view, folded: folded, pts: [], maxS: 4, maxR: 3600 })
+	readonly property bool haveCurve: shown.pts.length > 1
+	readonly property real maxS: Math.ceil(Math.max(shown.maxS, lValid && lSpd > 0 ? lSpd : 0))
+	readonly property real maxR: Math.ceil(Math.max(shown.maxR, view === 1 && lValid ? num(mRpm) || 0 : 0) / 500) * 500
 
 	// ---- layout: header, then the app's four corners around the plot ----
 	readonly property real k: Math.max(0.7, Math.min(1, width / 430, height / 348))
@@ -347,7 +456,7 @@ Rectangle {
 			Shape {
 				anchors.fill: parent
 				visible: !perf.lSteady && perf.lSettle > 0
-				preferredRendererType: Shape.CurveRenderer
+				preferredRendererType: Shape.GeometryRenderer
 				ShapePath {
 					strokeColor: Qt.rgba(Theme.color_orange.r, Theme.color_orange.g, Theme.color_orange.b, 0.3)
 					strokeWidth: 2.5
@@ -569,7 +678,8 @@ Rectangle {
 				}
 				Shape {
 					anchors.fill: parent
-					preferredRendererType: Shape.CurveRenderer
+					preferredRendererType: Shape.GeometryRenderer
+					asynchronous: true      // as XregChart
 					ShapePath {
 						strokeColor: Theme.color_card_separator
 						strokeWidth: 1
@@ -593,8 +703,8 @@ Rectangle {
 							paths: {
 								if (perf.view !== 0 || !perf.haveCurve)
 									return []
-								const one = perf.curve.pts.map(q => polar.pt(q[0], q[1]))
-								return perf.folded ? [one, perf.curve.pts.map(q => polar.pt(-q[0], q[1]))] : [one]
+								const one = perf.shown.pts.map(q => polar.pt(q[0], q[1]))
+								return perf.shown.folded ? [one, perf.shown.pts.map(q => polar.pt(-q[0], q[1]))] : [one]
 							}
 						}
 					}
@@ -621,7 +731,7 @@ Rectangle {
 					x: polar.cx - width / 2
 					y: Math.max(polar.cy + polarSpd.height / 2 + 2, (polar.height + polar.rr - height) / 2)
 					width: Math.min(implicitWidth, maxW)
-					visible: !perf.haveCurve
+					visible: !perf.haveCurve && !perf.sweeping
 					text: noSailTm.advanceWidth <= maxW ? noSailTm.text : "No sailing\ndata yet"
 					horizontalAlignment: Text.AlignHCenter
 					color: Theme.color_font_secondary
@@ -682,7 +792,7 @@ Rectangle {
 					const hit = (x, y, pad) => x > rx - pad && x < rx + rw + pad && y > ry - pad && y < ry + rh + pad
 					if (perf.lValid && hit(mx(perf.num(mRpm) || 0), my(perf.lSpd || 0), 8))
 						return false
-					return !perf.haveCurve || !perf.curve.pts.some(q => hit(mx(q[0]), my(q[1]), 3))
+					return !perf.haveCurve || !perf.shown.pts.some(q => hit(mx(q[0]), my(q[1]), 3))
 				}
 				readonly property bool lowRight: !clear(padL + 8, 8, spdCol.width, spdCol.height)
 					&& clear(padL + cw - 8 - spdCol.width, 4 + ch - 6 - spdCol.height, spdCol.width, spdCol.height)
@@ -728,7 +838,8 @@ Rectangle {
 				}
 				Shape {
 					anchors.fill: parent
-					preferredRendererType: Shape.CurveRenderer
+					preferredRendererType: Shape.GeometryRenderer
+					asynchronous: true      // as XregChart
 					ShapePath {
 						strokeColor: Theme.color_blue
 						strokeWidth: 2.2
@@ -736,7 +847,7 @@ Rectangle {
 						joinStyle: ShapePath.RoundJoin
 						capStyle: ShapePath.RoundCap
 						PathPolyline {
-							path: perf.view === 1 && perf.haveCurve ? perf.curve.pts.map(q => Qt.point(motor.mx(q[0]), motor.my(q[1]))) : []
+							path: perf.view === 1 && perf.haveCurve ? perf.shown.pts.map(q => Qt.point(motor.mx(q[0]), motor.my(q[1]))) : []
 						}
 					}
 				}
@@ -747,7 +858,7 @@ Rectangle {
 					x: motor.padL + (motor.cw - width) / 2
 					y: 4 + (motor.ch - height) / 2
 					width: Math.min(implicitWidth, maxW)
-					visible: !perf.haveCurve
+					visible: !perf.haveCurve && !perf.sweeping
 					text: noMotorTm.advanceWidth <= maxW ? noMotorTm.text : "No motoring\ndata yet"
 					horizontalAlignment: Text.AlignHCenter
 					color: Theme.color_font_secondary

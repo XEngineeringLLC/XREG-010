@@ -37,6 +37,30 @@ Item {
 		onTriggered: root.preload = true
 	}
 
+	// Bench timing of the pages' heaviest GUI-thread work: one "xreg timing:" line in gui-v2's log at most every 60 s,
+	// and only after something ran, with count, average and maximum milliseconds per function
+	readonly property QtObject timing: QtObject {
+		property var runs: ({})
+		function add(name, ms) {
+			const r = runs[name] || (runs[name] = { n: 0, sum: 0, max: 0 })
+			r.n++
+			r.sum += ms
+			r.max = Math.max(r.max, ms)
+			if (!timingLog.running)
+				timingLog.start()
+		}
+	}
+	Timer {
+		id: timingLog
+		interval: 60000
+		onTriggered: {
+			const runs = root.timing.runs
+			root.timing.runs = {}
+			console.log("xreg timing: " + Object.keys(runs).map(k => k + " n=" + runs[k].n + " avg=" + (runs[k].sum / runs[k].n).toFixed(1)
+				+ " max=" + runs[k].max + " ms").join(", "))
+		}
+	}
+
 	XregHeader {
 		id: header
 		width: root.width
@@ -82,11 +106,12 @@ Item {
 				XregDash {
 					svc: root.svc
 					animationEnabled: root.animationEnabled && root.current === 0
+					timing: root.timing
 				}
 			}
 		}
 		Slot {
-			page: Component { XregPlots { svc: root.svc } }
+			page: Component { XregPlots { svc: root.svc; timing: root.timing } }
 		}
 		Slot {
 			page: Component { XregSetup { svc: root.svc; home: root } }

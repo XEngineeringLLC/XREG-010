@@ -12,7 +12,8 @@ Page {
 	property int waitAfter: -1   // /ProbeResult seq when this page sent an address; -1 = not waiting
 	property string probeError
 	readonly property var others: regs.found.filter(f => !f.unit)
-	readonly property bool scanning: scanningItem.valid && scanningItem.value === 1
+	// from the Search tap: the bridge reports its search at its next tick, up to 0.5 s later
+	readonly property bool scanning: scanSync.shown
 	readonly property var probe: {
 		if (!probeResultItem.valid || !probeResultItem.value)
 			return null
@@ -49,6 +50,10 @@ Page {
 	VeQuickItem { id: addItem; uid: regs.mgr + "/Add" }
 	VeQuickItem { id: scanItem; uid: regs.mgr + "/Scan" }
 	VeQuickItem { id: scanningItem; uid: regs.mgr + "/Scanning" }
+	XregSync {
+		id: scanSync
+		value: scanningItem.valid && scanningItem.value === 1
+	}
 	VeQuickItem { id: probeResultItem; uid: regs.mgr + "/ProbeResult" }
 	VeQuickItem {
 		// the address field's own write: the answer to wait for is the next /ProbeResult
@@ -129,7 +134,10 @@ Page {
 				writeAccessLevel: VenusOS.User_AccessType_User
 				preferredVisible: regs.running
 				interactive: !page.scanning
-				onClicked: scanItem.setValue(1)
+				onClicked: {
+					scanItem.setValue(1)
+					scanSync.expect(true)
+				}
 			}
 			ListTextField {
 				text: "Add by address"

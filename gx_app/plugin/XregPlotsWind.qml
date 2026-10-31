@@ -22,6 +22,8 @@ Item {
 	property real cursor: NaN
 	property var d: ({})
 	property bool dirty: true
+	property QtObject timing           // XregHome's bench timing log
+	property int opens                 // the chart's reset on a return (reopen())
 
 	VeQuickItem { id: want; uid: tab.svc + "/Ui/Want/Wind" }
 	Timer {
@@ -31,13 +33,41 @@ Item {
 		running: tab.visible && !ScreenBlanker.blanked
 		onTriggered: want.setValue(Math.floor(Date.now() / 1000))
 	}
-	VeQuickItem { id: tws; uid: tab.svc + "/Plot/Wind/Tws"; onValueChanged: tab.dirty = true }
-	VeQuickItem { id: twa; uid: tab.svc + "/Plot/Wind/Twa"; onValueChanged: tab.dirty = true }
-	VeQuickItem { id: aws; uid: tab.svc + "/Plot/Wind/Aws"; onValueChanged: tab.dirty = true }
-	VeQuickItem { id: awa; uid: tab.svc + "/Plot/Wind/Awa"; onValueChanged: tab.dirty = true }
+	VeQuickItem { id: tws; uid: tab.svc + "/Plot/Wind/Tws"; onValueChanged: tab.changed() }
+	VeQuickItem { id: twa; uid: tab.svc + "/Plot/Wind/Twa"; onValueChanged: tab.changed() }
+	VeQuickItem { id: aws; uid: tab.svc + "/Plot/Wind/Aws"; onValueChanged: tab.changed() }
+	VeQuickItem { id: awa; uid: tab.svc + "/Plot/Wind/Awa"; onValueChanged: tab.changed() }
 
 	onWindowMinChanged: snap()
 	onTrueWindChanged: snap()
+	Component.onCompleted: Qt.callLater(flush)
+	onVisibleChanged: if (visible) Qt.callLater(flush)
+
+	// Redraw when an update arrives, once per update (as XregPlotsShort)
+	function changed() {
+		dirty = true
+		if (visible && !settle.running)
+			settle.start()
+	}
+	function flush() {
+		if (dirty && visible)
+			snap()
+	}
+	Timer {
+		id: settle
+		interval: BackendConnection.type === BackendConnection.MqttSource ? 100 : 0
+		onTriggered: tab.flush()
+	}
+	// Back from another tab: as the tab was when first opened
+	function reopen() {
+		if (!isNaN(cursor))
+			cursor = NaN
+		// XregChart redraws in full at a reset and at a redraw: each only where something changed
+		if (Object.keys(chart.hiddenKeys).length > 0 || !isNaN(chart.ownCursor))
+			opens++
+		if (dirty)
+			snap()
+	}
 
 	// 10 s samples, newest last; sample i sits at -(n-1-i)/6 minutes
 	function series(item) {
@@ -45,7 +75,9 @@ Item {
 		return v.slice(Math.max(0, v.length - windowMin * 6))
 	}
 	function snap() {
+		const t0 = Date.now()
 		dirty = false
+		settle.stop()
 		const dir = series(trueWind ? twa : awa)
 		const spd = series(trueWind ? tws : aws)
 		d = {
@@ -56,13 +88,8 @@ Item {
 					x: spd.map((q, i) => (i - (spd.length - 1)) / 6), v: spd }
 			]
 		}
-	}
-	Timer {
-		interval: 1000
-		repeat: true
-		triggeredOnStart: true
-		running: tab.visible
-		onTriggered: if (tab.dirty) tab.snap()
+		if (timing)
+			timing.add("wind", Date.now() - t0)
 	}
 	readonly property var ticks: {
 		const st = windowMin <= 5 ? 1 : windowMin <= 15 ? 3 : windowMin <= 30 ? 5 : 10
@@ -117,6 +144,7 @@ Item {
 		radius: Theme.geometry_overviewPage_widget_radius
 		color: Theme.color_background_secondary
 		XregChart {
+			id: chart
 			anchors { fill: parent; margins: 12 }
 			title: tab.trueWind ? "True wind" : "Apparent wind"
 			lines: tab.d.lines || []
@@ -131,6 +159,7 @@ Item {
 			rightUnit: "kn"
 			emptyText: "No wind data"
 			cursorX: tab.cursor
+			resets: tab.opens
 			onScrubbed: function(xValue) { tab.cursor = xValue }
 		}
 	}

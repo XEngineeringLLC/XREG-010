@@ -637,6 +637,7 @@ bool fsRemove(const char *path) {
 #define NK_dvccCvlMin      "dvccCvlMin"
 #define NK_dvccCvlMax      "dvccCvlMax"
 #define NK_dvccVicCutHold  "dvccVicCutHold"
+#define NK_dvccLostStop    "dvccLostStop"
 // Battery + extra temperature probes, battery-temperature source chain, hot-charge lockout
 // (BATTERY_TEMP_SENSORS_SPEC.md §6). owAddr* hold a 16-char lowercase hex ROM code, "" = unassigned.
 #define NK_battTempProbeEnable    "battTmpPrbEn"
@@ -2121,6 +2122,10 @@ cleanup:
 uint32_t httpsUploadLastMs = 0;
 uint32_t httpsUploadWorstMs = 0;
 
+// Written by httpsTask (Core 0), read by the maintenance reboot ladder (Core 1) through sensorRingCanDrain(): the last
+// upload failed (no internet on this WiFi, a server or credential error). A 400 drops its record, so it counts as progress.
+volatile bool sensorUploadLastFailed = false;
+
 void httpsTask(void *param) {
   if (otaInProgress) {
     // Returning from a FreeRTOS task aborts in vPortTaskWrapper (panic-reboot), so self-delete instead.
@@ -2258,6 +2263,7 @@ void httpsTask(void *param) {
       }
 
       if (request.type == HTTPS_UPLOAD_PAYLOAD) {
+        sensorUploadLastFailed = !opSuccess && lastHttpResponseCode != 400;
         if (opSuccess) {
           consecutiveFailures = 0;
         } else {
@@ -3184,6 +3190,16 @@ size_t buildSnapshotJson(const SensorSnapshot &snap) {
 bool sensorUploadsHeldForClock() {
   if (!sensorRing || ringIsEmpty() || clockIsReal()) return false;
   return sensorRing[sensorRingTail].collectionTime <= 0;
+}
+
+// The ring can drain now: uploads are on and allowed, and the last one reached the cloud. Otherwise (no internet on this
+// WiFi, Cloud Features off, demo, RSSI below the upload gate, the oldest record waiting on the clock) the maintenance
+// reboot ladder has nothing to wait for.
+bool sensorRingCanDrain() {
+  if (CloudFeatures != 1 || hardwarePresent != 1 || demoSeal) return false;
+  if (currentMode != MODE_CLIENT || !isRegistered || authToken.isEmpty()) return false;
+  if (!canUploadNow() || sensorUploadsHeldForClock()) return false;
+  return !sensorUploadLastFailed;
 }
 
 void uploadBufferedRecords() {

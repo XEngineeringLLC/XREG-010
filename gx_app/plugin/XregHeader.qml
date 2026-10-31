@@ -47,6 +47,20 @@ Item {
 
 	VeQuickItem { id: connected; uid: root.svc + "/Connected" }
 	VeQuickItem { id: onOff; uid: root.svc + "/SwitchableOutput/0/State" }
+	// Alternator Enable as the bridge's fast lane has it while one is sent (the Dashboard asks for it): the same value,
+	// holds of a write included, as frames arrive instead of every 500 ms
+	VeQuickItem { id: fastLive; uid: root.svc + "/Fast/Live" }
+	readonly property var fastOn: {
+		if (!fastLive.valid || !fastLive.value)
+			return undefined
+		try {
+			const v = JSON.parse(fastLive.value).OnOff
+			return v === null ? undefined : v
+		} catch (e) {
+			return undefined
+		}
+	}
+	readonly property bool enabledOn: fastOn !== undefined ? fastOn === 1 : onOff.valid && onOff.value === 1
 	VeQuickItem { id: schemaItem; uid: root.setupRow ? root.svc + "/Settings/Schema" : "" }
 
 	TabBar {
@@ -105,7 +119,7 @@ Item {
 			topPadding: topInset
 			bottomPadding: topInset
 			enabled: root.linkUp
-			value: onOff.valid && onOff.value === 1
+			value: root.enabledOn
 			onCommanded: function(on) {
 				onOff.setValue(on ? 1 : 0)
 				enableSwitch.expect(on)

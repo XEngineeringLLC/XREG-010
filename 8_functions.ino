@@ -950,6 +950,7 @@ static const ConfigManifestEntry CONFIG_MANIFEST[] = {
   { "dvccInst", NK_dvccInst, 1 },
   { "dvccSilenceS", NK_dvccSilenceS, 1 },
   { "dvccVicCutHold", NK_dvccVicCutHold, 1 },
+  { "dvccLostStop", NK_dvccLostStop, 1 },
   { "dvccSettleS", NK_dvccSettleS, 1 },
   { "dvccCvlMin", NK_dvccCvlMin, 1 },
   { "dvccCvlMax", NK_dvccCvlMax, 1 },

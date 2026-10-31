@@ -1,0 +1,297 @@
+{
+ "motoring": {
+  "json": "{\"b\":{\"a\":54.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":14.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "anchor": {
+  "json": "{\"b\":{\"a\":9.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":18.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":9.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "shore": {
+  "json": "{\"b\":{\"a\":22.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":3.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":25.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":6.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "evening": {
+  "json": "{\"b\":{\"a\":-11.0,\"st\":-1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":0.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":11.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "resting": {
+  "json": "{\"b\":{\"a\":0.1,\"st\":0,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":0.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":0.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "limit": {
+  "json": "{\"b\":{\"a\":50.0,\"st\":1,\"from\":\"Shunt\",\"lim\":50.0},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":56.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":14.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 56
+ },
+ "noshunt": {
+  "json": "{\"b\":{\"a\":null,\"st\":null,\"from\":\"\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"batt\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "nosolar": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":40.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":null,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"solar\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 42
+ },
+ "noalt": {
+  "json": "{\"b\":{\"a\":39.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":null,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":6.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"alt\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "unmeasured": {
+  "json": "{\"b\":{\"a\":16.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":10.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"unmeasured\",\"x\":6.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "full": {
+  "json": "{\"b\":{\"a\":40.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"vebus:276\",\"k\":\"multi\",\"a\":0.0,\"c\":\"MultiPlus-II 12/3000/120-32\"},{\"id\":\"dcgenset:290\",\"k\":\"dcgenset\",\"a\":0.0,\"c\":\"Fischer Panda AGT-DC\"},{\"id\":\"vebus:276/load\",\"k\":\"inverter\",\"a\":12.0,\"c\":\"MultiPlus-II 12/3000/120-32\"}],\"house\":16.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "many": {
+  "json": "{\"b\":{\"a\":110.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"vebus:276\",\"k\":\"multi\",\"a\":0.0,\"c\":\"MultiPlus-II 12/3000/120-32\"},{\"id\":\"dcgenset:290\",\"k\":\"dcgenset\",\"a\":0.0,\"c\":\"Fischer Panda AGT-DC\"},{\"id\":\"fuelcell:294\",\"k\":\"fuelcell\",\"a\":3.5,\"c\":\"EFOY Comfort 210\"},{\"id\":\"xreg:00005EEDC0DE5678\",\"k\":\"altx\",\"a\":45.0,\"c\":\"Stbd engine\"},{\"id\":\"dcdc:293\",\"k\":\"dcdc\",\"a\":18.0,\"c\":\"Orion XS Charger (DCDC)\"},{\"id\":\"dcsource:289\",\"k\":\"wind\",\"a\":7.5,\"c\":\"Wind charger\"},{\"id\":\"vebus:276/load\",\"k\":\"inverter\",\"a\":12.0,\"c\":\"MultiPlus-II 12/3000/120-32\"}],\"house\":20.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "overfull": {
+  "json": "{\"b\":{\"a\":125.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":3.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":140.0,\"c\":\"Dock charger\"}],\"house\":18.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "twochargers": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":3.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":25.0,\"c\":\"Bow\"},{\"id\":\"charger:282\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Stern\"}],\"house\":10.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "orion_src": {
+  "json": "{\"b\":{\"a\":54.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcdc:293\",\"k\":\"dcdc\",\"a\":20.0,\"c\":\"Start charger\"}],\"house\":34.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "orion_load": {
+  "json": "{\"b\":{\"a\":21.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":23.0,\"c\":\"Start charger\"}],\"house\":24.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "dcloads": {
+  "json": "{\"b\":{\"a\":4.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":18.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"},{\"id\":\"dcload:283\",\"k\":\"dcload\",\"a\":3.5,\"c\":\"Watermaker\"}],\"house\":4.5,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "loads_orion": {
+  "json": "{\"b\":{\"a\":18.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":23.0,\"c\":\"Start charger\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"},{\"id\":\"dcload:283\",\"k\":\"dcload\",\"a\":3.5,\"c\":\"Watermaker\"}],\"house\":17.5,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "loads_orion_inv": {
+  "json": "{\"b\":{\"a\":10.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"inverter:281\",\"k\":\"inverter\",\"a\":9.0,\"c\":\"Galley\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":23.0,\"c\":\"Start charger\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"}],\"house\":20.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "loads_over": {
+  "json": "{\"b\":{\"a\":-14.0,\"st\":-1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":12.0,\"c\":\"VE.Direct\"},{\"id\":\"dcload:284\",\"k\":\"dcload\",\"a\":40.0,\"c\":\"Windlass\"}],\"house\":null,\"hm\":0,\"why\":\"unmeasured\",\"x\":14.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "sum_inv": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"inverter:281\",\"k\":\"inverter\",\"a\":9.0,\"c\":\"Galley\"}],\"house\":23.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "sum_dcload": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"}],\"house\":26.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "sum_orion": {
+  "json": "{\"b\":{\"a\":20.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":23.0,\"c\":\"Start charger\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"}],\"house\":1.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "rows2": {
+  "json": "{\"b\":{\"a\":40.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"}],\"house\":10.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "rows3": {
+  "json": "{\"b\":{\"a\":40.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":22.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "rows4": {
+  "json": "{\"b\":{\"a\":40.0,\"st\":1,\"from\":\"Shunt\",\"lim\":40.0},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"}],\"house\":16.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "rows5": {
+  "json": "{\"b\":{\"a\":20.0,\"st\":1,\"from\":\"Shunt\",\"lim\":20.0},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":23.0,\"c\":\"Start charger\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"}],\"house\":13.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "rows6": {
+  "json": "{\"b\":{\"a\":20.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"dcsource:289\",\"k\":\"wind\",\"a\":4.0,\"c\":\"Wind charger\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":23.0,\"c\":\"Start charger\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"}],\"house\":17.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "demo": {
+  "json": "{\"b\":{\"a\":38.0,\"st\":1,\"from\":\"GX\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":48.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":21.0,\"c\":\"GX\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"},{\"id\":\"inverter:281\",\"k\":\"inverter\",\"a\":0.0,\"c\":\"Phoenix Inverter 12/800 Smart\"},{\"id\":\"dcdc:282\",\"k\":\"dcdcload\",\"a\":12.0,\"c\":\"Start battery charger\"},{\"id\":\"dcload:283\",\"k\":\"dcload\",\"a\":4.2,\"c\":\"Fridge\"}],\"house\":14.8,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 50
+ },
+ "why_alt": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":null,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"alt\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "why_solar": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":null,\"c\":\"\"}],\"house\":null,\"hm\":0,\"why\":\"solar\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_charger": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":null,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"charger\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_multi": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"vebus:276\",\"k\":\"multi\",\"a\":null,\"c\":\"MultiPlus-II 12/3000/120-32\"},{\"id\":\"vebus:276/load\",\"k\":\"inverter\",\"a\":null,\"c\":\"MultiPlus-II 12/3000/120-32\"}],\"house\":null,\"hm\":0,\"why\":\"multi\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_dcgenset": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcgenset:290\",\"k\":\"dcgenset\",\"a\":null,\"c\":\"Fischer Panda AGT-DC\"}],\"house\":null,\"hm\":0,\"why\":\"dcgenset\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_fuelcell": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"fuelcell:294\",\"k\":\"fuelcell\",\"a\":null,\"c\":\"EFOY Comfort 210\"}],\"house\":null,\"hm\":0,\"why\":\"fuelcell\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_altx": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"alternator:288\",\"k\":\"altx\",\"a\":null,\"c\":\"Stbd engine\"}],\"house\":null,\"hm\":0,\"why\":\"altx\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_dcdc": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcdc:293\",\"k\":\"dcdc\",\"a\":null,\"c\":\"Start charger\"}],\"house\":null,\"hm\":0,\"why\":\"dcdc\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_wind": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcsource:289\",\"k\":\"wind\",\"a\":null,\"c\":\"SmartShunt IP65 500A/50mV\"}],\"house\":null,\"hm\":0,\"why\":\"wind\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_water": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcsource:291\",\"k\":\"water\",\"a\":null,\"c\":\"SmartShunt 500A/50mV\"}],\"house\":null,\"hm\":0,\"why\":\"water\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_shaft": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcsource:292\",\"k\":\"shaft\",\"a\":null,\"c\":\"SmartShunt 500A/50mV\"}],\"house\":null,\"hm\":0,\"why\":\"shaft\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_source": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcsource:295\",\"k\":\"source\",\"a\":null,\"c\":\"SmartShunt 300A/50mV\"}],\"house\":null,\"hm\":0,\"why\":\"source\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_inverter": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"inverter:281\",\"k\":\"inverter\",\"a\":null,\"c\":\"Galley\"}],\"house\":null,\"hm\":0,\"why\":\"inverter\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_dcdcload": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":null,\"c\":\"Start charger\"}],\"house\":null,\"hm\":0,\"why\":\"dcdcload\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_dcload": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":null,\"c\":\"Fridge\"}],\"house\":null,\"hm\":0,\"why\":\"dcload\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_batt": {
+  "json": "{\"b\":{\"a\":null,\"st\":null,\"from\":\"\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":50.0,\"c\":\"\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":12.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"batt\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 52
+ },
+ "why_unmeasured_big": {
+  "json": "{\"b\":{\"a\":125.4,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":2.0,\"c\":\"VE.Direct\"},{\"id\":\"charger:280\",\"k\":\"charger\",\"a\":0.0,\"c\":\"Phoenix Smart IP43 Charger 12/30\"}],\"house\":null,\"hm\":0,\"why\":\"unmeasured\",\"x\":123.4,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "meter_agree": {
+  "json": "{\"b\":{\"a\":52.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":22.0,\"c\":\"VE.Direct\"}],\"house\":30.4,\"hm\":1,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "meter_gap": {
+  "json": "{\"b\":{\"a\":52.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":22.0,\"c\":\"VE.Direct\"}],\"house\":18.0,\"hm\":1,\"why\":\"gap\",\"x\":12.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "meter_gap_big": {
+  "json": "{\"b\":{\"a\":20.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":140.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":22.0,\"c\":\"VE.Direct\"}],\"house\":18.6,\"hm\":1,\"why\":\"gap\",\"x\":123.4,\"fs\":120.0}",
+  "active": true,
+  "target": 142
+ },
+ "meter_source": {
+  "json": "{\"b\":{\"a\":52.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":22.0,\"c\":\"VE.Direct\"}],\"house\":41.0,\"hm\":1,\"why\":\"unmeasured\",\"x\":11.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "meter_inside": {
+  "json": "{\"b\":{\"a\":18.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"dcdc:293\",\"k\":\"dcdcload\",\"a\":23.0,\"c\":\"Start charger\",\"in\":1},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\",\"in\":1}],\"house\":21.0,\"hm\":1,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "meter_inside_one": {
+  "json": "{\"b\":{\"a\":32.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\",\"in\":1}],\"house\":30.0,\"hm\":1,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "meter_nobatt": {
+  "json": "{\"b\":{\"a\":null,\"st\":null,\"from\":\"\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"}],\"house\":30.0,\"hm\":1,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "dcdc_meter_load": {
+  "json": "{\"b\":{\"a\":40.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"dcsource:301\",\"k\":\"dcdcload\",\"a\":12.0,\"c\":\"SmartShunt 300A/50mV\"}],\"house\":16.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 62
+ },
+ "dcload_modes": {
+  "json": "{\"b\":{\"a\":2.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":0.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":18.0,\"c\":\"VE.Direct\"},{\"id\":\"dcload:312\",\"k\":\"inverter\",\"a\":6.0,\"c\":\"SmartShunt 500A/50mV\"},{\"id\":\"dcload:311\",\"k\":\"dcload\",\"a\":4.0,\"c\":\"Fridge\"},{\"id\":\"dcload:310\",\"k\":\"dcload\",\"a\":3.0,\"c\":\"Water pump\"}],\"house\":3.0,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "demo_orion_fridge": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":48.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":21.0,\"c\":\"VE.Direct\"},{\"id\":\"dcdc:282\",\"k\":\"dcdcload\",\"a\":15.6,\"c\":\"Start battery charger\"},{\"id\":\"dcload:283\",\"k\":\"dcload\",\"a\":4.2,\"c\":\"Fridge\"}],\"house\":19.2,\"hm\":0,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": true,
+  "target": 50
+ },
+ "meter_alt_in": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\",\"in\":1},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"}],\"house\":38.0,\"hm\":1,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "meter_alt_in_loads": {
+  "json": "{\"b\":{\"a\":24.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\",\"in\":1},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\",\"in\":1}],\"house\":38.0,\"hm\":1,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ },
+ "meter_load_out": {
+  "json": "{\"b\":{\"a\":30.0,\"st\":1,\"from\":\"Shunt\",\"lim\":null},\"rows\":[{\"id\":\"alt\",\"k\":\"alt\",\"a\":60.0,\"c\":\"\"},{\"id\":\"solar\",\"k\":\"solar\",\"a\":8.0,\"c\":\"VE.Direct\"},{\"id\":\"dcload:279\",\"k\":\"dcload\",\"a\":6.0,\"c\":\"Fridge\"}],\"house\":32.0,\"hm\":1,\"why\":\"\",\"x\":0.0,\"fs\":120.0}",
+  "active": false,
+  "target": null
+ }
+}

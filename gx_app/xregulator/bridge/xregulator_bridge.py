@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # XREG-010 bridge for Venus OS. Finds the regulators on the GX's networks by uid and talks to each one the owner picked
 # over WiFi (its /gxevents stream, or /events on firmware without GX support, in; /get writes out). Publishes
-# com.victronenergy.xregulator (found and picked regulators, for the gui-v2 plugin) and, per picked regulator,
-# com.victronenergy.switch.xregulator_<uid6> for the switch pane and the plugin, plus, on firmware with /gxLimits,
-# com.victronenergy.alternator.xregulator_<uid6> for systemcalc's DVCC, and in demo mode, when nothing on the GX could take
-# it as a control input, com.victronenergy.battery.xregulator_<uid6>. While a power-flow tile shows, or a regulator takes
-# them for its web app (/gxDevices), it also reads the GX's own battery, solar, charger, inverter and DC meter readings
-# (GxReader). All logic lives in xreg_core.py; this file only maps it onto D-Bus. Picked regulators:
-# com.victronenergy.settings /Settings/Xregulator/Units, the GX devices seen /Settings/Xregulator/GxDevices; each
-# regulator's VRM instances and last address under /Settings/Devices/xregulator_<uid6>/ and .../xregulator_<uid6>_alt/.
+# com.victronenergy.xregulator (found and picked regulators and the GX app's own updates, for the gui-v2 plugin) and, per
+# picked regulator, com.victronenergy.switch.xregulator_<uid6> for the switch pane and the plugin, plus, on firmware with
+# /gxLimits, com.victronenergy.alternator.xregulator_<uid6> for systemcalc's DVCC, and in demo mode, when nothing on the
+# GX could take it as a control input, com.victronenergy.battery.xregulator_<uid6>. While a power-flow tile shows, or a
+# regulator takes them for its web app (/gxDevices), it also reads the GX's own battery, solar, charger, inverter and DC
+# meter readings (GxReader). All logic lives in xreg_core.py and xreg_update.py; this file only maps it onto D-Bus.
+# Picked regulators: com.victronenergy.settings /Settings/Xregulator/Units, the GX devices seen
+# /Settings/Xregulator/GxDevices; each regulator's VRM instances and last address under
+# /Settings/Devices/xregulator_<uid6>/ and .../xregulator_<uid6>_alt/.
 
 import logging, math, os, re, sys
 from functools import partial
@@ -25,6 +26,7 @@ from settingsdevice import SettingsDevice
 from ve_utils import unwrap_dbus_value
 
 import xreg_core
+import xreg_update
 
 SCHEMA_FILE = os.path.join(HERE, 'settings_schema.json')
 TICK_MS = 500
@@ -250,12 +252,18 @@ class GxReader:
                 'pv': num(SYSTEM_SERVICE, '/Dc/Pv/Current'), 'devices': devices, 'at': now}
 
 
+def no_text(path, value):
+    return ''
+
+
 def publish(svc, paths, on_write):
     for path, value, mode in paths:
+        # a fast-lane string can be long (a whole Short Term history is about 150 KB): no second copy of it as its Text
+        text = no_text if path.startswith('/Fast/') else None
         if mode == 'core':
-            svc.add_path(path, value, writeable=True, onchangecallback=on_write)
+            svc.add_path(path, value, writeable=True, onchangecallback=on_write, gettextcallback=text)
         else:
-            svc.add_path(path, value, writeable=mode == 'free')
+            svc.add_path(path, value, writeable=mode == 'free', gettextcallback=text)
     svc.register()
 
 
@@ -287,6 +295,8 @@ class Bridge:
         GLib.timeout_add(TICK_MS, self._tick)
         GLib.timeout_add(ALT_SCAN_S * 1000, self._scan_alternators)
         GLib.timeout_add(GX_READ_MS, self._read_gx)
+        # install.sh keeps a newly installed version only once its bridge's main loop runs
+        GLib.idle_add(xreg_update.mark_running, self.manager.updater.work, self.manager.updater.rid)
 
     @staticmethod
     def _paths(uid):
@@ -316,6 +326,7 @@ class Bridge:
         svc = VeDbusService(xreg_core.unit_service(core.uid), bus, register=False)
         publish(svc, core.static_paths(__file__), partial(self._on_write, core))
         self.units[core.uid] = (core, svc, bus)
+        core.wake = partial(self._arrived, core)
 
     def unit_removed(self, core):
         self._drop_alt(core.uid)
@@ -464,13 +475,46 @@ class Bridge:
                 self.manager.set_gx_side(self.gx.snapshot())
         return True
 
-    @staticmethod
-    def _on_write(target, path, value):
+    def _on_write(self, target, path, value):
         try:
-            return target.on_write(path, value)
+            ok = target.on_write(path, value)
         except Exception:
             log.exception('write %s', path)
             return False
+        if getattr(target, 'want_rose', False):
+            target.want_rose = False
+            GLib.idle_add(self._tick_unit, target)
+        return ok
+
+    def _tick_unit(self, core):
+        unit = self.units.get(core.uid)
+        if unit:
+            self._tick_one(core, unit[1])
+        return False
+
+    # The fast lane: a CSV1 frame arrived on the stream thread while a page asks for it. One fast tick at a time, at most
+    # every FAST_MIN_S; the main loop runs it, as every D-Bus change is made there.
+    def _arrived(self, core):
+        if not core.fast_pending:
+            core.fast_pending = True
+            GLib.idle_add(self._fast_unit, core)
+
+    def _fast_unit(self, core):
+        unit = self.units.get(core.uid)
+        if not unit:
+            core.fast_pending = False
+            return False
+        wait = core.fast_at + xreg_core.FAST_MIN_S - core.clock()
+        if wait > 0.002:
+            GLib.timeout_add(int(wait * 1000) + 1, self._fast_unit, core)
+            return False
+        core.fast_pending = False
+        try:
+            with unit[1] as ctx:
+                core.fast_tick(Publisher(ctx, partial(self._on_write, core)))
+        except Exception:
+            log.exception('fast tick')
+        return False
 
     def _tick(self):
         self._tick_one(self.manager, self.svc)   # first: it may add or remove regulators

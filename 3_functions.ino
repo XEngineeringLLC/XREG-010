@@ -888,6 +888,8 @@ enum Csv2Index {
   CSV2_dvccRxCanCcl,        // VE.Can carrier CCL as last merged, 0 under a stop-charging command (A x10; -2000000000 = none)
   CSV2_dvccRxWifiCvl,       // WiFi carrier (/gxLimits) last CVL (V x100; -2000000000 = not sent)
   CSV2_dvccRxWifiCcl,       // WiFi carrier last CCL (A x10; -2000000000 = not sent)
+  CSV2_dvccRxCanShare,      // VE.Can: the GX's 0x2015 addressed to this node, this alternator's share (A x10; -2000000000 = none)
+  CSV2_dvccNoLimitStop,     // 1 = Stop Charging Without Limits is holding the current ceiling at zero
 
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
@@ -944,7 +946,7 @@ enum Csv4Index {
 // field-name list the build uses to regenerate CSV3_FIELDS in web_src/script.js.
 // Comments inside MUST be /* */: a // swallows the continuation backslash and truncates every expansion consistently,
 // which only the CSV3_EXPECTED_FIELDS static_assert catches.
-#define CSV3_EXPECTED_FIELDS 449
+#define CSV3_EXPECTED_FIELDS 450
 #define CSV3_LIST(X) \
   /* SettingsStream: user-configurable settings — sent on change (settingsDirty) or every 60s fallback */ \
   X(TemperatureLimitF, "%d", SafeInt(TemperatureLimitF)) \
@@ -1335,6 +1337,7 @@ enum Csv4Index {
   X(dvccCvlMin, "%d", SafeInt(dvccCvlMin, 100))                                                                   /* plausible-CVL window low (V ×100) */ \
   X(dvccCvlMax, "%d", SafeInt(dvccCvlMax, 100))                                                                   /* plausible-CVL window high (V ×100) */ \
   X(dvccVicCutHold, "%d", SafeInt(dvccVicCutHold))                                                                /* Victron do-not-charge held after it stops arriving (0/1) */ \
+  X(dvccLostStop, "%d", SafeInt(dvccLostStop))                                                                    /* charge nothing while follow is on and nothing is followed (0/1) */ \
   X(HuntCutPct, "%d", (int)HuntCutPct)                                                                            /* damper test/pocket gain, % of user Ki */ \
   X(HuntVerifyPct, "%d", (int)HuntVerifyPct)                                                                      /* damper verify bar, % ripple reduction required */ \
   X(HuntWingPct, "%d", (int)HuntWingPct)                                                                          /* damper pocket taper width, % of speed per side */ \
@@ -2011,7 +2014,7 @@ static const char *const GX_EVT[GX_CH_COUNT] = { "CSVData", "CSVData4", "CSVData
 // Rows: 0 engine running (or a GX page asked for live data), 1 ignition on with the engine stopped, 2 ignition-off WiFi nap.
 // The side streams are built at 1 Hz (live) and every 5 s (settings) whatever the schedule; a row only thins them.
 static const uint32_t GX_IV[3][GX_CH_COUNT] = { { 500, 1000, 10000, 60000, 6000, 1000, 1000, 1000, 5000, 5000 },
-                                                { 5000, 10000, 30000, 120000, 30000, 10000, 10000, 10000, 30000, 30000 },
+                                                { 1000, 1000, 30000, 120000, 30000, 1000, 1000, 1000, 30000, 30000 },
                                                 { 10000, 30000, 60000, 300000, 60000, 30000, 30000, 30000, 60000, 60000 } };
 #define GX_SIDE_SIZE 512          // >= the largest side-stream buffer (AltLive, 512)
 // The side-stream builders tick on their own clocks, so a frame can land a little short of an interval equal to its
@@ -2019,9 +2022,12 @@ static const uint32_t GX_IV[3][GX_CH_COUNT] = { { 500, 1000, 10000, 60000, 6000,
 #define GX_SIDE_SLACK_MS 250UL
 static const char *const GX_TIER_NAME[3] = { "run", "stopped", "nap" };
 #define GX_RUN_HOLD_MS 30000UL    // the running schedule holds this long after the engine and field stop
-#define GX_FAST_HOLD_MS 60000UL   // GET /gxrate?fast=1 holds the running schedule this long
+#define GX_FAST_HOLD_MS 60000UL   // GET /gxrate?fast=1 holds the running schedule this long (fast=2 the same, CSV1 at the web app's rate)
+// fast=2: CSV1 no faster than this whatever webgaugesinterval says; the GX bridge parses every frame and the GX screen
+// redraws on it (VICTRON_GX_BENCH.md §9a, "GX live data at the web app's rate")
+#define GX_LIVE_FLOOR_MS 100UL
 #define GX_FLOW_HOLD_MS 60000UL   // GET /gxrate?flow=1 holds CSV4 at GX_FLOW_CSV4_MS this long (the GX power-flow tile)
-#define GX_FLOW_CSV4_MS 2000UL
+#define GX_FLOW_CSV4_MS 1000UL
 #define GX_STAGE_SIZE 8192        // >= PAYLOAD2_SIZE and PAYLOAD3_SIZE, the largest frames
 // Unacked frames on the GX link at which the sender waits (the frame stays owed); a connect sends a burst of every
 // channel, so the floor sits above a healthy burst.
@@ -2038,6 +2044,7 @@ static volatile bool gxKickPending = false;
 static volatile uint8_t gxStreamCount = 0;
 static volatile uint8_t gxTier = 1;
 static volatile uint32_t gxFastUntilMs = 0;   // 0 = no fast hold
+static volatile bool gxFastLive = false;      // the fast hold came as fast=2: CSV1 at the web app's rate too
 static volatile uint32_t gxFlowUntilMs = 0;   // 0 = no flow hold
 static uint32_t gxRunSeenMs = 0;
 static TaskHandle_t gxSendTaskHandle = nullptr;
@@ -2085,9 +2092,18 @@ static bool gxFlowActive(uint32_t now) {
   return until && (int32_t)(until - now) > 0;
 }
 
-// The channel's GX interval now: the tier's, with CSV4 no slower than GX_FLOW_CSV4_MS under a flow hold.
+// 0 none, 1 fast=1, 2 fast=2
+static uint8_t gxFastLevel(uint32_t now) { return gxFastActive(now) ? (gxFastLive ? 2 : 1) : 0; }
+
+// The channel's GX interval now: the tier's, with CSV4 no slower than GX_FLOW_CSV4_MS under a flow hold, and CSV1 at
+// webgaugesinterval (never under GX_LIVE_FLOOR_MS, never slower than the running schedule) under a fast=2 hold.
 static uint32_t gxIv(uint8_t ch, uint32_t now) {
   const uint32_t iv = GX_IV[gxTierEffective(now)][ch];
+  if (ch == 0 && gxFastLevel(now) == 2) {
+    const uint32_t web = (uint32_t)webgaugesinterval;
+    const uint32_t live = web > GX_LIVE_FLOOR_MS ? web : GX_LIVE_FLOOR_MS;
+    return live < iv ? live : iv;
+  }
   return (ch == 1 && iv > GX_FLOW_CSV4_MS && gxFlowActive(now)) ? GX_FLOW_CSV4_MS : iv;
 }
 
@@ -2101,14 +2117,16 @@ void gxRateJson(char *out, size_t n) {
   for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) iv[ch] = gxIv(ch, now);
   snprintf(out, n, "{\"tier\":\"%s\",\"fast\":%d,\"flow\":%d,\"csv1\":%lu,\"csv4\":%lu,\"csv2\":%lu,\"csv3\":%lu,\"ts\":%lu,"
                    "\"altLive\":%lu,\"perfLive\":%lu,\"motorLive\":%lu,\"altSettings\":%lu,\"perfSettings\":%lu,\"devPost\":%lu}",
-           GX_TIER_NAME[t], gxFastActive(now) ? 1 : 0, gxFlowActive(now) ? 1 : 0, (unsigned long)iv[0], (unsigned long)iv[1],
+           GX_TIER_NAME[t], (int)gxFastLevel(now), gxFlowActive(now) ? 1 : 0, (unsigned long)iv[0], (unsigned long)iv[1],
            (unsigned long)iv[2], (unsigned long)iv[3], (unsigned long)iv[4], (unsigned long)iv[5], (unsigned long)iv[6],
            (unsigned long)iv[7], (unsigned long)iv[8], (unsigned long)iv[9],
            (unsigned long)(phoneLiveNow ? GXDEV_EVERY_WATCHED_S : GXDEV_EVERY_IDLE_S) * 1000UL);
 }
 
-static void gxFastHold(bool on) {
-  gxFastUntilMs = on ? ((millis() + GX_FAST_HOLD_MS) | 1UL) : 0;
+// level: 0 releases, 1 the running schedule, 2 that and CSV1 at the web app's rate
+static void gxFastHold(uint8_t level) {
+  gxFastLive = level >= 2;
+  gxFastUntilMs = level ? ((millis() + GX_FAST_HOLD_MS) | 1UL) : 0;
   if (gxSendTaskHandle) xTaskNotifyGive(gxSendTaskHandle);   // a changed schedule goes out as GxRate
 }
 static void gxFlowHold(bool on) {
@@ -2194,6 +2212,7 @@ static uint8_t gxCopyFrame(uint8_t ch) {
 
 static void gxSendTask(void *) {
   uint8_t sentTier = 0xFF, sentFast = 0xFF, sentFlow = 0xFF, sentPhone = 0xFF;
+  uint32_t sentCsv1 = 0;
   for (;;) {
     bool owed = false;
     for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) owed |= __atomic_load_n(&gxWant[ch], __ATOMIC_ACQUIRE) != 0;
@@ -2206,9 +2225,10 @@ static void gxSendTask(void *) {
       continue;
     }
     const uint32_t now = millis();
-    const uint8_t tier = gxTierEffective(now), fast = gxFastActive(now) ? 1 : 0, flow = gxFlowActive(now) ? 1 : 0;
+    const uint8_t tier = gxTierEffective(now), fast = gxFastLevel(now), flow = gxFlowActive(now) ? 1 : 0;
     const uint8_t phone = phoneLiveNow ? 1 : 0;
-    if (tier != sentTier || fast != sentFast || flow != sentFlow || phone != sentPhone) {
+    const uint32_t csv1 = gxIv(0, now);   // under fast=2 it follows webgaugesinterval, which the owner can change
+    if (tier != sentTier || fast != sentFast || flow != sentFlow || phone != sentPhone || csv1 != sentCsv1) {
       char rate[GX_RATE_JSON_SIZE];
       gxRateJson(rate, sizeof(rate));
       if (gxEvents.send(rate, "GxRate") != AsyncEventSource::ENQUEUED) gxFramesDropped++;
@@ -2216,6 +2236,7 @@ static void gxSendTask(void *) {
       sentFast = fast;
       sentFlow = flow;
       sentPhone = phone;
+      sentCsv1 = csv1;
     }
     for (uint8_t ch = 0; ch < GX_CH_COUNT; ch++) {
       if (!__atomic_load_n(&gxWant[ch], __ATOMIC_ACQUIRE)) continue;
@@ -7560,6 +7581,12 @@ void setupServer() {
       dvccVicCutHold = constrain(inputMessage.toInt(), 0, 1);
       settingWrite(NK_dvccVicCutHold, String(dvccVicCutHold).c_str());
     }
+    if (paramOk(request, "dvccLostStop")) {
+      foundParameter = true;
+      inputMessage = request->getParam("dvccLostStop")->value();
+      dvccLostStop = constrain(inputMessage.toInt(), 0, 1);
+      settingWrite(NK_dvccLostStop, String(dvccLostStop).c_str());
+    }
     if (paramOk(request, "dvccCvlMin")) {
       foundParameter = true;
       inputMessage = request->getParam("dvccCvlMin")->value();
@@ -10432,12 +10459,16 @@ void setupServer() {
   });
 
   // GX schedule: fast=1 holds the engine-running schedule for 60 s whatever the engine does (the GX repeats it while a
-  // page shows live data), fast=0 releases it; flow=1 / flow=0 the same for CSV4 alone at 2 s (the power-flow tile).
-  // Cadence only; the GX still never counts as a watching dashboard.
+  // page shows live data), fast=2 that and CSV1 at the web app's rate (gxIv), fast=0 releases it; flow=1 / flow=0 the
+  // same for CSV4 alone at 1 s (the power-flow tile). Firmware before fast=2 reads it as 1. Cadence only; the GX still
+  // never counts as a watching dashboard.
   server.on("/gxrate", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
     const String fast = request->hasParam("fast") ? request->getParam("fast")->value() : String();
-    if (fast.length()) gxFastHold(fast.toInt() != 0);
+    if (fast.length()) {
+      const long level = fast.toInt();
+      gxFastHold(level == 0 ? 0 : level >= 2 ? 2 : 1);
+    }
     const String flow = request->hasParam("flow") ? request->getParam("flow")->value() : String();
     if (flow.length()) gxFlowHold(flow.toInt() != 0);
     char rate[GX_RATE_JSON_SIZE];
@@ -10644,7 +10675,7 @@ void setupServer() {
              (unsigned long)sseStallCount, sseStallLongestMs / 1000.0f, (unsigned long)sseFramesDropped,
              (unsigned)csv3LastLen, (unsigned)csv3PeakLen, (unsigned)PAYLOAD3_SIZE,
              (unsigned)gxEvents.count(), (unsigned)gxEvents.avgPacketsWaiting(), GX_TIER_NAME[gxTierEffective(now)],
-             gxFastActive(now) ? " (fast hold)" : "", gxSendTaskHandle ? "running" : "NOT RUNNING",
+             gxFastLevel(now) == 2 ? " (live hold)" : gxFastActive(now) ? " (fast hold)" : "", gxSendTaskHandle ? "running" : "NOT RUNNING",
              (unsigned long)gxFramesSent, (unsigned long)gxFramesHeld, (unsigned long)gxFramesTorn,
              (unsigned long)gxFramesDropped, (unsigned long)gxStreamDrops,
              aflWorstTotalUs / 1000.0f,
@@ -12513,6 +12544,7 @@ void SendWifiData() {
                                "%d,%d,%d,%d,%d,%d,%d,"   // +7 NMEA 2000 bus health: verdict, TEC, REC, frames received, bus-offs, lost frames, nodes heard
                                "%d,"            // +1 largest free PSRAM block (KB)
                                "%d,%d,%d,%d,"   // +4 DVCC Victron carriers: VE.Can CVL/CCL, WiFi CVL/CCL
+                               "%d,%d,"         // +2 DVCC: VE.Can share addressed to this node, Stop Charging Without Limits holding
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -13162,6 +13194,8 @@ void SendWifiData() {
                                SafeInt(dvccRxCanCcl, 10),                                // CSV2_dvccRxCanCcl
                                SafeInt(dvccRxWifiCvl, 100),                              // CSV2_dvccRxWifiCvl
                                SafeInt(dvccRxWifiCcl, 10),                               // CSV2_dvccRxWifiCcl
+                               SafeInt(dvccRxCanShare, 10),                              // CSV2_dvccRxCanShare
+                               (int)dvccNoLimitStop,                                     // CSV2_dvccNoLimitStop
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost

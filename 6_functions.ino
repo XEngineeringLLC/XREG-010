@@ -4904,11 +4904,20 @@ void AdjustFieldLearnMode() {
         // already this alternator's ceiling (dvccCclAltBasis): applied as is. CCL 0 is a legitimate command (cold/full/cell-high):
         // ceiling 0, recovery rides the existing rate-governed ramp.
         bool dvccCclBinding = false;
+        dvccNoLimitStop = false;
         if (dvccEn == 1 && dvccState == 3 /*FOLLOWING*/ && !cxOwnsBatteryNow() && !isnan(dvccCclA)) {
           bool shuntBasis = (!dvccCclAltBasis && HAS_BATT_SHUNT && bcurLive);
           float dvccCeil = shuntBasis ? fmaxf(0.0f, dvccCclA + loadOffsetFilt) : fmaxf(0.0f, dvccCclA);
           if (dvccCeil < uTargetAmps) {
             uTargetAmps = dvccCeil;
+            dvccCclBinding = true;
+          }
+        } else if (dvccStopForNoLimits() && !cxOwnsBatteryNow()) {
+          // Stop Charging Without Limits: a battery-current ceiling of 0, the same as a followed stop-charging command
+          float stopCeil = (HAS_BATT_SHUNT && bcurLive) ? fmaxf(0.0f, loadOffsetFilt) : 0.0f;
+          dvccNoLimitStop = true;
+          if (stopCeil < uTargetAmps) {
+            uTargetAmps = stopCeil;
             dvccCclBinding = true;
           }
         }

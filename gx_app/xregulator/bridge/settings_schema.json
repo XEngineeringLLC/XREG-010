@@ -1,6 +1,6 @@
 {
  "version": 2,
- "generatedFrom": "web_src/index.html:e4bd0df41c7d web_src/script.js:0e01a957c4d4 gx_app/settings_keys.txt:f5f24877592b",
+ "generatedFrom": "web_src/index.html:b51c9ca27d59 web_src/script.js:bc6ed19af7cc gx_app/settings_keys.txt:0a9db3d14280",
  "endpoints": {
   "zerofitstate": {
    "path": "/zerofitstate",
@@ -2451,7 +2451,34 @@
       "integer": true
      },
      "arm": true,
-     "help": "How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On. With a Victron GX, VE.Can and WiFi each time out on their own, and follow stops only when both are silent."
+     "help": "How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. With Stop Charging Without Limits On, it stops charging instead. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On. With a Victron GX, VE.Can and WiFi each time out on their own, and follow stops only when both are silent."
+    },
+    {
+     "key": "dvccLostStop",
+     "label": "Stop Charging Without Limits",
+     "type": "toggle",
+     "group": "Charge-Limit Follow",
+     "options": [
+      {
+       "value": 0,
+       "label": "Off"
+      },
+      {
+       "value": 1,
+       "label": "On"
+      }
+     ],
+     "echo": {
+      "stream": "CSV3",
+      "field": "dvccLostStop",
+      "scale": 1
+     },
+     "send": {
+      "scale": 1,
+      "integer": true
+     },
+     "arm": true,
+     "help": "What this regulator does while follow is on and no limits are being followed: before the first message arrives, while settling, after the Silence Timeout, and while the trust latch is set. Off: it charges to the targets set on this regulator. On: it charges nothing, the same as a battery's stop-charging command. With a battery shunt it keeps supplying the measured loads at zero battery current; without one, alternator current is held at zero. Charging resumes once limits are followed again. Commissioning is not affected."
     }
    ]
   },

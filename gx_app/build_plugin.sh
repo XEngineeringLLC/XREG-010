@@ -1,9 +1,9 @@
 #!/bin/zsh
-# Builds the gui-v2 plugin xregulator/gui-v2/xregulator.json from the QML in plugin/.
+# Builds the gui-v2 plugin xregulator/gui-v2/xregulator.json from the QML in plugin/, versioned from xregulator/VERSION.
 # Needs PySide6 for rcc, lupdate and lrelease: python3 -m pip install --break-system-packages PySide6
 set -e
 HERE=${0:A:h}
-VERSION=0.1
+VERSION=$(<$HERE/xregulator/VERSION)   # the one GX app number: the bridge, build_package.py and install.sh read it too
 PYS=$(python3 -c 'import PySide6, os; print(os.path.dirname(PySide6.__file__))')
 WORK=$(mktemp -d)
 trap 'rm -rf $WORK' EXIT

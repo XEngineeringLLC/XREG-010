@@ -16,7 +16,7 @@
 
 // Must be strict semver ^\d+\.\d+\.\d+$ — no suffixes, no leading v. Compared as an integer
 // major*10000 + minor*100 + patch, so the ceiling is 999.99.99 (minor/patch cannot exceed 99).
-const char *FIRMWARE_VERSION = "0.0.9";
+const char *FIRMWARE_VERSION = "0.0.10";
 
 // Stable proxy domain in front of the Supabase "ota" bucket, so hosting can move without a re-flash.
 // Download uses setInsecure; integrity is the on-device RSA-4096 signature check (performOTAUpdate).
@@ -5659,9 +5659,11 @@ int n2kRxSoh = -1;           // received state of health % (127506); -1 = not av
 // 126720). The Victron layout is PROVISIONAL until validated against a real GX capture (spec §8a); the trust machine gates it.
 int dvccEn = 0;             // master follow switch; decoded limits clamp targets only when 1
 int dvccSrcType = 0;        // limit source: 0 = Victron GX (VE.Can VREG and WiFi /gxLimits carriers), 1 = RV-C
-int dvccInst = 1;           // RV-C DC instance filter (RV-C is 1-oriented; 0 = accept any). Victron path locks to the first sending bus address instead
+int dvccInst = 1;           // RV-C DC instance filter (RV-C is 1-oriented; 0 = accept any). Victron path follows the lowest of every Victron sender instead
 int dvccSilenceS = 30;      // no valid limit frame for this long → drop the clamp, revert to local targets
 int dvccVicCutHold = 1;     // 1 = a Victron do-not-charge stays held after it stops arriving; 0 = it ages out like the voltage/current limits
+int dvccLostStop = 0;       // 1 = with follow on and nothing being followed (waiting, settling, stale, untrusted), charge nothing; 0 = own targets
+bool dvccNoLimitStop = false;  // dvccLostStop is holding the current ceiling at zero right now (control loop, for CSV2)
 int dvccSettleS = 10;       // in-range updates must span this long (and ≥2 frames) before the first clamp applies
 float dvccCvlMin = 9.0f;    // plausible-CVL window, absolute volts (class-seeded/rescaled like other voltage settings);
 float dvccCvlMax = 16.0f;   //   a CVL outside the window latches UNTRUSTED until manual reset
@@ -5695,6 +5697,7 @@ float dvccRxWifiCcl = NAN;
 uint32_t dvccRxWifiMs = 0;
 float dvccRxCanCvl = NAN;   // VE.Can carrier as it entered the last merge: held registers, CCL 0 under a stop-charging command
 float dvccRxCanCcl = NAN;
+float dvccRxCanShare = NAN;  // VE.Can carrier: the GX's 0x2015 addressed to this node, this alternator's share (A)
 #define DVCC_ADDR_WIFI 254  // dvccRxSrcAddr while only the WiFi carrier is fresh (254 is never a J1939 sender of data)
 // Raw-frame capture ring (spec §8a), PSRAM, filled from the raw-RX tap (5_functions), served as hex by /dvccCapture (3_functions)
 // so a customer boat can validate the decode with no tooling. Declared here so both files see it.
@@ -5743,6 +5746,7 @@ void dvccNoteName(uint8_t src, const unsigned char *d, int len);
 void dvccNoteProductInfo(const tN2kMsg &N2kMsg);
 void initDvccCapture();
 void dvccTick();
+bool dvccStopForNoLimits();
 void dvccRawFrameTap(unsigned long id, unsigned char len, const unsigned char *buf);
 
 // ===== NMEA 2000 bus health, raw capture, per-minute history — spec: NMEA2K_TRANSMIT_SPEC.md §16 =====

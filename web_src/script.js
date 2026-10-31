@@ -148,11 +148,6 @@ function retargetTempPlotsForUnit(prevUnit) {
     if (typeof temperatureData !== 'undefined' && temperatureData && temperatureData[1]) {
         const s = temperatureData[1];
         for (let i = 0; i < s.length; i++) if (s[i] != null && Number.isFinite(s[i])) s[i] = remap(s[i]);
-        if (typeof plotInterp !== 'undefined' && plotInterp.temperature) {
-            const p = plotInterp.temperature;
-            if (p.prevY && Number.isFinite(p.prevY[0])) p.prevY[0] = remap(p.prevY[0]);
-            if (p.nextY && Number.isFinite(p.nextY[0])) p.nextY[0] = remap(p.nextY[0]);
-        }
     }
     if (typeof temperaturePlot !== 'undefined' && temperaturePlot) {
         temperaturePlot.destroy();
@@ -445,9 +440,6 @@ function regDemoFillShort(sh) {
         temperatureData[1][i] = (tf === null) ? null : toDisplayTemp(tf); temperatureData[2][i] = pct;
         if (protEventData.length === L) protEventData[i] = g('protEventMask') || 0;
         if (modeStripData.length === L) modeStripData[i] = g('chargeStage') || 0;
-        if (useTimestamps) {
-            currentTempData[0][i] = voltageData[0][i] = rpmData[0][i] = temperatureData[0][i] = Math.floor(tSlot);
-        }
     }
     recomputeAutoScales(true);
     ['current', 'voltage', 'rpm', 'temperature'].forEach(n => queuePlotUpdate(n));
@@ -1205,7 +1197,9 @@ const CSV2_FIELDS = [
     "dvccRxCanCcl",            // VE.Can carrier CCL (A x10), 0 under a stop-charging command
     "dvccRxWifiCvl",           // WiFi carrier (/gxLimits from the GX app) CVL (V x100); ts_DvccWifi is its age
     "dvccRxWifiCcl",           // WiFi carrier CCL (A x10)
-    "sessionId",               // device boot identity, same in every channel this boot
+    "dvccRxCanShare",          // VE.Can: the GX's current share addressed to this regulator (A x10)
+    "dvccNoLimitStop",         // 1 = Stop Charging Without Limits is holding charging at zero
+    "sessionId",             // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
 
@@ -4170,6 +4164,7 @@ const CSV3_FIELDS = [
     "dvccCvlMin",  // plausible-CVL window low (V ×100)
     "dvccCvlMax",  // plausible-CVL window high (V ×100)
     "dvccVicCutHold",
+    "dvccLostStop",
     "HuntCutPct",  // damper test/pocket gain, % of user Ki
     "HuntVerifyPct",  // damper verify bar, % ripple reduction required
     "HuntWingPct",  // damper pocket taper width, % of speed per side
@@ -6976,8 +6971,8 @@ let currentTempData, voltageData, rpmData, temperatureData;
 // firmware: 1=OV 2=iExcess 4=LoadDump. Shifted with the data series each CSV1 frame.
 let protEventData = [];
 // Stream-gap marker per buffer sample, index-aligned to protEventData, shared by the four short-term
-// and two tuning plots. 0 = contiguous; >0 = seconds missing at that seam. The relative-time x-axis
-// is positional, so without this a disconnect is invisible.
+// and two tuning plots. 0 = contiguous; >0 = seconds missing at that seam, which sits mid-gap; the
+// marker labels how long the hole is.
 let gapMarkData = [];
 // Charge-mode code per buffer sample for the mode ribbon between the Current and Voltage
 // plots. 1-8 = firmware CHARGE_STAGE_* (via gLastChargeStage, 2 Hz CSV4 cadence), 9 = shutdown
@@ -7086,21 +7081,107 @@ function queuePlotUpdate(plotName) {
     }
 }
 
-// ── 60-fps interpolation ──────────────────────────────────────────────────
-function lerp(a, b, t) {
-    if (a === null || b === null) return b;
-    return a + (b - a) * t;
+// ── Live-plot stream clock ────────────────────────────────────────────────
+// Every CSV1-fed live plot places each sample by the regulator's send clock (sendMs), never by arrival order or buffer
+// index, and scrolls every display frame on a steady clock: the right edge shows LIVE_BEHIND_MS before the newest
+// sample, so a frame that comes a little late is in before its point scrolls on, and an arrival moves nothing on
+// screen. Same design as the GX app's charts (gx_app/plugin/XregChart.qml, sClock/sLag).
+const LIVE_BEHIND_MS = 100;
+const liveClock = {
+    t: NaN,         // stream time (ms) of the newest sample: steps by sendMs, by arrival time across a device-clock reset
+    ring: null,     // Float64Array: stream time per buffer slot, aligned to every shifted buffer from its newest end
+    lat: NaN,       // arrival minus stream time of the fastest frame of the last 10 s (ms)
+    latAt: 0,
+    latQt: [],      // arrival time of each frame of the last 10 s ...
+    latQv: [],      // ... and its arrival minus stream time
+    shown: NaN,     // stream time at the right edge this display frame
+    epochOff: NaN,  // Date.now() - performance.now(), re-synced only on a real step (sleep, clock set)
+    absBase: 0,     // clock-time x: (stream time - absBase) / 1000 = epoch seconds
+    edgeAbs: NaN,   // clock-time x: the right edge this display frame, epoch seconds
+};
+
+// Grows the ring to n slots, keeping its newest end; slots older than any sample are laid out one interval apart.
+function liveRingFit(n) {
+    const old = liveClock.ring;
+    if (old && old.length >= n) return;
+    const r = new Float64Array(n), iv = window._lastKnownInterval || 200, k = old ? old.length : 0;
+    if (old) r.set(old, n - k);
+    const anchor = old ? old[0] : (Number.isFinite(liveClock.t) ? liveClock.t : 0), top = old ? n - k : n - 1;
+    for (let i = 0; i < n - k; i++) r[i] = anchor - (top - i) * iv;
+    liveClock.ring = r;
 }
 
-const plotInterp = {
-    current:     { prevY: [0, 0, 0, 0],                nextY: [0, 0, 0, 0],                arrivalTime: 0, lerpDuration: 200 },
-    voltage:     { prevY: [0, 0, 0],                  nextY: [0, 0, 0],                  arrivalTime: 0, lerpDuration: 200 },
-    rpm:         { prevY: [0, 0],                     nextY: [0, 0],                     arrivalTime: 0, lerpDuration: 200 },
-    temperature: { prevY: [0, 0],                     nextY: [0, 0],                     arrivalTime: 0, lerpDuration: 200 },
-    pid:         { prevY: [0, 0, 0, 0, 0, 0, 0],      nextY: [0, 0, 0, 0, 0, 0, 0],      arrivalTime: 0, lerpDuration: 200 },
-    cv:          { prevY: [null, null, null, null],    nextY: [null, null, null, null],    arrivalTime: 0, lerpDuration: 200 },
-    cvpid:       { prevY: [null, null, null, null],    nextY: [null, null, null, null],    arrivalTime: 0, lerpDuration: 200 },
-};
+function liveRingPush(t) {
+    const r = liveClock.ring;
+    r.copyWithin(0, 1);
+    r[r.length - 1] = t;
+}
+
+function liveBufferMaxLen() {
+    let n = 0;
+    for (const b of [currentTempData, voltageData, rpmData, temperatureData, pidTuningData, cvTuningData, cvPidData])
+        if (b && b[0] && b[0].length > n) n = b[0].length;
+    return n;
+}
+
+// One CSV1 sample, after every buffer has shifted it in. step = sendMs delta, or the arrival delta when devStep is false
+// (device clock reset or absent); then the lateness estimate starts over, since old frames were timed on another clock.
+function liveClockSample(arrival, step, devStep) {
+    const c = liveClock;
+    if (!Number.isFinite(c.t)) {
+        const n = c.ring ? c.ring.length : liveBufferMaxLen();
+        c.t = arrival;
+        c.ring = null;
+        liveRingFit(n);
+    } else {
+        c.t += step;
+        liveRingPush(c.t);
+    }
+    if (!devStep) { c.latQt.length = 0; c.latQv.length = 0; c.lat = NaN; }
+    c.latQt.push(arrival);
+    c.latQv.push(arrival - c.t);
+    while (c.latQt[0] < arrival - 10000) { c.latQt.shift(); c.latQv.shift(); }
+    let m = Infinity;
+    for (let i = 0; i < c.latQv.length; i++) if (c.latQv[i] < m) m = c.latQv[i];
+    // Drops at once, rises at most 20 ms a second: a link that turns slower slows the scroll a little for a while
+    // instead of stepping it back.
+    c.lat = Number.isFinite(c.lat) ? Math.min(m, c.lat + (arrival - c.latAt) * 0.02) : m;
+    c.latAt = arrival;
+}
+
+// Per display frame (now = the rAF timestamp): the stream time at the right edge. With no data coming the edge runs
+// at most 1 s past the newest sample, then waits; at update rates slower than 1.1 s the limit is the interval + 0.9 s,
+// or the edge would wait before every frame.
+function liveClockFrame(now) {
+    const c = liveClock;
+    if (!Number.isFinite(c.lat) || !c.ring) return false;
+    const run = Math.max(1000, (window._lastKnownInterval || 200) + 900);
+    c.shown = Math.min(now - c.lat - LIVE_BEHIND_MS, c.t + run);
+    if (useTimestamps) {
+        const off = Date.now() - performance.now();
+        if (!(Math.abs(off - c.epochOff) < 50)) c.epochOff = off;
+        // A sample's epoch is its arrival on the fastest recent link; constant per sample while lat holds, so the
+        // points stay put and the x range slides (liveAbsXRange).
+        c.absBase = -(c.lat + c.epochOff);
+        c.edgeAbs = (c.shown - c.absBase) / 1000;
+    }
+    return true;
+}
+
+// x in seconds from base for every slot of a live buffer: base = shown gives seconds before the right edge (newer
+// samples sit past 0, clipped), base = absBase gives epoch seconds.
+function liveFillX(x, base) {
+    if (liveClock.ring.length < x.length) liveRingFit(x.length);
+    const r = liveClock.ring, off = r.length - x.length;
+    for (let i = 0; i < x.length; i++) x[i] = (r[off + i] - base) / 1000;
+}
+
+// Clock-time x range of the four Plots-tab charts: ends at the shown right edge, not at the newest sample (dMax only
+// before the first display frame).
+function liveAbsXRange(dMax) {
+    const e = Number.isFinite(liveClock.edgeAbs) ? liveClock.edgeAbs : dMax;
+    return [e - liveWindowSec, e];
+}
 
 let interpLoopRunning = false;
 
@@ -7115,46 +7196,12 @@ function startInterpLoop() {
         glitchFrames: 0,      // frames where gap >33ms (below 30fps)
         totalRenderMs: 0,     // cumulative setData time this period
         worstRenderMs: 0,     // single worst setData batch
-        lerpDurationSum: 0,   // for computing average adaptive interval
+        trailSum: 0,          // newest sample minus the shown right edge (ms), summed over live frames
+        trailMin: Infinity,   // negative = the edge ran past the newest sample (a frame came later than LIVE_BEHIND_MS)
+        liveFrames: 0,
         lastFrameTime: performance.now(),
         nextReportTime: performance.now() + 10000,
     };
-
-    function applyInterp(state, dataArray, seriesCount) {
-        if (state.arrivalTime === 0) return false;
-        const elapsedMs = performance.now() - state.arrivalTime;
-        const tLinear = Math.min(1, elapsedMs / state.lerpDuration);
-        // Smoothstep easing; softens the square step on slow-updating sensors.
-        const t = tLinear * tLinear * (3 - 2 * tLinear);
-        const last = dataArray[1].length - 1;
-        const elapsedSec = elapsedMs / 1000;
-
-        // Smooth x-scroll between packets. Relative mode: rebuild the x-array offset by elapsed time.
-        // Absolute (epoch) mode: pin x[0] and x[last] so range width survives the shift-buffer drop.
-        if (dataArray[0][last] > 1e9) {
-            const now = Date.now() / 1000;
-            const intervalSec = (window._lastKnownInterval || 200) / 1000;
-            dataArray[0][last] = now;
-            // Anchor left edge (prevents 4px tick snap at 5 Hz). Skip when the anchor lands right of x[1]:
-            // after a gap longer than the buffer x[1] is pre-gap, and non-monotonic x breaks uPlot.
-            const anchor = now - last * intervalSec;
-            if (last < 1 || anchor <= dataArray[0][1]) dataArray[0][0] = anchor;
-        } else {
-            const intervalSec = (window._lastKnownInterval || 200) / 1000;
-            for (let i = 0; i <= last; i++) {
-                dataArray[0][i] = -(last - i) * intervalSec - elapsedSec;
-            }
-        }
-
-        for (let s = 0; s < seriesCount; s++) {
-            const p = state.prevY[s];
-            const n = state.nextY[s];
-            // A null prev (gap seam or empty prefill) would lerp up from zero: snap instead. A null
-            // next is a sensor gone unavailable (no shunt): hold the gap, never lerp toward 0.
-            dataArray[s + 1][last] = (p == null || n == null) ? n : lerp(p, n, t);
-        }
-        return true;
-    }
 
     function plotsTabVisible() {
         const el = document.getElementById('plots');
@@ -7167,7 +7214,7 @@ function startInterpLoop() {
             && settings && settings.classList.contains('active');
     }
 
-    function frame() {
+    function frame(ts) {
         const frameStart = performance.now();
 
         // ── Frame timing ─────────────────────────────────────────────────
@@ -7182,6 +7229,14 @@ function startInterpLoop() {
 
         // ── Plot updates ──────────────────────────────────────────────────
         const renderStart = performance.now();
+        // The rAF timestamp, not performance.now(): one value per display frame, so the scroll steps evenly.
+        const live = liveClockFrame(ts);
+        if (live) {
+            const trail = liveClock.t - liveClock.shown;
+            diag.trailSum += trail;
+            if (trail < diag.trailMin) diag.trailMin = trail;
+            diag.liveFrames++;
+        }
 
         if (plotsTabVisible()) {
             // Backstop for a plot stuck at width 0 (built hidden, resize-on-show missed) — see healPlotWidth.
@@ -7189,15 +7244,18 @@ function startInterpLoop() {
             healPlotWidth(voltagePlot,     'voltage-plot',      300);
             healPlotWidth(rpmPlot,         'rpm-plot',          300);
             healPlotWidth(temperaturePlot, 'temperature-plot',  300);
-            if (currentTempPlot && applyInterp(plotInterp.current, currentTempData, 5)) {
+            const base = useTimestamps ? liveClock.absBase : liveClock.shown;
+            if (live && currentTempPlot) {
+                liveFillX(currentTempData[0], base);
                 if (autoScaleCurrent) {
                     if (_autoScaleCurrentLeft)  currentTempPlot.setScale('current', _autoScaleCurrentLeft);
                     if (_autoScaleCurrentRight) currentTempPlot.setScale('pct',     _autoScaleCurrentRight);
                 }
-                currentTempPlot.setData(currentTempData);
+                currentTempPlot.setData(currentTempData);   // its draw hook repaints the mode ribbon
                 plotRenderTracker.plots.current.count++;
             }
-            if (voltagePlot && applyInterp(plotInterp.voltage, voltageData, 3)) {
+            if (live && voltagePlot) {
+                liveFillX(voltageData[0], base);
                 if (autoScaleVoltage) {
                     if (_autoScaleVoltageLeft)  voltagePlot.setScale('voltage', _autoScaleVoltageLeft);
                     if (_autoScaleVoltageRight) voltagePlot.setScale('pct',     _autoScaleVoltageRight);
@@ -7205,8 +7263,8 @@ function startInterpLoop() {
                 voltagePlot.setData(voltageData);
                 plotRenderTracker.plots.voltage.count++;
             }
-            drawModeStrip();
-            if (rpmPlot && applyInterp(plotInterp.rpm, rpmData, 2)) {
+            if (live && rpmPlot) {
+                liveFillX(rpmData[0], base);
                 if (autoScaleRPM) {
                     if (_autoScaleRPMLeft)  rpmPlot.setScale('rpm', _autoScaleRPMLeft);
                     if (_autoScaleRPMRight) rpmPlot.setScale('pct', _autoScaleRPMRight);
@@ -7214,7 +7272,8 @@ function startInterpLoop() {
                 rpmPlot.setData(rpmData);
                 plotRenderTracker.plots.rpm.count++;
             }
-            if (temperaturePlot && applyInterp(plotInterp.temperature, temperatureData, 2)) {
+            if (live && temperaturePlot) {
+                liveFillX(temperatureData[0], base);
                 if (autoScaleTemp) {
                     if (_autoScaleTempLeft)  temperaturePlot.setScale('temperature', _autoScaleTempLeft);
                     if (_autoScaleTempRight) temperaturePlot.setScale('pct',         _autoScaleTempRight);
@@ -7227,14 +7286,18 @@ function startInterpLoop() {
             // Backstop for a plot stuck at width 0 (built hidden, resize-on-show missed) — see healPlotWidth.
             healPlotWidth(cvTuningPlot, 'cv-tuning-plot', 350);
             healPlotWidth(pidTuningPlot, 'pid-tuning-plot', 400);
-            if (pidTuningPlot && pidTuningData && applyInterp(plotInterp.pid, pidTuningData, 6)) {
+            // Tuning plots are seconds-ago in both x modes.
+            if (live && pidTuningPlot && pidTuningData) {
+                liveFillX(pidTuningData[0], liveClock.shown);
                 pidTuningPlot.setData(pidTuningData);
             }
-            if (cvTuningPlot && cvTuningData && applyInterp(plotInterp.cv, cvTuningData, 4)) {
+            if (live && cvTuningPlot && cvTuningData) {
+                liveFillX(cvTuningData[0], liveClock.shown);
                 cvTuningPlot.setData(cvTuningData);
             }
             healPlotWidth(cvPidPlot, 'cv-pid-plot', 300);
-            if (cvPidPlot && cvPidData && applyInterp(plotInterp.cvpid, cvPidData, 4)) {
+            if (live && cvPidPlot && cvPidData) {
+                liveFillX(cvPidData[0], liveClock.shown);
                 cvPidPlot.setData(cvPidData);
             }
         }
@@ -7242,25 +7305,27 @@ function startInterpLoop() {
         const renderMs = performance.now() - renderStart;
         diag.totalRenderMs += renderMs;
         if (renderMs > diag.worstRenderMs) diag.worstRenderMs = renderMs;
-        diag.lerpDurationSum += plotInterp.current.lerpDuration;
 
         // ── Periodic smoothness report ────────────────────────────────────
         if (frameStart >= diag.nextReportTime && diag.frameCount > 0) {
             const periodMs = frameStart - (diag.nextReportTime - 10000);
             const fps = (diag.frameCount / (periodMs / 1000)).toFixed(1);
             const avgRender = (diag.totalRenderMs / diag.frameCount).toFixed(2);
-            const avgLerp = (diag.lerpDurationSum / diag.frameCount).toFixed(0);
+            const trail = diag.liveFrames
+                ? `${(diag.trailSum / diag.liveFrames).toFixed(0)}ms min:${diag.trailMin.toFixed(0)}ms` : 'n/a';
             diagLog(
                 `[INTERP] fps:${fps} | worstGap:${diag.worstFrameGapMs.toFixed(1)}ms` +
                 ` | render/frame:${avgRender}ms | worstRender:${diag.worstRenderMs.toFixed(1)}ms` +
-                ` | glitches:${diag.glitchFrames} | avgLerp:${avgLerp}ms`
+                ` | glitches:${diag.glitchFrames} | edge trail:${trail}`
             );
             diag.frameCount = 0;
             diag.worstFrameGapMs = 0;
             diag.glitchFrames = 0;
             diag.totalRenderMs = 0;
             diag.worstRenderMs = 0;
-            diag.lerpDurationSum = 0;
+            diag.trailSum = 0;
+            diag.trailMin = Infinity;
+            diag.liveFrames = 0;
             diag.nextReportTime = frameStart + 10000;
         }
 
@@ -8213,17 +8278,9 @@ function insertStreamGap(gapSec) {
             for (let i = 1; i <= last; i++) b[s][i - 1] = b[s][i];
             b[s][last] = null;
         }
-        // Timestamp mode only (epoch x); the relative ramp is static and must not be shifted.
-        // Park the seam mid-gap so x stays sorted — uPlot requires monotonic x.
-        if (b[0][last] > 1e9) {
-            // The interp loop drags x[last] to wall-clock while the stream is dead; clamp back to the
-            // last-arrival stamp or the seam lands in the future and the next frame breaks monotonicity.
-            b[0][last] = Math.min(b[0][last], Date.now() / 1000 - gapSec);
-            const prevLast = b[0][last];
-            for (let i = 1; i <= last; i++) b[0][i - 1] = b[0][i];
-            b[0][last] = prevLast + gapSec / 2;
-        }
     }
+    // The seam's stream time is mid-gap (x comes from it, liveFillX), so x stays sorted: uPlot requires monotonic x.
+    liveRingPush(liveClock.t + gapSec * 500);
 
     const bufLen = (currentTempData && currentTempData[1]) ? currentTempData[1].length : 0;
     if (!bufLen) return;
@@ -8245,15 +8302,14 @@ function processCSVDataOptimized(data) {
 
         plotRenderTracker.dataPointsProcessed++;
 
-        const now = useTimestamps ? Math.floor(Date.now() / 1000) : null;
-
-        // Inter-arrival time sets lerpDuration, clamped to [100, 1000] ms against startup/gap outliers.
         const _arrivalNow = performance.now();
         // Two clocks. A hole in the regulator's own sendMs/WifiHeartBeat means frames were built and never
         // arrived (seam). A hole in arrival time alone is a TCP retransmit stall delivered in a burst:
         // nothing is missing, so no seam. Arrival time is the fallback only on a device-clock reset or no sendMs.
         const sendMs = Number(data.sendMs);
         const hb = Number(data.WifiHeartBeat);
+        liveRingFit(liveBufferMaxLen());   // before insertStreamGap pushes a seam into it
+        let streamStep = NaN, devStep = false;
         if (processCSVDataOptimized._lastArrival > 0) {
             const measured = _arrivalNow - processCSVDataOptimized._lastArrival;
             // 4 intervals of slack absorbs ordinary SSE jitter; the 1.5 s floor keeps a fast
@@ -8264,7 +8320,7 @@ function processCSVDataOptimized(data) {
             const framesLost = (hb - hbPrev) - 1;                             // frames built between these two that never arrived
             if (devDelta >= 0) {
                 // The device clock is exact, so the floor is tighter than the arrival path: a 1 s hole
-                // is ten dropped frames. Below that the positional plot just runs a few frames short.
+                // is ten dropped frames. Below that the trace just bridges the hole with a straight line.
                 if (devDelta > Math.max(4 * (window._lastKnownInterval || 200), 1000)) {
                     console.warn('[SSE GAP] ' + Math.round(devDelta) + ' ms of frames missing | heartbeat ' + hbPrev +
                                  ' -> ' + hb + ' (' + framesLost + ' frames never arrived) | arrival gap ' + measured.toFixed(0) + ' ms');
@@ -8277,14 +8333,9 @@ function processCSVDataOptimized(data) {
                              ' -> ' + hb);
                 insertStreamGap(measured / 1000);
             }
-            const clamped = Math.max(100, Math.min(1000, measured));
-            plotInterp.current.lerpDuration     = clamped;
-            plotInterp.voltage.lerpDuration     = clamped;
-            plotInterp.rpm.lerpDuration         = clamped;
-            plotInterp.temperature.lerpDuration = clamped;
-            plotInterp.pid.lerpDuration         = clamped;
-            plotInterp.cv.lerpDuration          = clamped;
-            plotInterp.cvpid.lerpDuration       = clamped;
+            // sendMs 0 is the app's own demo, which has no device clock
+            devStep = devDelta >= 0 && sendMs > 0;
+            streamStep = devStep ? devDelta : measured;
         }
         processCSVDataOptimized._lastArrival = _arrivalNow;
         processCSVDataOptimized._lastHb = hb;
@@ -8307,17 +8358,8 @@ function processCSVDataOptimized(data) {
         if ('MeasuredAmps' in data) window._lastMeasAmps = altCurrent;
         if ('BatteryV' in data) window._lastBatteryV = parseFloat(data.BatteryV) / 100;
 
-        const prevY_current = [
-            currentTempData[1][currentTempData[1].length - 1],
-            currentTempData[2][currentTempData[2].length - 1],
-            currentTempData[3][currentTempData[3].length - 1],
-            currentTempData[4][currentTempData[4].length - 1],
-            currentTempData[5][currentTempData[5].length - 1],
-        ];
+        // x (column 0) is not shifted here: the display loop writes it from the stream clock (liveFillX).
         for (let i = 1; i < currentTempData[1].length; i++) {
-            if (useTimestamps) {
-                currentTempData[0][i - 1] = currentTempData[0][i];
-            }
             currentTempData[1][i - 1] = currentTempData[1][i];
             currentTempData[2][i - 1] = currentTempData[2][i];
             currentTempData[3][i - 1] = currentTempData[3][i];
@@ -8325,69 +8367,36 @@ function processCSVDataOptimized(data) {
             currentTempData[5][i - 1] = currentTempData[5][i];
         }
         const lastCurrentIndex = currentTempData[1].length - 1;
-        if (useTimestamps) {
-            currentTempData[0][lastCurrentIndex] = now;
-        }
         currentTempData[1][lastCurrentIndex] = battCurrent;
         currentTempData[2][lastCurrentIndex] = altCurrent;
         currentTempData[3][lastCurrentIndex] = fieldCurrent;
         currentTempData[4][lastCurrentIndex] = fieldPct;
         currentTempData[5][lastCurrentIndex] = altCurrentFilt;
-        plotInterp.current.prevY = prevY_current;
-        plotInterp.current.nextY = [battCurrent, altCurrent, fieldCurrent, fieldPct, altCurrentFilt];
-        plotInterp.current.arrivalTime = performance.now();
 
         // ALWAYS UPDATE DATA STRUCTURES - Voltage plot data
         const adsBattV = 'BatteryV' in data ? parseFloat(data.BatteryV) / 100 : 0;
         const inaBattV = 'IBV' in data ? parseFloat(data.IBV) / 100 : 0;
 
-        const prevY_voltage = [
-            voltageData[1][voltageData[1].length - 1],
-            voltageData[2][voltageData[2].length - 1],
-            voltageData[3][voltageData[3].length - 1],
-        ];
         for (let i = 1; i < voltageData[1].length; i++) {
-            if (useTimestamps) {
-                voltageData[0][i - 1] = voltageData[0][i];
-            }
             voltageData[1][i - 1] = voltageData[1][i];
             voltageData[2][i - 1] = voltageData[2][i];
             voltageData[3][i - 1] = voltageData[3][i];
         }
         const lastVoltageIndex = voltageData[1].length - 1;
-        if (useTimestamps) {
-            voltageData[0][lastVoltageIndex] = now;
-        }
         voltageData[1][lastVoltageIndex] = adsBattV;
         voltageData[2][lastVoltageIndex] = inaBattV;
         voltageData[3][lastVoltageIndex] = fieldPct;
-        plotInterp.voltage.prevY = prevY_voltage;
-        plotInterp.voltage.nextY = [adsBattV, inaBattV, fieldPct];
-        plotInterp.voltage.arrivalTime = performance.now();
 
         // ALWAYS UPDATE DATA STRUCTURES - RPM plot data
         const rpmValue = 'RPM' in data ? parseFloat(data.RPM) : 0;
 
-        const prevY_rpm = [
-            rpmData[1][rpmData[1].length - 1],
-            rpmData[2][rpmData[2].length - 1],
-        ];
         for (let i = 1; i < rpmData[1].length; i++) {
-            if (useTimestamps) {
-                rpmData[0][i - 1] = rpmData[0][i];
-            }
             rpmData[1][i - 1] = rpmData[1][i];
             rpmData[2][i - 1] = rpmData[2][i];
         }
         const lastRPMIndex = rpmData[1].length - 1;
-        if (useTimestamps) {
-            rpmData[0][lastRPMIndex] = now;
-        }
         rpmData[1][lastRPMIndex] = rpmValue;
         rpmData[2][lastRPMIndex] = fieldPct;
-        plotInterp.rpm.prevY = prevY_rpm;
-        plotInterp.rpm.nextY = [rpmValue, fieldPct];
-        plotInterp.rpm.arrivalTime = performance.now();
 
         // ALWAYS UPDATE DATA STRUCTURES - Temperature plot data
         // Buffer holds DISPLAY units (remapped in place by retargetTempPlotsForUnit on a unit flip).
@@ -8396,26 +8405,13 @@ function processCSVDataOptimized(data) {
         const altTempRaw = 'AlternatorTemperatureF' in data ? toDisplayTemp(parseFloat(data.AlternatorTemperatureF) / 100) : 0;
         const altTemp = Number.isFinite(altTempRaw) ? altTempRaw : null;
 
-        const prevY_temp = [
-            temperatureData[1][temperatureData[1].length - 1],
-            temperatureData[2][temperatureData[2].length - 1],
-        ];
         for (let i = 1; i < temperatureData[1].length; i++) {
-            if (useTimestamps) {
-                temperatureData[0][i - 1] = temperatureData[0][i];
-            }
             temperatureData[1][i - 1] = temperatureData[1][i];
             temperatureData[2][i - 1] = temperatureData[2][i];
         }
         const lastTempIndex = temperatureData[1].length - 1;
-        if (useTimestamps) {
-            temperatureData[0][lastTempIndex] = now;
-        }
         temperatureData[1][lastTempIndex] = altTemp;
         temperatureData[2][lastTempIndex] = fieldPct;
-        plotInterp.temperature.prevY = prevY_temp;
-        plotInterp.temperature.nextY = [altTemp, fieldPct];
-        plotInterp.temperature.arrivalTime = performance.now();
 
         // All four live buffers are shifted; recompute auto Y ranges (the rAF loop applies them).
         recomputeAutoScales(false);
@@ -8450,12 +8446,6 @@ function processCSVDataOptimized(data) {
             // Keep latest real RPM for watermark
             window._lastKnownRPM = rpmValue;
 
-            const last_pid = pidTuningData[1].length - 1;
-            const prevY_pid = [
-                pidTuningData[1][last_pid], pidTuningData[2][last_pid],
-                pidTuningData[3][last_pid], pidTuningData[4][last_pid],
-                pidTuningData[5][last_pid], pidTuningData[6][last_pid],
-            ];
             for (let i = 1; i < pidTuningData[1].length; i++) {
                 pidTuningData[1][i - 1] = pidTuningData[1][i]; // setpointLimited
                 pidTuningData[2][i - 1] = pidTuningData[2][i]; // pidInput (PID EMA input = g_pidI_filtered, not truly raw)
@@ -8472,9 +8462,6 @@ function processCSVDataOptimized(data) {
             pidTuningData[4][lastPidIndex] = dutyCycle;
             pidTuningData[5][lastPidIndex] = pidOutput;
             pidTuningData[6][lastPidIndex] = rpmScaled;
-            plotInterp.pid.prevY = prevY_pid;
-            plotInterp.pid.nextY = [setpointLimited, pidInput, uTargetAmps, dutyCycle, pidOutput, rpmScaled];
-            plotInterp.pid.arrivalTime = performance.now();
         }
 
         // CV voltage tuning plot data — all four series come from CSV1 (fast rate).
@@ -8486,11 +8473,6 @@ function processCSVDataOptimized(data) {
             const inaV       = 'IBV' in data ? parseFloat(data.IBV) / 100 : null;
             const vForD      = 'cvKdFiltV' in data ? parseFloat(data.cvKdFiltV) / 100 : null;
             const icv        = 'Icv' in data ? parseFloat(data.Icv) / 100 : null;
-            const last_cv = cvTuningData[1].length - 1;
-            const prevY_cv = [
-                cvTuningData[1][last_cv], cvTuningData[2][last_cv],
-                cvTuningData[3][last_cv], cvTuningData[4][last_cv],
-            ];
             for (let i = 1; i < cvTuningData[1].length; i++) {
                 cvTuningData[1][i - 1] = cvTuningData[1][i];
                 cvTuningData[2][i - 1] = cvTuningData[2][i];
@@ -8502,9 +8484,6 @@ function processCSVDataOptimized(data) {
             cvTuningData[2][last] = inaV;
             cvTuningData[3][last] = vForD;
             cvTuningData[4][last] = icv;
-            plotInterp.cv.prevY = prevY_cv;
-            plotInterp.cv.nextY = [voltTarget, inaV, vForD, icv];
-            plotInterp.cv.arrivalTime = performance.now();
         }
 
         // CV P/I/D decomposition plot — P, I (integrator), D (−kdTrim), Icv (total). All from CSV1.
@@ -8515,7 +8494,6 @@ function processCSVDataOptimized(data) {
             const cvD = 'cvKdTrim' in data ? -parseFloat(data.cvKdTrim) / 100 : null;
             const cvIcv = 'Icv' in data ? parseFloat(data.Icv) / 100 : null;
             const lastP = cvPidData[1].length - 1;
-            const prevY_pid = [cvPidData[1][lastP], cvPidData[2][lastP], cvPidData[3][lastP], cvPidData[4][lastP]];
             for (let i = 1; i < cvPidData[1].length; i++) {
                 cvPidData[1][i - 1] = cvPidData[1][i];
                 cvPidData[2][i - 1] = cvPidData[2][i];
@@ -8526,11 +8504,9 @@ function processCSVDataOptimized(data) {
             cvPidData[2][lastP] = cvI;
             cvPidData[3][lastP] = cvD;
             cvPidData[4][lastP] = cvIcv;
-            plotInterp.cvpid.prevY = prevY_pid;
-            plotInterp.cvpid.nextY = [cvP, cvI, cvD, cvIcv];
-            plotInterp.cvpid.arrivalTime = performance.now();
         }
 
+        liveClockSample(_arrivalNow, streamStep, devStep);
         return 1;
     });
 }
@@ -8745,11 +8721,10 @@ const MODE_STRIP_META = {
 };
 let _modeStripLegendKey = '';
 
-// Runs in the 60fps interp frame while Plots is visible so bands scroll with the plots; x-aligned to
-// currentTempPlot's plot area via valToPos on the shared x buffer.
-function drawModeStrip() {
+// Runs from currentTempPlot's draw hook (every display frame while Plots is visible) so bands scroll with the plots;
+// x-aligned to its plot area via valToPos on the shared x buffer, with the x scale that draw just used.
+function drawModeStrip(u) {
     const cv = document.getElementById('mode-strip-canvas');
-    const u = currentTempPlot;
     if (!cv || !u || !u.over || !modeStripData.length || !currentTempData) return;
     if (cv.offsetParent === null) return;   // Short Term sub-tab hidden
 
@@ -8792,10 +8767,10 @@ function drawModeStrip() {
         if (i === n || modeStripData[i] !== segMode) {
             const meta = MODE_STRIP_META[segMode];
             if (meta) {
-                // Right edge of the newest segment pins to the plot edge, not the last sample —
-                // the interp loop keeps the last x slightly left of 0 while it eases in.
+                // The newest segment ends at the newest sample, like the traces: usually just past the plot edge
+                // (clipped), short of it only after the edge has run past the newest sample (a late frame).
                 const a = px(segStart);
-                const b = (i === n) ? (offL + oRect.width) : px(i);
+                const b = (i === n) ? px(n - 1) : px(i);
                 if (b > x0 && a < x1) present.add(segMode);
                 ctx.globalAlpha = 0.88;
                 ctx.fillStyle = THERMAL_MODE_COLORS[meta.key];
@@ -8873,8 +8848,8 @@ function initModeStripTip() {
     cv.addEventListener('pointerleave', () => { tip.style.display = 'none'; });
 }
 
-// uPlot draw hook: grey band at each sample where telemetry resumed after an outage, labelled with the
-// missing time (a relative-time seam has zero width). Deliberately not the protections' red: a gap is
+// uPlot draw hook: grey band at each outage's seam (mid-gap), labelled with the missing time.
+// Deliberately not the protections' red: a gap is
 // absent data, not an event. On the short-term and tuning plots; gapMarkData aligns to u.data[0].
 function drawGapMarkers(u) {
     if (!gapMarkData || !gapMarkData.length) return;
@@ -8976,12 +8951,6 @@ function reinitializePlotsWithNewTiming(data) {
     voltageIndex = 0;
     rpmIndex = 0;
     temperatureIndex = 0;
-
-    // Reset interp states so rAF loop doesn't apply stale prev/next to new arrays
-    plotInterp.current.arrivalTime = 0;
-    plotInterp.voltage.arrivalTime = 0;
-    plotInterp.rpm.arrivalTime = 0;
-    plotInterp.temperature.arrivalTime = 0;
 
     // Update plots - they'll auto-scale with time: true
     if (currentTempPlot) {
@@ -9118,6 +9087,7 @@ function updateAllEchosOptimized(data) {
         { key: 'dvccInst', id: 'dvccInst_echo', transform: v => v == 0 ? 'Any' : v },
         { key: 'dvccSilenceS', id: 'dvccSilenceS_echo', transform: v => v },
         { key: 'dvccVicCutHold', id: 'dvccVicCutHold_echo', transform: v => v == 1 ? 'On' : 'Off' },
+        { key: 'dvccLostStop', id: 'dvccLostStop_echo', transform: v => v == 1 ? 'On' : 'Off' },
         { key: 'dvccSettleS', id: 'dvccSettleS_echo', transform: v => v },
         { key: 'dvccCvlMin', id: 'dvccCvlMin_echo', transform: v => (v / 100).toFixed(2) },
         { key: 'dvccCvlMax', id: 'dvccCvlMax_echo', transform: v => (v / 100).toFixed(2) },
@@ -14168,7 +14138,6 @@ function initCVTuningDataStructures() {
         new Array(maxPoints).fill(null),   // [3] cvKdFiltV — Voltage for D term (V)
         new Array(maxPoints).fill(null),   // [4] Icv (A) — right axis
     ];
-    plotInterp.cv.arrivalTime = 0;
 }
 
 function initCVTuningPlot() {
@@ -14227,8 +14196,9 @@ function initCVTuningPlot() {
         ],
         scales: {
             // All ranges are fns, re-read each redraw, so window/Y edits apply via plain setData.
-            // x is fixed [-w, 0], never data-driven: applyInterp() slides x[last] each frame and snaps it
-            // back on packet arrival, which would make the axis shiver. w = selected window, not buffer span.
+            // x is fixed [-w, 0] with 0 = the shown right edge, never data-driven: the newest samples sit past 0 until
+            // they scroll on (liveFillX), and a range following them would jump on every arrival. w = selected window,
+            // not buffer span.
             x:     { time: false, auto: false, range: () => { const w = (cvXTime && cvXTime > 0) ? cvXTime : (xTime || 30); return [-w, 0]; } },
             volts: { range: (u, mn, mx) => (cvVoltsMin !== null && cvVoltsMax !== null) ? [cvVoltsMin, cvVoltsMax] : stableAutoRange(mn, mx, 0.1) },
             amps:  { range: (u, mn, mx) => (cvAmpsMin  !== null && cvAmpsMax  !== null) ? [cvAmpsMin,  cvAmpsMax]  : stableAutoRange(mn, mx, 0.1) },
@@ -14378,7 +14348,6 @@ function initCVPidDataStructures() {
         new Array(maxPoints).fill(null),   // [3] D = −kdTrim (A)
         new Array(maxPoints).fill(null),   // [4] Icv total (A)
     ];
-    plotInterp.cvpid.arrivalTime = 0;
 }
 
 function initCVPidPlot() {
@@ -15576,7 +15545,7 @@ function initCurrentTempPlot() {
             }
         ],
         scales: useTimestamps ? {
-            x: { time: true, range: (u, dMin, dMax) => [dMax - liveWindowSec, dMax] },
+            x: { time: true, range: (u, dMin, dMax) => liveAbsXRange(dMax) },
             current: { auto: false, range: () => [Ymin1, Ymax1] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging
             pct: { auto: false, range: () => [pctMin1, pctMax1] }     // fn so click-to-edit Field % range survives redraws
         } : {
@@ -15650,7 +15619,7 @@ function initCurrentTempPlot() {
                         currentTempResizeObserver.observe(plotEl);
                     }
                 ],
-                draw: [(u) => drawProtectionMarkers(u), (u) => drawGapMarkers(u)]
+                draw: [(u) => drawProtectionMarkers(u), (u) => drawGapMarkers(u), (u) => drawModeStrip(u)]
             }
         }]
     };
@@ -15746,7 +15715,7 @@ function initVoltagePlot() {
             }
         ],
         scales: useTimestamps ? {
-            x: { time: true, range: (u, dMin, dMax) => [dMax - liveWindowSec, dMax] },
+            x: { time: true, range: (u, dMin, dMax) => liveAbsXRange(dMax) },
             voltage: { auto: false, range: () => [Ymin2 / 100, Ymax2 / 100] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging
             pct: { auto: false, range: () => [pctMin2, pctMax2] }     // fn so click-to-edit Field % range survives redraws
         } : {
@@ -15906,7 +15875,7 @@ function initRPMPlot() {
             }
         ],
         scales: useTimestamps ? {
-            x: { time: true, range: (u, dMin, dMax) => [dMax - liveWindowSec, dMax] },
+            x: { time: true, range: (u, dMin, dMax) => liveAbsXRange(dMax) },
             rpm: { auto: false, range: () => [Ymin3, Ymax3] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging
             pct: { auto: false, range: () => [pctMin3, pctMax3] }     // fn so click-to-edit Field % range survives redraws
         } : {
@@ -16066,7 +16035,7 @@ function initTemperaturePlot() {
             }
         ],
         scales: useTimestamps ? {
-            x: { time: true, range: (u, dMin, dMax) => [dMax - liveWindowSec, dMax] },
+            x: { time: true, range: (u, dMin, dMax) => liveAbsXRange(dMax) },
             temperature: { auto: false, range: () => [toDisplayTemp(Ymin4), toDisplayTemp(Ymax4)] },   // fn, not array: re-read each redraw so Y edits survive setData re-ranging (Ymin4/Ymax4 stay native °F)
             pct: { auto: false, range: () => [pctMin4, pctMax4] }     // fn so click-to-edit Field % range survives redraws
         } : {
@@ -17311,6 +17280,7 @@ function updateTogglesFromData(data) {
         updateCheckbox("rvcFaultEnable_checkbox", data.rvcFaultEnable, "rvcFaultEnable");
         updateCheckbox("dvccEn_checkbox", data.dvccEn, "dvccEn");
         updateCheckbox("dvccVicCutHold_checkbox", data.dvccVicCutHold, "dvccVicCutHold");
+        updateCheckbox("dvccLostStop_checkbox", data.dvccLostStop, "dvccLostStop");
         // The override toggles live only in the Run Without Failed Sensors modal (rwfsRender reads the echo cache).
         rwfsOnSettingsEcho(data);
         updateCheckbox("bmsLogic_checkbox", data.bmsLogic, "bmsLogic");
@@ -21166,6 +21136,7 @@ max-width: 100%;     /* allow full width on mobile */
     document.getElementById("rvcFaultEnable_checkbox").checked = (document.getElementById("rvcFaultEnable").value === "1");
     document.getElementById("dvccEn_checkbox").checked = (document.getElementById("dvccEn").value === "1");
     document.getElementById("dvccVicCutHold_checkbox").checked = (document.getElementById("dvccVicCutHold").value === "1");
+    document.getElementById("dvccLostStop_checkbox").checked = (document.getElementById("dvccLostStop").value === "1");
     document.getElementById("battTempProbeEnable_checkbox").checked = (document.getElementById("battTempProbeEnable").value === "1");
     document.getElementById("extraTempProbeEnable_checkbox").checked = (document.getElementById("extraTempProbeEnable").value === "1");
     document.getElementById("hotChargeLockoutEnable_checkbox").checked = (document.getElementById("hotChargeLockoutEnable").value === "1");
@@ -21756,8 +21727,9 @@ function goToDiagSettings(ck) {
 }
 
 // Header strip for charge-limit follow: follow ON but not FOLLOWING (1 waiting, 4 stale, 5 untrusted) means the
-// clamps are NAN and local targets rule, which an owner relying on the sender may not expect. Never call this a
-// protection: no limit received is not a fault.
+// clamps are NAN and local targets rule, or with Stop Charging Without Limits (CSV2 dvccNoLimitStop) that charging is
+// held at zero, which an owner relying on the sender may not expect. Never call this a protection: no limit received
+// is not a fault.
 const DVCC_NOTICE_GRACE_MS = 60000;   // a GX rebooting or booting after us must not raise a banner
 let dvccNoticeSince = 0;
 
@@ -21767,7 +21739,7 @@ let dvccNoticeSince = 0;
 function renderDvccCards(data) {
     // Banner first: it is global, so it must not depend on the Integrations markup
     // that the two early-returns below guard.
-    if (data.dvccState !== undefined) updateDvccNotice(Number(data.dvccState), Number(data.dvccRxSrcAddr));
+    if (data.dvccState !== undefined) updateDvccNotice(Number(data.dvccState), Number(data.dvccRxSrcAddr), Number(data.dvccNoLimitStop) === 1);
     const row = document.getElementById('dvccStatus_row');
     const card = document.getElementById('li_dvccStatus_card');
     if ((!row && !card) || data.dvccState === undefined) return;
@@ -21851,7 +21823,9 @@ function renderDvccCards(data) {
     } else {
         cWord = 'heard';
         const at = (isFinite(src) && src < 254) ? ' \u00b7 addr ' + src : '';
-        cDetail = limTxt(data.dvccRxCanCvl, data.dvccRxCanCcl) + at + ' \u00b7 ' + secsOf(canAge) + ' s ago';
+        const share = aTxt(data.dvccRxCanShare);
+        const vals = [vTxt(data.dvccRxCanCvl), aTxt(data.dvccRxCanCcl), share ? 'share ' + share : ''].filter(Boolean);
+        cDetail = (vals.join(' \u00b7 ') || 'no limits sent') + at + ' \u00b7 ' + secsOf(canAge) + ' s ago';
     }
     let wWord, wDetail;
     if (wifiAge === 999999) {
@@ -21884,30 +21858,34 @@ function renderDvccCards(data) {
     if (btnRvc) { btnRvc.disabled = isRvc; setText('rvcUseBtn', isRvc ? 'In use' : 'Use RV-C'); }
 }
 
-function updateDvccNotice(st, srcAddr) {
+function updateDvccNotice(st, srcAddr, stopped) {
     const el = document.getElementById('dvcc-banner');
     if (!el) return;
+    const inControl = stopped
+        ? 'Charging is stopped until limits are followed again, because Stop Charging Without Limits is on.'
+        : "This regulator's own targets are in control.";
     let msg = '';
     if (st === 5) {
         // Latched — it needs a deliberate reset, so waiting out a grace period buys nothing.
         dvccNoticeSince = 0;
-        msg = '<b>EXTERNAL CHARGE LIMITS REJECTED</b> &mdash; an implausible value was received. This '
-            + "regulator's own targets are in control until the trust latch is reset.";
+        msg = '<b>EXTERNAL CHARGE LIMITS REJECTED</b> &mdash; an implausible value was received. '
+            + (stopped ? 'Charging is stopped until the trust latch is reset, because Stop Charging Without Limits is on.'
+                       : "This regulator's own targets are in control until the trust latch is reset.");
     } else if (st === 1 || st === 4) {
         if (!dvccNoticeSince) dvccNoticeSince = Date.now();
-        if (Date.now() - dvccNoticeSince >= DVCC_NOTICE_GRACE_MS) {
+        // A stop holds the field at once, so it is reported at once; the grace is only for own-target control.
+        if (stopped || Date.now() - dvccNoticeSince >= DVCC_NOTICE_GRACE_MS) {
             msg = (st === 4)
-                ? '<b>EXTERNAL CHARGE LIMITS LOST</b> &mdash; the sender went silent. This '
-                  + "regulator's own targets are in control."
+                ? '<b>EXTERNAL CHARGE LIMITS LOST</b> &mdash; the sender went silent. ' + inControl
                 : ((srcAddr === 255 || !isFinite(srcAddr))
-                    ? '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; follow is on but nothing is arriving. This '
-                      + "regulator's own targets are in control. Check the selected source, the CAN wiring "
+                    ? '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; follow is on but nothing is arriving. ' + inControl
+                      + ' Check the selected source, the CAN wiring '
                       + 'and bus termination, and for a Victron GX the XREG-010 app on the GX.'
                     : (srcAddr === 254)
                     ? '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; the Victron GX is connected over WiFi but is not '
-                      + "sending limits (CVL/CCL). This regulator's own targets are in control."
+                      + 'sending limits (CVL/CCL). ' + inControl
                     : '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; the sender is on the bus but is not '
-                      + "publishing limits (CVL/CCL). This regulator's own targets are in control.");
+                      + 'publishing limits (CVL/CCL). ' + inControl);
         }
     } else {
         dvccNoticeSince = 0;   // off / settling / following
@@ -23741,7 +23719,6 @@ function initPidTuningDataStructures() {
     ];
 
     pidTuningIndex = 0;
-    plotInterp.pid.arrivalTime = 0;
 }
 // Manual override for the PID plot's right-hand duty axis (browser-side only;
 // the left amps axis persists on the regulator as yyMin/yyMax).
@@ -23808,9 +23785,9 @@ function initPidTuningPlot() {
             x: {
                 time: false,
                 auto: false,
-                // fn so setData() re-runs it after rebuildPidTuningWindow resizes the buffer. Fixed [-w, 0], NOT data-driven:
-                // applyInterp() slides x[last] left then snaps it back each packet, which a data-driven range renders as
-                // an x-axis tick shiver.
+                // fn so setData() re-runs it after rebuildPidTuningWindow resizes the buffer. Fixed [-w, 0] with 0 = the
+                // shown right edge, NOT data-driven: the newest samples sit past 0 until they scroll on (liveFillX), and a
+                // range following them would jump on every arrival.
                 range: () => { const w = (xTime && xTime > 0) ? xTime : 30; return [-w, 0]; }   // selected window, NOT buffer span — 5-min buffer holds history, this draws the visible slice
             },
             amps: {

@@ -1,0 +1,41 @@
+module Victron.VenusOS
+singleton Theme 1.0 Theme.qml
+singleton Global 1.0 Global.qml
+singleton Units 1.0 Units.qml
+singleton BackendConnection 1.0 BackendConnection.qml
+singleton MockStore 1.0 MockStore.qml
+singleton UiConfig 1.0 UiConfig.qml
+singleton ScreenBlanker 1.0 ScreenBlanker.qml
+singleton ClockTime 1.0 ClockTime.qml
+VenusOS 1.0 VenusOS.qml
+VeQuickItem 1.0 VeQuickItem.qml
+Page 1.0 Page.qml
+GradientListView 1.0 GradientListView.qml
+VisibleItemModel 1.0 VisibleItemModel.qml
+ListItem 1.0 ListItem.qml
+ListSetting 1.0 ListSetting.qml
+ListText 1.0 ListText.qml
+ListSwitch 1.0 ListSwitch.qml
+ListButton 1.0 ListButton.qml
+ListNavigation 1.0 ListNavigation.qml
+ListRadioButtonGroup 1.0 ListRadioButtonGroup.qml
+ListTextField 1.0 ListTextField.qml
+SectionHeader 1.0 SectionHeader.qml
+ThreeLabelLayout 1.0 ThreeLabelLayout.qml
+TwoLabelItemLayout 1.0 TwoLabelItemLayout.qml
+CaptionLabel 1.0 CaptionLabel.qml
+SecondaryListLabel 1.0 SecondaryListLabel.qml
+Label 1.0 Label.qml
+Button 1.0 Button.qml
+ModalDialog 1.0 ModalDialog.qml
+NumberSelectorDialog 1.0 NumberSelectorDialog.qml
+DeviceListPluginPage 1.0 DeviceListPluginPage.qml
+Switch 1.0 Switch.qml
+ProgressArc 1.0 ProgressArc.qml
+QuantityLabel 1.0 QuantityLabel.qml
+SegmentedButtonRow 1.0 SegmentedButtonRow.qml
+AsymmetricRoundedRectangle 1.0 AsymmetricRoundedRectangle.qml
+TabBar 1.0 TabBar.qml
+SwipeView 1.0 SwipeView.qml
+ScrollBar 1.0 ScrollBar.qml
+ViewGradient 1.0 ViewGradient.qml

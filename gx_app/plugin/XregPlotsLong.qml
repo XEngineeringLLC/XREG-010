@@ -25,21 +25,28 @@ Item {
 	// the app keeps Victron/Solar on the all-hours average: it charges with the engine off
 	readonly property var engineOn: ["battVolt", "battCurr", "altCurr", "duty"]
 	readonly property var fields: fieldsItem.valid && String(fieldsItem.value).length ? String(fieldsItem.value).split(",") : []
-	property var d: ({})
+	property var d: ({})               // the last complete redraw (snap)
 	property bool dirty: true
 	property real cursor: NaN
 	property real openedAt: Date.now()
 	property real now: Date.now()
+	property QtObject timing           // XregHome's bench timing log
+	// A redraw gives one chart its data per event-loop turn (step), the charts on screen first, so a tap waits for one
+	// chart's work at most; a chart whose data has not changed keeps what it shows.
+	property var job: null
+	property bool stepPending
+	readonly property bool busy: job !== null
+	property var cache: ({})           // published name -> { raw, n, v, unit, t }: each string parsed once, until it changes
 
 	VeQuickItem { id: want; uid: tab.svc + "/Ui/Want/Long" }
 	VeQuickItem { id: rangeItem; uid: tab.svc + "/Ui/LongRange" }
-	VeQuickItem { id: fieldsItem; uid: tab.svc + "/Plot/Long/Fields"; onValueChanged: tab.dirty = true }
-	VeQuickItem { id: startItem; uid: tab.svc + "/Plot/Long/StartEpoch"; onValueChanged: tab.dirty = true }
-	VeQuickItem { id: stepItem; uid: tab.svc + "/Plot/Long/StepS"; onValueChanged: tab.dirty = true }
-	VeQuickItem { id: echoItem; uid: tab.svc + "/Plot/Long/Range"; onValueChanged: tab.dirty = true }
-	VeQuickItem { id: stageItem; uid: tab.svc + "/Plot/Long/chargeStage"; onValueChanged: tab.dirty = true }
+	VeQuickItem { id: fieldsItem; uid: tab.svc + "/Plot/Long/Fields"; onValueChanged: tab.changed() }
+	VeQuickItem { id: startItem; uid: tab.svc + "/Plot/Long/StartEpoch"; onValueChanged: tab.changed() }
+	VeQuickItem { id: stepItem; uid: tab.svc + "/Plot/Long/StepS"; onValueChanged: tab.changed() }
+	VeQuickItem { id: echoItem; uid: tab.svc + "/Plot/Long/Range"; onValueChanged: tab.changed() }
+	VeQuickItem { id: stageItem; uid: tab.svc + "/Plot/Long/chargeStage"; onValueChanged: tab.changed() }
 	// each field's newest recorded value in the whole ring: the legend's value when its window has none
-	VeQuickItem { id: lastItem; uid: tab.svc + "/Plot/Long/Last"; onValueChanged: tab.dirty = true }
+	VeQuickItem { id: lastItem; uid: tab.svc + "/Plot/Long/Last"; onValueChanged: tab.changed() }
 	Timer {
 		interval: 15000
 		repeat: true
@@ -69,15 +76,46 @@ Item {
 		delegate: VeQuickItem {
 			required property string modelData
 			uid: tab.svc + "/Plot/Long/" + modelData
-			onValueChanged: tab.dirty = true
+			onValueChanged: tab.changed()
 		}
-		onObjectAdded: function(index, object) { tab.items[object.modelData] = object; tab.dirty = true }
+		onObjectAdded: function(index, object) { tab.items[object.modelData] = object; tab.changed() }
 		onObjectRemoved: function(index, object) { delete tab.items[object.modelData] }
 	}
 
-	function arr(name) {
+	function entry(name) {
 		const it = name ? items[name] : null
-		return it && it.valid && String(it.value).length ? String(it.value).split(",").map(s => s.length ? parseFloat(s) : NaN) : null
+		const raw = it && it.valid ? String(it.value) : ""
+		if (!raw.length)
+			return null
+		let c = cache[name]
+		if (!c || c.raw !== raw) {
+			let n = 1
+			for (let i = raw.indexOf(","); i >= 0; i = raw.indexOf(",", i + 1))
+				++n
+			c = cache[name] = { raw: raw, n: n, v: null, unit: -1, t: null }
+		}
+		return c
+	}
+	// The series as numbers, NaN where a bin is empty; temp: converted to the GX's temperature unit
+	function arr(name, temp) {
+		const c = entry(name)
+		if (!c)
+			return null
+		if (!c.v) {
+			const s = c.raw.split(",")
+			let v = new Array(s.length)
+			for (let i = 0; i < s.length; ++i)
+				v[i] = s[i].length ? parseFloat(s[i]) : NaN
+			c.v = v
+		}
+		if (!temp)
+			return c.v
+		const u = Global.systemSettings.temperatureUnit
+		if (c.unit !== u) {
+			c.t = u === VenusOS.Units_Temperature_Celsius ? c.v.map(x => isFinite(x) ? x : NaN) : c.v.map(toUserTemp)
+			c.unit = u
+		}
+		return c.t
 	}
 	function toUserTemp(c) {
 		return isFinite(c) ? Units.convert(c, VenusOS.Units_Temperature_Celsius, Global.systemSettings.temperatureUnit) : NaN
@@ -116,88 +154,206 @@ Item {
 			{ key: "pitch", label: "Pitch", unit: "°", color: Theme.color_red }] }
 	]
 
-	function snap() {
+	Component.onCompleted: Qt.callLater(flush)
+	onVisibleChanged: if (visible) Qt.callLater(flush)
+	// new colours or temperature unit: the Repeater makes new, empty charts
+	onSpecsChanged: changed()
+
+	// Redraw when an update arrives, once per update (as XregPlotsShort)
+	function changed() {
+		dirty = true
+		if (visible && !settle.running)
+			settle.start()
+	}
+	function flush() {
+		if (dirty && visible)
+			snap()
+	}
+	Timer {
+		id: settle
+		interval: BackendConnection.type === BackendConnection.MqttSource ? 100 : 0
+		onTriggered: tab.flush()
+	}
+	// Back from another tab: as the tab was when first opened
+	function reopen() {
+		if (!isNaN(cursor))
+			cursor = NaN
+		openedAt = Date.now()
+		now = openedAt
+		flick.cancelFlick()
+		flick.contentY = 0
+		snap(true)
+	}
+
+	// What every chart shares (the x axis, the newest values, the charge stages), then a step per chart
+	function snap(reset) {
+		const t0 = Date.now()
 		dirty = false
+		settle.stop()
 		const start = Number(startItem.value), stepS = Number(stepItem.value)
+		const valid = startItem.valid && stepItem.valid && stepS > 0 && fields.length > 0
 		let out = { n: 0 }
-		if (!startItem.valid || !stepItem.valid || !(stepS > 0) || fields.length === 0) {
-			d = out
+		let j = { out: out, valid: valid, ticks: [], last: {}, lastRaw: "", stageRaw: "", hdr: "",
+			unit: Global.systemSettings.temperatureUnit, suffix: Global.systemSettings.temperatureUnitSuffix, reset: !!reset,
+			todo: order(), started: t0, work: 0 }
+		if (valid) {
+			let n = 0
+			for (const f of fields) {
+				const c = entry(f)
+				if (c && c.n > n) n = c.n
+			}
+			let xs = []
+			for (let i = 0; i < n; ++i)
+				xs.push(start + i * stepS)
+			out.n = n
+			out.xLo = start
+			out.xHi = start + Math.max(1, n) * stepS
+			out.xs = xs
+			j.hdr = start + "|" + stepS + "|" + n
+			j.lastRaw = lastItem.valid && lastItem.value ? String(lastItem.value) : ""
+			try {
+				j.last = j.lastRaw ? JSON.parse(lastItem.value) : {}
+			} catch (e) {
+				j.last = {}
+			}
+			j.stageRaw = stageItem.valid ? String(stageItem.value) : ""
+			const sv = j.stageRaw.length ? j.stageRaw.split(",").map(s => s.length ? parseFloat(s) : NaN) : null
+			out.stages = sv ? { x: xs, c: sv.map(c => isFinite(c) ? Math.round(c) : 0) } : null
+			j.ticks = ticksFor(out)
+		}
+		job = j
+		j.work = Date.now() - t0
+		if (timing)
+			timing.add("longSlice", j.work)
+		if (!stepPending) {
+			stepPending = true
+			Qt.callLater(step)
+		}
+	}
+	function step() {
+		stepPending = false
+		const j = job
+		if (!j)
+			return
+		if (!visible) {
+			job = null
+			dirty = true
 			return
 		}
-		let n = 0
-		for (const f of fields) {
-			const a = arr(f)
-			if (a && a.length > n) n = a.length
+		const t0 = Date.now()
+		const i = j.todo.shift()
+		const t = tiles.itemAt(i)
+		if (t)
+			show(j, specs[i], t)
+		else
+			dirty = true
+		const done = j.todo.length === 0
+		if (done) {
+			job = null
+			d = j.out
+		} else {
+			stepPending = true
+			Qt.callLater(step)
 		}
-		let xs = []
-		for (let i = 0; i < n; ++i)
-			xs.push(start + i * stepS)
-		out.n = n
-		out.xLo = start
-		out.xHi = start + Math.max(1, n) * stepS
-		out.xs = xs
-		const tempSuffix = Global.systemSettings.temperatureUnitSuffix
-		let lastMap = {}
-		try {
-			lastMap = lastItem.valid && lastItem.value ? JSON.parse(lastItem.value) : {}
-		} catch (e) {
-			lastMap = {}
+		const ms = Date.now() - t0
+		j.work += ms
+		if (timing) {
+			timing.add("longSlice", ms)
+			if (done) {
+				timing.add("long", j.work)
+				timing.add("longWall", Date.now() - j.started)
+			}
 		}
-		for (const sp of specs) {
-			let lines = []
+	}
+	// Charts on screen first, then the rest in page order
+	function order() {
+		let on = [], off = []
+		for (let i = 0; i < specs.length; ++i) {
+			const t = tiles.itemAt(i)
+			if (t && t.y < flick.contentY + flick.height && t.y + t.height > flick.contentY)
+				on.push(i)
+			else
+				off.push(i)
+		}
+		return on.concat(off)
+	}
+	// One chart: its lines from the series it plots, unless none of what they are made from has changed
+	function show(j, sp, t) {
+		const out = j.out
+		let sig = [sp, j.valid, j.hdr, j.lastRaw, j.unit, j.suffix]
+		if (j.valid) {
 			for (const s of sp.series) {
 				const name = nm(s.key)
-				let v = arr(name)
-				if (!v)
-					continue
-				let lo = arr(name + "Min"), hi = arr(name + "Max")
-				const on = arr(name + "OnAvg")
-				if (s.temp) {
-					v = v.map(toUserTemp)
-					lo = lo ? lo.map(toUserTemp) : null
-					hi = hi ? hi.map(toUserTemp) : null
-				}
-				const lastV = lastMap[s.key]
-				const base = { unit: s.temp ? tempSuffix : s.unit, dec: s.dec !== undefined ? s.dec : 1, color: s.color,
-					right: !!s.right, wrap: !!s.wrap, off: !!s.off, x: xs,
-					last: typeof lastV === "number" ? (s.temp ? toUserTemp(lastV) : lastV) : NaN }
-				if (on) {
-					lines.push(Object.assign({}, base, { key: s.key, label: s.label, v: on, lo: lo, hi: hi }))
-					lines.push(Object.assign({}, base, { key: s.key + "W", v: v, dash: true, w: 1, noLegend: true }))
-					out[sp.k + "Dash"] = true
-				} else {
-					lines.push(Object.assign({}, base, { key: s.key, label: s.label, v: v, lo: lo, hi: hi }))
-				}
+				sig.push(name, entry(name), entry(name + "Min"), entry(name + "Max"), entry(name + "OnAvg"))
 			}
-			out[sp.k] = lines
+			if (sp.k === "cur")
+				sig.push(j.stageRaw)
 		}
-		const sv = stageItem.valid && String(stageItem.value).length
-			? String(stageItem.value).split(",").map(s => s.length ? parseFloat(s) : NaN) : null
-		out.stages = sv ? { x: xs, c: sv.map(c => isFinite(c) ? Math.round(c) : 0) } : null
-		d = out
+		if (t.sig && t.sig.length === sig.length && sig.every((x, k) => x === t.sig[k])) {
+			if (j.valid)
+				out[sp.k] = t.lines
+			if (t.dash)
+				out[sp.k + "Dash"] = true
+		} else {
+			let lines = []
+			if (j.valid) {
+				for (const s of sp.series) {
+					const name = nm(s.key)
+					const v = arr(name, s.temp)
+					if (!v)
+						continue
+					const lo = arr(name + "Min", s.temp), hi = arr(name + "Max", s.temp)
+					const on = arr(name + "OnAvg")
+					const lastV = j.last[s.key]
+					const base = { unit: s.temp ? j.suffix : s.unit, dec: s.dec !== undefined ? s.dec : 1, color: s.color,
+						right: !!s.right, wrap: !!s.wrap, off: !!s.off, x: out.xs,
+						last: typeof lastV === "number" ? (s.temp ? toUserTemp(lastV) : lastV) : NaN }
+					if (on) {
+						lines.push(Object.assign({}, base, { key: s.key, label: s.label, v: on, lo: lo, hi: hi }))
+						lines.push(Object.assign({}, base, { key: s.key + "W", v: v, dash: true, w: 1, noLegend: true }))
+						out[sp.k + "Dash"] = true
+					} else {
+						lines.push(Object.assign({}, base, { key: s.key, label: s.label, v: v, lo: lo, hi: hi }))
+					}
+				}
+				out[sp.k] = lines
+			}
+			const xLo = out.n > 0 ? out.xLo : 0, xHi = out.n > 0 ? out.xHi : 1
+			// XregChart redraws in full for each of lines, xLo and xHi that changes: a new x range goes in on no lines
+			if ((t.xLo !== xLo || t.xHi !== xHi) && t.lines.length)
+				t.lines = []
+			t.n = out.n
+			t.xLo = xLo
+			t.xHi = xHi
+			if (t.ticks !== j.ticks)
+				t.ticks = j.ticks
+			t.stages = sp.k === "cur" ? out.stages || null : null
+			t.dash = !!out[sp.k + "Dash"]
+			t.lines = lines
+			t.sig = sig
+		}
+		// back from another tab: a legend entry tapped off or a cursor of its own, as on a new chart
+		if (j.reset && (Object.keys(t.chart.hiddenKeys).length > 0 || !isNaN(t.chart.ownCursor)))
+			t.resets++
 	}
 	Timer {
 		interval: 1000
 		repeat: true
 		triggeredOnStart: true
 		running: tab.visible
-		onTriggered: {
-			tab.now = Date.now()
-			if (tab.dirty)
-				tab.snap()
-		}
+		onTriggered: tab.now = Date.now()
 	}
 
 	// Ticks on local-time boundaries
-	readonly property var ticks: {
-		if (!(d.n > 0))
+	function ticksFor(r) {
+		if (!(r.n > 0))
 			return []
-		const span = d.xHi - d.xLo
+		const span = r.xHi - r.xLo
 		const st = span <= 3700 ? 600 : span <= 22000 ? 3600 : span <= 90000 ? 14400 : span <= 700000 ? 86400 : 432000
 		const fmt = span <= 90000 ? "hh:mm" : span <= 700000 ? "ddd d" : "MMM d"
-		const tzo = new Date(d.xLo * 1000).getTimezoneOffset() * 60
+		const tzo = new Date(r.xLo * 1000).getTimezoneOffset() * 60
 		let t = []
-		for (let s = Math.ceil((d.xLo - tzo) / st) * st + tzo; s <= d.xHi; s += st)
+		for (let s = Math.ceil((r.xLo - tzo) / st) * st + tzo; s <= r.xHi; s += st)
 			t.push({ x: s, t: Qt.formatDateTime(new Date(s * 1000), fmt) })
 		return t
 	}
@@ -205,8 +361,9 @@ Item {
 	readonly property string status: {
 		if (!fieldsItem.valid || fields.length === 0)
 			return ""
-		if (echoItem.valid && String(echoItem.value) !== range)
-			return "Loading " + range
+		// the range tapped, before the bridge echoes /Ui/LongRange
+		if (echoItem.valid && String(echoItem.value) !== rangeSync.shown)
+			return "Loading " + rangeSync.shown
 		if (!isNaN(cursor))
 			return Qt.formatDateTime(new Date(cursor * 1000), spans[ranges.indexOf(range)] > 90000 ? "ddd d MMM hh:mm" : "hh:mm")
 		return ""
@@ -242,6 +399,7 @@ Item {
 	}
 
 	Flickable {
+		id: flick
 		x: tab.m
 		y: tab.bodyY
 		width: tab.width - 2 * tab.m
@@ -259,28 +417,43 @@ Item {
 			spacing: gap
 
 			Repeater {
+				id: tiles
 				model: tab.specs
 				delegate: Rectangle {
+					id: tile
 					required property var modelData
+					// this chart's part of the last redraw, set by show()
+					property var lines: []
+					property real xLo: 0
+					property real xHi: 1
+					property var ticks: []
+					property var stages: null
+					property bool dash
+					property int n
+					property var sig: null
+					property int resets
+					readonly property Item chart: chartItem
 					width: grid.tileW
 					height: grid.tileH
 					radius: Theme.geometry_overviewPage_widget_radius
 					color: Theme.color_background_secondary
 					XregChart {
+						id: chartItem
 						anchors { fill: parent; margins: 10 }
 						title: modelData.title
-						lines: tab.d[modelData.k] || []
-						xLo: tab.d.n > 0 ? tab.d.xLo : 0
-						xHi: tab.d.n > 0 ? tab.d.xHi : 1
-						xTicks: tab.ticks
+						lines: tile.lines
+						xLo: tile.xLo
+						xHi: tile.xHi
+						xTicks: tile.ticks
 						leftFromZero: !!modelData.zero
 						leftUnit: modelData.unit
 						rightFixed: modelData.rightFixed || null
 						rightUnit: modelData.rightUnit || ""
-						stages: modelData.k === "cur" ? tab.d.stages || null : null
-						dashNote: tab.d[modelData.k + "Dash"] ? "dashed: incl. engine off" : ""
-						emptyText: tab.d.n > 0 ? "No data in this range" : tab.noData
+						stages: tile.stages
+						dashNote: tile.dash ? "dashed: incl. engine off" : ""
+						emptyText: tile.n > 0 ? "No data in this range" : tab.noData
 						cursorX: tab.cursor
+						resets: tile.resets
 						onScrubbed: function(xValue) { tab.cursor = xValue }
 					}
 				}

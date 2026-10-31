@@ -20,6 +20,11 @@ Item {
 	readonly property bool oneColumn: width < 760
 	property real now: Date.now() / 1000
 	property real cursor: NaN
+	property bool current: true        // XregPlots: false while another tab shows, when this one parses nothing
+	// XregPlots: back from another tab. Only a chart with a legend entry tapped off or a cursor of its own is reset:
+	// XregChart redraws in full at a reset.
+	property int trendResets
+	property int sessResets
 
 	VeQuickItem { id: want; uid: tab.svc + "/Ui/Want/Health" }
 	Timer {
@@ -60,9 +65,33 @@ Item {
 	VeQuickItem {
 		id: sessCsv
 		uid: tab.svc + "/Health/SessionCsv"
-		onValueChanged: tab.adoptSession()
+		onValueChanged: if (tab.current) tab.adoptSession()
 	}
-	Component.onCompleted: adoptSession()
+	// Opening takes three event-loop turns, so none holds a tap long: the summary, then the trend chart, then the session
+	property bool opened
+	Component.onCompleted: Qt.callLater(() => {
+		opened = true
+		Qt.callLater(adoptSession)
+	})
+	// Back from another tab: as the tab was when first opened
+	function reopen() {
+		if (!isNaN(cursor))
+			cursor = NaN
+		flick.cancelFlick()
+		flick.contentY = 0
+		const own = c => Object.keys(c.hiddenKeys).length > 0 || !isNaN(c.ownCursor)
+		if (own(trendChart))
+			trendResets++
+		if (own(sessChart))
+			sessResets++
+		// the session's dots, after the turn that shows the tab
+		Qt.callLater(() => {
+			moveClock()
+			if (liveRows.length)
+				liveRows = []
+			adoptSession()
+		})
+	}
 	VeQuickItem { id: liveTemp; uid: tab.svc + "/Live/AltTemp" }
 	VeQuickItem { id: liveField; uid: tab.svc + "/Live/Field" }
 	VeQuickItem { id: liveBattV; uid: tab.svc + "/Live/BattV" }
@@ -91,7 +120,7 @@ Item {
 	// Health vs engine-hours, as altTrendData / altTrendXRange / altTrendYRange
 	readonly property var trend: {
 		let pts = []
-		const lines = trendCsv.valid ? String(trendCsv.value).trim().split("\n") : []
+		const lines = tab.current && trendCsv.valid ? String(trendCsv.value).trim().split("\n") : []
 		for (let i = 1; i < lines.length; ++i) {
 			const c = lines[i].split(",")
 			if (c.length >= 3 && isFinite(parseFloat(c[0])))
@@ -178,6 +207,7 @@ Item {
 			rows.push({ tMs: tMs, pct: +c[1], amps: +c[2], measAmps: +c[3], pred: +c[4], rpm: +c[5], fieldPct: +c[6],
 				tempF: +c[7], vbus: +c[8], tSlope: +c[9], state: +c[10], ring: +c[11] })
 		}
+		Qt.callLater(syncSess)
 		if (nowMs === null) {
 			sessRows = []
 			return
@@ -189,7 +219,9 @@ Item {
 				temp: userTemp(r.tempF, VenusOS.Units_Temperature_Fahrenheit), tSlope: r.tSlope }
 		})
 		sessAt = at
-		liveRows = liveRows.filter(r => r.t > at)
+		const kept = liveRows.filter(r => r.t > at)
+		if (kept.length !== liveRows.length)
+			liveRows = kept
 	}
 	function pushLive() {
 		const t = Date.now() / 1000
@@ -212,7 +244,12 @@ Item {
 		repeat: true
 		triggeredOnStart: true
 		running: tab.visible
-		onTriggered: tab.now = Date.now() / 1000
+		onTriggered: tab.moveClock()
+	}
+	// The session window's end, unless it moved under a second ago (the clock's start trigger and a return both move it)
+	function moveClock() {
+		if (Math.abs(Date.now() / 1000 - now) >= 1)
+			now = Date.now() / 1000
 	}
 	readonly property var sess: {
 		const all = sessRows.concat(liveRows).filter(r => r.t > now - 1830)
@@ -251,6 +288,35 @@ Item {
 				{ key: "est", label: "Estimated", unit: "%", dec: 0, x: xs, v: est, color: Theme.color_blue, w: 5.4, dots: true }
 			]
 		}
+	}
+	// The session chart's inputs, each changed only when its value does (XregChart redraws in full for each), once per
+	// event-loop turn and after the tap or update that moved them: the 5 s clock moves the window and leaves the dots, a
+	// new dot leaves the axis
+	property var sessLines: []
+	property var sessYr: [80, 110]
+	property var sessShades: []
+	property bool sessSynced
+	onSessChanged: Qt.callLater(syncSess)
+	function syncSess() {
+		if (!same(sess.yr, sessYr))
+			sessYr = sess.yr
+		if (!same(sess.shades, sessShades))
+			sessShades = sess.shades
+		if (!same(sess.lines, sessLines))
+			sessLines = sess.lines
+		sessSynced = true
+	}
+	function same(a, b) {
+		if (typeof a === "number" || typeof b === "number")
+			return Object.is(a, b)
+		if (a === b)
+			return true
+		if (!a || !b || typeof a !== "object" || typeof b !== "object")
+			return false
+		if (!Array.isArray(a) && String(a).charAt(0) === "#")
+			return String(a) === String(b)
+		const ka = Object.keys(a), kb = Object.keys(b)
+		return ka.length === kb.length && ka.every(k => same(a[k], b[k]))
 	}
 	readonly property var sessTicks: {
 		let t = []
@@ -314,6 +380,7 @@ Item {
 	}
 
 	Flickable {
+		id: flick
 		x: tab.m
 		y: tab.bodyY
 		width: tab.width - 2 * tab.m
@@ -415,15 +482,18 @@ Item {
 					radius: Theme.geometry_overviewPage_widget_radius
 					color: Theme.color_background_secondary
 					XregChart {
+						id: trendChart
 						anchors { fill: parent; margins: 10 }
 						title: "Charging System Health vs Engine Hours"
-						lines: tab.trendDemo ? [] : tab.trendView.lines
+						lines: tab.trendDemo || !tab.opened ? [] : tab.trendView.lines
 						xLo: tab.trendView.xLo
 						xHi: tab.trendView.xHi
 						xTicks: tab.trendTicks
 						leftFixed: tab.trendView.yr
 						leftUnit: "%"
-						emptyText: !trendCsv.valid || !String(trendCsv.value).length ? "Waiting for data"
+						resets: tab.trendResets
+						emptyText: !tab.opened ? ""
+							: !trendCsv.valid || !String(trendCsv.value).length ? "Waiting for data"
 							: tab.trendDemo ? "Real results appear after 3 engine-hours (" + Math.min(tab.trend.length, 3) + " of 3 collected)"
 							: "No points in this window"
 					}
@@ -437,15 +507,16 @@ Item {
 						id: sessChart
 						anchors { left: parent.left; right: parent.right; top: parent.top; bottom: detail.top; margins: 10 }
 						title: "This Session"
-						lines: tab.sess.lines
+						lines: tab.sessLines
 						xLo: tab.now - 1800
 						xHi: tab.now
 						xTicks: tab.sessTicks
-						leftFixed: tab.sess.yr
+						leftFixed: tab.sessYr
 						leftUnit: "%"
-						shades: tab.sess.shades
-						emptyText: "No graded points in the last 30 minutes"
+						shades: tab.sessShades
+						emptyText: tab.sessSynced ? "No graded points in the last 30 minutes" : ""
 						cursorX: tab.cursor
+						resets: tab.sessResets
 						onScrubbed: function(xValue) { if (!isNaN(xValue)) tab.cursor = xValue }
 					}
 					Column {

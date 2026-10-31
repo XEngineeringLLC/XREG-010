@@ -2084,6 +2084,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   } else {
     dvccVicCutHold = settingRead(NK_dvccVicCutHold).toInt();
   }
+  if (!settingExists(NK_dvccLostStop)) {
+    settingWrite(NK_dvccLostStop, String(dvccLostStop).c_str());
+  } else {
+    dvccLostStop = settingRead(NK_dvccLostStop).toInt();
+  }
   // Captured before either load overwrites the globals, so the recovery pair below is the compile-time
   // default scaled exactly like the seed path — never a hardcoded 12 V number.
   const float dvccCvlMinSeed = dvccCvlMin * seedVScale;

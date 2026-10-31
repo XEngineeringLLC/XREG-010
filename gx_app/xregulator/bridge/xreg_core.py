@@ -5,16 +5,18 @@
 # published path, and the settings model. xregulator_bridge.py maps the Manager and each Core onto their own D-Bus
 # services; the offline tests drive them with dicts in their place.
 
-import collections, concurrent.futures, gzip, http.client, ipaddress, json, logging, math, os, queue, random, re
-import secrets, socket, struct, subprocess, threading, time
+import collections, concurrent.futures, gzip, http.client, ipaddress, itertools, json, logging, math, os, queue, random
+import re, secrets, socket, struct, subprocess, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 import xreg_cloud as cloud
+import xreg_update
 
 log = logging.getLogger('xregulator')
 
-VERSION = '0.2'
-CACHE_DIR = '/data/xregulator'   # outside the app folder: push_to_gx.sh mirrors that one with --delete
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VERSION = xreg_update.app_version(APP_DIR)
+CACHE_DIR = '/data/xregulator'   # outside the app folder: every install (install.sh) replaces that one
 EMPTY = -1999999999              # wire values at or below this mean "no reading" (firmware ROLL_EMPTY)
 
 # SSE event -> the web app's field list for it, read from the served script.js
@@ -65,15 +67,13 @@ LIVE = (
     ('DvccCcl',     'CSVData2', 'dvccRxCcl',              10,  None),
     ('DvccCanAge',  'TimestampData', 'ts_DvccVeCan',      1,   None),
     ('DvccWifiAge', 'TimestampData', 'ts_DvccWifi',       1,   None),
+    ('DvccStop',    'CSVData2', 'dvccNoLimitStop',        1,   None),   # 1 = Stop Charging Without Limits holding charging at zero
 )
 LIVE_WIND = ('TrueWind', 'TrueWindAngle', 'AppWind')
 # Apparent wind's age on the TimestampData stream, ms at that frame (999999 never seen). Older than the firmware's own
 # DATA_TIMEOUT it is no reading: firmware before 2026-10-29 sends a never-seen apparent wind as 0, not the empty marker.
 WIND_TS = {'ApparentWindSpeedNMEA': 'ts_AppWindSpeed', 'ApparentWindAngleNMEA': 'ts_AppWindAngle'}
 WIND_STALE_MS = 10000
-HIST_EVERY_S = 2
-HIST_LEN = 150       # 5 minutes at 2 s
-HISTORY = (('AltAmps', 1), ('BattV', 2), ('Field', 0))   # /History/<name> = comma-separated samples, oldest first
 WIND_EVERY_S = 30
 WIND_LEN = 120       # /History/<name>: 1 hour of 30 s means of each wind speed below
 # (path name, /Live name, demo backfill field): Wind is true wind speed, AppWind apparent (the Dashboard's wind tile)
@@ -81,7 +81,8 @@ WIND_HIST = (('Wind', 'TrueWind', 'TrueWindSpeedNMEA'), ('AppWind', 'AppWind', '
 BARO_FETCH_S = 600   # the regulator stores one barometer sample every 10 minutes
 BARO_KEEP = 432      # /History/Baro: 3 days, newest last; /History/BaroEnd is the newest sample's epoch
 
-# /Plot/Short/<name>: (CSV1 field, wire scale, conversion, decimals); 1 s means, last 300
+# Short Term series (ShortRecorder, /Fast/Short): (name, CSV1 field, wire scale, conversion, decimals), one sample per
+# CSV1 frame over the last SHORT_S seconds; the page's order, chargeStage after them
 SHORT = (
     ('MeasuredAmps',           'MeasuredAmps',           100, None,   1),
     ('Bcur',                   'Bcur',                   100, None,   1),
@@ -93,17 +94,31 @@ SHORT = (
     ('RPM',                    'RPM',                    1,   None,   0),
     ('AlternatorTemperatureC', 'AlternatorTemperatureF', 100, F_TO_C, 1),
 )
-SHORT_LEN = 300
-SHORT_PUB_S = 2
+SHORT_S = 300            # the Short Term page's longest window
+SHORT_GAP_EVERY_S = 1.0  # a stale stream adds an empty sample this often, so the page's time axis moves on
+SHORT_QUEUE_MAX = 2000   # CSV1 frames the stream reader holds for the main loop (a stalled main loop drops the oldest)
+# The fast lane, published as frames arrive while a page asks for it: /Fast/Short (ShortRecorder.message) and
+# /Fast/Live, the CSV1 readouts the Dashboard and the header show (/Live names; OnOff as /SwitchableOutput/0/State shows
+# it). The Dashboard's Alt and Batt amps stay on /Live, the power flow's readings, so a chip and the tile never disagree.
+FAST_LIVE = ('Field', 'BattV', 'Rpm', 'AltTemp', 'AmpTarget', 'Ignition', 'FieldStatus', 'OffReason')
+# /Fast/Live's numbers about twice a second, as the web app's gauges (GAUGE_RENDER_INTERVAL_MS 500), so the last digit
+# is readable; 0.45 so frames 100 ms apart give 0.5 s, not 0.6. A change in LIVE_STATE goes out with the frame.
+LIVE_READOUT_S = 0.45
+LIVE_STATE = ('OnOff', 'Ignition', 'FieldStatus', 'OffReason')
+FAST_MIN_S = 0.09       # the fast lane's shortest spacing: frames that arrive together (after a WiFi stall) go as one
+LIVE_RPM = 200           # the firmware's engine-spinning threshold (g_engineSpinningNow)
 # /Plot/Wind/<name>: 10 s means over the last hour; angles as vector means
 WIND_PLOT = (('Tws', 'TrueWindSpeedNMEA', 100, False), ('Twa', 'TrueWindAngleNMEA', 1, True),
              ('Aws', 'ApparentWindSpeedNMEA', 100, False), ('Awa', 'ApparentWindAngleNMEA', 1, True))
 WIND_PLOT_S = 10
 WIND_PLOT_LEN = 360
 
-WANT_TOPICS = ('Short', 'Long', 'Health', 'Wind', 'Perf', 'Settings', 'Flow', 'Cloud')
+WANT_TOPICS = ('Short', 'Long', 'Health', 'Wind', 'Perf', 'Settings', 'Flow', 'Cloud', 'Live')
 WANT_HOLD_S = 45.0
 FAST_TOPICS = ('Short', 'Wind', 'Perf', 'Health')   # pages that hold the regulator's engine-running GX schedule
+# pages that also ask for CSV1 at the web app's rate (/gxrate?fast=2; older firmware reads it as fast=1). Live is the
+# Dashboard, which the home page always shows: it asks only while the engine turns or the field is on, like Perf.
+LIVE_TOPICS = ('Short', 'Live')
 PERF_FAST_KN = 1.0   # the home page always wants Perf; below this SOG and STW, it must not hold the fast schedule at anchor
 FAST_EVERY_S = 30
 LONG_RANGES = {'1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800, '30d': 2592000}
@@ -153,10 +168,11 @@ FLOW_UNMEASURED_A = 1.0   # more into the battery than the sources give, past th
 # footnote names the difference: every sensor's offset, gain errors that grow with the current, and GX readings up to a
 # second apart from the regulator's
 FLOW_GAP_FRAC = 0.05    # of the sources' total, when that is more than FLOW_UNMEASURED_A
-# An imbalance ('unmeasured', 'gap') must hold this long before the footnote names it: two CSV4 frames at the tile's 2 s,
-# longer than the skew between inputs (a CSV4 frame against GX readings polled every 1 s, each up to 1 s old)
+# An imbalance ('unmeasured', 'gap') must hold this long before the footnote names it: two CSV4 frames at the slowest
+# tile rate (2 s, older firmware), longer than the skew between inputs (a CSV4 frame against GX readings polled every
+# 1 s, each up to 1 s old)
 FLOW_IMBALANCE_S = 4.0
-FLOW_HOLD_EVERY_S = 30  # /gxrate?flow=1 holds CSV4 at 2 s for 60 s; renewed this often while the tile is shown
+FLOW_HOLD_EVERY_S = 30  # /gxrate?flow=1 holds CSV4 at 1 s (2 s on older firmware) for 60 s; renewed this often while the tile is shown
 DVCC_HEARD_MS = 20000   # a Victron carrier counts as heard within this (the app's Victron card rule)
 # Row kinds in display order; the tile's table gives each its words and colour. 'alt' is this regulator, 'altx' any other
 # alternator (another regulator, an Orion XS in alternator mode, a Victron alternator), 'source' a generic DC meter;
@@ -601,36 +617,96 @@ def frame_after(c4, ts):
 # ---- Recorders (fed on the main tick) ----
 
 class ShortRecorder:
-    # 1 s means of every CSV1 frame that arrived in that second; a second with no frame holds the previous value while
-    # the stream is fresh (the GX schedule can send CSV1 only every 5-10 s), else it is a gap.
+    # One sample per CSV1 frame, numbered from 1 within this recorder (its epoch) and timed in ms: by the regulator's own
+    # clock (sendMs) while one stream from one boot lasts, else by the bridge's. A stale stream adds an empty sample every
+    # SHORT_GAP_EVERY_S, so the page's time axis moves on and its line breaks. Kept for SHORT_S plus the one sample before,
+    # which the line enters the window from. Each value is formatted once, when it arrives.
     def __init__(self):
-        self.series = {name: collections.deque(maxlen=SHORT_LEN) for name, *_ in SHORT}
-        self.stage = collections.deque(maxlen=SHORT_LEN)
+        self.epoch = secrets.token_hex(4)
+        self.t = collections.deque()                                      # ms on this recorder's timeline
+        self.cols = [collections.deque() for _ in range(len(SHORT) + 2)]  # dt from the sample before, SHORT, chargeStage
+        self.n = 0                     # number of the newest sample
+        self.at = None                 # bridge clock of the newest sample
+        self.prev = None               # (stream generation, sessionId, sendMs, t) of the newest frame
+        self.empty = True              # the newest sample is a gap (or there is none)
 
-    def close(self, means, fresh, stage):
-        for name, _field, _scale, conv, _dec in SHORT:
-            q = self.series[name]
-            m = means.get(name)
-            if m is not None:
-                v = conv(m) if conv else m
-            elif fresh and q:
-                v = q[-1]
+    def _append(self, t, texts):
+        if self.t:
+            t = max(t, self.t[-1] + 1)
+        self.cols[0].append(str(t - self.t[-1]) if self.t else '0')
+        self.t.append(t)
+        for q, s in zip(self.cols[1:], texts):
+            q.append(s)
+        self.n += 1
+        while len(self.t) >= 2 and self.t[1] <= t - SHORT_S * 1000:
+            self.t.popleft()
+            for q in self.cols:
+                q.popleft()
+        return t
+
+    def _clock(self, at):
+        # this recorder's time at bridge clock `at`, carried on from the newest sample
+        return self.t[-1] + max(0, int(round((at - self.at) * 1000))) if self.t else 0
+
+    def frame(self, at, gen, frame, stage):
+        sess, sms = frame.get('sessionId'), frame.get('sendMs')
+        sms = int(sms) if sms is not None else None
+        t = None
+        p = self.prev
+        if sms is not None and p and p[:2] == (gen, sess):
+            d = (sms - p[2]) & 0xFFFFFFFF
+            if 0 < d < 0x80000000:
+                t = p[3] + d
+        texts = []
+        for _name, field, scale, conv, dec in SHORT:
+            raw = frame.get(field)
+            if raw is None or raw <= EMPTY:
+                texts.append('')
             else:
-                v = None
-            q.append(v)
-        self.stage.append(stage if fresh else None)
+                v = raw / scale
+                texts.append('%.*f' % (dec, conv(v) if conv else v))
+        texts.append('' if stage is None else '%d' % stage)
+        t = self._append(self._clock(at) if t is None else t, texts)
+        self.at, self.empty = at, False
+        self.prev = (gen, sess, sms, t) if sms is not None else None
 
-    def strings(self):
-        out = {name: fmt_series(self.series[name], dec) for name, _f, _s, _c, dec in SHORT}
-        out['chargeStage'] = fmt_series(self.stage, 0)
-        return out
+    def gap(self, at):
+        # the stream is stale: no reading now (nothing before the first sample)
+        if not self.t or (self.empty and at - self.at < SHORT_GAP_EVERY_S):
+            return
+        self._append(self._clock(at), [''] * (len(SHORT) + 1))
+        self.at, self.empty = at, True
 
-    def fill(self, rows):
-        # /demoBackfill "short" rows (parse_backfill), oldest first, one per second, already in engineering units
+    def message(self, since=None):
+        # /Fast/Short: "s1;epoch;newest number;count;full;dt,..;<one ;-separated list per SHORT series, then
+        # chargeStage>", the samples after number `since`, or every sample held (full 1) when since is None or no longer
+        # held. A dt is ms from the sample before; a full message's first is 0.
+        held = len(self.t)
+        full = since is None or since < self.n - held or since > self.n
+        k = held if full else self.n - since
+        if full:
+            cols = [','.join(itertools.chain(('0',), itertools.islice(self.cols[0], 1, None))) if held else '']
+            cols += [','.join(q) for q in self.cols[1:]]
+        else:
+            cols = [','.join(reversed(list(itertools.islice(reversed(q), k)))) for q in self.cols]
+        return 's1;%s;%d;%d;%d;%s' % (self.epoch, self.n, k, 1 if full else 0, ';'.join(cols))
+
+    def fill(self, rows, at):
+        # /demoBackfill "short" rows (parse_backfill), oldest first, one per second, already in engineering units; the
+        # newest is now. A reading a row lacks holds the one before.
         self.__init__()
-        for r in rows[-SHORT_LEN:]:
-            self.close({name: r[field] for name, field, *_ in SHORT if r.get(field) is not None}, True,
-                       r.get('chargeStage'))
+        last = [''] * (len(SHORT) + 1)
+        for i, r in enumerate(rows):
+            texts = []
+            for j, (_name, field, _scale, conv, dec) in enumerate(SHORT):
+                v = r.get(field)
+                texts.append(last[j] if v is None else '%.*f' % (dec, conv(v) if conv else v))
+            st = r.get('chargeStage')
+            texts.append(last[-1] if st is None else '%d' % st)
+            self._append(i * 1000, texts)
+            last = texts
+        if self.t:
+            self.at, self.empty = at, False
 
 
 class WindRecorder:
@@ -1207,7 +1283,8 @@ class Link:
         self.mismatch = None
         self.frames = {}
         self.frame_at = {}
-        self.short_acc = {}
+        self.short_q = collections.deque(maxlen=SHORT_QUEUE_MAX)   # (clock, generation, CSV1 frame) for ShortRecorder
+        self.on_frame = None         # called on the stream thread after each CSV1 frame (Core: the fast lane)
         self.sock = None
         self.uid_mismatch = False
         discovery.watch[uid] = self.wake
@@ -1272,8 +1349,8 @@ class Link:
 
     def take_short(self):
         with self.lock:
-            acc, self.short_acc = self.short_acc, {}
-        return {name: s / n for name, (s, n) in acc.items() if n}
+            q, self.short_q = self.short_q, collections.deque(maxlen=SHORT_QUEUE_MAX)
+        return q
 
     # -- connection thread --
 
@@ -1461,12 +1538,9 @@ class Link:
                 self.frame_at[event] = now
                 if event == 'CSVData':
                     self.ever_live = True
-                    for name, field, scale, _conv, _dec in SHORT:
-                        raw = frame.get(field)
-                        if raw is not None and raw > EMPTY:
-                            a = self.short_acc.setdefault(name, [0.0, 0])
-                            a[0] += raw / scale
-                            a[1] += 1
+                    self.short_q.append((now, self.generation, frame))
+            if event == 'CSVData' and self.on_frame is not None:
+                self.on_frame()
         elif event in SCHEMA_EVENTS:
             vals = parse_plain(payload)
             if vals is None:
@@ -1893,6 +1967,7 @@ class Core:
         self.hold = {}
         self.want_at = {}
         self.want_on = dict.fromkeys(WANT_TOPICS, False)
+        self.want_rose = False   # a page just opened: the bridge ticks this unit at once instead of within 500 ms
         self.trend_want_at = {}   # Health window -> when a screen last asked for it
         self.trend_on = dict.fromkeys(HEALTH_WINDOWS, False)
         self.long_range = '24h'
@@ -1902,7 +1977,6 @@ class Core:
         self.next = collections.defaultdict(float)   # next due time per periodic job
         self.short = ShortRecorder()
         self.wind_plot = WindRecorder()
-        self.hist = {name: collections.deque(maxlen=HIST_LEN) for name, _ in HISTORY}
         self.wind = {name: collections.deque(maxlen=WIND_LEN) for name, _, _ in WIND_HIST}
         self.wind_acc = {name: [] for name, _, _ in WIND_HIST}
         self.baro = []
@@ -1914,8 +1988,20 @@ class Core:
         self.result_seq = 0
         self.reset_paths = set()
         self.added = set()
-        self.fast_held = False
+        self.fast_held = 0           # the /gxrate fast level this bridge holds the regulator at (0 none)
         self.fast_next = 0.0
+        # the fast lane (/Fast/*): the bridge's arrival hook (xregulator_bridge.py) sets wake; the stream thread calls it
+        # after a CSV1 frame while fast_wanted
+        self.wake = None
+        self.fast_pending = False    # xregulator_bridge.py: a fast-lane tick is scheduled
+        self.fast_wanted = False
+        self.fast_at = -1e18         # clock of the last fast-lane publish
+        self.fast_epoch = None       # ShortRecorder epoch and number of the newest sample /Fast/Short has carried
+        self.fast_since = None
+        self.fast_full = False       # a page asked for the whole Short Term history (/Fast/ShortFull)
+        self.fast_shown = dict.fromkeys(LIVE_TOPICS, False)
+        self.live_at, self.live_state = -1e18, None   # the last /Fast/Live readings sent: clock, LIVE_STATE values
+        self.link.on_frame = self._arrived
         self.last_generation = 0
         self.last_name = None
         self.live = False
@@ -2004,13 +2090,12 @@ class Core:
                   (g + '/Settings/Group', group, 'free'), (g + '/Settings/CustomName', '', 'free')]
         p += [('/Live/' + name, None, None) for name, *_ in LIVE]
         p += [('/Live/AltCapMax', None, None)]
-        p += [('/History/' + name, '', None) for name, _ in HISTORY]
-        p += [('/History/IntervalS', HIST_EVERY_S, None), ('/History/Baro', '', None), ('/History/BaroEnd', None, None)]
+        p += [('/History/Baro', '', None), ('/History/BaroEnd', None, None)]
         p += [('/History/' + name, '', None) for name, _, _ in WIND_HIST]
         p += [('/Ui/Want/' + t, None, 'core') for t in WANT_TOPICS]
         p += [('/Ui/LongRange', self.long_range, 'core')]
         p += [('/Ui/Want/HealthTrend/%d' % h, None, 'core') for h in HEALTH_WINDOWS]
-        p += [('/Plot/Short/' + name, '', None) for name, *_ in SHORT] + [('/Plot/Short/chargeStage', '', None)]
+        p += [('/Fast/Short', '', None), ('/Fast/ShortFull', None, 'core'), ('/Fast/Live', '', None)]
         p += [('/Plot/Long/Fields', '', None), ('/Plot/Long/StartEpoch', None, None), ('/Plot/Long/StepS', None, None),
               ('/Plot/Long/Range', self.long_range, None), ('/Plot/Long/Last', '', None)]
         p += [('/Plot/Long/' + name, '', None) for name in self._long_series_names()]
@@ -2078,7 +2163,17 @@ class Core:
             topic = path[9:]
             if topic not in WANT_TOPICS:
                 return False
+            if not self.want(topic, now):
+                self.want_rose = True
             self.want_at[topic] = now
+            if topic in LIVE_TOPICS:
+                self.fast_wanted = True
+            return True
+        if path == '/Fast/ShortFull':
+            # a Short Term page found a gap in /Fast/Short (or saw it first): the whole history goes out now
+            self.fast_full = True
+            self.want_rose = True
+            self.reset_paths.add(path)
             return True
         if path == '/Cloud/Refresh':
             self.cloud_refresh = True
@@ -2341,6 +2436,7 @@ class Core:
         self._wanted(pub, now, frames, fresh, info, live)
         if self.republish:
             self._republish(pub, now)
+        self._fast(pub, now, frames, fresh, info)
         self._settings(pub, now, frames, info)
         self._limits(pub, now, info)
         self._flow(pub, now, frames, fresh)
@@ -2349,6 +2445,70 @@ class Core:
         for path in self.reset_paths:
             pub[path] = None
         self.reset_paths.clear()
+
+    # -- the fast lane: published as CSV1 frames arrive, between ticks, while a page asks for it --
+
+    def _arrived(self):
+        # stream thread, after each CSV1 frame
+        wake = self.wake
+        if self.fast_wanted and wake is not None:
+            wake()
+
+    def fast_tick(self, pub):
+        now = self.clock()
+        frames, fresh, info = self.link.snapshot()
+        self._short_drain(now, frames, fresh)
+        self._fast(pub, now, frames, fresh, info)
+
+    def _short_drain(self, now, frames, fresh):
+        q = self.link.take_short()
+        if q:
+            c4 = frames.get('CSVData4') if 'CSVData4' in fresh else None
+            stage = c4.get('chargeStage') if c4 else None
+            for at, gen, frame in q:
+                st = 9 if (frame.get('shutdownPhase') or 0) > 0 else stage   # 9: the app's ribbon code for a shutdown
+                self.short.frame(at, gen, frame, None if st is None else int(st))
+        if 'CSVData' not in fresh:
+            self.short.gap(now)
+
+    def _fast(self, pub, now, frames, fresh, info):
+        on = {t: self.want(t, now) for t in LIVE_TOPICS}
+        self.fast_wanted = any(on.values())
+        if on['Short']:
+            # a new history (a demo switch, a backfill) goes out at once, empty or not, numbered from 1, so a page
+            # following the old one starts over without asking
+            new = self.fast_epoch != self.short.epoch
+            if new:
+                self.fast_epoch, self.fast_since = self.short.epoch, None if self.fast_since is None else 0
+            if new or self.fast_full or self.fast_since != self.short.n:
+                pub['/Fast/Short'] = self.short.message(None if self.fast_full else self.fast_since)
+                self.fast_since, self.fast_full = self.short.n, False
+        elif self.fast_shown['Short']:
+            pub['/Fast/Short'] = ''
+            self.fast_since, self.fast_full = None, False
+        if on['Live'] and 'CSVData' in fresh:
+            c1 = frames['CSVData']
+            out = {}
+            for name, ev, field, scale, conv in LIVE:
+                if name in FAST_LIVE:
+                    raw = c1.get(field)
+                    out[name] = None if raw is None or raw <= EMPTY else round(conv(raw / scale) if conv else raw / scale, 3)
+            raw = c1.get('OnOff')
+            on_off = self._onoff(frames, fresh, None if raw is None or raw <= EMPTY else float(raw))
+            if on_off is not None:
+                held = self._held('/SwitchableOutput/0/State', 1 if on_off else 0, now, info)
+                out['OnOff'] = (1 if on_off else 0) if held is None else held
+            else:
+                out['OnOff'] = None
+            state = tuple(out.get(k) for k in LIVE_STATE)
+            if state != self.live_state or now - self.live_at >= LIVE_READOUT_S:
+                pub['/Fast/Live'] = json.dumps(out, separators=(',', ':'))
+                self.live_at, self.live_state = now, state
+        elif on['Live'] or self.fast_shown['Live']:
+            pub['/Fast/Live'] = ''   # no reading: the page shows its no-data state, as /Live does
+            self.live_state = None
+        self.fast_shown = on
+        self.fast_at = now
 
     def _drain(self, pub, now, info):
         while True:
@@ -2375,7 +2535,7 @@ class Core:
                 self._devices_answer(*data)
             elif kind == 'demo':
                 if self.demo:
-                    self._backfill(data)
+                    self._backfill(data, now)
             elif kind == 'demo_retry':
                 self.demo_tries += 1
                 if self.demo_gen == data and self.demo_tries < DEMO_TRIES:
@@ -2481,8 +2641,6 @@ class Core:
 
     def _drop_history(self):
         self.short, self.wind_plot = ShortRecorder(), WindRecorder()
-        for q in self.hist.values():
-            q.clear()
         for name, _, _ in WIND_HIST:
             self.wind[name].clear()
             self.wind_acc[name] = []
@@ -2495,18 +2653,10 @@ class Core:
             self.next['src:' + name] = 0.0
         self.republish = True
 
-    def _backfill(self, data):
+    def _backfill(self, data, now):
         short, wind = data['short'], data['wind']
         if short:
-            self.short.fill(short)
-            fields = {name: field for name, _ev, field, _s, _c in LIVE}
-            picked = short[::-1][::2][:HIST_LEN][::-1]   # one row per 2 s, ending at the newest
-            for name, _ in HISTORY:
-                q = self.hist[name]
-                q.clear()
-                for r in picked:
-                    v = r.get(fields[name])
-                    q.append(v if v is not None else (q[-1] if q else 0.0))
+            self.short.fill(short, now)
         if wind:
             self.wind_plot.fill(wind)
             rows = wind[-3 * WIND_LEN:]
@@ -2521,14 +2671,9 @@ class Core:
 
     def _republish(self, pub, now):
         self.republish = False
-        for name, decimals in HISTORY:
-            pub['/History/' + name] = ','.join('%.*f' % (decimals, x) for x in self.hist[name])
         self._publish_wind(pub)
         pub['/History/Baro'] = ','.join('' if x is None else '%.1f' % x for x in self.baro)
         pub['/History/BaroEnd'] = self.baro_end
-        if self.want('Short', now):
-            for name, text in self.short.strings().items():
-                pub['/Plot/Short/' + name] = text
         if self.want('Wind', now):
             for name, text in self.wind_plot.strings().items():
                 pub['/Plot/Wind/' + name] = text
@@ -2662,13 +2807,7 @@ class Core:
 
     def _recorders(self, pub, now, frames, fresh, live, vals):
         wind_ok = self._since_switch(frames, fresh, 'CSVData4')
-        if now >= self.next['short']:
-            self.next['short'] = max(self.next['short'] + 1.0, now + 0.5) if self.next['short'] else now + 1.0
-            means = self.link.take_short()
-            stage = (frames.get('CSVData4') or {}).get('chargeStage') if 'CSVData4' in fresh else None
-            if 'CSVData' in fresh and (frames['CSVData'].get('shutdownPhase') or 0) > 0:
-                stage = 9   # the app's ribbon code for a shutdown in progress
-            self.short.close(means, live, stage)
+        self._short_drain(now, frames, fresh)
         if wind_ok:
             self.wind_plot.sample(frames['CSVData4'], self._wind_stale(frames, fresh))
         if now >= self.next['wind_plot']:
@@ -2681,13 +2820,6 @@ class Core:
                         pub['/Plot/Wind/' + name] = s
         if not live:
             return
-        if now >= self.next['hist']:
-            self.next['hist'] = now + HIST_EVERY_S
-            for name, decimals in HISTORY:
-                q = self.hist[name]
-                v = vals[name]
-                q.append(v if v is not None else (q[-1] if q else 0.0))
-                pub['/History/' + name] = ','.join('%.*f' % (decimals, x) for x in q)
         for name, live_name, _ in WIND_HIST:
             if vals[live_name] is not None and wind_ok:
                 self.wind_acc[name].append(vals[live_name])
@@ -2730,15 +2862,7 @@ class Core:
             self.next['baro'] = now + BARO_FETCH_S
             self._fetch('baro', '/baroHistory.bin', parse_baro)
 
-        # Short term
-        if on['Short'] and (rose['Short'] or now >= self.next['short_pub']):
-            self.next['short_pub'] = now + SHORT_PUB_S
-            for name, s in self.short.strings().items():
-                pub['/Plot/Short/' + name] = s
-        if fell['Short']:
-            for name, *_ in SHORT:
-                pub['/Plot/Short/' + name] = ''
-            pub['/Plot/Short/chargeStage'] = ''
+        # Short term: the fast lane (_fast)
 
         # Long term
         pub['/Plot/Long/Range'] = self.long_range
@@ -2834,21 +2958,29 @@ class Core:
         c4 = (frames.get('CSVData4') or {}) if 'CSVData4' in fresh else {}
         moving = any(c4.get(f) is not None and c4[f] > EMPTY and c4[f] / 100.0 >= PERF_FAST_KN
                      for f in ('SOGNMEA', 'STWNMEA'))
-        fast = any(on[t] for t in FAST_TOPICS if t != 'Perf' or moving) and connected and info['channel'] == 'gxevents'
+        c1 = (frames.get('CSVData') or {}) if 'CSVData' in fresh else {}
+        rpm, field = c1.get('RPM'), c1.get('fieldActiveStatus')
+        running = (rpm is not None and rpm >= LIVE_RPM) or (field is not None and field > EMPTY and field != 0)
+        level = 0
+        if connected and info['channel'] == 'gxevents':
+            if any(on[t] for t in LIVE_TOPICS if t != 'Live' or running):
+                level = 2
+            elif any(on[t] for t in FAST_TOPICS if t != 'Perf' or moving):
+                level = 1
         if info['generation'] != self.last_generation:
             self.last_generation = info['generation']
-            self.fast_next, self.fast_held = 0.0, False
+            self.fast_next, self.fast_held = 0.0, 0
             self.flow_next, self.flow_held = 0.0, False
-        if fast and now >= self.fast_next:
-            self.fast_next = now + FAST_EVERY_S
-            self.fast_held = True
-            self._gxrate('fast', 1)
-        elif not fast and self.fast_held:
-            self.fast_held = False
-            self.fast_next = 0.0
-            if connected:
-                self._gxrate('fast', 0)
-        # The power-flow tile holds only CSV4 at 2 s (firmware without that hold ignores flow=)
+        # a request refused because one is still on its way is tried again on the next tick
+        if level and (level != self.fast_held or now >= self.fast_next):
+            if self._gxrate('fast', level):
+                self.fast_next = now + FAST_EVERY_S
+                self.fast_held = level
+        elif not level and self.fast_held:
+            if not connected or self._gxrate('fast', 0):
+                self.fast_held = 0
+                self.fast_next = 0.0
+        # The power-flow tile holds only CSV4 at 1 s, 2 s on older firmware (firmware without that hold ignores flow=)
         flow = on['Flow'] and connected and info['channel'] == 'gxevents'
         if flow and now >= self.flow_next:
             self.flow_next = now + FLOW_HOLD_EVERY_S
@@ -2869,7 +3001,7 @@ class Core:
                 http_.request('/gxrate', query=q, timeout=5)
             except Exception as e:
                 log.warning('/gxrate: %s', fetch_error_text(e))
-        self.writer.put('gxrate_' + hold, job, dedupe=True)
+        return self.writer.put('gxrate_' + hold, job, dedupe=True)
 
     # -- home page power flow --
 
@@ -3373,7 +3505,7 @@ class Manager:
     # The pinned regulators, each a Core with its own D-Bus service, and what Discovery finds for the owner to pick from.
     # Adding, removing and re-pinning run on the main tick, never inside a D-Bus callback of a service they remove.
     def __init__(self, store, schema_text, discovery, unit_store, forget_store=None, listener=None,
-                 cache_dir=CACHE_DIR, clock=time.monotonic, wall=time.time):
+                 cache_dir=CACHE_DIR, clock=time.monotonic, wall=time.time, updater=None):
         self.store = store                 # 'units': the pinned uids, comma-separated, in the order added
         self.schema_text = schema_text or ''
         self.discovery = discovery
@@ -3393,6 +3525,9 @@ class Manager:
         self.gx_memory = {}                # the GX devices seen (GX_CLASS_KIND), store 'gx_devices'
         self.gx_present = set()            # their keys on D-Bus at the last GX reading
         self.gx_meter = False              # a DC system meter among them
+        # the GX app's own updates (/Update/*), with install.sh's workspace beside the cache
+        self.updater = updater or xreg_update.Updater(VERSION, APP_DIR, os.path.join(cache_dir, 'install'),
+                                                      clock=clock, wall=wall)
 
     def start(self):
         try:
@@ -3424,11 +3559,16 @@ class Manager:
                 ('/Units', '[]', None), ('/Found', '[]', None), ('/Scanning', 0, None), ('/ProbeResult', '', None),
                 ('/Add', None, 'core'), ('/Remove', None, 'core'), ('/Scan', None, 'core'), ('/Probe', '', 'core'),
                 ('/GxDevices', '[]', None), ('/GxForget', '', 'core'), ('/GxDrawsHouse', '', 'core'),
-                ('/GxMetered', '', 'core')]
+                ('/GxMetered', '', 'core')] + self.updater.static_paths()
 
     # -- writes from D-Bus (main thread) --
 
     def on_write(self, path, value):
+        if path.startswith('/Update/'):
+            ok = self.updater.on_write(path, value)
+            if ok:
+                self.reset_paths[path] = None
+            return ok
         uid = norm_uid(value)
         if path == '/Add':
             # a found regulator, or one the address probe reached; for one already pinned it only says where it is now
@@ -3738,6 +3878,8 @@ class Manager:
         pub['/GxDevices'] = json.dumps(devices, separators=(',', ':'))
         pub['/Found'] = json.dumps(self._found(), separators=(',', ':'))
         pub['/Scanning'] = int(self.discovery.sweeping)
+        for path, v in self.updater.values().items():
+            pub[path] = v
         for path, v in self.reset_paths.items():
             pub[path] = v
         self.reset_paths.clear()

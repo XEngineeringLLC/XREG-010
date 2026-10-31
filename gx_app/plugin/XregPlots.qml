@@ -2,8 +2,9 @@ import QtQuick
 import Victron.VenusOS
 
 // Plots, the home page's second page (XregHome): Short Term and Long Term as in the web app, alternator Health, and
-// Wind (opening on apparent wind). Each tab is loaded only while shown, so only its data is requested from the bridge
-// (/Ui/Want/*).
+// Wind (opening on apparent wind). A tab is built on its first visit and kept, hidden, while another shows: a hidden tab
+// stops its timers, so only the shown tab's data is requested from the bridge (/Ui/Want/*), and redraws nothing. On
+// its return it resets to how it first opened (reopen()) and redraws.
 Item {
 	id: page
 
@@ -20,11 +21,29 @@ Item {
 	property int windWindow: 30
 	property bool windTrue: false
 	property int healthWindow: 0
+	property QtObject timing           // XregHome's bench timing log
+	property int built                 // one bit per tab built so far
 
-	Loader {
-		anchors.fill: parent
-		sourceComponent: [shortTab, longTab, healthTab, windTab][page.tab]
+	Component.onCompleted: built |= 1 << tab
+	onTabChanged: {
+		if (!(built & (1 << tab))) {
+			built |= 1 << tab
+			return
+		}
+		const it = [shortSlot, longSlot, healthSlot, windSlot][tab].item
+		if (it)
+			it.reopen()
 	}
+	component TabSlot: Loader {
+		required property int index
+		anchors.fill: parent
+		active: (page.built & (1 << index)) !== 0
+		visible: page.tab === index
+	}
+	TabSlot { id: shortSlot; index: 0; sourceComponent: shortTab }
+	TabSlot { id: longSlot; index: 1; sourceComponent: longTab }
+	TabSlot { id: healthSlot; index: 2; sourceComponent: healthTab }
+	TabSlot { id: windSlot; index: 3; sourceComponent: windTab }
 
 	XregTabs {
 		x: page.m
@@ -44,6 +63,7 @@ Item {
 			toolY: page.toolY
 			bodyY: page.bodyY
 			windowS: page.shortWindow
+			timing: page.timing
 			onWindowPicked: function(seconds) { page.shortWindow = seconds }
 		}
 	}
@@ -55,6 +75,7 @@ Item {
 			toolX: page.toolX
 			toolY: page.toolY
 			bodyY: page.bodyY
+			timing: page.timing
 		}
 	}
 	Component {
@@ -66,6 +87,7 @@ Item {
 			toolY: page.toolY
 			bodyY: page.bodyY
 			windowH: page.healthWindow
+			current: page.tab === 2
 			onWindowPicked: function(hours) { page.healthWindow = hours }
 		}
 	}
@@ -79,6 +101,7 @@ Item {
 			bodyY: page.bodyY
 			windowMin: page.windWindow
 			trueWind: page.windTrue
+			timing: page.timing
 			onWindowPicked: function(minutes) { page.windWindow = minutes }
 			onFramePicked: function(isTrue) { page.windTrue = isTrue }
 		}

@@ -10,13 +10,15 @@ import Victron.VenusOS
 // before on one midnight-to-midnight axis.
 // Under 600 px wide (remote console on a phone held upright) the same pieces stack in one scrolling column, the power
 // flow as tall as its rows.
-// Reads the bridge's /Live and /History paths; temperatures arrive in Celsius and show in the owner's unit.
+// Reads the bridge's /Live and /History paths, and its fast lane /Fast/Live for the CSV1 readouts while it is sent;
+// temperatures arrive in Celsius and show in the owner's unit.
 // Status, stage, limiter and off-reason words are the web app's own (script.js fieldOffReasonText etc.).
 Item {
 	id: root
 
 	property bool animationEnabled
 	property string svc
+	property QtObject timing           // XregHome's bench timing log
 	readonly property bool linkUp: connected.valid && connected.value === 1
 	readonly property color brand: "#00a19a"    // web app --accent
 	readonly property real m: 14
@@ -46,26 +48,74 @@ Item {
 
 	VeQuickItem { id: connected; uid: root.svc + "/Connected" }
 	VeQuickItem { id: altAmps; uid: root.svc + "/Live/AltAmps" }
-	VeQuickItem { id: field; uid: root.svc + "/Live/Field" }
-	VeQuickItem { id: battV; uid: root.svc + "/Live/BattV" }
+	VeQuickItem { id: fieldItem; uid: root.svc + "/Live/Field" }
+	VeQuickItem { id: battVItem; uid: root.svc + "/Live/BattV" }
 	VeQuickItem { id: battA; uid: root.svc + "/Live/BattA" }
-	VeQuickItem { id: rpm; uid: root.svc + "/Live/Rpm" }
-	VeQuickItem { id: ampTarget; uid: root.svc + "/Live/AmpTarget" }
-	VeQuickItem { id: ignition; uid: root.svc + "/Live/Ignition" }
-	VeQuickItem { id: fieldStatus; uid: root.svc + "/Live/FieldStatus" }
-	VeQuickItem { id: offReason; uid: root.svc + "/Live/OffReason" }
+	VeQuickItem { id: rpmItem; uid: root.svc + "/Live/Rpm" }
+	VeQuickItem { id: ampTargetItem; uid: root.svc + "/Live/AmpTarget" }
+	VeQuickItem { id: ignitionItem; uid: root.svc + "/Live/Ignition" }
+	VeQuickItem { id: fieldStatusItem; uid: root.svc + "/Live/FieldStatus" }
+	VeQuickItem { id: offReasonItem; uid: root.svc + "/Live/OffReason" }
 	VeQuickItem { id: limiter; uid: root.svc + "/Live/Limiter" }
 	VeQuickItem { id: stage; uid: root.svc + "/Live/Stage" }
 	VeQuickItem { id: soc; uid: root.svc + "/Live/Soc" }
 	VeQuickItem { id: health; uid: root.svc + "/Live/Health" }
 	VeQuickItem { id: baro; uid: root.svc + "/Live/Baro" }
 	VeQuickItem { id: appWind; uid: root.svc + "/Live/AppWind" }
-	VeQuickItem { id: onOff; uid: root.svc + "/SwitchableOutput/0/State" }
+	VeQuickItem { id: onOffItem; uid: root.svc + "/SwitchableOutput/0/State" }
 	VeQuickItem {
-		id: altTemp
+		id: altTempItem
 		uid: root.svc + "/Live/AltTemp"
 		sourceUnit: Units.unitToVeUnit(VenusOS.Units_Temperature_Celsius)
 		displayUnit: Units.unitToVeUnit(Global.systemSettings.temperatureUnit)
+	}
+
+	// The CSV1 readouts, twice a second as the web app's gauges: the bridge's fast lane while it sends one (/Fast/Live,
+	// state changes as frames arrive, while this page asks, /Ui/Want/Live), else the 500 ms /Live paths. Alt and Batt amps stay
+	// on /Live: the power flow's own readings, so a chip and the tile never disagree.
+	VeQuickItem { id: wantLive; uid: root.svc + "/Ui/Want/Live" }
+	Timer {
+		interval: 15000
+		repeat: true
+		triggeredOnStart: true
+		running: root.visible && !ScreenBlanker.blanked
+		onTriggered: wantLive.setValue(Math.floor(Date.now() / 1000))
+	}
+	VeQuickItem { id: fastLive; uid: root.svc + "/Fast/Live" }
+	readonly property var fast: {
+		if (!fastLive.valid || !fastLive.value)
+			return null
+		try {
+			return JSON.parse(fastLive.value)
+		} catch (e) {
+			return null
+		}
+	}
+	// a readout as its VeQuickItem has it (valid, value), from the fast lane (fast) when that carries `name`
+	component Live: QtObject {
+		property var fast
+		property string name
+		property QtObject item
+		property var conv: null
+		readonly property bool fromFast: !!fast && fast[name] !== undefined
+		readonly property bool valid: fromFast ? fast[name] !== null : item.valid
+		readonly property var value: !fromFast ? item.value : fast[name] === null ? undefined
+			: conv ? conv(fast[name]) : fast[name]
+	}
+	Live { id: field; fast: root.fast; name: "Field"; item: fieldItem }
+	Live { id: battV; fast: root.fast; name: "BattV"; item: battVItem }
+	Live { id: rpm; fast: root.fast; name: "Rpm"; item: rpmItem }
+	Live { id: ampTarget; fast: root.fast; name: "AmpTarget"; item: ampTargetItem }
+	Live { id: ignition; fast: root.fast; name: "Ignition"; item: ignitionItem }
+	Live { id: fieldStatus; fast: root.fast; name: "FieldStatus"; item: fieldStatusItem }
+	Live { id: offReason; fast: root.fast; name: "OffReason"; item: offReasonItem }
+	Live { id: onOff; fast: root.fast; name: "OnOff"; item: onOffItem }
+	Live {
+		id: altTemp
+		fast: root.fast
+		name: "AltTemp"
+		item: altTempItem
+		conv: c => Units.convert(c, VenusOS.Units_Temperature_Celsius, Global.systemSettings.temperatureUnit)
 	}
 	VeQuickItem {
 		id: battTemp
@@ -82,6 +132,7 @@ Item {
 	VeQuickItem { id: dvccCcl; uid: root.svc + "/Live/DvccCcl" }
 	VeQuickItem { id: dvccCanAge; uid: root.svc + "/Live/DvccCanAge" }
 	VeQuickItem { id: dvccWifiAge; uid: root.svc + "/Live/DvccWifiAge" }
+	VeQuickItem { id: dvccStop; uid: root.svc + "/Live/DvccStop" }
 
 	function num(item) { return root.linkUp && item.valid ? item.value : NaN }
 	// Fixed decimals per quantity and a true minus sign (a digit's width; a hyphen is half that)
@@ -167,20 +218,22 @@ Item {
 		const over = heard.length ? " over " + heard.join(" and ") : ""
 		const lim = [dvccCvl.valid ? pad(dvccCvl.value.toFixed(2), 5) + " V" : "",
 					 dvccCcl.valid ? pad(dvccCcl.value.toFixed(1), 6) + " A" : ""].filter(t => t.length).join(", ")
+		// Stop Charging Without Limits holds charging at zero in every state but following
+		const stopped = dvccStop.valid && dvccStop.value === 1 ? ", charging stopped" : ""
 		switch (dvccState.value) {
 		case 0: return heard.length ? "Charge limits heard" + over + ", not followed" + (lim ? ": " + lim : "") : ""
-		case 1: return "Charge limits: waiting, none heard"
-		case 2: return "Charge limits: settling" + (lim ? ", " + lim : "") + over
+		case 1: return "Charge limits: waiting, none heard" + stopped
+		case 2: return "Charge limits: settling" + (lim ? ", " + lim : "") + over + stopped
 		case 3: return "Charge limits: following " + (lim || "no values") + over
-		case 4: return "Charge limits: stale, the sender went silent"
+		case 4: return "Charge limits: stale, the sender went silent" + stopped
 		case 5: return "Charge limits: untrusted" + (["", ", voltage limit out of range", ", current limit implausible",
-													  ", values flapping"][dvccUntrust.value] || "")
+													  ", values flapping"][dvccUntrust.value] || "") + stopped
 		}
 		return ""
 	}
 	readonly property color limitsColor: !dvccState.valid ? Theme.color_font_secondary
 		: dvccState.value === 3 ? Theme.color_green
-		: dvccState.value >= 4 ? Theme.color_orange : Theme.color_font_secondary
+		: dvccState.value >= 4 || (dvccStop.valid && dvccStop.value === 1) ? Theme.color_orange : Theme.color_font_secondary
 
 	// "a,b,,c" -> numbers, empty entries NaN
 	function series(str) {
@@ -479,6 +532,7 @@ Item {
 			svc: root.svc
 			linkUp: root.linkUp
 			active: root.visible && !ScreenBlanker.blanked
+			timing: root.timing
 		}
 
 		// Right column: wind, barometer
@@ -511,7 +565,7 @@ Item {
 				Shape {
 					id: windPlot
 					anchors.fill: parent
-					preferredRendererType: Shape.CurveRenderer
+					preferredRendererType: Shape.GeometryRenderer
 					readonly property var pts: root.points(windTile.v, 120, 0, windTile.yMax, width, height)   // bridge WIND_LEN
 					ShapePath {
 						strokeColor: "transparent"
@@ -601,7 +655,7 @@ Item {
 				Shape {
 					id: baroPlot
 					anchors { fill: parent; leftMargin: baroTile.gutter }
-					preferredRendererType: Shape.CurveRenderer
+					preferredRendererType: Shape.GeometryRenderer
 					ShapePath {
 						strokeColor: baroTile.colors[2]
 						strokeWidth: 2
