@@ -1766,19 +1766,17 @@ series = tb.series
 
 class TestApparentWindNoData(unittest.TestCase):
     def setUp(self):
-        self.old = xc.WIND_EVERY_S
-        xc.WIND_EVERY_S = 1
         self.reg = fr.FakeReg()
         self.h = Harness(self.reg)
         self.h.until(lambda: self.h.pub['/Connected'] == 1, 15, 'connected')
+        self.h.want('Live')   # the Dashboard: its wind tile follows /Plot/Wind
 
     def tearDown(self):
-        xc.WIND_EVERY_S = self.old
         self.h.close()
         self.reg.close()
 
     def app(self):
-        return [x for x in series(self.h.pub['/History/AppWind'])[1:] if x is not None]
+        return [x for x in self.h.wind('Aws') if x is not None]
 
     def test_never_seen_is_no_data(self):
         # older firmware: CSV4 sends 0 for a wind instrument it never heard, TS says 999999
@@ -1787,10 +1785,11 @@ class TestApparentWindNoData(unittest.TestCase):
         r.ts.update(ts_AppWindSpeed=999999, ts_AppWindAngle=999999)
         h.until(lambda: h.pub['/Live/AppWind'] is None, 10, 'never seen: none')
         h.tick_for(3.0)
-        n = len(self.app())
+        n, tru = len(self.app()), len([x for x in h.wind('Tws') if x is not None])
         h.tick_for(3.5)
-        self.assertEqual(len(self.app()), n)                       # no new apparent means while it reads none
+        self.assertEqual(len(self.app()), n)                       # no new apparent samples while it reads none
         self.assertEqual(h.pub['/Live/TrueWind'], 12.0)            # true wind has its own marker and is untouched
+        self.assertGreater(len([x for x in h.wind('Tws') if x is not None]), tru)
 
     def test_stale_is_no_data_and_fresh_comes_back(self):
         h, r = self.h, self.reg
@@ -1812,9 +1811,8 @@ class TestApparentWindNoData(unittest.TestCase):
         stale = xc.wind_stale({'TimestampData': {'ts_AppWindSpeed': 999999, 'ts_AppWindAngle': 999999}},
                               {'TimestampData'})
         self.assertEqual(stale, {'ApparentWindSpeedNMEA', 'ApparentWindAngleNMEA'})
-        rec.sample(frame, stale)
-        rec.close()
-        self.assertEqual({k: v[-1] for k, v in rec.series.items()}, {'Tws': 12.0, 'Twa': 170.0, 'Aws': None, 'Awa': None})
+        rec.frame(0.0, 1, frame, stale)
+        self.assertEqual(rec.message(None).split(';')[6:], ['12.0', '170', '', ''])
         # a TS frame that is not fresh judges nothing
         self.assertEqual(xc.wind_stale({'TimestampData': {'ts_AppWindSpeed': 999999}}, set()), set())
 

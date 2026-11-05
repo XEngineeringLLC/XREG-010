@@ -8,8 +8,11 @@
 # regulator takes them for its web app (/gxDevices), it also reads the GX's own battery, solar, charger, inverter and DC
 # meter readings (GxReader). All logic lives in xreg_core.py and xreg_update.py; this file only maps it onto D-Bus.
 # Picked regulators: com.victronenergy.settings /Settings/Xregulator/Units, the GX devices seen
-# /Settings/Xregulator/GxDevices; each regulator's VRM instances and last address under
-# /Settings/Devices/xregulator_<uid6>/ and .../xregulator_<uid6>_alt/.
+# /Settings/Xregulator/GxDevices, Slower plotting /Settings/Xregulator/SlowPlots and its automatic choice SlowPlotsAuto
+# and SlowPlotsCheck (the GX app page writes the switches, xreg_core.PlotRate the measurement), the plugin's larger-view chart settings /Settings/Xregulator/Views (XregView writes it); the Plots page's window
+# choices ShortWindow, HealthWindow, WindWindow, WindTrue and the screen memory HomePage, PlotsTab, SetupTab, ShowHelp,
+# CloudTab, CloudSection, CloudSpeedFilter, CloudBoardTabs (XregChoice writes them); each regulator's VRM instances,
+# last address and Long Term range under /Settings/Devices/xregulator_<uid6>/ and .../xregulator_<uid6>_alt/.
 
 import logging, math, os, re, sys
 from functools import partial
@@ -271,7 +274,23 @@ class Bridge:
     def __init__(self):
         self.bus = dbus.SystemBus()
         self.settings = SettingsDevice(self.bus, {'units': ['/Settings/Xregulator/Units', '', 0, 0],
-                                                  'gx_devices': ['/Settings/Xregulator/GxDevices', '', 0, 0]},
+                                                  'gx_devices': ['/Settings/Xregulator/GxDevices', '', 0, 0],
+                                                  'slow_plots': ['/Settings/Xregulator/SlowPlots', 0, 0, 1],
+                                                  'slow_plots_auto': ['/Settings/Xregulator/SlowPlotsAuto', 1, 0, 1],
+                                                  'slow_plots_check': ['/Settings/Xregulator/SlowPlotsCheck', '', 0, 0],
+                                                  'views': ['/Settings/Xregulator/Views', '', 0, 0],
+                                                  'short_window': ['/Settings/Xregulator/ShortWindow', 30, 0, 0],
+                                                  'health_window': ['/Settings/Xregulator/HealthWindow', 0, 0, 0],
+                                                  'wind_window': ['/Settings/Xregulator/WindWindow', 30, 0, 0],
+                                                  'wind_true': ['/Settings/Xregulator/WindTrue', 0, 0, 1],
+                                                  'home_page': ['/Settings/Xregulator/HomePage', 0, 0, 0],
+                                                  'plots_tab': ['/Settings/Xregulator/PlotsTab', 0, 0, 0],
+                                                  'setup_tab': ['/Settings/Xregulator/SetupTab', 0, 0, 0],
+                                                  'show_help': ['/Settings/Xregulator/ShowHelp', 0, 0, 1],
+                                                  'cloud_tab': ['/Settings/Xregulator/CloudTab', 0, 0, 0],
+                                                  'cloud_section': ['/Settings/Xregulator/CloudSection', 0, 0, 0],
+                                                  'cloud_speed_filter': ['/Settings/Xregulator/CloudSpeedFilter', 'overall', 0, 0],
+                                                  'cloud_board_tabs': ['/Settings/Xregulator/CloudBoardTabs', '', 0, 0]},
                                        lambda *a: None, timeout=30)
         try:
             with open(SCHEMA_FILE) as f:
@@ -302,15 +321,16 @@ class Bridge:
     def _paths(uid):
         group = '/Settings/Devices/' + xreg_core.unit_ident(uid)
         return (group + '/ClassAndVrmInstance', group + '/Host', group + '_alt/ClassAndVrmInstance',
-                group + '_batt/ClassAndVrmInstance')
+                group + '_batt/ClassAndVrmInstance', group + '/LongRange')
 
     def _unit_store(self, uid, instance):
         # localsettings moves a taken ClassAndVrmInstance to the next free one
-        inst, host, alt, batt = self._paths(uid)
+        inst, host, alt, batt, long_range = self._paths(uid)
         return Store(SettingsDevice(self.bus, {'instance': [inst, 'switch:%d' % instance, 0, 0],
                                                'host': [host, '', 0, 0],
                                                'alt_instance': [alt, 'alternator:%d' % xreg_core.INSTANCE, 0, 0],
-                                               'batt_instance': [batt, 'battery:%d' % xreg_core.INSTANCE, 0, 0]},
+                                               'batt_instance': [batt, 'battery:%d' % xreg_core.INSTANCE, 0, 0],
+                                               'long_range': [long_range, xreg_core.LONG_DEFAULT, 0, 0]},
                                     lambda *a: None, timeout=30))
 
     def _forget_store(self, uid):
@@ -327,6 +347,7 @@ class Bridge:
         publish(svc, core.static_paths(__file__), partial(self._on_write, core))
         self.units[core.uid] = (core, svc, bus)
         core.wake = partial(self._arrived, core)
+        core.nudge = partial(self._nudge, core)
 
     def unit_removed(self, core):
         self._drop_alt(core.uid)
@@ -491,6 +512,16 @@ class Bridge:
         if unit:
             self._tick_one(core, unit[1])
         return False
+
+    # Any thread: an answer the screen waits on is in the core's inbox; one tick soon shows it
+    def _nudge(self, core):
+        if not core.nudge_pending:
+            core.nudge_pending = True
+            GLib.idle_add(self._nudged, core)
+
+    def _nudged(self, core):
+        core.nudge_pending = False
+        return self._tick_unit(core)
 
     # The fast lane: a CSV1 frame arrived on the stream thread while a page asks for it. One fast tick at a time, at most
     # every FAST_MIN_S; the main loop runs it, as every D-Bus change is made there.

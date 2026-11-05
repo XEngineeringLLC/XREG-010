@@ -4,7 +4,9 @@ import Victron.VenusOS
 // Plots > Health: the web app's Charging System Health panel. Summary (live % of best, confidence, coverage),
 // health vs engine-hours (average and low-10% lines from /alttrend.csv) and This Session (a dot every 5 s from
 // /altsess.csv, then live from /Health/Live while the tab is open). Math and words follow script.js
-// (updateAltHealth, altTrendData, altSessionPush, altSessAdoptHistory, renderAltSessPoint).
+// (updateAltHealth, altTrendData, altSessionPush, altSessAdoptHistory, renderAltSessPoint). A tap on a chart opens its
+// larger view (XregChartPop), with Autoscale, Lock axes and axis limits kept on this GX (the web app keeps its health
+// plots' limits in the browser); no cursor: the line under the session chart reads its newest graded dot.
 Item {
 	id: tab
 
@@ -19,12 +21,9 @@ Item {
 	readonly property var stateLabels: ["MEASURED", "ESTIMATED", "Learning this operating region", "No reference here yet"]
 	readonly property bool oneColumn: width < 760
 	property real now: Date.now() / 1000
-	property real cursor: NaN
 	property bool current: true        // XregPlots: false while another tab shows, when this one parses nothing
-	// XregPlots: back from another tab. Only a chart with a legend entry tapped off or a cursor of its own is reset:
-	// XregChart redraws in full at a reset.
-	property int trendResets
-	property int sessResets
+	readonly property XregView trendPlotView: XregView { svc: tab.svc; name: "healthTrend" }
+	readonly property XregView sessPlotView: XregView { svc: tab.svc; name: "healthSession" }
 
 	VeQuickItem { id: want; uid: tab.svc + "/Ui/Want/Health" }
 	Timer {
@@ -69,21 +68,28 @@ Item {
 	}
 	// Opening takes three event-loop turns, so none holds a tap long: the summary, then the trend chart, then the session
 	property bool opened
-	Component.onCompleted: Qt.callLater(() => {
-		opened = true
-		Qt.callLater(adoptSession)
-	})
+	// the home page, which shows the larger views (XregPop)
+	property Item home: null
+	Component.onCompleted: {
+		for (let p = parent; p; p = p.parent) {
+			if (p.openPop !== undefined) {
+				home = p
+				break
+			}
+		}
+		Qt.callLater(() => {
+			opened = true
+			Qt.callLater(adoptSession)
+		})
+	}
+	function openPop(c) {
+		if (home)
+			home.openPop(c)
+	}
 	// Back from another tab: as the tab was when first opened
 	function reopen() {
-		if (!isNaN(cursor))
-			cursor = NaN
 		flick.cancelFlick()
 		flick.contentY = 0
-		const own = c => Object.keys(c.hiddenKeys).length > 0 || !isNaN(c.ownCursor)
-		if (own(trendChart))
-			trendResets++
-		if (own(sessChart))
-			sessResets++
 		// the session's dots, after the turn that shows the tab
 		Qt.callLater(() => {
 			moveClock()
@@ -117,7 +123,8 @@ Item {
 	}
 	readonly property int sessN: Math.max(0, Math.round(num(hSessN) || 0))
 
-	// Health vs engine-hours, as altTrendData / altTrendXRange / altTrendYRange
+	// Health vs engine-hours, as altTrendData / altTrendXRange; the y axis is the chart's padded autoscale, which takes in the
+	// 100% reference line
 	readonly property var trend: {
 		let pts = []
 		const lines = tab.current && trendCsv.valid ? String(trendCsv.value).trim().split("\n") : []
@@ -137,7 +144,7 @@ Item {
 		}
 		steps.sort((a, b) => a - b)
 		const gap = Math.max(3, (steps.length ? steps[Math.floor(steps.length / 2)] : 1) * 3)
-		let xs = [], avg = [], low = [], prev = null, maxE = 0, lo = 70, hi = 105
+		let xs = [], avg = [], low = [], prev = null, maxE = 0
 		for (const p of trend) {
 			if (prev !== null && p.eng - prev > gap) {
 				xs.push(prev + (p.eng - prev) / 2)
@@ -149,15 +156,12 @@ Item {
 			low.push(p.worst)
 			prev = p.eng
 			maxE = Math.max(maxE, p.eng)
-			if (isFinite(p.worst) && p.worst < lo) lo = Math.max(0, Math.floor(p.worst / 5) * 5)
-			if (isFinite(p.worst) && p.worst > hi) hi = Math.ceil(p.worst)
-			if (isFinite(p.overall) && p.overall > hi) hi = Math.ceil(p.overall)
 		}
 		const win = windowH
 		const xr = win > 0 ? [Math.max(0, maxE - win), Math.max(win, maxE)] : [0, Math.max(4, Math.ceil(maxE))]
 		const blue = Theme.color_blue
 		return {
-			xLo: xr[0], xHi: xr[1], yr: [lo, hi],
+			xLo: xr[0], xHi: xr[1],
 			lines: [
 				{ key: "ref", x: xr, v: [100, 100], color: Theme.color_font_disabled, w: 1, dash: true, noLegend: true },
 				{ key: "avg", label: "average", unit: "%", dec: 0, x: xs, v: avg, color: Qt.rgba(blue.r, blue.g, blue.b, 0.45), w: 1.5 },
@@ -253,7 +257,7 @@ Item {
 	}
 	readonly property var sess: {
 		const all = sessRows.concat(liveRows).filter(r => r.t > now - 1830)
-		let xs = [], meas = [], est = [], ringV = [], shades = [], lo = Infinity, hi = -Infinity, runStart = null, prevT = null
+		let xs = [], meas = [], est = [], ringV = [], shades = [], runStart = null, prevT = null
 		for (const r of all) {
 			const gapBefore = prevT !== null && r.t - prevT > 10
 			if (gapBefore && runStart === null)
@@ -268,18 +272,12 @@ Item {
 			meas.push(r.g && r.state === 0 ? r.pct : NaN)
 			est.push(r.g && r.state === 1 ? r.pct : NaN)
 			ringV.push(r.ring ? r.pct : NaN)
-			if (r.g) {
-				lo = Math.min(lo, r.pct)
-				hi = Math.max(hi, r.pct)
-			}
 			prevT = r.t
 		}
 		if (runStart !== null)
 			shades.push([runStart, now])
-		const pad = Math.max(2, (hi - lo) * 0.15)
 		return {
 			rows: all,
-			yr: isFinite(lo) ? [Math.floor(lo - pad), Math.ceil(hi + pad)] : [80, 110],
 			shades: shades,
 			lines: [
 				{ key: "ring", x: xs, v: ringV, color: Theme.color_orange, w: 9.6, dots: true, noLegend: true },
@@ -290,16 +288,12 @@ Item {
 		}
 	}
 	// The session chart's inputs, each changed only when its value does (XregChart redraws in full for each), once per
-	// event-loop turn and after the tap or update that moved them: the 5 s clock moves the window and leaves the dots, a
-	// new dot leaves the axis
+	// event-loop turn and after the tap or update that moved them: the 5 s clock moves the window and leaves the dots
 	property var sessLines: []
-	property var sessYr: [80, 110]
 	property var sessShades: []
 	property bool sessSynced
 	onSessChanged: Qt.callLater(syncSess)
 	function syncSess() {
-		if (!same(sess.yr, sessYr))
-			sessYr = sess.yr
 		if (!same(sess.shades, sessShades))
 			sessShades = sess.shades
 		if (!same(sess.lines, sessLines))
@@ -324,30 +318,26 @@ Item {
 			t.push({ x: now - mins * 60, t: mins === 0 ? "now" : mins + "m" })
 		return t
 	}
-	// Graded dot nearest the cursor, within a minute
-	readonly property var picked: {
-		if (isNaN(cursor))
-			return null
-		let best = null, bestD = 60
-		for (const r of sess.rows) {
-			if (r.g && Math.abs(r.t - cursor) < bestD) {
-				bestD = Math.abs(r.t - cursor)
-				best = r
-			}
+	// The newest graded dot in the window
+	readonly property var latest: {
+		const rows = sess.rows
+		for (let i = rows.length - 1; i >= 0 && rows[i].t >= now - 1800; --i) {
+			if (rows[i].g)
+				return rows[i]
 		}
-		return best
+		return null
 	}
 	function fx(v, dp, u) { return isFinite(v) ? v.toFixed(dp) + u : "--" }
-	readonly property string pickedLine1: {
-		const p = picked
+	readonly property string latestLine1: {
+		const p = latest
 		if (!p)
-			return "Tap a dot to see the conditions behind it."
+			return ""
 		const ago = Math.max(0, Math.round((now - p.t) / 60))
 		return Math.round(p.pct) + "% · " + (p.state === 0 ? "Measured" : "Estimated") + (p.ring ? " · full steady run" : " · brief point")
 			+ " · " + (ago === 0 ? "just now" : ago + " min ago")
 	}
-	readonly property string pickedLine2: {
-		const p = picked
+	readonly property string latestLine2: {
+		const p = latest
 		if (!p)
 			return ""
 		const unitC = Global.systemSettings.temperatureUnit !== VenusOS.Units_Temperature_Fahrenheit
@@ -481,21 +471,11 @@ Item {
 					height: charts.tileH
 					radius: Theme.geometry_overviewPage_widget_radius
 					color: Theme.color_background_secondary
-					XregChart {
+					TrendChart {
 						id: trendChart
 						anchors { fill: parent; margins: 10 }
-						title: "Charging System Health vs Engine Hours"
-						lines: tab.trendDemo || !tab.opened ? [] : tab.trendView.lines
-						xLo: tab.trendView.xLo
-						xHi: tab.trendView.xHi
-						xTicks: tab.trendTicks
-						leftFixed: tab.trendView.yr
-						leftUnit: "%"
-						resets: tab.trendResets
-						emptyText: !tab.opened ? ""
-							: !trendCsv.valid || !String(trendCsv.value).length ? "Waiting for data"
-							: tab.trendDemo ? "Real results appear after 3 engine-hours (" + Math.min(tab.trend.length, 3) + " of 3 collected)"
-							: "No points in this window"
+						tapOpens: true
+						onOpened: tab.openPop(trendPop)
 					}
 				}
 				Rectangle {
@@ -503,46 +483,111 @@ Item {
 					height: charts.tileH
 					radius: Theme.geometry_overviewPage_widget_radius
 					color: Theme.color_background_secondary
-					XregChart {
+					SessChart {
 						id: sessChart
 						anchors { left: parent.left; right: parent.right; top: parent.top; bottom: detail.top; margins: 10 }
-						title: "This Session"
-						lines: tab.sessLines
-						xLo: tab.now - 1800
-						xHi: tab.now
-						xTicks: tab.sessTicks
-						leftFixed: tab.sessYr
-						leftUnit: "%"
-						shades: tab.sessShades
-						emptyText: tab.sessSynced ? "No graded points in the last 30 minutes" : ""
-						cursorX: tab.cursor
-						resets: tab.sessResets
-						onScrubbed: function(xValue) { if (!isNaN(xValue)) tab.cursor = xValue }
+						tapOpens: true
+						onOpened: tab.openPop(sessPop)
 					}
-					Column {
+					SessDetail {
 						id: detail
 						anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 12 }
-						height: 3 * Math.ceil(Theme.font_size_caption * 1.25) + 4
-						spacing: 2
-						Label {
-							width: parent.width
-							elide: Text.ElideRight
-							text: tab.pickedLine1
-							color: tab.picked ? tab.stateColor(tab.picked.state) : Theme.color_font_secondary
-							font.pixelSize: Theme.font_size_caption
-							font.bold: !!tab.picked
-						}
-						Label {
-							width: parent.width
-							wrapMode: Text.WordWrap
-							maximumLineCount: 2
-							text: tab.pickedLine2
-							color: Theme.color_font_secondary
-							font.pixelSize: Theme.font_size_caption
-						}
 					}
 				}
 			}
+		}
+	}
+
+	Component {
+		id: trendPop
+		XregChartPop {
+			view: tab.trendPlotView
+			chart: bigTrend
+			title: "Charging System Health vs Engine Hours"
+			leftName: "Health"
+			leftUnit: "%"
+			TrendChart {
+				id: bigTrend
+				anchors.fill: parent
+				editAxes: true
+			}
+		}
+	}
+	Component {
+		id: sessPop
+		XregChartPop {
+			view: tab.sessPlotView
+			chart: bigSess
+			title: "This Session"
+			leftName: "Health"
+			leftUnit: "%"
+			SessChart {
+				id: bigSess
+				anchors { left: parent.left; right: parent.right; top: parent.top; bottom: bigDetail.top; bottomMargin: 6 }
+				editAxes: true
+			}
+			SessDetail {
+				id: bigDetail
+				anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+			}
+		}
+	}
+
+	// The health charts, small or in a larger view: their axes from their views, autoscale padded 10% and at least 10
+	// points wide, lines 3 px inside the plot's edges, a fixed axis's limits labelled
+	component TrendChart: XregChart {
+		title: "Charging System Health vs Engine Hours"
+		lines: tab.trendDemo || !tab.opened ? [] : tab.trendView.lines
+		xLo: tab.trendView.xLo
+		xHi: tab.trendView.xHi
+		xTicks: tab.trendTicks
+		view: tab.trendPlotView
+		leftFixed: view.leftFixed
+		leftUnit: "%"
+		leftMinSpan: 10
+		emptyText: !tab.opened ? ""
+			: !trendCsv.valid || !String(trendCsv.value).length ? "Waiting for data"
+			: tab.trendDemo ? "Real results appear after 3 engine-hours (" + Math.min(tab.trend.length, 3) + " of 3 collected)"
+			: "No points in this window"
+		pad: 0.1
+		inset: 3
+		fixedEnds: true
+	}
+	component SessChart: XregChart {
+		title: "This Session"
+		lines: tab.sessLines
+		xLo: tab.now - 1800
+		xHi: tab.now
+		xTicks: tab.sessTicks
+		view: tab.sessPlotView
+		leftFixed: view.leftFixed
+		leftUnit: "%"
+		leftMinSpan: 10
+		shades: tab.sessShades
+		emptyText: tab.sessSynced ? "No graded points in the last 30 minutes" : ""
+		pad: 0.1
+		inset: 3
+		fixedEnds: true
+	}
+	// the newest graded dot and the conditions behind it
+	component SessDetail: Column {
+		height: 3 * Math.ceil(Theme.font_size_caption * 1.25) + 4
+		spacing: 2
+		Label {
+			width: parent.width
+			elide: Text.ElideRight
+			text: tab.latestLine1
+			color: tab.latest ? tab.stateColor(tab.latest.state) : Theme.color_font_secondary
+			font.pixelSize: Theme.font_size_caption
+			font.bold: !!tab.latest
+		}
+		Label {
+			width: parent.width
+			wrapMode: Text.WordWrap
+			maximumLineCount: 2
+			text: tab.latestLine2
+			color: Theme.color_font_secondary
+			font.pixelSize: Theme.font_size_caption
 		}
 	}
 }

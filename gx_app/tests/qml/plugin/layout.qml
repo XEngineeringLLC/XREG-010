@@ -8,6 +8,7 @@ import Victron.VenusOS
 // Table's Charge Rate and Limit by rows (7), its caption and column descriptions (8). Added 2026-10-29: every tab row's
 // titles inside their tabs (9); the table caption's, descriptions' and column headings' sizes (in 8). Later that day:
 // check 9 on every button row, not only tabs; the column headings on one line, inside their columns (in 8).
+// Added 2026-10-31: a settings choice of up to three drawn as buttons on its page (10).
 Window {
 	id: win
 	width: pageW; height: pageH; visible: true
@@ -195,8 +196,8 @@ Window {
 	// 6: the motoring plot's no-data message: empty data, and demo data with its motoring front removed (a live point
 	// and speed readout, no curve)
 	function perfPane() { return find(home, x => x.sailBoat !== undefined && x.plotS !== undefined) }
-	// corner: the live point at 300 RPM and 3.9 kn, top left of the plot's empty 3600 RPM x 4 kn range, so the
-	// readout moves to bottom right
+	// corner: the live point at 300 RPM and 10.9 kn, top left of the plot's empty range (autoscale: 3500 RPM, 10.9 kn plus
+	// 10% to 12 kn), so the readout moves to bottom right
 	property string motorCase
 	function motorPrep(corner) {
 		perfPane().pinned = 1
@@ -207,7 +208,7 @@ Window {
 			MockStore.put(svc + "/Perf/CurveCsv", i >= 0 ? t.slice(0, i) : t)
 			if (corner) {
 				MockStore.put(svc + "/Perf/Motor/rpm", 300)
-				MockStore.put(svc + "/Perf/Motor/spd", 3.9)
+				MockStore.put(svc + "/Perf/Motor/spd", 10.9)
 			}
 		}
 	}
@@ -329,6 +330,25 @@ Window {
 	// places it, not elided, and the tab bar's margin clear of its button's border on both sides. A row drawn the same
 	// (titles, font, width) is checked once per data set.
 	property var tabRowsSeen: ({})
+	// Cloud: a fetch out with leaderboards on screen (/Cloud/Busy) reads "refreshing" in place of their age, Refresh off; a
+	// Refresh tap reads it at once
+	function cloudRefreshChecks(name) {
+		const cl = find(home, x => x.cloudState !== undefined)
+		const btn = find(cl, x => x.text === "Refresh" && x.flat === false)
+		const status = () => find(cl, x => x.elide === Text.ElideRight && /updated|refreshing/.test(String(x.text || "")))
+		if (!cl.model) {
+			check(!status(), name + " cloud: no leaderboards, no age line")
+			return
+		}
+		const before = status().text
+		MockStore.put(svc + "/Cloud/Busy", 1)
+		check(/ · refreshing$/.test(status().text) && !btn.enabled, name + " cloud: a fetch out reads refreshing, Refresh off (" + status().text + ")")
+		MockStore.put(svc + "/Cloud/Busy", 0)
+		check(status().text === before && /updated/.test(before) && btn.enabled, name + " cloud: answered, the age again (" + status().text + ")")
+		btn.clicked()
+		check(/refreshing$/.test(status().text) && !btn.enabled && MockStore.writes.some(w => w.uid === svc + "/Cloud/Refresh"),
+			  name + " cloud: a Refresh tap reads refreshing at once")
+	}
 	function tabChecks(where) {
 		const margin = Theme.geometry_tabBar_horizontalMargin
 		const bars = findAll(stage, x => isSeg(x) && x.visible)
@@ -356,6 +376,35 @@ Window {
 		}
 	}
 
+	// 10: a settings choice of up to three (XregSegButtons): its buttons inside the page, each choice's name inside its
+	// button's border by the tab bar's margin (wrapped, never elided or cut), the row's name clear of the buttons, the
+	// caption under both
+	function segRowChecks(where) {
+		const margin = Theme.geometry_tabBar_horizontalMargin
+		const rows = findAll(top, x => x.chosen !== undefined && x.beside !== undefined && x.visible)
+		check(rows.length > 0, dataName + ", " + where + ": choice button rows found: " + rows.length)
+		for (const row of rows) {
+			const btns = findAll(row, x => x.lit !== undefined && x.labelH !== undefined)
+			const name = find(row, x => x.text === row.text && x.contentWidth !== undefined)
+			const cap = find(row, x => x.text === row.caption && x.contentWidth !== undefined && x !== name)
+			const box = btns.map(b => rect(b))
+			const right = Math.max.apply(null, box.map(r => r.x + r.w))
+			const bad = btns.map((b, i) => {
+				const l = b.contentItem, r = box[i], bw = b.background.border.width
+				const gap = (r.w - l.contentWidth) / 2 - bw
+				return { t: l.text, gap: gap, lines: l.lineCount, cut: l.truncated || l.implicitHeight > r.h + 0.5 || gap < margin - 0.01 }
+			})
+			const nr = name ? rect(name) : null
+			const clear = !!nr && box.every(r => !overlap(nr, { x: r.x, y: r.y, w: r.w, h: r.h }))
+			const capOk = !cap || !cap.visible || box.every(r => rect(cap).y >= r.y + r.h - 0.5)
+			check(btns.length === row.options.length && right <= pageW + 0.5 && !bad.some(b => b.cut) && clear && capOk,
+				dataName + ", " + where + ": " + row.text + " (" + (row.beside ? "beside" : "under") + "): "
+				+ bad.map(b => "\"" + b.t + "\" " + b.lines + " line" + (b.lines > 1 ? "s" : "") + ", " + r1(b.gap) + " px inside" + (b.cut ? " CUT" : "")).join("; ")
+				+ (right > pageW + 0.5 ? "; past the page edge at " + r1(right) : "") + (clear ? "" : "; the name overlaps the buttons")
+				+ (capOk ? "" : "; the caption overlaps the buttons"))
+		}
+	}
+
 	property var queue: []
 	Timer { id: driver; interval: 500; repeat: true; running: true; onTriggered: win.stepOnce() }
 	function stepOnce() {
@@ -374,7 +423,7 @@ Window {
 			for (const t of [0, 1, 2])
 				queue.push(() => build(name, 1), () => { find(home, x => x.windTrue !== undefined && x.shortWindow !== undefined).tab = t }, () => {},
 						() => tabChecks("Plots tab " + t))
-			queue.push(() => build(name, 3), () => {}, () => tabChecks("Cloud"))
+			queue.push(() => build(name, 3), () => {}, () => tabChecks("Cloud"), () => cloudRefreshChecks(name))
 			for (const t of [1, 2])
 				queue.push(() => build(name, 3), () => { find(home, x => x.cloudState !== undefined).tab = t }, () => {}, () => tabChecks("Cloud tab " + t))
 			// each Leaderboards section, for its section row and its boards' tab rows
@@ -394,6 +443,9 @@ Window {
 			queue.push(() => build(name, 2, 0, "alternator/rpm_table"), () => {}, () => ctlRowChecks(""), () => tableRowsShown(), () => insetChecks(""),
 					() => MockStore.put(svc + "/Settings/Value/PhysicalPanelOverride", 1), () => {}, () => ctlRowChecks(", Physical Panel Override on"),
 					() => { top.showHelp = true }, () => {}, () => ctlRowChecks(", override and descriptions on"), () => insetChecks(", descriptions on"))
+			for (const pg of ["alternator/basic", "alarms", "battery/charge_settings", "battery/charge_settings/phase_definitions"])
+				queue.push(() => build(name, 2, 0, pg), () => {}, () => segRowChecks(pg), () => { top.showHelp = true }, () => {},
+						() => segRowChecks(pg + ", descriptions on"))
 		}
 	}
 }

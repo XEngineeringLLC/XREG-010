@@ -11,6 +11,7 @@ Rectangle {
 	property color brand
 	property var fmt: r => r.t      // the page's formatter (a Fahrenheit value in the GX's unit)
 	property int tabIndex: 0
+	signal tabPicked(int index)
 	property int expanded: -1
 	property bool infoOpen
 
@@ -80,7 +81,7 @@ Rectangle {
 			visible: (card.board.tabs || []).length > 1
 			model: (card.board.tabs || []).map(t => t.label)
 			currentIndex: card.tabIndex
-			onPicked: function(index) { card.tabIndex = index }
+			onPicked: function(index) { card.tabPicked(index) }
 		}
 		Label {
 			visible: card.rows.length === 0

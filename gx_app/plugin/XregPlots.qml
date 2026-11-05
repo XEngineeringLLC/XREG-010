@@ -16,11 +16,16 @@ Item {
 	readonly property real toolY: narrow ? 58 : 8
 	readonly property real bodyY: narrow ? 108 : 58
 	property int tab: 0
-	// Window choices survive switching tabs while the page is open
-	property int shortWindow: 30
-	property int windWindow: 30
-	property bool windTrue: false
-	property int healthWindow: 0
+	XregChoice { id: tabChoice; name: "PlotsTab"; shown: 0; follow: false; onShownChanged: page.tab = shown }
+	// The window choices: every screen on the GX shares them. Long Term's range is the bridge's.
+	XregChoice { id: shortChoice; name: "ShortWindow"; shown: 30 }
+	XregChoice { id: windChoice; name: "WindWindow"; shown: 30 }
+	XregChoice { id: windTrueChoice; name: "WindTrue"; shown: 0 }
+	XregChoice { id: healthChoice; name: "HealthWindow"; shown: 0 }
+	readonly property int shortWindow: shortChoice.shown
+	readonly property int windWindow: windChoice.shown
+	readonly property bool windTrue: windTrueChoice.shown === 1
+	readonly property int healthWindow: healthChoice.shown
 	property QtObject timing           // XregHome's bench timing log
 	property int built                 // one bit per tab built so far
 
@@ -51,7 +56,7 @@ Item {
 		width: page.barW
 		model: ["Short Term", "Long Term", "Health", "Wind"]
 		currentIndex: page.tab
-		onPicked: function(index) { page.tab = index }
+		onPicked: function(index) { page.tab = index; tabChoice.pick(index) }
 	}
 
 	Component {
@@ -64,7 +69,7 @@ Item {
 			bodyY: page.bodyY
 			windowS: page.shortWindow
 			timing: page.timing
-			onWindowPicked: function(seconds) { page.shortWindow = seconds }
+			onWindowPicked: function(seconds) { shortChoice.pick(seconds) }
 		}
 	}
 	Component {
@@ -88,7 +93,7 @@ Item {
 			bodyY: page.bodyY
 			windowH: page.healthWindow
 			current: page.tab === 2
-			onWindowPicked: function(hours) { page.healthWindow = hours }
+			onWindowPicked: function(hours) { healthChoice.pick(hours) }
 		}
 	}
 	Component {
@@ -102,8 +107,8 @@ Item {
 			windowMin: page.windWindow
 			trueWind: page.windTrue
 			timing: page.timing
-			onWindowPicked: function(minutes) { page.windWindow = minutes }
-			onFramePicked: function(isTrue) { page.windTrue = isTrue }
+			onWindowPicked: function(minutes) { windChoice.pick(minutes) }
+			onFramePicked: function(isTrue) { windTrueChoice.pick(isTrue ? 1 : 0) }
 		}
 	}
 }

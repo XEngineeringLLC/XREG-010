@@ -32,7 +32,7 @@ Item {
 		rowH: setup.home && setup.home.compact ? 34 : 40
 		model: setup.tabs.map(t => t.title)
 		currentIndex: setup.tab
-		onPicked: function(index) { if (setup.home) setup.home.setupTab = index }
+		onPicked: function(index) { if (setup.home) setup.home.pickSetupTab(index) }
 	}
 
 	XregCfgSection {

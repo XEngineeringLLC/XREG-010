@@ -3,7 +3,9 @@ import Victron.VenusOS
 
 // Health with change-only session chart inputs (new) against the binding-fed one (old): both charts' inputs equal value
 // by value through opening, live dots, the 5 s clock, rows ageing out, new session text, window taps and returns; and
-// what no longer reaches the session chart. Context: oldDir, newDir, healthText.
+// what no longer reaches the session chart. The y axes (the old page's fixed frames, now each chart's padded autoscale
+// from its view) and the cursor (gone; the line under the session chart reads its newest graded dot) are left out of the
+// comparison. Context: oldDir, newDir, healthText.
 Item {
 	id: win
 	width: 1024
@@ -74,16 +76,21 @@ Item {
 	function compare(label) {
 		const co = charts(oldP), cn = charts(newP)
 		let diff = co.length === 2 && cn.length === 2 ? "" : "chart count " + co.length + "/" + cn.length
-		const props = ["title", "lines", "xLo", "xHi", "xTicks", "leftFixed", "leftUnit", "shades", "emptyText", "cursorX"]
+		const props = ["title", "lines", "xLo", "xHi", "xTicks", "leftUnit", "shades", "emptyText"]
 		for (let i = 0; i < 2 && !diff; ++i)
 			for (const p of props) {
 				diff = deq(co[i][p], cn[i][p], co[i].title + "." + p)
 				if (diff)
 					break
 			}
-		for (const p of ["pickedLine1", "pickedLine2", "statusText"])
-			if (!diff)
-				diff = deq(oldP[p], newP[p], p)
+		if (!diff)
+			diff = deq(oldP.statusText, newP.statusText, "statusText")
+		// the newest graded dot in the window, read as the old page read a dot under its cursor
+		const g = newP.sess.rows.filter(r => r.g && r.t >= newP.now - 1800)
+		const last = g.length ? g[g.length - 1] : null
+		if (!diff && (last ? !newP.latestLine1.startsWith(Math.round(last.pct) + "% · " + (last.state === 0 ? "Measured" : "Estimated"))
+					  || newP.latest !== last : newP.latestLine1 !== ""))
+			diff = "latestLine1: " + newP.latestLine1
 		const pts = cn.reduce((s, c) => s + c.lines.reduce((t, l) => t + (l.v ? l.v.length : 0), 0), 0)
 		check(diff === "", label + ": both charts' inputs equal the old page's (" + pts + " line points)" + (diff ? " (" + diff + ")" : ""))
 	}
@@ -156,11 +163,6 @@ Item {
 			}
 			after(1, () => { oldP.now += 600; newP.now += 600 })
 			after(1, () => compare("unit " + unit + ", 10 min on: rows age out"))
-			after(1, () => {
-				const c = charts(oldP)[1], n = charts(newP)[1]
-				c.scrub(c.width * 0.97 - 40); n.scrub(n.width * 0.97 - 40)
-			})
-			after(1, () => compare("unit " + unit + ", a dot picked"))
 			after(1, () => { oldP.windowH = 100; newP.windowH = 100 })
 			after(5, () => compare("unit " + unit + ", window 100 h"))
 			after(1, () => { oldP.windowH = 10; newP.windowH = 10 })
@@ -168,27 +170,20 @@ Item {
 			after(1, () => { put("Health/SessionCsv", hd["Health/SessionCsv"].replace("#nowMs=5000000", "#nowMs=5100000")) })
 			after(5, () => { align(); })
 			after(5, () => compare("unit " + unit + ", new session text"))
-			// a return with nothing tapped: no reset; with a legend entry off: that chart only, as on a new chart
+			// a return: no chart is reset (what a larger view sets is kept in its view), and no chart has a cursor
 			after(1, () => {
 				zero()
-				const tr = newP.trendResets, sr = newP.sessResets
 				oldP.reopen(); newP.reopen()
-				check(charts(newP).every(c => Object.keys(c.hiddenKeys).length === 0 && isNaN(c.ownCursor)) && isNaN(newP.cursor), "return: legend and cursor as new")
-				check(newP.trendResets === tr && newP.sessResets === sr + 1, "return after a dot picked: the session chart alone is reset")
+				check(charts(newP).every(c => Object.keys(c.hiddenKeys).length === 0 && c.tapOpens && !!c.view),
+					"return: both charts open a larger view, keep their settings in a view and have no cursor")
 			})
 			// the new page takes the session's dots a turn after the tap
 			after(5, () => align())
 			after(5, () => compare("unit " + unit + ", return"))
-			after(1, () => {
-				for (const p of [oldP, newP]) { const c = charts(p)[0]; c.toggle(c.lines[1]) }
-				const tr = newP.trendResets, sr = newP.sessResets
-				oldP.reopen(); newP.reopen()
-				check(Object.keys(charts(newP)[0].hiddenKeys).length === 0 && newP.trendResets === tr + 1 && newP.sessResets === sr,
-					"return after a legend tap on the trend chart: it alone is reset")
-			})
+			after(1, () => { oldP.reopen(); newP.reopen() })
 			// the new page takes the session's dots a turn after the tap
 			after(5, () => align())
-			after(5, () => compare("unit " + unit + ", return after a legend tap"))
+			after(5, () => compare("unit " + unit + ", a second return"))
 			after(1, () => {
 				const t0 = newP.now
 				newP.visible = false

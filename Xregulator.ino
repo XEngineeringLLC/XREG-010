@@ -5280,32 +5280,47 @@ float longest_gale_duration_hours_alltime = 0.0;  // leaderboard: lifetime longe
 bool galeActive = false;
 uint32_t galeStartMs = 0;
 
-// IGNITION-CYCLE WATERMARKS: min/max since boot, unlike the NVS-persisted *_AllTime / *Max / *_min. NAN-initialized so the first
-// valid sample seeds both ends (wmIgnUpdate). 18 pairs × 8 bytes, internal RAM.
-struct IgnWatermark { float lo; float hi; };
+// IGNITION-CYCLE WATERMARKS: min/max since boot or the owner's last reset (/get?wmReset=), unlike the NVS-persisted *_AllTime /
+// *Max / *_min. NAN-initialized so the first valid sample seeds both ends (wmIgnUpdate). startS: esp_timer uptime seconds at
+// that boot or reset (0 = boot), so the apps can say "since 2:14 PM"; esp_timer, not millis(), which wraps at 49.7 days on a
+// boat left powered. 18 × 12 bytes, internal RAM.
+struct IgnWatermark { float lo; float hi; uint32_t startS; };
 
-IgnWatermark wmIgn_amps     = { NAN, NAN };   // MeasuredAmps (A)
-IgnWatermark wmIgn_altTempF = { NAN, NAN };   // AlternatorTemperatureF (°F)
-IgnWatermark wmIgn_IBV      = { NAN, NAN };   // IBV — INA228 battery V
-IgnWatermark wmIgn_Bcur     = { NAN, NAN };   // Bcur — INA228 battery A
-IgnWatermark wmIgn_SOC      = { NAN, NAN };   // SOC percent (0..100, float)
-IgnWatermark wmIgn_RPM      = { NAN, NAN };
-IgnWatermark wmIgn_SOG      = { NAN, NAN };   // SOGNMEA (knots)
-IgnWatermark wmIgn_AWS      = { NAN, NAN };   // ApparentWindSpeedNMEA (knots)
-IgnWatermark wmIgn_TWS      = { NAN, NAN };   // TrueWindSpeedNMEA (knots)
-IgnWatermark wmIgn_heel     = { NAN, NAN };   // imu_heel_deg
-IgnWatermark wmIgn_pitch    = { NAN, NAN };   // imu_pitch_deg
-IgnWatermark wmIgn_vacc     = { NAN, NAN };   // imu_vertical_accel_g
-IgnWatermark wmIgn_baro     = { NAN, NAN };   // baroPressure (mbar)
-IgnWatermark wmIgn_ambient  = { NAN, NAN };   // ambientTemp (°F)
-IgnWatermark wmIgn_VMGman   = { NAN, NAN };   // VMGNMEA — VMG to manual bearing (knots)
-IgnWatermark wmIgn_VMGup    = { NAN, NAN };   // VMGUpwind — VMG to windward (knots)
-IgnWatermark wmIgn_battTempF  = { NAN, NAN }; // BatteryTempProbeF (°F)
-IgnWatermark wmIgn_extraTempF = { NAN, NAN }; // ExtraTempF (°F)
+IgnWatermark wmIgn_amps     = { NAN, NAN, 0 };   // MeasuredAmps (A)
+IgnWatermark wmIgn_altTempF = { NAN, NAN, 0 };   // AlternatorTemperatureF (°F)
+IgnWatermark wmIgn_IBV      = { NAN, NAN, 0 };   // IBV — INA228 battery V
+IgnWatermark wmIgn_Bcur     = { NAN, NAN, 0 };   // Bcur — INA228 battery A
+IgnWatermark wmIgn_SOC      = { NAN, NAN, 0 };   // SOC percent (0..100, float)
+IgnWatermark wmIgn_RPM      = { NAN, NAN, 0 };
+IgnWatermark wmIgn_SOG      = { NAN, NAN, 0 };   // SOGNMEA (knots)
+IgnWatermark wmIgn_AWS      = { NAN, NAN, 0 };   // ApparentWindSpeedNMEA (knots)
+IgnWatermark wmIgn_TWS      = { NAN, NAN, 0 };   // TrueWindSpeedNMEA (knots)
+IgnWatermark wmIgn_heel     = { NAN, NAN, 0 };   // imu_heel_deg
+IgnWatermark wmIgn_pitch    = { NAN, NAN, 0 };   // imu_pitch_deg
+IgnWatermark wmIgn_vacc     = { NAN, NAN, 0 };   // imu_vertical_accel_g
+IgnWatermark wmIgn_baro     = { NAN, NAN, 0 };   // baroPressure (mbar)
+IgnWatermark wmIgn_ambient  = { NAN, NAN, 0 };   // ambientTemp (°F)
+IgnWatermark wmIgn_VMGman   = { NAN, NAN, 0 };   // VMGNMEA — VMG to manual bearing (knots)
+IgnWatermark wmIgn_VMGup    = { NAN, NAN, 0 };   // VMGUpwind — VMG to windward (knots)
+IgnWatermark wmIgn_battTempF  = { NAN, NAN, 0 }; // BatteryTempProbeF (°F)
+IgnWatermark wmIgn_extraTempF = { NAN, NAN, 0 }; // ExtraTempF (°F)
 
-// Watermark update/read helpers — defined in 7_functions.ino.
+// Every watermark, with the name /get?wmReset= and the CSV2 wmIgn_<name>_* fields use; the order is CSV2's.
+struct WmName { const char *name; IgnWatermark *w; };
+const WmName WM_ALL[18] = {
+  { "amps", &wmIgn_amps }, { "altTempF", &wmIgn_altTempF }, { "IBV", &wmIgn_IBV }, { "Bcur", &wmIgn_Bcur },
+  { "SOC", &wmIgn_SOC }, { "RPM", &wmIgn_RPM }, { "SOG", &wmIgn_SOG }, { "AWS", &wmIgn_AWS }, { "TWS", &wmIgn_TWS },
+  { "heel", &wmIgn_heel }, { "pitch", &wmIgn_pitch }, { "vacc", &wmIgn_vacc }, { "baro", &wmIgn_baro },
+  { "ambient", &wmIgn_ambient }, { "VMGman", &wmIgn_VMGman }, { "VMGup", &wmIgn_VMGup }, { "battTempF", &wmIgn_battTempF },
+  { "extraTempF", &wmIgn_extraTempF }
+};
+
+// Watermark update/read/reset helpers — defined in 7_functions.ino.
 inline void wmIgnUpdate(IgnWatermark &w, float v);
 inline int wmIgnCsv(float v, int scale);
+inline uint32_t wmIgnNowS();
+inline int wmIgnAge(const IgnWatermark &w);
+int wmIgnReset(const char *list);
 
 // Universal data freshness tracking
 

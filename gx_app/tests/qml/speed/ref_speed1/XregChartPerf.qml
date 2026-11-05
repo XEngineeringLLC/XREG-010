@@ -256,7 +256,7 @@ Rectangle {
 
 	// The curve sweep costs (sweep steps x front points): redo it only when its inputs move noticeably, checked every
 	// 2 s and at once on a view, frame or curve change
-	property var curve: ({ pts: [], maxS: 4, maxR: 3600 })
+	property var curve: ({ pts: [], maxS: 4, maxR: 3000 })
 	property string curveKey
 	function refresh() {
 		const sea = Math.round((lSea || 0) * 10) / 10
@@ -266,7 +266,7 @@ Rectangle {
 			return
 		curveKey = key
 		const t0 = Date.now()
-		let pts = [], maxS = 4, maxR = 3600
+		let pts = [], maxS = 4, maxR = 3000
 		if (view === 0 && sailFront.length >= 2) {
 			const aws = num(sWs) || 0
 			let lo = 999, hi = -999

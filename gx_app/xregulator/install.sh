@@ -37,6 +37,7 @@ VERIFY_S=${XREG_VERIFY_S:-120}
 BOOT_VERIFY_S=${XREG_BOOT_VERIFY_S:-600}
 BOOT_UPTIME_S=${XREG_BOOT_UPTIME_S:-600}
 STABLE_S=${XREG_STABLE_S:-10}
+NOTIFY_WAIT_S=${XREG_NOTIFY_WAIT_S:-60}
 BOOT_ID=${XREG_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)}
 RUN_ID=${XREG_RUN_ID:--}   # the bridge's id for an install it started, repeated in the result
 TAG='# xregulator-app'
@@ -57,11 +58,15 @@ note() {
 
 # A notification on the GX screen, for an outcome the app's page cannot show. venus-platform's /Notifications/Inject
 # takes "<type>\t<device name>\t<description>", type 2 information. In the background, errors ignored: nothing waits.
+# Sent late: taking the plugin out reloads gui-v2's screen, and a notification arriving during that reload is listed on
+# the Notifications tab with no pop-up (Ekrano, 2026-11-04, reload 7 s; slower GX models take longer).
 notify() {
 	command -v dbus-send >/dev/null 2>&1 || return 0
-	dbus-send --system --type=method_call --dest=com.victronenergy.platform /Notifications/Inject \
-		com.victronenergy.BusItem.SetValue "variant:string:$(printf '2\tXREG-010 GX app\t%s' "$*")" \
-		</dev/null >/dev/null 2>&1 &
+	{
+		sleep "$NOTIFY_WAIT_S"
+		dbus-send --system --type=method_call --dest=com.victronenergy.platform /Notifications/Inject \
+			com.victronenergy.BusItem.SetValue "variant:string:$(printf '2\tXREG-010 GX app\t%s' "$*")"
+	} </dev/null >/dev/null 2>&1 &
 }
 
 valid_version() {
@@ -302,7 +307,9 @@ service_up() {
 }
 
 # gui-v2 reloads plugins when a link in /data/apps/enabled changes, not when a file under it does: the link is made again
-# when the plugin differs from the one it replaces ($1; '' for none)
+# when the plugin differs from the one it replaces ($1; '' for none). That reload can keep running the old pages (Ekrano,
+# 2026-11-04: two reloads left it on pages 3 days old, cause not established), so the screen program restarts too. Before
+# svscan (the stick at boot) nothing runs yet; svc -t leaves a service that is down as it is.
 plugin_link() {
 	mkdir -p "$DATA/apps/enabled"
 	if [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$APP" ] && [ -n "$1" ] && cmp -s "$1" "$APP/gui-v2/xregulator.json"; then
@@ -317,6 +324,8 @@ plugin_link() {
 		sleep 2
 	fi
 	ln -s "$APP" "$LINK"
+	svok "$SERVICE/start-gui" 2>/dev/null && svc -t "$SERVICE/start-gui"
+	return 0
 }
 
 # Readable by everyone (dbus-flashmq walks the app without root), and the executables

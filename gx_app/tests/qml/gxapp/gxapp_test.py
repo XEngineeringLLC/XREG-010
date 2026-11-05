@@ -9,6 +9,7 @@ plugin, schema, size, scheme = sys.argv[1:5]
 W, H = {'FiveInch': (800, 424), 'SevenInch': (1024, 544), 'Portrait': (383, 741)}[size]
 stubs = qmlenv.stubs(size, scheme)
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+os.environ['TZ'] = 'UTC'   # as on a GX: in a zone matching the test's GX clock, the process's own time would pass as the GX's
 from PySide6.QtCore import QUrl, qInstallMessageHandler, QtMsgType, QTimer
 from PySide6.QtGui import QGuiApplication, QFontDatabase
 from PySide6.QtQml import QQmlApplicationEngine

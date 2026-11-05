@@ -6,9 +6,8 @@ import Victron.VenusOS
 // { key, label, unit, dec, x: [..], v: [..], lo: [..], hi: [..], color, w, dash, right, off, dots, wrap, noLegend, last }:
 // NaN in v breaks the line, lo/hi draw a min/max band, dots draws one round mark per sample, wrap breaks an angle line
 // where it crosses 0/360, off starts the line hidden, noLegend keeps it out of the legend, last is the value the legend
-// shows when the window holds none. Tapping a legend entry hides
-// or shows its line; pressing on the plot reads every line at that point (scrubbed() lets a page move the cursor on
-// several charts at once).
+// shows when the window holds none. Tapping a legend entry hides or shows its line. The legend's numbers change at most
+// twice a second (once with Slower plotting), whatever the data's rate: the GX's rule for every number on screen.
 // Streamed lines (Short Term, `stream` set): a line names its series in the page's sample store by `sk` (and may convert
 // it with `conv`) instead of carrying x and v; x is seconds before the newest sample. Each line is kept in data units
 // (seconds, value), one minimum and one maximum per pixel column, and placed by ShapePath.scale and its Shape's offset,
@@ -34,9 +33,24 @@ Item {
 	property var shades: []                 // [[x0, x1], ..] tinted spans
 	property string emptyText: "No data"
 	property string dashNote                // legend entry explaining the dashed lines
-	property real ownCursor: NaN
-	property real cursorX: ownCursor
-	signal scrubbed(real xValue)
+
+	// A chart that opens a larger view (XregView): its hidden lines come from the view, a fitted axis gets pad of its
+	// span above and below the readings (never past zero on a zero-based axis) and lines sit inset px inside the plot's
+	// top and bottom, so a line at an axis limit is drawn whole.
+	// tapOpens: a tap anywhere on the chart emits opened() and a drag is left to the page (no legend taps); editAxes: a
+	// tap on the top or bottom of an axis emits axisTapped().
+	property QtObject view: null
+	property real pad: 0
+	// A fitted axis is at least this wide, so a steady reading never fills the plot with its noise: a number in the
+	// axis's units, or "V" for 1 V per 12 V of system voltage, the class judged from the readings (the GX has no setting)
+	property var leftMinSpan: 0
+	property real rightMinSpan: 0
+	property real inset: 0
+	property bool fixedEnds                 // a fixed axis labels its two ends
+	property bool tapOpens
+	property bool editAxes
+	signal opened()
+	signal axisTapped(bool right, bool isMax)
 
 	// Streamed lines: the page's store { t: [ms], v: { sk: [values] }, off, h, reset, stages: [{ a, b, c }] } (absolute
 	// sample i at t[i - off], held from off + h), and its update count; streamStages draws its charge-stage runs
@@ -45,7 +59,10 @@ Item {
 	property bool streamStages
 	property int streamSalt                 // differs per chart on a page: spreads the charts' path re-sends (sPaths)
 	onStreamVerChanged: sStep()
-	onHiddenKeysChanged: if (stream) sAxes()
+	onHkChanged: if (stream) sAxes()
+	onLeftFixedChanged: if (stream) sAxes()
+	onRightFixedChanged: if (stream) sAxes()
+	onFixedEndsChanged: if (stream) sAxes()
 	onXLoChanged: if (stream) sStep()
 	property var ss: null                   // the streamed lines' state (sBegin), not bound
 	property int sVer                       // counts finished sStep()s: what the legend and stage strip follow
@@ -59,36 +76,51 @@ Item {
 	readonly property real sOffX: -sXl * sKx
 	// Streamed lines and their stage strip scroll every display frame on a steady clock instead of stepping as samples
 	// arrive: the right edge shows sBehindMs before the newest sample by the samples' own clock (the regulator's), so a
-	// frame that comes a little late is in before its point scrolls on. 100 ms: on the Ekrano 99% of frames came within
-	// ~110 ms of the fastest, and 0.1, 0.2 and 0.3 s looked the same; 60 redraws a second cost ~14% of the box over
-	// stepping (bench, 2026-10-31).
-	readonly property real sBehindMs: 100
+	// frame that comes a little late is in before its point scrolls on. At least 100 ms: on the Ekrano 99% of frames came
+	// within ~110 ms of the fastest, and 0.1, 0.2 and 0.3 s looked the same; 60 redraws a second cost ~14% of the box over
+	// stepping (bench, 2026-10-31). Updates further apart than that (webgaugesinterval over 100 ms) set it to their
+	// spacing, or the line's end would stop short of the edge before each one. smooth false (Slower plotting): no
+	// scrolling between updates, the newest sample at the right edge.
+	property bool smooth: true
+	readonly property real sBehindMinMs: 100
+	property real sBehindMs: sBehindMinMs   // (sClock)
 	property real sRefT: NaN                // the newest sample's time when the lines were last placed (sPlace)
 	property real sLat: NaN                 // local clock minus sample clock of the fastest recent frame (sClock)
-	property var sLatQ: []                  // [local ms, local - sample ms] of the last 10 s of placements
+	property var sLatQ: []                  // [local ms, local - sample ms, sample ms] of the last 10 s of new newest samples
 	property int sLatFor: -1                // the store reset sLatQ belongs to
 	property real sLatAt
 	property real sLagS                     // seconds the shown right edge trails sRefT: every frame and every placement
-	readonly property bool sSmoothOn: !!stream && visible && !ScreenBlanker.blanked && sLat === sLat
+	readonly property bool sSmoothOn: smooth && !!stream && visible && !ScreenBlanker.blanked && sLat === sLat
+	onSmoothChanged: sLagS = sLag()
 	FrameAnimation {
 		running: chart.sSmoothOn
 		onTriggered: chart.sLagS = chart.sLag()
 	}
 	// a frame later than sBehindMs lets the right edge run up to 1 s past the newest sample, then it waits there
 	function sLag() {
-		return sLat === sLat && sRefT === sRefT ? Math.max(-1, (sRefT - (Date.now() - sLat - sBehindMs)) / 1000) : 0
+		return smooth && sLat === sLat && sRefT === sRefT ? Math.max(-1, (sRefT - (Date.now() - sLat - sBehindMs)) / 1000) : 0
 	}
 	// sLat: the lowest of the last 10 s; it drops at once and rises at most 20 ms a second, so a link that turns slower
-	// slows the scroll a little for a while instead of stepping it back
+	// slows the scroll a little for a while instead of stepping it back. sBehindMs: the lower median of the spacings
+	// between those newest samples once there are 5 (a dropped frame or a burst after a stall leaves it), at least
+	// sBehindMinMs; it drops at once and rises at most 100 ms a second.
 	function sClock(s, tN) {
-		const now = Date.now(), q = s.reset === sLatFor ? sLatQ : []
-		q.push([now, now - tN])
-		while (q[0][0] < now - 10000)
+		const now = Date.now(), keep = s.reset === sLatFor && sLat === sLat, q = s.reset === sLatFor ? sLatQ : []
+		if (!q.length || tN !== q[q.length - 1][2])
+			q.push([now, now - tN, tN])
+		while (q.length > 1 && q[0][0] < now - 10000)
 			q.shift()
 		let m = Infinity
-		for (const e of q)
-			m = Math.min(m, e[1])
-		sLat = s.reset === sLatFor && sLat === sLat ? Math.min(m, sLat + (now - sLatAt) * 0.02) : m
+		const g = []
+		for (let i = 0; i < q.length; ++i) {
+			m = Math.min(m, q[i][1])
+			if (i)
+				g.push(q[i][2] - q[i - 1][2])
+		}
+		g.sort((a, b) => a - b)
+		const b = Math.max(sBehindMinMs, g.length >= 5 ? g[(g.length - 1) >> 1] : 0)
+		sLat = keep ? Math.min(m, sLat + (now - sLatAt) * 0.02) : m
+		sBehindMs = keep ? Math.min(b, sBehindMs + (now - sLatAt) * 0.1) : b
 		sLatQ = q
 		sLatFor = s.reset
 		sLatAt = now
@@ -97,19 +129,20 @@ Item {
 	}
 
 	property var hiddenKeys: ({})
-	// a page that keeps its charts across tab switches bumps this on return: legend and cursor as on a new chart
+	readonly property var hk: view ? view.hidden : hiddenKeys
+	// a page that keeps its charts across tab switches bumps this on return: the legend as on a new chart
 	property int resets
-	onResetsChanged: {
-		lift.stop()
-		hiddenKeys = ({})
-		ownCursor = NaN
-	}
+	onResetsChanged: hiddenKeys = ({})
 	readonly property var stageNames: ["", "Bulk", "Absorption", "Float", "Manual", "Maintain", "Target V", "Idle", "Commissioning", "Shutdown"]
 
 	function isHidden(ln) {
-		return hiddenKeys[ln.key] !== undefined ? hiddenKeys[ln.key] : !!ln.off
+		return hk[ln.key] !== undefined ? hk[ln.key] : !!ln.off
 	}
 	function toggle(ln) {
+		if (view) {
+			view.setHidden(ln.key, !isHidden(ln))
+			return
+		}
 		let h = Object.assign({}, hiddenKeys)
 		h[ln.key] = !isHidden(ln)
 		hiddenKeys = h
@@ -128,7 +161,7 @@ Item {
 
 	// x/v lines: the paths (most of a redraw) are worked out once, on the turn after any of their inputs change (oDraw),
 	// so a page that sets lines, xLo and xHi for a new range draws them once, not three times
-	readonly property var oKey: stream ? null : [lines, lAx, rAx, hasData, xLo, xHi, hiddenKeys]
+	readonly property var oKey: stream ? null : [lines, lAx, rAx, hasData, xLo, xHi, hk, inset]
 	onOKeyChanged: if (!stream) oLater.restart()
 	Component.onCompleted: if (!stream) oLater.restart()
 	Timer {
@@ -166,16 +199,19 @@ Item {
 		// 2.5 only where it stays a whole number (25, 250 ...), so tick labels never round
 		return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 && p >= 10 ? 2.5 : f <= 5 ? 5 : 10) * p
 	}
-	function mk(lo, hi, fixedStep) {
+	// ends: the two limits are ticks too, the inner ticks within half a step of them left out (the web app's manual axes)
+	function mk(lo, hi, fixedStep, ends) {
 		const st = fixedStep > 0 ? fixedStep : step(hi - lo)
 		let t = []
 		for (let k = Math.ceil(lo / st - 1e-9); k * st <= hi + st * 1e-6; ++k)
 			t.push(k * st)
+		if (ends)
+			t = [lo].concat(t.filter(v => v - lo >= st * 0.5 && hi - v >= st * 0.5), [hi])
 		return { lo: lo, hi: hi, ticks: t, st: st }
 	}
 	function axisFor(right, fixed, fromZero, cap) {
 		if (fixed)
-			return mk(fixed[0], fixed[1], right ? 0 : leftStep)
+			return mk(fixed[0], fixed[1], right ? 0 : leftStep, fixedEnds)
 		let lo = Infinity, hi = -Infinity
 		for (const l of shownLines) {
 			if (!!l.right !== right || !l.v || !l.x)
@@ -201,15 +237,35 @@ Item {
 				}
 			}
 		}
-		return fitAxis(lo, hi, fromZero, cap)
+		return fitAxis(lo, hi, fromZero, cap, right ? rightMinSpan : leftMinSpan)
 	}
 	// lo..hi of the readings in the window (lo > hi: none) -> a rounded axis
-	function fitAxis(lo, hi, fromZero, cap) {
+	function fitAxis(lo, hi, fromZero, cap, minSpan) {
 		if (lo > hi)
 			return null
 		if (fromZero) {
 			lo = Math.min(lo, 0)
 			hi = Math.max(hi, 0)
+		}
+		if (minSpan === "V")   // 13.3 V a class step: 13.5 V reads as 12 V, 27 as 24, 40 as 36, 54 as 48
+			minSpan = Math.min(4, Math.max(1, Math.round(Math.abs(lo + hi) / 2 / 13.3)))
+		if (minSpan > 0 && hi - lo < minSpan) {
+			if (fromZero && lo === 0)
+				hi = minSpan
+			else if (fromZero && hi === 0)
+				lo = -minSpan
+			else {
+				const mid = (lo + hi) / 2
+				lo = mid - minSpan / 2
+				hi = mid + minSpan / 2
+			}
+		}
+		if (pad > 0) {
+			const m = (hi - lo) * pad
+			if (!(fromZero && lo === 0))
+				lo -= m
+			if (!(fromZero && hi === 0))
+				hi += m
 		}
 		if (hi - lo < 1e-6) {
 			// every reading equal: open the axis around it, but a zero-based axis (a speed, RPM) only upward from 0
@@ -225,10 +281,12 @@ Item {
 		return mk(lo, hi)
 	}
 	function tickText(v, st) {
-		return v.toFixed(Math.max(0, Math.ceil(-Math.log10(st) - 1e-9)))
+		const s = v.toFixed(Math.max(0, Math.ceil(-Math.log10(st) - 1e-9)))
+		// a limit set between steps (12.3 on a 1 V grid) reads as it was set
+		return Math.abs(Number(s) - v) < st * 1e-3 ? s : String(Number(v.toFixed(1)))
 	}
 	function px(xv) { return (xv - xLo) / (xHi - xLo) * plot.width }
-	function py(v, ax) { return plot.height * (1 - (v - ax.lo) / (ax.hi - ax.lo)) }
+	function py(v, ax) { return inset + (plot.height - 2 * inset) * (1 - (v - ax.lo) / (ax.hi - ax.lo)) }
 
 	function segs(l, ax) {
 		let out = []
@@ -274,27 +332,17 @@ Item {
 		}
 		return out
 	}
-	// Value under the cursor (nearest sample), else the newest sample in the window
+	// the newest sample in the window
 	function valueAt(l) {
 		if (stream)
 			return sValueAt(l)
 		if (!l.v || !l.x)
 			return NaN
-		let best = NaN, bestD = Infinity
-		for (let i = 0; i < l.v.length; ++i) {
-			if (!isFinite(l.v[i]) || l.x[i] < xLo || l.x[i] > xHi)
-				continue
-			if (isNaN(cursorX)) {
-				best = l.v[i]
-			} else {
-				const dd = Math.abs(l.x[i] - cursorX)
-				if (dd < bestD) {
-					bestD = dd
-					best = l.v[i]
-				}
-			}
+		for (let i = l.v.length - 1; i >= 0; --i) {
+			if (isFinite(l.v[i]) && l.x[i] >= xLo && l.x[i] <= xHi)
+				return l.v[i]
 		}
-		return best
+		return NaN
 	}
 	function numText(v, l) {
 		const u = l.unit || ""
@@ -305,6 +353,32 @@ Item {
 	function valueText(l) {
 		const v = valueAt(l)
 		return isFinite(v) ? numText(v, l) : isFinite(l.last) ? numText(l.last, l) : "--"
+	}
+	// What the legend shows: valueText as of the last refresh, every readMs while the chart is on screen, and at once when
+	// the chart's data appears or its set of lines changes, so a number never changes faster than the GX's rule allows
+	VeQuickItem { id: slowRead; uid: BackendConnection.serviceUidFromName("com.victronenergy.settings", 0) + "/Settings/Xregulator/SlowPlots" }
+	readonly property int readMs: slowRead.valid && slowRead.value === 1 ? 1000 : 500
+	property var readVals: ({})
+	property string readKeys
+	function lineKey(l) { return l ? (l.key !== undefined ? l.key : l.label) : "" }
+	function readRefresh() {
+		let o = {}
+		for (let i = 0; i < lines.length; ++i)
+			o[lineKey(lines[i])] = valueText(lines[i])
+		readVals = o
+		readKeys = lines.map(lineKey).join(",")
+	}
+	function readText(l) {
+		const t = readVals[lineKey(l)]
+		return t !== undefined ? t : "--"
+	}
+	onLinesChanged: if (lines.map(lineKey).join(",") !== readKeys) readRefresh()
+	onHasDataChanged: readRefresh()
+	Timer {
+		interval: chart.readMs
+		repeat: true
+		running: chart.visible && !ScreenBlanker.blanked
+		onTriggered: chart.readRefresh()
 	}
 	// The widest value a legend entry can show on its axis, so the entries after it never move as the value changes
 	function valueTemplate(l) {
@@ -332,12 +406,6 @@ Item {
 			mm = Math.max(mm, Math.abs(l.last))
 		}
 		return numText(lo < 0 ? -mm : mm, l)
-	}
-	function scrub(mx) {
-		lift.stop()
-		const xv = xLo + Math.max(0, Math.min(1, mx / plot.width)) * (xHi - xLo)
-		ownCursor = xv
-		scrubbed(xv)
 	}
 
 	// ---- Streamed lines (see the top). Per line: entries e (data-unit points, null = a break) of closed runs, an open run
@@ -606,7 +674,9 @@ Item {
 		let has = false, llo = Infinity, lhi = -Infinity, rlo = Infinity, rhi = -Infinity
 		const w = {}
 		if (st && n > s.h) {
-			const tLo = s.t[n - 1] + xLo * 1000
+			// a view's axes also take what the scroll still shows at the left edge (up to sBehindMs behind the newest
+			// sample) and the sample the line enters from, so no line runs off the plot there
+			const tLo = s.t[n - 1] + xLo * 1000 - (view ? sBehindMs + 2 * st.cw : 0)
 			for (let k = 0; k < lines.length; ++k) {
 				const ln = lines[k], L = st.L[k], o = L.o
 				while (L.nh < L.nt.length && L.nt[L.nh] < tLo)
@@ -650,66 +720,62 @@ Item {
 			}
 			st.w = w
 		}
-		const la = leftFixed ? mk(leftFixed[0], leftFixed[1], leftStep) : fitAxis(llo, lhi, leftFromZero, leftCap)
-		const ra = rightFixed ? mk(rightFixed[0], rightFixed[1], 0) : fitAxis(rlo, rhi, rightFromZero, null)
+		const la = leftFixed ? mk(leftFixed[0], leftFixed[1], leftStep, fixedEnds)
+							 : fitAxis(llo, lhi, leftFromZero, leftCap, leftMinSpan)
+		const ra = rightFixed ? mk(rightFixed[0], rightFixed[1], 0, fixedEnds) : fitAxis(rlo, rhi, rightFromZero, null, rightMinSpan)
 		if (!sameAx(la, sAx.l) || !sameAx(ra, sAx.r))
 			sAx = { l: la, r: ra }
 		if (sHas !== has)
 			sHas = has
 	}
-	// the value under the cursor (the nearest reading, the earlier of two as near), else the newest in the window
+	// the newest reading in the window
 	function sValueAt(l) {
 		const s = stream, n = s.t.length, vs = s.v[l.sk]
-		if (sVer < 0 || !vs || n <= s.h)
+		if (!vs || n <= s.h)
 			return NaN
 		const tN = s.t[n - 1], tLo = tN + xLo * 1000, tHi = tN + xHi * 1000
-		const cv = v => l.conv ? l.conv(v) : v
-		if (isNaN(cursorX)) {
-			for (let i = n - 1; i >= s.h && s.t[i] >= tLo; --i) {
-				if (s.t[i] <= tHi && isFinite(vs[i]))
-					return cv(vs[i])
-			}
-			return NaN
+		for (let i = n - 1; i >= s.h && s.t[i] >= tLo; --i) {
+			if (s.t[i] <= tHi && isFinite(vs[i]))
+				return l.conv ? l.conv(vs[i]) : vs[i]
 		}
-		// under the cursor: by the times on screen, which trail the newest sample by the scroll's lag
-		const tR = (sRefT === sRefT ? sRefT : tN) - sLag() * 1000, cLo = tR + xLo * 1000, cHi = tR + xHi * 1000
-		const i0 = sFind(s, tR + cursorX * 1000)
-		let a = i0 - 1, b = i0
-		while (a >= s.h && s.t[a] >= cLo && !isFinite(vs[a]))
-			--a
-		while (b < n && s.t[b] <= cHi && !isFinite(vs[b]))
-			++b
-		const okA = a >= s.h && s.t[a] >= cLo && s.t[a] <= cHi
-		const okB = b < n && b >= s.h && s.t[b] >= cLo && s.t[b] <= cHi
-		if (!okA && !okB)
-			return NaN
-		if (okA && okB)
-			return cv(Math.abs((s.t[a] - tR) / 1000 - cursorX) <= Math.abs((s.t[b] - tR) / 1000 - cursorX) ? vs[a] : vs[b])
-		return cv(okA ? vs[a] : vs[b])
+		return NaN
 	}
-	// the stream's charge-stage runs in the window, in seconds from the lines' placed newest sample (sRefT): from the
-	// first reading after 1 s before the window's left edge (the strip trails by sLagS), the last to the newest
-	function sStageRuns() {
-		const s = stream, n = s.t.length, out = []
-		if (!s.stages || n <= s.h)
-			return out
-		const tN = sRefT === sRefT ? sRefT : s.t[n - 1], i0 = sFind(s, tN + xLo * 1000 - 1000)
-		if (i0 >= n)
-			return out
-		const t0 = s.t[i0]
+	// The stream's charge-stage runs in the samples' own ms ({ a, b (null: still running), c }), taken from the store at
+	// most every stageMs (stages change seldom) and at once when a new stage starts. The strip places them against the
+	// lines' newest sample, so they scroll with the lines every frame while the list itself rarely changes. A run that
+	// began before the window starts 2 s before its left edge, off the strip until the next pick.
+	readonly property int stageMs: 500
+	property var sStages: []
+	property real sStagesAt
+	property real sStageA: NaN              // the store's newest run's start when last picked
+	onSVerChanged: if (stream && streamStages) sStagePick()
+	function sStagePick() {
+		const s = stream, n = s.t.length
+		if (!s.stages || n <= s.h) {
+			if (sStages.length)
+				sStages = []
+			return
+		}
+		const last = s.stages.length ? s.stages[s.stages.length - 1] : null
+		const now = Date.now()
+		if (now - sStagesAt < stageMs && (!last || last.a === sStageA))
+			return
+		sStagesAt = now
+		sStageA = last ? last.a : NaN
+		const t0 = s.t[n - 1] + xLo * 1000 - 2000, out = []
 		for (let k = 0; k < s.stages.length; ++k) {
 			const r = s.stages[k]
-			if (r.c <= 0 || r.b !== null && r.b <= t0)
-				continue
-			out.push({ a: (Math.max(r.a, t0) - tN) / 1000, b: r.b === null ? Math.max(0, xHi) : (r.b - tN) / 1000, c: r.c })
+			if (r.c > 0 && (r.b === null || r.b > t0))
+				out.push({ a: Math.max(r.a, t0), b: r.b, c: r.c })
 		}
-		return out
+		sStages = out
 	}
 
+	// the strip's runs: the stream's in ms (stageX places them), else the page's `stages` in x units
 	readonly property var stageRuns: {
 		let out = []
 		if (stream)
-			return streamStages && sVer >= 0 ? sStageRuns() : out
+			return streamStages ? sStages : out
 		if (!stages || !stages.c || !stages.x)
 			return out
 		const c = stages.c, sx = stages.x, n = Math.min(c.length, sx.length)
@@ -722,6 +788,14 @@ Item {
 			}
 		}
 		return out
+	}
+	// a run end's x: a streamed run's against the lines' newest sample (sRefT), the open end at the window's right edge
+	function stageX(v) {
+		if (!stream)
+			return v
+		if (v === null)
+			return Math.max(0, xHi)
+		return sRefT === sRefT ? (v - sRefT) / 1000 : xLo - 10
 	}
 	function axisLabel(ax, i, unit) {
 		return tickText(ax.ticks[i], ax.st) + (i === ax.ticks.length - 1 && unit ? " " + unit : "")
@@ -756,16 +830,8 @@ Item {
 	readonly property real stripH: stages || stream && streamStages ? 14 : 0
 	readonly property real padB: 20 + (stripH > 0 ? stripH + 2 : 0)
 
-	Timer {
-		id: lift
-		interval: 4000
-		onTriggered: {
-			chart.ownCursor = NaN
-			chart.scrubbed(NaN)
-		}
-	}
 
-	// Title, then one legend entry per line (value under the cursor, or the newest), then the stages in view
+	// Title, then one legend entry per line (its newest value, readText), then the stages in view
 	Flow {
 		id: head
 		width: chart.width
@@ -803,7 +869,7 @@ Item {
 					}
 					XregNum {
 						template: chart.valueTemplate(entry.ln)
-						text: chart.valueText(entry.ln)
+						text: chart.readText(entry.ln)
 						font.pixelSize: Theme.font_size_tiny
 						font.bold: true
 					}
@@ -811,6 +877,7 @@ Item {
 				MouseArea {
 					anchors.fill: parent
 					anchors.margins: -6
+					enabled: !chart.tapOpens
 					onClicked: chart.toggle(entry.ln)
 				}
 			}
@@ -933,11 +1000,11 @@ Item {
 					property var sPaths: []
 					property var tPaths: []
 					property real sVb
-					readonly property real sKy: ax ? plot.height / (ax.hi - ax.lo) : 1
+					readonly property real sKy: ax ? (plot.height - 2 * chart.inset) / (ax.hi - ax.lo) : 1
 					readonly property size sScale: chart.stream ? Qt.size(chart.sKx, sKy) : Qt.size(1, 1)
 					// the line's own state, not the page's: a hidden tab or page keeps its paths, so a return redraws nothing
 					readonly property bool drawn: chart.hasData && !chart.isHidden(ln) && !chart.sBuilding
-					y: chart.stream && ax ? plot.height - (sVb - ax.lo) * sKy : 0
+					y: chart.stream && ax ? plot.height - chart.inset - (sVb - ax.lo) * sKy : 0
 					width: plot.width
 					height: plot.height
 					visible: drawn
@@ -978,43 +1045,11 @@ Item {
 				}
 			}
 		}
-		Rectangle {
-			visible: !isNaN(chart.cursorX) && chart.hasData
-			x: Math.round(chart.px(chart.cursorX))
-			width: 1
-			height: plot.height
-			color: Theme.color_font_primary
-			opacity: 0.6
-		}
-		MouseArea {
-			id: scrubArea
-			// The swipe host (XregHome) stops paging while a finger is on the plot, so a sideways drag moves the cursor
-			// and never the page; a vertical drag still scrolls a page of charts, which cancels the cursor.
-			property Item host: null
-			function hold(on) {
-				if (on && !host) {
-					for (let p = chart.parent; p; p = p.parent) {
-						if (p.swipeHolds !== undefined) {
-							host = p
-							host.swipeHolds++
-							break
-						}
-					}
-				} else if (!on && host) {
-					host.swipeHolds--
-					host = null
-				}
-			}
-			anchors.fill: parent
-			onPressed: (mouse) => { hold(true); chart.scrub(mouse.x) }
-			onPositionChanged: (mouse) => chart.scrub(mouse.x)
-			onReleased: { hold(false); lift.restart() }
-			onCanceled: { hold(false); lift.restart() }
-			Component.onDestruction: hold(false)
-		}
 	}
 
-	// Charge-stage strip under the plot, as in the app's mode ribbon: named where a band is wide enough
+	// Charge-stage strip under the plot, as in the app's mode ribbon. A band's name sits at its left end, or at the strip's
+	// left edge once that end has scrolled off, so it rides with the data or stays put rather than following the band's
+	// middle; it shows only where the band's part on screen has room.
 	Item {
 		x: plot.x
 		y: plot.y + plot.height + 2
@@ -1027,27 +1062,55 @@ Item {
 			color: Qt.rgba(Theme.color_font_secondary.r, Theme.color_font_secondary.g, Theme.color_font_secondary.b, 0.15)
 		}
 		Item {
+			id: runsLayer
 			x: chart.stream ? chart.sLagS * chart.sKx : 0
 			width: parent.width
 			height: parent.height
 			Repeater {
 				model: chart.stageRuns
 				delegate: Rectangle {
+					id: band
 					required property var modelData
-					x: chart.px(modelData.a)
-					width: Math.max(1, chart.px(modelData.b) - x)
+					// the part of the band left of the strip, and the room from there to the band's or the strip's end
+					readonly property real offL: Math.max(0, -(x + runsLayer.x))
+					readonly property real room: Math.min(width, runsLayer.width - runsLayer.x - x) - offL
+					x: chart.px(chart.stageX(modelData.a))
+					width: Math.max(1, chart.px(chart.stageX(modelData.b)) - x)
 					height: parent.height
 					color: chart.stageColor(modelData.c)
 					Label {
-						anchors.centerIn: parent
-						visible: implicitWidth + 10 < parent.width
-						text: chart.stageNames[modelData.c] || ""
+						x: band.offL + 4
+						anchors.verticalCenter: parent.verticalCenter
+						visible: implicitWidth + 8 <= band.room
+						text: chart.stageNames[band.modelData.c] || ""
 						color: Theme.color_white
 						font.pixelSize: 10
 						font.bold: true
 					}
 				}
 			}
+		}
+	}
+
+	// tapOpens: a tap opens the larger view; a drag goes on to the page (Qt's Flickable and swipe view take it over)
+	TapHandler {
+		enabled: chart.tapOpens
+		onTapped: chart.opened()
+	}
+	// editAxes: the top and bottom of each axis's labels, where the limits are, a finger wide
+	Repeater {
+		model: chart.editAxes && chart.hasData ? [[false, true], [false, false], [true, true], [true, false]] : []
+		delegate: MouseArea {
+			required property var modelData
+			readonly property bool onRight: modelData[0]
+			readonly property bool isMax: modelData[1]
+			readonly property real zoneH: Math.min(56, plot.height / 2)
+			visible: onRight ? chart.hasRight && !!chart.rAx : chart.hasLeft && !!chart.lAx
+			x: onRight ? plot.x + plot.width : 0
+			width: onRight ? chart.width - x : plot.x
+			y: plot.y + (isMax ? chart.inset - zoneH / 2 : plot.height - chart.inset - zoneH / 2)
+			height: zoneH
+			onClicked: chart.axisTapped(onRight, isMax)
 		}
 	}
 

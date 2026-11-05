@@ -2,7 +2,8 @@ import QtQuick
 import QtQuick.Window
 import Victron.VenusOS
 
-// Real pointer drags on the home page: page swipes, a chart's cursor, a vertical list scroll.
+// Real pointer drags on the home page: page swipes, charts that open a larger view (Short Term's and the Wind tab's: a tap
+// opens, a drag moves the page), a vertical list scroll.
 Window {
 	id: win
 	width: 1024; height: 544; visible: true
@@ -24,15 +25,21 @@ Window {
 		return null
 	}
 	function index() { return swipe.currentIndex }
-	function holds() { return home.swipeHolds }
-	// centre of the first chart's plot area on the Plots page, in window coordinates
+	function holds() { return swipe.interactive ? 0 : 1 }
+	// centre of the Wind tab's chart, in window coordinates (-1, -1: not found)
 	function chartPoint() {
-		const chart = find(home, c => c.scrubbed !== undefined && c.hiddenKeys !== undefined && c.visible)
-		const area = chart ? find(chart, c => c.hold !== undefined && c.host !== undefined) : null
-		if (!area) return Qt.point(-1, -1)
-		return area.mapToItem(contentItem, area.width / 2, area.height / 2)
+		const chart = find(home, c => c.editAxes !== undefined && c.tapOpens !== undefined && c.visible && c.tapOpens && /wind/.test(c.title))
+		return chart ? chart.mapToItem(contentItem, chart.width / 2, chart.height / 2) : Qt.point(-1, -1)
 	}
-	function plotsCursor() { const t = find(home, c => c.windowS !== undefined && c.cursor !== undefined); return t ? t.cursor : NaN }
+	// centre of a chart that opens a larger view (Short Term's first chart)
+	function openerPoint() {
+		const chart = find(home, c => c.editAxes !== undefined && c.tapOpens !== undefined && c.tapOpens && c.visible)
+		return chart ? chart.mapToItem(contentItem, chart.width / 2, chart.height / 2) : Qt.point(-1, -1)
+	}
+	function popShown() { return home.popShown }
+	// the Plots page's tab (0 Short Term ... 3 Wind)
+	function plotsTab(i) { const p = find(home, c => c.built !== undefined && c.tab !== undefined && c.barW !== undefined); if (p) p.tab = i }
+	function bigTitle() { const b = find(home, c => c.editAxes !== undefined && c.tapOpens !== undefined && c.editAxes && c.visible); return b ? b.title : "" }
 	function settingsList() { return find(home, c => c.contentY !== undefined && c.bottomMargin !== undefined && c.visible && c.contentHeight > c.height && c.parent && c.parent.embedded !== undefined) }
 	function listY() { const l = settingsList(); return l ? l.contentY : -1 }
 	function listPoint() { const l = settingsList(); return l ? l.mapToItem(contentItem, l.width / 2, l.height / 2) : Qt.point(-1, -1) }

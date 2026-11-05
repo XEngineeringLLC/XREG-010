@@ -137,7 +137,8 @@ Item {
 					check(updates.length === 0, "the same data again: no chart redrawn (" + updates.length + ")")
 			})
 		}
-		// a return to the tab with nothing new: no chart redrawn; with a legend entry off and a cursor, as on a new chart
+		// a return to the tab with nothing new: no chart redrawn; a legend entry tapped off stays off, kept in the chart's
+		// view (XregView), and no chart has a cursor
 		after(1, () => {
 			win.updates = []
 			oldP.visible = false; newP.visible = false
@@ -150,23 +151,20 @@ Item {
 		after(1, () => {
 			check(updates.length === 0, "return, nothing new: no chart redrawn (" + updates.length + ")")
 			compare("unit " + unit + ", return")
-			const co = charts(oldP), cn = charts(newP)
-			for (const cs of [co, cn]) {
-				cs[1].toggle(cs[1].lines[0])
-				cs[4].scrub(40)
-			}
-			oldP.cursor = 12345; newP.cursor = 12345
-			check(Object.keys(cn[1].hiddenKeys).length === 1 && !isNaN(cn[4].ownCursor), "a legend entry off on one chart, a cursor on another")
+			const cn = charts(newP)
+			check(cn.every(c => !!c.view && c.tapOpens), "every chart opens a larger view and has no cursor")
+			cn[1].toggle(cn[1].lines[0])
+			check(cn[1].isHidden(cn[1].lines[0]), "a legend entry off")
 			win.updates = []
 			oldP.reopen(); newP.reopen()
 		})
 		until(2, settled)
 		after(1, () => {
 			const cn = charts(newP)
-			check(cn.every(c => Object.keys(c.hiddenKeys).length === 0 && isNaN(c.ownCursor)) && isNaN(newP.cursor),
-				"return: legend and cursor reset on every chart")
+			check(cn[1].isHidden(cn[1].lines[0]), "return: the legend entry still off")
+			cn[1].toggle(cn[1].lines[0])
 			check(updates.length === 0, "return: no chart given new lines (" + updates.length + ")")
-			compare("unit " + unit + ", return after a legend tap and a cursor")
+			compare("unit " + unit + ", return after a legend tap")
 		})
 		// the temperature unit changes with the data unchanged
 		after(1, () => { Global.systemSettings.temperatureUnit = unit === 1 ? 2 : 1 })
@@ -181,6 +179,9 @@ Item {
 	}
 
 	Component.onCompleted: {
+		// the charts' views, kept per regulator in a setting the bridge creates empty
+		MockStore.put("mock/Serial", "0000FEEDC0DE1234")
+		MockStore.put("mock/com.victronenergy.settings/Settings/Xregulator/Views", "")
 		check(oldComp.status === Component.Ready && newComp.status === Component.Ready, "components load " + oldComp.errorString() + newComp.errorString())
 		runUnit(2)
 		runUnit(1)

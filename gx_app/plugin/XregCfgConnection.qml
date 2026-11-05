@@ -46,7 +46,6 @@ Page {
 	VeQuickItem { id: limitsCclItem; uid: page.svc + "/Link/GxLimits/Ccl" }
 	VeQuickItem { id: removeItem; uid: regs.mgr + "/Remove" }
 	VeQuickItem { id: flowDevicesItem; uid: regs.mgr + "/GxDevices" }
-	VeQuickItem { id: appVersionItem; uid: regs.mgr + "/Update/Installed" }
 
 	XregUnits { id: regs }
 
@@ -122,7 +121,7 @@ Page {
 					return gone ? gone + " not on this GX now" : ""
 				}
 				preferredVisible: page.flowDevices.length > 0
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregFlowDevices.qml",
+				onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregFlowDevices.qml",
 						{ title: text, svc: page.svc, home: page.home, setupId: page.setupId })
 			}
 			ListButton {
@@ -144,13 +143,12 @@ Page {
 			ListNavigation {
 				text: "Regulators"
 				secondaryText: page.boatToAdd > 0 ? page.boatToAdd + " more on this boat" : ""
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregRegulators.qml",
+				onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregRegulators.qml",
 						{ title: text, svc: page.svc, home: page.home, setupId: page.setupId })
 			}
 			ListNavigation {
 				text: "GX app"
-				secondaryText: appVersionItem.valid ? "Version " + appVersionItem.value : ""
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregGxApp.qml",
+				onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregGxApp.qml",
 						{ title: text, svc: page.svc, home: page.home, setupId: page.setupId })
 			}
 			ListButton {

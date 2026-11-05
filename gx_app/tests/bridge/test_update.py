@@ -616,13 +616,18 @@ class TestDetachedInstall(unittest.TestCase):
             # this process takes the fake bridge's place under the fake supervise, its pid in first so the fake
             # svscan never restarts the one it replaces
             pidf = os.path.join(gx.svc, 'supervise', 'pid')
-            with open(pidf) as f:
-                old = int(f.read())
-            proc = subprocess.Popen([sys.executable, '-B', script, BRIDGE, gx.app, gx.work, srv.base,
-                                     os.path.join(KEYS, 'test.pub'), want], env=gx.env, stdout=subprocess.PIPE, text=True)
-            with open(pidf, 'w') as f:
-                f.write(str(proc.pid))
-            os.kill(old, 9)
+            # the scan's lock: a scan that read the old pid before this swap would see it dead and restart over this process
+            lk = gx._svlock()
+            try:
+                with open(pidf) as f:
+                    old = int(f.read())
+                proc = subprocess.Popen([sys.executable, '-B', script, BRIDGE, gx.app, gx.work, srv.base,
+                                         os.path.join(KEYS, 'test.pub'), want], env=gx.env, stdout=subprocess.PIPE, text=True)
+                with open(pidf, 'w') as f:
+                    f.write(str(proc.pid))
+                os.kill(old, 9)
+            finally:
+                os.rmdir(lk)
             rc = proc.wait(timeout=60)
             out = proc.stdout.read()
             self.assertEqual(rc, -15, out)   # SIGTERM from install.sh's svc -t

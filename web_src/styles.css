@@ -1009,6 +1009,38 @@ details.integ-section[open] > summary.integ-section-title::after {
   color: #4fd6ce;
   background: rgba(0, 161, 154, 0.20);
 }
+/* Direction tag on an Integrations switch. Stripped from settings-search labels (ssBuildIndex) and
+   usage labels (usageElText) so setting names stay stable. */
+.integ-dir {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  border: 1px solid;
+  vertical-align: 1px;
+}
+.integ-dir-in {
+  color: #00746e;
+  background: rgba(0, 161, 154, 0.14);
+  border-color: rgba(0, 161, 154, 0.35);
+}
+.integ-dir-out {
+  color: #2a55a8;
+  background: rgba(58, 110, 214, 0.13);
+  border-color: rgba(58, 110, 214, 0.35);
+}
+.dark-mode .integ-dir-in {
+  color: #4fd6ce;
+  background: rgba(0, 161, 154, 0.20);
+}
+.dark-mode .integ-dir-out {
+  color: #9dbcff;
+  background: rgba(58, 110, 214, 0.24);
+}
 /* Pointer from a dialect card to the shared card that holds the rest of its settings */
 .integ-note {
   font-size: 12.5px;
@@ -3673,6 +3705,11 @@ hr {
   opacity: 0.5;
 }
 
+/* Stays clickable while locked so the press gets the "unlock controls first" answer instead of nothing. */
+.locked #altlog-record-btn {
+  pointer-events: auto;
+}
+
 .locked label.switch {
   pointer-events: none;
   opacity: 0.6;
@@ -4442,6 +4479,30 @@ body.readings-stale .reading-value {
 }
 .dark-mode .wm-inline { color: #888; }
 .dark-mode .wm-inline .arr { color: #5a5a5a; }
+
+/* "Highs and lows since 2:14 PM  Reset" at the top of each Live Data tab that shows them; hidden until the regulator
+   reports a start time. */
+.wm-reset-row {
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin: 0 4px 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.wm-reset-row[hidden] { display: none; }
+.wm-reset-btn {
+  background: none;
+  border: 0;
+  padding: 4px 2px;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.wm-reset-btn:disabled { color: var(--text-muted); cursor: default; }
 
 /* Zone abbreviation beside the Device Clock time. Smaller and non-breaking so
    "2:32:07 PM EDT" can only wrap between the time and the zone, never inside either. */
@@ -6448,3 +6509,9 @@ body.awaiting-echo select[name="UseFloat"], body.awaiting-echo select[name="n2kT
 body.awaiting-echo select[name="n2kExtraTempSource"], body.awaiting-echo select[name="battTempSource"],
 body.awaiting-echo select[name="n2kChgrMode"], body.awaiting-echo select[name="dvccSrcType"],
 body.awaiting-echo select[name="FieldWiring"], body.awaiting-echo select[name="ShuntLead"] { color: transparent; }
+
+/* onePress: a button waiting on its own round trip. No layout change. */
+button.press-busy {
+  opacity: 0.6;
+  cursor: progress;
+}

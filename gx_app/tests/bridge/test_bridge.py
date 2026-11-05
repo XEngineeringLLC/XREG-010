@@ -14,11 +14,10 @@ sys.path.insert(0, BRIDGE)
 sys.path.insert(0, HERE)
 import xreg_core as xc
 import fake_regulator as fr
-from short_client import ShortClient
+from short_client import ShortClient, WindClient
 SHORT_NAMES = [n for n, *_ in xc.SHORT] + ['chargeStage']
 
 SCHEMA_TEXT = open(BRIDGE + '/settings_schema.json').read()
-xc.WIND_PLOT_S = 1
 xc.LOCATE_RETRY_S = 1
 xc.GXLIMITS_EVERY_S = 0.3
 xc.DVCC_FRESH_S = 1.0
@@ -78,6 +77,8 @@ class Harness:
         self.page = ShortClient()   # a Short Term page following /Fast/Short of the main regulator
         self.follow_short = True    # off where a test is the page itself (test_fastlane.py)
         self._short_msg = None
+        self.wind_page = WindClient()   # a wind chart following /Plot/Wind of the main regulator
+        self._wind_msg = None
         self.mgr.start()
 
     # -- what xregulator_bridge.py does on the GX --
@@ -129,10 +130,19 @@ class Harness:
             self._short_msg = m
             if m and self.page.take(m) == 'gap':
                 self.write('/Fast/ShortFull', 1)
+        m = pub.get('/Plot/Wind') if pub is not None else None
+        if m != self._wind_msg:
+            self._wind_msg = m
+            if m and self.wind_page.take(m) == 'gap':
+                self.write('/Plot/WindFull', 1)
 
     def short(self, name):
         # the page's samples of one Short Term series
         return [None if x == '' else float(x) for x in self.page.cols[SHORT_NAMES.index(name)]]
+
+    def wind(self, name):
+        # the wind chart's samples of one series (Tws, Twa, Aws, Awa)
+        return self.wind_page.series(name)
 
     def alt(self, uid=None):
         return self.alts.get(uid or self.main, (None, None))[1]
@@ -222,7 +232,7 @@ class TestParsers(unittest.TestCase):
         js = fr.SCRIPT.decode()
         counts = {ev: len(xc.field_list(js, c)) for ev, c in xc.STREAMS.items()}
         self.assertEqual(counts['CSVData'], 53)
-        self.assertEqual(counts["CSVData2"], 653)
+        self.assertEqual(counts["CSVData2"], 671)
         self.assertEqual(counts['CSVData3'], 450)
         self.assertIn(counts['CSVData4'], (31, 32, 33, 36, 37))   # the round 3 power-flow fields; 36-37 the demo*A ones
         self.assertLessEqual(set(fr.FLOW_FIELDS), set(xc.field_list(js, 'CSV4_FIELDS')))
@@ -232,6 +242,22 @@ class TestParsers(unittest.TestCase):
         self.assertEqual(xc.parse_counted('3,1,2.5,-2000000000'), [1.0, 2.5, -2e9])
         self.assertIsNone(xc.parse_counted('4,1,2,3'))
         self.assertIsNone(xc.parse_counted('3,1,x,3'))
+
+    def test_plot_ylim_text(self):
+        # one "lo,hi" text for the published limits and a write's hold; deg F rounded as the web app's Math.round
+        echo = lambda chart, lo, hi: xc.ylim_echo({'lo': lo, 'hi': hi}, 'lo', 'hi', *xc.PLOT_YLIM[chart][2:])
+        self.assertEqual(echo('Current', -40.0, 120.0), '-40,120')
+        self.assertEqual(echo('Volts', 1250.0, 1500.0), '12.5,15')
+        self.assertEqual(echo('Temp', 80.0, 200.0), '26.67,93.33')
+        self.assertEqual(echo('Temp', 32.0, 33.0), '0,0.56')
+        self.assertEqual([echo('Volts', 1500.0, 1500.0), echo('Rpm', -2e9, 10.0), echo('Rpm', None, 10.0)], ['', '', ''])
+        self.assertEqual(xc.parse_ylim('-50,70'), ('-50,70', '-50', '70'))
+        self.assertEqual(xc.parse_ylim('12.5,15.0', 'dec'), ('12.5,15', '12.5', '15'))
+        self.assertEqual(xc.parse_ylim('26.67,93.33', 'degF'), ('26.67,93.33', '80', '200'))
+        self.assertEqual(xc.parse_ylim('-22.5,2.5', 'degF'), ('-22.22,2.78', '-8', '37'))   # -8.5 F and 36.5 F
+        for kind, bad in (('whole', '1.5,3'), ('dec', '12.5,12.5'), ('dec', 'inf,15'), ('dec', '-100000.5,0'),
+                          ('degF', '2.5,3'), ('degF', '1,'), ('degF', None)):
+            self.assertIsNone(xc.parse_ylim(bad, kind), bad)
 
     def test_baro(self):
         b, end = xc.parse_baro(fr.make_baro())
@@ -285,18 +311,184 @@ class TestParsers(unittest.TestCase):
         self.assertEqual(p[6 + SHORT_NAMES.index('Bcur')], ',,')
 
     def test_wind_recorder(self):
+        # every CSV4 frame is a sample, timed by sendMs, angles as sent; a stale field is no reading; a stale stream
+        # adds an empty sample every WIND_GAP_EVERY_S; an hour is kept, plus the sample the line enters from
         w = xc.WindRecorder()
-        for a in (350, 10, 350, 10):
-            w.sample({'TrueWindSpeedNMEA': 1000, 'TrueWindAngleNMEA': -170 if a == 350 else 170,
-                      'ApparentWindSpeedNMEA': 1500, 'ApparentWindAngleNMEA': a})
-        w.close()
-        w.close()   # empty bucket = gap
-        out = w.strings()
-        self.assertEqual(out['Tws'], '10.0,')
-        self.assertEqual(out['Aws'], '15.0,')
-        awa = float(out['Awa'].split(',')[0])
-        self.assertLess(min(awa, 360 - awa), 1)
-        self.assertEqual(abs(float(out['Twa'].split(',')[0])), 180)
+        f = {'TrueWindSpeedNMEA': 1234, 'TrueWindAngleNMEA': -170, 'ApparentWindSpeedNMEA': 1500,
+             'ApparentWindAngleNMEA': 350, 'sendMs': 10000, 'sessionId': 3}
+        w.frame(0.0, 1, f)
+        w.frame(0.4, 1, dict(f, sendMs=11000, TrueWindAngleNMEA=170, ApparentWindAngleNMEA=10),
+                {'ApparentWindSpeedNMEA'})
+        w.frame(0.9, 1, dict(f, sendMs=11500, TrueWindSpeedNMEA=xc.EMPTY))
+        w.gap(1.0)                          # stale: an empty sample at once
+        w.gap(1.5)                          # then one a second
+        w.gap(2.0)
+        p = w.message(None).split(';')
+        self.assertEqual(p[:5], ['w1', w.epoch, '5', '5', '1'])
+        self.assertEqual(p[5], '0,1000,500,100,1000')
+        self.assertEqual(p[6:], ['12.3,12.3,,,', '-170,170,-170,,', '15.0,,15.0,,', '350,10,350,,'])
+        self.assertEqual(w.message(4).split(';')[2:7], ['5', '1', '0', '1000', ''])
+        n = w.n
+        for i in range(1, 3602):
+            w.frame(3.0 + i, 1, dict(f, sendMs=12600 + 1000 * i))
+        self.assertEqual(w.n, n + 3601)
+        self.assertEqual(len(w.t), 3601)    # 3600 s back from the newest, and the sample before
+        self.assertEqual(w.t[-1] - w.t[1], 3599000)
+        b = xc.WindRecorder()
+        b.fill([{'TrueWindSpeedNMEA': 9.0, 'TrueWindAngleNMEA': 45.0, 'ApparentWindSpeedNMEA': None,
+                 'ApparentWindAngleNMEA': 30.0}] * 3, 10.0, 5.0)
+        self.assertEqual(b.message(None).split(';')[3:], ['3', '1', '0,10000,10000', '9.0,9.0,9.0', '45,45,45', ',,',
+                                                          '30,30,30'])
+
+
+class TestPlotRate(unittest.TestCase):
+    # Slower plotting's automatic choice (xreg_core.PlotRate) on a made-up clock, Short Term pages and CPU readings
+    class Cpu:
+        def __init__(self, t):
+            self.t, self.busy, self.render, self.thread, self.up = t, 0.5, 0.5, 'a', 1000.0
+
+        def read(self):
+            k = self.t[0] * 400   # four cores at 100 jiffies a second
+            return {'busy': self.busy * k, 'total': k, 'render': None if self.render is None else self.render * self.t[0],
+                    'thread': self.thread, 'up': self.up + self.t[0]}
+
+    class Unit:
+        def __init__(self, t):
+            self.t, self.shown, self.rate = t, False, 10
+
+        def want(self, topic, now):
+            return topic == 'Short' and self.shown
+
+        @property
+        def short_pubs(self):
+            return int(self.t[0] * self.rate)
+
+    def setUp(self):
+        self.t = [0.0]
+        self.store = Store(slow_plots=0, slow_plots_auto=1, slow_plots_check='')
+        self.cpu = self.Cpu(self.t)
+        self.unit = self.Unit(self.t)
+        self.pr = xc.PlotRate(self.store, self.cpu, lambda: self.t[0])
+
+    def run_for(self, s, step=0.5):
+        slow = None
+        end = self.t[0] + s
+        while self.t[0] < end - 1e-9:
+            self.t[0] += step
+            slow = self.pr.tick([self.unit])
+        return slow
+
+    def check(self):
+        return json.loads(self.store['slow_plots_check']) if self.store['slow_plots_check'] else None
+
+    def test_measures_once_after_settling_and_picks_by_load(self):
+        self.assertFalse(self.run_for(60))                         # no Short Term page: nothing measured
+        self.assertIsNone(self.check())
+        self.unit.shown = True
+        self.cpu.busy, self.cpu.render = 0.41, 0.74                 # the Ekrano's figures
+        self.assertFalse(self.run_for(xc.PLOT_SETTLE_S + xc.PLOT_CHECK_S - 1))
+        self.assertIsNone(self.check())
+        self.assertFalse(self.run_for(2))
+        self.assertEqual(self.check(), {'busy': 41, 'render': 74, 'slow': 0})
+        self.assertEqual(self.store['slow_plots'], 0)
+        self.cpu.busy = 0.95                                        # measured once: a busier GX later changes nothing
+        self.assertFalse(self.run_for(120))
+        self.assertEqual(self.check()['busy'], 41)
+
+    def test_busy_gx_or_busy_render_thread_turns_it_on(self):
+        self.unit.shown = True
+        self.cpu.busy, self.cpu.render = 0.72, 0.5
+        self.assertTrue(self.run_for(60))
+        self.assertEqual((self.check(), self.store['slow_plots'], self.store['slow_plots_auto']),
+                         ({'busy': 72, 'render': 50, 'slow': 1}, 1, 1))
+        self.setUp()
+        self.unit.shown = True
+        self.cpu.busy, self.cpu.render = 0.3, 0.93
+        self.assertTrue(self.run_for(60))
+        self.assertEqual(self.check(), {'busy': 30, 'render': 93, 'slow': 1})
+
+    def test_no_screen_gui_or_a_new_render_thread_decides_on_the_gx(self):
+        self.unit.shown = True
+        self.cpu.busy, self.cpu.render = 0.2, None                  # a GX without a screen: the remote console only
+        self.assertFalse(self.run_for(60))
+        self.assertEqual(self.check(), {'busy': 20, 'render': None, 'slow': 0})
+        self.setUp()
+        self.unit.shown = True
+        self.cpu.render = 2.0
+        self.run_for(xc.PLOT_SETTLE_S + 1)
+        self.cpu.thread = 'b'                                       # gui-v2 reloaded the plugin mid-window
+        self.run_for(xc.PLOT_CHECK_S + 1)
+        self.assertEqual(self.check()['render'], None)
+
+    def test_waits_for_uptime_full_rate_and_a_page_that_stays(self):
+        self.unit.shown = True
+        self.cpu.up = 0.0                                           # just booted: everything starts busy
+        self.run_for(xc.PLOT_BOOT_S - 1)
+        self.assertIsNone(self.check())
+        self.run_for(xc.PLOT_SETTLE_S + xc.PLOT_CHECK_S + 2)
+        self.assertIsNotNone(self.check())
+        self.setUp()
+        self.unit.shown, self.unit.rate = True, 1                   # the regulator not at the full rate: no decision
+        self.run_for(200)
+        self.assertIsNone(self.check())
+        self.unit.rate = 10
+        self.run_for(xc.PLOT_CHECK_S + 2)                           # the next window counts
+        self.assertIsNotNone(self.check())
+        self.setUp()
+        self.unit.shown = True
+        self.run_for(xc.PLOT_SETTLE_S + xc.PLOT_CHECK_S - 5)
+        self.unit.shown = False                                     # left before the end: start over next time
+        self.run_for(1)
+        self.unit.shown = True
+        self.run_for(xc.PLOT_SETTLE_S + 4)
+        self.assertIsNone(self.check())
+        self.run_for(xc.PLOT_CHECK_S)
+        self.assertIsNotNone(self.check())
+
+    def test_owner_choice_turns_automatic_off_and_back_on_measures_again(self):
+        self.unit.shown = True
+        self.cpu.busy = 0.8
+        self.assertTrue(self.run_for(60))
+        self.store['slow_plots'] = 0                                # the owner's switch
+        self.assertFalse(self.run_for(1))
+        self.assertEqual(self.store['slow_plots_auto'], 0)
+        self.assertFalse(self.run_for(120))                         # automatic off: no new measurement
+        self.assertEqual(self.check()['busy'], 80)
+        self.store['slow_plots'] = 1
+        self.assertTrue(self.run_for(1))
+        self.cpu.busy = 0.3
+        self.store['slow_plots_auto'] = 1                           # back on: Slower plotting off, measured again
+        self.assertFalse(self.run_for(0.5))
+        self.assertEqual((self.store['slow_plots'], self.store['slow_plots_check']), (0, ''))
+        self.assertFalse(self.run_for(60))
+        self.assertEqual(self.check(), {'busy': 30, 'render': 50, 'slow': 0})
+        self.store['slow_plots'] = 1                                # the owner again, with automatic on
+        self.assertTrue(self.run_for(0.5))
+        self.assertEqual((self.store['slow_plots_auto'], self.store['slow_plots']), (0, 1))
+
+    def test_cpu_reader_on_a_made_up_proc(self):
+        proc = tempfile.mkdtemp(dir=WORK)
+
+        def put(path, text):
+            os.makedirs(os.path.dirname(proc + path), exist_ok=True)
+            with open(proc + path, 'w') as f:
+                f.write(text)
+        put('/stat', 'cpu  100 5 50 800 20 3 2 0 0 0\ncpu0 1 2 3 4 5 6 7 8 9 10\n')
+        put('/uptime', '1234.56 4000.00\n')
+        put('/self/comm', 'python3\n')
+        put('/77/comm', 'dbus-daemon\n')
+        put('/88/comm', 'venus-gui-v2\n')
+        put('/88/task/88/comm', 'venus-gui-v2\n')
+        put('/88/task/91/comm', 'QSGRenderThread\n')
+        put('/88/task/91/stat', '91 (QSGRender) Thread) S 1 88 88 0 -1 4194368 900 0 0 0 250 50 0 0 20 0 30 0\n')
+        r = xc.CpuReader(proc)
+        r.tck = 100
+        s = r.read()
+        self.assertEqual((s['busy'], s['total'], s['render'], s['up']), (160, 980, 3.0, 1234.56))
+        self.assertTrue(s['thread'].endswith('/88/task/91/stat'))
+        shutil.rmtree(proc + '/88/task/91')                         # the thread went: looked up again, none now
+        self.assertEqual((r.read()['render'], r.read()['thread']), (None, None))
+        self.assertIsNone(xc.CpuReader(proc + '/none').read())
 
 
 class TestLongTerm(unittest.TestCase):
@@ -557,18 +749,21 @@ class TestGxFirmware(unittest.TestCase):
         self.reg.close()
 
     def test_wind_hour_true_and_apparent(self):
-        # the Dashboard's wind tile plots apparent wind (/History/AppWind); /History/Wind keeps the true wind means
-        old = xc.WIND_EVERY_S
-        xc.WIND_EVERY_S = 1
-        try:
-            h, pub = self.h, self.h.pub
-            h.until(lambda: pub['/Connected'] == 1, 15, 'connected')
-            h.until(lambda: len([x for x in series(pub['/History/AppWind'])[1:] if x is not None]) >= 2, 10, 'apparent means')
-            self.assertEqual((pub['/Live/AppWind'], pub['/Live/TrueWind']), (15.0, 12.0))
-            self.assertEqual({x for x in series(pub['/History/AppWind'])[1:] if x is not None}, {15.0})
-            self.assertEqual({x for x in series(pub['/History/Wind'])[1:] if x is not None}, {12.0})
-        finally:
-            xc.WIND_EVERY_S = old
+        # the Dashboard (/Ui/Want/Live) gets the wind hour for its tile: every CSV4 frame a sample, as it comes
+        h, pub = self.h, self.h.pub
+        h.until(lambda: pub['/Connected'] == 1, 15, 'connected')
+        self.assertEqual(pub['/Plot/Wind'], '')            # no page shows wind: nothing sent
+        h.want('Live')
+        h.until(lambda: len(h.wind('Aws')) >= 3, 10, 'apparent samples')
+        self.assertEqual((pub['/Live/AppWind'], pub['/Live/TrueWind']), (15.0, 12.0))
+        self.assertEqual(set(h.wind('Aws')), {15.0})
+        self.assertEqual(set(h.wind('Tws')), {12.0})
+        self.assertEqual(set(h.wind('Awa')), {350.0, 10.0})   # as sent, never averaged
+        n = h.wind_page.n
+        h.tick_for(2.5)
+        self.assertGreaterEqual(h.wind_page.n - n, 2)       # CSV4 every second here: a sample each
+        self.assertEqual(h.wind_page.asks, 0)
+        self.assertEqual(h.wind_page.n, h.core.wind_plot.n)
 
     def test_live_link_and_cache(self):
         h, pub = self.h, self.h.pub
@@ -659,6 +854,23 @@ class TestGxFirmware(unittest.TestCase):
         self.assertEqual(pub['/Plot/Long/battVolt'], '')
         self.assertIsNone(pub['/Plot/Long/StartEpoch'])
 
+    def test_long_range_survives_restart(self):
+        # kept in the regulator's localsettings group, so a bridge restart or a GX reboot opens on the range picked
+        h, uid = self.h, self.reg.uid
+        self.assertTrue(h.write('/Ui/LongRange', '7d'))
+        self.assertEqual(h.unit_stores[uid].get('long_range'), '7d')
+        stores = h.unit_stores
+        h.close()
+        self.h = h = Harness(self.reg, unit_stores=stores)
+        h.tick_for(0.3)
+        self.assertEqual(h.pub['/Ui/LongRange'], '7d')
+        self.assertEqual(h.pub['/Plot/Long/Range'], '7d')
+        stores[uid].set('long_range', '2h')   # not a range the page offers
+        h.close()
+        self.h = h = Harness(self.reg, unit_stores=stores)
+        h.tick_for(0.3)
+        self.assertEqual(h.pub['/Plot/Long/Range'], '24h')
+
     def test_health_perf_wind(self):
         h, pub = self.h, self.h.pub
         h.until(lambda: pub['/Connected'] == 1, 15, 'connected')
@@ -674,11 +886,10 @@ class TestGxFirmware(unittest.TestCase):
         self.assertTrue(h.write('/Ui/Want/HealthTrend/10', int(time.time())))
         h.until(lambda: any(r['q'].get('hours') == '10' for r in self.reg.requests('/alttrend.csv')), 5, 'hours=10')
         self.assertIn('motorLive', json.loads(pub['/Perf/Schema']))
-        h.until(lambda: len([v for v in series(pub['/Plot/Wind/Tws']) if v is not None]) >= 2, 6, 'wind samples')
-        self.assertEqual([v for v in series(pub['/Plot/Wind/Tws']) if v is not None][-1], 12.0)
-        self.assertEqual([v for v in series(pub['/Plot/Wind/Aws']) if v is not None][-1], 15.0)
-        twa = [v for v in series(pub['/Plot/Wind/Twa']) if v is not None][-1]
-        self.assertGreater(abs(twa), 160)   # 170 and -170 average to 180, never 0
+        h.until(lambda: len([v for v in h.wind('Tws') if v is not None]) >= 2, 6, 'wind samples')
+        self.assertEqual([v for v in h.wind('Tws') if v is not None][-1], 12.0)
+        self.assertEqual([v for v in h.wind('Aws') if v is not None][-1], 15.0)
+        h.until(lambda: {v for v in h.wind('Twa') if v is not None} == {170.0, -170.0}, 6, 'both true wind angles, as sent')
         for t in ('Health', 'Perf', 'Wind'):
             h.core.want_at[t] -= 60
         for w in (0, 10):
@@ -687,7 +898,7 @@ class TestGxFirmware(unittest.TestCase):
         self.assertEqual((pub['/Health/TrendCsv/0'], pub['/Health/TrendCsv/10']), ('', ''))
         self.assertEqual(pub['/Perf/CurveCsv'], '')
         self.assertIsNone(pub['/Perf/Live/pct'])
-        self.assertEqual(pub['/Plot/Wind/Tws'], '')
+        self.assertEqual(pub['/Plot/Wind'], '')
         self.assertEqual(pub['/Health/Live/latchPct'], 93.0)   # live health fields are always published
 
     def test_keyless_gx_writes(self):
@@ -727,6 +938,135 @@ class TestGxFirmware(unittest.TestCase):
         self.assertEqual(reg.requests('/armSettings'), [])
         self.assertFalse(reg.armed)
         self.assertEqual(reg.requests('/gxPair'), [])
+
+    def test_plot_ylim_and_watermarks(self):
+        # the current chart's manual limits are the regulator's Ymin1/Ymax1 (the web app's Current plot), one /get for
+        # both; the Dashboard readouts' larger views' highs and lows are its ignition-cycle watermarks from CSV2, none
+        # until the regulator has a sample (ROLL_EMPTY)
+        h, pub, reg = self.h, self.h.pub, self.reg
+        h.until(lambda: pub['/Connected'] == 1, 15, 'connected')
+        reg.csv3['Ymin1'], reg.csv3['Ymax1'] = -20, 20
+        reg.csv3_dirty.set()
+        h.until(lambda: pub['/Plot/YLim/Current'] == '-20,20', 5, 'limits echo')
+        self.assertTrue(h.write('/Plot/YLim/Current', '-50,70'))
+        h.core.tick(pub)
+        self.assertEqual(pub['/Plot/YLim/Current'], '-50,70')   # held until the echo
+        self.assertTrue(h.wait_result('Ymin1')['ok'])
+        g = [r for r in gets(reg, 'Ymin1') if 'Ymax1' in r['q']][-1]['q']
+        self.assertEqual((g['Ymin1'], g['Ymax1'], g['gx']), ('-50', '70', '1'))
+        h.tick_for(1.0)
+        self.assertEqual((reg.csv3['Ymin1'], reg.csv3['Ymax1']), (-50, 70))
+        self.assertEqual(pub['/Plot/YLim/Current'], '-50,70')   # the regulator's echo
+        n_before = len(reg.requests('/get'))
+        for bad in ('70,-50', '5,5', '1.5,3', 'x', '-50', ''):
+            self.assertFalse(h.write('/Plot/YLim/Current', bad), bad)
+        self.assertEqual(len(reg.requests('/get')), n_before)
+        rows = ('BattVHi', 'BattVLo', 'SocHi', 'SocLo', 'AltTempHi', 'AltTempLo', 'BattTempHi', 'BattTempLo', 'RpmHi',
+                'RpmLo')
+        empty = {'wmIgn_%s_%s' % (f, e): -2000000000 for f in ('IBV', 'SOC', 'altTempF', 'battTempF', 'RPM')
+                 for e in ('hi', 'lo')}
+        reg.dvcc.update(wmIgn_amps_hi=8800, wmIgn_amps_lo=0, wmIgn_Bcur_hi=6100, wmIgn_Bcur_lo=-2000000000, **empty)
+        h.until(lambda: pub['/Live/AltAmpsHi'] == 88, 15, 'watermarks')
+        self.assertEqual((pub['/Live/AltAmpsLo'], pub['/Live/BattAHi'], pub['/Live/BattALo']), (0, 61, None))
+        self.assertEqual([pub['/Live/' + n] for n in rows], [None] * len(rows))
+        reg.dvcc.update(wmIgn_IBV_hi=1442, wmIgn_IBV_lo=1253, wmIgn_SOC_hi=9800, wmIgn_SOC_lo=4000, wmIgn_altTempF_hi=2120,
+                        wmIgn_altTempF_lo=-40, wmIgn_battTempF_hi=770, wmIgn_battTempF_lo=500, wmIgn_RPM_hi=2400,
+                        wmIgn_RPM_lo=0)
+        h.until(lambda: pub['/Live/BattVHi'] == 14.42, 15, 'more watermarks')
+        self.assertEqual([pub['/Live/' + n] for n in rows], [14.42, 12.53, 98, 40, 100.0, -20.0, 25.0, 10.0, 2400, 0])
+
+    def test_watermark_reset(self):
+        # a readout panel's Reset: one /get?wmReset= (no unlock), the pairs cleared and their start shown at once, held
+        # so until a CSV2 frame built after the reset (the GX gets CSV2 every 10 to 30 s); a refused reset clears nothing
+        h, pub, reg = self.h, self.h.pub, self.reg
+        h.until(lambda: pub['/Connected'] == 1, 15, 'connected')
+        reg.dvcc.update(wmIgn_amps_hi=8800, wmIgn_amps_lo=100, wmIgn_amps_age=3600, wmIgn_Bcur_hi=6100, wmIgn_Bcur_lo=-500,
+                        wmIgn_Bcur_age=7200, wmIgn_SOC_hi=9800, wmIgn_SOC_lo=4000, wmIgn_SOC_age=3600)
+        h.until(lambda: pub['/Live/AltAmpsHi'] == 88 and pub['/Live/WmSince/Bcur'] is not None, 15, 'watermarks')
+        now = time.time()
+        self.assertLess(abs(pub['/Live/WmSince/amps'] - (now - 3600)), 5)
+        self.assertLess(abs(pub['/Live/WmSince/Bcur'] - (now - 7200)), 5)
+        n_before = len(reg.requests('/get'))
+        for bad in ('nope', 'amps,nope', 'amps;Bcur', ','):
+            self.assertFalse(h.write('/Live/WmReset', bad), bad)
+        self.assertEqual(len(reg.requests('/get')), n_before)
+        self.assertTrue(h.write('/Live/WmReset', 'amps,Bcur'))
+        self.assertTrue(h.wait_result('wmReset')['ok'])
+        self.assertEqual(reg.wm_resets, ['amps,Bcur'])
+        self.assertEqual(gets(reg, 'wmReset')[-1]['q']['gx'], '1')
+        self.assertEqual(reg.requests('/armSettings'), [])
+        h.tick_for(1.0)
+        now = time.time()
+        self.assertEqual([pub['/Live/' + n] for n in ('AltAmpsHi', 'AltAmpsLo', 'BattAHi', 'BattALo')], [None] * 4)
+        self.assertLess(abs(pub['/Live/WmSince/amps'] - now), 5)
+        self.assertLess(abs(pub['/Live/WmSince/Bcur'] - now), 5)
+        self.assertEqual(pub['/Live/SocHi'], 98)   # not in this reset
+        h.tick_for(3.0)   # frames built before the reset keep arriving
+        self.assertEqual(pub['/Live/AltAmpsHi'], None)
+        reset_at = pub['/Live/WmSince/amps']
+        reg.dvcc.update(wmIgn_amps_hi=2000, wmIgn_amps_lo=1900, wmIgn_amps_age=4)
+        h.until(lambda: pub['/Live/AltAmpsHi'] == 20, 15, 'the first frame after the reset')
+        self.assertEqual(pub['/Live/WmSince/amps'], reset_at)   # within the delivery jitter: held
+        self.assertEqual(pub['/Live/BattAHi'], None)   # its frame still predates the reset
+        # a second reset moments after the last: a frame from before it must not end the hold
+        reg.dvcc.update(wmIgn_amps_hi=2100, wmIgn_amps_lo=1900, wmIgn_amps_age=20)
+        h.until(lambda: pub['/Live/AltAmpsHi'] == 21, 15, 'a frame before the second reset')
+        self.assertTrue(h.write('/Live/WmReset', 'amps'))
+        self.assertTrue(h.wait_result('wmReset')['ok'])
+        h.tick_for(3.0)
+        self.assertEqual(pub['/Live/AltAmpsHi'], None)
+        reg.dvcc.update(wmIgn_amps_hi=500, wmIgn_amps_lo=400, wmIgn_amps_age=0)
+        h.until(lambda: pub['/Live/AltAmpsHi'] == 5, 15, 'the first frame after the second reset')
+        reg.wm_answer = 'Rejected: unknown watermark in SOC'
+        self.assertTrue(h.write('/Live/WmReset', 'SOC'))
+        self.assertFalse(h.wait_result('wmReset')['ok'])
+        h.tick_for(1.0)
+        self.assertEqual(pub['/Live/SocHi'], 98)
+
+    def test_plot_ylim_volts_rpm_temp(self):
+        # the Voltage, RPM and Temperature charts' limits are Ymin2-4/Ymax2-4: volts (x100 on CSV3, as typed on /get),
+        # whole RPM, and whole deg F on the regulator, published and written here in deg C
+        h, pub, reg = self.h, self.h.pub, self.reg
+        h.until(lambda: pub['/Connected'] == 1, 15, 'connected')
+        self.assertEqual({p for p in pub if p.startswith('/Plot/YLim/')},
+                         {'/Plot/YLim/' + n for n in ('Current', 'Volts', 'Rpm', 'Temp')})
+        reg.csv3.update(Ymin2=1100, Ymax2=1500, Ymin3=0, Ymax3=4000, Ymin4=-40, Ymax4=248)
+        reg.csv3_dirty.set()
+        h.until(lambda: pub['/Plot/YLim/Temp'] == '-40,120', 5, 'limits echo')
+        self.assertEqual((pub['/Plot/YLim/Volts'], pub['/Plot/YLim/Rpm']), ('11,15', '0,4000'))
+        for chart, value, shown, lo_key, sent, wire in (
+                ('Volts', '12.5,15.25', '12.5,15.25', 'Ymin2', ('12.5', '15.25'), (1250, 1525)),
+                ('Volts', '12.345,15.0', '12.35,15', 'Ymin2', ('12.35', '15'), (1235, 1500)),
+                ('Rpm', '500,3000', '500,3000', 'Ymin3', ('500', '3000'), (500, 3000)),
+                ('Temp', '40,120', '40,120', 'Ymin4', ('104', '248'), (104, 248)),
+                ('Temp', '41,93.33', '41.11,93.33', 'Ymin4', ('106', '200'), (106, 200))):
+            path, hi_key = '/Plot/YLim/' + chart, lo_key.replace('min', 'max')
+            self.assertTrue(h.write(path, value), value)
+            h.core.tick(pub)
+            self.assertEqual(pub[path], shown)   # held until the echo, as the regulator will echo it
+            self.assertEqual(h.core.hold[path][0], shown)
+            self.assertTrue(h.wait_result(lo_key)['ok'])
+            g = [r for r in gets(reg, lo_key) if hi_key in r['q']][-1]['q']
+            self.assertEqual((g[lo_key], g[hi_key], g['gx']), sent + ('1',))
+            self.assertEqual((reg.csv3[lo_key], reg.csv3[hi_key]), wire)
+            h.until(lambda: path not in h.core.hold, xc.CONFIRM_MARGIN_S - 0.5, 'echo releases the hold')
+            self.assertEqual(pub[path], shown)   # the regulator's echo
+        n_before = len(reg.requests('/get'))
+        for chart, bad in (('Volts', '15,12.5'), ('Volts', '12.501,12.504'), ('Volts', 'nan,15'), ('Volts', '12.5'),
+                           ('Rpm', '3000,3000'), ('Rpm', '500.5,3000'), ('Rpm', '0,100001'), ('Temp', '50,40'),
+                           ('Temp', '40,40.2'), ('Temp', 'x,40')):
+            self.assertFalse(h.write('/Plot/YLim/' + chart, bad), chart + ' ' + bad)
+        self.assertEqual(len(reg.requests('/get')), n_before)
+        # an accepted write the echo never matches (here the regulator applies only the low limit) shows the echo once
+        # the confirm window after the acceptance has passed, as the Current chart's does
+        reg.unknown_keys.add('Ymax4')
+        self.assertTrue(h.write('/Plot/YLim/Temp', '45,100'))
+        self.assertTrue(h.wait_result('Ymin4')['ok'])
+        self.assertEqual((reg.csv3['Ymin4'], reg.csv3['Ymax4']), (113, 200))
+        h.tick_for(1.0)
+        self.assertEqual(pub['/Plot/YLim/Temp'], '45,100')
+        h.until(lambda: pub['/Plot/YLim/Temp'] == '45,93.33', xc.CONFIRM_MARGIN_S + 5, 'hold times out')
+        self.assertNotIn('/Plot/YLim/Temp', h.core.hold)
 
     def test_table_action_source_hedge(self):
         h, pub, reg = self.h, self.h.pub, self.reg
@@ -1435,10 +1775,12 @@ class TestDemo(unittest.TestCase):
         self.assertEqual(set(h.page.t[i] - h.page.t[i - 1] for i in range(1, 300)), {1000})
         self.assertEqual(h.short('AlternatorTemperatureC')[0], 100.0)
         self.assertEqual(h.short('chargeStage')[0], 1)
-        self.assertEqual(series(h.pub['/History/Wind']), [9.0] * 120)    # 30 s means of three 10 s rows
-        self.assertEqual(series(h.pub['/History/AppWind']), [10.0] * 120)  # apparent, the Dashboard's tile
-        self.assertEqual(len(series(h.pub['/Plot/Wind/Tws'])), 360)
-        self.assertEqual(series(h.pub['/Plot/Wind/Twa'])[-1], 45.0)
+        h.until(lambda: len(h.wind('Tws')) >= 360, 5, 'wind hour backfilled')
+        tws = h.wind('Tws')
+        self.assertEqual(tws[:360], [8.0 + k % 3 for k in range(360)])    # the backfill's rows, 10 s apart
+        self.assertEqual(set(h.wind_page.t[i] - h.wind_page.t[i - 1] for i in range(1, 360)), {10000})
+        self.assertEqual(h.wind('Twa')[359], 45.0)
+        self.assertEqual(h.wind('Aws')[359], 10.0)
         self.assertEqual(len(reg.requests('/demoBackfill')), 1)
         h.tick_for(1.0)
         self.assertEqual(len(reg.requests('/demoBackfill')), 1)           # once per entry
@@ -1447,17 +1789,16 @@ class TestDemo(unittest.TestCase):
         self.assertTrue(h.write('/Settings/Value/hardwarePresent', 1))
         h.until(lambda: not h.core.demo, 10, 'demo left')
         self.assertLess(len(h.short('MeasuredAmps')), 3)
-        self.assertLess(len(series(h.pub['/Plot/Wind/Tws'])), 2)
-        self.assertEqual(h.pub['/History/Wind'], '')
-        self.assertEqual(h.pub['/History/AppWind'], '')
+        self.assertLess(len(h.wind('Tws')), 3)
+        self.assertNotIn(10.0, h.wind('Aws'))                              # the real boat's 15 kn, never the demo's
         self.assertEqual(len(reg.requests('/demoBackfill')), 1)
         # No again on the same stream (no reconnect between): this entry gets its own backfill (bench 2026-10-28: the
         # second demo of a session had an empty wind hour)
         self.assertEqual(h.core.link.snapshot()[2]['generation'], gen)
         self.assertTrue(h.write('/Settings/Value/hardwarePresent', 0))
         h.until(lambda: len(reg.requests('/demoBackfill')) == 2, 10, 'second entry backfilled')
-        h.until(lambda: series(h.pub['/History/Wind']) == [9.0] * 120, 10, 'wind hour filled again')
-        self.assertEqual(len(series(h.pub['/Plot/Wind/Tws'])), 360)
+        h.until(lambda: len(h.wind('Tws')) >= 360, 10, 'wind hour filled again')
+        self.assertEqual(h.wind('Tws')[:3], [8.0, 9.0, 10.0])
         self.assertEqual(h.core.link.snapshot()[2]['generation'], gen)
 
     def test_connect_while_in_demo(self):
@@ -1484,14 +1825,13 @@ class TestDemo(unittest.TestCase):
         h, reg = self.start(), self.reg
         reg.wind_demo_only = True
         self.assertTrue(h.write('/Settings/Value/hardwarePresent', 0))
-        h.until(lambda: len(series(h.pub['/Plot/Wind/Tws'])) >= 360, 10, 'wind backfilled')
+        h.until(lambda: len(h.wind('Tws')) >= 360, 10, 'wind backfilled')
         h.tick_for(3.0)
         self.assertTrue(h.write('/Settings/Value/hardwarePresent', 1))
         h.until(lambda: not h.core.demo, 10, 'demo left')
         h.tick_for(12.0)
-        self.assertEqual([x for x in series(h.pub['/Plot/Wind/Tws']) if x is not None], [])
-        self.assertEqual([x for x in series(h.pub['/History/Wind']) if x is not None], [])
-        self.assertEqual([x for x in series(h.pub['/History/AppWind']) if x is not None], [])
+        self.assertEqual([x for x in h.wind('Tws') if x is not None], [])
+        self.assertEqual([x for x in h.wind('Aws') if x is not None], [])
         self.assertIsNone(h.pub['/Live/AppWind'])
 
     def test_quiet_twin_in_demo_leaves_the_readings_to_wifi(self):
@@ -1512,7 +1852,7 @@ class TestDemo(unittest.TestCase):
         reg.backfill_refuse = 2
         self.assertTrue(h.write('/Settings/Value/hardwarePresent', 0))
         h.until(lambda: len(reg.requests('/demoBackfill')) == 3, 10, 'retried until it answers')
-        h.until(lambda: series(h.pub['/History/Wind']) == [9.0] * 120, 10, 'wind hour filled')
+        h.until(lambda: len(h.wind('Tws')) >= 360, 10, 'wind hour filled')
         h.tick_for(1.5)
         self.assertEqual(len(reg.requests('/demoBackfill')), 3)
 
@@ -1532,11 +1872,12 @@ class TestDemo(unittest.TestCase):
 
     def test_backfill_parser(self):
         b = xc.parse_backfill(json.dumps(fr.make_backfill(1_790_000_000)).encode())
-        self.assertEqual((len(b['short']), len(b['wind'])), (300, 360))
+        self.assertEqual((len(b['short']), len(b['wind']), b['wind_dt']), (300, 360, 10))
         self.assertEqual(b['short'][-1]['MeasuredAmps'], 42.99)
-        bad = {'v': 1, 'short': {'cols': ['IBV'], 'rows': [[13.5], [None], ['x'], [1, 2]]}}
+        bad = {'v': 1, 'short': {'cols': ['IBV'], 'rows': [[13.5], [None], ['x'], [1, 2]]}, 'wind': {'dt': 'x'}}
         self.assertEqual(xc.parse_backfill(json.dumps(bad).encode()), {'short': [{'IBV': 13.5}, {'IBV': None},
-                                                                                  {'IBV': None}], 'wind': []})
+                                                                                  {'IBV': None}], 'wind': [],
+                                                                        'wind_dt': 10.0})
         with self.assertRaises(ValueError):
             xc.parse_backfill(b'{"v":2}')
 
@@ -1687,6 +2028,24 @@ class TestFlow(unittest.TestCase):
         h.core.want_at['Flow'] -= 60
         h.until(lambda: reg.flow_holds[-1:] == ['0'], 5, 'flow=0')
 
+    def test_csv4_hold_retried_when_refused(self):
+        # a /gxrate request refused because one is still on its way is tried again on the next tick, both ways
+        h, reg = self.h, self.reg
+        real, refused = h.core._gxrate, []
+
+        def gxrate(hold, value):
+            if hold == 'flow' and len(refused) < 2:
+                refused.append(value)
+                return False
+            return real(hold, value)
+        h.core._gxrate = gxrate
+        h.until(lambda: reg.flow_holds == ['1'], 5, 'flow=1 on a later tick')
+        self.assertEqual(refused, [1, 1])
+        del refused[:]
+        h.core.want_at['Flow'] -= 60
+        h.until(lambda: reg.flow_holds[-1:] == ['0'], 5, 'flow=0 on a later tick')
+        self.assertEqual(refused, [0, 0])
+
 
 # ------------------------------------------------------------------ round 3: Cloud page
 
@@ -1695,6 +2054,7 @@ class FakeCloud:
     def __init__(self):
         import http.server, gzip as gz
         self.status, self.body, self.gzip, self.requests = 200, None, False, []
+        self.delay = 0.0
         cloudself = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -1705,6 +2065,7 @@ class FakeCloud:
                 n = int(self.headers.get('Content-Length') or 0)
                 cloudself.requests.append({'path': self.path, 'headers': {k.lower(): v for k, v in self.headers.items()},
                                            'body': json.loads(self.rfile.read(n) or b'null')})
+                time.sleep(cloudself.delay)
                 b = json.dumps(cloudself.body).encode()
                 self.send_response(cloudself.status)
                 self.send_header('Content-Type', 'application/json')
@@ -1910,6 +2271,31 @@ class TestCloud(unittest.TestCase):
         h.tick_for(0.3)
         self.assertEqual(h.pub['/Cloud/Json'], '')                           # 40-60 KB only while the page shows
         self.assertEqual(self.state(), xc.CLOUD_READY)
+
+    def test_refreshing_while_shown(self):
+        # a refresh with leaderboards on screen: the tap starts the call at once (the glue ticks on want_rose),
+        # /Cloud/Busy reads 1 until the answer, and the answer nudges a tick instead of waiting for the next one
+        h = self.start()
+        nudges = []
+        h.core.nudge = lambda: nudges.append(time.time())
+        h.want('Cloud')
+        h.until(lambda: self.state() == xc.CLOUD_READY, 10, 'ready')
+        self.assertEqual(h.pub['/Cloud/Busy'], 0)
+        self.cloud.delay = 1.0
+        h.core.want_rose = False
+        t0 = time.time()
+        self.assertTrue(h.write('/Cloud/Refresh', 1))
+        self.assertTrue(h.core.want_rose)
+        h.tick()
+        self.assertEqual((h.pub['/Cloud/Busy'], self.state()), (1, xc.CLOUD_READY))
+        self.assertEqual(json.loads(h.pub['/Cloud/Json'])['you']['n'], 'DemoBoat')   # the last bundle stays shown
+        del nudges[:]
+        end = time.time() + 10
+        while not nudges and time.time() < end:
+            time.sleep(0.01)
+        self.assertTrue(nudges and nudges[0] - t0 >= 0.9, nudges)
+        h.tick()
+        self.assertEqual((h.pub['/Cloud/Busy'], len(self.cloud.requests)), (0, 2))
 
     def test_gzip_answer(self):
         self.cloud.gzip = True

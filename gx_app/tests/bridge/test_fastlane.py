@@ -341,7 +341,7 @@ class TestCoreFastLane(unittest.TestCase):
         h.until(lambda: json.loads(pub['/Fast/Live'])['OnOff'] == 0, 3, 'held at the written value')
         self.fast_ticks(0.5)
         self.assertEqual(json.loads(pub['/Fast/Live'])['OnOff'], 0)
-        # engine stopped, field off: the Dashboard no longer holds the fast schedule (it shows at anchor all day)
+        # engine stopped, field off: the Dashboard keeps the fast schedule, as underway (no rule by engine or speed)
         self.reg.confirm_delay_s = None
         self.reg.field_status = 0
         fr_frame = self.reg.frame
@@ -355,11 +355,14 @@ class TestCoreFastLane(unittest.TestCase):
             v[1 + names.index('RPM')] = '0'
             return ','.join(v)
         self.reg.frame = stopped
-        h.until(lambda: self.reg.fast[-1] == '0', 5, 'released at anchor')
-        self.assertEqual(json.loads(pub['/Fast/Live'])['Rpm'], 0.0)   # the lane itself stays while the page is open
+        h.until(lambda: json.loads(pub['/Fast/Live'])['Rpm'] == 0.0, 5, 'stopped')
+        h.tick_for(1.5)
+        self.assertEqual(self.reg.fast[-1], '2')
+        self.assertNotIn('0', self.reg.fast)
         h.core.want_at['Live'] -= 60
         h.tick()
         self.assertEqual(pub['/Fast/Live'], '')
+        h.until(lambda: self.reg.fast[-1] == '0', 5, 'released when the page goes')
 
     def test_live_readouts_twice_a_second_state_at_once(self):
         h, pub = self.h, self.h.pub
@@ -393,6 +396,87 @@ class TestCoreFastLane(unittest.TestCase):
         finally:
             Pub.__setitem__ = orig
 
+
+    def test_slower_plotting(self):
+        # the GX app page's Slower plotting: Short Term and the Dashboard hold fast=1 (CSV1 every 500 ms) instead of
+        # fast=2, and /Fast/Live and /Fast/Short go out about once a second; a state change still goes with its frame
+        h, pub = self.h, self.h.pub
+        h.store['slow_plots'] = 1
+        h.until(lambda: pub['/Connected'] == 1, 15, 'connected')
+        sent = {'/Fast/Live': [], '/Fast/Short': []}
+        orig = Pub.__setitem__
+
+        def spy(p, path, value):
+            if p is pub and path in sent and value:
+                sent[path].append((time.time(), value))
+            orig(p, path, value)
+        Pub.__setitem__ = spy
+        try:
+            h.want('Short')
+            h.want('Live')
+            h.tick()
+            h.until(lambda: self.reg.fast[-1:] == ['1'], 5, 'fast=1')
+            self.assertNotIn('2', self.reg.fast)
+            page = ShortClient()
+            page.take(pub['/Fast/Short'])
+            for v in sent.values():
+                del v[:]
+            self.fast_ticks(4.2)
+            for path, v in sent.items():
+                gaps = [round(b[0] - a[0], 3) for a, b in zip(v, v[1:])]
+                self.assertTrue(3 <= len(v) <= 5, (path, len(v), gaps))
+                self.assertTrue(all(g >= 0.85 for g in gaps), (path, gaps))
+            for _, m in sent['/Fast/Short']:
+                self.assertEqual(page.take(m), 'inc')
+            behind = h.core.short.n - page.n                        # samples held back until the next publish
+            self.assertTrue(0 <= behind <= 2, behind)
+            rr = recorder_rows(h.core.short)[:len(h.core.short.t) - behind]
+            self.assertEqual(page.rows()[1:], rr[len(rr) - len(page.t) + 1:])
+            dts = [d for _, m in sent['/Fast/Short'] for d in parse(m)['dt']]
+            self.assertTrue(dts and all(450 <= d <= 600 for d in dts), dts)
+            # a switch write still goes out with the next frame
+            self.reg.confirm_delay_s = 1.5
+            t0 = time.time()
+            self.assertTrue(h.write('/SwitchableOutput/0/State', 0))
+            self.fast_ticks(0.7)
+            first = next((t for t, v in sent['/Fast/Live'] if t >= t0 and json.loads(v)['OnOff'] == 0), None)
+            self.assertIsNotNone(first)
+            self.assertLess(first - t0, 0.65)
+            # switched off: fast=2 again
+            h.store['slow_plots'] = 0
+            h.until(lambda: self.reg.fast[-1] == '2', 5, 'fast=2 once it is off')
+        finally:
+            Pub.__setitem__ = orig
+
+
+    def test_automatic_plot_rate(self):
+        # automatic on (the bridge's default on a GX): Short Term open at fast=2, the GX measured busy, Slower plotting
+        # turned on by the bridge and the regulator dropped to fast=1; the owner's switch then turns automatic off
+        h = self.h
+        h.store.update(slow_plots=0, slow_plots_auto=1, slow_plots_check='')
+        t0 = time.time()
+        h.mgr.plot_rate.cpu = types.SimpleNamespace(read=lambda: {
+            'busy': 0.85 * (time.time() - t0) * 400, 'total': (time.time() - t0) * 400 + 1,
+            'render': 0.6 * (time.time() - t0), 'thread': 'x', 'up': 1000.0})
+        keep = xc.PLOT_SETTLE_S, xc.PLOT_CHECK_S, xc.PLOT_MIN_RATE
+        xc.PLOT_SETTLE_S, xc.PLOT_CHECK_S, xc.PLOT_MIN_RATE = 0.5, 2.0, 3
+        try:
+            h.until(lambda: h.pub['/Connected'] == 1, 15, 'connected')
+            h.want('Short')
+            h.tick()
+            h.until(lambda: self.reg.fast[-1:] == ['2'], 5, 'fast=2 while it measures')
+            end = time.time() + 10
+            while time.time() < end and not h.store['slow_plots']:
+                self.fast_ticks(0.5)
+            check = json.loads(h.store['slow_plots_check'])
+            self.assertEqual((h.store['slow_plots'], check['slow'], check['render']), (1, 1, 60))
+            self.assertTrue(84 <= check['busy'] <= 85, check)
+            h.until(lambda: self.reg.fast[-1] == '1' and h.core.slow, 5, 'fast=1 once it is on')
+            h.store['slow_plots'] = 0
+            h.until(lambda: self.reg.fast[-1] == '2', 5, 'fast=2 by the owner')
+            self.assertEqual(h.store['slow_plots_auto'], 0)
+        finally:
+            xc.PLOT_SETTLE_S, xc.PLOT_CHECK_S, xc.PLOT_MIN_RATE = keep
 
 class TestGlueArrival(unittest.TestCase):
     def test_arrival_ticks_the_lane_rate_capped_and_only_when_wanted(self):

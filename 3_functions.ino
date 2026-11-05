@@ -601,20 +601,21 @@ enum Csv2Index {
   CSV2_nvsFullSaveWorstMs,        // worst saveNVSDataFull() duration since boot (ms)
   CSV2_nvsFullSaveCount,          // total saveNVSDataFull() calls since boot
 
-  // Ignition-cycle watermarks (lo + hi pairs, reset every boot). See wmIgn_* globals in Xregulator.ino.
-  CSV2_wmIgn_amps_lo,     CSV2_wmIgn_amps_hi,      // MeasuredAmps (A, int)
-  CSV2_wmIgn_altTempF_lo, CSV2_wmIgn_altTempF_hi,  // AlternatorTemperatureF (°F, int)
-  CSV2_wmIgn_IBV_lo,      CSV2_wmIgn_IBV_hi,       // INA228 battery V (×10, 1 decimal)
-  CSV2_wmIgn_Bcur_lo,     CSV2_wmIgn_Bcur_hi,      // INA228 battery A (int)
-  CSV2_wmIgn_SOC_lo,      CSV2_wmIgn_SOC_hi,       // SOC percent (0..100, int)
+  // Ignition-cycle watermarks (lo + hi pairs, reset at boot or by /get?wmReset=). See wmIgn_* globals in Xregulator.ino.
+  // Each pair at its live reading's scale, so the apps can show it to the same decimals.
+  CSV2_wmIgn_amps_lo,     CSV2_wmIgn_amps_hi,      // MeasuredAmps (A ×100)
+  CSV2_wmIgn_altTempF_lo, CSV2_wmIgn_altTempF_hi,  // AlternatorTemperatureF (°F ×10)
+  CSV2_wmIgn_IBV_lo,      CSV2_wmIgn_IBV_hi,       // INA228 battery V (×100)
+  CSV2_wmIgn_Bcur_lo,     CSV2_wmIgn_Bcur_hi,      // INA228 battery A (×100)
+  CSV2_wmIgn_SOC_lo,      CSV2_wmIgn_SOC_hi,       // SOC percent (×100)
   CSV2_wmIgn_RPM_lo,      CSV2_wmIgn_RPM_hi,       // Engine RPM (int)
-  CSV2_wmIgn_SOG_lo,      CSV2_wmIgn_SOG_hi,       // SOGNMEA knots (int)
-  CSV2_wmIgn_AWS_lo,      CSV2_wmIgn_AWS_hi,       // ApparentWindSpeedNMEA knots (int)
-  CSV2_wmIgn_TWS_lo,      CSV2_wmIgn_TWS_hi,       // TrueWindSpeedNMEA knots (int)
-  CSV2_wmIgn_heel_lo,     CSV2_wmIgn_heel_hi,      // imu_heel_deg (int)
-  CSV2_wmIgn_pitch_lo,    CSV2_wmIgn_pitch_hi,     // imu_pitch_deg (int)
-  CSV2_wmIgn_vacc_lo,     CSV2_wmIgn_vacc_hi,      // imu_vertical_accel_g (×10, 1 decimal)
-  CSV2_wmIgn_baro_lo,     CSV2_wmIgn_baro_hi,      // baroPressure mbar (int)
+  CSV2_wmIgn_SOG_lo,      CSV2_wmIgn_SOG_hi,       // SOGNMEA knots (×100)
+  CSV2_wmIgn_AWS_lo,      CSV2_wmIgn_AWS_hi,       // ApparentWindSpeedNMEA knots (×100)
+  CSV2_wmIgn_TWS_lo,      CSV2_wmIgn_TWS_hi,       // TrueWindSpeedNMEA knots (×100)
+  CSV2_wmIgn_heel_lo,     CSV2_wmIgn_heel_hi,      // imu_heel_deg (×100)
+  CSV2_wmIgn_pitch_lo,    CSV2_wmIgn_pitch_hi,     // imu_pitch_deg (×100)
+  CSV2_wmIgn_vacc_lo,     CSV2_wmIgn_vacc_hi,      // imu_vertical_accel_g (×1000)
+  CSV2_wmIgn_baro_lo,     CSV2_wmIgn_baro_hi,      // baroPressure mbar (×10)
   CSV2_wmIgn_ambient_lo,  CSV2_wmIgn_ambient_hi,   // ambientTemp °F (int)
   CSV2_restartRemainingSec,                        // seconds until scheduled reboot (0 = outside 10-min warning window)
   CSV2_currentGpsSource,                           // 0=none, 1=NMEA, 2=Phone, 3=Manual (GpsSource enum)
@@ -623,8 +624,8 @@ enum Csv2Index {
   CSV2_loggingActive,   // 1 if logging active, 0 if stopped (Stop/Start Logs)
   CSV2_sustainedTWS,                               // 2-min sustained true wind, knots ×10 (Beaufort + gale basis)
   CSV2_currentGaleMinutes,                         // live minutes continuously in a gale (sustained ≥34kt), int
-  CSV2_wmIgn_VMGman_lo,   CSV2_wmIgn_VMGman_hi,    // VMG manual session min/max (knots ×10)
-  CSV2_wmIgn_VMGup_lo,    CSV2_wmIgn_VMGup_hi,     // VMG upwind session min/max (knots ×10)
+  CSV2_wmIgn_VMGman_lo,   CSV2_wmIgn_VMGman_hi,    // VMG manual session min/max (knots ×100)
+  CSV2_wmIgn_VMGup_lo,    CSV2_wmIgn_VMGup_hi,     // VMG upwind session min/max (knots ×100)
 
   // Alternator (charging-system) health summary
   CSV2_altHealthPct,        // worst-region performance % ×10
@@ -844,8 +845,8 @@ enum Csv2Index {
   CSV2_VictronBattTempF,    // VE.Direct "T" battery temperature (°F x10; ROLL_EMPTY = none)
   CSV2_rvcRxBattTempF,      // RV-C DC_SOURCE_STATUS_2 battery temperature (°F x10; ROLL_EMPTY = none)
   CSV2_cvTempDerateInert,   // 1 = battery-temperature source class changed since commissioning; CV derate held at 1.0
-  CSV2_wmIgn_battTempF_lo,  CSV2_wmIgn_battTempF_hi,   // BatteryTempProbeF (°F, int)
-  CSV2_wmIgn_extraTempF_lo, CSV2_wmIgn_extraTempF_hi,  // ExtraTempF (°F, int)
+  CSV2_wmIgn_battTempF_lo,  CSV2_wmIgn_battTempF_hi,   // BatteryTempProbeF (°F ×10)
+  CSV2_wmIgn_extraTempF_lo, CSV2_wmIgn_extraTempF_hi,  // ExtraTempF (°F ×10)
 
   CSV2_fieldDutyFloor,      // enforced field-duty FLOOR x100: governor_apply's max(Min Field %, this speed's Keep-Alive %), 0 when bypassed (shutdown, sysID, protection clamp, MANUAL)
 
@@ -890,6 +891,13 @@ enum Csv2Index {
   CSV2_dvccRxWifiCcl,       // WiFi carrier last CCL (A x10; -2000000000 = not sent)
   CSV2_dvccRxCanShare,      // VE.Can: the GX's 0x2015 addressed to this node, this alternator's share (A x10; -2000000000 = none)
   CSV2_dvccNoLimitStop,     // 1 = Stop Charging Without Limits is holding the current ceiling at zero
+  // seconds since each ignition-cycle watermark's boot or owner reset (/get?wmReset=), in WM_ALL order
+  CSV2_wmIgn_amps_age, CSV2_wmIgn_altTempF_age, CSV2_wmIgn_IBV_age,
+  CSV2_wmIgn_Bcur_age, CSV2_wmIgn_SOC_age, CSV2_wmIgn_RPM_age,
+  CSV2_wmIgn_SOG_age, CSV2_wmIgn_AWS_age, CSV2_wmIgn_TWS_age,
+  CSV2_wmIgn_heel_age, CSV2_wmIgn_pitch_age, CSV2_wmIgn_vacc_age,
+  CSV2_wmIgn_baro_age, CSV2_wmIgn_ambient_age, CSV2_wmIgn_VMGman_age,
+  CSV2_wmIgn_VMGup_age, CSV2_wmIgn_battTempF_age, CSV2_wmIgn_extraTempF_age,
 
   CSV2_sessionId,    // boot identity — matches CSV1_sessionId while this cached block is from the live run
   CSV2_sendMs,            // millis() when this payload was BUILT (CSV2 builds one pass and sends the next)
@@ -5676,6 +5684,8 @@ void setupServer() {
     bool heartbeat = false;       // commissionHeartbeat= seen: answered, never counted as a setting write (see the CSV3 echo at the end)
     bool nvsPersistNow = false;   // set by discrete reset/set handlers that write saveNVSDataFull()-owned vars; forces ONE immediate persist at the end so a reboot before the next field-off edge can't revert the action
     String inputMessage;
+    String refusal;   // a start that cannot run: answered with 422 at the end of this handler, so the dashboard can show why
+    auto refuseStart = [&refusal](const String &why) { queueConsoleMessage(why); refusal = why; };
 
     // === SAFETY: Allow field OFF without arming ===
     if (request->hasParam("OnOff")) {
@@ -5705,6 +5715,18 @@ void setupServer() {
     if (request->hasParam("SilenceAlarm")) {
       SilenceAlarm = 1;
       logClientWrite(request, "ALARM: silence requested (no arming required)");
+      request->send(200, "text/plain", "1");
+      return;
+    }
+
+    // Resetting the highs and lows (ignition-cycle watermarks) is allowed without arming, like silence: it changes no setting.
+    if (request->hasParam("wmReset")) {
+      const String list = request->getParam("wmReset")->value();
+      if (wmIgnReset(list.c_str()) < 0) {
+        request->send(200, "text/plain", "Rejected: unknown watermark in " + list);
+        return;
+      }
+      logClientWrite(request, ("HIGHS AND LOWS: reset " + list).c_str());
       request->send(200, "text/plain", "1");
       return;
     }
@@ -5954,11 +5976,11 @@ void setupServer() {
                                  : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (sysMode == SYS_MODE_MANUAL) {
-        queueConsoleMessage("SystemID: start blocked — not allowed in Manual mode (duty is fixed; test cannot drive the field)");
+        refuseStart("Plant Delay test: start blocked — not allowed in Manual mode (duty is fixed; test cannot drive the field)");
       } else if (!sysidModeOK) {
-        queueConsoleMessage("SystemID: start blocked — only allowed while charging in Auto mode (bulk, absorption, float, or target voltage)");
+        refuseStart("Plant Delay test: start blocked — only allowed while charging in Auto mode (bulk, absorption, float, or target voltage)");
       } else if (activeTuning != nullptr) {
-        queueConsoleMessageF("SystemID: start blocked — %s is active. Turn it off before running the Plant Delay Test.", activeTuning);
+        refuseStart(String("Plant Delay test: start blocked — ") + activeTuning + " is active. Turn it off before running the Plant Delay Test.");
       } else if (systemIDActive == 0 && (millis() - systemIDLastEndMs) > 2000UL) {
         systemIDRunTok = webRunTok(request);
         systemIDRequested = true;
@@ -5968,7 +5990,7 @@ void setupServer() {
         systemIDAbortPhase = 0;
         queueConsoleMessage("SystemID: test requested via web UI");
       } else {
-        queueConsoleMessage("SystemID: start ignored (cooldown or already active)");
+        refuseStart("Plant Delay test: start ignored (cooldown or already active)");
       }
     }
 
@@ -6208,21 +6230,21 @@ void setupServer() {
                          : (altSweepActive != 0 || altSweepRequested) ? "Gate-tuning field sweep"
                          : (chcActive != 0 || chcRequested) ? "Charge health calibration" : nullptr;
       if (mode < 1 || mode > 5) {
-        queueConsoleMessage("Protection test: start blocked — invalid mode");
+        refuseStart("Protection test: start blocked — invalid mode");
       } else if (protTestActive != 0) {
-        queueConsoleMessage("Protection test: already running");
+        refuseStart("Protection test: already running");
       } else if (busy != nullptr) {
-        queueConsoleMessageF("Protection test: start blocked — %s is active", busy);
+        refuseStart(String("Protection test: start blocked — ") + busy + " is active");
       } else if ((millis() - protTestLastEndMs) < 5000UL) {
-        queueConsoleMessage("Protection test: start ignored (cooldown)");
+        refuseStart("Protection test: start ignored (cooldown)");
       } else if (mode == 5) {
         // Manual bench cut: uses the field the user already set (Manual Field into a resistor). No
         // AUTO / RPM gate — Ignore RPM is expected during bench work. Charging must be on: without it
         // there is no manual field to cut, and the queued request would fire later when it came on.
         if (ManualFieldToggle != 1) {
-          queueConsoleMessage("Protection test: manual cut blocked — turn Manual Field ON first");
+          refuseStart("Protection test: manual cut blocked — turn Manual Field ON first");
         } else if (!chargingEnabled) {
-          queueConsoleMessage("Protection test: manual cut blocked — turn charging (On/Off) on first");
+          refuseStart("Protection test: manual cut blocked — turn charging (On/Off) on first");
         } else {
           protTestMode = 5;
           protTestRepDone = 0;
@@ -6232,14 +6254,13 @@ void setupServer() {
                                protTestCutMs, protTestReps, protTestGapMs);
         }
       } else if (sysMode != SYS_MODE_AUTO) {
-        queueConsoleMessage("Protection test: start blocked — engine-running tests need charging in Auto mode (in Manual mode, use Bench Testing instead)");
+        refuseStart("Protection test: start blocked — engine-running tests need charging in Auto mode (in Manual mode, use Bench Testing instead)");
       } else if (!chargingEnabled) {
-        queueConsoleMessage("Protection test: start blocked — charging must be enabled (engine running, On/Off on)");
+        refuseStart("Protection test: start blocked — charging must be enabled (engine running, On/Off on)");
       } else if (const char *rr = rpmTestRefuseReason()) {
-        queueConsoleMessageF("Protection test: start blocked — %s", rr);
+        refuseStart(String("Protection test: start blocked — ") + rr);
       } else if (RPM < (float)MinRPMForField) {
-        queueConsoleMessageF("Protection test: start blocked — RPM %d below Min RPM For Field (%d); raise engine speed",
-                             (int)RPM, MinRPMForField);
+        refuseStart(String("Protection test: start blocked — RPM ") + (int)RPM + " below Min RPM For Field (" + MinRPMForField + "); raise engine speed");
       } else {
         protTestMode = (uint8_t)mode;
         if (protTestCmdA < 5.0f) protTestCmdA = (SystemIDStabilizeAmps >= 5.0f) ? SystemIDStabilizeAmps : 30.0f;
@@ -6300,10 +6321,16 @@ void setupServer() {
 
     // ── Gate-tuning capture: session logger + field sweeper (ALT_GATE_TUNING_CAPTURE_SPEC.md) ──
     // Each press only RAISES a flag: the 192 KB buffer is allocated, freed and state-changed on the control loop
-    // (altLogService), so a press can never free it mid-row. Replies come back on the console.
+    // (altLogService), so a press can never free it mid-row. Replies come back on the console, except a Record
+    // that cannot run, which is refused here so the app can show why.
     if (request->hasParam("altLogRecord")) {
       foundParameter = true;
-      altLogStartReq = true;
+      if (const char *rr = altLogRefuseReason()) {
+        queueConsoleMessageF("Gate capture: blocked — %s", rr);
+        refusal = rr;
+      } else {
+        altLogStartReq = true;
+      }
     }
     if (request->hasParam("altLogStop")) {
       foundParameter = true;
@@ -6333,11 +6360,11 @@ void setupServer() {
         // Same rule as the field curve: the duty override lives in the AUTO control path, and the
         // bumpless resume restores AUTO state. In MANUAL the user's fixed duty owns the field —
         // which is the throttle-sweep condition anyway, and needs no sweeper.
-        queueConsoleMessage("Field sweep: start blocked — only allowed while charging in Auto mode");
+        refuseStart("Field sweep: start blocked — only allowed while charging in Auto mode");
       } else if (altSweepRequested) {
-        queueConsoleMessage("Field sweep: start ignored (already requested)");
+        refuseStart("Field sweep: start ignored (already requested)");
       } else if (busy != nullptr) {
-        queueConsoleMessageF("Field sweep: start blocked — %s is active", busy);
+        refuseStart(String("Field sweep: start blocked — ") + busy + " is active");
       } else if ((millis() - altSweepLastEndMs) > 2000UL) {
         // Do NOT clear altSweepAbortRequested: after an external teardown the tick's static phase is still mid-ramp and
         // only the latch makes the next tick reset it; clearing it would let this Start resume the stale ramp as an
@@ -6356,7 +6383,7 @@ void setupServer() {
         altSweepReqMs = millis();
         altSweepRequested = true;
       } else {
-        queueConsoleMessage("Field sweep: start ignored (cooldown)");
+        refuseStart("Field sweep: start ignored (cooldown)");
       }
     }
     if (request->hasParam("altSweepCancel")) {
@@ -7067,7 +7094,7 @@ void setupServer() {
     if (request->hasParam("startTuningSweep")) {
       foundParameter = true;
       if (systemIDActive != 0 || fieldCurveActive != 0) {
-        queueConsoleMessage("Tuning sweep: start blocked — a SystemID/Field-curve test is active");
+        refuseStart("Tuning sweep: start blocked — a Plant Delay or field curve test is active");
       } else {
         tuningRunTok = webRunTok(request);
         tuningSweepRequested = true;   // momentary — the TuningMode sine block consumes it
@@ -7834,7 +7861,7 @@ void setupServer() {
     }
     if (request->hasParam("altZeroApply")) {
       foundParameter = true;
-      if (!altZeroApply()) queueConsoleMessage("Alt zero: nothing captured to apply");
+      if (!altZeroApply()) refuseStart("Alt zero: nothing captured to apply");
     }
     if (paramOk(request, "BatteryCOffset")) {
       foundParameter = true;
@@ -7992,7 +8019,7 @@ void setupServer() {
       settingWrite(NK_timeSourceMode, String(timeSourceMode).c_str());
       const char *lbl = (m == TSRC_AUTO)  ? "auto"
                       : (m == TSRC_NMEA)  ? "NMEA only"
-                      : (m == TSRC_PHONE) ? "this device only"
+                      : (m == TSRC_PHONE) ? "phone or computer only"
                                          : "NTP time only";
       queueConsoleMessageF("Time source set to %s", lbl);
     }
@@ -8006,7 +8033,7 @@ void setupServer() {
       queueConsoleMessageF("Position source set to %s",
                            (m == GPS_SRC_AUTO)  ? "auto"
                          : (m == GPS_SRC_NMEA)  ? "NMEA only"
-                                                : "phone only");
+                                                : "phone/tablet only");
     }
     if (paramOk(request, "speedSourceMode")) {
       foundParameter = true;
@@ -8016,7 +8043,7 @@ void setupServer() {
       speedSourceMode = m;
       settingWrite(NK_speedSourceMode, String(speedSourceMode).c_str());
       queueConsoleMessageF("Speed/course source set to %s",
-                           (m == SPD_SRC_PHONE) ? "phone GPS" : "NMEA 2000");
+                           (m == SPD_SRC_PHONE) ? "phone/tablet GPS" : "NMEA 2000");
     }
     if (request->hasParam("ResetThermTemp")) {
       foundParameter = true;
@@ -8463,14 +8490,14 @@ void setupServer() {
       settingWrite(NK_LatitudeManual, String(LatitudeManual, 6).c_str());
       settingWrite(NK_LongitudeManual, String(LongitudeManual, 6).c_str());
       settingWrite(NK_gpsManualActive, "1");
-      queueConsoleMessageF("GPS: Manual override set to %.6f, %.6f (sticky — beats NMEA & phone)", LatitudeManual, LongitudeManual);
+      queueConsoleMessageF("GPS: Manual override set to %.6f, %.6f (sticky — beats NMEA & phone/tablet)", LatitudeManual, LongitudeManual);
       nextWeatherUpdate = millis();  // fire next tick (signed-delta safe; '= 0' would miss past 24.8d uptime)
     }
     if (request->hasParam("clearGpsManual")) {
       foundParameter = true;
       gpsManualActive = false;
       settingWrite(NK_gpsManualActive, "0");
-      queueConsoleMessage("GPS: Manual override cleared — back to automatic (NMEA/phone)");
+      queueConsoleMessage("GPS: Manual override cleared — back to automatic (NMEA, phone, or tablet)");
       nextWeatherUpdate = millis();  // refresh weather with whatever the auto chain now resolves
     }
     if (paramOk(request, "weatherModeEnabled")) {
@@ -10312,6 +10339,10 @@ void setupServer() {
     }
     if (!foundParameter) {
       inputMessage = heartbeat ? "heartbeat" : "No message sent, the request_hasParam found no match";
+    }
+    if (refusal.length()) {
+      request->send(422, "text/plain", refusal);
+      return;
     }
     request->send(200, "text/plain", inputMessage);
   });
@@ -12545,6 +12576,7 @@ void SendWifiData() {
                                "%d,"            // +1 largest free PSRAM block (KB)
                                "%d,%d,%d,%d,"   // +4 DVCC Victron carriers: VE.Can CVL/CCL, WiFi CVL/CCL
                                "%d,%d,"         // +2 DVCC: VE.Can share addressed to this node, Stop Charging Without Limits holding
+                               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"   // +18 watermark ages (s)
                                "%u,%u\n",       // +2: sessionId, sendMs
                                CSV2_FIELD_COUNT,
                                SafeInt(IBVMax, 100),
@@ -12925,32 +12957,32 @@ void SendWifiData() {
                                SafeInt(nvsFullSaveLastMs),
                                SafeInt(nvsFullSaveWorstMs),
                                SafeInt(nvsFullSaveCount),
-                               wmIgnCsv(wmIgn_amps.lo, 1),
-                               wmIgnCsv(wmIgn_amps.hi, 1),
-                               wmIgnCsv(wmIgn_altTempF.lo, 1),
-                               wmIgnCsv(wmIgn_altTempF.hi, 1),
-                               wmIgnCsv(wmIgn_IBV.lo, 10),
-                               wmIgnCsv(wmIgn_IBV.hi, 10),
-                               wmIgnCsv(wmIgn_Bcur.lo, 1),
-                               wmIgnCsv(wmIgn_Bcur.hi, 1),
-                               wmIgnCsv(wmIgn_SOC.lo, 1),
-                               wmIgnCsv(wmIgn_SOC.hi, 1),
+                               wmIgnCsv(wmIgn_amps.lo, 100),
+                               wmIgnCsv(wmIgn_amps.hi, 100),
+                               wmIgnCsv(wmIgn_altTempF.lo, 10),
+                               wmIgnCsv(wmIgn_altTempF.hi, 10),
+                               wmIgnCsv(wmIgn_IBV.lo, 100),
+                               wmIgnCsv(wmIgn_IBV.hi, 100),
+                               wmIgnCsv(wmIgn_Bcur.lo, 100),
+                               wmIgnCsv(wmIgn_Bcur.hi, 100),
+                               wmIgnCsv(wmIgn_SOC.lo, 100),
+                               wmIgnCsv(wmIgn_SOC.hi, 100),
                                wmIgnCsv(wmIgn_RPM.lo, 1),
                                wmIgnCsv(wmIgn_RPM.hi, 1),
-                               wmIgnCsv(wmIgn_SOG.lo, 1),
-                               wmIgnCsv(wmIgn_SOG.hi, 1),
-                               wmIgnCsv(wmIgn_AWS.lo, 1),
-                               wmIgnCsv(wmIgn_AWS.hi, 1),
-                               wmIgnCsv(wmIgn_TWS.lo, 1),
-                               wmIgnCsv(wmIgn_TWS.hi, 1),
-                               wmIgnCsv(wmIgn_heel.lo, 1),
-                               wmIgnCsv(wmIgn_heel.hi, 1),
-                               wmIgnCsv(wmIgn_pitch.lo, 1),
-                               wmIgnCsv(wmIgn_pitch.hi, 1),
-                               wmIgnCsv(wmIgn_vacc.lo, 10),
-                               wmIgnCsv(wmIgn_vacc.hi, 10),
-                               wmIgnCsv(wmIgn_baro.lo, 1),
-                               wmIgnCsv(wmIgn_baro.hi, 1),
+                               wmIgnCsv(wmIgn_SOG.lo, 100),
+                               wmIgnCsv(wmIgn_SOG.hi, 100),
+                               wmIgnCsv(wmIgn_AWS.lo, 100),
+                               wmIgnCsv(wmIgn_AWS.hi, 100),
+                               wmIgnCsv(wmIgn_TWS.lo, 100),
+                               wmIgnCsv(wmIgn_TWS.hi, 100),
+                               wmIgnCsv(wmIgn_heel.lo, 100),
+                               wmIgnCsv(wmIgn_heel.hi, 100),
+                               wmIgnCsv(wmIgn_pitch.lo, 100),
+                               wmIgnCsv(wmIgn_pitch.hi, 100),
+                               wmIgnCsv(wmIgn_vacc.lo, 1000),
+                               wmIgnCsv(wmIgn_vacc.hi, 1000),
+                               wmIgnCsv(wmIgn_baro.lo, 10),
+                               wmIgnCsv(wmIgn_baro.hi, 10),
                                wmIgnCsv(wmIgn_ambient.lo, 1),
                                wmIgnCsv(wmIgn_ambient.hi, 1),
                                (int)restartRemainingSec,
@@ -12960,10 +12992,10 @@ void SendWifiData() {
                                (int)loggingActive,
                                SafeInt(sustainedTWS, 10),
                                SafeInt(currentGaleMinutes, 1),
-                               wmIgnCsv(wmIgn_VMGman.lo, 10),
-                               wmIgnCsv(wmIgn_VMGman.hi, 10),
-                               wmIgnCsv(wmIgn_VMGup.lo, 10),
-                               wmIgnCsv(wmIgn_VMGup.hi, 10),
+                               wmIgnCsv(wmIgn_VMGman.lo, 100),
+                               wmIgnCsv(wmIgn_VMGman.hi, 100),
+                               wmIgnCsv(wmIgn_VMGup.lo, 100),
+                               wmIgnCsv(wmIgn_VMGup.hi, 100),
                                SafeInt(altWorstPct(), 10),
                                altStatus(),
                                SafeInt(altCoveragePct(), 10),
@@ -13157,10 +13189,10 @@ void SendWifiData() {
                                isfinite(VictronBattTempF) ? (int)lroundf(VictronBattTempF * 10.0f) : ROLL_EMPTY,    // CSV2_VictronBattTempF
                                isfinite(rvcRxBattTempF) ? (int)lroundf(rvcRxBattTempF * 10.0f) : ROLL_EMPTY,        // CSV2_rvcRxBattTempF
                                (int)cvTempDerateInert,                                   // CSV2_cvTempDerateInert
-                               wmIgnCsv(wmIgn_battTempF.lo, 1),                // CSV2_wmIgn_battTempF_lo
-                               wmIgnCsv(wmIgn_battTempF.hi, 1),                // CSV2_wmIgn_battTempF_hi
-                               wmIgnCsv(wmIgn_extraTempF.lo, 1),               // CSV2_wmIgn_extraTempF_lo
-                               wmIgnCsv(wmIgn_extraTempF.hi, 1),               // CSV2_wmIgn_extraTempF_hi
+                               wmIgnCsv(wmIgn_battTempF.lo, 10),                // CSV2_wmIgn_battTempF_lo
+                               wmIgnCsv(wmIgn_battTempF.hi, 10),                // CSV2_wmIgn_battTempF_hi
+                               wmIgnCsv(wmIgn_extraTempF.lo, 10),               // CSV2_wmIgn_extraTempF_lo
+                               wmIgnCsv(wmIgn_extraTempF.hi, 10),               // CSV2_wmIgn_extraTempF_hi
                                SafeInt(g_fieldDutyFloor, 100),                           // CSV2_fieldDutyFloor
                                SafeInt(inaDieTempF, 10),                                 // CSV2_inaDieTempF
                                SafeInt(inaDieTempMaxF, 10),                              // CSV2_inaDieTempMaxF
@@ -13196,6 +13228,24 @@ void SendWifiData() {
                                SafeInt(dvccRxWifiCcl, 10),                               // CSV2_dvccRxWifiCcl
                                SafeInt(dvccRxCanShare, 10),                              // CSV2_dvccRxCanShare
                                (int)dvccNoLimitStop,                                     // CSV2_dvccNoLimitStop
+                               wmIgnAge(wmIgn_amps),                     // CSV2_wmIgn_amps_age
+                               wmIgnAge(wmIgn_altTempF),                 // CSV2_wmIgn_altTempF_age
+                               wmIgnAge(wmIgn_IBV),                      // CSV2_wmIgn_IBV_age
+                               wmIgnAge(wmIgn_Bcur),                     // CSV2_wmIgn_Bcur_age
+                               wmIgnAge(wmIgn_SOC),                      // CSV2_wmIgn_SOC_age
+                               wmIgnAge(wmIgn_RPM),                      // CSV2_wmIgn_RPM_age
+                               wmIgnAge(wmIgn_SOG),                      // CSV2_wmIgn_SOG_age
+                               wmIgnAge(wmIgn_AWS),                      // CSV2_wmIgn_AWS_age
+                               wmIgnAge(wmIgn_TWS),                      // CSV2_wmIgn_TWS_age
+                               wmIgnAge(wmIgn_heel),                     // CSV2_wmIgn_heel_age
+                               wmIgnAge(wmIgn_pitch),                    // CSV2_wmIgn_pitch_age
+                               wmIgnAge(wmIgn_vacc),                     // CSV2_wmIgn_vacc_age
+                               wmIgnAge(wmIgn_baro),                     // CSV2_wmIgn_baro_age
+                               wmIgnAge(wmIgn_ambient),                  // CSV2_wmIgn_ambient_age
+                               wmIgnAge(wmIgn_VMGman),                   // CSV2_wmIgn_VMGman_age
+                               wmIgnAge(wmIgn_VMGup),                    // CSV2_wmIgn_VMGup_age
+                               wmIgnAge(wmIgn_battTempF),                // CSV2_wmIgn_battTempF_age
+                               wmIgnAge(wmIgn_extraTempF),               // CSV2_wmIgn_extraTempF_age
                                (unsigned)g_sessionId,   // CSV2_sessionId
                                (unsigned)millis());     // CSV2_sendMs — build time; the send happens one pass later
     csv2BuildLastUs = micros() - _csv2b0;   // CSV2 build (snprintf) cost

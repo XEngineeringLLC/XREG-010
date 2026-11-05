@@ -103,6 +103,9 @@ qml() {
   note qml toggle $? "$(last $L/toggle.log SUMMARY)"
   python3 health_test.py $PLUGIN > $L/health.log 2>&1
   note qml health_windows $? "$(last $L/health.log SUMMARY)"
+  cd $Q/pop
+  python3 pop_test.py $PLUGIN > $L/pop.log 2>&1
+  note qml larger_views $? "$(last $L/pop.log SUMMARY)"
   cd $Q/tile
   for sc in Dark Light; do
     python3 flow_run.py $PLUGIN scenarios.json $sc > $L/tile_$sc.log 2>&1
@@ -150,3 +153,5 @@ for g in bridge package review qml; do
   [[ -f $L/summary_$g.txt ]] && { print -r -- "== $g"; cat $L/summary_$g.txt }
 done
 print -r -- "logs: $L"
+# non-zero when any suite's summary line ended in a non-zero exit; /dev/null keeps grep off stdin if no group ran
+! grep -qE '\(exit [1-9][0-9]*\)$' $L/summary_*.txt /dev/null

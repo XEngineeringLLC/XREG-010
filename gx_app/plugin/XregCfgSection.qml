@@ -6,6 +6,7 @@ import Victron.VenusOS
 // gx_app/xregulator/bridge/settings_schema.json): the app's Setup sub-tab, panel or nested <details> named by nodeId,
 // its rows in the app's order. A row is a setting, a group heading, a deeper page (pushed), the GX-only Connection
 // page, or a table drawn in place (XregCfgTable) with the app's buttons that sit above it (Charge Rate, Limit by).
+// A choice of up to three is a row of buttons changed in one tap (XregSegButtons); more choices open a page of them.
 // Embedded in the home page's Settings page it is the list alone; pushed, it carries the home page's header and
 // sub-tab row (XregHeader). A short page (the schema's "short") always shows its descriptions; a longer one has a
 // "Show descriptions" switch when anything on it has one.
@@ -18,6 +19,7 @@ Page {
 	property Item home                // the home page this belongs to (XregHome); none when opened on its own
 	property bool embedded            // inside the home page's Settings page, under its sub-tab row
 	property bool showHelp
+	XregChoice { id: helpChoice; name: "ShowHelp"; shown: 0; onShownChanged: page.showHelp = shown === 1 }
 	property bool wroteSinceOpen
 	property int lastSeq: -1
 	property var pendingWrite: null
@@ -75,7 +77,7 @@ Page {
 			if (c.group && c.group !== g)
 				out.push({ kind: "header", label: c.group })
 			g = c.group || null
-			out.push({ kind: c.type === "info" ? c.widget : c.type, cfg: c })
+			out.push({ kind: c.type === "info" ? c.widget : c.type === "select" && c.options.length <= 3 ? "buttons" : c.type, cfg: c })
 		}
 		return out
 	}
@@ -340,7 +342,7 @@ Page {
 				value: page.showHelp
 				writeAccessLevel: VenusOS.User_AccessType_User
 				preferredVisible: !page.shortPage && page.anyHelp
-				onCommanded: function(on) { page.showHelp = on }
+				onCommanded: function(on) { page.showHelp = on; helpChoice.pick(on ? 1 : 0) }
 			}
 			// A row's caption is " " until its row arrives (onLoaded, after the row is created): gui-v2's CaptionLabel
 			// reports a binding loop on its height the first time a caption created empty gets text, never on one
@@ -355,6 +357,7 @@ Page {
 						case "page": return pageRow
 						case "toggle": return toggleRow
 						case "select": return selectRow
+						case "buttons": return buttonsRow
 						case "number": return numberRow
 						case "action": return actionRow
 						case "table": return tableRow
@@ -452,6 +455,44 @@ Page {
 		}
 	}
 
+	// optionModel and choose() as the radio group's, so both kinds of choice read and pick alike
+	Component {
+		id: buttonsRow
+		XregSegButtons {
+			id: sb
+			property var row
+			readonly property var cfg: row ? row.cfg : null
+			GateWatch { id: gate; cfg: sb.cfg }
+			readonly property var optionModel: cfg ? cfg.options.map(o => {
+				const n = page.gateRev >= 0 ? page.gateNotes(o) : null
+				return { display: o.label, value: o.value, readOnly: !!o.disabled, interactive: n === null, caption: n || "" }
+			}) : []
+			function choose(i) {
+				const v = optionModel[i].value
+				if (dataItem.valid && dataItem.value === v)
+					return
+				if (cfg.confirm && (cfg.confirmWhen === undefined || cfg.confirmWhen === v))
+					page.confirmThen(cfg, () => page.writeValue(dataItem, v))
+				else
+					page.writeValue(dataItem, v)
+			}
+			text: cfg ? cfg.label : ""
+			// a greyed choice's reason leads, as the radio page showed it under that choice
+			caption: !row ? " " : gate.gated ? gate.note
+					: optionModel.map(o => o.caption).filter(c => c.length > 0)
+						.concat(page.helpOn && cfg.help ? [cfg.help] : []).join("\n")
+			writeAccessLevel: VenusOS.User_AccessType_User
+			options: optionModel.map(o => ({ label: o.display, enabled: !o.readOnly && o.interactive }))
+			currentIndex: dataItem.valid ? optionModel.findIndex(o => o.value === dataItem.value) : -1
+			interactive: dataItem.valid && page.linkUp && !gate.gated
+			onChosen: function(index) { choose(index) }
+			VeQuickItem {
+				id: dataItem
+				uid: sb.cfg ? page.valueUid(sb.cfg.key) : ""
+			}
+		}
+	}
+
 	Component {
 		id: numberRow
 		ListButton {
@@ -521,7 +562,7 @@ Page {
 			property var row
 			readonly property var cfg: row ? row.cfg : null
 			text: cfg ? cfg.title : ""
-			onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregCfgSection.qml",
+			onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregCfgSection.qml",
 					{ title: cfg.title, nodeId: cfg.id, svc: page.svc, home: page.home })
 		}
 	}
@@ -531,8 +572,10 @@ Page {
 		ListNavigation {
 			property var row
 			text: "Connection"
-			secondaryText: !connectedItem.valid ? "Bridge not running" : page.linkUp ? "Connected" : "No data from regulator"
-			onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregCfgConnection.qml",
+			// a drill-down row shows text only for a fault: a healthy value beside the chevron reads as a plain readout
+			secondaryText: !connectedItem.valid ? "Bridge not running" : page.linkUp ? "" : "No data from regulator"
+			secondaryTextColor: Theme.color_warning
+			onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregCfgConnection.qml",
 					{ title: text, svc: page.svc, home: page.home, setupId: page.nodeId.split("/")[0] })
 		}
 	}

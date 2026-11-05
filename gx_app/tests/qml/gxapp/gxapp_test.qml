@@ -15,6 +15,9 @@ Window {
 	function writes(path) { return MockStore.writes.filter(w => w.uid === mgr + path) }
 	function put(path, v) { MockStore.put(mgr + path, v) }
 	readonly property string hooksUid: "mock/com.victronenergy.platform/ModificationChecks/SystemHooksState"
+	readonly property string slowUid: "mock/com.victronenergy.settings/Settings/Xregulator/SlowPlots"
+	readonly property string autoUid: slowUid + "Auto"
+	readonly property string slowCheckUid: slowUid + "Check"
 	readonly property string hooksText: "Custom startup scripts are disabled on this GX, so the bridge does not start after a restart. Re-enable them in Settings > General > Support status."
 	property var settingsPage: null
 	function settingsHeader() {
@@ -42,7 +45,7 @@ Window {
 		id: pageManager
 		property var pushed: []
 		function pushPage(url, props) {
-			const u = String(url).replace("qrc:/xregulator/", pluginDir + "/")
+			const u = String(url).replace("qrc:/XREG-010/", pluginDir + "/")
 			props = props || {}
 			props.width = pageW
 			props.height = 3000
@@ -95,12 +98,12 @@ Window {
 	Component.onCompleted: {
 		Global.dialogLayer = dialogLayer
 		Global.pageManager = pageManager
-		page = pageManager.pushPage("qrc:/xregulator/XregGxApp.qml", { title: "GX app" })
+		page = pageManager.pushPage("qrc:/XREG-010/XregGxApp.qml", { title: "GX app" })
 		later(() => {
 			check(names() === "Bridge not running" && writes("/Update/Check").length === 0,
 				  "no bridge: only 'Bridge not running', no check asked (" + names() + ")")
 			check(row("Bridge not running").caption === "", "no bridge, startup-script state unknown: no caption")
-			settingsPage = pageManager.pushPage("qrc:/xregulator/XregSettings.qml", { title: "XREG-010" })
+			settingsPage = pageManager.pushPage("qrc:/XREG-010/XregSettings.qml", { title: "XREG-010" })
 			MockStore.put(hooksUid, 1)
 		}, () => {
 			// rc.local.disabled and no rc.local
@@ -129,6 +132,32 @@ Window {
 			check(row("Installed version").secondaryText === "0.3" && row("Latest version").secondaryText === "--"
 				  && row("Installed version").caption === "Build 2025-10-30 04:53 UTC" && row("Latest version").caption === "",
 				  "idle: 0.3 installed (" + row("Installed version").caption + "), latest --")
+			MockStore.put(slowUid, 0)   // the bridge has created Slower plotting and its automatic choice
+			MockStore.put(autoUid, 1)
+			MockStore.put(slowCheckUid, "")
+		}, () => {
+			const r = row("Slower plotting"), a = row("Automatic plot rate")
+			check(names() === "Installed version | Latest version | Check for updates | Automatic plot rate | Slower plotting | Remove the GX app"
+				  && !!r && !r.checked && !!a && a.checked, "Automatic plot rate on, Slower plotting off, above Remove (" + names() + ")")
+			check(a.caption.indexOf("the first time Short Term is on screen") > 0, "not measured yet: says when it measures (" + a.caption + ")")
+			geometry("Slower plotting")
+			r.click()
+			const w = MockStore.writes.filter(x => x.uid === slowUid)
+			check(w.length === 1 && w[0].value === 1, "Slower plotting: a tap writes 1 to localsettings (" + JSON.stringify(w) + ")")
+			MockStore.put(slowUid, 1)
+			MockStore.put(slowCheckUid, '{"busy":82,"render":95,"slow":1}')
+		}, () => {
+			check(row("Slower plotting").checked, "Slower plotting on")
+			check(row("Automatic plot rate").caption === "Measured with Short Term on screen: the GX was 82% busy and its screen "
+				  + "drawing used 95% of one processor core, so Slower plotting was turned on.", "measured: " + row("Automatic plot rate").caption)
+			MockStore.put(slowCheckUid, '{"busy":20,"render":null,"slow":0}')
+		}, () => {
+			check(row("Automatic plot rate").caption === "Measured with Short Term on screen: the GX was 20% busy, so Slower "
+				  + "plotting was left off.", "measured, no screen on the GX: " + row("Automatic plot rate").caption)
+			geometry("Automatic plot rate")
+			row("Automatic plot rate").click()
+			const w = MockStore.writes.filter(x => x.uid === autoUid)
+			check(w.length === 1 && w[0].value === 0, "Automatic plot rate: a tap writes 0 (" + JSON.stringify(w) + ")")
 			put("/Update/State", 1)
 		}, () => {
 			check(row("Latest version").secondaryText === "Checking" && row("Status").secondaryText === "Checking"
@@ -203,10 +232,12 @@ Window {
 				  && !!row("Update to version 0.4"), "failed: message shown, Update offered again")
 			geometry("failed")
 			put("/Update/Last", JSON.stringify({ result: "ok", to: "0.4", toBuild: 1761900000, from: "0.3", fromBuild: 1761800000, at: 1761780000, note: "" })); put("/Update/State", 2)
+			ClockTime.offsetMin = -240
 		}, () => {
 			const l = row("Last update")
-			check(!!l && l.secondaryText === "Version 0.3 to 0.4" && /^\d{4}-\d\d-\d\d \d\d:\d\d$/.test(l.caption)
-				  && row("Status").secondaryText === "Up to date" && !names().includes("Update to"), "last ok: Version 0.3 to 0.4, " + (l ? l.caption : "?"))
+			check(!!l && l.secondaryText === "Version 0.3 to 0.4" && l.caption === "2025-10-29 19:20"
+				  && row("Status").secondaryText === "Up to date" && !names().includes("Update to"), "last ok: Version 0.3 to 0.4, at the GX's UTC-4 time: " + (l ? l.caption : "?"))
+			ClockTime.offsetMin = 0
 			put("/Update/Last", JSON.stringify({ result: "rolledback", to: "0.5", toBuild: 1761900000, from: "0.4", fromBuild: 1761800000,
 				at: 1761780000, note: "The new version did not start within 600 s. The previous version is back and running." }))
 		}, () => {
@@ -234,32 +265,32 @@ Window {
 			// the Connection page's row
 			MockStore.put(svc + "/Connected", 1)
 			MockStore.put(svc + "/Serial", "0000FEEDC0DE1234")
-			const c = pageManager.pushPage("qrc:/xregulator/XregCfgConnection.qml", { title: "Connection", svc: svc, setupId: "system" })
+			const c = pageManager.pushPage("qrc:/XREG-010/XregCfgConnection.qml", { title: "Connection", svc: svc, setupId: "system" })
 			const r = rowsOf(c).find(x => x.text === "GX app")
-			check(!!r && r.secondaryText === "Version 0.3", "Connection page: GX app row, Version 0.3")
+			check(!!r && r.secondaryText === "", "Connection page: GX app row, no version beside the chevron (" + (r ? r.secondaryText : "?") + ")")
 			const n = pageManager.pushed.length
 			r.click()
 			const p = pageManager.pushed[n]
-			check(!!p && p.url === "qrc:/xregulator/XregGxApp.qml" && p.props.svc === svc && p.props.setupId === "system" && !!p.page,
+			check(!!p && p.url === "qrc:/XREG-010/XregGxApp.qml" && p.props.svc === svc && p.props.setupId === "system" && !!p.page,
 				  "Connection page: GX app opens XregGxApp with the regulator's svc and sub-tab")
 			page = c
 			geometry("connection page")
 			// Settings > Integrations with no regulator on the GX
-			const s = pageManager.pushPage("qrc:/xregulator/XregSettings.qml", { title: "XREG-010" })
+			const s = pageManager.pushPage("qrc:/XREG-010/XregSettings.qml", { title: "XREG-010" })
 			page = s
 		}, () => {
 			const g = row("GX app")
-			check(!!row("Regulators") && !!g && g.secondaryText === "Version 0.3", "Integrations, no regulator: Regulators and GX app rows (" + names() + ")")
+			check(!!row("Regulators") && !!g && g.secondaryText === "", "Integrations, no regulator: Regulators and GX app rows, no version beside the chevron (" + names() + ")")
 			geometry("integrations")
 			const n = pageManager.pushed.length
 			g.click()
-			check(pageManager.pushed.length === n + 1 && pageManager.pushed[n].url === "qrc:/xregulator/XregGxApp.qml", "Integrations: GX app opens XregGxApp")
+			check(pageManager.pushed.length === n + 1 && pageManager.pushed[n].url === "qrc:/XREG-010/XregGxApp.qml", "Integrations: GX app opens XregGxApp")
 			// from a regulator's home page (Settings > System > Connection > GX app): the home page's header on top
 			MockStore.put(svc + "/Settings/Schema", schemaText)
 			const hc = Qt.createComponent(pluginDir + "/XregHome.qml")
 			const home = hc.createObject(homeParent, { svc: svc, animationEnabled: false, hostPage: hostPage, width: pageW, height: pageH })
 			check(!!home, "home page created: " + hc.errorString())
-			page = pageManager.pushPage("qrc:/xregulator/XregGxApp.qml", { title: "GX app", svc: svc, home: home, setupId: "system" })
+			page = pageManager.pushPage("qrc:/XREG-010/XregGxApp.qml", { title: "GX app", svc: svc, home: home, setupId: "system" })
 		}, () => {}, () => {
 			const hdr = findAll(page, x => x.setupTabs !== undefined && x.pick !== undefined)[0]
 			const list = findAll(page, x => x.model !== undefined && x.contentY !== undefined)[0]

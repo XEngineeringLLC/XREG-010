@@ -14,18 +14,24 @@ Item {
 	property bool animationEnabled
 	property Item hostPage            // the gui-v2 page holding this one: pushed pages pop back to it
 	property int setupTab             // the Setup sub-tab shown on the Settings page
-	// A finger on a control that owns horizontal drags (a chart's cursor, XregChart): no page swipe until it lifts
-	property int swipeHolds
+	function pickSetupTab(tab) { setupTab = tab; setupChoice.pick(tab) }
+	XregChoice { id: setupChoice; name: "SetupTab"; shown: 0; follow: false; onShownChanged: root.setupTab = shown }
+	XregChoice { id: pageChoice; name: "HomePage"; shown: 0; follow: false; onShownChanged: swipe.setCurrentIndex(shown) }
 	property bool preload
 	readonly property int current: swipe.currentIndex
 	readonly property bool compact: header.compact
+	// a tile's or chart's larger view (XregPop), closed when the page changes or this page leaves the screen
+	readonly property bool popShown: pop.shown
+	function openPop(panel) { pop.open(panel) }
+	onCurrentChanged: { pop.close(); pageChoice.pick(current) }
+	onVisibleChanged: if (!visible) pop.close()
 
 	function go(index) {
 		swipe.setCurrentIndex(index)
 	}
 	function back(index, tab) {
 		if (tab !== undefined)
-			root.setupTab = tab
+			root.pickSetupTab(tab)
 		swipe.setCurrentIndex(index)
 		if (root.hostPage)
 			Global.pageManager.popPage(root.hostPage)
@@ -68,8 +74,8 @@ Item {
 		home: root
 	}
 
-	// The Templates SwipeView with gui-v2's own list settings: gui-v2's SwipeView took a required animationEnabled in
-	// 1.3 that 1.2.13 (this plugin's minimum) does not have, so no one declaration loads on both
+	// The Templates SwipeView with gui-v2's own list settings: gui-v2's SwipeView has a required animationEnabled in
+	// 1.3.22 that 1.3.4 (this plugin's minimum) does not have, so no one declaration loads on both
 	T.SwipeView {
 		id: swipe
 		readonly property bool moving: view.moving || settle.running
@@ -77,7 +83,6 @@ Item {
 			return pageX < view.contentX + pageW - 1 && pageX + pageW > view.contentX + 1
 		}
 		anchors { top: header.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
-		interactive: root.swipeHolds === 0
 		clip: true
 		contentItem: ListView {
 			id: view
@@ -119,6 +124,11 @@ Item {
 		Slot {
 			page: Component { XregCloud { svc: root.svc } }
 		}
+	}
+
+	XregPop {
+		id: pop
+		anchors.fill: parent
 	}
 
 	component Slot: Item {

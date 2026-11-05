@@ -102,9 +102,10 @@ Page {
 				delegate: ListNavigation {
 					width: list.width
 					text: regs.labelOf(modelData.uid, modelData.name)
-					secondaryText: modelData.connected ? "Connected" : "No data"
+					secondaryText: modelData.connected ? "" : "No data"   // drill-down rows show text only for a fault
+					secondaryTextColor: Theme.color_warning
 					caption: "ID " + modelData.id + (modelData.host ? ", " + modelData.host : "")
-					onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregSettings.qml",
+					onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregSettings.qml",
 							{ title: text, unitUid: modelData.uid })
 				}
 			}

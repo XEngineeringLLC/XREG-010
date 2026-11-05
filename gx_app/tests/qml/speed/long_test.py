@@ -9,6 +9,7 @@ import qmlenv
 old, new = sys.argv[1], sys.argv[2]
 stubs = qmlenv.stubs('SevenInch', 'Dark')
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+os.environ['TZ'] = 'UTC'   # as on a GX: the old page's ticks follow the process, the new one's the GX clock (the stub's UTC)
 from PySide6.QtCore import QUrl, qInstallMessageHandler, QtMsgType, QTimer
 from PySide6.QtGui import QGuiApplication, QFontDatabase
 from PySide6.QtQml import QQmlApplicationEngine

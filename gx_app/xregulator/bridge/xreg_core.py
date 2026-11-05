@@ -68,16 +68,50 @@ LIVE = (
     ('DvccCanAge',  'TimestampData', 'ts_DvccVeCan',      1,   None),
     ('DvccWifiAge', 'TimestampData', 'ts_DvccWifi',       1,   None),
     ('DvccStop',    'CSVData2', 'dvccNoLimitStop',        1,   None),   # 1 = Stop Charging Without Limits holding charging at zero
+    # highs and lows since the regulator started (its ignition-cycle watermarks, at their live readings' scales), for
+    # the larger views of the Dashboard's readouts; the battery amps come only from the regulator's own shunt, the
+    # battery temperature only from its own probe
+    ('AltAmpsHi',   'CSVData2', 'wmIgn_amps_hi',          100, None),
+    ('AltAmpsLo',   'CSVData2', 'wmIgn_amps_lo',          100, None),
+    ('BattAHi',     'CSVData2', 'wmIgn_Bcur_hi',          100, None),
+    ('BattALo',     'CSVData2', 'wmIgn_Bcur_lo',          100, None),
+    ('BattVHi',     'CSVData2', 'wmIgn_IBV_hi',           100, None),
+    ('BattVLo',     'CSVData2', 'wmIgn_IBV_lo',           100, None),
+    ('SocHi',       'CSVData2', 'wmIgn_SOC_hi',           100, None),
+    ('SocLo',       'CSVData2', 'wmIgn_SOC_lo',           100, None),
+    ('AltTempHi',   'CSVData2', 'wmIgn_altTempF_hi',      10,  F_TO_C),
+    ('AltTempLo',   'CSVData2', 'wmIgn_altTempF_lo',      10,  F_TO_C),
+    ('BattTempHi',  'CSVData2', 'wmIgn_battTempF_hi',     10,  F_TO_C),
+    ('BattTempLo',  'CSVData2', 'wmIgn_battTempF_lo',     10,  F_TO_C),
+    ('RpmHi',       'CSVData2', 'wmIgn_RPM_hi',           1,   None),
+    ('RpmLo',       'CSVData2', 'wmIgn_RPM_lo',           1,   None),
 )
 LIVE_WIND = ('TrueWind', 'TrueWindAngle', 'AppWind')
+# The highs and lows (watermarks) the readout panels show, by the regulator's name for each (/get?wmReset=, CSV2
+# wmIgn_<name>_age): their /Live high and low. /Live/WmSince/<name>: GX clock seconds when that pair started (the
+# regulator's boot or an owner's reset). WM_NAMES: every name the regulator takes.
+WM_LIVE = {'amps': ('AltAmpsHi', 'AltAmpsLo'), 'Bcur': ('BattAHi', 'BattALo'), 'IBV': ('BattVHi', 'BattVLo'),
+           'SOC': ('SocHi', 'SocLo'), 'altTempF': ('AltTempHi', 'AltTempLo'), 'battTempF': ('BattTempHi', 'BattTempLo'),
+           'RPM': ('RpmHi', 'RpmLo')}
+WM_NAMES = ('amps', 'altTempF', 'IBV', 'Bcur', 'SOC', 'RPM', 'SOG', 'AWS', 'TWS', 'heel', 'pitch', 'vacc', 'baro',
+            'ambient', 'VMGman', 'VMGup', 'battTempF', 'extraTempF')
+WM_SINCE_JITTER_S = 30   # a pair's start as worked out from a later frame's age moves by the frame's delivery delay
+WM_AFTER_SLACK_S = 2     # ages count whole seconds on both ends, so a frame built just after a reset can read about 1 s old
+WM_RESET_MAX_S = 120     # a GX clock that stepped back must not hold a pair cleared for long; CSV2 comes every 10 to 30 s
+# /Plot/YLim/<chart>: a plot's manual left-axis limits, the regulator's own (CSV3, written with one /get for both), which
+# the web app's live plot of the same name uses too. (lo key, hi key, CSV3 wire scale, kind); kind 'whole': whole
+# numbers both ways; 'dec': up to 2 decimals both ways (the regulator keeps a float, its /get takes it unscaled);
+# 'degF': whole deg F on the regulator, deg C on D-Bus to 2 decimals, a write sent as whole deg F as the web app rounds
+# it (Math.round). Published and held as ylim_text's "lo,hi", so a write's hold equals the regulator's echo.
+PLOT_YLIM = {'Current': ('Ymin1', 'Ymax1', 1,   'whole'),
+             'Volts':   ('Ymin2', 'Ymax2', 100, 'dec'),
+             'Rpm':     ('Ymin3', 'Ymax3', 1,   'whole'),
+             'Temp':    ('Ymin4', 'Ymax4', 1,   'degF')}
+YLIM_MAX = 100000    # largest magnitude of a limit, in the published units
 # Apparent wind's age on the TimestampData stream, ms at that frame (999999 never seen). Older than the firmware's own
 # DATA_TIMEOUT it is no reading: firmware before 2026-10-29 sends a never-seen apparent wind as 0, not the empty marker.
 WIND_TS = {'ApparentWindSpeedNMEA': 'ts_AppWindSpeed', 'ApparentWindAngleNMEA': 'ts_AppWindAngle'}
 WIND_STALE_MS = 10000
-WIND_EVERY_S = 30
-WIND_LEN = 120       # /History/<name>: 1 hour of 30 s means of each wind speed below
-# (path name, /Live name, demo backfill field): Wind is true wind speed, AppWind apparent (the Dashboard's wind tile)
-WIND_HIST = (('Wind', 'TrueWind', 'TrueWindSpeedNMEA'), ('AppWind', 'AppWind', 'ApparentWindSpeedNMEA'))
 BARO_FETCH_S = 600   # the regulator stores one barometer sample every 10 minutes
 BARO_KEEP = 432      # /History/Baro: 3 days, newest last; /History/BaroEnd is the newest sample's epoch
 
@@ -104,24 +138,42 @@ FAST_LIVE = ('Field', 'BattV', 'Rpm', 'AltTemp', 'AmpTarget', 'Ignition', 'Field
 # /Fast/Live's numbers about twice a second, as the web app's gauges (GAUGE_RENDER_INTERVAL_MS 500), so the last digit
 # is readable; 0.45 so frames 100 ms apart give 0.5 s, not 0.6. A change in LIVE_STATE goes out with the frame.
 LIVE_READOUT_S = 0.45
+# Slower plotting (/Settings/Xregulator/SlowPlots, the GX app page, for GX models with less to spare): /Fast/Live and
+# /Fast/Short at most this often, the regulator held at fast=1 (CSV1 every 500 ms) instead of fast=2; 0.9 so frames
+# 500 ms apart with up to 0.1 s of jitter give 1 s, not 1.5
+SLOW_PUB_S = 0.9
+# Slower plotting chosen by measurement while /Settings/Xregulator/SlowPlotsAuto is 1 (PlotRate): once, the first time a
+# Short Term page has asked at the full rate for PLOT_SETTLE_S, then over PLOT_CHECK_S. GX uptime at least PLOT_BOOT_S:
+# 42 s after a reboot, with no XREG-010 page shown, gui-v2 read 50 % of one core and the box 19.6 % (bench row 26). The
+# Ekrano, Short Term scrolling: the box 40-46 % busy, gui-v2's render thread 70-78 % of one core (§10 runs K-L).
+PLOT_SETTLE_S = 15
+PLOT_CHECK_S = 30
+PLOT_BOOT_S = 180
+PLOT_BUSY_MAX = 70       # % of the whole GX: at or over it, Slower plotting
+PLOT_RENDER_MAX = 90     # % of one core, gui-v2's render thread: near 100 it drops frames
+PLOT_MIN_RATE = 5        # /Fast/Short increments a second for a window to count as the full rate
 LIVE_STATE = ('OnOff', 'Ignition', 'FieldStatus', 'OffReason')
 FAST_MIN_S = 0.09       # the fast lane's shortest spacing: frames that arrive together (after a WiFi stall) go as one
-LIVE_RPM = 200           # the firmware's engine-spinning threshold (g_engineSpinningNow)
-# /Plot/Wind/<name>: 10 s means over the last hour; angles as vector means
-WIND_PLOT = (('Tws', 'TrueWindSpeedNMEA', 100, False), ('Twa', 'TrueWindAngleNMEA', 1, True),
-             ('Aws', 'ApparentWindSpeedNMEA', 100, False), ('Awa', 'ApparentWindAngleNMEA', 1, True))
-WIND_PLOT_S = 10
-WIND_PLOT_LEN = 360
+# Wind series (WindRecorder, /Plot/Wind): (name, CSV4 field, wire scale, decimals), one sample per CSV4 frame over the
+# last WIND_S seconds: the Wind tab's longest window and the Dashboard's wind tile. Angles as the regulator sends them.
+WIND = (('Tws', 'TrueWindSpeedNMEA', 100, 1), ('Twa', 'TrueWindAngleNMEA', 1, 0),
+        ('Aws', 'ApparentWindSpeedNMEA', 100, 1), ('Awa', 'ApparentWindAngleNMEA', 1, 0))
+WIND_S = 3600
+WIND_GAP_EVERY_S = 1.0   # no fresh CSV4: an empty sample this often, so the charts' time axis moves on and the lines break
+WIND_QUEUE_MAX = 600     # CSV4 frames the stream reader holds for the main loop (a stalled main loop drops the oldest)
+WIND_TOPICS = ('Wind', 'Live')   # pages showing the wind hour: the Wind tab, the Dashboard (its wind tile)
 
 WANT_TOPICS = ('Short', 'Long', 'Health', 'Wind', 'Perf', 'Settings', 'Flow', 'Cloud', 'Live')
 WANT_HOLD_S = 45.0
-FAST_TOPICS = ('Short', 'Wind', 'Perf', 'Health')   # pages that hold the regulator's engine-running GX schedule
-# pages that also ask for CSV1 at the web app's rate (/gxrate?fast=2; older firmware reads it as fast=1). Live is the
-# Dashboard, which the home page always shows: it asks only while the engine turns or the field is on, like Perf.
+# Pages that hold the regulator's engine-running GX schedule (fast=1), whatever the engine, ignition or boat speed: a
+# shown page updates alike at the dock and underway (owner's decision, 2026-10-31)
+FAST_TOPICS = ('Short', 'Live', 'Wind', 'Perf', 'Health')
+# pages that also ask for CSV1 at the web app's rate (fast=2; older firmware reads it as fast=1), unless Slower plotting
+# is on. Live is the Dashboard.
 LIVE_TOPICS = ('Short', 'Live')
-PERF_FAST_KN = 1.0   # the home page always wants Perf; below this SOG and STW, it must not hold the fast schedule at anchor
 FAST_EVERY_S = 30
 LONG_RANGES = {'1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800, '30d': 2592000}
+LONG_DEFAULT = '24h'
 LONG_POINTS = 300
 LONG_REFETCH_S = 600
 LONG_REUSE_S = 60    # a range change re-bins the cached ring when it is younger than this, then refetches
@@ -387,18 +439,22 @@ def circ_mean(sin_sum, cos_sum, signed):
 
 def parse_backfill(b):
     # GET /demoBackfill (demo only): {"v":1, "short": {"dt":1, "cols":[...], "rows":[[...]]}, "wind": {"dt":10, ...}},
-    # rows oldest first, newest at "now", plain engineering units. -> {'short': [row dict], 'wind': [row dict]}
+    # rows oldest first, newest at "now", plain engineering units.
+    # -> {'short': [row dict], 'wind': [row dict], 'wind_dt': seconds between wind rows}
     j = json.loads(gunzip_maybe(b))
     if not isinstance(j, dict) or j.get('v') != 1:
         raise ValueError('not a v1 demo backfill')
     out = {}
+    num = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
     for name in ('short', 'wind'):
         blk = j.get(name) if isinstance(j.get(name), dict) else {}
+        if name == 'wind':
+            dt = num(blk.get('dt'))
+            out['wind_dt'] = dt if dt is not None and dt > 0 else 10.0
         cols, rows = blk.get('cols'), blk.get('rows')
         if not isinstance(cols, list) or not isinstance(rows, list):
             out[name] = []
             continue
-        num = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
         out[name] = [dict(zip(cols, map(num, r))) for r in rows if isinstance(r, list) and len(r) == len(cols)]
     return out
 
@@ -616,15 +672,16 @@ def frame_after(c4, ts):
 
 # ---- Recorders (fed on the main tick) ----
 
-class ShortRecorder:
-    # One sample per CSV1 frame, numbered from 1 within this recorder (its epoch) and timed in ms: by the regulator's own
-    # clock (sendMs) while one stream from one boot lasts, else by the bridge's. A stale stream adds an empty sample every
-    # SHORT_GAP_EVERY_S, so the page's time axis moves on and its line breaks. Kept for SHORT_S plus the one sample before,
-    # which the line enters the window from. Each value is formatted once, when it arrives.
-    def __init__(self):
+class SampleRing:
+    # One sample per frame, numbered from 1 within this ring (its epoch) and timed in ms: by the regulator's own clock
+    # (sendMs) while one stream from one boot lasts, else by the bridge's. A stale stream adds an empty sample every
+    # gap_s, so a page's time axis moves on and its line breaks. Kept for keep_s plus the one sample before, which the
+    # line enters the window from. Each value is formatted once, when it arrives.
+    def __init__(self, tag, ncols, keep_s, gap_s):
+        self.tag, self.ncols, self.keep_s, self.gap_s = tag, ncols, keep_s, gap_s
         self.epoch = secrets.token_hex(4)
-        self.t = collections.deque()                                      # ms on this recorder's timeline
-        self.cols = [collections.deque() for _ in range(len(SHORT) + 2)]  # dt from the sample before, SHORT, chargeStage
+        self.t = collections.deque()                                    # ms on this ring's timeline
+        self.cols = [collections.deque() for _ in range(ncols + 1)]     # dt from the sample before, then the series
         self.n = 0                     # number of the newest sample
         self.at = None                 # bridge clock of the newest sample
         self.prev = None               # (stream generation, sessionId, sendMs, t) of the newest frame
@@ -638,17 +695,17 @@ class ShortRecorder:
         for q, s in zip(self.cols[1:], texts):
             q.append(s)
         self.n += 1
-        while len(self.t) >= 2 and self.t[1] <= t - SHORT_S * 1000:
+        while len(self.t) >= 2 and self.t[1] <= t - self.keep_s * 1000:
             self.t.popleft()
             for q in self.cols:
                 q.popleft()
         return t
 
     def _clock(self, at):
-        # this recorder's time at bridge clock `at`, carried on from the newest sample
+        # this ring's time at bridge clock `at`, carried on from the newest sample
         return self.t[-1] + max(0, int(round((at - self.at) * 1000))) if self.t else 0
 
-    def frame(self, at, gen, frame, stage):
+    def _frame(self, at, gen, frame, texts):
         sess, sms = frame.get('sessionId'), frame.get('sendMs')
         sms = int(sms) if sms is not None else None
         t = None
@@ -657,6 +714,42 @@ class ShortRecorder:
             d = (sms - p[2]) & 0xFFFFFFFF
             if 0 < d < 0x80000000:
                 t = p[3] + d
+        t = self._append(self._clock(at) if t is None else t, texts)
+        self.at, self.empty = at, False
+        self.prev = (gen, sess, sms, t) if sms is not None else None
+
+    def gap(self, at):
+        # the stream is stale: no reading now (nothing before the first sample)
+        if not self.t or (self.empty and at - self.at < self.gap_s):
+            return
+        self._append(self._clock(at), [''] * self.ncols)
+        self.at, self.empty = at, True
+
+    def message(self, since=None):
+        # "<tag>;epoch;newest number;count;full;dt,..;<one ,-separated list per series>", the samples after number
+        # `since`, or every sample held (full 1) when since is None or no longer held. A dt is ms from the sample before;
+        # a full message's first is 0.
+        held = len(self.t)
+        full = since is None or since < self.n - held or since > self.n
+        k = held if full else self.n - since
+        if full:
+            cols = [','.join(itertools.chain(('0',), itertools.islice(self.cols[0], 1, None))) if held else '']
+            cols += [','.join(q) for q in self.cols[1:]]
+        else:
+            cols = [','.join(reversed(list(itertools.islice(reversed(q), k)))) for q in self.cols]
+        return '%s;%s;%d;%d;%d;%s' % (self.tag, self.epoch, self.n, k, 1 if full else 0, ';'.join(cols))
+
+    def _filled(self, at):
+        if self.t:
+            self.at, self.empty = at, False
+
+
+class ShortRecorder(SampleRing):
+    # /Fast/Short ("s1"): one sample per CSV1 frame of the SHORT series, then chargeStage, over the last SHORT_S
+    def __init__(self):
+        super().__init__('s1', len(SHORT) + 1, SHORT_S, SHORT_GAP_EVERY_S)
+
+    def frame(self, at, gen, frame, stage):
         texts = []
         for _name, field, scale, conv, dec in SHORT:
             raw = frame.get(field)
@@ -666,30 +759,7 @@ class ShortRecorder:
                 v = raw / scale
                 texts.append('%.*f' % (dec, conv(v) if conv else v))
         texts.append('' if stage is None else '%d' % stage)
-        t = self._append(self._clock(at) if t is None else t, texts)
-        self.at, self.empty = at, False
-        self.prev = (gen, sess, sms, t) if sms is not None else None
-
-    def gap(self, at):
-        # the stream is stale: no reading now (nothing before the first sample)
-        if not self.t or (self.empty and at - self.at < SHORT_GAP_EVERY_S):
-            return
-        self._append(self._clock(at), [''] * (len(SHORT) + 1))
-        self.at, self.empty = at, True
-
-    def message(self, since=None):
-        # /Fast/Short: "s1;epoch;newest number;count;full;dt,..;<one ;-separated list per SHORT series, then
-        # chargeStage>", the samples after number `since`, or every sample held (full 1) when since is None or no longer
-        # held. A dt is ms from the sample before; a full message's first is 0.
-        held = len(self.t)
-        full = since is None or since < self.n - held or since > self.n
-        k = held if full else self.n - since
-        if full:
-            cols = [','.join(itertools.chain(('0',), itertools.islice(self.cols[0], 1, None))) if held else '']
-            cols += [','.join(q) for q in self.cols[1:]]
-        else:
-            cols = [','.join(reversed(list(itertools.islice(reversed(q), k)))) for q in self.cols]
-        return 's1;%s;%d;%d;%d;%s' % (self.epoch, self.n, k, 1 if full else 0, ';'.join(cols))
+        self._frame(at, gen, frame, texts)
 
     def fill(self, rows, at):
         # /demoBackfill "short" rows (parse_backfill), oldest first, one per second, already in engineering units; the
@@ -705,55 +775,32 @@ class ShortRecorder:
             texts.append(last[-1] if st is None else '%d' % st)
             self._append(i * 1000, texts)
             last = texts
-        if self.t:
-            self.at, self.empty = at, False
+        self._filled(at)
 
 
-class WindRecorder:
+class WindRecorder(SampleRing):
+    # /Plot/Wind ("w1"): one sample per CSV4 frame of the WIND series over the last WIND_S; a field the TimestampData
+    # stream calls stale (wind_stale) is no reading
     def __init__(self):
-        self.series = {name: collections.deque(maxlen=WIND_PLOT_LEN) for name, *_ in WIND_PLOT}
-        self._reset()
+        super().__init__('w1', len(WIND), WIND_S, WIND_GAP_EVERY_S)
 
-    def _reset(self):
-        self.acc = {name: [0.0, 0.0, 0, False] for name, *_ in WIND_PLOT}   # sum (or sin sum), cos sum, count, any < 0
-
-    def sample(self, frame, stale=()):
-        for name, field, scale, angle in WIND_PLOT:
+    def frame(self, at, gen, frame, stale=()):
+        texts = []
+        for _name, field, scale, dec in WIND:
             raw = frame.get(field)
-            if raw is None or raw <= EMPTY or field in stale:
-                continue
-            a = self.acc[name]
-            v = raw / scale
-            if angle:
-                r = math.radians(v)
-                a[0] += math.sin(r)
-                a[1] += math.cos(r)
-                a[3] = a[3] or v < 0
-            else:
-                a[0] += v
-            a[2] += 1
+            texts.append('' if raw is None or raw <= EMPTY or field in stale else '%.*f' % (dec, raw / scale))
+        self._frame(at, gen, frame, texts)
 
-    def close(self):
-        for name, _field, _scale, angle in WIND_PLOT:
-            s, c, n, neg = self.acc[name]
-            if not n:
-                v = None
-            elif angle:
-                v = circ_mean(s, c, neg)
-            else:
-                v = s / n
-            self.series[name].append(v)
-        self._reset()
-
-    def strings(self):
-        return {name: fmt_series(self.series[name], 0 if angle else 1) for name, _f, _s, angle in WIND_PLOT}
-
-    def fill(self, rows):
-        # /demoBackfill "wind" rows, oldest first, one per 10 s close, already in kt and degrees
+    def fill(self, rows, dt_s, at):
+        # /demoBackfill "wind" rows, oldest first, dt_s apart, already in kt and degrees; the newest is now
         self.__init__()
-        for r in rows[-WIND_PLOT_LEN:]:
-            for name, field, _scale, _angle in WIND_PLOT:
-                self.series[name].append(r.get(field))
+        for i, r in enumerate(rows):
+            texts = []
+            for _name, field, _scale, dec in WIND:
+                v = r.get(field)
+                texts.append('' if v is None else '%.*f' % (dec, v))
+            self._append(int(round(i * dt_s * 1000)), texts)
+        self._filled(at)
 
 
 # ---- Settings model (gx_app/xregulator/bridge/settings_schema.json, built by gx_app/gen_settings.py) ----
@@ -1284,6 +1331,7 @@ class Link:
         self.frames = {}
         self.frame_at = {}
         self.short_q = collections.deque(maxlen=SHORT_QUEUE_MAX)   # (clock, generation, CSV1 frame) for ShortRecorder
+        self.wind_q = collections.deque(maxlen=WIND_QUEUE_MAX)     # (clock, generation, CSV4 frame) for WindRecorder
         self.on_frame = None         # called on the stream thread after each CSV1 frame (Core: the fast lane)
         self.sock = None
         self.uid_mismatch = False
@@ -1350,6 +1398,11 @@ class Link:
     def take_short(self):
         with self.lock:
             q, self.short_q = self.short_q, collections.deque(maxlen=SHORT_QUEUE_MAX)
+        return q
+
+    def take_wind(self):
+        with self.lock:
+            q, self.wind_q = self.wind_q, collections.deque(maxlen=WIND_QUEUE_MAX)
         return q
 
     # -- connection thread --
@@ -1539,6 +1592,8 @@ class Link:
                 if event == 'CSVData':
                     self.ever_live = True
                     self.short_q.append((now, self.generation, frame))
+                elif event == 'CSVData4':
+                    self.wind_q.append((now, self.generation, frame))
             if event == 'CSVData' and self.on_frame is not None:
                 self.on_frame()
         elif event in SCHEMA_EVENTS:
@@ -1948,7 +2003,7 @@ class Core:
                  wall=time.time, instance=INSTANCE, alt_instance=INSTANCE, batt_instance=INSTANCE, on_repin=None):
         self.clock, self.wall = clock, wall
         self.uid = norm_uid(uid)
-        self.store = store   # 'host': where this regulator last answered
+        self.store = store   # 'host': where this regulator last answered; 'long_range': the Long Term range picked
         self.host = (store.get('host') or '').strip()
         self.instance = instance
         self.alt_instance = alt_instance
@@ -1970,15 +2025,17 @@ class Core:
         self.want_rose = False   # a page just opened: the bridge ticks this unit at once instead of within 500 ms
         self.trend_want_at = {}   # Health window -> when a screen last asked for it
         self.trend_on = dict.fromkeys(HEALTH_WINDOWS, False)
-        self.long_range = '24h'
+        self.long_range = store.get('long_range') if store.get('long_range') in LONG_RANGES else LONG_DEFAULT
         self.long_dirty = False
         self.lt = None
         self.lt_at = None
         self.next = collections.defaultdict(float)   # next due time per periodic job
         self.short = ShortRecorder()
         self.wind_plot = WindRecorder()
-        self.wind = {name: collections.deque(maxlen=WIND_LEN) for name, _, _ in WIND_HIST}
-        self.wind_acc = {name: [] for name, _, _ in WIND_HIST}
+        self.wind_epoch = None       # WindRecorder epoch and number of the newest sample /Plot/Wind has carried
+        self.wind_since = None
+        self.wind_full = False       # a page asked for the whole wind hour (/Plot/WindFull)
+        self.wind_at = -1e18         # clock of the last /Plot/Wind increment
         self.baro = []
         self.baro_end = None       # epoch of the newest barometer sample
         self.health_csv = {'SessionCsv': ''}
@@ -1987,6 +2044,8 @@ class Core:
         self.sources = {}   # endpoint name -> (parsed JSON, raw text, fetched at)
         self.result_seq = 0
         self.reset_paths = set()
+        self.wm_reset = {}   # name: GX clock seconds just before a reset the regulator took, until a CSV2 frame built after it
+        self.wm_since = {}   # name: the start last published
         self.added = set()
         self.fast_held = 0           # the /gxrate fast level this bridge holds the regulator at (0 none)
         self.fast_next = 0.0
@@ -2001,6 +2060,13 @@ class Core:
         self.fast_full = False       # a page asked for the whole Short Term history (/Fast/ShortFull)
         self.fast_shown = dict.fromkeys(LIVE_TOPICS, False)
         self.live_at, self.live_state = -1e18, None   # the last /Fast/Live readings sent: clock, LIVE_STATE values
+        self.short_at = -1e18        # clock of the last /Fast/Short increment
+        self.short_pubs = 0          # /Fast/Short messages sent, for PlotRate
+        self.slow = False            # Slower plotting, set by the Manager each tick
+        # the bridge's: from any thread, run a tick soon, so a write's result or a cloud answer in the inbox shows
+        # without waiting up to TICK_MS for the next one (a table page reads "Saving..." until the result)
+        self.nudge = None
+        self.nudge_pending = False   # xregulator_bridge.py: that tick is scheduled
         self.link.on_frame = self._arrived
         self.last_generation = 0
         self.last_name = None
@@ -2090,8 +2156,8 @@ class Core:
                   (g + '/Settings/Group', group, 'free'), (g + '/Settings/CustomName', '', 'free')]
         p += [('/Live/' + name, None, None) for name, *_ in LIVE]
         p += [('/Live/AltCapMax', None, None)]
+        p += [('/Live/WmSince/' + name, None, None) for name in WM_LIVE] + [('/Live/WmReset', '', 'core')]
         p += [('/History/Baro', '', None), ('/History/BaroEnd', None, None)]
-        p += [('/History/' + name, '', None) for name, _, _ in WIND_HIST]
         p += [('/Ui/Want/' + t, None, 'core') for t in WANT_TOPICS]
         p += [('/Ui/LongRange', self.long_range, 'core')]
         p += [('/Ui/Want/HealthTrend/%d' % h, None, 'core') for h in HEALTH_WINDOWS]
@@ -2099,7 +2165,8 @@ class Core:
         p += [('/Plot/Long/Fields', '', None), ('/Plot/Long/StartEpoch', None, None), ('/Plot/Long/StepS', None, None),
               ('/Plot/Long/Range', self.long_range, None), ('/Plot/Long/Last', '', None)]
         p += [('/Plot/Long/' + name, '', None) for name in self._long_series_names()]
-        p += [('/Plot/Wind/' + name, '', None) for name, *_ in WIND_PLOT]
+        p += [('/Plot/Wind', '', None), ('/Plot/WindFull', None, 'core')]
+        p += [('/Plot/YLim/' + name, '', 'core') for name in PLOT_YLIM]
         p += [('/Health/TrendCsv/%d' % h, '', None) for h in HEALTH_WINDOWS] + [('/Health/SessionCsv', '', None)]
         p += [('/Perf/Schema', '', None), ('/Perf/CurveCsv', '', None), ('/Perf/RidgeFrac', None, None),
               ('/Perf/IdwPower', None, None)]
@@ -2116,8 +2183,8 @@ class Core:
               ('/Link/Host', self.host, None), ('/Link/OtherUid', '', None), ('/Link/OtherName', '', None),
               ('/Link/AcceptRegulator', None, 'core')]
         p += [('/Flow/Json', '', None), ('/Flow/Ok', None, None)]
-        p += [('/Cloud/State', None, None), ('/Cloud/Message', '', None), ('/Cloud/AsOf', None, None),
-              ('/Cloud/Json', '', None), ('/Cloud/Refresh', None, 'core')]
+        p += [('/Cloud/State', None, None), ('/Cloud/Busy', 0, None), ('/Cloud/Message', '', None),
+              ('/Cloud/AsOf', None, None), ('/Cloud/Json', '', None), ('/Cloud/Refresh', None, 'core')]
         p += [('/Link/GxLimits/State', LIMITS_NONE, None), ('/Link/GxLimits/Cvl', None, None),
               ('/Link/GxLimits/Ccl', None, None)]
         return p
@@ -2175,9 +2242,16 @@ class Core:
             self.want_rose = True
             self.reset_paths.add(path)
             return True
+        if path == '/Plot/WindFull':
+            # a wind chart found a gap in /Plot/Wind (or saw it first): the whole hour goes out now
+            self.wind_full = True
+            self.want_rose = True
+            self.reset_paths.add(path)
+            return True
         if path == '/Cloud/Refresh':
             self.cloud_refresh = True
             self.cloud_next = 0.0
+            self.want_rose = True
             self.reset_paths.add(path)
             return True
         if path == '/Ui/LongRange':
@@ -2186,6 +2260,35 @@ class Core:
             if value != self.long_range:
                 self.long_range = value
                 self.long_dirty = True
+                self.store.set('long_range', value)
+            return True
+        if path == '/Live/WmReset':
+            # a readout panel's "Reset": the regulator clears these highs and lows (comma-separated WM_NAMES)
+            names = [n for n in str(value).split(',') if n]
+            if not names or any(n not in WM_NAMES for n in names):
+                return False
+            self.reset_paths.add(path)
+            self.n += 1
+            n = self.n
+            wire = ','.join(dict.fromkeys(names))
+            asked = int(self.wall())
+
+            def job():
+                ok, msg = self._write('wmReset', [('wmReset', wire)], False, False, None, None, n)
+                if ok:
+                    self.inbox.put(('wm_reset', (names, asked)))
+                self._post_result('wmReset', ok, msg)
+            self.writer.put('write', job)
+            return True
+        if path.startswith('/Plot/YLim/'):
+            chart = PLOT_YLIM.get(path[11:])
+            lim = parse_ylim(value, chart[3]) if chart else None
+            if lim is None:
+                return False
+            shown, lo, hi = lim
+            lo_key, hi_key = chart[:2]
+            self.hold[path] = [shown, now, None]
+            self._queue_write(lo_key, [(lo_key, lo), (hi_key, hi)], hold=[(path, shown)])
             return True
         if path == '/SwitchableOutput/0/Settings/Type':
             return value == 1
@@ -2282,7 +2385,14 @@ class Core:
         return frames
 
     def _post_result(self, key, ok, message):
-        self.inbox.put(('result', (key, ok, message)))
+        self._reply('result', (key, ok, message))
+
+    def _reply(self, kind, data):
+        # a worker thread's answer the screen waits on
+        self.inbox.put((kind, data))
+        nudge = self.nudge
+        if nudge is not None:
+            nudge()
 
     # -- authorization --
 
@@ -2431,8 +2541,8 @@ class Core:
         self._dynamic(pub, info)
         self._identity(pub, info, live, frames)
         self._demo(now, frames, info)
-        vals = self._live(pub, frames, fresh, live, info)
-        self._recorders(pub, now, frames, fresh, live, vals)
+        self._live(pub, frames, fresh, live, info)
+        self._recorders(pub, now, frames, fresh)
         self._wanted(pub, now, frames, fresh, info, live)
         if self.republish:
             self._republish(pub, now)
@@ -2480,9 +2590,11 @@ class Core:
             new = self.fast_epoch != self.short.epoch
             if new:
                 self.fast_epoch, self.fast_since = self.short.epoch, None if self.fast_since is None else 0
-            if new or self.fast_full or self.fast_since != self.short.n:
+            if new or self.fast_full or self.fast_since is None or (
+                    self.fast_since != self.short.n and (not self.slow or now - self.short_at >= SLOW_PUB_S)):
                 pub['/Fast/Short'] = self.short.message(None if self.fast_full else self.fast_since)
-                self.fast_since, self.fast_full = self.short.n, False
+                self.fast_since, self.fast_full, self.short_at = self.short.n, False, now
+                self.short_pubs += 1
         elif self.fast_shown['Short']:
             pub['/Fast/Short'] = ''
             self.fast_since, self.fast_full = None, False
@@ -2501,7 +2613,7 @@ class Core:
             else:
                 out['OnOff'] = None
             state = tuple(out.get(k) for k in LIVE_STATE)
-            if state != self.live_state or now - self.live_at >= LIVE_READOUT_S:
+            if state != self.live_state or now - self.live_at >= (SLOW_PUB_S if self.slow else LIVE_READOUT_S):
                 pub['/Fast/Live'] = json.dumps(out, separators=(',', ':'))
                 self.live_at, self.live_state = now, state
         elif on['Live'] or self.fast_shown['Live']:
@@ -2571,6 +2683,10 @@ class Core:
                     pub['/Settings/Http/' + name] = text
             elif kind == 'cloud':
                 self._cloud_answer(now, *data)
+            elif kind == 'wm_reset':
+                names, at = data
+                for name in names:
+                    self.wm_reset[name] = at
             elif kind == 'sources_now':
                 for name in self.model.endpoints:
                     self.next['src:' + name] = 0.0
@@ -2641,9 +2757,7 @@ class Core:
 
     def _drop_history(self):
         self.short, self.wind_plot = ShortRecorder(), WindRecorder()
-        for name, _, _ in WIND_HIST:
-            self.wind[name].clear()
-            self.wind_acc[name] = []
+        self.link.take_wind()   # the other boat's CSV4 frames
         self.baro, self.baro_end, self.lt, self.lt_at, self.curve_csv, self.sources = [], None, None, None, '', {}
         self.health_csv = dict.fromkeys(self.health_csv, '')
         self.health_trend = dict.fromkeys(HEALTH_WINDOWS, '')
@@ -2658,25 +2772,13 @@ class Core:
         if short:
             self.short.fill(short, now)
         if wind:
-            self.wind_plot.fill(wind)
-            rows = wind[-3 * WIND_LEN:]
-            rows = rows[len(rows) % 3:]   # whole 30 s means, the last ending at the newest row
-            for name, _, field in WIND_HIST:
-                q = self.wind[name]
-                q.clear()
-                for i in range(0, len(rows), 3):
-                    v = [r[field] for r in rows[i:i + 3] if r.get(field) is not None]
-                    q.append(sum(v) / len(v) if v else None)
+            self.wind_plot.fill(wind, data['wind_dt'], now)
         self.republish = True
 
     def _republish(self, pub, now):
         self.republish = False
-        self._publish_wind(pub)
         pub['/History/Baro'] = ','.join('' if x is None else '%.1f' % x for x in self.baro)
         pub['/History/BaroEnd'] = self.baro_end
-        if self.want('Wind', now):
-            for name, text in self.wind_plot.strings().items():
-                pub['/Plot/Wind/' + name] = text
         if self.want('Long', now):
             self._publish_long(pub)
         if self.want('Health', now):
@@ -2702,6 +2804,7 @@ class Core:
             vals[name] = round(conv(v) if conv else v, 3)
         if not vals['Health']:
             vals['Health'] = None
+        self._watermarks(pub, vals, frames, fresh, info)
         vals['OnOff'] = self._onoff(frames, fresh, vals['OnOff'])
         # Gauge full scale: the largest current cap in the RPM table
         csv3 = frames.get('CSVData3') or {}
@@ -2721,6 +2824,29 @@ class Core:
         pub['/GenericInput/1/Value'] = None if vals['BattV'] is None else round(vals['BattV'], 2)
         pub['/GenericInput/2/Value'] = None if vals['Field'] is None else round(vals['Field'])
         return vals
+
+    def _watermarks(self, pub, vals, frames, fresh, info):
+        c2 = (frames.get('CSVData2') or {}) if 'CSVData2' in fresh else {}
+        wall = int(self.wall())
+        # the ages were true when the frame arrived, which can be 30 s ago
+        now = self.clock()
+        arrived = wall - int(max(0.0, now - (info.get('frame_at') or {}).get('CSVData2', now)))
+        for name, (hi, lo) in WM_LIVE.items():
+            age = c2.get('wmIgn_%s_age' % name)
+            since = None if age is None or age < 0 else arrived - int(age)
+            at = self.wm_reset.get(name)
+            if at is not None:
+                # until a frame built after the reset arrives (CSV2 comes every 10 to 30 s), the reset shows now
+                if (since is not None and since >= at - WM_AFTER_SLACK_S) or abs(wall - at) > WM_RESET_MAX_S:
+                    del self.wm_reset[name]
+                else:
+                    vals[hi] = vals[lo] = None
+                    since = at
+            held = self.wm_since.get(name)
+            if since is not None and held is not None and abs(since - held) <= WM_SINCE_JITTER_S:
+                since = held
+            self.wm_since[name] = since
+            pub['/Live/WmSince/' + name] = since
 
     @staticmethod
     def _onoff(frames, fresh, v1):
@@ -2805,37 +2931,28 @@ class Core:
         self.switch_frames.pop(ev, None)
         return True
 
-    def _recorders(self, pub, now, frames, fresh, live, vals):
-        wind_ok = self._since_switch(frames, fresh, 'CSVData4')
+    def _recorders(self, pub, now, frames, fresh):
         self._short_drain(now, frames, fresh)
-        if wind_ok:
-            self.wind_plot.sample(frames['CSVData4'], self._wind_stale(frames, fresh))
-        if now >= self.next['wind_plot']:
-            first = not self.next['wind_plot']
-            self.next['wind_plot'] = now + WIND_PLOT_S
-            if not first:
-                self.wind_plot.close()
-                if self.want('Wind', now):
-                    for name, s in self.wind_plot.strings().items():
-                        pub['/Plot/Wind/' + name] = s
-        if not live:
-            return
-        for name, live_name, _ in WIND_HIST:
-            if vals[live_name] is not None and wind_ok:
-                self.wind_acc[name].append(vals[live_name])
-        if now >= self.next['wind']:
-            self.next['wind'] = now + WIND_EVERY_S
-            for name, _, _ in WIND_HIST:
-                acc = self.wind_acc[name]
-                self.wind[name].append(sum(acc) / len(acc) if acc else None)
-                self.wind_acc[name] = []
-            self._publish_wind(pub)
-            pub['/History/Baro'] = ','.join('' if x is None else '%.1f' % x for x in self.baro)
-            pub['/History/BaroEnd'] = self.baro_end
-
-    def _publish_wind(self, pub):
-        for name, _, _ in WIND_HIST:
-            pub['/History/' + name] = ','.join('' if x is None else '%.1f' % x for x in self.wind[name])
+        q = self.link.take_wind()
+        if q:
+            stale = self._wind_stale(frames, fresh)
+            for at, gen, frame in q:
+                self.wind_plot.frame(at, gen, frame, stale)
+        if 'CSVData4' not in fresh:
+            self.wind_plot.gap(now)
+        # /Plot/Wind, while a page shows wind: the samples since the last message, or the whole hour to a page that asked
+        # (or at a new history: a demo switch, a backfill, numbered from 1, so a page following the old one starts over)
+        if any(self.want(t, now) for t in WIND_TOPICS):
+            new = self.wind_epoch != self.wind_plot.epoch
+            if new:
+                self.wind_epoch, self.wind_since = self.wind_plot.epoch, None if self.wind_since is None else 0
+            if new or self.wind_full or self.wind_since is None or (
+                    self.wind_since != self.wind_plot.n and (not self.slow or now - self.wind_at >= SLOW_PUB_S)):
+                pub['/Plot/Wind'] = self.wind_plot.message(None if self.wind_full else self.wind_since)
+                self.wind_since, self.wind_full, self.wind_at = self.wind_plot.n, False, now
+        elif self.wind_since is not None:
+            pub['/Plot/Wind'] = ''
+            self.wind_since, self.wind_full = None, False
 
     def _fetch(self, kind, path, parse, timeout=20.0, failed=None):
         # failed: an inbox message to post when the fetch or its parse fails
@@ -2935,14 +3052,6 @@ class Core:
         if fell['Perf']:
             pub['/Perf/CurveCsv'] = ''
 
-        # Wind plots publish on their 10 s close; a page opening gets the buffer at once
-        if rose['Wind']:
-            for name, s in self.wind_plot.strings().items():
-                pub['/Plot/Wind/' + name] = s
-        if fell['Wind']:
-            for name, *_ in WIND_PLOT:
-                pub['/Plot/Wind/' + name] = ''
-
         # Settings sources: the JSON endpoints a settings page shows or echoes from, polled at the app's own rate
         for name, (path, poll) in self.model.endpoints.items():
             cached = self.sources.get(name)
@@ -2955,17 +3064,11 @@ class Core:
                 self._fetch('source', path, lambda b, name=name: _source_payload(name, b), timeout=6)
 
         # Fast GX schedule while a page shows live detail
-        c4 = (frames.get('CSVData4') or {}) if 'CSVData4' in fresh else {}
-        moving = any(c4.get(f) is not None and c4[f] > EMPTY and c4[f] / 100.0 >= PERF_FAST_KN
-                     for f in ('SOGNMEA', 'STWNMEA'))
-        c1 = (frames.get('CSVData') or {}) if 'CSVData' in fresh else {}
-        rpm, field = c1.get('RPM'), c1.get('fieldActiveStatus')
-        running = (rpm is not None and rpm >= LIVE_RPM) or (field is not None and field > EMPTY and field != 0)
         level = 0
         if connected and info['channel'] == 'gxevents':
-            if any(on[t] for t in LIVE_TOPICS if t != 'Live' or running):
+            if not self.slow and any(on[t] for t in LIVE_TOPICS):
                 level = 2
-            elif any(on[t] for t in FAST_TOPICS if t != 'Perf' or moving):
+            elif any(on[t] for t in FAST_TOPICS):
                 level = 1
         if info['generation'] != self.last_generation:
             self.last_generation = info['generation']
@@ -2983,14 +3086,13 @@ class Core:
         # The power-flow tile holds only CSV4 at 1 s, 2 s on older firmware (firmware without that hold ignores flow=)
         flow = on['Flow'] and connected and info['channel'] == 'gxevents'
         if flow and now >= self.flow_next:
-            self.flow_next = now + FLOW_HOLD_EVERY_S
-            self.flow_held = True
-            self._gxrate('flow', 1)
+            if self._gxrate('flow', 1):
+                self.flow_next = now + FLOW_HOLD_EVERY_S
+                self.flow_held = True
         elif not flow and self.flow_held:
-            self.flow_held = False
-            self.flow_next = 0.0
-            if connected:
-                self._gxrate('flow', 0)
+            if not connected or self._gxrate('flow', 0):
+                self.flow_held = False
+                self.flow_next = 0.0
 
     def _gxrate(self, hold, value):
         http_ = self.link.http
@@ -3215,6 +3317,7 @@ class Core:
             if self.cloud_busy and not self.cloud_text:
                 self._cloud_set(CLOUD_LOADING)
         pub['/Cloud/State'] = self.cloud_state
+        pub['/Cloud/Busy'] = 1 if self.cloud_busy else 0
         pub['/Cloud/Message'] = self.cloud_msg
         pub['/Cloud/AsOf'] = self.cloud_as_of
         pub['/Cloud/Json'] = self.cloud_text if want else ''
@@ -3230,34 +3333,34 @@ class Core:
             j = json.loads(b) if st == 200 else None
         except Exception as e:
             log.warning('/getAuthToken: %s', fetch_error_text(e))
-            self.inbox.put(('cloud', (CLOUD_NO_LINK, None, None)))
+            self._reply('cloud', (CLOUD_NO_LINK, None, None))
             return
         if not isinstance(j, dict):
-            self.inbox.put(('cloud', (CLOUD_ERROR, 'The regulator did not give its cloud token', None)))
+            self._reply('cloud', (CLOUD_ERROR, 'The regulator did not give its cloud token', None))
             return
         if not j.get('registered') or not j.get('token'):
-            self.inbox.put(('cloud', (CLOUD_UNREGISTERED, None, None)))
+            self._reply('cloud', (CLOUD_UNREGISTERED, None, None))
             return
         try:
             v = cloud.view(cloud.fetch(str(j['token']), timeout=CLOUD_TIMEOUT_S), int(self.wall()))
         except urllib.error.HTTPError as e:
             code, msg = cloud.http_error_body(e)
             if e.code == 401 and code == 'token_not_found':
-                self.inbox.put(('cloud', (CLOUD_UNREGISTERED, None, None)))
+                self._reply('cloud', (CLOUD_UNREGISTERED, None, None))
             else:
                 log.warning('cloud: HTTP %d %s', e.code, msg)
-                self.inbox.put(('cloud', (CLOUD_ERROR, 'The cloud could not answer (%s)' % (msg or 'HTTP %d' % e.code),
-                                          None)))
+                self._reply('cloud', (CLOUD_ERROR, 'The cloud could not answer (%s)' % (msg or 'HTTP %d' % e.code),
+                                      None))
             return
         except (urllib.error.URLError, OSError) as e:
             log.warning('cloud: %s', fetch_error_text(e))
-            self.inbox.put(('cloud', (CLOUD_OFFLINE, None, None)))
+            self._reply('cloud', (CLOUD_OFFLINE, None, None))
             return
         except ValueError as e:
             log.warning('cloud: %s', e)
-            self.inbox.put(('cloud', (CLOUD_ERROR, 'The cloud answered with something unreadable', None)))
+            self._reply('cloud', (CLOUD_ERROR, 'The cloud answered with something unreadable', None))
             return
-        self.inbox.put(('cloud', (CLOUD_READY, None, v)))
+        self._reply('cloud', (CLOUD_READY, None, v))
 
     def _cloud_answer(self, now, state, message, v):
         self.cloud_busy = False
@@ -3468,6 +3571,53 @@ class Core:
             path = '/Settings/Table/' + tid
             echo = self.model.table_json(tid, frames) if connected else ''
             pub[path] = self._shown(path, echo, now, info, connected)
+        c3 = frames.get('CSVData3') or {}
+        for name, chart in PLOT_YLIM.items():
+            path = '/Plot/YLim/' + name
+            pub[path] = self._shown(path, ylim_echo(c3, *chart) if connected else '', now, info, connected)
+
+
+def ylim_text(lo, hi):
+    # the one "lo,hi" form of a plot's limits, published and held: at most 2 decimals, no trailing zeros
+    return '%s,%s' % (fmt_num(round(lo, 2)), fmt_num(round(hi, 2)))
+
+
+def _ylim_ok(lo, hi):
+    return math.isfinite(lo) and math.isfinite(hi) and lo < hi and abs(lo) <= YLIM_MAX and abs(hi) <= YLIM_MAX
+
+
+def ylim_echo(c3, lo_key, hi_key, scale, kind):
+    # the regulator's limits from CSV3 -> ylim_text in the published units, '' when it sends none or no range
+    lo, hi = c3.get(lo_key), c3.get(hi_key)
+    if lo is None or hi is None or lo <= EMPTY or hi <= EMPTY:
+        return ''
+    lo, hi = lo / scale, hi / scale
+    if kind == 'degF':
+        lo, hi = F_TO_C(lo), F_TO_C(hi)
+    return ylim_text(lo, hi) if _ylim_ok(lo, hi) else ''
+
+
+def parse_ylim(value, kind='whole'):
+    # A written "lo,hi" in the published units -> (ylim_text of what the regulator will echo, lo and hi as its /get
+    # takes them), else None
+    try:
+        lo, hi = (float(x) for x in str(value).split(','))
+    except (TypeError, ValueError):
+        return None
+    if not _ylim_ok(lo, hi):
+        return None
+    if kind == 'whole':
+        if not (lo.is_integer() and hi.is_integer()):
+            return None
+        sent = shown = int(lo), int(hi)
+    elif kind == 'dec':
+        sent = shown = round(lo, 2), round(hi, 2)
+    else:
+        sent = tuple(math.floor(c * 9.0 / 5.0 + 32.0 + 0.5) for c in (lo, hi))
+        shown = tuple(round(F_TO_C(f), 2) for f in sent)
+    if not (sent[0] < sent[1] and _ylim_ok(*shown)):
+        return None
+    return ylim_text(*shown), fmt_num(sent[0]), fmt_num(sent[1])
 
 
 def _same(a, b):
@@ -3499,14 +3649,130 @@ def _instance(class_and_instance, default):
         return default
 
 
+class CpuReader:
+    # From /proc: the whole GX's busy and total jiffies, gui-v2's render thread's CPU seconds (None with no gui-v2 on
+    # this GX, where the remote console draws in the browser) and the GX's uptime
+    def __init__(self, proc='/proc'):
+        self.proc = proc
+        self.render = None   # the render thread's stat file, looked up again when it goes
+        try:
+            self.tck = os.sysconf('SC_CLK_TCK')
+        except (ValueError, OSError, AttributeError):
+            self.tck = 100
+
+    def _find_render(self):
+        for pid in os.listdir(self.proc):
+            if not pid.isdigit():
+                continue
+            try:
+                with open('%s/%s/comm' % (self.proc, pid)) as f:
+                    if f.read().strip() != 'venus-gui-v2':
+                        continue
+                task = '%s/%s/task' % (self.proc, pid)
+                for tid in os.listdir(task):
+                    with open('%s/%s/comm' % (task, tid)) as f:
+                        if f.read().strip() == 'QSGRenderThread':
+                            return '%s/%s/stat' % (task, tid)
+            except OSError:
+                continue
+        return None
+
+    def _render_s(self):
+        for _ in range(2):
+            if self.render is None:
+                self.render = self._find_render()
+                if self.render is None:
+                    return None
+            try:
+                with open(self.render) as f:
+                    v = f.read().rsplit(')', 1)[1].split()
+                return (int(v[11]) + int(v[12])) / self.tck   # utime + stime
+            except (OSError, IndexError, ValueError):
+                self.render = None
+        return None
+
+    def read(self):
+        # {'busy', 'total': jiffies, 'render': s or None, 'thread': its stat file, 'up': s}; None without /proc
+        try:
+            with open(self.proc + '/stat') as f:
+                v = [int(x) for x in f.readline().split()[1:9]]
+            with open(self.proc + '/uptime') as f:
+                up = float(f.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+        total = sum(v)
+        render = self._render_s()
+        return {'busy': total - v[3] - v[4], 'total': total, 'render': render,
+                'thread': self.render if render is not None else None, 'up': up}
+
+
+class PlotRate:
+    # Slower plotting (store 'slow_plots') and its automatic choice ('slow_plots_auto', 'slow_plots_check': the last
+    # measurement as JSON {"busy": %, "render": % or null, "slow": 0/1}, '' for none yet). The owner turning automatic on
+    # starts a new measurement at the full rate; the owner setting Slower plotting while automatic is on turns it off.
+    def __init__(self, store, cpu, clock):
+        self.store, self.cpu, self.clock = store, cpu, clock
+        self.seen = None       # (auto, slow) at the last tick
+        self.shown_at = None   # when a Short Term page began asking at the full rate
+        self.start = None      # (clock, CpuReader sample, /Fast/Short messages) at the measurement's start
+
+    def tick(self, cores):
+        # Slower plotting, as the cores should run this tick
+        st = self.store
+        auto, slow = bool(st.get('slow_plots_auto')), bool(st.get('slow_plots'))
+        if self.seen is not None:
+            if auto and not self.seen[0]:
+                st.set('slow_plots_check', '')
+                st.set('slow_plots', 0)
+                slow = False
+            elif auto and slow != self.seen[1]:
+                st.set('slow_plots_auto', 0)
+                auto = False
+        self.seen = (auto, slow)
+        now = self.clock()
+        if not auto or slow or st.get('slow_plots_check') or not any(c.want('Short', now) for c in cores):
+            self.shown_at = self.start = None
+            return slow
+        if self.shown_at is None:
+            self.shown_at = now
+        if self.start is None:
+            s = self.cpu.read() if now - self.shown_at >= PLOT_SETTLE_S else None
+            if s and s['up'] >= PLOT_BOOT_S:
+                self.start = (now, s, sum(c.short_pubs for c in cores))
+            return slow
+        t0, s0, n0 = self.start
+        dt = now - t0
+        if dt < PLOT_CHECK_S:
+            return slow
+        self.start = None
+        s1 = self.cpu.read()
+        if not s1 or s1['total'] <= s0['total'] or sum(c.short_pubs for c in cores) - n0 < PLOT_MIN_RATE * dt:
+            return slow   # the regulator not streaming at the full rate: measure again
+        busy = 100.0 * (s1['busy'] - s0['busy']) / (s1['total'] - s0['total'])
+        render = None
+        if s0['render'] is not None and s1['render'] is not None and s0['thread'] == s1['thread']:
+            render = 100.0 * (s1['render'] - s0['render']) / dt
+        pick = busy >= PLOT_BUSY_MAX or (render is not None and render >= PLOT_RENDER_MAX)
+        st.set('slow_plots_check', json.dumps({'busy': round(busy), 'render': None if render is None else round(render),
+                                               'slow': int(pick)}, separators=(',', ':')))
+        log.info('plot rate measured over %.0f s with Short Term shown: GX %.1f %% busy, render thread %s; Slower '
+                 'plotting %s', dt, busy, 'none' if render is None else '%.1f %% of one core' % render,
+                 'on' if pick else 'off')
+        if pick:
+            st.set('slow_plots', 1)
+            slow = True
+            self.seen = (auto, slow)
+        return slow
+
+
 # ---- Manager: the regulators this GX stands for ----
 
 class Manager:
     # The pinned regulators, each a Core with its own D-Bus service, and what Discovery finds for the owner to pick from.
     # Adding, removing and re-pinning run on the main tick, never inside a D-Bus callback of a service they remove.
     def __init__(self, store, schema_text, discovery, unit_store, forget_store=None, listener=None,
-                 cache_dir=CACHE_DIR, clock=time.monotonic, wall=time.time, updater=None):
-        self.store = store                 # 'units': the pinned uids, comma-separated, in the order added
+                 cache_dir=CACHE_DIR, clock=time.monotonic, wall=time.time, updater=None, cpu=None):
+        self.store = store                 # 'units': the pinned uids, comma-separated, in the order added; PlotRate's keys
         self.schema_text = schema_text or ''
         self.discovery = discovery
         self.unit_store = unit_store       # (uid, requested VRM instance) -> that regulator's store
@@ -3526,6 +3792,7 @@ class Manager:
         self.gx_present = set()            # their keys on D-Bus at the last GX reading
         self.gx_meter = False              # a DC system meter among them
         # the GX app's own updates (/Update/*), with install.sh's workspace beside the cache
+        self.plot_rate = PlotRate(store, cpu or CpuReader(), clock)
         self.updater = updater or xreg_update.Updater(VERSION, APP_DIR, os.path.join(cache_dir, 'install'),
                                                       clock=clock, wall=wall)
 
@@ -3839,6 +4106,9 @@ class Manager:
 
     def tick(self, pub):
         self._apply()
+        slow = self.plot_rate.tick(list(self.units.values()))
+        for core in self.units.values():
+            core.slow = slow
         self._match_alternators()
         self._match_batteries()
         while True:

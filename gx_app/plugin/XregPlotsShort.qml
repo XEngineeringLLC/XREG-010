@@ -5,7 +5,9 @@ import Victron.VenusOS
 // alternator temperature), each with field % on the right axis, over a 5 s to 5 min window. Data: the bridge's
 // /Fast/Short, one sample per CSV1 frame of the last 5 min, appended as frames arrive while this tab asks for them
 // (xreg_core.py ShortRecorder.message): the whole history when the tab first sees it or finds a gap (it writes
-// /Fast/ShortFull), then the newest samples. The charts decimate and draw it incrementally (XregChart's streamed lines).
+// /Fast/ShortFull), then the newest samples. The charts decimate and draw it incrementally (XregChart's streamed lines),
+// scrolling every display frame, or with Slower plotting (the GX app page, and a row below the charts) stepping once a
+// second as the bridge then sends.
 Item {
 	id: tab
 
@@ -19,7 +21,6 @@ Item {
 
 	readonly property var windows: [5, 10, 30, 60, 120, 300]   // the last is the history kept (the bridge's SHORT_S)
 	readonly property bool oneColumn: width < 760
-	property real cursor: NaN
 	property QtObject timing           // XregHome's bench timing log
 	property int opens                 // XregPlots: shown again after another tab
 
@@ -36,6 +37,39 @@ Item {
 	readonly property int keepMs: windows[windows.length - 1] * 1000
 
 	VeQuickItem { id: want; uid: tab.svc + "/Ui/Want/Short" }
+	VeQuickItem { id: slowItem; uid: BackendConnection.serviceUidFromName("com.victronenergy.settings", 0) + "/Settings/Xregulator/SlowPlots" }
+	VeQuickItem { id: slowAutoItem; uid: BackendConnection.serviceUidFromName("com.victronenergy.settings", 0) + "/Settings/Xregulator/SlowPlotsAuto" }
+	readonly property bool slow: slowItem.valid && slowItem.value === 1
+
+	// A tap on a chart opens its larger view (XregPop on the home page); its settings are in its view, its manual left
+	// limits the regulator's Ymin/Ymax that the web app's plot of the same name uses (Current 1, Voltage 2, RPM 3,
+	// Temperature 4, kept in whole degrees F). The charts under an open larger view stop scrolling between updates (they
+	// step), so the Ekrano draws one scrolling chart, not five.
+	readonly property XregView currentView: XregView { svc: tab.svc; name: "shortCurrent"; ylimPath: "/Plot/YLim/Current" }
+	readonly property XregView voltsView: XregView { svc: tab.svc; name: "shortVolts"; ylimPath: "/Plot/YLim/Volts"; decimals: 1 }
+	readonly property XregView rpmView: XregView { svc: tab.svc; name: "shortRpm"; ylimPath: "/Plot/YLim/Rpm" }
+	readonly property XregView tempView: XregView { svc: tab.svc; name: "shortTemp"; ylimPath: "/Plot/YLim/Temp"; tempLimits: true }
+	readonly property var views: ({ current: currentView, volts: voltsView, rpm: rpmView, temp: tempView })
+	property var popSpec: specs[0]
+	function openChart(spec) {
+		popSpec = spec
+		openPop(chartPop)
+	}
+	property Item home: null
+	readonly property bool popShown: !!home && home.popShown
+	Component.onCompleted: {
+		for (let p = parent; p; p = p.parent) {
+			if (p.openPop !== undefined) {
+				home = p
+				break
+			}
+		}
+		take(feed.value)
+	}
+	function openPop(c) {
+		if (home)
+			home.openPop(c)
+	}
 	Timer {
 		interval: 15000
 		repeat: true
@@ -51,11 +85,9 @@ Item {
 	}
 	VeQuickItem { id: ask; uid: tab.svc + "/Fast/ShortFull" }
 
-	Component.onCompleted: take(feed.value)
 	onVisibleChanged: if (visible && behind) bump()
 	// Back from another tab: as the tab was when first opened
 	function reopen() {
-		cursor = NaN
 		flick.cancelFlick()
 		flick.contentY = 0
 		opens++
@@ -278,56 +310,118 @@ Item {
 		y: tab.bodyY
 		width: tab.width - 2 * tab.m
 		height: tab.height - tab.bodyY - tab.m
-		contentHeight: grid.height
+		contentHeight: body.height
 		clip: true
 		interactive: contentHeight > height
 
-		Grid {
-			id: grid
-			readonly property real gap: 10
-			readonly property real tileW: tab.oneColumn ? parent.width : (parent.width - gap) / 2
-			// two rows fill the page; on a 5-inch screen under the home page's header they would be 145 px, too low for the
-			// current chart's three legend lines, so the page scrolls instead
-			readonly property real tileH: tab.oneColumn ? 260 : Math.max(200, (tab.height - tab.bodyY - tab.m - gap) / 2)
-			columns: tab.oneColumn ? 1 : 2
-			spacing: gap
+		Column {
+			id: body
+			width: parent.width
+			spacing: grid.gap
 
-			Repeater {
-				model: [
-					{ k: "current", title: "Current History", unit: "A", zero: true },
-					{ k: "volts", title: "Battery Voltage History", unit: "V", zero: false },
-					{ k: "rpm", title: "RPM History", unit: "", zero: true },
-					{ k: "temp", title: "Alternator Temperature History", unit: Global.systemSettings.temperatureUnitSuffix, zero: false }
-				]
-				delegate: Rectangle {
-					required property var modelData
-					required property int index
-					width: grid.tileW
-					height: grid.tileH
-					radius: Theme.geometry_overviewPage_widget_radius
-					color: Theme.color_background_secondary
-					XregChart {
-						anchors { fill: parent; margins: 10 }
-						title: modelData.title
-						lines: tab.d[modelData.k] || []
-						stream: tab.store
-						streamVer: tab.ver
-						streamStages: modelData.k === "current"
-						streamSalt: index * 13
-						xLo: -tab.windowS
-						xHi: 0
-						xTicks: tab.ticks
-						leftFromZero: modelData.zero
-						leftUnit: modelData.unit
-						rightFixed: [0, 100]
-						rightUnit: "%"
-						emptyText: "Waiting for data"
-						cursorX: tab.cursor
-						resets: tab.opens
-						onScrubbed: function(xValue) { tab.cursor = xValue }
+			Grid {
+				id: grid
+				readonly property real gap: 10
+				readonly property real tileW: tab.oneColumn ? parent.width : (parent.width - gap) / 2
+				// two rows fill the page; on a 5-inch screen under the home page's header they would be 145 px, too low for the
+				// current chart's three legend lines, so the page scrolls instead
+				readonly property real tileH: tab.oneColumn ? 260 : Math.max(200, (tab.height - tab.bodyY - tab.m - gap) / 2)
+				columns: tab.oneColumn ? 1 : 2
+				spacing: gap
+
+				Repeater {
+					model: tab.specs
+					delegate: Rectangle {
+						required property var modelData
+						required property int index
+						width: grid.tileW
+						height: grid.tileH
+						radius: Theme.geometry_overviewPage_widget_radius
+						color: Theme.color_background_secondary
+						ShortChart {
+							anchors { fill: parent; margins: 10 }
+							page: tab
+							spec: modelData
+							streamSalt: index * 13
+							tapOpens: true
+							resets: tab.opens
+							onOpened: tab.openChart(modelData)
+						}
 					}
 				}
 			}
+
+			// the GX app page's setting, here too where it takes effect; set by hand it turns Automatic plot rate off (bridge)
+			ListSwitch {
+				width: parent.width
+				text: "Slower plotting"
+				caption: "Updates the Dashboard numbers and the Short Term plots once a second. Uses less of the GX's processor, "
+						 + "for older GX models."
+						 + (slowAutoItem.valid && slowAutoItem.value === 1
+							? " Automatic plot rate sets this now; changing it here turns that off." : "")
+				dataItem.uid: slowItem.uid
+				writeAccessLevel: VenusOS.User_AccessType_User
+				preferredVisible: dataItem.valid
+			}
 		}
+	}
+
+	// axis: the left axis as the limit box names it
+	readonly property var specs: [
+		{ k: "current", title: "Current History", axis: "Current", unit: "A", zero: true, minSpan: 10 },
+		{ k: "volts", title: "Battery Voltage History", axis: "Voltage", unit: "V", zero: false, minSpan: "V" },
+		{ k: "rpm", title: "RPM History", axis: "RPM", unit: "", zero: true, minSpan: 3000 },
+		{ k: "temp", title: "Alternator Temperature History", axis: "Temperature",
+		  unit: Global.systemSettings.temperatureUnitSuffix, zero: false, minSpan: 10 }
+	]
+
+	Component {
+		id: chartPop
+		XregChartPop {
+			view: tab.views[tab.popSpec.k]
+			chart: bigChart
+			title: tab.popSpec.title
+			leftName: tab.popSpec.axis
+			leftUnit: tab.popSpec.unit
+			ShortChart {
+				id: bigChart
+				anchors.fill: parent
+				page: tab
+				spec: tab.popSpec
+				big: true
+				editAxes: true
+			}
+		}
+	}
+
+	// One Short Term chart, small or (big) in a larger view: its axes from its view, autoscale padded 10% (the left axis
+	// at least spec.minSpan wide, Field % at least 20 from 0), lines 3 px inside the plot's edges, a fixed axis's limits
+	// labelled.
+	component ShortChart: XregChart {
+		required property Item page
+		required property var spec
+		property bool big
+		title: spec.title
+		lines: page.d[spec.k] || []
+		stream: page.store
+		streamVer: page.ver
+		streamStages: spec.k === "current"
+		smooth: !page.slow && (big || !page.popShown)
+		xLo: -page.windowS
+		xHi: 0
+		xTicks: page.ticks
+		leftFromZero: spec.zero
+		leftUnit: spec.unit
+		rightUnit: "%"
+		emptyText: "Waiting for data"
+		view: page.views[spec.k]
+		leftFixed: view.leftFixed
+		rightFixed: view.rightFixed
+		rightFromZero: true
+		pad: 0.1
+		leftMinSpan: spec.minSpan
+		rightMinSpan: 20
+		inset: 3
+		fixedEnds: true
 	}
 }

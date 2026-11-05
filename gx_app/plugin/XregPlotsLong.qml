@@ -6,7 +6,8 @@ import Victron.VenusOS
 // tab asks for it). Where the bridge also sends an engine-on average (<name>OnAvg) it is the solid line and the
 // all-hours average is the faint dashed one, as in the app; otherwise the all-hours average is the line. The
 // temperature chart adds Battery (v5 records; empty on an older ring) and starts with Thermistor and Board hidden
-// (Mark, 2026-10-28); a tap on their legend entry shows them.
+// (Mark, 2026-10-28); a tap on their legend entry shows them. A tap on a chart opens its larger view (XregChartPop),
+// with Autoscale, Lock axes and axis limits kept on this GX (the web app keeps its Long Term limits in the browser).
 Item {
 	id: tab
 
@@ -27,7 +28,6 @@ Item {
 	readonly property var fields: fieldsItem.valid && String(fieldsItem.value).length ? String(fieldsItem.value).split(",") : []
 	property var d: ({})               // the last complete redraw (snap)
 	property bool dirty: true
-	property real cursor: NaN
 	property real openedAt: Date.now()
 	property real now: Date.now()
 	property QtObject timing           // XregHome's bench timing log
@@ -121,40 +121,43 @@ Item {
 		return isFinite(c) ? Units.convert(c, VenusOS.Units_Temperature_Celsius, Global.systemSettings.temperatureUnit) : NaN
 	}
 
+	// axis, rightAxis: the axes as the limit box names them; axisDec: decimals of the left axis's limits
 	readonly property var specs: [
-		{ k: "cur", title: "Currents", unit: "A", zero: true, series: [
+		{ k: "cur", title: "Currents", axis: "Current", unit: "A", zero: true, minSpan: 10, series: [
 			{ key: "battCurr", label: "Battery", unit: "A", color: Theme.color_orange },
 			{ key: "altCurr", label: "Alternator", unit: "A", color: Theme.color_green },
 			{ key: "victronCurr", label: "Victron/Solar", unit: "A", color: Theme.color_blue }] },
-		{ k: "volt", title: "Battery Voltage & SOC", unit: "V", rightFixed: [0, 100], rightUnit: "%", series: [
+		{ k: "volt", title: "Battery Voltage & SOC", axis: "Voltage", axisDec: 1, unit: "V", minSpan: "V", rightAxis: "SOC",
+		  rightFixed: [0, 100], rightUnit: "%", series: [
 			{ key: "battVolt", label: "Battery", unit: "V", dec: 2, color: Theme.color_green },
 			{ key: "soc", label: "SOC", unit: "%", dec: 0, color: Theme.color_blue, right: true }] },
-		{ k: "temp", title: "Temperatures & Barometric Pressure", unit: Global.systemSettings.temperatureUnitSuffix, rightUnit: "mbar", series: [
+		{ k: "temp", title: "Temperatures & Barometric Pressure", axis: "Temperature", unit: Global.systemSettings.temperatureUnitSuffix,
+		  minSpan: 10, rightAxis: "Pressure", rightUnit: "mbar", rightMinSpan: 10, series: [
 			{ key: "altTemp", label: "Alternator", temp: true, color: Theme.color_red },
 			{ key: "battTemp", label: "Battery", temp: true, color: Theme.color_green },
 			{ key: "tempTherm", label: "Thermistor", temp: true, color: Theme.color_orange, off: true },
 			{ key: "ambTemp", label: "Board", temp: true, color: Theme.color_blue, off: true },
 			{ key: "baro", label: "Baro", unit: "mbar", dec: 1, color: Theme.color_blackWater, right: true }] },
-		{ k: "rpm", title: "Engine RPM & Alternator Duty", unit: "", zero: true, rightFixed: [0, 100], rightUnit: "%", series: [
+		{ k: "rpm", title: "Engine RPM & Alternator Duty", axis: "RPM", unit: "", zero: true, minSpan: 3000, rightAxis: "Duty",
+		  rightFixed: [0, 100], rightUnit: "%", series: [
 			{ key: "rpm", label: "RPM", unit: "", dec: 0, color: Theme.color_blackWater },
 			{ key: "duty", label: "Duty", unit: "%", dec: 0, color: Theme.color_font_secondary, right: true }] },
-		{ k: "spd", title: "Speeds", unit: "kn", zero: true, series: [
+		{ k: "spd", title: "Speeds", axis: "Speed", unit: "kn", zero: true, minSpan: 10, series: [
 			{ key: "sog", label: "SOG", unit: "kn", color: Theme.color_green },
 			{ key: "tws", label: "True Wind", unit: "kn", color: Theme.color_blue },
 			{ key: "vmg", label: "VMG", unit: "kn", color: Theme.color_blackWater },
 			{ key: "aws", label: "App. Wind", unit: "kn", color: Theme.color_wasteWater }] },
-		{ k: "ang", title: "Angles", unit: "°", series: [
+		{ k: "ang", title: "Angles", axis: "Angle", unit: "°", minSpan: 30, series: [
 			{ key: "cog", label: "COG", unit: "°", dec: 0, color: Theme.color_blue, wrap: true },
 			{ key: "heading", label: "Heading", unit: "°", dec: 0, color: Theme.color_orange, wrap: true },
 			{ key: "awa", label: "AWA", unit: "°", dec: 0, color: Theme.color_green },
 			{ key: "twa", label: "TWA", unit: "°", dec: 0, color: Theme.color_lpg },
 			{ key: "leeway", label: "Leeway", unit: "°", dec: 1, color: Theme.color_wasteWater }] },
-		{ k: "mot", title: "Motion: Heel & Pitch", unit: "°", series: [
+		{ k: "mot", title: "Motion: Heel & Pitch", axis: "Angle", unit: "°", minSpan: 10, series: [
 			{ key: "heel", label: "Heel", unit: "°", color: Theme.color_lng },
 			{ key: "pitch", label: "Pitch", unit: "°", color: Theme.color_red }] }
 	]
 
-	Component.onCompleted: Qt.callLater(flush)
 	onVisibleChanged: if (visible) Qt.callLater(flush)
 	// new colours or temperature unit: the Repeater makes new, empty charts
 	onSpecsChanged: changed()
@@ -176,8 +179,6 @@ Item {
 	}
 	// Back from another tab: as the tab was when first opened
 	function reopen() {
-		if (!isNaN(cursor))
-			cursor = NaN
 		openedAt = Date.now()
 		now = openedAt
 		flick.cancelFlick()
@@ -332,9 +333,6 @@ Item {
 			t.lines = lines
 			t.sig = sig
 		}
-		// back from another tab: a legend entry tapped off or a cursor of its own, as on a new chart
-		if (j.reset && (Object.keys(t.chart.hiddenKeys).length > 0 || !isNaN(t.chart.ownCursor)))
-			t.resets++
 	}
 	Timer {
 		interval: 1000
@@ -344,6 +342,7 @@ Item {
 		onTriggered: tab.now = Date.now()
 	}
 
+	readonly property XregClock clock: XregClock {}
 	// Ticks on local-time boundaries
 	function ticksFor(r) {
 		if (!(r.n > 0))
@@ -351,10 +350,10 @@ Item {
 		const span = r.xHi - r.xLo
 		const st = span <= 3700 ? 600 : span <= 22000 ? 3600 : span <= 90000 ? 14400 : span <= 700000 ? 86400 : 432000
 		const fmt = span <= 90000 ? "hh:mm" : span <= 700000 ? "ddd d" : "MMM d"
-		const tzo = new Date(r.xLo * 1000).getTimezoneOffset() * 60
+		const tzo = -clock.offsetAt(r.xLo)
 		let t = []
 		for (let s = Math.ceil((r.xLo - tzo) / st) * st + tzo; s <= r.xHi; s += st)
-			t.push({ x: s, t: Qt.formatDateTime(new Date(s * 1000), fmt) })
+			t.push({ x: s, t: Qt.formatDateTime(clock.date(s), fmt) })
 		return t
 	}
 	readonly property string noData: now - openedAt < 60000 ? "Loading long-term history" : "No long-term records yet"
@@ -364,8 +363,6 @@ Item {
 		// the range tapped, before the bridge echoes /Ui/LongRange
 		if (echoItem.valid && String(echoItem.value) !== rangeSync.shown)
 			return "Loading " + rangeSync.shown
-		if (!isNaN(cursor))
-			return Qt.formatDateTime(new Date(cursor * 1000), spans[ranges.indexOf(range)] > 90000 ? "ddd d MMM hh:mm" : "hh:mm")
 		return ""
 	}
 
@@ -431,33 +428,91 @@ Item {
 					property bool dash
 					property int n
 					property var sig: null
-					property int resets
 					readonly property Item chart: chartItem
+					readonly property XregView view: XregView {
+						svc: tab.svc
+						name: "long" + tile.modelData.k.charAt(0).toUpperCase() + tile.modelData.k.slice(1)
+						rightDefault: tile.modelData.rightFixed || null
+						decimals: tile.modelData.axisDec || 0
+						tempLimits: tile.modelData.k === "temp"
+					}
 					width: grid.tileW
 					height: grid.tileH
 					radius: Theme.geometry_overviewPage_widget_radius
 					color: Theme.color_background_secondary
-					XregChart {
+					LongChart {
 						id: chartItem
 						anchors { fill: parent; margins: 10 }
-						title: modelData.title
-						lines: tile.lines
-						xLo: tile.xLo
-						xHi: tile.xHi
-						xTicks: tile.ticks
-						leftFromZero: !!modelData.zero
-						leftUnit: modelData.unit
-						rightFixed: modelData.rightFixed || null
-						rightUnit: modelData.rightUnit || ""
-						stages: tile.stages
-						dashNote: tile.dash ? "dashed: incl. engine off" : ""
-						emptyText: tile.n > 0 ? "No data in this range" : tab.noData
-						cursorX: tab.cursor
-						resets: tile.resets
-						onScrubbed: function(xValue) { tab.cursor = xValue }
+						tile: tile
+						tapOpens: true
+						onOpened: tab.openChart(tile)
 					}
 				}
 			}
 		}
+	}
+
+	// the home page, which shows the larger view (XregPop)
+	property Item home: null
+	Component.onCompleted: {
+		for (let p = parent; p; p = p.parent) {
+			if (p.openPop !== undefined) {
+				home = p
+				break
+			}
+		}
+		Qt.callLater(flush)
+	}
+	property Item popTile: null
+	function openChart(t) {
+		if (!home)
+			return
+		popTile = t
+		home.openPop(chartPop)
+	}
+	Component {
+		id: chartPop
+		XregChartPop {
+			view: tab.popTile.view
+			chart: bigChart
+			title: tab.popTile.modelData.title
+			leftName: tab.popTile.modelData.axis
+			leftUnit: tab.popTile.modelData.unit
+			rightName: tab.popTile.modelData.rightAxis || ""
+			rightUnit: tab.popTile.modelData.rightUnit || ""
+			LongChart {
+				id: bigChart
+				anchors.fill: parent
+				tile: tab.popTile
+				editAxes: true
+			}
+		}
+	}
+
+	// One Long Term chart, small or in a larger view: its axes from its tile's view, autoscale padded 10% (the left
+	// axis at least minSpan wide; SOC and Duty on 0-100), lines 3 px inside the plot's edges, a fixed axis's limits
+	// labelled; no cursor
+	component LongChart: XregChart {
+		required property Item tile
+		readonly property var spec: tile.modelData
+		title: spec.title
+		lines: tile.lines
+		xLo: tile.xLo
+		xHi: tile.xHi
+		xTicks: tile.ticks
+		view: tile.view
+		leftFromZero: !!spec.zero
+		leftUnit: spec.unit
+		leftMinSpan: spec.minSpan || 0
+		leftFixed: view.leftFixed
+		rightFixed: view.rightFixed || spec.rightFixed || null
+		rightMinSpan: spec.rightMinSpan || 0
+		rightUnit: spec.rightUnit || ""
+		stages: tile.stages
+		dashNote: tile.dash ? "dashed: incl. engine off" : ""
+		emptyText: tile.n > 0 ? "No data in this range" : tab.noData
+		pad: 0.1
+		inset: 3
+		fixedEnds: true
 	}
 }

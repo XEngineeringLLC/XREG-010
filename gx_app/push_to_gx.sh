@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Installs xregulator/ on the bench GX (GX=<ip> overrides the address) through install.sh, as the USB/SD package and the
 # in-app updater do: mirrors it into the stage /data/xregulator/install/new (unchanged files copied on the GX from the
-# installed app), then the staged install.sh swaps it in, restarts the bridge, re-creates the app link when the plugin
-# changed (gui-v2 rescans on link changes, not on file changes), and puts the previous version back if the new bridge
+# installed app), then the staged install.sh swaps it in, restarts the bridge, re-creates the app link and restarts gui-v2
+# when the plugin changed (a reload alone can keep the old pages), and puts the previous version back if the new bridge
 # does not start.
 set -e
 HERE=${0:A:h}

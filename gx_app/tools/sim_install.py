@@ -116,7 +116,7 @@ class GX:
                         XREG_DATA=self.data, XREG_SERVICE=self.service, XREG_UPTIME=self.uptime,
                         XREG_LOGDIR=os.path.join(self.root, 'varlog', 'xregulator'), XREG_VERIFY_S=str(verify_s),
                         XREG_BOOT_VERIFY_S=str(boot_verify_s), XREG_BOOT_UPTIME_S=str(boot_uptime_s),
-                        XREG_STABLE_S='1', XREG_BOOT_ID='boot0', SIM_BROKEN='')
+                        XREG_STABLE_S='1', XREG_NOTIFY_WAIT_S='0', XREG_BOOT_ID='boot0', SIM_BROKEN='')
         self.boot_uptime_s = boot_uptime_s
         self.env.pop('XREG_RUN_ID', None)
         self.scanning = False

@@ -2,10 +2,12 @@ import QtQuick
 import Victron.VenusOS
 
 // The GX app itself, plugin and bridge under one version number (xreg_update.py, /Update/* on the bridge's manager
-// service): the version installed, the newest on X Engineering's OTA host, Update and Remove. A version issued again
-// carries a newer build (epoch seconds, shown as its UTC date), which counts as newer. Opening the page has the bridge
-// read the release list once, as Check does; nothing else reads it. An update restarts the bridge, and gui-v2 reloads
-// the plugin when it changed, so every state shown is the bridge's.
+// service): the version installed, the newest on X Engineering's OTA host, Update and Remove; and Slower plotting with
+// its automatic choice, kept in localsettings (/Settings/Xregulator/SlowPlots, SlowPlotsAuto and the bridge's
+// measurement SlowPlotsCheck, all created by the bridge, xreg_core.PlotRate), for every regulator on this GX. A
+// version issued again carries a newer build (epoch seconds, shown as its UTC date), which counts as newer. Opening the
+// page has the bridge read the release list once, as Check does; nothing else reads it. An update restarts the bridge,
+// and the installer restarts gui-v2 when the plugin changed, so every state shown is the bridge's.
 Page {
 	id: page
 
@@ -16,6 +18,7 @@ Page {
 	// gui-v2's CaptionLabel reports a binding loop when a caption created empty first gets text, never on one created
 	// with some: captions are " " until the page is complete
 	property bool built
+	readonly property XregClock clock: XregClock {}
 	readonly property bool bridgeUp: installedItem.valid
 	// rc.local.disabled there and no rc.local (bits RcLocalDisabled 1, RcLocal 4): the bridge's startup line cannot run
 	readonly property bool hooksOff: hooksItem.valid && (hooksItem.value & 1) !== 0 && (hooksItem.value & 4) === 0
@@ -86,6 +89,7 @@ Page {
 	XregUnits { id: regs }
 
 	VeQuickItem { id: installedItem; uid: regs.mgr + "/Update/Installed" }
+	VeQuickItem { id: slowCheckItem; uid: BackendConnection.serviceUidFromName("com.victronenergy.settings", 0) + "/Settings/Xregulator/SlowPlotsCheck" }
 	// Venus OS's custom startup scripts, which start the bridge at boot (venus-platform ModificationChecks)
 	VeQuickItem { id: hooksItem; uid: BackendConnection.serviceUidFromName("com.victronenergy.platform", 0) + "/ModificationChecks/SystemHooksState" }
 	VeQuickItem { id: installedBuildItem; uid: regs.mgr + "/Update/InstalledBuild" }
@@ -203,9 +207,38 @@ Page {
 						return r.from && !same ? "Version " + r.from + " to " + r.to : page.cap(to) + " installed"
 					return page.cap(to) + " not installed"
 				}
-				caption: !page.built ? " " : page.lastResult ? Qt.formatDateTime(new Date(page.lastResult.at * 1000), "yyyy-MM-dd hh:mm")
+				caption: !page.built ? " " : page.lastResult ? Qt.formatDateTime(clock.date(page.lastResult.at), "yyyy-MM-dd hh:mm")
 										   + (page.lastResult.note ? ". " + page.lastResult.note : "") : ""
 				preferredVisible: page.bridgeUp && !!page.lastResult
+			}
+			ListSwitch {
+				text: "Automatic plot rate"
+				caption: {
+					let m = null
+					try {
+						m = slowCheckItem.valid && slowCheckItem.value ? JSON.parse(slowCheckItem.value) : null
+					} catch (e) {
+					}
+					if (!m)
+						return "Measures the GX's processor load the first time Short Term is on screen and turns Slower "
+							   + "plotting on if the plots would load the GX too heavily. Changing Slower plotting yourself "
+							   + "turns this off."
+					return "Measured with Short Term on screen: the GX was " + m.busy + "% busy"
+							+ (m.render !== null && m.render !== undefined
+							   ? " and its screen drawing used " + m.render + "% of one processor core" : "")
+							+ (m.slow ? ", so Slower plotting was turned on." : ", so Slower plotting was left off.")
+				}
+				dataItem.uid: BackendConnection.serviceUidFromName("com.victronenergy.settings", 0) + "/Settings/Xregulator/SlowPlotsAuto"
+				writeAccessLevel: VenusOS.User_AccessType_User
+				preferredVisible: dataItem.valid
+			}
+			ListSwitch {
+				text: "Slower plotting"
+				caption: "Updates the Dashboard numbers and the Short Term plots once a second. Uses less of the GX's "
+						 + "processor, for older GX models."
+				dataItem.uid: BackendConnection.serviceUidFromName("com.victronenergy.settings", 0) + "/Settings/Xregulator/SlowPlots"
+				writeAccessLevel: VenusOS.User_AccessType_User
+				preferredVisible: dataItem.valid
 			}
 			ListButton {
 				text: "Remove the GX app"

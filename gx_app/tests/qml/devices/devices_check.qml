@@ -25,7 +25,7 @@ Window {
 		id: pageManager
 		property var pushed: []
 		function pushPage(url, props) {
-			const c = Qt.createComponent(String(url).replace("qrc:/xregulator/", pluginDir + "/"))
+			const c = Qt.createComponent(String(url).replace("qrc:/XREG-010/", pluginDir + "/"))
 			if (c.status !== Component.Ready) { console.log("FAIL push " + url + ": " + c.errorString()); win.fails++; return null }
 			const p = c.createObject(pageParent, Object.assign({ width: pageW, height: pageH }, props))
 			pushed.push(p)

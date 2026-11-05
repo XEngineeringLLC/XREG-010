@@ -191,6 +191,8 @@ class FakeReg:
         self.limits = []               # accepted /gxLimits posts: {'cvl': '14.2', 'ccl': '37.5'}, either may be absent
         self.limits_uid = None         # the uid /gxLimits takes as its own (another unit's: the post is misaddressed)
         self.limits_page = None        # a 200 page /gxLimits answers instead (older firmware's AP-mode catch-all)
+        self.wm_resets = []   # each /get?wmReset= list taken
+        self.wm_answer = '1'
         self.dvcc = {'dvccState': 3, 'dvccUntrustReason': 0, 'dvccRxCvl': 1420, 'dvccRxCcl': 375}   # CSV2
         self.ts = {'ts_DvccVeCan': 999999, 'ts_DvccWifi': 1200}
         self.devposts = []             # accepted /gxDevices bodies, parsed: {'v': 1, 'd': [[kind, name, ...], ...]}
@@ -485,6 +487,10 @@ class FakeReg:
                     return self._send(200, '0')
                 if 'SilenceAlarm' in params:
                     return self._send(200, 'OK')
+                if 'wmReset' in params:   # allowed without arming, as silence
+                    with reg.lock:
+                        reg.wm_resets.append(params['wmReset'])
+                    return self._send(200, reg.wm_answer)
                 gx_ok = reg.gx >= 2 and params.get('gx') == '1'
                 if not gx_ok and not reg.armed:
                     return self._send(403, 'Settings not armed')

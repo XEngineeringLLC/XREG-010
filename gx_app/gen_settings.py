@@ -224,7 +224,7 @@ def tooltip_text(row):
 
 
 def label_parts(row, key):
-    """App label of a form row -> (label, unit, unit_is_temp). Drops the echo span and the tooltip."""
+    """App label of a form row -> (label, unit, unit_is_temp). Drops the echo span, the tooltip and the Input/Output tag."""
     fl = None
     for n in row.walk():
         if 'form-label' in n.classes():
@@ -235,7 +235,7 @@ def label_parts(row, key):
     temp = any('temp-unit-label' in n.classes() for n in fl.walk())
 
     def skip(n):
-        return is_tooltip(n) or (n.get('id') or '').startswith(key + '_echo') or (n.get('id') or '').endswith('_echo')
+        return is_tooltip(n) or 'integ-dir' in n.classes() or (n.get('id') or '').startswith(key + '_echo') or (n.get('id') or '').endswith('_echo')
     t = clean(fl.text(skip))
     t = re.sub(r'\((?:\s|,|\?|%\s*now|now)*\)', '', t)      # the emptied echo parentheses "( ? )", "( ? , ? % now)"
     t = re.sub(r'\s*:\s*$', '', clean(t))
@@ -990,7 +990,7 @@ class Gen:
     def build_js_action(self, ent):
         key, ln = ent['head'], ent['line']
         js = self.js.src
-        hits = [m.start() for m in re.finditer(r"/get\?" + key + r"=1'|\{\s*" + key + r":\s*'1'\s*\}|\"" + key + r"\",\s*\"1\"", js)]
+        hits = [m.start() for m in re.finditer(r"/get\?" + key + r"=1'|deviceCommand\('" + key + r"=1'|\{\s*" + key + r":\s*'1'\s*\}|\"" + key + r"\",\s*\"1\"", js)]
         fns = {self.js.enclosing_function(p) for p in hits} - {None}
         btns = [n for n in self.html.all if n.tag == 'button' and any(
             re.match(r'^\s*' + f + r'\(', n.get('onclick') or '') for f in fns)]

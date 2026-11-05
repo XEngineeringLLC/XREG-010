@@ -365,19 +365,41 @@ class Edges(unittest.TestCase):
         self.assertGreater(time.time() - t0, 3.5)
         self.assertEqual(gx.running(), '0.4')
 
+    def gui_restarts(self):
+        try:
+            return open(os.path.join(self.gx.root, 'state', 'svc.log')).read().count('start-gui')
+        except FileNotFoundError:
+            return 0
+
     def test_unchanged_plugin_keeps_the_link(self):
         gx = self.gx
         self.install03()
+        gui = subprocess.Popen(['sleep', '120'])            # the screen program, as svok sees it
+        self.addCleanup(gui.wait)
+        self.addCleanup(gui.kill)
+        os.makedirs(os.path.join(gx.service, 'start-gui', 'supervise'))
+        with open(os.path.join(gx.service, 'start-gui', 'supervise', 'pid'), 'w') as f:
+            f.write(str(gui.pid))
         ino = os.lstat(gx.link).st_ino
         new = self.stage('0.4', plugin=False)
         r = gx.sh(os.path.join(new, 'install.sh'), 'install', new, '--upgrade-only')
         self.assertEqual((r.returncode, gx.running()), (0, '0.4'))
         self.assertEqual(os.lstat(gx.link).st_ino, ino)    # gui-v2 left alone
+        self.assertEqual(self.gui_restarts(), 0)
         new = self.stage('0.5')                             # a changed plugin: the link is made again
         r = gx.sh(os.path.join(new, 'install.sh'), 'install', new, '--upgrade-only')
         self.assertEqual((r.returncode, gx.running()), (0, '0.5'))
         self.assertNotEqual(os.lstat(gx.link).st_ino, ino)
         self.assertEqual(os.readlink(gx.link), gx.app)
+        self.assertEqual(self.gui_restarts(), 1)            # its reload alone can keep the old pages
+
+    def test_changed_plugin_with_no_screen_program(self):
+        gx = self.gx
+        self.install03()
+        new = self.stage('0.4')
+        r = gx.sh(os.path.join(new, 'install.sh'), 'install', new, '--upgrade-only')
+        self.assertEqual((r.returncode, gx.running()), (0, '0.4'))   # nothing there to restart: the install still goes on
+        self.assertEqual(self.gui_restarts(), 0)
 
 
 if __name__ == '__main__':

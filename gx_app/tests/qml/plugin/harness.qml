@@ -34,7 +34,7 @@ Window {
 		property var pushed: []
 		property var pops: []
 		function pushPage(url, props) {
-			const u = String(url).replace("qrc:/xregulator/", pluginDir + "/")
+			const u = String(url).replace("qrc:/XREG-010/", pluginDir + "/")
 			if (props && props.svc === undefined) props.svc = win.svc
 			const c = Qt.createComponent(u)
 			if (c.status !== Component.Ready) { console.log("FAIL push " + url + ": " + c.errorString()); win.fails++; return null }
@@ -68,8 +68,7 @@ Window {
 		put("/Live/BattV", 13.2)
 		put("/Live/AppWind", 11.4)
 		put("/Live/TrueWind", 18.9)
-		put("/History/AppWind", "10.0,10.5,11.0,11.2")
-		put("/History/Wind", "18.0,18.5")
+		put("/Plot/Wind", "w1;h1;4;4;1;0,15000,15000,15000;18.0,18.5,,;200,200,,;10.0,10.5,11.0,11.2;40,40,40,40")
 		put("/SwitchableOutput/0/State", 0)
 		put("/Link/Channel", "gxevents")
 		put("/Link/Firmware", "0.0.9")
@@ -138,7 +137,7 @@ Window {
 	function acceptTop() { const d = openDialogs[openDialogs.length - 1]; if (!d) return false; d.accept(); return true }
 	function openPage(id) {
 		const n = pages.find(p => p.id === id)
-		return pageManager.pushPage("qrc:/xregulator/XregCfgSection.qml", { title: n ? n.title : id, nodeId: id, height: 30000 })
+		return pageManager.pushPage("qrc:/XREG-010/XregCfgSection.qml", { title: n ? n.title : id, nodeId: id, height: 30000 })
 	}
 
 	Component.onCompleted: {
@@ -186,6 +185,10 @@ Window {
 		later(() => gateAndResultTest())
 		later(() => gatesOpen())
 		later(() => gatesTest())
+		later(() => buttonRowsOpen())
+		later(() => buttonRowsTest())
+		later(() => {})
+		later(() => buttonRowsAccept())
 		later(() => captionStubCheck())
 		later(() => chartAxisChecks())
 		later(() => headerCompactChecks())
@@ -238,7 +241,7 @@ Window {
 		check(!findItem(dash, c => c.text === "Settings" && c.flat === false), "no Plots / Settings / Cloud buttons on the Dashboard")
 		const tile = findItem(dash, c => c.title === "Wind, last hour")
 		check(tile && tile.note.indexOf("11.4") === 0 && tile.note.indexOf("apparent") > 0, "wind tile reads apparent wind: '" + (tile ? tile.note : "") + "'")
-		check(tile && tile.v.length === 4 && tile.v[3] === 11.2, "wind tile plots /History/AppWind: " + (tile ? tile.v : ""))
+		check(tile && tile.v.length === 4 && tile.v[3] === 11.2, "wind tile plots /Plot/Wind: " + (tile ? tile.v : ""))
 		const tabs = findItem(header, c => c.model !== undefined && c.buttonClicked !== undefined && c.model.length === 4)
 		check(tabs && tabs.model.map(m => m.value).join("|") === "Dashboard|Plots|Settings|Cloud", "header tabs Dashboard | Plots | Settings | Cloud")
 		tabs.clickButton(1)
@@ -261,24 +264,13 @@ Window {
 		check(sec && !findItem(sec, c => c.text === "Show descriptions" && c.visible), "Alternator list has no Show descriptions switch")
 		check(!findItem(sec, c => c.setupTabs !== undefined), "embedded list draws no second header")
 		home.setupTab = 6
-		check(sec.nodeId === "integrations" && sec.rowModel.length === 3, "Integrations tab: heading + 2 rows: " + sec.rowModel.map(r => r.kind).join(","))
+		check(sec.nodeId === "integrations" && sec.rowModel.length === 4, "Integrations tab: heading + 3 rows: " + sec.rowModel.map(r => r.kind).join(","))
 		// a chart press holds the swipe
 		swipe.setCurrentIndex(1)
 		win.setupSec = sec
 	}
 	property var setupSec: null
 	function pushedHeaderChecks() {
-		const chart = findItem(home, c => c.scrubbed !== undefined && c.hiddenKeys !== undefined)
-		const area = chart ? findItem(chart, c => c.hold !== undefined && c.host !== undefined) : null
-		check(!!area, "chart scrub area found")
-		if (area) {
-			area.hold(true)
-			check(home.swipeHolds === 1 && !swipe.interactive, "finger on a chart: page swipe off")
-			area.hold(true)
-			check(home.swipeHolds === 1, "a second press event does not double-count")
-			area.hold(false)
-			check(home.swipeHolds === 0 && swipe.interactive, "finger lifted: page swipe on")
-		}
 		home.setupTab = 0
 		swipe.setCurrentIndex(2)
 		const n = pageManager.pushed.length
@@ -393,7 +385,11 @@ Window {
 			} else if (cfg.type === "info") {
 				if (cfg.widget === "zeroStatus") steps.push(() => check(it.text.indexOf("Measured +0.42 A (engine off, 150°F)") === 0, "zeroStatus: " + it.text))
 				if (cfg.widget === "kneeStatus") steps.push(() => check(it.statusLine() === "Status: watching, steady near 1200 RPM", "kneeStatus: " + it.statusLine()))
-				if (cfg.widget === "connection") steps.push(() => check(it.text === "Connection" && it.secondaryText === "Connected", "connection row: " + it.text + " / " + it.secondaryText))
+				if (cfg.widget === "connection") steps.push(() => check(it.text === "Connection" && it.secondaryText === "", "connection row, linked: no text beside the chevron: " + it.text + " / " + it.secondaryText),
+					() => MockStore.put(svc + "/Connected", 0),
+					() => { check(it.secondaryText === "No data from regulator" && Qt.colorEqual(it.secondaryTextColor, Theme.color_warning),
+								"connection row, no data: the fault in the warning color: " + it.secondaryText); MockStore.put(svc + "/Connected", 1) },
+					() => {})
 				if (cfg.widget === "probes") steps.push(() => {
 					check(it.statusText() === "1 probe on the bus, 1 unassigned", "probes status: " + it.statusText())
 					const rg = findAll(it, c => c.optionModel !== undefined && c.choose !== undefined)
@@ -574,6 +570,32 @@ Window {
 		c.leftFromZero = true
 		c.lines = [{ key: "a", label: "A", unit: "A", x: xs, v: [-4, -6, -5, -4] }]
 		check(c.lAx.lo <= -6 && c.lAx.hi === 0, "a negative zero-based axis still reaches 0: " + c.lAx.lo + " to " + c.lAx.hi)
+		// least spans: a steady reading never fills the plot with its noise
+		const left = (fromZero, minSpan, v) => {
+			c.leftFromZero = fromZero
+			c.leftMinSpan = minSpan
+			c.lines = [{ key: "a", label: "A", unit: "", x: xs, v: v }]
+			return c.lAx
+		}
+		let ax = left(false, "V", [13.48, 13.5, 13.49, 13.5])
+		check(ax.hi - ax.lo >= 1 && ax.lo <= 13.48 && ax.hi >= 13.5, "12 V battery at 13.48-13.50: at least 1 V tall, " + ax.lo + " to " + ax.hi)
+		ax = left(false, "V", [26.95, 27, 26.98, 27])
+		check(ax.hi - ax.lo >= 2 && ax.lo <= 26.95 && ax.hi >= 27, "24 V battery at 26.95-27.00: at least 2 V tall, " + ax.lo + " to " + ax.hi)
+		ax = left(false, "V", [53.9, 54, 53.95, 54])
+		check(ax.hi - ax.lo >= 4, "48 V battery at 53.9-54.0: at least 4 V tall, " + ax.lo + " to " + ax.hi)
+		ax = left(false, "V", [12.6, 13.4, 14.4, 14.4])
+		check(ax.lo <= 12.6 && ax.hi >= 14.4 && ax.hi - ax.lo <= 2.5, "a voltage swing wider than the floor is fitted, not widened: " + ax.lo + " to " + ax.hi)
+		ax = left(true, 3000, [750, 800, 780, 760])
+		check(ax.lo === 0 && ax.hi >= 3000, "RPM at idle: 0 to at least 3000, " + ax.lo + " to " + ax.hi)
+		ax = left(true, 3000, [0, 0, 0, 0])
+		check(ax.lo === 0 && ax.hi >= 3000, "RPM stopped: 0 to at least 3000, " + ax.lo + " to " + ax.hi)
+		ax = left(false, 10, [150, 151, 150.5, 150])
+		check(ax.hi - ax.lo >= 10 && ax.lo <= 150 && ax.hi >= 151, "temperature 150-151: at least 10 degrees tall, " + ax.lo + " to " + ax.hi)
+		ax = left(true, 10, [0.1, 0.4, 0.2, 0.3])
+		check(ax.lo === 0 && ax.hi >= 10, "current 0.1-0.4 A: 0 to at least 10 A, " + ax.lo + " to " + ax.hi)
+		c.rightMinSpan = 10
+		c.lines = [{ key: "spd", label: "Speed", unit: "kn", right: true, x: xs, v: [0, 0.5, 0.2, 0] }]
+		check(c.rAx.lo === 0 && c.rAx.hi >= 10, "wind 0-0.5 kn: 0 to at least 10 kn, " + c.rAx.lo + " to " + c.rAx.hi)
 		c.destroy()
 	}
 	// #3: the header and the Settings page's sub-tab row shrink at the 5-inch width only
@@ -604,7 +626,7 @@ Window {
 		cur.destroy()
 	}
 	function connectionTest() {
-		const sec = pageManager.pushPage("qrc:/xregulator/XregCfgSection.qml", { title: "System", nodeId: "system", height: 30000, home: home })
+		const sec = pageManager.pushPage("qrc:/XREG-010/XregCfgSection.qml", { title: "System", nodeId: "system", height: 30000, home: home })
 		const row = loaders(sec).find(l => l.item.row.kind === "connection")
 		const n = pageManager.pushed.length
 		row.item.click()
@@ -677,7 +699,10 @@ Window {
 				const note = noteOf(k, gate)
 				check(note !== null && !it.interactive && it.caption === note, tag + ": " + k + " greyed")
 			} else {
-				check(it.interactive && (it.caption === "" || it.caption === (itemCfg(k).help || "")), tag + ": " + k + " usable")
+				// a button row leads its caption with a greyed choice's reason (Zero-Current Float without a shunt)
+				const lead = it.optionModel && it.chosen ? it.optionModel.map(o => o.caption).filter(c => c.length > 0) : []
+				const ok = ["", itemCfg(k).help || ""].map(h => lead.concat(h ? [h] : []).join("\n"))
+				check(it.interactive && ok.indexOf(it.caption) >= 0, tag + ": " + k + " usable")
 			}
 		}
 	}
@@ -743,5 +768,69 @@ Window {
 		}
 		putV("UseFloat", 1)
 		all()
+	}
+
+	// -- a choice of up to three: buttons on the settings page, changed in one tap (XregSegButtons)
+	property var segPages: []
+	function segRow(key) { return rowItem(segPages, key) }
+	function segButtons(it) { return findAll(it, c => c.lit !== undefined && c.labelH !== undefined) }
+	function buttonRowsOpen() {
+		seed()
+		segPages = [openPage("alternator/basic"), openPage("alarms"), openPage("battery/charge_settings"),
+			openPage("battery/charge_settings/phase_definitions")]
+	}
+	function buttonRowsTest() {
+		const few = allItems().filter(c => c.type === "select" && !c.hidden && c.options.length <= 3 && !pages.some(p => p.children.some(t => (t.controls || []).indexOf(c.key) >= 0)))
+		check(few.length === 4, "four settings pages' choices of up to three: " + few.map(c => c.key).join(","))
+		for (const c of few) {
+			const it = segRow(c.key)
+			check(!!it && it.row.kind === "buttons" && it.chosen !== undefined && it.optionClicked === undefined, c.key + ": a button row, no page of choices")
+			if (!it) continue
+			const bs = segButtons(it)
+			check(bs.length === c.options.length && bs.every((b, i) => b.contentItem.text === c.options[i].label), c.key + ": one button per choice, in order")
+			// beside the name only when every choice fits there on one line (two choices; at a phone's size not always)
+			check(c.options.length <= 2 || !it.beside, c.key + ": buttons " + (it.beside ? "beside" : "under") + " the name")
+			check(!it.beside || bs.every(b => b.contentItem.lineCount === 1), c.key + ": beside the name, every choice on one line")
+			check(bs.every(b => b.contentItem.contentWidth <= b.contentItem.width + 0.5 && b.contentItem.implicitHeight <= b.height), c.key + ": every choice's name inside its button")
+			const want = c.options.findIndex(o => o.value === MockStore.get(svc + "/Settings/Value/" + c.key))
+			check(want >= 0 && bs.filter(b => b.lit).length === 1 && bs[want].lit, c.key + ": " + c.options[want].label + " lit from the echo")
+		}
+		const sl = segRow("ShuntLead"), slb = segButtons(sl)
+		check(!slb[0].enabled && slb[1].enabled && slb[2].enabled, "Shunt Location: Not set shown, not pickable")
+		const fc = segRow("ManualFieldToggle"), fcb = segButtons(fc)
+		const n0 = writesTo("/Settings/Value/ManualFieldToggle").length
+		fcb[1].clicked()
+		check(openDialogs.length === 1 && writesTo("/Settings/Value/ManualFieldToggle").length === n0, "Field Control: a tap on Manual asks first, writes nothing yet")
+		openDialogs[0].reject()
+		check(writesTo("/Settings/Value/ManualFieldToggle").length === n0 && fcb[0].lit && !fcb[1].lit, "Field Control: cancelled, nothing written, Auto still lit")
+		fcb[1].clicked()
+		acceptTop()
+	}
+	function buttonRowsAccept() {
+		const fc = segRow("ManualFieldToggle"), fcb = segButtons(fc)
+		check(lastWrite("/Settings/Value/ManualFieldToggle") === 1 && fcb[1].lit, "Field Control: confirmed, writes 1, Manual lit")
+		const n0 = writesTo("/Settings/Value/ManualFieldToggle").length
+		fcb[1].clicked()
+		check(writesTo("/Settings/Value/ManualFieldToggle").length === n0, "Field Control: a tap on the lit choice writes nothing")
+		fcb[0].clicked()
+		check(openDialogs.length === 0 && lastWrite("/Settings/Value/ManualFieldToggle") === 0 && fcb[0].lit, "Field Control: back to Auto in one tap, no question")
+		const al = segButtons(segRow("AlarmLatchEnabled"))
+		al[1].clicked()
+		check(lastWrite("/Settings/Value/AlarmLatchEnabled") === 1 && al[1].lit, "Alarm Latch Mode: Latched in one tap")
+		putV("BatteryShuntPresent", 0)
+		const uf = segRow("UseFloat"), ufb = segButtons(uf)
+		const note = (itemCfg("UseFloat").options[2].gates || [])[0].note
+		check(!ufb[2].enabled && ufb[1].enabled && uf.caption.indexOf(note) === 0, "Float Mode without a shunt: Zero-Current Float greyed, its reason under the row")
+		const n1 = writesTo("/Settings/Value/UseFloat").length
+		ufb[2].clicked()
+		check(writesTo("/Settings/Value/UseFloat").length === n1, "Float Mode: the greyed choice writes nothing")
+		const sl = segRow("ShuntLead")
+		check(!sl.interactive && segButtons(sl).every(b => !b.enabled) && sl.caption === noteOf("ShuntLead", "no-batt-current"), "Shunt Location greyed with its note while the shunt is off")
+		putV("BatteryShuntPresent", 1)
+		MockStore.put(svc + "/Connected", 0)
+		check(segButtons(fc).every(b => !b.enabled), "no link: every button greyed")
+		MockStore.put(svc + "/Connected", 1)
+		for (const p of segPages) p.destroy()
+		seed()
 	}
 }

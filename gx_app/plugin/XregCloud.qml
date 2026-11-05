@@ -6,7 +6,8 @@ import Victron.VenusOS
 // registration editing on a GX. The bridge fetches everything in one call to the get-leaderboard-bundle edge function
 // while this page asks for it (/Ui/Want/Cloud) and hands over /Cloud/Json, already shaped and formatted as the web page
 // shows it (xreg_cloud.py); /Cloud/State says why there is nothing to show: 0 off by the Cloud Features setting,
-// 1 not registered, 2 loading, 3 ready, 4 offline, 5 error, 6 regulator not connected.
+// 1 not registered, 2 loading, 3 ready, 4 offline, 5 error, 6 regulator not connected; /Cloud/Busy 1 while a fetch is out,
+// which with leaderboards on screen reads "refreshing" in place of their age.
 Item {
 	id: page
 
@@ -19,12 +20,35 @@ Item {
 	readonly property real bodyY: narrow ? 108 : 58
 	property int tab: 0
 	property int section: 0
+	property string speedFilter: "overall"
+	XregChoice { id: tabChoice; name: "CloudTab"; shown: 0; follow: false; onShownChanged: page.tab = shown }
+	XregChoice { id: sectionChoice; name: "CloudSection"; shown: 0; follow: false; onShownChanged: page.section = shown }
+	XregChoice { id: filterChoice; name: "CloudSpeedFilter"; shown: "overall"; follow: false; onShownChanged: page.speedFilter = shown }
+	// each board's tab, by board title (JSON): the cards are rebuilt at every refresh and section change
+	XregChoice { id: boardChoice; name: "CloudBoardTabs"; shown: "" }
+	readonly property var boardTabs: {
+		try {
+			const m = boardChoice.shown ? JSON.parse(boardChoice.shown) : {}
+			return m && typeof m === "object" && !Array.isArray(m) ? m : {}
+		} catch (e) {
+			return {}
+		}
+	}
+	function pickSection(index) { section = index; sectionChoice.pick(index) }
+	function pickBoardTab(title, index) {
+		const m = Object.assign({}, boardTabs)
+		m[title] = index
+		boardChoice.pick(JSON.stringify(m))
+	}
 	property var model: null
 	property real now: Date.now() / 1000
 
 	readonly property bool useC: Global.systemSettings.temperatureUnit === VenusOS.Units_Temperature_Celsius
 	readonly property int cloudState: stateItem.valid ? stateItem.value : -1
 	readonly property string message: msgItem.valid ? String(msgItem.value) : ""
+	// a Refresh tap reads "refreshing" at once: the bridge's /Cloud/Busy follows a moment later
+	property bool refreshTapped
+	readonly property bool refreshing: refreshTapped || (busyItem.valid && busyItem.value === 1)
 	readonly property string ago: {
 		if (!asOfItem.valid || !(asOfItem.value > 0))
 			return ""
@@ -36,6 +60,16 @@ Item {
 	VeQuickItem { id: want; uid: page.svc + "/Ui/Want/Cloud" }
 	VeQuickItem { id: refreshItem; uid: page.svc + "/Cloud/Refresh" }
 	VeQuickItem { id: stateItem; uid: page.svc + "/Cloud/State" }
+	VeQuickItem {
+		id: busyItem
+		uid: page.svc + "/Cloud/Busy"
+		onValueChanged: page.refreshTapped = false
+	}
+	Timer {
+		id: tapWait
+		interval: 2000
+		onTriggered: page.refreshTapped = false
+	}
 	VeQuickItem { id: msgItem; uid: page.svc + "/Cloud/Message" }
 	VeQuickItem { id: asOfItem; uid: page.svc + "/Cloud/AsOf" }
 	VeQuickItem {
@@ -83,7 +117,7 @@ Item {
 		width: page.barW
 		model: ["Leaderboards", "Speed", "Fleet"]
 		currentIndex: page.tab
-		onPicked: function(index) { page.tab = index }
+		onPicked: function(index) { page.tab = index; tabChoice.pick(index) }
 	}
 	Row {
 		x: page.toolX
@@ -98,7 +132,7 @@ Item {
 				width: parent.width
 				horizontalAlignment: Text.AlignRight
 				elide: Text.ElideRight
-				text: [page.regLine, page.model ? page.ago : ""].filter(s => s.length).join(" · ")
+				text: [page.regLine, !page.model ? "" : page.refreshing ? "refreshing" : page.ago].filter(s => s.length).join(" · ")
 				color: Theme.color_font_secondary
 				font.pixelSize: Theme.font_size_caption
 			}
@@ -118,8 +152,12 @@ Item {
 			height: 40
 			flat: false
 			text: "Refresh"
-			enabled: page.cloudState !== 0 && page.cloudState !== 1 && page.cloudState !== 2
-			onClicked: refreshItem.setValue(1)
+			enabled: page.cloudState !== 0 && page.cloudState !== 1 && page.cloudState !== 2 && !page.refreshing
+			onClicked: {
+				page.refreshTapped = true
+				tapWait.restart()
+				refreshItem.setValue(1)
+			}
 		}
 	}
 
@@ -226,7 +264,7 @@ Item {
 						}
 						MouseArea {
 							anchors.fill: parent
-							onClicked: page.section = index
+							onClicked: page.pickSection(index)
 						}
 					}
 				}
@@ -239,7 +277,7 @@ Item {
 				visible: page.narrow
 				model: bt.sections.map(s => s.title.split(" ")[0])
 				currentIndex: page.section
-				onPicked: function(index) { page.section = index }
+				onPicked: function(index) { page.pickSection(index) }
 			}
 			Flickable {
 				id: cards
@@ -264,6 +302,8 @@ Item {
 							board: modelData
 							brand: page.brand
 							fmt: page.shown
+							tabIndex: Number(page.boardTabs[modelData.title]) || 0
+							onTabPicked: function(index) { page.pickBoardTab(modelData.title, index) }
 						}
 					}
 				}
@@ -276,6 +316,8 @@ Item {
 		XregCloudSpeed {
 			boats: page.model.speed || []
 			brand: page.brand
+			filter: page.speedFilter
+			onFilterPicked: function(f) { page.speedFilter = f; filterChoice.pick(f) }
 		}
 	}
 

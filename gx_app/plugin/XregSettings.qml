@@ -23,7 +23,6 @@ Page {
 
 	XregUnits { id: regs }
 
-	VeQuickItem { id: appVersionItem; uid: regs.mgr + "/Update/Installed" }
 	VeQuickItem { id: hooksItem; uid: BackendConnection.serviceUidFromName("com.victronenergy.platform", 0) + "/ModificationChecks/SystemHooksState" }
 
 	Component.onCompleted: built = true
@@ -54,8 +53,9 @@ Page {
 		model: page.unitUid ? [] : regs.units
 		delegate: ListNavigation {
 			text: regs.labelOf(modelData.uid, modelData.name)
-			secondaryText: modelData.connected ? "Connected" : "No data"
-			onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregSettings.qml",
+			secondaryText: modelData.connected ? "" : "No data"   // drill-down rows show text only for a fault
+			secondaryTextColor: Theme.color_warning
+			onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregSettings.qml",
 					{ title: text, unitUid: modelData.uid })
 		}
 		footer: Column {
@@ -64,13 +64,12 @@ Page {
 				text: "Regulators"
 				secondaryText: regs.units.length === 0 ? "Find and add" : "Add or remove"
 				preferredVisible: regs.running
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregRegulators.qml", { title: text })
+				onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregRegulators.qml", { title: text })
 			}
 			ListNavigation {
 				text: "GX app"
-				secondaryText: appVersionItem.valid ? "Version " + appVersionItem.value : ""
 				preferredVisible: regs.running
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregGxApp.qml", { title: text })
+				onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregGxApp.qml", { title: text })
 			}
 		}
 	}

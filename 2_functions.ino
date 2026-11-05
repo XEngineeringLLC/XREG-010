@@ -3223,7 +3223,7 @@ void uploadBufferedRecords() {
   if (snap.collectionTime <= 0 && !clockIsReal()) {
     if (forceCloudFlushPending) {
       forceCloudFlushPending = false;
-      queueConsoleMessageF("Cloud sync: %u records wait for the clock to be set (internet time, GPS or the phone app)",
+      queueConsoleMessageF("Cloud sync: %u records wait for the clock to be set (internet time, GPS, or a connected phone or computer)",
                            (unsigned)sensorRingCount);
     }
     return;

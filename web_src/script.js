@@ -353,14 +353,14 @@ const REG_DEMO_REFUSED = new Set(['UpdateToVersion', 'commissionStart', 'startSy
     'ResetBoatPerformance', 'RPMScalingFactor', 'AltZeroCaptureNow', 'altZeroApply', 'ResetDynamicAltZero', 'LatitudeNMEA',
     'LongitudeNMEA', 'clearGpsManual', 'BatteryHealthTest', 'bhStartOver', 'bhClearHistory', 'capClearPoints', 'ZeroIMU',
     'ClearIMUZero', 'FastAltClearMatrix', 'FastAltRebaseline', 'ResetRipplePeaks', 'ResetKneeLearn', 'ResetZeroLog',
-    'ClearOverheatHistory', 'ResetLearningTable', 'RebootRegulator', 'forceCloudFlush', 'protTestStart', 'CVTuningMode', 'TuningMode',
+    'ClearOverheatHistory', 'ResetLearningTable', 'RebootRegulator', 'forceCloudFlush', 'CVTuningMode', 'TuningMode',
     'ResetSolarLedger', 'ClearBuffer', 'testProtectionsEnabled']);
 // True when a form would post a refused parameter: stop values (0) of the test switches and re-enabling protections pass
 function regDemoFormRefused(f) {
     if (!g_regDemo || !f || !f.elements) return false;
     for (const el of f.elements) {
         if (!el.name || !REG_DEMO_REFUSED.has(el.name)) continue;
-        if ((el.name === 'CVTuningMode' || el.name === 'TuningMode' || el.name === 'protTestStart') && Number(el.value) === 0) continue;
+        if ((el.name === 'CVTuningMode' || el.name === 'TuningMode') && Number(el.value) === 0) continue;
         if (el.name === 'testProtectionsEnabled' && Number(el.value) !== 0) continue;
         return true;
     }
@@ -955,19 +955,19 @@ const CSV2_FIELDS = [
     "nvsFullSaveWorstMs",                  // worst saveNVSDataFull() duration since boot (ms)
     "nvsFullSaveCount",                    // total saveNVSDataFull() calls since boot
     // 28 ignition-cycle watermarks (lo + hi pairs, reset every boot). Order MUST match firmware CSV2 enum.
-    "wmIgn_amps_lo",     "wmIgn_amps_hi",      // MeasuredAmps (A, int)
-    "wmIgn_altTempF_lo", "wmIgn_altTempF_hi",  // AlternatorTemperatureF (°F, int)
-    "wmIgn_IBV_lo",      "wmIgn_IBV_hi",       // INA228 battery V (×10, 1 decimal)
-    "wmIgn_Bcur_lo",     "wmIgn_Bcur_hi",      // INA228 battery A (int)
-    "wmIgn_SOC_lo",      "wmIgn_SOC_hi",       // SOC percent (0..100, int)
+    "wmIgn_amps_lo",     "wmIgn_amps_hi",      // MeasuredAmps (A ×100)
+    "wmIgn_altTempF_lo", "wmIgn_altTempF_hi",  // AlternatorTemperatureF (°F ×10)
+    "wmIgn_IBV_lo",      "wmIgn_IBV_hi",       // INA228 battery V (×100)
+    "wmIgn_Bcur_lo",     "wmIgn_Bcur_hi",      // INA228 battery A (×100)
+    "wmIgn_SOC_lo",      "wmIgn_SOC_hi",       // SOC percent (×100)
     "wmIgn_RPM_lo",      "wmIgn_RPM_hi",       // Engine RPM (int)
-    "wmIgn_SOG_lo",      "wmIgn_SOG_hi",       // SOGNMEA knots (int)
-    "wmIgn_AWS_lo",      "wmIgn_AWS_hi",       // ApparentWindSpeedNMEA knots (int)
-    "wmIgn_TWS_lo",      "wmIgn_TWS_hi",       // TrueWindSpeedNMEA knots (int)
-    "wmIgn_heel_lo",     "wmIgn_heel_hi",      // imu_heel_deg (int)
-    "wmIgn_pitch_lo",    "wmIgn_pitch_hi",     // imu_pitch_deg (int)
-    "wmIgn_vacc_lo",     "wmIgn_vacc_hi",      // imu_vertical_accel_g (×10, 1 decimal)
-    "wmIgn_baro_lo",     "wmIgn_baro_hi",      // baroPressure mbar (int)
+    "wmIgn_SOG_lo",      "wmIgn_SOG_hi",       // SOGNMEA knots (×100)
+    "wmIgn_AWS_lo",      "wmIgn_AWS_hi",       // ApparentWindSpeedNMEA knots (×100)
+    "wmIgn_TWS_lo",      "wmIgn_TWS_hi",       // TrueWindSpeedNMEA knots (×100)
+    "wmIgn_heel_lo",     "wmIgn_heel_hi",      // imu_heel_deg (×100)
+    "wmIgn_pitch_lo",    "wmIgn_pitch_hi",     // imu_pitch_deg (×100)
+    "wmIgn_vacc_lo",     "wmIgn_vacc_hi",      // imu_vertical_accel_g (×1000)
+    "wmIgn_baro_lo",     "wmIgn_baro_hi",      // baroPressure mbar (×10)
     "wmIgn_ambient_lo",  "wmIgn_ambient_hi",   // ambientTemp °F (int)
     "restartRemainingSec",                     // seconds until scheduled reboot (0 = banner hidden)
     "currentGpsSource",                        // 0=none, 1=NMEA, 2=Phone, 3=Manual
@@ -976,8 +976,8 @@ const CSV2_FIELDS = [
     "loggingActive",                           // 439 — 1=logging active, 0=stopped (Stop/Start Logs)
     "sustainedTWS",                            // 2-min sustained true wind, knots ×10 (Beaufort + gale basis)
     "currentGaleMinutes",                      // live minutes continuously in a gale (sustained ≥34kt), int
-    "wmIgn_VMGman_lo",   "wmIgn_VMGman_hi",    // VMG manual session min/max (knots ×10)
-    "wmIgn_VMGup_lo",    "wmIgn_VMGup_hi",     // VMG upwind session min/max (knots ×10)
+    "wmIgn_VMGman_lo",   "wmIgn_VMGman_hi",    // VMG manual session min/max (knots ×100)
+    "wmIgn_VMGup_lo",    "wmIgn_VMGup_hi",     // VMG upwind session min/max (knots ×100)
     "altHealthPct",        // health % ×10
     "altHealthStatus",     // 0 learn,1 healthy,2 drift-hi,3 drift-lo,4 low-coverage
     "altCoveragePct",      // frozen/with-data % ×10
@@ -1162,8 +1162,8 @@ const CSV2_FIELDS = [
     "VictronBattTempF",        // VE.Direct T field (°F x10; ROLL_EMPTY = none)
     "rvcRxBattTempF",          // RV-C DC_SOURCE_STATUS_2 (°F x10; ROLL_EMPTY = none)
     "cvTempDerateInert",       // 1 = battery-temp source class changed since commissioning; derate holds 1.0
-    "wmIgn_battTempF_lo", "wmIgn_battTempF_hi",     // BatteryTempProbeF (°F, int)
-    "wmIgn_extraTempF_lo", "wmIgn_extraTempF_hi",   // ExtraTempF (°F, int)
+    "wmIgn_battTempF_lo", "wmIgn_battTempF_hi",     // BatteryTempProbeF (°F ×10)
+    "wmIgn_extraTempF_lo", "wmIgn_extraTempF_hi",   // ExtraTempF (°F ×10)
     "fieldDutyFloor",          // enforced field-duty floor x100: max of Min Field % and this speed's Keep-Alive %; 0 = floor bypassed (shutdown, sysID, protection clamp, MANUAL)
     "inaDieTempF",             // INA228 internal die temperature °F x10 (ROLL_EMPTY = no reading)
     "inaDieTempMaxF",          // session max of the above °F x10 (ROLL_EMPTY = nothing has passed the warm-up + corroboration gate); this is what uploads daily
@@ -1199,6 +1199,13 @@ const CSV2_FIELDS = [
     "dvccRxWifiCcl",           // WiFi carrier CCL (A x10)
     "dvccRxCanShare",          // VE.Can: the GX's current share addressed to this regulator (A x10)
     "dvccNoLimitStop",         // 1 = Stop Charging Without Limits is holding charging at zero
+    // seconds since each ignition-cycle watermark's boot or owner reset (/get?wmReset=)
+    "wmIgn_amps_age", "wmIgn_altTempF_age", "wmIgn_IBV_age",
+    "wmIgn_Bcur_age", "wmIgn_SOC_age", "wmIgn_RPM_age",
+    "wmIgn_SOG_age", "wmIgn_AWS_age", "wmIgn_TWS_age",
+    "wmIgn_heel_age", "wmIgn_pitch_age", "wmIgn_vacc_age",
+    "wmIgn_baro_age", "wmIgn_ambient_age", "wmIgn_VMGman_age",
+    "wmIgn_VMGup_age", "wmIgn_battTempF_age", "wmIgn_extraTempF_age",
     "sessionId",             // device boot identity, same in every channel this boot
     "sendMs",                  // device millis() when this payload was BUILT (CSV2 sends one pass later)
 ];
@@ -1379,7 +1386,7 @@ function drawIExcessSpark(c, S) {
     let dmax = 0; for (let i = 0; i < N; i++) dmax = Math.max(dmax, S.peak[i], S.minE[i]);
     // Fixed: 0→ceiling so both clamps are framed. Auto: anchor the top to the data (which includes E),
     // so it can't zoom tighter than "E with headroom" — avoids the excessive-zoom-on-a-flat-signal trap.
-    const ymax = auto ? Math.max(dmax, 1) * 1.15 : Math.max(ceil, dmax) * 1.05;
+    const ymax = auto ? Math.max(dmax * 1.15, 2) : Math.max(ceil, dmax) * 1.05;
     const X = i => pad + i * (w - 2 * pad) / (N - 1), Y = v => h - pad - (Math.min(v, ymax) / ymax) * (h - 2 * pad);
     // floor always; ceiling whenever it's within the visible range
     g.strokeStyle = '#bbb'; g.lineWidth = 1; g.setLineDash([2, 3]);
@@ -1705,15 +1712,11 @@ function altZeroPaint(j) {
 }
 function altZeroNow() {
     if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
-    fetchWithTimeout(buildURL('/get?AltZeroCaptureNow=1'), {}, 8000)
-        .then(()=>{ setTimeout(fetchZeroFitState, 400); })
-        .catch(()=>{});
+    return deviceCommand('AltZeroCaptureNow=1', 8000).then(ok => { if (ok) setTimeout(fetchZeroFitState, 400); });
 }
 function altZeroApplyNow() {
     if (!settingsUnlocked) { xAlert("Please unlock controls first"); return; }
-    fetchWithTimeout(buildURL('/get?altZeroApply=1'), {}, 8000)
-        .then(()=>{ setTimeout(fetchZeroFitState, 400); })
-        .catch(()=>{});
+    return deviceCommand('altZeroApply=1', 8000).then(ok => { if (ok) setTimeout(fetchZeroFitState, 400); });
 }
 
 // Confidence-state labels + colors (firmware FrontStore::classify; OUTPUT-BLIND \u2014 position +
@@ -1843,7 +1846,7 @@ function altSetPaused(p){
 // every other line is label-prefixed, so the first one after the curve ends the block (altFrontBlockOnly).
 function altExportHealthDataset(){
   const get = u => fetchWithTimeout(buildURL(u),{},10000).then(r=>r.text()).catch(()=>'');
-  Promise.all([get('/altcurve.csv'), get('/altdebug.csv'), get('/altsess.csv')]).then(([ref, dbg, sess])=>{
+  return Promise.all([get('/altcurve.csv'), get('/altdebug.csv'), get('/altsess.csv')]).then(([ref, dbg, sess])=>{
     ref = (ref||'').replace(/\s+$/,''); dbg = (dbg||'').replace(/\s+$/,''); sess = (sess||'').replace(/\s+$/,'');
     if(ref.length < 8 && dbg.length < 8){ xAlert('No alternator health data to export yet.'); return; }
     const parts = [];
@@ -1892,12 +1895,45 @@ const ALTSWEEP_STATE_LABEL = ['idle', 'ramping up', 'ramping down', 'easing out'
 // not change length as the clock runs down. Paired with tabular-nums on the span in the markup.
 const altLogMMSS = s => `${String(Math.floor(Math.max(0, s) / 60)).padStart(2, '0')}:${String(Math.max(0, s) % 60).padStart(2, '0')}`;
 
-// One gate for every device write here: unlocked, and a real regulator on the other end.
+// A device write whose answer reaches the screen: the regulator's own reason (422), any other refusal, or no answer.
+// Resolves true only on a 200.
+function deviceCommand(query, timeoutMs = 5000) {
+    if (DEMO_MODE) { xAlert('Demo mode: no regulator is connected, so this cannot run.'); return Promise.resolve(false); }
+    return fetchWithTimeout(buildURL('/get?' + query), {}, timeoutMs).then(async r => {
+        if (r.ok) return true;
+        if (r.status === 423) return false;   // the fetch wrapper has already said why (regDemoNotice)
+        if (r.status === 403) xAlert('The regulator refused this: its controls are locked. Press Unlock Controls and try again.');
+        else if (r.status === 409) xAlert('The regulator refused this: a different regulator answered at this address.');
+        else xAlert((await r.text().catch(() => '')) || `The regulator refused this (HTTP ${r.status}).`);
+        return false;
+    }).catch(() => {
+        xAlert('The regulator did not answer, so the press did not reach it. Check the connection and try again.');
+        return false;
+    });
+}
+
 function altCapPost(query) {
-    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return false; }
-    if (DEMO_MODE) { xAlert('Demo mode — no regulator is connected, so the capture cannot be controlled.'); return false; }
-    fetchWithTimeout(buildURL('/get?' + query), {}, 5000).catch(() => {});
-    return true;
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return Promise.resolve(false); }
+    return deviceCommand(query);
+}
+
+// Accepted is not started: the recorder allocates PSRAM on the control loop and the sweep can refuse its span there, both
+// after the reply. AltLive confirms. Reads "starting" until then; altCaptureRender clears the entry when it sees the run.
+const ALTCAP_START_WAIT_MS = 5000;
+const altCapStartBy = { log: 0, sweep: 0 };   // performance.now() deadlines; 0 = none pending
+function altCapAwaitStart(kind, what, control, button) {
+    const by = performance.now() + ALTCAP_START_WAIT_MS;
+    altCapStartBy[kind] = by;
+    altCaptureRender();
+    setTrackedTimeout(() => {
+        if (altCapStartBy[kind] !== by) return;   // confirmed by the render, or superseded by a newer press
+        altCapStartBy[kind] = 0;
+        altCaptureRender();
+        xAlert(`The regulator took the press but has not reported ${what} after 5 seconds. The console gives the reason. If the ${control} still reads idle, press ${button} again.`);
+    }, ALTCAP_START_WAIT_MS);
+}
+function altLogRecordPost() {
+    return altCapPost('altLogRecord=1').then(ok => { if (ok) altCapAwaitStart('log', 'a recording', 'recorder', 'Record'); });
 }
 
 function altCapEnable(id, on) {
@@ -1911,8 +1947,9 @@ function altCapEnable(id, on) {
 function altCaptureRender() {
     const st = altLive.logState | 0;
     const recording = (st === 1);
+    if (recording) altCapStartBy.log = 0;
     const stEl = document.getElementById('altlog-state');
-    if (stEl) stEl.textContent = ALTLOG_STATE_LABEL[st] || '?';
+    if (stEl) stEl.textContent = altCapStartBy.log ? 'starting' : (ALTLOG_STATE_LABEL[st] || '?');
     const cd = document.getElementById('altlog-countdown');
     if (cd) {
         // Fixed-shape m:ss only (span is tabular-nums): a changing length re-wraps and shifts the whole row.
@@ -1937,8 +1974,9 @@ function altCaptureRender() {
     altCapEnable('altlog-discard-btn', st === 2 || st === 3);
     const sw = altLive.sweepState | 0;
     const rev = altLive.sweepRev | 0;   // 0 reached its ceiling, 1 a control limit, 2 Reverse now
+    if (sw) altCapStartBy.sweep = 0;
     const swEl = document.getElementById('altsweep-state');
-    if (swEl) swEl.textContent = (ALTSWEEP_STATE_LABEL[sw] || '?') +
+    if (swEl) swEl.textContent = (altCapStartBy.sweep ? 'starting' : (ALTSWEEP_STATE_LABEL[sw] || '?')) +
         ((sw === 2 && rev === 1) ? ' — turned around short of a limit'
          : (sw === 2 && rev === 2) ? ' — turned around by hand' : '');
     const swb = document.getElementById('altsweep-btn');
@@ -1979,7 +2017,7 @@ function altSweepMargins() {
     return { a: num('altsweep-margin-a', 10), v: num('altsweep-margin-v', 0.20 * k) };
 }
 
-// Sweep params live in the browser (localStorage), not NVS; altSweepPress reads the live boxes at Start,
+// Sweep params live in the browser (localStorage), not NVS; altSweepStartPress reads the live boxes at Start,
 // so Set (clamp + remember) is optional.
 const ALTSWEEP_LS_KEY = 'altSweepParams';
 
@@ -2018,16 +2056,25 @@ function altSweepRestoreParams() {
 }
 document.addEventListener('DOMContentLoaded', altSweepRestoreParams);
 
+// Stop shares this button and stays outside onePress, so nothing can hold it back. Only the start is guarded.
 function altLogRecordPress() {
+    if ((altLive.logState | 0) === 1) { altCapPost('altLogStop=1'); return; }
+    return altLogRecordStart();
+}
+function altLogRecordStart() {
     const st = altLive.logState | 0;
-    if (st === 1) { altCapPost('altLogStop=1'); return; }
     if (st === 2 || st === 3) {
         if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
-        xConfirm(`Recording will discard the ${altLive.logRows | 0} rows already captured — they have not been transferred. Continue?`)
-            .then(ok => { if (ok) altCapPost('altLogRecord=1'); });
-        return;
+        return xConfirm(`Recording will discard the ${altLive.logRows | 0} rows already captured — they have not been transferred. Continue?`)
+            .then(ok => { if (ok) return altLogRecordPost(); });
     }
-    altCapPost('altLogRecord=1');
+    return altLogRecordPost();
+}
+
+// Protection tests: the reply carries the refusal (engine speed, mode, another test). A test that starts reports on the console.
+function protTestFire(mode) {
+    if (!settingsUnlocked) { xAlert('Please unlock controls first'); return; }
+    return deviceCommand('protTestStart=' + mode).then(ok => { if (ok) fileToast('Protection test started. Its result goes to the console.'); });
 }
 
 function altLogDiscardPress() {
@@ -2077,8 +2124,12 @@ function altSweepReversePress() {
     altCapPost('altSweepReverse=1');
 }
 
+// Stop sweep shares this button and stays outside onePress, so nothing can hold it back. Only the start is guarded.
 function altSweepPress() {
     if ((altLive.sweepState | 0) !== 0) { altCapPost('altSweepCancel=1'); return; }
+    return altSweepStartPress();
+}
+function altSweepStartPress() {
     const val = id => { const e = document.getElementById(id); return e ? e.value.trim() : ''; };
     const rate = val('altsweep-rate') || '1.0';
     const from = val('altsweep-from') || '5';
@@ -2090,9 +2141,10 @@ function altSweepPress() {
     if (!(to > 0)) to = (md > 0) ? md : 0;
     else if (md > 0 && to > md) to = md;
     const m = altSweepMargins();
-    altCapPost(`altSweepStart=1&rate=${encodeURIComponent(rate)}&from=${encodeURIComponent(from)}` +
+    return altCapPost(`altSweepStart=1&rate=${encodeURIComponent(rate)}&from=${encodeURIComponent(from)}` +
                `&to=${encodeURIComponent(String(Math.round(to)))}` +
-               `&marginA=${encodeURIComponent(m.a)}&marginV=${encodeURIComponent(m.v)}`);
+               `&marginA=${encodeURIComponent(m.a)}&marginV=${encodeURIComponent(m.v)}`)
+        .then(ok => { if (ok) altCapAwaitStart('sweep', 'a sweep', 'sweeper', 'Start sweep'); });
 }
 
 // Little-endian; mirrors AltLogHdr / AltLogRow in 7_functions.ino — change both together. Each version only
@@ -2408,7 +2460,7 @@ function downloadRippleBundle(){
       deliverFile(stampName(name), txt, 'text/csv');
     }).catch(()=>{}));
   }
-  Promise.allSettled(jobs).then(endFileBatch);
+  return Promise.allSettled(jobs).then(endFileBatch);
 }
 
 // ── Configuration Backup & Sharing ──────────────────────────────────────────
@@ -2417,7 +2469,7 @@ function downloadRippleBundle(){
 function exportConfigDownload(){
   if(g_regDemo){ regDemoNotice(); return; }
   if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
-  fetchWithTimeout(buildURL('/exportConfig?download=1'),{},10000)
+  return fetchWithTimeout(buildURL('/exportConfig?download=1'),{},10000)
     .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
     .then(async txt=>{
       // The equipment records (firmware /exportRecords) ride in the same file as a "records" section.
@@ -3032,8 +3084,7 @@ function altSessYRange(){
   const scan = a => { for (const v of a) if (v != null) { if (v < lo) lo = v; if (v > hi) hi = v; } };
   scan(altSessMeas); scan(altSessEst);
   if (!isFinite(lo)) return [80, 110];
-  const pad = Math.max(2, (hi - lo) * 0.15);
-  return [Math.floor(lo - pad), Math.ceil(hi + pad)];
+  return stableAutoRange(lo, hi, 0.15, 10);
 }
 
 function buildAltSessPlot(){
@@ -3744,7 +3795,7 @@ function drawMotorPlot(){
     const step=Math.max(20, (hiR-loR)/120);
     for(let r=loR; r<=hiR+1e-6; r+=step){ const v=frontPred(motorFrontPts,[r,hw,sea],MOTOR_SCALE); if(v>0) line.push([r,v]); }
   }
-  let maxR=3600, maxS=4;
+  let maxR=3000, maxS=4;
   line.forEach(p=>{ if(p[0]>maxR)maxR=p[0]; if(p[1]>maxS)maxS=p[1]; });
   if(motorLive.valid){ if(motorLive.rpm>maxR)maxR=motorLive.rpm; if(motorLive.spd>maxS)maxS=motorLive.spd; }
   maxR=Math.ceil(maxR/500)*500; maxS=Math.ceil(maxS);
@@ -4424,6 +4475,7 @@ async function probeIdentify(base, timeoutMs) {
 // wantUid short-circuits the wait, so a single-regulator launch stays fast.
 const DISCOVERY_STRAGGLER_MS = 450;   // after the first answer, how long to keep listening for a second unit
 const isIpBase = b => /^https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(b || '');
+const SHARED_HOST = 'alternator.local';   // every regulator answers to it, so each request can land on a different board
 
 function probeRound(bases, timeoutMs, wantUid) {
     return new Promise((resolve) => {
@@ -4440,6 +4492,8 @@ function probeRound(bases, timeoutMs, wantUid) {
         bases.forEach(base => {
             probeIdentify(base, timeoutMs).then(hit => {
                 if (hit) {
+                    // Never carry the shared name forward as a unit's address: the IP it just reported stays on that unit.
+                    if (hit.base === 'http://' + SHARED_HOST && hit.ip && hit.ip !== '0.0.0.0' && IPV4_RE.test(hit.ip)) hit.base = 'http://' + hit.ip;
                     // One unit answers on several bases (its mDNS name, its IP, the remembered
                     // base). Fold them by uid, and keep the numeric address: a .local name can
                     // resolve to the OTHER regulator, an IP cannot.
@@ -4535,6 +4589,9 @@ async function discoverDeviceBase(wantUid, exhaustive) {
     // Browser: the address this page was served from. A regulator that came back at the SAME
     // place answers here in round 1 and the tab never has to move.
     if (!IS_CAPACITOR && first.indexOf(location.origin) === -1) first.push(location.origin);
+    // Browser: where the pinned unit last said it was, for when its name stops resolving.
+    const shown = window.xregUnit;
+    if (!IS_CAPACITOR && shown && shown.ip && shown.uid === wantUid && first.indexOf('http://' + shown.ip) === -1) first.push('http://' + shown.ip);
     const found = [];
     const merge = list => list.forEach(h => {
         const dup = h.uid ? found.find(f => f.uid === h.uid) : null;
@@ -4567,7 +4624,8 @@ async function discoverDeviceBase(wantUid, exhaustive) {
         const batch = [];
         for (let h = start; h < start + 25 && h <= 254; h++) {
             const cand = prefix + h;
-            if (cand !== ownIP) batch.push('http://' + cand);
+            // In the app ownIP is the phone. In a browser it is a regulator, possibly the one being looked for.
+            if (!IS_CAPACITOR || cand !== ownIP) batch.push('http://' + cand);
         }
         merge(await probeRound(batch, 1000, probeUid));
         // A pinned unit keeps the sweep running past a batch that only held its neighbour.
@@ -4638,6 +4696,8 @@ function peerAsHit(p) {
 async function refreshUnitIdentity() {
     if (DEMO_MODE) return null;
     const hit = await probeIdentify(API_BASE_URL || '', 4000);
+    // At the shared name this reply can come from the other board; the card keeps naming the board on screen.
+    if (hit && hit.uid && g_streamUid && hit.uid.toUpperCase() !== g_streamUid.toUpperCase()) return window.xregUnit || null;
     if (hit && hit.uid) applyConnectedIdentity(hit);
     return hit;
 }
@@ -4831,11 +4891,12 @@ function openRegulator(hit) {
 
 // Browser half of a switch. The unit's own name outlives any DHCP lease, so it is tried first; the
 // address that answered the scan is the fallback for a browser that cannot resolve .local names.
-// The landing page runs initUnitIdentity() and settles onto the unit's own name from there.
-async function moveTabToRegulator(hit) {
+// The landing page runs initUnitIdentity() and settles onto the unit's own name from there. lost = the tab's own
+// unit went missing from this address, so moving to the same uid is the point.
+async function moveTabToRegulator(hit, lost) {
     if (!hit || !hit.uid) return;
     const cur = window.xregUnit && window.xregUnit.uid;
-    if (cur && cur.toUpperCase() === hit.uid.toUpperCase()) return;
+    if (!lost && cur && cur.toUpperCase() === hit.uid.toUpperCase()) return;
     const here = location.pathname + location.search + location.hash;
     if (hit.host) {
         const byName = await probeIdentify('http://' + hit.host, 2500);
@@ -4844,7 +4905,14 @@ async function moveTabToRegulator(hit) {
             return;
         }
     }
-    if (isIpBase(hit.base)) { location.replace(hit.base + here); return; }
+    // The mark stops the landing page moving straight back to the name that just failed: on flaky mDNS that
+    // would reload the tab every time the name came and went.
+    if (isIpBase(hit.base)) {
+        const url = new URL(hit.base + here);
+        url.searchParams.set('xregStay', '1');
+        location.replace(url.href);
+        return;
+    }
     xAlert('That regulator answered only at ' + unitWhere(hit) + ', which this browser cannot follow. Open it directly at http://' + (hit.host || unitWhere(hit)) + '/', 'Switch Regulator');
 }
 
@@ -4880,6 +4948,8 @@ async function onStreamUnitMismatch(streamUid, wantUid) {
         rediscoverAfterLoss();
         return;
     }
+    // The picker is already asking; initUnitIdentity re-checks when it closes.
+    if (document.getElementById('regPickerDialog')) { g_streamMismatchUid = null; return; }
     const ownName = 'xreg-' + uid6(streamUid).toLowerCase() + '.local';
     const ok = await xConfirm('This page is showing regulator ID ' + uid6(streamUid) + ', but the address it was opened at also reaches regulator ID ' +
         uid6(wantUid) + '. A command sent from here may reach the wrong one and be refused. Move this page to ' + ownName + ', which reaches only the regulator shown?',
@@ -4899,11 +4969,18 @@ async function onStreamUnitMismatch(streamUid, wantUid) {
 // page already at the unit's own name (no loop); silent when the name doesn't answer (most Android browsers).
 // A pick made at the shared name lives in that origin's localStorage, so it survives whichever board served the page.
 function sharedChoiceGet() { try { return localStorage.getItem('xregChosenUid') || null; } catch (e) { return null; } }
-function sharedChoiceSet(uid) { try { if (uid) localStorage.setItem('xregChosenUid', uid.toUpperCase()); } catch (e) { } }
+function sharedChoiceSet(uid, host) {
+    try {
+        if (!uid) return;
+        localStorage.setItem('xregChosenUid', uid.toUpperCase());
+        if (host) localStorage.setItem('xregChosenHost', host); else localStorage.removeItem('xregChosenHost');
+    } catch (e) { }
+}
 
 async function initUnitIdentity() {
     if (IS_CAPACITOR || DEMO_MODE) return;
-    const hit = await probeIdentify(API_BASE_URL || '', 4000);
+    // 8 s: a cold lookup of the shared name takes 3-5 s while two boards answer it, and a miss leaves the tab with no identity.
+    const hit = await probeIdentify(API_BASE_URL || '', 8000);
     if (!hit) return;
     applyConnectedIdentity(hit);
     syncArmState();   // identity known: the arm poll can now carry this unit's token
@@ -4911,17 +4988,35 @@ async function initUnitIdentity() {
     if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
     localStorage.setItem('xregDeviceBase', location.origin);
     if (!CAN_DISCOVER || !hit.uid || !hit.host) return;
+    const params = new URLSearchParams(location.search);
+    if (params.has('xregStay')) {   // set by moveTabToRegulator: this tab is on an address because the name failed
+        params.delete('xregStay');
+        const rest = params.toString();
+        history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
+        return;
+    }
     if (location.hostname.toLowerCase() === hit.host.toLowerCase()) return;
     // The shared name on a network with more than one regulator: this browser's earlier choice
     // wins, otherwise the question is asked. A resolver race must not decide which engine a page
     // drives, and on shared marina WiFi the winner may be another boat's unit entirely.
-    if (location.hostname.toLowerCase() === 'alternator.local' && hit.peers && hit.peers.length) {
+    if (location.hostname.toLowerCase() === SHARED_HOST) {
+        const peers = hit.peers || [];
         const chosen = sharedChoiceGet();
         let target = null;
         if (chosen && chosen === hit.uid.toUpperCase()) target = hit;
-        else if (chosen) { const p = hit.peers.find(x => (x.uid || '').toUpperCase() === chosen); if (p) target = peerAsHit(p); }
-        if (!target) {
-            let all = [hit].concat(hit.peers.map(peerAsHit));
+        else if (chosen) {
+            const p = peers.find(x => (x.uid || '').toUpperCase() === chosen);
+            if (p) target = peerAsHit(p);
+            else {
+                // The serving board has not heard the chosen one yet (its 30 s browse), which does not mean it is gone.
+                let chosenHost = null;
+                try { chosenHost = localStorage.getItem('xregChosenHost'); } catch (e) { }
+                const direct = chosenHost ? await probeIdentify('http://' + chosenHost, 2500) : null;
+                if (direct && (direct.uid || '').toUpperCase() === chosen) target = direct;
+            }
+        }
+        if (!target && peers.length) {
+            let all = [hit].concat(peers.map(peerAsHit));
             const lead = 'More than one regulator is on this network. Which one is yours? An unnamed unit shows the six characters from its hotspot name and label. Units set up together are shown together.';
             let pick = await chooseRegulator(all, chosen, true, { lead: lead, rescan: true, note: 'This browser remembers the answer. Bookmark the page it lands on to skip the question.' });
             if (pick === 'rescan') {
@@ -4929,7 +5024,14 @@ async function initUnitIdentity() {
                 swept.forEach(h => { if (!all.some(a => a.uid === h.uid)) all.push(h); });
                 pick = await chooseRegulator(all, chosen, true, { lead: lead, note: 'This browser remembers the answer. Bookmark the page it lands on to skip the question.' });
             }
-            if (pick && pick !== 'rescan') { sharedChoiceSet(pick.uid); target = pick; }
+            if (pick && pick !== 'rescan') { sharedChoiceSet(pick.uid, pick.host); target = pick; }
+            // Not now: nobody chose, so the tab stays. Moving onto the serving board's name would let the resolver choose.
+            if (!target) {
+                const onScreen = g_streamUid;
+                g_streamUid = null;
+                if (onScreen) noteStreamUid(onScreen);
+                return;
+            }
         }
         if (target && target.uid.toUpperCase() !== hit.uid.toUpperCase()) { moveTabToRegulator(target); return; }
     }
@@ -4967,23 +5069,31 @@ async function discoverAndConnect() {
 // suppresses the dialog: the network-change watcher fires before any packet, and App Review must reach demo mode.
 async function rediscoverAfterLoss(quiet) {
     if (discoveryInProgress || DEMO_MODE) return;
+    const atSharedName = !IS_CAPACITOR && location.hostname.toLowerCase() === SHARED_HOST;
+    // Browser: a lost stream moves the tab only when its regulator is really gone from this address.
+    if (!IS_CAPACITOR) {
+        const reopenStream = () => { sseReconnectAttempts = 0; initializeEventSource(); };
+        // The picker is an open question, and a stream failing behind it must not answer it.
+        if (document.getElementById('regPickerDialog')) { window._rediscoveryTried = false; reopenStream(); return null; }
+        const here = await probeIdentify(location.origin, 2500);
+        if (here && (atSharedName || !here.uid || here.uid === rememberedUid())) { reopenStream(); return here; }
+    }
+    // At the shared name only a choice the user made counts; what the page last connected to was the resolver's pick.
+    const wantUid = atSharedName ? sharedChoiceGet() : rememberedUid();
     discoveryInProgress = true;
     let hits = [];
     try {
-        hits = await discoverDeviceBase(rememberedUid());
+        hits = await discoverDeviceBase(wantUid);
     } finally {
         discoveryInProgress = false;
     }
     if (DEMO_MODE) return;
-    const hit = await resolveRegulatorChoice(hits, rememberedUid());
+    const hit = await resolveRegulatorChoice(hits, wantUid);
     if (hit) {
         // A browser can't re-point API_BASE_URL (/events and write forms are same-origin; only /identify has CORS):
         // moving the tab to the address that answered IS the reconnect.
         if (!IS_CAPACITOR) {
-            // Carry the route across: the tab may be sitting on a deep link, and the address is
-            // the only part of it that went stale.
-            const here = location.pathname + location.search + location.hash;
-            if (hit.base && hit.base !== location.origin) { location.replace(hit.base + here); return hit; }
+            if (hit.base && hit.base !== location.origin) { moveTabToRegulator(hit, true); return hit; }
             // connectToRegulator() zeroes this for the app. Here the same origin answered, so the count
             // that just exhausted is still standing and initializeEventSource() would refuse to open.
             sseReconnectAttempts = 0;
@@ -5027,7 +5137,7 @@ function saveRegulatorApCreds() {
     const passEl = document.getElementById('regApPass');
     if (ssidEl) localStorage.setItem('xregApSsid', ssidEl.value.trim() || AP_SSID_DEFAULT);
     if (passEl) localStorage.setItem('xregApPass', passEl.value || AP_PASS_DEFAULT);
-    setApJoinStatus('regApJoinStatus', 'Saved on this phone.');
+    setApJoinStatus('regApJoinStatus', 'Saved on this phone or tablet.');
 }
 
 function setApJoinStatus(elId, msg) {
@@ -5040,7 +5150,7 @@ function setApJoinStatus(elId, msg) {
 async function joinRegulatorHotspot(statusElId) {
     const plugin = wifiJoinPlugin();
     if (!plugin) {
-        setApJoinStatus(statusElId, 'Joining a network from inside the app needs the phone app.');
+        setApJoinStatus(statusElId, 'Joining a network needs the XREG-010 app on a phone or tablet.');
         return;
     }
     const creds = getRegulatorApCreds();
@@ -5048,7 +5158,7 @@ async function joinRegulatorHotspot(statusElId) {
         setApJoinStatus(statusElId, 'Enter the regulator hotspot name first.');
         return;
     }
-    setApJoinStatus(statusElId, 'Asking this phone to join ' + creds.ssid + '…');
+    setApJoinStatus(statusElId, 'Asking this phone or tablet to join ' + creds.ssid + '…');
     try {
         await plugin.connect({ ssid: creds.ssid, password: creds.password });
     } catch (e) {
@@ -5396,7 +5506,7 @@ async function requestPhoneLocationPermission(whyLine) {
             return false;
         }
     } catch (e) { /* services off system-wide — the request below will fail harmlessly */ }
-    await xAlert(whyLine, 'Share this phone\'s position?', { okText: 'Continue' });
+    await xAlert(whyLine, 'Share position from this phone or tablet?', { okText: 'Continue' });
     try {
         const r = await window.Capacitor.Plugins.Geolocation.requestPermissions();
         return r && r.location === 'granted';
@@ -5414,13 +5524,13 @@ async function weatherModeToggled(isOn) {
         // Owner opted the phone out of position entirely, so the forecast has no coordinates
         // to work from and would silently never run. Say so instead of asking for location.
         await xAlert('The solar forecast needs the boat\'s position, and this boat has no GPS ' +
-                     'of its own. Set Setup > Boat > Position Source to use this phone as a ' +
+                     'of its own. Set Setup > Boat > Position Source to use a phone or tablet as a ' +
                      'backup, or type coordinates in Setup > Solar.', 'No position available');
         return;
     }
     await requestPhoneLocationPermission(
         'The solar forecast is looked up for your position. XREG-010 can take it from this ' +
-        'phone when the boat has no GPS of its own. It goes only to your regulator.');
+        'phone or tablet when the boat has no GPS of its own. It goes only to your regulator.');
 }
 
 // Ask the first time this phone reaches a regulator, never at launch: nothing has explained why yet, and a reviewer
@@ -5431,7 +5541,7 @@ async function maybeAskLocationOnFirstConnect() {
     if (Number(window.gpsPositionSource) === 1) return;   // owner already chose NMEA 2000 only
     try { localStorage.setItem('locPermAsked', '1'); } catch (e) { }
     await requestPhoneLocationPermission(
-        'XREG-010 can use this phone as a backup GPS for your boat, so distance run, ' +
+        'XREG-010 can use this phone or tablet as a backup GPS for your boat, so distance run, ' +
         'anchorages and the solar forecast still work when the boat has no GPS of its own. ' +
         'Position goes to your regulator on your local network. You can turn this off under ' +
         'Setup > Boat > Position Source.');
@@ -5446,9 +5556,9 @@ async function gpsPositionSourceChanged(sel) {
     if ((v === 0 || v === 2) && IS_CAPACITOR) {
         const ok = await requestPhoneLocationPermission(
             v === 2
-              ? 'XREG-010 will use this phone as the boat\'s position source, ignoring NMEA 2000. ' +
+              ? 'XREG-010 will use this phone or tablet as the boat\'s position source, ignoring NMEA 2000. ' +
                 'Position goes to your regulator on your local network.'
-              : 'XREG-010 will use this phone as a backup position source when the boat\'s own ' +
+              : 'XREG-010 will use this phone or tablet as a backup position source when the boat\'s own ' +
                 'GPS is unavailable, so distance run, anchorages and the solar forecast keep working. ' +
                 'Position goes to your regulator on your local network.');
         if (!ok) { selectRepaint(sel); return; }
@@ -5537,16 +5647,16 @@ function stopPhoneSpeedJsWatch() {
 function phoneSpeedModeDialogText() {
     const runLine = phoneSpeedNativePlugin()
         ? '- XREG-010 collects location data to enable speed and course logging even when the app is closed or not in use. ' +
-          'It keeps running for as long as the phone allows. Battery drain is substantial ' +
-          'with GPS running full-time; keep the phone on a charger underway. The phone ' +
+          'It keeps running for as long as the phone or tablet allows. Battery drain is substantial ' +
+          'with GPS running full-time; keep it on a charger underway. The phone or tablet ' +
           'shows its location indicator while this is active.\n'
-        : '- Works only while the app is open in the foreground on a phone aboard; ' +
+        : '- Works only while the app is open in the foreground on a phone or tablet aboard; ' +
           'speed greys out about 10 seconds after posting stops. Continuous GPS ' +
-          'use increases phone battery drain.\n';
-    return 'Speed and course will come from this phone instead of NMEA 2000.\n\n' +
+          'use increases battery drain.\n';
+    return 'Speed and course will come from a phone or tablet running the XREG-010 app instead of NMEA 2000.\n\n' +
         runLine +
         '- Speed records set in this mode are flagged in cloud uploads and are ' +
-        'excluded from the speed leaderboard. If a phone-sourced run becomes your ' +
+        'excluded from the speed leaderboard. If a phone- or tablet-sourced run becomes your ' +
         'best ever, your boat stays off the board until an NMEA-sourced record beats it.';
 }
 
@@ -5564,7 +5674,7 @@ async function phoneSpeedBgDisclosed() {
     if (bgSpeedDisclosureDeclined) return false;
     if (!bgSpeedDisclosurePending) {
         bgSpeedDisclosurePending = xConfirm(phoneSpeedModeDialogText(),
-            { title: 'Use phone GPS for speed?', okText: 'Use Phone GPS' })
+            { title: 'Use phone or tablet GPS for speed?', okText: 'Use Phone or Tablet GPS' })
             .then(ok => {
                 if (ok) markPhoneSpeedDisclosed(); else bgSpeedDisclosureDeclined = true;
                 bgSpeedDisclosurePending = null;
@@ -5649,14 +5759,14 @@ async function speedSourceModeChanged(sel) {
     const want = sel.value;
     if (Number(want) === 1) {
         const ok = await xConfirm(phoneSpeedModeDialogText(),
-            { title: 'Use phone GPS for speed?', okText: 'Use Phone GPS' });
+            { title: 'Use phone or tablet GPS for speed?', okText: 'Use Phone or Tablet GPS' });
         if (!ok) { selectRepaint(sel); return; }
         markPhoneSpeedDisclosed();   // this dialog IS the disclosure — the poster must not raise a second copy
         // Ask when the feature is switched on (guideline 5.1.1(ii), HIG). Capacitor only: device-global setting, this-client
         // permission, so a browser must still submit (its own geolocation prompt fires when posting starts).
         if (IS_CAPACITOR) {
             const granted = await requestPhoneLocationPermission(
-                'XREG-010 needs this phone\'s location to use it as the vessel speed source. ' +
+                'XREG-010 needs the location of this phone or tablet to use it as the vessel speed source. ' +
                 'Speed and course go to your regulator on your local network.');
             if (!granted) { selectRepaint(sel); return; }
         }
@@ -7083,9 +7193,10 @@ function queuePlotUpdate(plotName) {
 
 // ── Live-plot stream clock ────────────────────────────────────────────────
 // Every CSV1-fed live plot places each sample by the regulator's send clock (sendMs), never by arrival order or buffer
-// index, and scrolls every display frame on a steady clock: the right edge shows LIVE_BEHIND_MS before the newest
-// sample, so a frame that comes a little late is in before its point scrolls on, and an arrival moves nothing on
-// screen. Same design as the GX app's charts (gx_app/plugin/XregChart.qml, sClock/sLag).
+// index, and scrolls every display frame on a steady clock: the right edge shows the update interval, at least
+// LIVE_BEHIND_MS, before the newest sample, so a frame that comes a little late is in before its point scrolls on, an
+// arrival moves nothing on screen, and at intervals over 100 ms the line's end still reaches the edge before each frame.
+// Same design as the GX app's charts (gx_app/plugin/XregChart.qml, sClock/sLag).
 const LIVE_BEHIND_MS = 100;
 const liveClock = {
     t: NaN,         // stream time (ms) of the newest sample: steps by sendMs, by arrival time across a device-clock reset
@@ -7095,6 +7206,8 @@ const liveClock = {
     latQt: [],      // arrival time of each frame of the last 10 s ...
     latQv: [],      // ... and its arrival minus stream time
     shown: NaN,     // stream time at the right edge this display frame
+    behind: NaN,    // ms the right edge trails the fastest frame's clock (liveClockFrame)
+    frameAt: NaN,   // rAF timestamp of the display frame before
     epochOff: NaN,  // Date.now() - performance.now(), re-synced only on a real step (sleep, clock set)
     absBase: 0,     // clock-time x: (stream time - absBase) / 1000 = epoch seconds
     edgeAbs: NaN,   // clock-time x: the right edge this display frame, epoch seconds
@@ -7155,8 +7268,13 @@ function liveClockSample(arrival, step, devStep) {
 function liveClockFrame(now) {
     const c = liveClock;
     if (!Number.isFinite(c.lat) || !c.ring) return false;
-    const run = Math.max(1000, (window._lastKnownInterval || 200) + 900);
-    c.shown = Math.min(now - c.lat - LIVE_BEHIND_MS, c.t + run);
+    const iv = window._lastKnownInterval || 200, run = Math.max(1000, iv + 900), want = Math.max(LIVE_BEHIND_MS, iv);
+    // Drops at once, rises at most 100 ms a second: an interval raised mid-stream slows the scroll a little for a while
+    // instead of stepping it back.
+    c.behind = !(want > c.behind) || !Number.isFinite(c.frameAt) ? want
+        : Math.min(want, c.behind + (now - c.frameAt) * 0.1);
+    c.frameAt = now;
+    c.shown = Math.min(now - c.lat - c.behind, c.t + run);
     if (useTimestamps) {
         const off = Date.now() - performance.now();
         if (!(Math.abs(off - c.epochOff) < 50)) c.epochOff = off;
@@ -7197,7 +7315,7 @@ function startInterpLoop() {
         totalRenderMs: 0,     // cumulative setData time this period
         worstRenderMs: 0,     // single worst setData batch
         trailSum: 0,          // newest sample minus the shown right edge (ms), summed over live frames
-        trailMin: Infinity,   // negative = the edge ran past the newest sample (a frame came later than LIVE_BEHIND_MS)
+        trailMin: Infinity,   // negative = the edge ran past the newest sample (a frame came later than liveClock.behind)
         liveFrames: 0,
         lastFrameTime: performance.now(),
         nextReportTime: performance.now() + 10000,
@@ -7957,7 +8075,7 @@ function cfgPushShowPending(count, note) {
           Later
         </button>`);
     ov.style.display = 'flex';
-    document.getElementById('cfgpush-restart-btn').onclick = async () => {
+    document.getElementById('cfgpush-restart-btn').onclick = () => onePress('cfgPushRestart', async () => {
         // RebootRegulator is behind the /get arm gate: arm just-in-time or an unarmed dashboard gets a
         // silent 403 while this claims "Restarting". The panel stays up until arming succeeds.
         try {
@@ -7970,7 +8088,7 @@ function cfgPushShowPending(count, note) {
         cfgPushPendingDismissed = count;
         fetch(buildURL('/get?RebootRegulator=1')).catch(() => { });
         xAlert('Restarting. The update installs during boot, then the regulator restarts a second time to load it. Reconnect in about a minute.', 'Restarting');
-    };
+    });
     document.getElementById('cfgpush-later-btn').onclick = () => {
         ov.style.display = 'none';
         cfgPushPendingDismissed = count;
@@ -8182,16 +8300,27 @@ function niceAxisRange(lo, hi) {
 }
 
 // Jitter-free stand-in for uPlot.rangeNum(mn, mx, pad, true): pad by `pad` × span, then niceAxisRange.
-function stableAutoRange(mn, mx, pad) {
-    if (mn == null || mx == null || !isFinite(mn) || !isFinite(mx)) return [0, 1];
-    const m = (mx - mn) * (pad || 0);
+// minSpan (optional) is the narrowest span shown, centered on the data, so a near-flat reading can't fill the
+// chart. fromZero pins the bottom at 0 (lower only if the data goes negative) and makes minSpan the lowest top.
+function stableAutoRange(mn, mx, pad, minSpan, fromZero) {
+    if (mn == null || mx == null || !isFinite(mn) || !isFinite(mx)) return [0, (fromZero && minSpan) || 1];
+    pad = pad || 0; minSpan = minSpan || 0;
+    if (fromZero) {
+        const lo = Math.min(0, mn), m = (mx - lo) * pad;
+        return niceAxisRange(lo < 0 ? lo - m : 0, Math.max(mx + m, minSpan));
+    }
+    if (mx - mn < minSpan) { const mid = (mn + mx) / 2; mn = mid - minSpan / 2; mx = mid + minSpan / 2; }
+    const m = (mx - mn) * pad;
     return niceAxisRange(mn - m, mx + m);
 }
 
-// Padded min/max over selected series. minSpan floors the zoom; hardMin clamps the lower bound.
+// Voltage-axis zoom floor: vPer12 volts per 12 V of system class (x1 at 12 V, x2 at 24 V, x4 at 48 V).
+function voltSpanFloor(vPer12) { return vPer12 * (parseInt(window._nominalStored, 10) || 12) / 12; }
+
+// Padded auto range over selected series; minSpan and fromZero as in stableAutoRange.
 // visibleCount (optional) scans only the on-screen tail so an off-screen outlier can't pin the axis;
 // plot (optional) skips legend-hidden series.
-function computeScaleRange(dataArray, seriesIndices, minSpan, marginFrac, hardMin, visibleCount, plot) {
+function computeScaleRange(dataArray, seriesIndices, minSpan, marginFrac, fromZero, visibleCount, plot) {
     let lo = Infinity, hi = -Infinity;
     for (const idx of seriesIndices) {
         if (plot && plot.series[idx] && plot.series[idx].show === false) continue;
@@ -8205,21 +8334,9 @@ function computeScaleRange(dataArray, seriesIndices, minSpan, marginFrac, hardMi
         }
     }
     if (!isFinite(lo) || !isFinite(hi)) return null;
-    let span = hi - lo;
-    if (span < minSpan) {
-        const mid = (lo + hi) / 2;
-        lo = mid - minSpan / 2;
-        hi = mid + minSpan / 2;
-        span = minSpan;
-    }
-    const margin = span * marginFrac;
-    lo -= margin;
-    hi += margin;
-    if (hardMin !== undefined) lo = Math.max(hardMin, lo);
     // Snap to a stable grid so per-frame autoscale doesn't continuously re-tick the axis
-    [lo, hi] = niceAxisRange(lo, hi);
-    if (hardMin !== undefined) lo = Math.max(hardMin, lo);
-    return { min: lo, max: hi };
+    const [min, max] = stableAutoRange(lo, hi, marginFrac, minSpan, fromZero);
+    return { min, max };
 }
 
 // Trailing buffer points on screen (the buffer holds LIVE_BUFFER_SEC, only liveWindowSec is drawn);
@@ -8234,32 +8351,32 @@ function visiblePointCount() {
 function recomputeAutoScales(applyNow) {
     const vc = visiblePointCount();
     if (autoScaleCurrent && !autoScaleCurrentLocked) {
-        _autoScaleCurrentLeft  = computeScaleRange(currentTempData, [1, 2, 3, 5], 5, 0.10, undefined, vc, currentTempPlot);
-        _autoScaleCurrentRight = computeScaleRange(currentTempData, [4], 20, 0.10, 0, vc, currentTempPlot);
+        _autoScaleCurrentLeft  = computeScaleRange(currentTempData, [1, 2, 3, 5], 10, 0.10, false, vc, currentTempPlot);
+        _autoScaleCurrentRight = computeScaleRange(currentTempData, [4], 20, 0.10, true, vc, currentTempPlot);
         if (applyNow && currentTempPlot) {
             if (_autoScaleCurrentLeft)  currentTempPlot.setScale('current', _autoScaleCurrentLeft);
             if (_autoScaleCurrentRight) currentTempPlot.setScale('pct',     _autoScaleCurrentRight);
         }
     }
     if (autoScaleVoltage && !autoScaleVoltageLocked) {
-        _autoScaleVoltageLeft  = computeScaleRange(voltageData, [1, 2], 0.5 * (window._nominalStored || 12) / 12, 0.10, undefined, vc, voltagePlot);
-        _autoScaleVoltageRight = computeScaleRange(voltageData, [3], 20, 0.10, 0, vc, voltagePlot);
+        _autoScaleVoltageLeft  = computeScaleRange(voltageData, [1, 2], voltSpanFloor(1), 0.10, false, vc, voltagePlot);
+        _autoScaleVoltageRight = computeScaleRange(voltageData, [3], 20, 0.10, true, vc, voltagePlot);
         if (applyNow && voltagePlot) {
             if (_autoScaleVoltageLeft)  voltagePlot.setScale('voltage', _autoScaleVoltageLeft);
             if (_autoScaleVoltageRight) voltagePlot.setScale('pct',     _autoScaleVoltageRight);
         }
     }
     if (autoScaleRPM && !autoScaleRPMLocked) {
-        _autoScaleRPMLeft  = computeScaleRange(rpmData, [1], 200, 0.10, undefined, vc, rpmPlot);
-        _autoScaleRPMRight = computeScaleRange(rpmData, [2], 20, 0.10, 0, vc, rpmPlot);
+        _autoScaleRPMLeft  = computeScaleRange(rpmData, [1], 3000, 0.10, true, vc, rpmPlot);
+        _autoScaleRPMRight = computeScaleRange(rpmData, [2], 20, 0.10, true, vc, rpmPlot);
         if (applyNow && rpmPlot) {
             if (_autoScaleRPMLeft)  rpmPlot.setScale('rpm', _autoScaleRPMLeft);
             if (_autoScaleRPMRight) rpmPlot.setScale('pct', _autoScaleRPMRight);
         }
     }
     if (autoScaleTemp && !autoScaleTempLocked) {
-        _autoScaleTempLeft  = computeScaleRange(temperatureData, [1], 10, 0.10, undefined, vc, temperaturePlot);
-        _autoScaleTempRight = computeScaleRange(temperatureData, [2], 20, 0.10, 0, vc, temperaturePlot);
+        _autoScaleTempLeft  = computeScaleRange(temperatureData, [1], 10, 0.10, false, vc, temperaturePlot);
+        _autoScaleTempRight = computeScaleRange(temperatureData, [2], 20, 0.10, true, vc, temperaturePlot);
         if (applyNow && temperaturePlot) {
             if (_autoScaleTempLeft)  temperaturePlot.setScale('temperature', _autoScaleTempLeft);
             if (_autoScaleTempRight) temperaturePlot.setScale('pct',         _autoScaleTempRight);
@@ -9160,9 +9277,9 @@ function updateAllEchosOptimized(data) {
         { key: 'BattMonSrc', id: 'BattMonN2k_echo', transform: v => v == 1 ? 'in use' : 'not in use' },
         { key: 'BatteryVoltageSource', id: 'BatteryVoltageSource_echo', transform: v => ({0: 'Onboard INA228', 1: 'NMEA 2000', 3: 'Victron VE.Direct'}[v] ?? v) },
         { key: 'timeAxisModeChanging', id: 'timeAxisModeChanging_echo', transform: v => v == 1 ? 'UNIX' : 'Elapsed' },
-        { key: 'timeSourceMode', id: 'timeSourceMode_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'This device only', 3:'NTP time only'}[v] ?? '?') },
-        { key: 'gpsPositionSource', id: 'gpsPositionSource_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'Phone only'}[v] ?? '?') },
-        { key: 'speedSourceMode', id: 'speedSourceMode_echo', transform: v => ({0:'NMEA 2000', 1:'Phone GPS'}[v] ?? '?') },
+        { key: 'timeSourceMode', id: 'timeSourceMode_echo', transform: v => ({0:'Auto', 1:'NMEA only', 2:'Phone or computer only', 3:'NTP time only'}[v] ?? '?') },
+        { key: 'gpsPositionSource', id: 'gpsPositionSource_echo', transform: v => ({0:'NMEA, phone/tablet backup', 1:'NMEA only', 2:'Phone/tablet only'}[v] ?? '?') },
+        { key: 'speedSourceMode', id: 'speedSourceMode_echo', transform: v => ({0:'NMEA 2000', 1:'Phone/tablet GPS'}[v] ?? '?') },
         { key: 'webgaugesinterval', id: 'webgaugesinterval_echo', transform: v => v },
         // plotTimeWindow has no text echo — its buttons highlight the active value instead (below)
         { key: 'weatherModeEnabled', id: 'weatherModeEnabled_echo', transform: v => v == 1 ? 'On' : 'Off' },
@@ -12314,7 +12431,66 @@ async function rpmCapCancel() {
 // ===== Themed alert/confirm (dark modal shell) =====
 // One lazily-created overlay; requests queue behind _xDlgQueue so a second dialog never clobbers the
 // first's resolver. xConfirm resolves true ONLY on an explicit OK. Non-blocking: callers await them.
+// A button that writes first and repaints afterward stays live through the round trip, so a second press reruns the
+// whole sequence: every end-of-run question asked twice, a test started twice, or the NEXT step marked done unrun.
+// Stop, cancel and abort handlers stay off this list: they must always get through.
+const PRESS_MIN_HOLD_MS = 600;   // a reply faster than a double-click must not free the button for its own second click
+const _pressBusy = new Set();
+function onePress(key, fn) {
+    if (_pressBusy.has(key)) return Promise.resolve();
+    _pressBusy.add(key);
+    const ev = window.event;
+    const btn = (ev && ev.type === 'click' && ev.target && ev.target.closest) ? ev.target.closest('button') : null;
+    const mine = btn && !btn.disabled;
+    if (mine) { btn.disabled = true; btn.classList.add('press-busy'); }
+    const t0 = performance.now();
+    const release = () => setTimeout(() => {
+        _pressBusy.delete(key);
+        if (mine) { btn.disabled = false; btn.classList.remove('press-busy'); }
+    }, Math.max(0, PRESS_MIN_HOLD_MS - (performance.now() - t0)));
+    let out;
+    try { out = fn(); } catch (e) { release(); throw e; }
+    Promise.resolve(out).then(release, release);
+    return out;
+}
+// A handler is held until the promise it returns settles, so each of these returns its whole chain. A string first
+// argument is part of the key: downloadCsv is one function behind several different download buttons.
+['cxAdvance', 'cxAdvanceRun', 'cxFinish', 'cxChcApply', 'cxKneeApply', 'cxFieldApply', 'cxPlantApply', 'cxCVPlantApply',
+    'cxVerifyDone', 'cxDetune', 'cxSkip', 'cxManual', 'cxMatrixSkip', 'cxHintsDone', 'rpmCapContinue', 'confirmSystemIDStart',
+    'cvsFix', 'frAgain', 'downloadLogs', 'downloadCsv', 'downloadRippleBundle', 'altExportHealthDataset', 'altLogDumpPress',
+    'cxCVFitDownload', 'exportConfigDownload', 'shareConfigToLibrary', 'cfgDiffPreview', 'switchRegulator', 'addBoatRegulator',
+    'joinRegulatorHotspot', 'altSweepStartPress', 'altLogRecordStart', 'protTestFire', 'altZeroNow', 'altZeroApplyNow'].forEach(name => {
+    const fn = window[name];
+    window[name] = function (...a) {
+        return onePress(name + (typeof a[0] === 'string' ? '|' + a[0] : ''), () => fn.apply(this, a));
+    };
+});
+// The second click of a double-click lands on whatever replaced the first button: the next queued dialog's OK, or the
+// next wizard step's Run. Only a click near the one before counts, so Stop or the field switch elsewhere always gets
+// through. isTrusted: deliverFile and the file pickers click programmatically right after a dialog closes.
+const CLICK_EAT_MS = 350, CLICK_EAT_PX = 48;
+let _clickEatUntil = 0, _lastClickX = NaN, _lastClickY = NaN;
+function clickEat() { _clickEatUntil = performance.now() + CLICK_EAT_MS; }
+window.addEventListener('click', e => {
+    if (!e.isTrusted) return;
+    const near = Math.abs(e.clientX - _lastClickX) <= CLICK_EAT_PX && Math.abs(e.clientY - _lastClickY) <= CLICK_EAT_PX;
+    _lastClickX = e.clientX; _lastClickY = e.clientY;
+    if (near && performance.now() < _clickEatUntil) { e.stopPropagation(); e.preventDefault(); }
+}, true);
+
 let _xDlgQueue = Promise.resolve();
+// The same question already showing or queued gets the same answer instead of a second copy.
+const _xDlgPending = new Map();
+function _xDlgEnqueue(msg, opts) {
+    const key = JSON.stringify([String(msg), opts.title, !!opts.confirm, opts.okText, opts.cancelText]);
+    if (_xDlgPending.has(key)) return _xDlgPending.get(key);
+    const p = _xDlgQueue.then(() => _xDlgShow(msg, opts));
+    _xDlgQueue = p.then(() => { }, () => { });
+    _xDlgPending.set(key, p);
+    const clear = () => _xDlgPending.delete(key);
+    p.then(clear, clear);
+    return p;
+}
 function _xDlgShow(msg, opts) {
     const o = opts || {};
     let ov = document.getElementById('xdlg-overlay');
@@ -12344,7 +12520,7 @@ function _xDlgShow(msg, opts) {
         inp.autocomplete = o.password ? 'current-password' : 'off';
         inp.value = '';
         let settled = false;
-        const done = v => { if (settled) return; settled = true; ov.style.display = 'none'; resolve(v); };
+        const done = v => { if (settled) return; settled = true; ov.style.display = 'none'; clickEat(); resolve(v); };
         let exB = null, cancel = null;
         // Optional third action (e.g. "Go to the setting") on its own full-width row so a long label fits
         // at phone width. Resolves like Cancel: the caller's action replaces the submit.
@@ -12392,9 +12568,7 @@ function fuPanel(inner) {
           </div>`;
 }
 function xAlert(msg, title, opts) {
-    const p = _xDlgQueue.then(() => _xDlgShow(msg, Object.assign({ title: title }, opts || {})));
-    _xDlgQueue = p.then(() => { }, () => { });
-    return p;
+    return _xDlgEnqueue(msg, Object.assign({ title: title }, opts || {}));
 }
 function xPrompt(msg, opts) {
     const p = _xDlgQueue.then(() => _xDlgShow(msg, Object.assign({ confirm: true, prompt: true }, opts || {})));
@@ -12402,9 +12576,7 @@ function xPrompt(msg, opts) {
     return p;
 }
 function xConfirm(msg, opts) {
-    const p = _xDlgQueue.then(() => _xDlgShow(msg, Object.assign({ confirm: true }, opts || {})));
-    _xDlgQueue = p.then(() => { }, () => { });
-    return p;
+    return _xDlgEnqueue(msg, Object.assign({ confirm: true }, opts || {}));
 }
 // Jump Setup to the control for a form input name and flash it. Protections cards carry their label in a
 // sibling .protections-name, not a .form-row, so the row is found per layout.
@@ -14200,8 +14372,8 @@ function initCVTuningPlot() {
             // they scroll on (liveFillX), and a range following them would jump on every arrival. w = selected window,
             // not buffer span.
             x:     { time: false, auto: false, range: () => { const w = (cvXTime && cvXTime > 0) ? cvXTime : (xTime || 30); return [-w, 0]; } },
-            volts: { range: (u, mn, mx) => (cvVoltsMin !== null && cvVoltsMax !== null) ? [cvVoltsMin, cvVoltsMax] : stableAutoRange(mn, mx, 0.1) },
-            amps:  { range: (u, mn, mx) => (cvAmpsMin  !== null && cvAmpsMax  !== null) ? [cvAmpsMin,  cvAmpsMax]  : stableAutoRange(mn, mx, 0.1) },
+            volts: { range: (u, mn, mx) => (cvVoltsMin !== null && cvVoltsMax !== null) ? [cvVoltsMin, cvVoltsMax] : stableAutoRange(mn, mx, 0.1, voltSpanFloor(0.25)) },
+            amps:  { range: (u, mn, mx) => (cvAmpsMin  !== null && cvAmpsMax  !== null) ? [cvAmpsMin,  cvAmpsMax]  : stableAutoRange(mn, mx, 0.1, 2) },
         },
         hooks: {
             draw: [(u) => drawGapMarkers(u)],
@@ -14372,7 +14544,7 @@ function initCVPidPlot() {
         ],
         scales: {
             x:    { time: false, auto: false, range: () => { const w = (cvXTime && cvXTime > 0) ? cvXTime : (xTime || 30); return [-w, 0]; } },
-            amps: { range: (u, mn, mx) => (cvPidAmpsMin !== null && cvPidAmpsMax !== null) ? [cvPidAmpsMin, cvPidAmpsMax] : stableAutoRange(mn, mx, 0.1) },
+            amps: { range: (u, mn, mx) => (cvPidAmpsMin !== null && cvPidAmpsMax !== null) ? [cvPidAmpsMin, cvPidAmpsMax] : stableAutoRange(mn, mx, 0.1, 2) },
         },
         hooks: { draw: [(u) => drawGapMarkers(u)] },
     };
@@ -14894,6 +15066,114 @@ async function silenceAlarm() {
     } catch (e) { diagLog('silence alarm failed:', e); }
 }
 
+// ===== Highs and lows (ignition-cycle watermarks): a "since" time and Reset at the top of each Live Data tab =====
+// The regulator sends each pair's age (CSV2 wmIgn_<name>_age, seconds since its boot or reset) and clears pairs on
+// /get?wmReset=<names> without unlocking. Names: WM_ALL in Xregulator.ino. ids: the page's _hi/_lo spans.
+const WM_INFO = {
+    amps: ['alternator current', 'MeasAmpsID'], altTempF: ['alternator temperature', 'AltTempID'],
+    IBV: ['battery voltage', 'IBVID'], Bcur: ['battery current', 'BCurrID'], SOC: ['state of charge', 'SOC_percentID'],
+    RPM: ['engine speed', 'RPMID'], SOG: ['speed over ground', 'SOGNMEA_ID'], AWS: ['apparent wind', null],
+    TWS: ['true wind', null], heel: ['heel', 'imu_heel_deg_ID'], pitch: ['pitch', 'imu_pitch_deg_ID'],
+    vacc: ['vertical acceleration', 'imu_vertical_accel_g_ID'], baro: ['pressure', 'baroPressureID'],
+    ambient: ['board temperature', 'ambientTempID'], VMGman: ['VMG to bearing', 'VMGNMEA_ID'],
+    VMGup: ['VMG upwind', 'VMGUpwind_ID'], battTempF: ['battery temperature', 'battTempProbe_ID'],
+    extraTempF: ['extra temperature', 'extraTemp_ID'],
+};
+function ampsReadout(x100) {
+    const amps = x100 / 100, abs = Math.abs(amps);
+    return amps.toFixed(abs >= 100 ? 0 : abs >= 10 ? 1 : 2);
+}
+// Each pair's decimals: its live reading's. The regulator sends the pair at the live reading's scale.
+const WM_FIXED = { IBV: [100, 2], SOC: [100, 2], SOG: [100, 2], VMGman: [100, 2], VMGup: [100, 2], heel: [100, 2], pitch: [100, 2],
+    vacc: [1000, 3], baro: [10, 1] };
+const WM_TEMP_X10 = new Set(['altTempF', 'battTempF', 'extraTempF']);
+const WM_JITTER_MS = 30000;   // a start worked out from a later frame's age moves by that frame's delivery delay
+const WM_AFTER_SLACK_MS = 1500;      // ages count whole seconds on both ends, so a frame built just after a reset can read about 1 s old
+const WM_PENDING_MAX_MS = 120000;    // a browser clock that stepped back must not hold a pair cleared for long
+const _wmStart = {};          // name: browser-clock ms the pair started, held against that jitter
+const _wmPending = {};        // name: ms just before a reset the regulator took, until a frame built after it arrives
+const _wmSeen = {};           // name: a high or low has shown this page load (a pair with no sensor gets no time)
+function wmOnCsv2(data) {
+    const now = Date.now();
+    for (const name in WM_INFO) {
+        const hi = 'wmIgn_' + name + '_hi', lo = 'wmIgn_' + name + '_lo';
+        if (Number.isFinite(Number(data[hi])) || Number.isFinite(Number(data[lo]))) _wmSeen[name] = true;
+        const age = Number(data['wmIgn_' + name + '_age']);
+        let start = Number.isFinite(age) && age >= 0 ? now - age * 1000 : NaN;
+        const at = _wmPending[name];
+        if (at !== undefined) {
+            if ((Number.isFinite(start) && start >= at - WM_AFTER_SLACK_MS) || Math.abs(now - at) > WM_PENDING_MAX_MS) delete _wmPending[name];
+            else { data[hi] = NaN; data[lo] = NaN; start = at; }
+        }
+        const held = _wmStart[name];
+        if (Number.isFinite(start) && Number.isFinite(held) && Math.abs(start - held) <= WM_JITTER_MS) start = held;
+        _wmStart[name] = start;
+    }
+    wmRenderRows();
+}
+function wmTimeText(ms) {
+    const d = new Date(ms), t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    return d.toDateString() === new Date().toDateString() ? t : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + t;
+}
+function wmRenderRows() {
+    document.querySelectorAll('.wm-reset-row').forEach(row => {
+        const names = row.dataset.wm.split(',').filter(n => _wmSeen[n] && Number.isFinite(_wmStart[n]));
+        row.hidden = names.length === 0;
+        if (!names.length) return;
+        // the time most of the tab shares, and any pair that started at another (reset from the other app)
+        const byTime = {};
+        names.forEach(n => { const t = wmTimeText(_wmStart[n]); (byTime[t] = byTime[t] || []).push(n); });
+        const times = Object.keys(byTime).sort((a, b) => byTime[b].length - byTime[a].length
+            || Math.max(...byTime[b].map(n => _wmStart[n])) - Math.max(...byTime[a].map(n => _wmStart[n])));
+        const text = 'Highs and lows since ' + times[0] + times.slice(1).map(t =>
+            '; ' + byTime[t].map(n => WM_INFO[n][0]).join(', ') + ' since ' + t).join('');
+        const el = row.querySelector('.wm-since');
+        if (el.textContent !== text) el.textContent = text;
+    });
+}
+document.addEventListener('click', async ev => {
+    const btn = ev.target.closest && ev.target.closest('.wm-reset-btn');
+    if (!btn || btn.disabled) return;
+    // a second tap within 3 s resets, so a stray tap does nothing
+    if (!btn.dataset.armed) {
+        btn.dataset.armed = '1';
+        btn.textContent = 'Tap again to reset';
+        clearTimeout(btn._wmTimer);
+        btn._wmTimer = setTimeout(() => { delete btn.dataset.armed; btn.textContent = 'Reset'; }, 3000);
+        return;
+    }
+    clearTimeout(btn._wmTimer);
+    delete btn.dataset.armed;
+    const names = btn.closest('.wm-reset-row').dataset.wm.split(',');
+    btn.disabled = true;
+    btn.textContent = 'Resetting';
+    let failed = '';
+    const pressedAt = Date.now();
+    try {
+        const r = await fetchWithTimeout(buildURL('/get?wmReset=' + names.join(',')), {}, 10000);
+        const body = (await r.text()).trim();
+        if (!r.ok || body.startsWith('Rejected') || body.startsWith('No message')) failed = 'Could not reset';
+    } catch (e) {
+        diagLog('watermark reset failed:', e);
+        failed = 'No answer from the regulator';
+    }
+    btn.disabled = false;
+    if (failed) {
+        btn.textContent = failed;
+        btn._wmTimer = setTimeout(() => { btn.textContent = 'Reset'; }, 3000);
+        return;
+    }
+    btn.textContent = 'Reset';
+    const now = Date.now();
+    names.forEach(n => {
+        _wmPending[n] = pressedAt;
+        _wmStart[n] = now;
+        const id = WM_INFO[n][1];
+        ['_hi', '_lo'].forEach(sfx => { const el = id && document.getElementById(id + sfx); if (el) el.textContent = '\u2014'; });
+        if (n === 'AWS') ['windGust', 'windLull'].forEach(i => { const el = document.getElementById(i); if (el) el.textContent = '\u2014'; });
+    });
+    wmRenderRows();
+});
 
 async function factoryReset() {
     if (!settingsUnlocked) {
@@ -17143,13 +17423,13 @@ function updateGPSDisplay(lat, lon) {
             source.textContent = '(No GPS — enter coordinates manually below)';
             source.style.color = '#ff6464';
         } else if (manualActive) {
-            source.textContent = '(manual override — sticky, beats boat & phone GPS)';
+            source.textContent = '(manual override — sticky, beats boat & phone/tablet GPS)';
             source.style.color = '#ff9800';
         } else if (src === 1) {
             source.textContent = '(from boat GPS / NMEA2000)';
             source.style.color = 'var(--accent)';
         } else if (src === 2) {
-            source.textContent = '(from phone GPS)';
+            source.textContent = '(from phone/tablet GPS)';
             source.style.color = 'var(--accent)';
         } else {
             source.textContent = '';
@@ -19051,11 +19331,7 @@ window.addEventListener("load", function () {
                         newTextContent = (value / 100).toFixed(1);
                     }
                     else if (key === "MeasuredAmps" || key === "Bcur") {
-                        const amps = value / 100;
-                        const abs = Math.abs(amps);
-                        if (abs >= 100)      newTextContent = amps.toFixed(0);
-                        else if (abs >= 10)  newTextContent = amps.toFixed(1);
-                        else                 newTextContent = amps.toFixed(2);
+                        newTextContent = ampsReadout(value);
                     }
                     else if (["BatteryV", "uTargetAmps", "Ymin2", "Ymax2", "setpointLimited", "pidInput", "pidOutput", "pidError", "Channel3V", "IBV", "VictronVoltage", "vvout", "imu_heel_deg", "imu_pitch_deg", "imu_yaw_rate_dps", "fastOvCurrentCap", "ch1_avg_10s", "ch1_avg_2m", "ch1_avg_at", "ina_avg_10s", "ina_avg_2m", "ina_avg_at", "pf_avg_10s", "pf_avg_2m", "pf_avg_at", "vl_avg_10s", "vl_avg_2m", "vl_avg_at", "BatteryV_raw", "pidAltPV"].includes(key)) {
                         newTextContent = (value / 100).toFixed(2);
@@ -19228,6 +19504,7 @@ window.addEventListener("load", function () {
 
             const data = Object.fromEntries(CSV2_FIELDS.map((key, i) => [key, values[i]]));
             battNaToNaN(data);
+            wmOnCsv2(data);     // before any render: a reset not yet in this frame shows as cleared
             g_lastCsv2 = data;  // cache for the diagnostics snapshot in log exports
             noteStreamRx('csv2');
             renderBattTempDerate();   // live battery temp + applied derate scale arrive on CSV2
@@ -19295,16 +19572,16 @@ window.addEventListener("load", function () {
                     window.currentGpsSource = Number(data.currentGpsSource);
                     const gpsBadge = document.getElementById('gps-source-badge');
                     if (gpsBadge) {
-                        gpsBadge.textContent = ({ 0: 'no GPS', 1: 'NMEA 2000', 2: 'phone app', 3: 'Manual' })[Number(data.currentGpsSource)] ?? '—';
+                        gpsBadge.textContent = ({ 0: 'no GPS', 1: 'NMEA 2000', 2: 'phone/tablet', 3: 'Manual' })[Number(data.currentGpsSource)] ?? '—';
                     }
                 }
                 if (data.currentSpeedSource !== undefined) {
                     window.currentSpeedSource = Number(data.currentSpeedSource);
                 }
                 if (ind && (data.currentGpsSource !== undefined || data.currentTimeSource !== undefined)) {
-                    const gpsLbl  = ({0:'no GPS', 1:'NMEA GPS', 2:'Phone GPS', 3:'Manual'})[Number(data.currentGpsSource)] ?? '?';
-                    const spdLbl  = ({0:'no speed', 1:'NMEA speed', 2:'phone speed'})[Number(data.currentSpeedSource)] ?? '?';
-                    const timeLbl = ({0:'no time', 1:'GPS time', 2:'phone time', 3:'NTP time', 4:'drifting', 5:'estimated'})[Number(data.currentTimeSource)] ?? '?';
+                    const gpsLbl  = ({0:'no GPS', 1:'NMEA GPS', 2:'Phone/tablet GPS', 3:'Manual'})[Number(data.currentGpsSource)] ?? '?';
+                    const spdLbl  = ({0:'no speed', 1:'NMEA speed', 2:'phone/tablet speed'})[Number(data.currentSpeedSource)] ?? '?';
+                    const timeLbl = ({0:'no time', 1:'GPS time', 2:'phone/computer time', 3:'NTP time', 4:'drifting', 5:'estimated'})[Number(data.currentTimeSource)] ?? '?';
                     ind.textContent = gpsLbl + ' · ' + spdLbl + ' · ' + timeLbl;
                     const esp32Src = document.getElementById('esp32TimeSourceID');
                     if (esp32Src) esp32Src.textContent = timeLbl + ' · ' + gpsLbl;
@@ -19487,8 +19764,7 @@ window.addEventListener("load", function () {
                     // Temperature fields (raw integer °F from firmware — convert to display unit)
                     else if (["MaxAlternatorTemperatureF", "temperatureThermistor", "MaxTemperatureThermistor",
                         "ambientTemp", "MaxAlternatorTemperatureF_AllTime", "MaxTemperatureThermistor_AllTime",
-                        "wmIgn_altTempF_hi", "wmIgn_altTempF_lo", "wmIgn_ambient_hi", "wmIgn_ambient_lo",
-                        "wmIgn_battTempF_hi", "wmIgn_battTempF_lo", "wmIgn_extraTempF_hi", "wmIgn_extraTempF_lo"].includes(key)) {
+                        "wmIgn_ambient_hi", "wmIgn_ambient_lo"].includes(key)) {
                         newTextContent = Math.round(toDisplayTemp(value));
                     }
                     // Temperature PID input/setpoint scaled ×100 — convert to display unit
@@ -19623,12 +19899,16 @@ window.addEventListener("load", function () {
                     else if (key.startsWith("safeHours")) {
                         newTextContent = (value / 3600).toFixed(2);
                     }
-                    // Ignition-cycle watermarks sent ×10 (1 decimal): IBV, vertical accel, and both VMG sidebars
-                    else if (key === "wmIgn_IBV_lo" || key === "wmIgn_IBV_hi"
-                          || key === "wmIgn_vacc_lo" || key === "wmIgn_vacc_hi"
-                          || key === "wmIgn_VMGman_lo" || key === "wmIgn_VMGman_hi"
-                          || key === "wmIgn_VMGup_lo" || key === "wmIgn_VMGup_hi") {
-                        newTextContent = (value / 10).toFixed(1);
+                    // Ignition-cycle watermarks, to their live reading's decimals (RPM and ambient are whole, as live)
+                    else if (/^wmIgn_(amps|Bcur)_/.test(key)) {
+                        newTextContent = ampsReadout(value);
+                    }
+                    else if (key.startsWith("wmIgn_") && WM_TEMP_X10.has(key.slice(6, -3))) {
+                        newTextContent = toDisplayTemp(value / 10).toFixed(1);
+                    }
+                    else if (key.startsWith("wmIgn_") && WM_FIXED[key.slice(6, -3)]) {
+                        const [scale, places] = WM_FIXED[key.slice(6, -3)];
+                        newTextContent = (value / scale).toFixed(places);
                     }
                     // Default: display as integer, thousands-separated above 10000
                     else {
@@ -20135,7 +20415,7 @@ window.addEventListener("load", function () {
                 ["nvsFullSaveCount_ID", "nvsFullSaveCount"],
 
                 // Ignition-cycle watermarks — hi/lo spans next to each primary value on the dashboard.
-                // IBV and vacc are sent ×10 and rendered with toFixed(1) in the formatter chain above.
+                // Sent at their live readings' scales; decimals in the formatter chain above (WM_FIXED).
                 ["MeasAmpsID_hi",                "wmIgn_amps_hi"],     ["MeasAmpsID_lo",                "wmIgn_amps_lo"],
                 ["AltTempID_hi",                 "wmIgn_altTempF_hi"], ["AltTempID_lo",                 "wmIgn_altTempF_lo"],
                 ["IBVID_hi",                     "wmIgn_IBV_hi"],      ["IBVID_lo",                     "wmIgn_IBV_lo"],
@@ -21978,7 +22258,7 @@ function showRecoveryOptions() {
     if (IS_CAPACITOR && phoneIsOffline()) {
         // The phone, not the regulator, is the problem — say so instead of sending
         // the user off to power-cycle hardware that is probably fine.
-        addressHint = `This phone reports <b>no network connection</b>. Turn WiFi on, or rejoin the boat's network, and the app will reconnect on its own.`;
+        addressHint = `This phone or tablet reports <b>no network connection</b>. Turn WiFi on, or rejoin the boat's network, and the app will reconnect on its own.`;
     } else if (IS_CAPACITOR) {
         const lastBase = localStorage.getItem('xregDeviceBase') || 'http://alternator.local';
         // The unit name is user text — placeholder here, textContent after insertion.
@@ -21993,7 +22273,7 @@ function showRecoveryOptions() {
     // textContent after insertion (user-editable text, never markup).
     const joinBlock = wifiJoinPlugin() ? `
       <button onclick="joinRegulatorHotspot('recoveryJoinStatus')" style="width:100%; margin-top:10px; background:#2b3f4a; border:1px solid #3f6070; color:#9fd8e8; border-radius:5px; padding:9px 16px; cursor:pointer; font-size:13px;">Join Regulator WiFi</button>
-      <p style="font-size:11px; color:#777; margin:6px 0 0;">Asks this phone to join <b id="recoveryJoinSsid"></b>, the hotspot the regulator broadcasts in access-point mode. Its name and password live under Setup &#9656; System.</p>
+      <p style="font-size:11px; color:#777; margin:6px 0 0;">Asks this phone or tablet to join <b id="recoveryJoinSsid"></b>, the hotspot the regulator broadcasts in access-point mode. Its name and password live under Setup &#9656; System.</p>
       <p id="recoveryJoinStatus" style="font-size:11px; color:#8fd9d3; margin:6px 0 0; min-height:13px;"></p>` : '';
 
     // A boat can carry more than one regulator, and a lost connection is exactly when the app
@@ -22185,13 +22465,14 @@ function drawFuelCurve() {
     if (pts.length < 2) { svg.innerHTML = ''; return; }
 
     const W = 320, H = 110, L = 34, R = 6, T = 8, B = 20;
-    const maxR = pts[pts.length - 1][0] || 1;
+    const maxR = Math.max(pts[pts.length - 1][0], 3000);
     const maxG = Math.max(...pts.map(p => p[1]), 0.1);
     const X = r => L + (r / maxR) * (W - L - R);
     const Y = g => H - B - (g / maxG) * (H - T - B);
 
     let d = `M ${X(0)} ${Y(pts[0][1])} `;          // flat clamp below the first breakpoint
     pts.forEach(p => { d += `L ${X(p[0])} ${Y(p[1])} `; });
+    d += `L ${X(maxR)} ${Y(pts[pts.length - 1][1])}`;   // and above the last, out to the 3000 rpm axis floor
 
     let out = `<line class="fc-grid" x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}"/>`
             + `<line class="fc-grid" x1="${L}" y1="${T}" x2="${L}" y2="${H - B}"/>`
@@ -22801,7 +23082,7 @@ function rwfsOnSettingsEcho(data) {
     if (data.NoRpmCurrentA !== undefined && Number.isFinite(Number(data.NoRpmCurrentA))) rwfsFlags.NoRpmCurrentA = Number(data.NoRpmCurrentA) / 10;
     if (data.IgnoreTemperature !== undefined) rwfsFlags.seen = true;
     const el = document.getElementById('rwfs_status_echo');
-    if (el) { const t = rwfsActiveList().length ? ('Running without: ' + rwfsActiveList().join(', ')) : 'All sensors in use'; if (el.textContent !== t) el.textContent = t; }
+    if (el) { const t = rwfsActiveList().length ? ('Running without: ' + rwfsActiveList().join(', ')) : 'All required sensors in use'; if (el.textContent !== t) el.textContent = t; }
     if (changed && rwfsModalOpen()) rwfsRender(false);
     updateSensorBanner();
 }
@@ -23342,262 +23623,262 @@ function svTargetV() {
     // voltageTarget rides CSV1 into cvPlotCache (÷100 = volts); blank until the stream is up
     const t = (typeof cvPlotCache === 'object' && cvPlotCache && cvPlotCache.voltageTarget != null)
         ? ' (now <b>' + (cvPlotCache.voltageTarget / 100).toFixed(2) + '&nbsp;V</b>)' : '';
-    return 'the active charge target' + t + ' — set on Setup ▸ Battery ▸ Charge Settings, moves with charge stage';
+    return 'the active charge target' + t + ', set on Setup ▸ Battery ▸ Charge Settings, moves with charge stage';
 }
 function svTempSensor() {
     const s = getEchoText('TempSource_echo');
-    if (s === 'Digital') return 'digital one-wire probe (DS18B20) per Temp Source on Setup ▸ Temperature';
+    if (s === 'Digital') return 'digital probe (DS18B20) per Temp Source on Setup ▸ Temperature';
     if (s === 'Thermistor') return 'thermistor per Temp Source on Setup ▸ Temperature';
     return 'digital probe or thermistor, per Temp Source on Setup ▸ Temperature';
 }
 
 // shared source descriptions
-const S_ADS_ALT = 'alternator output current — Hall-effect clamp, read by the external 16-bit ADC (ADS1115 ch&nbsp;1, shared round-robin), new sample about every 13&nbsp;ms (up to ~30&nbsp;ms worst case)';
-const S_INA_I = 'battery current — INA228 shunt monitor, new sample about every 6&nbsp;ms while charging (up to ~18&nbsp;ms worst case)';
-const S_INA_V = 'battery voltage — INA228 bus-voltage register, new sample about every 6&nbsp;ms while charging (up to ~18&nbsp;ms worst case), about once a second with the field off';
-const S_FAST = 'the same alternator Hall clamp, tapped to the ESP32’s own on-chip ADC (GPIO3) at 20,000 samples/s — separate from the ADS1115 slow path';
-const S_RPM_ADS = 'engine speed — tach conditioner voltage on ADS1115 ch&nbsp;2 × RPM scaling factor, new reading about every 40&nbsp;ms (up to ~80&nbsp;ms worst case)';
-const S_DUTY = 'field drive strength (duty cycle) — the regulator’s own PWM command, no sensor involved';
+const S_ADS_ALT = 'alternator output current from the clamp-on current sensor, new reading about every 13&nbsp;ms (up to ~30&nbsp;ms)';
+const S_INA_I = 'battery current from the battery shunt, new reading about every 6&nbsp;ms while charging (up to ~18&nbsp;ms)';
+const S_INA_V = 'battery voltage from the battery monitor chip, new reading about every 6&nbsp;ms while charging (up to ~18&nbsp;ms), about once a second with the field off';
+const S_FAST = 'the same alternator current sensor, read at 20,000 samples per second';
+const S_RPM_ADS = 'engine speed from the tachometer input × RPM Scaling Factor, new reading about every 40&nbsp;ms (up to ~80&nbsp;ms)';
+const S_DUTY = 'field drive strength (duty cycle), the regulator’s command, no sensor involved';
 
-function sIETau() { return 'smoothed with a moving-average low-pass (EMA), time constant ' + svv('IExcessTau_echo', 'ms') + ' — adjustable: the "Averaging Time Constant" field in this Detection section'; }
-function sAltEma() { return 'smoothed with a moving-average low-pass (EMA), time constant ' + svv('altEmaSec_echo', 's') + ' — adjustable: the "Signal smoothing filter" field in this Steady-State Detection group'; }
+function sIETau() { return 'smoothed, time constant ' + svv('IExcessTau_echo', 'ms') + ', set by the "Averaging Time Constant" field in this Detection section'; }
+function sAltEma() { return 'smoothed, time constant ' + svv('altEmaSec_echo', 's') + ', set by the "Signal smoothing filter" field in this Steady-State Detection group'; }
 
 const SINFO = {
     // ── Diag: Oscillation Damper ──
     huntGov: () => [
-        ['Signal', S_DUTY + ' — the applied duty actually written to the field, sampled at a fixed 20&nbsp;samples/s so the analysis band never moves when the control loop cadence changes'],
-        ['Detects', 'a sustained tone in one of six fixed frequency slots from 0.31 to 2.34&nbsp;Hz, measured over a 6.4&nbsp;s window (Goertzel, Hann-weighted). It must beat ' + svv('HuntTrigPct_echo', '%') + ' duty swing AND stand 3× above the other slots, on ' + svv('HuntQualifyScans_echo', '') + ' scans in a row with engine speed steady (within ' + svv('HuntSteadyPct_echo', '%') + ' of where it started), before a test opens. A wobble that keeps the voltage damper (D-term) rhythmically reversing qualifies at a lower duty bar — its rhythm is the evidence'],
-        ['Ignored while', 'open loop, a protection or recovery is acting, any tuning/commissioning routine is running, Manual mode is on, the current target has just moved, or engine speed is drifting — none of those are the plant hunting'],
-        ['Acts on', 'one lever per test. Usually the current loop\'s integral gain (PID Ki): one cut to ' + svv('HuntCutPct_echo', '%') + ' of your setting, then a re-measure. When the D-term is the part swinging, it is paused instead — and switched off entirely across a verified trouble spot, never reduced partway. Verified fixes are mapped by engine speed and applied proactively at that speed from then on, tapering to full gain over ' + svv('HuntWingPct_echo', '%') + ' of speed beyond the trouble spot'],
-        ['Kept only if', 'the wobble shrinks at least ' + svv('HuntVerifyPct_echo', '%') + ', averaged scans before vs after. A failed D-term test rolls straight into the Ki test; only when every lever fails is full strength restored, with no new test for ' + svv('HuntCooldownMin_echo', ' min') + '. The map survives restarts; Clear System erases it'],
-        ['Set', 'the Oscillation Damper switch and its seven settings on Setup ▸ Alternator ▸ Tuning ▸ Current ▸ Controller Parameters, next to the PID Ki it acts on'],
+        ['Signal', S_DUTY],
+        ['Detects', 'a steady swing between 0.31 and 2.34&nbsp;Hz. It must exceed ' + svv('HuntTrigPct_echo', '%') + ' duty swing, on ' + svv('HuntQualifyScans_echo', '') + ' scans in a row with engine speed steady (within ' + svv('HuntSteadyPct_echo', '%') + '), before a test starts'],
+        ['Ignored while', 'a protection, recovery, tuning routine, or commissioning is running, in Manual mode, just after the current target moves, or while engine speed is changing'],
+        ['Acts on', 'one change per test: a cut in the current loop gain (PID Ki) to ' + svv('HuntCutPct_echo', '%') + ' of your setting, or pausing the voltage damper (D term). Confirmed fixes are mapped by engine speed, tapering to full gain over ' + svv('HuntWingPct_echo', '%') + ' of speed beyond the trouble spot'],
+        ['Kept only if', 'the wobble shrinks at least ' + svv('HuntVerifyPct_echo', '%') + '. If every test fails, full strength returns, with no new test for ' + svv('HuntCooldownMin_echo', ' min') + '. The map survives restarts, and Clear System erases it'],
+        ['Set', 'the Oscillation Damper settings on Setup ▸ Alternator ▸ Tuning ▸ Current ▸ Controller Parameters'],
     ],
     // ── Protections: Detection ──
     MaxTableValue: () => [
         ['Signal', S_ADS_ALT],
         ['Compared to', 'derived trip point = this limit + 10&nbsp;A = ' + svv('HardOCTripAmps_echo', 'A') + ', after the debounce below'],
-        ['Filter', 'none — raw; this is the last line of defense'],
+        ['Filter', 'none, this is the last line of defense'],
         ['Set', 'same setting as the Alternator Current Limit on the Tuning tab — editing either updates the trip point'],
     ],
     HardOCDebounceMs: () => [
         ['Signal', S_ADS_ALT],
         ['Role', 'excess above ' + svv('HardOCTripAmps_echo', 'A') + ' must persist this long continuously before the field cut'],
-        ['Filter', 'none — raw'],    ],
+        ['Filter', 'none'],    ],
     ovG1: () => [
-        ['Signal', 'predicted voltage = measured + ' + svv('TdPred_echo', 's') + ' × rate-of-rise (rising only), vs ' + svv('OvPredMarginV_echo', 'V') + ' above target'],
+        ['Signal', 'predicted voltage = measured + ' + svv('TdPred_echo', 's') + ' × rate of rise (rising only), vs ' + svv('OvPredMarginV_echo', 'V') + ' above target'],
         ['Source', S_INA_V + ', unfiltered'],
-        ['Filter', 'only the rate-of-rise is smoothed — moving-average low-pass (EMA), time constant ' + svv('DvdtTC_echo', 'ms') + ' — adjustable: the "dvdt EMA TC" field in this group'],
+        ['Filter', 'only the rate of rise is smoothed, time constant ' + svv('DvdtTC_echo', 'ms') + ', set by the "dvdt EMA TC" field in this group'],
         ['Compared to', svTargetV()],
     ],
     DvdtTC: () => [
-        ['Signal', 'the voltage rate-of-rise feeding Group 1’s prediction'],
-        ['Source', 'successive INA228 bus-voltage samples about 6&nbsp;ms apart (up to ~18&nbsp;ms)'],
-        ['Filter', 'this field IS the filter — moving-average low-pass (EMA) time constant'],    ],
+        ['Signal', 'the voltage rate of rise used by Group 1’s prediction'],
+        ['Source', 'battery voltage readings about 6&nbsp;ms apart (up to ~18&nbsp;ms)'],
+        ['Filter', 'this field is the smoothing time constant'],    ],
     ovG2: () => [
         ['Signal', 'filtered battery voltage vs ' + svv('OvMeasMarginV_echo', 'V') + ' above target'],
         ['Source', S_INA_V],
-        ['Filter', 'averaging (EMA) sized from the commissioned plant response (~10–80 ms) — rejects belt-ripple crests; logged as ovFilt_V in the CV log'],
+        ['Filter', 'smoothing sized from the commissioned alternator response (~10–80 ms), which rejects belt ripple'],
         ['Compared to', svTargetV()],
     ],
     ovTierLo: () => [
-        ['Signal', 'filtered battery voltage vs ' + svv('OvTierLoMarginV_echo', 'V') + ' above target — the same filtered signal Group 2 sheds on'],
+        ['Signal', 'filtered battery voltage vs ' + svv('OvTierLoMarginV_echo', 'V') + ' above target, the same signal Group 2 uses'],
         ['Source', S_INA_V],
-        ['Filter', 'averaging (EMA) sized from the commissioned plant response (~10–80 ms) — a ripple crest dipping back under the line resets the clock instead of accumulating'],
-        ['Trips', 'after ' + svv('OvTierLoDwellMs_echo', 'ms') + ' continuously above the line (0 disables the tier); the proportional shed gets that whole window to resolve the excursion first'],
-        ['Action', 'immediate field cut, with the same escalating re-enable lockout as the instant overvoltage cut'],
+        ['Filter', 'same smoothing as Group 2 (~10–80 ms). A ripple crest dipping back under the line resets the clock'],
+        ['Trips', 'after ' + svv('OvTierLoDwellMs_echo', 'ms') + ' continuously above the line (0 disables the tier), which gives Group 2 that whole time to bring the voltage down'],
+        ['Action', 'immediate field cut, with the same growing re-enable lockout as the instant over-voltage cut'],
         ['Compared to', svTargetV()],
     ],
     ovTierMid: () => [
         ['Signal', 'filtered battery voltage vs ' + svv('OvTierMidMarginV_echo', 'V') + ' above target'],
         ['Source', S_INA_V],
-        ['Filter', 'averaging (EMA) sized from the commissioned plant response (~10–80 ms)'],
-        ['Trips', 'after ' + svv('OvTierMidDwellMs_echo', 'ms') + ' continuously above the line (0 disables the tier) — a faster response to a larger excursion than the low tier'],
-        ['Action', 'immediate field cut, with the same escalating re-enable lockout as the instant overvoltage cut'],
+        ['Filter', 'same smoothing as Group 2 (~10–80 ms)'],
+        ['Trips', 'after ' + svv('OvTierMidDwellMs_echo', 'ms') + ' continuously above the line (0 disables the tier), a faster response to a larger excursion than the low tier'],
+        ['Action', 'immediate field cut, with the same growing re-enable lockout as the instant over-voltage cut'],
         ['Compared to', svTargetV()],
     ],
     hardShutdownV: () => [
-        ['Signal', 'raw per-tick battery voltage vs the absolute ceiling ' + svv('AlternatorHardShutdownV_echo', 'V')],
+        ['Signal', 'raw battery voltage vs the absolute ceiling ' + svv('AlternatorHardShutdownV_echo', 'V')],
         ['Source', S_INA_V + ', unfiltered'],
-        ['Filter', 'none — raw per-tick, armed in every mode including manual; catches fast excursions the filtered tiers ride through'],
-        ['Set', '0.1 V (× system-voltage class / 12) below the Hardware Shutdown Voltage, so software always acts before the hardware backstop'],
+        ['Filter', 'none, armed in every mode including Manual'],
+        ['Set', '0.1 V per 12 V of system voltage below the Hardware Shutdown Voltage'],
     ],
     hwShutdownV: () => [
-        ['Signal', 'battery voltage averaged inside the shunt monitor chip (INA228) vs its programmed limit ' + svv('VoltageHardwareLimit_echo', 'V')],
-        ['Action', 'the chip’s alert pin cuts the field electrically, with no processor involvement — the backstop if software ever hangs. Should never be the rung that fires'],
-        ['Set', '0.2 V (× system-voltage class / 12) below your battery’s BMS charge-disconnect voltage (its highest-cell trip voltage × cell count); for lead-acid and AGM, where connected DC equipment becomes the limiting factor'],
+        ['Signal', 'battery voltage averaged inside the battery monitor chip (INA228) vs its programmed limit ' + svv('VoltageHardwareLimit_echo', 'V')],
+        ['Action', 'the chip’s alert pin cuts the field electrically, with no software involved. Should never be the one that fires'],
+        ['Set', '0.2 V per 12 V of system voltage below the battery BMS charge-disconnect voltage, or for lead-acid and AGM, where connected DC equipment becomes the limit'],
     ],
     // ── CV Tuning: voltage D term (rate-of-rise damping, pre-protection) ──
     cvKd: () => [
-        ['Signal', 'rate of rise of the smoothed battery voltage — the per-tick slope of the Voltage-sensor-filtered signal; logged as cvDSlope_Vps in the CV log'],
+        ['Signal', 'rate of rise of the smoothed battery voltage'],
         ['Source', S_INA_V + ', through the Voltage sensor smoothing filter (Tuning → Plant Delay)'],
-        ['Compared to', 'the deadband line ' + svv('CvKdDeadbandVps_echo', '') + ' + ' + svv('CvKdDbSlope_echo', '') + '·I V/s (clamped ' + svv('CvKdDbFloor_echo', '') + '–' + svv('CvKdDbCeil_echo', 'V/s') + '), evaluated at the commanded current; armed only within ' + svv('CvKdArmV_echo', 'V') + ' below ' + svTargetV()],
-        ['Action', 'once the rate clears the deadband (an on/off gate with hysteresis — re-arms at half), trims the current setpoint by ' + svv('VoltageKd_echo', 'A') + ' per V/s of the FULL rate, recomputed each tick and released when the rate falls back — removes current on a fast rise, and (two-sided) adds current on a fast fall while below target to damp undershoot'],
-        ['Capped at', svv('CvKdMaxTrimA_echo', 'A') + ' — the back-off saturates here so a fast rise never floors the field (that torque step is a real protection\'s job, not the softener\'s)'],
+        ['Compared to', 'the tolerance line ' + svv('CvKdDeadbandVps_echo', '') + ' + ' + svv('CvKdDbSlope_echo', '') + '·I V/s (limited to ' + svv('CvKdDbFloor_echo', '') + '–' + svv('CvKdDbCeil_echo', 'V/s') + '), armed only within ' + svv('CvKdArmV_echo', 'V') + ' below ' + svTargetV()],
+        ['Action', 'once the rate clears the tolerance line, trims the current target by ' + svv('VoltageKd_echo', 'A') + ' per V/s of rise until the rate falls back'],
+        ['Capped at', svv('CvKdMaxTrimA_echo', 'A') + ', so a fast rise never drops the field to its floor'],
     ],
     // ── Live Data ▸ Diag: Overvoltage History (lifetime counters) ──
     ovtSoft: () => [
         ['Signal', 'filtered battery voltage vs ' + svv('OvMeasMarginV_echo', 'V') + ' above ' + svTargetV()],
-        ['Action', 'the current command is tapered down in proportion to the excess (35 A per volt) — no field cut, nothing felt at the engine'],
-        ['Counts', 'each engagement of that taper (rising edge). It engages routinely during normal regulation, so a large lifetime count is expected and healthy'],
+        ['Action', 'current is tapered down in proportion to the excess (35 A per volt), with no field cut and nothing felt at the engine'],
+        ['Counts', 'each engagement. It engages routinely during normal regulation, so a large lifetime count is expected'],
         ['Sources', 'any charge source can push the bus voltage here — alternator, solar, or shore'],
     ],
     ovtSwHard: () => [
-        ['Signal', 'raw per-tick battery voltage vs the hard-shutdown ceiling (AlternatorHardShutdownV) = ' + svv('AlternatorHardShutdownV_echo', 'V')],
-        ['Action', 'instant field cut plus an escalating re-enable delay (adaptive lockout). Compares the unfiltered per-tick sample, armed in every mode — and its threshold sits below the hardware comparator, so software always gets first shot'],
-        ['Counts', 'each cut (rising edge), lifetime — survives restarts; the Protections tab twin is per-session'],
-        ['Sources', 'counts bus-voltage excursions from any charge source (alternator, solar, shore), not just the alternator'],
+        ['Signal', 'raw battery voltage vs Alternator Hard Shutdown Voltage = ' + svv('AlternatorHardShutdownV_echo', 'V')],
+        ['Action', 'instant field cut plus a growing re-enable delay. Armed in every mode, and set below the hardware shutdown so software acts first'],
+        ['Counts', 'each cut, lifetime, survives restarts'],
+        ['Sources', 'any charge source (alternator, solar, shore), not just the alternator'],
     ],
     ovtIna: () => [
-        ['Signal', 'battery voltage averaged inside the shunt monitor chip (INA228 SLOW_ALERT — a few ms in the fast charging mode) vs the Hardware Shutdown Voltage'],
-        ['Action', 'the chip’s alert pin cuts the field electrically, with no processor involvement — the backstop if software hangs. Sustained trips are latched by firmware; a pin blip that clears before the 250 ms status poll still cuts the field but may not be logged'],
-        ['Counts', 'each logged hardware trip (rising edge), lifetime. Its threshold sits above every software rung, so software should always act first — a nonzero count here means software failed to protect: a red flag worth reporting'],
+        ['Signal', 'battery voltage averaged inside the battery monitor chip (INA228) vs the Hardware Shutdown Voltage'],
+        ['Action', 'the chip’s alert pin cuts the field electrically, with no software involved. A very brief trip still cuts the field but may not be logged'],
+        ['Counts', 'each logged hardware trip, lifetime. It sits above every software cut, so a nonzero count means software failed to protect and is worth reporting'],
         ['Sources', 'any charge source can push the bus voltage here — alternator, solar, or shore'],
     ],
     iexG3: () => [
         ['Signal', 'smoothed excess of alternator current over the live current command'],
         ['Source', S_ADS_ALT],
         ['Filter', sIETau()],
-        ['Armed', 'whenever charging with test protections on — strict near-target regime inside the Strict Band, looser bulk regime below it'],
+        ['Armed', 'whenever charging with test protections on, strict inside the Strict Band, looser below it'],
     ],
     IExcessArmMarginV: () => [
         ['Signal', 'battery voltage vs (target − this band)'],
         ['Source', S_INA_V + ', unfiltered'],
-        ['Role', 'picks which detector regime is armed: inside the band = strict near-target detector, below it = looser bulk detector'],
+        ['Role', 'picks which check is armed: strict inside the band, looser below it'],
         ['Compared to', svTargetV()],
     ],
     IExcessFrac: () => [
         ['Signal', 'smoothed current excess vs the trip line (' + svv('IExcessFrac_echo', '%') + ' of command + ' + svv('IExcessBaseA_echo', 'A') + ' base), clamped to the Floor / Ceiling'],
-        ['Source', S_ADS_ALT + ' — near-target regime, picked by the Strict Band'],
+        ['Source', S_ADS_ALT + ', near-target check, picked by the Strict Band'],
         ['Filter', sIETau()],    ],
     IExcessFracBulk: () => [
         ['Signal', 'smoothed alternator-current excess vs the trip line (' + svv('IExcessFrac_echo', '%') + ' of ceiling + ' + svv('IExcessBaseA_echo', 'A') + ' base + ' + svv('IExcessCcOffsetA_echo', 'A') + ' CC offset)'],
-        ['Ceiling', 'RPM-table cap (auto-learned table, Setup ▸ Alternator) minus any thermal / warm-up derate, never above the Command Limit'],
+        ['Ceiling', 'RPM table limit minus any temperature or warm-up reduction, never above the Command Limit'],
         ['Source', S_ADS_ALT],
         ['Filter', sIETau()],
     ],
     IExcessFloorA: () => [
         ['Role', 'lower bound (amps) on both alternator trip lines (CV and CC)'],
         ['Signal context', S_ADS_ALT],
-        ['Set', 'operator-owned — never auto-written by commissioning; size it with the ripple plot below (measured in Commissioning ▸ Step 5)'],
+        ['Set', 'by you, never by commissioning. Size it with the ripple plot below (measured in Commissioning ▸ Step 5)'],
     ],
     IExcessCeilA: () => [
         ['Role', 'upper bound (amps) on both alternator trip lines (CV and CC)'],
         ['Signal context', S_ADS_ALT],    ],
     BattCurrentLimitA: () => [
         ['Role', 'ceiling, not a trip: the alternator command is capped at this limit + the measured house-load draw, so the battery never receives more than this'],
-        ['Load offset', 'EMA of (alternator current − battery current), ~0.25 s — clamped ≥ 0 so estimate noise can only lower the ceiling'],
-        ['Source', S_INA_I + ' — requires the INA228 shunt; 0 = disabled'],
+        ['Load offset', 'measured loads (alternator current minus battery current, averaged over about 0.25 s), which can only lower the ceiling'],
+        ['Source', S_INA_I + ', requires the battery shunt, 0 disables'],
     ],
     ripPlotAlt: () => [
         ['Threshold lines', 'recomputed live from the threshold / floor / ceiling fields above'],
-        ['Ripple line', 'alternator ripple measured during Commissioning ▸ Step 5 (current check), filtered with the same EMA the detectors use (τ = ' + svv('IExcessTau_echo', 'ms') + ' — the "Averaging Time Constant" field above) so it is detector-eye ripple; fixed until Step 5 is re-run'],
+        ['Ripple line', 'alternator ripple measured during Commissioning ▸ Step 5, smoothed the same way as the detectors (' + svv('IExcessTau_echo', 'ms') + ', the "Averaging Time Constant" field above). Fixed until Step 5 is re-run'],
         ['Source', S_ADS_ALT],
     ],
     IExcessTau: () => [
-        ['Role', 'this field IS the filter — moving-average low-pass (EMA) time constant on the detector’s excess signal (both regimes)'],
-        ['Also used by', 'the measured-ripple capture (Setup ▸ Diag ▸ Ripple Capture) and the commissioning ripple fit, so the ripple plots stay comparable to what the detectors see. Changing it changes those measurements too.'],    ],
+        ['Role', 'this field is the smoothing time constant on the detector signal'],
+        ['Also used by', 'the ripple capture (Setup ▸ Diag ▸ Ripple Capture) and the commissioning ripple measurement. Changing it changes those measurements too'],    ],
     IExcessRelFrac: () => [
-        ['Signal', 'the same smoothed excess (EMA, τ = ' + svv('IExcessTau_echo', 'ms') + ' — the "Averaging Time Constant" field above) vs ' + svv('IExcessRelFrac_echo', '%') + ' of the threshold, for re-arm'],    ],
+        ['Signal', 'the same smoothed excess vs ' + svv('IExcessRelFrac_echo', '%') + ' of the threshold, for re-arm'],    ],
     loadDump: () => [
-        ['Signal', 'rate-of-change of battery current, computed on every new sample'],
+        ['Signal', 'rate of change of battery current'],
         ['Source', S_INA_I],
-        ['Filter', 'none — raw per-sample derivative (a filtered edge would be missed)'],
-        ['Trips', 'when a tier’s set number of consecutive samples all exceed its threshold — a sample is one battery-current reading, about every 6 ms (up to ~18 ms worst case); the output is cut at the next control update, about 13 ms apart (up to ~30 ms worst case); a single sample below resets that tier’s run'],
-        ['Armed', 'whenever charging with fast battery reads — even when test protections are disabled; only the Group 5 Enable toggle disarms it'],    ],
+        ['Filter', 'none, since a filtered edge would be missed'],
+        ['Trips', 'when a tier’s set number of readings in a row all exceed its threshold. A reading comes about every 6 ms (up to ~18 ms), and the output is cut at the next control update, about 13 ms apart (up to ~30 ms)'],
+        ['Armed', 'whenever charging, even with test protections disabled. Only the Group 5 Enable toggle disarms it'],    ],
     // ── Protections: Response ──
     KHard: () => [
-        ['Acts on', 'the current cap — trimmed by ' + svv('KHard_echo', 'A') + ' per volt of overshoot, recomputed from the live overshoot every control tick'],
-        ['Overshoot signal', 'Group 1 predicted / Group 2 measured battery voltage (INA228 bus register)'],    ],
+        ['Acts on', 'the current limit, trimmed by ' + svv('KHard_echo', 'A') + ' per volt of overshoot'],
+        ['Overshoot signal', 'Group 1 predicted or Group 2 measured battery voltage'],    ],
     IExcessKBleed: () => [
-        ['Acts on', 'the voltage-loop integrator, once at the instant the Group 3 detector fires; the amount scales with the smoothed excess (EMA, τ = ' + svv('IExcessTau_echo', 'ms') + ' — the "Averaging Time Constant" field in Detection)'],    ],
+        ['Acts on', 'the voltage loop’s stored current, once when the Group 3 detector fires, in proportion to the smoothed excess'],    ],
     AwBleedRate: () => [
-        ['Acts on', 'the voltage-loop integrator while any protection is clamping'],
+        ['Acts on', 'the voltage loop’s stored current while any protection is limiting'],
         ['Effective rate', (function () { const r = parseFloat(getEchoText('AwBleedRate_echo')), m = parseFloat(getEchoText('MaxTableValue_echo')); return svv('AwBleedRate_echo') + ' × Command Limit ' + svv('MaxTableValue_echo', 'A') + (isFinite(r) && isFinite(m) ? ' = <b>' + (r * m).toFixed(0) + '&nbsp;A/s</b>' : ''); })()],    ],
     // ── Protections: Recovery ──
     cvRecovKiMax: () => [
-        ['Acts on', 'the voltage loop’s stored current memory (its integrator) after every protection has released, while Recovery Refill is on'],
-        ['Effective rate', 'up to ' + svv('cvRecovKiMax_echo', '×') + ' the integrator’s normal rebuild rate at the moment of release, tapering back to 1× as the memory refills'],
-        ['Paced by', 'live voltage error (' + S_INA_V + ' vs target) — the boost multiplies the normal error-driven rebuild, so it never pushes at/above target and pauses while the derivative brake or anti-windup holds the loop down'],
-        ['Ceiling', 'the current that held the target before the event — commanding more on the way back can only overshoot'],
+        ['Acts on', 'the voltage loop’s stored current after every protection has released, while Recovery Refill is on'],
+        ['Effective rate', 'up to ' + svv('cvRecovKiMax_echo', '×') + ' the normal rebuild rate at release, tapering back to 1× as it refills'],
+        ['Paced by', 'voltage error, so it never pushes at or above target'],
+        ['Ceiling', 'the current that held the target before the event'],
     ],
     fastRise: () => [
-        ['Acts on', 'the current-setpoint slew after a protection releases'],
+        ['Acts on', 'how fast the current target rises after a protection releases'],
         ['Effective rate', (function () { const x = parseFloat(getEchoText('FastSetpointRiseRate_echo')), b = parseFloat(getEchoText('SetpointRiseRate_echo')); return svv('FastSetpointRiseRate_echo', '×') + ' the normal Setpoint Rise Rate ' + svv('SetpointRiseRate_echo', 'A/s') + ' (set on Tuning ▸ Current)' + (isFinite(x) && isFinite(b) ? ' = <b>' + (x * b).toFixed(0) + '&nbsp;A/s</b>' : ''); })()],
-        ['Gate', 'battery voltage (INA228, unfiltered) below target − ' + svv('FastSetpointRiseHeadroomV_echo', 'V') + ', capped at ' + svv('FastSetpointRiseWindowMs_echo', 'ms')],
+        ['Condition', 'battery voltage below target − ' + svv('FastSetpointRiseHeadroomV_echo', 'V') + ', for at most ' + svv('FastSetpointRiseWindowMs_echo', 'ms')],
         ['Compared to', svTargetV()],
     ],
     // ── Setup ▸ Diag: C1+C2 fast channel ──
     faDrift: () => [
-        ['Signal', 'the fast channel’s own current, smoothed by a 300&nbsp;ms moving-average low-pass (EMA — hardcoded in firmware, not adjustable), judged across each 0.5&nbsp;s capture window (also hardcoded)'],
-        ['Source', S_FAST + ' (16-sample average → 1,250/s stream)'],
-        ['Gates', 'both the anomaly detector’s arming (C1) and the map folds (C2): window rejected when drift exceeds the larger of the floor or the slope % of the window’s mean current'],    ],
+        ['Signal', 'the fast channel’s current, smoothed over 300&nbsp;ms, judged across each 0.5&nbsp;s measurement'],
+        ['Source', S_FAST],
+        ['Applies to', 'both fault detection and the ripple map. A measurement is rejected when drift exceeds the larger of the floor or the slope % of its mean current'],    ],
     faAtten: () => [
-        ['Signal', S_ADS_ALT + ' (the authoritative slow reading — not the fast channel itself), with a 5&nbsp;s dwell (hardcoded in firmware)'],
-        ['Acts on', 'the on-chip ADC’s input range on GPIO3: sensitive (6&nbsp;dB) below the switch-down value, high-range (12&nbsp;dB) above the switch-up value; the switch lands on a window boundary'],    ],
+        ['Signal', S_ADS_ALT + ', with a 5&nbsp;s delay'],
+        ['Acts on', 'the input range of the fast channel: sensitive below the switch-down value, high-range above the switch-up value'],    ],
     // ── Setup ▸ Diag: C2 map-only gates ──
     faRpmEdgeMargin: () => [
-        ['Signal', S_RPM_ADS + ', smoothed by a 1&nbsp;s moving-average low-pass (EMA — hardcoded in firmware, not adjustable)'],
-        ['Gate', 'the whole 0.5&nbsp;s window must stay inside one 50-RPM bin with at least this margin to both edges — map folds only, never detector arming'],
-        ['Auto-relaxed', 'during the commissioning map bootstrap this gate is loosened automatically'],
+        ['Signal', S_RPM_ADS + ', smoothed over 1&nbsp;s'],
+        ['Condition', 'the whole 0.5&nbsp;s measurement must stay inside one 50-RPM band with at least this margin to both edges. Ripple map only'],
+        ['Auto-relaxed', 'during the commissioning map step this check is loosened automatically'],
     ],
     faPeakMinA: () => [
-        ['Signal', 'each detected tone’s amplitude from the spectrum (FFT) of a 0.5&nbsp;s window (hardcoded) of the 1,250/s stream'],
+        ['Signal', 'each detected tone’s size from a 0.5&nbsp;s measurement'],
         ['Source', S_FAST],
     ],
     // ── Setup ▸ Diag: C3 steadiness bands ──
     altBandRpm: () => [
         ['Signal', S_RPM_ADS],
         ['Filter', sAltEma()],
-        ['Gate', 'stay within the wobble limit of the straight line drawn through the window, with that line no steeper than the rate limit — all five signals (RPM, duty, voltage, amps, temperature) must pass at once before a point records. The line may climb or fall, so a smooth pull away from idle records'],    ],
+        ['Condition', 'stay within the wobble limit of a straight line through the window, with that line no steeper than the rate limit. All five signals (RPM, duty, voltage, amps, temperature) must pass at once'],    ],
     altBandDuty: () => [
         ['Signal', S_DUTY],
         ['Filter', sAltEma()],
-        ['Gate', 'stay within the wobble limit of its own straight line AND drift no faster than the rate limit — one of the five signals that must all pass at once'],    ],
+        ['Condition', 'stay within the wobble limit of its straight line and drift no faster than the rate limit, one of five signals that must pass at once'],    ],
     altBandVbus: () => [
         ['Signal', S_INA_V],
-        ['Filter', sAltEma() + ', then held back by the output lead so it is paired with the engine speed that produced it'],
-        ['Gate', 'plain highest-minus-lowest spread across the window, no line fitted — one of the five signals that must all pass at once'],    ],
+        ['Filter', sAltEma() + ', then delayed by the output lead to pair it with engine speed'],
+        ['Condition', 'plain highest-minus-lowest spread across the window, one of five signals that must pass at once'],    ],
     altBandTemp: () => [
         ['Signal', 'alternator temperature — ' + svTempSensor()],
-        ['Filter', 'none — judged raw, deliberately unsmoothed (thermal mass is its own filter)'],
-        ['Gate', 'plain highest-minus-lowest spread over a look-back of this length, no line fitted. The look-back runs continuously while the engine does, so a dip in output no longer restarts it. Full steady runs need the whole window; the This-Session tier automatically uses half of it (' + (function () { const v = parseFloat(getEchoText('altThermSec_echo')); return isFinite(v) ? '<b>' + (v / 2).toFixed(0) + '&nbsp;s</b>' : 'half the window'; })() + ')'],    ],
+        ['Filter', 'none'],
+        ['Condition', 'plain highest-minus-lowest spread over a look-back of this length. Full steady runs need the whole window, and This Session uses half of it (' + (function () { const v = parseFloat(getEchoText('altThermSec_echo')); return isFinite(v) ? '<b>' + (v / 2).toFixed(0) + '&nbsp;s</b>' : 'half the window'; })() + ')'],    ],
     altBandAmps: () => [
         ['Signal', S_ADS_ALT],
-        ['Filter', sAltEma() + ', then held back by the output lead so it is paired with the engine speed that produced it'],
-        ['Gate', 'stay within the larger of the % of reading or the floor, measured from its own straight line — while the engine sweeps smoothly the output ramps smoothly with it, and that is the pair worth recording'],
-        ['Rate', 'that line may not be steeper than the larger of the rate limit (% of reading per second) or its floor. This is the setting that bounds how far a record taken on the move can drift: the output pairing is never exact, and what a residual error costs is that error multiplied by the ramp rate'],    ],
+        ['Filter', sAltEma() + ', then delayed by the output lead to pair it with engine speed'],
+        ['Condition', 'stay within the larger of the % of reading or the floor, measured from a straight line'],
+        ['Rate', 'that line may be no steeper than the larger of the rate limit (% of reading per second) or its floor'],    ],
     altEmaSec: () => [
-        ['Role', 'this field IS the filter — an interval-aware moving-average low-pass (EMA) on RPM, field duty, voltage, and amps before their steadiness limits are judged; temperature is deliberately excluded'],    ],
+        ['Role', 'this field is the smoothing time constant on RPM, field duty, voltage, and amps. Temperature is not smoothed'],    ],
     altLead: () => [
-        ['Signals', 'alternator amps (ADS1115 Hall clamp) and bus voltage (INA228), both delayed by this much before being paired with engine speed, field duty and temperature'],
-        ['Why', 'output answers where the engine is heading, not where it has been. Measured on held-field speed sweeps 2026-09-08: uncorrected, an accelerating pass reads 2–4&nbsp;A high against a decelerating pass at the same indicated speed; corrected, the two agree to 0.1–0.6&nbsp;A'],
-        ['Resolution', 'rounded to the detector\u2019s own tenth-of-a-second tick, and capped at 1&nbsp;s'],    ],
+        ['Signals', 'alternator amps and bus voltage, both delayed by this much before being paired with engine speed, field duty, and temperature'],
+        ['Why', 'output leads the speed reading. Measured on held-field speed sweeps: uncorrected, an accelerating pass reads 2–4&nbsp;A high against a decelerating pass at the same speed. Corrected, the two agree to 0.1–0.6&nbsp;A'],
+        ['Resolution', 'rounded to a tenth of a second, capped at 1&nbsp;s'],    ],
     altMinRun: () => [
-        ['Signal', 'the combined verdict of all five signals (RPM, field duty, voltage, amps, temperature) — a qualifying run shorter than this never emits a point'],    ],
+        ['Signal', 'all five signals together (RPM, field duty, voltage, amps, temperature). A qualifying run shorter than this never records a point'],    ],
     altAdmit: () => [
-        ['Signals', 'smoothed alternator amps (ADS1115 Hall clamp) and smoothed field duty (PWM command)'],
+        ['Signals', 'smoothed alternator amps and smoothed field duty'],
         ['Filter', sAltEma()],    ],
     altFit: () => [
-        ['Acts on', 'the best-ever reference surface and its locally-weighted fit (LWLR)'],
-        ['Fit inputs', 'smoothed RPM, excitation (derived from field duty / voltage / temperature, expressed for a 12&nbsp;V field winding so every Field Winding Voltage reads on one scale), vs the recorded points'],
-        ['Prune k', 'stored on the device but applied cloud-side by the prune job'],
+        ['Acts on', 'the best-ever reference and its local fit'],
+        ['Fit inputs', 'smoothed RPM and field strength (from field duty, voltage, and temperature), vs the recorded points'],
+        ['Prune k', 'stored on the regulator, applied in the cloud'],
     ],
     altHiField: () => [
-        ['Signals', 'smoothed field duty (PWM command) at or above ' + svv('altHiFieldPct_echo', '%') + ' of the alternator\'s field ceiling (the lower of Max Field % and the duty Max Field Volts works out to) AND smoothed alternator amps (ADS1115) at or below ' + svv('altLowOutAmps_echo', 'A') + ' for ' + svv('altHiFieldSec_echo', 's')],
+        ['Signals', 'smoothed field duty at or above ' + svv('altHiFieldPct_echo', '%') + ' of the field ceiling (the lower of Max Field % and the duty Max Field Volts works out to) and smoothed alternator amps at or below ' + svv('altLowOutAmps_echo', 'A') + ' for ' + svv('altHiFieldSec_echo', 's')],
         ['Filter', sAltEma()],
-        ['Role', 'advisory readout only — no audible alarm, no field action'],    ],
+        ['Role', 'readout only, no alarm and no field action'],    ],
     // ── Setup ▸ Diag: C4 measured-ripple capture ──
     ripWinMs: () => [
-        ['Signals', 'battery current (INA228 shunt, a sample about every 6&nbsp;ms while charging, up to ~18&nbsp;ms) + alternator current (ADS1115 Hall clamp, about every 13&nbsp;ms, up to ~30&nbsp;ms) + engine speed (ADS1115 ch&nbsp;2, about every 40&nbsp;ms, up to ~80&nbsp;ms)'],
-        ['Filter', 'the same EMA the over-current detectors use — τ = ' + svv('IExcessTau_echo', 'ms') + ', set as "Averaging Time Constant" on Setup ▸ Alternator ▸ Protections'],
-        ['Recorded value', 'the smaller of the two half-window peak-to-peaks'],
-        ['Consumed by', 'Commissioning ▸ Step 5 current check and the RPM-table game'],
+        ['Signals', 'battery current (about every 6&nbsp;ms while charging, up to ~18&nbsp;ms), alternator current (about every 13&nbsp;ms, up to ~30&nbsp;ms), and engine speed (about every 40&nbsp;ms, up to ~80&nbsp;ms)'],
+        ['Filter', 'the same smoothing the over-current detectors use, ' + svv('IExcessTau_echo', 'ms') + ', set as "Averaging Time Constant" on Setup ▸ Alternator ▸ Protections'],
+        ['Recorded value', 'the smaller of the two half-window peak-to-peak swings'],
+        ['Used by', 'Commissioning ▸ Step 5 current check and the RPM table'],
     ],
     ripDriftFloorA: () => [
-        ['Signals', 'the two half-window averages of each sensor (alternator ADS1115, battery INA228, plus RPM with its own fixed floor), and the travel of the current command'],
-        ['Command', 'the slewed current setpoint — internal, no sensor'],    ],
+        ['Signals', 'the two half-window averages of each sensor, and the travel of the current command'],
+        ['Command', 'the current target, no sensor'],    ],
     ripDriftPct: () => [
-        ['Signal', 'travel of the current command only — the slewed internal setpoint, no sensor; the sensor gates self-scale instead (see the floor)'],    ],
+        ['Signal', 'travel of the current command only. The sensor checks scale automatically (see the floor)'],    ],
 };
 
 function drawPidWatermark(u) {
@@ -23794,7 +24075,7 @@ function initPidTuningPlot() {
                 // Default auto (NOT auto:false): uPlot only passes fresh data min/max when the scale is auto, which
                 // auto-fit needs. Manual returns firmware yyMin/yyMax; lock pins the frozen range.
                 range: (u, mn, mx) => pidAmpsLock ? pidAmpsLock
-                    : (pidAmpsAuto ? stableAutoRange(mn, mx, 0.1) : [yyMin, yyMax])
+                    : (pidAmpsAuto ? stableAutoRange(mn, mx, 0.1, 2) : [yyMin, yyMax])
             },
             duty: {
                 auto: false,
@@ -25389,8 +25670,8 @@ function renderThermalPlot1(data, tMin) {
         scales: {
             x: thermalXScale(),
             // null manual range = auto-fit (default); a typed range pins the axis
-            temp: { range: (u, mn, mx) => thermalY.p0.temp || stableAutoRange(mn, mx, 0.1) },
-            amps: { range: (u, mn, mx) => thermalY.p0.amps || stableAutoRange(mn, mx, 0.1) }
+            temp: { range: (u, mn, mx) => thermalY.p0.temp || stableAutoRange(mn, mx, 0.1, 10) },
+            amps: { range: (u, mn, mx) => thermalY.p0.amps || stableAutoRange(mn, mx, 0.1, 10) }
         },
         axes: [
             { label: 'Minutes Ago', grid: { show: true } },
@@ -25458,7 +25739,7 @@ function renderThermalPlot2(data, tMin) {
         scales: {
             x: thermalXScale(),
             // null manual range = auto-fit (default); a typed range pins the axis
-            amps: { range: (u, mn, mx) => thermalY.p2.amps || stableAutoRange(mn, mx, 0.1) }
+            amps: { range: (u, mn, mx) => thermalY.p2.amps || stableAutoRange(mn, mx, 0.1, 2) }
         },
         axes: [
             { label: 'Minutes Ago', grid: { show: true } },
@@ -25803,12 +26084,12 @@ function windLiveOnCsv2(data) {
     else _windWmGale = 'Gale ' + Math.floor(gm / 60) + 'h ' + (gm % 60 < 10 ? '0' : '') + (gm % 60) + 'm';
 
     // Dial-card readouts: Beaufort badge + gust/lull (ignition-cycle apparent-wind hi/lo,
-    // whole knots) + live true wind dir/spd. All real CSV2/cache fields; show — when absent.
+    // knots ×100) + live true wind dir/spd. All real CSV2/cache fields; show — when absent.
     const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
     setTxt('windBeaufort', _windWmBeaufort || '—');
     const gust = Number(data.wmIgn_AWS_hi), lull = Number(data.wmIgn_AWS_lo);
-    setTxt('windGust', Number.isFinite(gust) && gust > 0 ? gust + ' kt' : '—');
-    setTxt('windLull', Number.isFinite(lull) && lull >= 0 ? lull + ' kt' : '—');
+    setTxt('windGust', Number.isFinite(gust) && gust > 0 ? (gust / 100).toFixed(1) + ' kt' : '—');
+    setTxt('windLull', Number.isFinite(lull) && lull >= 0 ? (lull / 100).toFixed(1) + ' kt' : '—');
     setTxt('windTrueDir', Number.isFinite(_windCsv1.tDir) ? Math.round(_windCsv1.tDir) + '°' : '—');
     setTxt('windTrueSpd', Number.isFinite(_windCsv1.tSpd) ? _windCsv1.tSpd.toFixed(1) + ' kt' : '—');
 
@@ -25892,8 +26173,8 @@ function windTrendRender() {
         scales: {
             x: { time: false, auto: false, min: -windWindowMin, max: 0, range: (u, mn, mx) => [mn, mx] },   // pass-through fn, not a fixed array (see thermalXScale): the array overrode setScale and killed drag-zoom
             // null manual range = auto-fit (default); a typed/locked range pins the axis
-            dir: { range: (u, mn, mx) => windY.dir || stableAutoRange(mn, mx, 0.18) },
-            spd: { range: (u, mn, mx) => windY.spd || (mn == null ? [0, 5] : stableAutoRange(Math.min(0, mn), mx, 0.15)) }
+            dir: { range: (u, mn, mx) => windY.dir || stableAutoRange(mn, mx, 0.18, 30) },
+            spd: { range: (u, mn, mx) => windY.spd || stableAutoRange(mn, mx, 0.15, 10, true) }
         },
         axes: [
             { label: 'Minutes Ago', grid: { show: true } },
@@ -27373,8 +27654,15 @@ function tuningToggleTest() {
 function _startTuningSweepNow() {
     const statusEl = document.getElementById('tuning-sweep-status');
     fetch(buildURL("/get?startTuningSweep=1"))
-        .then(r => {
-            if (!r.ok) { if (statusEl) statusEl.textContent = 'Start failed (HTTP ' + r.status + ')'; return; }
+        .then(async r => {
+            if (!r.ok) {
+                // Nothing will run, so disarm rather than leave Stop Test up over an idle generator.
+                const why = (r.status === 422 && await r.text().catch(() => '')) || ('Start failed (HTTP ' + r.status + ')');
+                tuningModeSend(0);
+                _setTestBtnRunning(false);
+                if (statusEl) statusEl.textContent = why;
+                return;
+            }
             if (statusEl) statusEl.textContent = 'Sweep running…';
             _setTestBtnRunning(true);
             const bsec = document.getElementById('tuning-bode-section'); if (bsec) bsec.style.display = 'none';
@@ -27724,24 +28012,25 @@ function confirmSystemIDStart() {
     const formData = new URLSearchParams();
     formData.append("startSystemID", "1");
 
-    fetchWithTimeout(buildURL("/get?" + formData.toString()), {}, 8000)
-        .then(() => {
-            console.log("SystemID test requested");
-            sysidShowScreen('progress');
-            sysidLastPhase = -1;
-            sysidPhaseStartWall = Date.now();
-            sysidStartProgressPoll();
-            // Switch to Plots tab so user can watch the current waveform during the test.
-            if (vesselInfoComplete) {
-                showMainTab('plots');
-                // On a phone, auto-minimize to the progress pill so the waveform is
-                // visible by default; it auto-expands again when results land.
-                if (window.innerWidth <= 600) sysidMinimize();
-            }
-        })
-        .catch(err => {
-            xAlert("Failed to send start command: " + err);
-        });
+    return deviceCommand(formData.toString(), 8000).then(ok => {
+        if (!ok) {   // refused: back to the checks this press came from, not a progress screen for a test that is not running
+            sysidUpdatePreflight();
+            if (!sysidPreflightInterval) sysidPreflightInterval = setInterval(sysidUpdatePreflight, 1000);
+            return;
+        }
+        console.log("SystemID test requested");
+        sysidShowScreen('progress');
+        sysidLastPhase = -1;
+        sysidPhaseStartWall = Date.now();
+        sysidStartProgressPoll();
+        // Switch to Plots tab so user can watch the current waveform during the test.
+        if (vesselInfoComplete) {
+            showMainTab('plots');
+            // On a phone, auto-minimize to the progress pill so the waveform is
+            // visible by default; it auto-expands again when results land.
+            if (window.innerWidth <= 600) sysidMinimize();
+        }
+    });
 }
 
 function abortSystemIDTest() {
@@ -28548,10 +28837,11 @@ function cxAdvance(markDone = true) {
     const cur = cx.phase, nx = cxNextSelected(cur);
     const done = markDone ? cxGet('commissionStageDone=' + cur) : Promise.resolve();
     // The session marks follow the device's: a refused or lost mark stays on this step, so Next can be pressed again.
-    done.then(() => {
+    return done.then(() => {
         if (markDone && cx.handled) delete cx.handled[cur];   // measured now — drop any earlier skip/manual note for this session
         cxPassStage(cur, markDone ? 'done' : 'pass');
-        if (nx === -1) cxFinish(); else cxGoto(nx);
+        if (nx === -1) return cxFinish();
+        cxGoto(nx);
     }).catch(e => { xAlert('This step could not be marked done: ' + e + '. Nothing moved on; try again.'); commissionRender(); });
 }
 // Shared Next/Finish button, emitted only once the step's action is done. markDone is passed to cxAdvance;
@@ -28577,10 +28867,10 @@ function cxApplyRunBtn(applyFn, clean) {
 // cxAdvance(true) plus an immediate start of the next stage's test.
 function cxAdvanceRun() {
     const cur = cx.phase, nx = cxNextSelected(cur);
-    cxGet('commissionStageDone=' + cur).then(() => {
+    return cxGet('commissionStageDone=' + cur).then(() => {
         if (cx.handled) delete cx.handled[cur];   // measured now — drop any earlier skip/manual note for this session
         cxPassStage(cur, 'done');
-        if (nx === -1) { cxFinish(); return; }
+        if (nx === -1) return cxFinish();
         cxGoto(nx);
         if (CX_AUTORUN[nx] && !cxDriveOffReason()) CX_AUTORUN[nx]();
     }).catch(e => { xAlert('The values were applied, but this step could not be marked done: ' + e + '. Nothing moved on; try again.'); commissionRender(); });
@@ -28622,11 +28912,12 @@ async function cxSkip(stage) {
         if (!ok) return;
     }
     const nx = cxNextSelected(stage);
-    cxGet('commissionStageSkip=' + stage).then(() => {
+    return cxGet('commissionStageSkip=' + stage).then(() => {
         cx.handled = cx.handled || {};
         cx.handled[stage] = 'skip';
         cxPassStage(stage, 'skip');
-        if (nx === -1) cxFinish(); else cxGoto(nx);
+        if (nx === -1) return cxFinish();
+        cxGoto(nx);
     }).catch(e => xAlert('The step could not be skipped: ' + e + '.'));
 }
 
@@ -28638,11 +28929,12 @@ async function cxManual(stage) {
         { title: 'Mark done manually', okText: 'Mark done', cancelText: 'Cancel' });
     if (!ok) return;
     const nx = cxNextSelected(stage);
-    cxGet('commissionStageManual=' + stage).then(() => {
+    return cxGet('commissionStageManual=' + stage).then(() => {
         cx.handled = cx.handled || {};
         cx.handled[stage] = 'manual';
         cxPassStage(stage, 'manual');
-        if (nx === -1) cxFinish(); else cxGoto(nx);
+        if (nx === -1) return cxFinish();
+        cxGoto(nx);
     }).catch(e => xAlert('The step could not be marked done: ' + e + '.'));
 }
 
@@ -28843,12 +29135,13 @@ function cxShowTab(main, sub) {
 // Single /get chokepoint for commissioning writes. A refusal rejects like a lost connection: 403 = settings locked,
 // 409 = a different regulator answered; reading those as success showed writes that never landed.
 function cxGet(params) {
-    return fetch(buildURL('/get?' + params)).then(r => {
+    // A hung write has to end: onePress holds the pressed button until this settles.
+    return fetchWithTimeout(buildURL('/get?' + params), {}, 15000).then(async r => {
         if (r.ok) return r;
         const why = r.status === 403 ? 'controls are locked'
                   : r.status === 409 ? 'a different regulator answered'
                   : r.status === 423 ? 'it is not available in demo mode'
-                  : 'the regulator refused it (HTTP ' + r.status + ')';
+                  : (r.status === 422 && await r.text().catch(() => '')) || 'the regulator refused it (HTTP ' + r.status + ')';
         const e = new Error(why); e.toString = () => why;
         throw e;
     });
@@ -28999,6 +29292,7 @@ function closeCommissionModal() {
 const CX_PHASE_TAB = { 0: ['plots', 'displays'], 1: ['plots', 'displays'], 2: ['plots', 'displays'], 3: ['tuning', 'current'], 4: ['plots', 'displays'], 6: ['plots', 'displays'], 7: ['plots', 'displays'], 8: ['plots', 'displays'] };
 
 function cxGoto(phase) {
+    clickEat();
     cxStopPoll();                 // drop any timer from the phase we're leaving
     cx.phase = phase;
     // Persist the phase (survives reload; firmware re-baselines the step snapshot on entry). Not for Prep: a paused
@@ -29628,9 +29922,9 @@ function cxFieldStart() {
 }
 function cxFieldApply(run = false) {
     const r = cx.fieldResult; if (!r) return;
-    cxGet('SystemIDStabilizeAmps=' + r.propStabA.toFixed(1))
+    return cxGet('SystemIDStabilizeAmps=' + r.propStabA.toFixed(1))
         .then(() => cxGet('SystemIDStepAmplitude=' + r.propStepPct.toFixed(2)))
-        .then(() => { cx.fieldApplied = true; if (run) cxAdvanceRun(); else commissionRender(); })
+        .then(() => { cx.fieldApplied = true; if (run) return cxAdvanceRun(); commissionRender(); })
         .catch(e => xAlert('Apply failed: ' + e));
 }
 
@@ -29856,16 +30150,16 @@ function cxKneeCancel() {
 // the new one (/get handler ordering in 3_functions.ino). go = advance once both writes land.
 function cxKneeApply(go) {
     const fit = cxFdFit();
-    const after = () => { if (go) cxAdvance(true); else commissionRender(); };
+    const after = () => { if (go) return cxAdvance(true); commissionRender(); };
     // The anchors live in RAM only, so the maximum working RPM they imply is stored now (NVS maxWorkingRpm).
     const top = cxKneeTopRpm(cx.kneeAnchors);
-    cxGet('applyKneeCurve=1' + (top ? '&maxWorkingRpm=' + top : '')).then(() => {
+    return cxGet('applyKneeCurve=1' + (top ? '&maxWorkingRpm=' + top : '')).then(() => {
         cx.kneeApplied = true;
         if (top && cx.chc) cx.chc.maxRpm = top;
-        if (!fit) { after(); return; }
+        if (!fit) return after();
         let p = 'fieldDecayTauMs=' + fit.worst;
         if (!fit.flat) p += '&fdDrainLoMs=' + fit.loMs + '&fdDrainHiMs=' + fit.hiMs + '&fdDrainRpmLo=' + fit.rpmLo + '&fdDrainRpmHi=' + fit.rpmHi;
-        cxGet(p).then(() => { cx.fdApplied = true; after(); })
+        return cxGet(p).then(() => { cx.fdApplied = true; return after(); })
             .catch(e => xAlert('Drain apply failed: ' + e));
     }).catch(e => xAlert('Apply failed: ' + e));
 }
@@ -30029,11 +30323,11 @@ function cxPlantStart(wide) {
 function cxPlantApply(run = false) {
     const f = cx.fit; if (!f || !f.ok) return;
     const tcFast = Math.max(1, Math.round(f.tauMs / 3)), tcSlow = Math.max(1, Math.round(f.tauMs));
-    cxGet('PidKp=' + f.Kp.toFixed(4))
+    return cxGet('PidKp=' + f.Kp.toFixed(4))
         .then(() => cxGet('PidKi=' + f.Ki.toFixed(4)))
         .then(() => cxGet('OutputPIDFilterTC=' + tcFast))
         .then(() => cxGet('VoltageFilterTC=' + tcSlow))
-        .then(() => { cx.plantApplied = true; if (run) cxAdvanceRun(); else commissionRender(); })
+        .then(() => { cx.plantApplied = true; if (run) return cxAdvanceRun(); commissionRender(); })
         .catch(e => xAlert('Apply failed: ' + e));
 }
 
@@ -30329,13 +30623,13 @@ function cxDetune() {
     const kp = baseKp * 0.8, ki = baseKi * 0.8;
     if (!(kp > 0) || !(ki > 0)) { xAlert('Cannot soften: no valid current-loop gains available (run the plant sweep first).'); return; }
     sysidFitKp = kp; sysidFitKi = ki;
-    cxGet('PidKp=' + kp.toFixed(4)).then(() => cxGet('PidKi=' + ki.toFixed(4))).then(() => cxVerifyStart())
+    return cxGet('PidKp=' + kp.toFixed(4)).then(() => cxGet('PidKi=' + ki.toFixed(4))).then(() => cxVerifyStart())
         .catch(e => xAlert('The softened gains could not be saved: ' + e + '. The previous gains are still in use.'));
 }
 function cxVerifyDone() {
-    cxSendEach(['TuningMode=0']).then(f => {
+    return cxSendEach(['TuningMode=0']).then(f => {
         if (f.length) { cxReportStopFailure('Leaving the tuning test', f); return; }
-        cxAdvance();
+        return cxAdvance();
     });
 }
 
@@ -30610,7 +30904,7 @@ function cxCVPlantApply() {
     const f = cx.cvFit; if (!f || !f.ok) return;
     // Store the measured stiffness as cvPlantKa (Kb rides along as 0); recomputeCvGains() applies
     // Kp = α/K, Ki = ρ·Kp and the gain source switches to Measured.
-    cxGet('cvPlantKa=' + f.Ka.toFixed(5) + '&cvPlantKb=' + f.Kb.toFixed(5))
+    return cxGet('cvPlantKa=' + f.Ka.toFixed(5) + '&cvPlantKb=' + f.Kb.toFixed(5))
         .then(() => cxGet('cvGainMode=1'))
         .then(() => { cx.cvApplied = true; commissionRender(); })
         .catch(e => xAlert('Apply failed: ' + e));
@@ -30936,7 +31230,7 @@ function cxCVFitLog(f, m) {
 // Raw fit dump (CV_AUTOTUNE_PLAN.md §7): confidence header + raw (t, IBV, Bcur, MeasuredAmps), built on-device.
 function cxCVFitDownload() {
     // Fetched to a blob so deliverFile names it like the log batch and gives delivery feedback on every platform.
-    fetchWithTimeout(buildURL('/cvfit.csv'), {}, 15000)
+    return fetchWithTimeout(buildURL('/cvfit.csv'), {}, 15000)
         .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
         .then(txt => deliverFile(`cvfit_${getLogTimestamp()}${getLogNameSuffix()}.csv`, txt, 'text/csv'))
         .catch(e => xAlert('CV fit download failed: ' + (e && e.message ? e.message : e)));
@@ -31187,11 +31481,12 @@ async function cxMatrixSkip() {
     if (!ok) return;
     cxMatrixFieldRelease();   // clears matrixOn/rtFieldArmed so cxRunActive() is false at the next step
     const nx = cxNextSelected(4);
-    cxGet('commissionStageSkip=4').then(() => {
+    return cxGet('commissionStageSkip=4').then(() => {
         cx.handled = cx.handled || {};
         cx.handled[4] = 'skip';
         cxPassStage(4, 'skip');
-        if (nx === -1) cxFinish(); else cxGoto(nx);
+        if (nx === -1) return cxFinish();
+        cxGoto(nx);
     }).catch(e => { xAlert('The step could not be skipped: ' + e + '.'); commissionRender(); });
 }
 
@@ -32217,7 +32512,7 @@ function cxRenderThresh(b) {
         '<h2 style="font-size:15px;font-weight:600;margin:0 0 4px;">Voltage-Rise Tolerance (D-term deadband)</h2>' +
         '<p style="font-size:13px;color:#b7b7b7;margin:0 0 12px;line-height:1.5;">' +
           'Set how far the voltage-rise line sits above the rise rate commissioning measured. Larger means fewer nuisance engagements, but a later reaction to a genuine fast rise.'
-          + cxWhyTip('The damper in the voltage loop (the D term) ignores voltage moving slower than its deadband, so ordinary belt and diode ripple cannot work the field. Commissioning measured your own ripple rise rate and set that line already; the <strong>Safety Margin</strong> is how far above it the line sits. Change the D-term voltage filter and this must be re-run.'
+          + cxWhyTip('The voltage damper ignores voltage moving slower than its tolerance line, so belt and diode ripple do not affect the field. Commissioning measured your ripple and set that line. The <strong>Safety Margin</strong> is how far above the ripple the line sits. Re-run this step after changing the D-term voltage filter.'
                      + cxDocLink('step-6-fault-threshold-autotuning')) +
         '</p>' +
         '<div id="cxDbndNoFit"></div>' +
@@ -32622,7 +32917,7 @@ function cvsFix(kind) {
     if (!t) { xAlert('No live tuning values yet — run the test first.'); return; }
     const p = cvsFixPlan(kind, t);
     if (!p) return;
-    cxGet(p.q).then(() => {
+    return cxGet(p.q).then(() => {
         if (_cvsTune) Object.assign(_cvsTune, p.set);
         const box = document.getElementById('cvsFixBox');
         if (box && _cvsFixCtx) box.outerHTML = cvsFixesHtml(_cvsFixCtx);
@@ -33115,9 +33410,11 @@ function cxChcApply() {
     const pr = cxChcPair(j.lead);
     if (pr.n < 2 || pr.rel > CHC_PAIR_DISAGREE) return;
     const q = Math.max(0, Math.min(1.0, Math.round(pr.mean / 0.1) * 0.1));
-    cxGet('altLeadSec=' + q.toFixed(2))
+    const btn = document.getElementById('cx-chc-apply');
+    if (btn) btn.textContent = 'Saving…';
+    return cxGet('altLeadSec=' + q.toFixed(2))
         .then(() => cxAdvance(true))
-        .catch(e => xAlert('Could not save the calibration: ' + e));
+        .catch(e => { commissionRender(); xAlert('Could not save the calibration: ' + e); });
 }
 function cxChcRestart() { cx.chc.done = null; cx.chc.started = false; cx.chc.err = null; commissionRender(); }
 
@@ -33269,7 +33566,7 @@ function cxRenderChc(b) {
                    ' · max ' + d.rateMax.toFixed(0) + ' rpm/s');
     if (ok) body += kv('Stored value', q.toFixed(2) + ' s');
     body += '<hr style="border:none;border-top:1px solid #333;margin:9px 0;">';
-    if (ok) body += '<div style="margin-top:12px;"><button onclick="cxChcApply()" class="btn-primary" style="width:100%;padding:9px;">Approve and finish</button></div>';
+    if (ok) body += '<div style="margin-top:12px;"><button id="cx-chc-apply" onclick="cxChcApply()" class="btn-primary" style="width:100%;padding:9px;">Approve and finish</button></div>';
     body += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;"><button onclick="cxChcRestart()" class="' + (ok ? 'btn-secondary' : 'btn-primary') + ' btn-sm">Run it again</button>' +
         (!ok ? cxNextBtn(false, false) : '') + '</div>';
     b.innerHTML = body;
@@ -33507,7 +33804,7 @@ async function cxAltZeroOffer() {
 function cxFinish() {
     // Persist on Finish so a ✕ on Helpful Hints can't lose the tune; close/navigate waits for Done.
     // cmEpoch = browser clock (the device clock may never have been set).
-    cxGet('commissionDone=1&cmEpoch=' + Math.floor(Date.now() / 1000)).then(async () => {
+    return cxGet('commissionDone=1&cmEpoch=' + Math.floor(Date.now() / 1000)).then(async () => {
         // cxEffMask: the last step's done bit is usually still in flight on CSV3. "Complete" = the REQUIRED
         // stages (firmware's COMMISSIONED test); Stress test and Charge health calibration are optional.
         const mask = cxEffMask();
@@ -34245,14 +34542,12 @@ window.addEventListener('load', function () {
   function computeYRange() {
     if (baroYManual) return baroYManual;
     if (!autoscaleY) return [940, 1050];
-    // Middle 2/3 of plot height: pad = 25% of data range above and below.
+    // Middle 2/3 of plot height: pad = 25% of data range above and below (span floored at 10 mbar).
     const slice = computePlotSlice().values;
     let lo = Infinity, hi = -Infinity;
     for (const v of slice) { if (v != null) { if (v < lo) lo = v; if (v > hi) hi = v; } }
-    if (!isFinite(lo) || !isFinite(hi) || lo >= hi) return [940, 1050];
-    const range = Math.max(hi - lo, 2);
-    const pad = range * 0.25;
-    return [lo - pad, hi + pad];
+    if (!isFinite(lo) || !isFinite(hi)) return [940, 1050];
+    return stableAutoRange(lo, hi, 0.25, 10);
   }
 
   function formatAgoLabel(secNeg) {
@@ -34664,9 +34959,8 @@ window.addEventListener('load', function () {
         let mn = Infinity, mx = -Infinity;
         (scaleVals[sc.name] || []).forEach(arr => { for (const v of arr) { if (v != null && isFinite(v)) { if (v < mn) mn = v; if (v > mx) mx = v; } } });
         if (isFinite(mn) && isFinite(mx)) {
-          if (mn === mx) { mn -= 1; mx += 1; }
-          const pad = (mx - mn) * 0.05;
-          c.plot.setScale(sc.name, { min: mn - pad, max: mx + pad });
+          const [lo, hi] = ltAutoRange(sc, mn, mx);
+          c.plot.setScale(sc.name, { min: lo, max: hi });
         }
       });
     });
@@ -34761,6 +35055,12 @@ window.addEventListener('load', function () {
     vline(Math.floor(Date.now() / 1000), 'rgba(244,67,54,0.55)', [4, 3]);   // live edge "now"
   }
 
+  // Auto Y range for a scale with no fixed range: 5% pad, floored by the spec's minSpan (a number, or a fn
+  // for floors that follow the voltage class) and fromZero.
+  function ltAutoRange(sc, mn, mx) {
+    return stableAutoRange(mn, mx, 0.05, typeof sc.minSpan === 'function' ? sc.minSpan() : sc.minSpan, sc.fromZero);
+  }
+
   // Built once (empty); ltRenderAll feeds binned data. Drag-x zoom re-bins ALL charts; dbl-click resets.
   function buildLtChart(id, spec) {
     const el = document.getElementById(id);
@@ -34792,7 +35092,9 @@ window.addEventListener('load', function () {
     const axes = [ { grid: { show: true } } ];
     spec.scales.forEach(sc => {
       // fn, not array: a fixed array overrides setScale, so a typed Y override on a fixed-range scale (SOC / Duty %) never applied
-      scales[sc.name] = sc.range ? { auto: false, range: () => (ltYOverride[id] && ltYOverride[id][sc.name]) || sc.range } : { auto: true };
+      // Auto scales: uPlot re-ranges them itself on a legend toggle, so the floor and a typed override live in the fn too
+      scales[sc.name] = sc.range ? { auto: false, range: () => (ltYOverride[id] && ltYOverride[id][sc.name]) || sc.range }
+                                 : { auto: true, range: (u, mn, mx) => (ltYOverride[id] && ltYOverride[id][sc.name]) || ltAutoRange(sc, mn, mx) };
       axes.push({ scale: sc.name, label: sc.label, side: sc.side, grid: { show: sc.side === 3 },
                   splits: edgeLabeledSplits(() => !!(ltYOverride[id] && ltYOverride[id][sc.name])),
                   values: sc.fmt ? (u, ticks) => ticks.map(sc.fmt) : undefined });
@@ -34965,7 +35267,7 @@ window.addEventListener('load', function () {
     const noBattShunt = document.body.classList.contains('no-batt-current');
     buildLtChart('lt-current-plot', {
       title: 'Currents (A)',
-      scales: [ { name:'A', label:'Amps', side:3 } ],
+      scales: [ { name:'A', label:'Amps', side:3, minSpan:10 } ],
       series: [ ...(noBattShunt ? [] : [
                 { key:'battCurr',    scale:'A', color:'#FF9800', label:'Battery (A)',       band:true, on:true, ah:true },
                 { key:'battCurrW',   dataKey:'battCurr', scale:'A', color:'#FF9800', label:'Battery incl. engine off',    faint:true }]),
@@ -34975,7 +35277,7 @@ window.addEventListener('load', function () {
     });
     buildLtChart('lt-voltage-plot', {
       title: 'Battery Voltage & SOC',
-      scales: [ { name:'V', label:'Volts', side:3 },
+      scales: [ { name:'V', label:'Volts', side:3, minSpan:() => voltSpanFloor(1) },
                 { name:'pct', label:'SOC %', side:1, range:[0,100], fmt:v=>Math.round(v)+'%' } ],
       series: [ { key:'battVolt', scale:'V', color:'#4CAF50', label:'Battery (V)', band:true, on:true },
                 { key:'battVoltW', dataKey:'battVolt', scale:'V', color:'#4CAF50', label:'Volts incl. engine off', faint:true },
@@ -34984,8 +35286,8 @@ window.addEventListener('load', function () {
     buildLtChart('lt-temp-plot', {
       title: 'Temperatures & Barometric Pressure',
       // temp:true series render display-converted in ltRenderAll; ltData stays native °F
-      scales: [ { name:'F', label:tempUnitLabel(), side:3 },
-                { name:'mb', label:'mbar', side:1 } ],
+      scales: [ { name:'F', label:tempUnitLabel(), side:3, minSpan:10 },
+                { name:'mb', label:'mbar', side:1, minSpan:10 } ],
       series: [ { key:'altTemp',   scale:'F',  color:'#F44336', label:'Alternator (' + tempUnitLabel() + ')', band:true, temp:true },
                 { key:'tempTherm', scale:'F',  color:'#FF9800', label:'Thermistor (' + tempUnitLabel() + ')', band:true, temp:true },
                 { key:'battTemp',  scale:'F',  color:'#4CAF50', label:'Battery (' + tempUnitLabel() + ')', band:true, temp:true },
@@ -34994,7 +35296,7 @@ window.addEventListener('load', function () {
     });
     buildLtChart('lt-rpm-plot', {
       title: 'Engine RPM & Alternator Duty',
-      scales: [ { name:'rpm', label:'RPM', side:3 },
+      scales: [ { name:'rpm', label:'RPM', side:3, minSpan:3000, fromZero:true },
                 { name:'pct', label:'Duty %', side:1, range:[0,100], fmt:v=>Math.round(v)+'%' } ],
       series: [ { key:'rpm',  scale:'rpm', color:'#9C27B0', label:'RPM', band:true },
                 { key:'duty', scale:'pct', color:'#9E9E9E', label:'Duty (%)', band:true, on:true },
@@ -35002,7 +35304,7 @@ window.addEventListener('load', function () {
     });
     buildLtChart('lt-wind-plot', {
       title: 'Speeds (kt)',
-      scales: [ { name:'kt', label:'Knots', side:3 } ],
+      scales: [ { name:'kt', label:'Knots', side:3, minSpan:10, fromZero:true } ],
       series: [ { key:'sog', scale:'kt', color:'#4CAF50', label:'SOG (kt)',        band:true },
                 { key:'tws', scale:'kt', color:'#2196F3', label:'True Wind (kt)',  band:true },
                 { key:'vmg', scale:'kt', color:'#9C27B0', label:'VMG (kt)',        band:true },
@@ -35010,7 +35312,7 @@ window.addEventListener('load', function () {
     });
     buildLtChart('lt-angles-plot', {
       title: 'Angles (°)',
-      scales: [ { name:'deg', label:'Degrees', side:3 } ],
+      scales: [ { name:'deg', label:'Degrees', side:3, minSpan:30 } ],
       series: [ { key:'cog',     scale:'deg', color:'#2196F3', label:'COG (°)',     unwrap:true },
                 { key:'heading', scale:'deg', color:'#FF9800', label:'Heading (°)', unwrap:true },
                 { key:'awa',     scale:'deg', color:'#4CAF50', label:'AWA (°)',  band:true },
@@ -35019,7 +35321,7 @@ window.addEventListener('load', function () {
     });
     buildLtChart('lt-motion-plot', {
       title: 'Motion — Heel & Pitch (°)',
-      scales: [ { name:'deg', label:'Degrees', side:3 } ],
+      scales: [ { name:'deg', label:'Degrees', side:3, minSpan:10 } ],
       series: [ { key:'heel',  scale:'deg', color:'#3F51B5', label:'Heel (°)',  band:true },
                 { key:'pitch', scale:'deg', color:'#FF5722', label:'Pitch (°)', band:true } ]
     });
@@ -35478,7 +35780,7 @@ window.addEventListener('load', function () {
       height: 300,
       scales: {
         x: { time: false },
-        mpg: { range: (u, mn, mx) => yManual ? yManual : stableAutoRange(mn, mx, 0.1) }
+        mpg: { range: (u, mn, mx) => yManual ? yManual : stableAutoRange(mn, mx, 0.1, 0, true) }
       },
       series: [
         { label: "RPM" },
@@ -35668,7 +35970,7 @@ function initFastScopePlot() {
             amps: {
                 range: (u, mn, mx) => (fastScopeAmpsMin != null && fastScopeAmpsMax != null)
                     ? [fastScopeAmpsMin, fastScopeAmpsMax]
-                    : (mn == null ? [-1, 1] : stableAutoRange(mn, mx, 0.1))
+                    : (mn == null ? [-1, 1] : stableAutoRange(mn, mx, 0.1, 2))
             }
         },
         axes: [
@@ -35975,6 +36277,7 @@ function faFlipViewToggle(which) {
     if (fastFlipPlot) {
         fastFlipPlot.setSeries(1, { show: faFlipShowRaw });
         fastFlipPlot.setSeries(2, { show: faFlipShowFilt });
+        faFlipApplyAxis(fastFlipSelected);   // setSeries re-runs uPlot's own unfloored fit, which would replace this page's range
     }
 }
 // Reference flipbook (Plots → Scope, second card). Pulls /faflip.bin: 8-byte header
@@ -36768,7 +37071,7 @@ function rippleMapRender() {
     const ramp = dark ? RIPPLEMAP_RAMP_DARK : RIPPLEMAP_RAMP_LIGHT;
     const cs = getComputedStyle(document.body);
     const muted = (cs.getPropertyValue('--text-muted') || '').trim() || '#888';
-    const maxPk = Math.max(0.01, ...rippleMapCells.map(c => c.pkpk));
+    const maxPk = Math.max(0.5, ...rippleMapCells.map(c => c.pkpk));
     const byKey = {};
     for (const c of rippleMapCells) byKey[c.rpmLo + '_' + c.ampLo] = c;
 
@@ -36950,7 +37253,7 @@ function ssBuildIndex() {
         const clone = labEl.cloneNode(true);
         // Field-cap rows also carry live "% now" readouts and a "limiting" tag; removing the spans leaves
         // "(, )" or "(% now)" behind, collapsed here ("(%)" and other unit parens survive).
-        clone.querySelectorAll('.tooltip, .cap-limiting, [id$="_echo"], [id$="_now"], [id$="_asDuty"], [id$="_part"]').forEach(n => n.remove());
+        clone.querySelectorAll('.tooltip, .integ-dir, .cap-limiting, [id$="_echo"], [id$="_now"], [id$="_asDuty"], [id$="_part"]').forEach(n => n.remove());
         const label = ssCleanLabel(clone.textContent.replace(/\(\s*[,\s]*(?:%\s*now)?\s*\)/g, ' '));
         if (label.length < 2) return;
         const tipEl = labEl.querySelector('.tooltip-box');
@@ -37468,7 +37771,7 @@ function usageElText(el) {
     if (!el) return '';
     if (el.tagName === 'INPUT') return (el.value || '').trim();
     const src = (el.querySelector('.tab-label-full') || el).cloneNode(true);
-    src.querySelectorAll('.tooltip, .sinfo, .tooltip-box, [id$="_echo"]').forEach(n => n.remove());
+    src.querySelectorAll('.tooltip, .sinfo, .tooltip-box, .integ-dir, [id$="_echo"]').forEach(n => n.remove());
     // "(  )" leftovers from removed echo spans, e.g. "Margin Below Onset (%) ()"
     return src.textContent.replace(/\(\s*\)/g, '').replace(/\s+/g, ' ').trim();
 }

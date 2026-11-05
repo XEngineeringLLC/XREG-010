@@ -1,6 +1,6 @@
 {
  "version": 2,
- "generatedFrom": "web_src/index.html:b51c9ca27d59 web_src/script.js:bc6ed19af7cc gx_app/settings_keys.txt:0a9db3d14280",
+ "generatedFrom": "web_src/index.html:a01f7508d493 web_src/script.js:b66417e394a9 gx_app/settings_keys.txt:0a9db3d14280",
  "endpoints": {
   "zerofitstate": {
    "path": "/zerofitstate",
@@ -53,7 +53,7 @@
        "tagged": true,
        "confirm": "Manual mode drives the field straight from the Manual Field PWM box. It is a bench and diagnostic mode: while it is on, the regulator stops protecting the alternator and the battery.\n\nNo longer enforced:\n• Alternator temperature — no cut-back, no over-temperature shutdown, and no cut when the temperature sensor stops reporting. The alternator can cook.\n• Min Field % and the per-speed Keep-Alive floor — a PWM of 0 really means zero field, so a tachometer driven off the stator will stop reading.\n• Engine speed — no low-RPM cut, no engine-stopped cut, no implausible-tachometer cut. The field stays energized with the engine stopped.\n• Battery too cold and too hot to charge.\n• Battery voltage plausibility and the two-sensor disagreement checks.\n• The timed over-voltage steps and any protection lockout already running.\n• The whole current-control loop: no charge current target, no battery current limit, no externally sent limits, no charge stages.\n\nStill enforced: the master On/Off switch, the hardware over-voltage shutdown (Alternator Hard Shutdown V), and the Max Field % / Max Field Volts ceiling. If the INA228 battery monitor is not reading, Manual has no over-voltage protection at all: the hardware shutdown is that chip.",
        "confirmWhen": 1,
-       "help": "Auto runs the charge stages and every protection. Manual drives the field straight from the Manual Field PWM box below and turns the protections off: no temperature cut-back or over-temperature shutdown, no Min Field or per-speed tachometer keep-alive floor (a PWM of 0 really means zero field), no engine-speed or tachometer-plausibility cut, no battery temperature or voltage checks, and no current control at all. The master On/Off switch, the hardware over-voltage shutdown and the field ceiling (Max Field % and Max Field Volts, whichever is lower) still apply. If the INA228 battery monitor is not reading, Manual has no over-voltage protection at all: the hardware shutdown is that chip. Switching to Manual asks for confirmation and lists the full set."
+       "help": "Auto runs the charge stages and all protections. Manual drives the field directly from the Manual Field PWM box below and turns off most protections, including temperature, engine speed, battery, and current control. The On/Off switch, the hardware over-voltage shutdown, and the field ceiling stay active. If the battery monitor is not reading, Manual has no over-voltage protection. Switching to Manual asks for confirmation and lists everything that turns off."
       },
       {
        "key": "ManualDutyTarget",
@@ -75,7 +75,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "Direct PWM duty cycle applied to the field winding when Manual mode is active, 0–100% in steps of 0.01, delivered as typed — Min Field and the per-speed keep-alive floor do not raise it, so 0 is a genuinely dead field. Only the field ceiling, Max Field % or Max Field Volts, whichever is lower, still caps it. Has no effect in Auto mode. Use with caution — Manual mode bypasses the thermal, engine-speed, battery and current protections."
+       "help": "Field duty applied in Manual mode, 0–100%. Only Max Field %, Max Field Volts and the two board ceilings limit it. No effect in Auto mode. Use with caution: Manual mode bypasses the thermal, engine-speed, battery, and current protections."
       },
       {
        "key": "SwitchingFrequency",
@@ -97,7 +97,7 @@
         "integer": true
        },
        "arm": true,
-       "help": "100 to 2000 Hz is a good range — may want to avoid human hearing frequencies depending on installation location and noise."
+       "help": "100 to 2000 Hz is a good range, may want to avoid human hearing frequencies depending on installation location and noise."
       },
       {
        "key": "TemperatureLimitF",
@@ -120,7 +120,7 @@
         "integer": true
        },
        "arm": true,
-       "help": "Maximum safe temperature at the sensor location. The temperature PID begins reducing current as temperature approaches this value — intervention starts at (Limit − Temp PID Margin). Hard warning and critical shutdowns trigger above it. Sensors often read 20–30°F cooler than true winding temperature; account for this offset when setting this value."
+       "help": "Maximum safe temperature at the sensor location. The regulator begins reducing current as temperature approaches this value. Hard warning and critical shutdowns trigger above it. Sensors often read 20–30°F cooler than true winding temperature, account for this offset when setting this value."
       },
       {
        "key": "InvertAltAmps",
@@ -169,7 +169,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "Amps subtracted from every alternator current reading to cancel the sensor's zero error. Measured Zero below sets it for you, or you can enter a known value here. With Alternator Zero Correction off, a change here moves the learned correction by the same amount, so switching the correction on later is right from the first reading instead of spending several days re-learning. With the correction on, a change here leaves the learned correction alone, because the reading you corrected from already had it taken out."
+       "help": "Amps subtracted from every alternator current reading to cancel the sensor's zero error. Measured Zero below sets it, or enter a known value."
       },
       {
        "key": "AltZeroCaptureNow",
@@ -178,7 +178,7 @@
        "group": "Current Sensing",
        "arm": true,
        "buttonText": "Zero Now",
-       "help": "With the field at 0%, the alternator makes no current, so the current sensor should read exactly zero. Whatever it reads instead is its zero error on this installation. Zero Now works with the engine running or stopped: it turns the field off if it is on, waits for the reading to settle, averages it for ten seconds, and reports what it found. Apply folds that number into the Alternator Current Offset above, where it is stored permanently. If Alternator Zero Correction was off while it measured, Apply moves the learned correction by the same amount so the two stay in step. If it was on, the measurement already had the learned correction taken out, so that correction stays as it is. The sensor's zero moves a little with temperature, so measure while the engine compartment is warm, such as right after a run. The commissioning wizard offers the same measurement at the finish. With the engine running, charging pauses for under a minute. A reading that is too large or too noisy is refused rather than applied."
+       "help": "Measures the current sensor's zero error so it can be stored as the Alternator Current Offset. Zero Now turns the field off, averages the reading for ten seconds, and reports the result. Apply stores it. Measure while the engine compartment is warm. With the engine running, charging pauses for under a minute."
       },
       {
        "key": "altZeroApply",
@@ -192,7 +192,7 @@
         "field": "capHeld",
         "value": 1
        },
-       "help": "With the field at 0%, the alternator makes no current, so the current sensor should read exactly zero. Whatever it reads instead is its zero error on this installation. Zero Now works with the engine running or stopped: it turns the field off if it is on, waits for the reading to settle, averages it for ten seconds, and reports what it found. Apply folds that number into the Alternator Current Offset above, where it is stored permanently. If Alternator Zero Correction was off while it measured, Apply moves the learned correction by the same amount so the two stay in step. If it was on, the measurement already had the learned correction taken out, so that correction stays as it is. The sensor's zero moves a little with temperature, so measure while the engine compartment is warm, such as right after a run. The commissioning wizard offers the same measurement at the finish. With the engine running, charging pauses for under a minute. A reading that is too large or too noisy is refused rather than applied."
+       "help": "Measures the current sensor's zero error so it can be stored as the Alternator Current Offset. Zero Now turns the field off, averages the reading for ten seconds, and reports the result. Apply stores it. Measure while the engine compartment is warm. With the engine running, charging pauses for under a minute."
       },
       {
        "key": "@zeroStatus",
@@ -356,7 +356,7 @@
           "scale": 1,
           "integer": false
          },
-         "help": "Hard current ceiling (A) for this RPM range. In Amps mode, enter your limit here — the kW column is calculated from this value and the present battery voltage. In kW mode, this is derived from your kW limit and live battery voltage each control tick.",
+         "help": "Hard current ceiling (A) for this RPM range. In Amps mode, enter your limit here and the kW column is calculated from it. In kW mode, this is derived from your kW limit and live battery voltage.",
          "keyPattern": "rpmCapCurrentTable{i}",
          "capCol": "amps"
         },
@@ -377,7 +377,7 @@
           "scale": 1,
           "integer": false
          },
-         "help": "Power limit for this RPM range. This is electrical power, assuming 100% alternator efficiency. If you want to convert to engine power, you can mentally multiply table values by 2 to account for mechanical and electrical losses. In kW mode, enter your limit here — the firmware divides by live battery voltage each control tick to derive the amp ceiling, so the load stays constant regardless of voltage sag or rise. In Amps mode, this is calculated for reference only.",
+         "help": "Power limit for this RPM range. This is electrical power, assuming 100% alternator efficiency. If you want to convert to engine power, you can mentally multiply table values by 2 to account for mechanical and electrical losses. In kW mode, enter your limit here and the load stays constant regardless of voltage sag or rise. In Amps mode, this is calculated for reference only.",
          "keyPattern": "rpmCapKW{i}",
          "capCol": "kw"
         },
@@ -398,7 +398,7 @@
           "scale": 1,
           "integer": false
          },
-         "help": "Tachometer keep-alive floor: the lowest field duty cycle (%) the regulator will hold at this engine speed, even when the controls otherwise want less. The RPM signal reads normally with the field off; only a rapid field drop blinds it. This floor sits a small margin below where output current begins, to keep the field from dropping fast from a working level to zero. Edit these cells by hand only while Automatic Learning (card below) is off.",
+         "help": "Lowest field duty (%) the regulator holds at this engine speed, so the field does not drop quickly to zero, which can interrupt the tachometer signal. Set a small margin below where output current begins. Edit by hand only while Automatic Learning is off.",
          "keyPattern": "rpmMinDutyTable{i}",
          "readOnlyWhen": {
           "key": "kneeLearnEnable",
@@ -472,7 +472,7 @@
         "integer": true
        },
        "arm": true,
-       "help": "Master switch. On = the regulator owns and auto-fills the Keep-Alive (%) column. Off = the column is yours to edit and is left alone."
+       "help": "On: the regulator fills in the Keep-Alive (%) column. Off: you edit the column."
       },
       {
        "key": "kneeMarginPct",
@@ -495,7 +495,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "How far below the current-onset point to park the floor. Larger = safer (never forces unwanted current), smaller = field stays more primed. The value it starts at is already scaled for the Nominal Battery Voltage and Field Winding Voltage in Vessel Info."
+       "help": "How far below the current-onset point to set the floor. Larger = safer (never forces unwanted current), smaller = field stays more primed."
       },
       {
        "key": "kneeOnsetA",
@@ -518,7 +518,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "How far output current must rise above the freshly measured zero, while probing, to count as \"the alternator just started making current\" (the onset). Keep it a few times the current sensor noise — under one amp is typical."
+       "help": "How far current must rise above zero during learning to count as the alternator starting to make current. Usually under 1 A, a few times the sensor noise."
       },
       {
        "key": "kneeReArmA",
@@ -541,7 +541,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "Once a range is locked, if this much current ever appears at its floor the onset has dropped, so the floor is lowered one margin step. Set above the worst current-sensor zero drift (a couple of amps) so noise never re-triggers it."
+       "help": "If this much current appears at a learned floor, the floor is lowered one margin step. Set above the current sensor's zero drift, a couple of amps."
       },
       {
        "key": "kneeDwellSec",
@@ -564,7 +564,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "Settle and hold time at each probe step: RPM, temperature and field must stay steady this long before the floor is stepped again. A few seconds is plenty; longer = stricter."
+       "help": "How long RPM, temperature, and field must hold steady at each learning step before the next step. A few seconds is enough."
       },
       {
        "key": "kneeStepPct",
@@ -587,7 +587,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "How many field-duty points the floor climbs at each step while hunting the onset. Smaller = finer knee resolution but slower; this is the staircase increment, taken once per Step Dwell."
+       "help": "How many field-duty points each learning step climbs. Smaller is more exact but slower."
       },
       {
        "key": "kneeTempComp",
@@ -615,7 +615,7 @@
         "integer": true
        },
        "arm": true,
-       "help": "When on, the applied floor is corrected for alternator case temperature — the field-onset point rises with winding resistance, so a colder alternator gets a lower floor. Turn off to apply the learned floors as-is (useful for bench comparison)."
+       "help": "On: the floor is corrected for alternator temperature, lower when cold and higher when hot. Off: learned floors apply as they are."
       },
       {
        "key": "kneeTempRefF",
@@ -639,7 +639,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "The alternator case temperature the learned floors are referenced to (learning happens hot, so ~180 °F / ~82 °C is typical). The temperature correction lowers the floor below this and raises it above."
+       "help": "The alternator temperature the learned floors are based on. About 180 °F is typical, since learning happens hot."
       },
       {
        "key": "kneeMaxFloorPct",
@@ -662,7 +662,7 @@
         "integer": false
        },
        "arm": true,
-       "help": "Safety cap — no learned floor will ever exceed this, even while probing. Bounds how much field can be held during light load."
+       "help": "No learned floor can exceed this, even during learning."
       },
       {
        "key": "kneeRpmTolPct",
@@ -793,7 +793,7 @@
         "integer": true
        },
        "arm": true,
-       "help": "Not safe for Lithium batteries. This mode bypasses the normal charge algorithm — use only with flooded or AGM batteries, or in consultation with your battery manufacturer. Overrides normal charging with fixed voltage control — mainly useful for tuning voltage loop parameters or simulating an old-school automotive alternator voltage regulator."
+       "help": "Not safe for Lithium batteries. This mode bypasses the normal charge algorithm, use only with flooded or AGM batteries, or in consultation with your battery manufacturer. Overrides normal charging with fixed voltage control, mainly useful for tuning voltage loop parameters or simulating an old-school automotive alternator voltage regulator."
       },
       {
        "key": "TargetVoltageSetpoint",
@@ -951,7 +951,7 @@
           "integer": false
          },
          "arm": true,
-         "help": "How long battery voltage must remain continuously within 50 mV below Bulk voltage (or higher) before Absorption begins. The 50 mV arming band is hard-coded — it lets the timer start as the battery approaches Bulk, rather than waiting for the exact crossing. Prevents transient voltage spikes from triggering an early Absorption entry. 0.25s typical. Note that there isn't any controls difference between Bulk and Absorb other than the limiting voltage, if those are set differently, so this is more a question of display nomenclature."
+         "help": "How long battery voltage must remain continuously within 50 mV below Bulk voltage (or higher) before Absorption begins. Prevents transient voltage spikes from triggering an early Absorption entry. 0.25s typical. Note that there isn't any controls difference between Bulk and Absorb other than the limiting voltage, if those are set differently, so this is more a question of display nomenclature."
         },
         {
          "key": "AbsorptionVoltage",
@@ -973,7 +973,7 @@
           "integer": false
          },
          "arm": true,
-         "help": "Voltage held during Absorption. Typically 0.1 to 0.2 below Bulk Voltage for an AC charger/ solar or 0.3 to 0.4 below for an alternator controller. It's wise to leave some margin for transients during rapid engine speed changes. The battery dictates how much current it accepts — current tapers naturally as the battery fills."
+         "help": "Voltage held during Absorption. Typically 0.1 to 0.2 below Bulk Voltage for an AC charger/ solar or 0.3 to 0.4 below for an alternator controller. It's wise to leave some margin for transients during rapid engine speed changes. The battery dictates how much current it accepts, current tapers naturally as the battery fills."
         },
         {
          "key": "TailCurrent_A",
@@ -1021,7 +1021,7 @@
            "note": "Tail Current and the Rebulk Current Threshold are greyed too, because no battery monitor is set up under Setup → Integrations either. Absorption ends on time alone, and float (if enabled) then holds the float voltage."
           }
          ],
-         "help": "Absorption ends when charging current tapers to or below this value continuously for the Absorption Completion Time. Confirms the battery is genuinely full. 5 amps per 100Ah of bank is typical. Two things must both be true before this counts: current at or below your number, AND the battery still sitting up at the Absorption Voltage. A big load coming on, or the engine dropping to idle, can pull charging current down to almost nothing while the battery is only part full — on its own that looks exactly like a finished battery. Requiring the voltage to still be up there tells the two apart. If another charge source (solar, shore power) is holding the battery even higher, that still counts."
+         "help": "Absorption ends when charging current tapers to or below this value continuously for the Absorption Completion Time. Confirms the battery is full. 5 amps per 100Ah of bank is typical. The battery must also still be up at the Absorption Voltage, because a big load or the engine dropping to idle can pull charging current down to almost nothing while the battery is only part full."
         },
         {
          "key": "absorptionCompleteTime",
@@ -1065,7 +1065,7 @@
           "integer": true
          },
          "arm": true,
-         "help": "Maximum time in Absorption before forcing a transition regardless of current. Safety fallback in case Tail Current is never reached. Typical starting point: 30m per 100Ah of battery bank. This clock only runs while the battery is actually held up at the Absorption Voltage. If the voltage sags — engine at idle, a heavy load, or any limit holding the alternator back — the clock pauses and picks up where it left off, so time spent not really absorbing doesn't count against you. As a backstop the phase always ends at twice this figure of real elapsed time, even if the battery never got up to voltage."
+         "help": "Maximum time in Absorption before forcing a transition regardless of current. Safety fallback in case Tail Current is never reached. Typical starting point: 30m per 100Ah of battery bank. This clock only runs while the battery is held up at the Absorption Voltage, and the phase always ends at twice this figure of real elapsed time."
         },
         {
          "key": "UseFloat",
@@ -1114,7 +1114,7 @@
           "integer": true
          },
          "arm": true,
-         "help": "No Float (idle) — after Absorption the field turns off. The battery carries the house loads, and charging restarts when the rebulk criteria (next section) are met. Voltage Float — the classic third stage: holds the battery at Float Voltage to maintain near-full charge, and returns to Bulk when the rebulk criteria are met or Float Duration runs out. Zero-Current Float — the alternator carries exactly the house loads and the battery rests at 0 A, at whatever voltage it naturally sits. The battery is neither charged nor discharged while the engine runs. Needs the INA228 battery shunt. The rebulk criteria stay armed — unlike the manual Force Maintain Mode override below, which suspends the charge-stage machine entirely."
+         "help": "No Float (idle): after Absorption the field turns off, and charging restarts when the rebulk criteria are met. Voltage Float: holds the battery at Float Voltage, returning to Bulk when the rebulk criteria are met or Float Duration runs out. Zero-Current Float: the alternator carries the house loads and the battery rests at 0 A. Needs the battery shunt."
         },
         {
          "key": "FloatVoltage",
@@ -1146,7 +1146,7 @@
            "note": "Float Voltage and Float Duration only apply to the Voltage Float mode selected above. Pick Voltage Float to set them."
           }
          ],
-         "help": "Holding voltage used only when Use Float is ON. Typical: ~13.4V"
+         "help": "Holding voltage used only in Voltage Float mode. Typical: ~13.4V"
         },
         {
          "key": "FLOAT_DURATION",
@@ -1320,7 +1320,7 @@
            "note": "Tail Current and the Rebulk Current Threshold are greyed too, because no battery monitor is set up under Setup → Integrations either. Absorption ends on time alone, and float (if enabled) then holds the float voltage."
           }
          ],
-         "help": "If net battery current is more negative than this value (i.e. the battery is discharging at this rate or faster), the system returns to Bulk. Provides more reliable rebulk detection than voltage alone under load. Typical ~0.02–0.05C discharge 2 to 5 amps per 100Ah of battery bank."
+         "help": "If net battery current is more negative than this value (i.e. the battery is discharging at this rate or faster), the system returns to Bulk. Provides more reliable rebulk detection than voltage alone under load. 2 to 5 amps per 100Ah of battery bank is typical."
         },
         {
          "key": "rebulkDebounceTime",
@@ -1372,7 +1372,7 @@
        },
        "arm": true,
        "hidden": true,
-       "help": "Turn off if this device has no battery shunt (battery-current sensor). Battery current, State of Charge, battery health, the battery charge-current limit, load-dump detection and float charging all become unavailable — the alternator current limit is then the only thing bounding charge current. Their settings stay on their pages, greyed, and each card says why; only the live readouts that would sit at a dash are hidden. If your shunt is in the battery negative lead and its current reaches the regulator only over NMEA 2000 or VE.Direct, the regulator's own battery voltage reading runs high while charging, by charging current × shunt resistance (10 mV per 100 A on a 500 A / 50 mV shunt). Wiring Cable 2 pins 9 and 10 to the shunt removes it."
+       "help": "Turn off if this regulator has no battery shunt. Battery current, State of Charge, battery health, the battery charge-current limit, load dump detection, and float charging then become unavailable, and the alternator current limit is the only limit on charge current."
       },
       {
        "key": "InvertBattAmps",
@@ -1496,7 +1496,7 @@
          "note": "Battery Shunt Present is Off, so the four rows that set up the shunt — Invert Battery Amps, Battery Current Offset, Shunt Resistance and Shunt Location — are greyed. Switch it to Yes to set them up."
         }
        ],
-       "help": "Resistance of your current shunt in micro-ohms (µΩ). The current sensor converts the shunt's measured voltage drop to amps using this value — a wrong value scales all current and SoC readings proportionally. Shunts are rated by a full-scale millivolt drop at a rated current, and the resistance follows: µΩ = mV ÷ amps × 1000. Victron SmartShunt / BMV are the 50 mV family (500 A = 100 µΩ, 1000 A = 50 µΩ, 2000 A = 25 µΩ). Check your shunt's datasheet for the exact rating. RatedµΩmΩ 50 mV — Victron / marine 100 A5000.5 200 A2500.25 300 A1670.167 400 A1250.125 500 A — BMV-7121000.1 1000 A500.05 2000 A250.025 75 mV — industrial / analog meter 50 A15001.5 100 A7500.75 150 A5000.5 200 A3750.375 300 A2500.25 400 A1880.188 500 A1500.15 600 A1250.125 100 mV 100 A10001.0 200 A5000.5 300 A3330.333 500 A2000.2 1000 A1000.1"
+       "help": "Resistance of the shunt in micro-ohms (µΩ). A wrong value scales all current and SoC readings. µΩ = rated mV ÷ rated amps × 1000. Check the shunt's datasheet. RatedµΩmΩ 50 mV — Victron / marine 100 A5000.5 200 A2500.25 300 A1670.167 400 A1250.125 500 A — BMV-7121000.1 1000 A500.05 2000 A250.025 75 mV — industrial / analog meter 50 A15001.5 100 A7500.75 150 A5000.5 200 A3750.375 300 A2500.25 400 A1880.188 500 A1500.15 600 A1250.125 100 mV 100 A10001.0 200 A5000.5 300 A3330.333 500 A2000.2 1000 A1000.1"
       },
       {
        "key": "ShuntLead",
@@ -1546,7 +1546,7 @@
          "note": "Battery Shunt Present is Off, so the four rows that set up the shunt — Invert Battery Amps, Battery Current Offset, Shunt Resistance and Shunt Location — are greyed. Switch it to Yes to set them up."
         }
        ],
-       "help": "Which battery cable your shunt sits in. Negative lead: the Regulator Ground Wire lands on the shunt's load side, and the regulator removes the shunt's own voltage drop from its battery voltage reading. Positive lead: the Regulator Power Wire lands on the shunt's load side, and no correction is needed."
+       "help": "Which battery cable the shunt is in. Negative lead: the Regulator Ground Wire lands on the shunt's load side, and the regulator corrects its voltage reading. Positive lead: the Regulator Power Wire lands on the shunt's load side."
       }
      ]
     }
@@ -1618,7 +1618,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "On: the probe assigned the Battery role supplies the battery temperature used by the cold-charge and hot-charge lockouts, the voltage-loop gain derate and the NMEA 2000 battery status message. Off: the Battery probe is still read for the table above but is not used as a battery temperature source."
+     "help": "On: the probe assigned the Battery role supplies battery temperature. Off: it is still read for the table above but not used."
     },
     {
      "key": "extraTempProbeEnable",
@@ -1645,7 +1645,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "On: the probe assigned the Extra role is shown as Extra Temperature on Live Data, can raise the high and low alarms under Setup → Alarms → Temperature Alarms, and can be transmitted on NMEA 2000. Off: the Extra probe is still read for the table above but is not reported anywhere else."
+     "help": "On: the probe assigned the Extra role shows on Live Data, can raise alarms, and can be sent on NMEA 2000. Off: it is still read for the table above only."
     }
    ]
   },
@@ -1790,7 +1790,7 @@
       "integer": false
      },
      "arm": true,
-     "help": "Fraction of nameplate output the array really delivers after tilt, shading, temperature and charger losses. Learned from the ledger automatically while Learn Performance Ratio is on; a value typed here restarts the learning from that point."
+     "help": "Share of rated output the array really delivers after tilt, shading, temperature, and charger losses. Learned automatically while Learn Performance Ratio is on."
     },
     {
      "key": "UVThresholdHigh",
@@ -1812,7 +1812,7 @@
       "integer": false
      },
      "arm": true,
-     "help": "Forecast harvest a day must exceed to count as sunny; at least 2 of the next 3 days must clear it to pause the alternator. Decides alone when Size Threshold from Consumption is off, and stands in until the ledger has consumption history."
+     "help": "Forecast harvest a day must exceed to count as sunny. At least 2 of the next 3 days must clear it to pause the alternator."
     },
     {
      "key": "solarUseConsEnable",
@@ -1839,7 +1839,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "On: a day counts as sunny enough when its forecast harvest covers the consumption predicted from the ledger plus the margin below; until that history exists the High Solar Threshold stands in. Off: the High Solar Threshold alone decides."
+     "help": "On: a day counts as sunny enough when its forecast covers predicted consumption plus the margin below. Off: High Solar Threshold alone sets it."
     },
     {
      "key": "solarConsMarginPct",
@@ -1888,7 +1888,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "On: each complete day with a forecast and a VE.Direct link nudges the performance ratio toward what the panels actually delivered, so the forecast fits this array. Off: the ratio stays at the value entered above."
+     "help": "On: each complete day moves the performance ratio toward what the panels delivered. Needs a forecast and a VE.Direct link. Off: the ratio stays as entered."
     },
     {
      "key": "solarLearnRatePct",
@@ -1910,7 +1910,7 @@
       "integer": false
      },
      "arm": true,
-     "help": "How far one day's result moves the performance ratio. Small values ride out a single cloudy day; large values track a real change, such as new shade or a cleaned array, within a few days."
+     "help": "How far one day's result moves the performance ratio. Small values ignore a single cloudy day. Large values follow a real change, such as new shade, within a few days."
     }
    ]
   },
@@ -1968,7 +1968,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "Sounds the alarm for faults that have no threshold of their own: a required sensor that stops reading (alternator temperature, engine speed, alternator current, either battery voltage, battery temperature), a battery current shunt or VE.Direct feed that goes quiet, a lost ADS1115 or INA228 chip, a stalled temperature task, and the INA228 hardware over-voltage trip. Off limits the alarm to the thresholds set on this page and to the cold and hot charge lockouts. The header line names the fault either way, and Silence mutes the buzzer for the fault that is sounding."
+     "help": "Sounds the alarm for faults that have no threshold setting, such as a required sensor that stops reading or a hardware over-voltage trip. Off limits the alarm to the thresholds on this page and the charge lockouts. Silence mutes the buzzer for the current fault."
     },
     {
      "key": "TempAlarm",
@@ -2308,7 +2308,7 @@
        "note": "The High Current Alarm (Battery) is greyed: no battery shunt is installed, so battery current is not measured. The alternator current alarm is unaffected. Setup → Battery → Measurement Sources → Battery Shunt Present."
       }
      ],
-     "help": "Alarm only — never reduces the field. Fires when battery current magnitude exceeds this value in either direction, so it catches heavy discharge as well as over-charge. Separate from the Group 4 Battery Charge Current Limit (which actively caps the command); set this alarm above that limit so a correctly limited charge doesn't alarm. 0 disables."
+     "help": "Alarm only, and never reduces the field. Sounds when battery current exceeds this in either direction. Set above the Battery Charge Current Limit so normal charging does not alarm. 0 disables."
     },
     {
      "key": "AlarmLatchEnabled",
@@ -2402,7 +2402,7 @@
      },
      "arm": true,
      "hidden": true,
-     "help": "Uses the battery instance above as the regulator's battery monitor. Its own state of charge (PGN 127506) becomes the one shown and used. With no shunt wired to the regulator, its current (PGN 127508) also ends absorption on taper current and triggers the current rebulk. Same setting as Use as Battery Monitor in the VE.Direct card, so only one can be on."
+     "help": "Input switch, active while Receive NMEA2K Data is on. On: uses the battery instance above as the regulator's battery monitor, for state of charge (PGN 127506). With no shunt wired to the regulator, its current (PGN 127508) also ends absorption and triggers rebulk. Off: the values are still shown, but the regulator does not use them. Same setting as in the VE.Direct card, so only one can be on."
     },
     {
      "key": "dvccEn",
@@ -2429,7 +2429,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "Obey the charge voltage and current limits (CVL/CCL) a battery management system or gateway publishes on the NMEA 2000 port, or a Victron GX sends over WiFi (the coordination Victron calls DVCC). Received limits are requests: they can only lower this regulator's own targets, never raise them, and every local protection stays fully in charge. A new authority must send steady, plausible values for the settling time before its limits apply. If no limits ever arrive, or the sender goes silent, this regulator falls back to its own targets and a warning strip appears at the top of the dashboard. Charging is never left ungoverned, but the sender is not the backstop it would be while following. A current limit of 0 A is obeyed as \"stop charging,\" the battery's strongest command. While a lower external voltage limit is in control, the internal bulk/absorption/float progression pauses and resumes when the limit releases. Leave this off to watch the decoded limits below and confirm they match what your BMS or GX displays."
+     "help": "Input master switch for charge limits. On: obeys the charge voltage and current limits (CVL/CCL) from a BMS or gateway on NMEA 2000, or a Victron GX over WiFi (DVCC). Limits can only lower this regulator's targets, and every local protection stays active. If the sender goes silent, the regulator returns to the targets set on it and shows a warning. A current limit of 0 A means stop charging. Off: received limits are shown but not obeyed, so leave this off to check them against the BMS or GX first."
     },
     {
      "key": "dvccSilenceS",
@@ -2451,7 +2451,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "How long without a valid limit message before this regulator stops following and returns to its own targets, through the normal rate-governed ramp. With Stop Charging Without Limits On, it stops charging instead. When messages resume, a fresh settling period runs before limits apply again. Victron sends each limit as its own message, so each one is also dropped on its own when it has not been heard for this long or 60 seconds, whichever is longer. The exception is a stop-charging command while Hold Stop-Charging Command is On. With a Victron GX, VE.Can and WiFi each time out on their own, and follow stops only when both are silent."
+     "help": "How long without a valid limit before this regulator stops following and returns to the targets set on it. With Stop Charging Without Limits on, it stops charging instead."
     },
     {
      "key": "dvccLostStop",
@@ -2478,7 +2478,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "What this regulator does while follow is on and no limits are being followed: before the first message arrives, while settling, after the Silence Timeout, and while the trust latch is set. Off: it charges to the targets set on this regulator. On: it charges nothing, the same as a battery's stop-charging command. With a battery shunt it keeps supplying the measured loads at zero battery current; without one, alternator current is held at zero. Charging resumes once limits are followed again. Commissioning is not affected."
+     "help": "What happens while follow is on and no limits are being followed. Off: charges to this regulator's targets. On: charges nothing, though with a battery shunt it still supplies measured loads. Commissioning is not affected."
     }
    ]
   },
@@ -2549,7 +2549,7 @@
      },
      "arm": true,
      "hidden": true,
-     "help": "Chooses who sets the charge rate and Force \"Maintain Mode\": this app, or the two switch-panel wires on data Cable 3 (Charge Rate on pin 5, Force Float on pin 7). Off — this app decides both modes. The wires are still read and reported below, but they change nothing. On — the panel decides both modes, and the matching controls in this app grey out and stop having any effect. Charge Rate: switch on = High, switch off = Low. Force Float: switch on = Force \"Maintain Mode\", which still needs a battery shunt and still yields to Target Voltage mode."
+     "help": "Chooses who sets the charge rate and Force \"Maintain Mode\": this app, or the switch-panel wires on Cable 3 (Charge Rate on pin 5, Force Float on pin 7). Off: this app sets both. On: the panel sets both and the matching controls here stop working. Charge Rate switch on is High, off is Low. Force Float switch on is Force \"Maintain Mode\"."
     }
    ]
   }

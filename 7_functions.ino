@@ -1353,13 +1353,16 @@ static void altLogStopRec(uint8_t reason) {
                        (unsigned long)altLogRows, secs);
 }
 
+// Asked at the press too (/get), so the app can say why instead of leaving Record looking dead.
+const char *altLogRefuseReason() {
+  // Temp is one of the four axes AND the gate that disables the whole fold.
+  if (IgnoreTemperature) return "Recording needs the alternator temperature. Stop running without it first (Setup > System > Run Without Failed Sensors).";
+  return rpmTestRefuseReason();   // engine speed is another axis, and an ignored tach stops the fold too
+}
+
 static bool altLogStartRec() {
   if (altLogState == 1) { queueConsoleMessage("Gate capture: already recording"); return false; }
-  if (IgnoreTemperature) {   // temp is one of the four axes AND the gate that disables the whole fold
-    queueConsoleMessage("Gate capture: blocked — Ignore Temperature is on, so there is no case-temp axis to log");
-    return false;
-  }
-  if (const char *rr = rpmTestRefuseReason()) {   // engine speed is another axis, and an ignored tach stops the fold too
+  if (const char *rr = altLogRefuseReason()) {
     queueConsoleMessageF("Gate capture: blocked — %s", rr);
     return false;
   }
@@ -3219,6 +3222,10 @@ struct PerfEng {
     int64_t until = (int64_t)t0 + FRONT_STEP_US;
     for (;;) {
       if (perfQKind == 0) {
+        if (perfSimMode >= 0.5f && perfLiveArmed && !perfLiveReady) {   // demo: the live points' lookups (9_demo.ino)
+          if (demoPerfGradeStep(until)) perfLiveReady = true;
+          break;
+        }
         if (perfLiveArmed && !perfLiveReady && perfLiveBefore == 0) {
           perfQ->begin(perfLiveMotor ? motorFront : sailFront, perfLiveX, perfLiveK[1], perfLiveK[2], perfLiveK[0], perfLiveK[3], perfLiveGen);
           perfQKind = 2;
@@ -3896,10 +3903,14 @@ void boatPerf_tick(uint32_t nowMs) {
     switch (perfSseStep) {
       case 1:
         // step 1: 1 Hz evaluator + OUTPUT-BLIND state classifier for the active mode (mirrors
-        // altHealth_tick). NO clamp on the % — it may exceed 100 vs a stale front. Demo: both views, from the model.
+        // altHealth_tick). NO clamp on the % — it may exceed 100 vs a stale front. Demo: both views, never 100 % or more.
         // Live: the point is read here and graded by PerfEng::step() on the passes after (PerfEng::applyLive).
         if (perfLiveArmed) { perfLiveArmed = false; perfSseStep = 2; break; }   // graded and applied
-        if (perfSimMode >= 0.5f) { demoPerfGrade(); perfSseStep = 2; break; }
+        if (perfSimMode >= 0.5f) {   // demo: both views taken here, graded by PerfEng::step() (9_demo.ino, DemoDot)
+          perfLiveArmed = true; perfLiveReady = false;
+          demoPerfGradeStart();
+          break;
+        }
         {
           const bool drive = frontDriveOn();
           float px[PERF_NAXIS];
@@ -3933,8 +3944,10 @@ void boatPerf_tick(uint32_t nowMs) {
           }
         }
         break;
-      case 2: perfSendLive();      perfSseStep = 3; break;                  // step 2: sailing live SSE
-      case 3: perfSendMotorLive(); perfSseStep = (++sc >= 5) ? 4 : 0; break; // step 3: motoring live SSE
+      case 2: if (perfSimMode >= 0.5f) demoPerfPut(false);                  // step 2: sailing live SSE (demo: as taken at step 1)
+              perfSendLive();      perfSseStep = 3; break;
+      case 3: if (perfSimMode >= 0.5f) demoPerfPut(true);                   // step 3: motoring live SSE
+              perfSendMotorLive(); perfSseStep = (++sc >= 5) ? 4 : 0; break;
       case 4: sc = 0; sendPerfSettings(); perfSseStep = 0; break;           // step 4: settings echo (1-in-5)
     }
   } else if (foldDue) {
@@ -6409,12 +6422,15 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   // ── IDLE: wait for trigger (do NOT touch dutyOut — another override may own it) ──
   if (phase == 0) {
     if (!altSweepRequested) return false;
-    // A request is only consumed on a normal running control tick, so one pressed with the engine
-    // stopped (or during a fault lockout) would otherwise sit armed and start a field ramp by itself
-    // whenever running resumed. Expire it instead — the button is a metre away from the throttle.
-    if ((uint32_t)(nowMs - altSweepReqMs) > 30000u) {
+    // Backstop: endFieldTestsOutsideAuto drops a request when the field leaves normal AUTO, so this only
+    // catches control ticks that stopped arriving. The request would otherwise sit armed and start a field
+    // ramp by itself when they resumed. Expire it instead — the button is a metre away from the throttle.
+    // Signed: the web task can stamp altSweepReqMs after nowMs was sampled, and that is a fresh press.
+    // The -1000 bound keeps a request older than 24.8 days from reading as fresh.
+    const int32_t reqAgeMs = (int32_t)(nowMs - altSweepReqMs);
+    if (reqAgeMs > 30000 || reqAgeMs < -1000) {
       altSweepRequested = false;
-      queueConsoleMessage("Field sweep: start request expired — the control loop was not running (engine stopped or field off). Press Start again.");
+      queueConsoleMessage("Field sweep: start request expired before the control loop picked it up. Press Start again.");
       return false;
     }
     altSweepRequested = false;
@@ -6766,6 +6782,38 @@ inline int wmIgnCsv(float v, int scale) {
   if (x < -1000000000.0f) return -1000000000;   // stays clear of ROLL_EMPTY, which must stay unreachable
   return (int)lroundf(x);
 }
+inline uint32_t wmIgnNowS() { return (uint32_t)(esp_timer_get_time() / 1000000LL); }
+// CSV2 wmIgn_<name>_age: seconds since this watermark's boot or reset.
+inline int wmIgnAge(const IgnWatermark &w) { return (int)min<uint32_t>(wmIgnNowS() - w.startS, 2000000000u); }
+// /get?wmReset=: comma-separated WM_ALL names, or "all". Every name is checked before anything clears, so a bad list
+// clears nothing. Returns the number cleared, -1 for an unknown name.
+int wmIgnReset(const char *list) {
+  bool pick[18] = { false };
+  const bool all = strcmp(list, "all") == 0;
+  int n = 0;
+  if (all) {
+    for (int i = 0; i < 18; i++) pick[i] = true;
+    n = 18;
+  } else {
+    char buf[200];
+    strlcpy(buf, list, sizeof(buf));
+    for (char *save = nullptr, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(nullptr, ",", &save)) {
+      int i = 0;
+      while (i < 18 && strcmp(tok, WM_ALL[i].name) != 0) i++;
+      if (i == 18) return -1;
+      if (!pick[i]) n++;
+      pick[i] = true;
+    }
+  }
+  const uint32_t now = wmIgnNowS();
+  for (int i = 0; i < 18; i++) {
+    if (!pick[i]) continue;
+    WM_ALL[i].w->lo = NAN;
+    WM_ALL[i].w->hi = NAN;
+    WM_ALL[i].w->startS = now;
+  }
+  return n;
+}
 
 // ───── Charge health system calibration (commissioning stage 9): the alternator's speed lead ─────
 // At fixed field, output answers where the engine is GOING (rotor flux lag), so the health tracker pairs output
@@ -6976,13 +7024,16 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
   // ── IDLE ──
   if (phase == 0) {
     if (!chcRequested) return false;
-    // A request is only consumed on a normal running control tick, so one pressed with the engine
-    // stopped (or during a fault lockout) would otherwise sit armed and pin the field by itself
-    // whenever running resumed. Expire it instead — the button is a metre away from the throttle.
-    if ((uint32_t)(nowMs - chcReqMs) > 30000u) {
+    // Backstop: endFieldTestsOutsideAuto drops a request when the field leaves normal AUTO, so this only
+    // catches control ticks that stopped arriving. The request would otherwise sit armed and pin the field
+    // by itself when they resumed. Expire it instead — the button is a metre away from the throttle.
+    // Signed: the web task can stamp chcReqMs after nowMs was sampled, and that is a fresh press.
+    // The -1000 bound keeps a request older than 24.8 days from reading as fresh.
+    const int32_t reqAgeMs = (int32_t)(nowMs - chcReqMs);
+    if (reqAgeMs > 30000 || reqAgeMs < -1000) {
       chcRequested = false;
-      chcFinish(false, "the engine stopped, or the field was switched off");
-      queueConsoleMessage("Charge health calibration: start request expired — the control loop was not running (engine stopped or field off). Press Start again.");
+      chcFinish(false, "the start request expired before the control loop picked it up");
+      queueConsoleMessage("Charge health calibration: start request expired before the control loop picked it up. Press Start again.");
       return false;
     }
     chcRequested = false;

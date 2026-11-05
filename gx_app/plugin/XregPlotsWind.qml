@@ -2,8 +2,13 @@ import QtQuick
 import Victron.VenusOS
 
 // Plots > Wind: wind speed and direction, true or apparent, over the last 5 to 60 minutes, as the web app's Wind
-// Trend (direction on the left axis, speed on the right). Data: the bridge's 10 s means of the last hour
-// (/Plot/Wind/*, angles averaged as vectors), sent every 10 s while this tab asks for them.
+// Trend (direction on the left axis, speed on the right). Data: every wind reading the GX receives (one per CSV4 frame)
+// over the last hour, from the bridge's /Plot/Wind (XregWindStore) while this tab asks for it. Drawn as XregChart's
+// streamed lines: each update converts only its new samples (one minimum and one maximum per pixel column), and the
+// chart steps once per reading rather than scrolling every display frame: a reading moves the 5 min window about two
+// pixels, too little for a scroll to show, and scrolling costs the GX a redraw every frame. A tap on the chart opens its
+// larger view (XregChartPop), with Autoscale, Lock axes and axis limits kept on this GX, one set for each wind frame (the
+// web app keeps its Wind Trend limits in the page); no cursor.
 Item {
 	id: tab
 
@@ -19,11 +24,11 @@ Item {
 
 	readonly property var windows: [5, 15, 30, 60]
 	readonly property color brand: "#00a19a"    // web app --accent, the app's wind speed trace
-	property real cursor: NaN
-	property var d: ({})
-	property bool dirty: true
 	property QtObject timing           // XregHome's bench timing log
-	property int opens                 // the chart's reset on a return (reopen())
+	// true wind's left axis is a compass direction, apparent wind's an angle off the bow: each frame keeps its own
+	readonly property XregView trueView: XregView { svc: tab.svc; name: "windTrue"; rightDefault: null }
+	readonly property XregView appView: XregView { svc: tab.svc; name: "windApp"; rightDefault: null }
+	readonly property XregView frameView: trueWind ? trueView : appView
 
 	VeQuickItem { id: want; uid: tab.svc + "/Ui/Want/Wind" }
 	Timer {
@@ -33,69 +38,40 @@ Item {
 		running: tab.visible && !ScreenBlanker.blanked
 		onTriggered: want.setValue(Math.floor(Date.now() / 1000))
 	}
-	VeQuickItem { id: tws; uid: tab.svc + "/Plot/Wind/Tws"; onValueChanged: tab.changed() }
-	VeQuickItem { id: twa; uid: tab.svc + "/Plot/Wind/Twa"; onValueChanged: tab.changed() }
-	VeQuickItem { id: aws; uid: tab.svc + "/Plot/Wind/Aws"; onValueChanged: tab.changed() }
-	VeQuickItem { id: awa; uid: tab.svc + "/Plot/Wind/Awa"; onValueChanged: tab.changed() }
+	XregWindStore {
+		id: wind
+		svc: tab.svc
+		active: tab.visible
+		timing: tab.timing
+	}
+	// a streamed chart takes new lines at its next step: step it once the lines follow the frame
+	onTrueWindChanged: Qt.callLater(wind.bump)
 
-	onWindowMinChanged: snap()
-	onTrueWindChanged: snap()
-	Component.onCompleted: Qt.callLater(flush)
-	onVisibleChanged: if (visible) Qt.callLater(flush)
-
-	// Redraw when an update arrives, once per update (as XregPlotsShort)
-	function changed() {
-		dirty = true
-		if (visible && !settle.running)
-			settle.start()
-	}
-	function flush() {
-		if (dirty && visible)
-			snap()
-	}
-	Timer {
-		id: settle
-		interval: BackendConnection.type === BackendConnection.MqttSource ? 100 : 0
-		onTriggered: tab.flush()
-	}
-	// Back from another tab: as the tab was when first opened
-	function reopen() {
-		if (!isNaN(cursor))
-			cursor = NaN
-		// XregChart redraws in full at a reset and at a redraw: each only where something changed
-		if (Object.keys(chart.hiddenKeys).length > 0 || !isNaN(chart.ownCursor))
-			opens++
-		if (dirty)
-			snap()
-	}
-
-	// 10 s samples, newest last; sample i sits at -(n-1-i)/6 minutes
-	function series(item) {
-		const v = item.valid && item.value ? String(item.value).split(",").map(s => s.length ? parseFloat(s) : NaN) : []
-		return v.slice(Math.max(0, v.length - windowMin * 6))
-	}
-	function snap() {
-		const t0 = Date.now()
-		dirty = false
-		settle.stop()
-		const dir = series(trueWind ? twa : awa)
-		const spd = series(trueWind ? tws : aws)
-		d = {
-			lines: [
-				{ key: "dir", label: trueWind ? "Direction" : "Angle", unit: "°", dec: 0, color: Theme.color_orange, wrap: true,
-					x: dir.map((q, i) => (i - (dir.length - 1)) / 6), v: dir },
-				{ key: "spd", label: "Speed", unit: "kn", dec: 1, color: tab.brand, right: true,
-					x: spd.map((q, i) => (i - (spd.length - 1)) / 6), v: spd }
-			]
+	// the home page, which shows the larger view (XregPop)
+	property Item home: null
+	Component.onCompleted: {
+		for (let p = parent; p; p = p.parent) {
+			if (p.openPop !== undefined) {
+				home = p
+				break
+			}
 		}
-		if (timing)
-			timing.add("wind", Date.now() - t0)
 	}
+	// Back from another tab: the chart draws what came while hidden (XregWindStore), nothing more
+	function reopen() {}
+
+	// sk: the series in the store each line draws (the direction line's breaks at 0/360 are in the store)
+	readonly property var lines: [
+		{ key: "dir", sk: trueWind ? "Twa" : "Awa", label: trueWind ? "Direction" : "Angle", unit: "°", dec: 0,
+		  color: Theme.color_orange },
+		{ key: "spd", sk: trueWind ? "Tws" : "Aws", label: "Speed", unit: "kn", dec: 1, color: tab.brand, right: true }
+	]
+	// in seconds before the newest reading, as the streamed lines' x
 	readonly property var ticks: {
 		const st = windowMin <= 5 ? 1 : windowMin <= 15 ? 3 : windowMin <= 30 ? 5 : 10
 		let t = []
 		for (let mm = windowMin - st; mm >= 0; mm -= st)
-			t.push({ x: -mm, t: mm === 0 ? "now" : mm + " min" })
+			t.push({ x: -mm * 60, t: mm === 0 ? "now" : mm + " min" })
 		return t
 	}
 
@@ -143,24 +119,57 @@ Item {
 		height: tab.height - tab.chartY - tab.m
 		radius: Theme.geometry_overviewPage_widget_radius
 		color: Theme.color_background_secondary
-		XregChart {
+		WindChart {
 			id: chart
 			anchors { fill: parent; margins: 12 }
-			title: tab.trueWind ? "True wind" : "Apparent wind"
-			lines: tab.d.lines || []
-			xLo: -(tab.windowMin - 1 / 6)
-			xHi: 0
-			xTicks: tab.ticks
-			leftUnit: "°"
-			leftFixed: tab.trueWind ? [0, 360] : null
-			leftStep: tab.trueWind ? 90 : 0
-			leftCap: [0, 360, 90]
-			rightFromZero: true
-			rightUnit: "kn"
-			emptyText: "No wind data"
-			cursorX: tab.cursor
-			resets: tab.opens
-			onScrubbed: function(xValue) { tab.cursor = xValue }
+			tapOpens: true
+			onOpened: if (tab.home) tab.home.openPop(chartPop)
 		}
+	}
+
+	Component {
+		id: chartPop
+		XregChartPop {
+			view: tab.frameView
+			chart: bigChart
+			title: tab.trueWind ? "True wind" : "Apparent wind"
+			leftName: tab.trueWind ? "Direction" : "Angle"
+			leftUnit: "°"
+			rightName: "Speed"
+			rightUnit: "kn"
+			WindChart {
+				id: bigChart
+				anchors.fill: parent
+				editAxes: true
+			}
+		}
+	}
+
+	// The wind chart, small or in its larger view: its axes from the frame's view, autoscale padded 10% (the angle at
+	// least 30° wide, the speed from 0 and at least 10 kn), lines 3 px inside the plot's edges, a fixed axis's limits
+	// labelled. True wind's direction is 0-360 in quarters under autoscale.
+	component WindChart: XregChart {
+		title: tab.trueWind ? "True wind" : "Apparent wind"
+		lines: tab.lines
+		stream: wind.store
+		streamVer: wind.ver
+		smooth: false
+		xLo: -tab.windowMin * 60
+		xHi: 0
+		xTicks: tab.ticks
+		view: tab.frameView
+		leftUnit: "°"
+		leftFixed: view.leftFixed || (tab.trueWind ? [0, 360] : null)
+		leftStep: tab.trueWind && !view.leftFixed ? 90 : 0
+		leftCap: [0, 360, 90]
+		leftMinSpan: 30
+		rightFixed: view.rightFixed
+		rightFromZero: true
+		rightMinSpan: 10
+		rightUnit: "kn"
+		emptyText: "No wind data"
+		pad: 0.1
+		inset: 3
+		fixedEnds: true
 	}
 }

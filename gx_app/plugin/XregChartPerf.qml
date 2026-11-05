@@ -8,6 +8,9 @@ import Victron.VenusOS
 // script.js (parseFrontCsv, frontPred, foldAwaJS, appToTrue, drawPerfPlot, drawMotorPlot, renderPerf); the bridge
 // passes PerfLive, MotorLive and /perfcurve.csv through unchanged as /Perf/*, and the regulator's perfRidgeFrac and
 // perfIdwPower settings as /Perf/RidgeFrac and /Perf/IdwPower.
+// The larger view (XregDash) is a second tile that mirrors this one (mirror): it draws the curve this one sweeps and its
+// Sailing/Motoring and wind-frame taps set this one's, so the sweep runs once and the two never disagree. Both follow
+// the axes' view (axes, XregView): Autoscale, Lock axes, the speed and RPM maximums and the wind frame, kept on this GX.
 Rectangle {
 	id: perf
 
@@ -16,6 +19,14 @@ Rectangle {
 	property bool active
 	property QtObject timing           // XregHome's bench timing log
 	readonly property color brand: "#00a19a"    // web app --accent, the app's speed number
+	property Item mirror: null
+	readonly property Item src: mirror || perf
+	property QtObject axes: null
+	// the larger view: a tap on an axis's top number emits axisTapped() (XregChartPop sets that maximum); the type grows up
+	// to maxK times the 430 x 348 tile's
+	property bool editAxes
+	property real maxK: 1
+	signal axisTapped(bool right, bool isMax)
 
 	radius: Theme.geometry_overviewPage_widget_radius
 	color: Theme.color_background_secondary
@@ -40,6 +51,7 @@ Rectangle {
 	VeQuickItem { id: sSteady; uid: perf.svc + "/Perf/Live/steady" }
 	VeQuickItem { id: sSettle; uid: perf.svc + "/Perf/Live/settleSec" }
 	VeQuickItem { id: sState; uid: perf.svc + "/Perf/Live/state" }
+	VeQuickItem { id: sSim; uid: perf.svc + "/Perf/Live/sim" }
 	VeQuickItem { id: sHours; uid: perf.svc + "/Perf/Live/sailHours" }
 	VeQuickItem { id: mValid; uid: perf.svc + "/Perf/Motor/valid" }
 	VeQuickItem { id: mRpm; uid: perf.svc + "/Perf/Motor/rpm" }
@@ -72,8 +84,15 @@ Rectangle {
 	readonly property int liveView: num(mValid) >= 0.5 && num(sValid) >= 0.5 ? (num(engRpm) > 0 ? 1 : 0)
 		: num(mValid) >= 0.5 ? 1 : num(sValid) >= 0.5 ? 0 : -1
 	onLiveViewChanged: if (liveView >= 0) autoView = liveView
-	readonly property int view: !sailBoat ? 1 : pinned >= 0 ? pinned : autoView
-	property bool trueFrame: false
+	readonly property int view: mirror ? mirror.view : !sailBoat ? 1 : pinned >= 0 ? pinned : autoView
+	property bool trueFrame: mirror ? mirror.trueFrame : !!axes && axes.mine.trueFrame === true
+	// the wind frame tapped: kept in the axes' view where there is one (with no regulator serial yet, until a reload)
+	function setFrame(t) {
+		if (axes && axes.key)
+			axes.set({ trueFrame: t ? true : null })
+		else
+			trueFrame = t
+	}
 
 	readonly property bool lValid: num(view ? mValid : sValid) >= 0.5
 	readonly property int lState: isFinite(num(view ? mState : sState)) ? num(view ? mState : sState) | 0 : 3
@@ -108,6 +127,8 @@ Rectangle {
 	property bool folded: true
 	property int curveRev: 0
 	function parseCurve() {
+		if (mirror)
+			return
 		let sail = [], motor = [], cur = null, naxis = 3
 		// read value, not valid: inside a value-change handler valid may not have caught up yet
 		const txt = curveCsv.value ? String(curveCsv.value) : ""
@@ -262,16 +283,16 @@ Rectangle {
 
 	// The curve sweep costs (sweep steps x front points): redo it only when its inputs move noticeably, checked every
 	// 2 s and at once on a view, frame, curve, ridge or power change; a wind (headwind) or sea-state change alone starts
-	// one at most 15 s after the last one started (hold), so the curve may lag it by up to 15 s (Mark, 2026-10-30). It
-	// runs in slices of about 3 ms (at least one step), one per event-loop turn, so taps are handled in between; its
-	// inputs are taken when it starts, and the chart keeps the last complete curve until it ends. A new input starts a
-	// new sweep in place of the running one.
-	property var curve: ({ view: -1, folded: true, pts: [], maxS: 4, maxR: 3600 })
+	// one at most 15 s after the last one started (hold), so the curve may lag it by up to 15 s (Mark, 2026-10-30); in
+	// demo mode, at once while the dot is outside the curve shown (dotOutside). It runs in slices of about 3 ms (at least
+	// one step), one per event-loop turn, so taps are handled in between; its inputs are taken when it starts, and the
+	// chart keeps the last complete curve until it ends. A new input starts a new sweep in place of the running one.
+	property var curve: ({ view: -1, folded: true, pts: [], maxS: 4, maxR: 3000 })
 	property string curveKey
 	property real sweptAt: -Infinity
 	property var job: null
 	property bool slicePending
-	readonly property bool sweeping: job !== null
+	readonly property bool sweeping: mirror ? mirror.sweeping : job !== null
 	// The last 8 curves swept, by key, so a Sailing/Motoring or Apparent/True tap back shows one at once; a sailing curve
 	// keeps its apparent angles (raw) and wind, from which the other wind frame is the same speeds at other angles
 	property var swept: ({})
@@ -283,7 +304,10 @@ Rectangle {
 		while (sweptKeys.length > 8)
 			delete swept[sweptKeys.shift()]
 	}
-	function refresh() {
+	// now: no hold, but never in place of a sweep running (demo mode, the dot outside the curve shown)
+	function refresh(now) {
+		if (mirror)
+			return
 		// not lSea: inside onViewChanged it may still hold the other view's sea state
 		const sea = Math.round((num(view ? mSea : sSea) || 0) * 10) / 10
 		const soft = sea + "|" + (view ? Math.round(num(mHw) * 2 || 0) : Math.round(num(sWs) * 2 || 0))
@@ -303,8 +327,10 @@ Rectangle {
 			curve = ready
 			return
 		}
+		if (now && job !== null)
+			return
 		const wait = sweptAt + 15000 - Date.now()
-		if (curveKey.indexOf(fixed) === 0 && wait > 0) {
+		if (curveKey.indexOf(fixed) === 0 && wait > 0 && !now) {
 			if (!hold.running) {
 				hold.interval = wait
 				hold.start()
@@ -315,7 +341,7 @@ Rectangle {
 		curveKey = key
 		sweptAt = Date.now()
 		const j = { key: key, view: view, folded: folded, sea: sea, trueFrame: trueFrame, p: idwPower, ridge: ridgeFrac, pts: [],
-			raw: [], maxS: 4, maxR: 3600, started: Date.now(), work: 0 }
+			raw: [], maxS: 4, maxR: 3000, started: Date.now(), work: 0 }
 		if (view === 0 && sailFront.length >= 2) {
 			j.front = sailFront
 			j.sc = sailScale
@@ -342,7 +368,7 @@ Rectangle {
 			j.end = hi + 1e-6
 		} else {
 			job = null
-			curve = { view: view, folded: folded, pts: [], maxS: 4, maxR: 3600 }
+			curve = { view: view, folded: folded, pts: [], maxS: 4, maxR: 3000 }
 			return
 		}
 		job = j
@@ -409,25 +435,186 @@ Rectangle {
 		repeat: true
 		triggeredOnStart: true
 		running: perf.visible
-		onTriggered: perf.refresh()
+		onTriggered: perf.refresh(perf.dotOutside)
 	}
 	Timer {
 		id: hold
 		onTriggered: if (perf.visible) perf.refresh()
 	}
 	// a curve swept for the other view is not drawn while this view's sweep runs
-	readonly property var shown: curve.view === view ? curve : ({ view: view, folded: folded, pts: [], maxS: 4, maxR: 3600 })
+	readonly property var shown: mirror ? mirror.shown : curve.view === view ? curve : ({ view: view, folded: folded, pts: [], maxS: 4, maxR: 3000 })
 	readonly property bool haveCurve: shown.pts.length > 1
-	readonly property real maxS: Math.ceil(Math.max(shown.maxS, lValid && lSpd > 0 ? lSpd : 0))
-	readonly property real maxR: Math.ceil(Math.max(shown.maxR, view === 1 && lValid ? num(mRpm) || 0 : 0) / 500) * 500
+	// Demo mode (the regulator's sim flag): the dot never outside the curve drawn (Mark, 2026-10-31). The regulator holds
+	// the speed it sends under the curve at the point (9_demo.ino, DemoDot); the curve here can be one swept up to 15 s
+	// before at another wind, so the dot is drawn on it at most (dotSpd, the speed readout unchanged) and a new sweep
+	// starts without the hold. curveAtDot: the drawn curve on the dot's ray (sailing) or at its RPM (motoring), 0 if none.
+	readonly property bool demo: num(sSim) >= 0.5
+	readonly property real dotAngle: trueFrame ? appToTrue(num(sWa) || 0, lSpd || 0, num(sWs) || 0) : num(sWa) || 0
+	readonly property real curveAtDot: {
+		if (!demo || !haveCurve || !lValid)
+			return 0
+		const pts = shown.pts
+		if (view === 1) {
+			const r = num(mRpm) || 0
+			for (let i = 1; i < pts.length; ++i)
+				if (pts[i - 1][0] <= r && r <= pts[i][0])
+					return pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * (r - pts[i - 1][0]) / Math.max(1e-9, pts[i][0] - pts[i - 1][0])
+			return 0
+		}
+		let a = dotAngle
+		while (a > 180) a -= 360
+		while (a < -180) a += 360
+		if (shown.folded)
+			a = Math.abs(a)
+		const rad = Math.PI / 180, ux = Math.sin(a * rad), uy = Math.cos(a * rad)
+		for (let i = 1; i < pts.length; ++i) {
+			const a1 = pts[i - 1][0], a2 = pts[i][0]
+			if (a < Math.min(a1, a2) || a > Math.max(a1, a2))
+				continue
+			const x1 = pts[i - 1][1] * Math.sin(a1 * rad), y1 = pts[i - 1][1] * Math.cos(a1 * rad)
+			const x2 = pts[i][1] * Math.sin(a2 * rad), y2 = pts[i][1] * Math.cos(a2 * rad)
+			const den = ux * (y2 - y1) - uy * (x2 - x1)
+			return Math.abs(den) < 1e-12 ? Math.max(pts[i - 1][1], pts[i][1]) : (x1 * (y2 - y1) - y1 * (x2 - x1)) / den
+		}
+		return 0
+	}
+	readonly property real dotSpd: curveAtDot > 0 ? Math.min(lSpd || 0, 0.995 * curveAtDot) : lSpd || 0
+	readonly property bool dotOutside: curveAtDot > 0 && lSpd > curveAtDot
+	onDotOutsideChanged: if (dotOutside) src.refresh(true)
+	// The axes under autoscale: speed from 0, at least 10 kn and 10% above the fastest of the curve and the live point, in
+	// whole knots a quarter (the polar's rings, the motoring map's gridlines); RPM from 0, at least 3000 and 10% above the
+	// highest, in 500s. Locked or set by hand: the axes' view holds them (their minimums stay 0).
+	readonly property real autoS: 4 * Math.ceil(Math.max(10, 1.1 * Math.max(shown.maxS, lValid && dotSpd > 0 ? dotSpd : 0)) / 4)
+	readonly property real autoR: Math.ceil(Math.max(3000, 1.1 * Math.max(shown.maxR, view === 1 && lValid ? num(mRpm) || 0 : 0)) / 500) * 500
+	readonly property var fixedS: axes ? axes.leftFixed : null
+	readonly property var fixedR: axes && view === 1 ? axes.rightFixed : null
+	readonly property real maxS: fixedS ? fixedS[1] : autoS
+	readonly property real maxR: fixedR ? fixedR[1] : autoR
+	// the axes as XregChartPop reads them: speed on the left, RPM (motoring) on the right
+	readonly property var lAx: ({ lo: 0, hi: maxS })
+	readonly property var rAx: view === 1 ? ({ lo: 0, hi: maxR }) : null
+	// a quarter of the speed axis, to one decimal where a limit set by hand makes it fractional
+	function speedText(v) { return String(Math.round(v * 10) / 10) }
 
 	// ---- layout: header, then the app's four corners around the plot ----
-	readonly property real k: Math.max(0.7, Math.min(1, width / 430, height / 348))
+	readonly property real k: Math.max(0.7, Math.min(maxK, width / 430, height / 348))
 	function fs(px, floor) { return Math.max(floor, Math.round(px * k)) }
 	readonly property real headH: 40
 	readonly property real side: Math.round(84 * k)
 	readonly property real toggleH: 28
-	readonly property real plotS: Math.max(60, Math.min(height - headH - toggleH - 10, width - 20 - 2 * side))
+	// What the plot keeps clear of, in the body's coordinates: the header's items (the settle status as wide as
+	// "Settling" whether shown or not) and each corner's rows as drawn: a label's text (where it changes, the widest it
+	// can be: reach), a readout's whole box. The bottom-left corner counts as tall as its longest grading words wrap. So
+	// the plot never changes size as the readings change.
+	readonly property var headRects: {
+		let r = [{ x: 2, y: 6 - headH, w: settleRow.x + 24 + settlingTm.advanceWidth - 12, h: 26 }]
+		if (segRow.visible)
+			r.push({ x: segRow.x - body.x, y: segRow.y - headH, w: segRow.width, h: segRow.height })
+		return r
+	}
+	function rowRects(col, dy) {
+		let out = []
+		for (const c of col.children) {
+			if (!c.visible)
+				continue
+			let w, h
+			if (c.wrapMode === undefined) {
+				// the headwind Flow as one line, read from its rows alone: it wraps only beside the motoring map, where
+				// neither its width nor its height counts
+				const kids = c.children.filter(k => k.visible)
+				w = kids.reduce((a, k) => a + k.width, 0) + Math.max(0, kids.length - 1) * c.spacing
+				h = Math.max(0, ...kids.map(k => k.height))
+			} else {
+				w = c.reach !== undefined ? c.reach : c.template && c.template.length ? c.width
+					: c.wrapMode === Text.NoWrap ? c.implicitWidth : Math.min(c.width, c.implicitWidth)
+				h = c.height
+			}
+			if (w <= 0 || h <= 0)
+				continue
+			const right = c.horizontalAlignment === Text.AlignRight
+			out.push({ x: col.x + c.x + (right ? c.width - w : 0), y: col.y + c.y - dy, w: w, h: h })
+		}
+		return out
+	}
+	property real stateWorstH
+	function measureStates() {
+		let h = 0
+		for (let i = 0; i < stateSizes.count; ++i)
+			h = Math.max(h, stateSizes.itemAt(i) ? stateSizes.itemAt(i).implicitHeight : 0)
+		stateWorstH = h
+	}
+	readonly property var cornerRects: ({
+		tl: rowRects(cornerTL, 0), tr: rowRects(cornerTR, 0), br: rowRects(cornerBR, 0),
+		bl: rowRects(cornerBL, Math.max(0, stateWorstH - stateLabel.height))
+	})
+	function rectDist(px, py, o) {
+		const dx = Math.max(o.x - px, 0, px - o.x - o.w), dy = Math.max(o.y - py, 0, py - o.y - o.h)
+		return Math.sqrt(dx * dx + dy * dy)
+	}
+	function hitsAny(a, list, gap) {
+		return list.some(o => a.x < o.x + o.w + gap && o.x < a.x + a.w + gap && a.y < o.y + o.h + gap && o.y < a.y + a.h + gap)
+	}
+	// The polar as big as the tile allows: centred across the body, at the height that gives the largest circle 4 px
+	// clear of the header's items and the corners' rows (it may reach between them, and up into the header between its
+	// items), "0° into wind" above it and "180°" and the wind-frame toggles under it, all inside the tile. Among equal
+	// circles, the middle height.
+	readonly property var polarFit: {
+		if (view !== 0)
+			return { cx: body.width / 2, cy: body.height / 2, r: 30 }
+		const obs = headRects.concat(cornerRects.tl, cornerRects.tr, cornerRects.bl, cornerRects.br)
+		const cx = body.width / 2, bh = body.height, top = 4 - headH
+		const tw = topLabel.implicitWidth, th = topLabel.implicitHeight
+		const lowW = Math.max(lowLabel.implicitWidth, frameRow.width), lowH = lowLabel.implicitHeight + 2 + frameRow.height
+		const radius = cy => {
+			let r = Math.min(cx, cy - top - th - 1, bh - lowH - 1 - cy)
+			for (const o of obs)
+				r = Math.min(r, rectDist(cx, cy, o) - 4)
+			r = Math.floor(r)
+			while (r > 20 && (hitsAny({ x: cx - tw / 2, y: cy - r - 1 - th, w: tw, h: th }, obs, 2)
+					|| hitsAny({ x: cx - lowW / 2, y: cy + r + 1, w: lowW, h: lowH }, obs, 2)))
+				r--
+			return r
+		}
+		let best = -1, lo = 0, hi = 0
+		for (let cy = top; cy <= bh; cy += 2) {
+			const r = radius(cy)
+			if (r > best) {
+				best = r
+				lo = hi = cy
+			} else if (r === best) {
+				hi = cy
+			}
+		}
+		const cy = Math.round((lo + hi) / 2)
+		return { cx: cx, cy: cy, r: Math.max(30, radius(cy)) }
+	}
+	// The motoring map: between the corner columns, or across the body's full width between the top and bottom corners'
+	// rows, whichever plot has the longer short side; the RPM name under it. Between the columns the last RPM label,
+	// centred 4 px inside the plot's right edge, stays 2 px clear of the right corners' rows: the plot at the body's full
+	// height, narrowed where that label meets one, or at the columns' full width, as tall as keeps it clear.
+	readonly property var motorFit: {
+		const bw = body.width, bh = body.height, g = 4
+		const nameH = rpmLabel.implicitHeight + 6, padL = motor.padL, padB = motor.padB
+		const c = cornerRects, rights = c.tr.concat(c.br)
+		const lw = lastRpmTm.advanceWidth, lh = lastRpmTm.height
+		const hits = (h, w) => rights.filter(o => o.y < h - padB + 2 + lh && h - padB + 2 < o.y + o.h && side + w - 4 + lw / 2 > o.x - 2)
+		const tall = { x: side, y: 0, w: bw - 2 * side, h: bh - nameH }
+		for (const o of hits(tall.h, tall.w))
+			tall.w = Math.min(tall.w, o.x - 2 + 4 - lw / 2 - side)
+		const wide = { x: side, y: 0, w: bw - 2 * side, h: bh - nameH }
+		while (wide.h > 2 * padB && hits(wide.h, wide.w).length)
+			wide.h -= 2
+		const y0 = Math.max(...c.tl.concat(c.tr).map(o => o.y + o.h)) + g
+		const across = { x: 0, y: y0, w: bw, h: Math.min(...c.bl.concat(c.br).map(o => o.y)) - g - nameH - y0 }
+		const shortSide = f => Math.min(f.w - padL, f.h - padB)
+		return [tall, wide, across].reduce((m, f) => shortSide(f) > shortSide(m) ? f : m)
+	}
+	readonly property real plotS: Math.max(60, view === 0 ? 2 * polarFit.r : Math.min(motorFit.w, motorFit.h))
+	TextMetrics { id: settlingTm; font.family: Global.fontFamily; font.pixelSize: Theme.font_size_caption; font.bold: true; text: "Settling" }
+	TextMetrics { id: headwindTm; font.family: Global.fontFamily; font.pixelSize: perf.fs(14, 12); text: "headwind" }
+	TextMetrics { id: tailwindTm; font.family: Global.fontFamily; font.pixelSize: perf.fs(14, 12); text: "tailwind" }
+	TextMetrics { id: lastRpmTm; font.family: Global.fontFamily; font.pixelSize: perf.fs(10, 10); text: String(perf.maxR) }
+	TextMetrics { id: veryRoughTm; font.family: Global.fontFamily; font.pixelSize: perf.fs(14, 12); text: perf.seaWord(9) }
 
 	Label {
 		x: 12
@@ -438,6 +625,7 @@ Rectangle {
 	}
 	// Settle status: Settled, or Settling with the seconds left before recording starts
 	Row {
+		id: settleRow
 		x: 72
 		y: 8
 		height: 22
@@ -470,7 +658,7 @@ Rectangle {
 					capStyle: ShapePath.RoundCap
 					PathAngleArc {
 						centerX: 9; centerY: 9; radiusX: 7; radiusY: 7; startAngle: -90
-						sweepAngle: perf.settlePeak > 0 ? 360 * perf.lSettle / perf.settlePeak : 0
+						sweepAngle: perf.src.settlePeak > 0 ? 360 * perf.lSettle / perf.src.settlePeak : 0
 					}
 				}
 			}
@@ -491,7 +679,20 @@ Rectangle {
 		}
 	}
 	TextMetrics { id: motoringTm; font.family: Global.fontFamily; font.pixelSize: Theme.font_size_tiny; text: "Motoring" }
+	readonly property real touchMargin: 14      // gui-v2's button touch margin (geometry_button_touch_verticalMargin)
+	// Sailing / Motoring a finger tall: a tap up to touchMargin under the buttons, above them to the tile's top or right of
+	// them to its edge picks the nearer one, where it would otherwise open the larger view (the buttons are 30 px tall)
+	MouseArea {
+		z: 1
+		visible: segRow.visible
+		x: segRow.x - 8
+		width: perf.width - x
+		height: segRow.y + segRow.height + perf.touchMargin
+		onClicked: function(mouse) { perf.src.pinned = mouse.x + x < segRow.x + segRow.width / 2 ? 0 : 1 }
+	}
 	SegmentedButtonRow {
+		id: segRow
+		z: 1      // over the larger view's axis zone where the polar reaches up beside it
 		anchors { right: parent.right; rightMargin: 8; top: parent.top; topMargin: 6 }
 		// never so narrow that "Motoring" loses its 12 px each side, as the 5-inch tile's 0.7 scale made it
 		width: Math.max(Math.round(190 * perf.k), 2 * Math.ceil(motoringTm.advanceWidth + 24))
@@ -500,7 +701,7 @@ Rectangle {
 		fontPixelSize: Theme.font_size_tiny
 		model: [{ value: "Sailing" }, { value: "Motoring" }]
 		currentIndex: perf.view
-		onButtonClicked: function(buttonIndex) { perf.pinned = buttonIndex }
+		onButtonClicked: function(buttonIndex) { perf.src.pinned = buttonIndex }
 	}
 
 	Item {
@@ -512,6 +713,7 @@ Rectangle {
 
 		// Top left: conditions
 		Column {
+			id: cornerTL
 			width: perf.side
 			Label {
 				width: parent.width
@@ -526,7 +728,10 @@ Rectangle {
 				font.pixelSize: perf.fs(26, 18)
 				font.bold: true
 			}
-			Row {
+			// headwind or tailwind beside the knots; with the motoring map beside the corners, under them where the corner
+			// is too narrow, so never into the map
+			Flow {
+				width: perf.view === 1 && perf.motorFit.x === 0 ? body.width / 2 : perf.side
 				spacing: 4
 				XregNum {
 					template: perf.view ? "88 kn" : "888°"
@@ -540,6 +745,7 @@ Rectangle {
 				}
 				Label {
 					visible: perf.view && perf.lValid
+					width: Math.ceil(Math.max(headwindTm.advanceWidth, tailwindTm.advanceWidth))   // so it wraps the same either way
 					text: (perf.num(mHw) || 0) < 0 ? "tailwind" : "headwind"
 					color: Theme.color_font_secondary
 					font.pixelSize: perf.fs(14, 12)
@@ -548,6 +754,7 @@ Rectangle {
 		}
 		// Top right: sea state
 		Column {
+			id: cornerTR
 			anchors.right: parent.right
 			width: perf.side
 			Label {
@@ -567,6 +774,7 @@ Rectangle {
 			Label {
 				width: parent.width
 				horizontalAlignment: Text.AlignRight
+				readonly property real reach: Math.min(width, veryRoughTm.advanceWidth)
 				text: isFinite(perf.lSea) ? perf.seaWord(perf.lSea) : ""
 				color: Theme.color_font_secondary
 				font.pixelSize: perf.fs(14, 12)
@@ -574,6 +782,7 @@ Rectangle {
 		}
 		// Bottom left: % of best and what it is based on
 		Column {
+			id: cornerBL
 			anchors.bottom: parent.bottom
 			width: perf.side
 			XregNum {
@@ -589,6 +798,8 @@ Rectangle {
 				font.pixelSize: perf.fs(14, 12)
 			}
 			Label {
+				id: stateLabel
+				readonly property real reach: width
 				width: parent.width
 				wrapMode: Text.WordWrap
 				text: perf.lValid ? perf.stateLabels[perf.lState] || "" : ""
@@ -598,6 +809,7 @@ Rectangle {
 		}
 		// Bottom right: data maturity
 		Column {
+			id: cornerBR
 			anchors { right: parent.right; bottom: parent.bottom }
 			width: perf.side
 			XregNum {
@@ -630,14 +842,29 @@ Rectangle {
 				font.pixelSize: perf.fs(12, 11)
 			}
 		}
+		// each grading state's words as the bottom-left corner wraps them, for its tallest (stateWorstH)
+		Repeater {
+			id: stateSizes
+			model: perf.stateLabels
+			delegate: Label {
+				required property string modelData
+				visible: false
+				width: perf.side
+				wrapMode: Text.WordWrap
+				text: modelData
+				font.pixelSize: stateLabel.font.pixelSize
+				onImplicitHeightChanged: perf.measureStates()
+				Component.onCompleted: perf.measureStates()
+			}
+		}
 
-		// Plot box, centred between the corner columns
+		// Plot box: the polar's circle (polarFit), or the motoring map's plot (motorFit)
 		Item {
 			id: box
-			x: (body.width - width) / 2
-			y: 0
-			width: perf.plotS
-			height: perf.plotS
+			x: perf.view === 0 ? perf.polarFit.cx - perf.polarFit.r : perf.motorFit.x
+			y: perf.view === 0 ? perf.polarFit.cy - perf.polarFit.r : perf.motorFit.y
+			width: perf.view === 0 ? 2 * perf.polarFit.r : perf.motorFit.w
+			height: perf.view === 0 ? 2 * perf.polarFit.r : perf.motorFit.h
 
 			// Sailing polar: rings, spokes every 45 degrees, best-ever line (mirrored when symmetric), live dot
 			Item {
@@ -645,8 +872,8 @@ Rectangle {
 				anchors.fill: parent
 				visible: perf.view === 0
 				readonly property real cx: width / 2
-				readonly property real cy: height * 0.54
-				readonly property real rr: Math.min(width, height) * 0.42
+				readonly property real cy: height / 2
+				readonly property real rr: Math.min(width, height) / 2
 				function pt(ang, s) {
 					const r = s / perf.maxS * rr, a = ang * Math.PI / 180
 					return Qt.point(cx + r * Math.sin(a), cy - r * Math.cos(a))
@@ -669,10 +896,10 @@ Rectangle {
 						XregNum {
 							x: polar.cx + 3
 							y: polar.cy - parent.r + 1
-							template: "88 kn"
-							text: Math.round(perf.maxS * (index + 1) / 4) + " kn"
+							template: perf.maxS % 4 ? "88.8 kn" : "88 kn"
+							text: perf.speedText(perf.maxS * (index + 1) / 4) + " kn"
 							color: Theme.color_font_disabled
-							font.pixelSize: 10
+							font.pixelSize: perf.fs(10, 10)
 						}
 					}
 				}
@@ -710,18 +937,20 @@ Rectangle {
 					}
 				}
 				Label {
+					id: topLabel
 					anchors.horizontalCenter: parent.horizontalCenter
 					y: polar.cy - polar.rr - height - 1
 					text: "0° into wind"
 					color: Theme.color_font_secondary
-					font.pixelSize: 10
+					font.pixelSize: perf.fs(10, 10)
 				}
 				Label {
+					id: lowLabel
 					anchors.horizontalCenter: parent.horizontalCenter
 					y: polar.cy + polar.rr + 1
 					text: "180°"
 					color: Theme.color_font_secondary
-					font.pixelSize: 10
+					font.pixelSize: perf.fs(10, 10)
 				}
 				// Halfway down the lower half, but never over the speed readout, and inside the circle: on a small polar
 				// (5-inch) it drops to the readout's foot, shrinks and breaks onto two lines
@@ -729,7 +958,7 @@ Rectangle {
 					id: noSail
 					readonly property real maxW: polar.rr * 1.5
 					x: polar.cx - width / 2
-					y: Math.max(polar.cy + polarSpd.height / 2 + 2, (polar.height + polar.rr - height) / 2)
+					y: Math.max(polar.cy + polarSpd.height / 2 + 2, polar.cy + (polar.rr - height) / 2)
 					width: Math.min(implicitWidth, maxW)
 					visible: !perf.haveCurve && !perf.sweeping
 					text: noSailTm.advanceWidth <= maxW ? noSailTm.text : "No sailing\ndata yet"
@@ -739,8 +968,7 @@ Rectangle {
 					TextMetrics { id: noSailTm; font: noSail.font; text: "No sailing data yet" }
 				}
 				Rectangle {
-					readonly property point at: polar.pt(perf.trueFrame ? perf.appToTrue(perf.num(sWa) || 0, perf.lSpd || 0, perf.num(sWs) || 0)
-						: perf.num(sWa) || 0, perf.lSpd || 0)
+					readonly property point at: polar.pt(perf.dotAngle, perf.dotSpd)
 					visible: perf.view === 0 && perf.lValid
 					x: at.x - width / 2
 					y: at.y - height / 2
@@ -765,9 +993,15 @@ Rectangle {
 						anchors.horizontalCenter: parent.horizontalCenter
 						text: perf.num(sSrc) >= 1.5 ? "KN · SOG" : "KN · STW"
 						color: Theme.color_font_secondary
-						font.pixelSize: 10
+						font.pixelSize: perf.fs(10, 10)
 						font.bold: true
 					}
+				}
+				// editAxes: the outer ring's speed, the axis maximum, a finger wide
+				AxisZone {
+					x: polar.cx - 8
+					y: polar.cy - polar.rr - 22
+					width: 96
 				}
 			}
 
@@ -776,14 +1010,21 @@ Rectangle {
 				id: motor
 				anchors.fill: parent
 				visible: perf.view === 1
-				readonly property real padL: 38
-				readonly property real padB: 16
+				readonly property real padL: Math.round(38 * Math.max(1, perf.k))
+				readonly property real padB: Math.round(16 * Math.max(1, perf.k))
 				readonly property real cw: width - padL - 4
 				readonly property real ch: height - padB - 4
-				// at most six RPM labels, and at least 30 px apart (four-digit labels touch on the 5-inch plot at 1000)
+				// at most six RPM labels, and at least 30 px apart (four-digit labels touch on the 5-inch plot at 1000); the axis
+				// maximum labelled, a step from the label before it
 				readonly property real rStep: [500, 1000, 2000, 5000, 10000].find(s => s >= perf.maxR / 6
 						&& s / perf.maxR * cw >= 30) || 10000
-				readonly property real sStep: Math.max(1, Math.ceil(perf.maxS / 5))
+				readonly property var rTicks: {
+					let t = []
+					for (let r = 0; r <= perf.maxR - 0.999 * rStep; r += rStep)
+						t.push(r)
+					return t.concat([perf.maxR])
+				}
+				readonly property real sStep: perf.maxS / 4
 				function mx(r) { return padL + r / perf.maxR * cw }
 				function my(s) { return 4 + ch - s / perf.maxS * ch }
 				// The speed readout sits top left, over the low-RPM end the curve rises from; on a small plot (5-inch) the
@@ -797,27 +1038,27 @@ Rectangle {
 				readonly property bool lowRight: !clear(padL + 8, 8, spdCol.width, spdCol.height)
 					&& clear(padL + cw - 8 - spdCol.width, 4 + ch - 6 - spdCol.height, spdCol.width, spdCol.height)
 				Repeater {
-					model: Math.floor(perf.maxR / motor.rStep) + 1
+					model: motor.rTicks
 					delegate: Item {
-						required property int index
+						required property real modelData
 						Rectangle {
-							x: motor.mx(index * motor.rStep)
+							x: motor.mx(modelData)
 							y: 4
 							width: 1
 							height: motor.ch
 							color: Theme.color_card_separator
 						}
 						Label {
-							x: motor.mx(index * motor.rStep) - width / 2
+							x: motor.mx(modelData) - width / 2
 							y: motor.height - motor.padB + 2
-							text: index * motor.rStep
+							text: modelData
 							color: Theme.color_font_disabled
-							font.pixelSize: 10
+							font.pixelSize: perf.fs(10, 10)
 						}
 					}
 				}
 				Repeater {
-					model: Math.floor(perf.maxS / motor.sStep) + 1
+					model: 5
 					delegate: Item {
 						required property int index
 						Rectangle {
@@ -830,9 +1071,9 @@ Rectangle {
 						Label {
 							x: motor.padL - width - 3
 							y: motor.my(index * motor.sStep) - height / 2
-							text: index * motor.sStep + (index === Math.floor(perf.maxS / motor.sStep) ? " kn" : "")
+							text: perf.speedText(index * motor.sStep) + (index === 4 ? " kn" : "")
 							color: Theme.color_font_disabled
-							font.pixelSize: 10
+							font.pixelSize: perf.fs(10, 10)
 						}
 					}
 				}
@@ -868,7 +1109,7 @@ Rectangle {
 				Rectangle {
 					visible: perf.view === 1 && perf.lValid
 					x: motor.mx(perf.num(mRpm) || 0) - width / 2
-					y: motor.my(perf.lSpd || 0) - height / 2
+					y: motor.my(perf.dotSpd) - height / 2
 					width: 13; height: 13; radius: 6.5
 					color: perf.lSteady ? Theme.color_green : Theme.color_orange
 					border.width: 2
@@ -890,17 +1131,30 @@ Rectangle {
 						anchors.right: motor.lowRight ? parent.right : undefined
 						text: perf.num(mSrc) >= 1.5 ? "KN · SOG" : "KN · STW"
 						color: Theme.color_font_secondary
-						font.pixelSize: 10
+						font.pixelSize: perf.fs(10, 10)
 						font.bold: true
 					}
+				}
+				// editAxes: the top speed and the last RPM, the axes' maximums, a finger wide
+				AxisZone {
+					x: 0
+					y: motor.my(perf.maxS) - 28
+					width: motor.padL + 4
+				}
+				AxisZone {
+					onRight: true
+					x: motor.mx(perf.maxR) - 44
+					y: motor.height - motor.padB - 20
+					width: 88
 				}
 			}
 		}
 
 		// Under the plot: the polar's wind frame (Apparent is the front's own frame), or the motoring x axis name
 		Row {
+			id: frameRow
 			anchors.horizontalCenter: box.horizontalCenter
-			y: box.height + 4
+			y: box.y + box.height + 1 + lowLabel.implicitHeight + 2
 			spacing: 0
 			visible: perf.view === 0
 			Repeater {
@@ -920,23 +1174,36 @@ Rectangle {
 						anchors.centerIn: parent
 						text: parent.modelData
 						color: parent.isOn ? Theme.color_button_down_text : Theme.color_font_secondary
-						font.pixelSize: 12
+						font.pixelSize: perf.fs(12, 12)
 					}
+					// a finger wide and tall: the touch margin above and below, and out past the pair's ends
 					MouseArea {
 						anchors.fill: parent
-						anchors.margins: -4
-						onClicked: perf.trueFrame = parent.index === 1
+						anchors.topMargin: -perf.touchMargin
+						anchors.bottomMargin: -perf.touchMargin
+						anchors.leftMargin: parent.index === 0 ? -12 : 0
+						anchors.rightMargin: parent.index === 1 ? -12 : 0
+						onClicked: perf.src.setFrame(parent.index === 1)
 					}
 				}
 			}
 		}
 		Label {
+			id: rpmLabel
 			anchors.horizontalCenter: box.horizontalCenter
-			y: box.height + 4
+			y: box.y + box.height + 4
 			visible: perf.view === 1
 			text: "RPM"
 			color: Theme.color_font_secondary
-			font.pixelSize: 12
+			font.pixelSize: perf.fs(12, 12)
 		}
+	}
+
+	// editAxes: a finger-sized tap zone over an axis's top number (onRight: the RPM axis)
+	component AxisZone: MouseArea {
+		property bool onRight
+		visible: perf.editAxes
+		height: 56
+		onClicked: perf.axisTapped(onRight, true)
 	}
 }

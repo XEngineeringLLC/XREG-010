@@ -48,7 +48,7 @@ DeviceListPluginPage {
 				text: "Regulators"
 				secondaryText: regs.units.length === 0 ? "Find and add" : "Add or remove"
 				preferredVisible: regs.running
-				onClicked: Global.pageManager.pushPage("qrc:/xregulator/XregRegulators.qml", { title: text })
+				onClicked: Global.pageManager.pushPage("qrc:/XREG-010/XregRegulators.qml", { title: text })
 			}
 		}
 	}

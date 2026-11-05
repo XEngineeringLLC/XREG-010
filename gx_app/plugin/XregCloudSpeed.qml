@@ -11,6 +11,7 @@ Item {
 	property var boats: []          // [{ n, len, v, type, boat, you }] from /Cloud/Json speed
 	property color brand
 	property string filter: "overall"
+	signal filterPicked(string f)
 	property var picked: null
 
 	readonly property var filters: [["overall", "All"], ["sailboat", "Sailboats"], ["catamaran", "Catamarans"],
@@ -66,7 +67,7 @@ Item {
 		rowH: 36
 		model: sp.filters.map(f => f[1])
 		currentIndex: sp.filters.findIndex(f => f[0] === sp.filter)
-		onPicked: function(index) { sp.filter = sp.filters[index][0] }
+		onPicked: function(index) { sp.filterPicked(sp.filters[index][0]) }
 	}
 	Row {
 		anchors { right: parent.right; verticalCenter: seg.verticalCenter }
