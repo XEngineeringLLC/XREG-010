@@ -153,7 +153,7 @@ Page {
 			}
 			ListButton {
 				text: "Remove from this GX"
-				secondaryText: "Remove"
+				secondaryText: "Remove regulator"
 				writeAccessLevel: VenusOS.User_AccessType_User
 				preferredVisible: connectedItem.valid
 				onClicked: {
@@ -162,7 +162,10 @@ Page {
 						title: "Remove from this GX",
 						body: "The GX will stop showing " + page.label + " and stop changing anything on it. You can "
 							  + "add it again on the Regulators page.",
-						okFn: () => removeItem.setValue(uid)
+						okFn: () => {
+							removeItem.setValue(uid)
+							Global.pageManager.popToAbovePage(page.home ? page.home.hostPage : page)
+						}
 					})
 				}
 			}

@@ -486,7 +486,7 @@ class TestGlueArrival(unittest.TestCase):
         gi.repository.GLib.idle_add = lambda fn, *a: idle.append((fn, a))
         gi.repository.GLib.timeout_add = lambda ms, fn, *a: (later.append((ms, fn, a)) if a else timers.append(fn))
         reg = fr.FakeReg(gx=3)
-        reg.live_ms, reg.clock_fields = 100, True
+        reg.live_ms, reg.clock_fields = 40, True                    # closer than FAST_MIN_S, so the spacing has to come from the cap
         cache = tempfile.mkdtemp(dir=WORK)
         group = '/Settings/Devices/xregulator_feedc0'
         real_run = xc.subprocess.run
@@ -516,7 +516,9 @@ class TestGlueArrival(unittest.TestCase):
             self.assertEqual(svc._dbusobjects['/Fast/Short'].GetText(), '')    # no second copy as Text
             self.assertNotEqual(svc._dbusobjects['/Live/BattV'].GetText(), '')
             n0 = core.short.n
-            runs = 0
+            ticks = []                                              # real ticks: _fast_unit also runs just to wait out the spacing
+            fast_tick = core.fast_tick
+            core.fast_tick = lambda pub: (ticks.append(core.clock()), fast_tick(pub))[1]
             end = time.time() + 2.0
             while time.time() < end:
                 time.sleep(0.02)
@@ -526,10 +528,9 @@ class TestGlueArrival(unittest.TestCase):
                 self.assertLessEqual(len(pend), 1)                  # one fast tick pending at a time
                 for fn, a in pend:
                     fn(*a)
-                    runs += 1
             self.assertGreater(core.short.n, n0 + 8)
             self.assertEqual(int(svc['/Fast/Short'].split(';')[2]), core.short.n)   # every sample published
-            self.assertLess(runs, 2.0 / xc.FAST_MIN_S + 6)
+            self.assertGreaterEqual(min(b - a for a, b in zip(ticks, ticks[1:])), xc.FAST_MIN_S - 0.0021)   # _fast_unit's 2 ms slack
         finally:
             xc.subprocess.run = real_run
             reg.close()

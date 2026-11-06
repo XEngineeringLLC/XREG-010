@@ -245,7 +245,7 @@ Page {
 				secondaryText: "Remove"
 				writeAccessLevel: VenusOS.User_AccessType_User
 				preferredVisible: page.bridgeUp
-				interactive: !page.updBusy
+				interactive: !page.updBusy || page.updState === 1   // the bridge lets a Remove overtake a check
 				onClicked: {
 					Global.dialogLayer.open(confirmDialog, {
 						title: "Remove the GX app",

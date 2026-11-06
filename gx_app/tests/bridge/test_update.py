@@ -467,6 +467,25 @@ class TestUpdater(UpdaterCase):
         self.assertEqual(self.u.values()['/Update/State'], xu.REMOVING)
         self.assertFalse(self.u.check())
 
+    def test_remove_during_a_check(self):
+        # the page starts a check as it opens, up to 20 s with no internet; its answer must not undo the Remove
+        release(self.files, PKG)
+        good = self.files[xu.MANIFEST]
+        for body in (good, b'not a release list'):
+            self.spawned.clear()
+            self.u.state = xu.IDLE
+            self.srv.seen.clear()
+            self.files[xu.MANIFEST] = [body[:1], body[1:]]   # sent 0.3 s apart
+            self.assertTrue(self.u.check())
+            self.assertTrue(wait(lambda: self.srv.seen))
+            self.assertEqual(self.u.values()['/Update/State'], xu.CHECKING)
+            self.assertTrue(self.u.on_write('/Update/Remove', 1))
+            self.assertTrue(wait(lambda: self.spawned))
+            os.remove(self.spawned[0][0][1])
+            time.sleep(0.8)   # the check's answer has arrived
+            self.assertEqual(self.u.values()['/Update/State'], xu.REMOVING)
+            self.assertEqual(self.u.values()['/Update/Message'], '')
+
 
 class TestInstallReports(UpdaterCase):
     def write(self, name, text):

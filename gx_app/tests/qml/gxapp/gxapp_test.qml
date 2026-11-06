@@ -20,6 +20,7 @@ Window {
 	readonly property string slowCheckUid: slowUid + "Check"
 	readonly property string hooksText: "Custom startup scripts are disabled on this GX, so the bridge does not start after a restart. Re-enable them in Settings > General > Support status."
 	property var settingsPage: null
+	property Item homePage: null
 	function settingsHeader() {
 		return findAll(settingsPage, x => x.caption !== undefined
 					   && ["Bridge not running", "No regulator on this GX yet", "Regulators on this GX"].indexOf(x.text) >= 0)[0] || null
@@ -44,6 +45,8 @@ Window {
 	QtObject {
 		id: pageManager
 		property var pushed: []
+		property var poppedAbove: []
+		function popToAbovePage(p) { poppedAbove.push(p) }
 		function pushPage(url, props) {
 			const u = String(url).replace("qrc:/XREG-010/", pluginDir + "/")
 			props = props || {}
@@ -161,7 +164,7 @@ Window {
 			put("/Update/State", 1)
 		}, () => {
 			check(row("Latest version").secondaryText === "Checking" && row("Status").secondaryText === "Checking"
-				  && !row("Check for updates").interactive && !row("Remove the GX app").interactive, "checking: Checking, buttons off")
+				  && !row("Check for updates").interactive && row("Remove the GX app").interactive, "checking: Checking, Check off, Remove still on")
 			put("/Update/Latest", "0.4"); put("/Update/LatestBuild", 1761900000); put("/Update/Size", 163840); put("/Update/State", 3)
 		}, () => {
 			const u = row("Update to version 0.4")
@@ -290,6 +293,7 @@ Window {
 			const hc = Qt.createComponent(pluginDir + "/XregHome.qml")
 			const home = hc.createObject(homeParent, { svc: svc, animationEnabled: false, hostPage: hostPage, width: pageW, height: pageH })
 			check(!!home, "home page created: " + hc.errorString())
+			homePage = home
 			page = pageManager.pushPage("qrc:/XREG-010/XregGxApp.qml", { title: "GX app", svc: svc, home: home, setupId: "system" })
 		}, () => {}, () => {
 			const hdr = findAll(page, x => x.setupTabs !== undefined && x.pick !== undefined)[0]
@@ -297,6 +301,23 @@ Window {
 			check(!!hdr && !!list && list.y >= hdr.height - 0.5 && hdr.width === pageW,
 				  "with home: header " + (hdr ? Math.round(hdr.height) : "?") + " px over the list at y " + (list ? Math.round(list.y) : "?"))
 			geometry("with home header")
+			// Remove from this GX leaves the app: above the page holding the home page, or above this page with no home page
+			page = pageManager.pushPage("qrc:/XREG-010/XregCfgConnection.qml", { title: "Connection", svc: svc, home: homePage, setupId: "system" })
+			row("Remove from this GX").click()
+		}, () => {
+			check(openDialogs.length === 1 && openDialogs[0].title === "Remove from this GX" && writes("/Remove").length === 0
+				  && pageManager.poppedAbove.length === 0, "Remove from this GX asks first, and stays until OK")
+			acceptTop()
+		}, () => {}, () => {
+			check(writes("/Remove").length === 1 && writes("/Remove")[0].value === "0000FEEDC0DE1234"
+				  && pageManager.poppedAbove.length === 1 && pageManager.poppedAbove[0] === hostPage,
+				  "OK: removes this regulator and leaves the app above its host page")
+			page = pageManager.pushPage("qrc:/XREG-010/XregCfgConnection.qml", { title: "Connection", svc: svc, setupId: "system" })
+			row("Remove from this GX").click()
+		}, () => {
+			acceptTop()
+		}, () => {}, () => {
+			check(pageManager.poppedAbove.length === 2 && pageManager.poppedAbove[1] === page, "no home page: leaves this page")
 		})
 		driver.running = true
 	}

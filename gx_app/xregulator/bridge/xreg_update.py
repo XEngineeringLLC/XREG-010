@@ -412,8 +412,9 @@ class Updater:
         return True
 
     def remove(self):
+        # not held up by a check: the page starts one as it opens, and with no internet it runs 20 s or more
         with self.lock:
-            if self.state in BUSY:
+            if self.state in BUSY and self.state != CHECKING:
                 return False
             self.state, self.message = REMOVING, ''
             self.spawned = self.clock()
@@ -477,8 +478,16 @@ class Updater:
 
     def _check(self):
         # a query no cache between here and the OTA host has seen; the host serves the file without it
-        latest, entry = parse_manifest(self._fetch(MANIFEST + '?r=' + secrets.token_hex(4), MANIFEST_MAX))
+        try:
+            latest, entry = parse_manifest(self._fetch(MANIFEST + '?r=' + secrets.token_hex(4), MANIFEST_MAX))
+        except Exception:
+            with self.lock:
+                if self.state != CHECKING:   # a Remove took over: this answer no longer matters
+                    return
+            raise
         with self.lock:
+            if self.state != CHECKING:
+                return
             self.latest, self.entry = latest, entry
             self.state = AVAILABLE if newer(latest, self.rid) else CURRENT
         log.info('GX app update check: %s installed, %s listed', self.rid, latest)
