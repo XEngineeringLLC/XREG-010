@@ -280,24 +280,32 @@ void gxDevicesHandle(AsyncWebServerRequest *request) {
   request->send(200, "application/json", out);
 }
 
+// A failed fetch keeps the held forecast (analyzeWeatherMode releases it once stale) and retries 1, 2, 4 ... min, capped
+// at 1 h: each attempt holds core0Busy (the field-on wait, the standby hold), so a WiFi with no internet is not hammered.
+static uint32_t wxRetryMs = 0;   // httpsTask (Core 0) only
+static void wxFetchFailed() {
+  wxRetryMs = (wxRetryMs == 0) ? 60000UL : (wxRetryMs >= 1800000UL ? 3600000UL : wxRetryMs * 2);
+  nextWeatherUpdate = millis() + wxRetryMs;
+}
+
 bool executeFetchWeatherData() {
   // Called by HTTPS task on Core 0
   Serial.println(">>> executeFetchWeatherData() ENTERED");
   if (LatitudeNMEA == 0.0 && LongitudeNMEA == 0.0) {
     snprintf(weatherLastError, sizeof(weatherLastError), "No GPS coordinates available");
-    weatherDataValid = 0;
+    wxFetchFailed();
     queueConsoleMessageF("Weather: No GPS coordinates");
     return false;
   }
   if (currentMode != MODE_CLIENT) {
     snprintf(weatherLastError, sizeof(weatherLastError), "Not in client mode");
-    weatherDataValid = 0;
+    wxFetchFailed();
     return false;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
     snprintf(weatherLastError, sizeof(weatherLastError), "WiFi not connected");
-    weatherDataValid = 0;
+    wxFetchFailed();
     return false;
   }
   // Not HTTPClient: GET() can't feed the 16 s task WDT, and getString() has no deadline or size cap.
@@ -321,13 +329,13 @@ bool executeFetchWeatherData() {
   IPAddress wxIP;
   if (WiFi.hostByName(WX_HOST, wxIP) != 1) {  // a slow lookup inside connect() would run unfed
     snprintf(weatherLastError, sizeof(weatherLastError), "DNS lookup failed");
-    weatherDataValid = 0;
+    wxFetchFailed();
     return false;
   }
   esp_task_wdt_reset();
   if (!client.connect(WX_HOST, 443, CONNECT_TIMEOUT)) {
     snprintf(weatherLastError, sizeof(weatherLastError), "Connect failed");
-    weatherDataValid = 0;
+    wxFetchFailed();
     client.stop();
     return false;
   }
@@ -378,14 +386,14 @@ bool executeFetchWeatherData() {
     free(reply);  // ArduinoJson 7 copies what it keeps
     if (error) {
       snprintf(weatherLastError, sizeof(weatherLastError), "JSON parse error: %s", error.c_str());
-      weatherDataValid = 0;
+      wxFetchFailed();
       Serial.printf("JSON error: %s\n", error.c_str());
       return false;
     }
     JsonArray radiation = doc["daily"]["shortwave_radiation_sum"];
     if (radiation.size() < 3) {
       snprintf(weatherLastError, sizeof(weatherLastError), "Insufficient forecast data");
-      weatherDataValid = 0;
+      wxFetchFailed();
       return false;
     }
     float mjToday = radiation[0];
@@ -423,6 +431,7 @@ bool executeFetchWeatherData() {
     weatherDataValid = 1;
     weatherLastError[0] = '\0';
     nextWeatherUpdate = millis() + WeatherUpdateInterval;
+    wxRetryMs = 0;
     Serial.printf("Solar forecast: Today=%.1f, Tomorrow=%.1f, Day2=%.1f kWh\n",
                   pKwHrToday, pKwHrTomorrow, pKwHr2days);
     queueConsoleMessageF("Weather updated: %.1f kWh today", pKwHrToday);
@@ -435,7 +444,7 @@ bool executeFetchWeatherData() {
     else if (stalled) snprintf(weatherLastError, sizeof(weatherLastError), "Reply stalled after %d bytes", got);
     else snprintf(weatherLastError, sizeof(weatherLastError), "HTTP error: %d", httpResponseCode);
     free(reply);
-    weatherDataValid = 0;
+    wxFetchFailed();
     Serial.printf("Weather: %s\n", weatherLastError);
     return false;
   }
@@ -497,8 +506,8 @@ void updateWeatherMode() {
     return;  // forecast still fresh — nothing to fetch
   }
 
-  // Everything below reaches the internet.
-  if (currentMode != MODE_CLIENT || WiFi.status() != WL_CONNECTED) {
+  // Everything below reaches the internet. Demo mode: the position is the simulated boat's, so no fetch at all.
+  if (demoSeal || currentMode != MODE_CLIENT || WiFi.status() != WL_CONNECTED) {
     return;
   }
 
@@ -507,13 +516,16 @@ void updateWeatherMode() {
   if (!fieldCutSettled(55000)) {
     return;
   }
+  if (LatitudeNMEA == 0.0 && LongitudeNMEA == 0.0) {
+    return;  // no position yet: blocked like the field gate, so the first fix fetches at once
+  }
 
   // Signed delta survives the 49.7-day millis() rollover
   if ((int32_t)(now - nextWeatherUpdate) >= 0) {
     HttpsRequest req = { .type = HTTPS_FETCH_WEATHER };
-    if (xQueueSend(httpsQueue, &req, 0) == pdTRUE) {
-      nextWeatherUpdate = now + WeatherUpdateInterval;
-    } else {
+    // Before the send: the fetch on Core 0 replaces it (a full interval on success, a backed-off retry on failure).
+    nextWeatherUpdate = now + WeatherUpdateInterval;
+    if (xQueueSend(httpsQueue, &req, 0) != pdTRUE) {
       nextWeatherUpdate = now + 2000;
     }
   }
@@ -560,6 +572,14 @@ void solarLedgerInit() {
     // the hour in progress has no trustworthy baseline: it never qualifies, and the next pass re-bases.
     if (sledLive.curHour >= 0 && sledLive.curHour < 24) sledLive.hourBad[sledLive.curHour] = 1;
     sledLive.curHour = -1;
+    // A counter below its baseline came back from an NVS save older than the day's open: the day's totals so far are
+    // gone, so it counts on from here and stays out of the consumption prediction.
+    bool lost = false;
+    if (SolarChargedEnergy_AllTime < sledLive.baseSolarWh)     { sledLive.baseSolarWh  = SolarChargedEnergy_AllTime;      lost = true; }
+    if (AlternatorChargedEnergy_AllTime < sledLive.baseAltWh)  { sledLive.baseAltWh    = AlternatorChargedEnergy_AllTime; lost = true; }
+    if (ChargedEnergy_AllTime < sledLive.baseChgWh)            { sledLive.baseChgWh    = ChargedEnergy_AllTime;           lost = true; }
+    if (DischargedEnergy_AllTime < sledLive.baseDischgWh)      { sledLive.baseDischgWh = DischargedEnergy_AllTime;        lost = true; }
+    if (lost) { sledLive.flags |= SLED_F_PARTIAL; sledLiveDirty = true; }
   } else {
     memset(&sledLive, 0, sizeof(sledLive));
     sledLive.predHarvKwh = sledLive.predIrrKwh = sledLive.predConsKwh = NAN;
@@ -757,10 +777,12 @@ static void solarLedgerCloseDay() {
   L.dayIdx = 0;
 }
 
-// The flash writers. Ring + live-day blobs to LittleFS, learned ratio to NVS. Callers own the gate:
-// the service only reaches here with the field gate cut; the shutdown/restart paths accept the stall.
+// The flash writers. Ring + live-day blobs to LittleFS; learned ratio and the lifetime energy counters the live day is
+// measured against to NVS. Callers own the gate: the service only reaches here with the field gate cut; the
+// shutdown/restart paths accept the stall.
 static void sledWrite(bool ring) {
   if (!sledRing) return;
+  saveEnergyCountersNvs();   // before the blob: a cut between the two leaves the counters newer than its baselines, never older
   if (ring) {
     uint16_t start = (sledCount < SLED_SIZE) ? 0 : sledHead;
     writePsramBlob(SLED_PATH, SLED_MAGIC, SLED_VER, 0, sledRing, sizeof(SolarLedgerRec), SLED_SIZE, start, sledCount);
@@ -1420,7 +1442,7 @@ if (!BMP388Disconnected) {
   for (int i = 0; i < MAX_DATA_INDICES; i++) {
     dataTimestamps[i] = now;
   }
-  dataTimestamps[IDX_INA_DIE_TEMP] = 0;   // stamped only by a real sample past the warm-up discard: the heat ceiling's freshness
+  dataTimestamps[IDX_INA_DIE_TEMP] = 0;   // stamped only by a real sample past the warm-up discard: the die age readout and the field resistance test (the heat ceiling reads g_fdDieMs)
   dataTimestamps[IDX_VE_SOC] = 0;         // a boot stamp would pass an unseen VE.Direct port off as a battery monitor
   dataTimestamps[IDX_SOG_NMEA] = 0;       // and the 0 kn initializer as a speed reading: the lifetime average speed took it every boot
   dataTimestamps[IDX_VICTRON_SOLAR] = 0;  // and as an MPPT (the solar ledger would log a measured 0 harvest)
@@ -1605,11 +1627,11 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   // ×(V/12), field-duty seeds ×fieldScale(), matching applyNominalVoltageChange. Existing keys load verbatim.
   const float seedVScale = (float)SYSTEM_VOLTAGE_CLASS / 12.0f;
   const float seedDScale = fieldScale();
-  // RAM-only sweep knobs (never NVS) scale once here: 0.15 V at 48 V is a quarter of the per-cell margin,
-  // and the sweep bypasses every soft protection layer.
-  altSweepMarginV *= seedVScale;
-  altSweepRatePctS *= seedDScale;   // its field-duty siblings, RAM-only the same way
-  altSweepFromPct  *= seedDScale;
+  // RAM-only sweep knobs (never NVS) are set here from their 12 V bases, never scaled in place: the demo exit reload runs
+  // this again. 0.15 V at 48 V is a quarter of the per-cell margin, and the sweep bypasses every soft protection layer.
+  altSweepMarginV  = ALT_SWEEP_MARGIN_V_12V * seedVScale;
+  altSweepRatePctS = ALT_SWEEP_RATE_12V * seedDScale;   // its field-duty siblings, RAM-only the same way
+  altSweepFromPct  = FIELDCURVE_DUTY_START;             // already 5 % x fieldScale()
   if (!settingExists(NK_ManualDutyTarget)) {
     ManualDutyTarget *= seedDScale;
     settingWrite(NK_ManualDutyTarget, String(ManualDutyTarget, 2).c_str());
@@ -1651,12 +1673,12 @@ void InitSystemSettings() {  // load all settings from NVS.  If no keys exist, c
   if (!settingExists(NK_SOC_BlockRebulk_percent)) {
     settingWrite(NK_SOC_BlockRebulk_percent, String(SOC_BlockRebulk_percent).c_str());
   } else {
-    SOC_BlockRebulk_percent = settingRead(NK_SOC_BlockRebulk_percent).toInt();
+    SOC_BlockRebulk_percent = settingRead(NK_SOC_BlockRebulk_percent).toFloat();
   }
   if (!settingExists(NK_SOC_AllowRebulk_percent)) {
     settingWrite(NK_SOC_AllowRebulk_percent, String(SOC_AllowRebulk_percent).c_str());
   } else {
-    SOC_AllowRebulk_percent = settingRead(NK_SOC_AllowRebulk_percent).toInt();
+    SOC_AllowRebulk_percent = settingRead(NK_SOC_AllowRebulk_percent).toFloat();
   }
   if (!settingExists(NK_wavePeriod)) {
     settingWrite(NK_wavePeriod, String(wavePeriod).c_str());
@@ -3796,6 +3818,8 @@ void resetAccelStats() {
   imu_slam_count = 0;
   imu_slam_peak_max = 0;
 }
+static bool cf_seeded = false;
+static bool cfSeedWait = false;   // demo exit: no filter step until a real accel sample seeds it (imuDemoExitReset)
 void complementaryFilter(float ax, float ay, float az, float gx, float gy, float dt) {
   // Accel-derived angles (noisy but no drift)
   float accel_heel = atan2(ay, sqrt(ax * ax + az * az)) * 180.0f / PI - imuHeelOffsetDeg;
@@ -3803,7 +3827,6 @@ void complementaryFilter(float ax, float ay, float az, float gx, float gy, float
 
   // First sample seeds the filter from accel: starting at 0 slewed for seconds and the long-term ring
   // recorded the sweep as a min/max wedge. (IMU-zero capture still snaps to 0: a new level reference.)
-  static bool cf_seeded = false;
   if (!cf_seeded) {
     cf_seeded = true;
     cf_heel = accel_heel;
@@ -3880,6 +3903,15 @@ void imuZeroFinalizeIfDue() {
   }
 }
 
+// Wave period decimation state (10 Hz output, real-time gated)
+static float wave_decim_sum = 0;
+static uint16_t wave_decim_count = 0;
+static unsigned long wave_last_decim_ms = 0;
+static bool wave_dc_initialized = false;
+static float msi_rms2_ewma = 0;    // 60s RMS² EWMA for MSI frequency-weighted vertical accel
+static bool gps_was_moving = false; // hysteresis state: ON above 1.7 kt, OFF below 1.3 kt
+static unsigned long seaStateTick_ms = 0;
+
 void updateAccelMetrics() {
   // Runs every main-loop pass (NOT 1 Hz); most calls find no new samples (104 Hz arrival). Its timer
   // shows 0 on the dashboard because sub-ms integer-divides to 0; it IS running.
@@ -3918,14 +3950,6 @@ void updateAccelMetrics() {
 
   uint32_t samples_processed = 0;
   unsigned long now = millis();
-
-  // Wave period decimation state (10 Hz output, real-time gated)
-  static float wave_decim_sum = 0;
-  static uint16_t wave_decim_count = 0;
-  static unsigned long wave_last_decim_ms = 0;
-  static bool wave_dc_initialized = false;
-  static float msi_rms2_ewma = 0;    // 60s RMS² EWMA for MSI frequency-weighted vertical accel
-  static bool gps_was_moving = false; // hysteresis state: ON above 1.7 kt, OFF below 1.3 kt
 
   // Process accel ring buffer — cap per call as a safety net against edge cases
   uint16_t accel_cap = 0;
@@ -4017,6 +4041,13 @@ void updateAccelMetrics() {
     imuWindow->lastUpdateTime_us = now_us;
     imuRingBuffer->accel_tail = (imuRingBuffer->accel_tail + 1) % ACCEL_RING_SIZE;
     samples_processed++;
+  }
+
+  // After demo nothing below runs on the simulated attitude; the first real accel sample seeds the unseeded filter
+  if (cfSeedWait) {
+    if (samples_processed == 0) { imuZeroFinalizeIfDue(); return; }
+    cfSeedWait = false;
+    complementaryFilter(imu_accel_x_raw, imu_accel_y_raw, imu_accel_z_raw, 0.0f, 0.0f, 0.0f);
   }
 
   // GPS speed gate — ON above 1.7 kt, OFF below 1.3 kt (hysteresis prevents threshold chatter)
@@ -4346,7 +4377,6 @@ void updateAccelMetrics() {
   }
 
   // Sea-state minute buckets by MSI score and moving/stationary (SOG knots)
-  static unsigned long seaStateTick_ms = 0;
   if (now - seaStateTick_ms >= 60000) {
     seaStateTick_ms = now;
     bool moving = (SOGNMEA >= 1.5f);
@@ -4367,6 +4397,25 @@ void updateAccelMetrics() {
     float pitch_penalty = min(imu_pitch_deviation_60s /  8.0f, 1.0f) * 35.0f;  //  8 deg pitch dev -> full penalty
     imu_anchorage_comfort = constrain(100.0f - roll_penalty - pitch_penalty, 0.0f, 100.0f);
   }
+}
+
+// Demo exit, on the loop core like the FIFO drain and updateAccelMetrics: the filter, the sample rings and the sea-state
+// averages hold the simulated sea. Back to their boot state; the first real accel sample seeds the filter.
+void imuDemoExitReset() {
+  if (imuRingBuffer) {
+    imuRingBuffer->accel_tail = imuRingBuffer->accel_head;
+    imuRingBuffer->gyro_tail = imuRingBuffer->gyro_head;
+  }
+  if (imuWindow) imuWindow->lastGyroUpdateTime_us = 0;
+  cf_seeded = false; cfSeedWait = true;
+  cf_heel = 0; cf_pitch = 0; imu_heel_deg = 0; imu_pitch_deg = 0;
+  wave_decim_sum = 0; wave_decim_count = 0; wave_dc_initialized = false;
+  wave_period_ewma = -1.0f; imu_wave_period_sec = -1.0f; wave_last_crossing_time = 0; wave_last_crossing_positive = false;
+  msi_rms2_ewma = 0; imu_msi_score = 0; imu_vomit_pct = 0; imu_anchorage_comfort = 0;
+  rolling60s.index = 0; rolling60s.count = 0; rolling120s.index = 0; rolling120s.count = 0;
+  imu_heel_change_60s = 0; imu_heel_deviation_60s = 0; imu_pitch_change_60s = 0; imu_pitch_deviation_60s = 0;
+  imu_heel_deviation_120s = 0; imu_pitch_deviation_120s = 0; imu_heading_swing_120s = -1.0f;
+  seaStateTick_ms = millis();
 }
 
 
@@ -5144,7 +5193,12 @@ cleanup:
       // Same reboot as the success path (clean recovery into current firmware,
       // rejected image already aborted/never set bootable) — but say so honestly.
       Serial.println("=== OTA UPDATE FAILED AFTER DOWNLOAD (see error above) — rebooting on current firmware ===");
+      strlcpy(otaFailWhy, "the downloaded firmware did not pass verification", sizeof(otaFailWhy));
+      otaSaveFailRecord(updateInfo.version.c_str());
+      g_rebootIntent = REBOOT_INTENT_TAG | REBOOT_WHY_OTA_FAILED;
     }
+    // A regulator running from factory installs straight from the web request, with no dump before it.
+    if (gpio4IsLow && !ringIsEmpty()) dumpSensorRingToLittleFS();
     delay(3000);
     ESP.restart();
   } else {
@@ -5172,6 +5226,7 @@ void performOTAUpdate(const UpdateInfo &updateInfo) {
     delay(waitTime);
   }
   if (!prepareForOTA()) {
+    strlcpy(otaFailWhy, "a background network task did not stop in time", sizeof(otaFailWhy));
     otaRestoreNormalOperation(false);
     return;
   }
@@ -5193,6 +5248,8 @@ void performOTAUpdate(const UpdateInfo &updateInfo) {
     Serial.printf("❌ Signature download failed: %d (%s)\n",
                   httpCode,
                   http.errorToString(httpCode).c_str());
+    if (httpCode == 404 || httpCode == 400) snprintf(otaFailWhy, sizeof(otaFailWhy), "version %s is not on the update server", updateInfo.version.c_str());   // 400: see otaPrecheckRun
+    else snprintf(otaFailWhy, sizeof(otaFailWhy), "the update's signature did not download (%s)", http.errorToString(httpCode).c_str());
     http.end();
     otaRestoreNormalOperation(false);
     return;
@@ -5201,6 +5258,7 @@ void performOTAUpdate(const UpdateInfo &updateInfo) {
   int sigLen = http.getSize();
   if (sigLen <= 0 || sigLen > OTA_SIG_MAX_LEN) {
     Serial.printf("Signature reply size invalid: %d bytes\n", sigLen);
+    strlcpy(otaFailWhy, "the update server sent a malformed signature", sizeof(otaFailWhy));
     http.end();
     otaRestoreNormalOperation(false);
     return;
@@ -5234,6 +5292,7 @@ void performOTAUpdate(const UpdateInfo &updateInfo) {
     }
     if ((int)signatureBase64.length() != sigLen) {
       Serial.printf("Signature download %s: got %d of %d bytes\n", sigStalled ? "stalled" : "cut off", signatureBase64.length(), sigLen);
+      strlcpy(otaFailWhy, "the update's signature download stopped partway", sizeof(otaFailWhy));
       http.end();
       otaRestoreNormalOperation(false);
       return;
@@ -5424,6 +5483,184 @@ void detachOta0ForInstall() {
   clearOta0Record();
   if (factory && esp_ota_get_boot_partition() != factory) esp_ota_set_boot_partition(factory);
 }
+// UpdateToVersion pre-check, run on the httpsTask worker before anything is staged: the factory installer's own gates
+// (WiFi, RSSI, internet), then a GET of the version's signature through the update proxy, which proves DNS, TLS, the proxy
+// and that the version exists. Each blocking call stays inside httpsTask's 16 s WDT, fed between them.
+bool otaPrecheckRun(const char *version, char *why, size_t whyCap) {
+  if (!version[0] || strspn(version, "0123456789.") != strlen(version)) {   // it goes into the request line below
+    snprintf(why, whyCap, "\"%s\" is not a version number", version);
+    return false;
+  }
+  if (currentMode != MODE_CLIENT || WiFi.status() != WL_CONNECTED) {
+    snprintf(why, whyCap, "the regulator is not connected to WiFi");
+    return false;
+  }
+  int rssi = WiFi.RSSI();
+  if (rssi < OTA_MIN_RSSI_DBM) {
+    snprintf(why, whyCap, "the WiFi signal at the regulator is too weak (%d dBm)", rssi);
+    return false;
+  }
+  esp_task_wdt_reset();
+  {
+    WiFiClient probe;   // testInternetSpeed's first test, which the factory installer applies
+    bool reached = probe.connect("1.1.1.1", 80, 10000);
+    probe.stop();
+    esp_task_wdt_reset();
+    if (!reached) {
+      snprintf(why, whyCap, "the regulator's WiFi network has no internet access");
+      return false;
+    }
+  }
+  if (ESP.getMaxAllocHeap() < 15000) {
+    snprintf(why, whyCap, "the regulator is too low on memory for a secure connection");
+    return false;
+  }
+  const char *sep = strstr(OTA_BASE_URL, "://");
+  const char *otaHost = sep ? sep + 3 : OTA_BASE_URL;
+  IPAddress resolved;
+  if (WiFi.hostByName(otaHost, resolved) != 1) {
+    snprintf(why, whyCap, "the regulator could not look up the update server (%s)", otaHost);
+    return false;
+  }
+  esp_task_wdt_reset();
+  WiFiClientSecure client;
+  client.setInsecure();   // as performOTAUpdate's signature fetch: integrity comes from the RSA verify
+  client.setHandshakeTimeout(HANDSHAKE_TIMEOUT / 1000);
+  uint32_t start = millis();
+  if (!client.connect(otaHost, 443, CONNECT_TIMEOUT)) {
+    esp_task_wdt_reset();
+    client.stop();
+    snprintf(why, whyCap, "the regulator could not open a secure connection to the update server");
+    return false;
+  }
+  esp_task_wdt_reset();
+  // HTTP/1.0 as in doCloudPOST: no chunked replies. Only the status line is read.
+  client.printf("GET /firmware_%s.sig HTTP/1.0\r\nHost: %s\r\nDevice-ID: %s\r\nConnection: close\r\n\r\n",
+                version, otaHost, getDeviceId().c_str());
+  char statusBuf[64];
+  size_t statusLen = 0;
+  bool gotStatusLine = false;
+  uint32_t readStart = millis();
+  while (client.connected() && millis() - readStart < READ_TIMEOUT && millis() - start < GLOBAL_TIMEOUT) {
+    esp_task_wdt_reset();
+    while (client.available()) {
+      char c = (char)client.read();
+      readStart = millis();
+      if (statusLen < sizeof(statusBuf) - 1) statusBuf[statusLen++] = c;
+      if (c == '\n') { gotStatusLine = true; break; }
+    }
+    if (gotStatusLine) break;
+    delay(1);
+  }
+  client.stop();
+  statusBuf[statusLen] = '\0';
+  const char *sp = strchr(statusBuf, ' ');
+  int httpCode = (gotStatusLine && sp) ? atoi(sp + 1) : 0;
+  Serial.printf("OTA precheck: %s signature GET -> %d in %u ms\n", version, httpCode, (unsigned)(millis() - start));
+  if (httpCode == 200) return true;
+  // 400 too: the storage behind the update proxy answers a missing object with 400, and the proxy passes the code on.
+  if (httpCode == 404 || httpCode == 400) snprintf(why, whyCap, "version %s is not on the update server", version);
+  else if (httpCode > 0) snprintf(why, whyCap, "the update server answered HTTP %d", httpCode);
+  else snprintf(why, whyCap, "the update server did not answer");
+  return false;
+}
+// Arms the staged update and requests the reboot into the factory installer (the pre-check passed). Returns false, with
+// nothing armed, when NVS refuses the request.
+bool otaStageFactoryInstall(const char *version) {
+  nvs_handle_t h;
+  if (nvs_open("update_req", NVS_READWRITE, &h) != ESP_OK) return false;
+  nvs_erase_key(h, "target_ver");
+  nvs_erase_key(h, "update_flag");
+  bool ok = nvs_set_str(h, "target_ver", version) == ESP_OK && nvs_set_u8(h, "update_flag", 1) == ESP_OK;
+  if (ok && nvs_set_u8(h, "wake_flag", 1) != ESP_OK) Serial.println("UPDATE DEBUG: Failed to set wake_flag");
+  if (ok) ok = nvs_commit(h) == ESP_OK;
+  if (!ok) { nvs_erase_key(h, "target_ver"); nvs_erase_key(h, "update_flag"); nvs_commit(h); }
+  nvs_close(h);
+  if (!ok) return false;
+  const esp_partition_t *factory_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+  esp_ota_set_boot_partition(factory_partition);
+  Serial.printf("Update to version %s requested - rebooting to factory\n", version);
+  rebootRequestWhy = REBOOT_WHY_FACTORY;
+  rebootRequestedAt = millis();
+  rebootRequested = true;
+  return true;
+}
+// The failed attempt's reason for the next boot (otaReportFailedAttempt); the RAM console does not survive the restart.
+void otaSaveFailRecord(const char *version) {
+  nvs_handle_t h;
+  if (nvs_open("update_req", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_str(h, "fail_ver", version);
+  nvs_set_str(h, "fail_why", otaFailWhy[0] ? otaFailWhy : "the download or install did not finish");
+  nvs_commit(h);
+  nvs_close(h);
+}
+// A staged install returned on the factory installer, so it failed. Restart rather than keep running factory: when nothing
+// was written, this boot's ensurePreferredBootPartition already pointed the next boot back at the recorded ota_0; when ota_0
+// was erased, the next boot is factory again. The staged flag was cleared before the attempt, so this cannot loop.
+// The field is off here: otaFieldHold holds it off on this boot, and the attempt starts only once it is.
+void otaFactoryAttemptFailed(const char *version) {
+  otaSaveFailRecord(version);
+  Serial.printf("UPDATE: staged install of %s failed (%s) - restarting\n", version, otaFailWhy);
+  Serial.println(REBOOT_WHY_LINE[REBOOT_WHY_OTA_FAILED]);
+  Serial.flush();
+  g_rebootIntent = REBOOT_INTENT_TAG | REBOOT_WHY_OTA_FAILED;
+  ESP.restart();
+}
+// Boot: the factory installer with a staged update holds the field off until it restarts (otaFieldHold; RAM only, so the
+// owner's Enable is untouched in NVS) and starts the give-up clock.
+void otaFactoryStagedBoot() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (!running || running->subtype != ESP_PARTITION_SUBTYPE_APP_FACTORY) return;
+  nvs_handle_t h;
+  if (nvs_open("update_req", NVS_READONLY, &h) != ESP_OK) return;
+  uint8_t flag = 0;
+  const bool staged = nvs_get_u8(h, "update_flag", &flag) == ESP_OK && flag == 1;
+  nvs_close(h);
+  if (!staged) return;
+  otaFieldHold = true;
+  otaFactoryWaiting = true;
+  queueConsoleMessage("UPDATE: factory installer - alternator held off until the update finishes");
+}
+// The staged install never started on the factory installer (WiFi never joined, or not in client mode): drop it and go back.
+void otaFactoryGiveUp() {
+  otaFactoryWaiting = false;
+  char ver[32] = "the update";
+  nvs_handle_t h;
+  if (nvs_open("update_req", NVS_READONLY, &h) == ESP_OK) {
+    size_t n = sizeof(ver);
+    if (nvs_get_str(h, "target_ver", ver, &n) != ESP_OK) strlcpy(ver, "the update", sizeof(ver));
+    nvs_close(h);
+  }
+  clearPendingUpdateNVS();
+  strlcpy(otaFailWhy, WiFi.status() == WL_CONNECTED ? "the factory installer could not start the download"
+                                                    : "the factory installer could not join WiFi", sizeof(otaFailWhy));
+  otaFactoryAttemptFailed(ver);
+}
+// Boot: report and clear the record otaSaveFailRecord left, keeping it in RAM for /otaResult.
+void otaReportFailedAttempt() {
+  nvs_handle_t h;
+  if (nvs_open("update_req", NVS_READONLY, &h) != ESP_OK) return;
+  size_t vl = sizeof(otaLastFailVer);
+  bool found = nvs_get_str(h, "fail_ver", otaLastFailVer, &vl) == ESP_OK;
+  if (found) {
+    size_t wl = sizeof(otaLastFailWhy);
+    if (nvs_get_str(h, "fail_why", otaLastFailWhy, &wl) != ESP_OK) strlcpy(otaLastFailWhy, "the download or install did not finish", sizeof(otaLastFailWhy));
+  } else {
+    otaLastFailVer[0] = '\0';
+  }
+  nvs_close(h);
+  if (!found) return;
+  if (nvs_open("update_req", NVS_READWRITE, &h) == ESP_OK) {
+    nvs_erase_key(h, "fail_ver");
+    nvs_erase_key(h, "fail_why");
+    nvs_commit(h);
+    nvs_close(h);
+  }
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  const bool onFactory = running && running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY;
+  queueConsoleMessageF("UPDATE: %s did not install: %s. %s", otaLastFailVer, otaLastFailWhy,
+                       onFactory ? "Running the factory firmware; try the update again." : "The installed firmware is unchanged.");
+}
 void performOTAUpdateToVersion(const char *targetVersion) {
   if (demoSeal) { queueConsoleMessage(DEMO_REFUSAL); return; }   // demo mode: no software update (web assets are outside the LittleFS seal)
   //This performs an OTA update to specific version
@@ -5443,6 +5680,7 @@ void performOTAUpdateToVersion(const char *targetVersion) {
   //Delting this- an OTA update takes priority, and we will bulldoze thru
   // Not a vTaskDelete(): prepareForOTA() raises otaInProgress and waits for httpsTask to leave between ops.
   core0Busy = true;
+  strlcpy(otaFailWhy, "the download or install did not finish", sizeof(otaFailWhy));
 
   Serial.println("HEAP BEFORE version check:");
   Serial.printf("  Internal: %u free, %u largest\n",
@@ -5458,6 +5696,7 @@ void performOTAUpdateToVersion(const char *targetVersion) {
   if (currentMode != MODE_CLIENT) {
     Serial.println("OTA: Cannot update - not in client mode");
     events.send("OTA: Cannot update - must be in client mode", "console", millis());
+    strlcpy(otaFailWhy, "the regulator was not in WiFi client mode", sizeof(otaFailWhy));
     core0Busy = false;
     return;
   }
@@ -5465,6 +5704,7 @@ void performOTAUpdateToVersion(const char *targetVersion) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("OTA: Cannot update - WiFi not connected");
     events.send("OTA: Cannot update - WiFi not connected", "console", millis());
+    strlcpy(otaFailWhy, "the regulator was not connected to WiFi", sizeof(otaFailWhy));
     core0Busy = false;
     return;
   }
@@ -5477,6 +5717,7 @@ void performOTAUpdateToVersion(const char *targetVersion) {
   if (!testInternetSpeed()) {
     Serial.println("OTA: Cannot update - internet too slow or unavailable");
     events.send("OTA: Cannot update - internet connection insufficient", "console", millis());
+    strlcpy(otaFailWhy, "the regulator's WiFi network had no internet access", sizeof(otaFailWhy));
     otaSetWdtWindow(WDT_TIMEOUT_MS);
     core0Busy = false;
     return;
@@ -5486,6 +5727,7 @@ void performOTAUpdateToVersion(const char *targetVersion) {
   if (rssi < OTA_MIN_RSSI_DBM) {
     Serial.printf("OTA: WiFi too weak (%d dBm) - canceling update\n", rssi);
     events.send("OTA: WiFi signal too weak for safe download", "console", millis());
+    snprintf(otaFailWhy, sizeof(otaFailWhy), "the WiFi signal at the regulator was too weak (%d dBm)", rssi);
     otaSetWdtWindow(WDT_TIMEOUT_MS);
     core0Busy = false;
     return;
@@ -6218,6 +6460,8 @@ time_t getCurrentTimestamp() {
 // RTC epoch retained across a SOFTWARE reset (accurate when clockRealTag says it was real), else the NVS
 // "SoftClockEp" saved at each field-off (an estimate, cold boot). Labeled TIME_ESTIMATED until a real source wins.
 // Persist only the epoch, never millis.
+bool softClockRetained = false;   // this boot's clock is the RTC's, which kept counting through the reset (baroMarkBootGap)
+bool softClockColdSeeded = false; // this boot's clock is the NVS estimate, which leaves out the time off (trip recovery)
 void restoreSoftClock() {
   if (timeIsSynced) return;   // a live source already won during early boot — leave it
 
@@ -6226,6 +6470,7 @@ void restoreSoftClock() {
     timeBase = rtc;
     timeBaseMillis = millis();
     timeIsSynced = true;
+    softClockRetained = true;
     currentTimeSource = TIME_ESTIMATED;
     Serial.printf("Soft clock: adopted retained RTC epoch=%ld (%s)\n", (long)rtc, clockIsReal() ? "real" : "estimate");
     return;
@@ -6240,6 +6485,7 @@ void restoreSoftClock() {
       timeBase = (time_t)saved;
       timeBaseMillis = millis();
       timeIsSynced = true;
+      softClockColdSeeded = true;
       currentTimeSource = TIME_ESTIMATED;
       struct timeval tv = { (time_t)saved, 0 };
       settimeofday(&tv, nullptr);              // keep time(nullptr) consistent for AP-mode callers

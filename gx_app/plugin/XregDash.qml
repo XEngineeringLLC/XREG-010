@@ -369,18 +369,25 @@ Item {
 		}
 		return { x: x, v: y }
 	}
-	// a day's line as points on the tile's midnight-to-midnight plot, w by h px; NaN samples are skipped
+	// a day's line on the tile's midnight-to-midnight plot, w by h px, as one run of points per unbroken stretch: a NaN
+	// sample (none taken) ends the run, so no line is drawn across the time the regulator was off
 	function linePoints(l, lo, hi, w, h) {
 		if (!(hi > lo))
 			return []
-		let pts = []
+		let runs = [], run = []
 		for (let i = 0; i < l.v.length; ++i) {
-			if (isNaN(l.v[i]))
+			if (isNaN(l.v[i])) {
+				if (run.length)
+					runs.push(run)
+				run = []
 				continue
+			}
 			const f = Math.max(lo, Math.min(hi, l.v[i]))
-			pts.push(Qt.point(l.x[i] / 24 * w, h - (f - lo) / (hi - lo) * h))
+			run.push(Qt.point(l.x[i] / 24 * w, h - (f - lo) / (hi - lo) * h))
 		}
-		return pts
+		if (run.length)
+			runs.push(run)
+		return runs
 	}
 	// The barometer tile's larger view: the three days on one chart, with Autoscale, Lock axes and axis limits kept on
 	// this GX; the tile follows what is set there (its axis, the days hidden)
@@ -1176,7 +1183,8 @@ Item {
 				readonly property var days: [0, 1, 2].map(k => root.baroHidden(k) ? []
 					: root.linePoints(root.baroDays[k], lo, hi, baroPlot.width, baroPlot.height))
 				readonly property var colors: root.baroColors
-				readonly property var nowPt: days[0].length ? days[0][days[0].length - 1] : null
+				readonly property var lastRun: days[0].length ? days[0][days[0].length - 1] : []
+				readonly property var nowPt: lastRun.length ? lastRun[lastRun.length - 1] : null
 				readonly property real gutter: baroHi.width + 4   // lines start right of the scale; fixed, so the plot never shifts
 				hasData: valid.length > 1
 				footH: 18
@@ -1237,19 +1245,19 @@ Item {
 						strokeColor: baroTile.colors[2]
 						strokeWidth: 2
 						fillColor: "transparent"
-						PathPolyline { path: baroTile.days[2] }
+						PathMultiline { paths: baroTile.days[2] }
 					}
 					ShapePath {
 						strokeColor: baroTile.colors[1]
 						strokeWidth: 2
 						fillColor: "transparent"
-						PathPolyline { path: baroTile.days[1] }
+						PathMultiline { paths: baroTile.days[1] }
 					}
 					ShapePath {
 						strokeColor: baroTile.colors[0]
 						strokeWidth: 3
 						fillColor: "transparent"
-						PathPolyline { path: baroTile.days[0] }
+						PathMultiline { paths: baroTile.days[0] }
 					}
 				}
 				// Where today stops: the latest sample and its time of day

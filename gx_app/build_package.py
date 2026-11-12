@@ -14,8 +14,9 @@
 #   python3 build_package.py <out dir> [--key private.pem [--ota-key]] [--base-manifest json] [--notes text]
 # Without --key: the zip only. --ota-key refuses a key whose public half is not the bridge's OTA_PUBLIC_KEY. A version the
 # manifest lists already gets its entry replaced by this build. Every build runs tools/sim_install.py against the zip
-# and writes nothing if it fails.
-import argparse, base64, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, zipfile
+# and writes nothing if it fails. With --key, build_plugin.sh runs first when the compiled plugin's QML or version is not
+# plugin/ and VERSION as they are now.
+import argparse, base64, hashlib, json, os, re, shutil, stat, struct, subprocess, sys, tempfile, time, zipfile, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.path.join(HERE, 'xregulator')
@@ -58,6 +59,44 @@ def entry(name, mode, when):
 def files_list(blobs):
     # "<sha256>  <path>" per app file, as sha256sum prints it, for install.sh's check of an installed app
     return ''.join('%s  %s\n' % (hashlib.sha256(blobs[rel]).hexdigest(), rel) for rel in sorted(blobs)).encode()
+
+
+def plugin_stale(version):
+    # What the compiled plugin differs from its sources in: its version, or a .qml in its rcc resource (format 2+, each
+    # file zlib-compressed or stored) that is not plugin/<name> byte for byte. A reissue keeps VERSION, so the version
+    # alone cannot tell an old build.
+    with open(os.path.join(TREE, 'gui-v2', 'xregulator.json')) as f:
+        j = json.load(f)
+    out = [] if j.get('version') == version else ['version %s' % j.get('version')]
+    r = base64.b64decode(j.get('resource') or '')
+    if r[:4] != b'qres' or struct.unpack('>I', r[4:8])[0] < 2:
+        return out + ['no rcc resource of format 2 or later']
+    tree, data, names = struct.unpack('>III', r[8:20])
+    built = {}
+
+    def walk(i):
+        o = tree + 22 * i
+        name_at, flags = struct.unpack('>IH', r[o:o + 6])
+        if flags & 2:
+            count, first = struct.unpack('>II', r[o + 6:o + 14])
+            for k in range(count):
+                walk(first + k)
+            return
+        n = struct.unpack('>H', r[names + name_at:names + name_at + 2])[0]
+        name = r[names + name_at + 6:names + name_at + 6 + 2 * n].decode('utf-16-be')
+        d = data + struct.unpack('>I', r[o + 10:o + 14])[0]
+        blob = r[d + 4:d + 4 + struct.unpack('>I', r[d:d + 4])[0]]
+        if flags & 4:
+            die('the plugin resource is zstd-compressed: build_plugin.sh must keep rcc on zlib')
+        built[name] = zlib.decompress(blob[4:]) if flags & 1 else blob
+    walk(0)
+    src = {}
+    for name in os.listdir(os.path.join(HERE, 'plugin')):
+        if name.endswith('.qml'):
+            with open(os.path.join(HERE, 'plugin', name), 'rb') as f:
+                src[name] = f.read()
+    qml = set(src) | {n for n in built if n.endswith('.qml')}
+    return out + sorted(n for n in qml if built.get(n) != src.get(n))
 
 
 def build_zip(path, version, build):
@@ -150,10 +189,16 @@ def main():
     version = xreg_update.app_version(TREE)
     if version == '0':
         die('xregulator/VERSION is missing or not a version')
+    # a release carries plugin/ as it is now: rebuilt here only when it differs, as each build stamps new file times
+    if a.key and plugin_stale(version) and subprocess.run([os.path.join(HERE, 'build_plugin.sh')]).returncode:
+        die('build_plugin.sh failed: nothing written')
     with open(os.path.join(TREE, 'gui-v2', 'xregulator.json')) as f:
         plugin = json.load(f).get('version')
     if plugin != version:
         die('the plugin is built as %s, VERSION says %s: run build_plugin.sh' % (plugin, version))
+    stale = plugin_stale(version) if a.key else []
+    if stale:
+        die('the built plugin is not plugin/ as it is now (%s)' % ', '.join(stale))
     manifest = {'versions': {}}
     if a.base_manifest:
         with open(a.base_manifest) as f:

@@ -985,6 +985,27 @@ class SettingsModel:
                                                           '' if hi is None else fmt_num(hi)))
         return v
 
+    BATTERY_ORDER_KEYS = ('BulkVoltage', 'AbsorptionVoltage', 'FloatVoltage', 'RebulkVoltage', 'UseFloat')
+
+    def battery_order(self, key, value, frames):
+        # The app's validateBatterySettings() hard blocks on the charge voltages, for a write of key = value. A value
+        # not echoed yet is skipped, as the app skips its NaN. Raises ValueError with the app's message.
+        if key not in self.BATTERY_ORDER_KEYS:
+            return
+        st = {k: value if k == key else (self.display(self.items[k], frames) if k in self.items else None)
+              for k in self.BATTERY_ORDER_KEYS}
+        num = lambda k: isinstance(st[k], (int, float)) and not isinstance(st[k], bool)
+        if key in ('AbsorptionVoltage', 'BulkVoltage') and num('AbsorptionVoltage') and num('BulkVoltage') \
+                and st['AbsorptionVoltage'] > st['BulkVoltage']:
+            raise ValueError('Absorption Voltage cannot be higher than Bulk Voltage.')
+        voltage_float = num('UseFloat') and st['UseFloat'] == 1
+        if key in ('UseFloat', 'FloatVoltage', 'AbsorptionVoltage') and voltage_float and num('FloatVoltage') \
+                and num('AbsorptionVoltage') and st['FloatVoltage'] > st['AbsorptionVoltage']:
+            raise ValueError('Float Voltage cannot be higher than Absorption Voltage.')
+        if key in ('UseFloat', 'RebulkVoltage', 'FloatVoltage') and voltage_float and num('RebulkVoltage') \
+                and num('FloatVoltage') and st['RebulkVoltage'] >= st['FloatVoltage']:
+            raise ValueError('Rebulk Voltage must be lower than Float Voltage.')
+
     @staticmethod
     def wire(item, value):
         if isinstance(value, str):
@@ -997,19 +1018,15 @@ class SettingsModel:
 
     @staticmethod
     def _rpm_ascending(rpm):
-        # The app's validateLearningTable(): strictly rising up to the last non-zero row, zeros only at the end
-        last = max([i for i, v in enumerate(rpm) if v != 0] or [-1])
-        for i in range(1, last + 1):
-            if rpm[i] <= rpm[i - 1]:
-                raise ValueError('RPM values must increase. Row %d (%s) must be greater than Row %d (%s)'
-                                 % (i + 1, fmt_num(rpm[i]), i, fmt_num(rpm[i - 1])))
-        seen = False
-        for i in range(len(rpm) - 1, -1, -1):
-            if rpm[i] != 0:
-                seen = True
-            elif seen:
-                raise ValueError('Zero RPM values are only allowed at the end of the table. Found zero at row %d'
-                                 % (i + 1))
+        # The app's validateLearningTable(): every row above 0 and higher than the row before it. The firmware lookup has
+        # no unused rows: a 0 in the last row would apply that row's limits at every engine speed.
+        rule = 'All ten rows need an engine speed, each higher than the row above.'
+        for i, v in enumerate(rpm):
+            if v <= 0:
+                raise ValueError('Row %d RPM must be greater than 0. %s' % (i + 1, rule))
+            if i and v <= rpm[i - 1]:
+                raise ValueError('RPM values must increase. Row %d (%s) must be greater than Row %d (%s). %s'
+                                 % (i + 1, fmt_num(v), i, fmt_num(rpm[i - 1]), rule))
 
     def table_json(self, tid, frames):
         t = self.tables[tid]
@@ -1666,6 +1683,8 @@ class Worker:
             finally:
                 with self.lock:
                     self.busy[kind] -= 1
+                    if not self.busy[kind]:
+                        del self.busy[kind]
 
 
 # ---- Core ----
@@ -2082,6 +2101,7 @@ class Core:
         self.limits_sent = False   # the last /gxLimits post carried a value, so an empty one is owed when that stops
         self.limits_hold = -1      # link generation a refused post stopped posting for
         self.demo = False          # the regulator is in demo mode (Hardware Present? = No)
+        self.hist_gen = 0          # demo switches (_drop_history): a fetch asked before the latest one is not kept
         self.demo_gen = -1         # link generation /demoBackfill was fetched for in this demo spell
         self.demo_tries = 0        # failed /demoBackfill fetches since the entry or reconnect
         self.switch_frames = {}    # the frames on hand at the last demo switch: the other boat's, kept out of the history
@@ -2299,8 +2319,11 @@ class Core:
                 return False
             if v not in (0, 1):
                 return False
-            self.hold[path] = [v, now, None]
-            self._queue_write('OnOff', [('OnOff', str(v))], arm=(v == 1), control=True, hold=[(path, v)])
+            # Offline the write only reports "Not connected": a held tap would show a state the field is not in
+            held = [(path, v)] if self.live else []
+            if held:
+                self.hold[path] = [v, now, None]
+            self._queue_write('OnOff', [('OnOff', str(v))], arm=(v == 1), control=True, hold=held)
             return True
         if path.startswith('/Settings/Value/'):
             key = path[16:]
@@ -2309,6 +2332,7 @@ class Core:
                 return False
             try:
                 v = self.model.check(item, value)
+                self.model.battery_order(key, v, self._echo_frames(now))
             except ValueError as e:
                 self._post_result(key, False, str(e))
                 return False
@@ -2628,6 +2652,10 @@ class Core:
                 kind, data = self.inbox.get_nowait()
             except queue.Empty:
                 return
+            if kind == 'fetched':
+                gen, kind, data = data
+                if gen != self.hist_gen:
+                    continue
             if kind == 'result':
                 key, ok, message = data
                 self.result_seq += 1
@@ -2765,6 +2793,7 @@ class Core:
             self.next[k] = 0.0
         for name in self.model.endpoints:
             self.next['src:' + name] = 0.0
+        self.hist_gen += 1
         self.republish = True
 
     def _backfill(self, data, now):
@@ -2816,6 +2845,10 @@ class Core:
         if not live:
             for i in range(3):
                 pub['/GenericInput/%d/Value' % i] = None
+            # the regulator's state is unknown: the switch pane shows none rather than the last one
+            self.hold.pop('/SwitchableOutput/0/State', None)
+            pub['/SwitchableOutput/0/State'] = None
+            pub['/SwitchableOutput/0/Status'] = 0x00
             return vals
         on = 1 if vals['OnOff'] else 0
         self._set(pub, '/SwitchableOutput/0/State', on, info)
@@ -2956,16 +2989,17 @@ class Core:
 
     def _fetch(self, kind, path, parse, timeout=20.0, failed=None):
         # failed: an inbox message to post when the fetch or its parse fails
-        http_ = self.link.http
+        http_, gen = self.link.http, self.hist_gen
 
         def job():
             try:
-                self.inbox.put((kind, parse(http_.get_ok(path, timeout=timeout))))
+                self.inbox.put(('fetched', (gen, kind, parse(http_.get_ok(path, timeout=timeout)))))
             except Exception as e:
                 log.warning('%s: %s', path, fetch_error_text(e))
                 if failed:
                     self.inbox.put(failed)
-        self.fetcher.put(path, job, dedupe=True)
+        # deduped per demo spell: a fetch still running from before the switch must not hold back the refetch
+        self.fetcher.put((path, gen), job, dedupe=True)
 
     def _wanted(self, pub, now, frames, fresh, info, live):
         connected = info['state'] == 'streaming'
@@ -3010,10 +3044,12 @@ class Core:
             v = hl.get(name) if alt_fresh else None
             pub['/Health/Live/' + name] = None if v is None else round(v, 3)
         if on['Health']:
-            # Session rows are placed by arrival time, so a cached copy would sit early by its age; wait for fresh
+            # Session rows are placed by the GX time stamped on the text as it arrives (gxAt); a page that opens still
+            # gets a fresh copy, for the newest rows
             if connected and (rose['Health'] or now >= self.next['health']):
                 self.next['health'] = now + HEALTH_REFETCH_S
-                self._fetch('health', '/altsess.csv', lambda b: ('SessionCsv', text(b)))
+                self._fetch('health', '/altsess.csv',
+                            lambda b, wall=self.wall: ('SessionCsv', '%s\n# gxAt=%.1f\n' % (text(b), wall())))
         if fell['Health']:
             pub['/Health/SessionCsv'] = ''
         for hours in HEALTH_WINDOWS:
@@ -3295,6 +3331,7 @@ class Core:
             # the app's gate: no cloud contact at all, and nothing from an earlier fetch stays on show
             self._cloud_set(CLOUD_OFF)
             self.cloud_text, self.cloud_as_of, self.cloud_at, self.cloud_demo = '', None, None, False
+            self.cloud_next = 0.0   # switched back on, a fetch goes out at once, not after the last answer's 600 s
         elif self.demo:
             # regulator demo mode: no cloud, a canned bundle in the function's shape (the app's demoFillCloudPanes)
             if not self.cloud_demo:
@@ -3307,6 +3344,7 @@ class Core:
         else:
             if self.cloud_demo:
                 self.cloud_text, self.cloud_as_of, self.cloud_demo = '', None, False
+                self.cloud_next = 0.0   # the real boards at once, not after the 600 s of an answer from before the demo
                 self._cloud_set(CLOUD_LOADING)
             stale = self.cloud_at is None or now - self.cloud_at >= CLOUD_REFRESH_S
             if (want or self.cloud_refresh) and not self.cloud_busy and now >= self.cloud_next \
@@ -3358,6 +3396,12 @@ class Core:
             return
         except ValueError as e:
             log.warning('cloud: %s', e)
+            self._reply('cloud', (CLOUD_ERROR, 'The cloud answered with something unreadable', None))
+            return
+        except Exception as e:
+            # a body cut short (http.client.IncompleteRead, gzip's EOFError or zlib.error) or a bundle of another shape:
+            # an answer is owed whatever happened, since cloud_busy holds back every later fetch until one comes
+            log.warning('cloud: %s %s', e.__class__.__name__, e)
             self._reply('cloud', (CLOUD_ERROR, 'The cloud answered with something unreadable', None))
             return
         self._reply('cloud', (CLOUD_READY, None, v))

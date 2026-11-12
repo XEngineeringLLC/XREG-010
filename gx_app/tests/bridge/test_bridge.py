@@ -276,16 +276,16 @@ class TestParsers(unittest.TestCase):
         self.assertFalse(xc.serial_matches(fr.UID, None, uids))
 
     def test_identity_helpers(self):
-        self.assertEqual(xc.uid6('000028621AD9B4DC'), '28621A')   # the app's uid.slice(-12, -6), never the OUI tail
-        self.assertEqual(xc.unit_service('000028621AD9B4DC'), 'com.victronenergy.switch.xregulator_28621a')
-        self.assertEqual(xc.label('000028621AD9B4DC', 'Port engine'), 'Port engine (XREG-28621A)')
-        self.assertEqual(xc.label('000028621AD9B4DC', 'XREG-28621A'), 'XREG-28621A')
-        self.assertEqual(xc.norm_uid(' 000028621ad9b4dc '), '000028621AD9B4DC')
-        self.assertEqual(xc.norm_uid('28621A'), '')
+        self.assertEqual(xc.uid6('0000FEEDC0DE1234'), 'FEEDC0')   # the app's uid.slice(-12, -6), never the OUI tail
+        self.assertEqual(xc.unit_service('0000FEEDC0DE1234'), 'com.victronenergy.switch.xregulator_feedc0')
+        self.assertEqual(xc.label('0000FEEDC0DE1234', 'Port engine'), 'Port engine (XREG-FEEDC0)')
+        self.assertEqual(xc.label('0000FEEDC0DE1234', 'XREG-FEEDC0'), 'XREG-FEEDC0')
+        self.assertEqual(xc.norm_uid(' 0000feedc0de1234 '), '0000FEEDC0DE1234')
+        self.assertEqual(xc.norm_uid('FEEDC0'), '')
         self.assertEqual([xc.gx_version(i) for i in ({'gx': 2}, {'gx': 1}, {}, {'gx': 'x'})], [2, 1, 0, 0])
-        self.assertIsNone(xc.xreg_ident(b'{"device":"printer","uid":"000028621AD9B4DC"}'))
+        self.assertIsNone(xc.xreg_ident(b'{"device":"printer","uid":"0000FEEDC0DE1234"}'))
         self.assertIsNone(xc.xreg_ident(b'{"device":"xreg-010","uid":"none"}'))
-        self.assertEqual(xc.xreg_ident(b'{"device":"XREG-010","uid":"000028621ad9b4dc"}')['uid'], '000028621ad9b4dc')
+        self.assertEqual(xc.xreg_ident(b'{"device":"XREG-010","uid":"0000feedc0de1234"}')['uid'], '0000feedc0de1234')
         self.assertEqual(xc._instance('switch:101', 100), 101)
         self.assertEqual(xc._instance('', 100), 100)
 
@@ -637,6 +637,30 @@ class TestSettingsModel(unittest.TestCase):
         self.assertEqual(core._answer(200, b'Rejected: out of range'), (False, 'Rejected: out of range'))
         self.assertEqual(core._answer(200, b'OK'), (True, ''))
 
+    def test_battery_voltage_order(self):
+        # the app's validateBatterySettings() hard blocks; the float rules apply only with Voltage Float (UseFloat 1)
+        c = self.csv3
+        c.update(BulkVoltage=1440, AbsorptionVoltage=1420, FloatVoltage=1350, RebulkVoltage=1280, UseFloat=1)
+        order = lambda k, v: self.m.battery_order(k, v, self.frames)
+        for k, v, msg in (('AbsorptionVoltage', 14.5, 'Absorption Voltage cannot be higher than Bulk Voltage.'),
+                          ('BulkVoltage', 14.1, 'Absorption Voltage cannot be higher than Bulk Voltage.'),
+                          ('FloatVoltage', 14.3, 'Float Voltage cannot be higher than Absorption Voltage.'),
+                          ('RebulkVoltage', 13.5, 'Rebulk Voltage must be lower than Float Voltage.'),
+                          ('FloatVoltage', 12.8, 'Rebulk Voltage must be lower than Float Voltage.')):
+            with self.assertRaises(ValueError) as e:
+                order(k, v)
+            self.assertEqual(str(e.exception), msg, k)
+        for k, v in (('AbsorptionVoltage', 14.4), ('FloatVoltage', 14.2), ('RebulkVoltage', 13.4), ('TailCurrent_A', 99)):
+            order(k, v)
+        c['UseFloat'] = 0
+        order('RebulkVoltage', 13.6)   # no voltage float: Float Voltage is not used
+        c['RebulkVoltage'] = 1360
+        with self.assertRaises(ValueError):
+            order('UseFloat', 1)        # switching it on with Rebulk above Float
+        c['UseFloat'] = 1
+        c['FloatVoltage'] = xc.EMPTY    # not echoed yet: skipped, as the app's NaN
+        order('RebulkVoltage', 13.6)
+
     def test_outline_walk(self):
         # every item of the nested outline reaches the model, wherever it sits (pages hold items and deeper pages)
         schema = json.loads(SCHEMA_TEXT)
@@ -728,12 +752,20 @@ class TestSettingsModel(unittest.TestCase):
         edits = {'rpmTableRPMPoints%d' % i: (0 if i in (3, 9) else 500 + 300 * i) for i in range(10)}
         with self.assertRaises(ValueError) as e:
             self.m.table_params('rpmTable', edits, self.frames)
-        self.assertIn('Row 4 (0) must be greater than Row 3 (1100)', str(e.exception))   # the app reports this first
+        self.assertIn('Row 4 RPM must be greater than 0', str(e.exception))   # the app reports this first
         edits = {'rpmTableRPMPoints%d' % i: (0 if i == 0 else 500 + 300 * i) for i in range(10)}
         with self.assertRaises(ValueError) as e:
             self.m.table_params('rpmTable', edits, self.frames)
-        self.assertIn('Zero RPM values are only allowed at the end of the table. Found zero at row 1', str(e.exception))
+        self.assertIn('Row 1 RPM must be greater than 0', str(e.exception))
+        # trailing zero rows are refused too: the firmware would apply the last row at every engine speed
         edits = {'rpmTableRPMPoints%d' % i: (0 if i >= 6 else 500 + 300 * i) for i in range(10)}
+        with self.assertRaises(ValueError) as e:
+            self.m.table_params('rpmTable', edits, off)
+        self.assertIn('Row 7 RPM must be greater than 0', str(e.exception))
+        with self.assertRaises(ValueError) as e:
+            self.m.table_params('rpmTable', {'rpmTableRPMPoints9': 0}, off)
+        self.assertIn('Row 10 RPM must be greater than 0', str(e.exception))
+        edits = {'rpmTableRPMPoints%d' % i: 600 + 400 * i for i in range(10)}
         self.assertEqual(len(self.m.table_params('rpmTable', edits, off)), 41)
 
 
@@ -1281,6 +1313,9 @@ class TestOlderFirmware(unittest.TestCase):
             self.assertTrue(h.write('/SwitchableOutput/0/State', 0))
             r = h.wait_result('OnOff')
             self.assertEqual((r['ok'], r['message']), (False, 'Not connected to XREG-FEEDC0'))
+            h.tick_for(0.6)
+            self.assertIsNone(h.pub['/SwitchableOutput/0/State'])   # offline: no state, and the tap is not held
+            self.assertNotIn('/SwitchableOutput/0/State', h.core.hold)
         finally:
             h.close()
 
@@ -1326,12 +1361,12 @@ class TestDiscovery(unittest.TestCase):
         d = xc.Discovery(browse=False)
         zc = types.SimpleNamespace(get_service_info=lambda t, n, timeout: FakeInfo(
             {'uid': '0000feedc0de1234', 'name': 'Port engine', 'fw': '0.0.10', 'host': 'xreg-feedc0',
-             'pair': '5EEDC0,zz,28621a'}, ['fe80::1', '172.20.10.3']))
+             'pair': '5EEDC0,zz,aaaac0'}, ['fe80::1', '172.20.10.3']))
         added = types.SimpleNamespace(name='Added')
         d._mdns_event(zeroconf=zc, service_type=xc.MDNS_TYPE, name='xreg-feedc0.' + xc.MDNS_TYPE, state_change=added)
         e = d.get(fr.UID)
         self.assertEqual((e['host'], e['name'], e['fw'], e['pair'], e['via']),
-                         ('172.20.10.3', 'Port engine', '0.0.10', ['5EEDC0', '28621A'], 'mdns'))
+                         ('172.20.10.3', 'Port engine', '0.0.10', ['5EEDC0', 'AAAAC0'], 'mdns'))
         zc.get_service_info = lambda t, n, timeout: FakeInfo({'uid': UID_B}, ['172.20.10.4'], port=8080)
         d._mdns_event(zeroconf=zc, service_type=xc.MDNS_TYPE, name='xreg-5eedc0.' + xc.MDNS_TYPE, state_change=added)
         self.assertEqual(d.hosts_for(UID_B), ['172.20.10.4:8080'])
@@ -1869,6 +1904,34 @@ class TestDemo(unittest.TestCase):
         h.tick_for(1.5)
         self.assertFalse(h.core.demo)
         self.assertEqual(self.reg.requests('/demoBackfill'), [])
+
+    def test_exit_drops_a_fetch_from_demo(self):
+        # a Long Term fetch still running at the exit: the demo month it brings is not kept, and the real ring follows
+        # at once rather than after the 600 s refetch
+        h, reg = self.start(), self.reg
+        self.assertTrue(h.write('/Settings/Value/hardwarePresent', 0))
+        h.until(lambda: h.core.demo, 10, 'demo seen')
+        demo_end, real_end = 1_790_000_000, 1_790_600_000
+        reg.lt_bin = fr.make_longterm(last_epoch=demo_end)
+        http_ = h.core.link.http
+        get_ok, started, release = http_.get_ok, threading.Event(), threading.Event()
+
+        def held(path, timeout=10.0):
+            b = get_ok(path, timeout=timeout)
+            if path == '/longTermPlots.bin' and not started.is_set():
+                started.set()
+                release.wait(10)
+            return b
+        http_.get_ok = held
+        h.want('Long')
+        h.until(started.is_set, 10, 'demo month in flight')
+        reg.lt_bin = fr.make_longterm(last_epoch=real_end)
+        self.assertTrue(h.write('/Settings/Value/hardwarePresent', 1))
+        h.until(lambda: not h.core.demo, 10, 'demo left')
+        release.set()
+        h.until(lambda: h.core.lt is not None, 10, 'a month kept')
+        self.assertEqual(h.core.lt['recs'][-1][0], real_end)
+        self.assertEqual(len(reg.requests('/longTermPlots.bin')), 2)
 
     def test_backfill_parser(self):
         b = xc.parse_backfill(json.dumps(fr.make_backfill(1_790_000_000)).encode())

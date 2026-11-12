@@ -36,8 +36,6 @@
      cloud-off         CloudFeatures = 0 */
 body.no-batt-current .req-batt-current { display: none !important; }
 body.no-soc-src .req-soc-src { display: none !important; }
-/* Only the Alternator diag panel survives no-shunt, so drop its now-single-tab switcher. */
-body.no-batt-current #livedata-diag .diag-panel-tabs { display: none !important; }
 
 /* Dim the CHILDREN, never the gated element: parent opacity would also fade the .gate-note
    (a direct child, excluded here). */
@@ -3578,6 +3576,28 @@ hr {
   animation: button-pulse 0.4s ease-out;
 }
 
+/* The teal buttons (the Set submits): the same pulse, ring in their color, light and dark */
+@keyframes button-pulse-primary {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(0, 161, 154, 0.45);
+  }
+
+  50% {
+    transform: scale(1.02);
+    box-shadow: 0 0 0 4px rgba(0, 161, 154, 0.22);
+  }
+
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(0, 161, 154, 0);
+  }
+}
+
+.btn-primary.button-pulse {
+  animation: button-pulse-primary 0.4s ease-out;
+}
+
 /* Teal flash for the first-row Limit (A) box when deep-linked from the Ignore RPM warning. */
 @keyframes cap-first-row-flash {
   0%, 100% { box-shadow: 0 0 0 0 rgba(53, 214, 199, 0); }
@@ -6515,3 +6535,12 @@ button.press-busy {
   opacity: 0.6;
   cursor: progress;
 }
+
+/* Battery Wear Record grids (Live Data > Diag > Battery). The first column stays put while the grid scrolls sideways. */
+.bw-grid { border-collapse: collapse; font-size: 0.78em; font-variant-numeric: tabular-nums; }
+.bw-grid th, .bw-grid td { padding: 3px 6px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--border); }
+.bw-grid th { color: var(--text-muted); font-weight: 600; }
+.bw-grid th:first-child, .bw-grid td:first-child { text-align: left; position: sticky; left: 0; background: var(--card-light); }
+.bw-grid td.bw-total { font-weight: 600; }
+.bw-grid tr.bw-sub td { color: var(--text-muted); font-size: 0.92em; border-bottom-style: dotted; }
+.bw-grid tr.bw-sub td:first-child { padding-left: 18px; }

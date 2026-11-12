@@ -693,11 +693,23 @@ String settingRead(const char *key) {
   return out;
 }
 
+// The first NVS write error of a boot goes to the console; the rest are only counted (cloud daily nvs_write_fails).
+esp_err_t nvsNote(esp_err_t e) {
+  if (e != ESP_OK && g_nvsWriteFails++ == 0) queueConsoleMessageF("Settings storage (NVS) write failed: %s", esp_err_to_name(e));
+  return e;
+}
+
+int nvsStatsEntries(bool used) {
+  nvs_stats_t st;
+  if (nvs_get_stats(NULL, &st) != ESP_OK) return -1;
+  return (int)(used ? st.used_entries : st.free_entries);
+}
+
 bool settingWrite(const char *key, const char *value) {
   if (!key || !value) return false;
   if (demoSeal) return demoOvWrite(key, value);   // demo: applies in RAM only, gone at exit
   nvs_handle_t h;
-  if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+  if (nvsNote(nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &h)) != ESP_OK) return false;
   // compare-first: unchanged value -> no flash write (wear + entry churn)
   char cur[128];
   size_t len = sizeof(cur);
@@ -705,8 +717,8 @@ bool settingWrite(const char *key, const char *value) {
     nvs_close(h);
     return true;
   }
-  esp_err_t e = nvs_set_str(h, key, value);
-  if (e == ESP_OK) e = nvs_commit(h);
+  esp_err_t e = nvsNote(nvs_set_str(h, key, value));
+  if (e == ESP_OK) e = nvsNote(nvs_commit(h));
   nvs_close(h);
   return e == ESP_OK;
 }
@@ -1222,28 +1234,69 @@ struct PsramBlobHeader {
   uint32_t userWord;    // caller flags (e.g. "reference finalized"); 0 if unused
 };
 
+// Byte compare of the file at `path` against what writePsramBlob would write. Caller holds the FS lock.
+// hdrp is a PsramBlobHeader; void* because the Arduino builder hoists a prototype above the struct.
+static bool psramBlobSameOnFlash(const char *path, const void *hdrp, const uint8_t *bytes,
+                                 size_t recordSize, uint32_t capacity, uint32_t startIdx, uint32_t count) {
+  const PsramBlobHeader &hdr = *(const PsramBlobHeader *)hdrp;
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  if ((size_t)f.size() != sizeof(hdr) + (size_t)count * recordSize) { f.close(); return false; }
+  uint8_t buf[256];
+  bool same = (f.read(buf, sizeof(hdr)) == sizeof(hdr)) && memcmp(buf, &hdr, sizeof(hdr)) == 0;
+  uint32_t remaining = count;
+  uint32_t idx = startIdx % capacity;
+  while (same && remaining > 0) {
+    uint32_t span = capacity - idx;
+    if (span > remaining) span = remaining;
+    const uint8_t *p = bytes + (size_t)idx * recordSize;
+    size_t left = (size_t)span * recordSize;
+    while (same && left > 0) {
+      size_t n = left < sizeof(buf) ? left : sizeof(buf);
+      same = (f.read(buf, n) == n) && memcmp(buf, p, n) == 0;
+      p += n;
+      left -= n;
+    }
+    remaining -= span;
+    idx = 0;
+    if (wdtMainTaskSubscribed) esp_task_wdt_reset();
+  }
+  f.close();
+  return same;
+}
+
 // Dumps `count` records of ring `base[capacity]` from `startIdx` in chronological order (a plain array
-// passes startIdx=0, count=capacity). Removes the partial file on a short write. Returns records written.
+// passes startIdx=0, count=capacity). Skips the write when the file already holds these exact bytes; otherwise
+// writes `path`.tmp and renames it over `path`, so a short write leaves the previous copy. Returns records
+// written (or already on flash).
 uint32_t writePsramBlob(const char *path, uint32_t magic, uint32_t version,
                         uint32_t userWord, const void *base, size_t recordSize,
                         uint32_t capacity, uint32_t startIdx, uint32_t count) {
   if (!base || recordSize == 0 || capacity == 0) return 0;
   if (count > capacity) count = capacity;
 
+  char tmpPath[64];
+  if (snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path) >= (int)sizeof(tmpPath)) return 0;
+  PsramBlobHeader hdr = { magic, version, count, (uint32_t)recordSize, userWord };
+  const uint8_t *bytes = (const uint8_t *)base;
+
   fsTakeLock();
-  File f = LittleFS.open(path, "w");
+  if (psramBlobSameOnFlash(path, &hdr, bytes, recordSize, capacity, startIdx, count)) {
+    fsReleaseLock();
+    return count;
+  }
+  File f = LittleFS.open(tmpPath, "w");
   if (!f) {
     fsReleaseLock();
-    Serial.printf("writePsramBlob: open failed (%s)\n", path);
+    Serial.printf("writePsramBlob: open failed (%s)\n", tmpPath);
     return 0;
   }
   fsFreeDirty = true;
 
-  PsramBlobHeader hdr = { magic, version, count, (uint32_t)recordSize, userWord };
   bool ok = (f.write((const uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr));
 
   // Body in up to two contiguous spans: [startIdx..capacity) then wrap [0..rem).
-  const uint8_t *bytes = (const uint8_t *)base;
   uint32_t remaining = count;
   uint32_t idx = startIdx % capacity;
   while (ok && remaining > 0) {
@@ -1257,10 +1310,14 @@ uint32_t writePsramBlob(const char *path, uint32_t magic, uint32_t version,
   }
 
   f.close();
-  if (!ok) LittleFS.remove(path);            // drop the partial file
+  if (ok && !LittleFS.rename(tmpPath, path)) {
+    LittleFS.remove(path);                   // in case rename refuses an existing destination
+    ok = LittleFS.rename(tmpPath, path);
+  }
+  if (!ok) LittleFS.remove(tmpPath);
   fsReleaseLock();
   if (!ok) {
-    Serial.printf("writePsramBlob: short write (%s) — file removed\n", path);
+    Serial.printf("writePsramBlob: write failed (%s)\n", path);
     return 0;
   }
   return count;
@@ -1435,6 +1492,12 @@ void performDeepFactoryReset() {
   // so no background task gets a chance to re-persist something.
   queueConsoleMessage("DEEP FACTORY RESET: Wiping all settings and data, restarting...");
   delay(1500);
+
+  // The battery wear record and the overvoltage counters live in RTC memory, which the restart below keeps: with a bad magic
+  // the boot starts both empty (captureResetReason). Before the NVS erase, so a wear save landing after it is one the boot rejects.
+  g_batWear.headMagic = 0;
+  g_batWear.magic = 0;
+  g_ovTel.magic = 0;
 
   // Step 1: reformat LittleFS (settings and Vessel Info live in NVS, wiped in Step 2). fsMutex is taken and
   // deliberately NEVER released, so any task that would re-create a file blocks until the reboot.
@@ -1738,6 +1801,53 @@ static bool owVetPowerOn(const uint8_t *addr, uint8_t *sp) {
          && sp[2] == OW_MARK_TH && sp[3] == OW_MARK_TL;
 }
 
+// Bit (1 << TR_BATT / TR_EXTRA) set = that role's global still holds demo mode's simulated value: set at demo exit,
+// cleared by the role's first real read. Read with owRoleDemoStale(); the RAM value is not data while set.
+volatile uint8_t owDemoStaleMask = 0;
+bool owRoleDemoStale(uint8_t role) { return (__atomic_load_n(&owDemoStaleMask, __ATOMIC_RELAXED) >> role) & 1u; }
+
+// Demo mode: the field driver's rotor-resistance correction takes the real alternator probe (fdAltTempF) while the simulated
+// boat owns AlternatorTemperatureF. Only that probe, 5 s apart or 1 s after a miss, the ALT path's checks, into g_fdAltProbeF.
+static void owDemoAltRead() {
+  static uint32_t lastMs = 0;
+  static bool lastOk = false;
+  const uint32_t now = millis();
+  if (lastMs != 0 && now - lastMs < (lastOk ? 5000UL : 1000UL)) return;
+  lastMs = now;
+  lastOk = false;
+  DeviceAddress a;
+  portENTER_CRITICAL(&owMux);
+  const bool bound = tempRoleSlot[TR_ALT] >= 0;
+  memcpy(a, tempDeviceAddress, sizeof(DeviceAddress));
+  portEXIT_CRITICAL(&owMux);
+  if (!bound) return;
+  if (!sensors.isConnected(a)) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+    if (!sensors.isConnected(a)) return;
+  }
+  if (!sensors.requestTemperaturesByAddress(a)) return;
+  vTaskDelay(pdMS_TO_TICKS(sensors.millisToWaitForConversion(resolution)));
+  lastTempTaskHeartbeat = millis();
+  uint8_t sp[9];
+  if (!sensors.readScratchPad(a, sp)) return;
+  if (OneWire::crc8(sp, 8) != sp[8] || owScratchAllZero(sp)) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+    if (!sensors.readScratchPad(a, sp) || OneWire::crc8(sp, 8) != sp[8] || owScratchAllZero(sp)) return;
+  }
+  bool allFF = true;
+  for (int i = 0; i < 9; i++) if (sp[i] != 0xFF) { allFF = false; break; }
+  if (allFF || !owVetPowerOn(a, sp)) return;
+  if (sp[4] != DS18B20_CFG_BYTE) {   // the next read, 1 s on, is at the set resolution
+    sensors.setResolution(a, resolution);
+    return;
+  }
+  const float tempF = (int16_t)((sp[1] << 8) | sp[0]) / 16.0f * 1.8f + 32.0f;
+  if (!(tempF > -50 && tempF < 300)) return;
+  g_fdAltProbeF = tempF;
+  g_fdAltProbeMs = millis();
+  lastOk = true;
+}
+
 void TempTask(void *parameter) {
   // NO watchdog registration - keep it separate from main loop watchdog
 
@@ -1763,7 +1873,8 @@ void TempTask(void *parameter) {
     }
 
     if (hardwarePresent == 0) {
-      vTaskDelay(pdMS_TO_TICKS(5000));
+      if (bootHardwareInitDone && TempSource == 0) owDemoAltRead();
+      vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
@@ -2055,6 +2166,7 @@ altDone:
           if (battTempProbeEnable == 1) {
             BatteryTempProbeF = tempF;
             MARK_FRESH(IDX_BATT_TEMP_PROBE);
+            __atomic_fetch_and(&owDemoStaleMask, (uint8_t)~(1u << TR_BATT), __ATOMIC_RELAXED);
             wmIgnUpdate(wmIgn_battTempF, tempF);
           }
         }
@@ -2063,6 +2175,7 @@ altDone:
           if (extraTempProbeEnable == 1) {
             ExtraTempF = tempF;
             MARK_FRESH(IDX_EXTRA_TEMP);
+            __atomic_fetch_and(&owDemoStaleMask, (uint8_t)~(1u << TR_EXTRA), __ATOMIC_RELAXED);
             wmIgnUpdate(wmIgn_extraTempF, tempF);
           }
         }
@@ -2160,9 +2273,19 @@ void httpsTask(void *param) {
 
     HttpsRequest request;
     if (xQueueReceive(httpsQueue, &request, pdMS_TO_TICKS(1000))) {
-      // Demo mode: only the weather forecast fetch leaves the boat; every upload and cloud operation is dropped here.
-      if (demoSeal && request.type != HTTPS_FETCH_WEATHER) {
+      // Demo mode: nothing leaves the boat. The weather fetch is dropped too: it would ask for the simulated boat's position.
+      if (demoSeal) {
         if (request.payload) free(request.payload);
+        // Same hand-back as the field-on queue flush (AdjustFieldLearnMode): these senders wait on their state with no timeout.
+        if (request.type == HTTPS_UPLOAD_CX_LEDGER) cxLedgerUpState = -1;
+        else if (request.type == HTTPS_CLOUD_OP) cloudOpFailDemoDropped();
+        else if (request.type == HTTPS_UPLOAD_CONFIG) configSnapshotRequested = true;
+        else if (request.type == HTTPS_GET_PENDING_CONFIG) pendingConfigCheckDone = false;
+        else if (request.type == HTTPS_FETCH_WEATHER) nextWeatherUpdate = millis();   // updateWeatherMode holds it until exit
+        else if (request.type == HTTPS_UPLOAD_PAYLOAD) {
+          lastUploadWasBuffered = false;
+          sensorRingInFlightIndex = -1;  // publish last: Core 1 queues the next slot as soon as it reads -1
+        }
         continue;
       }
 
@@ -2420,11 +2543,13 @@ void resetSensorWindow() {
   currentWindow->cog_max = 0;
   currentWindow->cog_area_v_us = 0;
   currentWindow->cog_valid_us = 0;
+  currentWindow->cog_sin_us = currentWindow->cog_cos_us = 0;
 
   currentWindow->heading_min = 999900;
   currentWindow->heading_max = 0;
   currentWindow->heading_area_v_us = 0;
   currentWindow->heading_valid_us = 0;
+  currentWindow->heading_sin_us = currentWindow->heading_cos_us = 0;
 
   currentWindow->aws_min = 999900;
   currentWindow->aws_max = 0;
@@ -2435,6 +2560,7 @@ void resetSensorWindow() {
   currentWindow->awa_max = 0;
   currentWindow->awa_area_v_us = 0;
   currentWindow->awa_valid_us = 0;
+  currentWindow->awa_sin_us = currentWindow->awa_cos_us = 0;
 
   currentWindow->tws_min = 999900;
   currentWindow->tws_max = 0;
@@ -2445,6 +2571,7 @@ void resetSensorWindow() {
   currentWindow->twa_max = 0;
   currentWindow->twa_area_v_us = 0;
   currentWindow->twa_valid_us = 0;
+  currentWindow->twa_sin_us = currentWindow->twa_cos_us = 0;
 
   currentWindow->leeway_min = 999900;
   currentWindow->leeway_max = -999900;
@@ -2567,6 +2694,20 @@ void resetAccelWindow() {
   // compares against it; its 100 ms dt sanity check is what absorbs the 71.6 min wrap there.
   imuWindow->lastUpdateTime_us = micros();
   imuWindow->windowStartTime = millis();
+}
+
+// A wind or heading angle averages as a vector: a linear mean across the 0/360 (or +-180) seam points the opposite way.
+static inline void angAccum(int64_t &sinUs, int64_t &cosUs, float deg, uint64_t delta_us) {
+  const float r = deg * 0.01745329252f;
+  sinUs += (int64_t)(sinf(r) * 10000.0f) * (int64_t)delta_us;
+  cosUs += (int64_t)(cosf(r) * 10000.0f) * (int64_t)delta_us;
+}
+// The vector average in degrees x100, in the range its samples came in: 0..360, or +-180 when any was negative (mn < 0).
+static inline int32_t angAvgX100(int64_t sinUs, int64_t cosUs, int32_t mn) {
+  float a = atan2f((float)sinUs, (float)cosUs) * 57.29577951f;
+  if (a < 0.0f && mn >= 0) a += 360.0f;
+  if (a >= 360.0f) a = 0.0f;
+  return (int32_t)(a * 100.0f);
 }
 
 void updateSensorWindow() {
@@ -2826,6 +2967,7 @@ void updateSensorWindow() {
     if (shouldAccumulate) {
       currentWindow->cog_area_v_us += (int64_t)cog * delta_us;
       currentWindow->cog_valid_us += delta_us;
+      angAccum(currentWindow->cog_sin_us, currentWindow->cog_cos_us, COGNMEA, delta_us);
     }
   }
 
@@ -2836,6 +2978,7 @@ void updateSensorWindow() {
     if (shouldAccumulate) {
       currentWindow->heading_area_v_us += (int64_t)heading * delta_us;
       currentWindow->heading_valid_us += delta_us;
+      angAccum(currentWindow->heading_sin_us, currentWindow->heading_cos_us, HeadingNMEA, delta_us);
     }
   }
 
@@ -2857,6 +3000,7 @@ void updateSensorWindow() {
     if (shouldAccumulate) {
       currentWindow->awa_area_v_us += (int64_t)awa * delta_us;
       currentWindow->awa_valid_us += delta_us;
+      angAccum(currentWindow->awa_sin_us, currentWindow->awa_cos_us, ApparentWindAngleNMEA, delta_us);
     }
   }
 
@@ -2877,6 +3021,7 @@ void updateSensorWindow() {
     if (shouldAccumulate) {
       currentWindow->twa_area_v_us += (int64_t)twa * delta_us;
       currentWindow->twa_valid_us += delta_us;
+      angAccum(currentWindow->twa_sin_us, currentWindow->twa_cos_us, TrueWindAngleNMEA, delta_us);
     }
   }
 
@@ -3583,6 +3728,9 @@ void pushSensorSnapshot(time_t collectionTime) {
   SNAP_CHAN(vmg, 100.0);         SNAP_CHAN(uTargetAmps, 100.0); SNAP_CHAN(battTemp, 100.0); SNAP_CHAN(extraTemp, 100.0);
   SNAP_CHAN(solarPower, 100.0);  SNAP_CHAN(solarVolt, 100.0);
 #undef SNAP_CHAN
+#define SNAP_ANG(ch) if (w.ch##_valid_us > 0) s.ch.avg = angAvgX100(w.ch##_sin_us, w.ch##_cos_us, w.ch##_min) / 100.0f
+  SNAP_ANG(cog); SNAP_ANG(heading); SNAP_ANG(awa); SNAP_ANG(twa);
+#undef SNAP_ANG
   s.battVoltOnAvg    = snapAvg(w.battVolt_on_area_v_us,    w.battVolt_on_us,    100.0);
   s.battCurrOnAvg    = snapAvg(w.battCurr_on_area_v_us,    w.battCurr_on_us,    100.0);
   s.altCurrOnAvg     = snapAvg(w.altCurr_on_area_v_us,     w.altCurr_on_us,     100.0);
@@ -3668,8 +3816,8 @@ struct SensorRingBackupHeader {
   uint32_t entrySize;  // sizeof(SensorSnapshot) — sanity guard against struct layout change
 };
 
-// Bulk dump of the PSRAM ring at shutdown Phase 4 (30-min cloud drain window expired with records left).
-// Blocking flash write is fine: the field is off and the device is about to sleep.
+// Bulk dump of the PSRAM ring to flash. Blocking: callers run it only at the key-off (shutdown Phase 2 and 4), after a
+// 1 h rest, or just before a restart.
 uint16_t dumpSensorRingToLittleFS() {
   if (!sensorRing || ringIsEmpty()) return 0;
   fsTakeLock();
@@ -3719,8 +3867,8 @@ uint16_t dumpSensorRingToLittleFS() {
   return written;
 }
 
-// Boot restore into the empty ring. The file is deleted regardless: a partial restore is acceptable, a stale
-// backup would double-upload next boot.
+// Boot restore into the empty ring. The file stays until a drain to empty (sensorRingBackupStale) deletes it or the
+// next dump replaces it, so a reset before then restores it again; a stamped record sent twice is idempotent in the cloud.
 uint16_t restoreSensorRingFromLittleFS() {
   if (!sensorRing) return 0;
   if (!fsExists(SENSOR_RING_BACKUP_PATH)) return 0;
@@ -3769,7 +3917,6 @@ uint16_t restoreSensorRingFromLittleFS() {
   }
   bufferedRecordCount = sensorRingCount;
   f.close();
-  LittleFS.remove(SENSOR_RING_BACKUP_PATH);
   fsReleaseLock();
   Serial.printf("restoreSensorRingFromLittleFS: restored %u snapshots\n", restored);
   return restored;
@@ -3832,6 +3979,12 @@ void buildLongTermRecord(LongTermRecord &rec) {
   LT_ENV(aws,         aws,         1,  11);
   LT_ENV(awa,         awa,         10, 12);
   LT_ENV(twa,         twa,         10, 13);
+#define LT_ANG(dst, field) do { \
+  if (currentWindow->field##_valid_us > 0) \
+    rec.dst = ltScale(angAvgX100(currentWindow->field##_sin_us, currentWindow->field##_cos_us, currentWindow->field##_min), 10); \
+  } while (0)
+  LT_ANG(awa[2], awa);
+  LT_ANG(twa[2], twa);
   LT_IMU(heel,        heel,        1,  14);
   LT_IMU(pitch,       pitch,       1,  15);
   LT_ENV(soc,         soc,         10, 16);
@@ -3840,6 +3993,9 @@ void buildLongTermRecord(LongTermRecord &rec) {
   LT_AVG(ambTemp_avg, ambTemp, 10, 18);
   LT_AVG(cog_avg,     cog,     10, 19);
   LT_AVG(heading_avg, heading, 10, 20);
+  LT_ANG(cog_avg, cog);
+  LT_ANG(heading_avg, heading);
+#undef LT_ANG
   LT_AVG(leeway_avg,  leeway,  10, 21);
   LT_AVG(altZero_avg, altZero, 1,  22);
 
@@ -4050,7 +4206,15 @@ void zeroLogResetAll() {
 // (RAM only), and flushes to flash field-off only (60s-settled, every 30 min, new-data-gated — same
 // flash discipline as dumpLongTermRing). The flush is the only flash write; sampling is trivial.
 void zeroLogService() {
-  if (demoSeal) return;   // demo mode: no samples, no fit, no flash; an offset changed in demo reverts before this runs again
+  static uint32_t lastFieldOnMs = 0;
+  // Demo: the field was not tracked (the 5 s wait restarts at the seal drop), and the alternator probe value stays simulated
+  // until TempTask's first real read moves its stamp
+  static uint32_t demoLeftMs = 0, demoAltStampMs = 0;
+  if (demoSeal) {   // demo mode: no samples, no fit, no flash; an offset changed in demo reverts before this runs again
+    lastFieldOnMs = demoLeftMs = millis() | 1u;
+    demoAltStampMs = dataTimestamps[IDX_ALTERNATOR_TEMP];
+    return;
+  }
   // An AlternatorCOffset change from any path lands here, on the core that appends to and fits from these rings.
   static uint32_t basisMovedMs = 0;
   const float off = AlternatorCOffset;
@@ -4066,7 +4230,6 @@ void zeroLogService() {
 
   // SAMPLE — own short field-off timer. fieldCutSettled() has a 20 s floor (it gates flash writes,
   // a different job), so we track field-off start here for the 5 s sampling threshold.
-  static uint32_t lastFieldOnMs = 0;
   if (fieldActiveStatus > 0) lastFieldOnMs = now;
   // An owner-ignored alternator current (or Limp Home) is no zero-drift sample. Spinning as the control tick reads it:
   // the ignition stands in for an ignored tach.
@@ -4081,6 +4244,11 @@ void zeroLogService() {
       const bool tempIgnored = IgnoreTemperature || LimpHome;   // owner-ignored: blank, as an absent probe
       bool tempValid = !tempIgnored && !isnan(AlternatorTemperatureF);
       if (!tempValid && !tempIgnored && now < ZEROLOG_TEMP_GRACE_MS) return;
+      if (demoLeftMs && tempValid) {   // after demo: wait for the real read; past the same grace window, blank
+        if (dataTimestamps[IDX_ALTERNATOR_TEMP] != demoAltStampMs) demoLeftMs = 0;
+        else if (now - demoLeftMs < ZEROLOG_TEMP_GRACE_MS) return;
+        else tempValid = false;
+      }
       if (!altAmpsFresh()) return;   // a held (stale) current is not a zero-drift sample (§10.5); the sample waits
 
       lastSampleMs = now;
@@ -4382,6 +4550,14 @@ static inline size_t cfgRemain(int off) {
   X(total_power_cycles,         "%d",    (int)totalPowerCycles) \
   X(wifi_reconnects_total,      "%d",    (int)wifiReconnectsTotal) \
   X(min_free_heap_kb,           "%d",    (int)MinFreeHeap) \
+  /* min_free_heap_kb above counts PSRAM too (MALLOC_CAP_DEFAULT), so each pool gets its own lowest-since-boot row. */ \
+  X(min_internal_heap_kb,       "%u",    (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024)) \
+  X(min_psram_kb,               "%u",    (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024)) \
+  X(largest_psram_block_kb,     "%lu",   (unsigned long)LargestPSRAMBlock) \
+  X(psram_boot_fail_mask,       "%lu",   (unsigned long)g_psramBootFailMask) \
+  X(nvs_used_entries,           "%d",    nvsStatsEntries(true)) \
+  X(nvs_free_entries,           "%d",    nvsStatsEntries(false)) \
+  X(nvs_write_fails,            "%lu",   (unsigned long)g_nvsWriteFails) \
   X(heap_frag_pct,              "%d",    (int)Heapfrag) \
   X(largest_internal_block_kb,  "%lu",   (unsigned long)LargestInternalBlock) \
   X(littlefs_free_kb,           "%d",    (int)LittleFsFreeKb) \
@@ -4489,8 +4665,9 @@ bool buildConfigPayload() {
     "{\"device_uid\":\"%s\",\"token\":\"%s\",\"snapshot_timestamp\":\"%s\","
     // payload_v = ingest schema version; bump when this body's shape changes (edge fn ignores it, tracing only).
     // v2 state.ov_telemetry, v3 settings.tables (settings jsonb = full /exportConfig record), v4
-    // commissioning_results -> learned_state minus stress_test (now in the ledger), v5 CLOUD_DAILY_LIST block.
-    "\"payload_v\":5,"
+    // commissioning_results -> learned_state minus stress_test (now in the ledger), v5 CLOUD_DAILY_LIST block,
+    // v6 state.battery_wear, ov_telemetry counters only.
+    "\"payload_v\":6,"
     "\"settings\":",
     device_id_hex, authToken.c_str(), timestampStr);
   if (offset < 0 || offset >= CONFIG_PAYLOAD_SIZE) return false;
@@ -4559,24 +4736,20 @@ bool buildConfigPayload() {
     ",\"fa_pkpk_worst_session\":%.2f,\"fa_peak_worst_a_session\":%.2f,\"fa_peak_worst_hz_session\":%.1f",
     faSesPkpkWorstA, faSesPeakWorstA, faSesPeakWorstHz);
 
-  // Lifetime OV telemetry (OvTelemetry, Xregulator.ino): one nested object → device_statistics.ov_telemetry; the
-  // edge fn must EXCLUDE it from the device_state_daily flatten (a nested value 500s that INSERT). time_ms as
-  // decimal strings (uint64 exceeds JS 53-bit). A true power cut zeroes the struct; the cloud overwrites as-is.
+  // Lifetime OV counters (OvTelemetry) and the battery wear record (BatteryWear, Xregulator.ino): nested objects →
+  // device_statistics.ov_telemetry / .battery_wear (+ battery_wear_monthly); the edge fn must EXCLUDE both from the
+  // device_state_daily flatten (a nested value 500s that INSERT). The real records only: demo never uploads.
   offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset),
-    ",\"ov_telemetry\":{\"soft\":%lu,\"sw_hard\":%lu,\"ina\":%lu,\"kd\":%lu,"
-    "\"tier_low\":%lu,\"tier_mid\":%lu,\"bulk\":%.2f,\"k\":%.2f,"
-    "\"bins_fine\":%d,\"bins_coarse\":%d,\"events\":[",
+    ",\"ov_telemetry\":{\"soft\":%lu,\"sw_hard\":%lu,\"ina\":%lu,\"kd\":%lu,\"tier_low\":%lu,\"tier_mid\":%lu}",
     (unsigned long)g_ovTel.softExceedCount, (unsigned long)g_ovTel.swHardCutCount,
     (unsigned long)g_ovTel.inaCutCount, (unsigned long)g_ovTel.kdEventCount,
-    (unsigned long)g_ovTel.tierLowCutCount, (unsigned long)g_ovTel.tierMidCutCount,
-    BulkVoltage, (float)SYSTEM_VOLTAGE_CLASS / 12.0f,
-    OV_HIST_FINE_BINS, OV_HIST_COARSE_BINS);
-  for (int i = 0; i < OV_HIST_BINS; i++)
-    offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "%s%lu", i ? "," : "", (unsigned long)g_ovTel.events[i]);
-  offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "],\"time_ms\":[");
-  for (int i = 0; i < OV_HIST_BINS; i++)
-    offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "%s\"%llu\"", i ? "," : "", (unsigned long long)g_ovTel.timeMs[i]);
-  offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "]}");
+    (unsigned long)g_ovTel.tierLowCutCount, (unsigned long)g_ovTel.tierMidCutCount);
+  offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), ",\"battery_wear\":");
+  if (cfgRemain(offset) > 0) {
+    size_t bwLen = batteryWearJson(configPayloadBuffer + offset, cfgRemain(offset), g_batWear);
+    if (bwLen) offset += (int)bwLen;
+    else offset += snprintf(configPayloadBuffer + offset, cfgRemain(offset), "null");
+  }
 
   // Control Accuracy since the last MANUAL reset (post-upload auto-reset is disabled): daily rows are a RUNNING
   // TOTAL; difference two rows to isolate a day. The 6 columns MUST exist in device_state_daily before shipping.
@@ -5820,6 +5993,8 @@ uint16_t faDomAmpAX100 = 0;      // pk-pk amplitude (2 × sine amplitude), A ×1
 uint16_t faDomRpm = 0;           // RPM (bin center) where it occurs
 static uint32_t faMatrixDirtyWindows = 0;
 static volatile bool faPendingMatrixClear = false;  // set by /get handler (Core 0), executed on Core 1
+static bool faMatrixClearDefer = false;     // tach-rescale clear: it can run ~2 s after boot with the engine running, so the file
+static bool faMatrixRemovePending = false;  // removal waits for a settled cut
 
 // ── Measured filtered ripple capture (RIPPLE_DETECTION_REARCH_SPEC §3.1, admission §10) ──
 // Always-on IExcessTau low-pass of each detector's sensor current (Bcur battery G4, MeasuredAmps alt G3), pk-pk
@@ -6473,7 +6648,7 @@ static void faWindowFinalize() {
   bool gated = false;
   bool detWindowOk = false;  // this window suitable to extend the detector's contiguous-clean 2 s capture
   float winMeanAmps = (faDecimWinN > 0) ? (float)(faWinAmpsSum / faDecimWinN) : 0.0f;
-  if (clean && !faWinProtection && faEmaSeeded) {
+  if (clean && !faWinProtection && faEmaSeeded && !demoSeal) {   // demo: simulated RPM, nothing learned
     int rpmBinLo = (int)(faWinRpmEmaMin / FA_RPM_BIN_W);
     int rpmBinHi = (int)(faWinRpmEmaMax / FA_RPM_BIN_W);
     bool rpmSteady = (rpmBinLo == rpmBinHi)
@@ -7041,11 +7216,36 @@ void faMatrixFlush() {
   if (n > 0) faMatrixDirtyWindows = 0;
 }
 
-// RPM ripple table + session stamps → flash (one ~420 B record). Written ONLY on game teardown
-// (done/Abort/modal close/deadman) — the table is frozen between sweeps, so there is nothing to
-// flush periodically.
+// RPM ripple table + session stamps → flash (one ~420 B record). Written ONLY after a game teardown
+// (done/Abort/modal close/deadman/field leaving Auto), at the next settled field cut or a planned reboot —
+// the table is frozen between sweeps, so there is nothing to flush periodically.
 void ripTabFlush() {
   writePsramBlob(RIPTAB_PATH, RIPTAB_MAGIC, RIPTAB_VER, 0, &ripTab, sizeof(RipTab), 1, 0, 1);
+}
+
+// A dirty matrix is about to be flushed as a whole blob, which replaces the old file anyway.
+static void faMatrixRemoveIfPending() {
+  if (!faMatrixRemovePending) return;
+  faMatrixRemovePending = false;
+  if (faMatrixDirtyWindows > 0) return;
+  fsTakeLock();
+  LittleFS.remove(FA_MATRIX_PATH);
+  fsReleaseLock();
+}
+
+// Planned-reboot paths, field cut: the deferred save above would otherwise be lost. The demo seal keeps it pending.
+void ripTabSaveIfPending() {
+  if (demoSeal || !ripTabPendingSave) return;
+  ripTabPendingSave = false;
+  ripTabFlush();
+}
+
+// Same paths: matrix windows and flipbook pages banked since the last settled-cut flush.
+void faFlushDirtyNow() {
+  if (demoSeal) return;
+  faMatrixRemoveIfPending();
+  if (faMatrixDirtyWindows > 0) faMatrixFlush();
+  if (faFlipDirty) faFlipFlush();
 }
 
 // Reference flipbook → flash (whole blob, ~18 KB) via the shared versioned-blob scaffold.
@@ -7082,7 +7282,8 @@ void faMatrixMaybeFlush() {
     ripTab.sess.ibvMaxV = -1e9f;
     ripTabPendingSave = true;   // no game teardown will save it
   }
-  if (ripTabPendingSave) {
+  // Same field-cut gate as the matrix flush below; the flag holds the save until then, and it writes the table as it is then.
+  if (ripTabPendingSave && fieldCutSettled(0)) {
     ripTabPendingSave = false;
     ripTabFlush();
   }
@@ -7092,9 +7293,15 @@ void faMatrixMaybeFlush() {
     memset(faMatrix, 0, sizeof(FaCell) * FA_RPM_BINS * FA_AMP_BINS);
     faCellsUsed = 0;
     faMatrixDirtyWindows = 0;
-    fsTakeLock();
-    LittleFS.remove(FA_MATRIX_PATH);
-    fsReleaseLock();
+    const bool deferRemove = faMatrixClearDefer && !fieldCutSettled(0);   // field already cut: remove now, or a power-off first brings the old file back
+    faMatrixClearDefer = false;
+    if (deferRemove) {
+      faMatrixRemovePending = true;
+    } else {
+      fsTakeLock();
+      LittleFS.remove(FA_MATRIX_PATH);
+      fsReleaseLock();
+    }
     filtRippleArmed = false;  // reseed the low-pass EMAs on the next sample
     faDomReset();  // map wiped — clear the Highest Tone in Map headline too (persists at the next save)
     queueConsoleMessage("Resonance & Ripple Map cleared");
@@ -7105,8 +7312,8 @@ void faMatrixMaybeFlush() {
     if (faFlip) {
       memset(faFlip, 0, sizeof(FaFlipPage) * FA_FLIP_SLOTS);  // all 9: reference bands AND anomaly captures
       faAnomNext = 0;
-      faFlipDirty = true;
-      faFlipFlush();
+      faFlipDirty = true;   // persisted by the settled-cut flush below: this can run ~2 s after boot with the engine running
+      if (fieldCutSettled(0)) faFlipFlush();   // field already cut: persist now, as the matrix removal above
       queueConsoleMessage("Fast alt-current flipbook fully cleared (reference + anomaly) -- engine-RPM axis rescaled");
     }
     return;
@@ -7127,6 +7334,7 @@ void faMatrixMaybeFlush() {
   bool rising = off && !prevOff;
   bool periodic = off && (millis() - lastFlushMs >= FA_MATRIX_FLUSH_MS);
   prevOff = off;
+  if (off) faMatrixRemoveIfPending();
   if ((rising || periodic) && (faMatrixDirtyWindows > 0 || faFlipDirty)) {
     if (faMatrixDirtyWindows > 0) faMatrixFlush();
     if (faFlipDirty) faFlipFlush();
@@ -7261,6 +7469,17 @@ void faInit() {
   faBitRev = (uint16_t *)ps_malloc(FA_FFT_N * sizeof(uint16_t));
   if (!faRawRing || !faMatrix || !faFlip || !faToneBuf || !faFftRe || !faFftIm
       || !faFtWin || !faTwidRe || !faTwidIm || !faBitRev) {
+    // Free the ones that did allocate: consumers test these pointers, and faMatrix/faFlip were never zeroed.
+    free(faRawRing); faRawRing = NULL;
+    free(faMatrix); faMatrix = NULL;
+    free(faFlip); faFlip = NULL;
+    free(faToneBuf); faToneBuf = NULL;
+    free(faFftRe); faFftRe = NULL;
+    free(faFftIm); faFftIm = NULL;
+    free(faFtWin); faFtWin = NULL;
+    free(faTwidRe); faTwidRe = NULL;
+    free(faTwidIm); faTwidIm = NULL;
+    free(faBitRev); faBitRev = NULL;
     Serial.println("faInit: ps_malloc failed -- fast alt-current channel off");
     return;
   }

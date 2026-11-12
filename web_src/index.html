@@ -7055,7 +7055,8 @@
                     <span class="tooltip-box">Maximum time in Absorption before forcing a transition regardless of current. Safety fallback in case Tail
                       Current is never reached. Typical starting point: 30m per 100Ah of battery bank. This clock only runs while the
                       battery is held up at the Absorption Voltage, and the phase always ends at twice this figure of real elapsed
-                      time.</span>
+                      time, not counting time when the alternator is not charging or a followed charge voltage limit holds the
+                      battery below the Absorption Voltage.</span>
                   </span>
                 </div>
                 <div class="form-input">
@@ -7150,13 +7151,13 @@
                   <span>Minimum Float Time (min) (<span id="MinFloatTime_echo">?</span>):</span>
                   <span class="tooltip">
                     ℹ️
-                    <span class="tooltip-box">Delay after Absorption completes before any rebulk is allowed. Applies in all three Float Modes (idle, voltage float, zero-current float).</span>
+                    <span class="tooltip-box">Delay after Absorption completes before a voltage or discharge-current rebulk is allowed. Applies in all three Float Modes (idle, voltage float, zero-current float). A state of charge at or below SoC Allow Rebulk Below rebulks without waiting.</span>
                   </span>
                 </div>
                 <div class="form-input">
                   <form action="/get" method="GET" target="hidden-form"
                     onsubmit="return validateAndSubmitBatteryNumber(this, 'MinFloatTime')">
-                    <input name="MinFloatTime" type="number" step="0.01" min="0" max="9999999" />
+                    <input name="MinFloatTime" type="number" step="1" min="0" max="9999999" />
                     <input type="submit" value="Set" class="btn-primary" />
                   </form>
                 </div>
@@ -7696,8 +7697,9 @@
                   discharge current exceeds <strong>Rebulk Current Threshold</strong> — continuously for
                   <strong>Rebulk Debounce Time</strong>. The timer resets if the condition clears before the
                   debounce expires. If SoC data is available, it suppresses rebulk when the battery is at or above
-                  the block threshold and permits it again when SoC drops to the allow threshold — but SoC alone
-                  cannot trigger rebulk; voltage, current, or (in float) timeout criteria must also be met.
+                  the block threshold and permits it again when SoC drops to the allow threshold. SoC at or below
+                  the allow threshold also triggers a rebulk by itself, once each time SoC falls through it, without
+                  waiting for <strong>Minimum Float Time</strong>.
                 </p>
                 <p style="margin: 10px 0 0 0;">
                   <strong>Bulk:</strong> The system pushes the maximum thermally- (and otherwise-) allowed current
@@ -8276,7 +8278,7 @@
                     style="font-family: 'Courier New', monospace; font-size: 13px; color: #666; margin-left: 5px;"><span
                       id="solarLearnEnable_echo">?</span></span>
                   <span class="tooltip">
-                    <span class="tooltip-box">On: each complete day moves the performance ratio toward what the panels delivered. Needs a forecast and a
+                    <span class="tooltip-box">On: each day moves the performance ratio toward what the panels delivered. Needs a forecast and a
                       VE.Direct link. Off: the ratio stays as entered.</span>
                   </span>
                 </div>
@@ -8356,10 +8358,10 @@
                 <p style="margin: 0 0 12px 0;">
                   <strong>How it checks itself.</strong> Every day the regulator books what the forecast promised, what
                   the panels delivered over VE.Direct, and what the boat consumed (from the battery shunt). With Learn
-                  Performance Ratio on, each complete day nudges the ratio toward the real array, so the forecast fits
+                  Performance Ratio on, each day nudges the ratio toward the real array, so the forecast fits
                   your boat rather than a typical one. With Size Threshold from Consumption on, the bar a day must clear
                   becomes the consumption the last week predicts plus the margin, instead of a fixed number. The
-                  ledger and its chart are on Live Data, Weather.
+                  ledger and its chart are on Live Data, Integrations.
                 </p>
                 <p style="margin: 0;">
                   <strong>If the forecast goes stale.</strong> A forecast the regulator can no longer refresh — no
@@ -9369,7 +9371,7 @@
             <details class="integ-section">
               <summary class="integ-section-title">Victron GX (DVCC)<span class="integ-state"><span id="integStateVic">?</span></span></summary>
 
-              <p class="integ-copy">Follows the charge voltage and current limits (CVL/CCL) a Victron GX sets with DVCC. Over VE.Can, the GX broadcasts the voltage limit on the 250 kbps NMEA 2000/VE.Can backbone this regulator shares, and that port has to be listening: turn on Receive NMEA2K Data in the NMEA 2000 card above, or the follow switch below. VE.Can has no bank filter, so the first device heard becomes the authority and its address shows in the status row below.</p>
+              <p class="integ-copy">Follows the charge voltage and current limits (CVL/CCL) a Victron GX sets with DVCC. Over VE.Can, the GX broadcasts the limits on the 250 kbps NMEA 2000/VE.Can backbone this regulator shares, and following them needs Transmit on NMEA2K turned on in the NMEA 2000 card above. Another alternator regulator on the backbone repeats the current share the GX sent it, in the same form as the GX's battery limit. With transmit on, this regulator sends a request when it joins that makes every device on the backbone announce its maker, and it ignores limits from any device that is not Victron. With transmit off it cannot send that request, so VE.Can limits are shown here but not followed. VE.Can has no bank filter, so the lowest limits any Victron device sends are followed, and the address of the device setting the voltage limit shows in the status row below.</p>
 
               <p class="integ-copy">Over WiFi, the XREG-010 app on the GX sends the voltage and current limits DVCC sets for this alternator, with no CAN connection needed.</p>
 
@@ -9391,8 +9393,9 @@
               <div class="form-row">
                 <div class="form-label">Over VE.Can (<span id="vicCanWord_ID">?</span>):
                   <span class="tooltip">&#8505;&#65039;<span class="tooltip-box">Whether the GX's limits are arriving on VE.Can, and their values. heard: within the last 20 seconds. silent:
-                    earlier but not recently. none heard: nothing yet, so check the GX is on this backbone with DVCC on. Reads
-                    "idle" while RV-C is the chosen source.</span></span>
+                    earlier but not recently. none heard: nothing yet, so check the GX is on this backbone with DVCC on. not
+                    followed, transmit off: shown but not used until Transmit on NMEA2K is turned on. Reads "idle" while RV-C
+                    is the chosen source.</span></span>
                 </div>
                 <div class="form-input">
                   <span class="integ-live" id="vicCanDetail_ID">&mdash;</span>
@@ -10259,7 +10262,7 @@
                       &#8505;&#65039;
                       <span class="tooltip-box">No starts demo mode and switches the field off. A simulated boat drives
                         every reading, and once you switch the field on, its output follows those readings. Nothing is saved
-                        or uploaded, and any setting you change lasts only until you switch back to Yes, which brings back
+                        or uploaded, most settings are refused, and any setting you can change lasts only until you switch back to Yes, which brings back
                         the real readings, records, and settings. The field then stays off until you switch it on.</span>
                     </span>
                   </div>
@@ -10581,7 +10584,7 @@
               <div class="form-row">
                 <div class="form-input" style="flex-wrap: wrap; gap: 6px;">
                   <input type="text" id="shareConfigName" placeholder="Name" />
-                  <input type="button" value="Share to Library" class="btn-secondary"
+                  <input type="button" id="shareConfigBtn" value="Share to Library" class="btn-secondary"
                     onclick="shareConfigToLibrary()" />
                 </div>
               </div>
@@ -11929,7 +11932,7 @@
             </div>
             <div class="metric-row">
               <span class="metric-label">Performance Ratio
-                <span class="tooltip">ℹ️<span class="tooltip-box">Fraction of the array's nameplate the forecast is scaled by. Learned from complete days when Learn Performance Ratio is on (Setup, Solar).</span></span>
+                <span class="tooltip">ℹ️<span class="tooltip-box">Fraction of the array's nameplate the forecast is scaled by. Learned when Learn Performance Ratio is on (Setup, Solar).</span></span>
               </span>
               <span class="metric-value"><span id="sledRatioID">&mdash;</span></span>
             </div>
@@ -14861,14 +14864,13 @@
   
     <div id="livedata-diag" class="sub-tab-content">
 
-      <p class="gate-note gate-note-shunt">No battery shunt is installed, so the battery
-         diagnostics panel has no signal to report and is not shown &mdash; only the alternator
-         panel below. Setup &rarr; Battery &rarr; Measurement Sources &rarr; Battery Shunt
-         Present.</p>
+      <p class="gate-note gate-note-shunt">No battery shunt is installed, so the Resistance Test
+         and Capacity Trend on the Battery panel have no signal to report and are not shown.
+         Setup &rarr; Battery &rarr; Measurement Sources &rarr; Battery Shunt Present.</p>
 
       <div class="diag-panel-tabs">
         <button class="diag-panel-tab active" onclick="showDiagPanel('alternator', event)">Alternator</button>
-        <button class="diag-panel-tab req-batt-current" onclick="showDiagPanel('battery', event)">Battery</button>
+        <button class="diag-panel-tab" onclick="showDiagPanel('battery', event)">Battery</button>
       </div>
 
       <div id="diag-panel-alternator" class="diag-panel active">
@@ -15438,18 +15440,14 @@
         </details>
         </div>
       </details>
-      <!-- Overvoltage History — lifetime OV telemetry (RTC RAM), on-demand /getOvTelemetry fetch -->
+      <!-- Overvoltage History — lifetime OV protection counters (RTC RAM), on-demand /getOvTelemetry fetch -->
       <details class="diag-section" ontoggle="if (this.open) fetchOvTelemetry()">
         <summary class="diag-section-title">Overvoltage History</summary>
         <div class="settings-card">
           <p style="font-size:0.8em;color:var(--text-muted);margin:0 0 10px 0;">
-            Lifetime record of bus-voltage excursions above the Bulk target, from any charge source
-            (alternator, solar, shore). Each band measures how far the voltage climbed above the Bulk
-            target in effect at that moment — the record follows the target wherever it is set or
-            adjusted. Coverage is continuous from the Bulk target to more than 15&nbsp;V above it:
-            0.2&nbsp;V resolution through ≈18&nbsp;V on a 12&nbsp;V system, 1&nbsp;V bands beyond, and
-            an overflow band at the top. It survives restarts and firmware updates; a full power-down
-            (battery disconnected) starts it fresh.
+            Lifetime count of each overvoltage protection acting. It survives restarts and firmware updates; a full
+            power-down (battery disconnected) starts it fresh. Time the battery spent at each voltage is in the
+            Battery Wear Record (Battery tab).
           </p>
 
           <div class="metric-row telemetry-row">
@@ -15497,34 +15495,11 @@
             <span class="metric-value telemetry-value"><span id="ovtInaCount">—</span></span>
           </div>
 
-          <div style="overflow-x:auto;margin-top:12px;">
-            <table style="width:100%;border-collapse:collapse;font-size:0.82em;min-width:300px;">
-              <thead>
-                <tr style="color:var(--text-muted);">
-                  <th style="text-align:left;font-weight:600;padding:2px 6px 6px 0;">Voltage band</th>
-                  <th style="text-align:right;font-weight:600;padding:2px 8px 6px 8px;">Events</th>
-                  <th style="text-align:right;font-weight:600;padding:2px 0 6px 8px;">Total time</th>
-                </tr>
-              </thead>
-              <tbody id="ovtBinsBody">
-                <tr><td colspan="3" style="padding:6px 0;color:var(--text-muted);">—</td></tr>
-              </tbody>
-            </table>
-          </div>
-          <p style="font-size:0.74em;color:var(--text-muted);margin:8px 0 0 0;">
-            Only bands with activity are listed, plus the first empty band above them — that zero row
-            marks where the record continues upward. Band labels are printed using the
-            current Bulk setting — if Bulk is later changed, past time keeps its above-target meaning
-            and the printed voltages shift to match. The lowest bands accumulate large
-            event counts from normal regulation ripple crossing band edges — total time is the
-            better severity measure there.
-          </p>
-
           <!-- wrap: the two labels together are wider than a 320px phone and pushed the whole page
                into horizontal scroll -->
           <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap;">
             <button type="button" class="btn-secondary" onclick="fetchOvTelemetry()">↺ Refresh</button>
-            <button type="button" class="btn-secondary" onclick="resetOvTelemetryLifetime()">Reset Lifetime OV History</button>
+            <button type="button" class="btn-secondary" onclick="resetOvTelemetryLifetime()">Reset Lifetime OV Counters</button>
           </div>
         </div>
       </details>
@@ -15572,9 +15547,76 @@
       </details>
       </div><!-- closes #diag-panel-alternator -->
 
-      <div id="diag-panel-battery" class="diag-panel req-batt-current">
+      <div id="diag-panel-battery" class="diag-panel">
 
-      <details class="diag-section" open>
+      <!-- Battery Wear Record — lifetime time-at-condition grids (BatteryWear), on-demand /getBatteryWear fetch.
+           Outside .req-batt-current: voltage and temperature need no battery current sensor. -->
+      <details class="diag-section" ontoggle="if (this.open) fetchBatteryWear()">
+        <summary class="diag-section-title">Battery Wear Record</summary>
+        <div class="settings-card">
+          <p style="font-size:0.8em;color:var(--text-muted);margin:0 0 10px 0;">
+            How long the battery has spent at each voltage, temperature, and state of charge, how much charge went in
+            and out at each rate and temperature, and how deep its cycles were, whatever the charge source. High voltage, heat, sitting full or
+            nearly empty, and charging in the cold are what wear a battery out. The record survives restarts, firmware
+            updates, and power cuts. Clear it with Clear Wear Record below when the battery is replaced.
+          </p>
+          <div id="bwSummary"><div style="color:var(--text-muted);font-size:0.85em;">—</div></div>
+
+          <div style="margin:14px 0 4px 0;"><span style="font-weight:600;">Time at voltage and battery temperature</span>
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">How long the battery has spent at each voltage (measured at the battery), split by battery temperature. High voltage and heat together age a battery fastest, so time near the top of the table and in the hot columns matters most. Avg A is the average battery current at that voltage (+ charging). Alt is the share of that time the alternator was producing current; high voltage with a low Alt share came from another charge source, such as solar or shore power.</span>
+            </span>
+          </div>
+          <div style="overflow-x:auto;"><table id="bwVtTable" class="bw-grid"></table></div>
+
+          <div style="margin:14px 0 4px 0;"><span style="font-weight:600;">Time at state of charge and battery temperature</span>
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">How long the battery has spent at each state of charge, split by battery temperature. Lithium batteries age fastest when held full and warm, and lead-acid batteries lose capacity when left partly charged. Off is time the regulator was not running, listed against the state of charge it last saw.</span>
+            </span>
+          </div>
+          <div style="overflow-x:auto;"><table id="bwStTable" class="bw-grid"></table></div>
+
+          <div style="margin:14px 0 4px 0;"><span style="font-weight:600;">Charge in by rate and battery temperature (Ah)</span>
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">Amp-hours put into the battery, by charge rate and battery temperature. Rate is in C, the current as a fraction of battery capacity: 0.5 C on a 400 Ah battery is 200 A. The Amps column uses the battery capacity in your settings. Fast charging in the cold wears lithium batteries fastest, and most must not be charged below freezing at all. Each rate is split by the state of charge the battery was at, because fast charging near full is harder on a battery than fast charging when it is low. The Alt column is the share the alternator may have supplied. The regulator measures the alternator but not solar or shore power, so when both charge at once the alternator is counted first, up to its whole output. Pick Alternator or Other sources to see either one alone.</span>
+            </span>
+            <select id="bwChgSrc" onchange="if (bwLastData) renderBatteryWear(bwLastData)" style="margin-left:8px;display:none;">
+              <option value="all">All sources</option>
+              <option value="alt">Alternator</option>
+              <option value="other">Other sources</option>
+            </select>
+          </div>
+          <div style="overflow-x:auto;"><table id="bwChgTable" class="bw-grid"></table></div>
+
+          <div style="margin:14px 0 4px 0;"><span style="font-weight:600;">Charge out by rate and battery temperature (Ah)</span>
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">Amp-hours drawn from the battery, by discharge rate and battery temperature. Heavy loads, such as an inverter, show in the higher rates.</span>
+            </span>
+          </div>
+          <div style="overflow-x:auto;"><table id="bwDisTable" class="bw-grid"></table></div>
+
+          <div style="margin:14px 0 4px 0;"><span style="font-weight:600;">Cycle depth</span>
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">Each discharge and recharge swing, counted by how far the state of charge moved. Deep cycles wear a battery much faster than shallow ones, so two batteries with the same charge throughput can age very differently. A cycle is a discharge and its recharge; a swing with no matching return counts as half. Avg middle is the state of charge halfway through the swing. Swings under 2% are not counted.</span>
+            </span>
+          </div>
+          <div style="overflow-x:auto;"><table id="bwCycTable" class="bw-grid"></table></div>
+
+          <div style="margin:14px 0 4px 0;"><span style="font-weight:600;">Time between full charges</span>
+            <span class="tooltip">ℹ️
+              <span class="tooltip-box">How long the battery went between full charges (99% state of charge or more), including time the regulator was off. Lead-acid batteries lose capacity the longer they go without a full charge, and lithium batteries need one now and then to balance their cells and keep the state of charge reading accurate.</span>
+            </span>
+          </div>
+          <div style="overflow-x:auto;"><table id="bwFullTable" class="bw-grid"></table></div>
+
+          <div style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap;">
+            <button type="button" class="btn-secondary" onclick="fetchBatteryWear()">↺ Refresh</button>
+            <button type="button" class="btn-danger-ghost" onclick="resetBatteryWear()">Clear Wear Record</button>
+          </div>
+        </div>
+      </details>
+
+      <details class="diag-section req-batt-current" open>
         <summary class="diag-section-title">Resistance Test (DCIR)</summary>
         <div class="settings-card">
                     <!-- Run / status -->
@@ -15593,7 +15635,7 @@
                     <div style="display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0;">
                       <button type="button" class="btn-primary" onclick="bhwOpen()">Run Health Test</button>
                       <form action="/get" method="GET" target="hidden-form" style="margin: 0;"
-                        onsubmit="return xConfirmSubmit(this, 'Clear all battery-health history and reset the 100% baseline? Use this only when the battery has been replaced.');">
+                        onsubmit="return xConfirmSubmit(this, 'Clear all battery-health history, reset the 100% baseline and start the wear record over? Use this only when the battery has been replaced.');">
                         <input type="hidden" name="bhStartOver" value="1">
                         <input type="submit" value="Start Over (battery replaced)" class="btn-danger-ghost"
                           onclick="setTimeout(pollBatteryHealth, 600);" />
@@ -15702,7 +15744,7 @@
         </div>
       </details>
 
-      <details class="diag-section" open>
+      <details class="diag-section req-batt-current" open>
         <summary class="diag-section-title">Capacity Trend</summary>
         <div class="settings-card">
                     <div id="capChemNote" style="display:none; margin:2px 0 12px; padding:9px 12px; background:rgba(230,162,60,0.12); border:1px solid rgba(230,162,60,0.5); border-radius:6px; font-size:12.5px; line-height:1.45; color:#d08a1e;">
@@ -15859,8 +15901,13 @@
               full, the amp-hours returned are extrapolated to a full 0–100% span and plotted. A
               falling line is real capacity fade. Only deep charges qualify, so the plot fills in
               slowly.</p>
-            <p><b>Replaced the bank?</b> Press Start Over in the Resistance Test section — the next
-              capacity reading becomes the new 100% baseline.</p>
+            <p><b>Battery Wear Record</b> adds up, from the first day, the time the battery spends at each
+              voltage, temperature and state of charge, and the charge that goes in and out at each rate and
+              temperature. The voltage and temperature tables need no battery current sensor. The state-of-charge
+              and charge tables fill from a battery shunt or a battery monitor on NMEA 2000 or VE.Direct, and stay
+              empty with neither.</p>
+            <p class="req-batt-current"><b>Replaced the bank?</b> Press Start Over in the Resistance Test section — the next
+              capacity reading becomes the new 100% baseline, and the wear record starts over.</p>
             <p>Note: lots of better functionality is planned for future versions of this page.</p>
           </div>
         </div>

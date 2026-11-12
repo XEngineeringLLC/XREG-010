@@ -16,7 +16,7 @@
 
 
 
-// Alternator temperature (C) recorded with a Field Resistance write. 90 s, not n2kAltTempF's 20 s: the engine-off poll is
+// Alternator temperature (C) recorded with a Field Resistance write. 90 s even running (n2kAltTempF drops to 20 s): the engine-off poll is
 // 60 s, and a cold engine is exactly when the resistance is measured. NAN = no reading to record.
 float fieldResProbeC() {
   if (IgnoreTemperature || LimpHome) return NAN;
@@ -868,7 +868,7 @@ enum Csv2Index {
   CSV2_fieldCurDutyCeil,    // 10 A field-current ceiling, duty % x100
   CSV2_fieldHeatDutyCeil,   // field-drive heat ceiling, duty % x100 (99 until the first valid die sample)
   CSV2_fieldCeilBind,       // binding ccDutyCeiling() term: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the J2 connector, 4 heat at the D5 spreader
-  CSV2_fieldRcOhm,          // FieldResistance corrected for alternator temperature, less FD_MARGIN, ohm x100 (both board ceilings and Field Amps use it)
+  CSV2_fieldRcOhm,          // FieldResistance corrected for alternator temperature, less FD_MARGIN, ohm x100 (Field Amps uses it, and both board ceilings outside demo; in demo they correct for the real alternator temperature)
   CSV2_fieldHeatLimS,       // lifetime seconds held at the heat ceiling
   CSV2_fieldCurLimS,        // lifetime seconds held at the 10 A ceiling
   CSV2_fieldHeatLimSesS,    // session seconds held at the heat ceiling (ResetFieldHeatLimTime)
@@ -1092,8 +1092,8 @@ enum Csv4Index {
   X(RebulkVoltage, "%d", SafeInt(RebulkVoltage, 100)) \
   X(rebulkDebounceTime, "%d", SafeInt(rebulkDebounceTime)) \
   X(MinFloatTime, "%d", SafeInt(MinFloatTime)) \
-  X(SOC_BlockRebulk_percent, "%d", SafeInt(SOC_BlockRebulk_percent)) \
-  X(SOC_AllowRebulk_percent, "%d", SafeInt(SOC_AllowRebulk_percent)) \
+  X(SOC_BlockRebulk_percent, "%.1f", SOC_BlockRebulk_percent) \
+  X(SOC_AllowRebulk_percent, "%.1f", SOC_AllowRebulk_percent) \
   X(DutySlowRampRate, "%d", SafeInt(DutySlowRampRate, 100)) \
   X(ShutdownPhase2HoldMs, "%d", SafeInt(ShutdownPhase2HoldMs)) \
   X(TempPIDKp, "%d", SafeInt(TempPIDKp, 1000)) \
@@ -1468,7 +1468,7 @@ enum TsIndex {
   TS_ExtraTemp,     // EXTRA-role DS18B20 staleness (IDX_EXTRA_TEMP)
   TS_VeBattTemp,    // VE.Direct "T" battery temperature staleness (IDX_VE_BATT_TEMP)
   TS_RvcBattTemp,   // RV-C DC_SOURCE_STATUS_2 battery temperature staleness (IDX_RVC_BATT_TEMP)
-  TS_DieTemp,       // INA228 die temperature: age of the last valid sample (IDX_INA_DIE_TEMP), the field-drive heat ceiling's input
+  TS_DieTemp,       // INA228 die temperature: age of the last valid sample (IDX_INA_DIE_TEMP); simulated in demo, where the heat ceiling reads the real g_fdDieMs
   TS_DvccVeCan,     // DVCC Victron source, VE.Can carrier: age of the last accepted limit register (IDX_DVCC_VECAN)
   TS_DvccWifi,      // DVCC Victron source, WiFi carrier: age of the last /gxLimits post (IDX_DVCC_WIFI)
 
@@ -3038,6 +3038,7 @@ const char *cloudFailReason(int code) {
 #define CLOUDOP_REGISTER       2
 #define CLOUDOP_UPDATE_PROFILE 3
 #define CLOUDOP_DELETE_DATA    4
+#define CLOUDOP_OTA_PRECHECK   5   // payload = target version; not a cloud call: the update proxy (otaPrecheckRun)
 #define CLOUDOP_PAYLOAD_CAP 1024
 #define CLOUDOP_RESP_CAP    2048
 #define CLOUDOP_BODY_CAP    2304   // resp + envelope headroom, so pass-through can never truncate
@@ -3063,24 +3064,25 @@ static void cloudOpSetBodyJson(const char *resp) {
   else snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"error\":\"malformed cloud response\"}");
 }
 
-static void cloudOpStageAndReply(AsyncWebServerRequest *request, uint8_t kind, const char *payload) {
+// Returns true when the op was staged (202 sent); every refusal has already answered.
+static bool cloudOpStageAndReply(AsyncWebServerRequest *request, uint8_t kind, const char *payload) {
   if (demoSeal) {
     char b[160];
     snprintf(b, sizeof(b), "{\"success\":false,\"error\":\"%s\"}", DEMO_REFUSAL);
     request->send(423, "application/json", b);
-    return;
+    return false;
   }
   if (!cloudOpBuffersReady()) {
     request->send(500, "application/json", "{\"error\":\"alloc failed\"}");
-    return;
+    return false;
   }
   if (cloudOpState == 1) {
     request->send(503, "application/json", "{\"error\":\"cloud operation already in progress\"}");
-    return;
+    return false;
   }
   if (strlen(payload) >= CLOUDOP_PAYLOAD_CAP) {
     request->send(500, "application/json", "{\"error\":\"payload too large\"}");
-    return;
+    return false;
   }
   strcpy(cloudOpPayload, payload);
   cloudOpKind = kind;
@@ -3092,11 +3094,12 @@ static void cloudOpStageAndReply(AsyncWebServerRequest *request, uint8_t kind, c
   if (xQueueSend(httpsQueue, &req, 0) != pdTRUE) {
     cloudOpState = 0;
     request->send(503, "application/json", "{\"error\":\"cloud queue full, retry shortly\"}");
-    return;
+    return false;
   }
   char buf[64];
   snprintf(buf, sizeof(buf), "{\"state\":\"pending\",\"op\":%u}", (unsigned)cloudOpSeq);
   request->send(202, "application/json", buf);
+  return true;
 }
 
 // Runs on the httpsTask worker (HTTPS_CLOUD_OP).
@@ -3225,6 +3228,21 @@ void executeCloudOp() {
       }
       break;
     }
+    case CLOUDOP_OTA_PRECHECK: {
+      char why[sizeof(otaPrecheckWhy)] = { 0 };
+      const bool passed = otaPrecheckRun(cloudOpPayload, why, sizeof(why));
+      if (passed) {
+        snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"ok\":true}");
+      } else {
+        DynamicJsonDocument d(256);
+        d["ok"] = false;
+        d["error"] = why;
+        serializeJson(d, cloudOpBody, CLOUDOP_BODY_CAP);
+      }
+      strlcpy(otaPrecheckWhy, why, sizeof(otaPrecheckWhy));
+      otaPrecheckState = passed ? 2 : 3;   // after the reason: otaPrecheckService reads it on core 1
+      break;
+    }
     default:
       snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"error\":\"unknown op\"}");
       outCode = 500;
@@ -3234,11 +3252,59 @@ void executeCloudOp() {
   cloudOpState = 2;   // last: the poll reads code/body only after seeing state done
 }
 
+// loop(): acts on the UpdateToVersion pre-check verdict. The op cannot be dropped unrun (Enable is 0, so the field-on queue
+// flush never runs; demo mode refuses at staging), so the 150 s limit is only a backstop, past the client's 90 s poll.
+void otaPrecheckService() {
+  uint8_t st = otaPrecheckState;
+  if (st == 0) return;
+  bool clientSawVerdict = true;
+  if (st == 1) {
+    if (millis() - otaPrecheckStartMs < 150000UL) return;
+    strlcpy(otaPrecheckWhy, "the update check did not finish", sizeof(otaPrecheckWhy));
+    st = 3;
+    clientSawVerdict = false;
+  }
+  // Passed: the restart into the factory installer waits for the field to finish winding down (Enable went to 0 at the press)
+  if (st == 2 && !gpio4IsLow) {
+    if (millis() - otaPrecheckStartMs < 150000UL) return;
+    strlcpy(otaPrecheckWhy, "the alternator field did not switch off", sizeof(otaPrecheckWhy));
+    st = 3;
+    clientSawVerdict = false;
+  }
+  otaPrecheckState = 0;
+  if (st == 2 && otaStageFactoryInstall(otaPrecheckVersion)) {
+    queueConsoleMessageF("UPDATE: %s - update server reachable, restarting into the factory installer", otaPrecheckVersion);
+    return;
+  }
+  if (st == 2) {
+    strlcpy(otaPrecheckWhy, "the update request could not be saved", sizeof(otaPrecheckWhy));
+    clientSawVerdict = false;   // it saw the check pass
+  }
+  if (!clientSawVerdict) {   // the overlay learns it from /otaResult instead
+    strlcpy(otaLastFailVer, otaPrecheckVersion, sizeof(otaLastFailVer));
+    strlcpy(otaLastFailWhy, otaPrecheckWhy, sizeof(otaLastFailWhy));
+  }
+  queueConsoleMessageF("UPDATE: %s not started: %s", otaPrecheckVersion, otaPrecheckWhy);
+  if (OnOff == 0 && otaPrecheckOnOffBefore != 0) {
+    OnOff = otaPrecheckOnOffBefore;
+    settingsDirty = true;
+    queueConsoleMessage("OTA UPDATE: not installed - Alternator Enable back to its setting before the update");
+  }
+}
+
 // The field-on queue flush (AdjustFieldLearnMode) dropped the staged op before the worker ran it.
 void cloudOpFailDropped() {
   if (cloudOpState != 1) return;
   snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"error\":\"cloud request dropped when charging started, try again\"}");
   cloudOpCode = 503;
+  cloudOpState = 2;
+}
+
+// httpsTask's demo-mode drop discarded the staged op before the worker ran it: answer as a demo refusal at staging would.
+void cloudOpFailDemoDropped() {
+  if (cloudOpState != 1) return;
+  snprintf(cloudOpBody, CLOUDOP_BODY_CAP, "{\"success\":false,\"error\":\"%s\"}", DEMO_REFUSAL);
+  cloudOpCode = 423;
   cloudOpState = 2;
 }
 
@@ -3251,6 +3317,8 @@ void cloudOpFailDropped() {
 #define FU_NO_MEM  2   // answered 503
 struct FrontUpload { uint32_t total; uint8_t state; char text[1]; };
 static String importConfigBuf;   // body accumulator for POST /importConfig (config sharing)
+// Assigning "" or String() keeps the old capacity (String::move reuses it), so a done or refused import frees it this way.
+static void importConfigBufFree() { importConfigBuf.~String(); new (&importConfigBuf) String(); }
 
 static void frontUploadBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
   FrontUpload *u = (FrontUpload *)request->_tempObject;
@@ -5209,19 +5277,19 @@ void setupServer() {
 
   // Equipment records (8_functions.ino): the boat's history files, their NVS keys and the lifetime namespace, saved
   // in the same file as the config by the dashboard. ?summary=1 = sizes and content hashes only, for the preview.
-  // Streamed from PSRAM — hundreds of KB of base64 must never become an internal-heap String.
+  // Streamed a chunk at a time straight from LittleFS: over a megabyte of base64 that must never sit in memory whole. A
+  // response that ends before the JSON closes means a record file changed or failed mid-read; the dashboard asks again.
   server.on("/exportRecords", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed"); return;
     }
     if (demoSeal) { demoRefuse(request); return; }   // demo mode: the stores in RAM are the demo's
-    size_t n = 0;
-    void *rec = recordsExportJson(paramOk(request, "summary") && request->getParam("summary")->value().toInt() != 0, &n);
-    if (!rec) { request->send(503, "text/plain", "records unavailable (out of memory, or a record file could not be read)"); return; }
+    void *rec = recordsExportOpen(paramOk(request, "summary") && request->getParam("summary")->value().toInt() != 0);
+    if (!rec) { request->send(503, "text/plain", "records unavailable (out of memory)"); return; }
     std::shared_ptr<void> sp(rec, recordsExportFree);
-    AsyncWebServerResponse *response = request->beginResponse("application/json", n,
-      [sp](uint8_t *out, size_t maxLen, size_t index) -> size_t {
-        return recordsExportRead(sp.get(), out, maxLen, index);
+    AsyncWebServerResponse *response = request->beginChunkedResponse("application/json",
+      [sp](uint8_t *out, size_t maxLen, size_t) -> size_t {
+        return recordsExportRead(sp.get(), out, maxLen);
       });
     response->addHeader("Cache-Control", "no-cache");
     request->send(response);
@@ -5230,15 +5298,30 @@ void setupServer() {
   // Apply the records groups the preview picked (body {"records":{...}}). Files are staged for the next boot, so
   // the regulator always reboots after this: soon when nothing else follows, or within 30 s when the dashboard is
   // about to post the config import too (?then=config), whose own reboot normally comes first.
+  // Refused with the field up: the upload is about 1 MB of flash writes. recImportFieldOn carries that refusal from the first
+  // body chunk to the handler (both run on the async_tcp task).
+  static AsyncWebServerRequest *recImportFieldOn = nullptr;
   server.on("/importRecords", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       if (refuseMisaddressed(request)) return;
       if (demoSeal) { demoRefuse(request); return; }
       if (!settingsArmActive(request)) { request->send(403, "text/plain", "Settings not armed"); return; }
-      const char *body = (const char *)request->_tempObject;
-      if (!body || strlen(body) < 2) { request->send(400, "text/plain", "Empty body"); return; }
-      int n = recordsImport(body);
-      if (n == -2) { request->send(500, "text/plain", "The records could not be staged (out of memory or flash space); nothing was changed"); return; }
+      if (recImportFieldOn == request) {
+        recImportFieldOn = nullptr;
+        request->send(409, "text/plain", "Charging is running. Switch Alternator Enable off, then import again; nothing was changed");
+        return;
+      }
+      void *imp = request->_tempObject;   // the import the body callback has been feeding
+      const size_t total = request->contentLength();
+      if (!imp && total > 4194304) { request->send(413, "text/plain", "The records file is too large for the regulator (over 4 MB); nothing was changed"); return; }
+      if (!imp && total > 0) { request->send(507, "text/plain", "The regulator is out of memory and could not receive the records; nothing was changed. Restart it and import again."); return; }
+      if (!imp) { request->send(400, "text/plain", "Empty body"); return; }
+      int n = recordsImportFinish(imp);
+      if (n == -6) { request->send(413, "text/plain", "The records file is too large for the regulator; nothing was changed"); return; }
+      if (n == -5) { request->send(503, "text/plain", "The regulator is still receiving another records import; nothing was changed. Try again in a moment."); return; }
+      if (n == -4) { request->send(400, "text/plain", "The records in the file are damaged or incomplete; nothing was changed"); return; }
+      if (n == -3) { request->send(507, "text/plain", "The regulator ran out of memory while reading the records; nothing was changed. Restart it and import again."); return; }
+      if (n == -2) { request->send(500, "text/plain", "A record file could not be written to the regulator's storage (full?); nothing was changed"); return; }
       if (n < 0) { request->send(400, "text/plain", "No records object in body"); return; }
       const bool thenConfig = request->hasParam("then") && request->getParam("then")->value() == "config";
       if (thenConfig) importRebootDeadlineMs = millis() + 30000UL;
@@ -5249,31 +5332,38 @@ void setupServer() {
     },
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-      if (total > 4194304) return;   // bound: a full set of records is well under 1 MB of base64
+      if (total > 4194304) return;   // bound: a full set of records is about 1.5 MB of base64
       if (index == 0 && !request->_tempObject) {
-        request->_tempObject = ps_malloc(total + 1);
-        if (request->_tempObject) ((char *)request->_tempObject)[0] = '\0';
+        // Record files are written to flash as the body arrives, so a request the handler will refuse stops here.
+        if (recImportFieldOn == request) recImportFieldOn = nullptr;   // a stale match from a request that never reached its handler
+        if (addressedElsewhere(request) || demoSeal || !settingsArmActive(request)) return;
+        if (!gpio4IsLow) { recImportFieldOn = request; return; }
+        request->_tempObject = recordsImportOpen();
+        if (request->_tempObject) {
+          // The request frees the block itself; the part files of an upload that never finished go here.
+          request->onDisconnect([request]() { recordsImportAbort(request->_tempObject); });
+          // A chunk's flash write can wait on the FS lock behind one of the regulator's own record saves, and the
+          // server's 3 s receive timeout would end the upload there.
+          request->client()->setRxTimeout(20);
+        }
       }
-      char *body = (char *)request->_tempObject;
-      if (!body || index + len > total) return;
-      memcpy(body + index, data, len);
-      body[index + len] = '\0';
+      recordsImportFeed(request->_tempObject, data, len);
     });
 
   // Config Sharing import (POST the /exportConfig JSON). Only allowlisted manifest keys are written. Reboots afterwards
   // so InitSystemSettings re-reads the set consistently (?noReboot=1 suppresses).
   server.on("/importConfig", HTTP_POST,
     [](AsyncWebServerRequest *request) {
-      if (refuseMisaddressed(request)) { importConfigBuf = ""; return; }
-      if (demoSeal) { importConfigBuf = ""; demoRefuse(request); return; }
+      if (refuseMisaddressed(request)) { importConfigBufFree(); return; }
+      if (demoSeal) { importConfigBufFree(); demoRefuse(request); return; }
       if (!settingsArmActive(request)) {
-        importConfigBuf = ""; request->send(403, "text/plain", "Settings not armed"); return;
+        importConfigBufFree(); request->send(403, "text/plain", "Settings not armed"); return;
       }
       if (importConfigBuf.length() < 2) {
-        importConfigBuf = ""; request->send(400, "text/plain", "Empty body"); return;
+        importConfigBufFree(); request->send(400, "text/plain", "Empty body"); return;
       }
       char *bodyc = strdup(importConfigBuf.c_str());
-      importConfigBuf = "";
+      importConfigBufFree();
       if (!bodyc) { request->send(500, "text/plain", "Out of memory"); return; }
       String preClassV = settingRead(NK_BatteryVoltage);
       String preWindV = settingRead(NK_FieldWindingV) + "/" + settingRead(NK_fieldWindApplied);
@@ -5291,7 +5381,9 @@ void setupServer() {
       bool reboot = classMoved || !request->hasParam("noReboot") || request->getParam("noReboot")->value().toInt() == 0;
       if (reboot) { rebootRequestWhy = REBOOT_WHY_IMPORT; rebootRequestedAt = millis(); rebootRequested = true; }
       String resp = "{\"applied\":";
-      resp += n; resp += ",\"reboot\":"; resp += (reboot ? 1 : 0); resp += "}";
+      resp += n; resp += ",\"reboot\":"; resp += (reboot ? 1 : 0);
+      if (cfgImportRpmTableRefused()) resp += ",\"rpmRefused\":1";
+      resp += "}";
       request->send(200, "application/json", resp);
     },
     NULL,
@@ -5588,6 +5680,7 @@ void setupServer() {
   });
   server.on("/saveVesselInfo", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }   // writes NVS raw, outside the overlay the exit discards
     if (!settingsArmActive(request)) {
       request->send(401, "application/json", "{\"success\":false,\"error\":\"Settings not armed\"}");
       return;
@@ -5693,6 +5786,7 @@ void setupServer() {
       if (requestedState == 0) {
         // Turning OFF is ALWAYS allowed — safety critical
         OnOff = 0;
+        otaPrecheckOnOffBefore = 0;   // an OFF during an update check stays off if the update does not start
         if (demoSeal) demoWriteThrough(NK_OnOff, "0");   // a safety OFF outlives demo mode: never back on at exit
         else settingWrite(NK_OnOff, "0");
         stateRevision++;
@@ -5743,8 +5837,10 @@ void setupServer() {
       request->send(403, "text/plain", "Not available from a Victron GX");
       return;
     }
-    if (demoPhase == DEMO_EXITING) {   // the real settings are reloading; a write now would be lost
-      request->send(503, "text/plain", "Leaving demo mode, try again in a moment.");
+    // Exit: the real settings are reloading, a write now would be lost. Entry: not sealed yet, a write (an ON included) would
+    // land in real NVS and outlive the demo.
+    if (demoPhase == DEMO_EXITING || demoPhase == DEMO_ENTERING) {
+      request->send(503, "text/plain", "Demo mode is still switching, try again in a moment.");
       return;
     }
     if (demoExitCutWaiting() && request->hasParam("OnOff") && request->getParam("OnOff")->value().toInt() != 0) {
@@ -5754,6 +5850,29 @@ void setupServer() {
     if (demoSeal && demoParamDenied(request)) {
       demoRefuse(request);
       return;
+    }
+    // The breakpoints this request would leave (sent over stored) must all be above 0 and rising: findRPMSegment has no unused
+    // rows. Refused whole, before anything is applied: the amps, Keep-Alive and capLimitMode in the same save belong to them.
+    {
+      int pts[RPM_TABLE_SIZE];
+      memcpy(pts, rpmTableRPMPoints, sizeof(pts));
+      bool ptsSent = false;
+      for (int i = 0; i < RPM_TABLE_SIZE; i++) {
+        char pn[32];
+        snprintf(pn, sizeof(pn), "rpmTableRPMPoints%d", i);
+        if (paramOk(request, pn)) { pts[i] = request->getParam(pn)->value().toInt(); ptsSent = true; }
+      }
+      for (int i = 0; ptsSent && i < RPM_TABLE_SIZE; i++) {
+        if (pts[i] > 0 && (i == 0 || pts[i] > pts[i - 1])) continue;
+        const char *rule = "All ten rows need an engine speed, each higher than the row above.";
+        char why[200];
+        if (pts[i] <= 0) snprintf(why, sizeof(why), "RPM table not saved. Row %d RPM must be greater than 0. %s", i + 1, rule);
+        else snprintf(why, sizeof(why), "RPM table not saved. RPM values must increase. Row %d (%d) must be greater than Row %d (%d). %s",
+                      i + 1, pts[i], i, pts[i - 1], rule);
+        queueConsoleMessage(why);
+        request->send(422, "text/plain", why);
+        return;
+      }
     }
 
     // Arm-gated like every other mutation — a stale/replayed update URL must never reboot the
@@ -5767,7 +5886,7 @@ void setupServer() {
       selectedVersion[31] = '\0';
 
       // RAM only, so the reboot after a completed install brings Enable back from NVS. Every path below that ends
-      // without a reboot puts it back here instead.
+      // without a reboot puts it back, here or (pre-check failed) in otaPrecheckService.
       const int onOffBeforeOta = OnOff;
       auto otaRestoreEnable = [onOffBeforeOta]() {
         if (OnOff != 0 || onOffBeforeOta == 0) return;
@@ -5798,81 +5917,21 @@ void setupServer() {
         inputMessage = "Update initiated from factory partition";
 
       } else {
-        Serial.println("UPDATE DEBUG: Storing update request in NVS");
-
-        nvs_handle_t nvs_handle;
-        esp_err_t err = nvs_open("update_req", NVS_READWRITE, &nvs_handle);
-        if (err != ESP_OK) {
-          Serial.printf("UPDATE DEBUG: Failed to open NVS namespace 'update_req': %s\n", esp_err_to_name(err));
-          otaRestoreEnable();
-          request->send(500, "text/plain", "NVS open failed");
+        // Nothing is staged until the regulator itself reaches the update server: the app's own internet test runs on the
+        // phone, which can be on cellular. 202 now; the client polls /cloudOpState, otaPrecheckService acts on the verdict.
+        if (otaPrecheckState == 1) {
+          request->send(503, "application/json", "{\"error\":\"an update check is already running\"}");
           return;
         }
-
-        nvs_erase_key(nvs_handle, "target_ver");
-        nvs_erase_key(nvs_handle, "update_flag");
-
-        err = nvs_set_str(nvs_handle, "target_ver", selectedVersion);
-        if (err != ESP_OK) {
-          Serial.printf("UPDATE DEBUG: Failed to set target_ver: %s\n", esp_err_to_name(err));
-          nvs_close(nvs_handle);
+        strlcpy(otaPrecheckVersion, selectedVersion, sizeof(otaPrecheckVersion));
+        otaPrecheckOnOffBefore = onOffBeforeOta;
+        otaPrecheckStartMs = millis();
+        otaLastFailVer[0] = '\0';
+        otaPrecheckState = 1;
+        if (!cloudOpStageAndReply(request, CLOUDOP_OTA_PRECHECK, selectedVersion)) {
+          otaPrecheckState = 0;
           otaRestoreEnable();
-          request->send(500, "text/plain", "NVS write failed");
-          return;
         }
-
-        uint8_t updateFlag = 1;
-        err = nvs_set_u8(nvs_handle, "update_flag", updateFlag);
-        if (err != ESP_OK) {
-          Serial.printf("UPDATE DEBUG: Failed to set update_flag: %s\n", esp_err_to_name(err));
-          nvs_close(nvs_handle);
-          otaRestoreEnable();
-          request->send(500, "text/plain", "NVS write failed");
-          return;
-        }
-
-        uint8_t wakeFlag = 1;
-        err = nvs_set_u8(nvs_handle, "wake_flag", wakeFlag);
-        if (err != ESP_OK) {
-          Serial.printf("UPDATE DEBUG: Failed to set wake_flag: %s\n", esp_err_to_name(err));
-        }
-
-        err = nvs_commit(nvs_handle);
-
-        nvs_handle_t verify_handle;
-        if (nvs_open("update_req", NVS_READONLY, &verify_handle) == ESP_OK) {
-          uint8_t verifyFlag = 0;
-          char verifyVersion[32] = { 0 };
-          size_t verifySize = 32;
-
-          if (nvs_get_u8(verify_handle, "update_flag", &verifyFlag) == ESP_OK && nvs_get_str(verify_handle, "target_ver", verifyVersion, &verifySize) == ESP_OK) {
-            Serial.printf("UPDATE DEBUG: NVS write verified - flag: %u, version: %s\n", verifyFlag, verifyVersion);
-          } else {
-            Serial.println("UPDATE DEBUG: NVS write verification FAILED");
-          }
-          nvs_close(verify_handle);
-        }
-
-        Serial.printf("Update to version %s requested - rebooting to factory\n", selectedVersion);
-        esp_ota_set_boot_partition(factory_partition);
-        inputMessage = "Rebooting to factory for update";
-
-        request->send(200, "text/plain", inputMessage);
-        Serial.println("=== RESTART SEQUENCE ===");
-        Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-        Serial.printf("Active tasks: %u\n", uxTaskGetNumberOfTasks());
-        Serial.println("Closing event connections...");
-        events.close();
-        gxEvents.close();
-        Serial.println("========================================");
-        Serial.println("NOTE: Task termination backtrace next is expected and harmless");
-        Serial.println("========================================");
-        Serial.flush();
-        // Deferred like every other reboot path: the 200 above is only written once this handler
-        // returns, so restarting inline discarded it and left the caller waiting on a dead socket.
-        rebootRequestWhy = REBOOT_WHY_FACTORY;
-        rebootRequestedAt = millis();
-        rebootRequested = true;
         return;
       }
     }
@@ -6365,6 +6424,8 @@ void setupServer() {
         refuseStart("Field sweep: start ignored (already requested)");
       } else if (busy != nullptr) {
         refuseStart(String("Field sweep: start blocked — ") + busy + " is active");
+      } else if (const char *stop = altSweepChargeStop()) {
+        refuseStart(String("Field sweep: start blocked — ") + stop);
       } else if ((millis() - altSweepLastEndMs) > 2000UL) {
         // Do NOT clear altSweepAbortRequested: after an external teardown the tick's static phase is still mid-ramp and
         // only the latch makes the next tick reset it; clearing it would let this Start resume the stale ramp as an
@@ -7038,13 +7099,13 @@ void setupServer() {
       foundParameter = true;
       inputMessage = request->getParam("SOC_BlockRebulk_percent")->value();
       settingWrite(NK_SOC_BlockRebulk_percent, inputMessage.c_str());
-      SOC_BlockRebulk_percent = inputMessage.toInt();
+      SOC_BlockRebulk_percent = inputMessage.toFloat();
     }
     if (paramOk(request, "SOC_AllowRebulk_percent")) {
       foundParameter = true;
       inputMessage = request->getParam("SOC_AllowRebulk_percent")->value();
       settingWrite(NK_SOC_AllowRebulk_percent, inputMessage.c_str());
-      SOC_AllowRebulk_percent = inputMessage.toInt();
+      SOC_AllowRebulk_percent = inputMessage.toFloat();
     }
     if (paramOk(request, "BulkVoltage")) {
       foundParameter = true;
@@ -7098,6 +7159,10 @@ void setupServer() {
       } else {
         tuningRunTok = webRunTok(request);
         tuningSweepRequested = true;   // momentary — the TuningMode sine block consumes it
+        // The block clears these only on consume; with the field held off the last run would be served under this token.
+        // After the request: done=false seen without it would hold the sine centre with no entry ramp.
+        tuningSweepDone = false;
+        tuningSweepAbortReason = 0;
       }
     }
     if (paramOk(request, "SwitchingFrequency")) {
@@ -7511,6 +7576,7 @@ void setupServer() {
       settingWrite(NK_n2kRxBattInst, String(n2kRxBattInstance).c_str());
       n2kRxBattV = n2kRxBattA = n2kRxBattTempF = NAN;  // clear the old bank's values; SOC too
       n2kRxSoc = n2kRxSoh = -1;
+      n2kRxBattSrc = n2kRxSocSrc = 255;
       dataTimestamps[IDX_N2K_BATT] = 0;
       dataTimestamps[IDX_N2K_SOC] = 0;
     }
@@ -8382,6 +8448,7 @@ void setupServer() {
       // the Auto Zero form also carries this field at 0 (older web apps send it on every Auto Zero toggle)
       if (inputMessage.toInt() == 1) {
         ResetDynamicAltZero = 1;  // Set the flag - don't save to file as it's momentary
+        zeroFitClearNvs();
         queueConsoleMessage("Alt Zero: Reset requested from web interface");
       }
     }
@@ -8729,7 +8796,9 @@ void setupServer() {
       settingRemove(NK_bhResults);  // legacy NVS copies — keep the boot migration from resurrecting them
       settingRemove(NK_bhCapBlob);
       settingWrite(NK_bhBaseline, "0");
-      queueConsoleMessage("BATT HEALTH: history cleared, baseline reset (battery replaced)");
+      batteryWearClear(batWear());   // the wear record describes the battery, so it starts over with it
+      if (!demoBatWearPtr) g_batWearSaveReq = true;
+      queueConsoleMessage("BATT HEALTH: history cleared, baseline reset, wear record cleared (battery replaced)");
     }
     if (request->hasParam("bhClearHistory")) {
       foundParameter = true;   // wipe ONLY the resistance-test table; capacity baseline + trend untouched
@@ -10425,6 +10494,7 @@ void setupServer() {
   // POST body only: the password never rides in a URL a log or a proxy could keep.
   server.on("/setPassword", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (refuseMisaddressed(request)) return;
+    if (demoSeal) { demoRefuse(request); return; }
     if (!settingsArmActive(request)) {
       request->send(403, "application/json", "{\"ok\":0,\"err\":\"armed\"}");
       return;
@@ -10460,6 +10530,7 @@ void setupServer() {
   // The boat's other regulators (Setup > System > Regulators on this boat). The dashboard writes
   // both units, so each side is a plain arm-gated store of the other's uid and name.
   server.on("/pair", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoSeal) { demoRefuse(request); return; }
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -10477,6 +10548,7 @@ void setupServer() {
     request->send(200, "application/json", out);
   });
   server.on("/unpair", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (demoSeal) { demoRefuse(request); return; }
     if (!settingsArmActive(request)) {
       request->send(403, "text/plain", "Settings not armed");
       return;
@@ -10895,6 +10967,19 @@ void setupServer() {
     out = "{\"state\":\"done\",\"op\":" + String(cloudOpSeq) + ",\"code\":" + String(cloudOpCode) + ",\"body\":";
     out += (cloudOpBody && cloudOpBody[0]) ? cloudOpBody : "null";
     out += "}";
+    request->send(200, "application/json", out);
+  });
+
+  // The last staged install that did not complete this boot or the one before (otaReportFailedAttempt); ver "" = none.
+  // The update overlay polls it to replace "in progress" with the reason.
+  server.on("/otaResult", HTTP_GET, [](AsyncWebServerRequest *request) {
+    DynamicJsonDocument d(320);
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    d["ver"] = otaLastFailVer;
+    d["why"] = otaLastFailWhy;
+    d["factory"] = running && running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY;
+    String out;
+    serializeJson(d, out);
     request->send(200, "application/json", out);
   });
 
@@ -11870,38 +11955,43 @@ void setupServer() {
     request->send(200, "text/plain", "OK");
   });
 
-  // Lifetime OV telemetry for the Diagnostics panel. Not in CSV2 (avoids field-count churn) —
-  // polled on demand. time_ms as decimal strings: uint64 dwell is beyond JS's 53-bit integers.
+  // Lifetime OV counters for the Diagnostics panel. Not in CSV2 (avoids field-count churn) — polled on demand.
   server.on("/getOvTelemetry", HTTP_GET, [](AsyncWebServerRequest *request) {
     const OvTelemetry &ov = ovTel();
-    const size_t cap = 2048;  // worst-case body ~1.2 KB (31 bins × two arrays + metadata)
+    char buf[200];
+    snprintf(buf, sizeof(buf),
+             "{\"soft\":%lu,\"sw_hard\":%lu,\"ina\":%lu,\"kd\":%lu,\"tier_low\":%lu,\"tier_mid\":%lu}",
+             (unsigned long)ov.softExceedCount, (unsigned long)ov.swHardCutCount,
+             (unsigned long)ov.inaCutCount, (unsigned long)ov.kdEventCount,
+             (unsigned long)ov.tierLowCutCount, (unsigned long)ov.tierMidCutCount);
+    request->send(200, "application/json", buf);
+  });
+
+  // Battery wear record (BatteryWear): the cloud's battery_wear JSON, the demo copy while in demo. Polled on demand.
+  server.on("/getBatteryWear", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const size_t cap = 32768;   // worst case (every box filled) is about 21 KB
     char *buf = (char *)ps_malloc(cap);
     if (!buf) {
-      request->send(500, "text/plain", "Out of memory");
+      request->send(503, "application/json", "{\"err\":\"out of memory\"}");
       return;
     }
-    int off = snprintf(buf, cap,
-                       "{\"bulk\":%.2f,\"k\":%.2f,\"bins_fine\":%d,\"bins_coarse\":%d,"
-                       "\"fine_width_12v\":0.2,\"coarse_width_12v\":1.0,"
-                       "\"soft\":%lu,\"sw_hard\":%lu,\"ina\":%lu,\"kd\":%lu,"
-                       "\"tier_low\":%lu,\"tier_mid\":%lu,\"events\":[",
-                       BulkVoltage, (float)SYSTEM_VOLTAGE_CLASS / 12.0f, OV_HIST_FINE_BINS, OV_HIST_COARSE_BINS,
-                       (unsigned long)ov.softExceedCount, (unsigned long)ov.swHardCutCount,
-                       (unsigned long)ov.inaCutCount, (unsigned long)ov.kdEventCount,
-                       (unsigned long)ov.tierLowCutCount, (unsigned long)ov.tierMidCutCount);
-    for (int i = 0; i < OV_HIST_BINS && off > 0 && off < (int)cap; i++)
-      off += snprintf(buf + off, cap - off, "%s%lu", i ? "," : "", (unsigned long)ov.events[i]);
-    if (off > 0 && off < (int)cap) off += snprintf(buf + off, cap - off, "],\"time_ms\":[");
-    for (int i = 0; i < OV_HIST_BINS && off > 0 && off < (int)cap; i++)
-      off += snprintf(buf + off, cap - off, "%s\"%llu\"", i ? "," : "", (unsigned long long)ov.timeMs[i]);
-    if (off > 0 && off < (int)cap) off += snprintf(buf + off, cap - off, "]}");
-    if (off <= 0 || off >= (int)cap) {
+    size_t n = batteryWearJson(buf, cap, batWear());
+    if (!n) {
       free(buf);
       request->send(500, "text/plain", "Payload overflow");
       return;
     }
-    request->send(200, "application/json", buf);
-    free(buf);
+    sendPsramText(request, "application/json", buf, n);
+  });
+
+  // New battery: the wear record starts over; the NVS copy is rewritten at the next field-cut chance so a power cut
+  // cannot bring the old record back.
+  server.on("/resetBatteryWear", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (refuseMisaddressed(request)) return;
+    batteryWearClear(batWear());
+    if (!demoBatWearPtr) g_batWearSaveReq = true;
+    queueConsoleMessage("Battery wear record cleared");
+    request->send(200, "text/plain", "OK");
   });
 
   server.on("/resetThermalProtectionCounters", HTTP_POST, [](AsyncWebServerRequest *request) {

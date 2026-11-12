@@ -135,4 +135,4 @@ dvccSilenceS
 dvccLostStop
 
 @connection anchor=gxCard
-hardwarePresent
+hardwarePresent confirm=const:HW_PRESENT_DEMO_MSG@0

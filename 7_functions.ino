@@ -1178,6 +1178,10 @@ static void altRestoreTrendBucket() {    // boot restore — resume the partial 
       pos = comma + 1;
     }
   }
+  if (altBucket_n >= 1) {
+    altOverallPctLive = (float)(altBucket_sum / altBucket_n) * 100.0f;
+    altWorstPctLive   = altBucketP10();
+  }
 }
 
 // ---- Demo-mode feed (altSimMode follows Hardware Present = No, 9_demo.ino) ----
@@ -2254,18 +2258,20 @@ static void altTrendPersist() {
     File f = LittleFS.open("/alttrend.bin", "w");
     if (f) {
       uint32_t hdr[2] = { ALT_TRENDLOG_MAGIC, ALT_VER };
-      f.write((const uint8_t *)hdr, sizeof(hdr));
-      if (altTrendCount > 0) f.write((const uint8_t *)altTrend, (size_t)altTrendCount * sizeof(AltTrendPt));
+      size_t body = (size_t)altTrendCount * sizeof(AltTrendPt);
+      bool ok = f.write((const uint8_t *)hdr, sizeof(hdr)) == sizeof(hdr);
+      if (ok && body > 0) ok = f.write((const uint8_t *)altTrend, body) == body;
       f.close();
-      altTrendFlushed = altTrendCount; altTrendRewrite = false;
+      if (ok) { altTrendFlushed = altTrendCount; altTrendRewrite = false; }
     }
   } else if ((uint32_t)altTrendCount > altTrendFlushed) {   // append only the new buckets
     File f = LittleFS.open("/alttrend.bin", "a");
     if (f) {
-      f.write((const uint8_t *)(altTrend + altTrendFlushed),
-              (size_t)((uint32_t)altTrendCount - altTrendFlushed) * sizeof(AltTrendPt));
+      size_t n = (size_t)((uint32_t)altTrendCount - altTrendFlushed) * sizeof(AltTrendPt);
+      bool ok = f.write((const uint8_t *)(altTrend + altTrendFlushed), n) == n;
       f.close();
-      altTrendFlushed = altTrendCount;
+      if (ok) altTrendFlushed = altTrendCount;
+      else altTrendRewrite = true;   // a partial record would misalign every later one
     }
   }
   fsFreeDirty = true;
@@ -3320,7 +3326,7 @@ void perfFold_tick(uint32_t nowMs) {
     aws = perfSimTws; awa = perfSimTwa; pitch = perfSimPitch; rpm = perfSimRpm;
     spd = (perfSpeedSrc >= 1.5f) ? perfSimSog : perfSimStw; haveSpd = true;
   } else {
-    if (IS_STALE(IDX_APPARENT_WIND_SPEED) || isnan(ApparentWindSpeedNMEA) || isnan(ApparentWindAngleNMEA)) { perfSteady = false; perfSettleSec = -1.0f; return; }
+    if (IS_STALE(IDX_APPARENT_WIND_SPEED) || isnan(ApparentWindSpeedNMEA) || isnan(ApparentWindAngleNMEA)) { perfSteady = false; perfSettleSec = -1.0f; perfLiveValid = false; motorLiveValid = false; return; }
     aws = ApparentWindSpeedNMEA; awa = ApparentWindAngleNMEA;
     pitch = imu_pitch_deg; rpm = RPM;
     if (perfSpeedSrc >= 1.5f) { haveSpd = !IS_STALE(IDX_SOG_NMEA); spd = SOGNMEA; }
@@ -6360,6 +6366,15 @@ bool fieldCurve_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
 // quarter of the limit it guards, so a small cap still sweeps.
 static inline float altSweepAmpMargin(float limitA) { return fminf(altSweepMarginA, 0.25f * limitA); }
 
+// A followed stop-charging command (CCL at or near 0, which the limit test below skips) or Stop Charging Without Limits
+// holding: no turnaround stays short of a 0 A ceiling, so the sweep is refused at Start and ended mid-run, and normal Auto
+// applies the stop at its own fall rate (the down leg would keep charging the whole way back at the sweep rate).
+const char *altSweepChargeStop() {
+  if (dvccEn == 1 && dvccState == 3 && !isnan(dvccCclA) && dvccCclA <= 0.5f) return "the followed charge-current limit (CCL) is at 0 A";
+  if (dvccStopForNoLimits()) return "Stop Charging Without Limits is on and no battery limits are being followed";
+  return nullptr;
+}
+
 // Which control limit the machine is approaching, from live measurements vs CONFIGURED limits, not ctrlLimiter
 // (the min-select chain is bypassed and ctrlLimiter forced 0 during the sweep). Each test repeats that chain's
 // enable gates, or the sweep would turn around on a limit the regulator itself would not honour.
@@ -6465,6 +6480,15 @@ bool altSweep_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     phase = 1;
     queueConsoleMessageF("Field sweep: %.1f%% → %.1f%% → %.1f%% at %.2f%%/s (~%.0f s), Max Field %% %.0f%%",
                          fromDuty, toDuty, fromDuty, ratePctS, 2.0f * (toDuty - fromDuty) / ratePctS, dutyCeil);
+  }
+
+  if (const char *stop = altSweepChargeStop()) {
+    queueConsoleMessageF("Field sweep: ended — %s", stop);
+    altSweepActive = 0;
+    altSweepMeasuredLeg = false;
+    altSweepLastEndMs = millis();
+    phase = 0;
+    return false;
   }
 
   // ── EASE-IN ───────────────────────────────────────────────────────────────
@@ -7270,4 +7294,38 @@ bool chc_tick(float &dutyOut, float ampsRaw, uint32_t nowMs) {
     return true;
   }
   return false;
+}
+
+// Boot PSRAM buffers that failed to allocate (a feature silently off): one console line, and the mask goes to the cloud
+// daily row psram_boot_fail_mask. Bit order is the cloud contract: append only.
+void psramBootCheck() {
+  const struct { bool missing; const char *name; } chk[] = {
+    { !cvLogReady,            "cvLog" },
+    { !pidLogReady,           "pidLog" },
+    { !thermalLogReady,       "thermalLog" },
+    { faDetMem == NULL,       "fault detector" },
+    { faRawRing == NULL,      "fast alt-current channel" },
+    { altFrontBuf == nullptr || altTrend == nullptr, "alternator health" },
+    { sailFrontBuf == nullptr, "boat performance" },
+    { sensorRing == nullptr,  "sensor ring" },
+    { longTermRing == nullptr, "long-term ring" },
+    { zeroLogRing == nullptr, "zero log" },
+    { consoleHist == nullptr, "console history" },
+    { configPayloadBuffer == nullptr, "config payload" },
+    { bhSamples == nullptr,   "battery health" },
+    { ch1Ring == nullptr,     "CH1 ring" },
+    { sledRing == nullptr,    "solar ledger" },
+  };
+  char names[256] = "";
+  size_t len = 0;
+  g_psramBootFailMask = 0;
+  for (size_t i = 0; i < sizeof(chk) / sizeof(chk[0]); i++) {
+    if (!chk[i].missing) continue;
+    g_psramBootFailMask |= 1UL << i;
+    if (len < sizeof(names)) len += snprintf(names + len, sizeof(names) - len, "%s%s", len ? ", " : "", chk[i].name);
+  }
+  if (g_psramBootFailMask) {
+    Serial.printf("PSRAM: boot allocation failed for %s\n", names);
+    queueConsoleMessageF("PSRAM: boot allocation failed for %s - those features are off this boot", names);
+  }
 }

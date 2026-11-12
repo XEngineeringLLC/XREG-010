@@ -25,6 +25,9 @@ void sensorFaultNames(uint16_t bits, char *out, size_t n);
 const char *reasonToString(FieldEventReason r);
 bool alarmBatteryVoltage(float &v);
 static bool chargeDecisionExternalV(float &out);
+// The owner's settings under demoEnter's forced ones (9_demo.ino)
+bool demoRealIgnoreTemperature();
+bool demoRealShunt();
 
 void SystemTime(const tN2kMsg &N2kMsg) {
   unsigned char SID;
@@ -86,7 +89,6 @@ static const double N2K_TWO_PI = 6.2832;
 void Heading(const tN2kMsg &N2kMsg) {
   static unsigned long lastHeadingUpdate = 0;
   if (millis() - lastHeadingUpdate < 2000) return;
-  lastHeadingUpdate = millis();
   unsigned char SID;
   tN2kHeadingReference HeadingReference;
   double Heading;
@@ -95,6 +97,7 @@ void Heading(const tN2kMsg &N2kMsg) {
 
   if (ParseN2kHeading(N2kMsg, SID, Heading, Deviation, Variation, HeadingReference)) {
     if (!n2kIn(Heading, 0.0, N2K_TWO_PI)) return;        // F-RES-04: skip NA / reserved field, otherwise -1e9 leaks into HeadingNMEA
+    lastHeadingUpdate = millis();   // stamped only once accepted: an NA frame from another sender must not take the slot
     HeadingNMEA = Heading * 180.0 / PI;
     HeadingRefNMEA = (HeadingReference == N2khr_true) ? 0
                    : (HeadingReference == N2khr_magnetic) ? 1 : -1;
@@ -118,8 +121,9 @@ void Heading(const tN2kMsg &N2kMsg) {
 // Best 60 s time-weighted mean SOG (Sustained Speed record). Integrated from timestamped samples so it
 // is cadence-independent; a score needs a fully covered 60 s with no gap past SUST_MAX_GAP_MS, so an
 // NMEA dropout cannot manufacture a record from two samples far apart.
+static uint8_t sustHead = 0, sustCount = 0;   // file scope for sustainedSpeedReset()
 void updateSustainedSpeed(float sogKn) {
-  static uint8_t head = 0, count = 0;
+  uint8_t &head = sustHead, &count = sustCount;
   if (!sustT || !sustV) return;   // PSRAM ring (allocated in setup)
   uint32_t *t = sustT;
   float    *v = sustV;
@@ -162,12 +166,16 @@ void updateSustainedSpeed(float sogKn) {
   if (sogSust1m > MaxSpeed) MaxSpeed = sogSust1m;
   if (sogSust1m > MaxSpeed_AllTime) MaxSpeed_AllTime = sogSust1m;
 }
+// Starts the window over: demo exit, whose last simulated sample is inside SUST_MAX_GAP_MS of the first real one.
+void sustainedSpeedReset() {
+  sustCount = 0;
+  sogSust1m = 0.0f;
+}
 
 //*****************************************************************************
 void COGSOG(const tN2kMsg &N2kMsg) {
   static unsigned long lastCOGSOGUpdate = 0;
   if (millis() - lastCOGSOGUpdate < 2000) return;
-  lastCOGSOGUpdate = millis();
 
   unsigned char SID;
   tN2kHeadingReference HeadingReference;
@@ -179,6 +187,7 @@ void COGSOG(const tN2kMsg &N2kMsg) {
     const bool cogOk = n2kIn(COG, 0.0, N2K_TWO_PI);
     const bool sogOk = n2kIn(SOG, 0.0, 30.9);   // 60 kn
     if (!cogOk && !sogOk) return;
+    lastCOGSOGUpdate = millis();   // stamped only once a field is accepted: an all-NA frame from another sender must not take the slot
     // Phone GPS selected: NMEA values are not written (freshness stamps still land, for /debug) so
     // the record chain and leaderboard flag never mix sources.
     if (cogOk) {
@@ -212,7 +221,6 @@ void GNSS(const tN2kMsg &N2kMsg) {
   //Serial.printf("PGN: %lu\n", N2kMsg.PGN);
   static unsigned long lastGNSSUpdate = 0;
   if (millis() - lastGNSSUpdate < 2000) return;
-  lastGNSSUpdate = millis();
 
   unsigned char SID;
   uint16_t DaysSince1970;
@@ -243,6 +251,7 @@ void GNSS(const tN2kMsg &N2kMsg) {
 
     if (!isnan(Latitude) && !isnan(Longitude) && Latitude != 0.0 && Longitude != 0.0 && abs(Latitude) <= 90.0 && abs(Longitude) <= 180.0 && nSatellites > 0) {
 
+      lastGNSSUpdate = millis();   // stamped only on a usable fix: a no-fix frame from another sender must not take the slot
       LatitudeNMEA = Latitude;
       LongitudeNMEA = Longitude;
       SatelliteCountNMEA = (nSatellites == 0xFF) ? 0 : nSatellites;   // 0xFF is the N2K "not available" code, not 255 satellites
@@ -322,6 +331,15 @@ void BatteryConfigurationStatus(const tN2kMsg &N2kMsg) {
   }
 }
 //*****************************************************************************
+// The battery-receive source lock (n2kRxBattSrc, n2kRxSocSrc): the locked sender, or any sender once it has been silent.
+static uint32_t n2kRxBattSrcMs = 0, n2kRxSocSrcMs = 0;
+static bool n2kRxSrcAccept(uint8_t src, uint8_t &lockSrc, uint32_t &lockMs) {
+  const uint32_t now = millis();
+  if (lockSrc != 255 && src != lockSrc && now - lockMs <= N2K_RX_SRC_LOCK_MS) return false;
+  lockSrc = src;
+  lockMs = now;
+  return true;
+}
 void DCStatus(const tN2kMsg &N2kMsg) {
   unsigned char SID;
   unsigned char DCInstance;
@@ -339,11 +357,16 @@ void DCStatus(const tN2kMsg &N2kMsg) {
     }
     return;
   }
-  // Ingest SOC/SOH from the selected battery bank (display/telemetry only, never control)
-  if (DCInstance == n2kRxBattInstance && DCType == N2kDCt_Battery) {
-    n2kRxSoc = (StateOfCharge > 100) ? -1 : (int)StateOfCharge;  // >100 = N2K not-available encoding
-    n2kRxSoh = (StateOfHealth > 100) ? -1 : (int)StateOfHealth;
-    if (n2kRxSoc >= 0 || n2kRxSoh >= 0) MARK_FRESH(IDX_N2K_SOC);
+  // Ingest SOC/SOH from the selected battery bank (display/telemetry only, never control). One sender (n2kRxSocSrc); a
+  // field it leaves not-available keeps its last value for N2K_RX_SRC_LOCK_MS rather than blanking it.
+  if (DCInstance == n2kRxBattInstance && DCType == N2kDCt_Battery && n2kRxSrcAccept(N2kMsg.Source, n2kRxSocSrc, n2kRxSocSrcMs)) {
+    static uint32_t socMs = 0, sohMs = 0;
+    const uint32_t now = millis();
+    if (StateOfCharge <= 100) { n2kRxSoc = (int)StateOfCharge; socMs = now; }   // >100 = N2K not-available encoding
+    else if (now - socMs > N2K_RX_SRC_LOCK_MS) n2kRxSoc = -1;
+    if (StateOfHealth <= 100) { n2kRxSoh = (int)StateOfHealth; sohMs = now; }
+    else if (now - sohMs > N2K_RX_SRC_LOCK_MS) n2kRxSoh = -1;
+    if (StateOfCharge <= 100 || StateOfHealth <= 100) MARK_FRESH(IDX_N2K_SOC);
   }
   if (NMEA2KVerbose == 1) {
     OutputStream->print("DC instance: ");
@@ -378,16 +401,26 @@ void BatteryStatus(const tN2kMsg &N2kMsg) {
     return;
   }
   // Selected bank (shunt or BMS "virtual shunt" on N2K): V/A are display only; T is batteryTempF()
-  // source 2 (charge lockouts, CV derate). Missing fields stay NAN.
-  if (BatteryInstance == n2kRxBattInstance) {
-    const bool vOk = n2kIn(BatteryVoltage, 0.0, 70.0 * ((double)SYSTEM_VOLTAGE_CLASS / 12.0));
-    const bool aOk = n2kIn(BatteryCurrent, -2000.0, 2000.0);
-    const bool tOk = n2kIn(BatteryTemperature, 233.15, 358.15);   // -40..85 °C
-    if (!vOk && !aOk && !tOk) return;
-    n2kRxBattV = vOk ? (float)BatteryVoltage : NAN;
-    n2kRxBattA = aOk ? (float)BatteryCurrent : NAN;
-    n2kRxBattTempF = tOk ? (float)KelvinToF(BatteryTemperature) : NAN;
-    MARK_FRESH(IDX_N2K_BATT);
+  // source 2 (charge lockouts, CV derate). One sender (n2kRxBattSrc). IDX_N2K_BATT stamps the frame, not each field, so a
+  // field the sender leaves out keeps its last value only for N2K_RX_SRC_LOCK_MS, then reads NAN.
+  static uint32_t vMs = 0, aMs = 0, tMs = 0;
+  const uint32_t now = millis();
+  const bool vOk = n2kIn(BatteryVoltage, 0.0, 70.0 * ((double)SYSTEM_VOLTAGE_CLASS / 12.0));
+  const bool aOk = n2kIn(BatteryCurrent, -2000.0, 2000.0);
+  const bool tOk = n2kIn(BatteryTemperature, 233.15, 358.15);   // -40..85 °C
+  // A sender with a temperature takes the lock from one that has sent none for N2K_RX_SRC_LOCK_MS. Between two that both
+  // send one, the holder keeps it.
+  if (BatteryInstance == n2kRxBattInstance && tOk && n2kRxBattSrc != 255 && N2kMsg.Source != n2kRxBattSrc
+      && now - tMs > N2K_RX_SRC_LOCK_MS)
+    n2kRxBattSrc = 255;
+  if (BatteryInstance == n2kRxBattInstance && n2kRxSrcAccept(N2kMsg.Source, n2kRxBattSrc, n2kRxBattSrcMs)) {
+    if (vOk) { n2kRxBattV = (float)BatteryVoltage; vMs = now; }
+    else if (now - vMs > N2K_RX_SRC_LOCK_MS) n2kRxBattV = NAN;
+    if (aOk) { n2kRxBattA = (float)BatteryCurrent; aMs = now; }
+    else if (now - aMs > N2K_RX_SRC_LOCK_MS) n2kRxBattA = NAN;
+    if (tOk) { n2kRxBattTempF = (float)KelvinToF(BatteryTemperature); tMs = now; }
+    else if (now - tMs > N2K_RX_SRC_LOCK_MS) n2kRxBattTempF = NAN;
+    if (vOk || aOk || tOk) MARK_FRESH(IDX_N2K_BATT);
   }
   if (NMEA2KVerbose == 1) {
     OutputStream->print("Battery instance: ");
@@ -943,6 +976,10 @@ static void dvccVicIngestMerged() {
   for (uint8_t i = 0; i < DVCC_VIC_SND_N; i++) {
     DvccVicSnd &s = dvccVicSnd[i];
     if (!s.used) continue;
+    if (dvccVicForeign(s.addr)) {  // identified after it was accepted (its claim answered our join-time request)
+      s.used = false;
+      continue;
+    }
     if ((uint32_t)(now - s.lastMs) > silenceMs) {  // this sender went silent: everything it held goes, a held cut included
       s.used = false;
       continue;
@@ -955,23 +992,27 @@ static void dvccVicIngestMerged() {
     else if (!canCut && !isnan(s.ccl) && (isnan(canCcl) || s.ccl < canCcl)) { canCcl = s.ccl; cclAddr = s.addr; }
   }
   bool canFresh = (dvccVicCanMs != 0);
+  // VE.Can is followed only with transmit on: telling the GX from an alternator regulator re-broadcasting its own share
+  // (identical frames) needs every sender's address claim, which only the join-time ISO request can get. Still shown.
+  bool canUse = canFresh && n2kTxEnable == 1;
   bool wifiFresh = (dvccRxWifiMs != 0) && (uint32_t)(now - dvccRxWifiMs) <= silenceMs;
   dvccRxCanCvl = canFresh ? canCvl : NAN;
   dvccRxCanCcl = canFresh ? (canCut ? 0.0f : canCcl) : NAN;  // do-not-charge = CCL 0 (obey-zero)
   dvccRxCanShare = canFresh ? dvccVicShare : NAN;
-  float cvl = dvccRxCanCvl, ccl = dvccRxCanCcl;
+  if (!canUse && !wifiFresh) return;  // nothing followable: the trust machine sees silence
+  float cvl = canUse ? dvccRxCanCvl : NAN, ccl = canUse ? dvccRxCanCcl : NAN;
   bool cclAlt = false;
   if (wifiFresh) cvl = dvccLower(cvl, dvccRxWifiCvl);
   // CCLs compared as alternator amps: the shares (VE.Can addressed 0x2015, WiFi) are this alternator's already, the battery
   // CCL gets the house-load offset the control loop would add (live shunt only). The winner keeps its own basis.
-  const float shares[2] = { dvccRxCanShare, wifiFresh ? dvccRxWifiCcl : NAN };
+  const float shares[2] = { canUse ? dvccRxCanShare : NAN, wifiFresh ? dvccRxWifiCcl : NAN };
   for (uint8_t i = 0; i < 2; i++) {
     if (isnan(shares[i])) continue;
     float curAsAlt = (!cclAlt && !isnan(ccl) && HAS_BATT_SHUNT && bcurFresh()) ? fmaxf(0.0f, ccl + loadOffsetFilt) : ccl;
     if (isnan(curAsAlt) || shares[i] < curAsAlt) { ccl = shares[i]; cclAlt = true; }
   }
   uint8_t who = (cvlAddr != 255) ? cvlAddr : (cclAddr != 255) ? cclAddr : dvccVicLastAddr;
-  dvccIngest(cvl, ccl, canFresh ? who : (uint8_t)DVCC_ADDR_WIFI, 0, 0);
+  dvccIngest(cvl, ccl, canUse ? who : (uint8_t)DVCC_ADDR_WIFI, 0, 0);
   dvccRxCclAltBasis = cclAlt;
 }
 
@@ -1690,13 +1731,38 @@ tN2kChargerMode n2kChargerModeSetting() {
 }
 
 // Alarm-engine alternator temp (TempSource: OneWire vs thermistor; -99 = thermistor disconnected), NAN = unusable.
-// 20 s freshness as the stale alarm / temp-stale cut, so a sensor dying mid-run never transmits its last value forever.
+// The alarm's freshness (tempProbeFresh: 20 s running, 90 s at rest for the 60 s engine-off poll), so a sensor dying mid-run never transmits its last value forever.
 float n2kAltTempF() {
   if (IgnoreTemperature || LimpHome) return NAN;   // running without the alternator temperature: nothing goes on the bus
-  unsigned long ts = dataTimestamps[(TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP];
-  if (ts == 0 || (millis() - ts) > 20000) return NAN;
+  if (!tempProbeFresh((TempSource == 0) ? IDX_ALTERNATOR_TEMP : IDX_THERMISTOR_TEMP)) return NAN;
   if (TempSource == 0) return AlternatorTemperatureF;
   return (temperatureThermistor == -99) ? NAN : (float)temperatureThermistor;
+}
+
+// The rotor-resistance correction's alternator temperature (updateFieldDerateCeilings). In demo mode n2kAltTempF is the
+// simulated boat's, so this is the real probe or thermistor, under the owner's own Ignore Temperature (demoEnter forces 0).
+float fdAltTempF() {
+  if (hardwarePresent == 1) return n2kAltTempF();
+  if (demoRealIgnoreTemperature() || LimpHome) return NAN;
+  const uint32_t ts = (TempSource == 0) ? g_fdAltProbeMs : g_fdThermMs;
+  if (ts == 0 || (int32_t)(millis() - ts) > 20000) return NAN;   // tempProbeFresh's running window: the demo reads are at most 5 s apart, engine running or not
+  if (TempSource == 0) return g_fdAltProbeF;
+  return (g_fdThermF == -99) ? NAN : (float)g_fdThermF;
+}
+
+// Demo exit (demoExitBegin): the selected alternator source takes the real reading the demo took for the field driver, with
+// its own stamp, when tempProbeFresh's rule passes it, so no simulated value is read after exit. Otherwise nothing changes.
+void demoExitRealAltTemp() {
+  const uint32_t win = g_engineRunning ? 20000UL : 90000UL;
+  const uint32_t now = millis();
+  if (TempSource == 0 && tempRoleSlot[TR_ALT] >= 0 && g_fdAltProbeMs != 0 && (int32_t)(now - g_fdAltProbeMs) <= (int32_t)win) {
+    AlternatorTemperatureF = g_fdAltProbeF;
+    dataTimestamps[IDX_ALTERNATOR_TEMP] = g_fdAltProbeMs;
+  }
+  if (TempSource == 1 && g_fdThermMs != 0 && (int32_t)(now - g_fdThermMs) <= (int32_t)win) {
+    temperatureThermistor = g_fdThermF;
+    dataTimestamps[IDX_THERMISTOR_TEMP] = g_fdThermMs;
+  }
 }
 
 // Bus readings, NAN = not available: the n2kAltTempF rule — an ignored sensor, or any sensor under LimpHome, never goes out.
@@ -1869,6 +1935,8 @@ void n2kApplyNodeConfig(bool live) {
 void nmea2kTransmitTick() {
   static bool n2kCfgInfoSent = false, n2kCfgInfoArmed = false, n2kInstDescPending = false;
   static uint32_t n2kCfgInfoAtMs = 0;
+  static bool n2kClaimReqSent = false, n2kClaimReqArmed = false;
+  static uint32_t n2kClaimReqAtMs = 0;
   // A GX or display wrote installation description 1 / 2 (126208; a GX shows field 1 as the CustomName). Persisted
   // at field-off like the address; printable ASCII only, since the text rides the cloud settings JSON.
   if (NMEA2000.ReadResetInstallationDescriptionChanged()) n2kInstDescPending = true;
@@ -1884,6 +1952,7 @@ void nmea2kTransmitTick() {
   }
   if (n2kTxEnable != 1 && rvcTxEnable != 1) {
     n2kCfgInfoSent = n2kCfgInfoArmed = false;
+    n2kClaimReqSent = n2kClaimReqArmed = false;
     return;
   }
 
@@ -1894,6 +1963,7 @@ void nmea2kTransmitTick() {
     n2kAddrPending = (uint8_t)n2kSrcAddrLive;
     if (n2kSrcAddrLive <= 251) n2kPreferredAddr = (uint8_t)n2kSrcAddrLive;  // 254 = lost the claim; keep the last good one
     n2kCfgInfoSent = false;
+    n2kClaimReqSent = false;
   }
   // 126998 is on-request only; broadcast it once per join (2 s after a valid claim) in case a GX never asks.
   if (n2kTxEnable != 1 || !n2kNodeActive || NMEA2000.GetN2kSource() > 251) {
@@ -1906,6 +1976,26 @@ void nmea2kTransmitTick() {
     } else if (millis() - n2kCfgInfoAtMs >= 2000UL) {
       NMEA2000.SendConfigurationInformation();  // a refused send stays pending inside the library, which retries it
       n2kCfgInfoSent = true;
+    }
+  }
+  // Every node re-sends its address claim (60928) on this one request per join: claims made before this node joined are
+  // otherwise never heard, and the DVCC sender filter (dvccVicForeign) can refuse only a node whose claim it has heard.
+  if (n2kTxEnable != 1 || !n2kNodeActive || NMEA2000.GetN2kSource() > 251) {
+    n2kClaimReqSent = false;
+    n2kClaimReqArmed = false;
+  } else if (!n2kClaimReqSent) {
+    if (!n2kClaimReqArmed) {
+      n2kClaimReqArmed = true;
+      n2kClaimReqAtMs = millis();
+    } else if (millis() - n2kClaimReqAtMs >= 1000UL) {
+      tN2kMsg claimReq;
+      SetN2kPGN59904(claimReq, 0xFF, 60928UL);
+      if (NMEA2000.SendMsg(claimReq)) {
+        n2kTxCount++;
+        n2kClaimReqSent = true;
+        return;
+      }
+      n2kTxDropCount++;
     }
   }
   if (n2kAddrPending != 255 && fieldCutSettled(2000)) {   // settled like the other field-off writers, not the raw cut flag
@@ -2567,6 +2657,9 @@ void checkAndRestart() {
 
   static unsigned long quietSince = 0;      // continuous-hold start of the current quiet window
   static unsigned long countdownStart = 0;  // 10-min warning start (relaxed/hard tiers only)
+  static uint32_t fieldDownMs = 0;          // millis() | 1 once the restart's field-down began (0 = not begun)
+  static int fieldDownOnOff = 0;            // OnOff then: a restart called off after the field-down puts it back (OnOff 0 is RAM only)
+  auto fieldDownCallOff = []() { if (fieldDownMs) { fieldDownMs = 0; if (OnOff == 0) OnOff = fieldDownOnOff; } };
 
   bool wantReboot = maintRebootHealthReq || up >= REBOOT_OPPORTUNISTIC_MS;
   if (!wantReboot) {
@@ -2579,6 +2672,7 @@ void checkAndRestart() {
   if (otaInProgress || g_autoTestActive) {
     quietSince = 0;
     countdownStart = 0;
+    fieldDownCallOff();
     restartRemainingSec = 0;
     return;
   }
@@ -2613,6 +2707,7 @@ void checkAndRestart() {
   if (!windowOk) {
     quietSince = 0;
     countdownStart = 0;
+    fieldDownCallOff();
     restartRemainingSec = 0;
     return;
   }
@@ -2643,16 +2738,33 @@ void checkAndRestart() {
     }
   }
 
+  // Field down first, the key-off way: OnOff 0 sends it through the normal shutdown ramp (runShutdownPath, every
+  // protection live, the loop still running) to the GPIO4 cut. The park below waits until the cut has settled 32 s, so
+  // the loop's own field-cut writers (field-off NVS and front saves, ledgers, logs, queued records) have run first.
+  if (!fieldDownMs) {
+    fieldDownMs = millis() | 1u;
+    fieldDownOnOff = OnOff;
+    queueConsoleMessage("Maintenance restart: field ramping down, then saving and restarting");
+  }
+  OnOff = 0;
+  restartRemainingSec = 1;
+  const bool fieldDownLate = (int32_t)(millis() - fieldDownMs) > (int32_t)REBOOT_FIELD_DOWN_WAIT_MS;
+  if (!fieldCutSettled(12000) && !fieldDownLate) return;
+
   {
     restartRemainingSec = 1;  // keep banner visible through the shutdown sequence
     Serial.println("=== MAINTENANCE RESTART ===");
 
-    // OnOff=0 is RAM-only: on reboot the device returns to the user's last OnOff state.
+    // OnOff=0 is RAM-only: on reboot the device returns to the user's last OnOff state. The field is cut already unless
+    // the ramp-down wait ran out; then it is cut here, as the restart itself would.
+    if (!gpio4IsLow) Serial.println("Restart: field still up after the ramp-down wait - cutting it");
     Serial.println("Restart: hard-zero PWM and disable charging");
     apply_pwm_float(0.0f);
     dutyCycle = 0.0f;
     lastAppliedDuty = 0.0f;
     OnOff = 0;
+    digitalWrite(4, LOW);
+    gpio4IsLow = true;
     delay(500);            // brief settle so any in-flight tick sees OnOff=0
     esp_task_wdt_reset();
 
@@ -2685,14 +2797,8 @@ void checkAndRestart() {
     delay(1000);
     esp_task_wdt_reset();
 
-    // Save final sensor window if it has data — push into PSRAM ring so the
-    // shutdown Phase 4 dump (or next-tick cloud upload) preserves it.
-    if (currentWindow->dutyCycle_valid_us > 0) {
-      Serial.println("Pushing final sensor window into ring before restart");
-      time_t collectionTime = computeCollectionTime();
-      pushSensorSnapshot(collectionTime);
-      resetSensorWindow();
-    }
+    // Final sensor window into the PSRAM ring, with its long-term plot record, as key-off Phase 2 does.
+    uploadSensorHistory();
 
     // Un-uploaded telemetry (offline, AP, WiFi with no internet: cloudIdle waives the drain): dump the PSRAM ring to flash as
     // shutdown Phase 4 does; setup() restores it on next boot.
@@ -2702,14 +2808,82 @@ void checkAndRestart() {
       dumpSensorRingToLittleFS();
     }
 
+    // Key-off Phase 2's deferred saves: the loop ran them every pass until the park; this takes a button pressed since.
+    if (pendingSaveCVTuningLog) {
+      pendingSaveCVTuningLog = false;
+      saveCVTuningLog();
+    }
+    if (pendingSaveTuningLog) {
+      pendingSaveTuningLog = false;
+      saveTuningLog();
+    }
+    if (pendingSaveSystemIDLog) {
+      pendingSaveSystemIDLog = false;
+      saveSystemIDLog();
+    }
+    if (pendingSaveSysidSweepLog) {
+      pendingSaveSysidSweepLog = false;
+      saveSysidSweepLog();
+    }
+    if (pendingSaveTuningSweepLog) {
+      pendingSaveTuningSweepLog = false;
+      saveTuningSweepLog();
+    }
+    if (pendingRpmAxisWipe) {  // before the flags it raises, so they drain here too
+      pendingRpmAxisWipe = false;
+      rpmAxisWipeExecute();
+    }
+    if (pendingImportBootAct) {
+      uint16_t act = pendingImportBootAct;
+      pendingImportBootAct = 0;
+      importBootActRun(act);
+    }
+    if (pendingResetAlternatorHealth) {
+      pendingResetAlternatorHealth = false;
+      resetAlternatorHealth();
+    }
+    altHealthWindingCheck();
+    if (pendingResetBoatPerformance) {
+      pendingResetBoatPerformance = false;
+      resetBoatPerformance();
+    }
+    if (pendingClearOverheatHistory) {
+      pendingClearOverheatHistory = false;
+      clearOverheatHistoryAction();
+    }
+    if (pendingSaveUserTableEdits) {
+      pendingSaveUserTableEdits = false;
+      saveUserTableEdits();
+    }
+    if (pendingSaveVesselInfo) {
+      pendingSaveVesselInfo = false;
+      saveVesselInfoToNvs();
+    }
+    esp_task_wdt_reset();
+
+    // Writers the loop runs only with the field cut settled: their passes ran during the settle wait; this takes what
+    // queued since, a wait that ran out, and the knee floors' 5-min throttle.
+    ripTabSaveIfPending();
+    faFlushDirtyNow();
+    if (prev_zeroLogHead != zeroLogHead) dumpZeroLog();
+    if (zeroFitHistCount > 0 && prev_zeroFitHistHead != zeroFitHistHead) dumpZeroFit();
+    huntLedgerService();
+    huntMapService();
+    owRoleService();
+    bhFlushCapNVS();
+    overheatHistFlush();
+    kneeLearnFlushNow();
+    esp_task_wdt_reset();
+
     // Persist the long-term plot ring so the maintenance restart doesn't shed up to 15 min of
     // unflushed records (the periodic flush only fires every LONGTERM_DUMP_INTERVAL_MS).
     dumpLongTermRing();
     dumpUsageAccum();  // app-usage period counters span the restart via /usage.bin
     solarLedgerFlushNow();  // ledger + live day + learned ratio span the restart too
-    // Best-ever fronts + their unsynced cloud-pending points (a quiet window can fall mid-sail). Field physically
-    // cut only: the 72 h hard tier restarts with the field live, and these are the largest blobs.
-    if (gpio4IsLow) { altHealthSave(); boatPerfSave(); }
+    // Best-ever fronts + their unsynced cloud-pending points (a quiet window can fall mid-sail). The field is cut here.
+    altHealthSave();
+    boatPerfSave();
+    esp_task_wdt_reset();
 
     if (WiFi.getMode() != WIFI_OFF) {
       // "console" only: the client has no "status" listener
@@ -2728,6 +2902,7 @@ void checkAndRestart() {
     writeFile(LittleFS, "/ScheduledRestart.flag", "1");
     esp_task_wdt_delete(NULL);
     delay(100);
+    distHourCarryStash();   // RTC RAM, no flash: the Max 24-Hour Distance window continues after the restart
     ESP.restart();
   }
 }
@@ -2768,7 +2943,7 @@ void captureResetReason() {
     case ESP_RST_POWERON: LastResetReason = 0; break;
     case ESP_RST_SW:
       if (wasScheduled) g_bootRebootWhy = REBOOT_WHY_REMOTE;
-      LastResetReason = wasScheduled ? 11 : REBOOT_WHY_RESET[g_bootRebootWhy];  // 11=scheduled, 17-21=REBOOT_WHY_*, 1=unscheduled
+      LastResetReason = wasScheduled ? 11 : REBOOT_WHY_RESET[g_bootRebootWhy];  // 11=scheduled, 17-22=REBOOT_WHY_*, 1=unscheduled
       break;
     case ESP_RST_DEEPSLEEP: LastResetReason = 2; break;
     case ESP_RST_EXT: LastResetReason = 3; break;
@@ -2793,6 +2968,11 @@ void captureResetReason() {
   g_rawResetRtc0 = (int)rtc_get_reset_reason(0);
   g_rawResetRtc1 = (int)rtc_get_reset_reason(1);
 
+  // Power-on, brownout and glitch resets are power events even when RTC RAM survived; only these are firmware-caused.
+  g_bootSoftReset = rawReason == ESP_RST_SW || rawReason == ESP_RST_PANIC || rawReason == ESP_RST_INT_WDT
+                    || rawReason == ESP_RST_TASK_WDT || rawReason == ESP_RST_WDT || rawReason == ESP_RST_CPU_LOCKUP;
+  if (!g_bootSoftReset) g_alarmLatchKeep = 0;   // a latched alarm survives only a firmware-caused reset: cycling the power clears it
+
   // Black box: capture last session's snapshot before loop() starts overwriting it, then
   // invalidate so a reset before the first loop pass can't replay this session's copy.
   memcpy(&g_blackBoxPrev, &g_blackBox, sizeof(g_blackBoxPrev));
@@ -2800,12 +2980,15 @@ void captureResetReason() {
   const bool bbWasDemo = (g_blackBoxPrev.magic == BLACKBOX_DEMO_MAGIC);   // reset during demo mode: simulated values, not a record
   g_blackBox.magic = 0;
 
-  // Lifetime OV telemetry: bad magic = true power-down or a firmware layout change — start clean
-  // (no migration; an old bin layout is not comparable). Valid magic carries the history through.
+  // Lifetime OV counters: bad magic = true power-down or a firmware layout change — start clean (no migration). Valid magic
+  // carries them through.
   if (g_ovTel.magic != OVTEL_MAGIC) {
     memset(&g_ovTel, 0, sizeof(g_ovTel));
     g_ovTel.magic = OVTEL_MAGIC;
   }
+  // Battery wear: a valid RTC copy is newer than the NVS one; otherwise loadNVSData() restores the NVS copy.
+  g_batWearRtcValid = (g_batWear.magic == BW_MAGIC && g_batWear.headMagic == BW_MAGIC);
+  if (!g_batWearRtcValid) batteryWearClear(g_batWear);
 
   Serial.printf("RESET: %s | esp=%d rtc0=%d rtc1=%d\n",
                 resetReasonName(), g_rawResetEsp, g_rawResetRtc0, g_rawResetRtc1);
@@ -3104,7 +3287,8 @@ void UpdateBatterySOC(unsigned long elapsedMillis) {
 
   // A held (stale) or owner-ignored reading earns no on-time, energy or fuel (§10.5); the energy terms
   // also need a live, trusted bus voltage (tiers 3/4 hold IBV). LimpHome ignores every sensor.
-  alternatorIsOn = altAmpsFresh() && !IgnoreAltCurrent && !LimpHome && (MeasuredAmps > CurrentThreshold);
+  // Field enable must be up: with it cut, a reading above CurrentThreshold (default below one ADC count) is Hall noise.
+  alternatorIsOn = altAmpsFresh() && !IgnoreAltCurrent && !LimpHome && !gpio4IsLow && (MeasuredAmps > CurrentThreshold);
   const bool altEnergyOk = alternatorIsOn && ibvFresh() && !IgnoreBattVMain;
 
   if (alternatorIsOn) {
@@ -3223,6 +3407,9 @@ bool sailingEngineOff() {
   if (ignitionForcedOn()) return !rpmIgnored && RPM < 50;
   return (rpmIgnored || RPM < 50) && Ignition == 0;
 }
+static bool odoBaselineReset = true;
+// Demo exit: the baseline is the simulated boat's last position, so the next real fix starts a new one
+void odometerRebaseline() { odoBaselineReset = true; }
 void UpdateTravelStatistics(unsigned long elapsedMillis) {
   // ===== DISTANCE CALCULATION - Using GPS position (Haversine) =====
 
@@ -3237,13 +3424,12 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
     static double lastLat = 0;
     static double lastLon = 0;
     static uint32_t lastFixMs = 0;
-    static bool firstRun = true;
 
-    if (firstRun) {
+    if (odoBaselineReset) {
       lastLat = LatitudeNMEA;
       lastLon = LongitudeNMEA;
       lastFixMs = millis();
-      firstRun = false;
+      odoBaselineReset = false;
     } else {
       double distanceDelta_nm = calculateHaversineDistance(lastLat, lastLon, LatitudeNMEA, LongitudeNMEA);
 
@@ -3294,7 +3480,8 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
   // time sync, then resumes (< 1 h old) or finalizes; no sync within 10 min of boot finalizes it.
   {
     if (tripPendingRecovery) {
-      if (timeIsSynced && timeBase > 0) {
+      // A cold boot's NVS estimate leaves out the time off, so every saved trip would look fresh: wait for a real clock.
+      if (timeIsSynced && timeBase > 0 && (!softClockColdSeeded || clockIsReal())) {
         uint32_t nowEpoch = timeBase + (millis() - timeBaseMillis) / 1000;
         bool fresh = (currentTripLastUpdateEpoch > 0)
                   && (nowEpoch >= currentTripLastUpdateEpoch)
@@ -3395,6 +3582,21 @@ void UpdateTravelStatistics(unsigned long elapsedMillis) {
   }
 }
 
+void distHourCarryStash() {
+  memcpy(g_distCarry.buckets, distHourBuckets, sizeof(g_distCarry.buckets));
+  g_distCarry.head = distHourHead;
+  g_distCarry.elapsedMs = millis() - distHourStartMs;
+  g_distCarry.magic = DIST_CARRY_MAGIC;
+}
+void distHourCarryAdopt() {
+  if (g_bootSoftReset && g_distCarry.magic == DIST_CARRY_MAGIC && g_distCarry.head < 24) {
+    memcpy(distHourBuckets, g_distCarry.buckets, sizeof(g_distCarry.buckets));
+    distHourHead = (uint8_t)g_distCarry.head;
+    distHourStartMs = millis() - g_distCarry.elapsedMs;   // wraps below 0 on purpose: the loop's unsigned (now - start) stays exact
+  }
+  g_distCarry.magic = 0;
+}
+
 // One sample/min into the PSRAM ring while GPS + depth are valid. A contiguous 5 h span (no gap > 10 min),
 // swing < 100 yd and depth range 2-100 ft updates DeepestAnchorage_Ft_AllTime with its mean depth.
 void UpdateAnchorageDetection(bool gpsValid) {
@@ -3451,16 +3653,20 @@ void UpdateAnchorageDetection(bool gpsValid) {
   double centroidLon = sumLon / (double)spanCount;
   float depthAvg = depthSum / (float)spanCount;
   float depthRange = depthMax - depthMin;
-  double maxSwingNm = 0;
+  if (depthRange < MIN_DEPTH_CHANGE_FT || depthRange > MAX_DEPTH_CHANGE_FT) return;
+  if (!(depthAvg > DeepestAnchorage_Ft_AllTime)) return;
+  // Swing on a local flat-earth projection: within 100 yd it matches the haversine to millimetres, without 9 soft-float
+  // double libm calls per sample (300 of them were tens of ms in one control pass).
+  const float nmPerDegLat = (float)(3440.065 * PI / 180.0);   // same Earth radius as calculateHaversineDistance
+  const float nmPerDegLon = nmPerDegLat * (float)cos(centroidLat * PI / 180.0);
+  const float maxSwingSq = (float)(MAX_SWING_NM * MAX_SWING_NM);
   for (uint16_t step = 0; step < spanCount; step++) {
     uint16_t idx = (newestIdx + ANCHORAGE_RING_SIZE - step) % ANCHORAGE_RING_SIZE;
-    double d = calculateHaversineDistance(centroidLat, centroidLon,
-                                          anchorageRing[idx].lat, anchorageRing[idx].lon);
-    if (d > maxSwingNm) maxSwingNm = d;
+    float dy = (float)(anchorageRing[idx].lat - centroidLat) * nmPerDegLat;
+    float dx = (float)(anchorageRing[idx].lon - centroidLon) * nmPerDegLon;
+    if (dx * dx + dy * dy > maxSwingSq) return;
   }
-  if (maxSwingNm > MAX_SWING_NM) return;
-  if (depthRange < MIN_DEPTH_CHANGE_FT || depthRange > MAX_DEPTH_CHANGE_FT) return;
-  if (depthAvg > DeepestAnchorage_Ft_AllTime) DeepestAnchorage_Ft_AllTime = depthAvg;
+  DeepestAnchorage_Ft_AllTime = depthAvg;
 }
 
 // Single source of truth for "engine is spinning" (tach gate).
@@ -4220,6 +4426,8 @@ void CheckAlarms() {
   // ========== MANUAL LATCH RESET ==========
   if (ResetAlarmLatch == 1) {
     alarmLatch = false;
+    alarmLatchReal = false;
+    g_alarmLatchKeep = 0;
     ResetAlarmLatch = 0;
     queueConsoleMessage("ALARM LATCH: Manually reset");
   }
@@ -4233,6 +4441,10 @@ void CheckAlarms() {
   } else {
     outputAlarmState = currentAlarmCondition;
   }
+  // The INA228 block above reads the real chip in demo too: its overvoltage latch is real and outlives the exit
+  if (demoSeal && AlarmLatchEnabled == 1 && (alarmBits & (1UL << 17))) alarmLatchReal = true;
+  // Retained copy for the next software reset; in demo only the latch's real part, never one from simulated readings.
+  g_alarmLatchKeep = (demoSeal ? alarmLatchReal : alarmLatch) ? ALARM_LATCH_KEEP_TAG : 0;
 
   // ========== SILENCE ==========
   // Silence (the buzzer is continuous) mutes the condition sounding now. Clears after 10 s with nothing sounding (a held
@@ -4255,6 +4467,9 @@ void CheckAlarms() {
     alarmSilenced = false;
     alarmSilencedBits = 0;
   }
+  // A Silence in force rides the retained latch, or the restart would start the buzzer again for the same alarm. Not in
+  // demo: its Silence acts on simulated alarms.
+  if (alarmSilenced && !demoSeal && g_alarmLatchKeep == ALARM_LATCH_KEEP_TAG) g_alarmLatchKeep = ALARM_LATCH_KEEP_MUTED_TAG;
 
   // ========== FINAL OUTPUT CONTROL ==========
   bool finalOutput = false;
@@ -4576,6 +4791,21 @@ void zeroCorrFollowOffset(float delta) {
   }
   queueConsoleMessageF("Zero correction: learned offset moved %+.2f A with the current offset (correction off)", delta);
 }
+// Reset Zero, web task: the cleared equation goes to NVS with the press, since the field-off save that would carry it
+// can be an engine run away. handleAltZeroReset() clears RAM and the history file on the loop.
+void zeroFitClearNvs() {
+  const float z = 0.0f;
+  nvs_handle_t h;
+  if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_i32(h, "ZFitValid", 0);
+  nvs_set_i32(h, "ZFitSensor", ZF_BOARD);
+  nvs_set_blob(h, "ZFitC", &z, sizeof(float));
+  nvs_set_blob(h, "ZFitB", &z, sizeof(float));
+  nvs_set_blob(h, "ZFitR2", &z, sizeof(float));
+  nvs_set_u32(h, "ZFitEpoch", 0);
+  nvs_commit(h);
+  nvs_close(h);
+}
 
 void handleAltZeroReset() {
   if (ResetDynamicAltZero == 1) {
@@ -4756,35 +4986,411 @@ bool inaWriteAdcConfig(uint16_t word) {
   return (((uint16_t)hi << 8) | lo) == word;
 }
 
-// Returns 0..OV_HIST_BINS-1, or -1 if raw bus voltage is at/below Bulk (struct + bin layout
-// documented at the OvTelemetry declaration in Xregulator.ino).
-int ovHistBin(float rawV) {
-  float k = (float)SYSTEM_VOLTAGE_CLASS / 12.0f;
-  float v = rawV - BulkVoltage;  // volts above Bulk (raw)
-  if (v <= 0.0f) return -1;
-  float fineW = 0.2f * k, fineTop = 3.6f * k;  // 18 fine bins; top ≈18V at a 14.4 Bulk
-  if (v < fineTop) return (int)(v / fineW);  // 0..17
-  float c = (v - fineTop) / (1.0f * k);
-  if (c < (float)OV_HIST_COARSE_BINS) return OV_HIST_FINE_BINS + (int)c;  // 18..29
-  return OV_HIST_BINS - 1;  // 30 overflow
+// ===== Battery wear record (BatteryWear, Xregulator.ino) =====
+// Box edges; a value equal to an edge falls in the box above it. batteryWearJson() prints these tables with the data.
+// Voltage boxes are 0.1 V where damage rates climb steeply (13-17 V): with the per-box average voltage, a damage rate
+// growing e-fold per 0.1 V comes out within about 4 % of the full trace (simulated 2026-11-11).
+static const float BW_V_EDGES_12V[BW_V_BINS - 1] = {
+  10.5f, 11.0f, 11.5f, 12.0f, 12.5f,
+  13.0f, 13.1f, 13.2f, 13.3f, 13.4f, 13.5f, 13.6f, 13.7f, 13.8f, 13.9f,
+  14.0f, 14.1f, 14.2f, 14.3f, 14.4f, 14.5f, 14.6f, 14.7f, 14.8f, 14.9f,
+  15.0f, 15.1f, 15.2f, 15.3f, 15.4f, 15.5f, 15.6f, 15.7f, 15.8f, 15.9f,
+  16.0f, 16.1f, 16.2f, 16.3f, 16.4f, 16.5f, 16.6f, 16.7f, 16.8f, 16.9f,
+  17.0f, 18.0f, 20.0f, 24.0f };
+static const float BW_T_EDGES_F[BW_T_KNOWN - 1]     = { 14.0f, 32.0f, 41.0f, 50.0f, 68.0f, 86.0f, 104.0f, 122.0f };
+static const float BW_SOC_EDGES[BW_SOC_BINS - 2]    = { 10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f, 70.0f, 80.0f, 90.0f, 95.0f };
+static const float BW_RATE_EDGES_C[BW_RATE_BINS - 1] = { 0.02f, 0.05f, 0.1f, 0.2f, 0.5f, 1.0f };
+static const float BW_CSOC_EDGES[BW_CSOC_BINS - 2]  = { 50.0f, 80.0f };
+static const float BW_CYC_EDGES[BW_CYC_BINS - 1]    = { 5.0f, 10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f, 70.0f, 80.0f, 90.0f };
+static const float BW_FULL_EDGES_D[BW_FULL_BINS - 1] = { 1.0f, 2.0f, 4.0f, 7.0f, 14.0f, 30.0f, 60.0f };
+
+static inline int bwBinOf(float x, const float *edges, int n) {   // n edges -> box 0..n
+  int i = 0;
+  while (i < n && x >= edges[i]) i++;
+  return i;
+}
+static inline void bwAddDs(uint32_t &ds, uint8_t &carry, uint32_t dtMs) {
+  const uint32_t t = (uint32_t)carry + dtMs;
+  ds += t / 100UL;
+  carry = (uint8_t)(t % 100UL);
+}
+static inline void bwAddCah(uint32_t &cah, uint32_t &res, uint64_t mAms) {   // 0.01 Ah = 36,000,000 mA ms
+  const uint64_t t = (uint64_t)res + mAms;
+  cah += (uint32_t)(t / 36000000ULL);
+  res = (uint32_t)(t % 36000000ULL);
+}
+static inline uint32_t bwNowEpoch() { return clockIsReal() ? (uint32_t)time(nullptr) : 0; }
+
+void batteryWearClear(BatteryWear &w) {
+  memset(&w, 0, sizeof(w));
+  w.vMaxTDf = BW_NO_TEMP_DF;
+  w.tMaxDf = BW_NO_TEMP_DF;
+  w.tMinChgDf = BW_NO_TEMP_DF;
+  w.socMin = 255;
+  w.lastSocBin = BW_SOC_BINS - 1;
+  w.headMagic = BW_MAGIC;
+  w.magic = BW_MAGIC;
 }
 
-// Called once per control tick in every mode — field state does not gate it, because external
-// charge sources (solar, shore) can drive bus OV with the field off and must still be captured.
-void updateOvHistogram(float rawV, bool vTrusted, uint32_t nowMs) {
-  static uint32_t lastMs = 0;
-  static int lastBin = -1;
-  uint32_t dt = (lastMs == 0) ? 0 : (nowMs - lastMs);
-  if (dt > 1000) dt = 1000;  // clamp: never attribute a boot/stall gap to a bin
-  lastMs = nowMs;
-  int bin = vTrusted ? ovHistBin(rawV) : -1;   // an ignored or held reading is no dwell, and ends the event
-  if (bin < 0) {
-    lastBin = -1;
-    return;
+static void bwCycCount(BatteryWear &w, uint16_t a, uint16_t b, uint32_t halves) {
+  const uint16_t d = (a > b) ? a - b : b - a;
+  const int cb = bwBinOf(d / 10.0f, BW_CYC_EDGES, BW_CYC_BINS - 1);
+  w.cycHalf[cb] += halves;
+  w.cycDepthSum[cb] += (uint32_t)d * halves;
+  w.cycMidSum[cb] += (uint32_t)((a + b) / 2) * halves;
+}
+
+// Streaming rainflow (ASTM E1049 three-point): a range at least as large as the one before it closes that one, as a full cycle,
+// or as a half cycle when it holds the start of history.
+static void bwRfPush(BatteryWear &w, uint16_t p) {
+  uint16_t *s = w.rfStack;
+  if (w.rfN >= BW_RF_DEPTH) {   // residue full: retire the oldest leg as a half cycle
+    bwCycCount(w, s[0], s[1], 1);
+    memmove(&s[0], &s[1], (BW_RF_DEPTH - 1) * sizeof(uint16_t));
+    w.rfN--;
   }
-  ovTel().timeMs[bin] += dt;
-  if (bin != lastBin) ovTel().events[bin]++;
-  lastBin = bin;
+  s[w.rfN++] = p;
+  while (w.rfN >= 3) {
+    const int n = w.rfN;
+    const uint16_t X = (s[n - 1] > s[n - 2]) ? s[n - 1] - s[n - 2] : s[n - 2] - s[n - 1];
+    const uint16_t Y = (s[n - 2] > s[n - 3]) ? s[n - 2] - s[n - 3] : s[n - 3] - s[n - 2];
+    if (X < Y) break;
+    if (n == 3) { bwCycCount(w, s[0], s[1], 1); s[0] = s[1]; s[1] = s[2]; w.rfN = 2; }
+    else { bwCycCount(w, s[n - 3], s[n - 2], 2); s[n - 3] = s[n - 1]; w.rfN -= 2; }
+  }
+}
+
+static void bwRfTick(BatteryWear &w, float soc) {
+  const uint16_t s = (uint16_t)constrain(lroundf(soc * 10.0f), 0L, 1000L);
+  if (w.rfN == 0) { w.rfStack[0] = s; w.rfN = 1; w.rfExt = s; w.rfDir = 0; return; }
+  if (w.rfDir == 0) {
+    const uint16_t s0 = w.rfStack[w.rfN - 1];
+    if (s >= s0 + BW_RF_HYST) { w.rfDir = 1; w.rfExt = s; }
+    else if (s + BW_RF_HYST <= s0) { w.rfDir = -1; w.rfExt = s; }
+  } else if (w.rfDir > 0) {
+    if (s > w.rfExt) w.rfExt = s;
+    else if (s + BW_RF_HYST <= w.rfExt) { bwRfPush(w, w.rfExt); w.rfDir = -1; w.rfExt = s; }
+  } else {
+    if (s < w.rfExt) w.rfExt = s;
+    else if (s >= w.rfExt + BW_RF_HYST) { bwRfPush(w, w.rfExt); w.rfDir = 1; w.rfExt = s; }
+  }
+}
+
+// Wall-clock interval, regulator-off time included: the battery sits partly charged whether or not anything is watching.
+static void bwFullTick(BatteryWear &w, float soc, uint32_t nowE) {
+  if (!nowE) return;
+  if (soc >= 99.0f) {
+    if (w.fullAway && w.fullLastEpoch && nowE > w.fullLastEpoch) {
+      const uint32_t gap = nowE - w.fullLastEpoch;
+      const int fb = bwBinOf(gap / 86400.0f, BW_FULL_EDGES_D, BW_FULL_BINS - 1);
+      w.fullN[fb]++;
+      w.fullSumS[fb] += gap;
+    }
+    w.fullAway = 0;
+    w.fullLastEpoch = nowE;
+  } else if (soc < 97.0f) {
+    w.fullAway = 1;
+  }
+}
+
+// Once per control tick in every mode: solar or shore power can stress the battery with the field off. mainVoltsOk is the
+// tick's trust in its own battery reading (tier 3 reads the second sensor, tier 4 none).
+void batteryWearTick(const TickSnapshot &tick, bool mainVoltsOk) {
+  BatteryWear &w = batWear();
+  static uint32_t lastMs = 0;
+  // Observed time with no real clock, the part below one second (whole seconds go into lastAliveEpoch). One per record:
+  // shared, a no-clock demo spell would be taken off the real record's next gap. A new demo copy starts its own from zero.
+  static uint64_t unstampedReal = 0, unstampedDemo = 0;
+  static const BatteryWear *lastRec = nullptr;
+  if (&w != lastRec) {
+    if (&w != &g_batWear) unstampedDemo = 0;
+    lastRec = &w;
+  }
+  uint64_t &unstampedMs = (&w == &g_batWear) ? unstampedReal : unstampedDemo;
+  uint32_t dt = (lastMs == 0) ? 0 : (tick.nowMs - lastMs);
+  lastMs = tick.nowMs;
+  if (dt > 1000) dt = 1000;   // a stall is not time at a condition
+
+  // An external battery-voltage source reads at the battery itself, past a long ground wire.
+  float v = NAN, ext;
+  if (BatteryVoltageSource != 0 && chargeDecisionExternalV(ext)) v = ext;
+  else if (mainVoltsOk) v = tick.currentBatteryVoltage;
+  // Just after demo exit the probe still holds the simulated value until the 1-Wire task's first real read: unknown until then,
+  // so a demo temperature never reaches the grids or the lifetime extremes.
+  const float tF = (battTempActiveSrc == 1 && owRoleDemoStale(TR_BATT)) ? NAN : battTempActiveF;
+  const float iA = (HAS_BATT_SHUNT && bcurFresh()) ? Bcur : netMonCurrentA();   // + = charging, NAN = none
+  const float soc = socDecisionOk() ? socShownX100() / 100.0f : NAN;
+  const uint32_t nowE = bwNowEpoch();
+  // Producing, or its output unknown: the record never clears the alternator on a reading it cannot trust.
+  const bool altUnknown = !altAmpsFresh() || IgnoreAltCurrent || LimpHome;
+  const bool altMaybe = !gpio4IsLow && (altUnknown || MeasuredAmps > NoOutputAmps);
+
+  const bool tKnown = isfinite(tF);
+  const int tb = tKnown ? bwBinOf(tF, BW_T_EDGES_F, BW_T_KNOWN - 1) : BW_T_BINS - 1;
+  const int16_t tDf = tKnown ? (int16_t)constrain(lroundf(tF * 10.0f), -32000L, 32000L) : BW_NO_TEMP_DF;
+  const int sb = isfinite(soc) ? bwBinOf(soc, BW_SOC_EDGES, BW_SOC_BINS - 2) : BW_SOC_BINS - 1;
+
+  // Time the record saw nothing: regulator off, a demo spell. Counted against the SoC last seen before it.
+  if (nowE) {
+    if (w.sinceEpoch == 0) w.sinceEpoch = nowE;
+    if (w.lastAliveEpoch != 0 && nowE > w.lastAliveEpoch) {
+      const uint32_t gap = nowE - w.lastAliveEpoch;
+      if (gap > 5) {
+        w.unobservedS += gap;
+        w.unobsSocS[(w.lastSocBin < BW_SOC_BINS) ? w.lastSocBin : BW_SOC_BINS - 1] += gap;
+        w.gapCount++;
+      }
+    }
+    w.lastAliveEpoch = nowE;
+    unstampedMs = 0;
+  } else {
+    // Observed with no real clock: not a gap. Its whole seconds move the stamp itself, which the record carries through
+    // restarts and power-offs; counted in RAM, a session that never got the clock was later taken as time not recorded.
+    unstampedMs += dt;
+    if (w.lastAliveEpoch != 0) w.lastAliveEpoch += (uint32_t)(unstampedMs / 1000ULL);
+    unstampedMs %= 1000ULL;
+  }
+  w.lastSocBin = (uint8_t)sb;
+
+  bwAddDs(w.stDs[sb][tb], w.stRes, dt);
+  if (tKnown) w.tSumDfMs[tb] += (int64_t)tDf * (int64_t)dt;
+
+  if (isfinite(v) && v > 1.0f) {
+    const float v12 = v * 12.0f / (float)SYSTEM_VOLTAGE_CLASS;
+    const int vb = bwBinOf(v12, BW_V_EDGES_12V, BW_V_BINS - 1);
+    const uint32_t mv12 = (uint32_t)lroundf(fminf(v12, 65.0f) * 1000.0f);
+    bwAddDs(w.vtDs[vb][tb], w.vtRes, dt);
+    w.vSumMvMs[vb] += (uint64_t)mv12 * dt;
+    if (altMaybe) bwAddDs(w.vAltDs[vb], w.vAltRes, dt);
+    if (isfinite(iA)) {
+      bwAddDs(w.vIDs[vb], w.vIRes, dt);
+      w.iSumMaMs[vb] += (int64_t)lroundf(constrain(iA, -5000.0f, 5000.0f) * 1000.0f) * (int64_t)dt;
+    }
+    if (mv12 > w.vMaxMv12) { w.vMaxMv12 = (uint16_t)mv12; w.vMaxTDf = tDf; w.vMaxEpoch = nowE; }
+  } else {
+    bwAddDs(w.noVoltDs, w.noVoltCarry, dt);
+  }
+
+  if (isfinite(iA)) {
+    const float c = fabsf(iA) / (float)max(1, BatteryCapacity_Ah);
+    const int rb = bwBinOf(c, BW_RATE_EDGES_C, BW_RATE_BINS - 1);
+    const uint64_t mAms = (uint64_t)lroundf(fminf(fabsf(iA), 5000.0f) * 1000.0f) * dt;
+    if (iA >= 0.0f) {
+      const int cb = isfinite(soc) ? bwBinOf(soc, BW_CSOC_EDGES, BW_CSOC_BINS - 2) : BW_CSOC_BINS - 1;
+      bwAddCah(w.chgCah[tb][rb][cb], w.chgRes, mAms);
+      // Other sources are not measured, so the alternator is credited first, up to its whole output.
+      if (altMaybe) {
+        const float share = (altUnknown || iA <= 0.0f) ? 1.0f : fminf(1.0f, MeasuredAmps / iA);
+        bwAddCah(w.chgAltCah[tb][rb][cb], w.chgAltRes, (uint64_t)((double)mAms * share));
+      }
+      if (tKnown && c > BW_RATE_EDGES_C[0] && (w.tMinChgDf == BW_NO_TEMP_DF || tDf < w.tMinChgDf)) {
+        w.tMinChgDf = tDf; w.tMinChgEpoch = nowE;
+      }
+    } else {
+      bwAddCah(w.disCah[tb][rb], w.disRes, mAms);
+    }
+  }
+
+  if (tKnown && (w.tMaxDf == BW_NO_TEMP_DF || tDf > w.tMaxDf)) { w.tMaxDf = tDf; w.tMaxEpoch = nowE; }
+  if (isfinite(soc)) {
+    const uint8_t s = (uint8_t)constrain(lroundf(soc), 0L, 100L);
+    if (w.socMin == 255 || s < w.socMin) { w.socMin = s; w.socMinEpoch = nowE; }
+    bwRfTick(w, soc);
+    bwFullTick(w, soc, nowE);
+  }
+}
+
+// One JSON shape for /getBatteryWear and the cloud's battery_wear: sparse (non-empty boxes only), seconds and Ah as
+// decimals, box edges included. Returns the length, or 0 if cap was too small.
+size_t batteryWearJson(char *buf, size_t cap, const BatteryWear &w) {
+  size_t n = 0;
+  bool over = false;
+  auto put = [&](const char *fmt, ...) {
+    if (over) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf + n, cap - n, fmt, ap);
+    va_end(ap);
+    if (r < 0 || (size_t)r >= cap - n) { over = true; return; }
+    n += (size_t)r;
+  };
+  auto edges = [&](const char *name, const float *e, int cnt, const char *fmt) {
+    put("\"%s\":[", name);
+    for (int i = 0; i < cnt; i++) { put(i ? "," : ""); put(fmt, (double)e[i]); }
+    put("]");
+  };
+  auto opt = [&](bool ok, const char *fmt, double val) { if (ok) put(fmt, val); else put("null"); };
+
+  put("{\"v\":3,\"k\":%.2f,\"cap_ah\":%d,\"since\":%lu,\"unobs_s\":%lu,\"gaps\":%lu,\"no_v_s\":%lu.%lu,\"edges\":{",
+      (double)SYSTEM_VOLTAGE_CLASS / 12.0, (int)BatteryCapacity_Ah, (unsigned long)w.sinceEpoch,
+      (unsigned long)w.unobservedS, (unsigned long)w.gapCount,
+      (unsigned long)(w.noVoltDs / 10UL), (unsigned long)(w.noVoltDs % 10UL));
+  edges("v12", BW_V_EDGES_12V, BW_V_BINS - 1, "%.1f");  put(",");
+  edges("t_f", BW_T_EDGES_F, BW_T_KNOWN - 1, "%.0f");   put(",");
+  edges("soc", BW_SOC_EDGES, BW_SOC_BINS - 2, "%.0f");  put(",");
+  edges("rate_c", BW_RATE_EDGES_C, BW_RATE_BINS - 1, "%.2f"); put(",");
+  edges("csoc", BW_CSOC_EDGES, BW_CSOC_BINS - 2, "%.0f"); put(",");
+  edges("cyc", BW_CYC_EDGES, BW_CYC_BINS - 1, "%.0f");   put(",");
+  edges("full_d", BW_FULL_EDGES_D, BW_FULL_BINS - 1, "%.0f");
+  put("},\"vt\":[");
+  bool first = true;
+  for (int vb = 0; vb < BW_V_BINS; vb++)
+    for (int tb = 0; tb < BW_T_BINS; tb++) {
+      const uint32_t ds = w.vtDs[vb][tb];
+      if (!ds) continue;
+      put("%s[%d,%d,%lu.%lu]", first ? "" : ",", vb, tb, (unsigned long)(ds / 10UL), (unsigned long)(ds % 10UL));
+      first = false;
+    }
+  put("],\"vb\":[");
+  first = true;
+  for (int vb = 0; vb < BW_V_BINS; vb++) {
+    uint32_t ds = 0;
+    for (int tb = 0; tb < BW_T_BINS; tb++) ds += w.vtDs[vb][tb];
+    if (!ds) continue;
+    put("%s[%d,%.3f,%lu.%lu,%lu.%lu,%lu.%lu,", first ? "" : ",", vb,
+        (double)w.vSumMvMs[vb] / ((double)ds * 100.0) / 1000.0,
+        (unsigned long)(ds / 10UL), (unsigned long)(ds % 10UL),
+        (unsigned long)(w.vAltDs[vb] / 10UL), (unsigned long)(w.vAltDs[vb] % 10UL),
+        (unsigned long)(w.vIDs[vb] / 10UL), (unsigned long)(w.vIDs[vb] % 10UL));
+    opt(w.vIDs[vb] > 0, "%.2f", w.vIDs[vb] ? (double)w.iSumMaMs[vb] / ((double)w.vIDs[vb] * 100.0) / 1000.0 : 0.0);
+    put("]");
+    first = false;
+  }
+  put("],\"t_avg\":[");
+  for (int tb = 0; tb < BW_T_KNOWN; tb++) {
+    uint32_t ds = 0;
+    for (int sb = 0; sb < BW_SOC_BINS; sb++) ds += w.stDs[sb][tb];
+    put(tb ? "," : "");
+    opt(ds > 0, "%.1f", ds ? (double)w.tSumDfMs[tb] / ((double)ds * 100.0) / 10.0 : 0.0);
+  }
+  put("],\"st\":[");
+  first = true;
+  for (int sb = 0; sb < BW_SOC_BINS; sb++)
+    for (int tb = 0; tb < BW_T_BINS; tb++) {
+      const uint32_t ds = w.stDs[sb][tb];
+      if (!ds) continue;
+      put("%s[%d,%d,%lu.%lu]", first ? "" : ",", sb, tb, (unsigned long)(ds / 10UL), (unsigned long)(ds % 10UL));
+      first = false;
+    }
+  put("],\"chg\":[");
+  first = true;
+  for (int tb = 0; tb < BW_T_BINS; tb++)
+    for (int rb = 0; rb < BW_RATE_BINS; rb++)
+      for (int cb = 0; cb < BW_CSOC_BINS; cb++) {
+        const uint32_t c = w.chgCah[tb][rb][cb], a = w.chgAltCah[tb][rb][cb];
+        if (!c && !a) continue;
+        put("%s[%d,%d,%d,%lu.%02lu,%lu.%02lu]", first ? "" : ",", tb, rb, cb, (unsigned long)(c / 100UL), (unsigned long)(c % 100UL),
+            (unsigned long)(a / 100UL), (unsigned long)(a % 100UL));
+        first = false;
+      }
+  put("],\"dis\":[");
+  first = true;
+  for (int tb = 0; tb < BW_T_BINS; tb++)
+    for (int rb = 0; rb < BW_RATE_BINS; rb++) {
+      const uint32_t c = w.disCah[tb][rb];
+      if (!c) continue;
+      put("%s[%d,%d,%lu.%02lu]", first ? "" : ",", tb, rb, (unsigned long)(c / 100UL), (unsigned long)(c % 100UL));
+      first = false;
+    }
+  put("],\"unobs_soc\":[");
+  for (int sb = 0; sb < BW_SOC_BINS; sb++) put("%s%lu", sb ? "," : "", (unsigned long)w.unobsSocS[sb]);
+  put("],\"cyc\":[");
+  first = true;
+  for (int cb = 0; cb < BW_CYC_BINS; cb++) {
+    const uint32_t h = w.cycHalf[cb];
+    if (!h) continue;
+    put("%s[%d,%lu,%.1f,%.1f]", first ? "" : ",", cb, (unsigned long)h,
+        w.cycDepthSum[cb] / (10.0 * h), w.cycMidSum[cb] / (10.0 * h));
+    first = false;
+  }
+  put("],\"cyc_open\":[");
+  for (int i = 0; i < w.rfN && i < BW_RF_DEPTH; i++) put("%s%.1f", i ? "," : "", w.rfStack[i] / 10.0);
+  if (w.rfN && w.rfDir) put(",%.1f", w.rfExt / 10.0);
+  put("],\"full\":[");
+  first = true;
+  for (int fb = 0; fb < BW_FULL_BINS; fb++) {
+    const uint32_t c = w.fullN[fb];
+    if (!c) continue;
+    put("%s[%d,%lu,%.2f]", first ? "" : ",", fb, (unsigned long)c, w.fullSumS[fb] / (86400.0 * c));
+    first = false;
+  }
+  const uint32_t nowE = bwNowEpoch();
+  put("],\"full_last\":%lu,\"since_full_s\":", (unsigned long)w.fullLastEpoch);
+  if (!w.fullLastEpoch || !nowE) put("null");
+  else put("%lu", (unsigned long)((w.fullAway && nowE > w.fullLastEpoch) ? nowE - w.fullLastEpoch : 0));
+  put(",\"ext\":{\"vmax\":");
+  opt(w.vMaxMv12 > 0, "%.3f", w.vMaxMv12 / 1000.0);
+  put(",\"vmax_at\":%lu,\"vmax_tf\":", (unsigned long)w.vMaxEpoch);
+  opt(w.vMaxTDf != BW_NO_TEMP_DF, "%.1f", w.vMaxTDf / 10.0);
+  put(",\"tmax_f\":");
+  opt(w.tMaxDf != BW_NO_TEMP_DF, "%.1f", w.tMaxDf / 10.0);
+  put(",\"tmax_at\":%lu,\"tmin_chg_f\":", (unsigned long)w.tMaxEpoch);
+  opt(w.tMinChgDf != BW_NO_TEMP_DF, "%.1f", w.tMinChgDf / 10.0);
+  put(",\"tmin_chg_at\":%lu,\"soc_min\":", (unsigned long)w.tMinChgEpoch);
+  opt(w.socMin != 255, "%.0f", (double)w.socMin);
+  put(",\"soc_min_at\":%lu}}", (unsigned long)w.socMinEpoch);
+  return over ? 0 : n;
+}
+
+// NVS checksums a blob from the source, then reads the source again to write it, and the loop changes the live record every
+// tick: write from a private copy (firmware-internals.md, "NVS blobs are written from a copy").
+// Field cut only: saveNVSDataFull() also runs from owner reset buttons and demo entry, which can come with the field on.
+// Skipping costs nothing: the RTC copy keeps the record until the next field-cut save.
+bool batteryWearSaveTo(nvs_handle_t h) {
+  if (!gpio4IsLow) return false;
+  g_batWearLastSaveMs = millis();   // also on a failure: one try per hour, never every pass
+  const bool ownerReset = g_batWearSaveReq;
+  g_batWearSaveReq = false;
+  if (g_batWearStoredForeign && !ownerReset) return false;   // only an owner's reset replaces a record this image cannot read
+  BatteryWear *copy = (BatteryWear *)ps_malloc(sizeof(BatteryWear));
+  if (!copy) return false;
+  memcpy(copy, &g_batWear, sizeof(BatteryWear));
+  const bool ok = nvsNote(nvs_set_blob(h, "BattWear", copy, sizeof(BatteryWear))) == ESP_OK;
+  free(copy);
+  if (ok) g_batWearStoredForeign = false;
+  return ok;
+}
+
+// Records import: rec (a validated BatteryWear) becomes the NVS copy, or nullptr erases it. The live RTC copy is
+// invalidated so the import reboot loads the NVS one; importRebootPending keeps every saver off it until then.
+bool batteryWearImport(const uint8_t *rec, size_t n) {
+  nvs_handle_t h;
+  if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) return false;
+  bool ok;
+  if (rec) ok = nvs_set_blob(h, "BattWear", rec, n) == ESP_OK;
+  else { const esp_err_t e = nvs_erase_key(h, "BattWear"); ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND); }
+  if (ok) ok = nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  if (ok) { g_batWear.magic = 0; g_batWear.headMagic = 0; }
+  return ok;
+}
+
+// Boot only: a demo-exit reload must not roll the live record back to the last save.
+void batteryWearLoadFrom(nvs_handle_t h) {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  size_t sz = 0;
+  const bool stored = nvs_get_blob(h, "BattWear", nullptr, &sz) == ESP_OK;
+  // The factory image is never updated, so a stored record of another size came from a newer release: batteryWearSaveTo
+  // keeps off it. On any other image that record is an older layout, and the first save replaces it.
+  g_batWearStoredForeign = stored && sz != sizeof(BatteryWear) && otaRunningFactory();
+  if (g_batWearRtcValid) return;
+  if (!stored || sz != sizeof(BatteryWear)) return;   // none, or another layout
+  BatteryWear *tmp = (BatteryWear *)ps_malloc(sizeof(BatteryWear));
+  if (!tmp) return;
+  if (nvs_get_blob(h, "BattWear", tmp, &sz) == ESP_OK && tmp->magic == BW_MAGIC && tmp->headMagic == BW_MAGIC) memcpy(&g_batWear, tmp, sizeof(BatteryWear));
+  free(tmp);
+}
+
+// Field cut only (a flash write stalls the cache): the loop's hourly save and a reset's rewrite.
+void batteryWearSaveNow() {
+  if (hardwarePresent != 1 || demoSeal || importRebootPending) return;
+  nvs_handle_t h;
+  if (nvsNote(nvs_open("storage", NVS_READWRITE, &h)) != ESP_OK) { g_batWearLastSaveMs = millis(); return; }
+  batteryWearSaveTo(h);
+  nvsNote(nvs_commit(h));
+  nvs_close(h);
 }
 
 // BATTERY_TYPE is free text from Vessel Info, so substring-match the common lithium spellings.
@@ -5201,6 +5807,7 @@ void _ReadAnalogInputs_inner() {
       if (isfinite(inaDieTempF) && inaDieWarmup >= INA_DIETEMP_WARMUP_SAMPLES) {   // the field-drive heat ceiling's input: out of range ages it like a missing read
         g_fdDieTempF = inaDieTempF;
         MARK_FRESH(IDX_INA_DIE_TEMP);
+        g_fdDieMs = dataTimestamps[IDX_INA_DIE_TEMP];
       }
       if (!isfinite(inaDieTempF)) {
         inaDiePrevF = NAN;               // bad read re-arms corroboration; the next sample cannot feed the max either
@@ -5378,9 +5985,11 @@ void _ReadAnalogInputs_inner() {
                            }
 
                            // Out of range = sensor unpowered/unplugged: never published. MeasuredAmps holds, the UI greys
-                           // it by age, and REASON_CURRENT_STALE cuts the field after 10 s.
+                           // it by age, and REASON_CURRENT_STALE cuts the field after 75 rejected samples (~1 s; 10 s with the field off).
                            const bool ampsSane = ampsCand > -kNegLim[rIdx] && ampsCand < kSanityLim[rIdx];
                            g_altAmpsOutOfRange = !ampsSane;
+                           if (ampsSane) adsMissRun[1] = 0;
+                           else if (adsMissRun[1] < 255) adsMissRun[1]++;
                            {
                              static bool ampsWasSane = true;
                              if (ampsSane != ampsWasSane) {
@@ -5564,8 +6173,10 @@ void _ReadAnalogInputs_inner() {
 
   // §10.2 / §10.3 / §1.4: stale rules counted in ADS cycles (a long loop pass is not a dead input), with a 3 s
   // wall-clock backstop that counts only while the state machine steps. CH0: 4 cycles -> REASON_VOLTAGE2_STALE /
-  // mask bit 4. CH2: 10 cycles, or no ADS1115, reads as a stopped engine for every consumer.
+  // mask bit 4. CH2: 10 cycles, or no ADS1115, reads as a stopped engine for every consumer. CH1: 75 cycles (~1 s) ->
+  // REASON_CURRENT_STALE while the field is energized (buildTickSnapshot, which keeps the 10 s wall-clock rule for the rest).
   {
+    g_altAmpsRunLost = adsMissRun[1] >= 75;
     uint32_t nowMs = millis();
     bool stepping = (ADS1115Disconnected == 0) && ((uint32_t)(nowMs - adsLastStepMs) < 1000UL);
     uint32_t ageV = (dataTimestamps[IDX_BATTERY_V] == 0) ? nowMs : (nowMs - dataTimestamps[IDX_BATTERY_V]);
@@ -5643,6 +6254,132 @@ void _ReadAnalogInputs_inner() {
   }
 
   // IMU FIFO drain runs in drainIMUFifo(), called from loop() after AdjustFieldLearnMode()
+}
+
+// ── Demo mode: the field driver's own inputs from the real chips ─────────────
+// demoReadSensors calls this every pass. Each read is the matching block above at the same or a slower cadence, into the
+// g_fd* globals only. INADisconnected and ADS1115Disconnected keep their entry values, so a chip that dies in demo reads as
+// stale; the INA228 alone is re-armed, as below.
+static bool demoInaGone = false;   // stands in for the 3 s INADisconnected line in demo: slow poll, no die read, no ADC switch
+void demoReadFieldDriveReal() {
+  const bool fieldOn = !gpio4IsLow;
+  // INA228 bus at inaReadInterval (demoReadSensors keeps the fast/slow ADC switch). The three hardware OV re-arms of
+  // _ReadAnalogInputs_inner (§1.4) are repeated here: a chip reset in demo otherwise leaves BOVL at maximum = hardware OV off.
+  static uint32_t lastBusMs = 0, lastValidMs = 0, fieldOnMs = 0;
+  static uint8_t missRun = 0;
+  static bool missRunFieldOn = false, prevFieldOn = false, lastMissI2c = false, missRunHadI2c = false;
+  if (INADisconnected == 0 && millis() - lastBusMs >= (demoInaGone ? INA_SLOW_INTERVAL_MS : inaReadInterval)) {
+    lastBusMs = millis();
+    float busV = INA.getBusVoltage();
+    const int busErr = INA.getLastError();
+    if (busErr == 0 && demoInaGone) {
+      demoInaGone = false;
+      missRunHadI2c = false;
+      INA.begin();
+      inaApplyConfig();
+      queueConsoleMessage("INA228 responding again — chip re-initialized, hardware overvoltage protection re-armed");
+    }
+    if (ShuntLead == 1 && demoRealShunt()) {
+      const float shuntMv = INA.getShuntVoltage() * 1000;
+      if (INA.getLastError() == 0 && !isnan(shuntMv)) busV -= (InvertBattAmps ? -1.0f : 1.0f) * shuntMv / 1000.0f;
+    }
+    if ((busErr == 0) && !isnan(busV) && busV > 5.0 && busV < fminf(85.0f, 70.0f * ((float)SYSTEM_VOLTAGE_CLASS / 12.0f))) {
+      g_fdBusV = busV;
+      lastValidMs = millis();
+      if (missRun > 0 && missRunHadI2c) {
+        g_inaQuietConfig = true;
+        inaApplyConfig();
+        g_inaQuietConfig = false;
+        queueConsoleMessageF("INA228 back after %u dropped reads — configuration and hardware overvoltage threshold re-applied", (unsigned)missRun);
+      }
+      missRunHadI2c = false;
+      missRun = 0;
+    } else {
+      lastMissI2c = (busErr != 0);
+      if (busErr != 0) missRunHadI2c = true;
+      if (missRun == 0) missRunFieldOn = fieldOn;
+      if (missRun < 255) missRun++;
+    }
+  }
+  {
+    const uint32_t nowMs = millis();
+    if (fieldOn && !prevFieldOn) fieldOnMs = nowMs;
+    prevFieldOn = fieldOn;
+    const uint32_t age = (lastValidMs == 0) ? nowMs : (nowMs - lastValidMs);
+    const uint32_t sinceValid = (fieldOn && (nowMs - fieldOnMs) < age) ? (nowMs - fieldOnMs) : age;
+    const bool fieldOnRule = fieldOn || (missRun > 0 && missRunFieldOn);
+    g_fdBusStale = (INADisconnected != 0) || (missRun >= (fieldOnRule ? 10 : 3)) || (sinceValid > (fieldOnRule ? 1000UL : 5000UL));
+    if (lastMissI2c && missRun >= 3 && age > 3000UL) demoInaGone = true;
+  }
+  static uint32_t lastBovlCheckMs = 0;
+  if (INADisconnected == 0 && !demoInaGone && millis() - lastBovlCheckMs >= 30000UL) {
+    lastBovlCheckMs = millis();
+    const uint16_t bovl = INA.getBusOvervoltageTH();
+    if (INA.getLastError() == 0 && bovl != inaExpectedBovlLsb()) {
+      queueConsoleMessageF("INA228 hardware overvoltage threshold read back as 0x%04X, expected 0x%04X — re-applying", (unsigned)bovl, (unsigned)inaExpectedBovlLsb());
+      g_inaQuietConfig = true;
+      inaApplyConfig();
+      g_inaQuietConfig = false;
+    }
+  }
+  // Die, 1 Hz. DIETEMP's power-on 0 C is gone long before demo can start; only a re-init since (g_inaDieRewarm) discards again.
+  static uint32_t lastDieMs = 0;
+  static uint8_t dieDiscard = 0;
+  if (INADisconnected == 0 && !demoInaGone && millis() - lastDieMs >= INA_DIETEMP_INTERVAL_MS) {
+    lastDieMs = millis();
+    if (g_inaDieRewarm) {
+      g_inaDieRewarm = false;
+      dieDiscard = INA_DIETEMP_WARMUP_SAMPLES;
+    }
+    float tC = INA.getTemperature();
+    const bool readOk = (INA.getLastError() == 0);
+    if (tC > 256.0f) tC -= 512.0f;
+    if (readOk && tC > -60.0f && tC < 150.0f) {
+      if (dieDiscard > 0) {
+        dieDiscard--;
+      } else {
+        g_fdDieTempF = tC * 1.8f + 32.0f;
+        g_fdDieMs = millis();
+      }
+    }
+  }
+  // Thermistor, only as the alternator temperature: CH3 alone, one conversion per 40 ms (its rate in the full cycle). It drives
+  // adsState / adsTriggeredChannel itself, so a conversion in flight at either seam is read as the channel it was.
+  if (TempSource == 1 && ADS1115Disconnected == 0) {
+    static uint32_t lastThermTrigMs = 0;
+    const uint32_t nowMs = millis();
+    if (adsState != ADS_IDLE) {
+      if (nowMs - adsStateEntered >= ADS_CONVERSION_MS) {
+        Wire.beginTransmission(0x48);
+        Wire.write(ADS1115_REG_POINTER_CONVERT);
+        const uint8_t endStatus = Wire.endTransmission(false);
+        const uint8_t n = Wire.requestFrom((uint8_t)0x48, (uint8_t)2);
+        if (endStatus == 0 && n == 2 && Wire.available() >= 2) {
+          const uint8_t hi = Wire.read();
+          const uint8_t lo = Wire.read();
+          if (adsTriggeredChannel == 3) {
+            const float v = (int16_t)(((uint16_t)hi << 8) | lo) / 32768.0 * 6.144;
+            const float c = (v < 0.05f) ? -99.0f : thermistorTempC(v);
+            const int f = (int)(c * 1.8f + 32.0f);
+            if (c > -98.5f && f > -58 && f < 392) {
+              g_fdThermF = f;
+              g_fdThermMs = millis();
+            }
+          }
+        } else {
+          while (Wire.available()) Wire.read();
+        }
+        adsState = ADS_IDLE;
+      }
+    } else if (nowMs - lastThermTrigMs >= 40) {
+      lastThermTrigMs = nowMs;
+      adsTriggeredChannel = 3;
+      adc.setMux(adsMuxCodes[3]);
+      adc.triggerConversion();
+      adsStateEntered = millis();
+      adsState = ADS_WAIT;
+    }
+  }
 }
 
 // ── IMU FIFO Drain ────────────────────────────────────────────────────────────
@@ -6330,12 +7067,18 @@ void initializeNVS() {
 }
 // Synchronous full write — for setup() and emergency use only.
 // Not safe to call from loop() — blocks for up to 200ms.
+// Every set in the full save goes through nvsNote; undefined again right after the function.
+#define nvs_set_blob(...) nvsNote(nvs_set_blob(__VA_ARGS__))
+#define nvs_set_i32(...) nvsNote(nvs_set_i32(__VA_ARGS__))
+#define nvs_set_u16(...) nvsNote(nvs_set_u16(__VA_ARGS__))
+#define nvs_set_u32(...) nvsNote(nvs_set_u32(__VA_ARGS__))
+#define nvs_set_u64(...) nvsNote(nvs_set_u64(__VA_ARGS__))
 void saveNVSDataFull() {
   if (importRebootPending) return;   // a records import just wrote these keys; the reboot loads them
   if (hardwarePresent != 1 || demoSeal) return;   // demo mode: the accumulators in RAM are the demo's (exit reloads the real ones)
   uint32_t _nvsT0 = millis();
   nvs_handle_t h;
-  esp_err_t err = nvs_open("storage", NVS_READWRITE, &h);
+  esp_err_t err = nvsNote(nvs_open("storage", NVS_READWRITE, &h));
   if (err != ESP_OK) {
     queueConsoleMessage("ERROR: Failed to open NVS");
     Serial.println("ERROR: Failed to open NVS");
@@ -6399,6 +7142,11 @@ void saveNVSDataFull() {
   if (prev_AvgSpeed_AllTime != (int32_t)(AvgSpeed_AllTime * 100))           { nvs_set_i32(h, "AvgSpd_AT",      (int32_t)(AvgSpeed_AllTime * 100));             prev_AvgSpeed_AllTime = (int32_t)(AvgSpeed_AllTime * 100);           chg = true; }
   putBlob("SpdAccum_AT",  speedAccumulator_AllTime,          prev_spdAccum_AllTime);
   if (prev_spdTime_AllTime   != (uint32_t)totalSpeedSampleTime_AllTime)     { nvs_set_u32(h, "SpdTime_AT",     (uint32_t)totalSpeedSampleTime_AllTime);        prev_spdTime_AllTime   = (uint32_t)totalSpeedSampleTime_AllTime;     chg = true; }
+  // A Reset Avg Speed the loop has not applied yet saves as zero, or the next boot would bring the old average back.
+  { const bool spdRst = avgSpeedResetRequested;
+    putBlob("SpdAccum", spdRst ? 0.0 : speedAccumulator, prev_spdAccum);
+    const uint32_t spdT = spdRst ? 0u : (uint32_t)totalSpeedSampleTime;
+    if (prev_spdTime != spdT) { nvs_set_u32(h, "SpdTime", spdT); prev_spdTime = spdT; chg = true; } }
   if (prev_AvgSOC != (int32_t)(AvgSOC * 100))                               { nvs_set_i32(h, "AvgSOC",         (int32_t)(AvgSOC * 100));                       prev_AvgSOC = (int32_t)(AvgSOC * 100);                               chg = true; }
   // SOC alltime + voltage AllTime accumulators + battery state
   { uint64_t sc = (uint64_t)(socAccumulator_AllTime * 100.0);
@@ -6508,14 +7256,17 @@ void saveNVSDataFull() {
     if (ring) {
       uint16_t head;
       time_t epoch;
+      bool real;
       do {
         head = baroHistoryHead;
         memcpy(ring, baroPressureHistory, BARO_HISTORY_SIZE * sizeof(uint16_t));
-        epoch = baroHistoryLastEpoch;
+        epoch = baroGapNvsEpoch ? (time_t)baroGapNvsEpoch : baroHistoryLastEpoch;   // a marked boot gap: served 0, stored here (baroMarkBootGap)
+        real = baroEpochReal;
       } while (head != baroHistoryHead);
       nvs_set_blob(h, "BaroHist",     ring, BARO_HISTORY_SIZE * sizeof(uint16_t));
       nvs_set_u16(h,  "BaroHistHead", head);
-      nvs_set_u32(h,  "BaroHistEpch", (uint32_t)epoch);
+      // Bit 0 = stamped by a real clock: the next cold boot may then measure the off time exactly (baroGapService).
+      nvs_set_u32(h,  "BaroHistEpch", epoch ? (((uint32_t)epoch & ~1UL) | (real ? 1UL : 0UL)) : 0);
       free(ring);
       prev_baroHistoryHead = head;
       chg = true;
@@ -6528,8 +7279,11 @@ void saveNVSDataFull() {
     nvs_set_u32(h, "SoftClockEp", (uint32_t)getCurrentTimestamp());
     chg = true;
   }
+  // Every observed tick changes it. Shutdown, field-off drain and planned-reboot saves always write it; the boot save waits
+  // (g_batWearHourlyOnly), since a soft reset keeps the RTC copy anyway.
+  if ((!g_batWearHourlyOnly || g_batWearSaveReq || (uint32_t)(millis() - g_batWearLastSaveMs) >= 3600000UL) && batteryWearSaveTo(h)) chg = true;
 
-  if (chg) nvs_commit(h);
+  if (chg) nvsNote(nvs_commit(h));
   nvs_close(h);
   overheatSafeTimeFlush();
   lastNVSSaveTime = millis();
@@ -6537,6 +7291,31 @@ void saveNVSDataFull() {
   nvsFullSaveLastMs = (_nvsElapsed > 65535UL) ? 65535 : (uint16_t)_nvsElapsed;
   if (nvsFullSaveLastMs > nvsFullSaveWorstMs) nvsFullSaveWorstMs = nvsFullSaveLastMs;
   nvsFullSaveCount++;
+}
+#undef nvs_set_blob
+#undef nvs_set_i32
+#undef nvs_set_u16
+#undef nvs_set_u32
+#undef nvs_set_u64
+
+// The four lifetime energy counters alone, written with the solar ledger's live-day blob (sledWrite) so a power cut at
+// anchor brings them back no older than that blob's baselines. Callers hold the field cut; u32 items need no copy.
+// Shares saveNVSDataFull's prev_ shadows: each key is written only when it moved, and its shadow takes the value written.
+void saveEnergyCountersNvs() {
+  if (importRebootPending) return;   // a records import just wrote these keys; the reboot loads them
+  if (hardwarePresent != 1 || demoSeal) return;
+  const uint32_t c = (uint32_t)ChargedEnergy_AllTime, d = (uint32_t)DischargedEnergy_AllTime;
+  const uint32_t a = (uint32_t)AlternatorChargedEnergy_AllTime, s = (uint32_t)SolarChargedEnergy_AllTime;
+  if (c == prev_ChargedEnergy_AllTime && d == prev_DischrgdEnergy_AllTime
+      && a == prev_AltChrgdEnergy_AllTime && s == prev_SolarEnergy_AllTime) return;
+  nvs_handle_t h;
+  if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) return;
+  if (c != prev_ChargedEnergy_AllTime)  { nvs_set_u32(h, "ChrgdEng_AT", c);   prev_ChargedEnergy_AllTime = c; }
+  if (d != prev_DischrgdEnergy_AllTime) { nvs_set_u32(h, "DschrgEng_AT", d);  prev_DischrgdEnergy_AllTime = d; }
+  if (a != prev_AltChrgdEnergy_AllTime) { nvs_set_u32(h, "AltChrgEng_AT", a); prev_AltChrgdEnergy_AllTime = a; }
+  if (s != prev_SolarEnergy_AllTime)    { nvs_set_u32(h, "SolarEng_AT", s);   prev_SolarEnergy_AllTime = s; }
+  nvs_commit(h);
+  nvs_close(h);
 }
 
 
@@ -6559,6 +7338,7 @@ bool fieldCutSettled(uint32_t extraMs) {
 
 // Do not add a periodic NVS save: nvs_commit() blocks Core 1 for hundreds of ms during sector erase. All NVS
 // persistence goes through saveNVSDataFull() at the field-off edge and at shutdown, both with the field off.
+// One exception: the battery wear blob also saves hourly while the field stays cut (loop(), batteryWearSaveNow()).
 
 // First-boot SoC seed, run at the end of setup() so IBV and the vessel-info values are real (defaults at loadNVSData).
 // With Vessel Info never saved it waits: saveVesselInfoToNvs() re-invokes it, so it never runs on compile-time defaults.
@@ -6723,6 +7503,9 @@ void loadNVSData() {
   // Session Travel Statistics
   if (nvs_get_i32(nvs_handle, "TotalDist100", &temp_int32) == ESP_OK) TotalDistance = temp_int32 / 100.0f;
   if (nvs_get_i32(nvs_handle, "AvgSpeed", &temp_int32) == ESP_OK) AvgSpeed = temp_int32 / 100.0f;
+  required_size = sizeof(double);
+  nvs_get_blob(nvs_handle, "SpdAccum", &speedAccumulator, &required_size);
+  if (nvs_get_u32(nvs_handle, "SpdTime", &temp_uint32) == ESP_OK) totalSpeedSampleTime = temp_uint32;
 
   if (nvs_get_i32(nvs_handle, "TotDist100_AT", &temp_int32) == ESP_OK) TotalDistance_AllTime = temp_int32 / 100.0f;
   if (nvs_get_i32(nvs_handle, "AvgSpd_AT", &temp_int32) == ESP_OK) AvgSpeed_AllTime = temp_int32 / 100.0f;
@@ -6913,12 +7696,144 @@ void loadNVSData() {
     nvs_get_u16(nvs_handle, "BaroHistHead", (uint16_t *)&baroHistoryHead);
     uint32_t epochTmp = 0;
     nvs_get_u32(nvs_handle, "BaroHistEpch", &epochTmp);
-    baroHistoryLastEpoch = (time_t)epochTmp;
+    baroHistoryLastEpoch = (time_t)(epochTmp & ~1UL);
+    baroEpochReal = (epochTmp & 1UL) != 0;
     prev_baroHistoryHead = baroHistoryHead;
   }
+  batteryWearLoadFrom(nvs_handle);
 
   nvs_close(nvs_handle);
   //queueConsoleMessage("NVS: Persistent data loaded successfully");
+}
+
+// ── Barometer ring across a reboot ──────────────────────────────────────────
+// script.js and the GX app place ring slot k at "newest epoch - k x 10 min" and read 0 as no sample, so each sample a reboot
+// missed needs an empty slot, or pre-off pressure plots as the last hours and the 3 h tendency reaches across the off time.
+#define BARO_GAP_UNKNOWN_SLOTS 18   // the tendency's 3 h look-back: an unmeasured gap is at least this, so the tendency never spans it
+static uint32_t baroGapSlots = 0;       // empty slots the boot marker wrote
+static uint16_t baroGapHeadAfter = 0;   // head just after them: the samples taken since start here
+static uint32_t baroGapPreEpoch = 0;    // the newest pre-gap sample's epoch
+static uint32_t baroGapMarkMs = 0;      // millis() at the marker
+static bool baroGapRemeasure = false;   // cold boot: measure again once the clock is real (baroGapService)
+static bool baroGapPreReal = false;     // the pre-gap epoch was stamped by a real clock (baroEpochReal as loaded)
+#define BARO_GAP_KEEP (BARO_GAP_UNKNOWN_SLOTS + 6)   // the 3 h floor plus an hour of samples taken before the clock is real
+static uint16_t baroGapOldest[BARO_GAP_KEEP];   // the ring's oldest samples as the marker found them, put back if the gap shrinks
+
+// Once per boot, from setup() after restoreSoftClock() and before the saveNVSDataFull() that persists the marked ring.
+void baroMarkBootGap() {
+  baroFirstSamplePending = true;
+  if (!baroPressureHistory) return;
+  bool any = false;
+  for (uint16_t i = 0; i < BARO_HISTORY_SIZE && !any; i++) any = baroPressureHistory[i] != 0;
+  if (!any) return;
+  const uint32_t ivS = BARO_SAMPLE_INTERVAL_MS / 1000UL;
+  const uint32_t eLast = (uint32_t)baroHistoryLastEpoch;
+  const uint32_t now = (uint32_t)getCurrentTimestamp();   // 0 = no clock
+  const bool measurable = eLast > 0 && now >= eLast;
+  const uint32_t intervals = measurable ? (now - eLast) / ivS : 0;
+  uint32_t slots = intervals >= 2 ? intervals - 1 : 0;   // the next sample fills the last interval
+  const bool preReal = baroEpochReal;
+  const bool exact = measurable && (softClockRetained || (clockIsReal() && preReal));   // one clock ran through the off time, or a real one at both ends
+  if (!exact) {
+    if (softClockRetained || g_bootSoftReset) {
+      slots = 0;   // a firmware restart takes seconds; with no clock to measure, nothing is added
+    } else {
+      // Cold boot: the clock is the NVS estimate, which leaves out the off time.
+      if (slots < BARO_GAP_UNKNOWN_SLOTS) slots = BARO_GAP_UNKNOWN_SLOTS;
+      baroGapRemeasure = eLast > 0;
+    }
+  }
+  // First sample: at the next 10-min slot after a short restart, so the cadence holds; at once after a gap.
+  lastBaroSampleMs = millis() - ((slots == 0 && measurable) ? min(now - eLast, ivS) : ivS) * 1000UL;
+  if (slots == 0) return;
+  for (uint16_t i = 0; i < BARO_GAP_KEEP; i++) baroGapOldest[i] = baroPressureHistory[(baroHistoryHead + i) % BARO_HISTORY_SIZE];
+  if (slots >= BARO_HISTORY_SIZE) {
+    memset(baroPressureHistory, 0, BARO_HISTORY_SIZE * sizeof(uint16_t));
+    prev_baroHistoryHead = 0xFFFF;   // head unchanged: the boot save must still store the cleared ring
+  } else {
+    for (uint32_t i = 0; i < slots; i++) baroPressureHistory[(baroHistoryHead + i) % BARO_HISTORY_SIZE] = 0;
+    baroHistoryHead = (baroHistoryHead + slots) % BARO_HISTORY_SIZE;
+  }
+  baroGapSlots = slots;
+  baroGapHeadAfter = baroHistoryHead;
+  baroGapPreEpoch = eLast;
+  baroGapPreReal = preReal;
+  baroGapMarkMs = millis();
+  // The tendency compares the live pressure with 18 slots before the newest FILLED slot, which stays pre-gap until a sample
+  // lands, so the served epoch is 0 (unknown) until then. NVS keeps the newest empty slot's time for the next boot to measure from.
+  baroGapNvsEpoch = !now ? 0 : exact ? eLast + slots * ivS : now - ivS;
+  baroEpochReal = exact ? preReal : clockIsReal();
+  baroHistoryLastEpoch = 0;
+  queueConsoleMessageF("Barometer history: %lu empty slots for the time off (%s)", (unsigned long)slots,
+                       exact ? "measured" : "length unknown, at least 3 h");
+}
+
+// Cold boot: the marker's gap is a floor and the clock an estimate. Once a real clock arrives, grow the gap to the measured off
+// time, moving the samples taken since up with it, and put the newest sample's epoch on the real clock. Shrinks it only when
+// the pre-off epoch was stamped by a real clock too (baroGapPreReal): one from a session with no real clock lags the truth, so
+// a measurement under 3 h could still put a pre-off sample in the tendency's look-back.
+void baroGapService() {
+  if (!baroGapRemeasure || !clockIsReal() || demoPhase != DEMO_OFF || !baroPressureHistory) return;   // demo: the ring is its copy
+  baroGapRemeasure = false;
+  const uint32_t ivS = BARO_SAMPLE_INTERVAL_MS / 1000UL;
+  const uint16_t n = BARO_HISTORY_SIZE;
+  const int64_t markReal = (int64_t)timeBase + (int32_t)(baroGapMarkMs - (uint32_t)timeBaseMillis) / 1000;
+  const uint16_t post = (uint16_t)((baroHistoryHead + n - baroGapHeadAfter) % n);   // samples taken since the marker
+  if (post) { baroHistoryLastEpoch = timeBase + (int32_t)(lastBaroSampleMs - (uint32_t)timeBaseMillis) / 1000; baroEpochReal = true; }
+  else if (baroGapNvsEpoch && markReal > (int64_t)ivS) { baroGapNvsEpoch = (uint32_t)(markReal - ivS); baroEpochReal = true; }
+  if (markReal <= (int64_t)baroGapPreEpoch) return;
+  const uint32_t intervals = (uint32_t)((markReal - (int64_t)baroGapPreEpoch) / ivS);
+  const uint32_t want = intervals >= 2 ? intervals - 1 : 0;
+  const bool shrink = baroGapPreReal && want < baroGapSlots;
+  // A ring turned over since the marker (post would alias) or already past the gap has nothing left to move.
+  if ((want <= baroGapSlots && !shrink) || baroGapSlots + post >= n
+      || (uint32_t)(millis() - baroGapMarkMs) >= (uint32_t)(n - 1) * BARO_SAMPLE_INTERVAL_MS) return;
+  if (shrink) {
+    const uint32_t cut = baroGapSlots - want;
+    const uint16_t h = baroHistoryHead;
+    for (uint16_t i = 0; i < post; i++) baroPressureHistory[(baroGapHeadAfter + n - cut + i) % n] = baroPressureHistory[(baroGapHeadAfter + i) % n];   // oldest first
+    // The cut slots at the head are the ring's oldest again: baroGapOldest goes back, slot j counted from the head the marker found.
+    for (uint32_t i = 0; i < cut; i++) {
+      const uint32_t j = want + post + i;
+      baroPressureHistory[(h + n - cut + i) % n] = j < BARO_GAP_KEEP ? baroGapOldest[j] : 0;
+    }
+    baroHistoryHead = (h + n - cut) % n;
+    if (!post && !want) { baroHistoryLastEpoch = baroGapPreEpoch; baroGapNvsEpoch = 0; }   // no gap after all: the pre-off sample is the newest again
+    prev_baroHistoryHead = 0xFFFF;   // the boot save stored the 3 h floor
+    queueConsoleMessageF("Barometer history: time off measured with the real clock, %lu empty slots", (unsigned long)want);
+    return;
+  }
+  uint32_t grow = want - baroGapSlots;
+  if (grow > (uint32_t)(n - post - baroGapSlots)) grow = n - post - baroGapSlots;   // every pre-off sample is older than the ring
+  const uint16_t h = baroHistoryHead;
+  for (uint16_t i = 1; i <= post; i++) baroPressureHistory[(h + grow + n - i) % n] = baroPressureHistory[(h + n - i) % n];   // newest first
+  for (uint32_t i = 0; i < grow; i++) baroPressureHistory[(baroGapHeadAfter + i) % n] = 0;
+  baroHistoryHead = (h + grow) % n;
+  queueConsoleMessageF("Barometer history: time off measured with the real clock, %lu empty slots", (unsigned long)(baroGapSlots + grow));
+}
+
+// Leaving demo: the real ring is back as it was at entry (demoExitBegin, then loadNVSData), so the samples the demo span missed
+// need empty slots as a reboot's do. From demoReloadWork(), while the loop's sampler is held (demoStoresBusy()). lastBaroSampleMs
+// is the last real sample's again, so the next one is due at once; it waits for a real reading (demoExitBegin cleared baroPressure).
+void baroMarkDemoGap() {
+  baroFirstSamplePending = true;
+  if (!baroPressureHistory) return;
+  const uint32_t eLast = (uint32_t)baroHistoryLastEpoch;   // as stored at entry
+  if (baroGapNvsEpoch) baroHistoryLastEpoch = 0;           // a boot gap still waiting for its first sample: served 0 again
+  const uint32_t intervals = (uint32_t)(millis() - lastBaroSampleMs) / BARO_SAMPLE_INTERVAL_MS;
+  const uint32_t slots = intervals >= 2 ? intervals - 1 : 0;   // the next sample fills the last interval
+  if (slots == 0) return;
+  if (slots >= BARO_HISTORY_SIZE) {
+    memset(baroPressureHistory, 0, BARO_HISTORY_SIZE * sizeof(uint16_t));
+    prev_baroHistoryHead = 0xFFFF;
+  } else {
+    for (uint32_t i = 0; i < slots; i++) baroPressureHistory[(baroHistoryHead + i) % BARO_HISTORY_SIZE] = 0;
+    baroHistoryHead = (baroHistoryHead + slots) % BARO_HISTORY_SIZE;
+  }
+  // As at boot: the epoch is served as 0 until a sample lands, and NVS keeps the newest empty slot's time.
+  if (eLast) baroGapNvsEpoch = eLast + slots * (BARO_SAMPLE_INTERVAL_MS / 1000UL);
+  baroHistoryLastEpoch = 0;
+  queueConsoleMessageF("Barometer history: %lu empty slots for the time in demo", (unsigned long)slots);
 }
 void initNVSCache() {
   // Session cache
@@ -6959,6 +7874,8 @@ void initNVSCache() {
   prev_AvgSpeed_AllTime = (int32_t)(AvgSpeed_AllTime * 100);
   prev_spdAccum_AllTime = speedAccumulator_AllTime;
   prev_spdTime_AllTime  = (uint32_t)totalSpeedSampleTime_AllTime;
+  prev_spdAccum = speedAccumulator;
+  prev_spdTime  = (uint32_t)totalSpeedSampleTime;
   prev_vltAccum_AllTime = voltageAccumulator_AllTime;
   prev_vltTime_AllTime  = (uint32_t)totalVoltageSampleTime_AllTime;
   prev_pwrTime_AllTime  = (uint32_t)totalPoweredTime_AllTime;

@@ -1158,7 +1158,7 @@ class Gen:
             if rule != 'ascending' or pat + '{i}' not in [c['keyPattern'] for c in item['columns']]:
                 self.err(ln, tid, 'validate=%s: only ascending:<column key prefix> is understood' % opts['validate'])
             elif not self.ascending_rule_present():
-                self.err(ln, tid, 'validateLearningTable in script.js no longer checks strictly increasing values')
+                self.err(ln, tid, 'validateLearningTable in script.js no longer checks every row above 0 and strictly increasing')
             item['validate'] = {'rule': rule, 'keyPattern': pat + '{i}'}
         if 'capMode' in opts:
             self.cap_tables.append((ln, item, opts['capMode']))   # its select may be listed after the table
@@ -1170,8 +1170,16 @@ class Gen:
         return item
 
     def ascending_rule_present(self):
+        # The rule the GX enforces (xreg_core _rpm_ascending): one pass over all ten rows refusing a row at or below 0 and
+        # a row not above the one before. A loop bounded short of row 10 would let trailing zero rows through again.
         body = self.js.body('validateLearningTable') or ''
-        return 'rpmValues[i] <= rpmValues[i - 1]' in body and 'Zero RPM values are only allowed at the end' in body
+        for m in re.finditer(r'for \(let i = 0; i < 10; i\+\+\) \{', body):
+            b = m.end() - 1
+            loop = body[b:match_close(body, b, '{', '}') + 1]
+            if (re.search(r'if \(rpmValues\[i\] <= 0\) \{\s*errors\.push\(', loop)
+                    and re.search(r'if \(i > 0 && rpmValues\[i\] <= rpmValues\[i - 1\]\) \{\s*errors\.push\(', loop)):
+                return True
+        return False
 
     def panel_title(self, form):
         for a in form.ancestors():

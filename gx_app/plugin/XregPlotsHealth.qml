@@ -93,9 +93,7 @@ Item {
 		// the session's dots, after the turn that shows the tab
 		Qt.callLater(() => {
 			moveClock()
-			if (liveRows.length)
-				liveRows = []
-			adoptSession()
+			adoptSession()   // keeps the live dots newer than the file's arrival; an unstamped file counts as arriving now
 		})
 	}
 	VeQuickItem { id: liveTemp; uid: tab.svc + "/Live/AltTemp" }
@@ -188,13 +186,17 @@ Item {
 		// read value, not valid: inside a value-change handler valid may not have caught up yet
 		const txt = sessCsv.value !== undefined && sessCsv.value !== null ? String(sessCsv.value) : ""
 		let nowMs = null, rows = [], prev = null
-		const at = Date.now() / 1000
+		let at = Date.now() / 1000
 		for (const ln of txt.split("\n")) {
 			if (!ln.length)
 				continue
 			if (ln[0] === "#") {
 				const mm = ln.match(/nowMs=(\d+)/)
 				if (mm) nowMs = +mm[1]
+				// the bridge's arrival stamp: a copy adopted later (a tab return, a first build) keeps its own time; none
+				// (an older bridge) leaves it at now. Never ahead of now, should the GX clock have been set back since.
+				const ga = ln.match(/gxAt=(\d+(?:\.\d+)?)/)
+				if (ga) at = Math.min(at, +ga[1])
 				continue
 			}
 			const c = ln.split(",")

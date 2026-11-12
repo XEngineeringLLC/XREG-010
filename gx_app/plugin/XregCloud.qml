@@ -71,7 +71,14 @@ Item {
 		onTriggered: page.refreshTapped = false
 	}
 	VeQuickItem { id: msgItem; uid: page.svc + "/Cloud/Message" }
-	VeQuickItem { id: asOfItem; uid: page.svc + "/Cloud/AsOf" }
+	VeQuickItem {
+		id: asOfItem
+		uid: page.svc + "/Cloud/AsOf"
+		// invalid only when nothing may stay on show (Cloud Features off, not registered, demo left); an empty
+		// /Cloud/Json means only that the page stopped asking
+		onValueChanged: if (!(value > 0)) page.model = null
+		onValidChanged: if (!valid) page.model = null
+	}
 	VeQuickItem {
 		id: jsonItem
 		uid: page.svc + "/Cloud/Json"

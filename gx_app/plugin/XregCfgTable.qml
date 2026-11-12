@@ -17,6 +17,7 @@ Item {
 	property var aux: ({})
 	property var edits: ({})
 	property var pending: ({})
+	property var sent: ({})     // the last Save's own edits, kept for its answer: settleTimer clears pending before a late one
 	property int rev
 	property string statusText
 	property bool wroteSinceOpen
@@ -125,6 +126,7 @@ Item {
 	function discardEdits() {
 		edits = ({})
 		pending = ({})
+		sent = ({})
 		if (statusText === "Unsaved changes")
 			statusText = ""
 	}
@@ -192,27 +194,24 @@ Item {
 			rowIndex: r
 		})
 	}
-	// The app's validateLearningTable: strictly increasing up to the last non-zero row, zeros only at the end.
+	// The app's validateLearningTable and the bridge's _rpm_ascending: every row above 0 and higher than the row before.
+	// The firmware lookup has no unused rows: a 0 in the last row would apply that row's limits at every engine speed.
 	function validate() {
 		const vr = tableCfg.validate
 		if (!vr)
 			return ""
 		const col = cols.find(c => c.keyPattern === vr.keyPattern)
+		const rule = "All ten rows need an engine speed, each higher than the row above."
 		const v = []
-		for (let i = 0; i < nRows; i++)
-			v.push(Number(cellValue(col, i)) || 0)
-		let last = -1
-		for (let i = nRows - 1; i >= 0; i--)
-			if (v[i] !== 0) { last = i; break }
-		for (let i = 1; i <= last; i++)
-			if (v[i] <= v[i - 1])
-				return "RPM values must increase. Row " + (i + 1) + " (" + v[i] + ") must be greater than Row " + i + " (" + v[i - 1] + ")"
-		let seen = false
-		for (let i = nRows - 1; i >= 0; i--) {
-			if (v[i] !== 0)
-				seen = true
-			else if (seen)
-				return "Zero RPM values are only allowed at the end of the table. Found zero at row " + (i + 1)
+		for (let i = 0; i < nRows; i++) {
+			const raw = cellValue(col, i)
+			if (raw === undefined || raw === null)
+				return "Waiting for the table from the regulator"
+			v.push(Number(raw))
+			if (!(v[i] > 0))    // NaN too: a blank is refused here, never sent
+				return "Row " + (i + 1) + " RPM must be greater than 0. " + rule
+			if (i > 0 && v[i] <= v[i - 1])
+				return "RPM values must increase. Row " + (i + 1) + " (" + v[i] + ") must be greater than Row " + i + " (" + v[i - 1] + "). " + rule
 		}
 		return ""
 	}
@@ -251,6 +250,7 @@ Item {
 			const until = Date.now() + 3000
 			for (const k in edits)
 				pending[k] = { value: edits[k], until: until }
+			sent = Object.assign({}, edits)
 			edits = ({})
 			statusText = "Saving..."
 			wroteSinceOpen = true
@@ -280,10 +280,17 @@ Item {
 		if (stale || !tableCfg || res.key !== tableCfg.tableId)
 			return
 		if (!res.ok) {
+			// the refused edits back in their cells, under any typed since, so Save sends them again
+			for (const k in sent)
+				if (!(k in edits))
+					edits[k] = sent[k]
+			sent = ({})
 			pending = ({})
-			statusText = "Unsaved changes"
+			statusText = Object.keys(edits).length > 0 ? "Unsaved changes" : ""
 			Global.showToastNotification(VenusOS.Notification_Warning, res.message || "Not saved", 5000)
 			rev++
+		} else {
+			sent = ({})
 		}
 	}
 

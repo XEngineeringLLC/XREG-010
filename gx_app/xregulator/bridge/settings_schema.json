@@ -1,6 +1,6 @@
 {
  "version": 2,
- "generatedFrom": "web_src/index.html:a01f7508d493 web_src/script.js:b66417e394a9 gx_app/settings_keys.txt:0a9db3d14280",
+ "generatedFrom": "web_src/index.html:023fd1b1f72e web_src/script.js:29031ba073c2 gx_app/settings_keys.txt:3393c2932130",
  "endpoints": {
   "zerofitstate": {
    "path": "/zerofitstate",
@@ -1065,7 +1065,7 @@
           "integer": true
          },
          "arm": true,
-         "help": "Maximum time in Absorption before forcing a transition regardless of current. Safety fallback in case Tail Current is never reached. Typical starting point: 30m per 100Ah of battery bank. This clock only runs while the battery is held up at the Absorption Voltage, and the phase always ends at twice this figure of real elapsed time."
+         "help": "Maximum time in Absorption before forcing a transition regardless of current. Safety fallback in case Tail Current is never reached. Typical starting point: 30m per 100Ah of battery bank. This clock only runs while the battery is held up at the Absorption Voltage, and the phase always ends at twice this figure of real elapsed time, not counting time when the alternator is not charging or a followed charge voltage limit holds the battery below the Absorption Voltage."
         },
         {
          "key": "UseFloat",
@@ -1187,7 +1187,7 @@
          "group": "Float Phase",
          "min": 0,
          "max": 9999999,
-         "step": 0.01,
+         "step": 1,
          "decimals": 0,
          "unit": "min",
          "echo": {
@@ -1200,7 +1200,7 @@
           "integer": true
          },
          "arm": true,
-         "help": "Delay after Absorption completes before any rebulk is allowed. Applies in all three Float Modes (idle, voltage float, zero-current float)."
+         "help": "Delay after Absorption completes before a voltage or discharge-current rebulk is allowed. Applies in all three Float Modes (idle, voltage float, zero-current float). A state of charge at or below SoC Allow Rebulk Below rebulks without waiting."
         },
         {
          "key": "MaintainMode",
@@ -1888,7 +1888,7 @@
       "integer": true
      },
      "arm": true,
-     "help": "On: each complete day moves the performance ratio toward what the panels delivered. Needs a forecast and a VE.Direct link. Off: the ratio stays as entered."
+     "help": "On: each day moves the performance ratio toward what the panels delivered. Needs a forecast and a VE.Direct link. Off: the ratio stays as entered."
     },
     {
      "key": "solarLearnRatePct",
@@ -2521,7 +2521,9 @@
       "integer": true
      },
      "arm": true,
-     "help": "No starts demo mode and switches the field off. A simulated boat drives every reading, and once you switch the field on, its output follows those readings. Nothing is saved or uploaded, and any setting you change lasts only until you switch back to Yes, which brings back the real readings, records, and settings. The field then stays off until you switch it on."
+     "confirm": "Start demo mode?\n\nThe field switches off and every reading comes from a simulated boat until Hardware Present is set back to Yes.",
+     "confirmWhen": 0,
+     "help": "No starts demo mode and switches the field off. A simulated boat drives every reading, and once you switch the field on, its output follows those readings. Nothing is saved or uploaded, most settings are refused, and any setting you can change lasts only until you switch back to Yes, which brings back the real readings, records, and settings. The field then stays off until you switch it on."
     },
     {
      "key": "PhysicalPanelOverride",

@@ -12,14 +12,14 @@
 # release is already out: gx_changelog.sh writes the changelog entry, xregbackup2 snapshots the source as
 # PUBLISHED_gx<release>_<date> (the commit the next version's changelog diffs from), and the published files and the
 # entry go into that snapshot's gx_release/.
-# Needs: supabase CLI logged in, openssl, $PRIVATE_KEY, a plugin built at this version (build_plugin.sh); for the
-# record, the claude CLI and xregbackup2 in ~/.zshrc.
+# Needs: supabase CLI logged in, openssl, $PRIVATE_KEY, PySide6 (build_package.py runs build_plugin.sh when the built
+# plugin is not plugin/ as it is now); for the record, the claude CLI and xregbackup2 in ~/.zshrc.
 # Usage: gx_app/publish_gx.sh ["notes"]
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PRIVATE_KEY="/Users/joeceo/private_key.pem"
-SUPABASE_WORKDIR="/Users/joeceo/Projects/Cloud Workspace"   # storage commands run from the supabase-linked dir
+PRIVATE_KEY="${PRIVATE_KEY:-$HOME/private_key.pem}"
+SUPABASE_WORKDIR="${SUPABASE_WORKDIR:-$HOME/Projects/Cloud Workspace}"   # storage commands run from the supabase-linked dir
 OTA_BUCKET="ota"
 SUPABASE_PUBLIC_BASE="https://qnbekuaoweuteylitzvo.supabase.co/storage/v1/object/public/${OTA_BUCKET}"
 OTA_PUBLIC="https://ota.xengineering.net"   # what the bridge and the docs link read
@@ -131,7 +131,8 @@ CL_ENTRY="$RECORD/changelog_entry.md"
 CL_RC=${PIPESTATUS[0]}
 
 SNAP_NAME="PUBLISHED_gx${REL}_$(date +%Y-%m-%d)"
-# xregbackup2's folder ($HOME is /Users/joeceo there); a test gives HOME a stand-in .zshrc that defines xregbackup2
+# xregbackup2's folder (it writes under the owner's home, which is $HOME); a test gives HOME a stand-in .zshrc that
+# defines xregbackup2, and sets PRIVATE_KEY and SUPABASE_WORKDIR
 SNAP="$HOME/Projects/Old Backups 2/Xregulator_$SNAP_NAME"
 echo ""
 echo "=== Source snapshot $SNAP_NAME ==="

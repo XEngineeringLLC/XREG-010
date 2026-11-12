@@ -334,6 +334,14 @@ let isDeviceRegistered = (() => { try { return sessionStorage.getItem('deviceReg
 let source; // Declare at broader scope
 
 let vesselInfoComplete = false; // Tracks if vessel info is filled out
+// False until /vessel_info.json answers 200 or 404. A timeout or other error says nothing about the unit, so it never locks the tabs.
+let vesselInfoKnown = false;
+function vesselInfoLocked() { return vesselInfoKnown && !vesselInfoComplete; }
+let _vesselReadSeq = 0, _vesselAppliedSeq = 0;   // a read answering after a newer one was applied is dropped
+let _vesselRetryTimer = null;
+let _vesselNoneBase = null;     // address that answered the 404 now applied; null while the applied answer is a record
+let _vesselFormDirty = false;   // owner changed the form since it was last painted or saved
+let _vesselPendingPaint = null; // record held back from the form while it was being edited
 
 window.vesselInfo = null; // Cache for vessel data
 
@@ -343,24 +351,29 @@ let demoInterval = null;
 
 // ===== Regulator demo mode: CSV3 hardwarePresent 0 (9_demo.ino) =====
 // Unrelated to DEMO_MODE above (the app with no regulator at all): here a real regulator simulates the boat and refuses
-// the owner actions listed below with HTTP 423.
+// every write except the ones listed below with HTTP 423.
 let g_regDemo = false;
 let g_regDemoBackfilled = false;
 const REG_DEMO_TEXT = 'Not available in demo mode. Set Hardware Present to Yes to use it.';
-// The native-form subset of demoParamDenied (9_demo.ino): those posts land in an iframe the app cannot read back. fetch() paths need no list (423 below)
-const REG_DEMO_REFUSED = new Set(['UpdateToVersion', 'commissionStart', 'startSystemID', 'startTuningSweep', 'restartCVTest',
-    'startFieldCurve', 'startKneeSweep', 'chcStart', 'cvPlantFitStart', 'fieldCutStart', 'cvStressStart', 'ResetAlternatorHealth',
-    'ResetBoatPerformance', 'RPMScalingFactor', 'AltZeroCaptureNow', 'altZeroApply', 'ResetDynamicAltZero', 'LatitudeNMEA',
-    'LongitudeNMEA', 'clearGpsManual', 'BatteryHealthTest', 'bhStartOver', 'bhClearHistory', 'capClearPoints', 'ZeroIMU',
-    'ClearIMUZero', 'FastAltClearMatrix', 'FastAltRebaseline', 'ResetRipplePeaks', 'ResetKneeLearn', 'ResetZeroLog',
-    'ClearOverheatHistory', 'ResetLearningTable', 'RebootRegulator', 'forceCloudFlush', 'CVTuningMode', 'TuningMode',
-    'ResetSolarLedger', 'ClearBuffer', 'testProtectionsEnabled']);
-// True when a form would post a refused parameter: stop values (0) of the test switches and re-enabling protections pass
+// The allow-list of demoParamDenied (9_demo.ino), for native /get forms: those posts land in an iframe the app cannot read back.
+// fetch() paths need no list (423 below)
+const REG_DEMO_ALLOWED = new Set(['OnOff', 'ManualFieldToggle', 'ManualDutyTarget', 'MaxDuty', 'MaxFieldVolts', 'MinDuty',
+    'hardwarePresent', 'ResetAlarmLatch', 'altLogStop', 'altSweepCancel', 'bhAbort', 'cancelFieldCurve', 'cancelKneeSweep',
+    'cancelSystemID', 'chcCancel', 'commissionAbort', 'commissionStop', 'cvPlantFitCancel', 'cvStressCancel', 'fieldCutCancel',
+    'protTestCancel', 'commissionHeartbeat',
+    'displayTempUnit', 'displayVolUnit', 'Ymin1', 'Ymax1', 'Ymin2', 'Ymax2', 'Ymin3', 'Ymax3', 'Ymin4', 'Ymax4', 'yyMin', 'yyMax',
+    'xTime', 'plotTimeWindow', 'timeAxisModeChanging', 'maxPoints',
+    'uid', 'tok', 'src', 'n', 'gx']);
+const REG_DEMO_ALLOWED_ZERO = new Set(['TuningMode', 'CVTuningMode', 'resTest', 'bcurRtest', 'resTestTargetA', 'protTestStart',
+    'ripGameFill', 'faCommissionGate']);   // their stop value only
+// True when a /get form would post anything off the allow-list: stop values (0) of the test switches and re-enabling protections pass
 function regDemoFormRefused(f) {
     if (!g_regDemo || !f || !f.elements) return false;
+    if (!/\/get(\?|$)/.test(f.getAttribute('action') || '')) return false;
     for (const el of f.elements) {
-        if (!el.name || !REG_DEMO_REFUSED.has(el.name)) continue;
-        if ((el.name === 'CVTuningMode' || el.name === 'TuningMode') && Number(el.value) === 0) continue;
+        if (!el.name || el.disabled || REG_DEMO_ALLOWED.has(el.name)) continue;
+        if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) continue;
+        if (REG_DEMO_ALLOWED_ZERO.has(el.name) && Number(el.value) === 0) continue;
         if (el.name === 'testProtectionsEnabled' && Number(el.value) !== 0) continue;
         return true;
     }
@@ -370,10 +383,64 @@ function regDemoOnCsv3(data) {
     const on = Number(data.hardwarePresent) === 0;
     if (on && !g_regDemo) g_regDemoBackfilled = false;
     if (!on && g_regDemo) demoCloudIframesOff();
+    const switched = on !== g_regDemo;
     g_regDemo = on;
+    // In demo CSV3 echoes the simulated bank's source (own shunt, forced), so the real one is taken only outside it
+    if (!on) g_regRealOwnSoc = Number(data.BattMonSrc) === 0 && Number(data.BatteryShuntPresent) === 1;
+    if (switched) regDemoSwitched(on);
     const exp = document.getElementById('exportConfigBtn');   // Export Config: refused in demo (the settings in RAM are the demo's)
     if (exp) exp.disabled = on;
+    const shr = document.getElementById('shareConfigBtn');    // Share to Library: the same settings, published to every boat
+    if (shr) shr.disabled = on;
     if (on && !g_regDemoBackfilled) { g_regDemoBackfilled = true; setTrackedTimeout(regDemoBackfill, 1500); }
+}
+// A demo switch leaves the page's history caches holding the other mode's samples (the GX bridge drops its own too):
+// empty them at once, and refetch the device-held ones after the regulator has swapped its stores (503 until then).
+let g_regDemoGen = 0;          // bumped at each switch; a history fetch that started before the latest one is dropped
+let g_regRealOwnSoc = null;    // last non-demo CSV3: SoC is the regulator's own shunt count (null = none seen yet)
+const REG_DEMO_SWAP_MS = 1500;
+const REG_DEMO_SOC_MS = 5 * 60 * 1000;
+const REG_DEMO_SOC_TEXT = "The regulator does not count the real battery's charge or discharge while demo mode is on. After demo mode ends, its state of charge will be off by that amount until the battery's next full charge.";
+function regDemoSwitched(on) {
+    const gen = ++g_regDemoGen;
+    // Runs inside the CSV3 handler: one failing reset must not skip the others or the rest of that frame
+    const step = f => { try { f(); } catch (e) { console.warn('demo switch reset:', e); } };
+    step(windRingReset);
+    step(thermalRingReset);
+    step(altSessReset);
+    step(() => { sledRows = []; sledLastFetchMs = 0; });   // the Solar Ledger tab refetches on its next open
+    step(() => window.baroOnDemoSwitch(gen));
+    step(() => window.ltOnDemoSwitch(gen));
+    setTrackedTimeout(() => {
+        if (gen !== g_regDemoGen) return;
+        _altTrendLastFetch = 0; _perfCurveLastFetch = 0;   // refetched on their next frame while on screen
+        if (panelOnScreen('sled-harv-plot')) solarLedgerFetch();
+        [['huntDamperCard', fetchHuntLedger], ['accStateBody', fetchAccState], ['ovtSoftCount', fetchOvTelemetry], ['bwSummary', fetchBatteryWear]].forEach(([id, f]) => {
+            const el = document.getElementById(id), d = el && el.closest('details');
+            if (d && d.open) f();
+        });
+    }, REG_DEMO_SWAP_MS);
+    if (on) setTrackedTimeout(() => regDemoSocNotice(gen), REG_DEMO_SOC_MS);
+}
+// fetchOnce resolves true on success; retried every 3 s, up to 10 tries, until then or the next switch
+function regDemoRetry(gen, fetchOnce, onGiveUp) {
+    let tries = 0;
+    const attempt = () => {
+        if (gen !== g_regDemoGen) return;
+        Promise.resolve(fetchOnce()).then(ok => {
+            if (ok || gen !== g_regDemoGen) return;
+            if (++tries < 10) setTrackedTimeout(attempt, 3000);
+            else if (onGiveUp) onGiveUp();
+        });
+    };
+    setTrackedTimeout(attempt, REG_DEMO_SWAP_MS);
+}
+// Once per demo span, in the file toast (a fixed overlay, so nothing moves). Not shown when the real SoC comes from a
+// battery monitor or there is none: then nothing goes uncounted.
+function regDemoSocNotice(gen) {
+    if (gen !== g_regDemoGen || !g_regDemo || g_regRealOwnSoc === false) return;
+    if (document.visibilityState === 'hidden') { setTrackedTimeout(() => regDemoSocNotice(gen), 10000); return; }
+    fileToast(REG_DEMO_SOC_TEXT, 15000);
 }
 // One notice per refusal however many layers saw it (fetch wrapper, cxGet, the optimistic writers)
 let _regDemoNoticeMs = 0;
@@ -1179,7 +1246,7 @@ const CSV2_FIELDS = [
     "fieldCurDutyCeil",        // the board's 10 A field-current ceiling as duty x100 (solved on the temperature-corrected resistance)
     "fieldHeatDutyCeil",       // field-drive heat ceiling as duty x100 (99 = not limiting)
     "fieldCeilBind",           // which term sets the enforced field ceiling: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the field connector, 4 heat at the D5 spreader
-    "fieldRcOhm",              // field resistance both board ceilings and Field Amps use, corrected for alternator temperature, less the 12 % margin (ohm x100)
+    "fieldRcOhm",              // field resistance Field Amps uses (and both board ceilings, outside demo), corrected for alternator temperature, less the 12 % margin (ohm x100)
     "fieldHeatLimS",           // lifetime seconds held at the heat ceiling (raw seconds)
     "fieldCurLimS",            // lifetime seconds held at the 10 A ceiling (raw seconds)
     "fieldHeatLimSesS",        // session seconds held at the heat ceiling (raw seconds; Reset on Live Data)
@@ -1428,6 +1495,7 @@ function cxRpmSparkOnCsv1(data) {
         // resTestTargetA for ripScoreArmed; the sweep-game Start-Shooting gate mirrors that arm off it.
         const a = Number(data.pidAltPV);
         cx.liveAmps = isFinite(a) ? a / 100 : NaN;
+        if (cx.rtFieldArmed) cxHoldOffCheck(data);
         if (cx.rtestState === 'leveling') cxRtTick();
         cxFdFitCursorLive();
         const idleEl = document.getElementById('chcIdleNow');   // stage 9 setup: live speed under the Start button
@@ -2107,7 +2175,7 @@ async function altLogDumpPress() {
         return;
     }
     const ts = getLogTimestamp(), sfx = getLogNameSuffix();
-    deliverFile(`altgate_${ts}${sfx}.csv`, altLogToCsv(d), 'text/csv');
+    if (!(await deliverFile(`altgate_${ts}${sfx}.csv`, altLogToCsv(d), 'text/csv'))) return;
     // The clear is arm-gated on the device (the transfer itself is not), and an 18-min recording plus a
     // drive can cross a lock (another client, or a reboot) — a 403 resolves the fetch, so it has to be
     // checked or the buffer silently stays held and the next Record warns about un-transferred rows.
@@ -2473,15 +2541,22 @@ function exportConfigDownload(){
     .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
     .then(async txt=>{
       // The equipment records (firmware /exportRecords) ride in the same file as a "records" section.
+      // The regulator ends the stream early, leaving the JSON unfinished, when a record file is saved while it is being
+      // sent. Only that is asked for again; an HTTP error or no answer is final.
       let out=txt, recErr='';
-      try{
-        const rr=await fetchWithTimeout(buildURL('/exportRecords'),{},60000);
-        if(!rr.ok) throw new Error('HTTP '+rr.status);
-        const rec=await rr.json();
-        const cfg=JSON.parse(txt);
-        if(rec&&rec.records) cfg.records=rec.records;
-        out=JSON.stringify(cfg);
-      }catch(e){ recErr=(e&&e.message)?e.message:String(e); }
+      for(let attempt=0; attempt<3; attempt++){
+        try{
+          const rr=await fetchWithTimeout(buildURL('/exportRecords'),{},60000);
+          if(!rr.ok){ recErr='HTTP '+rr.status; break; }
+          let rec;
+          try{ rec=await rr.json(); }catch(e){ recErr=(e&&e.message)?e.message:String(e); continue; }
+          const cfg=JSON.parse(txt);
+          if(rec&&rec.records) cfg.records=rec.records;
+          out=JSON.stringify(cfg);
+          recErr='';
+        }catch(e){ recErr=(e&&e.message)?e.message:String(e); }
+        break;
+      }
       const d=new Date(), p=n=>String(n).padStart(2,'0');
       const stamp=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+'-'+p(d.getMinutes())+'-'+p(d.getSeconds());
       deliverFile('regulator-config '+stamp+'.json', out, 'application/json');
@@ -2495,7 +2570,8 @@ let _cfgDiffResolve=null,_cfgDiffIncoming=null,_cfgDiffCur={},_cfgBasisKeys=[],_
 const _CFG_REC_LABELS={altHealth:'Alternator health record',boatPerf:'Boat performance curves',
   battHealth:'Battery health history (internal resistance and capacity)',solarLedger:'Solar ledger',
   zeroFitHistory:'Current-sensor zero-drift history',resonanceMap:'Resonance map',
-  damperRecord:'Oscillation damper episode record',lifetime:'Lifetime totals and records'};
+  damperRecord:'Oscillation damper episode record',lifetime:'Lifetime totals and records',
+  batteryWear:'Battery wear record'};
 function _cfgRecSummary(g){
   const b=g?Number(g.bytes)||0:0, n=g?Number(g.items)||0:0;
   if(!b&&!n) return '(none)';
@@ -2779,12 +2855,15 @@ async function cfgDiffPreview(blobText, sourceLabel){
       +refRows.map(refRow).join('')+'</table>';
   }
   const hasRows=!!(nChange||nFresh);
-  // Advisory only (an import is legitimate any time); above the table so it's read before Apply.
+  // Advisory for settings (a settings import is legitimate any time); the regulator refuses equipment records while the
+  // field is up (/importRecords). Above the table so it's read before Apply.
   if(hasRows&&_cfgFieldIsLive()){
     h='<div style="color:#f0a500; border:1px solid #6a4a00; background:#241c05; border-radius:4px; padding:8px 10px; margin-bottom:12px; font-size:0.9em; line-height:1.45;">'
       +'Charging is running right now. Applying saves '+(nChange+nFresh)+' setting'+((nChange+nFresh)===1?'':'s')
       +' to permanent memory, and each save can briefly pause the regulator\'s control loop. '
-      +'Best done with charging switched off. You can still apply.</div>'+h;
+      +'Best done with charging switched off. '
+      +(recRows.length?'Equipment records are not imported while charging is running: switch Alternator Enable off first, or uncheck the record rows.':'You can still apply.')
+      +'</div>'+h;
   }
   body.innerHTML=h;
   document.getElementById('cfgdiff-apply-btn').style.display=hasRows?'':'none';
@@ -2802,7 +2881,7 @@ async function _cfgPostImport(bodyText){
   try{
     let nRec=0;
     if(recBody){
-      const rr=await fetchWithTimeout(buildURL('/importRecords?then=config'),{method:'POST',body:recBody},60000);
+      const rr=await fetchWithTimeout(buildURL('/importRecords?then=config'),{method:'POST',body:recBody},180000);   // the regulator writes each record file to flash as it arrives
       if(!rr.ok){ const t=await rr.text(); throw new Error('equipment records: '+(t||('HTTP '+rr.status))); }
       nRec=Number((await rr.json()).applied)||0;
       recDone=true;
@@ -2810,7 +2889,9 @@ async function _cfgPostImport(bodyText){
     const r=await fetchWithTimeout(buildURL('/importConfig'),{method:'POST',body:bodyText},12000);
     if(!r.ok){ const t=await r.text(); throw new Error(t||('HTTP '+r.status)); }
     const res=await r.json();
-    xAlert('Applied '+res.applied+' settings'+(recBody?' and '+nRec+' record items':'')+'. '+(res.reboot?'The regulator is rebooting — reconnect in ~30 s.':''));
+    xAlert('Applied '+res.applied+' settings'+(recBody?' and '+nRec+' record items':'')+'. '
+      +(res.rpmRefused?'The RPM table in the file was not imported (speed rows, limits, Keep-Alive, overheat history): all ten rows need an engine speed, each higher than the row above. ':'')
+      +(res.reboot?'The regulator is rebooting — reconnect in ~30 s.':''));
   }catch(e){
     const why=e&&e.message?e.message:e;
     if(recDone) xAlert('The equipment records were imported, but the settings were not ('+why+'). The regulator restarts within 30 s to load the records. Once it reconnects, import the file again with the record rows unchecked to bring in the settings.','Settings not imported');
@@ -2831,6 +2912,7 @@ function importConfigFromFile(){
   reader.readAsText(inp.files[0]);
 }
 async function shareConfigToLibrary(){
+  if(g_regDemo){ regDemoNotice(); return; }   // /exportConfig answers with the demo's settings, and this posts them to the public library
   if(!settingsUnlocked){ xAlert('Please unlock controls first'); return; }
   const nameEl=document.getElementById('shareConfigName');
   const name=nameEl?nameEl.value.trim():'';
@@ -2891,7 +2973,9 @@ function fetchAltTrend() {
   // Firmware decimates WITHIN ?hours=N, so short windows keep full resolution. All = no param.
   const win = +altTrendWindow;
   const url = '/alttrend.csv' + (win > 0 ? ('?hours=' + win) : '');
+  const gen = g_regDemoGen;
   fetch(buildURL(url)).then(r=>r.text()).then(txt=>{
+    if (gen !== g_regDemoGen) return;
     const ln = txt.trim().split('\n'); altTrend = [];
     for (let i=1;i<ln.length;i++){ const c=ln[i].split(','); if(c.length<3) continue;
       altTrend.push({eng:+c[0], worst:+c[1], overall:+c[2]}); }
@@ -3300,12 +3384,14 @@ function altSessMaybeRecover(){
 }
 function altSessFetchHistory(){
   altSessHistState = 1;
+  const gen = g_regDemoGen;   // a demo switch after this request reset the state: drop its answer, leave the state alone
   fetch(buildURL('/altsess.csv')).then(r => {
+    if (gen !== g_regDemoGen) return null;
     if (r.status === 404) { altSessHistState = 2; return null; }   // firmware without the route: never retry
     if (!r.ok) throw new Error('http ' + r.status);
     return r.text();
   }).then(txt => {
-    if (txt === null) return;
+    if (txt === null || gen !== g_regDemoGen) return;
     let nowMs = null; const rows = [];
     for (const ln of txt.split('\n')){
       if (!ln) continue;
@@ -3321,12 +3407,23 @@ function altSessFetchHistory(){
     altSessHistState = 2;
     altSessHistTries = 0;
   }).catch(() => {
+    if (gen !== g_regDemoGen) return;
     // Retry with growing backoff: one terminal failure would lose the pre-open history for the session, since
     // live pushes keep the newest dot fresh and the staleness trigger never fires.
     altSessHistTries++;
     altSessHistState = (altSessHistTries < 5) ? 0 : 2;
     altSessHistNextTryMs = Date.now() + 5000 * altSessHistTries;
   });
+}
+// Demo switch: the dots are the other mode's (Export Health Dataset writes them as SESSPT rows). The device's own ring
+// is refetched by altSessMaybeRecover once the regulator has swapped its stores.
+function altSessReset(){
+  altSessT = []; altSessMeas = []; altSessEst = []; altSessGap = []; altSessRing = []; altSessInfo = [];
+  altSessHoverIdx = -1; altSessCycle = { x: -999, y: -999, list: [], idx: 0 };
+  altSessHistState = 0; altSessHistTries = 0; altSessHistNextTryMs = Date.now() + REG_DEMO_SWAP_MS;
+  if (altSessPlot) altSessPlot.setData([altSessT, altSessMeas, altSessEst]);
+  const pt = document.getElementById('alt-session-point');
+  if (pt) { pt.style.color = '#888'; pt.textContent = 'Click a dot to see the conditions behind it.'; }
 }
 function altSessAdoptHistory(rows, nowMs){
   const src = altLive.source|0;                          // active reference surface, effectively per-session
@@ -3701,7 +3798,7 @@ function parseFrontCsv(txt){
   });
   sailFrontPts=sail; motorFrontPts=motor;
 }
-function fetchPerfCurve(){ fetch(buildURL('/perfcurve.csv')).then(r=>r.text()).then(txt=>{ parseFrontCsv(txt); drawPerfPlot(); drawMotorPlot(); }).catch(()=>{}); }
+function fetchPerfCurve(){ const gen=g_regDemoGen; fetch(buildURL('/perfcurve.csv')).then(r=>r.text()).then(txt=>{ if(gen!==g_regDemoGen) return; parseFrontCsv(txt); drawPerfPlot(); drawMotorPlot(); }).catch(()=>{}); }
 // Both views share one curve, refetched only while the card is on screen. A hidden card zeroes the
 // stamp so the first live frame after it comes back fetches at once.
 function perfFetchIfShown(){
@@ -4702,8 +4799,34 @@ async function refreshUnitIdentity() {
     return hit;
 }
 
+// The page holds one unit's state everywhere (caches, plots, the commissioning session, the cloud token), so the app moves to
+// another unit by reloading onto it, as a browser tab does. Stored first: after the reload the stored uid is hit.uid and
+// g_pageTookForeign is false, so the same connect cannot reload again. Never when either uid is unknown, never in demo.
+let g_unitReloading = false;
+function unitChangeNeedsReload(hit) {
+    const cur = rememberedUid();
+    if (!IS_CAPACITOR || DEMO_MODE || !hit || !hit.uid || !cur) return false;
+    return hit.uid.toUpperCase() !== cur.toUpperCase() || g_pageTookForeign;
+}
+function unitChangeReload(hit) {
+    const otherUnit = hit.uid.toUpperCase() !== (rememberedUid() || '').toUpperCase();
+    console.log('[DISCOVERY] now ' + hit.uid + (otherUnit ? ', was ' + rememberedUid() : ', after another unit\'s frames') + ': reloading');
+    g_unitReloading = true;
+    localStorage.setItem('xregDeviceBase', hit.base);
+    localStorage.setItem('xregDeviceUid', hit.uid);
+    if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
+    if (hit.name) localStorage.setItem('xregDeviceName', hit.name);
+    // Per unit but not keyed by uid, so a reload alone would hand them to the new unit (the console feeds Download Logs).
+    if (otherUnit) { try { sessionStorage.removeItem('deviceRegistered'); sessionStorage.removeItem('socSeedDismissed'); } catch (e) { } clearConsole(); }
+    location.reload();
+}
+
 function connectToRegulator(hit) {
+    if (g_unitReloading) return;
     console.log('[DISCOVERY] regulator ' + (hit.uid || 'unknown-uid') + ' at ' + hit.base + ' (fw ' + (hit.fw || 'unknown') + ')');
+    if (unitChangeNeedsReload(hit)) { unitChangeReload(hit); return; }
+    // A 404 from the old address may have come from whatever device holds it now; the read on stream open decides.
+    if (vesselInfoKnown && _vesselNoneBase !== null && hit.base !== _vesselNoneBase) { vesselInfoKnown = false; window._vesselInfoLoaded = false; }
     API_BASE_URL = hit.base;
     resetStreamIdentity();
     localStorage.setItem('xregDeviceBase', hit.base);
@@ -4751,6 +4874,14 @@ function groupHits(hits) {
     const groups = {};
     hits.forEach(h => { const r = find(key(h)); (groups[r] = groups[r] || []).push(h); });
     return Object.keys(groups).map(k => groups[k]);
+}
+
+// While the startup splash is up (z-index 99999, styles.css) the picker goes above it: at a cold launch, and in a tab
+// held for a forward, the question comes before the splash lifts, and under it nobody could answer. Once the splash is
+// down the picker is back under the themed dialogs (#xdlg-overlay, 11000), so the dialog holding the keyboard is on top.
+function regPickerZ() {
+    const splash = document.getElementById('waiting-for-regulator');
+    return (splash && !splash._wfrHidden && splash.getClientRects().length) ? 100000 : 10001;
 }
 
 // Picker. Resolves with the chosen hit, null if dismissed, or 'rescan' when opts.rescan offered a
@@ -4801,7 +4932,7 @@ function chooseRegulator(hits, wantUid, forced, opts) {
 
         const div = document.createElement('div');
         div.id = 'regPickerDialog';
-        div.innerHTML = '<div id="regPickBackdrop" style="position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:10001; display:flex; align-items:center; justify-content:center;">' +
+        div.innerHTML = '<div id="regPickBackdrop" style="position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:' + regPickerZ() + '; display:flex; align-items:center; justify-content:center;">' +
             '<div style="background:#1e1e1e; color:#ddd; width:430px; max-width:calc(100vw - 40px); max-height:calc(100vh - 60px); overflow-y:auto; border-radius:8px; box-shadow:0 6px 32px rgba(0,0,0,0.8); border:1px solid #444; box-sizing:border-box;">' +
             '<div style="padding:10px 16px 9px; border-bottom:1px solid #333; background:#252525; border-radius:8px 8px 0 0; font-weight:600; font-size:13px; color:#aaa; letter-spacing:0.03em; display:flex; align-items:center; justify-content:space-between;">' +
             '<span id="regPickTitle"></span>' +
@@ -4889,37 +5020,40 @@ function openRegulator(hit) {
     moveTabToRegulator(hit);
 }
 
-// Browser half of a switch. The unit's own name outlives any DHCP lease, so it is tried first; the
-// address that answered the scan is the fallback for a browser that cannot resolve .local names.
-// The landing page runs initUnitIdentity() and settles onto the unit's own name from there. lost = the tab's own
-// unit went missing from this address, so moving to the same uid is the point.
+// Where a unit answers right now, as an origin. Its own name outlives any DHCP lease, so it is tried first; its address is
+// for a browser that cannot resolve .local names. Null when neither answers as that unit: an address from another unit's
+// peer table can be 120 s stale, and a tab sent to a dead one ends on the browser's error page.
+async function unitOrigin(hit) {
+    const same = r => !!r && (r.uid || '').toUpperCase() === hit.uid.toUpperCase();
+    if (hit.host && same(await probeIdentify('http://' + hit.host, 2500))) return 'http://' + hit.host;
+    if (isIpBase(hit.base) && same(await probeIdentify(hit.base, 2500))) return hit.base;
+    return null;
+}
+
+// Browser half of a switch: the tab goes to wherever the unit answers (unitOrigin), and a landing page stays where it
+// lands (initUnitIdentity). lost = the tab's own unit went missing from this address, so moving to the same uid is the
+// point. Resolves true when the tab is navigating.
 async function moveTabToRegulator(hit, lost) {
-    if (!hit || !hit.uid) return;
+    if (!hit || !hit.uid) return false;
     const cur = window.xregUnit && window.xregUnit.uid;
-    if (!lost && cur && cur.toUpperCase() === hit.uid.toUpperCase()) return;
-    const here = location.pathname + location.search + location.hash;
-    if (hit.host) {
-        const byName = await probeIdentify('http://' + hit.host, 2500);
-        if (byName && byName.uid === hit.uid) {
-            location.replace('http://' + hit.host + here);
-            return;
-        }
+    if (!lost && cur && cur.toUpperCase() === hit.uid.toUpperCase()) return false;
+    const at = await unitOrigin(hit);
+    if (at) {
+        location.replace(at + location.pathname + location.search + location.hash);
+        return true;
     }
-    // The mark stops the landing page moving straight back to the name that just failed: on flaky mDNS that
-    // would reload the tab every time the name came and went.
-    if (isIpBase(hit.base)) {
-        const url = new URL(hit.base + here);
-        url.searchParams.set('xregStay', '1');
-        location.replace(url.href);
-        return;
-    }
-    xAlert('That regulator answered only at ' + unitWhere(hit) + ', which this browser cannot follow. Open it directly at http://' + (hit.host || unitWhere(hit)) + '/', 'Switch Regulator');
+    if (isIpBase(hit.base)) xAlert('That regulator did not answer at ' + [hit.host, hit.base.replace(/^https?:\/\//, '')].filter(Boolean).join(' or ') +
+        '. It may be off or still starting up.', 'Switch Regulator');
+    else xAlert('That regulator answered only at ' + unitWhere(hit) + ', which this browser cannot follow. Open it directly at http://' + (hit.host || unitWhere(hit)) + '/', 'Switch Regulator');
+    return false;
 }
 
 // ── Stream identity guard ────────────────────────────────────────────────────────────
 // A stream uid differing from the connected identity means the address is ambiguous: the app re-finds its pinned
 // unit; a browser is offered a move. Writes are already safe: they carry controlUid() and the other board refuses them.
 let g_streamMismatchUid = null;   // the mismatch already handled, so one bad address raises one dialog
+// App: frames from another unit were handled before its uid arrived, so the next connect reloads (unitChangeNeedsReload).
+let g_pageTookForeign = false;
 function resetStreamIdentity() {
     g_streamUid = null;
     g_streamMismatchUid = null;
@@ -4934,6 +5068,7 @@ function noteStreamUid(uid) {
     syncWriteUidInputs();
     const want = IS_CAPACITOR ? rememberedUid() : ((window.xregUnit && window.xregUnit.uid) || null);
     if (!want || want.toUpperCase() === uid.toUpperCase()) { g_streamMismatchUid = null; return; }
+    if (IS_CAPACITOR) g_pageTookForeign = true;
     if (g_streamMismatchUid === uid) return;
     g_streamMismatchUid = uid;
     onStreamUnitMismatch(uid, want);
@@ -4948,7 +5083,8 @@ async function onStreamUnitMismatch(streamUid, wantUid) {
         rediscoverAfterLoss();
         return;
     }
-    // The picker is already asking; initUnitIdentity re-checks when it closes.
+    // A picker is already putting the choice to the user. The shared-name question re-checks when it closes
+    // (askWhichRegulator); behind any other picker this mismatch is not raised again for this stream.
     if (document.getElementById('regPickerDialog')) { g_streamMismatchUid = null; return; }
     const ownName = 'xreg-' + uid6(streamUid).toLowerCase() + '.local';
     const ok = await xConfirm('This page is showing regulator ID ' + uid6(streamUid) + ', but the address it was opened at also reaches regulator ID ' +
@@ -4964,10 +5100,13 @@ async function onStreamUnitMismatch(streamUid, wantUid) {
     xAlert('The regulator shown did not answer a scan. Open it directly at http://' + ownName + '/', 'Switch Regulator');
 }
 
-// Ask the unit who it is (UI naming, AP fields, a uid to pin), then move the tab onto its own mDNS name: an address
-// is a DHCP lease a bounced hotspot invalidates, and alternator.local is answered by every regulator. Never runs on a
-// page already at the unit's own name (no loop); silent when the name doesn't answer (most Android browsers).
+// Ask the unit who it is (UI naming, AP fields, a uid to pin). The tab then stays where it was opened unless it is at
+// alternator.local AND either a second regulator is heard or this browser has picked one there before: every regulator
+// answers that name, so with two each request can land on a different board. An address reaches one board, and one that
+// goes stale is re-found by rediscoverAfterLoss. A browser that has never been asked, with one regulator, is not moved
+// and does not wait: a move reloads the page and takes whatever was being typed.
 // A pick made at the shared name lives in that origin's localStorage, so it survives whichever board served the page.
+// It is never cleared, so that browser keeps being forwarded to its unit's own name after the second regulator is gone.
 function sharedChoiceGet() { try { return localStorage.getItem('xregChosenUid') || null; } catch (e) { return null; } }
 function sharedChoiceSet(uid, host) {
     try {
@@ -4977,70 +5116,141 @@ function sharedChoiceSet(uid, host) {
     } catch (e) { }
 }
 
+// A browser that has already picked a regulator at the shared name is about to be forwarded to it, so the splash stays
+// up until that is decided (hideWaitingForRegulator defers to this). No stored pick, no hold: a browser that has never
+// been asked never waits.
+let g_identityHold = !IS_CAPACITOR && CAN_DISCOVER && location.hostname.toLowerCase() === SHARED_HOST && !!sharedChoiceGet();
+let g_hideAfterHold = false;
+function releaseIdentityHold() {
+    if (!g_identityHold) return;
+    g_identityHold = false;
+    if (g_hideAfterHold) hideWaitingForRegulator();
+}
+// A forward goes only to an address that has just answered, so it lands in a second or two. A page still here after
+// this long had its forward stopped (Esc, the Stop button), and nothing else would lift the splash.
+const FORWARD_GIVE_UP_MS = 10000;
+
 async function initUnitIdentity() {
     if (IS_CAPACITOR || DEMO_MODE) return;
+    let moving = false;
+    try { moving = await settleUnitIdentity(); }
+    finally {
+        if (moving) setTimeout(releaseIdentityHold, FORWARD_GIVE_UP_MS);
+        else releaseIdentityHold();
+    }
+}
+
+// The stream names its board once, in the frame that opens it, and that frame can beat the identity reply. Puts the
+// comparison to noteStreamUid again once both are known.
+function recheckStreamUnit() {
+    const onScreen = g_streamUid;
+    g_streamUid = null;
+    if (onScreen) noteStreamUid(onScreen);
+}
+
+// Resolves true when the tab is navigating away.
+async function settleUnitIdentity() {
     // 8 s: a cold lookup of the shared name takes 3-5 s while two boards answer it, and a miss leaves the tab with no identity.
     const hit = await probeIdentify(API_BASE_URL || '', 8000);
-    if (!hit) return;
+    if (!hit) return false;
     applyConnectedIdentity(hit);
     syncArmState();   // identity known: the arm poll can now carry this unit's token
     if (hit.uid) localStorage.setItem('xregDeviceUid', hit.uid);
     if (hit.host) localStorage.setItem('xregDeviceHost', hit.host);
     localStorage.setItem('xregDeviceBase', location.origin);
-    if (!CAN_DISCOVER || !hit.uid || !hit.host) return;
-    const params = new URLSearchParams(location.search);
-    if (params.has('xregStay')) {   // set by moveTabToRegulator: this tab is on an address because the name failed
-        params.delete('xregStay');
-        const rest = params.toString();
-        history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
-        return;
-    }
-    if (location.hostname.toLowerCase() === hit.host.toLowerCase()) return;
-    // The shared name on a network with more than one regulator: this browser's earlier choice
-    // wins, otherwise the question is asked. A resolver race must not decide which engine a page
-    // drives, and on shared marina WiFi the winner may be another boat's unit entirely.
-    if (location.hostname.toLowerCase() === SHARED_HOST) {
-        const peers = hit.peers || [];
-        const chosen = sharedChoiceGet();
-        let target = null;
-        if (chosen && chosen === hit.uid.toUpperCase()) target = hit;
-        else if (chosen) {
-            const p = peers.find(x => (x.uid || '').toUpperCase() === chosen);
-            if (p) target = peerAsHit(p);
-            else {
-                // The serving board has not heard the chosen one yet (its 30 s browse), which does not mean it is gone.
-                let chosenHost = null;
-                try { chosenHost = localStorage.getItem('xregChosenHost'); } catch (e) { }
-                const direct = chosenHost ? await probeIdentify('http://' + chosenHost, 2500) : null;
-                if (direct && (direct.uid || '').toUpperCase() === chosen) target = direct;
-            }
+    if (!CAN_DISCOVER || !hit.uid || !hit.host) return false;
+    if (location.hostname.toLowerCase() !== SHARED_HOST) return false;
+    // The shared name: this browser's earlier choice wins, otherwise the question is asked once another regulator is
+    // heard. A resolver race must not decide which engine a page drives, and on shared marina WiFi the winner may be
+    // another boat's unit entirely.
+    const peers = hit.peers || [];
+    const chosen = sharedChoiceGet();
+    const mine = !!chosen && chosen === hit.uid.toUpperCase();
+    if (chosen && !mine) {
+        // The chosen unit has to answer before the tab is sent to it. The serving board may not have heard it yet (its
+        // 30 s browse), so the name stored with the choice stands in; one it still lists can have been off for 120 s.
+        const p = peers.find(x => (x.uid || '').toUpperCase() === chosen);
+        let chosenHost = null;
+        try { chosenHost = localStorage.getItem('xregChosenHost'); } catch (e) { }
+        const at = await unitOrigin(p ? peerAsHit(p) : { uid: chosen, host: chosenHost });
+        if (at) {
+            location.replace(at + location.pathname + location.search + location.hash);
+            return true;
         }
-        if (!target && peers.length) {
-            let all = [hit].concat(peers.map(peerAsHit));
-            const lead = 'More than one regulator is on this network. Which one is yours? An unnamed unit shows the six characters from its hotspot name and label. Units set up together are shown together.';
-            let pick = await chooseRegulator(all, chosen, true, { lead: lead, rescan: true, note: 'This browser remembers the answer. Bookmark the page it lands on to skip the question.' });
-            if (pick === 'rescan') {
-                const swept = await sweepAllRegulators(null);
-                swept.forEach(h => { if (!all.some(a => a.uid === h.uid)) all.push(h); });
-                pick = await chooseRegulator(all, chosen, true, { lead: lead, note: 'This browser remembers the answer. Bookmark the page it lands on to skip the question.' });
-            }
-            if (pick && pick !== 'rescan') { sharedChoiceSet(pick.uid, pick.host); target = pick; }
-            // Not now: nobody chose, so the tab stays. Moving onto the serving board's name would let the resolver choose.
-            if (!target) {
-                const onScreen = g_streamUid;
-                g_streamUid = null;
-                if (onScreen) noteStreamUid(onScreen);
-                return;
-            }
-        }
-        if (target && target.uid.toUpperCase() !== hit.uid.toUpperCase()) { moveTabToRegulator(target); return; }
     }
-    const byName = await probeIdentify('http://' + hit.host, 2500);
+    let target = null;
+    if (mine) target = hit;
+    else if (peers.length) target = await askWhichRegulator([hit].concat(peers.map(peerAsHit)));
+    if (target && await moveToChosenRegulator(target, hit)) return true;
+    // Staying at the shared name, where the stream can be from another board than the one that just identified.
+    recheckStreamUnit();
+    // No one else heard and no choice that answers: one regulator as far as this page can tell.
+    if (!target) watchForSecondRegulator();
+    return false;
+}
+
+// The shared-name question. Resolves with the pick (remembered for this browser), or null on Not now. Once per page:
+// Not now is an answer, and the watch below must not ask it again. (current) marks the unit on screen.
+let g_regQuestionAsked = false;
+async function askWhichRegulator(all) {
+    g_regQuestionAsked = true;
+    const lead = 'More than one regulator is on this network. Which one is yours? An unnamed unit shows the six characters from its hotspot name and label. Units set up together are shown together.';
+    const note = 'This browser remembers the answer. Bookmark the page it lands on to skip the question.';
+    let pick = await chooseRegulator(all, controlUid(), true, { lead: lead, rescan: true, note: note });
+    if (pick === 'rescan') {
+        const swept = await sweepAllRegulators(null);
+        swept.forEach(h => { if (!all.some(a => a.uid === h.uid)) all.push(h); });
+        pick = await chooseRegulator(all, controlUid(), true, { lead: lead, note: note });
+    }
+    if (pick && pick !== 'rescan') { sharedChoiceSet(pick.uid, pick.host); return pick; }
+    // Not now: nobody chose, so the tab stays. Moving onto the serving board's name would let the resolver choose.
+    recheckStreamUnit();
+    return null;
+}
+
+// Off the shared name and onto the chosen unit. me = the unit this page identified as. Resolves true when navigating.
+async function moveToChosenRegulator(target, me) {
+    if (target.uid.toUpperCase() !== me.uid.toUpperCase()) return await moveTabToRegulator(target);
+    const byName = await probeIdentify('http://' + me.host, 2500);
     // Same uid or nothing: on a two-regulator boat a name that lands on the other board would
-    // silently swap which unit this tab is driving.
-    if (byName && byName.uid === hit.uid) {
-        location.replace('http://' + hit.host + location.pathname + location.search + location.hash);
+    // silently swap which unit this tab is driving. Silent when the name doesn't answer (most Android browsers).
+    if (byName && byName.uid === me.uid) {
+        location.replace('http://' + me.host + location.pathname + location.search + location.hash);
+        return true;
     }
+    return false;
+}
+
+// One regulator at load is not a promise: a second can power up later, and a board can take 30 s to hear another. So a
+// tab that stayed at the shared name keeps asking, and raises the question when a second unit shows. Asked, never moved.
+const SECOND_REG_POLL_MS = 30000;
+let g_secondRegWatch = null;
+function watchForSecondRegulator() {
+    if (g_secondRegWatch || g_regQuestionAsked) return;
+    g_secondRegWatch = setInterval(checkForSecondRegulator, SECOND_REG_POLL_MS);
+}
+async function checkForSecondRegulator() {
+    if (g_regQuestionAsked) { clearInterval(g_secondRegWatch); return; }
+    // g_streamMismatchUid: the "Two regulators answer here" dialog has already put this to the user. An open picker is
+    // someone else's question (Switch Regulator), and asking would close it. An open themed dialog holds the keyboard,
+    // so the question waits for it rather than open underneath.
+    const dlgUp = () => { const d = document.getElementById('xdlg-overlay'); return !!d && d.style.display !== 'none'; };
+    const busy = () => document.hidden || DEMO_MODE || isOfflineMode || discoveryInProgress || g_streamMismatchUid ||
+        document.getElementById('regPickerDialog') || dlgUp();
+    if (busy()) return;
+    const me = window.xregUnit;
+    if (!me || !me.uid || !me.host) return;
+    const reply = await probeIdentify(API_BASE_URL || '', 4000);
+    if (!reply || !reply.uid || g_regQuestionAsked || busy()) return;
+    // This reply can come from the second regulator itself. Its own address goes forward, never the shared name.
+    if (reply.ip && reply.ip !== '0.0.0.0' && IPV4_RE.test(reply.ip)) reply.base = 'http://' + reply.ip;
+    const all = [me];
+    [reply].concat((reply.peers || []).map(peerAsHit)).forEach(h => {
+        if (h.uid && !all.some(a => a.uid.toUpperCase() === h.uid.toUpperCase())) all.push(h);
+    });
+    if (all.length < 2) return;
+    const pick = await askWhichRegulator(all);
+    if (pick) moveToChosenRegulator(pick, me);
 }
 document.addEventListener('DOMContentLoaded', initUnitIdentity);
 
@@ -5078,8 +5288,11 @@ async function rediscoverAfterLoss(quiet) {
         const here = await probeIdentify(location.origin, 2500);
         if (here && (atSharedName || !here.uid || here.uid === rememberedUid())) { reopenStream(); return here; }
     }
-    // At the shared name only a choice the user made counts; what the page last connected to was the resolver's pick.
-    const wantUid = atSharedName ? sharedChoiceGet() : rememberedUid();
+    // At the shared name a choice the user made comes first. A tab that was never asked heard one regulator and has been
+    // showing it, so that unit is the one to find again: with nothing wanted, the first unit to answer the scan takes the
+    // tab, and that can be a neighbour's. After Not now the page was on the resolver's pick, which is no choice.
+    const shownUid = (window.xregUnit && window.xregUnit.uid) || null;
+    const wantUid = atSharedName ? (sharedChoiceGet() || (g_regQuestionAsked ? null : shownUid)) : rememberedUid();
     discoveryInProgress = true;
     let hits = [];
     try {
@@ -6077,7 +6290,7 @@ function handleAndroidBack() {
     // Vessel Info incomplete pins the UI to Setup, where sending Back to Live Data would only
     // raise the nag alert — minimize instead.
     const active = document.querySelector('.tab-content.active');
-    if (active && active.id !== 'livedata' && vesselInfoComplete) { showMainTab('livedata'); return; }
+    if (active && active.id !== 'livedata' && !vesselInfoLocked()) { showMainTab('livedata'); return; }
     const App = window.Capacitor.Plugins.App;
     if (App && App.minimizeApp) App.minimizeApp();
 }
@@ -6091,7 +6304,7 @@ document.addEventListener('visibilitychange', () => {
 
 function initializeEventSource() {
 
-    if (DEMO_MODE) {
+    if (DEMO_MODE || g_unitReloading) {
         return;
     }
 
@@ -6142,6 +6355,7 @@ function initializeEventSource() {
             closeRecovery();           // Dismiss Connection Lost dialog if it's open
             if (isOfflineMode) exitOfflineMode(); // Re-enable inputs if user had gone offline
             checkInstallIdFreshness(); // drop stale console history if the device was reflashed/reset
+            fetchAndPopulateVesselInfo(); // every connection: discovery after load, a restart (config import), a moved address
             // Close the hole this outage just punched in the console. Only on a genuine reconnect —
             // the first open of a page life has no gap to fill, and checkInstallIdFreshness may be
             // about to clear the buffer for a reflashed device.
@@ -7620,24 +7834,86 @@ function confirmUpdate(form, version) {
         armDevice('Starting a firmware update.')
             .then(ok => {
                 if (!ok) return;   // password prompt cancelled or refused: nothing starts
-                kickOffAppWebUpdate(version);  // No-op in browser; in iOS app downloads matching web bundle in parallel
-                showUpdateInProgressOverlay(version);  // Same modal the forced-update path shows
-                form.submit();
+                return startFirmwareUpdate(version);
             })
             .catch(() => xAlert('Could not reach the device to start the update. Check the connection and try again.'));
     });
 }
 
 // Shows the "Update in progress…" full-screen overlay used by both the manual
-// "Change to X.X.XX" flow and the forced-update flow.
-function showUpdateInProgressOverlay(versionStr) {
+// "Change to X.X.XX" flow and the forced-update flow. checking: the regulator's own internet check panel instead.
+function showUpdateInProgressOverlay(versionStr, checking) {
     forcedUpdateInProgressUntil = Date.now() + 6 * 60 * 1000;
     const banner = document.getElementById('forced-update-banner');
     if (banner) banner.style.display = 'none';
     const overlay = fuOverlay();
     overlay.style.display = 'flex';
-    overlay.innerHTML = fuInProgressPanel(versionStr);
+    overlay.innerHTML = checking ? fuCheckingPanel(versionStr) : fuInProgressPanel(versionStr);
     fuOffPaintCurrent();
+}
+
+// On a unit running ota_0, UpdateToVersion answers 202 while the regulator tests its own WiFi, internet and the update
+// server, and stages nothing unless that passes. A unit on the factory partition installs inside the request instead,
+// so a request that times out has started. Both flows (manual and forced) come through here.
+let fuChecking = false;   // the checking panel is up: handleForcedUpdate's per-frame repaint keeps it
+async function startFirmwareUpdate(versionStr) {
+    fuChecking = true;
+    showUpdateInProgressOverlay(versionStr, true);
+    const tok = armTokenGet();
+    const url = buildURL('/get?UpdateToVersion=' + encodeURIComponent(versionStr)) + (tok ? '&tok=' + encodeURIComponent(tok) : '');
+    let res = null, body = null;
+    try {
+        res = await cloudOpPost(url, { cache: 'no-store' }, 8000);
+        body = await res.clone().json().catch(() => null);
+    } catch (e) {
+        if (e instanceof TypeError) {   // fetch never reached the device
+            fuUpdateFailed(versionStr, 'The regulator could not be reached to start the update.');
+            return;
+        }
+        // 'Request timeout' (factory partition installing) or a lost poll: the install may be running
+    }
+    if (body && body.ok === false) {
+        fuUpdateFailed(versionStr, 'The regulator could not start the update: ' + (body.error || 'unknown reason') + '. Nothing was installed.');
+        return;
+    }
+    if (res && !res.ok && res.status !== 202) {
+        const msg = body && body.error ? body.error : (await res.text().catch(() => '')) || ('HTTP ' + res.status);
+        fuUpdateFailed(versionStr, 'The regulator refused the update request: ' + msg + '.');
+        return;
+    }
+    fuChecking = false;
+    kickOffAppWebUpdate(versionStr);  // No-op in browser; in iOS app downloads matching web bundle in parallel
+    showUpdateInProgressOverlay(versionStr);
+    fuWatchForFailure(versionStr);
+}
+
+// A failed install restarts the regulator into the firmware it had, and that boot serves the reason at /otaResult.
+// Polls while the in-progress window is open; fetch errors during the reboots are expected and ignored.
+function fuWatchForFailure(versionStr) {
+    const tick = async () => {
+        const ov = document.getElementById('forced-update-overlay');
+        if (Date.now() >= forcedUpdateInProgressUntil || !ov || ov.style.display === 'none') return;
+        try {
+            const r = await fetchWithTimeout(buildURL('/otaResult'), { cache: 'no-store' }, 4000);
+            const j = r.ok ? await r.json() : null;
+            if (j && j.ver === versionStr) {
+                fuUpdateFailed(versionStr, 'The update to ' + versionStr + ' did not install: ' + j.why + '. ' +
+                    (j.factory ? 'The regulator is running its factory firmware; run the update again.' : 'The installed firmware is unchanged.'));
+                return;
+            }
+        } catch (e) { }
+        setTrackedTimeout(tick, 5000);
+    };
+    setTrackedTimeout(tick, 5000);
+}
+
+// Ends the in-progress window so the forced-update UI (if any) takes the screen back, then says why.
+function fuUpdateFailed(versionStr, msg) {
+    fuChecking = false;
+    forcedUpdateInProgressUntil = 0;
+    const ov = document.getElementById('forced-update-overlay');
+    if (ov) ov.style.display = 'none';
+    xAlert(msg + '\n\nAlternator Enable is back to its setting before the update.', 'Update ' + versionStr + ' not installed');
 }
 
 // Created on first use by either the manual or the forced path; not in index.html.
@@ -7688,6 +7964,18 @@ function fuOffPaint(v, pendingV) {
 function fuOffPaintCurrent() {
     const p = pendingToggles.get('OnOff');
     fuOffPaint(g_onOffDevice, p ? p.desiredValue : undefined);
+}
+
+function fuCheckingPanel(versionStr) {
+    return fuPanel(`
+                  <div style="margin-bottom: 12px; font-weight: bold; font-size: 16px;">
+                      Checking the connection…
+                  </div>
+                  <p style="margin: 8px 0 4px 0; font-size: 15px;">
+                      The regulator is testing its own internet connection and the update server before it starts v<strong>${versionStr}</strong>. This can take up to a minute.
+                  </p>
+                  ${fuOffBtnHtml()}
+            `);
 }
 
 function fuInProgressPanel(versionStr) {
@@ -7879,13 +8167,11 @@ function handleForcedUpdate(data) {
     if (!banner) {
         banner = document.createElement('div');
         banner.id = 'forced-update-banner';
+        // In the page flow above the header: fixed at top 0 it covered the header's OFF/ON and the minimized strip.
+        // The body's padding already clears the notch.
         banner.style.cssText = `
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        z-index: 10000;
-        padding: calc(28px + env(safe-area-inset-top)) 36px 28px;
+        margin-bottom: 8px;
+        padding: 28px 36px;
         text-align: center;
         font-weight: 600;
         display: none;
@@ -7927,7 +8213,7 @@ function handleForcedUpdate(data) {
         overlay.style.display = 'flex';
 
         if (updateActive) {
-            overlay.innerHTML = fuInProgressPanel(versionStr);
+            overlay.innerHTML = fuChecking ? fuCheckingPanel(versionStr) : fuInProgressPanel(versionStr);
         } else {
             overlay.innerHTML = fuPanel(`
                   <div style="margin-bottom: 12px; font-weight: bold; font-size: 16px;">
@@ -7960,7 +8246,7 @@ function handleForcedUpdate(data) {
         const timeRemaining = formatDeadline(deadline);
 
         banner.innerHTML = `
-        Mandatory update to firmware version ${versionStr} will be required in ${timeRemaining}.  
+        Mandatory update to firmware version ${versionStr} will be required in <span style="display:block; white-space:nowrap;">${timeRemaining}.</span>
         <button onclick="triggerForcedUpdate('${versionStr}')"
                 class="forced-update-btn btn-secondary"
                 style="margin-left: 24px;">
@@ -8164,25 +8450,7 @@ async function triggerForcedUpdate(versionStr) {
             xAlert('Could not reach the device to start the update. Check the connection and try again.');
             return;
         }
-        kickOffAppWebUpdate(versionStr);  // No-op in browser; in iOS app downloads matching web bundle in parallel
-        // Renders "in progress" now (next CSV2 tick is ~5 s away) and suppresses the prompt for 6 min.
-        showUpdateInProgressOverlay(versionStr);
-
-        const form = document.createElement('form');
-        form.action = buildURL('/get');
-        form.method = 'GET';
-        form.target = 'hidden-form';
-
-        const versionInput = document.createElement('input');
-        versionInput.type = 'hidden';
-        versionInput.name = 'UpdateToVersion';
-        versionInput.value = versionStr;
-
-        form.appendChild(versionInput);
-        document.body.appendChild(form);
-        syncWriteUidInputs(form);   // a GET form drops the action's query string: uid and the arm token must be inputs
-        form.submit();
-        document.body.removeChild(form);
+        await startFirmwareUpdate(versionStr);
     }
 }
 
@@ -9725,11 +9993,26 @@ function controlWriteRefusedSay(r) {
 // A settings switch. The browser has already flipped it, so checked IS the position chosen. A caller that waited on a
 // dialog asserts the position first (an echo may have repainted the switch while the dialog was open). Returns true
 // when the write went out. gx_app/gen_settings.py reads the handlers that call this to learn what each switch sends.
-function handleUserToggle(checkboxId, hiddenInputId, dataKey) {
+// Hardware Present to No starts the regulator's demo mode, which no page marks. The GX asks with the same text
+// (gx_app/settings_keys.txt).
+const HW_PRESENT_DEMO_MSG = 'Start demo mode?\n\nThe field switches off and every reading comes from a simulated boat until '
+    + 'Hardware Present is set back to Yes.';
+// Switches that ask before one position is sent: [the position that asks, the question]
+const TOGGLE_ASKS = { hardwarePresent: [false, HW_PRESENT_DEMO_MSG] };
+function handleUserToggle(checkboxId, hiddenInputId, dataKey, asked) {
     const cb = document.getElementById(checkboxId);
     const hidden = document.getElementById(hiddenInputId);
     if (!cb || !hidden) return false;
     const on = cb.checked;
+    const ask = TOGGLE_ASKS[dataKey];
+    if (ask && !asked && on === ask[0] && settingsUnlocked && !DEMO_MODE) {
+        // A report can repaint the switch while the question is open, so the answer sets it again
+        xConfirm(ask[1]).then(ok => {
+            if (ok) { cb.checked = on; handleUserToggle(checkboxId, hiddenInputId, dataKey, true); }
+            else toggleRepaint(dataKey, checkboxId, !on);
+        });
+        return false;
+    }
     hidden.value = on ? '1' : '0';
     syncSegmented(checkboxId);
     return controlWrite({ [dataKey]: on ? 1 : 0 }, hidden.name + '=' + hidden.value,
@@ -9759,11 +10042,14 @@ function echoReplay() {
 
 //feedback on button clicking
 function submitMessage() {
-    // Use 'this' which refers to the element that called the function
-    if (this && this.classList) {
-        this.classList.add('button-pulse');
-        setTrackedTimeout(() => this.classList.remove('button-pulse'), 600);
-    }
+    // Called bare (onclick="submitMessage()", or from a form's submit handler), so `this` is never the button: it comes
+    // from the event in flight. A toggle's onchange and a call after an await find no button and do nothing.
+    const ev = window.event;
+    const t = ev && (ev.submitter || ev.target);
+    const btn = t && t.closest ? t.closest('button, input[type="submit"], input[type="button"]') : null;
+    if (!btn) return;
+    btn.classList.add('button-pulse');
+    setTrackedTimeout(() => btn.classList.remove('button-pulse'), 600);
 }
 
 // A group Save posts EVERY input, and the /get handler reads a blank box as 0 and wipes that setting.
@@ -10089,7 +10375,8 @@ const resetReasonLookup = {
     18: "Restart after Wi-Fi setup",
     19: "Restart after Wi-Fi set over USB",
     20: "Restart to load a cloud settings push",
-    21: "Restart into the factory installer for an update"
+    21: "Restart into the factory installer for an update",
+    22: "Restart after a firmware update did not install"
 };
 
 
@@ -10172,59 +10459,62 @@ async function initializeProfileTab() {
     }
 }
 
+// Only a 404 means "no Vessel Info saved" (the firmware handler's contract). Throws on a timeout, any other status or an
+// unreadable body: the unit's state is then unknown, not "never saved".
+async function readVesselInfoRecord() {
+    const response = await fetchWithTimeout(buildURL('/vessel_info.json'), {}, 5000);
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    if (!data || typeof data !== 'object') throw new Error('unreadable Vessel Info');
+    return data;
+}
+
+// At load and on every stream open. An unknown result is retried while the stream is up and never decides the landing.
 async function fetchAndPopulateVesselInfo() {
+    if (DEMO_MODE) return;
+    const seq = ++_vesselReadSeq;
+    const base = API_BASE_URL;
+    let data;
     try {
-        const response = await fetchWithTimeout(buildURL('/vessel_info.json'), {}, 5000);
-        if (!response.ok) {
+        data = await readVesselInfoRecord();
+    } catch (error) {
+        diagLog('Vessel info read failed, state unknown:', error);
+        if (seq === _vesselReadSeq && !_vesselRetryTimer && !DEMO_MODE && source && source.readyState === EventSource.OPEN)
+            _vesselRetryTimer = setTrackedTimeout(() => { _vesselRetryTimer = null; fetchAndPopulateVesselInfo(); }, 5000);
+        return;
+    }
+    // Older than an answer already applied, or sent to an address the app has since left: not the connected unit's.
+    if (seq <= _vesselAppliedSeq || base !== API_BASE_URL || DEMO_MODE) return;
+    _vesselAppliedSeq = seq;
+    applyVesselInfoRecord(data, true, base);
+    window._vesselInfoLoaded = true;
+    maybeApplyLanding();
+}
 
-            // Dev note: comment out the line below to allow local file previewing without vessel_info.json
-            vesselInfoComplete = false;
+// One answer (data = the record, null = 404) into the stored-record state and what is derived from it. The form boxes
+// follow only when paint is set (paintVesselForm holds the record back while the owner edits).
+function applyVesselInfoRecord(data, paint, base) {
+    const wasLocked = vesselInfoLocked();
+    if (_vesselRetryTimer) { clearTrackedTimeout(_vesselRetryTimer); _vesselRetryTimer = null; }
+    vesselInfoKnown = true;
+    _vesselNoneBase = data ? null : base;
+    if (!data) {
+        const had = window.vesselInfo !== null;
+        window.vesselInfo = null;
+        window._nominalStored = undefined;
+        _vesselPendingPaint = null;
 
-            return;
-        }
+        // Dev note: comment out the line below to allow local file previewing without vessel_info.json
+        vesselInfoComplete = false;
 
-        const data = await response.json();
+        if (had) { applyBoatTypeUI(); applyClassScaledInputAttrs(); updateBattHealthChemNote(); }
+    } else {
         window.vesselInfo = data;
         applyBoatTypeUI();
-
-        const form = document.getElementById('vessel-info-form');
-        if (!form) return;
-
-        // Not part of allFieldsFilled: an unnamed unit is a named-enough unit (XREG-<id>), and
-        // requiring it would re-gate every regulator already commissioned.
-        if (form.REGULATOR_NAME) form.REGULATOR_NAME.value = data.regulator_name || '';
-        form.BOAT_LENGTH_FT.value = data.boat_length_ft || '';
-        form.BOAT_DISPLACEMENT_LBS.value = data.boat_displacement_lbs || '';
-        form.BOAT_TYPE.value = data.boat_type || 'monohull';
-        form.BOAT_MAKE_MODEL.value = data.boat_make_model || '';
-        form.BOAT_YEAR.value = data.boat_year || new Date().getFullYear();
-        form.HOME_PORT.value = data.home_port || '';
-        form.ENGINE_MAKE.value = data.engine_make || '';
-        form.ENGINE_HP.value = data.engine_hp || '';
-        form.BATTERY_VOLTAGE.value = data.battery_voltage || 12;
         window._nominalStored = data.battery_voltage || 12;  // baseline class for the save-rescale warning + open-loop warnings
-        if (form.FIELD_WINDING_V) {
-            window._windingStored = Number(data.field_winding_v) || 12;
-            form.FIELD_WINDING_V.value = String(window._windingStored);
-            fieldWindingSyncOptions();
-        }
+        window._windingStored = Number(data.field_winding_v) || 12;
         applyClassScaledInputAttrs();
-        form.BATTERY_CAPACITY_AH.value = data.battery_capacity_ah || '';
-        form.BATTERY_TYPE.value = data.battery_type || '';
-        form.BATTERY_MAKE_MODEL.value = data.battery_make_model || '';
-        form.ALTERNATOR_BRAND_MODEL.value = data.alternator_brand_model || '';
-        form.SOLAR_WATTS.value = data.solar_watts || '';
-
-        const orientationRadios = form.querySelectorAll('input[name="imuMountOrientation"]');
-        orientationRadios.forEach(radio => {
-            if (parseInt(radio.value) === data.imu_mount_orientation) {
-                radio.checked = true;
-            }
-        });
-
-        form.IMU_DIST_BOW_FT.value = data.imu_dist_bow_ft || '';
-        form.IMU_DIST_CL_FT.value = data.imu_dist_cl_ft || '';
-        form.IMU_HEIGHT_WL_FT.value = data.imu_height_wl_ft || '';
 
         const allFieldsFilled =
             data.boat_length_ft &&
@@ -10249,13 +10539,53 @@ async function fetchAndPopulateVesselInfo() {
         vesselInfoComplete = allFieldsFilled;
         if (allFieldsFilled) setVesselButtonUpdateMode();
         if (typeof updateBattHealthChemNote === 'function') updateBattHealthChemNote();
-
-    } catch (error) {
-        diagLog('Vessel info not found or invalid:', error);
-    } finally {
-        window._vesselInfoLoaded = true;
-        maybeApplyLanding();
+        if (paint) paintVesselForm(data);
     }
+    // After the landing: a unit now known to lack complete Vessel Info is pinned to the form, as a fresh one is.
+    if (window._landingApplied && !wasLocked && vesselInfoLocked()
+        && !document.querySelector('#settings.active #settings-vessel-info.active')) applyLandingTab();
+}
+
+// The form boxes from a record, held back while the owner edits the form (focus in it on screen, or a change not yet
+// saved). The held record goes in when focus leaves an unchanged form (listener beside the submit handler).
+function paintVesselForm(data) {
+    const form = document.getElementById('vessel-info-form');
+    if (!form) return;
+    if (_vesselFormDirty || (form.contains(document.activeElement) && form.offsetParent !== null)) { _vesselPendingPaint = data; return; }
+    _vesselPendingPaint = null;
+
+    // Not part of allFieldsFilled: an unnamed unit is a named-enough unit (XREG-<id>), and
+    // requiring it would re-gate every regulator already commissioned.
+    if (form.REGULATOR_NAME) form.REGULATOR_NAME.value = data.regulator_name || '';
+    form.BOAT_LENGTH_FT.value = data.boat_length_ft || '';
+    form.BOAT_DISPLACEMENT_LBS.value = data.boat_displacement_lbs || '';
+    form.BOAT_TYPE.value = data.boat_type || 'monohull';
+    form.BOAT_MAKE_MODEL.value = data.boat_make_model || '';
+    form.BOAT_YEAR.value = data.boat_year || new Date().getFullYear();
+    form.HOME_PORT.value = data.home_port || '';
+    form.ENGINE_MAKE.value = data.engine_make || '';
+    form.ENGINE_HP.value = data.engine_hp ?? '';
+    form.BATTERY_VOLTAGE.value = data.battery_voltage || 12;
+    if (form.FIELD_WINDING_V) {
+        form.FIELD_WINDING_V.value = String(window._windingStored);
+        fieldWindingSyncOptions();
+    }
+    form.BATTERY_CAPACITY_AH.value = data.battery_capacity_ah || '';
+    form.BATTERY_TYPE.value = data.battery_type || '';
+    form.BATTERY_MAKE_MODEL.value = data.battery_make_model || '';
+    form.ALTERNATOR_BRAND_MODEL.value = data.alternator_brand_model || '';
+    form.SOLAR_WATTS.value = data.solar_watts ?? '';
+
+    const orientationRadios = form.querySelectorAll('input[name="imuMountOrientation"]');
+    orientationRadios.forEach(radio => {
+        if (parseInt(radio.value) === data.imu_mount_orientation) {
+            radio.checked = true;
+        }
+    });
+
+    form.IMU_DIST_BOW_FT.value = data.imu_dist_bow_ft ?? '';
+    form.IMU_DIST_CL_FT.value = data.imu_dist_cl_ft ?? '';
+    form.IMU_HEIGHT_WL_FT.value = data.imu_height_wl_ft ?? '';
 }
 
 // Flip the Save button to "Update Vessel Info" and reveal its tooltip once info is on file.
@@ -10302,6 +10632,22 @@ async function handleVesselInfoSave(event) {
         imu_height_wl_ft: parseFloat(form.IMU_HEIGHT_WL_FT.value)
     };
 
+    // The stored class to compare with is read now from the regulator this save goes to: the page's copy can predate a
+    // reconnect, an import or another client's save. 404 = first save; no answer = nothing is written.
+    let _onFile;
+    try {
+        _onFile = await readVesselInfoRecord();
+    } catch (error) {
+        messageDiv.style.display = 'block';
+        messageDiv.style.backgroundColor = '#ffebee';
+        messageDiv.style.color = '#c62828';
+        messageDiv.textContent = 'Not saved. The regulator did not return its stored Vessel Info (' + error.message
+            + '), so a change of system voltage could not be checked. Check the connection and save again.';
+        return;
+    }
+    _vesselAppliedSeq = ++_vesselReadSeq;
+    applyVesselInfoRecord(_onFile, false, API_BASE_URL);
+
     // If the user changed system voltage, warn before saving — /saveVesselInfo rescales the whole
     // charge-voltage profile + hard-shutdown trip for the new class. Cancelling aborts the save.
     const _oldV = parseInt(window._nominalStored, 10);
@@ -10329,19 +10675,21 @@ async function handleVesselInfoSave(event) {
             body: formData
         }, 8000);
 
+        // the fetch wrapper has already said why (regDemoNotice); the form keeps what was typed
+        if (response.status === 423) { messageDiv.style.display = 'none'; return; }
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const result = await response.json();
 
         if (result.success) {
             // Battery-defaults populator baseline: what the device had on file BEFORE this save
-            const _prevBatt = window.vesselInfo ? {
-                type: window.vesselInfo.battery_type || '',
-                cap: Number(window.vesselInfo.battery_capacity_ah),
-                volt: Number(window.vesselInfo.battery_voltage)
+            const _prevBatt = _onFile ? {
+                type: _onFile.battery_type || '',
+                cap: Number(_onFile.battery_capacity_ah),
+                volt: Number(_onFile.battery_voltage)
             } : null;
-            const _prevOrient = (window.vesselInfo && window.vesselInfo.imu_mount_orientation !== undefined)
-                ? Number(window.vesselInfo.imu_mount_orientation) : null;
+            const _prevOrient = (_onFile && _onFile.imu_mount_orientation !== undefined)
+                ? Number(_onFile.imu_mount_orientation) : null;
             window.vesselInfo = vesselData;
             applyBoatTypeUI();
             // Re-read identity rather than trusting the submitted string: a cleared name falls
@@ -10352,6 +10700,8 @@ async function handleVesselInfoSave(event) {
             applyClassScaledInputAttrs();
             updateBattHealthChemNote();  // chemistry may have just changed
             vesselInfoComplete = true;
+            // The form is the record now; a read sent before this save must not paint the old one back.
+            _vesselFormDirty = false; _vesselPendingPaint = null; _vesselNoneBase = null; _vesselAppliedSeq = ++_vesselReadSeq;
             setVesselButtonUpdateMode();  // first save → becomes "Update Vessel Info" + tooltip
 
             messageDiv.style.backgroundColor = '#e8f5e9';
@@ -11671,13 +12021,19 @@ function commPrepFloatMode(v) {
 function commPrepCollectChanges() {
     const out = [];
     const toF = d => displayTempUnit === 1 ? Math.round((d * 9 / 5 + 32) * 10) / 10 : d;   // display → native °F
+    // Outside any form, so the browser never enforces min/max, and the firmware refuses some bad values with only a
+    // console line: the first bad changed box goes to out.invalid. Step is not enforced (a °C temperature, a 72 A limit).
     const rec = (param, id, native) => {
         const el = document.getElementById(id);
-        if (!el || el.value === '') return;                 // blank → don't write
+        if (!el) return;
+        if (el.validity.badInput) { out.invalid = out.invalid || el; return; }   // typed, but not a number
+        if (el.value === '') return;                        // blank → don't write
         if (el.value === (_commPrepInit[id] || '')) return; // unchanged in the shown unit
         const v = parseFloat(el.value);
         if (!isFinite(v)) return;
-        out.push({ param, value: native ? native(v) : v });
+        const n = native ? native(v) : v;                   // min/max are authored in the native unit (°F for temperature)
+        if (n < parseFloat(el.min) || n > parseFloat(el.max)) { out.invalid = out.invalid || el; return; }
+        out.push({ param, value: n });
     };
     rec('TemperatureLimitF', 'commprep-templimit', toF);
     if (_commPrepWiring !== _commPrepWiringInit && (_commPrepWiring === 1 || _commPrepWiring === 2)) out.push({ param: 'FieldWiring', value: _commPrepWiring });
@@ -11711,8 +12067,20 @@ function commPrepCollectChanges() {
 // (commPrepContinue) hands off to the commissioning wizard — immediately, or (vessel-save chain) by resolving
 // true so the chain opens Charge Rate Limits later.
 async function commPrepFinish(start) {
-    if (!start && !(await cxSetupLeaveConfirm())) return;
     const changes = _commPrepCfg ? commPrepCollectChanges() : [];   // no snapshot: the config read failed and nothing was shown to edit
+    if (changes.invalid) {
+        // Nothing is sent: the screen stays up with the cursor in the box. The temperature box's limits are in °F.
+        const el = changes.invalid;
+        const lbl = el.parentElement && el.parentElement.querySelector('label');
+        const range = (el.id === 'commprep-templimit' && displayTempUnit === 1)
+            ? Math.ceil((parseFloat(el.min) - 32) * 50 / 9) / 10 + ' to ' + Math.floor((parseFloat(el.max) - 32) * 50 / 9) / 10
+            : el.min + ' to ' + el.max;
+        await xAlert((lbl ? lbl.textContent : 'This box') + ' takes a number from ' + range + '. Nothing was saved. Correct it, or clear the box to keep the current setting, then press '
+            + (start ? 'Next' : 'I\'ll do this later') + ' again.', 'Not saved');
+        el.focus();
+        return;
+    }
+    if (!start && !(await cxSetupLeaveConfirm())) return;
     _commPrepRpmActive = false;
     document.getElementById('commprep-modal-overlay').style.display = 'none';
     if (start) vesselNextStepWait(true);   // the write below, then openRpmCap (or the chain's battery-defaults read), run against a blank page
@@ -12334,7 +12702,7 @@ function rpmCapRender() {
         rows +=
             '<tr>' +
             '<td><div class="crl-rpm">' + pre +
-            '<input class="crl-in" type="number" step="1" min="0" value="' + s.rpm[i] + '" oninput="rpmCapEdit(' + i + ',\'rpm\',this.value)">' + suf + '</div></td>' +
+            '<input class="crl-in" type="number" step="1" min="0" value="' + (isFinite(s.rpm[i]) ? s.rpm[i] : '') + '" oninput="rpmCapEdit(' + i + ',\'rpm\',this.value)">' + suf + '</div></td>' +
             '<td><input class="crl-in" type="number" step="' + step + '" min="0" value="' + rpmCapShown(s.lo[i]) + '" oninput="rpmCapEdit(' + i + ',\'lo\',this.value)"></td>' +
             '<td><input class="crl-in" type="number" step="' + step + '" min="0" value="' + rpmCapShown(s.hi[i]) + '" oninput="rpmCapEdit(' + i + ',\'hi\',this.value)"></td>' +
             '</tr>';
@@ -12359,14 +12727,33 @@ function rpmCapRender() {
 
 // Render a stored amp value in the current unit (kW derived at the live battery voltage).
 function rpmCapShown(amps) {
+    if (!isFinite(amps)) return '';   // a cell left blank stays blank across an Amps/kW toggle
     if (_rpmCap.unit === 'kw') { const kw = ampsToKW(amps); return isFinite(kw) ? Math.round(kw * 100) / 100 : 0; }
-    return isFinite(amps) ? Math.round(amps) : 0;
+    return Math.round(amps);
 }
-// Store an edited cell as amps (canonical); an RPM edit stores the integer breakpoint.
+// Store an edited cell as amps (canonical); an RPM edit stores the integer breakpoint. A blank cell stores NaN,
+// which rpmCapContinue refuses: it must never reach the regulator as 0.
 function rpmCapEdit(i, col, v) {
     const n = parseFloat(v);
-    if (col === 'rpm') { _rpmCap.rpm[i] = isFinite(n) ? Math.round(n) : 0; return; }
-    _rpmCap[col][i] = (_rpmCap.unit === 'kw') ? kwToAmps(isFinite(n) ? n : 0) : (isFinite(n) ? n : 0);
+    if (col === 'rpm') { _rpmCap.rpm[i] = isFinite(n) ? Math.round(n) : NaN; return; }
+    _rpmCap[col][i] = !isFinite(n) ? NaN : (_rpmCap.unit === 'kw') ? kwToAmps(n) : n;
+}
+// First problem that would stop Continue, as the message to show; '' when the table can be sent. The firmware
+// lookup has no unused rows: a 0 or out-of-order breakpoint applies the last row's limit at every engine speed.
+function rpmCapProblem(s) {
+    const rule = 'All ten rows need an engine speed, each higher than the row above.';
+    for (let i = 0; i < 10; i++) {
+        const row = 'Row ' + (i + 1) + (i === 0 ? ' (the top row)' : '');
+        if (!isFinite(s.rpm[i])) return row + ' has no engine speed. ' + rule;
+        if (s.rpm[i] <= 0) return row + ' engine speed must be greater than 0. ' + rule;
+        if (i > 0 && s.rpm[i] <= s.rpm[i - 1]) return row + ' engine speed (' + s.rpm[i] + ' RPM) must be higher than row ' + i + ' (' + s.rpm[i - 1] + ' RPM). ' + rule;
+    }
+    const u = (s.unit === 'kw') ? 'kW' : 'A';
+    for (let i = 0; i < 10; i++) {
+        if (!isFinite(s.lo[i])) return 'The Low (' + u + ') limit at ' + s.rpm[i] + ' RPM is empty. Enter a number in every limit cell; 0 is allowed.';
+        if (!isFinite(s.hi[i])) return 'The High (' + u + ') limit at ' + s.rpm[i] + ' RPM is empty. Enter a number in every limit cell; 0 is allowed.';
+    }
+    return '';
 }
 // Toggle Amps/kW — re-render so every cell converts at the current voltage; canonical amps are kept.
 function rpmCapSetUnit(unit) {
@@ -12381,6 +12768,8 @@ async function rpmCapContinue(mode) {
     const s = _rpmCap;
     if (!s) return;   // tables never read; rpmCapRender offers Retry
     if (settingsUnlocked) {
+        const problem = rpmCapProblem(s);
+        if (problem) { await xAlert(problem, 'Charge Rate Limits'); return; }
         let url = '/get?capBothSave=1';
         for (let i = 0; i < 10; i++) {
             const hiKw = ampsToKW(s.hi[i]), loKw = ampsToKW(s.lo[i]);
@@ -12459,7 +12848,8 @@ function onePress(key, fn) {
     'cxVerifyDone', 'cxDetune', 'cxSkip', 'cxManual', 'cxMatrixSkip', 'cxHintsDone', 'rpmCapContinue', 'confirmSystemIDStart',
     'cvsFix', 'frAgain', 'downloadLogs', 'downloadCsv', 'downloadRippleBundle', 'altExportHealthDataset', 'altLogDumpPress',
     'cxCVFitDownload', 'exportConfigDownload', 'shareConfigToLibrary', 'cfgDiffPreview', 'switchRegulator', 'addBoatRegulator',
-    'joinRegulatorHotspot', 'altSweepStartPress', 'altLogRecordStart', 'protTestFire', 'altZeroNow', 'altZeroApplyNow'].forEach(name => {
+    'joinRegulatorHotspot', 'altSweepStartPress', 'altLogRecordStart', 'protTestFire', 'altZeroNow', 'altZeroApplyNow',
+    'resetBatteryWear'].forEach(name => {
     const fn = window[name];
     window[name] = function (...a) {
         return onePress(name + (typeof a[0] === 'string' ? '|' + a[0] : ''), () => fn.apply(this, a));
@@ -13189,13 +13579,11 @@ function fetchAccState() {
 }
 
 // ===== Overvoltage History (Live Data ▸ Diag) =====
-// Band edges scale by the returned k (SYSTEM_VOLTAGE_CLASS/12); time_ms arrives as decimal strings (uint64-safe).
 function fetchOvTelemetry() {
-    const body = document.getElementById('ovtBinsBody');
     fetch(buildURL('/getOvTelemetry'))
         .then(r => r.ok ? r.json() : null)
         .then(d => {
-            if (!d) { if (body) body.innerHTML = '<tr><td colspan="3" style="padding:6px 0;color:var(--text-muted);">Not available.</td></tr>'; return; }
+            if (!d) return;
             const put = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
             put('ovtSoftCount', d.soft);
             put('ovtSwHardCount', d.sw_hard);
@@ -13203,41 +13591,251 @@ function fetchOvTelemetry() {
             put('ovtKdCount', d.kd !== undefined ? d.kd : '—');
             put('ovtTierLowCount', d.tier_low !== undefined ? d.tier_low : '—');
             put('ovtTierMidCount', d.tier_mid !== undefined ? d.tier_mid : '—');
-            if (!body) return;
-            const fineW = d.fine_width_12v * d.k, coarseW = d.coarse_width_12v * d.k;
-            const fineTop = d.bulk + d.bins_fine * fineW;
-            const nBins = d.bins_fine + d.bins_coarse + 1;
-            const binLo = i => i < d.bins_fine ? d.bulk + i * fineW
-                : i < d.bins_fine + d.bins_coarse ? fineTop + (i - d.bins_fine) * coarseW
-                : fineTop + d.bins_coarse * coarseW;
-            const fmtDwell = ms => ms >= 90000 ? (ms / 60000).toFixed(2) + ' min' : (ms / 1000).toFixed(2) + ' s';
-            let lastActive = -1;
-            for (let i = 0; i < nBins; i++) if (d.events[i] || Number(d.time_ms[i])) lastActive = i;
-            // One zero row above the highest active band shows coverage continues upward.
-            const capRow = Math.min(lastActive + 1, nBins - 1);
-            let rows = '';
-            for (let i = 0; i <= capRow; i++) {
-                const ev = d.events[i], ms = Number(d.time_ms[i]);
-                if (!ev && !ms && i !== capRow) continue;
-                const band = (i === nBins - 1)
-                    ? '≥ ' + binLo(i).toFixed(2) + ' V'
-                    : binLo(i).toFixed(2) + ' – ' + binLo(i + 1).toFixed(2) + ' V';
-                rows += '<tr style="border-top:1px solid var(--border);">'
-                    + '<td style="padding:5px 6px 5px 0;color:var(--text-muted);white-space:nowrap;">' + band + '</td>'
-                    + '<td style="padding:5px 8px;text-align:right;font-weight:600;">' + ev + '</td>'
-                    + '<td style="padding:5px 0 5px 8px;text-align:right;font-weight:600;white-space:nowrap;">' + fmtDwell(ms) + '</td>'
-                    + '</tr>';
-            }
-            body.innerHTML = rows || '<tr><td colspan="3" style="padding:6px 0;color:var(--text-muted);">No time above the Bulk target recorded yet.</td></tr>';
         })
-        .catch(() => { if (body) body.innerHTML = '<tr><td colspan="3" style="padding:6px 0;color:var(--text-muted);">Not available.</td></tr>'; });
+        .catch(() => { });
 }
 
 function resetOvTelemetryLifetime() {
-    xConfirm('This permanently clears the lifetime overvoltage history — the histogram and the three lifetime counters that survive restarts and firmware updates. The session counters on the Protections tab are not affected. Clear it?').then(ok => {
+    xConfirm('This permanently clears the lifetime overvoltage protection counters that survive restarts and firmware updates. The session counters on the Protections tab and the Battery Wear Record are not affected. Clear them?').then(ok => {
         if (!ok) return;
         fetch(buildURL('/resetOvTelemetryLifetime'), { method: 'POST' })
             .then(() => fetchOvTelemetry())
+            .catch(() => { });
+    });
+}
+
+// ===== Battery Wear Record (Live Data ▸ Diag ▸ Battery) =====
+// /getBatteryWear is sparse: one [box indexes..., value] row per non-empty box, the box edges in d.edges. Voltage edges are
+// 12 V equivalent; d.k (system voltage / 12) turns them into this system's volts. Times are seconds, charge is Ah.
+function bwFmtDur(s) {
+    if (!(s > 0)) return '';
+    if (s < 60) return Math.max(1, Math.round(s)) + 's';
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    if (s < 172800) return (s / 3600).toFixed(s < 36000 ? 1 : 0) + 'h';
+    return Math.round(s / 86400) + 'd';
+}
+function bwFmtDurLong(s) {
+    if (!(s > 0)) return 'none';
+    if (s < 3600) return Math.max(1, Math.round(s / 60)) + ' min';
+    if (s < 172800) return (s / 3600).toFixed(1) + ' hours';
+    return Math.round(s / 86400).toLocaleString() + ' days';
+}
+function bwFmtAh(a) {
+    if (!(a > 0)) return '';
+    return a < 10 ? a.toFixed(1) : Math.round(a).toLocaleString();
+}
+function bwFmtDate(e) {
+    return e > 1577836800 ? new Date(e * 1000).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+}
+function bwBandLabels(edges, fmt, unit) {   // n edges -> n + 1 labels
+    const out = [];
+    for (let i = 0; i <= edges.length; i++) {
+        if (i === 0) out.push('&lt; ' + fmt(edges[0]) + unit);
+        else if (i === edges.length) out.push('≥ ' + fmt(edges[i - 1]) + unit);
+        else out.push(fmt(edges[i - 1]) + '–' + fmt(edges[i]) + unit);
+    }
+    return out;
+}
+function bwShade(v, max) {   // log scale, so a few seconds and many months both read
+    if (!(v > 0) || !(max > 0)) return '';
+    const a = 0.08 + 0.42 * Math.log10(1 + v) / Math.log10(1 + max);
+    return ' style="background:rgba(214,120,40,' + a.toFixed(2) + ')"';
+}
+
+function fetchBatteryWear() {
+    const sum = document.getElementById('bwSummary');
+    return fetch(buildURL('/getBatteryWear'))
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+            if (!d || !d.edges) throw new Error('no record');
+            renderBatteryWear(d);
+        })
+        .catch(() => { if (sum) sum.innerHTML = '<div style="color:var(--text-muted);font-size:0.85em;">Not available.</div>'; });
+}
+
+let bwLastData = null;   // the source picker re-renders from it
+function renderBatteryWear(d) {
+    bwLastData = d;
+    const E = d.edges, k = Number.isFinite(d.k) ? d.k : 1;
+    const unitT = tempUnitLabel();
+    const empty = n => '<tr><td colspan="' + n + '" style="color:var(--text-muted);">Nothing recorded yet.</td></tr>';
+    const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+    const vt = d.vt || [], vbRows = d.vb || [], st = d.st || [], chg = d.chg || [], dis = d.dis || [];
+    const offSoc = d.unobs_soc || [];
+
+    // Temperature columns: only the bands that hold anything, in every table, so the columns line up.
+    const nT = E.t_f.length + 2;
+    const tLab = bwBandLabels(E.t_f, v => Math.round(toDisplayTemp(v)), ' ' + unitT).concat(['No temp']);
+    const tUsed = new Array(nT).fill(false);
+    vt.forEach(r => { tUsed[r[1]] = true; });
+    st.forEach(r => { tUsed[r[1]] = true; });
+    chg.forEach(r => { tUsed[r[0]] = true; });
+    dis.forEach(r => { tUsed[r[0]] = true; });
+    const tCols = [];
+    for (let i = 0; i < nT; i++) if (tUsed[i]) tCols.push(i);
+    const tHead = tCols.map(i => '<th>' + tLab[i] + '</th>').join('');
+
+    // Summary
+    const cap = d.cap_ah > 0 ? d.cap_ah : 0;
+    let disTot = 0;
+    dis.forEach(r => { disTot += r[2]; });
+    let observed = 0;
+    st.forEach(r => { observed += r[2]; });
+    const x = d.ext || {};
+    const have = v => v !== null && v !== undefined;
+    const at = e => { const t = bwFmtDate(e); return t ? ' on ' + t : ''; };
+    const tTxt = f => toDisplayTemp(f).toFixed(1) + ' ' + unitT;
+    const row = (label, val, tip) => '<div class="metric-row telemetry-row"><span class="metric-label telemetry-label">' + label
+        + (tip ? ' <span class="tooltip">ℹ️<span class="tooltip-box">' + tip + '</span></span>' : '')
+        + '</span><span class="metric-value telemetry-value" style="white-space:normal;text-align:right;">' + val + '</span></div>';
+    const lines = [
+        row('Record started', bwFmtDate(d.since) || 'when the clock is set'),
+        row('Time recorded', bwFmtDurLong(observed)),
+        row('Time not recorded (regulator off)', d.unobs_s > 0
+            ? bwFmtDurLong(d.unobs_s) + ' in ' + d.gaps + (d.gaps === 1 ? ' gap' : ' gaps') : 'none',
+            'The regulator records only while it is powered. Each gap is counted, and the Off column of the state of charge table shows the charge the battery was left at.'),
+        row('Highest battery voltage', have(x.vmax)
+            ? (x.vmax * k).toFixed(2) + ' V' + at(x.vmax_at) + (have(x.vmax_tf) ? ', battery ' + tTxt(x.vmax_tf) : '') : '—',
+            'The highest reading at any moment, so a brief spike counts. The temperature is the battery temperature at that moment.'),
+        row('Hottest battery', have(x.tmax_f) ? tTxt(x.tmax_f) + at(x.tmax_at) : '—'),
+        row('Coldest battery while charging', have(x.tmin_chg_f) ? tTxt(x.tmin_chg_f) + at(x.tmin_chg_at) : '—',
+            'Ignores charge currents under 2% of battery capacity per hour (0.02 C), such as a trickle from solar.'),
+        row('Lowest state of charge', have(x.soc_min) ? x.soc_min + '%' + at(x.soc_min_at) : '—'),
+        row('Since last full charge', !have(d.since_full_s) ? (d.full_last > 0 || !st.some(r => r[0] !== E.soc.length + 1) ? '—' : 'not seen full yet')
+            : d.since_full_s > 0 ? bwFmtDurLong(d.since_full_s) : 'full now'),
+        row('Full cycles delivered', cap > 0 && disTot > 0 ? (disTot / cap).toFixed(1) : '—',
+            'Total charge out divided by battery capacity.'),
+    ];
+    set('bwSummary', lines.join('<hr style="border:none;border-top:1px solid var(--border);margin:6px 0;">'));
+
+    // Voltage x temperature, highest voltage on top
+    const vLab = bwBandLabels(E.v12.map(v => v * k), v => v.toFixed(1), ' V');
+    const vCell = {};
+    let vMax = 0;
+    vt.forEach(r => { (vCell[r[0]] = vCell[r[0]] || {})[r[1]] = r[2]; vMax = Math.max(vMax, r[2]); });
+    let h = '<thead><tr><th>Battery</th>' + tHead + '<th>Total</th><th>Avg A</th><th>Alt</th></tr></thead><tbody>';
+    vbRows.slice().sort((a, b) => b[0] - a[0]).forEach(r => {
+        const c = vCell[r[0]] || {};
+        h += '<tr><td>' + vLab[r[0]] + '</td>'
+            + tCols.map(t => '<td' + bwShade(c[t], vMax) + '>' + bwFmtDur(c[t]) + '</td>').join('')
+            + '<td class="bw-total">' + bwFmtDur(r[2]) + '</td>'
+            + '<td>' + (Number.isFinite(r[5]) ? r[5].toFixed(1) : '—') + '</td>'
+            // Total and Alt round to 0.1 s separately on the regulator, so in a box held for seconds Alt can arrive above Total.
+            + '<td>' + (r[2] > 0 ? Math.round(100 * Math.min(r[3], r[2]) / r[2]) + '%' : '') + '</td></tr>';
+    });
+    set('bwVtTable', h + (vbRows.length ? '' : empty(tCols.length + 4)) + '</tbody>');
+
+    // State of charge x temperature, fullest on top, "no SoC" last; Off = time unrecorded at the SoC last seen
+    const nS = E.soc.length + 2;
+    const sLab = bwBandLabels(E.soc, v => v, '%').concat(['No SoC']);
+    const sCell = {};
+    let sMax = 0;
+    st.forEach(r => { (sCell[r[0]] = sCell[r[0]] || {})[r[1]] = r[2]; sMax = Math.max(sMax, r[2]); });
+    const sRows = [];
+    for (let i = nS - 2; i >= 0; i--) if (sCell[i] || offSoc[i] > 0) sRows.push(i);
+    if (sCell[nS - 1] || offSoc[nS - 1] > 0) sRows.push(nS - 1);
+    h = '<thead><tr><th>SoC</th>' + tHead + '<th>Total</th><th>Off</th></tr></thead><tbody>';
+    sRows.forEach(i => {
+        const c = sCell[i] || {};
+        let tot = 0;
+        Object.keys(c).forEach(t => { tot += c[t]; });
+        h += '<tr><td>' + sLab[i] + '</td>'
+            + tCols.map(t => '<td' + bwShade(c[t], sMax) + '>' + bwFmtDur(c[t]) + '</td>').join('')
+            + '<td class="bw-total">' + bwFmtDur(tot) + '</td><td>' + bwFmtDur(offSoc[i]) + '</td></tr>';
+    });
+    set('bwStTable', h + (sRows.length ? '' : empty(tCols.length + 3)) + '</tbody>');
+
+    // Charge in / out: rate x temperature. Charge in also splits each rate into state-of-charge sub-rows.
+    const rLab = bwBandLabels(E.rate_c, v => v, ' C');
+    const ampLab = i => {
+        if (!cap) return '';
+        const lo = i === 0 ? 0 : E.rate_c[i - 1] * cap, hi = i < E.rate_c.length ? E.rate_c[i] * cap : null;
+        return hi === null ? '≥ ' + Math.round(lo) : Math.round(lo) + '–' + Math.round(hi);
+    };
+    const csLab = bwBandLabels(E.csoc, v => v, '%').concat(['SoC unknown']);
+    // Charge in rows carry the alternator's share as a fifth value (firmware record v3 on); src picks what the cells show.
+    const hasAlt = chg.some(r => r.length > 4);
+    const srcSel = document.getElementById('bwChgSrc');
+    if (srcSel) srcSel.style.display = hasAlt ? '' : 'none';
+    const src = hasAlt && srcSel ? srcSel.value : 'all';
+    const ahTable = (id, rows, withSoc) => {
+        const cell = {}, split = {}, altRow = {}, altSplit = {};
+        const altCol = withSoc && hasAlt && src === 'all';
+        let max = 0;
+        rows.forEach(r => {
+            const t = r[0], rb = r[1], all = withSoc ? r[3] : r[2], alt = withSoc ? Math.min(r[4] || 0, all) : 0;
+            const ah = !withSoc || src === 'all' ? all : src === 'alt' ? alt : all - alt;
+            if (!(ah > 0)) return;
+            const c = (cell[rb] = cell[rb] || {});
+            c[t] = (c[t] || 0) + ah;
+            max = Math.max(max, c[t]);
+            altRow[rb] = (altRow[rb] || 0) + alt;
+            if (withSoc) {
+                const s = ((split[rb] = split[rb] || {})[r[2]] = split[rb][r[2]] || {});
+                s[t] = (s[t] || 0) + ah;
+                const as = (altSplit[rb] = altSplit[rb] || {});
+                as[r[2]] = (as[r[2]] || 0) + alt;
+            }
+        });
+        const rbs = Object.keys(cell).map(Number).sort((a, b) => a - b);
+        const line = (cls, label, amps, c, alt) => {
+            let tot = 0;
+            Object.keys(c).forEach(tt => { tot += c[tt]; });
+            return '<tr' + cls + '><td>' + label + '</td>' + (cap ? '<td>' + amps + '</td>' : '')
+                + tCols.map(tt => '<td' + bwShade(c[tt], max) + '>' + bwFmtAh(c[tt]) + '</td>').join('')
+                + '<td class="bw-total">' + bwFmtAh(tot) + '</td>'
+                + (altCol ? '<td>' + (tot > 0 ? Math.round(100 * alt / tot) + '%' : '') + '</td>' : '') + '</tr>';
+        };
+        let t = '<thead><tr><th>Rate</th>' + (cap ? '<th>Amps</th>' : '') + tHead + '<th>Total</th>'
+            + (altCol ? '<th>Alt</th>' : '') + '</tr></thead><tbody>';
+        rbs.forEach(rb => {
+            t += line('', rLab[rb], ampLab(rb), cell[rb], altRow[rb]);
+            // Sub-rows only when the split says something: a rate whose charge all went in at one SoC band needs none.
+            const bands = withSoc && split[rb] ? Object.keys(split[rb]).map(Number).sort((a, b) => a - b) : [];
+            if (bands.length > 1) bands.forEach(cb => {
+                t += line(' class="bw-sub"', 'at ' + csLab[cb], '', split[rb][cb], altSplit[rb][cb]);
+            });
+        });
+        set(id, t + (rbs.length ? '' : empty(tCols.length + (cap ? 3 : 2) + (altCol ? 1 : 0))) + '</tbody>');
+    };
+    ahTable('bwChgTable', chg, true);
+    ahTable('bwDisTable', dis, false);
+
+    // Cycle depth and time between full charges: both need a state of charge.
+    const noSoc = '<tr><td colspan="4" style="color:var(--text-muted);white-space:normal;">Needs a state of charge from a battery '
+        + 'current sensor or a battery monitor.</td></tr>';
+    const socSeen = st.some(r => r[0] !== nS - 1);
+    const cyc = d.cyc || [], full = d.full || [];
+    const cLab = E.cyc ? bwBandLabels(E.cyc, v => v, '%') : [];
+    if (cLab.length) cLab[0] = cLab[0].replace('&lt; ', '2–');
+    const fmtCyc = h => (h % 2 ? (h / 2).toFixed(1) : (h / 2).toLocaleString());
+    let cycMax = 0, cycTot = 0;
+    cyc.forEach(r => { cycMax = Math.max(cycMax, r[1]); cycTot += r[1]; });
+    h = '<thead><tr><th>Depth</th><th>Cycles</th><th>Avg depth</th><th>Avg middle</th></tr></thead><tbody>';
+    cyc.slice().sort((a, b) => b[0] - a[0]).forEach(r => {
+        h += '<tr><td>' + cLab[r[0]] + '</td><td' + bwShade(r[1], cycMax) + '>' + fmtCyc(r[1]) + '</td><td>'
+            + r[2].toFixed(0) + '%</td><td>' + r[3].toFixed(0) + '%</td></tr>';
+    });
+    if (cyc.length) h += '<tr><td class="bw-total">All</td><td class="bw-total">' + fmtCyc(cycTot) + '</td><td></td><td></td></tr>';
+    set('bwCycTable', h + (cyc.length ? '' : socSeen ? empty(4) : noSoc) + '</tbody>');
+
+    const fLab = E.full_d ? bwBandLabels(E.full_d, v => v, ' days') : [];
+    if (fLab.length) fLab[0] = fLab[0].replace(' days', ' day');
+    let fMax = 0;
+    full.forEach(r => { fMax = Math.max(fMax, r[1]); });
+    h = '<thead><tr><th>Between full charges</th><th>Times</th><th>Average</th></tr></thead><tbody>';
+    full.slice().sort((a, b) => b[0] - a[0]).forEach(r => {
+        h += '<tr><td>' + fLab[r[0]] + '</td><td' + bwShade(r[1], fMax) + '>' + r[1].toLocaleString() + '</td><td>'
+            + bwFmtDurLong(r[2] * 86400) + '</td></tr>';
+    });
+    set('bwFullTable', h + (full.length ? '' : socSeen ? empty(3) : noSoc.replace('colspan="4"', 'colspan="3"')) + '</tbody>');
+}
+
+function resetBatteryWear() {
+    return xConfirm('This permanently clears the Battery Wear Record. Clear it only when the battery has been replaced (Start Over in the Resistance Test section clears it too). Clear it?').then(ok => {
+        if (!ok) return;
+        return fetch(buildURL('/resetBatteryWear'), { method: 'POST' })
+            .then(() => fetchBatteryWear())
             .catch(() => { });
     });
 }
@@ -13627,9 +14225,13 @@ window._firstCsvPacketReceived = false;
 function hideWaitingForRegulator() {
     const el = document.getElementById('waiting-for-regulator');
     if (!el || el._wfrHidden) return;
+    // A tab about to be forwarded off the shared name keeps the splash until that is decided (releaseIdentityHold).
+    if (g_identityHold && !DEMO_MODE) { g_hideAfterHold = true; return; }
     el._wfrHidden = true;
     el.classList.add('wfr-hiding');
     setTimeout(() => { el.style.display = 'none'; }, 480);
+    const picker = document.getElementById('regPickBackdrop');
+    if (picker) picker.style.zIndex = regPickerZ();   // a question raised over the splash goes back under the themed dialogs
 }
 
 // Cold-open delay for the Diag fast-scope kick, so first paint finishes before waveform fetches.
@@ -15169,7 +15771,12 @@ document.addEventListener('click', async ev => {
         _wmPending[n] = pressedAt;
         _wmStart[n] = now;
         const id = WM_INFO[n][1];
-        ['_hi', '_lo'].forEach(sfx => { const el = id && document.getElementById(id + sfx); if (el) el.textContent = '\u2014'; });
+        // Both paint caches still hold the pre-reset text: a first new value equal to it would never repaint the dash.
+        ['_hi', '_lo'].forEach(sfx => {
+            const el = id && document.getElementById(id + sfx);
+            if (el) el.textContent = '\u2014';
+            if (id) { lastWrittenValues.delete(id + sfx); lastValues.delete(id + sfx + '_wmIgn_' + n + sfx); }
+        });
         if (n === 'AWS') ['windGust', 'windLull'].forEach(i => { const el = document.getElementById(i); if (el) el.textContent = '\u2014'; });
     });
     wmRenderRows();
@@ -17028,6 +17635,7 @@ async function passwordSet() {
     if (a !== b) { xAlert('The two entries did not match. Nothing was changed.', 'Settings password'); return; }
     let r = null;
     try { r = await fetchWithTimeout(buildURL('/setPassword'), { method: 'POST', body: new URLSearchParams({ new: a, cur: cur }) }, 8000); } catch (e) { }
+    if (r && r.status === 423) return;   // the fetch wrapper has already said why (regDemoNotice)
     const j = r ? await r.json().catch(() => null) : null;
     if (j && j.ok) {
         g_pwRequired = true;
@@ -17054,6 +17662,7 @@ async function passwordOff() {
     if (!ok) return;
     let r = null;
     try { r = await fetchWithTimeout(buildURL('/setPassword'), { method: 'POST', body: new URLSearchParams({ off: '1', cur: cur }) }, 8000); } catch (e) { }
+    if (r && r.status === 423) return;   // the fetch wrapper has already said why (regDemoNotice)
     const j = r ? await r.json().catch(() => null) : null;
     if (j && j.ok) {
         g_pwRequired = false;
@@ -17275,6 +17884,7 @@ async function pairWithRegulator(me, other) {
     if (!(await ensureArmed('Adding a regulator to this boat changes this unit\'s settings.'))) return;
     let r = null;
     try { r = await fetchWithTimeout(buildURL('/pair?uid=' + encodeURIComponent(other.uid) + '&name=' + encodeURIComponent(other.name || '')), {}, 8000); } catch (e) { }
+    if (r && r.status === 423) return;   // the fetch wrapper has already said why (regDemoNotice)
     if (!r || !r.ok) { xAlert('This regulator refused the pairing (' + (r ? 'HTTP ' + r.status : 'no answer') + ').', 'Add a Regulator'); return; }
     const res = await remotePairWrite(other, me, true);
     if (!res.ok) {
@@ -17295,6 +17905,7 @@ async function removeBoatRegulator(p, live) {
     if (!(await ensureArmed('Removing a regulator from this boat changes this unit\'s settings.'))) return;
     let r = null;
     try { r = await fetchWithTimeout(buildURL('/unpair?uid=' + encodeURIComponent(p.uid)), {}, 8000); } catch (e) { }
+    if (r && r.status === 423) return;   // the fetch wrapper has already said why (regDemoNotice)
     if (!r || !r.ok) { xAlert('This regulator refused the change (' + (r ? 'HTTP ' + r.status : 'no answer') + ').', 'Regulators on This Boat'); return; }
     if (live) {
         const res = await remotePairWrite(live, window.xregUnit, false);
@@ -18756,6 +19367,10 @@ window.addEventListener("load", function () {
     const vesselForm = document.getElementById('vessel-info-form');
     if (vesselForm) {
         vesselForm.addEventListener('submit', handleVesselInfoSave);
+        // An owner's change holds re-read records off the form until a save; focus leaving an unchanged form lets one in.
+        vesselForm.addEventListener('input', () => { _vesselFormDirty = true; });
+        vesselForm.addEventListener('change', () => { _vesselFormDirty = true; });
+        vesselForm.addEventListener('focusout', () => setTimeout(() => { if (_vesselPendingPaint) paintVesselForm(_vesselPendingPaint); }, 0));
     }
 
     startStalenessDetection(); // stalness detectioin detect stale values
@@ -19075,7 +19690,8 @@ window.addEventListener("load", function () {
     });
 
     window.addEventListener('beforeunload', function (e) {
-        if (learningTableHasChanges || fuelTableHasChanges) {
+        // A unit-change reload has already stored the new unit, so a "Stay" would leave this page driving the wrong one.
+        if ((learningTableHasChanges || fuelTableHasChanges) && !g_unitReloading) {
             e.preventDefault();
             e.returnValue = 'You have unsaved table changes. Are you sure you want to leave?';
             return e.returnValue;
@@ -21655,7 +22271,7 @@ function showMainTab(tabName) {
     }
 
     // Block all tabs except Setup until vessel info complete
-    if (tabName !== 'settings' && !vesselInfoComplete) {
+    if (tabName !== 'settings' && vesselInfoLocked()) {
         // Only alert if user is actively trying to switch (not on initial load)
         if (document.getElementById(tabName)) {
             xAlert('Please complete Vessel Info in Setup tab first');
@@ -21729,7 +22345,7 @@ function showRegistrationRequiredModal(featureName) {
 function showSubTab(parentTab, subTabName, evt = null) {
 
     // Block all subtabs except Setup > Vessel Info until vessel info complete
-    if (!vesselInfoComplete && !(parentTab === 'settings' && subTabName === 'vessel-info')) {
+    if (vesselInfoLocked() && !(parentTab === 'settings' && subTabName === 'vessel-info')) {
         xAlert('Please complete Vessel Info in Setup tab first');
         showMainTab('settings');
         showSubTab('settings', 'vessel-info');
@@ -22066,6 +22682,8 @@ function renderDvccCards(data) {
     // Nothing is decoded off CAN unless ParseMessages runs: receive toggle OR the follow master. WiFi needs neither.
     const portOn = ((document.getElementById('NMEA2KData_echo') || {}).textContent === 'Enabled') ||
                    ((document.getElementById('dvccEn_echo') || {}).textContent === 'Enabled');
+    // VE.Can limits are followed only with NMEA 2000 transmit on (firmware dvccVicIngestMerged); shown either way.
+    const txOn = ((document.getElementById('n2kTxEnable_echo') || {}).textContent === 'Enabled');
     const canOffWord = 'CAN receive off';
     const canOffDetail = 'turn on Receive NMEA2K Data (NMEA 2000 card) or Follow External Charge Limits below';
     const secsOf = a => Math.round(a / 1000);
@@ -22107,6 +22725,10 @@ function renderDvccCards(data) {
         const vals = [vTxt(data.dvccRxCanCvl), aTxt(data.dvccRxCanCcl), share ? 'share ' + share : ''].filter(Boolean);
         cDetail = (vals.join(' \u00b7 ') || 'no limits sent') + at + ' \u00b7 ' + secsOf(canAge) + ' s ago';
     }
+    if (portOn && !txOn && canAge !== 999999) {   // nothing ever received: stays "none heard", there may be no VE.Can link at all
+        cWord = 'not followed, transmit off';
+        cDetail += ' \u00b7 turn on Transmit on NMEA2K in the NMEA 2000 card';
+    }
     let wWord, wDetail;
     if (wifiAge === 999999) {
         wWord = 'none heard';
@@ -22118,9 +22740,10 @@ function renderDvccCards(data) {
         wWord = 'heard';
         wDetail = limTxt(data.dvccRxWifiCvl, data.dvccRxWifiCcl) + ' \u00b7 ' + secsOf(wifiAge) + ' s ago';
     }
-    const vicFresh = (portOn && canAge <= 20000) || wifiFresh;
+    const vicFresh = (portOn && txOn && canAge <= 20000) || wifiFresh;
     const vicChip = vicFresh ? 'source \u00b7 heard'
-        : (!portOn && wifiAge === 999999) ? 'source \u00b7 receive off' : 'source \u00b7 no data';
+        : (!portOn && wifiAge === 999999) ? 'source \u00b7 receive off'
+        : (portOn && !txOn && canAge <= 20000) ? 'source \u00b7 transmit off' : 'source \u00b7 no data';
     const rvcChip = !portOn ? 'source \u00b7 receive off' : (fresh ? 'source \u00b7 heard' : 'source \u00b7 no data');
     const idleDetail = (isRvc ? 'RV-C' : 'Victron GX') + ' is the selected source';
     setText('integStateVic', isRvc ? 'not selected' : vicChip);
@@ -22153,9 +22776,17 @@ function updateDvccNotice(st, srcAddr, stopped) {
                        : "This regulator's own targets are in control until the trust latch is reset.");
     } else if (st === 1 || st === 4) {
         if (!dvccNoticeSince) dvccNoticeSince = Date.now();
+        const vicSel = ((document.getElementById('dvccSrcType_echo') || {}).textContent || '').indexOf('Victron') >= 0;
+        const txOff = ((document.getElementById('n2kTxEnable_echo') || {}).textContent === 'Disabled');
+        const wifiLive = Number((window.sensorAges || {}).dvccWifi ?? 999999) <= 20000;
         // A stop holds the field at once, so it is reported at once; the grace is only for own-target control.
         if (stopped || Date.now() - dvccNoticeSince >= DVCC_NOTICE_GRACE_MS) {
-            msg = (st === 4)
+            msg = (vicSel && txOff && !wifiLive)
+                ? '<b>VE.CAN LIMITS NOT FOLLOWED</b> &mdash; turn on Transmit on NMEA2K in the NMEA 2000 card. '
+                  + 'Another alternator regulator on the network repeats the current share the GX sent it, in the same '
+                  + "form as the GX's battery limit. With transmit off, this regulator cannot request each device's maker, "
+                  + 'so it cannot tell the two apart. ' + inControl
+                : (st === 4)
                 ? '<b>EXTERNAL CHARGE LIMITS LOST</b> &mdash; the sender went silent. ' + inControl
                 : ((srcAddr === 255 || !isFinite(srcAddr))
                     ? '<b>NO EXTERNAL CHARGE LIMITS</b> &mdash; follow is on but nothing is arriving. ' + inControl
@@ -22565,34 +23196,36 @@ function validateLearningTable() {
     for (let i = 0; i < 10; i++) {
         const rpmInput = document.getElementById(`rpmTableRPMPoints${i}_input`);
         if (rpmInput) {
-            rpmValues[i] = parseFloat(rpmInput.value) || 0;
+            rpmValues[i] = parseFloat(rpmInput.value);
         }
     }
 
-    let lastNonZeroIndex = -1;
-    for (let i = 9; i >= 0; i--) {
-        if (rpmValues[i] !== 0) {
-            lastNonZeroIndex = i;
+    // The firmware lookup has no unused rows: a 0 or out-of-order breakpoint applies the last row at every speed.
+    const rpmRule = 'All ten rows need an engine speed, each higher than the row above.';
+    for (let i = 0; i < 10; i++) {
+        if (!isFinite(rpmValues[i])) {
+            errors.push(`Row ${i + 1} has no RPM. ${rpmRule}`);
             break;
         }
-    }
-
-    // Validate RPM strictly increases up to last non-zero entry
-    for (let i = 0; i <= lastNonZeroIndex; i++) {
+        if (rpmValues[i] <= 0) {
+            errors.push(`Row ${i + 1} RPM must be greater than 0. ${rpmRule}`);
+            break;
+        }
         if (i > 0 && rpmValues[i] <= rpmValues[i - 1]) {
-            errors.push(`RPM values must increase. Row ${i + 1} (${rpmValues[i]}) must be greater than Row ${i} (${rpmValues[i - 1]})`);
+            errors.push(`RPM values must increase. Row ${i + 1} (${rpmValues[i]}) must be greater than Row ${i} (${rpmValues[i - 1]}). ${rpmRule}`);
             break;
         }
     }
 
-    // Check that zeros only appear at the end
-    let foundNonZero = false;
-    for (let i = 9; i >= 0; i--) {
-        if (rpmValues[i] !== 0) {
-            foundNonZero = true;
-        } else if (foundNonZero) {
-            errors.push(`Zero RPM values are only allowed at the end of the table. Found zero at row ${i + 1}`);
-            break;
+    // A blank cell is dropped by the regulator, but its derived Amps or kW partner still goes out as 0.
+    const cols = [['rpmCapCurrentTable', 'Limit (A)'], ['rpmCapKW', 'Limit (kW)'], ['rpmMinDutyTable', 'Keep-Alive (%)']];
+    for (let i = 0; i < 10 && !errors.length; i++) {
+        for (const [key, name] of cols) {
+            const el = document.getElementById(`${key}${i}_input`);
+            if (el && !el.disabled && el.value.trim() === '') {
+                errors.push(`Row ${i + 1} ${name} is empty. Enter a number in every cell; 0 is allowed here.`);
+                break;
+            }
         }
     }
 
@@ -25268,7 +25901,11 @@ async function canCaptureStart() {
         canCapShow('Downloading the recording.', 1);
         let got;
         try { got = await canCapFetchFile(30000); }
-        catch (e) { canCapShow('Could not download the recording: ' + canCapSentence(canCapErrText(e)), null, 'err'); return; }
+        catch (e) {
+            fetchWithTimeout(buildURL('/canCapture?free=1'), {}, 5000).catch(() => { });
+            canCapShow('Could not download the recording: ' + canCapSentence(canCapErrText(e)), null, 'err');
+            return;
+        }
         deliverFile(got.name, got.text, 'text/plain');
         fetchWithTimeout(buildURL('/canCapture?free=1'), {}, 5000).catch(() => { });
 
@@ -25453,6 +26090,13 @@ let _thermalRing = {
 let _thermalCsv1 = { measAmps: 0, uTarget: 0 };   // latest CSV1 values (10Hz)
 let _thermalAntiWindupAccum = 0;                  // OR-accumulated between samples
 let _thermalLastSampleMs = 0;
+
+// Demo switch (regDemoSwitched): the ring holds up to an hour of the other mode's loop; the next CSV2 sample redraws.
+function thermalRingReset() {
+    for (const k in _thermalRing) _thermalRing[k] = [];
+    _thermalAntiWindupAccum = 0;
+    _thermalLastSampleMs = 0;
+}
 
 function thermalLiveOnCsv1(data) {
     if ('MeasuredAmps' in data) _thermalCsv1.measAmps = Number(data.MeasuredAmps) / 100;
@@ -26107,6 +26751,15 @@ function windLiveOnCsv2(data) {
     // Only touch the chart when the Weather/Solar sub-tab is actually visible.
     const el = document.getElementById('windtrend-plot');
     if (el && el.offsetParent) windTrendRender();
+}
+
+// Demo switch (regDemoSwitched): the ring holds up to an hour of the other mode's wind. Demo entry refills it from
+// /demoBackfill; at exit it starts again from the live samples.
+function windRingReset() {
+    _windRing = { ts: [], tDir: [], tSpd: [], aDir: [], aSpd: [] };
+    _windLastSampleMs = 0;
+    if (windTrendPlot) windTrendPlot.setData([[], [], []]);
+    ['windLgD', 'windLgS'].forEach(id => { const e = document.getElementById(id); if (e) e.textContent = '--'; });
 }
 
 function _windDirArr() { return windTrendMode === 'true' ? _windRing.tDir : _windRing.aDir; }
@@ -27813,7 +28466,7 @@ async function closeSystemIDModalUser() {
         const abort = await xConfirm(
             'A plant test is still running and driving the alternator field.\n\nOK aborts the test now. Cancel lets it keep running in the background — it ends on its own, and reopening this window shows live progress.',
             { title: 'Plant test still running', okText: 'Abort test', cancelText: 'Keep running' });
-        if (abort) { abortSystemIDTest(); return; }   // sends cancelSystemID and closes the modal
+        if (abort) { abortSystemIDTest(); return; }   // sends cancelSystemID; closes the modal once the regulator confirms
     }
     closeSystemIDModal();
 }
@@ -28033,14 +28686,19 @@ function confirmSystemIDStart() {
     });
 }
 
+// Closes only on a confirmed cancel: a locked unit answers 403 and the test keeps driving the field.
 function abortSystemIDTest() {
-    if (sysidPollInterval) { clearInterval(sysidPollInterval); sysidPollInterval = null; }
     const formData = new URLSearchParams();
     formData.append("cancelSystemID", "1");
     fetchWithTimeout(buildURL("/get?" + formData.toString()), {}, 5000)
-        .then(() => console.log("SystemID: abort sent"))
-        .catch(err => console.warn("SystemID abort send failed:", err));
-    closeSystemIDModal();
+        .then(r => {
+            if (!r.ok) throw new Error(r.status === 403 ? 'controls are locked' : 'HTTP ' + r.status);
+            closeSystemIDModal();   // also stops the progress poll
+        })
+        .catch(err => {
+            if (parseInt(getField('systemIDActive_ID') ?? 0) === 0) { closeSystemIDModal(); return; }   // reply lost, test already ended
+            xAlert('The regulator did not confirm the abort (' + (err && err.message ? err.message : err) + '). The Plant Delay test is still running. Unlock controls and press Abort again. Switching the alternator off from the header always works.', 'Abort not confirmed');
+        });
 }
 
 function sysidStartProgressPoll() {
@@ -29011,7 +29669,7 @@ function cxDriveOffReason() {
 // Every button that starts a field-driving test. Gated live off CSV1 so a test can't be fired into a
 // field the firmware won't drive.
 const CX_RUN_FNS = ['cxFieldStart', 'cxKneeStart', 'cxPlantStart', 'cxVerifyStart', 'cxCVPlantStart', 'cxFdStart',
-                    'cxMatrixStart', 'cxStressStart', 'cxChcStart'];
+                    'cxMatrixStart', 'cxStressStart', 'cxChcStart', 'cxDetune'];
 function cxDriveGateRefresh() {
   const b = document.getElementById('commission-body');
   if (!cx || cx.phase < 1 || !b) return;
@@ -29297,7 +29955,7 @@ function cxGoto(phase) {
     cx.phase = phase;
     // Persist the phase (survives reload; firmware re-baselines the step snapshot on entry). Not for Prep: a paused
     // run's persisted step must keep its RESUME marker through a Prep-only peek (Start writes phase 0 itself).
-    if (settingsUnlocked && phase > 0) cxGet('commissionPhase=' + phase).catch(() => { });
+    if (settingsUnlocked && phase > 0 && !g_regDemo) cxGet('commissionPhase=' + phase).catch(() => { });   // demo refuses it
     // A new step is the one moment the panel SHOULD re-anchor to this phase's height (placeLeftPanel
     // holds the top across mid-step re-renders otherwise).
     { const p = document.getElementById('commission-modal-panel'); if (p) p._holdTop = false; }
@@ -29432,12 +30090,17 @@ function cxPrepRefresh() {
         const c3 = (typeof g_lastCsv3 === 'object' && g_lastCsv3) ? g_lastCsv3 : {};
         const battLim = ('BattCurrentLimitA' in c3) ? parseFloat(c3.BattCurrentLimitA) / 10 : 0;
         const shuntR = ('ShuntResistanceMicroOhm' in c3) ? parseFloat(c3.ShuntResistanceMicroOhm) : 0;
-        if (shuntR > 0)
-            shEl.innerHTML = '<strong style="color:#5a5;">INA228 shunt OK</strong>' + (battLim > 0 ? ' — Battery Charge Current Limit active at ' + battLim.toFixed(0) + ' A.' : '.');
-        else if (battLim > 0)
-            shEl.innerHTML = '<span style="color:#f0a500;">no valid INA228 shunt (shunt resistance unset) — the Battery Charge Current Limit is set but INACTIVE.</span>';
+        // Firmware gates: shunt = HAS_BATT_SHUNT; limit = BattLimitEnable && BattCurrentLimitA > 0 && shunt.
+        const shuntOff = String(c3.BatteryShuntPresent) === '0';
+        const limSet = Number(c3.BattLimitEnable) !== 0 && battLim > 0;
+        if (!('BatteryShuntPresent' in c3))
+            shEl.textContent = '…';
+        else if (!shuntOff && shuntR > 0)
+            shEl.innerHTML = '<strong style="color:#5a5;">INA228 shunt OK</strong>' + (limSet ? ' — Battery Charge Current Limit active at ' + battLim.toFixed(0) + ' A.' : '.');
+        else if (limSet)
+            shEl.innerHTML = '<span style="color:#f0a500;">no valid INA228 shunt (' + (shuntOff ? 'Battery Shunt Present is No' : 'shunt resistance unset') + ') — the Battery Charge Current Limit is set but INACTIVE.</span>';
         else
-            shEl.innerHTML = '<span style="color:#888;">no INA228 battery shunt configured — battery-side features (charge limit, tail detection) unavailable.</span>';
+            shEl.innerHTML = '<span style="color:#888;">no INA228 battery shunt configured — battery-side features (charge limit' + (Number(c3.BattMonSrc) === 0 ? ', tail detection' : '') + ') unavailable.</span>';
     }
     // §6: every required sensor in use and reading. Blocks Start like engineOk; the reason lands in the box.
     const sensorBlock = rwfsCommissioningBlock();
@@ -30673,9 +31336,7 @@ function cxCVRemedyPanel(r) {
             '<div style="margin-top:8px;"><button onclick="cxCVPlantStart(' + r.useDI + ')" class="btn-primary btn-sm">Use a stronger step &amp; re-run</button> <button onclick="cxCVWeakAck()" class="btn-secondary btn-sm">Keep this result</button></div>' +
             keepWarn + liNote;
     } else {
-        html += (r.ovLimited
-                ? '<p style="font-size:15px;line-height:1.5;"><strong>A stronger test step isn\'t available here</strong> — the test already had to shrink its step to stay clear of your over-voltage limit. To get a cleaner reading, run it with the bank a bit less full (more voltage room below the limit), then re-run. Otherwise keep this result, and plan on tuning the voltage-loop gains by hand if you see poor holding in Absorption or Float.</p>'
-                : '<p style="font-size:15px;line-height:1.5;"><strong>A stronger test step isn\'t available here.</strong> The reading needs roughly <strong>' + r.needDI + ' A</strong> of step to clear the noise, and the alternator\'s current limit at this RPM caps it at about <strong>' + r.capHead + ' A</strong> above the baseline. Run at ' + rpmTxt + ' (more current headroom), or raise the alternator current limit, then re-run. Otherwise keep this result, and plan on tuning the voltage-loop gains by hand if you see poor holding in Absorption or Float.</p>') +
+        html += '<p style="font-size:15px;line-height:1.5;"><strong>A stronger test step isn\'t available here.</strong> The reading needs roughly <strong>' + r.needDI + ' A</strong> of step to clear the noise, and the alternator\'s current limit at this RPM caps it at about <strong>' + r.capHead + ' A</strong> above the baseline. Run at ' + rpmTxt + ' (more current headroom), or raise the alternator current limit, then re-run. Otherwise keep this result, and plan on tuning the voltage-loop gains by hand if you see poor holding in Absorption or Float.</p>' +
             '<div style="margin-top:8px;"><button onclick="cxCVWeakAck()" class="btn-primary btn-sm">Keep this result</button> <button onclick="cxCVPlantStart()" class="btn-secondary btn-sm">Re-run</button></div>' +
             liNote;
     }
@@ -30798,7 +31459,6 @@ function cvFitFromDevice(j) {
     if (w & 2)  weakW.push('Weak signal vs. noise — result is usable but rough. A higher or quieter RPM would help.');
     if (w & 4)  faceExtra.push('Some pulse edges were unusable (a disturbance or timing hiccup) — the result comes from the clean ones. Re-run if you want a firmer reading.');
     if (w & 8)  faceExtra.push('Something else moved during the test (a load switched, or another charger). Re-run with all other loads steady.');
-    if (w & 16) faceExtra.push('Over-voltage headroom was tight — the step was reduced to protect the bank.');
     if (w & 32) {
         const worst = Math.abs(j.driftTrainPct || 0) >= Math.abs(j.driftSetupPct || 0) ? (j.driftTrainPct || 0) : (j.driftSetupPct || 0);
         faceExtra.push('Engine speed ' + (worst < 0 ? 'fell' : 'rose') + ' about ' + Math.abs(worst).toFixed(0) +
@@ -30816,14 +31476,13 @@ function cvFitFromDevice(j) {
         const prevStep = (j.stepA > 0) ? j.stepA : dI;
         const needDI = Math.ceil(prevStep * (SNR_GOAL / Math.max(1, snr)));   // step that would reach a comfortable SNR
         const useDI  = Math.min(needDI, Math.floor(capHead), 100);           // what we can command within the table + backstop
-        // Class-scaled, matching cvpfVScale() in 8_functions.ino: 300 mV per 12 V block (180 mV after an OV
-        // fall-back), so a 48 V bank probes 1200 mV.
-        const targetDV = ((w & 16) ? 0.18 : 0.30) * ((parseInt(window._nominalStored, 10) || 12) / 12);
+        // Class-scaled, matching cvpfVScale() in 8_functions.ino: 300 mV per 12 V block, so a 48 V bank probes 1200 mV.
+        const targetDV = 0.30 * ((parseInt(window._nominalStored, 10) || 12) / 12);
         const dV = (j.dV_mV || 0) / 1000;
         remedy = { needDI: needDI, useDI: useDI, capHead: Math.floor(capHead),
-                   // Firmware honors any boosted diMax past the fixed ΔV target (unless it OV-fell-back),
+                   // Firmware honors any boosted diMax past the fixed ΔV target,
                    // so "stronger" is judged against the step last commanded, not the 40 A ceiling.
-                   canBoost: (useDI > prevStep + 2) && !(w & 16),
+                   canBoost: useDI > prevStep + 2,
                    // Warn bit0: the alternator delivered under 60% of the commanded step, the ONLY evidence speed was
                    // binding (capHead is the configured cap table, not a measurement); otherwise more RPM is a guess.
                    deliveryShort: !!(w & 1),
@@ -30832,7 +31491,6 @@ function cvFitFromDevice(j) {
                    rippleLimited: ((w & 3) === 2) && dV >= 0.8 * targetDV,
                    // Both proposed gains at their clamp floors: a cleaner reading could not change them.
                    atFloor: (j.Kp <= 2.001 && j.Ki <= 1.001),
-                   ovLimited: !!(w & 16),
                    snr: Math.round(snr), targetMv: Math.round(targetDV * 1000),
                    rpmAtFit: Math.round(j.rpmAtFit || 0) };
     }
@@ -31320,17 +31978,36 @@ function cxMatrixStart() {
         cx.matrixIdle = isFinite(med) ? Math.round(med) : 0;
         cxGame.binLo = isFinite(med) ? Math.min(1200, Math.max(400, Math.floor((med - 50) / CX_GAME_BIN_W) * CX_GAME_BIN_W)) : CX_GAME_BIN_LO;
         cxGame.bins = null;   // next cxGameStart rebuilds on the detected band
-        cx.rtFieldArmed = true;   // field under wizard command → closeCommissionModal tears it down
-        cx.rtLastCmd = Date.now();
-        // Arm the field + test current now so it ramps to setpoint; the fold window (ripGameFill=1) waits for Start
-        // Shooting. Idle stamp + resTest level are staged first so the deferred wipe on ripGameFill=1 stamps them.
-        cxFieldArm();   // take field ownership → invalidates any pending deferred release from a prior stop
-        cxGet('ripGameIdleRpm=' + cx.matrixIdle)
-            .then(() => cxGet('resTest=1'))
-            .then(() => cxGet('resTestTargetA=' + levelA.toFixed(1)))
-            .then(() => cxGet('faCommissionGate=1'))
-            .then(() => { cxStopPoll(); cxPollTimer = setInterval(cxMatrixPoll, 2000); cxMatrixPoll(); })
-            .catch(() => cxGameToast('Device not responding — close and retry'));
+        // One fixed current for the whole band, so it must fit the lowest RPM-table limit in it: the firmware holds a test to
+        // the limit, and a bin it holds below the target never scores. The owner sees and accepts the current first.
+        const bandLo = cxGame.binLo, bandHi = CX_GAME_BIN_HI;
+        const limA = cxCapMinOver(bandLo, bandHi);
+        const holdA = isFinite(limA) ? Math.min(levelA, limA) : levelA;
+        if (!(holdA > 1)) {
+            cx.matrixOn = false; commissionRender();
+            xAlert('Your RPM table allows almost no current between ' + bandLo + ' and ' + bandHi + ' RPM, so the sweep has nothing to hold. Check the table, then start the sweep again.');
+            return;
+        }
+        const lowered = holdA < levelA - 0.05;
+        xConfirm('The sweep holds the alternator at ' + holdA.toFixed(0) + ' A at every engine speed from ' + bandLo + ' to ' + bandHi + ' RPM.' +
+                 (lowered ? ' That is lower than the usual ' + levelA.toFixed(0) + ' A, to stay within your RPM table across that range.' : ''),
+                 { title: 'Start the ripple sweep?', okText: 'Start', cancelText: 'Cancel' }).then(ok => {
+            if (!cx || !cx.matrixOn) return;   // torn down while the question was up
+            if (!ok) { cx.matrixOn = false; commissionRender(); return; }
+            cx.matrixLevelA = holdA;
+            cx.rtFieldArmed = true;   // field under wizard command → closeCommissionModal tears it down
+            cx.rtLastCmd = Date.now();
+            // Arm the field + test current now so it ramps to setpoint; the fold window (ripGameFill=1) waits for Start
+            // Shooting. Idle stamp + resTest level are staged first so the deferred wipe on ripGameFill=1 stamps them.
+            cxFieldArm();   // take field ownership → invalidates any pending deferred release from a prior stop
+            cxGet('ripGameIdleRpm=' + cx.matrixIdle)
+                .then(() => cxGet('resTest=1'))
+                .then(() => cxGet('resTestTargetA=' + holdA.toFixed(1)))
+                .then(() => cxGet('faCommissionGate=1'))
+                .then(() => { cxStopPoll(); cxPollTimer = setInterval(cxMatrixPoll, 2000); cxMatrixPoll(); })
+                .catch(() => cxGameToast('Device not responding — close and retry'));
+            commissionRender();
+        });
         commissionRender();
     }, 4000);
 }
@@ -32036,19 +32713,44 @@ function cxRtestInit() {  // find the RPM with the worst measured filtered rippl
         commissionRender();
     }).catch(() => { cx.rtestState = 'none'; commissionRender(); });
 }
-function cxRtReady() {  // user is holding the resonant RPM → arm field-commanding and start level 1
-    // Size the 3 levels from the cap-table ceiling AT THE TEST RPM, not the global max: the worst-ripple pick can land at
-    // idle, where a global-max level saturates and clusters the points. Rows are "below this RPM" bands in ascending
-    // order, so the binding row is the first breakpoint above the test RPM (amps column is populated in kW mode too).
-    let iMax = 0, capAt = 0;
+// The RPM table's current limit at rpm as the firmware's interpolateRPMTable computes it (row 0 below the first breakpoint,
+// row 9 at or above the last, linear between): the limit it holds a test current to. NaN when a cell is unreadable.
+function cxCapAtRpm(rpm) {
+    const pts = [];
     for (let i = 0; i < 10; i++) {
         const c = document.getElementById('rpmCapCurrentTable' + i + '_input');
         const r = document.getElementById('rpmTableRPMPoints' + i + '_input');
+        pts.push([r ? parseFloat(r.value) : NaN, c ? parseFloat(c.value) : NaN]);
+    }
+    if (!pts.every(([rp, a]) => isFinite(rp) && isFinite(a))) return NaN;
+    if (rpm < pts[0][0]) return pts[0][1];
+    if (rpm >= pts[9][0]) return pts[9][1];
+    const i = pts.findIndex((p, k) => k < 9 && rpm >= p[0] && rpm < pts[k + 1][0]);
+    return i < 0 ? pts[9][1] : pts[i][1] + (rpm - pts[i][0]) / (pts[i + 1][0] - pts[i][0]) * (pts[i + 1][1] - pts[i][1]);
+}
+// Lowest limit anywhere in [lo, hi] RPM: the ends and every breakpoint between (the limit is linear between breakpoints).
+function cxCapMinOver(lo, hi) {
+    let m = Math.min(cxCapAtRpm(lo), cxCapAtRpm(hi));
+    for (let i = 0; i < 10; i++) {
+        const r = document.getElementById('rpmTableRPMPoints' + i + '_input');
+        const rp = r ? parseFloat(r.value) : NaN;
+        if (isFinite(rp) && rp > lo && rp < hi) m = Math.min(m, cxCapAtRpm(rp));
+    }
+    return m;
+}
+function cxRtReady() {  // user is holding the resonant RPM → arm field-commanding and start level 1
+    // Size the 3 levels from the cap-table ceiling AT THE TEST RPM, not the global max: the worst-ripple pick can land at
+    // idle, where a global-max level saturates and clusters the points. The ceiling is the firmware's interpolateRPMTable
+    // at that RPM (row 0 below the first breakpoint, row 9 at or above the last, linear between), the limit it enforces on
+    // the test current. The amps column is populated in kW mode too.
+    let iMax = 0;
+    for (let i = 0; i < 10; i++) {
+        const c = document.getElementById('rpmCapCurrentTable' + i + '_input');
         const v = c ? parseFloat(c.value) : NaN;
         if (isFinite(v) && v > iMax) iMax = v;
-        if (!capAt && r && isFinite(v) && cx.rtestRpm < (parseFloat(r.value) || 0)) capAt = v;
     }
-    if (!capAt) capAt = iMax;   // test RPM above every breakpoint (or RPM column unreadable) → top-band cap
+    let capAt = cxCapAtRpm(cx.rtestRpm);
+    if (!isFinite(capAt)) capAt = iMax;   // RPM or amps column unreadable → top-band cap (the firmware still holds the test to its limit)
     if (!(capAt > 5)) { cx.rtestState = 'failed'; cx.rtFailMsg = 'Output ceiling at ' + cx.rtestRpm + ' RPM unknown (RPM-cap table empty) — can\'t size the levels.'; commissionRender(); return; }
     cx.rtLevels = [0.30 * capAt, 0.60 * capAt, 0.90 * capAt];  // 3 spread levels across what this speed can actually deliver
     cx.rtLevel = 0; cx.rtPts = []; cx.rtest = null; cx.rtWinN = 0; cx.rtRingAt = 0;
@@ -32203,13 +32905,34 @@ function cxRtAbort() {
     cx.rtestState = 'idle';
     commissionRender();
 }
+// The firmware ends the fixed-current hold whenever the field leaves normal Auto (cut, shutdown ramp, Manual) and no
+// keepalive re-arms it, so a field reported off with a named reason ends whichever step holds it.
+function cxHoldOffCheck(data) {
+    const fa = Number(data.fieldActiveStatus), why = Number(data.fieldEventReason) || 0;
+    if (fa === 1 || why === 0 || why === 18) return;   // 18 = commissioning rest, seen only before the hold lands
+    const cause = cxCutCauseText(why) || fieldOffReasonText(why) || ('reason ' + why);
+    const tail = cxCutIsOv(why)
+        ? ' The battery could not take this current at this engine speed. Run the step again at a lower state of charge.'
+        : ' Clear the cause, then run the step again. Live Data → Console has the firmware line.';
+    if (cx.matrixOn) {
+        cxMatrixStop();
+        xAlert('The ripple sweep stopped because the field was turned off: ' + cause + '.' + tail, 'Ripple sweep stopped');
+    } else if (cx.rtestState === 'leveling') {
+        const lvl = cx.rtLevels ? Math.round(cx.rtLevels[cx.rtLevel]) : 0;
+        cxRtAbort();
+        cx.rtestState = 'failed';
+        cx.rtFailMsg = 'The current check stopped at the ' + lvl + ' A level because the field was turned off: ' + cause + '.' + tail;
+        commissionRender();
+    }
+}
 
 // ── Ripple vs. trip-threshold reference plot (RIPPLE_DETECTION_REARCH_SPEC §4) ──
 // Shared by the Protections plots and the read-only Step-8 review: trip line E(I)=max(floor,min(frac·I,ceil)),
 // recomputed live from the setting fields, vs. the stored ripple fit (a0+a1·I). NEVER writes to the device.
 let cxRipFit = null;   // {alt:{a0,a1,rpm,n,i:[],pk:[]}} from /ripfit; null until first fetch
+// Resolves true once a fresh copy is in cxRipFit, false when the read failed (cxRipFit is then left as it was).
 function loadRipFit(cb) {
-    fetch(buildURL('/ripfit')).then(r => r.json()).then(j => { cxRipFit = j; protUpdateMarginEcho(); cvKdUpdateMarginEcho(); if (cb) cb(); }).catch(() => { if (cb) cb(); });
+    return fetch(buildURL('/ripfit')).then(r => r.json()).then(j => { cxRipFit = j; protUpdateMarginEcho(); cvKdUpdateMarginEcho(); if (cb) cb(); return true; }).catch(() => { if (cb) cb(); return false; });
 }
 // Typed value wins (live preview); else the echo (Protections inputs are blank "set new value" boxes).
 function pField(name, echoId) {
@@ -32379,13 +33102,15 @@ function protApplySlope() {
 function protApplyMargin() {
     const el = document.getElementById('protMarginInput'); const m = el ? parseFloat(el.value) : NaN;
     if (!isFinite(m)) { xAlert('Enter a margin in amps first.'); return; }
-    const doApply = () => {
+    // Read fresh on every Set: the regulator discards the fit when the averaging TC, the ripple window or the tach
+    // scaling changes, and after Switch Regulator the cached copy belongs to the other unit.
+    return loadRipFit().then(ok => {
+        if (!ok) { xAlert('The measured ripple could not be read from the regulator, so nothing was changed. Check the connection and press Set again.', 'Not changed'); return; }
         const rf = cxRipFit && cxRipFit.alt;
-        if (!rf || !(rf.n > 0)) { xAlert('No measured ripple yet — run Commissioning ▸ Step 5 (current-check) first, or set the Slope and CV base directly.'); return; }
+        if (!rf || !(rf.n > 0)) { renderRipplePlots(); xAlert('The regulator has no measured ripple (the current check has not been run, or a later setting change discarded it), so nothing was changed. Run Commissioning ▸ Step 5 (current-check), or set the Slope and CV base directly.', 'Not changed'); return; }
         const base = Math.min(40, Math.max(0, rf.a0 + m)), slope = Math.min(50, Math.max(2, rf.a1 * 100));
-        cxGet('IExcessBaseA=' + base.toFixed(1) + '&IExcessFrac=' + slope.toFixed(1) + '&IExcessFracBulk=' + slope.toFixed(1)).then(() => setTimeout(renderRipplePlots, 400)).catch(e => xAlert('The safety margin could not be saved: ' + e + '.', 'Not changed'));
-    };
-    if (!cxRipFit) loadRipFit(doApply); else doApply();
+        return cxGet('IExcessBaseA=' + base.toFixed(1) + '&IExcessFrac=' + slope.toFixed(1) + '&IExcessFracBulk=' + slope.toFixed(1)).then(() => setTimeout(renderRipplePlots, 400)).catch(e => xAlert('The safety margin could not be saved: ' + e + '.', 'Not changed'));
+    });
 }
 
 // ── Voltage-slope vs deadband reference plot (CV D-term) — the V/s twin of the G3 ripple card ──
@@ -32431,13 +33156,15 @@ function dbndCeil() { const c = getEchoNumber('CvKdDbCeil_echo'); return (isFini
 function cvKdApplyMargin() {
     const el = document.getElementById('cvKdMarginInput'); const m = el ? parseFloat(el.value) : NaN;
     if (!isFinite(m)) { xAlert('Enter a margin in V/s first.'); return; }
-    const doApply = () => {
+    // Read fresh on every Set: the regulator discards the fit when the D-term voltage filter, the ripple window or
+    // the tach scaling changes, and after Switch Regulator the cached copy belongs to the other unit.
+    return loadRipFit().then(ok => {
+        if (!ok) { xAlert('The measured voltage slope could not be read from the regulator, so nothing was changed. Check the connection and press Set again.', 'Not changed'); return; }
         const rf = cxRipFit && cxRipFit.slp;
-        if (!rf || !(rf.n > 0)) { xAlert('No measured voltage slope yet — run Commissioning ▸ Step 5 (current-check) first, or set the Voltage-Rise Tolerance base and slope directly.'); return; }
+        if (!rf || !(rf.n > 0)) { renderSlopeDeadbandPlot(); xAlert('The regulator has no measured voltage slope (the current check has not been run, or a later setting change discarded it), so nothing was changed. Run Commissioning ▸ Step 5 (current-check), or set the Voltage-Rise Tolerance base and slope directly.', 'Not changed'); return; }
         const base = Math.min(dbndCeil(), Math.max(0, rf.a0 + m)), slope = Math.max(0, rf.a1);
-        cxGet('CvKdDeadbandVps=' + base.toFixed(2) + '&CvKdDbSlope=' + slope.toFixed(5)).then(() => setTimeout(renderSlopeDeadbandPlot, 400)).catch(e => xAlert('The safety margin could not be saved: ' + e + '.', 'Not changed'));
-    };
-    if (!cxRipFit) loadRipFit(doApply); else doApply();
+        return cxGet('CvKdDeadbandVps=' + base.toFixed(2) + '&CvKdDbSlope=' + slope.toFixed(5)).then(() => setTimeout(renderSlopeDeadbandPlot, 400)).catch(e => xAlert('The safety margin could not be saved: ' + e + '.', 'Not changed'));
+    });
 }
 // Margin echo = saved base − measured intercept (client-side inverse, like the G3 margin echo).
 function cvKdUpdateMarginEcho() {
@@ -33017,7 +33744,7 @@ function cxChcSetupFetch(force) {
         if (!onSetup()) return;
         const capA = Number(j.topCapA) || 0, hi = !!j.hiCol, changed = capA !== c.capA || hi !== c.capHi;
         c.capA = capA; c.capHi = hi;
-        if (!(Number(j.maxRpm) > 0) && !(c.maxRpm > 0) && c.step8Top > 0) {
+        if (!g_regDemo && !(Number(j.maxRpm) > 0) && !(c.maxRpm > 0) && c.step8Top > 0) {   // demo refuses the write
             c.maxRpm = c.step8Top;
             cxGet('maxWorkingRpm=' + c.step8Top).then(() => cxChcSetupFetch(true)).catch(() => { c.maxRpm = 0; commissionRender(); });   // not stored: drop the session value so the next setup read tries again
             commissionRender();
@@ -34358,6 +35085,15 @@ window.addEventListener('load', function () {
     fetchTimer = setInterval(() => { if (panelVisible) fetchBaroHistory(); }, FETCH_INTERVAL_MS);
   };
 
+  // Demo switch (regDemoSwitched): the buffer and the forecast built on it are the other mode's pressure history
+  window.baroOnDemoSwitch = function (gen) {
+    if (!initialized) return;
+    for (let i = 0; i < BARO_HISTORY_SIZE; i++) baroBuffer[i] = NaN;
+    baroBufferEpochAtEnd = 0;
+    if (baroPlot) refreshPlot();
+    regDemoRetry(gen, fetchBaroHistory);
+  };
+
   // Note: we don't have a "tab hidden" hook so panelVisible stays true. Fetches are cheap (~2 KB)
   // so re-fetching every 10 min in the background is fine.
 
@@ -34431,11 +35167,16 @@ window.addEventListener('load', function () {
 
   // ---------- HISTORY FETCH ------------------------------------------------
   function fetchBaroHistory() {
-    fetch(buildURL('/baroHistory.bin'), { cache: 'no-cache' })
+    const gen = g_regDemoGen;
+    return fetch(buildURL('/baroHistory.bin'), { cache: 'no-cache' })
       .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.arrayBuffer(); })
-      .then(buf => parseHistory(buf))
-      .then(() => { if (baroPlot) refreshPlot(); else buildBaroPlot(); })
-      .catch(e => { /* offline — quietly skip */ });
+      .then(buf => {
+        if (gen !== g_regDemoGen) return false;
+        parseHistory(buf);
+        if (baroPlot) refreshPlot(); else buildBaroPlot();
+        return true;
+      })
+      .catch(e => { /* offline — quietly skip */ return false; });
   }
 
   function parseHistory(arrayBuf) {
@@ -35519,7 +36260,8 @@ window.addEventListener('load', function () {
   };
   // oldest = oldest LOADED record (brush clamp; never move it for an empty window or the brush opens on blank).
   // probeFrom = next window to REQUEST, set only while stepping over confirmed-empty windows (no re-ask on retry).
-  let ltCloud = { avail: undefined, fetching: false, oldest: null, probeFrom: null, exhausted: false };
+  // retryAt = Date.now() ms before which no pull starts after a thrown fetch (no internet), else the re-render re-pulls at once.
+  let ltCloud = { avail: undefined, fetching: false, oldest: null, probeFrom: null, exhausted: false, retryAt: 0 };
 
   function ltCloudEnabled() {
     if (g_regDemo) return false;   // regulator demo mode: the plots are its made-up month, never stitched to real cloud history
@@ -35711,6 +36453,7 @@ window.addEventListener('load', function () {
       ltCloudExtendReach();
     } catch (e) {
       // Network/parse failure — leave state so a later brush retries.
+      ltCloud.retryAt = Date.now() + 30000;
     } finally {
       ltCloud.fetching = false;
     }
@@ -35724,14 +36467,14 @@ window.addEventListener('load', function () {
 
   // Called from ltRenderAll: pull when the view passes the oldest loaded record.
   function ltCloudMaybePull(fromSec) {
-    if (!ltData || ltCloud.exhausted || ltCloud.fetching || ltCloud.avail === false) return;
+    if (!ltData || ltCloud.exhausted || ltCloud.fetching || ltCloud.avail === false || Date.now() < ltCloud.retryAt) return;
     if (isFinite(fromSec) && fromSec < ltCloudOldestSec()) ltCloudPull();
   }
 
   // oldestSec = boundary below which cloud fills. Do not pull here: the initial ltRenderAll's ltCloudMaybePull
   // already fires one, and a second races it (this resets the fetching flag) → duplicate data.
   function ltCloudInit(oldestSec) {
-    ltCloud = { avail: undefined, fetching: false, oldest: oldestSec, exhausted: false };
+    ltCloud = { avail: undefined, fetching: false, oldest: oldestSec, exhausted: false, retryAt: 0 };
     if (!ltCloudEnabled()) {
       ltCloud.avail = false;
       const apMode = (window._lastKnownMode === 1);   // 1 = Access Point (the currentModeID span shows the NAME)
@@ -35744,9 +36487,11 @@ window.addEventListener('load', function () {
 
   // Re-fetch the ring on EVERY tab open (cheap: only populated records are sent); cloud stays lazy.
   window.initLongTermPlots = function () {
-    fetch(buildURL('/longTermPlots.bin'), { cache: 'no-cache' })
+    const gen = g_regDemoGen;
+    return fetch(buildURL('/longTermPlots.bin'), { cache: 'no-cache' })
       .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.arrayBuffer(); })
       .then(buf => {
+        if (gen !== g_regDemoGen) return false;
         ltData = parseLT(buf);
         if (!ltData) throw new Error('parse failed');
         ltSortData();   // strict monotonic order before any render
@@ -35755,13 +36500,25 @@ window.addEventListener('load', function () {
         // stitch can fill the timeline; only show the "no data" notice when cloud is off.
         if (ltData.n === 0 && !ltCloudEnabled()) {
           ltStatus('No long-term data yet — records accumulate locally every ~10 min. Without WiFi/Cloud, history is on-device only (about 30 days).');
-          return;
+          ltCharts.forEach(c => c.plot.setData(c.plot.series.map(() => [])));   // charts still drawing an earlier ring (the demo month after a demo)
+          ltDrawStageBar();
+          return true;
         }
         ltStatus(null);
         buildAllLtPlots();
+        return true;
       })
       // On a transient re-fetch failure, keep whatever's already on screen rather than blanking.
-      .catch(e => { if (!ltLoaded) ltStatus('Long-term history unavailable (' + e.message + ').'); });
+      .catch(e => { if (!ltLoaded) ltStatus('Long-term history unavailable (' + e.message + ').'); return false; });
+  };
+  // Demo switch (regDemoSwitched): the ring on screen is the other mode's month. Refetched even with the tab hidden:
+  // returning to Plots with Long Term still selected does not re-enter initLongTermPlots.
+  window.ltOnDemoSwitch = function (gen) {
+    if (!ltLoaded) return;
+    regDemoRetry(gen, window.initLongTermPlots, () => {
+      ltCharts.forEach(c => c.plot.setData(c.plot.series.map(() => [])));
+      ltStatus('Long-term history unavailable (no reply from the regulator).');
+    });
   };
 })();
 
@@ -37915,8 +38672,9 @@ function solarLedgerTabOpened() {
     else solarLedgerRender();
 }
 function solarLedgerFetch() {
+    const gen = g_regDemoGen;
     fetch(buildURL('/solarledger.csv'), { cache: 'no-cache' }).then(r => r.ok ? r.text() : null).then(txt => {
-        if (txt === null) return;
+        if (txt === null || gen !== g_regDemoGen) return;
         sledLastFetchMs = Date.now();
         const rows = [], meta = {};
         const num = x => (x === '' || x === undefined) ? null : +x;

@@ -16,7 +16,7 @@
 
 // Must be strict semver ^\d+\.\d+\.\d+$ — no suffixes, no leading v. Compared as an integer
 // major*10000 + minor*100 + patch, so the ceiling is 999.99.99 (minor/patch cannot exceed 99).
-const char *FIRMWARE_VERSION = "0.0.10";
+const char *FIRMWARE_VERSION = "0.0.11";
 
 // Stable proxy domain in front of the Supabase "ota" bucket, so hosting can move without a re-flash.
 // Download uses setInsecure; integrity is the on-device RSA-4096 signature check (performOTAUpdate).
@@ -695,6 +695,24 @@ uint32_t prev_imu_min_stat_extreme = 0;
 unsigned long forcedUpdateDeadline = 0;
 bool hasForcedUpdate = false;
 int forcedFwVersionInt = 0;
+// UpdateToVersion pre-check: the /get handler stages it (CLOUDOP_OTA_PRECHECK), the httpsTask worker writes the verdict,
+// otaPrecheckService() in loop() stages the factory install or puts Enable back.
+volatile uint8_t otaPrecheckState = 0;   // 0 idle, 1 checking, 2 passed, 3 failed
+uint32_t otaPrecheckStartMs = 0;
+int otaPrecheckOnOffBefore = 0;
+char otaPrecheckVersion[32] = { 0 };
+char otaPrecheckWhy[112] = { 0 };
+// Why the current install attempt stopped (performOTAUpdateToVersion and below); the factory installer saves it for the next boot.
+char otaFailWhy[112] = { 0 };
+// The last staged install that did not complete, as the next boot found it (otaReportFailedAttempt); /otaResult serves it.
+char otaLastFailVer[32] = { 0 };
+char otaLastFailWhy[112] = { 0 };
+// The factory installer booted for a staged update (otaFactoryStagedBoot): the field winds down and stays off, since the owner
+// asked for the update, not a charge on this firmware. otaFactoryWaiting: the install has not started yet, given up after
+// OTA_FACTORY_WAIT_MS (WiFi never joined).
+bool otaFieldHold = false;
+bool otaFactoryWaiting = false;
+#define OTA_FACTORY_WAIT_MS 180000UL
 volatile bool otaCheckDone = false;   // boot version report + forced-update check sent (loop(), core 1); registration reads it on core 0
 bool pendingConfigCheckDone = false;  // boot admin-config pull sent; the field-on queue flush re-arms it
 
@@ -734,6 +752,7 @@ const unsigned long REBOOT_OPPORTUNISTIC_MS = 86400000UL;   // 24 h
 const unsigned long REBOOT_RELAXED_MS       = 172800000UL;  // 48 h
 const unsigned long REBOOT_HARD_MS          = 259200000UL;  // 72 h
 const unsigned long REBOOT_QUIET_HOLD_MS    = 300000UL;     // quiet window must hold this long
+const unsigned long REBOOT_FIELD_DOWN_WAIT_MS = 90000UL;   // the shutdown ramp plus the 32 s cut settle, with margin; past it the restart cuts GPIO4 itself
 const int   REBOOT_SOC_FLOOR_X100  = 3000;   // quiet-tier SoC preference (SOC_percent is %×100)
 const float REBOOT_VBAT_FLOOR_V    = 11.8f;  // ×(SYSTEM_VOLTAGE_CLASS/12) — quiet/relaxed battery floor
 const float REBOOT_VBAT_BROWNOUT_V = 11.5f;  // ×(SYSTEM_VOLTAGE_CLASS/12) — hard tier: WiFi startup spike into a near-dead
@@ -877,6 +896,8 @@ int Heapfrag = 0;         // 0–100 %, integer only; computed with each interna
 uint32_t FreePSRAM = 0;   // KB of free PSRAM
 uint32_t LargestPSRAMBlock = 0;  // KB, largest contiguous free PSRAM block; written only by setup() and cpuLoadTask (Core 0)
 volatile uint32_t largestPsramAtMs = 0;    // millis() of that walk, 0 = none yet
+uint32_t g_psramBootFailMask = 0;   // boot PSRAM buffers that failed to allocate, bits in psramBootCheck() order
+uint32_t g_nvsWriteFails = 0;       // NVS open/set/commit errors since boot (nvsNote)
 size_t LargestInternalBlock = 0;           // KB, largest contiguous free internal block; written only by walkInternalHeap() (setup, cpuLoadTask)
 volatile uint32_t largestInternalAtMs = 0; // millis() of that walk, 0 = none yet
 volatile bool heapWalkAllowed = false;     // Core 1 copy of fieldCutSettled(0) for cpuLoadTask (the function's state is Core-1 only)
@@ -936,6 +957,7 @@ int totalPowerCycles = 0;    // Total number of power cycles (persistent)
 int g_rawResetEsp = -1;
 int g_rawResetRtc0 = -1;
 int g_rawResetRtc1 = -1;
+bool g_bootSoftReset = false;   // this boot followed a firmware-caused reset (restart, panic, watchdog), not a power event
 
 // Black box in RTC noinit RAM: survives every reset but a true power-down, so valid magic after an unexplained reset proves
 // the 3.3V rail never died. Written every loop pass; captured + re-armed at boot in captureResetReason().
@@ -955,9 +977,141 @@ typedef struct {
 // sizeof folded into the magic so a layout change invalidates old snapshots.
 #define BLACKBOX_MAGIC (0xB1ACB0C5UL ^ (uint32_t)sizeof(BlackBoxSnap))
 #define BLACKBOX_DEMO_MAGIC (BLACKBOX_MAGIC ^ 0x00DE0000UL)
+// Consecutive boots whose session never reached BOOT_STABLE_MS (crash, watchdog or brownout loop: RTC survives those, not a
+// power-down). From BOOT_QUIET_AFTER on, the boot-time NVS/LittleFS saves are skipped so the loop can't wear the flash out.
+// Defined ahead of g_distCarry, the previous first RTC noinit definition, so the linker places it LAST: nothing older moves.
+typedef struct {
+  uint32_t shortRuns;
+  uint32_t reachedStable;
+  uint32_t magic;
+} BootRunGuard;
+#define BOOT_RUN_MAGIC (0xB0071009UL ^ (uint32_t)sizeof(BootRunGuard))
+#define BOOT_STABLE_MS 600000UL
+#define BOOT_QUIET_AFTER 3
+RTC_NOINIT_ATTR BootRunGuard g_bootRun;
+bool g_bootSavesQuiet = false;
+void bootRunGuardUpdate() {
+  if (g_bootRun.magic != BOOT_RUN_MAGIC) {
+    g_bootRun.shortRuns = 0;
+    g_bootRun.magic = BOOT_RUN_MAGIC;
+  } else if (g_bootRun.reachedStable) {
+    g_bootRun.shortRuns = 0;
+  } else if (g_bootRun.shortRuns < 1000000UL) {
+    g_bootRun.shortRuns++;
+  }
+  g_bootRun.reachedStable = 0;
+  g_bootSavesQuiet = g_bootRun.shortRuns >= BOOT_QUIET_AFTER;
+  if (g_bootSavesQuiet) Serial.printf("BOOT: %lu short sessions in a row - boot-time saves skipped until this one runs 10 min\n",
+                                      (unsigned long)g_bootRun.shortRuns);
+}
+// Max 24-Hour Distance window (distHourBuckets) carried across the maintenance restart: stashed by checkAndRestart just before
+// ESP.restart(), adopted once after a software reset (distHourCarryAdopt). Defined ahead of g_alarmLatchKeep, the previous first
+// RTC noinit definition, so the linker places it LAST: nothing older moves.
+typedef struct {
+  float buckets[24];
+  uint32_t elapsedMs;   // time already spent in buckets[head]
+  uint32_t head;
+  uint32_t magic;
+} DistHourCarry;
+#define DIST_CARRY_MAGIC (0xD1574C24UL ^ (uint32_t)sizeof(DistHourCarry))
+RTC_NOINIT_ATTR DistHourCarry g_distCarry;
+// Latched alarm (alarmLatch) carried across a software reset: ALARM_LATCH_KEEP_TAG = latched, ALARM_LATCH_KEEP_MUTED_TAG =
+// latched with Silence in force, anything else = not. Mirrored by
+// CheckAlarms, judged in captureResetReason, re-asserted in setup() in Latched mode. Defined ahead of g_batWear so it lands
+// above the shipped 0.0.10 RTC footprint (see g_batWear), which a factory image rewrites during every update.
+RTC_NOINIT_ATTR uint32_t g_alarmLatchKeep;
+#define ALARM_LATCH_KEEP_TAG 0xA1A7C4EDUL
+#define ALARM_LATCH_KEEP_MUTED_TAG 0xA1A7517EUL
+
+// Battery wear record: lifetime time-at-condition grids from which any damage model (time and temperature at voltage, time at
+// state of charge, charge throughput by temperature and rate) can be computed later. Each control tick adds its time to exactly
+// one box per grid; no events. Cycle depth (rainflow over SoC) and time between full charges are the two counts. Box edges (12 V-equivalent volts, F, SoC %, C-rate) are bwVBin() & co. in 5_functions.ino and
+// travel with every /getBatteryWear and cloud copy. Live copy in RTC noinit (survives crashes and soft resets); NVS blob
+// "BattWear" in "storage" for power cuts, written at field-cut saves only (saveNVSDataFull, hourly while cut).
+#define BW_V_BINS    50   // <10.5, 0.5 V to 13.0, 0.1 V to 17.0, 17-18, 18-20, 20-24, >=24 (12 V equivalent)
+#define BW_T_BINS    10   // <14, 14-32, 32-41, 41-50, 50-68, 68-86, 86-104, 104-122, >=122 F, then "no battery temperature"
+#define BW_T_KNOWN    9
+#define BW_SOC_BINS  12   // 10 % bands to 90, 90-95, 95-100, then "no SoC"
+#define BW_RATE_BINS  7   // |I| / capacity: <0.02, 0.05, 0.1, 0.2, 0.5, 1.0, >=1.0 C
+#define BW_CSOC_BINS  4   // charge SoC: <50, 50-80, >=80 %, then "no SoC"
+#define BW_CYC_BINS  11   // half-cycle SoC depth: 2-5, 5-10, 10 % steps to 90, >=90 %
+#define BW_RF_DEPTH  16   // rainflow residue (unclosed reversals); a battery's residue is a handful
+#define BW_RF_HYST   20   // 0.1 % units: a reversal needs 2 % of travel back, so counting jitter is not cycles
+#define BW_FULL_BINS  8   // days between full charges: <1, 1-2, 2-4, 4-7, 7-14, 14-30, 30-60, >=60
+#define BW_NO_TEMP_DF INT16_MIN
+typedef struct {
+  uint8_t  factoryRtcPad[32];       // never used: lies over 0x500003BC-0x500003DB, where a 0.0.10 factory image's bootloader
+                                    // loads its .rtc.force_slow data on every update
+  uint64_t headMagic;               // BW_MAGIC too: an image with another RTC layout writes from the low end, so a valid
+                                    // tail magic alone cannot prove the front survived
+  uint64_t vSumMvMs[BW_V_BINS];     // sum(12 V-equivalent mV x ms) per voltage box: its average voltage
+  int64_t  iSumMaMs[BW_V_BINS];     // sum(battery mA x ms, + = charging) over the box's current-known time
+  int64_t  tSumDfMs[BW_T_KNOWN];    // sum(0.1 F x ms) per temperature band: its average temperature
+  uint32_t vtDs[BW_V_BINS][BW_T_BINS];   // time in 0.1 s units at voltage x temperature (fresh trusted voltage only)
+  uint32_t vAltDs[BW_V_BINS];       // of that, time with the alternator producing or its output unknown
+  uint32_t vIDs[BW_V_BINS];         // of that, time with battery current known (the divisor for iSumMaMs)
+  uint32_t stDs[BW_SOC_BINS][BW_T_BINS]; // time at SoC x temperature, every observed tick
+  uint32_t chgCah[BW_T_BINS][BW_RATE_BINS][BW_CSOC_BINS];  // charge in, 0.01 Ah units
+  uint32_t chgAltCah[BW_T_BINS][BW_RATE_BINS][BW_CSOC_BINS];  // of that, the share the alternator may have supplied
+  uint32_t disCah[BW_T_BINS][BW_RATE_BINS];                // charge out, 0.01 Ah units
+  uint32_t unobsSocS[BW_SOC_BINS];  // seconds the record saw nothing (regulator off, demo), by the SoC box last seen
+  uint32_t unobservedS, gapCount;
+  uint32_t noVoltDs;                // observed time with no trusted battery voltage
+  uint32_t sinceEpoch;              // record start: first real-clock tick after a reset (0 = not yet)
+  uint32_t lastAliveEpoch;          // last real-clock tick plus the time observed since with no real clock: the start of any gap
+  uint32_t vMaxEpoch, tMaxEpoch, tMinChgEpoch, socMinEpoch;
+  uint32_t cycHalf[BW_CYC_BINS];      // closed half cycles by depth (a full cycle counts 2)
+  uint32_t cycDepthSum[BW_CYC_BINS];  // sum(depth, 0.1 %) per half cycle: the box's average depth
+  uint32_t cycMidSum[BW_CYC_BINS];    // sum(middle SoC, 0.1 %) per half cycle: the box's average middle SoC
+  uint32_t fullN[BW_FULL_BINS];       // intervals between full charges (SoC >= 99 % after falling below 97 %), by length
+  uint32_t fullSumS[BW_FULL_BINS];    // their total length, s (the box's average)
+  uint32_t fullLastEpoch;             // last tick at full (0 = never seen full)
+  uint16_t vMaxMv12;                // highest 12 V-equivalent voltage, mV
+  int16_t  vMaxTDf;                 // battery temperature at that moment, 0.1 F (BW_NO_TEMP_DF = none)
+  int16_t  tMaxDf, tMinChgDf;       // hottest battery; coldest battery while charging above 0.02 C (BW_NO_TEMP_DF = none yet)
+  uint8_t  socMin;                  // lowest SoC seen (255 = none yet)
+  uint8_t  lastSocBin;
+  uint16_t rfStack[BW_RF_DEPTH];    // rainflow residue, SoC 0.1 %; [0] is the start of history
+  uint16_t rfExt;                   // running extreme of the leg in progress
+  // One remainder per grid, not per box: each whole unit lands in the box current when it fills, so a box is off by under one
+  // unit per entry, both ways, and totals stay exact. Per-box remainders cost 1.4 KB.
+  uint32_t chgRes, chgAltRes, disRes;  // mA ms below one 0.01 Ah unit (< 36,000,000)
+  uint8_t  vtRes, vAltRes, vIRes, stRes;  // ms below one 0.1 s unit
+  uint8_t  noVoltCarry;
+  uint8_t  rfN;                     // points in rfStack
+  int8_t   rfDir;                   // leg in progress: +1 rising, -1 falling, 0 not yet moved BW_RF_HYST from the start
+  uint8_t  fullAway;                // fell below 97 % since the last full
+  uint32_t magic;
+} BatteryWear;
+#define BW_MAGIC (0xBA77E1A0UL ^ (uint32_t)sizeof(BatteryWear))
+// RTC layout (the linker places noinit variables in reverse definition order): g_ovTel, g_blackBox, clockRealTag and
+// g_rebootIntent keep the shipped 0.0.10 addresses 0x50000200-0x500003BB (OvTelemetry keeps its 400 B), then this record,
+// whose factoryRtcPad covers the factory image's 32 B .rtc.force_slow load, then every newer variable. Check with nm
+// against the 0.0.10 build after any change here.
+RTC_NOINIT_ATTR BatteryWear g_batWear;
+BatteryWear *demoBatWearPtr = nullptr;   // demo: a PSRAM copy, like ovTel()
+#define batWear() (demoBatWearPtr ? *demoBatWearPtr : g_batWear)
+bool g_batWearRtcValid = false;          // boot: RTC copy survived, so the NVS copy (older) is not loaded
+bool g_batWearSaveReq = false;           // a reset wants the NVS copy rewritten at the next field-cut chance
+bool g_batWearHourlyOnly = false;        // set around the boot-time full save: the wear record waits for its hour (the field-off drain writes it)
+bool g_batWearStoredForeign = false;     // factory image, boot: the NVS copy is a newer release's layout (batteryWearLoadFrom)
+uint32_t g_batWearLastSaveMs = 0;
+void batteryWearClear(BatteryWear &w);   // 5_functions.ino
+// Declared here: the Arduino builder hoists its own prototypes above this typedef, which fails for a BatteryWear parameter.
+static void bwCycCount(BatteryWear &w, uint16_t a, uint16_t b, uint32_t halves);
+static void bwRfPush(BatteryWear &w, uint16_t p);
+static void bwRfTick(BatteryWear &w, float soc);
+static void bwFullTick(BatteryWear &w, float soc, uint32_t nowE);
+struct TickSnapshot;
+void batteryWearTick(const TickSnapshot &tick, bool mainVoltsOk);
+size_t batteryWearJson(char *buf, size_t cap, const BatteryWear &w);
+bool batteryWearSaveTo(nvs_handle_t h);
+void batteryWearLoadFrom(nvs_handle_t h);
+void batteryWearSaveNow();
+
 // Why a deferred reboot was asked for (REBOOT_INTENT_TAG | REBOOT_WHY_*), told to the next boot (captureResetReason): RTC
-// noinit, so the reboot path writes no flash. Defined ahead of clockRealTag, so the linker places it last and clockRealTag,
-// g_blackBox and g_ovTel keep their addresses.
+// noinit, so the reboot path writes no flash. Defined ahead of clockRealTag, so the linker places it after clockRealTag, and
+// clockRealTag, g_blackBox and g_ovTel keep their addresses.
 RTC_NOINIT_ATTR uint32_t g_rebootIntent;
 #define REBOOT_INTENT_TAG 0x1A904700UL
 // Soft-clock origin (CLOCK_REAL_TAG, clockIsReal() below). Defined first so the linker places it LAST in RTC noinit:
@@ -967,15 +1121,11 @@ RTC_NOINIT_ATTR BlackBoxSnap g_blackBox;
 BlackBoxSnap g_blackBoxPrev;        // copy of last session's snapshot, taken at boot
 bool g_blackBoxPrevValid = false;   // true if last session's magic matched (RTC RAM survived)
 
-// Lifetime OV excursion telemetry in RTC noinit RAM (lost only on true power-down — accepted). Histogram of RAW bus V vs Bulk:
-// 18 fine 0.2 V bins to Bulk+3.6, 12 coarse 1.0 V bins to Bulk+15.6, +1 overflow; widths scale ×(class/12). Separate from the
-// session counters (g_voltSpikeCount etc.); zeroed only by a magic mismatch or /resetOvTelemetryLifetime.
-#define OV_HIST_FINE_BINS 18
-#define OV_HIST_COARSE_BINS 12
-#define OV_HIST_BINS (OV_HIST_FINE_BINS + OV_HIST_COARSE_BINS + 1)  // 31
+// Lifetime overvoltage-protection counters in RTC noinit RAM (lost only on true power-down — accepted). Separate from the
+// session counters (g_voltSpikeCount etc.); zeroed only by a magic mismatch or /resetOvTelemetryLifetime. Time spent at each
+// battery voltage lives in the battery wear record (BatteryWear, below).
 typedef struct {
-  uint64_t timeMs[OV_HIST_BINS];  // cumulative ms with raw bus V in this band (first: 8-byte align; u32 would wrap at 49.7 days/bin)
-  uint32_t events[OV_HIST_BINS];  // entries into this band (band-occupancy rising edge; low bins run large from CV ripple — expected, timeMs is the ripple-robust metric)
+  uint8_t  reserved[372];         // 0.0.10's histogram space; a 0.0.10 factory image still writes its histogram here
   uint32_t softExceedCount;       // rising edge: filtered V crossed target + OvMeasMarginV (Group-2 soft cap actually engaged)
   uint32_t swHardCutCount;        // rising edge: REASON_FAST_OVERVOLTAGE (SW hard cut, raw/per-tick)
   uint32_t inaCutCount;           // rising edge: REASON_INA_OVERVOLTAGE (INA228 averaged-compare latched cut — software-failed-to-protect backstop)
@@ -983,14 +1133,17 @@ typedef struct {
   uint32_t tierLowCutCount;       // rising edge: REASON_OV_TIER_LOW (timed cut, LOW tier)
   uint32_t tierMidCutCount;       // rising edge: REASON_OV_TIER_MID (timed cut, MID tier)
   uint32_t magic;
-} OvTelemetry;  // ~392 B; RTC slow RAM has ample room (black box is the only other user)
-// Size + bin count in the magic: a layout change self-invalidates (no migration; old histograms aren't comparable).
-#define OVTEL_MAGIC (0x0E7E1E77UL ^ (uint32_t)sizeof(OvTelemetry) ^ ((uint32_t)OV_HIST_BINS << 8))
+} OvTelemetry;
+// Byte-for-byte the 0.0.10 layout (counters at offset 372) under 0.0.10's magic: every update runs the 0.0.10 factory image,
+// which wipes the block on a magic mismatch, so any other layout or magic zeroes the lifetime counters on every update. Its
+// size also keeps the RTC variables above it at their 0.0.10 addresses (see g_batWear).
+static_assert(sizeof(OvTelemetry) == 400 && offsetof(OvTelemetry, softExceedCount) == 372, "OvTelemetry must match 0.0.10");
+#define OVTEL_MAGIC (0x0E7E1E77UL ^ 400UL ^ (31UL << 8))   // 0.0.10's value: base ^ sizeof ^ (31 histogram bins << 8)
 RTC_NOINIT_ATTR OvTelemetry g_ovTel;
 // Writers and /getOvTelemetry go through ovTel(): in demo it is a PSRAM copy, so RTC never carries demo data into a later boot.
 OvTelemetry *demoOvTelPtr = nullptr;
 #define ovTel() (demoOvTelPtr ? *demoOvTelPtr : g_ovTel)
-// ovHistBin() + updateOvHistogram() live in 5_functions.ino (need BulkVoltage, declared below).
+
 
 // These are health variables for the TempTask (digital temperature measurement)
 unsigned long lastTempTaskHeartbeat = 0;
@@ -1278,10 +1431,12 @@ uint8_t  altSweepActive        = 0;   // 0 idle, 1 ramping up, 2 ramping down, 3
 bool     altSweepMeasuredLeg   = false;
 volatile bool altSweepRequested = false;      // set by /get?altSweepStart
 volatile bool altSweepAbortRequested = false; // set by /get?altSweepCancel, and by the fast-OV cut
-float    altSweepRatePctS      = 1.0f;        // ramp rate (% duty per second). 12 V value, x fieldScale() at boot and on a class or winding change, like the floor below
+#define ALT_SWEEP_RATE_12V     1.0f   // 12 V bases InitSystemSettings sets the two knobs from (it runs again at demo exit)
+#define ALT_SWEEP_MARGIN_V_12V 0.20f
+float    altSweepRatePctS      = ALT_SWEEP_RATE_12V;        // ramp rate (% duty per second). 12 V value, x fieldScale() at boot and on a class or winding change, like the floor below
 // Ramp turnaround margins (panel controls posted with the start); see altSweepLimitNow() in 7_functions.ino.
 float    altSweepMarginA       = 10.0f;      // amps below every current limit
-float    altSweepMarginV       = 0.20f;      // volts below every voltage limit (12V value; ×class/12 at boot and on class change).
+float    altSweepMarginV       = ALT_SWEEP_MARGIN_V_12V;      // volts below every voltage limit (12V value; ×class/12 at boot and on class change).
                                              // Not 0.15: a >=1.2 V/s bank acceptance knee fired the hard cut ~1.5 s after turnaround
 float    altSweepFromPct       = FIELDCURVE_DUTY_START;   // ramp floor (%)
 float    altSweepToPct         = 0.0f;        // ramp ceiling (%); 0 = resolve to the live field ceiling at start
@@ -1512,7 +1667,7 @@ portMUX_TYPE wxHourMux = portMUX_INITIALIZER_UNLOCKED;   // the fetch (Core 0) w
 #define SLED_F_VEDIRECT 0x02   // VE.Direct frames were seen during the day
 #define SLED_F_SHUNT    0x04   // battery shunt configured (consumption is measurable)
 #define SLED_F_LEARNED  0x08   // this day moved performanceRatio
-#define SLED_F_PARTIAL  0x10   // coverage below SLED_MIN_COVER_MIN — excluded from the consumption prediction (learning is per hour and judges each hour's own coverage)
+#define SLED_F_PARTIAL  0x10   // coverage below SLED_MIN_COVER_MIN, or totals lost to a restart (solarLedgerInit) — excluded from the consumption prediction (learning is per hour and judges each hour's own coverage)
 #define SLED_F_SAMEDAY  0x20   // forecast only arrived after midnight (device booted late) — a full-day number, but not the one any overnight pause acted on
 #define SLED_F_HOURLY   0x40   // an hourly forecast was captured for the day; learning needs it (per-hour actual vs forecast, battery-limited hours discarded)
 #define SLED_F_LIVE     0x80   // CSV export only: the day still in progress
@@ -1616,9 +1771,9 @@ uint32_t rebulkTimer = 0;                     // millis() timestamp, 0 = inactiv
 // Optional: don't allow immediate rebulk right after entering float
 uint32_t MinFloatTime = 5UL * 60UL * 1000UL;  // ms
 
-// SoC-based refinements (same scaling as SOC_percent: percent*100)
-int SOC_BlockRebulk_percent = 90;
-int SOC_AllowRebulk_percent = 80;
+// SoC-based refinements, plain percent with decimals (unlike SOC_percent, which is percent*100)
+float SOC_BlockRebulk_percent = 90.0f;
+float SOC_AllowRebulk_percent = 80.0f;
 
 uint32_t FLOAT_DURATION = 8 * 3600;  // 8 hours in seconds
 uint32_t floatStartTime = 0;
@@ -1970,7 +2125,7 @@ bool tripPendingRecovery = false;                // set true on boot if NVS had 
 uint32_t timeSinceLastMotion = 0;                // ms accumulated below 1.5 kn while trip active
 uint32_t timeSinceLastValidGps = 0;              // ms accumulated with invalid GPS while trip active
 // Rolling 24-hour max distance (lb-max-24hr leaderboard). 24 hourly buckets; bucket[head] = in-progress hour.
-// Sum of all 24 ≈ last 24 hours of motion (~1 hr undercount worst case). Ring is session-only; watermark is NVS-persisted.
+// Sum of all 24 ≈ last 24 hours of motion (~1 hr undercount worst case). Ring survives only the maintenance restart (g_distCarry); watermark is NVS-persisted.
 float Max24hrDistance_AllTime = 0.0f;            // nm (lifetime max over any rolling 24-hr window)
 float (&distHourBuckets)[24] = PsramPlace::make<float[24]>();                 // per-hour distance accumulators (nm)
 uint8_t distHourHead = 0;                        // index of current in-progress hour bucket
@@ -2023,7 +2178,7 @@ bool isRegistered = false;  // Registration status
 
 // CLOUD FEATURES - STATIC BUFFERS// For ESP32-S3 with 16GB and OPI PSRAM
 const int PAYLOAD_BUFFER_SIZE = 6144;  // PSRAM. ~2.9 kB worst case at payload_v 6; headroom for the next additive block
-const int CONFIG_PAYLOAD_SIZE = 32768;  // sized for the config picker spec (~190 fields)
+const int CONFIG_PAYLOAD_SIZE = 65536;  // config picker spec (~190 fields) plus the battery wear record (up to ~16 KB)
 const int ALT_UPLOAD_BUF_SIZE  = 256 * 1024;  // PSRAM sync block cap: a full alt batch (≤4096 pts) out, then the cloud's front read back into it (4096 rows ≤ 229 KB)
 const int PERF_UPLOAD_BUF_SIZE = 512 * 1024;  // PSRAM sync block cap: sail+motor batches (≤4096 pts EACH) out, then both fronts back (2 × 4096 rows ≤ 393 KB)
 #define SYNC_NOTE_BOAT_OUT  0  // syncAllocNote() slots: the upload block (Core 1) ...
@@ -2210,11 +2365,13 @@ struct SensorWindow {
   int32_t cog_max = 0;
   int64_t cog_area_v_us = 0;
   uint64_t cog_valid_us = 0;
+  int64_t cog_sin_us = 0, cog_cos_us = 0;   // sin and cos x 10000 x us: an angle's average is taken as a vector (angAccum)
 
   int32_t heading_min = 999900;
   int32_t heading_max = 0;
   int64_t heading_area_v_us = 0;
   uint64_t heading_valid_us = 0;
+  int64_t heading_sin_us = 0, heading_cos_us = 0;
 
   // Apparent wind speed
   int32_t aws_min = 999900;
@@ -2227,6 +2384,7 @@ struct SensorWindow {
   int32_t awa_max = 0;
   int64_t awa_area_v_us = 0;
   uint64_t awa_valid_us = 0;
+  int64_t awa_sin_us = 0, awa_cos_us = 0;
 
   // True wind speed
   int32_t tws_min = 999900;
@@ -2239,6 +2397,7 @@ struct SensorWindow {
   int32_t twa_max = 0;
   int64_t twa_area_v_us = 0;
   uint64_t twa_valid_us = 0;
+  int64_t twa_sin_us = 0, twa_cos_us = 0;
 
   int32_t leeway_min = 999900;
   int32_t leeway_max = -999900;
@@ -2347,7 +2506,10 @@ uint16_t       *baroPressureHistory     = nullptr;               // ps_malloc'd 
 volatile uint16_t baroHistoryHead       = 0;                     // next write slot (circular)
 uint16_t        prev_baroHistoryHead    = 0xFFFF;                // NVS shadow — write only when head moved
 unsigned long   lastBaroSampleMs        = 0;                     // millis() of last sample
-time_t          baroHistoryLastEpoch    = 0;                     // GPS/NTP epoch of newest sample (0 = unsynced — JS falls back to fixed sample spacing)
+time_t          baroHistoryLastEpoch    = 0;                     // GPS/NTP epoch of newest sample (0 = unsynced, or a boot gap not yet sampled past — JS falls back to fixed sample spacing)
+bool            baroFirstSamplePending  = false;                 // first sample since boot: a NAN reading retries next pass, not in 10 min
+uint32_t        baroGapNvsEpoch         = 0;                     // nonzero = boot gap marked, epoch served as 0 until a sample; NVS stores this
+bool            baroEpochReal           = false;                 // the epoch NVS stores was stamped by a real clock (clockIsReal()); kept as bit 0 of BaroHistEpch
 
 // Long Term Plots: ~1-month PSRAM ring of min/max/avg envelopes at SENSOR_UPLOAD_INTERVAL, built from the closing SensorWindow,
 // served via /longTermPlots.bin, persisted (writePsramBlob/readPsramBlob) at field-off edge + shutdown, restored at boot.
@@ -2753,6 +2915,8 @@ int32_t prev_BestUpVMG_AT = 0;
 int32_t prev_GaleHrs_AT = 0;
 double prev_spdAccum_AllTime = -1.0;
 uint32_t prev_spdTime_AllTime = 0;
+double prev_spdAccum = -1.0;
+uint32_t prev_spdTime = 0;
 double prev_vltAccum_AllTime = -1.0;
 uint32_t prev_vltTime_AllTime = 0;
 uint32_t prev_pwrTime_AllTime = 0;
@@ -2871,7 +3035,8 @@ int ResetDynamicAltZero = 0;        // Momentary reset button (0=normal, 1=reset
 //Momentary Buttons and alarm logic
 int FactorySettings = 0;  // Reset Button
 bool alarmLatch = false;        // Current latched alarm state
-int AlarmLatchEnabled = 0;      // Whether latching is enabled (0/1 for consistency)
+bool alarmLatchReal = false;    // demo: the part of alarmLatch from real events (entry latch, real INA228 overvoltage); exit restores it
+int AlarmLatchEnabled = 0;     // Whether latching is enabled (0/1 for consistency)
 int AlarmTest = 0;              // Momentary alarm test (1 = test active)
 bool alarmOutputState = false;  // Single source of truth for GPIO 21 state — mirrors every digitalWrite(21,...)
 int ResetAlarmLatch = 0;        // Momentary reset command
@@ -2896,7 +3061,8 @@ int ShuntResistanceMicroOhm = 100;    // Shunt resistance in microohms
 // Zero-current float (UseFloat=2) parks the CV target at BulkVoltage and relies on uTargetAmps=0, which needs Bcur: with no usable
 // shunt it MUST degrade to plain voltage float (else absorption voltage with no current cap or expiry). Every UseFloat==2 branch
 // reads this, never UseFloat, so target, timeout, stage label and zeroFloatActive never disagree.
-#define EFFECTIVE_USE_FLOAT ((UseFloat == 2 && !HAS_BATT_SHUNT) ? 1 : UseFloat)
+// Tier 2 (alternator current ignored) degrades it the same way: voltage-only control has no current command to zero.
+#define EFFECTIVE_USE_FLOAT ((UseFloat == 2 && (!HAS_BATT_SHUNT || g_limpTier == 2)) ? 1 : UseFloat)
 int ChargedDetectionTime = 180;       // Time at charged state to consider 100% (seconds) (3 mins, industry standard for lithium)
 int IgnoreTemperature = 0;            // If no temp sensor, set to 1
 int IgnoreRPM = 0;                    // If RPM sensor absent or malfunctioning, set to 1 to bypass RPM gate
@@ -2928,6 +3094,7 @@ uint8_t g_battTempState = 0;          // §2.6: 0 not expected, 1 reading, 2 los
 uint8_t g_battCurState = 0;           // §11.6 battery current (optional, declared by BatteryShuntPresent): 0 not declared, 1 reading, 2 lost 10 s (alarm + header line, never a cut)
 uint8_t g_limpTier = 0;               // §4.2
 bool g_altAmpsOutOfRange = false;     // CH1 reading outside the sensor's sane window (held value in MeasuredAmps)
+bool g_altAmpsRunLost = false;        // 75 CH1 cycles in a row (~1 s at ~13 ms) with no valid sample: REASON_CURRENT_STALE's limit while the field is energized
 bool g_ibvStale = false;              // §10.1 stale condition, computed in _ReadAnalogInputs_inner
 bool g_inaQuietConfig = false;        // inaApplyConfig()/updateINA228OvervoltageThreshold(): skip the info lines during a runtime re-arm
 volatile bool inaOvReprogramPending = false;  // web-task setters raise it, loop() runs updateINA228OvervoltageThreshold(): Wire drops its lock between register-pointer write and read, so a Core 0 transaction in that gap hits the wrong INA228 register
@@ -3392,7 +3559,8 @@ volatile unsigned long rebootRequestedAt = 0;  // writers store this BEFORE the 
 #define REBOOT_WHY_IMPROV 3       // Wi-Fi sent over USB (Improv)
 #define REBOOT_WHY_CFG_PUSH 4     // cloud settings push applied
 #define REBOOT_WHY_FACTORY 5      // switched to the factory installer for a firmware update
-#define REBOOT_WHY_COUNT 6
+#define REBOOT_WHY_OTA_FAILED 6   // the factory installer's attempt failed: back to the installed firmware
+#define REBOOT_WHY_COUNT 7
 volatile uint8_t rebootRequestWhy = REBOOT_WHY_REMOTE;
 // Per REBOOT_WHY_*: the reboot's serial line, the reset reason the next boot records (LastResetReason; script.js
 // resetReasonLookup), and that boot's "reset:" name
@@ -3402,11 +3570,12 @@ const char *const REBOOT_WHY_LINE[REBOOT_WHY_COUNT] = {
   "=== WIFI SETUP REBOOT (joining with the saved Wi-Fi settings) ===",
   "=== IMPROV WIFI REBOOT (joining the network sent over USB) ===",
   "=== CLOUD SETTINGS PUSH REBOOT (loading the pushed settings) ===",
-  "=== FACTORY SWITCH REBOOT (the factory installer runs the update) ===" };
-const uint8_t REBOOT_WHY_RESET[REBOOT_WHY_COUNT] = { 1, 17, 18, 19, 20, 21 };
+  "=== FACTORY SWITCH REBOOT (the factory installer runs the update) ===",
+  "=== FAILED UPDATE REBOOT (back to the installed firmware) ===" };
+const uint8_t REBOOT_WHY_RESET[REBOOT_WHY_COUNT] = { 1, 17, 18, 19, 20, 21, 22 };
 const char *const REBOOT_WHY_NAME[REBOOT_WHY_COUNT] = { "software", "software, import restart",
   "software, Wi-Fi setup restart", "software, Improv Wi-Fi restart", "software, cloud settings push restart",
-  "software, factory switch restart" };
+  "software, factory switch restart", "software, failed update restart" };
 uint8_t g_bootRebootWhy = REBOOT_WHY_REMOTE;   // this boot's, from g_rebootIntent (captureResetReason)
 // Maintenance-reboot countdown for the dashboard banner (0 = none; CSV2). Only the relaxed/hard tiers count down; quiet-tier
 // reboots have no client by construction.
@@ -3453,7 +3622,7 @@ float g_fieldDutyFloor = 0.0f;
 // Board field ceilings from updateFieldDerateCeilings() (6_functions.ino), here for the same reason as g_fieldDutyFloor.
 float g_fieldCurDutyCeil = 99.0f;   // 10 A field-current ceiling, duty %
 float g_fieldHeatDutyCeil = 99.0f;  // field-drive heat ceiling, duty %
-float g_fieldRcOhm = NAN;           // FieldResistance corrected for alternator temperature, less FD_MARGIN: the 10 A cap, the heat law and the Field Amps readout all use it (NAN = no resistance entered)
+float g_fieldRcOhm = NAN;           // FieldResistance corrected for alternator temperature, less FD_MARGIN: the 10 A cap, the heat law and the Field Amps readout all use it (NAN = no resistance entered). Demo mode: the readout's, on the simulated temperature; the two ceilings correct by the real one (fdAltTempF)
 uint8_t g_fieldCeilBind = 0;        // which ccDutyCeiling() term binds: 0 Max Field %, 1 Max Field Volts, 2 10 A current, 3 heat at the J2 connector, 4 heat at the D5 spreader
 uint32_t g_fieldHeatLimS = 0;       // lifetime seconds held at the heat ceiling (NVS FieldHeatLimS, daily cloud field_heat_limited_s)
 uint32_t g_fieldCurLimS = 0;        // lifetime seconds held at the 10 A ceiling (NVS FieldCurLimS, daily cloud field_cur_limited_s)
@@ -3622,7 +3791,6 @@ const char *cvpfAbortMsg = "";
 uint32_t cvpfPhaseStartMs = 0, cvpfSampleLastMs = 0, cvpfTestStartMs = 0;
 float    cvpfBaseA = 10.0f, cvpfPilotA = 6.0f, cvpfStepA = 6.0f, cvpfTargetDV = 0.30f;
 float    cvpfPilotK = 0.02f, cvpfPilotVbase = 12.0f, cvpfCmdA = 10.0f;
-bool     cvpfFellBack = false;
 bool     cvpfBoosted = false;   // operator accepted the weak-signal stronger step: cvpfDiMaxA is that step, target-ΔV sizing skipped
 float    cvpfBaseDuty = 0.0f, cvpfStepDuty = 0.0f;  // settled duties captured from the current PID, replayed abruptly
 float    cvpfPreSetpoint = 0.0f;   // setpointLimited before the test — restored pre-override so the resume snapshot is clean
@@ -3696,7 +3864,7 @@ float   tuningSweepEnd      = 15.0f;   // Hz — auto-sweep high end
 uint8_t tuningSweepCycles   = 2;       // analysed cycles per frequency (1 settle cycle skipped); integer-cycle windowed, so 2 is clean
 volatile bool tuningSweepRequested = false;  // UI "Run Sweep" → start/restart the sweep
 bool    tuningSweepActive   = false;   // sweep in progress
-bool    tuningSweepDone     = false;   // sweep finished, tuningBode[] valid
+volatile bool tuningSweepDone = false;   // sweep finished, tuningBode[] valid
 uint32_t tuningRunTok       = 0;       // run token, see fieldCurveRunTok
 #define TUNING_SWEEP_NPOINTS 10        // log-spaced sweep points
 struct TuningBodePoint { float freqHz; float gain; float phaseDeg; };  // gain = measured/reference (unitless)
@@ -4596,6 +4764,9 @@ bool commissionRestoreMinPct();
 void commissionClearMinPctBackup();
 // Deferred commissioning-start persist worker (defined in 2_functions.ino) — called from loop().
 void cxStartPersistService();
+// Pending ripple-table save + dirty ripple map/flipbook flush (defined in 2_functions.ino) — called from the reboot paths with the field cut.
+void ripTabSaveIfPending();
+void faFlushDirtyNow();
 void kneeLearnObserve(float rpm, float appliedDuty, float tF, float amps,
                       float dutyRequest, float rpmFloorDuty, bool modeOk);
 void kneeLearnInit();
@@ -4627,12 +4798,17 @@ void kneeAdoptLearnedState(const float *tbl, const float *flr, const float *knee
 #define IBA_PERF       0x2000   // NK_impBootAct: boat-performance Clear All (the import changed perfSpeedSrc)
 void rpmAxisWipeLocal(uint16_t parts);
 void importStagedCommit();
+void otaParkRecords();
+void otaUnparkRecords();
 void importBootActionsLoad();
 void importBootActRun(uint16_t act);
-void *recordsExportJson(bool summary, size_t *outLen);
-size_t recordsExportRead(void *rec, uint8_t *out, size_t maxLen, size_t index);
+void *recordsExportOpen(bool summary);
+size_t recordsExportRead(void *rec, uint8_t *out, size_t maxLen);
 void recordsExportFree(void *rec);
-int recordsImport(const char *body);
+void *recordsImportOpen();
+void recordsImportFeed(void *imp, const uint8_t *data, size_t len);
+void recordsImportAbort(void *imp);
+int recordsImportFinish(void *imp);
 
 // Config Sharing (8_functions.ino) — export/import the cloneable settings set
 String manifestConfigObject();
@@ -4676,7 +4852,7 @@ String pendingConfigClearId = "";   // id passed from get → clear within one b
 
 unsigned long lastOverheatTime[RPM_TABLE_SIZE] = { 0 };          // Timestamp of last overheat per RPM
 int overheatCount[RPM_TABLE_SIZE] = { 0 };                       // Total overheat events per RPM
-unsigned long cumulativeNoOverheatTime[RPM_TABLE_SIZE] = { 0 };  // Safe operation time per RPM
+uint64_t cumulativeNoOverheatTime[RPM_TABLE_SIZE] = { 0 };  // Safe operation ms per RPM (32-bit wrapped at 1193 h in one bin)
 uint32_t learningUpCount[RPM_TABLE_SIZE] = { 0 };
 
 // ===== LEARNING STATE VARIABLES =====
@@ -5667,6 +5843,11 @@ float n2kRxBattA = NAN;      // received battery current (127508, signed)
 float n2kRxBattTempF = NAN;  // received battery temperature (127508)
 int n2kRxSoc = -1;           // received state of charge % (127506); -1 = not available
 int n2kRxSoh = -1;           // received state of health % (127506); -1 = not available
+// Two senders on one instance (a shunt and a BMS) would alternate frame by frame. Each PGN locks to the first source address
+// heard and changes only after that source is silent for N2K_RX_SRC_LOCK_MS (127508 also yields to a sender with a
+// temperature, see BatteryStatus); 255 = none. The instance setting clears them.
+uint8_t n2kRxBattSrc = 255, n2kRxSocSrc = 255;
+#define N2K_RX_SRC_LOCK_MS 10000UL
 
 // ===== DVCC-style charge-limit follow (CVL/CCL) — spec: Working Markdown Docs/DVCC_FOLLOW_SPEC.md =====
 // A received charge limit is a clamp-only REQUEST: it can lower the voltage target or current ceiling, never raise; every local
@@ -5834,8 +6015,16 @@ uint32_t inaBusReadWorstUs = 0;    // worst µs spent in the two INA228 Wire rea
 uint32_t inaBusSlowCount = 0;      // INA228 bus reads > 15 ms (one Wire-timeout's worth) since reset
 uint32_t ina228ErrorCount = 0;     // INA228 reads dropped (sanity fail / exception)
 float inaDieTempF = NAN;           // INA228 internal die temperature (°F) — the only sensor AT the power stage; BMP388 board temp is bulk and lags it badly
-float g_fdDieTempF = NAN;          // the same reading as the heat law sees it: written only with a valid sample past the warm-up discard (IDX_INA_DIE_TEMP stamp)
-bool g_inaDieRewarm = false;       // set by inaApplyConfig(): a re-initialized chip reads DIETEMP 0 C until its first conversion, so the warm-up discard runs again
+float g_fdDieTempF = NAN;          // the same reading as the heat law sees it: written only with a valid sample past the warm-up discard (stamp g_fdDieMs)
+uint32_t g_fdDieMs = 0;            // g_fdDieTempF's stamp, 0 = never: the heat ceiling and REASON_DIE_TEMP_LOST read it. Real in demo mode too
+// Demo mode: the field driver's own inputs from the real chips (demoReadFieldDriveReal, owDemoAltRead); the simulated boat feeds every other consumer
+float g_fdBusV = 0.0f;             // INA228 bus volts, ShuntLead-corrected as IBV is
+bool g_fdBusStale = true;          // g_ibvStale's rule on those reads
+float g_fdAltProbeF = NAN;         // alternator-role DS18B20 (TempTask, Core 0), stamp g_fdAltProbeMs
+uint32_t g_fdAltProbeMs = 0;
+int g_fdThermF = -99;              // thermistor (ADS1115 CH3), stamp g_fdThermMs
+uint32_t g_fdThermMs = 0;
+bool g_inaDieRewarm = false;      // set by inaApplyConfig(): a re-initialized chip reads DIETEMP 0 C until its first conversion, so the warm-up discard runs again
 uint32_t g_fieldDerateWorstUs = 0;  // worst updateFieldDerateCeilings() pass since boot / Reset Peak Values (/debug): the control-loop budget for it is 500 us
 float inaDieTempMaxF = NAN;        // session max of inaDieTempF, zeroed at boot and by Reset Peak Values. Uploads once per 24h as device_state_daily.ina_die_temp_max_f, so a bad first read here becomes a permanent fleet record — hence the warm-up + corroboration gate at the read site
 uint32_t imuFifoFetchWorstUs = 0;  // worst µs spent in Get_FIFO_Sample since reset
@@ -6001,16 +6190,17 @@ const char WIFI_CONFIG_HTML[] PROGMEM =
   // Post-save countdown: the Save button is replaced by the status panel so the result can't read as a button to press. The
   // countdown covers a fetch rejection when the AP drops first, and the backstop timer below covers a socket that goes quiet.
   "<script>"
-  "(function(){var f=document.forms[0],b=document.getElementById('sv'),s=document.getElementById('st'),done=0;"
+  "(function(){var f=document.forms[0],b=document.getElementById('sv'),s=document.getElementById('st'),done=0,tm;"
   "function cd(pre){if(done)return;done=1;var n=25;(function t(){s.textContent=n>0?(pre+'Restarting - '+n+'s'):'Restart complete. Reconnect your device to your chosen network, then open alternator.local in a browser.';"
   "if(n-->0)setTimeout(t,1000)})()}"
   "function bad(m){if(done)return;done=1;s.style.color='#a00';s.textContent=m;b.style.display='';b.disabled=false}"
-  "f.addEventListener('submit',function(e){e.preventDefault();b.disabled=true;b.style.display='none';"
+  // Save is pressable again only after bad(); re-arm for this attempt and kill the last attempt's backstop.
+  "f.addEventListener('submit',function(e){e.preventDefault();done=0;clearTimeout(tm);b.disabled=true;b.style.display='none';"
   "s.style.display='block';s.style.color='';s.textContent='Saving...';"
   "var q=new URLSearchParams(new FormData(f));"
   // Backstop: fetch() has no default timeout, so a POST that neither answers nor errors leaves
   // 'Saving...' up forever. Wording is hedged because we never saw the 200 in that case.
-  "setTimeout(function(){cd('No answer from the regulator - it may already be restarting. ')},8000);"
+  "tm=setTimeout(function(){cd('No answer from the regulator - it may already be restarting. ')},8000);"
   // A 400 (short AP password) or 500 (NVS write failed) answers fast and RESOLVES the fetch, so only
   // r.ok may start the countdown. A rejected fetch is the restart taking the AP down = really saved.
   "fetch('/wifi',{method:'POST',body:q}).then(function(r){if(r.ok){cd('Settings saved. ');return;}"
@@ -6248,6 +6438,7 @@ void setup() {
     while (true)
       ;  // halt
   } else {
+    otaUnparkRecords();     // first: record files parked across an update come back before anything reads or replaces them
     importStagedCommit();   // before any loader opens them: files a config import staged swap in over the live ones
     initSensorBuffer();
     // Restore PSRAM ring from LittleFS backup if Phase 4 dumped one before
@@ -6305,10 +6496,13 @@ void setup() {
 
 
   captureResetReason();            // immediately capture the reason for last ESP32 shutdown and store in LittleFS and variable that won't be overwritten until next boot
+  bootRunGuardUpdate();
+  distHourCarryAdopt();            // needs g_bootSoftReset from captureResetReason
   ensurePreferredBootPartition();
   loadNVSData();                   // Load persistent variables from NVS- everything from last session is restored
   initNVSCache();                  // Sync change-detection cache with loaded NVS values to prevent false writes
   restoreSoftClock();              // Re-establish a usable timebase (retained RTC, else NVS epoch) so AP-mode/no-internet Long Term records aren't stamped 0 and rendered as phantom gaps. Snaps to truth when a real source reports.
+  baroMarkBootGap();               // empty barometer slots for the time off; needs the clock above, and the boot save below stores them
   loadUsageAccum();                // App-usage accumulator survives the maintenance restart (dumped at the shutdown flush points)
   huntMapLoad();                   // Oscillation-damper speed pockets (RAM-authoritative; this is the boot restore)
   {  // Seed Free Data Storage once — boot is a guaranteed-safe moment for the ~100ms usedBytes() traversal
@@ -6339,7 +6533,11 @@ void setup() {
   prevSessionMaxLoopTime = (uint32_t)LastSessionMaxLoopTime;  // last session's worst (µs), black-box-corrected above when available
   MaxLoopTime = 0;                       // reset for this session (persists to NVS on next save)
   totalPowerCycles++;
-  saveNVSDataFull();  // Synchronous write — persists boot-time adjustments before loop() starts
+  if (!g_bootSavesQuiet) {
+    g_batWearHourlyOnly = true;
+    saveNVSDataFull();  // Synchronous write — persists boot-time adjustments before loop() starts
+    g_batWearHourlyOnly = false;
+  }
   initAlternatorHealth();
   altSettingsLoad();
   initBoatPerformance();
@@ -6375,6 +6573,15 @@ void setup() {
   bhInitSettings();           // Battery Health: DCIR test config + persisted DCIR/capacity blobs
   initWeatherModeSettings();  // Add weather mode settings--- otherwise similar to line above (InitSystemSettings)
   runSettingsMigrations();    // settings-schema migration chain — must stay after the last NVS settings loader
+  if (AlarmLatchEnabled == 1 && (g_alarmLatchKeep == ALARM_LATCH_KEEP_TAG || g_alarmLatchKeep == ALARM_LATCH_KEEP_MUTED_TAG)) {   // captureResetReason zeroed it unless a software reset
+    alarmLatch = true;
+    // alarmSilencedBits stays 0, so only a latch whose condition has ended stays muted: any condition present now sounds.
+    alarmSilenced = (g_alarmLatchKeep == ALARM_LATCH_KEEP_MUTED_TAG);
+    queueConsoleMessage(alarmSilenced ? "ALARM LATCH: still latched and silenced from before the restart"
+                                      : "ALARM LATCH: still latched from before the restart");
+  }
+  otaReportFailedAttempt();   // a staged install that failed on the factory installer last boot
+  otaFactoryStagedBoot();     // after the loaders: holds the field off on the factory installer's update boot
   importBootActionsLoad();    // wipes a config import left for this boot; they run from loop() after every loader
   accessInit();               // settings password + paired-regulator list (own NVS keys, outside the CSV3 echo on purpose)
   loadTuningLog();            // restore last session's tuning records from LittleFS
@@ -6406,6 +6613,7 @@ void setup() {
 
   resetSensorWindow();  // Initialize sensor window (Cloud Features My History, starts hi/low water marks all fresh)
   resetAccelWindow();
+  WiFi.persistent(false);  // before the first WiFi.mode(): the driver keeps STA/AP config in RAM, so a loop() rejoin never writes flash
   setupWiFi();  // NOW setup WiFi with all settings properly loaded
 
   // ===== CREATE HTTPS TASK ON CORE 0 =====
@@ -6536,6 +6744,7 @@ void setup() {
                 (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
                 (unsigned)LargestPSRAMBlock);
   walkInternalHeap();  // seeds LargestInternalBlock / Heapfrag; with the field live, cpuLoadTask's next walk can be hours away
+  psramBootCheck();
   Serial.printf("Internal RAM after setup: %d KB free, largest block %u KB\n",
                 (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), (unsigned)LargestInternalBlock);
   Serial.println("=== SETUP COMPLETE ===");
@@ -6545,6 +6754,15 @@ void loop() {
 
   esp_task_wdt_reset();
   starttime = esp_timer_get_time();
+  if (!g_bootRun.reachedStable && millis() >= BOOT_STABLE_MS) {
+    g_bootRun.reachedStable = 1;
+    if (g_bootSavesQuiet) {   // stable now: run the field-off drain the quiet boot skipped
+      g_bootSavesQuiet = false;
+      fieldOffFlushDone = false;
+      fieldOffMatrixFlushDone = false;
+      if (gpio4IsLow) fieldOffEdgeMs = millis();
+    }
+  }
   // Latched at the top of the pass so a pass that drops the field mid-way still counts as
   // field-on (it ran control code). Consumed by the field-ON loop worst at the bottom of loop().
   ftLoopPassSeq++;  // pass tag for blame capture — must precede every TIMED_CALL in this pass
@@ -6579,14 +6797,19 @@ void loop() {
     const uint8_t why = (rebootRequestWhy < REBOOT_WHY_COUNT) ? rebootRequestWhy : REBOOT_WHY_REMOTE;
     Serial.println(REBOOT_WHY_LINE[why]);
     g_rebootIntent = why ? (REBOOT_INTENT_TAG | why) : 0;
-    // The maintenance restart's ring, plot and usage saves (setup() restores them); flash writes only with the field cut.
-    // Not its NVS or curve saves: imports and the config push reboot through here, and altHealthSave would overwrite
-    // the altbaseSec a records import just wrote.
+    // The maintenance restart's ring, plot and usage saves, plus the ripple table, map and flipbook (setup() restores them);
+    // flash writes only with the field cut. Not its NVS or curve saves: imports and the config push reboot through here, and
+    // altHealthSave would overwrite the altbaseSec a records import just wrote (imported ripple files are staged, so they win).
     if (gpio4IsLow) {
       if (currentWindow->dutyCycle_valid_us > 0) { pushSensorSnapshot(computeCollectionTime()); resetSensorWindow(); }
       if (!ringIsEmpty()) dumpSensorRingToLittleFS();
       dumpLongTermRing();
       dumpUsageAccum();
+      ripTabSaveIfPending();
+      faFlushDirtyNow();
+      // The one NVS save here: a factory image built for another wear-record layout clears the RTC copy, so the stored one must be current.
+      if (why == REBOOT_WHY_FACTORY) batteryWearSaveNow();
+      if (why == REBOOT_WHY_FACTORY) otaParkRecords();   // after the saves above: the factory image must not find a record it cannot read
     }
     ESP.restart();
   }
@@ -6634,14 +6857,14 @@ void loop() {
     manualUpdateCheckDone = true;
   }
 
-  if (pendingUpdateWaiting && WiFi.status() == WL_CONNECTED) {
+  if (pendingUpdateWaiting && WiFi.status() == WL_CONNECTED && demoPhase == DEMO_OFF) {   // demo waits: the seal drops its NVS writes, then it reboots
     if (!gpio4IsLow) {
       // performOTAUpdateToVersion blocks the control loop for the whole download+flash, freezing field PWM at its last duty with
       // every software protection dead. Never start it with the field enable line up (a duty-0 hold counts as up); nothing can raise
       // duty once the loop is seized, so a present-state check is sufficient.
       static bool stagedOtaDeferLogged = false;
       if (!stagedOtaDeferLogged) {
-        queueConsoleMessage("Staged update waiting: install starts when charging stops (field off)");
+        queueConsoleMessage("Staged update: waiting for the field to switch off before the install");
         stagedOtaDeferLogged = true;
       }
     } else if (esp_ota_get_running_partition() == esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL)) {
@@ -6656,6 +6879,8 @@ void loop() {
           nvs_commit(wakeH);
           nvs_close(wakeH);
         }
+        batteryWearSaveNow();   // as the deferred reboot's REBOOT_WHY_FACTORY save
+        otaParkRecords();   // the field is off on this branch
         Serial.printf("UPDATE: staged update for %s found on ota_0 - restarting to factory to install\n", pendingVersion);
         Serial.flush();
         ESP.restart();
@@ -6667,14 +6892,18 @@ void loop() {
 
       // Clear the flag pre-attempt so a mid-install crash can't boot-loop
       clearPendingUpdateNVS();
+      otaFactoryWaiting = false;
 
       // core0Busy: other tasks skip flash/heavy work during the install (contract: only set
       // with the field off — satisfied by the gate above).
       core0Busy = true;
 
       performOTAUpdateToVersion(pendingVersion);  // This calls prepareForOTA() which kills tasks
+      otaFactoryAttemptFailed(pendingVersion);    // a completed install reboots inside, so reaching here means it failed
     }
   }
+  if (otaFactoryWaiting && millis() > OTA_FACTORY_WAIT_MS && demoPhase == DEMO_OFF) otaFactoryGiveUp();
+  otaPrecheckService();
 
   // === OTA UPDATE: simple one-shot FORCED UPDATE check ===
   static bool otaVerSent = false, otaForcedSent = false;
@@ -6809,18 +7038,27 @@ void loop() {
     if (fieldCutSettled(2000) && !demoSeal) TIMED_CALL(ft_bhFlushCapNVS, bhFlushCapNVS());  // Battery Health persist
     if (fieldCutSettled(2000) && !demoSeal) overheatHistFlush();  // overheat-history NVS persist — dirty-flagged at overheat entry
 
-    // Baro history sampler, 10-min cadence; skipped while BMP388 is NAN. Epoch stamped only if timeIsSynced, so after a cold boot the
-    // loaded NVS epoch lets the JS detect the power-off gap and grey out those slots.
+    // Baro history sampler, 10-min cadence; skipped while BMP388 is NAN (the first sample since boot retries every pass instead).
+    // Epoch stamped only if timeIsSynced. script.js and the GX app do no gap detection of their own: the samples a reboot missed are
+    // empty (0) slots written by baroMarkBootGap() / baroGapService() (5_functions.ino), which both read as no sample.
     // In demo the ring is the demo copy (9_demo.ino), so the made-up week continues with the simulated barometer.
     if ((hardwarePresent == 1 || demoPhase == DEMO_ON) && baroPressureHistory && (currentTime - lastBaroSampleMs >= BARO_SAMPLE_INTERVAL_MS)) {
-      lastBaroSampleMs = currentTime;
       if (!isnan(baroPressure)) {
+        lastBaroSampleMs = currentTime;
         baroPressureHistory[baroHistoryHead] = (uint16_t)(baroPressure * 10.0f + 0.5f);
         baroHistoryHead = (baroHistoryHead + 1) % BARO_HISTORY_SIZE;
         if (demoPhase == DEMO_ON) baroHistoryLastEpoch = demoNowEpoch();   // the demo's clock, synced or not (its seed ends at entry)
-        else if (timeIsSynced) baroHistoryLastEpoch = timeBase + (currentTime - timeBaseMillis) / 1000;
+        else {
+          if (timeIsSynced) baroHistoryLastEpoch = timeBase + (currentTime - timeBaseMillis) / 1000;
+          baroEpochReal = clockIsReal();
+          baroFirstSamplePending = false;
+          baroGapNvsEpoch = 0;
+        }
+      } else if (!baroFirstSamplePending || demoPhase == DEMO_ON) {
+        lastBaroSampleMs = currentTime;
       }
     }
+    baroGapService();   // cold boot only: re-measures the boot gap once, when the clock first becomes real
 
     // Long-term ring → flash only while the field gate is physically cut (fieldCutSettled, never fieldOffSettled). Deferring across a
     // long run costs only power-cut durability (the 72 h reboot and shutdown paths dump it). Dumps on the cut-settled rising edge and
@@ -6913,14 +7151,27 @@ void loop() {
     static int lastIgnitionState = 1;            // Previous ignition state; starts ON, so a key-off boot takes the OFF edge
     static bool lastWifiWakeActive = false;      // Track previous WiFi wake mode state
     static bool wakeExpiryWarningShown = false;  // Track if we've warned about wake mode expiring
+    // Quiet boot (g_bootSavesQuiet) that found the key off: Phase 2 skips its flash saves like the boot save, so a reset loop
+    // at rest stops writing, and reruns once the session reaches 10 minutes. Phase 3 still holds WiFi up. A real key-off is never held.
+    static bool ignBlockFirstPass = true;
+    static bool keyOffAtBoot = false;
+    static bool keyOffSavesOwed = false;
+    const bool ignBootPass = ignBlockFirstPass;
+    ignBlockFirstPass = false;
 
     if (Ignition == 0) {
       // ===== IGNITION OFF =====
       // Edge detection FIRST — must set pendingShutdownFlush before the state machine checks it
       if (lastIgnitionState == 1) {
         pendingShutdownFlush = true;
+        keyOffAtBoot = ignBootPass;
         Serial.println("Ignition OFF");
         lastIgnitionState = 0;
+      }
+      if (keyOffSavesOwed && !g_bootSavesQuiet) {
+        keyOffSavesOwed = false;
+        keyOffAtBoot = false;
+        if (pendingShutdownFlush) shutdownNVSFlushDone = false;   // Phase 2 again, this time with its saves
       }
       wifiWakeActive = (wifiWakeStart > 0 && (millis() - wifiWakeStart) < WIFI_WAKE_DURATION);
       // Detect state change for WiFi wake mode
@@ -6956,10 +7207,15 @@ void loop() {
           } else if (!shutdownNVSFlushDone) {
             // Phase 2: field just cut — flush NVS and save partial sensor window immediately
             setCpuFrequencyMhz(240);
-            saveNVSDataFull();  // absolute latest values, no critical-zone gate
-            altHealthSave();
-            boatPerfSave();
+            const bool quietSkip = keyOffAtBoot && g_bootSavesQuiet;
+            if (quietSkip) keyOffSavesOwed = true;
+            if (!quietSkip) {
+              saveNVSDataFull();  // absolute latest values, no critical-zone gate
+              altHealthSave();
+              boatPerfSave();
+            }
             uploadSensorHistory();  // save whatever is in the current window to local buffer
+            if (!quietSkip && !ringIsEmpty()) dumpSensorRingToLittleFS();  // on flash from the key-off: a battery switch-off inside the 30-min drain window keeps it
             if (pendingSaveCVTuningLog) {
               pendingSaveCVTuningLog = false;
               saveCVTuningLog();
@@ -7052,6 +7308,8 @@ void loop() {
       // Detect ignition state change to ON
       if (lastIgnitionState != 1) {
         pendingShutdownFlush = false;  // ignition back on — cancel any pending flush
+        keyOffAtBoot = false;
+        keyOffSavesOwed = false;
         shutdownNVSFlushDone = false;
         shutdownCloudDeadlineMs = 0;
         queueDrainHoldStart = 0;
@@ -7192,13 +7450,19 @@ void loop() {
           fieldOffMatrixFlushDone = false;
         } else if (lastFieldStateForFlush == -1 && !fieldNowActive) {
           fieldOffEdgeMs = millis();  // first observation; field already off
+          if (g_bootSavesQuiet) {
+            fieldOffFlushDone = true;
+            fieldOffMatrixFlushDone = true;
+            queueConsoleMessageF("%lu short sessions in a row - boot-time saves skipped until this one runs 10 min",
+                                 (unsigned long)g_bootRun.shortRuns);
+          }
         }
         lastFieldStateForFlush = fieldNowActive ? 1 : 0;
 
         // Gate 1 (+20 s — 2x the fast-OV lockout cap): drain storage namespace to NVS
         if (!fieldOffFlushDone && !pendingShutdownFlush && !fieldNowActive && !demoSeal
             && fieldOffEdgeMs > 0 && (millis() - fieldOffEdgeMs) >= 20000UL) {
-          saveNVSDataFull();
+          saveNVSDataFull();   // wear record included: a run under an hour must be on flash before a power-off with no key-off
           fieldOffFlushDone = true;
         }
         // Gate 2 (+28 s): write performance matrix to LittleFS — staggered so
@@ -7208,6 +7472,13 @@ void loop() {
           altHealthSave();
           boatPerfSave();
           fieldOffMatrixFlushDone = true;
+        }
+        // Battery wear record (BatteryWear): hourly while the field stays cut, and soon after a reset. Field-on running is
+        // covered by the RTC copy and the field-off drain above; this is for a boat sitting for days with the field off.
+        if (!pendingShutdownFlush && !fieldNowActive && !demoSeal && hardwarePresent == 1
+            && fieldOffEdgeMs > 0 && (millis() - fieldOffEdgeMs) >= 36000UL
+            && (g_batWearSaveReq || (uint32_t)(millis() - g_batWearLastSaveMs) >= 3600000UL)) {
+          batteryWearSaveNow();
         }
         // Gate 3 (engine stopped 1 h, ignition still on): the two saves that otherwise wait for a key-off
         // (shutdown Phase 4) or the 72 h maintenance restart, for a boat whose ignition never goes off

@@ -1337,10 +1337,14 @@ static bool cfgTableValue(const char *name, String &o) {
     int v[RPM_TABLE_SIZE]; sz = sizeof(v);
     if ((ok = (nvs_get_blob(h, name, v, &sz) == ESP_OK && sz == sizeof(v))))
       for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) o += ','; o += String(v[i]); }
-  } else if (strcmp(name, "lastOverheat") == 0 || strcmp(name, "cumulativeTime") == 0) {
+  } else if (strcmp(name, "lastOverheat") == 0) {
     unsigned long v[RPM_TABLE_SIZE]; sz = sizeof(v);
     if ((ok = (nvs_get_blob(h, name, v, &sz) == ESP_OK && sz == sizeof(v))))
       for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) o += ','; o += String(v[i]); }
+  } else if (strcmp(name, "cumulativeTime") == 0) {
+    uint64_t v[RPM_TABLE_SIZE]; sz = sizeof(v);
+    if ((ok = (nvs_get_blob(h, name, v, &sz) == ESP_OK && sz == sizeof(v))))
+      for (int i = 0; i < RPM_TABLE_SIZE; i++) { char b[24]; snprintf(b, sizeof(b), "%llu", (unsigned long long)v[i]); if (i) o += ','; o += b; }
   } else if (strcmp(name, "totalEvents") == 0 || strcmp(name, "totalOverheats") == 0) {
     uint32_t v;
     if ((ok = (nvs_get_u32(h, name, &v) == ESP_OK))) o = String((unsigned long)v);
@@ -1656,6 +1660,18 @@ static bool cfgCsvToULong(const String &s, unsigned long *out, int n) {
   }
   return true;
 }
+static bool cfgCsvToU64(const String &s, uint64_t *out, int n) {
+  int pos = 0;
+  for (int i = 0; i < n; i++) {
+    if (pos >= (int)s.length()) return false;
+    out[i] = strtoull(s.c_str() + pos, nullptr, 10);
+    int c = s.indexOf(',', pos);
+    if (c < 0) return i == n - 1;
+    if (i == n - 1) return false;
+    pos = c + 1;
+  }
+  return true;
+}
 static bool cfgCsvToBool(const String &s, bool *out, int n) {
   int v[RPM_TABLE_SIZE];
   if (n > RPM_TABLE_SIZE || !cfgCsvToInt(s, v, n)) return false;
@@ -1724,6 +1740,23 @@ static void cfgImportNoteTableChanged(const char *name, const String &fileVal) {
   }
 }
 
+// The /get handler's rule: findRPMSegment has no unused rows, so all ten breakpoints must be above 0 and rising, or the
+// last row's limits apply at every engine speed. Logs the first broken row; true = refused.
+static bool cfgImportRpmRefused = false;   // the import in progress or just finished refused the file's RPM table
+bool cfgImportRpmTableRefused() { return cfgImportRpmRefused; }   // for the /importConfig reply (3_functions.ino)
+static bool cfgImportRpmPointsRefused(const int *pts) {
+  for (int i = 0; i < RPM_TABLE_SIZE; i++) {
+    if (pts[i] > 0 && (i == 0 || pts[i] > pts[i - 1])) continue;
+    const char *what = "IMPORT WARNING: RPM table not imported (breakpoints, limits, Keep-Alive, overheat history).";
+    const char *rule = "All ten rows need an engine speed, each higher than the row above.";
+    if (pts[i] <= 0) queueConsoleMessageF("%s Row %d RPM must be greater than 0. %s", what, i + 1, rule);
+    else queueConsoleMessageF("%s RPM values must increase. Row %d (%d) must be greater than Row %d (%d). %s",
+                              what, i + 1, pts[i], i, pts[i - 1], rule);
+    return true;
+  }
+  return false;
+}
+
 // Apply the "tables" section (`tbl` = that object alone). Moved rpmPoints reset the knee tracker and the moved bins'
 // overheat history as a manual breakpoint edit does, BEFORE the imported minDutyTable lands. bk_* blobs belong to
 // applyImportCommissioning. Live arrays reload at the end for noReboot=1.
@@ -1732,6 +1765,11 @@ static int applyImportTables(const char *tbl, float zfShiftA) {
   String val;
   int pts[RPM_TABLE_SIZE];
   bool havePts = cfgJsonExtract(tbl, "rpmPoints", val) && cfgCsvToInt(val, pts, RPM_TABLE_SIZE);
+  // Refused breakpoints take along every table of this file indexed by them: the cap and Keep-Alive columns (the learner
+  // state rides on the latter) and the per-speed overheat history. Saved against breakpoints in force here, they'd be wrong.
+  const bool ptsRefused = havePts && cfgImportRpmPointsRefused(pts);
+  cfgImportRpmRefused = ptsRefused;
+  if (ptsRefused) havePts = false;
   if (havePts && cfgImportChangedNames) {
     String o;
     for (int i = 0; i < RPM_TABLE_SIZE; i++) { if (i) o += ','; o += String(pts[i]); }
@@ -1751,7 +1789,7 @@ static int applyImportTables(const char *tbl, float zfShiftA) {
   if (nvs_open("learning", NVS_READWRITE, &h) == ESP_OK) {
     if (havePts) { nvs_set_blob(h, "rpmPoints", pts, sizeof(pts)); applied++; }
     static const char *CFG_TABLE_FKEYS[] = { "capTable", "capPowerTable", "capTableLo", "capPowerTableLo", "minDutyTable" };
-    for (size_t k = 0; k < sizeof(CFG_TABLE_FKEYS)/sizeof(CFG_TABLE_FKEYS[0]); k++) {
+    for (size_t k = 0; !ptsRefused && k < sizeof(CFG_TABLE_FKEYS)/sizeof(CFG_TABLE_FKEYS[0]); k++) {
       float f[RPM_TABLE_SIZE];
       if (!cfgJsonExtract(tbl, CFG_TABLE_FKEYS[k], val) || !cfgCsvToFloat(val, f, RPM_TABLE_SIZE)) continue;
       if (cfgImportChangedNames) { String o; cfgJoinFloats(o, f, RPM_TABLE_SIZE, 2); cfgImportNoteTableChanged(CFG_TABLE_FKEYS[k], o); }
@@ -1761,11 +1799,12 @@ static int applyImportTables(const char *tbl, float zfShiftA) {
     }
     // Per-speed overheat history — one record, all six parts or none.
     int oc[RPM_TABLE_SIZE];
-    unsigned long lo[RPM_TABLE_SIZE], ct[RPM_TABLE_SIZE];
+    unsigned long lo[RPM_TABLE_SIZE];
+    uint64_t ct[RPM_TABLE_SIZE];
     String ev, to, sm;
-    if (cfgJsonExtract(tbl, "overheatCount", val) && cfgCsvToInt(val, oc, RPM_TABLE_SIZE)
+    if (!ptsRefused && cfgJsonExtract(tbl, "overheatCount", val) && cfgCsvToInt(val, oc, RPM_TABLE_SIZE)
         && cfgJsonExtract(tbl, "lastOverheat", val) && cfgCsvToULong(val, lo, RPM_TABLE_SIZE)
-        && cfgJsonExtract(tbl, "cumulativeTime", val) && cfgCsvToULong(val, ct, RPM_TABLE_SIZE)
+        && cfgJsonExtract(tbl, "cumulativeTime", val) && cfgCsvToU64(val, ct, RPM_TABLE_SIZE)
         && cfgJsonExtract(tbl, "totalEvents", ev) && cfgJsonExtract(tbl, "totalOverheats", to) && cfgJsonExtract(tbl, "totalSafeMs", sm)) {
       memcpy(overheatCount, oc, sizeof(oc));
       memcpy(lastOverheatTime, lo, sizeof(lo));
@@ -2155,6 +2194,89 @@ void importStagedCommit() {
   }
 }
 
+// ── Record files across an update ─────────────────────────────────────────────
+// An update boots the factory image first: the copy the board shipped with, never replaced. Its loaders delete a record
+// file whose header they do not recognise, so a record whose layout changes after a board ships would be lost at every
+// update. otaParkRecords() runs before that boot and moves such a file into OTA_PARK_DIR; otaUnparkRecords() moves it back.
+// A file the factory image reads is not moved, so it loads there as it always did.
+// shipVer / shipSize are what the 0.0.10 factory image accepts (compiler-checked against that source) and stay FROZEN: a
+// layout change moves ver / recSize only, and that difference is what parks the file. A board whose factory image has this
+// code is judged by that image: booting as factory, it takes back every parked file it can read. A record file added later
+// gets a row when it is added, its ship columns set to the layout it first ships in.
+#define OTA_PARK_DIR "/otapark"
+struct OtaRecFmt { const char *path; uint32_t magic, ver, recSize, shipVer, shipSize; };   // recSize 0: an 8-byte {magic, version} header
+static const OtaRecFmt OTA_REC_FMT[] = {
+  { LONGTERM_BACKUP_PATH, LONGTERM_BACKUP_MAGIC, LONGTERM_BACKUP_VER, sizeof(LongTermRecord),         5, 152 },
+  { ZEROLOG_PATH,         ZEROLOG_MAGIC,         ZEROLOG_VER,         sizeof(ZeroLogRecord),          3, 20 },
+  { ZFIT_PATH,            ZFIT_MAGIC,            ZFIT_VER,            sizeof(ZeroFitRecord),          2, 20 },
+  { FA_MATRIX_PATH,       FA_MATRIX_MAGIC,       FA_MATRIX_VER,       sizeof(FaCell),                 5, 40 },
+  { FA_FLIP_PATH,         FA_FLIP_MAGIC,         FA_FLIP_VER,         sizeof(FaFlipPage),             1, 8020 },
+  { RIPTAB_PATH,          RIPTAB_MAGIC,          RIPTAB_VER,          sizeof(RipTab),                 1, 420 },
+  { SLED_PATH,            SLED_MAGIC,            SLED_VER,            sizeof(SolarLedgerRec),         2, 48 },
+  { SLED_LIVE_PATH,       SLED_MAGIC ^ 1u,       SLED_VER,            sizeof(SolarLedgerLive),        2, 216 },
+  { BHRES_PATH,           BHRES_MAGIC,           BHRES_VER,           sizeof(BattHealthResult),       2, 40 },
+  { BHCAP_PATH,           BHCAP_MAGIC,           BHCAP_VER,           sizeof(BattCapPoint),           1, 24 },
+  { "/altfront.bin",      ALT_FRONT_MAGIC,       ALT_VER,             sizeof(FrontPoint<ALT_NAXIS>),  4, 36 },
+  { "/altfrontup.bin",    ALT_FRONT_MAGIC,       ALT_VER,             sizeof(FrontPoint<ALT_NAXIS>),  4, 36 },
+  { "/altpend.bin",       ALT_PEND_MAGIC,        ALT_VER,             sizeof(FrontPoint<ALT_NAXIS>),  4, 36 },
+  { "/alttrend.bin",      ALT_TRENDLOG_MAGIC,    ALT_VER,             0,                              4, 0 },
+  { "/sailfront.bin",     PERF_SAILF_MAGIC,      PERF_VER,            sizeof(FrontPoint<PERF_NAXIS>), 3, 32 },
+  { "/motorfront.bin",    PERF_MOTF_MAGIC,       PERF_VER,            sizeof(FrontPoint<PERF_NAXIS>), 3, 32 },
+  { "/perfpends.bin",     PERF_PEND_MAGIC,       PERF_VER,            sizeof(FrontPoint<PERF_NAXIS>), 3, 32 },
+  { "/perfpendm.bin",     PERF_PEND_MAGIC,       PERF_VER,            sizeof(FrontPoint<PERF_NAXIS>), 3, 32 },
+  { "/perfpendsa.bin",    PERF_PENDA_MAGIC,      PERF_VER,            1,                              3, 1 },
+  { "/perfpendma.bin",    PERF_PENDA_MAGIC,      PERF_VER,            1,                              3, 1 },
+};
+
+static bool otaRunningFactory() {
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  return run && run->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY;
+}
+
+// Caller holds the FS lock (raw calls: fsExists would take it again). Plain arguments: the IDE's generated prototype lands
+// above the struct.
+static bool otaRecReadableHere(const char *file, uint32_t magic, uint32_t ver, uint32_t recSize) {
+  uint32_t h[4] = { 0, 0, 0, 0 };   // PsramBlobHeader: magic, version, count, recordSize
+  const size_t need = recSize ? sizeof(h) : 2 * sizeof(uint32_t);
+  File f = LittleFS.open(file, "r");
+  const bool ok = f && f.read((uint8_t *)h, need) == need && h[0] == magic && h[1] == ver && (!recSize || h[3] == recSize);
+  if (f) f.close();
+  return ok;
+}
+
+// Before the restart into the factory installer, field off, after the last record save.
+void otaParkRecords() {
+  if (otaRunningFactory()) return;
+  bool dirMade = false;
+  fsTakeLock();
+  for (const OtaRecFmt &e : OTA_REC_FMT) {
+    if (e.ver == e.shipVer && e.recSize == e.shipSize) continue;
+    const String parked = String(OTA_PARK_DIR) + e.path;
+    if (!LittleFS.exists(e.path) || LittleFS.exists(parked)) continue;   // a copy still parked is the older, longer record: it wins
+    if (!dirMade) { LittleFS.mkdir(OTA_PARK_DIR); dirMade = true; }
+    if (LittleFS.rename(e.path, parked.c_str())) fsFreeDirty = true;
+  }
+  fsReleaseLock();
+}
+
+// setup(), once LittleFS is mounted, before importStagedCommit() and every loader. The factory image takes back only what it
+// can read; any other image takes everything, over whatever the factory image wrote at the live path meanwhile.
+void otaUnparkRecords() {
+  fsTakeLock();
+  if (LittleFS.exists(OTA_PARK_DIR)) {
+    const bool onFactory = otaRunningFactory();
+    for (const OtaRecFmt &e : OTA_REC_FMT) {
+      const String parked = String(OTA_PARK_DIR) + e.path;
+      if (!LittleFS.exists(parked) || (onFactory && !otaRecReadableHere(parked.c_str(), e.magic, e.ver, e.recSize))) continue;
+      LittleFS.remove(e.path);
+      LittleFS.rename(parked.c_str(), e.path);
+    }
+    LittleFS.rmdir(OTA_PARK_DIR);   // refused while a file is still parked, which keeps it for the next boot
+    fsFreeDirty = true;
+  }
+  fsReleaseLock();
+}
+
 // setup(), after the last loader: hand the import's boot-time work to loop() (importBootActRun).
 void importBootActionsLoad() {
   if (!settingExists(NK_impBootAct)) return;
@@ -2182,7 +2304,8 @@ static const char *const REC_ZF_FILES[]   = { ZFIT_PATH, ZEROLOG_PATH };
 static const char *const REC_FA_FILES[]   = { FA_MATRIX_PATH, FA_FLIP_PATH };
 static const char *const REC_HUNT_FILES[] = { "/huntledger.csv" };
 #define REC_N(a) (uint8_t)(sizeof(a) / sizeof(a[0]))
-struct RecGroup { const char *name; const char *const *files; uint8_t nFiles; const char *const *nvs; uint8_t nNvs; bool storage; };
+// wear: the battery wear record, carried as its NVS blob "BattWear" (base64), too big for the storage group's 256 B blobs.
+struct RecGroup { const char *name; const char *const *files; uint8_t nFiles; const char *const *nvs; uint8_t nNvs; bool storage; bool wear; };
 static const RecGroup REC_GROUPS[] = {
   { "altHealth",      REC_ALT_FILES,  REC_N(REC_ALT_FILES),  REC_ALT_NVS, REC_N(REC_ALT_NVS), false },
   { "boatPerf",       REC_PERF_FILES, REC_N(REC_PERF_FILES), nullptr, 0, false },
@@ -2192,6 +2315,7 @@ static const RecGroup REC_GROUPS[] = {
   { "resonanceMap",   REC_FA_FILES,   REC_N(REC_FA_FILES),   nullptr, 0, false },
   { "damperRecord",   REC_HUNT_FILES, REC_N(REC_HUNT_FILES), nullptr, 0, false },
   { "lifetime",       nullptr, 0, nullptr, 0, true },
+  { "batteryWear",    nullptr, 0, nullptr, 0, false, true },
 };
 static const size_t REC_GROUP_COUNT = sizeof(REC_GROUPS) / sizeof(REC_GROUPS[0]);
 // Lifetime keys the record leaves alone: the zero-drift fit imports as its own tables row, so unticking that row keeps
@@ -2207,9 +2331,13 @@ static bool recStorageKept(const char *key) {
 }
 
 static String recStagedPath(const char *live) { return String("/imp_") + (live[0] == '/' ? live + 1 : live); }
+// Where an import in flight holds a file until the whole upload has checked out. Not an /imp_ name: the boot commits
+// every /imp_ file it finds, and a 0.0.10 factory image does too.
+static String recPartPath(const char *live) { return String("/rcv_") + (live[0] == '/' ? live + 1 : live); }
 
-// The records JSON as a chain of fixed 16 KB PSRAM blocks, served block by block (hundreds of KB of base64 must stay
-// off the internal heap). Never reallocated: tlsf_realloc copies inside the PSRAM heap lock, which Core 1 takes.
+// The export's JSON text between record files (keys, the NVS sections, the battery wear record) as a chain of fixed
+// 16 KB PSRAM blocks, emptied once sent; the record files never pass through it. Never reallocated: tlsf_realloc copies
+// inside the PSRAM heap lock, which Core 1 takes.
 class RecOut {
  public:
   struct Blk { Blk *next; size_t used; char d[16384]; };
@@ -2221,7 +2349,12 @@ class RecOut {
   RecOut() = default;
   RecOut(const RecOut &) = delete;
   RecOut &operator=(const RecOut &) = delete;
-  ~RecOut() { while (head) { Blk *n = head->next; free(head); head = n; } }
+  ~RecOut() { clear(); }
+  void clear() {
+    while (head) { Blk *n = head->next; free(head); head = n; }
+    tail = cur = nullptr;
+    len = curAt = 0;
+  }
   bool grow() {
     Blk *b = (Blk *)ps_malloc(sizeof(Blk));
     if (!b) { ok = false; return false; }
@@ -2272,26 +2405,13 @@ class RecOut {
   }
 };
 
-static uint32_t recFnv(const uint8_t *d, size_t n) {
-  uint32_t h = 2166136261u;
+#define REC_FNV_INIT 2166136261u
+// A file's hash is built a chunk at a time: start from REC_FNV_INIT and pass each result back in.
+static uint32_t recFnvAdd(uint32_t h, const uint8_t *d, size_t n) {
   for (size_t i = 0; i < n; i++) { h ^= d[i]; h *= 16777619u; }
   return h;
 }
-
-// Whole file into PSRAM (caller frees); nullptr when absent, or with *failed set when it could not be read whole.
-static uint8_t *recReadFile(const char *path, size_t *n, bool *failed) {
-  *n = 0;
-  fsTakeLock();
-  File f = LittleFS.open(path, "r");
-  if (!f) { fsReleaseLock(); return nullptr; }
-  size_t sz = f.size();
-  uint8_t *buf = (uint8_t *)ps_malloc(sz ? sz : 1);
-  if (buf) *n = f.read(buf, sz);
-  f.close();
-  fsReleaseLock();
-  if (!buf || *n != sz) { free(buf); *n = 0; *failed = true; return nullptr; }
-  return buf;
-}
+static uint32_t recFnv(const uint8_t *d, size_t n) { return recFnvAdd(REC_FNV_INIT, d, n); }
 
 // One "storage" entry as "type:value" (BLOB as hex). False for a type this never writes.
 static bool recStorageValue(nvs_handle_t h, const nvs_entry_info_t &info, String &o) {
@@ -2328,66 +2448,212 @@ static bool recStorageValue(nvs_handle_t h, const nvs_entry_info_t &info, String
   return true;
 }
 
-// Records JSON in PSRAM as an opaque RecOut (void*: a sketch type in a free-function signature breaks the Arduino
-// auto-prototype); serve it with recordsExportRead, release it with recordsExportFree. nullptr on OOM or an unreadable
-// record file. Every group is present, empty ones too, so importing it leaves none. summary = names, sizes and an
-// order-independent content hash (sum of per-item hashes) for the import preview, excluding lifetime keys an import
-// never writes.
-void *recordsExportJson(bool summary, size_t *outLen) {
-  RecOut *o = new (std::nothrow) RecOut();
-  if (!o) return nullptr;
-  o->add("{\"records_v\":1,\"fw_version\":");
-  o->addStr(String(FIRMWARE_VERSION));
-  o->add(",\"records\":{");
-  for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
-    const char *const *files = REC_GROUPS[gi].files;
-    const char *const *nvs = REC_GROUPS[gi].nvs;
-    uint32_t hash = 0;
-    size_t bytes = 0, items = 0;
-    bool readFail = false;
-    if (gi) o->add(",");
-    o->addStr(String(REC_GROUPS[gi].name));
-    o->add(":{");
-    const size_t body = o->len;   // the group body is written in place; a non-empty one is followed by ","
-    if (REC_GROUPS[gi].nFiles) {
-      o->add("\"files\":{");
-      bool first = true;
-      for (uint8_t f = 0; f < REC_GROUPS[gi].nFiles; f++) {
-        size_t n = 0;
-        uint8_t *buf = recReadFile(files[f], &n, &readFail);
-        if (!buf) continue;
-        hash += recFnv(buf, n) ^ recFnv((const uint8_t *)files[f], strlen(files[f]));
-        bytes += n; items++;
-        if (!summary) {
-          if (!first) o->add(",");
-          first = false;
-          o->addStr(String(files[f])); o->add(":\"");
-          o->addB64(buf, n);
-          o->add("\"");
-        }
-        free(buf);
+// Record-file bytes read per FS-lock hold while a file is exported. A multiple of 3, so every chunk but a file's last
+// encodes to whole base64 groups and the pieces concatenate to the one-shot encoding.
+#define REC_IO_BYTES 12288
+// One filler call stops working without sending after this long (hashing files for the summary, or re-reading one to
+// check it): async_tcp serves every dashboard stream too.
+#define REC_FILL_BUDGET_MS 200
+
+// /exportRecords, produced as the response filler asks for it, each record file read from LittleFS a chunk at a time, so
+// the memory in use does not grow with the history held. Every group is present, empty ones too, so importing it leaves
+// none. summary = names, sizes and an order-independent content hash (sum of per-item hashes) for the import preview,
+// excluding lifetime keys an import never writes.
+class RecExport {
+ public:
+  explicit RecExport(bool s) : summary(s) {}
+  RecExport(const RecExport &) = delete;
+  RecExport &operator=(const RecExport &) = delete;
+
+  // The next bytes of the JSON; 0 ends the response. A record file that cannot be read, or that a saver replaced while
+  // it was being sent, ends it early: the JSON is left unterminated, so no reader can take it for a whole record.
+  size_t fill(uint8_t *out, size_t maxLen) {
+    size_t w = 0;
+    bool worked = false;
+    const uint32_t t0 = millis();
+    while (w < maxLen && step != X_FAILED) {
+      if (txtAt < txt.len) {
+        const size_t k = txt.read(out + w, maxLen - w, txtAt);
+        txtAt += k; w += k;
+        continue;
       }
-      o->add("}");
+      if (txt.len) { txt.clear(); txtAt = 0; }
+      if (ioAt < ioLen) {
+        // Whole 3-byte groups until the chunk's last piece. The -1 leaves room for the NUL mbedtls writes after its output.
+        const size_t room = maxLen - w;
+        size_t take = (room - 1) / 4 * 3;
+        if (!take) break;
+        if (take > ioLen - ioAt) take = ioLen - ioAt;
+        size_t k = 0;
+        if (mbedtls_base64_encode(out + w, room, &k, io + ioAt, take) != 0) { fail("could not be encoded"); break; }
+        ioAt += take; w += k;
+        continue;
+      }
+      if (step == X_DONE) break;
+      // Only between two JSON tokens. A filler that returns nothing ends the response, and the library never calls
+      // again after two RESPONSE_TRY_AGAIN answers with nothing in flight, so a call that only worked sends one space.
+      if (worked && !midStr && millis() - t0 >= REC_FILL_BUDGET_MS) {
+        if (!w) out[w++] = ' ';
+        break;
+      }
+      advance();
+      worked = true;
     }
-    if (REC_GROUPS[gi].nNvs) {
-      o->add(o->len > body ? ",\"nvs\":{" : "\"nvs\":{");
+    return w;
+  }
+
+ private:
+  enum : uint8_t { X_HEAD, X_GROUP, X_FILE_NEXT, X_FILE_READ, X_FILE_CHECK, X_TAIL, X_DONE, X_FAILED };
+  enum : uint8_t { RD_GOT, RD_ABSENT, RD_FAILED };
+  const bool summary;
+  uint8_t step = X_HEAD;
+  RecOut txt;             // JSON text waiting to be sent, ahead of anything in io
+  size_t txtAt = 0;
+  size_t gi = 0;
+  uint8_t fi = 0;
+  bool wrote = false;     // the group's body holds something, so what follows needs a comma
+  bool firstFile = true;
+  bool midStr = false;    // a file's base64 string is open in what has been sent
+  uint32_t hash = 0;
+  size_t bytes = 0, items = 0;
+  size_t fSize = 0, fAt = 0;
+  uint32_t fHash = 0, fSent = 0;
+  size_t ioLen = 0, ioAt = 0;   // io[ioAt..ioLen) still to send as base64
+  uint8_t io[REC_IO_BYTES];
+
+  void fail(const char *why) {
+    if (step == X_FAILED) return;
+    const bool inFile = gi < REC_GROUP_COUNT && fi < REC_GROUPS[gi].nFiles && step >= X_FILE_NEXT && step <= X_FILE_CHECK;
+    queueConsoleMessageF("Equipment records export stopped: %s %s", inFile ? REC_GROUPS[gi].files[fi] : "the record", why);
+    step = X_FAILED;
+    txt.clear();
+    txtAt = ioAt = ioLen = 0;
+  }
+
+  // io[] from the current file at fAt, the file opened and closed inside one lock hold: a handle kept between calls
+  // would make every saver's rename over the file fail. first = take the file's size, which holds for both passes;
+  // records appended after that are not part of this export.
+  uint8_t readChunk(bool first) {
+    uint8_t r = RD_FAILED;
+    fsTakeLock();
+    File f = LittleFS.open(REC_GROUPS[gi].files[fi], "r");
+    if (!f) {
+      if (first) r = RD_ABSENT;
+    } else {
+      if (first) fSize = f.size();
+      size_t want = fSize - fAt;
+      if (want > sizeof(io)) want = sizeof(io);
+      if ((size_t)f.size() >= fSize && (fAt == 0 || f.seek(fAt)) && f.read(io, want) == want) { ioLen = want; r = RD_GOT; }
+      f.close();
+    }
+    fsReleaseLock();
+    return r;
+  }
+
+  void chunkTaken(bool send) {
+    fHash = recFnvAdd(fHash, io, ioLen);
+    fAt += ioLen;
+    ioAt = send ? 0 : ioLen;
+  }
+
+  void fileDone(uint32_t h) {
+    const char *name = REC_GROUPS[gi].files[fi];
+    hash += h ^ recFnv((const uint8_t *)name, strlen(name));
+    bytes += fSize; items++;
+    fi++;
+    step = X_FILE_NEXT;
+  }
+
+  void advance() {
+    switch (step) {
+      case X_HEAD:
+        txt.add("{\"records_v\":1,\"fw_version\":");
+        txt.addStr(String(FIRMWARE_VERSION));
+        txt.add(",\"records\":{");
+        step = X_GROUP;
+        break;
+      case X_GROUP:
+        if (gi >= REC_GROUP_COUNT) { txt.add("}}"); step = X_DONE; break; }
+        hash = 0; bytes = 0; items = 0; fi = 0; firstFile = true;
+        if (gi) txt.add(",");
+        txt.addStr(String(REC_GROUPS[gi].name));
+        txt.add(":{");
+        wrote = REC_GROUPS[gi].nFiles != 0;
+        if (wrote) txt.add("\"files\":{");
+        step = wrote ? X_FILE_NEXT : X_TAIL;
+        break;
+      case X_FILE_NEXT: {
+        const RecGroup &G = REC_GROUPS[gi];
+        if (fi >= G.nFiles) { txt.add("}"); step = X_TAIL; break; }
+        fAt = 0; fHash = REC_FNV_INIT;
+        const uint8_t r = readChunk(true);
+        if (r == RD_ABSENT) { fi++; break; }
+        if (r == RD_FAILED) { fail("could not be read"); break; }
+        if (!summary) {
+          if (!firstFile) txt.add(",");
+          firstFile = false;
+          txt.addStr(String(G.files[fi])); txt.add(":\"");
+          midStr = true;
+        }
+        chunkTaken(!summary);
+        step = X_FILE_READ;
+        break;
+      }
+      case X_FILE_READ:
+        if (fAt < fSize) {
+          if (readChunk(false) != RD_GOT) { fail("changed while it was being read"); break; }
+          chunkTaken(!summary);
+          break;
+        }
+        if (!summary) { txt.add("\""); midStr = false; }
+        if (summary || fSize <= sizeof(io)) { fileDone(fHash); break; }   // one chunk is one lock hold: whole as read
+        fSent = fHash; fAt = 0; fHash = REC_FNV_INIT;
+        step = X_FILE_CHECK;
+        break;
+      case X_FILE_CHECK:
+        // The chunks went out under separate lock holds, so a saver may have replaced the file between two of them and
+        // the bytes sent may be part old, part new. Reading it again to the same hash shows they are one whole file.
+        if (fAt < fSize) {
+          if (readChunk(false) != RD_GOT) { fail("changed while it was being read"); break; }
+          chunkTaken(false);
+          break;
+        }
+        if (fHash != fSent) { fail("changed while it was being read"); break; }
+        fileDone(fSent);
+        break;
+      case X_TAIL:
+        groupTail();
+        break;
+      default:
+        break;
+    }
+    if (!txt.ok) fail("ran out of memory");
+  }
+
+  // What follows a group's files: its NVS keys, the lifetime namespace, the battery wear record, then its totals.
+  void groupTail() {
+    const RecGroup &G = REC_GROUPS[gi];
+    if (G.nNvs) {
+      txt.add(wrote ? ",\"nvs\":{" : "\"nvs\":{");
+      wrote = true;
       bool first = true;
-      for (uint8_t k = 0; k < REC_GROUPS[gi].nNvs; k++) {
-        if (!settingExists(nvs[k])) continue;
-        String v = settingRead(nvs[k]);
-        String kv = String(nvs[k]) + "=" + v;
+      for (uint8_t k = 0; k < G.nNvs; k++) {
+        if (!settingExists(G.nvs[k])) continue;
+        String v = settingRead(G.nvs[k]);
+        String kv = String(G.nvs[k]) + "=" + v;
         hash += recFnv((const uint8_t *)kv.c_str(), kv.length());
         items++;
         if (!summary) {
-          if (!first) o->add(",");
+          if (!first) txt.add(",");
           first = false;
-          o->addStr(String(nvs[k])); o->add(":"); o->addStr(v);
+          txt.addStr(String(G.nvs[k])); txt.add(":"); txt.addStr(v);
         }
       }
-      o->add("}");
+      txt.add("}");
     }
-    if (REC_GROUPS[gi].storage) {
-      o->add(o->len > body ? ",\"storage\":{" : "\"storage\":{");
+    if (G.storage) {
+      txt.add(wrote ? ",\"storage\":{" : "\"storage\":{");
+      wrote = true;
       nvs_handle_t h;
       if (nvs_open("storage", NVS_READONLY, &h) == ESP_OK) {
         nvs_iterator_t it = nullptr;
@@ -2404,9 +2670,9 @@ void *recordsExportJson(bool summary, size_t *outLen) {
               items++;
             }
             if (!summary) {
-              if (!first) o->add(",");
+              if (!first) txt.add(",");
               first = false;
-              o->addStr(String(info.key)); o->add(":"); o->addStr(v);
+              txt.addStr(String(info.key)); txt.add(":"); txt.addStr(v);
             }
           }
           e = nvs_entry_next(&it);
@@ -2414,47 +2680,52 @@ void *recordsExportJson(bool summary, size_t *outLen) {
         nvs_release_iterator(it);
         nvs_close(h);
       }
-      o->add("}");
+      txt.add("}");
     }
-    if (strcmp(REC_GROUPS[gi].name, "altHealth") == 0) {
+    if (G.wear) {
+      // The live RTC copy: newer than the NVS one, which is only as fresh as the last field-cut save.
+      uint8_t *w = (uint8_t *)ps_malloc(sizeof(BatteryWear));
+      if (!w) { fail("ran out of memory"); return; }
+      memcpy(w, &g_batWear, sizeof(BatteryWear));
+      const BatteryWear *bw = (const BatteryWear *)w;
+      if (bw->magic == BW_MAGIC && bw->headMagic == BW_MAGIC) {
+        hash += recFnv(w, sizeof(BatteryWear));
+        bytes += sizeof(BatteryWear); items++;
+        if (!summary) { txt.add("\"blob\":\""); txt.addB64(w, sizeof(BatteryWear)); txt.add("\""); wrote = true; }
+      }
+      free(w);
+    }
+    if (strcmp(G.name, "altHealth") == 0) {
       char es[32];
       snprintf(es, sizeof(es), ",\"eng_s\":%ld", (long)EngineRunTime_AllTime);
-      o->add(es);
+      txt.add(es);
+      wrote = true;
     }
-    if (!o->ok || readFail) { delete o; return nullptr; }
-    if (o->len > body) o->add(",");
+    if (wrote) txt.add(",");
     char tail[64];
     snprintf(tail, sizeof(tail), "\"bytes\":%u,\"items\":%u,\"hash\":\"%08lx\"}", (unsigned)bytes, (unsigned)items, (unsigned long)hash);
-    o->add(tail);
+    txt.add(tail);
+    gi++;
+    step = X_GROUP;
   }
-  o->add("}}");
-  if (!o->ok) { delete o; return nullptr; }
-  *outLen = o->len;
-  return o;
+};
+
+// A records export as an opaque RecExport in PSRAM (void*: a sketch type in a free-function signature breaks the Arduino
+// auto-prototype). The response filler calls recordsExportRead until it returns 0; recordsExportFree releases it.
+// nullptr = out of memory.
+void *recordsExportOpen(bool summary) {
+  void *m = ps_malloc(sizeof(RecExport));
+  return m ? new (m) RecExport(summary) : nullptr;
 }
 
-// AsyncWebServer filler for a recordsExportJson result: bytes from index on, sequential calls walk the blocks in order.
-size_t recordsExportRead(void *rec, uint8_t *out, size_t maxLen, size_t index) {
-  return rec ? ((RecOut *)rec)->read(out, maxLen, index) : 0;
+size_t recordsExportRead(void *rec, uint8_t *out, size_t maxLen) {
+  return rec ? ((RecExport *)rec)->fill(out, maxLen) : 0;
 }
 
-void recordsExportFree(void *rec) { delete (RecOut *)rec; }
-
-// Span of the string value of "key" inside obj (no escapes are expected — base64 and hex never carry any).
-static bool recJsonStrSpan(const char *obj, const char *key, const char **start, size_t *len) {
-  String needle = "\"";
-  needle += key;
-  needle += "\"";
-  const char *p = strstr(obj, needle.c_str());
-  if (!p) return false;
-  p += needle.length();
-  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') p++;
-  if (*p != '"') return false;
-  const char *e = strchr(p + 1, '"');
-  if (!e) return false;
-  *start = p + 1;
-  *len = (size_t)(e - p - 1);
-  return true;
+void recordsExportFree(void *rec) {
+  if (!rec) return;
+  ((RecExport *)rec)->~RecExport();
+  free(rec);
 }
 
 // One "type:value" lifetime entry back into the open "storage" handle.
@@ -2482,44 +2753,398 @@ static bool recStorageWrite(nvs_handle_t h, const char *key, const String &tv) {
   return false;
 }
 
-// Apply the `records` groups the body carries; whatever a group lacks is removed so the importer holds what the source
-// held. Files stage first: any decode/write failure removes every staged file and touches nothing else (-2); -1 =
-// malformed. On success sets importRebootPending so this unit's savers don't overwrite the imported keys before reboot.
-int recordsImport(const char *body) {
-  char *rec = cfgObjectDup(body, "records");
-  if (!rec) return -1;
-  char *grp[REC_GROUP_COUNT] = {}, *fo[REC_GROUP_COUNT] = {}, *no[REC_GROUP_COUNT] = {}, *so[REC_GROUP_COUNT] = {};
+#define REC_IMPORT_MAX  4194304   // upload bytes accepted
+#define REC_IMPORT_WBUF 16384     // decoded bytes of a record file held before one write to its part file
+#define REC_IMPORT_TEXT 65536     // the picked groups' nvs / storage / blob JSON, kept until the whole upload has arrived
+#define REC_BLOB_TEXT   ((sizeof(BatteryWear) + 2) / 3 * 4 + 8)   // base64 of a battery wear record in this layout
+#define REC_FILES_MAX   4         // most record files in one group: a bit each in fSeen / fPart (checked in recordsImportOpen)
+#define REC_E_NONE  (-1)
+#define REC_E_WRITE (-2)
+#define REC_E_NOMEM (-3)
+#define REC_E_BAD   (-4)
+#define REC_E_BUSY  (-5)
+#define REC_E_BIG   (-6)
+
+// One import is received at a time: the part files have fixed names. async_tcp only. An owner silent for longer than
+// any live upload can be (the /importRecords route drops a sender after 20 s without data) is taken over.
+#define REC_IMPORT_STALE_MS 30000UL
+static uint32_t recImportOwner = 0, recImportSeq = 0, recImportSeenMs = 0;
+
+static inline bool recWs(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+// /importRecords as the upload arrives: a JSON reader that decodes each picked record file's base64 straight into a part
+// file and keeps only the small NVS sections as text, so the memory in use does not grow with the history sent. Nothing
+// a boot would commit exists until recordsImportFinish has seen the whole upload check out.
+// One calloc'd PSRAM block with no destructor: it rides request->_tempObject, which the request frees with free().
+// A class, not a struct: with "enum : uint8_t" inside a struct the Arduino prototype generator (ctags) takes the member
+// functions for free ones and writes no prototype for any function after them, in this file or the next.
+class RecImport {
+ public:
+  enum : uint8_t { RP_ROOT, RP_KEY_OR_END, RP_KEY, RP_IN_KEY, RP_COLON, RP_VALUE, RP_AFTER, RP_FILE, RP_BLOB,
+                   RP_ENG_STR, RP_ENG_NUM, RP_CAPTURE, RP_SKIP, RP_SKIP_NUM, RP_END };
+  enum : uint8_t { RS_FILES = 1, RS_NVS = 2, RS_STORAGE = 4, RS_BLOB = 8 };
+  uint32_t id;
+  int8_t err;          // 0, or the REC_E_ result that ended it
+  bool closed;         // finished or aborted
+  uint8_t ps;          // RP_
+  uint8_t lvl;         // objects open on the path root > records > group > files
+  bool esc;            // inside a string, the last byte was an unescaped backslash
+  bool inStr;          // RP_CAPTURE / RP_SKIP: inside a string
+  uint16_t depth;      // RP_CAPTURE / RP_SKIP: containers open inside the value
+  bool sawRecords;
+  bool keyLong;
+  uint8_t keyLen;
+  char key[40];
+  uint8_t g, f;        // the group / file being read
+  bool picked[REC_GROUP_COUNT];
+  uint8_t sect[REC_GROUP_COUNT];    // RS_ sections the group carried
+  uint8_t fSeen[REC_GROUP_COUNT];   // bit per file: its key arrived
+  uint8_t fPart[REC_GROUP_COUNT];   // bit per file: a part file was written
+  uint32_t fBytes[REC_GROUP_COUNT][REC_FILES_MAX];
+  uint32_t nvsAt[REC_GROUP_COUNT], stoAt[REC_GROUP_COUNT];   // offsets into text
+  uint32_t blobAt, blobLen;
+  bool blobLong;       // longer than a record in this layout can be
+  bool haveEngS;
+  uint8_t engLen;
+  char engS[24];
+  uint32_t acc;        // base64 group in progress: accN characters, pad '=' seen
+  uint8_t accN, pad;
+  bool b64End;         // a padded group closed the string's data
+  size_t rxBytes, wLen, textLen;
+  uint8_t wbuf[REC_IMPORT_WBUF];
+  char text[REC_IMPORT_TEXT];
+
+  void fail(int8_t e) { if (!err) err = e; }
+
+  bool put(char c) {
+    if (textLen >= sizeof(text)) { fail(REC_E_BIG); return false; }
+    text[textLen++] = c;
+    return true;
+  }
+
+  // wbuf to the current file's part file. Opened and closed per write: the block must stay free()-able as it is, so
+  // nothing here may hold a File.
+  bool flushPart() {
+    if (!wLen) return true;
+    const uint8_t bit = (uint8_t)(1 << f);
+    const String part = recPartPath(REC_GROUPS[g].files[f]);
+    fsTakeLock();
+    File out = LittleFS.open(part.c_str(), (fPart[g] & bit) ? "a" : "w");
+    bool ok = (bool)out;
+    if (out) {
+      ok = (out.write(wbuf, wLen) == wLen);
+      out.close();
+      fsFreeDirty = true;
+    }
+    fsReleaseLock();
+    fPart[g] |= bit;
+    fBytes[g][f] += (uint32_t)wLen;
+    wLen = 0;
+    if (!ok) fail(REC_E_WRITE);
+    return ok;
+  }
+
+  void dropParts() {
+    for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
+      for (uint8_t i = 0; i < REC_GROUPS[gi].nFiles; i++) {
+        if (!(fPart[gi] & (1 << i))) continue;
+        const String part = recPartPath(REC_GROUPS[gi].files[i]);
+        fsTakeLock();
+        if (LittleFS.exists(part.c_str())) LittleFS.remove(part.c_str());
+        fsFreeDirty = true;
+        fsReleaseLock();
+      }
+      fPart[gi] = 0;
+    }
+  }
+
+  void outByte(uint8_t b) {
+    wbuf[wLen++] = b;
+    if (wLen == sizeof(wbuf)) flushPart();
+  }
+
+  // One character of a record file's base64. Stricter than mbedtls: the exporter writes no line breaks and always pads.
+  void b64(char c) {
+    uint32_t v;
+    if (c >= 'A' && c <= 'Z') v = (uint32_t)(c - 'A');
+    else if (c >= 'a' && c <= 'z') v = (uint32_t)(c - 'a') + 26;
+    else if (c >= '0' && c <= '9') v = (uint32_t)(c - '0') + 52;
+    else if (c == '+') v = 62;
+    else if (c == '/') v = 63;
+    else if (c == '=' && !b64End && accN >= 2) {
+      if (accN == 3) { outByte((uint8_t)(acc >> 10)); outByte((uint8_t)(acc >> 2)); b64End = true; }
+      else if (++pad == 2) { outByte((uint8_t)(acc >> 4)); b64End = true; }
+      return;
+    } else { fail(REC_E_BAD); return; }
+    if (pad || b64End) { fail(REC_E_BAD); return; }
+    acc = (acc << 6) | v;
+    if (++accN == 4) {
+      outByte((uint8_t)(acc >> 16)); outByte((uint8_t)(acc >> 8)); outByte((uint8_t)acc);
+      acc = 0; accN = 0;
+    }
+  }
+
+  void closeObject() { ps = (--lvl == 0) ? RP_END : RP_AFTER; }
+
+  bool section(uint8_t bit) {
+    if (sect[g] & bit) { fail(REC_E_BAD); return false; }
+    sect[g] |= bit;
+    return true;
+  }
+
+  // The first character of a value, with its key in key[]: where the group tables say it is a record, read it; pass
+  // over anything else, so a group or file this firmware does not know is ignored as it always was.
+  void value(char c) {
+    const bool obj = (c == '{'), str = (c == '"');
+    if (c == ',' || c == '}' || c == ']') { fail(REC_E_BAD); return; }
+    esc = false;
+    if (!keyLong && lvl == 1) {
+      if (obj && !sawRecords && strcmp(key, "records") == 0) { sawRecords = true; lvl = 2; ps = RP_KEY_OR_END; return; }
+    } else if (!keyLong && lvl == 2) {
+      for (size_t i = 0; obj && i < REC_GROUP_COUNT; i++) {
+        if (strcmp(key, REC_GROUPS[i].name) != 0) continue;
+        if (picked[i]) { fail(REC_E_BAD); return; }
+        picked[i] = true; g = (uint8_t)i; lvl = 3; ps = RP_KEY_OR_END;
+        return;
+      }
+    } else if (!keyLong && lvl == 3) {
+      const RecGroup &G = REC_GROUPS[g];
+      if (obj && G.nFiles && strcmp(key, "files") == 0) {
+        if (section(RS_FILES)) { lvl = 4; ps = RP_KEY_OR_END; }
+        return;
+      }
+      if (obj && ((G.nNvs && strcmp(key, "nvs") == 0) || (G.storage && strcmp(key, "storage") == 0))) {
+        const bool nvs = (key[0] == 'n');
+        if (!section(nvs ? RS_NVS : RS_STORAGE)) return;
+        (nvs ? nvsAt : stoAt)[g] = (uint32_t)textLen;
+        depth = 1; inStr = false; ps = RP_CAPTURE;
+        put(c);
+        return;
+      }
+      if (str && G.wear && strcmp(key, "blob") == 0) {
+        if (section(RS_BLOB)) { blobAt = (uint32_t)textLen; blobLen = 0; ps = RP_BLOB; }
+        return;
+      }
+      if (!obj && c != '[' && !haveEngS && strcmp(key, "eng_s") == 0 && strcmp(G.name, "altHealth") == 0) {
+        engLen = 0;
+        if (str) ps = RP_ENG_STR;
+        else { engS[engLen++] = c; ps = RP_ENG_NUM; }
+        return;
+      }
+    } else if (!keyLong && lvl == 4) {
+      const RecGroup &G = REC_GROUPS[g];
+      for (uint8_t i = 0; str && i < G.nFiles; i++) {
+        if (strcmp(key, G.files[i]) != 0) continue;
+        if (fSeen[g] & (1 << i)) { fail(REC_E_BAD); return; }
+        fSeen[g] |= (uint8_t)(1 << i);
+        f = i; acc = 0; accN = pad = 0; b64End = false; wLen = 0; ps = RP_FILE;
+        return;
+      }
+    }
+    if (obj || c == '[') { depth = 1; inStr = false; ps = RP_SKIP; }
+    else if (str) { depth = 0; inStr = true; ps = RP_SKIP; }
+    else ps = RP_SKIP_NUM;
+  }
+
+  void one(char c) {
+    if (c == '\0' && ps != RP_END) { fail(REC_E_BAD); return; }   // the kept sections are read as C strings
+    if (ps == RP_FILE) {
+      if (esc) { esc = false; if (c == '/') b64(c); else fail(REC_E_BAD); }   // "\/" is the one escape base64 can carry
+      else if (c == '"') { if ((accN == 0 && pad == 0) || b64End) { if (flushPart()) ps = RP_AFTER; } else fail(REC_E_BAD); }
+      else if (c == '\\') esc = true;
+      else b64(c);
+      return;
+    }
+    if (ps == RP_ENG_NUM || ps == RP_SKIP_NUM) {
+      if (c != ',' && c != '}' && c != ']' && !recWs(c)) {
+        if (ps == RP_ENG_NUM && engLen < sizeof(engS) - 1) engS[engLen++] = c;
+        return;
+      }
+      if (ps == RP_ENG_NUM) { engS[engLen] = '\0'; haveEngS = true; }
+      ps = RP_AFTER;   // the delimiter is read below
+    }
+    switch (ps) {
+      case RP_ROOT:
+        if (recWs(c)) return;
+        if (c == '{') { lvl = 1; ps = RP_KEY_OR_END; }
+        else fail(REC_E_NONE);
+        return;
+      case RP_KEY_OR_END:
+      case RP_KEY:
+        if (recWs(c)) return;
+        if (c == '"') { keyLen = 0; keyLong = false; esc = false; ps = RP_IN_KEY; }
+        else if (c == '}' && ps == RP_KEY_OR_END) closeObject();
+        else fail(REC_E_BAD);
+        return;
+      case RP_IN_KEY:
+        if (!esc && c == '"') { key[keyLen] = '\0'; ps = RP_COLON; return; }
+        if (!esc && c == '\\') { esc = true; return; }
+        esc = false;
+        if (keyLen < sizeof(key) - 1) key[keyLen++] = c;
+        else keyLong = true;
+        return;
+      case RP_COLON:
+        if (recWs(c)) return;
+        if (c == ':') ps = RP_VALUE;
+        else fail(REC_E_BAD);
+        return;
+      case RP_VALUE:
+        if (!recWs(c)) value(c);
+        return;
+      case RP_AFTER:
+        if (recWs(c)) return;
+        if (c == ',') ps = RP_KEY;
+        else if (c == '}') closeObject();
+        else fail(REC_E_BAD);
+        return;
+      case RP_CAPTURE:   // an nvs or storage object, kept as it was sent
+        if (!put(c)) return;
+        if (inStr) {
+          if (esc) esc = false;
+          else if (c == '\\') esc = true;
+          else if (c == '"') inStr = false;
+        } else if (c == '"') inStr = true;
+        else if (c == '{' || c == '[') depth++;
+        else if ((c == '}' || c == ']') && --depth == 0) { if (put('\0')) ps = RP_AFTER; }
+        return;
+      case RP_SKIP:
+        if (inStr) {
+          if (esc) esc = false;
+          else if (c == '\\') esc = true;
+          else if (c == '"') { inStr = false; if (!depth) ps = RP_AFTER; }
+        } else if (c == '"') inStr = true;
+        else if (c == '{' || c == '[') depth++;
+        else if ((c == '}' || c == ']') && --depth == 0) ps = RP_AFTER;
+        return;
+      case RP_BLOB:
+        if (!esc && c == '"') { if (put('\0')) ps = RP_AFTER; return; }
+        esc = (!esc && c == '\\');
+        if (blobLen >= REC_BLOB_TEXT) blobLong = true;
+        else if (put(c)) blobLen++;
+        return;
+      case RP_ENG_STR:
+        if (c == '"') { engS[engLen] = '\0'; haveEngS = true; ps = RP_AFTER; }
+        else if (engLen < sizeof(engS) - 1) engS[engLen++] = c;
+        return;
+      default:   // RP_END: whatever follows the root object is ignored
+        return;
+    }
+  }
+
+  void feed(const uint8_t *d, size_t n) {
+    rxBytes += n;
+    if (rxBytes > REC_IMPORT_MAX) fail(REC_E_BIG);
+    for (size_t i = 0; i < n && !err; i++) one((char)d[i]);
+  }
+};
+
+// Starts receiving an import (void*: a sketch type in a free-function signature breaks the Arduino auto-prototype).
+// nullptr = out of memory. The caller hands every body chunk to recordsImportFeed, ends with recordsImportFinish, and
+// calls recordsImportAbort when the connection goes away; the block itself is released with free().
+void *recordsImportOpen() {
+  static_assert(REC_N(REC_ALT_FILES) <= REC_FILES_MAX && REC_N(REC_PERF_FILES) <= REC_FILES_MAX && REC_N(REC_BH_FILES) <= REC_FILES_MAX
+                && REC_N(REC_SLED_FILES) <= REC_FILES_MAX && REC_N(REC_ZF_FILES) <= REC_FILES_MAX && REC_N(REC_FA_FILES) <= REC_FILES_MAX
+                && REC_N(REC_HUNT_FILES) <= REC_FILES_MAX, "raise REC_FILES_MAX");
+  RecImport *I = (RecImport *)ps_calloc(1, sizeof(RecImport));
+  if (!I) return nullptr;
+  if (++recImportSeq == 0) recImportSeq = 1;
+  I->id = recImportSeq;
+  if (recImportOwner && millis() - recImportSeenMs < REC_IMPORT_STALE_MS) I->err = REC_E_BUSY;
+  else { recImportOwner = I->id; recImportSeenMs = millis(); }
+  return I;
+}
+
+void recordsImportFeed(void *imp, const uint8_t *data, size_t len) {
+  RecImport *I = (RecImport *)imp;
+  if (!I || I->closed || I->err) return;
+  if (I->id != recImportOwner) { I->err = REC_E_BUSY; return; }
+  recImportSeenMs = millis();
+  I->feed(data, len);
+}
+
+// The upload ended without recordsImportFinish (connection lost, or refused): its part files go. Harmless after a finish.
+void recordsImportAbort(void *imp) {
+  RecImport *I = (RecImport *)imp;
+  if (!I || I->closed) return;
+  I->closed = true;
+  if (I->id != recImportOwner) return;   // never the owner, or taken over: the part files are another import's
+  recImportOwner = 0;
+  I->dropParts();
+}
+
+// Checks a received import, turns its part files into staged files and applies the NVS halves; whatever a picked group
+// lacks is removed so the importer holds what the source held. Returns items applied. Below zero nothing was changed
+// and no part or staged file is left: -1 no records object, -2 a staged file could not be written, -3 out of memory,
+// -4 damaged or cut short, -5 another import was being received, -6 too large. On success sets importRebootPending so
+// this unit's savers don't overwrite the imported keys before reboot.
+int recordsImportFinish(void *imp) {
+  RecImport *I = (RecImport *)imp;
+  if (!I || I->closed) return REC_E_BAD;
+  I->closed = true;
+  const bool owner = (I->id == recImportOwner);
+  if (owner) recImportOwner = 0;
+  else I->fail(REC_E_BUSY);
+  if (!I->err && I->ps != RecImport::RP_END) I->err = (I->ps == RecImport::RP_ROOT) ? REC_E_NONE : REC_E_BAD;
+  if (!I->err && !I->sawRecords) I->err = REC_E_NONE;
+  const bool *grp = I->picked;
+  char *no[REC_GROUP_COUNT] = {}, *so[REC_GROUP_COUNT] = {};
+  for (size_t gi = 0; gi < REC_GROUP_COUNT && !I->err; gi++) {
+    if (!grp[gi]) continue;   // not picked: this regulator keeps its own
+    const RecGroup &G = REC_GROUPS[gi];
+    const uint8_t need = (G.nFiles ? RecImport::RS_FILES : 0) | (G.nNvs ? RecImport::RS_NVS : 0) | (G.storage ? RecImport::RS_STORAGE : 0);
+    if ((I->sect[gi] & need) != need) { I->err = REC_E_BAD; break; }
+    if (G.nNvs) no[gi] = I->text + I->nvsAt[gi];
+    if (G.storage) so[gi] = I->text + I->stoAt[gi];
+  }
+  if (I->err) {
+    if (owner) I->dropParts();
+    return I->err;
+  }
+  const String engS = I->engS;   // altHealth's eng_s
+  const bool haveEngS = I->haveEngS;
   int applied = 0;
-  bool bad = false;
-  // Phase 1: every group's sections, then every file decoded and staged.
+  bool bad = false, oom = false;
+  // The lifetime erase list is sized now, before anything changes, so running out of memory changes nothing.
+  char (*gone)[NVS_KEY_NAME_MAX_SIZE] = nullptr;
+  size_t nAll = 0;
+  for (size_t gi = 0; gi < REC_GROUP_COUNT && !bad; gi++) {
+    if (!REC_GROUPS[gi].storage || !grp[gi]) continue;
+    nvs_iterator_t it = nullptr;
+    for (esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, "storage", NVS_TYPE_ANY, &it); e == ESP_OK; e = nvs_entry_next(&it)) nAll++;
+    nvs_release_iterator(it);
+    gone = (char (*)[NVS_KEY_NAME_MAX_SIZE])ps_malloc((nAll + 1) * NVS_KEY_NAME_MAX_SIZE);
+    if (!gone) bad = oom = true;
+  }
+  // Phase 1: every part file holds the bytes decoded into it (the end of a write is flushed when the file closes, and
+  // File::close() reports nothing, so a full filesystem can pass unseen), then each becomes its staged file.
+  for (size_t gi = 0; gi < REC_GROUP_COUNT && !bad; gi++) {
+    for (uint8_t f = 0; grp[gi] && f < REC_GROUPS[gi].nFiles && !bad; f++) {
+      if (!(I->fPart[gi] & (1 << f))) continue;
+      fsTakeLock();
+      File pf = LittleFS.open(recPartPath(REC_GROUPS[gi].files[f]).c_str(), "r");
+      if (!pf || (size_t)pf.size() != (size_t)I->fBytes[gi][f]) bad = true;
+      if (pf) pf.close();
+      fsReleaseLock();
+    }
+  }
   for (size_t gi = 0; gi < REC_GROUP_COUNT && !bad; gi++) {
     const RecGroup &G = REC_GROUPS[gi];
-    grp[gi] = cfgObjectDup(rec, G.name);
-    if (!grp[gi]) continue;   // not picked: this regulator keeps its own
-    if (G.nFiles && !(fo[gi] = cfgObjectDup(grp[gi], "files"))) bad = true;
-    if (G.nNvs && !(no[gi] = cfgObjectDup(grp[gi], "nvs"))) bad = true;
-    if (G.storage && !(so[gi] = cfgObjectDup(grp[gi], "storage"))) bad = true;
+    if (!grp[gi]) continue;
     for (uint8_t f = 0; f < G.nFiles && !bad; f++) {
       const char *live = G.files[f];
-      const char *b64 = nullptr;
-      size_t bl = 0, n = 0;
-      uint8_t *buf = nullptr;
-      if (recJsonStrSpan(fo[gi], live, &b64, &bl)) {
-        mbedtls_base64_decode(nullptr, 0, &n, (const unsigned char *)b64, bl);
-        buf = (uint8_t *)ps_malloc(n ? n : 1);
-        if (!buf || mbedtls_base64_decode(buf, n, &n, (const unsigned char *)b64, bl) != 0) { free(buf); bad = true; break; }
-      }
       String staged = recStagedPath(live);
       fsTakeLock();
-      File out = LittleFS.open(staged.c_str(), "w");   // zero bytes = the source had no such file
-      bool ok = (bool)out;
-      if (out) {
-        if (buf && n) ok = (out.write(buf, n) == n);
-        out.close();
-        fsFreeDirty = true;
+      if (LittleFS.exists(staged.c_str())) LittleFS.remove(staged.c_str());
+      bool ok;
+      if (I->fPart[gi] & (1 << f)) {
+        ok = LittleFS.rename(recPartPath(live).c_str(), staged.c_str());
+      } else {
+        File out = LittleFS.open(staged.c_str(), "w");   // zero bytes = the source had no such file
+        ok = (bool)out;
+        if (out) out.close();
       }
+      fsFreeDirty = true;
       fsReleaseLock();
-      free(buf);
       if (!ok) bad = true;
       else applied++;
     }
@@ -2530,7 +3155,8 @@ int recordsImport(const char *body) {
       if (grp[gi]) for (uint8_t f = 0; f < REC_GROUPS[gi].nFiles; f++) LittleFS.remove(recStagedPath(REC_GROUPS[gi].files[f]).c_str());
     fsFreeDirty = true;
     fsReleaseLock();
-    applied = -2;
+    I->dropParts();
+    applied = oom ? REC_E_NOMEM : REC_E_WRITE;
   } else {
     // Phase 2: the NVS halves.
     bool lifeIn = false, altIn = false;
@@ -2562,26 +3188,38 @@ int recordsImport(const char *body) {
       }
       // The trend axis counts engine seconds from altbaseSec. Without the lifetime totals this regulator keeps its own
       // engine hours, so the baseline moves by the difference and new trend points continue where the file's stopped.
-      String es;
-      if (strcmp(G.name, "altHealth") == 0 && !lifeIn && cfgJsonExtract(grp[gi], "eng_s", es) && settingExists(NK_altbaseSec)) {
+      const String &es = engS;
+      if (strcmp(G.name, "altHealth") == 0 && !lifeIn && haveEngS && settingExists(NK_altbaseSec)) {
         int32_t ownEng = (int32_t)EngineRunTime_AllTime;
         nvs_handle_t eh;
         if (nvs_open("storage", NVS_READONLY, &eh) == ESP_OK) { nvs_get_i32(eh, "EngRunTime_AT", &ownEng); nvs_close(eh); }
         const double base = (double)ownEng - (double)es.toInt() + settingRead(NK_altbaseSec).toDouble();
         settingWrite(NK_altbaseSec, String(base, 1).c_str());
       }
+      if (G.wear) {
+        // A record from another layout (other firmware) cannot be converted: this regulator keeps its own. A group with
+        // no blob means the source had none, so this one starts over, as a file the source lacked is removed.
+        size_t n = 0;
+        if (I->sect[gi] & RecImport::RS_BLOB) {
+          uint8_t *buf = (uint8_t *)ps_malloc(sizeof(BatteryWear));
+          const bool fits = buf && !I->blobLong
+                            && mbedtls_base64_decode(buf, sizeof(BatteryWear), &n, (const unsigned char *)I->text + I->blobAt, I->blobLen) == 0
+                            && n == sizeof(BatteryWear) && ((const BatteryWear *)buf)->magic == BW_MAGIC
+                            && ((const BatteryWear *)buf)->headMagic == BW_MAGIC;
+          if (fits && batteryWearImport(buf, n)) applied++;
+          else if (!fits) queueConsoleMessage("IMPORT: the battery wear record is from another firmware version; this regulator kept its own");
+          free(buf);
+        } else if (batteryWearImport(nullptr, 0)) {
+          applied++;
+        }
+      }
       if (G.storage) {
         nvs_handle_t h;
         if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
           // This regulator's lifetime keys the file does not hold go, as its files do: every key the export would
           // carry (recStorageValue), less the kept ones. Collected first; erasing under the iterator is not allowed.
-          size_t nAll = 0;
-          nvs_iterator_t it = nullptr;
-          for (esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, "storage", NVS_TYPE_ANY, &it); e == ESP_OK; e = nvs_entry_next(&it)) nAll++;
-          nvs_release_iterator(it);
-          char (*gone)[NVS_KEY_NAME_MAX_SIZE] = (char (*)[NVS_KEY_NAME_MAX_SIZE])ps_malloc((nAll + 1) * NVS_KEY_NAME_MAX_SIZE);
           size_t nGone = 0;
-          it = nullptr;
+          nvs_iterator_t it = nullptr;
           for (esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, "storage", NVS_TYPE_ANY, &it); gone && e == ESP_OK && nGone < nAll; e = nvs_entry_next(&it)) {
             nvs_entry_info_t info;
             nvs_entry_info(it, &info);
@@ -2593,7 +3231,6 @@ int recordsImport(const char *body) {
           }
           nvs_release_iterator(it);
           for (size_t i = 0; i < nGone; i++) nvs_erase_key(h, gone[i]);
-          free(gone);
           const char *p = so[gi] + 1;
           while (true) {
             p = strchr(p, '"');
@@ -2617,8 +3254,7 @@ int recordsImport(const char *body) {
     }
     if (applied) cfgImportNoteChanged("equipment records");
   }
-  for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) { free(grp[gi]); free(fo[gi]); free(no[gi]); free(so[gi]); }
-  free(rec);
+  free(gone);
   return applied;
 }
 
@@ -2628,8 +3264,10 @@ static void recordsStagedCommit() {
   for (size_t gi = 0; gi < REC_GROUP_COUNT; gi++) {
     for (uint8_t f = 0; f < REC_GROUPS[gi].nFiles; f++) {
       const char *live = REC_GROUPS[gi].files[f];
-      String staged = recStagedPath(live);
+      String staged = recStagedPath(live), part = recPartPath(live);
       fsTakeLock();
+      // What an upload left when the power went mid-transfer: never whole, so never committed.
+      if (LittleFS.exists(part.c_str())) { LittleFS.remove(part.c_str()); fsFreeDirty = true; }
       if (LittleFS.exists(staged.c_str())) {
         if (strcmp(live, "/altfront.bin") == 0) wipe |= 1;
         else if (strcmp(live, "/sailfront.bin") == 0 || strcmp(live, "/motorfront.bin") == 0) wipe |= 2;
@@ -2658,6 +3296,7 @@ static void recordsStagedCommit() {
 }
 
 int applyImportConfig(const char *body, bool cloudPush) {
+  cfgImportRpmRefused = false;
   if (!body) return -1;
   char *cfgBuf = cfgObjectDup(body, "config");
   if (!cfgBuf) return -1;   // malformed / wrong shape — reject, don't half-apply
@@ -3201,8 +3840,8 @@ static void cvpfSizeStep() {
   di = fminf(di, headroom / fmaxf(1e-3f, Kupper));
   // Target-ΔV sizing — skipped on an operator-boosted re-run (cvpfBoosted), whose whole point is a
   // bigger swing for SNR; the OV-headroom and cap-table clamps still bound it, and the gassing gate
-  // judges the projected peak. Never skipped after an OV fallback re-size (headroom already proved tight).
-  if (!cvpfBoosted || cvpfFellBack)
+  // judges the projected peak.
+  if (!cvpfBoosted)
     di = fminf(di, cvpfTargetDV / fmaxf(1e-3f, Klong));
   // Never command past what the alternator cap table allows at this RPM (the step rides on top of cvpfBaseA).
   // Skip when g_I_cap is unset/tiny (low RPM) — the delivery-short warn catches under-delivery instead.
@@ -3288,17 +3927,12 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
     case 2: {  // HOLD — practice run at the sized step; capture the settled duty as the pulse crest
       float target = cvpfBaseA + cvpfStepA;
       cvpfCmdA = target;
-      // Runtime OV guard: first trip → re-hold at a 180 mV (12V-equiv) step; second → abort. Both class-scaled: the
-      // bus crosses a fixed cushion 4x faster per cell at 48V.
+      // Runtime OV guard: abort on the first crossing. Class-scaled: the bus crosses a fixed cushion 4x faster per cell at 48V.
       if (IBV > AlternatorHardShutdownV - 0.10f * cvpfVScale()) {
-        if (!cvpfFellBack) {
-          cvpfFellBack = true; cvpfTargetDV = 0.18f * cvpfVScale(); cvpfWarn |= 0x10;
-          cvpfSizeStep();
-          cvpfPhaseStartMs = nowMs; cvpfInBandMs = 0;
-          queueConsoleMessageF("CV plant-fit: over-voltage headroom tight — step reduced to %.0f A, re-testing", cvpfStepA);
-        } else {
-          cvpfAbort("over-voltage during fit even at the reduced step — lower the charge target or raise OV headroom, then re-run");
-        }
+        snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
+                 "voltage headroom too tight for the %.0f A test step: the bus reached %.2f V, within %.2f V of the Alternator Hard Shutdown Voltage (%.2f V). Draw the bank down with loads or turn off other charge sources, then re-run",
+                 cvpfStepA, IBV, 0.10f * cvpfVScale(), AlternatorHardShutdownV);
+        cvpfAbort(cvpfDiagBuf);
         break;
       }
       cvpfAmpsEma += 0.05f * (measA - cvpfAmpsEma);
@@ -3332,7 +3966,10 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
                // settle after the crest, so both replayed levels carry the same engine speed and plant gain
       cvpfCmdA = cvpfBaseA;
       if (IBV > AlternatorHardShutdownV - 0.10f * cvpfVScale()) {
-        cvpfAbort("over-voltage while returning to the baseline current — lower the charge target or raise OV headroom, then re-run");
+        snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
+                 "voltage headroom too tight on the return to baseline current: the bus reached %.2f V, within %.2f V of the Alternator Hard Shutdown Voltage (%.2f V). Draw the bank down with loads or turn off other charge sources, then re-run",
+                 IBV, 0.10f * cvpfVScale(), AlternatorHardShutdownV);
+        cvpfAbort(cvpfDiagBuf);
         break;
       }
       cvpfAmpsEma += 0.05f * (measA - cvpfAmpsEma);
@@ -3375,7 +4012,10 @@ bool cvpf_tick(float &dutyOut, float measA, uint32_t nowMs) {
     case 4: {  // PULSES — abrupt duty squares; every segment boundary is a measured edge
       // Same class-scaled cushion as HOLD/REBASE; matters most here since direct-duty edges have no rise pacing.
       if (IBV > AlternatorHardShutdownV - 0.10f * cvpfVScale()) {
-        cvpfAbort("over-voltage during the pulse train — re-run once charging is steady");
+        snprintf(cvpfDiagBuf, sizeof(cvpfDiagBuf),
+                 "voltage headroom too tight during the %.0f A pulse train: the bus reached %.2f V, within %.2f V of the Alternator Hard Shutdown Voltage (%.2f V). Draw the bank down with loads or turn off other charge sources, then re-run",
+                 cvpfStepA, IBV, 0.10f * cvpfVScale(), AlternatorHardShutdownV);
+        cvpfAbort(cvpfDiagBuf);
         break;
       }
       int seg = (int)(elapsed / CVPF_PULSE_SEG_MS);   // 0,2,4,6 = base; 1,3,5,7 = step
@@ -3538,7 +4178,7 @@ bool cvpfStartTest(float diMaxReq) {
   cvpfPhase = 0;
   cvpfPhaseStartMs = millis(); cvpfTestStartMs = cvpfPhaseStartMs;
   cvpfBaseA = 10.0f; cvpfPilotA = 6.0f; cvpfStepA = 6.0f;
-  cvpfTargetDV = 0.30f * cvpfVScale(); cvpfFellBack = false;  // 300 mV per 12V block — ripple-limited SNR, so per-cell (see cvpfVScale)
+  cvpfTargetDV = 0.30f * cvpfVScale();  // 300 mV per 12V block — ripple-limited SNR, so per-cell (see cvpfVScale)
   cvpfCmdA = cvpfBaseA;
   // Any request is a boost, including ones under the 40 A default: the default is a ceiling the 300 mV target
   // or the cap table almost always undercuts, so gating the boost on >40 A silently re-ran the same step.
@@ -3580,9 +4220,9 @@ void cvpfAbort(const char *reason) {
 void cvpfServiceCompletion() {
   if (cvpfState != 1) return;
   if (!cvPlantFitActive) { cvpfProcess(); cxLedgerLogCvpf(); return; }   // tick machine finished the RELEASE phase
-  // Worst case: settle timeout + pilot + two hold timeouts (OV re-size) + REBASE at its full budget
+  // Worst case: settle timeout + pilot + hold timeout + REBASE at its full budget
   // (fall-rate ramp of the largest boosted step, plus its settle allowance) + 9 segments + slack.
-  uint32_t budget = CVPF_SETTLE_TIMEOUT_MS + CVPF_T_PILOT_MS + 2 * CVPF_HOLD_TIMEOUT_MS
+  uint32_t budget = CVPF_SETTLE_TIMEOUT_MS + CVPF_T_PILOT_MS + CVPF_HOLD_TIMEOUT_MS
                     + CVPF_REBASE_SETTLE_MS + (uint32_t)(1000.0f * CVPF_DI_MAX_CEIL / TEST_ENTRY_RATE_A)
                     + 9 * CVPF_PULSE_SEG_MS + 8000;
   if (millis() - cvpfTestStartMs > budget) cvpfAbort("timed out (engine stopped or left Auto mode?)");
